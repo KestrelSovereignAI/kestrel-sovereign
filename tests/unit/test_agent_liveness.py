@@ -601,3 +601,108 @@ def test_the_reanchor_guard_refuses_a_directly_launched_agent(
     assert "agent 'Emma' appears to be running" in err
     assert f"PID {os.getpid()} serves it" in err
     assert "to avoid DB corruption" in err
+
+
+def test_strict_identity_uses_the_actual_kernel_session_and_never_retires_itself(tmp_path):
+    import subprocess
+    from uuid import UUID
+
+    if not (sys.platform.startswith("linux") or sys.platform == "darwin"):
+        pytest.skip("Strict kernel boot UUID observer supports Linux and Darwin")
+    identity = liveness.process_identity(require_kernel_session=True)
+    assert identity["birth_id"] == ProcessManager.process_birth_identity(os.getpid())
+    assert identity["kernel_session"] == liveness._kernel_session_id()
+    if sys.platform == "darwin":
+        actual = subprocess.check_output(
+            ["/usr/sbin/sysctl", "-n", "kern.bootsessionuuid"], text=True, timeout=5
+        ).strip()
+    else:
+        actual = Path("/proc/sys/kernel/random/boot_id").read_text(encoding="ascii").strip()
+    assert identity["kernel_session"] == f"{sys.platform}:{UUID(actual)}"
+    assert not liveness.recorded_process_exited(
+        tmp_path / "original-owner", identity, require_kernel_session=True
+    )
+
+
+def test_strict_identity_refuses_an_unreadable_original_start_instant(monkeypatch):
+    monkeypatch.setattr(ProcessManager, "process_start_time", staticmethod(lambda pid: None))
+    with pytest.raises(liveness.ProcessIdentityUnavailable, match="start time"):
+        liveness.process_identity(require_kernel_session=True)
+
+
+@pytest.fixture
+def exited_process_identity(tmp_path):
+    import subprocess
+
+    if not (sys.platform.startswith("linux") or sys.platform == "darwin"):
+        pytest.skip("Strict kernel boot UUID observer supports Linux and Darwin")
+    code = (
+        "import json, sys; from kestrel_sovereign.multi_agent.liveness import process_identity; "
+        "sys.stdout.write(json.dumps(process_identity(require_kernel_session=True)))"
+    )
+    home = tmp_path / "owner-home"
+    home.mkdir()
+    result = subprocess.run(
+        [sys.executable, "-B", "-c", code], cwd=tmp_path,
+        env={"PATH": os.environ["PATH"], "HOME": str(home), "PYTHONDONTWRITEBYTECODE": "1",
+             "PYTHONPATH": str(Path(liveness.__file__).resolve().parents[2])},
+        text=True, capture_output=True, check=True, timeout=15,
+    )
+    return json.loads(result.stdout)
+
+
+def test_strict_identity_observes_an_original_exited_process(tmp_path, exited_process_identity):
+    assert liveness.recorded_process_exited(
+        tmp_path / "original-owner", exited_process_identity, require_kernel_session=True
+    )
+
+
+@pytest.mark.parametrize("field,value", [
+    ("kernel_session", "foreign-kernel"), ("kernel_session", None),
+    ("pid", None), ("pid", True), ("started_at", float("nan")),
+    ("host", "another-original-host"), ("pid_namespace", "foreign-namespace"),
+])
+def test_strict_retirement_never_spends_a_foreign_or_incomplete_owner(
+    tmp_path, exited_process_identity, field, value
+):
+    payload = {**exited_process_identity, field: value}
+    assert not liveness.recorded_process_exited(
+        tmp_path / "foreign-owner", payload, require_kernel_session=True
+    )
+
+
+def test_strict_retirement_refuses_an_older_record_without_kernel_proof(tmp_path, exited_process_identity):
+    payload = dict(exited_process_identity)
+    payload.pop("kernel_session")
+    assert not liveness.recorded_process_exited(
+        tmp_path / "original-owner", payload, require_kernel_session=True
+    )
+
+
+def test_unreadable_kernel_identity_refuses_capture_and_retirement(
+    tmp_path, exited_process_identity, monkeypatch
+):
+    original = PermissionError("original kernel session read was refused")
+
+    def refused():
+        raise original
+
+    monkeypatch.setattr(liveness, "_kernel_session_id", refused)
+    with pytest.raises(liveness.ProcessIdentityUnavailable) as caught:
+        liveness.process_identity(require_kernel_session=True)
+    assert caught.value.__cause__ is original
+    assert not liveness.recorded_process_exited(
+        tmp_path / "original-owner", exited_process_identity, require_kernel_session=True
+    )
+
+
+def test_strict_retirement_ignores_a_clock_adjusted_creation_timestamp(tmp_path, monkeypatch):
+    if not (sys.platform.startswith("linux") or sys.platform == "darwin"):
+        pytest.skip("Strict native process identity observer")
+    identity = liveness.process_identity(require_kernel_session=True)
+    assert identity["pid"] == os.getpid()
+    shifted_start = identity["started_at"] + 3600
+    monkeypatch.setattr(ProcessManager, "_probe_process", staticmethod(lambda pid: (True, shifted_start)))
+    assert not liveness.recorded_process_exited(
+        tmp_path / "live-original-owner", identity, require_kernel_session=True
+    ), "a clock-derived timestamp change retired a physically live original process"

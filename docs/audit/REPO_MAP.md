@@ -19,7 +19,7 @@ Auto-generated file-tree + per-file purpose index. Always-loaded context for the
 GitHub App (issue #791). Do **not** edit by hand — regenerate via `python scripts/generate_repo_map.py`.
 
 **Generated:** 2026-10-21
-**Scope:** 3288 tracked files (2459 `.py`, 365 `.md`, 464 other). Excludes `__pycache__`, `node_modules`, `.venv`, `.claude`, build artifacts.
+**Scope:** 3291 tracked files (2462 `.py`, 365 `.md`, 464 other). Excludes `__pycache__`, `node_modules`, `.venv`, `.claude`, build artifacts.
 
 **Format per file:** `path — one-line purpose` plus the public top-level Python symbols on the next line
 (classes and functions; private `_name` skipped).
@@ -1135,9 +1135,9 @@ Repo entry points and standard project files.
 - **kestrel_sovereign/multi_agent/config.py** — MultiAgent Configuration - Registry of agents managed by a Kestrel Host.
   - `def spawn_retirement_denies_startup(data_dir)`; `class HostConfig`; `class LocalAgentConfig`; `class RemoteAgentConfig`; `class MultiAgentConfig`
 - **kestrel_sovereign/multi_agent/liveness.py** — Whether a live process is serving an agent, however it was launched (#3522).
-  - `class AgentHolder`; `def process_identity()`; `class ServingRecord`; `def recorded_process_exited(path, payload)`; `def serving_holder(data_dir)`; `def agent_holder(project_dir, agent_name, data_dir)`
+  - `class AgentHolder`; `class ProcessIdentityUnavailable`; `def process_identity()`; `class ServingRecord`; `def same_process_identity(first, second)`; `def recorded_process_exited(path, payload)`; `def serving_holder(data_dir)`; `def agent_holder(project_dir, agent_name, data_dir)`
 - **kestrel_sovereign/multi_agent/process_manager.py** — Agent Process Manager - Starts, stops, and monitors agent subprocesses.
-  - `def recorded_pid(value)`; `def recorded_start_time(value)`; `class PidStatus`; `class PidRecord`; `class AgentProcess`; `class ProcessManager`
+  - `def recorded_pid(value)`; `def recorded_birth_identity(value)`; `def recorded_start_time(value)`; `class PidStatus`; `class PidRecord`; `class AgentProcess`; `class ProcessManager`
 - **kestrel_sovereign/multi_agent/proxy.py** — Kestrel Host Proxy - Routes requests to the correct agent process.
   - `def get_agent_base_url(agent_config)`; `def resolve_agent(agent_id, config)`; `def build_proxy_headers(request)`; `async def proxy_request_streaming(request, agent_id, path, config, …)`
 - **kestrel_sovereign/multi_agent/route_name.py** — Lossless path-safe encoding for host-routed agent names.
@@ -3486,6 +3486,8 @@ Repo entry points and standard project files.
   - `def test_public_host_enables_push_with_one_canonical_default_policy()`; `def test_each_policy_setting_is_configurable_by_environment(field)`; `def test_nonpositive_or_wrong_typed_settings_are_refused(field, value)`; `def test_invalid_operator_policy_fails_before_publication(environment)`; `def test_embedding_requires_a_typed_push_policy()`
 - **tests/unit/test_a2a_native_push_polling.py** — Bounded push polling, terminal retirement and scoped retention over real TLS.
   - `async def completed_push_history(manager, monkeypatch, outbound_tls, request)`; `class TestRetainedPushHistory`; `async def test_poll_delivery_work_is_limited_by_the_configured_batch(manager, monkeypatch, outbound_tls)`; `async def test_unsubscribed_task_mutations_do_not_accumulate_push_history(manager, monkeypatch, push_enabled)`
+- **tests/unit/test_a2a_native_push_process_recovery.py** — SIGKILL of a real native HTTPS owner must have a durable recovery boundary.
+  - `async def test_copied_and_foreign_process_witnesses_cannot_spend_an_original_attempt(outbox, field)`; `async def test_original_process_ownership_survives_a_diagnostic_clock_change(outbox, monkeypatch, shift_before_admission)`; `async def test_push_startup_requires_physical_owner_identity_before_optional_ddl(manager, monkeypatch)`; `async def test_invalid_process_recovery_batch_cannot_consume_original_attempts(outbox, limit)`; `async def test_malformed_original_process_witness_refuses_recovery(outbox)`; `async def test_process_inventory_uses_the_live_attempt_partial_index(outbox, monkeypatch)`; `async def native_push_child(value, outbound_tls, tmp_path)`; `async def test_a_different_real_process_cannot_monitor_or_retire_the_original_attempt(outbox, outbound_tls, tmp_path)`; `…`
 - **tests/unit/test_a2a_native_push_reconfiguration.py** — Official repeated inline callbacks and immutable generation replacement.
   - `async def test_official_client_can_repeat_its_inline_callback_on_each_new_input(wire, config_id)`; `async def test_identical_registration_has_one_snapshot_and_one_original_consumer(outbox)`; `async def test_repeated_registration_refuses_a_foreign_original_subscriber(outbox)`; `async def test_public_create_replaces_a_logical_id_and_keeps_only_its_current_value(wire)`; `async def test_two_independent_identical_setters_share_one_generation_and_snapshot(outbox, native_a2a_backend_factory)`; `async def test_postgres_direct_setter_waits_for_the_original_task_boundary(push_store, native_a2a_backend_factory, monkeypatch)`; `async def test_failed_continuation_replacement_restores_the_original_input_and_lease(manager, monkeypatch)`; `async def test_delete_joins_replaced_http_generation_and_preserves_a_later_setter(outbox, outbound_tls, outbound_close_barrier, monkeypatch)`; `…`
 - **tests/unit/test_a2a_native_push_service.py** — Original resident acceptance, startup failure, and service shutdown custody.
@@ -4920,6 +4922,8 @@ Repo entry points and standard project files.
   - `def test_nonblocking_lock_refuses_same_process_contention_then_rearms(tmp_path)`; `def test_nonblocking_lock_refuses_another_process(tmp_path)`; `def test_database_cleanup_refuses_a_replacement_or_shared_inode(tmp_path, replacement)`; `def test_database_cleanup_removes_only_the_exclusively_created_inode(tmp_path)`
 - **tests/unit/test_private_storage_windows.py** — Regression coverage for the Windows private-file custody branch.
   - `def test_read_only_witness_does_not_chmod_on_windows(monkeypatch, tmp_path)`
+- **tests/unit/test_process_birth_identity.py** — Kernel process lifetime identity is independent of epoch creation time.
+  - `def test_invalid_birth_identity_never_becomes_a_lifetime_witness(value)`; `def test_canonical_kernel_birth_values_round_trip(value)`; `def test_invalid_pid_cannot_reach_kernel_birth_observation(pid)`; `def test_actual_process_birth_remains_live_without_an_epoch_match()`; `def test_opaque_birth_identity_cannot_use_an_epoch_or_hidden_pid_as_retirement(monkeypatch, tmp_path)`; `def test_unknown_pid_presence_does_not_convert_opaque_birth_into_absence(monkeypatch)`; `def test_missing_birth_never_uses_an_older_epoch_record_as_strict_proof(tmp_path)`; `def test_native_kernel_capability_refuses_unsupported_platform(monkeypatch)`
 - **tests/unit/test_process_input_preinit_defer.py** — Regression: a COGNITION dispatch reaching process_input before the agent finishes initialize() must DEFER (clean retryable error), not crash.
   - `async def test_cognition_turn_before_init_defers_with_clear_error()`; `async def test_preinit_turn_does_not_raise_attributeerror()`
 - **tests/unit/test_process_manager.py** — Unit tests for the Kestrel ProcessManager.
@@ -5575,10 +5579,12 @@ Repo entry points and standard project files.
   - `def create_admission_task(task_type, coroutine)`; `class NativeAdmissionFault`
 - **tests/utils/native_push.py** — Real managed native push storage with an explicitly paused delivery producer.
   - `def configure_push_test_key(monkeypatch)`; `def intercept_push_commit_ack(outbox, monkeypatch, after_commit)`; `async def managed_push_service(manager, monkeypatch)`
+- **tests/utils/native_push_process.py** — Owned child running the real native push worker through an actual TLS close.
+  - `async def main()`
 - **tests/utils/original_failure.py** — Source identity and physical-retirement assertions shared by custody tests.
   - `class OriginalFailure`
 - **tests/utils/outbound_tls.py** — One verified public-origin TLS fixture for production GET and POST callers.
-  - `def outbound_close_barrier(monkeypatch)`; `def outbound_tls(tmp_path, monkeypatch, request)`
+  - `def hold_outbound_response_close(monkeypatch)`; `def outbound_close_barrier(monkeypatch)`; `def route_outbound_tls_peer(monkeypatch)`; `def outbound_tls(tmp_path, monkeypatch, request)`
 - **tests/utils/override_writers.py** — Name the operator as the writer of a model mandate a test pins (#2652).
   - `def as_operator()`
 - **tests/utils/parallel_support.py** — Parallel test execution support utilities.

@@ -40,6 +40,7 @@ whatever answers on a registered port need not serve this project: the public
 
 from __future__ import annotations
 
+import errno
 import json
 import os
 import secrets
@@ -48,6 +49,7 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional
+from uuid import UUID
 
 #: Directory under an agent's data directory holding its serving records.
 SERVING_RECORD_DIRNAME = ".serving"
@@ -94,23 +96,75 @@ def _here() -> tuple[str, Optional[str]]:
     return socket.gethostname(), _pid_namespace()
 
 
-def process_identity() -> dict[str, Any]:
+class ProcessIdentityUnavailable(RuntimeError):
+    """The operating system cannot identify this original physical owner."""
+
+
+def _kernel_session_id() -> str:
+    """The kernel's random boot UUID, never a wall-clock or host-name proxy.
+
+    Linux exposes its boot_id through procfs; Darwin exposes bootsessionuuid
+    through sysctlbyname. An unavailable interface is an explicit capability
+    refusal. No weaker identity substitutes for it.
+    """
+    if sys.platform.startswith("linux"):
+        value = Path("/proc/sys/kernel/random/boot_id").read_text(encoding="ascii").strip()
+    elif sys.platform == "darwin":
+        import ctypes
+
+        sysctl = ctypes.CDLL(None, use_errno=True).sysctlbyname
+        sysctl.argtypes = (
+            ctypes.c_char_p, ctypes.c_void_p, ctypes.POINTER(ctypes.c_size_t),
+            ctypes.c_void_p, ctypes.c_size_t,
+        )
+        sysctl.restype = ctypes.c_int
+        size = ctypes.c_size_t()
+        key = b"kern.bootsessionuuid"
+        if sysctl(key, None, ctypes.byref(size), None, 0) != 0:
+            code = ctypes.get_errno()
+            raise OSError(code, os.strerror(code))
+        buffer = ctypes.create_string_buffer(size.value)
+        if sysctl(key, buffer, ctypes.byref(size), None, 0) != 0:
+            code = ctypes.get_errno()
+            raise OSError(code, os.strerror(code))
+        value = buffer.value.decode("ascii")
+    else:
+        raise OSError(errno.ENOTSUP, "Physical process retirement requires a supported kernel boot UUID")
+    return f"{sys.platform}:{UUID(value)}"
+
+
+def process_identity(*, require_kernel_session: bool = False) -> dict[str, Any]:
     """This process, as a record names it: PID, start instant, host, namespace.
 
     Every field :func:`recorded_process_exited` checks. The start instant is
     None when it cannot be read, and a record holding None never proves its
     process exited.
+
+    Strict mode additionally requires the kernel boot UUID and a raw kernel
+    birth identity. Its epoch value is diagnostic and never establishes an
+    exited process or a changed current owner.
     """
     from kestrel_sovereign.multi_agent.process_manager import ProcessManager
 
     pid = os.getpid()
     host, pid_namespace = _here()
-    return {
+    identity = {
         "pid": pid,
         "started_at": ProcessManager.process_start_time(pid),
         "host": host,
         "pid_namespace": pid_namespace,
     }
+    if require_kernel_session:
+        if _parse_record(identity) is None or (
+            sys.platform.startswith("linux") and not pid_namespace
+        ):
+            raise ProcessIdentityUnavailable("Original process PID, start time or namespace is unavailable")
+        try:
+            identity["kernel_session"] = _kernel_session_id()
+            identity["birth_id"] = ProcessManager.process_birth_identity(pid)
+        except (OSError, ValueError) as error:
+            raise ProcessIdentityUnavailable("Original kernel process identity is unavailable") from error
+    return identity
 
 
 class ServingRecord:
@@ -253,6 +307,7 @@ class _RecordedProcess:
     started_at: float
     host: str
     pid_namespace: Optional[str]
+    birth_id: str | None = None
 
 
 def _parse_record(payload: dict[str, Any]) -> Optional[_RecordedProcess]:
@@ -267,6 +322,7 @@ def _parse_record(payload: dict[str, Any]) -> Optional[_RecordedProcess]:
     could ever prove it stale.
     """
     from kestrel_sovereign.multi_agent.process_manager import (
+        recorded_birth_identity,
         recorded_pid,
         recorded_start_time,
     )
@@ -285,7 +341,26 @@ def _parse_record(payload: dict[str, Any]) -> Optional[_RecordedProcess]:
         not isinstance(pid_namespace, str) or not pid_namespace
     ):
         return None
-    return _RecordedProcess(pid, started_at, host, pid_namespace)
+    birth_id = recorded_birth_identity(payload.get("birth_id"))
+    if "birth_id" in payload and birth_id is None:
+        return None
+    return _RecordedProcess(pid, started_at, host, pid_namespace, birth_id)
+
+
+def same_process_identity(first: Any, second: Any) -> bool:
+    """Match complete strict physical identities, ignoring epoch diagnostics."""
+    if not isinstance(first, dict) or not isinstance(second, dict):
+        return False
+    before, after = _parse_record(first), _parse_record(second)
+    if before is None or after is None or before.birth_id is None or after.birth_id is None:
+        return False
+    kernel = first.get("kernel_session")
+    return (
+        isinstance(kernel, str) and bool(kernel)
+        and kernel == second.get("kernel_session")
+        and (before.pid, before.host, before.pid_namespace, before.birth_id)
+        == (after.pid, after.host, after.pid_namespace, after.birth_id)
+    )
 
 
 def _unprovable(path: Path, evidence: str) -> AgentHolder:
@@ -296,7 +371,7 @@ def _unprovable(path: Path, evidence: str) -> AgentHolder:
     )
 
 
-def _record_holder(path: Path, payload) -> Optional[AgentHolder]:
+def _record_holder(path: Path, payload, *, require_birth: bool = False) -> Optional[AgentHolder]:
     """What one serving record establishes: None only on proof that it is stale.
 
     The record must read; every identifying field must parse
@@ -336,9 +411,15 @@ def _record_holder(path: Path, payload) -> Optional[AgentHolder]:
             f"{path} records PID {recorded.pid} serving it {where}, which "
             "cannot be checked from here",
         )
-    status, detail = ProcessManager.identify_recorded_process(
-        recorded.pid, recorded.started_at, path.name
-    )
+    if require_birth:
+        status, detail = ProcessManager.identify_recorded_process(
+            recorded.pid, recorded.started_at, path.name,
+            recorded_birth=recorded.birth_id, require_birth=True,
+        )
+    else:
+        status, detail = ProcessManager.identify_recorded_process(
+            recorded.pid, recorded.started_at, path.name
+        )
     if status is PidStatus.STALE:
         return None
     if status is PidStatus.LIVE:
@@ -364,7 +445,9 @@ def _provably_stale(path: Path, payload) -> bool:
     return _record_holder(path, payload) is None
 
 
-def recorded_process_exited(path: Path, payload: Any) -> bool:
+def recorded_process_exited(
+    path: Path, payload: Any, *, require_kernel_session: bool = False
+) -> bool:
     """Whether the process ``payload`` names has provably exited.
 
     ``payload`` carries the fields :func:`process_identity` writes, read from
@@ -373,9 +456,26 @@ def recorded_process_exited(path: Path, payload: Any) -> bool:
     names the process owning something: True only when the record parses, was
     written on this host and in this PID namespace, and nothing runs as its
     PID here or what does started at another instant.
+
+    Strict kernel mode also requires the same boot UUID and original birth
+    identity. It never spends an epoch timestamp difference as exit evidence.
     """
     if not isinstance(payload, dict):
         return False
+    if require_kernel_session:
+        kernel = payload.get("kernel_session")
+        if not isinstance(kernel, str) or not kernel:
+            return False
+        if sys.platform.startswith("linux") and (
+            not isinstance(payload.get("pid_namespace"), str) or not payload["pid_namespace"]
+        ):
+            return False
+        try:
+            if kernel != _kernel_session_id():
+                return False
+        except (OSError, ValueError):
+            return False
+        return _record_holder(path, payload, require_birth=True) is None
     return _provably_stale(path, payload)
 
 

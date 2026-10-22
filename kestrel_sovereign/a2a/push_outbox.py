@@ -105,7 +105,7 @@ class NativePushOutbox(UnifiedStoreBase):
             publish_native_store_schema,
         )
 
-        self.configurations.require_encryption_ready()
+        self.configurations.require_execution_ready()
         if not await self.backend.table_exists(self.signals.EVENTS):
             raise RuntimeError(
                 "Native push requires an initialized durable signal ledger"

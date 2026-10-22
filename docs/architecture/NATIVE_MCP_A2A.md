@@ -902,12 +902,39 @@ The sender inventories its attempt before an admission COMMIT can become
 uncertain, so a lost acknowledgement before HTTP begins is recoverable without
 inventing a network request or replacing the original database outcome.
 
+Each attempt also persists its original physical process witness before HTTP
+admission: kernel boot UUID, host/PID namespace, PID and raw kernel process
+birth identity. Capture, dispatch checks and ordinary retirement require that
+same process identity. The epoch creation timestamp is diagnostic; a clock
+adjustment cannot revoke ownership or establish an exit. Strict observation
+uses Linux boot-relative process ticks or Darwin's kernel process lifetime ID.
+Only the original kernel/namespace and a changed birth identity or a
+kernel-confirmed absent PID can establish that the original process exited.
+Opaque reads and denied process observations retain the attempt.
+
+Delete observes its exact revoked-generation inventory; the resident observes
+finite indexed batches with a rotating inventory hint so live owners cannot
+starve later exited owners. Observation records physical retirement only: it
+neither acknowledges a notification nor grants another HTTP request. Native
+startup requires encryption and this kernel identity capability before push DDL
+or publication. Automatic observation supports Linux and macOS; unavailable
+kernel interfaces refuse push startup explicitly.
+
+An observer in another kernel or PID namespace cannot prove the original
+owner exited. Such deletion remains pending, including after a reboot or
+container replacement without an authoritative containment receipt.
+[#3796](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/3796)
+tracks that separate receipt capability; no lease, heartbeat, host name or
+force-clear flag substitutes for it. The general launcher/serving-record
+migration to the shared kernel birth identity contract is tracked in
+[#3797](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/3797).
+
 `TaskChangeStore` records metadata-only references through SQLite and PostgreSQL
 triggers in each original task transaction. Capture requires an active callback
 generation and its exact active durable consumer; ordinary tasks and disabled
 push recipients accumulate no unused journal. The optional push initializer
 installs capture after its configuration, subscription and consumer stores.
-The current core schema bundle is revision 5 and push is revision 3. Earlier
+The current core schema bundle is revision 5 and push is revision 4. Earlier
 native capture or generation layouts require offline migration, including partial old bundles.
 Offline conversion suspends the canonical trigger inventory while rewriting
 history and restores it before commit, without producing new work for historical
@@ -941,8 +968,8 @@ error types, excluding callback secrets.
 Owned database transitions finish before cancellation is reported, preserving
 actual commit failures. Delete revokes configuration and consumer admission in
 one transaction, joins local request owners, then requires the durable retirement
-receipt. A remote or failed owner leaves deletion pending with credentials
-retained; an expired lease cannot establish retirement. Active configurations
+receipt. An owner whose retirement cannot be proven leaves deletion pending
+with credentials retained; an expired lease cannot establish retirement. Active configurations
 also block task cleanup before their first HTTP request.
 
 `NativePushOutbox.prepare` validates a copied callback before task row locks and

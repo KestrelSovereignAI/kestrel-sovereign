@@ -144,6 +144,18 @@ def recorded_pid(value: object) -> Optional[int]:
     return None
 
 
+def recorded_birth_identity(value: object) -> str | None:
+    """One canonical kernel-provided unsigned 64-bit lifetime identity."""
+    if not isinstance(value, str) or ":" not in value:
+        return None
+    platform, number = value.split(":", 1)
+    if platform not in {"linux", "darwin"} or not number.isascii() or not number.isdecimal():
+        return None
+    if len(number) > 20 or not 0 <= int(number) < 2**64 or str(int(number)) != number:
+        return None
+    return value
+
+
 def recorded_start_time(value: object) -> Optional[float]:
     """``value`` as the start instant a record holds, or None when it is not one.
 
@@ -441,6 +453,58 @@ class ProcessManager:
                 return False
 
     @staticmethod
+    def process_birth_identity(pid: int) -> str:
+        """Read the original kernel birth identity without an epoch conversion.
+
+        Linux stat field 22 is raw boot-relative ticks; Darwin's unique process
+        identifier is allocated by the kernel for that process's lifetime.
+        Neither depends on wall-clock changes. Missing or opaque data raises;
+        callers must distinguish that from a kernel-confirmed absent PID.
+        """
+        if recorded_pid(pid) is None:
+            raise ValueError("Process birth identity requires a positive PID")
+        if sys.platform.startswith("linux"):
+            if os.readlink("/proc/self") != str(os.getpid()):
+                raise OSError(errno.EXDEV, "procfs does not expose this PID namespace")
+            raw = Path(f"/proc/{pid}/stat").read_bytes()
+            if not raw.startswith(str(pid).encode("ascii") + b" (") or b")" not in raw:
+                raise OSError(errno.EIO, "Kernel process stat has no original PID boundary")
+            fields = raw.rsplit(b")", 1)[1].split()
+            if len(fields) <= 19 or not fields[19].isdigit():
+                raise OSError(errno.EIO, "Kernel process stat has no birth identity")
+            value = f"linux:{int(fields[19])}"
+        elif sys.platform == "darwin":
+            import ctypes
+
+            class UniqueProcessInfo(ctypes.Structure):
+                # proc_uniqidentifierinfo, XNU proc_info_private.h (API size 56).
+                _fields_ = [
+                    ("executable_uuid", ctypes.c_ubyte * 16),
+                    ("unique_id", ctypes.c_uint64),
+                    ("parent_unique_id", ctypes.c_uint64),
+                    ("pid_version", ctypes.c_int32),
+                    ("parent_pid_version", ctypes.c_int32),
+                    ("reserved_a", ctypes.c_uint64),
+                    ("reserved_b", ctypes.c_uint64),
+                ]
+
+            read = ctypes.CDLL("/usr/lib/libproc.dylib", use_errno=True).proc_pidinfo
+            read.argtypes = (ctypes.c_int, ctypes.c_int, ctypes.c_uint64, ctypes.c_void_p, ctypes.c_int)
+            read.restype = ctypes.c_int
+            info = UniqueProcessInfo()
+            # PROC_PIDUNIQIDENTIFIERINFO. Executable UUID and PID version may
+            # change at exec; only the kernel's process lifetime ID is used.
+            if read(pid, 17, 0, ctypes.byref(info), ctypes.sizeof(info)) != ctypes.sizeof(info):
+                code = ctypes.get_errno() or errno.EIO
+                raise OSError(code, os.strerror(code))
+            value = f"darwin:{info.unique_id}"
+        else:
+            raise OSError(errno.ENOTSUP, "Kernel process birth identity is unavailable")
+        if recorded_birth_identity(value) is None:
+            raise OSError(errno.EIO, "Kernel process birth identity is invalid")
+        return value
+
+    @staticmethod
     def process_start_time(pid: int) -> Optional[float]:
         """When `pid` started, or None if that cannot be established.
 
@@ -566,7 +630,8 @@ class ProcessManager:
 
     @staticmethod
     def identify_recorded_process(
-        pid: int, recorded_start: Optional[float], source: str
+        pid: int, recorded_start: Optional[float], source: str, *,
+        recorded_birth: str | None = None, require_birth: bool = False,
     ) -> tuple[PidStatus, str]:
         """Whether the process running as ``pid`` here is the one a record names.
 
@@ -579,6 +644,22 @@ class ProcessManager:
         instant. UNDECIDABLE otherwise: something runs as ``pid`` and nothing
         proves whose it is, or the process table cannot be read from here.
         """
+        if require_birth:
+            if recorded_birth_identity(recorded_birth) is None:
+                return PidStatus.UNDECIDABLE, f"{source} has no original kernel birth identity"
+            try:
+                actual_birth = ProcessManager.process_birth_identity(pid)
+            except (OSError, ValueError):
+                try:
+                    os.kill(pid, 0)
+                except ProcessLookupError:
+                    return PidStatus.STALE, f"kernel confirms no process is running as PID {pid}"
+                except OSError:
+                    pass
+                return PidStatus.UNDECIDABLE, f"PID {pid} kernel birth identity cannot be established"
+            if actual_birth == recorded_birth:
+                return PidStatus.LIVE, f"PID {pid} retains its original kernel birth identity"
+            return PidStatus.STALE, f"PID {pid} belongs to another kernel process lifetime"
         exists, live_start = ProcessManager._probe_process(pid)
         if exists is False:
             # Nothing is running under that number. Whether it once was is not

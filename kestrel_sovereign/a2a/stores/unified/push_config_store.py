@@ -1,6 +1,8 @@
 """Creator-owned native push configuration with encrypted callback credentials."""
 
+import json
 from dataclasses import dataclass, field
+from pathlib import Path
 from uuid import uuid4
 
 from a2a.types import TaskPushNotificationConfig
@@ -15,6 +17,11 @@ from kestrel_sovereign.a2a.stores.unified.base import (
     UnifiedStoreBase,
 )
 from kestrel_sovereign.a2a.stores.unified.task_store import TaskStore
+from kestrel_sovereign.multi_agent.liveness import (
+    process_identity,
+    recorded_process_exited,
+    same_process_identity,
+)
 
 
 class PushConfigConflict(NativeStoreConflict):
@@ -55,6 +62,12 @@ class PushDeliveryAttempt:
     generation: str
     attempt_id: str
     executor_id: str
+    _owner_identity_bytes: bytes = field(repr=False)
+
+    @property
+    def owner_identity(self) -> dict:
+        """An independent process witness captured before admission."""
+        return json.loads(self._owner_identity_bytes)
 
 
 class PushConfigStore(UnifiedStoreBase):
@@ -73,6 +86,7 @@ class PushConfigStore(UnifiedStoreBase):
             )
         super().__init__(task_store.backend, owns_backend=False)
         self.task_store = task_store
+        self._recovery_after = ""
 
     async def initialize(self) -> None:
         from kestrel_sovereign.a2a.native_schema import native_schema_initialization
@@ -112,12 +126,16 @@ class PushConfigStore(UnifiedStoreBase):
                     generation TEXT NOT NULL,
                     attempt_id TEXT PRIMARY KEY,
                     executor_id TEXT NOT NULL,
+                    owner_identity TEXT NOT NULL CHECK (length(owner_identity) > 0),
                     retired INTEGER NOT NULL DEFAULT 0 CHECK (retired IN (0, 1)),
                     FOREIGN KEY (recipient_id, tenant, task_id, config_id, generation)
                         REFERENCES a2a_push_configs(recipient_id, tenant, task_id, config_id, generation)
                 );
                 CREATE INDEX IF NOT EXISTS a2a_push_live_attempts
-                    ON a2a_push_delivery_attempts (recipient_id, tenant, task_id, config_id, generation, retired)
+                    ON a2a_push_delivery_attempts (recipient_id, tenant, task_id, config_id, generation, retired);
+                CREATE INDEX IF NOT EXISTS a2a_push_unretired_processes
+                    ON a2a_push_delivery_attempts (recipient_id, tenant, attempt_id)
+                    WHERE retired = 0
             """)
 
             await self._initialize_task_cleanup_guard()
@@ -195,9 +213,20 @@ class PushConfigStore(UnifiedStoreBase):
         # configuration writes and reads; there is no plaintext storage mode.
         return AEADCipher(get_agent_key(self.scope.recipient_id, "service-keys"))
 
-    def require_encryption_ready(self) -> None:
-        """Refuse service startup before any schema work when keys are absent."""
+    @staticmethod
+    def _process_owner_bytes() -> bytes:
+        return json_dumps(process_identity(require_kernel_session=True)).encode("utf-8")
+
+    @staticmethod
+    def _owns_attempt_process(attempt: PushDeliveryAttempt) -> bool:
+        return same_process_identity(
+            attempt.owner_identity, process_identity(require_kernel_session=True)
+        )
+
+    def require_execution_ready(self) -> None:
+        """Refuse startup before DDL without keys or physical-owner identity."""
         self._cipher()
+        self._process_owner_bytes()
 
     def _decode(self, row) -> PushConfiguration:
         task_id, config_id, creator_id, generation, ciphertext = row
@@ -339,6 +368,14 @@ class PushConfigStore(UnifiedStoreBase):
         if value.tenant != self.scope.tenant:
             raise PushConfigConflict("Push retirement belongs to another tenant")
         async with self.write_transaction():
+            rows = await self.backend.fetch_all(
+                "SELECT attempt_id, owner_identity FROM a2a_push_delivery_attempts "
+                "WHERE recipient_id = ? AND tenant = ? AND task_id = ? AND config_id = ? "
+                "AND creator_id = ? AND generation = ? AND retired = 0",
+                (*self._scope_parameters, value.task_id, value.id,
+                 configuration.creator_id, configuration.generation),
+            )
+            await self._retire_exited_attempts(rows)
             changed = (
                 await self.backend.execute(
                     "UPDATE a2a_push_configs SET state = 'deleted', ciphertext = NULL "
@@ -395,6 +432,7 @@ class PushConfigStore(UnifiedStoreBase):
         if type(limit) is not int or limit <= 0:
             raise ValueError("Push retirement batch size must be positive")
         async with self.write_transaction():
+            await self.recover_exited_attempts(limit=limit)
             rows = await self.backend.fetch_all(
                 "SELECT task_id, config_id, creator_id, generation, ciphertext "
                 "FROM a2a_push_configs config WHERE recipient_id = ? AND tenant = ? "
@@ -409,6 +447,48 @@ class PushConfigStore(UnifiedStoreBase):
             retired = 0
             for row in rows:
                 retired += await self.finish_delete(self._decode(row))
+        return retired
+
+    async def _retire_exited_attempts(self, rows) -> int:
+        """Spend only each stored original process's positive exit observation."""
+        retired = 0
+        for attempt_id, original_owner in rows:
+            try:
+                owner = json.loads(original_owner)
+            except (json.JSONDecodeError, UnicodeError) as error:
+                raise PushConfigConflict("Stored push process witness is invalid") from error
+            if recorded_process_exited(
+                Path(attempt_id), owner, require_kernel_session=True
+            ):
+                retired += await self.backend.execute(
+                    "UPDATE a2a_push_delivery_attempts SET retired = 1 "
+                    "WHERE recipient_id = ? AND tenant = ? AND attempt_id = ? "
+                    "AND owner_identity = ? AND retired = 0",
+                    (*self._scope_parameters, attempt_id, original_owner),
+                )
+        return retired
+
+    async def recover_exited_attempts(self, *, limit: int) -> int:
+        """Observe a finite rotating batch without leases or heartbeat authority.
+
+        The cursor is only a fair inventory hint. Live or foreign owners never
+        grant retirement, and cannot keep a later exited owner out of the next
+        batch. Exact-generation Delete separately observes its entire captured
+        inventory through the same process predicate.
+        """
+        if type(limit) is not int or limit <= 0:
+            raise ValueError("Push process recovery batch size must be positive")
+        query = (
+            "SELECT attempt_id, owner_identity FROM a2a_push_delivery_attempts "
+            "WHERE recipient_id = ? AND tenant = ? AND retired = 0 AND attempt_id > ? "
+            "ORDER BY attempt_id LIMIT ?"
+        )
+        async with self.write_transaction():
+            rows = await self.backend.fetch_all(query, (*self._scope_parameters, self._recovery_after, limit))
+            if not rows and self._recovery_after:
+                rows = await self.backend.fetch_all(query, (*self._scope_parameters, "", limit))
+            retired = await self._retire_exited_attempts(rows)
+        self._recovery_after = rows[-1][0] if rows else ""
         return retired
 
     def prepare_delivery(
@@ -428,6 +508,7 @@ class PushConfigStore(UnifiedStoreBase):
             configuration.generation,
             uuid4().hex,
             executor_id,
+            self._process_owner_bytes(),
         )
 
     async def admit_delivery(self, attempt: PushDeliveryAttempt) -> bool:
@@ -439,6 +520,8 @@ class PushConfigStore(UnifiedStoreBase):
         """
         if not isinstance(attempt, PushDeliveryAttempt):
             raise TypeError("Push admission requires its inventoried delivery attempt")
+        if not self._owns_attempt_process(attempt):
+            return False
         async with self.write_transaction():
             # Serialize with begin_delete on the same configuration row. An
             # INSERT/SELECT alone could observe an older PostgreSQL snapshot
@@ -460,8 +543,8 @@ class PushConfigStore(UnifiedStoreBase):
                 return False
             await self.backend.execute(
                 "INSERT INTO a2a_push_delivery_attempts "
-                "(recipient_id, tenant, task_id, config_id, creator_id, generation, attempt_id, executor_id) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                "(recipient_id, tenant, task_id, config_id, creator_id, generation, attempt_id, executor_id, owner_identity) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     *self._scope_parameters,
                     attempt.task_id,
@@ -470,12 +553,15 @@ class PushConfigStore(UnifiedStoreBase):
                     attempt.generation,
                     attempt.attempt_id,
                     attempt.executor_id,
+                    attempt._owner_identity_bytes.decode("utf-8"),
                 ),
             )
         return True
 
     async def delivery_is_current(self, attempt: PushDeliveryAttempt) -> bool:
         """A worker's revocation monitor reads its exact durable admission."""
+        if not self._owns_attempt_process(attempt):
+            return False
         row = await self.backend.fetch_one(
             "SELECT 1 FROM a2a_push_configs AS config "
             "JOIN a2a_push_delivery_attempts AS attempt "
@@ -485,7 +571,7 @@ class PushConfigStore(UnifiedStoreBase):
             "WHERE config.recipient_id = ? AND config.tenant = ? AND config.state = 'active' "
             "AND attempt.task_id = ? AND attempt.config_id = ? AND attempt.creator_id = ? "
             "AND attempt.generation = ? AND attempt.attempt_id = ? AND attempt.executor_id = ? "
-            "AND attempt.retired = 0",
+            "AND attempt.owner_identity = ? AND attempt.retired = 0",
             (
                 *self._scope_parameters,
                 attempt.task_id,
@@ -494,6 +580,7 @@ class PushConfigStore(UnifiedStoreBase):
                 attempt.generation,
                 attempt.attempt_id,
                 attempt.executor_id,
+                attempt._owner_identity_bytes.decode("utf-8"),
             ),
         )
         return row is not None
@@ -504,11 +591,14 @@ class PushConfigStore(UnifiedStoreBase):
         Call only after resource retirement, including on failed HTTP delivery.
         The attempt remains until configuration deletion; retries are idempotent.
         """
+        if not self._owns_attempt_process(attempt):
+            return False
         return (
             await self.backend.execute(
                 "UPDATE a2a_push_delivery_attempts SET retired = 1 "
                 "WHERE recipient_id = ? AND tenant = ? AND task_id = ? AND config_id = ? "
-                "AND creator_id = ? AND generation = ? AND attempt_id = ? AND executor_id = ?",
+                "AND creator_id = ? AND generation = ? AND attempt_id = ? AND executor_id = ? "
+                "AND owner_identity = ?",
                 (
                     *self._scope_parameters,
                     attempt.task_id,
@@ -517,6 +607,7 @@ class PushConfigStore(UnifiedStoreBase):
                     attempt.generation,
                     attempt.attempt_id,
                     attempt.executor_id,
+                    attempt._owner_identity_bytes.decode("utf-8"),
                 ),
             )
             == 1

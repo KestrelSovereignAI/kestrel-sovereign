@@ -13,8 +13,7 @@ import pytest
 from tests.utils.tls import make_tls_contexts, tls_http_server
 
 
-@pytest.fixture
-def outbound_close_barrier(monkeypatch):
+def hold_outbound_response_close(monkeypatch, *, entered_callback=None):
     """Retain the real response stream's close until its test owner releases it."""
     import asyncio
 
@@ -28,6 +27,8 @@ def outbound_close_barrier(monkeypatch):
 
         async def close():
             entered.set()
+            if entered_callback is not None:
+                entered_callback()
             await release.wait()
             await original_close()
 
@@ -38,10 +39,69 @@ def outbound_close_barrier(monkeypatch):
         client.event_hooks["response"].append(response_owner)
 
     monkeypatch.setattr(httpx.AsyncClient, "__init__", client_owner)
+    return SimpleNamespace(entered=entered, release=release)
+
+
+@pytest.fixture
+def outbound_close_barrier(monkeypatch):
+    """Own the shared physical-close barrier through test cleanup."""
+    barrier = hold_outbound_response_close(monkeypatch)
     try:
-        yield SimpleNamespace(entered=entered, release=release)
+        yield barrier
     finally:
-        release.set()
+        barrier.release.set()
+
+
+def route_outbound_tls_peer(monkeypatch, *, hostname, target_port, dns_validations):
+    """Share one verified public-IP to owned real TLS fixture route across processes."""
+    if type(dns_validations) is not int or dns_validations <= 0:
+        raise ValueError("DNS validation budget must be positive")
+    dns, dials = [], []
+    actual_dns = socket.getaddrinfo
+    actual_dial = socket.create_connection
+
+    def resolve(host, port, *args, **kwargs):
+        if host == "127.0.0.1":
+            return actual_dns(host, port, *args, **kwargs)
+        dns.append(host)
+        assert host == hostname
+        assert len(dns) <= dns_validations, (
+            "hostname exceeded its independent validation budget"
+        )
+        return [
+            (
+                socket.AF_INET,
+                socket.SOCK_STREAM,
+                socket.IPPROTO_TCP,
+                "",
+                ("8.8.8.8", port),
+            )
+        ]
+
+    def dial(
+        address,
+        timeout=socket._GLOBAL_DEFAULT_TIMEOUT,
+        source_address=None,
+        **kwargs,
+    ):
+        dials.append(address)
+        assert address == ("8.8.8.8", target_port)
+        return actual_dial(("127.0.0.1", target_port), timeout, source_address, **kwargs)
+
+    monkeypatch.setattr(socket, "getaddrinfo", resolve)
+    monkeypatch.setattr(socket, "create_connection", dial)
+    # The native async backend connects directly, without socket.create_connection.
+    from httpcore._backends.anyio import AnyIOBackend
+
+    actual_async_dial = AnyIOBackend.connect_tcp
+
+    async def async_dial(self, host, port, **kwargs):
+        dials.append((host, port))
+        assert (host, port) == ("8.8.8.8", target_port)
+        return await actual_async_dial(self, host="127.0.0.1", port=port, **kwargs)
+
+    monkeypatch.setattr(AnyIOBackend, "connect_tcp", async_dial)
+    return SimpleNamespace(dns=dns, dials=dials)
 
 
 @pytest.fixture
@@ -63,30 +123,10 @@ def outbound_tls(tmp_path, monkeypatch, request):
     monkeypatch.setenv("https_proxy", "http://127.0.0.1:1")
     monkeypatch.setenv("NO_PROXY", "")
     monkeypatch.setenv("no_proxy", "")
-    dns, dials, requests, posts, sni = [], [], [], [], []
+    requests, posts, sni = [], [], []
     reply = threading.Event()
     reply.set()
-    actual_dns = socket.getaddrinfo
-    actual_dial = socket.create_connection
     server_context.set_servername_callback(lambda sock, name, context: sni.append(name))
-
-    def resolve(host, port, *args, **kwargs):
-        if host == "127.0.0.1":
-            return actual_dns(host, port, *args, **kwargs)
-        dns.append(host)
-        assert host == hostname
-        assert len(dns) <= dns_validations, (
-            "hostname exceeded its independent validation budget"
-        )
-        return [
-            (
-                socket.AF_INET,
-                socket.SOCK_STREAM,
-                socket.IPPROTO_TCP,
-                "",
-                ("8.8.8.8", port),
-            )
-        ]
 
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self):
@@ -139,35 +179,15 @@ def outbound_tls(tmp_path, monkeypatch, request):
     with tls_http_server(server_context, Handler) as server:
         port = server.server_port
 
-        def dial(
-            address,
-            timeout=socket._GLOBAL_DEFAULT_TIMEOUT,
-            source_address=None,
-            **kwargs,
-        ):
-            dials.append(address)
-            assert address == ("8.8.8.8", port)
-            return actual_dial(("127.0.0.1", port), timeout, source_address, **kwargs)
-
-        monkeypatch.setattr(socket, "getaddrinfo", resolve)
-        monkeypatch.setattr(socket, "create_connection", dial)
-        # The native async backend connects directly, without socket.create_connection.
-        from httpcore._backends.anyio import AnyIOBackend
-
-        actual_async_dial = AnyIOBackend.connect_tcp
-
-        async def async_dial(self, host, port, **kwargs):
-            dials.append((host, port))
-            assert (host, port) == ("8.8.8.8", server.server_port)
-            return await actual_async_dial(self, host="127.0.0.1", port=port, **kwargs)
-
-        monkeypatch.setattr(AnyIOBackend, "connect_tcp", async_dial)
+        route = route_outbound_tls_peer(
+            monkeypatch, hostname=hostname, target_port=port, dns_validations=dns_validations
+        )
         yield SimpleNamespace(
             url=f"https://straße.example:{port}",
             host=hostname,
             port=port,
-            dns=dns,
-            dials=dials,
+            dns=route.dns,
+            dials=route.dials,
             requests=requests,
             posts=posts,
             reply=reply,
