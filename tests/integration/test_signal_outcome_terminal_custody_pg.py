@@ -392,7 +392,6 @@ async def test_original_journal_native_setup_cannot_redirect_or_forge_commit(dis
     async def handler(payload):
         effects.append('genuine-effect')
         entered.set()
-        await release.wait()
         return {'genuine': True}
     c.registry.register(_action_reg('setup.boundary.audit', handler=handler))
     signal = _signal('setup.boundary.audit')
