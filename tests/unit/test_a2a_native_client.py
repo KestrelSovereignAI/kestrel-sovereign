@@ -829,6 +829,57 @@ async def test_client_mime_preflight_refuses_before_reservation_or_http(
     assert not p.trace and not await p.store.list_recent()
 
 
+@pytest.mark.parametrize(
+    ("defaults", "override", "mime", "accepted"),
+    [
+        (["text/plain"], ["image/png"], "image/png", True),
+        (["text/plain", "image/png"], ["text/plain"], "image/png", False),
+        (["image/png"], [], "image/png", True),
+        (["text/plain"], [], "image/png", False),
+    ],
+)
+async def test_selected_skill_input_modes_override_card_defaults_before_reserving(
+    peer_session, defaults, override, mime, accepted
+):
+    from a2a.utils.errors import ContentTypeNotSupportedError
+
+    from kestrel_sovereign.a2a.extensions import skill_hint_metadata
+
+    p = peer_session
+    card = p.arguments["card"]
+    card.default_input_modes[:] = defaults
+    card.skills[0].input_modes[:] = override
+    card = create_agent_card_signer(
+        p.identity.hybrid_keypair.classical.private_key,
+        {"kid": p.identity.signing_did + "#key-1", "alg": "EdDSA"},
+    )(card)
+    signer = replace(
+        p.arguments["signer"],
+        extensions=frozenset(item.uri for item in card.capabilities.extensions),
+    )
+    session = NativePeerSession(**(p.arguments | {"card": card, "signer": signer}))
+    request = request_for(p)
+    request.message.ClearField("parts")
+    request.message.parts.append(Part(raw=b"image payload", media_type=mime))
+    request.metadata.update(skill_hint_metadata(card.skills[0].id))
+    try:
+        if accepted:
+            dispatch, frozen = await session.reserve(
+                request, dispatch_tool="send_a2a_task", verb="task"
+            )
+            assert dispatch.state is DispatchState.RESERVED
+            assert frozen.message.parts == request.message.parts
+        else:
+            with pytest.raises(ContentTypeNotSupportedError):
+                await session.reserve(
+                    request, dispatch_tool="send_a2a_task", verb="task"
+                )
+            assert not await p.store.list_recent()
+        assert not p.trace
+    finally:
+        await session.close()
+
+
 @pytest.mark.parametrize("kind", ["withdrawal", "cancellation"])
 async def test_cancellation_retains_original_execution_control_and_remote_evidence(
     peer_session, kind

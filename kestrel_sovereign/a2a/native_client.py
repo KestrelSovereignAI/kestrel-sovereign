@@ -401,6 +401,8 @@ class NativePeerSession:
                 raise NativePeerProtocolError(
                     "Peer does not advertise the suggested skill"
                 )
+            if selected.input_modes:
+                modes = selected.input_modes
         validate_input_parts(wire.message.parts, modes)
         return claims
 
