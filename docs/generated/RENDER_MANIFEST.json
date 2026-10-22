@@ -441,7 +441,8 @@
         "kestrel_sovereign/features/keys/feature.py",
         "kestrel_sovereign/multi_agent/route_name.py",
         "kestrel_sovereign/security/agent_encryption.py",
-        "kestrel_sovereign/security/service_key_storage.py"
+        "kestrel_sovereign/security/service_key_storage.py",
+        "tests/interop/test_a2a_go.py"
       ],
       "findings": [
         "missing_code_refs"
