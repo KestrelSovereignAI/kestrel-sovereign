@@ -2210,18 +2210,43 @@ class PostgresBackend(DatabaseBackend):
 
     async def _read_original_signal_outcome_relation(self, connection, name):
         from kestrel_sovereign.signals.outcome_custody import _OriginalPostgresJournalRelation
+        from kestrel_sovereign.signals.store import _OUTCOME_COLUMNS
         row = await connection.fetchrow('''
             SELECT pg_catalog.current_database() AS database_name,
                    n.oid::bigint AS namespace_oid, c.oid::bigint AS relation_oid,
-                   n.nspname AS schema_name, c.relname AS relation_name
+                   n.nspname AS schema_name, c.relname AS relation_name,
+                   ARRAY(SELECT a.attname FROM pg_catalog.pg_attribute AS a
+                         WHERE a.attrelid=c.oid AND a.attnum>0 AND NOT a.attisdropped
+                         ORDER BY a.attnum) AS column_names
             FROM pg_catalog.pg_class AS c
             JOIN pg_catalog.pg_namespace AS n ON n.oid = c.relnamespace
-            WHERE c.oid = pg_catalog.to_regclass($1) AND c.relkind IN ('r', 'p')
+            WHERE c.oid = pg_catalog.to_regclass($1) AND c.relkind = 'r'
               AND c.relpersistence = 'p'
+              AND NOT c.relrowsecurity AND NOT c.relforcerowsecurity
+              AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_trigger AS t WHERE t.tgrelid=c.oid)
+              AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_rewrite AS r WHERE r.ev_class=c.oid)
+              AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_constraint AS k WHERE k.conrelid=c.oid AND k.contype='c')
+              AND NOT EXISTS (
+                  SELECT 1 FROM pg_catalog.pg_index AS i WHERE i.indrelid=c.oid
+                    AND (i.indexprs IS NOT NULL OR
+                         (i.indpred IS NOT NULL AND pg_catalog.pg_get_expr(i.indpred, i.indrelid)
+                          NOT IN ('(constitution_hash IS NOT NULL)', 'constitution_hash IS NOT NULL')) OR
+                         EXISTS (SELECT 1 FROM pg_catalog.pg_opclass AS op
+                                 JOIN pg_catalog.pg_namespace AS onsp ON onsp.oid=op.opcnamespace
+                                 WHERE op.oid=ANY(i.indclass) AND onsp.nspname<>'pg_catalog')))
+              AND NOT EXISTS (
+                  SELECT 1 FROM pg_catalog.pg_attribute AS a
+                  JOIN pg_catalog.pg_type AS t ON t.oid=a.atttypid
+                  JOIN pg_catalog.pg_namespace AS tn ON tn.oid=t.typnamespace
+                  WHERE a.attrelid=c.oid AND a.attnum>0 AND NOT a.attisdropped
+                    AND (tn.nspname<>'pg_catalog' OR a.attgenerated<>'' OR a.attidentity<>''))
         ''', name)
         if row is None or row['relation_name'] != 'signal_log':
-            raise ExecutionAuthorityError('Original native signal journal relation unavailable')
-        return _OriginalPostgresJournalRelation(**dict(row))
+            return None
+        fields = dict(row)
+        if set(fields.pop('column_names')) != set(_OUTCOME_COLUMNS):
+            return None
+        return _OriginalPostgresJournalRelation(**fields)
 
     async def _capture_original_signal_outcome_relation(self, journal):
         from kestrel_sovereign.signals.outcome_custody import _OriginalSignalOutcome, _JOURNAL_ADMISSION
