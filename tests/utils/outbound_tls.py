@@ -13,7 +13,7 @@ import pytest
 from tests.utils.tls import make_tls_contexts, tls_http_server
 
 
-def hold_outbound_response_close(monkeypatch, *, entered_callback=None):
+def hold_outbound_response_close(monkeypatch, *, entered_callback=None, response_filter=None):
     """Retain the real response stream's close until its test owner releases it."""
     import asyncio
 
@@ -23,6 +23,8 @@ def hold_outbound_response_close(monkeypatch, *, entered_callback=None):
     original_init = httpx.AsyncClient.__init__
 
     async def response_owner(response):
+        if response_filter is not None and not response_filter(response):
+            return
         original_close = response.stream.aclose
 
         async def close():

@@ -207,6 +207,39 @@ async def test_due_inventory_is_bounded_scoped_and_never_changes_original_leases
     ) == before, "a read-only due hint changed the original lease"
 
 
+async def test_due_order_uses_pending_retry_and_expired_lease_eligibility(ledger):
+    registration = _registration(replay_retained=False)
+    for index in range(3):
+        await ledger.register_consumer(replace(registration, consumer_id=f"consumer-{index}"))
+    await _persist(ledger, "original-due-order")
+    clock = ledger.now_utc() + timedelta(seconds=1)
+    leased = []
+    for index in range(2):
+        leased.append(await ledger.claim_delivery(
+            agent_id=registration.agent_id, consumer_id=f"consumer-{index}",
+            executor_id="original-executor", now=clock,
+        ))
+    await ledger.nack_delivery(
+        agent_id=registration.agent_id, consumer_id=leased[1].consumer_id,
+        delivery_id=leased[1].delivery_id, lease_token=leased[1].lease_token,
+        error="original failed delivery", retry_delay=timedelta(seconds=1), now=clock,
+    )
+    before = await ledger.backend.fetch_all(
+        "SELECT consumer_id, status, lease_token, lease_expires_at, next_attempt_at "
+        "FROM durable_signal_deliveries ORDER BY consumer_id"
+    )
+    assert await ledger.due_consumer_ids(
+        agent_id=registration.agent_id, source=registration.source, limit=3,
+        now=leased[0].lease_expires_at + timedelta(seconds=1),
+    ) == ["consumer-2", "consumer-1", "consumer-0"], (
+        "a retry or expired lease kept its original creation-time priority"
+    )
+    assert await ledger.backend.fetch_all(
+        "SELECT consumer_id, status, lease_token, lease_expires_at, next_attempt_at "
+        "FROM durable_signal_deliveries ORDER BY consumer_id"
+    ) == before
+
+
 async def test_retry_inventory_respects_its_original_next_attempt_boundary(ledger):
     await ledger.register_consumer(_registration(replay_retained=False))
     await _persist(ledger, "retry")

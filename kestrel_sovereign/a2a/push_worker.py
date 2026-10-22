@@ -293,69 +293,82 @@ class NativePushWorker:
         finally:
             self._active.pop(task, None)
 
+    async def _process_subscription(self, subscription: PushSubscription) -> int:
+        """Claim one original delivery and settle its own HTTP result."""
+        delivery = await self._owned_transition(
+            self.outbox.signals.claim_delivery(
+                agent_id=self.outbox.agent_id,
+                consumer_id=subscription.consumer_id,
+                executor_id=self.executor_id,
+            ),
+            subscription,
+        )
+        if delivery is None:
+            return 0
+        run = _DeliveryRun(subscription)
+        outcome = await await_owned_operation(
+            self._deliver(subscription, delivery, run),
+            retirement_resource=delivery,
+            retain_originals=True,
+            name="native-push-delivery",
+            cancel_on_caller_cancellation=True,
+        )
+        # Delete may win through the monitor before it cancels the local
+        # child. Both paths join the same physical HTTP owner.
+        error = self._delivery_error(outcome.error, planned_stop=run.revoked)
+        error = execution_terminal_error(
+            outcome.cancellation,
+            error,
+            retain_originals=True,
+            prefer_cancellation=True,
+        )
+        if error is not None:
+            if is_execution_control_error(error):
+                raise error
+            if isinstance(error, (PushDeliveryRevoked, PushDeliveryLeaseLost)):
+                return 1
+            if not isinstance(error, (httpx.HTTPError, TimeoutError, SSRFError)):
+                raise error
+            # Native HTTP errors may contain secret URLs/headers. Durable
+            # retry diagnostics retain only the type, never their text.
+            released = await self._owned_transition(
+                self.outbox.signals.nack_delivery(
+                    **self._lease_parameters(delivery),
+                    error=type(error).__name__,
+                    retry_delay=self.retry_delay,
+                ),
+                delivery,
+            )
+            if released is None:
+                raise PushDeliveryLeaseLost(
+                    "Push retry lost its original delivery lease"
+                ) from error
+            logger.warning(
+                "Native push delivery will retry after %s", type(error).__name__
+            )
+        return 1
+
     async def run_once(self) -> int:
-        """Forward, deliver and retire finite batches from the original ledgers."""
+        """Join a bounded concurrent batch selected by its next eligible time.
+
+        One HTTP deadline must not delay every other callback in the batch.
+        Each child owns its claim, request, retry/ACK and original retirement;
+        infrastructure/control failure still cancels and joins its siblings.
+        """
         await self._owned_transition(
             self.outbox.forward_pending(limit=self.batch_size), self.outbox
         )
-        count = 0
-        for subscription in await self.outbox.subscriptions(due_limit=self.batch_size):
-            delivery = await self._owned_transition(
-                self.outbox.signals.claim_delivery(
-                    agent_id=self.outbox.agent_id,
-                    consumer_id=subscription.consumer_id,
-                    executor_id=self.executor_id,
-                ),
-                subscription,
-            )
-            if delivery is None:
-                continue
-            count += 1
-            run = _DeliveryRun(subscription)
-            outcome = await await_owned_operation(
-                self._deliver(subscription, delivery, run),
-                retirement_resource=delivery,
-                retain_originals=True,
-                name="native-push-delivery",
-                cancel_on_caller_cancellation=True,
-            )
-            # Delete may win through the monitor before it cancels the local
-            # child. Both paths join the same physical HTTP owner.
-            error = self._delivery_error(outcome.error, planned_stop=run.revoked)
-            error = execution_terminal_error(
-                outcome.cancellation,
-                error,
-                retain_originals=True,
-                prefer_cancellation=True,
-            )
-            if error is not None:
-                if is_execution_control_error(error):
-                    raise error
-                if isinstance(error, (PushDeliveryRevoked, PushDeliveryLeaseLost)):
-                    continue
-                if not isinstance(error, (httpx.HTTPError, TimeoutError, SSRFError)):
-                    raise error
-                # Native HTTP errors may contain secret URLs/headers. Durable
-                # retry diagnostics retain only the type, never their text.
-                released = await self._owned_transition(
-                    self.outbox.signals.nack_delivery(
-                        **self._lease_parameters(delivery),
-                        error=type(error).__name__,
-                        retry_delay=self.retry_delay,
-                    ),
-                    delivery,
-                )
-                if released is None:
-                    raise PushDeliveryLeaseLost(
-                        "Push retry lost its original delivery lease"
-                    ) from error
-                logger.warning(
-                    "Native push delivery will retry after %s", type(error).__name__
-                )
+        subscriptions = await self.outbox.subscriptions(due_limit=self.batch_size)
+        counts = await gather_owned(
+            (self._process_subscription(subscription) for subscription in subscriptions),
+            retain_originals=True,
+            retirement_resource=self.outbox,
+            name_prefix="native-push-batch",
+        )
         await self._owned_transition(
             self.outbox.retire_history(limit=self.batch_size), self.outbox
         )
-        return count
+        return sum(counts)
 
     async def delete(self, task_id: str, config_id: str, *, creator_id: str) -> None:
         """Acknowledge Delete only after revocation and original HTTP retirement."""

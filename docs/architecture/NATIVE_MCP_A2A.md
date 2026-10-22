@@ -978,6 +978,12 @@ deletes only terminal events from the exact private push source and removes
 journal references to those exact deleted IDs in one transaction. Pending,
 retrying and leased deliveries retain their events. Retry diagnostics contain
 error types, excluding callback secrets.
+The due queue orders pending work by its initial eligibility, retries by their
+next attempt time, and expired leases by lease expiration. A failed callback
+therefore goes behind older waiting work. At most `BATCH_SIZE` subscription
+children run concurrently; each retains its own claim, HTTP owner and ACK/retry
+transition. One slow callback cannot serialize every healthy callback in that
+batch. Batch cancellation joins all accepted children before returning.
 Owned database transitions finish before cancellation is reported, preserving
 actual commit failures. Delete revokes configuration and consumer admission in
 one transaction, joins local request owners, then requires the durable retirement

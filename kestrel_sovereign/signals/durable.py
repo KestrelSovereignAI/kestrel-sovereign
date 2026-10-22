@@ -4047,7 +4047,9 @@ class DurableSignalStore(UnifiedStoreBase):
         rows = await self._backend.fetch_all(
             f"""
             WITH live_due AS MATERIALIZED (
-                SELECT d.agent_id, d.consumer_id, d.created_at
+                SELECT d.agent_id, d.consumer_id,
+                  CASE WHEN d.status = '{LEASED}' THEN d.lease_expires_at
+                    ELSE COALESCE(d.next_attempt_at, d.created_at) END AS due_at
                 FROM {self.DELIVERIES} d
                 WHERE d.agent_id = ?
                   AND d.status IN ('{PENDING}', '{RETRY}', '{LEASED}')
@@ -4064,7 +4066,7 @@ class DurableSignalStore(UnifiedStoreBase):
               ON c.agent_id = due.agent_id AND c.consumer_id = due.consumer_id
             WHERE c.source = ? AND c.active = ?
             GROUP BY due.consumer_id
-            ORDER BY MIN(due.created_at), due.consumer_id
+            ORDER BY MIN(due.due_at), due.consumer_id
             LIMIT ?
             """,
             (agent_id, clock, clock, source, self.to_bool_param(True), limit),

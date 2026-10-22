@@ -19,7 +19,7 @@ Auto-generated file-tree + per-file purpose index. Always-loaded context for the
 GitHub App (issue #791). Do **not** edit by hand — regenerate via `python scripts/generate_repo_map.py`.
 
 **Generated:** 2026-10-21
-**Scope:** 3294 tracked files (2464 `.py`, 365 `.md`, 465 other). Excludes `__pycache__`, `node_modules`, `.venv`, `.claude`, build artifacts.
+**Scope:** 3295 tracked files (2465 `.py`, 365 `.md`, 465 other). Excludes `__pycache__`, `node_modules`, `.venv`, `.claude`, build artifacts.
 
 **Format per file:** `path — one-line purpose` plus the public top-level Python symbols on the next line
 (classes and functions; private `_name` skipped).
@@ -3477,6 +3477,8 @@ Repo entry points and standard project files.
   - `async def test_callback_dns_releases_host_lease_and_rechecks_original_authority(wire, monkeypatch, operation, policy_change)`; `async def test_callback_commit_retains_authority_until_original_sql_ack(wire, monkeypatch, operation)`; `async def test_unauthorized_callback_does_not_resolve_peer_supplied_dns(wire, monkeypatch)`
 - **tests/unit/test_a2a_native_push_config_store.py** — Native task authority, real AEAD storage and retryable push retirement.
   - `async def push_store(native_a2a_backend_factory, monkeypatch)`; `def config(task, config_id)`; `async def admit(store, configuration)`; `async def test_native_config_round_trip_encrypts_all_callback_material(push_store)`; `async def test_task_creator_authority_cannot_be_forged_by_another_principal(push_store, operation)`; `async def test_ciphertext_is_bound_to_every_ownership_column(push_store, field)`; `async def test_deletion_revokes_new_reads_and_retains_original_generation_until_retirement(push_store)`; `async def test_config_id_default_pagination_and_idempotent_set(push_store)`; `…`
+- **tests/unit/test_a2a_native_push_fairness.py** — Real callback retries cannot monopolize a bounded native delivery batch.
+  - `async def register(manager, outbox, url)`; `async def test_one_creators_retries_do_not_starve_older_waiting_deliveries(manager, monkeypatch, outbound_tls)`; `async def test_a_healthy_callback_finishes_while_another_original_http_owner_is_open(manager, monkeypatch, outbound_tls, stop_batch)`
 - **tests/unit/test_a2a_native_push_host.py** — Ready runtime publication, signed capability, and fail-closed host startup.
   - `async def push_host(publication, monkeypatch)`; `async def prepare(p)`; `async def test_host_binds_original_ready_service_before_signed_capability(push_host)`; `async def test_host_preparation_waits_for_actual_runtime_ready_boundary(push_host, monkeypatch)`; `async def test_transient_journal_read_preserves_original_signed_publication(push_host, monkeypatch)`; `async def test_missing_encryption_refuses_host_publication_before_push_schema(push_host, monkeypatch)`; `async def test_publication_cannot_advertise_an_unprepared_push_policy(push_host)`
 - **tests/unit/test_a2a_native_push_http.py** — Standard push CRUD and inline admission through both official SDK bindings.
