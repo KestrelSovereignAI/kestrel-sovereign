@@ -117,6 +117,7 @@ from kestrel_sdk.signals import (
 from kestrel_sovereign.execution_custody import (
     execution_commit_outcome,
     execution_finite_error,
+    execution_observation_error,
     is_execution_control_error,
 )
 from kestrel_sovereign.features.storage_access import resolve_agent_privacy_config
@@ -1441,7 +1442,7 @@ class SignalDispatcher:
                     resident_context.run(release_live_admission, owner)
             except BaseException as cleanup:
                 errors.append(cleanup)
-            raise execution_finite_error(*errors, retain_originals=True)
+            raise execution_observation_error(*errors, message='Original durable enqueue publication and physical join')
         return SignalDispatchHandle(
             signal_id=enqueued_signal_id,
             task=task,

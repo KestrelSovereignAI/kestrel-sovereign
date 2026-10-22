@@ -18,6 +18,8 @@ from kestrel_sovereign.storage.db.native_journal_programs import (
     ('set_trace_callback', (lambda query: None,)),
     ('enable_load_extension', (False,)),
     ('load_extension', ('must-not-load',)),
+    ('deserialize', (b'not-a-native-database',)),
+    ('setlimit', (sqlite3.SQLITE_LIMIT_LENGTH, 1000000)),
 ])
 def test_native_sqlite_program_registration_is_fenced_until_actual_rollback(method, arguments):
     native = _NativeJournalSQLiteConnection(':memory:')
@@ -35,6 +37,27 @@ def test_native_sqlite_program_registration_is_fenced_until_actual_rollback(meth
         assert not native._original_journal_programs_supported()
     finally:
         native.close()
+
+
+def test_native_sqlite_dbconfig_is_fenced_when_supported():
+    if not hasattr(sqlite3.Connection, 'setconfig'):
+        pytest.skip('Native dbconfig was added in Python 3.12')
+    native = _NativeJournalSQLiteConnection(':memory:')
+    try:
+        native._begin_original_journal()
+        with pytest.raises(NativeJournalConfigurationError):
+            native.setconfig(sqlite3.SQLITE_DBCONFIG_DEFENSIVE, True)
+        native.rollback()
+        native.setconfig(sqlite3.SQLITE_DBCONFIG_DEFENSIVE, True)
+        assert not native._original_journal_programs_supported()
+    finally:
+        native.close()
+
+
+def test_native_postgres_proof_targets_only_original_physical_relation():
+    from kestrel_sovereign.signals.store import SignalLogStore
+    assert 'FROM ONLY "owned".signal_log WHERE ' in SignalLogStore._outcome_match_query('"owned".signal_log', postgres=True)
+    assert 'FROM main.signal_log WHERE ' in SignalLogStore._outcome_match_query('main.signal_log', postgres=False)
 
 
 @pytest.mark.parametrize('name,value', [('text_factory', bytes), ('isolation_level', None), ('autocommit', True)])

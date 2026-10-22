@@ -70,18 +70,25 @@ async def test_sqlite_journal_rejects_executable_schema_before_routing(dispatche
 
 async def test_original_sqlite_refuses_deserialized_main_destination(dispatcher_components, db_path):
     import sqlite3
+    import tempfile
+    from pathlib import Path
     from kestrel_sovereign.execution_custody import is_execution_control_error
     c = dispatcher_components
     native = c.backend._connection._conn
     scope = ExecutionCustody(_OriginalWork())
     signal = _signal('native.deserialized.main')
     def replace_main_with_actual_clone():
-        clone = sqlite3.connect(':memory:')
-        try:
-            native.backup(clone)
-            native.deserialize(clone.serialize(), name='main')
-        finally:
-            clone.close()
+        with tempfile.TemporaryDirectory() as directory:
+            clone = sqlite3.connect(str(Path(directory) / 'actual-clone.db'))
+            try:
+                version = native.execute('PRAGMA main.schema_version').fetchone()[0]
+                native.backup(clone)
+                assert clone.execute('PRAGMA journal_mode=DELETE').fetchone()[0] == 'delete'
+                clone.execute(f'PRAGMA schema_version={version}')
+                native.deserialize(clone.serialize(), name='main')
+                assert native.execute('PRAGMA main.schema_version').fetchone()[0] == version
+            finally:
+                clone.close()
     async def handler(payload):
         await c.backend._connection._execute(replace_main_with_actual_clone)
         scope.revoke('actual cutoff after native main replacement')

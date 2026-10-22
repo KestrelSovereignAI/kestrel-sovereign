@@ -917,7 +917,13 @@ connection or database slot is allocated by this connection class.
 Core-owned SQLite connections likewise track native callback/function/extension
 registration. A customized session remains ineligible for original journals until
 reconnect, including after callback removal. This is a supported configuration
-boundary, not a Python/native-code sandbox. Actual journal BEGIN seals SQLite
+boundary, not a Python/native-code sandbox. SQLite deserialization, native limits
+and database configuration are fenced alongside callbacks;
+replacing main with an identical serialized schema cannot retain the old file's
+journal capability. PostgreSQL proofs target ONLY the captured physical relation,
+and the supported shape excludes ordinary/foreign inheritance in both directions.
+Inherited foreign scans cannot borrow terminal-journal privilege.
+Actual journal BEGIN seals SQLite
 program configuration through actual COMMIT/rollback; PostgreSQL configuration
 is sealed through actual transaction and pool reset. Native connection codecs
 and callback state are checked, not only the pool recipe. PostgreSQL reset's
@@ -939,6 +945,8 @@ the caller's public Signal, so a genuinely NACKed delivery can be reclaimed.
 Allocation and callback-publication refusal also release that reservation only
 after any accepted original dispatch task physically joins. Cleanup is idempotent
 even when a callback registered before raising, and retains the original failure.
+Caller withdrawal during that join remains a Base cancellation/control carrier,
+not an ordinary publication exception with cancellation hidden only as its cause.
 
 SQLite's plain audit shape excludes CHECK programs, column collations,
 expression/custom-collation indexes and noncanonical partial predicates; the

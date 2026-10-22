@@ -2232,6 +2232,8 @@ class PostgresBackend(DatabaseBackend):
             WHERE c.oid  OPERATOR(pg_catalog.=)  pg_catalog.to_regclass($1) AND c.relkind  OPERATOR(pg_catalog.=)  'r'
               AND c.relpersistence  OPERATOR(pg_catalog.=)  'p'
               AND NOT c.relrowsecurity AND NOT c.relforcerowsecurity
+              AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_inherits AS h
+                  WHERE h.inhparent OPERATOR(pg_catalog.=) c.oid OR h.inhrelid OPERATOR(pg_catalog.=) c.oid)
               AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_trigger AS t WHERE t.tgrelid OPERATOR(pg_catalog.=) c.oid)
               AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_rewrite AS r WHERE r.ev_class OPERATOR(pg_catalog.=) c.oid)
               AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_constraint AS k WHERE k.conrelid OPERATOR(pg_catalog.=) c.oid AND k.contype OPERATOR(pg_catalog.=) 'c')

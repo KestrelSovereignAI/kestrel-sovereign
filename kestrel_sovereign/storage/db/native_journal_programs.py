@@ -51,9 +51,9 @@ class _NativeJournalSQLiteConnection(sqlite3.Connection):
         if name == 'autocommit':
             self._journal_autocommit_legacy = self.autocommit == sqlite3.LEGACY_TRANSACTION_CONTROL
 
-    def _program_call(self, name, *args, **kwargs):
+    def _program_call(self, method_name, /, *args, **kwargs):
         _register_program(self)
-        return getattr(super(), name)(*args, **kwargs)
+        return getattr(super(), method_name)(*args, **kwargs)
 
     def create_function(self, *args, **kwargs):
         return self._program_call('create_function', *args, **kwargs)
@@ -81,6 +81,16 @@ class _NativeJournalSQLiteConnection(sqlite3.Connection):
 
     def load_extension(self, *args, **kwargs):
         return self._program_call('load_extension', *args, **kwargs)
+
+    def deserialize(self, *args, **kwargs):
+        return self._program_call('deserialize', *args, **kwargs)
+
+    def setlimit(self, *args, **kwargs):
+        return self._program_call('setlimit', *args, **kwargs)
+
+    if hasattr(sqlite3.Connection, 'setconfig'):
+        def setconfig(self, *args, **kwargs):
+            return self._program_call('setconfig', *args, **kwargs)
 
     def _original_journal_programs_supported(self):
         return (not self._journal_programs_configured and self.text_factory is str

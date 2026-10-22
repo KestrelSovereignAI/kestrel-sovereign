@@ -2093,7 +2093,7 @@ async def test_enqueue_publication_join_preserves_actual_caller_withdrawal(tmp_p
         release.set()
         outcome = await await_owned_task(caller)
         assert outcome.error is not None and not isinstance(outcome.error, Exception), 'actual withdrawal was demoted to an ordinary exception'
-        chain = _explicit_control_chain(outcome.error)
+        chain = tuple(_explicit_control_chain(outcome.error))
         assert any(error is rejected for error in chain)
         assert any(isinstance(error, asyncio.CancelledError) and error.args == ('actual caller withdrawal during original join',) for error in chain)
         assert all(task.done() for task in agent.tasks)
