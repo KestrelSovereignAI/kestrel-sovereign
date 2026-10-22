@@ -2586,6 +2586,49 @@ async def test_early_recovered_claim_journals_its_actual_disposition(tmp_path, b
         await _close(backend, agent)
 
 
+@pytest.mark.parametrize('captured_subclass', [False, True])
+@pytest.mark.parametrize('changed', [False, True])
+async def test_native_runtime_did_cannot_delegate_identity_comparison(dispatcher_components, captured_subclass, changed):
+    from kestrel_sovereign.execution_custody import is_execution_control_error, execution_commit_outcome
+    c = dispatcher_components
+    class EqualText(str):
+        __hash__ = str.__hash__
+        def __eq__(self, other):
+            return True
+        def __ne__(self, other):
+            return False
+    original_id = c.agent._did
+    c.agent._did = EqualText(original_id) if captured_subclass else original_id
+    scope = ExecutionCustody(_OriginalWork(backend_type=c.backend.backend_type))
+    effects = []
+    async def handler(payload):
+        effects.append('genuinely completed original effect')
+        observed = 'replacement-runtime-did' if changed else original_id
+        # Both capture-side and observed-side application comparison protocols
+        # must be excluded; use the agent's real supported DID getter.
+        c.agent._did = observed if captured_subclass else EqualText(observed)
+        scope.revoke('actual work cutoff after original handler effect')
+        return {'genuine': True}
+    c.registry.register(_action_reg('native.runtime.did', handler=handler))
+    error = None
+    try:
+        with bind_execution_runtime(SimpleNamespace(_execution_custody=scope)):
+            try:
+                await c.dispatcher.dispatch_signal(_signal('native.runtime.did'))
+            except BaseException as caught:
+                error = caught
+    finally:
+        c.agent._did = original_id
+        try:
+            await c.dispatcher.shutdown_durable_delivery()
+        except BaseException as cleanup:
+            assert is_execution_control_error(cleanup)
+    assert effects == ['genuinely completed original effect']
+    assert (is_execution_control_error(error) if changed else error is None), 'application equality concealed changed runtime DID'
+    assert execution_commit_outcome(error) is None
+    assert await c.backend.fetch_val('SELECT COUNT(*) FROM signal_log') == int(not changed)
+
+
 @pytest.mark.parametrize('change', ['signal', 'agent', 'backend', 'runtime_scope'])
 async def test_original_journal_refuses_substituted_identity(dispatcher_components, monkeypatch, tmp_path, change):
     from kestrel_sovereign.signals.store import SignalLogStore

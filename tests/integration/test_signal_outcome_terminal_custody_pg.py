@@ -12,6 +12,7 @@ from tests.unit.test_signal_outcome_terminal_custody import (  # noqa: F401
     test_unadmitted_or_forged_native_journal_never_grants_storage,
     test_handler_cannot_use_journal_permission_or_replay_after_success,
     test_original_journal_refuses_substituted_identity,
+    test_native_runtime_did_cannot_delegate_identity_comparison,
     test_handler_cannot_mint_unrelated_journal_and_self_attach,
     test_original_journal_destination_cannot_follow_mutable_table,
     test_projection_control_failure_is_not_a_placeholder,
