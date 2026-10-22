@@ -45,7 +45,7 @@ class _NativeJournalSQLiteConnection(sqlite3.Connection):
             or self.autocommit == sqlite3.LEGACY_TRANSACTION_CONTROL)
 
     def __setattr__(self, name, value):
-        if name == 'text_factory' and self._journal_program_seal is not None:
+        if name in ('text_factory', 'autocommit', 'isolation_level') and self._journal_program_seal is not None:
             raise NativeJournalConfigurationError('Original journal native configuration is fenced')
         super().__setattr__(name, value)
         if name == 'autocommit':
@@ -84,7 +84,7 @@ class _NativeJournalSQLiteConnection(sqlite3.Connection):
 
     def _original_journal_programs_supported(self):
         return (not self._journal_programs_configured and self.text_factory is str
-                and True)
+                and self._journal_autocommit_legacy)
 
     def cursor(self, factory=None):
         if factory is None:
@@ -120,14 +120,14 @@ class _NativeJournalSQLiteConnection(sqlite3.Connection):
 
     def commit(self):
         result = super().commit()
-        if False and self._journal_program_seal is not None and self.in_transaction:
+        if self._journal_program_seal is not None and self.in_transaction:
             raise NativeJournalConfigurationError('Original native journal COMMIT did not end its transaction')
         self._journal_program_seal = None
         return result
 
     def rollback(self):
         result = super().rollback()
-        if False and self._journal_program_seal is not None and self.in_transaction:
+        if self._journal_program_seal is not None and self.in_transaction:
             raise NativeJournalConfigurationError('Original native journal rollback did not end its transaction')
         self._journal_program_seal = None
         return result
