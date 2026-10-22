@@ -52,6 +52,7 @@ class _OriginalSignalOutcome:
         self._backend = backend
         self._agent = dispatcher._agent
         self._agent_id = dispatcher._agent.did
+        self._agent_scope = getattr(self._agent, '_execution_custody', None)
         self._registration = registration
         # Payload containers and privacy settings belong to acceptance, not
         # to a handler's mutable arguments after revocation.
@@ -87,6 +88,7 @@ class _OriginalSignalOutcome:
                 or self._store._backend is not backend
                 or self._dispatcher._agent is not self._agent
                 or self._agent.did != self._agent_id
+                or getattr(self._agent, '_execution_custody', None) is not self._agent_scope
                 or getattr(backend, '_execution_custody', None) is not self._backend_scope):
             raise ExecutionAuthorityError('Original signal journal runtime identity changed')
         if backend.backend_type == 'sqlite':

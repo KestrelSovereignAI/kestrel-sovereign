@@ -711,7 +711,7 @@ async def test_early_recovered_claim_journals_its_actual_disposition(tmp_path, b
         await _close(backend, agent)
 
 
-@pytest.mark.parametrize('change', ['signal', 'agent', 'backend'])
+@pytest.mark.parametrize('change', ['signal', 'agent', 'backend', 'runtime_scope'])
 async def test_original_journal_refuses_substituted_identity(dispatcher_components, monkeypatch, tmp_path, change):
     from kestrel_sovereign.signals.store import SignalLogStore
     from kestrel_sovereign.storage.db import SQLiteBackend
@@ -733,6 +733,9 @@ async def test_original_journal_refuses_substituted_identity(dispatcher_componen
             c.agent._did = 'different-agent'
         elif change == 'backend':
             c.store._backend = other
+        elif change == 'runtime_scope':
+            monkeypatch.setattr(c.agent, '_execution_custody',
+                ExecutionCustody(_OriginalWork(backend_type=c.backend.backend_type)), raising=False)
         return await original_writer(*args, **kwargs)
 
     def changed_signal(signal, registration, result, **kwargs):
@@ -748,6 +751,8 @@ async def test_original_journal_refuses_substituted_identity(dispatcher_componen
         assert is_execution_control_error(refused.value)
     finally:
         c.agent._did = initial_agent_id
+        if change == 'runtime_scope':
+            monkeypatch.delattr(c.agent, '_execution_custody')
         c.store._backend = c.backend
         # Join exactly the original failed terminal owner; no new retry of its
         # already retained failure is interpreted as a successful write.
