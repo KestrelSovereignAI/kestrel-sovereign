@@ -51,6 +51,7 @@ class NativeRequestAuthority:
     resolver: Resolver
     authorize_sender: Callable[[str], Awaitable[str | None]]
     require_current: Callable[[NativeVerifiedSender | None], None]
+    authorize_retained_principal: Callable[[str], Awaitable[bool]]
 
 
 @dataclass(frozen=True)
@@ -95,6 +96,34 @@ class NativeDIDRequestGuard:
         if SIGNED_SENDER_URI not in self.required_extensions:
             raise ValueError("The DID guard requires the signed-sender extension")
 
+    def _new_authority(self) -> NativeRequestAuthority:
+        authority = self.authority_factory()
+        if not isinstance(authority, NativeRequestAuthority):
+            raise TypeError("Native admission requires request-owned policy authority")
+        return authority
+
+    @asynccontextmanager
+    async def hold_retained_authority(self, principal_id: str) -> AsyncIterator[None]:
+        """Reauthorize a canonical callback creator under this publication lease.
+
+        No original request nonce is replayed and no new identity is verified.
+        The caller must supply the principal from its retained server-side row.
+        """
+        if not isinstance(principal_id, str) or not principal_id.strip():
+            raise ValueError("Retained native authority requires a concrete principal")
+        # Resident polling retains typed native database outcomes for its
+        # idempotent retry policy; HTTP error translation belongs to requests.
+        async with self.lifecycle_lease():
+            authority = self._new_authority()
+            authority.require_current(None)
+            allowed = await authority.authorize_retained_principal(principal_id)
+            authority.require_current(None)
+            if allowed is not True:
+                raise HTTPException(
+                    status_code=403, detail="A2A recipient policy refused this principal"
+                )
+            yield
+
     @asynccontextmanager
     async def admit(
         self, params: _Request, operation: str, context: ServerCallContext
@@ -111,11 +140,7 @@ class NativeDIDRequestGuard:
                 message="Required Agent Card extensions were not activated"
             )
         async with _native_persistence_errors(), self.lifecycle_lease():
-            authority = self.authority_factory()
-            if not isinstance(authority, NativeRequestAuthority):
-                raise TypeError(
-                    "Native admission requires request-owned policy authority"
-                )
+            authority = self._new_authority()
             authority.require_current(None)
             try:
                 sender = await verify_native_request(

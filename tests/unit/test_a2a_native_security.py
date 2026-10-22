@@ -26,6 +26,71 @@ from tests.utils.native_a2a_security import (
 )
 
 
+async def test_retained_principal_policy_uses_no_new_sender_proof(native_request_admission):
+    p = native_request_admission
+    async with p.guard.hold_retained_authority(PRINCIPAL):
+        assert p.lock.locked()
+    assert not p.state.authorizations
+    await p.backend.execute("DELETE FROM native_test_principals")
+    with pytest.raises(HTTPException) as refused:
+        async with p.guard.hold_retained_authority(PRINCIPAL):
+            pytest.fail("Revoked retained principal obtained authority")
+    assert refused.value.status_code == 403
+    assert not p.state.authorizations
+
+
+async def test_retained_policy_cannot_commit_after_its_authorization_await(native_request_admission):
+    p = native_request_admission
+
+    async def authorize(principal):
+        assert principal == PRINCIPAL
+        p.state.current = False
+        return True
+
+    authority = replace(p.guard.authority_factory(), authorize_retained_principal=authorize)
+    guard = replace(p.guard, authority_factory=lambda: authority)
+    with pytest.raises(HTTPException) as refused:
+        async with guard.hold_retained_authority(PRINCIPAL):
+            pytest.fail("Retired publication obtained authority")
+    assert refused.value.status_code == 403
+
+
+async def test_retained_policy_keeps_native_database_failure_for_resident_recovery(
+    native_request_admission,
+):
+    p = native_request_admission
+    original = QueryError("native policy query failed")
+
+    async def authorize(principal):
+        assert principal == PRINCIPAL
+        raise original
+
+    authority = replace(p.guard.authority_factory(), authorize_retained_principal=authorize)
+    guard = replace(p.guard, authority_factory=lambda: authority)
+    with pytest.raises(QueryError) as failed:
+        async with guard.hold_retained_authority(PRINCIPAL):
+            pytest.fail("Failed policy read granted authority")
+    assert failed.value is original
+
+
+@pytest.mark.parametrize("result", [False, None, 1, "yes"])
+async def test_retained_principal_requires_explicit_policy_permission(
+    native_request_admission, result
+):
+    p = native_request_admission
+
+    async def authorize(principal):
+        assert principal == PRINCIPAL
+        return result
+
+    authority = replace(p.guard.authority_factory(), authorize_retained_principal=authorize)
+    guard = replace(p.guard, authority_factory=lambda: authority)
+    with pytest.raises(HTTPException) as denied:
+        async with guard.hold_retained_authority(PRINCIPAL):
+            pytest.fail("Policy did not explicitly grant retained access")
+    assert denied.value.status_code == 403
+
+
 @pytest.mark.parametrize("protocol", ["JSONRPC", "HTTP+JSON"])
 async def test_verified_sender_policy_supplies_the_only_durable_creator(
     native_request_admission, protocol

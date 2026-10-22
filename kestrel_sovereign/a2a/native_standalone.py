@@ -82,6 +82,11 @@ class _SingleAgentNativeRequest:
             did, router=self.owner.router, requester=self.owner.requester
         )
 
+    async def authorize_retained_principal(self, principal_id):
+        return await self.owner.authorizer.authorize_retained_principal_with_policy(
+            principal_id, router=self.owner.router, requester=self.owner.requester
+        )
+
 
 class SingleAgentNativeAuthority:
     """Bind request authority to one original runtime and explicit peer policy.
@@ -131,6 +136,9 @@ class SingleAgentNativeAuthority:
             or not callable(getattr(authorizer, "has_valid_policy_scope", None))
             or not callable(
                 getattr(authorizer, "authorize_principal_with_policy", None)
+            )
+            or not callable(
+                getattr(authorizer, "authorize_retained_principal_with_policy", None)
             )
             or authorizer.has_valid_policy_scope(router, requester) is not True
         ):
@@ -214,7 +222,8 @@ class SingleAgentNativeAuthority:
         def authority():
             request = _SingleAgentNativeRequest(self)
             return NativeRequestAuthority(
-                request.resolve, request.authorize, request.require_current
+                request.resolve, request.authorize, request.require_current,
+                request.authorize_retained_principal,
             )
 
         return NativeDIDRequestGuard(

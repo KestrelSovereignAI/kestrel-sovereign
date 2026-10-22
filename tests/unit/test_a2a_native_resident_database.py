@@ -36,7 +36,11 @@ from tests.unit.test_a2a_native_question_supervisor import (
 from tests.unit.test_a2a_native_task_manager import request
 from tests.utils.database_query_faults import prepare_transient_database_query_fault
 from tests.utils.native_a2a import manager_for
-from tests.utils.native_push import configure_push_test_key, intercept_push_commit_ack
+from tests.utils.native_push import (
+    configure_push_test_key,
+    fixture_push_authorizer,
+    intercept_push_commit_ack,
+)
 
 
 @pytest_asyncio.fixture
@@ -55,6 +59,7 @@ async def push_runtime(native_a2a_backend_factory, monkeypatch):
             signals,
             policy=NativePushPolicy(retry_seconds=1),
             task_factory=create_owned_task,
+            authorize_creator=fixture_push_authorizer(manager.task_store),
         )
         yield SimpleNamespace(manager=manager, service=service, backend=backend)
     finally:

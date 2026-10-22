@@ -32,6 +32,9 @@ from tests.unit.test_a2a_native_resident_database import _wait_for_original_reco
 from tests.unit.test_durable_callback_runtime_context import resident_dispatcher
 from tests.utils.database_query_faults import prepare_transient_database_query_fault
 from tests.utils.native_push import configure_push_test_key
+from tests.utils.outbound_tls import (
+    outbound_tls as outbound_tls,  # noqa: PLC0414 - actual HTTPS fixture
+)
 
 
 @pytest_asyncio.fixture
@@ -105,6 +108,261 @@ async def test_host_binds_original_ready_service_before_signed_capability(push_h
     finally:
         async with p.host.a2a_lifecycle_lease():
             native.withdraw()
+
+
+@pytest_asyncio.fixture
+async def callback_host(push_host, monkeypatch):
+    from kestrel_sovereign.a2a.push_worker import NativePushWorker
+
+    p = push_host
+    entered, release = asyncio.Event(), asyncio.Event()
+    original_iteration = NativePushWorker.run_once
+
+    async def paused_iteration(self):
+        entered.set()
+        await release.wait()
+        return await original_iteration(self)
+
+    monkeypatch.setattr(NativePushWorker, "run_once", paused_iteration)
+    native = await prepare_hosted_native_publication(
+        p.app, p.host, "registered-agent", p.recipient,
+        {"KESTREL_BASE_URL": "https://native.test", "KESTREL_A2A_PUSH_RENEWAL_SECONDS": "1",
+         "KESTREL_A2A_PUSH_LEASE_SECONDS": "4", "KESTREL_A2A_PUSH_RETRY_SECONDS": "1"},
+    )
+    service = p.manager.push_service
+    await entered.wait()
+    p.recipient._native_a2a_publication = native
+    async with p.host.a2a_lifecycle_lease():
+        p.host._register_agent("registered-agent", p.recipient)
+    p.callback_publication = native
+    p.push_worker = service.worker
+    p.push_iteration = lambda: original_iteration(service.worker)
+    p.release_push_iteration = release
+    try:
+        yield p
+    finally:
+        async with p.host.a2a_lifecycle_lease():
+            native.withdraw()
+
+
+async def register_callback(p, url):
+    from a2a.types import TaskPushNotificationConfig
+    from tests.utils.native_a2a_security import PRINCIPAL, send
+
+    task = await p.manager.create_task(send(p), creator_agent_id=PRINCIPAL)
+    await p.push_worker.outbox.register(
+        TaskPushNotificationConfig(task_id=task.id, url=url, tenant=p.scope.tenant),
+        creator_id=PRINCIPAL,
+    )
+    return task
+
+
+async def revoke_callback_creator(p):
+    from tests.utils.native_a2a_security import PRINCIPAL
+
+    async with p.host.a2a_lifecycle_lease():
+        await p.backend.execute(
+            "DELETE FROM native_test_principals WHERE principal = ?", (PRINCIPAL,)
+        )
+
+
+@pytest.mark.parametrize("outbound_tls", [{"dns_validations": 3}], indirect=True)
+async def test_hosted_callback_rechecks_retained_creator_policy(callback_host, outbound_tls, monkeypatch):
+    p = callback_host
+    task = await register_callback(p, outbound_tls.url + "/callback")
+    assert await p.push_iteration() == 1
+    assert len(outbound_tls.posts) == 1
+    await revoke_callback_creator(p)
+    await p.manager.complete_task(
+        task.id, "Private result after policy revocation",
+        recipient_agent_id=p.recipient.did,
+    )
+    reads = []
+    original = p.manager.task_store.get_for_creator
+
+    async def read(*args, **kwargs):
+        reads.append(args)
+        return await original(*args, **kwargs)
+
+    monkeypatch.setattr(p.manager.task_store, "get_for_creator", read)
+    assert await p.push_iteration() == 1
+    assert not reads, "Revoked creator caused a new task-payload read"
+    assert len(outbound_tls.posts) == 1, "Revoked creator received a later task snapshot"
+    assert len(outbound_tls.dns) == 2
+    assert await p.backend.fetch_all("SELECT retired FROM a2a_push_delivery_attempts") == [(1,)]
+    assert not p.manager.push_service.task.done()
+
+
+@pytest.mark.parametrize("outbound_tls", [{"dns_validations": 1}], indirect=True)
+async def test_callback_rechecks_policy_after_task_read_before_dns(
+    callback_host, outbound_tls, monkeypatch
+):
+    p = callback_host
+    await register_callback(p, outbound_tls.url + "/callback")
+    original = p.manager.task_store.get_for_creator
+
+    async def read(*args, **kwargs):
+        native = await original(*args, **kwargs)
+        await revoke_callback_creator(p)
+        return native
+
+    monkeypatch.setattr(p.manager.task_store, "get_for_creator", read)
+    assert await p.push_iteration() == 1
+    assert not outbound_tls.posts and len(outbound_tls.dns) == 1
+    assert await p.backend.fetch_all("SELECT retired FROM a2a_push_delivery_attempts") == []
+
+
+@pytest.mark.parametrize("fault", ["policy", "identity", "registration", "publication"])
+@pytest.mark.parametrize("outbound_tls", [{"dns_validations": 1}], indirect=True)
+async def test_callbacks_refuse_a_retired_publication_before_dns(
+    callback_host, outbound_tls, fault
+):
+    from types import SimpleNamespace
+
+    p = callback_host
+    await register_callback(p, outbound_tls.url + "/callback")
+    async with p.host.a2a_lifecycle_lease():
+        if fault == "policy":
+            p.host.install_a2a_hosted_policy(
+                p.recipient, resolver=p.policy.resolver, authorizer=p.policy.authorizer,
+                router=p.policy.router, requester=p.policy.requester,
+            )
+        elif fault == "identity":
+            p.recipient.identity = replace(p.recipient.identity, new_verification_methods=[])
+        elif fault == "registration":
+            p.host._agents["registered-agent"] = SimpleNamespace(**vars(p.recipient))
+        else:
+            p.callback_publication.withdraw()
+    assert await p.push_iteration() == 1
+    assert not outbound_tls.posts and len(outbound_tls.dns) == 1
+    assert await p.backend.fetch_all("SELECT retired FROM a2a_push_delivery_attempts") == []
+
+
+@pytest.mark.parametrize("outbound_tls", [{"dns_validations": 2}], indirect=True)
+async def test_callback_rechecks_policy_after_real_dns_before_http(
+    callback_host, outbound_tls, monkeypatch
+):
+    from kestrel_sovereign.a2a import push_transport
+
+    p = callback_host
+    await register_callback(p, outbound_tls.url + "/callback")
+    original = push_transport.assert_safe_url
+    original_renew = p.push_worker._renew
+    original_send = p.push_worker.transport.send
+    monitor_renewed, http_retired = asyncio.Event(), asyncio.Event()
+    dns_returning = False
+
+    async def renew(delivery):
+        await original_renew(delivery)
+        if not dns_returning:
+            # Hold the monitor after its actual first lease renewal. The
+            # final HTTP admission must independently observe the revocation.
+            monitor_renewed.set()
+            await http_retired.wait()
+
+    async def send(*args, **kwargs):
+        try:
+            return await original_send(*args, **kwargs)
+        finally:
+            http_retired.set()
+
+    async def resolve(*args, **kwargs):
+        nonlocal dns_returning
+        result = await original(*args, **kwargs)
+        await asyncio.wait_for(monitor_renewed.wait(), 5)
+        await revoke_callback_creator(p)
+        dns_returning = True
+        return result
+
+    monkeypatch.setattr(p.push_worker, "_renew", renew)
+    monkeypatch.setattr(p.push_worker.transport, "send", send)
+    monkeypatch.setattr(push_transport, "assert_safe_url", resolve)
+    try:
+        assert await p.push_iteration() == 1
+    finally:
+        http_retired.set()
+    assert not outbound_tls.posts and len(outbound_tls.dns) == 2
+    assert await p.backend.fetch_all("SELECT retired FROM a2a_push_delivery_attempts") == [(1,)]
+
+
+@pytest.mark.parametrize("outbound_tls", [{"dns_validations": 2}], indirect=True)
+async def test_policy_revocation_joins_an_already_admitted_http_owner(callback_host, outbound_tls):
+    p = callback_host
+    await register_callback(p, outbound_tls.url + "/callback")
+    outbound_tls.reply.clear()
+    iteration = asyncio.create_task(p.push_iteration())
+    try:
+        async with asyncio.timeout(5):
+            while not outbound_tls.posts:
+                await asyncio.sleep(0.01)
+        await revoke_callback_creator(p)
+        assert await asyncio.wait_for(iteration, 5) == 1
+        assert len(outbound_tls.posts) == 1
+        assert await p.backend.fetch_all(
+            "SELECT retired FROM a2a_push_delivery_attempts"
+        ) == [(1,)]
+    finally:
+        outbound_tls.reply.set()
+        if not iteration.done():
+            iteration.cancel()
+        await asyncio.gather(iteration, return_exceptions=True)
+
+
+@pytest.mark.parametrize("outbound_tls", [{"dns_validations": 2}], indirect=True)
+async def test_native_policy_outage_retries_on_the_original_resident(
+    callback_host, outbound_tls, monkeypatch
+):
+    p = callback_host
+    fail_query = await prepare_transient_database_query_fault(p.backend)
+    with pytest.raises(DatabaseError) as failed:
+        await fail_query()
+    original_error = failed.value
+    original = p.policy.router.authorize_inbound_sender
+    recovered = asyncio.Event()
+    errors = []
+
+    async def authorize(*args):
+        if not errors:
+            errors.append(original_error)
+            raise original_error
+        result = await original(*args)
+        recovered.set()
+        return result
+
+    await register_callback(p, outbound_tls.url + "/callback")
+    monkeypatch.setattr(p.policy.router, "authorize_inbound_sender", authorize)
+    owner = p.manager.push_service.task
+    p.release_push_iteration.set()
+    await _wait_for_original_recovery(owner, recovered)
+    async with asyncio.timeout(10):
+        while not outbound_tls.posts:
+            assert not owner.done()
+            await asyncio.sleep(0.01)
+    assert len(errors) == 1 and len(outbound_tls.posts) == 1
+    assert p.manager.push_service.task is owner and not owner.done()
+
+
+async def test_callback_policy_refusal_retains_original_execution_control(callback_host):
+    from starlette.exceptions import HTTPException
+
+    from kestrel_sovereign.execution_custody import ExecutionAuthorityError
+    from tests.utils.native_a2a_security import PRINCIPAL
+
+    p = callback_host
+    original = HTTPException(status_code=403, detail="Original policy operation retired")
+    original.__cause__ = ExecutionAuthorityError("Original authority retired")
+
+    async def authorize(principal):
+        assert principal == PRINCIPAL
+        raise original
+
+    native = p.callback_publication
+    guard = native._guard
+    authority = replace(guard.authority_factory(), authorize_retained_principal=authorize)
+    native._guard = replace(guard, authority_factory=lambda: authority)
+    with pytest.raises(HTTPException) as failed:
+        await native._authorize_push_creator(PRINCIPAL)
+    assert failed.value is original
 
 
 async def test_host_preparation_waits_for_actual_runtime_ready_boundary(

@@ -2,6 +2,7 @@
 
 import asyncio
 import logging
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import timedelta
 from uuid import uuid4
@@ -59,6 +60,7 @@ class NativePushWorker:
         outbox: NativePushOutbox,
         transport: NativePushTransport,
         *,
+        authorize_creator: Callable[[str], Awaitable[bool]],
         poll_interval: timedelta,
         renewal_interval: timedelta,
         retry_delay: timedelta,
@@ -75,6 +77,9 @@ class NativePushWorker:
             raise ValueError(
                 "Push runner and transport must share the exact configuration store"
             )
+        if not callable(authorize_creator):
+            raise TypeError("Native push requires live recipient authorization")
+        self._authorize_creator = authorize_creator
         for name, duration in (
             ("poll", poll_interval),
             ("renewal", renewal_interval),
@@ -217,6 +222,7 @@ class NativePushWorker:
                     "Push delivery differs from its original subscription"
                 )
             if payload["journal_sequence"] > subscription.after_sequence:
+                await self._authorize_subscription(subscription)
                 configuration = await self.outbox.configurations.get(
                     subscription.task_id,
                     subscription.config_id,
@@ -243,11 +249,12 @@ class NativePushWorker:
 
                 async def post():
                     try:
+                        await self._authorize_subscription(subscription)
                         await self.transport.send(
                             configuration,
                             native,
                             executor_id=self.executor_id,
-                            before_dispatch=lambda: self._renew(delivery),
+                            before_dispatch=lambda: self._admit_http(subscription, delivery),
                         )
                     finally:
                         finished.set()
@@ -266,6 +273,7 @@ class NativePushWorker:
                             raise PushDeliveryRevoked(
                                 "Push configuration was revoked during delivery"
                             )
+                        await self._authorize_subscription(subscription)
                         await self._renew(delivery)
                         try:
                             await asyncio.wait_for(
@@ -292,6 +300,14 @@ class NativePushWorker:
                 )
         finally:
             self._active.pop(task, None)
+
+    async def _authorize_subscription(self, subscription: PushSubscription) -> None:
+        if await self._authorize_creator(subscription.creator_id) is not True:
+            raise PushDeliveryRevoked("Push creator is no longer authorized by the recipient")
+
+    async def _admit_http(self, subscription: PushSubscription, delivery: DurableDelivery) -> None:
+        await self._renew(delivery)
+        await self._authorize_subscription(subscription)
 
     async def _process_subscription(self, subscription: PushSubscription) -> int:
         """Claim one original delivery and settle its own HTTP result."""

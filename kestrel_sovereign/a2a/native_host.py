@@ -106,6 +106,11 @@ class _HostedNativeRequest:
             did, router=self.policy.router, requester=self.policy.requester
         )
 
+    async def authorize_retained_principal(self, principal_id: str) -> bool:
+        return await self.policy.authorizer.authorize_retained_principal_with_policy(
+            principal_id, router=self.policy.router, requester=self.policy.requester
+        )
+
 
 def create_hosted_native_guard(
     manager: AgentManager,
@@ -140,6 +145,9 @@ def create_hosted_native_guard(
         or not callable(
             getattr(policy.authorizer, "authorize_principal_with_policy", None)
         )
+        or not callable(
+            getattr(policy.authorizer, "authorize_retained_principal_with_policy", None)
+        )
         or policy.authorizer.has_valid_policy_scope(policy.router, policy.requester)
         is not True
     ):
@@ -167,7 +175,8 @@ def create_hosted_native_guard(
             recipient_witness,
         )
         return NativeRequestAuthority(
-            request.resolve, request.authorize, request.require_current
+            request.resolve, request.authorize, request.require_current,
+            request.authorize_retained_principal,
         )
 
     return NativeDIDRequestGuard(

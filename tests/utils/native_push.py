@@ -24,6 +24,23 @@ def configure_push_test_key(monkeypatch):
     monkeypatch.delenv("KESTREL_DATA_KEY_FILE", raising=False)
 
 
+def fixture_push_authorizer(task_store):
+    """Test policy grants callbacks to creators in this disposable task store.
+
+    Host/publication tests use their actual independently revocable directory.
+    Storage/transport fixtures supply this explicit policy instead of having a
+    permissive default in the production worker or resident service.
+    """
+    async def authorize(principal_id):
+        return await task_store.backend.fetch_one(
+            "SELECT id FROM a2a_tasks WHERE creator_agent_id = ? "
+            "AND recipient_agent_id = ? AND tenant = ? LIMIT 1",
+            (principal_id, task_store.scope.recipient_id, task_store.scope.tenant),
+        ) is not None
+
+    return authorize
+
+
 def intercept_push_commit_ack(
     outbox, monkeypatch, after_commit, *, owner=None, method="forward_pending"
 ):
@@ -90,6 +107,7 @@ async def managed_push_service(manager, monkeypatch, *, pause_delivery: bool):
     worker = NativePushWorker(
         outbox,
         NativePushTransport(outbox.configurations, timeout=timedelta(seconds=5)),
+        authorize_creator=fixture_push_authorizer(manager.task_store),
         poll_interval=timedelta(seconds=1),
         renewal_interval=timedelta(seconds=20),
         retry_delay=timedelta(seconds=1),

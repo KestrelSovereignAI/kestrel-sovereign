@@ -24,7 +24,7 @@ from tests.unit.test_a2a_native_push_outbox import (
 from tests.unit.test_a2a_native_push_outbox import (
     push_store as push_store,  # noqa: PLC0414 - pytest fixture dependency
 )
-from tests.utils.native_push import intercept_push_commit_ack
+from tests.utils.native_push import fixture_push_authorizer, intercept_push_commit_ack
 from tests.utils.outbound_tls import (
     outbound_close_barrier as outbound_close_barrier,  # noqa: PLC0414 - pytest fixture re-export
 )
@@ -37,6 +37,7 @@ def worker(value, *, database_retry_policy=None):
     return NativePushWorker(
         value,
         NativePushTransport(value.configurations, timeout=timedelta(seconds=5)),
+        authorize_creator=fixture_push_authorizer(value.configurations.task_store),
         poll_interval=timedelta(milliseconds=10),
         renewal_interval=timedelta(milliseconds=20),
         retry_delay=timedelta(seconds=1),
@@ -51,6 +52,16 @@ async def test_worker_uses_its_explicit_typed_database_retry_budget(outbox):
     assert worker(value, database_retry_policy=policy).database_retry_policy is policy
     with pytest.raises(TypeError, match="database retry policy"):
         worker(value, database_retry_policy=True)
+
+
+async def test_worker_requires_an_explicit_live_recipient_authorizer(outbox):
+    value, _ = outbox
+    with pytest.raises(TypeError, match="live recipient authorization"):
+        NativePushWorker(
+            value, NativePushTransport(value.configurations, timeout=timedelta(seconds=5)),
+            authorize_creator=None, poll_interval=timedelta(seconds=1),
+            renewal_interval=timedelta(seconds=20), retry_delay=timedelta(seconds=1), batch_size=10,
+        )
 
 
 async def register(value, task, url):
@@ -483,6 +494,7 @@ async def test_invalid_worker_policy_refuses_before_execution(outbox, field, bad
         "renewal_interval": timedelta(seconds=20),
         "retry_delay": timedelta(seconds=1),
         "batch_size": 10,
+        "authorize_creator": fixture_push_authorizer(value.configurations.task_store),
     }
     options[field] = bad
     with pytest.raises(ValueError):

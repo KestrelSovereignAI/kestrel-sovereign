@@ -123,6 +123,21 @@ class RecipientA2ASenderAuthorizer:
             context,
         )
 
+    async def authorize_retained_principal_with_policy(
+        self, principal_id: str, *, router: Any, requester: Any,
+    ) -> bool:
+        """Recheck a previously verified ledger principal against live policy.
+
+        Native callback delivery supplies the creator from its canonical store.
+        This does not resolve or authenticate a new caller-supplied signing DID.
+        """
+        if not isinstance(principal_id, str) or not principal_id.strip():
+            return False
+        context = self._validate_scoped_context(router, requester)
+        if context is None:
+            return False
+        return await self._authorize_sender_id_with_context(principal_id, context)
+
 
     async def authorize(self, verified_sender_did: str) -> bool:
         """Authorize a sender only after its signature has been verified."""

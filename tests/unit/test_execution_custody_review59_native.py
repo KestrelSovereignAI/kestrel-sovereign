@@ -82,6 +82,7 @@ async def test_a2a_authorization_preserves_original_native_control(tmp_path, nat
         authority = NativeRequestAuthority(
             original_authority.resolver, authorizer.authorize_principal,
             original_authority.require_current,
+            original_authority.authorize_retained_principal,
         )
         guard = replace(admission.guard, authority_factory=lambda: authority)
         params = send(admission)

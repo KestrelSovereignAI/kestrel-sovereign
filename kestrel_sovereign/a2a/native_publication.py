@@ -39,6 +39,7 @@ from kestrel_sovereign.a2a.scope import NativeRecipientScope
 from kestrel_sovereign.a2a.task_manager import OutboundActorScopeError
 from kestrel_sovereign.execution_custody import (
     bind_native_http_execution_admission,
+    is_execution_control_error,
     native_execution_response_owner,
     owned_native_http_client,
 )
@@ -137,9 +138,22 @@ class NativeA2APublication:
                 recipient.dispatcher.durable_store,
                 policy=configuration.push,
                 task_factory=recipient._track_runtime_task,
+                authorize_creator=publication._authorize_push_creator,
             )
         publication._build_card(profile)
         return publication
+
+    async def _authorize_push_creator(self, principal_id: str) -> bool:
+        guard, binding = self._guard, self._binding
+        if guard is None or binding is None:
+            return False
+        try:
+            async with guard.hold_retained_authority(principal_id):
+                return self._guard is guard and self._binding is binding and self.registry.is_current(binding)
+        except HTTPException as error:
+            if is_execution_control_error(error) or error.status_code not in {401, 403, 404}:
+                raise
+            return False
 
     def _build_card(
         self, profile: dict[str, str], *, preparing: bool = False

@@ -72,10 +72,18 @@ async def admission(native_a2a_backend_factory, native_signing):
         )
         return row[0] if row else None
 
+    async def authorize_retained(principal_id):
+        assert lock.locked()
+        return await backend.fetch_one(
+            "SELECT principal FROM native_test_principals WHERE principal = ?",
+            (principal_id,),
+        ) is not None
+
     authority = NativeRequestAuthority(
         resolver=lambda did: native_signing[1],
         authorize_sender=authorize,
         require_current=require_current,
+        authorize_retained_principal=authorize_retained,
     )
     guard = NativeDIDRequestGuard(
         routing_key="registered-agent",

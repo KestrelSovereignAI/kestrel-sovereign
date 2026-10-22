@@ -470,7 +470,7 @@ message. Every ancestor must still acknowledge active work and have no pending
 cancellation when a follow-up is reserved and immediately before peer HTTP.
 A question follow-up retains the original question's correlation and deadline;
 it cannot become independent work by using another tool or delivery verb.
-The native core store bundle is revision 2. Earlier private candidate schemas
+The native core store bundle is revision 5. Earlier private candidate schemas
 are refused before startup writes; the runtime does not upgrade them in place.
 
 Incoming `SendMessage` continuations append the original message to the same
@@ -889,6 +889,15 @@ are separate facts. `PushConfigStore` binds callback credentials to the native
 task's creator, recipient and tenant. The shared AEAD service-key hierarchy
 protects the complete configuration, with its task, owner and generation in
 associated data. Reads return independent official protobuf values.
+
+The worker reauthorizes the stored creator against the exact publication's
+live recipient policy before reading the task, before egress, and at final
+HTTP admission after DNS and lease renewal. Its in-flight monitor repeats that
+check and joins the original HTTP owner when access is revoked. A request
+already admitted may have reached its callback; revocation cannot retract it.
+Publication withdrawal or replacement cannot silently grant the old worker a
+new authority. These checks authenticate no new sender and replay no request
+nonce. Native database errors retain their original polling disposition.
 
 A configuration ID names one current value; an omitted ID defaults to the task
 ID. Repeating an identical normalized configuration preserves its generation,

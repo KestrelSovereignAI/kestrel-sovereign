@@ -22,7 +22,7 @@ from tests.unit.test_a2a_native_push_outbox import (
 from tests.unit.test_a2a_native_push_outbox import callback, refuse_original_database_write
 from tests.unit.test_a2a_native_push_worker import register, worker
 from tests.unit.test_durable_callback_runtime_context import resident_dispatcher
-from tests.utils.native_push import intercept_push_commit_ack
+from tests.utils.native_push import fixture_push_authorizer, intercept_push_commit_ack
 from tests.utils.outbound_tls import (
     outbound_close_barrier as outbound_close_barrier,  # noqa: PLC0414 - pytest fixture re-export
 )
@@ -72,6 +72,7 @@ async def test_canonical_startup_uses_actual_runtime_ready_publisher(outbox):
             value.signals,
             policy=policy,
             task_factory=runtime._track_runtime_task,
+            authorize_creator=fixture_push_authorizer(manager.task_store),
         )
         assert manager.push_service is service
         assert service.task in runtime._background_tasks
@@ -89,6 +90,7 @@ async def test_canonical_startup_uses_actual_runtime_ready_publisher(outbox):
                 value.signals,
                 policy=policy,
                 task_factory=runtime._track_runtime_task,
+                authorize_creator=fixture_push_authorizer(manager.task_store),
             )
         await manager.close()
         assert service.task.done() and value.backend.is_connected
@@ -119,7 +121,8 @@ async def test_failed_binding_joins_actual_resident_before_startup_returns(
     try:
         with pytest.raises(RuntimeError) as caught:
             await start_native_push_service(
-                manager, value.signals, policy=NativePushPolicy(), task_factory=publish
+                manager, value.signals, policy=NativePushPolicy(), task_factory=publish,
+                authorize_creator=fixture_push_authorizer(manager.task_store),
             )
         assert caught.value is original
         assert len(accepted) == 1 and accepted[0].done()

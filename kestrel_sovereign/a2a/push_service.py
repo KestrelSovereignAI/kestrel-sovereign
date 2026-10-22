@@ -2,7 +2,7 @@
 
 import asyncio
 import logging
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from datetime import timedelta
 
 from kestrel_sovereign._async_ownership import (
@@ -25,7 +25,8 @@ class PushServiceUnavailable(RuntimeError):
 
 
 async def start_native_push_service(
-    manager, signals, *, policy: NativePushPolicy, task_factory: Callable
+    manager, signals, *, policy: NativePushPolicy, task_factory: Callable,
+    authorize_creator: Callable[[str], Awaitable[bool]],
 ):
     """Bind a ready resident using the host's canonical stores and task publisher."""
     from kestrel_sovereign.a2a.push_outbox import NativePushOutbox
@@ -52,6 +53,7 @@ async def start_native_push_service(
             outbox.configurations, timeout=timedelta(seconds=policy.timeout_seconds),
             database_retry_policy=database_retry_policy, retry_delay=retry_delay,
         ),
+        authorize_creator=authorize_creator,
         poll_interval=timedelta(seconds=policy.poll_seconds),
         renewal_interval=timedelta(seconds=policy.renewal_seconds),
         retry_delay=retry_delay,
