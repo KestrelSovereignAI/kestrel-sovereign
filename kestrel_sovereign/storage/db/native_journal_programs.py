@@ -12,6 +12,11 @@ from contextvars import ContextVar
 _ORIGINAL_POSTGRES_CONNECT = ContextVar('original_postgres_journal_connect', default=None)
 
 
+def _has_exact_native_type(value, *supported):
+    """Type identity only: membership/equality can execute a metaclass."""
+    return any(type(value) is native for native in supported)
+
+
 class NativeJournalConfigurationError(RuntimeError):
     """The native connection cannot enter/change an original journal profile."""
 
@@ -30,7 +35,7 @@ class _NativeJournalSQLiteCursor(sqlite3.Cursor):
         if native._journal_program_seal is not None:
             if (not native._original_journal_programs_supported()
                     or type(parameters) is not tuple
-                    or any(type(value) not in (type(None), int, float, str, bytes) for value in parameters)
+                    or any(not _has_exact_native_type(value, type(None), int, float, str, bytes) for value in parameters)
                     or any((type(value), sqlite3.PrepareProtocol) in sqlite3.adapters for value in parameters)):
                 raise NativeJournalConfigurationError('Original journal binds only plain native scalar parameters')
         return super().execute(query, parameters)

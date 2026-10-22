@@ -914,6 +914,19 @@ scoped native journals. Unscoped legacy pools retain ordinary append; an
 unfenced external pool cannot claim the stronger scoped contract. No additional
 connection or database slot is allocated by this connection class.
 
+Original pool admission also snapshots plain native connection arguments and
+nested startup settings. Callable password providers and opaque application
+configuration objects (including application SSLContext objects) cannot carry
+this stronger journal contract. Core adopts its neutral native connector while
+admitted: outside a journal it behaves like ordinary asyncpg connect; inside a
+journal it checks the original recipe at actual reconnect, AFTER any pool wait,
+and detaches its inputs. A pre-queue check alone cannot fence late mutations.
+The actual admitted session supplies resolved endpoint, authentication identity
+and startup defaults; later PGHOST/PGDATABASE or related environment changes
+cannot redirect a terminal reconnect. Reused sessions must match that original
+resolved binding. These private in-memory recipes contain credentials and are
+never serialized or included in diagnostics.
+
 Core-owned SQLite connections likewise track native callback/function/extension
 registration. A customized session remains ineligible for original journals until
 reconnect, including after callback removal. This is a supported configuration
@@ -947,6 +960,13 @@ after any accepted original dispatch task physically joins. Cleanup is idempoten
 even when a callback registered before raising, and retains the original failure.
 Caller withdrawal during that join remains a Base cancellation/control carrier,
 not an ordinary publication exception with cancellation hidden only as its cause.
+The resident also passes its own original journal evidence to its waiting
+ingress, so a cancellation observed AFTER successful resident COMMIT/reset keeps
+that actual classification and original PostgreSQL receipts. This handoff is
+finite completion evidence, never a grant of work or an invented receipt. An
+ordinary Stop with no independent failure retains CancelledError/lifecycle
+semantics; independent failures and borrowed-wait publication errors use the
+canonical finite Base observation carrier without abandoning the producer.
 
 SQLite's plain audit shape excludes CHECK programs, column collations,
 expression/custom-collation indexes and noncanonical partial predicates; the
@@ -969,6 +989,11 @@ original mutable dictionary cannot change the caller's result or audit digest.
 Canonical builtin containers are copied from their native storage, not through
 application `__deepcopy__`, iteration overrides or constructors. The same
 data-only contract snapshots the accepted signal envelope. Native frozen scalar
+type checks use identity, not equality: an application metaclass cannot claim
+that a mutable container is an immutable scalar or that an adapter is a native
+backend. Native container storage is checked without consulting an application's
+`__class__` property.
+Native frozen scalar
 records (`ScheduledTaskOutcome`, `CausationFrame`) retain their identity;
 mutable application objects and mutable fields in those records are unsupported.
 Core's native reviewed reply text retains its boolean post-response verdicts in

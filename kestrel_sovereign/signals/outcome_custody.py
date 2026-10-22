@@ -14,6 +14,7 @@ from decimal import Decimal
 from uuid import UUID
 from zoneinfo import ZoneInfo
 from types import ModuleType
+from kestrel_sovereign.storage.db.native_journal_programs import _has_exact_native_type
 
 from kestrel_sovereign.execution_custody import (
     ExecutionAuthorityError, current_execution_custody, require_execution_work,
@@ -38,15 +39,15 @@ def _snapshot_outcome_data(value, memo=None):
 
     scalar_types = (type(None), bool, int, float, str, bytes, date, timedelta,
                     Decimal, UUID, timezone, ZoneInfo)
-    if type(value) in scalar_types:
+    if _has_exact_native_type(value, *scalar_types):
         return value
-    if type(value) in (datetime, time):
-        if value.tzinfo is not None and type(value.tzinfo) not in (timezone, ZoneInfo):
+    if _has_exact_native_type(value, datetime, time):
+        if value.tzinfo is not None and not _has_exact_native_type(value.tzinfo, timezone, ZoneInfo):
             raise TypeError('Signal outcome has a mutable timezone')
         return value
-    if type(value) in (SignalMode, Status, Trust, Urgency, Visibility):
+    if _has_exact_native_type(value, SignalMode, Status, Trust, Urgency, Visibility):
         return value
-    if isinstance(value, str):
+    if issubclass(type(value), str):
         # A genuine agent reply can carry the Core post-response verdict on
         # its string. It has already loaded streaming; do not import the agent
         # graph for ordinary data, and do not inspect application metaclasses.
@@ -65,33 +66,33 @@ def _snapshot_outcome_data(value, memo=None):
     identity = id(value)
     if identity in memo:
         return memo[identity]
-    if type(value) in (CausationFrame, ScheduledTaskOutcome):
+    if _has_exact_native_type(value, CausationFrame, ScheduledTaskOutcome):
         for field in fields(value):
             stored = object.__getattribute__(value, field.name)
             if _snapshot_outcome_data(stored, memo) is not stored:
                 raise TypeError('Native immutable outcome record has mutable fields')
         return value
-    if isinstance(value, dict):
+    if issubclass(type(value), dict):
         copied = memo[identity] = {}
         for key, item in dict.items(value):
             copied[_snapshot_outcome_data(key, memo)] = _snapshot_outcome_data(item, memo)
         return copied
-    if isinstance(value, list):
+    if issubclass(type(value), list):
         copied = memo[identity] = []
         copied.extend(_snapshot_outcome_data(item, memo) for item in list.__iter__(value))
         return copied
-    if isinstance(value, tuple):
+    if issubclass(type(value), tuple):
         items = tuple(_snapshot_outcome_data(item, memo) for item in tuple.__iter__(value))
         # A list nested in a tuple can recurse back to the same tuple. Its
         # recursive traversal may already have installed the canonical copy.
         if identity not in memo:
             memo[identity] = items
         return memo[identity]
-    if isinstance(value, set):
+    if issubclass(type(value), set):
         copied = memo[identity] = set()
         copied.update(_snapshot_outcome_data(item, memo) for item in set.__iter__(value))
         return copied
-    if isinstance(value, frozenset):
+    if issubclass(type(value), frozenset):
         copied = frozenset(_snapshot_outcome_data(item, memo) for item in frozenset.__iter__(value))
         memo[identity] = copied
         return copied
@@ -312,7 +313,7 @@ class _OriginalSignalOutcome:
         if type(dispatcher._store) is not SignalLogStore:
             raise ExecutionAuthorityError('Original native signal store required')
         backend = dispatcher._store._backend
-        if type(backend) not in (SQLiteBackend, PostgresBackend):
+        if not _has_exact_native_type(backend, SQLiteBackend, PostgresBackend):
             raise ExecutionAuthorityError('Original native signal backend required')
         require_execution_work(backend)
         # Admission identity for classifying this invocation's later surface
@@ -570,7 +571,7 @@ async def _capture_original_outcome(dispatcher, signal, registration, *, accepta
     store = dispatcher._store
     backend = store._backend
     native = (type(store) is SignalLogStore and store.TABLE == 'signal_log'
-              and type(backend) in (SQLiteBackend, PostgresBackend))
+              and _has_exact_native_type(backend, SQLiteBackend, PostgresBackend))
     if native and type(backend) is PostgresBackend:
         native = postgres_module.ASYNCPG_AVAILABLE and isinstance(
             backend._pool, (postgres_module.asyncpg.Pool, PostgresPoolAdapter))

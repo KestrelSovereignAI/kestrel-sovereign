@@ -406,10 +406,19 @@ async def test_sqlite_original_journal_refuses_replaced_physical_destination(dis
 
 
 @pytest.mark.parametrize('cutoff', [False, True])
-async def test_projection_retained_alias_cannot_rewrite_actual_result(dispatcher_components, cutoff):
+@pytest.mark.parametrize('lying_type', [False, True])
+async def test_projection_retained_alias_cannot_rewrite_actual_result(dispatcher_components, cutoff, lying_type):
     from kestrel_sovereign.signals.store import _digest
     c = dispatcher_components
-    body = {'nested': {'value': 'actual-return'}}
+    hooks = []
+    class ClaimsNative(type):
+        def __eq__(self, other):
+            hooks.append(True)
+            return True
+    class ForeignDictionary(dict, metaclass=ClaimsNative):
+        pass
+    body = (ForeignDictionary(nested={'value': 'actual-return'}) if lying_type
+            else {'nested': {'value': 'actual-return'}})
     scope = ExecutionCustody(_OriginalWork(backend_type=c.backend.backend_type))
     async def handler(payload):
         if cutoff:
@@ -428,6 +437,40 @@ async def test_projection_retained_alias_cannot_rewrite_actual_result(dispatcher
     assert result.action_result == {'nested': {'value': 'actual-return'}}
     assert await c.backend.fetch_val('SELECT action_result_digest FROM signal_log WHERE id=?', (signal.id,)) == _digest({'nested': {'value': 'actual-return'}})
     assert c.dispatcher._log_write_failures == 0
+    assert not hooks, 'snapshot consulted application type equality'
+
+
+async def test_application_metaclass_cannot_admit_a_foreign_native_backend(dispatcher_components):
+    from kestrel_sovereign.execution_custody import is_execution_control_error
+    c = dispatcher_components
+    original_type = type(c.backend)
+    effects, programs = [], []
+    class ClaimsNative(type(original_type)):
+        __hash__ = type.__hash__
+        def __eq__(self, other):
+            return True
+    class ForeignBackend(original_type, metaclass=ClaimsNative):
+        async def _append_original_signal_outcome(self, journal):
+            programs.append(True)
+            return await super()._append_original_signal_outcome(journal)
+    c.backend.__class__ = ForeignBackend
+    scope = ExecutionCustody(_OriginalWork(backend_type=c.backend.backend_type))
+    async def handler(payload):
+        effects.append(True)
+        scope.revoke('actual cutoff after foreign backend claimed native identity')
+        return {'genuine': True}
+    c.registry.register(_action_reg('native.type.identity', handler=handler))
+    error = None
+    try:
+        with bind_execution_runtime(SimpleNamespace(_execution_custody=scope)):
+            try:
+                await c.dispatcher.dispatch_signal(_signal('native.type.identity'))
+            except BaseException as caught:
+                error = caught
+        assert not effects and not programs, 'application type equality admitted a foreign backend to original journal custody'
+        assert is_execution_control_error(error)
+    finally:
+        c.backend.__class__ = original_type
 
 
 async def test_result_snapshot_never_delegates_to_mutable_copy_hook(dispatcher_components):

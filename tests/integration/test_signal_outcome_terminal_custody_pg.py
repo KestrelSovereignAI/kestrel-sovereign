@@ -34,6 +34,7 @@ from tests.unit.test_signal_outcome_terminal_custody import (  # noqa: F401
     test_original_journal_verifies_exact_row_before_native_commit,
     test_postcommit_privacy_observation_does_not_poison_healthy_dispatch,
     test_projection_retained_alias_cannot_rewrite_actual_result,
+    test_application_metaclass_cannot_admit_a_foreign_native_backend,
     test_resident_completed_journal_receipt_reaches_withdrawn_ingress,
 )
 
