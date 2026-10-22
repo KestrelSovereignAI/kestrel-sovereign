@@ -97,16 +97,19 @@ async def test_postgres_original_journal_refuses_redeferred_trigger_mutation(dis
         return {'genuine': True}
     c.registry.register(_action_reg('redeferred.audit', handler=handler))
     signal = _signal('redeferred.audit')
+    error = None
     with bind_execution_runtime(SimpleNamespace(_execution_custody=scope)):
-        with pytest.raises(BaseException) as caught:
+        try:
             await c.dispatcher.dispatch_signal(signal)
-    assert is_execution_control_error(caught.value)
-    assert execution_commit_outcome(caught.value) != 'committed', 're-deferred deletion escaped row proof and was acknowledged'
-    assert any(getattr(item, 'signal_result', None) is not None for item in _explicit_control_chain(caught.value))
+        except BaseException as caught:
+            error = caught
     assert await control.fetchval(f'SELECT COUNT(*) FROM {table} WHERE id=$1', signal.id) == 0
     assert await control.fetchval(f'SELECT COUNT(*) FROM {effect}') == 1
+    assert is_execution_control_error(error), 'absent terminal row was reported as successfully journaled'
+    assert execution_commit_outcome(error) != 'committed', 're-deferred deletion escaped row proof and was acknowledged'
+    assert any(getattr(item, 'signal_result', None) is not None for item in _explicit_control_chain(error))
     assert c.dispatcher._log_write_failures == 1
-    assert execution_native_source_error(caught.value) is None
+    assert execution_native_source_error(error) is None
     assert c.dispatcher._outcome_log_control_error is None
     await c.backend.execute(f'DROP TRIGGER journal_queue ON {table}')
     fresh = await c.dispatcher.dispatch_signal(_signal('redeferred.audit'))
