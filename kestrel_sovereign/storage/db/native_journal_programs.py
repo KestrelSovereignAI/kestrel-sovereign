@@ -89,8 +89,11 @@ class _NativeJournalSQLiteConnection(sqlite3.Connection):
         cursor = self.cursor()
         try:
             return cursor.execute(query, parameters)
-        except BaseException:
-            cursor.close()
+        except BaseException as original:
+            try:
+                cursor.close()
+            except BaseException as cleanup:
+                raise BaseExceptionGroup('Original native cursor and cleanup failures', [original, cleanup]) from None
             raise
 
     def _begin_original_journal(self):
@@ -192,6 +195,8 @@ else:
             self._journal_program_seal = (asyncio.current_task(), native_state)
 
         def _end_original_journal(self):
+            if self._journal_program_seal is None:
+                return False
             owner, native_state = self._journal_program_seal
             if owner is not asyncio.current_task():
                 raise NativeJournalConfigurationError('Only the original native journal owner can release its program fence')

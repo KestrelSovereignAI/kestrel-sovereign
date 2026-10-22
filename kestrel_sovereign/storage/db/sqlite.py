@@ -27,7 +27,7 @@ from typing import (
 )
 
 import aiosqlite
-from .native_journal_programs import _NativeJournalSQLiteConnection
+from .native_journal_programs import _NativeJournalSQLiteConnection, NativeJournalConfigurationError
 
 from kestrel_sovereign.execution_custody import (
     ExecutionAuthorityError,
@@ -2348,6 +2348,8 @@ class SQLiteBackend(DatabaseBackend):
                 except Exception as e:
                     if not self._in_transaction:
                         await self._rollback_after_failure(conn, error=e, original_outcome=original_outcome)
+                    if original_outcome is not None and type(e) is NativeJournalConfigurationError:
+                        raise original_outcome.write_refusal('native_programs_changed') from e
                     if is_execution_control_error(e):
                         raise
                     raise QueryError(f"Query failed: {e}\nQuery: {query}") from e

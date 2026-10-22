@@ -6,11 +6,13 @@ in the ambient context and native commit/cleanup evidence retains them.
 """
 
 import asyncio
+import sys
 from dataclasses import dataclass, fields, replace
 from datetime import date, datetime, time, timedelta, timezone
 from decimal import Decimal
 from uuid import UUID
 from zoneinfo import ZoneInfo
+from types import ModuleType
 
 from kestrel_sovereign.execution_custody import (
     ExecutionAuthorityError, current_execution_custody, require_execution_work,
@@ -43,6 +45,20 @@ def _snapshot_outcome_data(value, memo=None):
         return value
     if type(value) in (SignalMode, Status, Trust, Urgency, Visibility):
         return value
+    if isinstance(value, str):
+        # A genuine agent reply can carry the Core post-response verdict on
+        # its string. It has already loaded streaming; do not import the agent
+        # graph for ordinary data, and do not inspect application metaclasses.
+        streaming = sys.modules.get('kestrel_sovereign.agent.streaming')
+        native_text = (vars(streaming).get('_PostResponseText')
+                       if type(streaming) is ModuleType else None)
+        if native_text is not None and type(value) is native_text:
+            verdict = {name: object.__getattribute__(value, name)
+                       for name in ('denied', 'modified', 'enforcing')}
+            if any(type(flag) is not bool for flag in verdict.values()):
+                raise TypeError('Native post-response text requires boolean verdict fields')
+            return native_text(str.__str__(value), **verdict)
+        return str.__str__(value)
     if memo is None:
         memo = {}
     identity = id(value)

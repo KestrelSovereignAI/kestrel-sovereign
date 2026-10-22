@@ -105,6 +105,38 @@ async def test_sqlite_journal_refuses_trace_program_through_commit(dispatcher_co
     assert await c.backend.fetch_val('SELECT COUNT(*) FROM signal_log') == 0
 
 
+async def test_original_sqlite_program_fence_is_live_at_actual_commit(dispatcher_components, monkeypatch):
+    from kestrel_sovereign._async_ownership import create_owned_task, await_owned_task
+    from kestrel_sovereign.storage.db.native_journal_programs import NativeJournalConfigurationError
+    c = dispatcher_components
+    entered, release = asyncio.Event(), asyncio.Event()
+    commit = c.backend._commit_write
+    async def held_commit(connection, **kwargs):
+        if kwargs.get('original_outcome') is not None:
+            entered.set()
+            await release.wait()
+        return await commit(connection, **kwargs)
+    monkeypatch.setattr(c.backend, '_commit_write', held_commit)
+    scope = ExecutionCustody(_OriginalWork())
+    async def handler(payload):
+        scope.revoke('actual cutoff before held native COMMIT')
+        return {'genuine': True}
+    c.registry.register(_action_reg('actual.commit.program.fence', handler=handler))
+    traced = []
+    with bind_execution_runtime(SimpleNamespace(_execution_custody=scope)):
+        task = create_owned_task(c.dispatcher.dispatch_signal(_signal('actual.commit.program.fence')))
+    try:
+        await asyncio.wait_for(entered.wait(), 3)
+        with pytest.raises(NativeJournalConfigurationError):
+            await c.backend._connection.set_trace_callback(traced.append)
+    finally:
+        release.set()
+        outcome = await await_owned_task(task)
+    assert outcome.error is None and outcome.result.action_result == {'genuine': True}
+    assert not traced and await c.backend.fetch_val('SELECT COUNT(*) FROM signal_log') == 1
+    assert c.backend._connection._conn._original_journal_programs_supported()
+
+
 async def test_sqlite_journal_refuses_noncanonical_column_affinity(dispatcher_components):
     from kestrel_sovereign.execution_custody import is_execution_control_error
     c = dispatcher_components
@@ -413,6 +445,17 @@ def test_native_immutable_record_identity_requires_immutable_fields():
     malformed = ScheduledTaskOutcome(status='blocked', result_text=['mutable'])
     with pytest.raises(TypeError, match='mutable fields'):
         _snapshot_outcome_data(malformed)
+
+
+def test_snapshot_preserves_native_post_response_verdict_without_retained_alias():
+    from kestrel_sovereign.agent.streaming import _PostResponseText
+    from kestrel_sovereign.signals.outcome_custody import _snapshot_outcome_data
+    original = _PostResponseText('genuine reviewed text', denied=True, modified=True, enforcing=True)
+    copied = _snapshot_outcome_data(original)
+    assert type(copied) is _PostResponseText and copied is not original
+    original.denied = original.modified = original.enforcing = False
+    assert copied == 'genuine reviewed text'
+    assert copied.denied and copied.modified and copied.enforcing
 
 
 async def test_uncopyable_result_preserves_actual_return_without_projection_or_replay(dispatcher_components):

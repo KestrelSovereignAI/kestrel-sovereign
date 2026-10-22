@@ -46,6 +46,58 @@ async def _fresh_journal_pool(original, **options):
     return await asyncpg.create_pool(*original._connect_args, **original._connect_kwargs, **options)
 
 
+async def test_postgres_program_configuration_stays_fenced_through_actual_reset(dispatcher_components, native_pg, monkeypatch):
+    from kestrel_sovereign._async_ownership import create_owned_task, await_owned_task
+    from kestrel_sovereign.storage.db.native_journal_programs import NativeJournalPostgresConnection, NativeJournalConfigurationError
+    from tests.unit.test_signals_dispatcher import _action_reg, _signal
+    c = dispatcher_components
+    entered, release = asyncio.Event(), asyncio.Event()
+    original_reset = NativeJournalPostgresConnection.reset
+    native = []
+    async def held_reset(connection, *args, **kwargs):
+        await original_reset(connection, *args, **kwargs)
+        if c.dispatcher._original_outcome_writer.get() is not None:
+            native.append(connection)
+            entered.set()
+            await release.wait()
+    monkeypatch.setattr(NativeJournalPostgresConnection, 'reset', held_reset)
+    c.registry.register(_action_reg('actual.reset.program.fence'))
+    task = create_owned_task(c.dispatcher.dispatch_signal(_signal('actual.reset.program.fence')))
+    try:
+        await asyncio.wait_for(entered.wait(), 3)
+        with pytest.raises(NativeJournalConfigurationError):
+            await native[0].set_type_codec('text', schema='pg_catalog', encoder=str, decoder=str, format='text')
+    finally:
+        release.set()
+        outcome = await await_owned_task(task)
+    assert outcome.error is None and outcome.result.action_result == {'received': {}}
+    assert native[0]._journal_program_seal is None
+    assert native[0]._original_journal_programs_supported()
+    assert await c.backend.fetch_val('SELECT COUNT(*) FROM signal_log') == 1
+
+
+async def test_postgres_getter_cannot_unseal_before_original_reset_owner_completes(dispatcher_components):
+    from tests.unit.test_signals_dispatcher import _action_reg, _signal
+    c = dispatcher_components
+    attempted = []
+    class ObservingAgent(type(c.agent)):
+        @property
+        def did(self):
+            journal = c.dispatcher._original_outcome_writer.get()
+            native = journal._postgres_session if journal is not None else None
+            if native is not None and native._journal_program_seal is not None:
+                _, native_state = native._journal_program_seal
+                if native_state.retirement.owner is None:
+                    attempted.append(native._end_original_journal())
+            return self._did
+    c.agent.__class__ = ObservingAgent
+    c.registry.register(_action_reg('early.unseal.getter'))
+    result = await c.dispatcher.dispatch_signal(_signal('early.unseal.getter'))
+    assert result.action_result == {'received': {}}
+    assert attempted and not any(attempted), 'getter released program fence before actual native reset existed'
+    assert await c.backend.fetch_val('SELECT COUNT(*) FROM signal_log') == 1
+
+
 @pytest.mark.parametrize('installed', ['before', 'handler'])
 async def test_postgres_journal_refuses_custom_connection_codecs(dispatcher_components, native_pg, installed):
     import asyncpg
