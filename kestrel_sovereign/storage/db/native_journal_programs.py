@@ -143,7 +143,7 @@ class _NativeJournalSQLiteConnection(sqlite3.Connection):
         # write guard. Check+seal+BEGIN run in one native worker operation.
         if not self._original_journal_programs_supported() or self._journal_program_seal is not None:
             raise NativeJournalConfigurationError('Original journal requires a plain native SQLite connection')
-        self._journal_program_seal = self._original_journal_durability()
+        self._journal_program_seal = self._original_journal_configuration()
         try:
             cursor = super().execute('BEGIN IMMEDIATE')
             cursor.close()
@@ -152,7 +152,7 @@ class _NativeJournalSQLiteConnection(sqlite3.Connection):
                 self._journal_program_seal = None
             raise
 
-    def _original_journal_durability(self):
+    def _original_journal_configuration(self):
         # Fixed native reads bypass application cursor/row factories. Values
         # are sampled on the SQLite worker, never from a thread-affine getter
         # on the event loop. No SQL text comes from application configuration.
@@ -161,7 +161,7 @@ class _NativeJournalSQLiteConnection(sqlite3.Connection):
         try:
             values = []
             for name in ('journal_mode', 'synchronous', 'fullfsync',
-                         'checkpoint_fullfsync', 'wal_autocheckpoint'):
+                         'checkpoint_fullfsync', 'wal_autocheckpoint', 'data_version'):
                 cursor.execute('PRAGMA main.' + name)
                 row = cursor.fetchone()
                 if row is None or len(row) != 1 or not _has_exact_native_type(row[0], str, int):
@@ -173,7 +173,7 @@ class _NativeJournalSQLiteConnection(sqlite3.Connection):
 
     def commit(self):
         if (self._journal_program_seal is not None
-                and self._original_journal_durability() != self._journal_program_seal):
+                and self._original_journal_configuration() != self._journal_program_seal):
             raise NativeJournalDurabilityRefusal('Original journal durability changed before native COMMIT')
         result = super().commit()
         if self._journal_program_seal is not None and self.in_transaction:

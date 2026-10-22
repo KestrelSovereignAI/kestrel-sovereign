@@ -2276,7 +2276,7 @@ class SQLiteBackend(DatabaseBackend):
                         sql = cursor.fetchone()[0]
                         if not re.fullmatch(r'CREATE\s+INDEX(?:\s+IF\s+NOT\s+EXISTS)?\s+idx_signal_log_constitution_hash\s+ON\s+signal_log\s*\(\s*constitution_hash\s*\)\s+WHERE\s+constitution_hash\s+IS\s+NOT\s+NULL\s*', sql, re.IGNORECASE):
                             return None
-                return (version, *row, columns, native._original_journal_durability())
+                return (version, *row, columns, native._original_journal_configuration())
             finally:
                 try:
                     if snapshot:

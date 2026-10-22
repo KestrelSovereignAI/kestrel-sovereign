@@ -365,6 +365,7 @@ class _OriginalSignalOutcome:
         self._acknowledgments = ()
         self._sqlite_committed_connection = None
         self._audit_loss_recorded = False
+        self._ordinary_writer_failure = None
         self._outer_admission = self._writer_admission = None
         self._phase = 'accepted'
         self._observer_depth = 0

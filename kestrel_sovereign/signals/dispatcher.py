@@ -3027,6 +3027,8 @@ class SignalDispatcher:
                 cleanup = error
         if journal is not None:
             original = journal.retain_committed(original)
+            if original is not None or cleanup is not None:
+                cleanup = execution_observation_error(cleanup, journal._ordinary_writer_failure)
         if all(error is None or type(error) is asyncio.CancelledError for error in (original, cleanup)):
             # Pure ordinary Stop retains its legacy cancellation shape. An
             # independent failure must not be selected away by that policy.
@@ -3061,7 +3063,8 @@ class SignalDispatcher:
         for task in tasks:
             outcome = await await_owned_task(task)
             journal = journals.get(task)
-            observed_error = outcome.error
+            observed_error = execution_observation_error(outcome.error,
+                journal._ordinary_writer_failure if journal is not None else None)
             if journal is not None and observed_error is not None and not journal.has_acknowledged_commit():
                 self._record_original_outcome_loss(journal, journal._identity[0], observed_error)
                 if (outcome.cancellation is None and isinstance(observed_error, Exception) and not is_execution_control_error(observed_error)
@@ -7876,6 +7879,14 @@ class SignalDispatcher:
     def _record_original_outcome_loss(self, journal, signal_id, error):
         """Exactly one unacknowledged original row, even if its Task never starts."""
         if journal is not None:
+            if (isinstance(error, Exception) and not is_execution_control_error(error)
+                    and execution_commit_outcome(error) is None
+                    and not journal.has_acknowledged_commit()):
+                # Best-effort loss is suppressed only for a healthy observer.
+                # Its ORIGINAL error remains available when public cancellation
+                # arrives after _log_safe has already observed/recorded it.
+                journal._ordinary_writer_failure = execution_observation_error(
+                    journal._ordinary_writer_failure, error)
             if journal.has_acknowledged_commit() or journal._audit_loss_recorded:
                 return
             journal._audit_loss_recorded = True

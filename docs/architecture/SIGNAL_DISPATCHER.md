@@ -956,6 +956,18 @@ original schema row/cookie, defeating a value-only catalog fingerprint. Ordinary
 SQL configuration remains available; it cannot retain the stronger journal
 permission. Application authorizer replacement remains separately unsupported.
 
+The original SQLite connection also pins its native read-only `data_version`.
+An externally committed write conservatively retires that journal admission,
+even when another connection restores every catalog value and schema cookie.
+This can refuse an audit row after an unrelated external commit; it never
+replays the completed handler. A fresh signal acquires a fresh generation.
+Original-connection writes do not advance this engine evidence. Native BEGIN
+IMMEDIATE excludes external commits through the final profile/row proof/COMMIT.
+Ordinary writer failures are retained on the original journal through public
+observation/finalization. A healthy caller still treats them as best-effort
+audit loss; a withdrawing caller retains both its actual cancellation and the
+original SQL/publication error without inventing commit uncertainty.
+
 Core-owned SQLite connections likewise track native callback/function/extension
 registration. A customized session remains ineligible for original journals until
 reconnect, including after callback removal. This is a supported configuration
