@@ -7868,7 +7868,7 @@ class SignalDispatcher:
             if is_execution_control_error(exc) or execution_commit_outcome(exc) is not None:
                 self._retain_durable_writer_control(exc)
                 raise execution_observation_error(exc, withdrawal)
-            if not isinstance(exc, Exception):
+            if not isinstance(exc, Exception) or withdrawal is not None:
                 raise execution_observation_error(exc, withdrawal)
         if withdrawal is not None:
             raise withdrawal
