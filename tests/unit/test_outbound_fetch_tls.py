@@ -1,6 +1,8 @@
 """Exercise Core's production fetch callers over real verified TLS and HTTP."""
 
 import json
+import socket
+from ipaddress import ip_address
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
@@ -19,6 +21,11 @@ def test_did_fetch_preserves_idna2008_host_sni_and_proxy_isolation(outbound_tls)
     from kestrel_sovereign.identity.did_web import _default_fetcher
 
     peer = outbound_tls
+    # The public-origin fixture must not intercept unrelated local database
+    # resolution. The real outbound dial below still has its exact IP guard.
+    addresses = socket.getaddrinfo("localhost", 0, type=socket.SOCK_STREAM)
+    assert addresses and all(ip_address(address[4][0]).is_loopback for address in addresses)
+    assert peer.dns == [] and peer.dials == []
     assert (
         json.loads(_default_fetcher(peer.url + "/did.json"))["id"]
         == "did:web:straße.example"

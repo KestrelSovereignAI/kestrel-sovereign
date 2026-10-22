@@ -63,7 +63,9 @@ def route_outbound_tls_peer(monkeypatch, *, hostname, target_port, dns_validatio
     actual_dial = socket.create_connection
 
     def resolve(host, port, *args, **kwargs):
-        if host == "127.0.0.1":
+        # Keep the owned TLS route out of ordinary loopback infrastructure
+        # resolution, including PostgreSQL's localhost connections in CI.
+        if host in {"127.0.0.1", "::1", "localhost"}:
             return actual_dns(host, port, *args, **kwargs)
         dns.append(host)
         assert host == hostname

@@ -372,11 +372,11 @@ jobs:
           uv run --python 3.11 --no-sync python -m pytest
           -p pytest_asyncio.plugin -p pytest_timeout -p kestrel_sovereign.testing.fixtures
           tests/integration/test_wait_resident_custody_pg.py
-          tests/unit/test_a2a_question_expiry_settlement.py
+          tests/unit/test_a2a_native_question_supervisor.py
           tests/unit/test_agent_manager.py tests/unit/test_audit_read_back_own_writes.py
           tests/unit/test_execution_custody_production_routes.py
           tests/unit/test_execution_custody_review49_native.py tests/unit/test_spawn_feature.py
-          -k "wait_resident_outlives or crash_while_the_late_wake_is_in_flight or spawn_receipt_wait_cannot_outlive or deeply_nested_value_never_raises or public_stream_rename_retains_privacy or native_fanout_physically_joins_stronger_late_sibling or terminate_child_preserves_active_cancellation_group"
+          -k "wait_resident_outlives or crash_after_durable_admission_before_outbox_checkpoint_deduplicates or privacy_elided_question_wake_rehydrates_from_owned_outbox_after_restart or answer_after_clock_deadline_creates_ordered_deadline_and_late_waves or spawn_receipt_wait_cannot_outlive or deeply_nested_value_never_raises or public_stream_rename_retains_privacy or native_fanout_physically_joins_stronger_late_sibling or terminate_child_preserves_active_cancellation_group"
           -q --tb=short -o addopts='' --timeout=60 --session-timeout=600
         env:
           TEST_POSTGRES_URL: postgresql://kestrel_user:kestrel_password@localhost:5433/kestrel

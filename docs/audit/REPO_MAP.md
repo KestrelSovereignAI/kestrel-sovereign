@@ -3764,7 +3764,7 @@ Repo entry points and standard project files.
 - **tests/unit/test_ci_gate_actions_fallback.py** — A credential that cannot read the Checks API must still produce a verdict.
   - `async def test_a_refused_checks_api_falls_back_to_the_actions_api(monkeypatch)`; `async def test_the_caveat_names_the_class_of_gate_that_stays_invisible(monkeypatch)`; `async def test_a_complete_rollup_has_no_caveat_at_all(monkeypatch)`; `async def test_a_network_failure_on_checks_does_not_take_the_fallback(monkeypatch)`; `async def test_both_check_endpoints_refused_is_a_hard_auth_failure(monkeypatch)`; `async def test_a_refused_status_propagates_instead_of_degrading(monkeypatch)`; `async def test_a_401_on_the_checks_read_does_not_degrade(monkeypatch)`; `async def test_a_401_on_the_actions_fallback_does_not_degrade_either(monkeypatch)`; `…`
 - **tests/unit/test_ci_minimum_python_custody.py** — The supported minimum interpreter must exercise actual native custody.
-  - `def minimum_job()`; `def test_minimum_lane_pins_interpreter_and_exact_release_ref()`; `def test_minimum_lane_cannot_silently_skip_native_or_omit_regressions()`
+  - `def minimum_job()`; `def test_minimum_lane_pins_interpreter_and_exact_release_ref()`; `def test_minimum_lane_cannot_silently_skip_native_or_omit_regressions()`; `def test_minimum_lane_references_existing_files_and_live_test_selectors()`
 - **tests/unit/test_ci_native_a2a_job.py** — The required native lane must exercise SQLite shutdown and foreign wire use.
   - `def test_native_lane_collects_wire_and_original_shutdown_regressions()`
 - **tests/unit/test_ci_no_metered_provider_credentials.py** — Routine CI cannot enable metered tests through repo or inherited secrets.
