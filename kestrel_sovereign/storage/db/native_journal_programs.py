@@ -6,6 +6,7 @@ that journal owns its native transaction/reset. These are configuration fences,
 not SQL executors or grants of work authority.
 """
 import asyncio
+import ipaddress
 import sqlite3
 from contextvars import ContextVar
 
@@ -23,6 +24,56 @@ class NativeJournalConfigurationError(RuntimeError):
 
 class NativeJournalDurabilityRefusal(NativeJournalConfigurationError):
     """Native preflight refused BEFORE the original sqlite COMMIT call."""
+
+
+def _native_tcp_endpoint(peer):
+    if (type(peer) is not tuple or len(peer) not in (2, 4)
+            or type(peer[0]) is not str or type(peer[1]) is not int
+            or not 0 < peer[1] < 65536):
+        raise NativeJournalConfigurationError('Original native socket peer is unsupported')
+    host = peer[0]
+    if len(peer) == 4 and peer[3]:
+        if type(peer[3]) is not int or peer[3] < 0:
+            raise NativeJournalConfigurationError('Original native IPv6 scope is unsupported')
+        host += '%' + str(peer[3])
+    try:
+        host = ipaddress.ip_address(host).compressed
+    except ValueError as error:
+        raise NativeJournalConfigurationError('Original native socket peer must be numeric') from error
+    return host, peer[1]
+
+
+class _OriginalJournalConnectLoop:
+    """Original native loop, fixed socket peer and independently pinned TLS name.
+
+    asyncpg has no separate public hostaddr argument. This private connection-
+    local delegate keeps dialing the admitted numeric peer while its native TLS
+    handshake still verifies/sends the original hostname. It changes no global
+    resolver or event loop and carries no work admission.
+    """
+    __slots__ = ('_loop', '_endpoint', '_tls_server_hostname')
+
+    def __init__(self, loop, endpoint, tls_server_hostname):
+        self._loop = loop
+        self._endpoint = _native_tcp_endpoint(endpoint)
+        self._tls_server_hostname = tls_server_hostname
+
+    def __getattr__(self, name):
+        return getattr(self._loop, name)
+
+    async def create_connection(self, protocol_factory, host=None, port=None, **kwargs):
+        if (host, port) != self._endpoint:
+            raise NativeJournalConfigurationError('Original native socket peer differs')
+        if kwargs.get('ssl'):
+            kwargs['server_hostname'] = self._tls_server_hostname
+        return await self._loop.create_connection(protocol_factory, host, port, **kwargs)
+
+    async def start_tls(self, transport, protocol, sslcontext, *, server_hostname=None, **kwargs):
+        peer = transport.get_extra_info('peername')
+        if _native_tcp_endpoint(peer) != self._endpoint:
+            raise NativeJournalConfigurationError('Original native TLS socket peer differs')
+        return await self._loop.start_tls(transport, protocol, sslcontext,
+            server_hostname=self._tls_server_hostname, **kwargs)
 
 
 def _register_program(connection):
@@ -281,6 +332,16 @@ else:
             if not self._original_journal_programs_supported() or self._journal_program_seal is not None:
                 raise NativeJournalConfigurationError('Original journal requires a plain native PostgreSQL connection')
             self._journal_program_seal = (asyncio.current_task(), native_state)
+
+        def _retire_original_journal_refusal(self):
+            # Refusing application configuration must not execute it during
+            # termination either. Do not invoke public listener-removal hooks
+            # or a reset/query program; retire this exact native socket once.
+            self._termination_listeners.clear()
+            self._listeners.clear()
+            self._log_listeners.clear()
+            self._query_loggers.clear()
+            super().terminate()
 
         def _end_original_journal(self):
             if self._journal_program_seal is None:

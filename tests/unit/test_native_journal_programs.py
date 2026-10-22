@@ -8,6 +8,84 @@ from kestrel_sovereign.storage.db.native_journal_programs import (
 )
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize('upgrade', [False, True])
+async def test_original_numeric_peer_preserves_actual_tls_hostname(tmp_path, upgrade):
+    import asyncio
+    import ssl
+    from datetime import datetime, timedelta, timezone
+    from cryptography import x509
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import ec
+    from cryptography.x509.oid import NameOID
+    from kestrel_sovereign._async_ownership import await_owned_task
+    from kestrel_sovereign.storage.db.native_journal_programs import _OriginalJournalConnectLoop
+    name = 'original-journal-peer.invalid'
+    key = ec.generate_private_key(ec.SECP256R1())
+    subject = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, name)])
+    now = datetime.now(timezone.utc)
+    certificate = (x509.CertificateBuilder().subject_name(subject).issuer_name(subject)
+        .public_key(key.public_key()).serial_number(x509.random_serial_number())
+        .not_valid_before(now - timedelta(minutes=1)).not_valid_after(now + timedelta(hours=1))
+        .add_extension(x509.SubjectAlternativeName([x509.DNSName(name)]), critical=False)
+        .sign(key, hashes.SHA256()))
+    cert_path, key_path = tmp_path / 'owned-cert.pem', tmp_path / 'owned-key.pem'
+    cert_path.write_bytes(certificate.public_bytes(serialization.Encoding.PEM))
+    key_path.write_bytes(key.private_bytes(serialization.Encoding.PEM,
+        serialization.PrivateFormat.PKCS8, serialization.NoEncryption()))
+    server_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    server_context.load_cert_chain(cert_path, key_path)
+    client_context = ssl.create_default_context(cafile=str(cert_path))
+    assert client_context.check_hostname and client_context.verify_mode == ssl.CERT_REQUIRED
+    names, server_transports, upgrades = [], [], []
+    server_context.set_servername_callback(lambda obj, servername, context: names.append(servername))
+    loop = asyncio.get_running_loop()
+    class Protocol(asyncio.Protocol):
+        def __init__(self, *, server=False):
+            self.server = server
+            self.closed = loop.create_future()
+        def connection_made(self, transport):
+            if self.server:
+                server_transports.append(transport)
+                if upgrade:
+                    upgrades.append(asyncio.create_task(loop.start_tls(transport, self,
+                        server_context, server_side=True, ssl_handshake_timeout=3)))
+        def connection_lost(self, exc):
+            if not self.closed.done():
+                self.closed.set_result(exc)
+    server = await loop.create_server(lambda: Protocol(server=True), '127.0.0.1', 0,
+        ssl=None if upgrade else server_context)
+    endpoint = server.sockets[0].getsockname()[:2]
+    pinned = _OriginalJournalConnectLoop(loop, endpoint, name)
+    client_transport = None
+    protocol = Protocol()
+    try:
+        client_transport, _ = await pinned.create_connection(lambda: protocol, *endpoint,
+            **({} if upgrade else {'ssl': client_context, 'ssl_handshake_timeout': 3}))
+        if upgrade:
+            client_transport = await pinned.start_tls(client_transport, protocol, client_context,
+                server_hostname=endpoint[0], ssl_handshake_timeout=3)
+            for task in upgrades:
+                outcome = await await_owned_task(task)
+                assert outcome.error is None
+                server_transports.append(outcome.result)
+        assert client_transport.get_extra_info('peername')[:2] == endpoint
+        assert client_transport.get_extra_info('ssl_object').server_hostname == name
+        assert names == [name], 'numeric dialing changed actual TLS SNI / certificate identity'
+    finally:
+        if client_transport is not None:
+            client_transport.close()
+            await asyncio.wait_for(protocol.closed, 3)
+        server.close()
+        await server.wait_closed()
+        for transport in server_transports:
+            transport.close()
+        for task in upgrades:
+            if not task.done():
+                task.cancel()
+            await await_owned_task(task)
+
+
 @pytest.mark.parametrize('method,arguments', [
     ('create_function', ('journal_identity', 1, lambda value: value)),
     ('create_aggregate', ('journal_aggregate', 1, None)),

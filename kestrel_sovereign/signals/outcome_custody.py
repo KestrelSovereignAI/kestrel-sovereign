@@ -174,9 +174,10 @@ def _restore_native_connect_configuration(value):
 
 def _native_effective_connect_configuration(connection):
     """Observe actual admitted native endpoint/defaults, never a later env."""
-    address = connection._addr
-    if type(address) is tuple and len(address) == 2:
-        host, port = address
+    address = connection._transport.get_extra_info('peername')
+    if type(address) is tuple and len(address) in (2, 4):
+        from kestrel_sovereign.storage.db.native_journal_programs import _native_tcp_endpoint
+        host, port = _native_tcp_endpoint(address)
     elif type(address) is str:
         filename = os.path.basename(address)
         prefix = '.s.PGSQL.'
@@ -188,6 +189,10 @@ def _native_effective_connect_configuration(connection):
     if type(host) is not str or type(port) is not int or not 0 < port < 65536:
         raise ExecutionAuthorityError('Original native endpoint is unsupported')
     params = connection._params
+    tls = connection._transport.get_extra_info('ssl_object')
+    tls_server_hostname = tls.server_hostname if tls is not None else None
+    if tls_server_hostname is not None and type(tls_server_hostname) is not str:
+        raise ExecutionAuthorityError('Original native TLS hostname is unsupported')
     return _freeze_native_connect_configuration({
         'host': host, 'port': port, 'user': params.user, 'database': params.database,
         'password': params.password if params.password is not None else '',
@@ -197,6 +202,7 @@ def _native_effective_connect_configuration(connection):
         'target_session_attrs': params.target_session_attrs.value,
         'krbsrvname': params.krbsrvname if params.krbsrvname is not None else 'postgres',
         'gsslib': params.gsslib,
+        'tls_server_hostname': tls_server_hostname,
     })
 
 
@@ -274,7 +280,15 @@ class _OriginalPostgresJournalPool:
         original_args, original_kwargs = _restore_native_connect_configuration(self.configuration)
         if self.resolved_configuration is None:
             raise ExecutionAuthorityError('Original native reconnect endpoint was not admitted')
-        original_kwargs.update(_restore_native_connect_configuration(self.resolved_configuration))
+        resolved = _restore_native_connect_configuration(self.resolved_configuration)
+        tls_server_hostname = resolved.pop('tls_server_hostname')
+        original_kwargs.update(resolved)
+        if tls_server_hostname is not None:
+            from kestrel_sovereign.storage.db.native_journal_programs import _OriginalJournalConnectLoop
+            # asyncpg uses its host both for dialing and TLS identity. Dial the
+            # actual admitted peer, retaining the independently observed SNI /
+            # certificate hostname through direct TLS and STARTTLS alike.
+            loop = _OriginalJournalConnectLoop(loop, (resolved['host'], resolved['port']), tls_server_hostname)
         original_kwargs.update(loop=loop, connection_class=connection_class, record_class=record_class)
         return original_args, original_kwargs
 
