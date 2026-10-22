@@ -40,8 +40,8 @@ class _NativeJournalSQLiteConnection(sqlite3.Connection):
         super().__init__(*args, **kwargs)
 
     def __setattr__(self, name, value):
-        if name == 'text_factory' and self._journal_program_seal is not None:
-            raise NativeJournalConfigurationError('Original journal text conversion is fenced')
+        if name in ('text_factory', 'autocommit', 'isolation_level') and self._journal_program_seal is not None:
+            raise NativeJournalConfigurationError('Original journal native configuration is fenced')
         super().__setattr__(name, value)
 
     def _program_call(self, name, *args, **kwargs):
@@ -76,7 +76,9 @@ class _NativeJournalSQLiteConnection(sqlite3.Connection):
         return self._program_call('load_extension', *args, **kwargs)
 
     def _original_journal_programs_supported(self):
-        return not self._journal_programs_configured and self.text_factory is str
+        return (not self._journal_programs_configured and self.text_factory is str
+                and (not hasattr(self, 'autocommit')
+                     or self.autocommit == sqlite3.LEGACY_TRANSACTION_CONTROL))
 
     def cursor(self, factory=None):
         if factory is None:
@@ -112,11 +114,15 @@ class _NativeJournalSQLiteConnection(sqlite3.Connection):
 
     def commit(self):
         result = super().commit()
+        if self._journal_program_seal is not None and self.in_transaction:
+            raise NativeJournalConfigurationError('Original native journal COMMIT did not end its transaction')
         self._journal_program_seal = None
         return result
 
     def rollback(self):
         result = super().rollback()
+        if self._journal_program_seal is not None and self.in_transaction:
+            raise NativeJournalConfigurationError('Original native journal rollback did not end its transaction')
         self._journal_program_seal = None
         return result
 
@@ -180,7 +186,7 @@ else:
             return super().remove_termination_listener(*args, **kwargs)
 
         def _original_journal_programs_supported(self):
-            if (self._journal_programs_configured or self._query_loggers or self._listeners
+            if (self.is_closed() or self._journal_programs_configured or self._query_loggers or self._listeners
                     or self._log_listeners or self._termination_listeners):
                 return False
             settings = self._protocol.get_settings()
@@ -188,6 +194,21 @@ else:
                        settings.get_data_codec(oid, format=fmt, ignore_custom_codec=True)
                        for oid in asyncpg.protocol.protocol.BUILTIN_TYPE_OID_MAP
                        for fmt in (-1, 0, 1))
+
+        async def _wait_original_journal_retirement(self):
+            # Pool return precedes its old writer's final fence release. A
+            # successor borrows observation of that exact original task; it
+            # neither clears its seal nor cancels/adopts its native cleanup.
+            seal = self._journal_program_seal
+            if seal is None:
+                return
+            owner, _ = seal
+            if owner is asyncio.current_task():
+                raise NativeJournalConfigurationError('Original journal cannot reenter its native session')
+            from kestrel_sovereign._async_ownership import await_owned_task
+            await await_owned_task(owner, defer_cancellation=False)
+            if self._journal_program_seal is not None:
+                raise NativeJournalConfigurationError('Previous original journal has unresolved native retirement')
 
         def _begin_original_journal(self, native_state):
             if not self._original_journal_programs_supported() or self._journal_program_seal is not None:

@@ -37,15 +37,18 @@ def test_native_sqlite_program_registration_is_fenced_until_actual_rollback(meth
         native.close()
 
 
-def test_native_sqlite_text_configuration_is_fenced_through_real_commit():
+@pytest.mark.parametrize('name,value', [('text_factory', bytes), ('isolation_level', None), ('autocommit', True)])
+def test_native_sqlite_text_configuration_is_fenced_through_real_commit(name, value):
     native = _NativeJournalSQLiteConnection(':memory:')
     try:
+        if name == 'autocommit' and not hasattr(native, name):
+            pytest.skip('Native autocommit property was added in Python 3.12')
         native.execute('CREATE TABLE actual_effect(value TEXT)')
         native.commit()
         native._begin_original_journal()
         native.execute("INSERT INTO actual_effect VALUES('genuine')")
         with pytest.raises(NativeJournalConfigurationError):
-            native.text_factory = bytes
+            setattr(native, name, value)
         native.commit()
         assert native._journal_program_seal is None and not native.in_transaction
         assert native.execute('SELECT value FROM actual_effect').fetchone() == ('genuine',)

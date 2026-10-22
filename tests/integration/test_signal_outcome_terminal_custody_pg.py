@@ -47,6 +47,7 @@ async def _fresh_journal_pool(original, **options):
 
 
 async def test_postgres_successor_journal_reuses_physically_reset_connection(dispatcher_components, native_pg, monkeypatch):
+    from contextlib import asynccontextmanager
     from kestrel_sovereign._async_ownership import create_owned_task, await_owned_task
     from kestrel_sovereign.storage.db import postgres as pg
     from tests.unit.test_signals_dispatcher import _action_reg, _signal
@@ -55,8 +56,9 @@ async def test_postgres_successor_journal_reuses_physically_reset_connection(dis
     original_pool = c.backend._pool
     pool = await _fresh_journal_pool(original_pool, min_size=1, max_size=1)
     c.backend._pool = pool
-    retired, release = asyncio.Event(), asyncio.Event()
+    retired, release, successor_acquired = asyncio.Event(), asyncio.Event(), asyncio.Event()
     original_join = pg.await_owned_task
+    original_checkout = c.backend._tracked_pool_checkout
     held, natives, tasks = [], [], []
     async def hold_join(task, *args, **kwargs):
         outcome = await original_join(task, *args, **kwargs)
@@ -68,16 +70,25 @@ async def test_postgres_successor_journal_reuses_physically_reset_connection(dis
             await release.wait()
         return outcome
     monkeypatch.setattr(pg, 'await_owned_task', hold_join)
+    @asynccontextmanager
+    async def observe_checkout(*args, **kwargs):
+        async with original_checkout(*args, **kwargs) as acquired:
+            journal = c.dispatcher._original_outcome_writer.get()
+            if held and journal is not None and journal._postgres_session is None:
+                successor_acquired.set()
+            yield acquired
+    monkeypatch.setattr(c.backend, '_tracked_pool_checkout', observe_checkout)
     c.registry.register(_action_reg('healthy.successor.journal'))
     try:
         tasks.append(create_owned_task(c.dispatcher.dispatch_signal(_signal('healthy.successor.journal'))))
         await asyncio.wait_for(retired.wait(), 3)
         assert held[0].done(), 'test must observe actual physical pool retirement'
         tasks.append(create_owned_task(c.dispatcher.dispatch_signal(_signal('healthy.successor.journal'))))
-        successor = await asyncio.wait_for(await_owned_task(tasks[-1]), 3)
-        assert successor.error is None
+        await asyncio.wait_for(successor_acquired.wait(), 3)
         assert not natives[0].is_closed(), 'healthy reused connection was terminated by stale seal'
         release.set()
+        successor = await asyncio.wait_for(await_owned_task(tasks[-1]), 3)
+        assert successor.error is None
         original = await await_owned_task(tasks[0])
         assert original.error is None
         assert c.dispatcher._log_write_failures == 0

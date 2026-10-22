@@ -1398,11 +1398,12 @@ class SignalDispatcher:
             _durable_admission_fence=admission_fence,
         )
         enqueued_signal_id = signal.id
-        self._live_durable_cognition_event_ids.add(enqueued_signal_id)
-        task = self._agent._track_background_task(
-            coro, name=f"durable_cognition:{consumer_id}:{enqueued_signal_id}"
-        )
+        released = False
         def release_live_admission(_task: asyncio.Task[SignalResult]) -> None:
+            nonlocal released
+            if released:
+                return
+            released = True
             self._live_durable_cognition_event_ids.discard(enqueued_signal_id)
             # A NACK can have committed just before the task becomes terminal.
             # Re-scan only after releasing this local first-claim fence.
@@ -1413,9 +1414,34 @@ class SignalDispatcher:
         # existing resident consumer. Capture that SAME runtime while the
         # publisher is admitted, not the expiring HTTP/turn context inherited
         # by the dispatch task. Revocation of the original runtime still wins.
-        task.add_done_callback(
-            release_live_admission, context=self._resident_timer_context(),
-        )
+        from kestrel_sovereign._async_ownership import OwnedTaskAdmission, await_owned_task
+        accepted = OwnedTaskAdmission()
+        task = None
+        resident_context = None
+        try:
+            resident_context = self._resident_timer_context()
+            self._live_durable_cognition_event_ids.add(enqueued_signal_id)
+            task = self._agent._track_background_task(
+                coro, name=f"durable_cognition:{consumer_id}:{enqueued_signal_id}", admission=accepted,
+            )
+            task.add_done_callback(release_live_admission, context=resident_context)
+        except BaseException as original:
+            owner = accepted.task if accepted.task is not None else task
+            errors = [original]
+            if owner is not None:
+                joined = await await_owned_task(owner)
+                errors.extend((joined.error, joined.cancellation))
+            else:
+                try:
+                    coro.close()
+                except BaseException as cleanup:
+                    errors.append(cleanup)
+            try:
+                if resident_context is not None:
+                    resident_context.run(release_live_admission, owner)
+            except BaseException as cleanup:
+                errors.append(cleanup)
+            raise execution_finite_error(*errors, retain_originals=True)
         return SignalDispatchHandle(
             signal_id=enqueued_signal_id,
             task=task,
