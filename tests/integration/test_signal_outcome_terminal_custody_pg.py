@@ -35,6 +35,88 @@ pytestmark = [pytest.mark.asyncio, pytest.mark.integration]
 native_pg = _native_pg_fixture
 
 
+@pytest.mark.parametrize('boundary', ['handler_generation', 'handler_configuration', 'checkout_both', 'adapter_checkout_both'])
+async def test_original_journal_refuses_same_pool_reconfiguration(dispatcher_components, native_pg, monkeypatch, boundary):
+    from contextlib import asynccontextmanager
+    from kestrel_sovereign.execution_custody import ExecutionCustody, bind_execution_runtime, is_execution_control_error
+    from kestrel_sovereign.storage.db.postgres import PostgresPoolAdapter
+    from tests.unit.test_signal_outcome_terminal_custody import _OriginalWork
+    from tests.unit.test_signals_dispatcher import _action_reg, _signal
+    c = dispatcher_components
+    _, control, schema = native_pg
+    native_pool = c.backend._pool
+    original_args, original_kwargs = native_pool._connect_args, native_pool._connect_kwargs
+    alternate = schema + '_replacement'
+    await control.execute(f'CREATE SCHEMA "{alternate}"')
+    await control.execute(f'CREATE TABLE "{alternate}".signal_log (LIKE "{schema}".signal_log INCLUDING ALL)')
+    entered, release = __import__('asyncio').Event(), __import__('asyncio').Event()
+    effects = []
+    scope = ExecutionCustody(_OriginalWork(backend_type='postgres'))
+    owner = SimpleNamespace(_execution_custody=scope)
+    original_backend_pool = c.backend._pool
+    if boundary.startswith('adapter_'):
+        @asynccontextmanager
+        async def same_checkout(checkout):
+            async with checkout as owned:
+                yield owned
+        c.backend._pool = PostgresPoolAdapter(native_pool, same_checkout)
+    original_checkout = c.backend._tracked_pool_checkout
+    @asynccontextmanager
+    async def held_checkout(*args, **kwargs):
+        if 'checkout' in boundary and c.dispatcher._original_outcome_writer.get() is not None:
+            entered.set()
+            await release.wait()
+        async with original_checkout(*args, **kwargs) as owned:
+            yield owned
+    async def handler(payload):
+        effects.append('genuine-effect')
+        if boundary.startswith('handler_'):
+            entered.set()
+            await release.wait()
+        return {'genuine': True}
+    monkeypatch.setattr(c.backend, '_tracked_pool_checkout', held_checkout)
+    c.registry.register(_action_reg('pool.configuration.audit', handler=handler))
+    signal = _signal('pool.configuration.audit')
+    handle = None
+    try:
+        with bind_execution_runtime(owner):
+            handle = await c.dispatcher.enqueue_signal(signal)
+            await __import__('asyncio').wait_for(entered.wait(), 2)
+            if boundary != 'handler_generation':
+                settings = dict(original_kwargs.get('server_settings', {}))
+                settings['search_path'] = alternate
+                native_pool.set_connect_args(original_args[0], **{**original_kwargs, 'server_settings': settings})
+            if boundary != 'handler_configuration':
+                await native_pool.expire_connections()
+            else:
+                # Public physical retirement without a generation bump forces
+                # the next connection to use the new public configuration.
+                held = [await native_pool.acquire() for _ in range(native_pool.get_max_size())]
+                for connection in held:
+                    await connection.close()
+                for connection in held:
+                    await native_pool.release(connection)
+            scope.revoke('original work cutoff after public pool rotation')
+            release.set()
+            from kestrel_sovereign._async_ownership import await_owned_task
+            outcome = await await_owned_task(handle.task)
+            assert is_execution_control_error(outcome.error), 'original journal used the same pool with replacement configuration'
+        assert effects == ['genuine-effect']
+        assert await control.fetchval(f'SELECT COUNT(*) FROM "{alternate}".signal_log') == 0
+        assert await control.fetchval(f'SELECT COUNT(*) FROM "{schema}".signal_log WHERE id=$1', signal.id) == 0
+        assert not c.dispatcher._outcome_log_tasks
+    finally:
+        release.set()
+        if handle is not None:
+            from kestrel_sovereign._async_ownership import await_owned_task
+            await await_owned_task(handle.task)
+        c.backend._pool = original_backend_pool
+        monkeypatch.setattr(c.backend, '_tracked_pool_checkout', original_checkout)
+        native_pool.set_connect_args(original_args[0], **original_kwargs)
+        await native_pool.expire_connections()
+        await control.execute(f'DROP SCHEMA "{alternate}" CASCADE')
+
+
 @pytest.fixture
 async def dispatcher_components(native_pg):
     backend, _, _ = native_pg
