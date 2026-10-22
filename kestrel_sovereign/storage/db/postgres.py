@@ -2269,6 +2269,12 @@ class PostgresBackend(DatabaseBackend):
                     journal.require_original(self)
                     if status != 'INSERT 0 1':
                         raise journal.write_refusal('row_count')
+                    # This standalone native transaction owns only the fixed
+                    # journal operation. Flush deferred trigger/constraint
+                    # effects before proving the final row, not at COMMIT
+                    # after that proof has already been observed.
+                    await connection.execute('SET CONSTRAINTS ALL IMMEDIATE')
+                    journal.require_original(self)
                     matches = await connection.fetch(match_query, *values)
                     journal.require_original(self)
                     if len(matches) != 1 or tuple(matches[0]) != (1,):

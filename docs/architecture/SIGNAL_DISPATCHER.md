@@ -871,6 +871,9 @@ SQLite performs the proof on its same native worker without an application row
 factory and closes the proof cursor there. A transient post-COMMIT privacy
 observation preserves the real committed fact without adding uncertainty to
 otherwise healthy scopes; independent native failures retain their provenance.
+PostgreSQL flushes deferred constraints/triggers in this standalone transaction
+before that row proof, so a deferred deletion cannot occur after verification
+and turn a successful COMMIT into a false audit acknowledgment.
 
 The original privacy-policy epoch and persistence-gate identity also remain
 fixed. The native INSERT retains that same gate through COMMIT/reset and
