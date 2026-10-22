@@ -36,6 +36,76 @@ pytestmark = [pytest.mark.asyncio, pytest.mark.integration]
 native_pg = _native_pg_fixture
 
 
+@pytest.mark.parametrize('boundary', ['namespace', 'fake_ack'])
+async def test_original_journal_native_setup_cannot_redirect_or_forge_commit(dispatcher_components, native_pg, boundary):
+    import asyncpg
+    from kestrel_sovereign.execution_custody import (
+        ExecutionCustody, bind_execution_runtime, execution_commit_outcome, is_execution_control_error,
+    )
+    from kestrel_sovereign._async_ownership import await_owned_task
+    from tests.unit.test_signal_outcome_terminal_custody import _OriginalWork
+    from tests.unit.test_signals_dispatcher import _action_reg, _signal
+    c = dispatcher_components
+    _, control, schema = native_pg
+    alternate = schema + '_setup_replacement'
+    await control.execute(f'CREATE SCHEMA "{alternate}"')
+    await control.execute(f'CREATE TABLE "{alternate}".signal_log (LIKE "{schema}".signal_log INCLUDING ALL)')
+    route = [schema]
+    attempted = []
+    async def setup(connection):
+        await connection.execute(f'SET search_path TO "{route[0]}"')
+        journal = c.dispatcher._original_outcome_writer.get()
+        if boundary == 'fake_ack' and journal is not None:
+            attempted.append(True)
+            journal.acknowledged(c.backend)
+    original_pool = c.backend._pool
+    pool = await asyncpg.create_pool(*original_pool._connect_args,
+        **original_pool._connect_kwargs, min_size=0, max_size=2, setup=setup)
+    c.backend._pool = pool
+    entered, release = asyncio.Event(), asyncio.Event()
+    effects = []
+    scope = ExecutionCustody(_OriginalWork(backend_type='postgres'))
+    owner = SimpleNamespace(_execution_custody=scope)
+    async def handler(payload):
+        effects.append('genuine-effect')
+        entered.set()
+        await release.wait()
+        return {'genuine': True}
+    c.registry.register(_action_reg('setup.boundary.audit', handler=handler))
+    signal = _signal('setup.boundary.audit')
+    handle = None
+    try:
+        with bind_execution_runtime(owner):
+            handle = await c.dispatcher.enqueue_signal(signal)
+            await asyncio.wait_for(entered.wait(), 2)
+            if boundary == 'namespace':
+                route[0] = alternate
+            scope.revoke('actual original work cutoff after setup routing change')
+            release.set()
+            outcome = await await_owned_task(handle.task)
+        assert effects == ['genuine-effect']
+        original_rows = await control.fetchval(f'SELECT COUNT(*) FROM "{schema}".signal_log WHERE id=$1', signal.id)
+        replacement_rows = await control.fetchval(f'SELECT COUNT(*) FROM "{alternate}".signal_log')
+        if boundary == 'namespace':
+            assert outcome.error is None
+            assert (original_rows, replacement_rows) == (1, 0), 'setup redirected the original fixed journal namespace'
+        else:
+            assert attempted == [True]
+            assert is_execution_control_error(outcome.error)
+            assert execution_commit_outcome(outcome.error) != 'committed', 'setup fabricated a COMMIT without native SQL'
+            assert (original_rows, replacement_rows) == (0, 0)
+            assert c.dispatcher._log_write_failures == 1, 'the actually absent audit was not counted'
+        assert not c.dispatcher._outcome_log_tasks
+    finally:
+        release.set()
+        if handle is not None:
+            await await_owned_task(handle.task)
+        c.backend._pool = original_pool
+        async with asyncio.timeout(10):
+            await pool.close()
+        await control.execute(f'DROP SCHEMA "{alternate}" CASCADE')
+
+
 @pytest.mark.parametrize('boundary', ['handler_generation', 'handler_configuration', 'checkout_both', 'adapter_checkout_both'])
 async def test_original_journal_refuses_same_pool_reconfiguration(dispatcher_components, native_pg, monkeypatch, boundary):
     from contextlib import asynccontextmanager

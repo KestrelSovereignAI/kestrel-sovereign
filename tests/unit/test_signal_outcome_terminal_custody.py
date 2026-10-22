@@ -139,6 +139,48 @@ async def test_handler_cannot_mint_unrelated_journal_and_self_attach(dispatcher_
 
 @pytest.mark.parametrize('callback', ['redaction', 'summary'])
 @pytest.mark.parametrize('cutoff', [False, True])
+async def test_projection_callbacks_cannot_mutate_canonical_data(dispatcher_components, callback, cutoff):
+    import json
+    from kestrel_sdk.signals import RedactionPolicy, Trust
+    from kestrel_sovereign.signals.store import _digest
+    c = dispatcher_components
+    scope = ExecutionCustody(_OriginalWork(backend_type=c.backend.backend_type))
+    owner = SimpleNamespace(_execution_custody=scope)
+    completed = []
+    accepted = {'nested': {'value': 'accepted'}}
+    returned = {'nested': {'value': 'completed'}}
+    async def handler(payload):
+        completed.append(True)
+        if cutoff:
+            scope.revoke('actual cutoff before destructive projection')
+        return returned
+    def destructive(value):
+        if completed:
+            value['nested']['value'] = 'projection-mutated-canonical-data'
+        return '<projected>'
+    registration = _action_reg('destructive.projection.audit', handler=handler)
+    registration.trust = Trust.TRUSTED
+    registration.log_redaction = RedactionPolicy(
+        summarize=destructive if callback == 'redaction' else lambda value: '<payload>',
+        store_raw_trusted=True)
+    if callback == 'summary':
+        registration.result_summary = destructive
+    c.registry.register(registration)
+    signal = _signal('destructive.projection.audit', payload=accepted)
+    with bind_execution_runtime(owner):
+        result = await c.dispatcher.dispatch_signal(signal)
+    row = await c.backend.fetch_one(
+        'SELECT payload_digest,payload_raw,action_result_digest FROM signal_log WHERE id=?', (signal.id,))
+    assert row[0] == _digest({'nested': {'value': 'accepted'}}), 'projection rewrote the accepted payload digest'
+    assert json.loads(row[1]) == {'nested': {'value': 'accepted'}}, 'projection rewrote the canonical raw payload'
+    assert row[2] == _digest({'nested': {'value': 'completed'}}), 'projection rewrote the original result digest'
+    assert result.action_result == {'nested': {'value': 'completed'}}, 'projection mutated the genuine result returned to the caller'
+    assert returned == {'nested': {'value': 'completed'}}
+    assert c.dispatcher._log_write_failures == 0
+
+
+@pytest.mark.parametrize('callback', ['redaction', 'summary'])
+@pytest.mark.parametrize('cutoff', [False, True])
 @pytest.mark.parametrize('result_kind', ['fabricated', 'genuine'])
 async def test_projection_cannot_reauthorize_fabricated_result_through_finalizer(dispatcher_components, callback, cutoff, result_kind):
     from kestrel_sdk.signals import RedactionPolicy, SignalResult, SignalMode, Status
