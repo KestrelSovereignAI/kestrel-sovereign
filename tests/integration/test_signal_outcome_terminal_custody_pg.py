@@ -37,6 +37,39 @@ pytestmark = [pytest.mark.asyncio, pytest.mark.integration]
 native_pg = _native_pg_fixture
 
 
+async def test_original_journal_refuses_enclosing_transaction_before_destination_checkout(dispatcher_components):
+    import asyncpg
+    from kestrel_sovereign.execution_custody import ExecutionAuthorityError, _explicit_control_chain
+    from tests.unit.test_signals_dispatcher import _action_reg, _signal
+    c = dispatcher_components
+    original_pool = c.backend._pool
+    pool = await asyncpg.create_pool(*original_pool._connect_args,
+        **original_pool._connect_kwargs, min_size=0, max_size=1)
+    c.backend._pool = pool
+    effects = []
+    async def handler(payload):
+        effects.append('handler must not run inside an unsupported enclosing transaction')
+        return {'genuine': True}
+    c.registry.register(_action_reg('enclosing.admission.audit', handler=handler))
+    error = None
+    try:
+        try:
+            async with asyncio.timeout(1):
+                async with c.backend.transaction():
+                    await c.dispatcher.dispatch_signal(_signal('enclosing.admission.audit'))
+        except BaseException as caught:
+            error = caught
+        assert error is not None
+        assert any(isinstance(item, ExecutionAuthorityError) and 'enclosing transaction' in str(item)
+                   for item in _explicit_control_chain(error)), 'destination capture waited for its own enclosing transaction pool slot'
+        assert effects == []
+        assert not c.dispatcher._outcome_log_tasks
+    finally:
+        c.backend._pool = original_pool
+        async with asyncio.timeout(10):
+            await pool.close()
+
+
 @pytest.mark.parametrize('boundary', ['namespace', 'fake_ack', 'relation'])
 async def test_original_journal_native_setup_cannot_redirect_or_forge_commit(dispatcher_components, native_pg, boundary):
     import asyncpg

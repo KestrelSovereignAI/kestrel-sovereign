@@ -2176,7 +2176,11 @@ class SQLiteBackend(DatabaseBackend):
                 raise
             raise ExecutionCommitOutcomeError(outcome) from error
         if original_outcome is not None:
-            original_outcome.record_sqlite_commit(self, conn)
+            # ONLY this actual native COMMIT-return boundary can seal the
+            # fact. A callable journal helper must not let a reentrant privacy
+            # getter manufacture it before INSERT/COMMIT.
+            original_outcome.require_sqlite_cleanup(self, conn)
+            original_outcome._sqlite_committed_connection = conn
         try:
             self._require_write_admission(original_outcome)
             if original_outcome is None:

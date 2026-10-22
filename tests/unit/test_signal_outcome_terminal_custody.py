@@ -30,6 +30,65 @@ class _OriginalWork:
 
 
 @pytest.mark.parametrize('cutoff', ['handler', 'journal'])
+async def test_sqlite_original_journal_cannot_be_shadowed_by_temporary_table(dispatcher_components, monkeypatch, cutoff):
+    c = dispatcher_components
+    scope = ExecutionCustody(_OriginalWork())
+    owner = SimpleNamespace(_execution_custody=scope)
+    async def handler(payload):
+        await c.backend.execute('CREATE TEMP TABLE signal_log AS SELECT * FROM main.signal_log WHERE 0')
+        if cutoff == 'handler':
+            scope.revoke('actual cutoff after ordinary temporary-table creation')
+        return {'genuine': True}
+    if cutoff == 'journal':
+        original_writer = c.dispatcher._write_outcome_log
+        async def late_cutoff(*args, **kwargs):
+            scope.revoke('actual cutoff at original native writer')
+            return await original_writer(*args, **kwargs)
+        monkeypatch.setattr(c.dispatcher, '_write_outcome_log', late_cutoff)
+    c.registry.register(_action_reg('sqlite.shadow.audit', handler=handler))
+    signal = _signal('sqlite.shadow.audit')
+    with bind_execution_runtime(owner):
+        result = await c.dispatcher.dispatch_signal(signal)
+    assert result.action_result == {'genuine': True}
+    assert await c.backend.fetch_val('SELECT COUNT(*) FROM main.signal_log WHERE id=?', (signal.id,)) == 1, 'temporary table redirected the durable original journal'
+    assert await c.backend.fetch_val('SELECT COUNT(*) FROM temp.signal_log') == 0
+    assert c.dispatcher._log_write_failures == 0
+
+
+async def test_privacy_getter_cannot_record_sqlite_commit_before_native_sql(dispatcher_components):
+    from kestrel_sovereign.execution_custody import execution_commit_outcome, is_execution_control_error
+    c = dispatcher_components
+    attempted = []
+    getter_error = RuntimeError('actual reentrant privacy getter failure before original INSERT')
+    def epoch():
+        journal = c.dispatcher._original_outcome_writer.get()
+        if journal is not None and journal._phase == 'submitted' and not attempted:
+            attempted.append(True)
+            record = getattr(journal, 'record_sqlite_commit', None)
+            if record is not None:
+                record(c.backend, c.backend._connection)
+            raise getter_error
+        return 'original-test-epoch'
+    c.agent._get_privacy_policy_epoch = epoch
+    scope = ExecutionCustody(_OriginalWork())
+    owner = SimpleNamespace(_execution_custody=scope)
+    async def handler(payload):
+        scope.revoke('actual original work cutoff before native writer')
+        return {'genuine': True}
+    c.registry.register(_action_reg('sqlite.getter.ack', handler=handler))
+    signal = _signal('sqlite.getter.ack')
+    with bind_execution_runtime(owner):
+        with pytest.raises(BaseException) as caught:
+            await c.dispatcher.dispatch_signal(signal)
+    assert attempted == [True]
+    assert is_execution_control_error(caught.value)
+    assert execution_commit_outcome(caught.value) != 'committed', 'getter fabricated SQLite COMMIT before native SQL'
+    assert await c.backend.fetch_val('SELECT COUNT(*) FROM main.signal_log WHERE id=?', (signal.id,)) == 0
+    assert c.dispatcher._log_write_failures == 1, 'the absent audit was incorrectly counted as committed'
+    assert not c.dispatcher._outcome_log_tasks
+
+
+@pytest.mark.parametrize('cutoff', ['handler', 'journal'])
 async def test_original_native_outcome_persists_after_work_cutoff_without_fresh_work(
     dispatcher_components, monkeypatch, cutoff,
 ):
@@ -929,7 +988,7 @@ async def test_sqlite_original_journal_privacy_hold_outlives_cancelled_commit_cl
     async def held_actual_execute(function, *args, **kwargs):
         journal = c.dispatcher._original_outcome_writer.get()
         selected = (getattr(function, '__name__', '') == 'execute'
-            and args and str(args[0]).lstrip().startswith('INSERT INTO signal_log')
+            and journal is not None and args and args[0] is journal._query
             if failure == 'insert_rollback_failure'
             else getattr(function, '__name__', '') == 'commit')
         if journal is None or not selected:

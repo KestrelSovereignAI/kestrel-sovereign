@@ -882,7 +882,10 @@ COMMIT acknowledgment, reset/retirement debt, cancellation, and later identity
 denial retain their original evidence. An acknowledged audit row is never
 evidence that fresh work is authorized or that an external effect is replayable.
 SQLite records its actual native COMMIT return before the later identity
-recheck; that fact is not a fabricated PostgreSQL COMMIT/reset receipt. A
+recheck, directly at the backend return boundary, never through a caller-facing
+recording helper. Its fixed INSERT targets `main.signal_log`; a handler-created
+temporary table cannot shadow the durable destination. That fact is not a
+fabricated PostgreSQL COMMIT/reset receipt. A
 cancellation does not transfer this native journal to a separately allocated
 drain: its original writer retains both the write lock and privacy protection
 through the existing native rollback/cursor fence. Refused or unstarted Tasks

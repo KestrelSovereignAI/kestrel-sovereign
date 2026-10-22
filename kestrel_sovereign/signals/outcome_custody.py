@@ -127,7 +127,8 @@ class _OriginalSignalOutcome:
         self._signal_snapshot = deepcopy(signal)
         self._registration_snapshot = replace(registration,
             log_redaction=replace(registration.log_redaction))
-        self._query = SignalLogStore._outcome_insert_query()
+        self._query = SignalLogStore._outcome_insert_query(
+            'main.signal_log' if type(backend) is SQLiteBackend else 'signal_log')
         self._acceptance = acceptance
         self._identity = self._signal_identity(signal)
         self._backend_scope = getattr(backend, '_execution_custody', None)
@@ -255,15 +256,6 @@ class _OriginalSignalOutcome:
         return ((self._sqlite_committed_connection is not None
                     and self._sqlite_committed_connection is self._backing)
                 or any(receipt.acknowledged for receipt in self._acknowledgments))
-
-    def record_sqlite_commit(self, backend, connection):
-        """Native producer records actual COMMIT return before identity recheck.
-
-        This is evidence about the original connection, not renewed admission
-        of a changed agent/runtime. SQLite does not invent a PG reset receipt.
-        """
-        self.require_sqlite_cleanup(backend, connection)
-        self._sqlite_committed_connection = connection
 
     def require_sqlite_cleanup(self, backend, connection):
         """Only this submitted writer's fixed connection; no fresh work grant."""
