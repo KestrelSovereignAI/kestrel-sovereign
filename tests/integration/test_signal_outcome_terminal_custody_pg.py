@@ -192,8 +192,8 @@ async def test_postgres_reconnect_pins_actual_socket_peer_across_dns_change(disp
                 await retire_original()
 
 
-@pytest.mark.parametrize('direct_tls,journal_cancel', [(False, False), (True, False), (False, True)])
-async def test_postgres_pinned_peer_keeps_native_tls_identity_on_reconnect(dispatcher_components, native_pg, monkeypatch, tmp_path, direct_tls, journal_cancel):
+@pytest.mark.parametrize('direct_tls,journal_cancel,trust_change', [(False, False, False), (True, False, False), (False, True, False), (False, False, True), (True, False, True)])
+async def test_postgres_pinned_peer_keeps_native_tls_identity_on_reconnect(dispatcher_components, native_pg, monkeypatch, tmp_path, direct_tls, journal_cancel, trust_change):
     from kestrel_sovereign._async_ownership import await_owned_task
     from kestrel_sovereign.execution_custody import ExecutionCustody, bind_execution_runtime
     from tests.unit.test_native_journal_programs import _owned_tls_contexts
@@ -248,6 +248,8 @@ async def test_postgres_pinned_peer_keeps_native_tls_identity_on_reconnect(dispa
             async with pool.acquire() as connection:
                 if not journal_cancel:
                     await connection.close()
+            if trust_change:
+                monkeypatch.setenv('PGSSLROOTCERT', str(tmp_path / 'not-the-admitted-root.pem'))
             if journal_cancel:
                 await control.execute('BEGIN')
                 locked.append(True)
@@ -338,7 +340,7 @@ async def test_native_tls_proxy_retires_after_actual_pool_close_reports_failure(
     try:
         with pytest.raises(OSError) as caught:
             await test_postgres_pinned_peer_keeps_native_tls_identity_on_reconnect(
-                dispatcher_components, native_pg, monkeypatch, tmp_path, direct_tls, False)
+                dispatcher_components, native_pg, monkeypatch, tmp_path, direct_tls, False, False)
         assert caught.value is physical
         assert proxies and len(retired) == len(proxies), 'actual pool close failure skipped independent proxy retirement'
         assert all(not server.is_serving() for server, _ in proxies)

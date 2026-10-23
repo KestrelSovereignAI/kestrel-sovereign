@@ -19,6 +19,56 @@ from tests.integration.test_maintenance_original_retirement import _original_con
 from tests.utils.original_failure import OriginalFailure
 
 cleanup_pg = _cleanup_pg
+from tests.unit.test_signals_dispatcher import dispatcher_components as _signal_components, db_path as _signal_db_path
+dispatcher_components = _signal_components
+db_path = _signal_db_path
+
+
+@pytest.mark.parametrize('entry', ['safe_mode', 'activation', 'ready'])
+async def test_finite_completed_refusal_reaches_original_feature_lifecycle_caller(dispatcher_components, onboarding_owner, entry):
+    from kestrel_sovereign.kestrel_agent import enter_feature_lifecycle_safe_mode
+    from kestrel_sovereign.execution_custody import execution_native_source_error
+    from tests.unit.test_signals_dispatcher import _action_reg, _signal
+    c = dispatcher_components
+    _, agent, _database = onboarding_owner
+    originals = []
+    class UnsupportedBody:
+        pass
+    body = {'actual completed value': UnsupportedBody()}
+    async def handler(payload):
+        return body
+    c.registry.register(_action_reg('finite.completed.refusal', handler=handler))
+    async def refuse():
+        try:
+            await c.dispatcher.dispatch_signal(_signal('finite.completed.refusal'))
+        except BaseException as error:
+            assert is_execution_control_error(error)
+            assert execution_native_source_error(error) is None
+            originals.append(OriginalFailure.capture(error))
+            raise
+    class Feature(SDKFixtureFeature):
+        contribution_prefix = 'finite-completed-refusal'
+        async def on_enable(self):
+            if entry == 'activation':
+                await refuse()
+        async def on_agent_ready(self, owner):
+            if entry == 'ready':
+                await refuse()
+    feature = Feature(agent)
+    if entry == 'safe_mode':
+        refused = await await_owned_task(create_owned_task(refuse(), retain_originals=True))
+        operation = enter_feature_lifecycle_safe_mode(agent, 'actual finite completed refusal', refused.error)
+    elif entry == 'ready':
+        await agent._activate_feature_runtime(feature, notify_ready=False)
+        operation = agent._notify_feature_runtime_ready(feature)
+    else:
+        operation = agent._activate_feature_runtime(feature)
+    result = await await_owned_task(create_owned_task(operation, retain_originals=True))
+    assert len(originals) == 1
+    originals[0].assert_retained(result.error)
+    assert any(getattr(error, 'signal_result', None) is not None
+               and error.signal_result.action_result is body for error in _explicit_control_chain(result.error))
+    assert not any(isinstance(error, asyncio.CancelledError) for error in _explicit_control_chain(result.error))
 
 
 @pytest.mark.asyncio

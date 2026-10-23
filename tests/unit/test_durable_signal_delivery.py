@@ -264,6 +264,51 @@ async def _channel_dispatcher(path, did: str, *, rate_limit: RateLimit | None = 
     return backend, agent, dispatcher
 
 
+async def test_recovery_journal_admission_failure_settles_original_delivery_lease(tmp_path):
+    from kestrel_sovereign._async_ownership import await_owned_task
+    from kestrel_sovereign.execution_custody import is_execution_control_error
+    path = tmp_path / 'actual-recovery-journal-admission.db'
+    backend, agent, dispatcher = await _channel_dispatcher(path, 'did:agent:journal-admission')
+    consumer = DurableConsumerRegistration(
+        consumer_id=DURABLE_COGNITION_CONSUMER_ID, source='channel.message', agent_id=agent.did,
+        correlation_selector=f'payload.{DURABLE_COGNITION_MARKER}={DURABLE_COGNITION_MARKER_VALUE}', max_attempts=0)
+    async def leave_retry(prompt):
+        raise OSError('actual original route failed before restart')
+    agent.process_input = leave_retry
+    try:
+        await dispatcher.register_durable_consumer(consumer)
+        handle = await dispatcher.enqueue_durable_cognition(_channel_signal(agent.did, 'admission-recovery'),
+            source_event_id='actual-journal-admission-recovery', consumer_id=consumer.consumer_id)
+        assert (await handle.wait()).status is Status.FAILED
+        assert (await dispatcher.list_durable_deliveries())[0].status == RETRY
+    finally:
+        await dispatcher.shutdown_durable_delivery()
+        await _close(backend, agent)
+    # Wait for the actual one-second retry deadline; never rewrite leases or
+    # clocks to manufacture a recoverable row.
+    await asyncio.sleep(1.1)
+    backend, agent, dispatcher = await _channel_dispatcher(path, 'did:agent:journal-admission')
+    calls = []
+    async def must_not_start(prompt):
+        calls.append(prompt)
+        return 'must not start before native audit admission'
+    agent.process_input = must_not_start
+    try:
+        await dispatcher.register_durable_consumer(consumer)
+        await backend.execute('CREATE TRIGGER unsupported_recovery_audit AFTER INSERT ON signal_log BEGIN SELECT 1; END')
+        result = await await_owned_task(asyncio.create_task(dispatcher._drain_durable_cognition_consumer(consumer.consumer_id)))
+        assert is_execution_control_error(result.error)
+        (delivery,) = await dispatcher.list_durable_deliveries()
+        assert delivery.attempts == 2 and not calls
+        assert delivery.status == FAILED, 'journal admission failure stranded the original claimed delivery'
+        assert delivery.lease_token is None and delivery.lease_owner is None
+        assert delivery.is_terminal and delivery.acknowledged_at is None
+        assert not dispatcher._accepted_signal_outcomes
+    finally:
+        await await_owned_task(asyncio.create_task(dispatcher.shutdown_durable_delivery()))
+        await _close(backend, agent)
+
+
 async def _a2a_submitted_dispatcher(path, did: str):
     from kestrel_sovereign.signals.sources.a2a_task_submitted import (
         build_a2a_task_submitted_registration,
