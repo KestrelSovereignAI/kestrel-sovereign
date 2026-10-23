@@ -981,7 +981,9 @@ async def test_postgres_successor_journal_reuses_physically_reset_connection(dis
     @asynccontextmanager
     async def observe_checkout(*args, **kwargs):
         async with original_checkout(*args, **kwargs) as acquired:
-            journal = c.dispatcher._original_outcome_writer.get()
+            # A successor now seals its admission checkout too, before its
+            # terminal writer exists. Observe that actual earlier borrow.
+            journal = c.dispatcher._original_outcome_writer.get() or c.dispatcher._original_outcome_admission.get()
             if held and journal is not None and journal._postgres_session is None:
                 successor_acquired.set()
             yield acquired
@@ -994,6 +996,8 @@ async def test_postgres_successor_journal_reuses_physically_reset_connection(dis
         tasks.append(create_owned_task(c.dispatcher.dispatch_signal(_signal('healthy.successor.journal'))))
         await asyncio.wait_for(successor_acquired.wait(), 3)
         assert not natives[0].is_closed(), 'healthy reused connection was terminated by stale seal'
+        await asyncio.sleep(0)
+        assert not tasks[-1].done(), 'successor crossed a still-owned original session seal'
         release.set()
         successor = await asyncio.wait_for(await_owned_task(tasks[-1]), 3)
         assert successor.error is None
