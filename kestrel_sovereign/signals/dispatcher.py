@@ -5320,7 +5320,7 @@ class SignalDispatcher:
             routing_task = routing_admission.task
             if routing_task is not None and not routing_task.done():
                 self._retain_durable_cognition_task(routing_task, delivery=delivery)
-            else:
+            elif routing_task is None:
                 # Ordinary refusal paths can return a FAILED/HOLD result.
                 # Their original-token CAS is idempotent if that path already
                 # settled the delivery; no unowned live lease may escape just
@@ -5329,6 +5329,10 @@ class SignalDispatcher:
                     await self._release_retained_durable_cognition_task(delivery, observe_failure=True)
                 except BaseException as cleanup:
                     raise retain(cleanup)
+            # A normal completed-route return follows its native ACK/NACK or
+            # exact-token release. Do not start another storage operation
+            # after its original journal has already retired. Settlement
+            # failures below must escape to the exception owner above.
 
     async def _execute_original_claimed_durable_cognition(
         self, signal, registration, start, *, delivery, consumer_id,
@@ -5669,6 +5673,7 @@ class SignalDispatcher:
                     "delivery=%s",
                     delivery.delivery_id,
                 )
+                raise
             self._finalize_deferred_durable_outcome(
                 deferred_outcomes,
                 fallback_signal=routing_signal,
@@ -5747,6 +5752,7 @@ class SignalDispatcher:
                     "delivery=%s",
                     delivery.delivery_id,
                 )
+                raise
             self._finalize_deferred_durable_outcome(
                 deferred_outcomes,
                 fallback_signal=routing_signal,
