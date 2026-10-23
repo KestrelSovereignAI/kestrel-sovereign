@@ -942,7 +942,9 @@ exposure. Every public policy setter/mutator advances a monotonic generation;
 restoring a value or a failed mutation cannot restore an earlier receipt.
 Original handshake and transaction/reset seals refuse mutation before native
 processing. Concurrent in-progress policy mutation is refused, not waited on by
-the journal observer. Application TLS callback/class programs are unsupported.
+the journal observer. Retirement removes its exact native seal identity without
+acquiring that observation lock, so an already-refused setter cannot strand a
+physically retired seal. Application TLS callback/class programs are unsupported.
 An otherwise healthy sibling with a different loaded context is retired and
 reconnected through the same bounded pool with the admitted policy; trust-object
 identity is not weakened or inferred from a partial public fingerprint.
@@ -964,9 +966,14 @@ is not fabricated commit uncertainty, and audit-loss handling cannot swallow
 that withdrawal. Accepted signal identity uses canonical native text/enum values,
 never application string equality or hashing as evidence.
 This includes terminal-outcome selection and recovered-claim admission. All
+terminal selection uses genuine result/producer identity; mutable envelope IDs
+are checked against the captured journal at binding, where a mismatch records
+audit loss and refuses rather than silently dropping an accepted outcome. All
 recovered identity/mode validation and acceptance construction occur inside the
 exact-token cleanup boundary before any routing task can start. Failed cleanup
 retains its original lease debt and cannot be reported as successful settlement.
+Ordinary cancellation while asynchronous caller rehydration is unwinding also
+releases that exact claim; withdrawal and any release failure remain observable.
 
 SQLite admission also captures its actual journal/synchronous/full-fsync/WAL
 checkpoint configuration. The original native relation checks compare that

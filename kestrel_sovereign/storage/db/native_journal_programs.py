@@ -85,7 +85,7 @@ def _adopt_native_tls_context(context):
     if type(context) is ssl.SSLContext:
         ssl.SSLContext.__setattr__(context, '_native_journal_tls_lock', threading.RLock())
         ssl.SSLContext.__setattr__(context, '_native_journal_tls_generation', 0)
-        ssl.SSLContext.__setattr__(context, '_native_journal_tls_seals', 0)
+        ssl.SSLContext.__setattr__(context, '_native_journal_tls_seals', set())
         ssl.SSLContext.__setattr__(context, '_native_journal_tls_programs', False)
         ssl.SSLContext.__setattr__(context, '__class__', _NativeJournalTLSContext)
     return context
@@ -116,12 +116,14 @@ class _OriginalNativeTLSPolicy:
     """One finite seal across actual handshake or original transaction/reset."""
 
     def __init__(self, context, generation):
+        if type(self) is not _OriginalNativeTLSPolicy:
+            raise NativeJournalConfigurationError('Original TLS requires native seal identity')
         self._context = context
         if context is not None:
             with _native_tls_policy_lock(context):
                 if _native_tls_policy_generation(context) != generation:
                     raise NativeJournalConfigurationError('Original native TLS policy changed')
-                ssl.SSLContext.__setattr__(context, '_native_journal_tls_seals', context._native_journal_tls_seals + 1)
+                set.add(context._native_journal_tls_seals, self)
 
     def __enter__(self):
         return self
@@ -129,9 +131,12 @@ class _OriginalNativeTLSPolicy:
     def __exit__(self, *_error):
         context = self._context
         if context is not None:
-            with _native_tls_policy_lock(context):
-                ssl.SSLContext.__setattr__(context, '_native_journal_tls_seals', context._native_journal_tls_seals - 1)
-                self._context = None
+            # Retirement is NOT a fallible policy observation. Native set
+            # removal of this exact private identity cannot execute user code
+            # or wait for a refused setter holding the policy lock. Mutation
+            # and new seals still serialize/check generation under that lock.
+            set.discard(context._native_journal_tls_seals, self)
+            self._context = None
 
 
 def _native_tcp_endpoint(peer):

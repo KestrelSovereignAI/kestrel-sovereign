@@ -211,6 +211,54 @@ def test_native_tls_failed_mutation_and_program_registration_are_monotonic(tmp_p
         _native_tls_policy_generation(context)
 
 
+def test_native_tls_policy_retirement_survives_a_refused_setter_holding_lock(tmp_path, monkeypatch):
+    import threading
+    from kestrel_sovereign.storage.db.native_journal_programs import (
+        _adopt_native_tls_context, _native_tls_policy_generation, _OriginalNativeTLSPolicy, _NativeJournalTLSContext,
+    )
+    _, context, _ = _owned_tls_contexts(tmp_path, 'native-policy.invalid')
+    _adopt_native_tls_context(context)
+    entered, release = threading.Event(), threading.Event()
+    errors = []
+    original = _NativeJournalTLSContext._before_native_tls_change
+    def paused_refusal(self, name):
+        try:
+            return original(self, name)
+        except NativeJournalConfigurationError:
+            entered.set()
+            release.wait(5)
+            raise
+    monkeypatch.setattr(_NativeJournalTLSContext, '_before_native_tls_change', paused_refusal)
+    policy = _OriginalNativeTLSPolicy(context, _native_tls_policy_generation(context))
+    def setter():
+        try:
+            context.set_ciphers('DEFAULT')
+        except NativeJournalConfigurationError as error:
+            errors.append(error)
+    thread = threading.Thread(target=setter)
+    thread.start()
+    try:
+        assert entered.wait(5)
+        policy.__exit__(None, None, None)
+    finally:
+        release.set()
+        thread.join(5)
+        policy.__exit__(None, None, None)
+    assert not thread.is_alive() and len(errors) == 1
+    context.set_ciphers('DEFAULT')
+
+
+def test_native_tls_seal_identity_never_admits_application_hash_protocol(tmp_path):
+    from kestrel_sovereign.storage.db.native_journal_programs import _adopt_native_tls_context, _native_tls_policy_generation, _OriginalNativeTLSPolicy
+    _, context, _ = _owned_tls_contexts(tmp_path, 'native-policy.invalid')
+    _adopt_native_tls_context(context)
+    class ForeignSeal(_OriginalNativeTLSPolicy):
+        def __hash__(self):
+            raise AssertionError('application seal hash executed')
+    with pytest.raises(NativeJournalConfigurationError, match='native seal identity'):
+        ForeignSeal(context, _native_tls_policy_generation(context))
+
+
 def test_native_tls_policy_observation_does_not_wait_for_mutator_thread(tmp_path):
     import threading
     from kestrel_sovereign.storage.db.native_journal_programs import _adopt_native_tls_context, _native_tls_policy_generation

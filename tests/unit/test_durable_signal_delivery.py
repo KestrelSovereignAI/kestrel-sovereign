@@ -366,6 +366,70 @@ async def _a2a_submitted_dispatcher(path, did: str):
     return backend, agent, dispatcher
 
 
+@pytest.mark.parametrize('public_handle', [False, True])
+@pytest.mark.parametrize('release_failure', [False, True])
+async def test_cancelled_async_rehydration_releases_its_original_claim(tmp_path, public_handle, release_failure):
+    import time
+    from kestrel_sovereign._async_ownership import await_owned_task
+    from kestrel_sovereign.execution_custody import _explicit_control_chain
+    from kestrel_sovereign.privacy import get_privacy_preset
+    backend, agent, dispatcher = await _channel_dispatcher(tmp_path / 'cancelled-rehydrate.db', 'did:agent:rehydration')
+    source = 'test.async-rehydration' if public_handle else 'channel.message'
+    agent.privacy_config = get_privacy_preset('normal' if public_handle else 'ephemeral')
+    agent.durable_rehydratable_sources = frozenset({source})
+    if public_handle:
+        # A privacy-elided channel redelivery must use its MAC-verified live
+        # envelope, not a recovery hook. Exercise the supported generic source
+        # hook through a REAL public handle rather than bypassing that policy.
+        dispatcher._registry.register(replace(build_channel_message_registration(), name=source))
+    consumer = DurableConsumerRegistration(consumer_id='test.rehydration-cognition' if public_handle else DURABLE_COGNITION_CONSUMER_ID,
+        source=source, agent_id=agent.did, max_attempts=0)
+    entered, release = asyncio.Event(), asyncio.Event()
+    task = None
+    async def rehydrate(event, *, dispatch_signal):
+        entered.set()
+        await release.wait()
+        return replace(_channel_signal(agent.did, 'rehydrated-original'), source=source)
+    agent.rehydrate_durable_cognition_signal = rehydrate
+    try:
+        await dispatcher.register_durable_consumer(consumer)
+        live = replace(_channel_signal(agent.did, 'cancel-rehydrate'), source=source)
+        persisted = await dispatcher._durable_store.persist_signal(live, agent_id=agent.did,
+            source_event_id='cancel-rehydrate-original', retention_days=7, caller_identity=None)
+        if release_failure:
+            await backend.execute("CREATE TRIGGER refuse_cancel_recovery_release BEFORE UPDATE ON durable_signal_deliveries WHEN OLD.status='leased' AND NEW.status!='leased' BEGIN SELECT RAISE(ABORT, 'actual cancelled recovery release refused'); END")
+        if public_handle:
+            handle = await dispatcher.enqueue_durable_cognition(live,
+                source_event_id='cancel-rehydrate-original', consumer_id=consumer.consumer_id)
+            task = handle.task
+        else:
+            delivery = await dispatcher.claim_durable_delivery_for_event(consumer_id=consumer.consumer_id,
+                event_id=persisted.event_id, executor_id=dispatcher._durable_delivery_owner)
+            seed = dispatcher._durable_retry_seed(delivery.event)
+            task = asyncio.create_task(dispatcher._route_durable_cognition_delivery(seed,
+                dispatcher._registry.get(seed.source), time.monotonic(), persisted_event_id=delivery.event_id,
+                consumer_id=consumer.consumer_id, durable_admission=None, durable_created=False,
+                use_live_signal=False, claimed_delivery=delivery))
+        await asyncio.wait_for(entered.wait(), 5)
+        task.cancel('actual caller withdrawal during source rehydration')
+        outcome = await await_owned_task(task)
+        errors = tuple(_explicit_control_chain(outcome.error))
+        assert any(isinstance(error, asyncio.CancelledError) for error in errors)
+        if release_failure:
+            assert any('actual cancelled recovery release refused' in str(error) for error in errors), 'rehydration cancellation hid native release failure'
+            await backend.execute('DROP TRIGGER refuse_cancel_recovery_release')
+        else:
+            (delivery,) = await dispatcher.list_durable_deliveries()
+            assert delivery.status == RETRY, 'rehydration withdrawal left the physically finished claim leased'
+            assert delivery.lease_expires_at is None
+    finally:
+        release.set()
+        if task is not None:
+            await await_owned_task(task)
+        await await_owned_task(asyncio.create_task(dispatcher.shutdown_durable_delivery()))
+        await _close(backend, agent)
+
+
 async def _assert_sync_shutdown_drained(
     backend: SQLiteBackend,
     agent: _Agent,

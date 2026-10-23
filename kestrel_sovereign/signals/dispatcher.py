@@ -1178,7 +1178,6 @@ class SignalDispatcher:
         Execution-authority loss and uncertain commits remain typed errors
         so the owning invocation can reconcile instead of retrying effects."""
         self._require_standalone_native_outcome_entry()
-        from kestrel_sovereign.signals.outcome_custody import _native_identity_text
         if _journal_completion is None:
             _journal_completion = []
         elif type(_journal_completion) is not list or _journal_completion:
@@ -1260,8 +1259,7 @@ class SignalDispatcher:
                 self._deferred_outcome_logs.set(None)
                 journal = self._original_outcome_admission.get()
                 selected = [outcome for outcome in original_outcomes
-                    if outcome.result is result and _native_identity_text(outcome.signal.id) == _native_identity_text(signal.id)
-                    and outcome.registration is registration]
+                    if outcome.result is result and outcome.registration is registration]
                 if journal is not None:
                     try:
                         result = _snapshot_terminal_result(result)
@@ -5169,7 +5167,6 @@ class SignalDispatcher:
         use_live_signal, retry_delay, durable_admission, persisted_event_id, _journal_completion=None,
     ):
         """Own recovered claim admission and its original journal through join."""
-        from kestrel_sovereign.signals.outcome_custody import _native_identity_text
         if _journal_completion is not None and (type(_journal_completion) is not list or _journal_completion):
             raise TypeError('Original resident journal handoff requires a fresh native slot')
         async with self._admit_durable_operation():
@@ -5193,8 +5190,7 @@ class SignalDispatcher:
                     self._deferred_outcome_logs.set(None)
                     if result is not None:
                         selected = [outcome for outcome in original_outcomes
-                            if outcome.result is result and _native_identity_text(outcome.signal.id) == _native_identity_text(result.signal_id)
-                            and outcome.registration is registration]
+                            if outcome.result is result and outcome.registration is registration]
                         if journal is not None:
                             try:
                                 from kestrel_sovereign.signals.outcome_custody import _snapshot_terminal_result
@@ -5248,6 +5244,15 @@ class SignalDispatcher:
         except BaseException as error:
             if is_execution_control_error(error):
                 await self._terminalize_failed_cognition(delivery, error)
+                raise
+            if isinstance(error, asyncio.CancelledError):
+                # Rehydration ran in this original owner, before any routing
+                # Task existed. It has now physically unwound: release its
+                # exact token, preserving withdrawal and any native failure.
+                try:
+                    await self._release_retained_durable_cognition_task(delivery, observe_failure=True)
+                except BaseException as cleanup:
+                    raise execution_observation_error(error, cleanup) from None
                 raise
             if not isinstance(error, Exception):
                 raise

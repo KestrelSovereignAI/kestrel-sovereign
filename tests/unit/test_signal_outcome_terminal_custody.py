@@ -381,7 +381,8 @@ async def test_terminal_selection_never_calls_application_id_equality(dispatcher
     assert await c.backend.fetch_val('SELECT COUNT(*) FROM signal_log WHERE id=?', (identity,)) == 1
 
 
-async def test_recovered_terminal_selection_uses_native_identity(tmp_path, monkeypatch):
+@pytest.mark.parametrize('late_change', [False, True])
+async def test_recovered_terminal_selection_uses_native_identity(tmp_path, monkeypatch, late_change):
     import time
     from kestrel_sovereign.signals import DurableConsumerRegistration
     from tests.unit.test_durable_signal_delivery import _channel_signal
@@ -402,7 +403,10 @@ async def test_recovered_terminal_selection_uses_native_identity(tmp_path, monke
         return signal
     monkeypatch.setattr(dispatcher, '_signal_for_durable_retry', observe_recovery)
     async def cognition(prompt):
-        recovered[0].id = UnequalText(recovered[0].id)
+        if late_change:
+            asyncio.current_task().add_done_callback(lambda _task: setattr(recovered[0], 'id', 'changed-after-genuine-result'))
+        else:
+            recovered[0].id = UnequalText(recovered[0].id)
         return 'genuinely completed cognition'
     agent.process_input = cognition
     try:
@@ -414,16 +418,24 @@ async def test_recovered_terminal_selection_uses_native_identity(tmp_path, monke
         delivery = await dispatcher.claim_durable_delivery_for_event(consumer_id=consumer.consumer_id,
             event_id=persisted.event_id, executor_id=dispatcher._durable_delivery_owner)
         seed = dispatcher._durable_retry_seed(delivery.event)
-        result = await dispatcher._route_durable_cognition_delivery(seed,
+        outcome = await await_owned_task(asyncio.create_task(dispatcher._route_durable_cognition_delivery(seed,
             dispatcher._registry.get(seed.source), time.monotonic(), persisted_event_id=delivery.event_id,
             consumer_id=consumer.consumer_id, durable_admission=None, durable_created=False,
-            use_live_signal=False, claimed_delivery=delivery)
+            use_live_signal=False, claimed_delivery=delivery)))
+        if late_change:
+            assert is_execution_control_error(outcome.error), 'late signal mutation silently skipped the genuine journal'
+            assert dispatcher._log_write_failures == 1
+            assert await backend.fetch_val('SELECT COUNT(*) FROM signal_log WHERE id=?', (seed.id,)) == 0
+            (settled,) = await dispatcher.list_durable_deliveries()
+            assert settled.status == 'acknowledged', 'journal refusal must not relabel the completed cognition ACK'
+            return
+        assert outcome.error is None
+        result = outcome.result
         assert result.status.value == 'ok'
         assert not comparisons, 'recovered terminal selection executed application equality'
         assert await backend.fetch_val('SELECT COUNT(*) FROM signal_log WHERE id=?', (seed.id,)) == 1
     finally:
-        await dispatcher.shutdown_durable_delivery()
-        await _close(backend, agent)
+        await _close_native_counterexample_dispatch(backend, agent, dispatcher)
 
 
 @pytest.mark.parametrize('shape', ['expression_index', 'predicate_index', 'predicate_comment', 'check', 'check_comment'])
