@@ -7320,6 +7320,11 @@ class KestrelAgent(
                 # Do not retain a third-party cleanup/quarantine exception as a
                 # printable cause; either may contain feature configuration.
                 raise quarantine_error from None
+            if withdrawals:
+                # A settled cleanup can report ordinary SQL failure together
+                # with this caller's withdrawal, without unresolved control.
+                # Retain withdrawal without exposing third-party cleanup text.
+                raise execution_observation_error(activation_error, *withdrawals) from None
             raise
 
         if notify_ready:
