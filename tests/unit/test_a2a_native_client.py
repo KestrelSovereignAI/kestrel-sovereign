@@ -767,7 +767,7 @@ async def test_peer_card_refusal_preserves_question_recovery_and_deadline_wakes(
 
 @pytest.mark.parametrize(
     "fault",
-    ["draft", "ambiguous", "other-tenant", "required-extension", "boolean-version"],
+    ["draft", "minor-version", "invalid-version", "ambiguous", "other-tenant", "required-extension", "boolean-version"],
 )
 async def test_signed_but_incompatible_card_is_refused(peer_session, fault):
     p = peer_session
@@ -775,6 +775,10 @@ async def test_signed_but_incompatible_card_is_refused(peer_session, fault):
     selected = p.arguments["interface"]
     if fault == "draft":
         selected.protocol_version = "0.3"
+    elif fault == "minor-version":
+        selected.protocol_version = "1.1"
+    elif fault == "invalid-version":
+        selected.protocol_version = "invalid"
     elif fault == "other-tenant":
         selected.tenant = "other"
     elif fault == "ambiguous":
@@ -794,6 +798,28 @@ async def test_signed_but_incompatible_card_is_refused(peer_session, fault):
     with pytest.raises(NativePeerProtocolError):
         NativePeerSession(**p.arguments)
     assert not p.trace
+
+
+@pytest.mark.parametrize("version", ["1.0.0", "1.0.1", "1.0.999"])
+async def test_signed_patch_version_card_uses_same_native_wire(peer_session, version):
+    p = peer_session
+    p.arguments["interface"].protocol_version = version
+    p.arguments["card"] = create_agent_card_signer(
+        p.identity.hybrid_keypair.classical.private_key,
+        {"kid": p.identity.signing_did + "#key-1", "alg": "EdDSA"},
+    )(p.arguments["card"])
+    session = NativePeerSession(**p.arguments)
+    try:
+        dispatch, wire = await session.reserve(
+            request_for(p), dispatch_tool="send_a2a_task", verb="task",
+        )
+        receipt = await session.send(dispatch, wire)
+        assert receipt.dispatch.state is DispatchState.ACKNOWLEDGED
+        assert receipt.response.id == receipt.dispatch.remote_task_id
+        assert p.trace[0][3] == "1.0"
+    finally:
+        await session.close()
+    assert not p.http.is_closed
 
 
 @pytest.mark.parametrize(

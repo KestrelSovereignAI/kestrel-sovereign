@@ -17,7 +17,9 @@ from tests.unit.test_execution_custody_review15 import control_error
 @pytest.mark.parametrize("repeat", [False, True])
 @pytest.mark.parametrize("fails", [False, True])
 async def test_joined_terminalizer_debt_tracks_child_receipt_not_caller_cancel(carrier, repeat, fails, monkeypatch):
+    import contextvars
     dispatcher = SignalDispatcher.__new__(SignalDispatcher)
+    dispatcher._cognition_claim_settlement = contextvars.ContextVar('test_claim_settlement', default=None)
     dispatcher._agent = SimpleNamespace(did="did:test:original")
     dispatcher._durable_delivery_owner = "original-owner"
     dispatcher._retained_cognition_control_debt = {}

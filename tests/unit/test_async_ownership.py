@@ -129,6 +129,46 @@ async def test_borrowed_observation_withdraws_without_cancelling_or_joining_orig
 
 
 @pytest.mark.asyncio
+async def test_borrowed_callback_removal_failure_cannot_demote_caller_cancellation():
+    from kestrel_sovereign.execution_custody import _explicit_control_chain
+    entered, release = asyncio.Event(), asyncio.Event()
+    refusal = RuntimeError('actual borrowed completion callback removal refused')
+    loop = asyncio.get_running_loop()
+    factory = loop.get_task_factory()
+    observer = None
+    class RejectRemoval(asyncio.Task):
+        def remove_done_callback(self, callback):
+            if getattr(callback, '__name__', '') == 'mark_complete' and asyncio.current_task() is observer:
+                raise refusal
+            return super().remove_done_callback(callback)
+    async def original():
+        await release.wait()
+        return 'genuine original result'
+    loop.set_task_factory(lambda loop, coro, **kwargs: RejectRemoval(coro, loop=loop, **kwargs))
+    try:
+        source = create_owned_task(original())
+    finally:
+        loop.set_task_factory(factory)
+    async def borrow():
+        entered.set()
+        return await await_owned_task(source, defer_cancellation=False)
+    observer = create_owned_task(borrow())
+    try:
+        await entered.wait()
+        observer.cancel('actual borrowed caller withdrawal with removal failure')
+        observed = await await_owned_task(observer)
+        assert observed.error is not None and not isinstance(observed.error, Exception)
+        chain = tuple(_explicit_control_chain(observed.error))
+        assert any(error is refusal for error in chain)
+        assert any(isinstance(error, asyncio.CancelledError) and error.args == ('actual borrowed caller withdrawal with removal failure',) for error in chain)
+        assert not source.done() and not source.cancelling()
+    finally:
+        release.set()
+        await await_owned_task(observer)
+        assert (await await_owned_task(source)).result == 'genuine original result'
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("allocation", ["completion", "shield"])
 async def test_completion_allocation_refusal_cannot_abandon_original(monkeypatch, allocation):
     release, refused = asyncio.Event(), asyncio.Event()

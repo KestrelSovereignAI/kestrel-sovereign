@@ -99,6 +99,56 @@ async def test_append_writes_redacted_summary(store):
     assert rows[0][1] is None  # store_raw_trusted=False by default
 
 
+@pytest.mark.parametrize('projection', ['redaction', 'summary'])
+async def test_ordinary_append_preserves_callback_input_identity(store, projection):
+    from dataclasses import replace
+    signal = _signal()
+    result = _ok_result(signal)
+    registration = _registration()
+    original = signal.payload if projection == 'redaction' else result.action_result
+    def summarize(value):
+        return 'original input' if value is original else 'copied input'
+    if projection == 'redaction':
+        registration.log_redaction = replace(registration.log_redaction, summarize=summarize)
+    else:
+        registration.result_summary = summarize
+    await store.append(signal, registration, result)
+    column = 'payload_redacted' if projection == 'redaction' else 'result_summary'
+    stored = await store.backend.fetch_val('SELECT '+column+' FROM signal_log WHERE id=?', (signal.id,))
+    assert stored == 'original input', 'ordinary append changed its established callback inputs'
+
+
+@pytest.mark.parametrize('projection', ['redaction', 'summary'])
+async def test_ordinary_append_preserves_registered_subclass_adapter(store, projection):
+    import sqlite3
+    from dataclasses import replace
+    class OrdinaryText(str):
+        pass
+    original = OrdinaryText('ordinary callback text')
+    calls = []
+    def adapt(value):
+        calls.append(value)
+        return 'ordinary native adapter value'
+    key = (OrdinaryText, sqlite3.PrepareProtocol)
+    sqlite3.register_adapter(OrdinaryText, adapt)
+    registration = _registration()
+    if projection == 'redaction':
+        registration.log_redaction = replace(registration.log_redaction, summarize=lambda payload: original)
+    else:
+        registration.result_summary = lambda result: original
+    signal = _signal()
+    try:
+        returned = await store.append(signal, registration, _ok_result(signal))
+        column = 'payload_redacted' if projection == 'redaction' else 'result_summary'
+        stored = await store.backend.fetch_val('SELECT ' + column + ' FROM signal_log WHERE id=?', (signal.id,))
+        assert stored == 'ordinary native adapter value', 'ordinary append coerced away its supported adapter'
+        assert len(calls) == 1 and calls[0] is original
+        if projection == 'summary':
+            assert returned is original, 'bounded ordinary summary lost its existing subtype identity'
+    finally:
+        sqlite3.adapters.pop(key, None)
+
+
 @pytest.mark.asyncio
 async def test_trusted_opt_in_stores_raw(store):
     sig = _signal()
@@ -282,3 +332,22 @@ async def test_purge_expired_deletes_only_old_rows(store):
 
     rows = await store.backend.fetch_all("SELECT source FROM signal_log")
     assert [r[0] for r in rows] == ["new"]
+
+
+@pytest.mark.asyncio
+async def test_ordinary_alternate_table_append_and_retention(tmp_path):
+    class AlternateLog(SignalLogStore):
+        TABLE = 'alternate_signal_log'
+    backend = SQLiteBackend(str(tmp_path / 'alternate.db'))
+    await backend.connect()
+    try:
+        store = AlternateLog(backend)
+        await store.initialize()
+        signal = _signal()
+        await store.append(signal, _registration(retention_days=1), _ok_result(signal))
+        assert await backend.fetch_val('SELECT COUNT(*) FROM alternate_signal_log') == 1
+        assert not await backend.table_exists('signal_log')
+        assert await store.purge_expired(now=datetime.now(timezone.utc) + timedelta(days=2)) == 1
+        assert await backend.fetch_val('SELECT COUNT(*) FROM alternate_signal_log') == 0
+    finally:
+        await backend.close()

@@ -442,6 +442,7 @@
         "kestrel_sovereign/multi_agent/route_name.py",
         "kestrel_sovereign/security/agent_encryption.py",
         "kestrel_sovereign/security/service_key_storage.py",
+        "tests/interop/a2a_tck/COVERAGE.json",
         "tests/interop/test_a2a_go.py",
         "tests/interop/test_a2a_tck.py"
       ],

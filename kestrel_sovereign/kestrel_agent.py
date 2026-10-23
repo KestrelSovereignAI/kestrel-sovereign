@@ -147,6 +147,8 @@ from kestrel_sovereign.command_policy import (
 from kestrel_sovereign.execution_custody import (
     _explicit_control_chain,
     execution_native_source_error,
+    execution_observation_error,
+    execution_observer_cancellations,
     execution_terminal_error,
     execution_work_operation,
     is_execution_control_error,
@@ -532,9 +534,17 @@ async def enter_feature_lifecycle_safe_mode(agent: object, reason: str, *errors,
     """
     cause = SafeModeCause.FEATURE_LIFECYCLE_UNCERTAIN.value
     _retain_feature_lifecycle_safe_mode(agent, reason, *errors)
-    controls = [error for error in errors if is_execution_control_error(error)]
-    withdrawals = [error for error in errors if isinstance(error, asyncio.CancelledError)
-                   and not is_execution_control_error(error)]
+    controls, withdrawals = [], []
+    def retain_failure(error):
+        if is_execution_control_error(error):
+            controls.append(error)
+        elif isinstance(error, asyncio.CancelledError):
+            withdrawals.append(error)
+        elif isinstance(error, BaseExceptionGroup):
+            _raise_unexpected_lifecycle_exception_group(error)
+            withdrawals.extend(execution_observer_cancellations(error))
+    for error in errors:
+        retain_failure(error)
     quarantine = getattr(agent, "_quarantine_feature_contributions", None)
     for feature in features:
         feature.enabled = False
@@ -542,12 +552,7 @@ async def enter_feature_lifecycle_safe_mode(agent: object, reason: str, *errors,
             try:
                 quarantine(feature)
             except (Exception, asyncio.CancelledError, BaseExceptionGroup) as error:
-                if is_execution_control_error(error):
-                    controls.append(error)
-                elif isinstance(error, asyncio.CancelledError):
-                    withdrawals.append(error)
-                elif isinstance(error, BaseExceptionGroup):
-                    _raise_unexpected_lifecycle_exception_group(error)
+                retain_failure(error)
     try:
         enter = getattr(agent, "enter_safe_mode", None)
         if callable(enter):
@@ -555,12 +560,7 @@ async def enter_feature_lifecycle_safe_mode(agent: object, reason: str, *errors,
             if inspect.isawaitable(result):
                 await result
     except (Exception, asyncio.CancelledError, BaseExceptionGroup) as error:
-        if is_execution_control_error(error):
-            controls.append(error)
-        elif isinstance(error, asyncio.CancelledError):
-            withdrawals.append(error)
-        elif isinstance(error, BaseExceptionGroup):
-            _raise_unexpected_lifecycle_exception_group(error)
+        retain_failure(error)
     finally:
         _retain_feature_lifecycle_safe_mode(agent, reason, *controls)
     withdrawals.extend(
@@ -570,7 +570,7 @@ async def enter_feature_lifecycle_safe_mode(agent: object, reason: str, *errors,
         and all(error is not prior for prior in withdrawals)
     )
     terminal = execution_terminal_error(
-        agent._feature_lifecycle_control, *withdrawals, retain_originals=True,
+        agent._feature_lifecycle_control, *controls, *withdrawals, retain_originals=True,
         isolate_control_originals=True,
     )
     if terminal is not None:
@@ -7300,6 +7300,11 @@ class KestrelAgent(
                 # Do not retain a third-party cleanup/quarantine exception as a
                 # printable cause; either may contain feature configuration.
                 raise quarantine_error from None
+            if withdrawals:
+                # A settled cleanup can report ordinary SQL failure together
+                # with this caller's withdrawal, without unresolved control.
+                # Retain withdrawal without exposing third-party cleanup text.
+                raise execution_observation_error(activation_error, *withdrawals) from None
             raise
 
         if notify_ready:
@@ -7337,7 +7342,8 @@ class KestrelAgent(
                 # let the enable endpoint report success after its caller left.
                 transition_task = asyncio.current_task()
                 if (
-                    isinstance(exc, asyncio.CancelledError)
+                    (isinstance(exc, asyncio.CancelledError)
+                     or execution_observer_cancellations(exc))
                     and transition_task is not None
                     and transition_task.cancelling()
                 ):
@@ -7409,7 +7415,9 @@ class KestrelAgent(
                 and not isinstance(error, Exception)
                 and not is_execution_control_error(error)
             ):
-                raise error
+                _raise_unexpected_lifecycle_exception_group(error)
+                if not execution_observer_cancellations(error):
+                    raise error
             errors.append(error)
             self._remember_shutdown_control(error)
 
@@ -7471,9 +7479,9 @@ class KestrelAgent(
             try:
                 self.task_manager.unregister_provider(feature.name)
             except (Exception, asyncio.CancelledError, BaseExceptionGroup) as exc:
-                if isinstance(exc, BaseExceptionGroup) and not isinstance(exc, Exception) and not is_execution_control_error(exc):
-                    raise
-                if is_execution_control_error(exc):
+                if isinstance(exc, BaseExceptionGroup) and not isinstance(exc, Exception):
+                    retain_failure(exc)
+                elif is_execution_control_error(exc):
                     retain_failure(exc)
                 logging.warning(
                     "Failed to unregister feature '%s' from task manager: %s",
@@ -7532,9 +7540,7 @@ class KestrelAgent(
 
         # Surface the failure only AFTER every independent cleanup step ran.
         if errors:
-            raise execution_terminal_error(
-                *errors, retain_originals=True, isolate_control_originals=True,
-            )
+            raise execution_observation_error(*errors)
         return reported
 
     def _hold_feature(self, feature: "Feature") -> None:

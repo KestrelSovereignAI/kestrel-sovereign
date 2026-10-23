@@ -431,6 +431,15 @@ test('review100 Pipeline startup preserves original playback failure through pub
   await nativeVoice(async ({ page, enteredWorklet, releaseWorklet }) => {
     await page.evaluate(async () => {
       const { createPipelineClient } = await import('/js/voice/pipeline.js');
+      // Observe the actual native settlement without replacing its promise,
+      // resource operation, result or rejection.
+      window.originalNativeSettlements = [];
+      const originalAllSettled = Promise.allSettled;
+      Promise.allSettled = function (operations) {
+        const actual = originalAllSettled.call(this, operations);
+        actual.then(records => window.originalNativeSettlements.push(records));
+        return actual;
+      };
       window.client = await createPipelineClient({ onEvent: event => window.nativeEvents.push(event) });
       window.startup = window.client.start().then(() => null, error => { window.publicFailure = error; return error.message; });
     });
@@ -441,11 +450,12 @@ test('review100 Pipeline startup preserves original playback failure through pub
     releaseWorklet();
     const native = await page.evaluate(async () => {
       const settled = await window.client.whenStartupSettled();
-      return { same: settled[0].reason === window.publicFailure,
+      return { same: settled[0].publicReason === window.publicFailure,
+        actual: settled[0].reason === window.originalNativeSettlements[0][0].reason,
         closed: window.nativeContexts.every(context => context.state === 'closed'),
         tracks: window.client.micStream.getTracks().every(track => track.readyState === 'ended') };
     });
-    assert.deepEqual(native, { same: true, closed: true, tracks: true });
+    assert.ok(native.same && native.actual && native.closed && native.tracks, JSON.stringify(native));
   }, '{"persisted":false}', { autoStart: false, framed: true, holdWorklet: 'playback' });
 });
 

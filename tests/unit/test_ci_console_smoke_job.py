@@ -49,6 +49,17 @@ def test_is_bounded():
     assert int(smoke["timeout-minutes"]) <= 10
 
 
+def test_browser_dependency_install_has_a_bounded_network_budget():
+    # Two actual Ubuntu26.04 runs exhausted five minutes downloading the
+    # mandatory font/system packages before any application test could run.
+    assert int(_step("Install the Chromium browser")["timeout-minutes"]) == 10
+    assert int(_job()["timeout-minutes"]) <= 20
+
+
+def test_browser_job_pins_a_reviewed_stable_runner_image():
+    assert _job()['runs-on'] == 'ubuntu-24.04'
+
+
 def test_references_no_secret_and_reads_only():
     """No production key can reach the smoke: the job names no secret."""
     text = yaml.safe_dump(_job())
@@ -85,3 +96,11 @@ def test_teardown_runs_on_success_failure_and_cancellation():
     assert "server.pid" in script
     assert 'kill -TERM -- "-$pid"' in script
     assert 'rm -rf "$home"' in script
+
+
+def test_locked_browser_registry_is_checked_before_installing_chromium():
+    steps = _job()["steps"]
+    compatibility = _step("Verify locked Playwright runner compatibility")
+    assert compatibility["run"] == "node --test tests/js/test_playwright_platform_support.cjs"
+    assert steps.index(compatibility) > steps.index(_step("Install JavaScript dependencies"))
+    assert steps.index(compatibility) < steps.index(_step("Install the Chromium browser"))

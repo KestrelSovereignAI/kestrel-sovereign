@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import os
 import shutil
 from functools import partial
@@ -14,6 +13,7 @@ import pytest
 
 from tests.utils.native_go_peer import retire_peer
 from tests.utils.native_tck_business import execute_tck_task
+from tests.utils.native_tck_report import validate_tck_report
 
 
 @pytest.mark.timeout(300)
@@ -39,6 +39,12 @@ async def test_tck_native_requirements(native_go_environment, a2a_tck_source, le
         PYTHONPATH=os.pathsep.join([str(Path(__file__).parent), str(tck_root)]),
     )
     log_path = environment.root / f"tck-{level}.log"
+    reports = environment.root / f"tck-{level}-reports"
+    source_reports = tck_root / "reports"
+    # MUST and full runs share the test-owned runner checkout, never evidence.
+    # A crash must not be evaluated against the previous invocation's report.
+    if source_reports.exists():
+        shutil.rmtree(source_reports)
     arguments = [
         "uv", "run", "--no-sync", "./run_tck.py", "--sut-host", origin,
         "--transport", "jsonrpc,http_json",
@@ -55,17 +61,6 @@ async def test_tck_native_requirements(native_go_environment, a2a_tck_source, le
             await asyncio.wait_for(process.wait(), 240)
         finally:
             await retire_peer(process, process_group=True)
-    reports = environment.root / f"tck-{level}-reports"
-    shutil.copytree(tck_root / "reports", reports)
-    assert process.returncode == 0, log_path.read_text()
-    report = json.loads((reports / "compatibility.json").read_text())
-    failures = {
-        key: value for key, value in report["per_requirement"].items()
-        if value["level"] == "MUST" and value["status"] == "FAIL"
-    }
-    assert not failures, failures
-    assert report["summary"]["score_scope"] == "automated"
-    assert report["summary"]["must_compatibility"] == "100.0%", report["summary"]
-    for requirement in ("DM-MSG-001", "STREAM-SUB-002"):
-        for transport in ("jsonrpc", "http_json"):
-            assert report["per_requirement"][requirement]["transports"][transport] == "PASS"
+            if source_reports.exists():
+                shutil.copytree(source_reports, reports)
+    validate_tck_report(reports, level=level, returncode=process.returncode)

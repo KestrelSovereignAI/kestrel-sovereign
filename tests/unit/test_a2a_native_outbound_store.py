@@ -66,6 +66,22 @@ async def reserve(store, params, *, dispatch_id=None, recipient="did:recipient")
     )
 
 
+@pytest.mark.parametrize("version", ["1.0", "1.0.0", "1.0.1", "1.0.999"])
+async def test_reservation_ignores_specification_patch_version(outbound, version):
+    params = request()
+    reservation = await outbound.reserve(
+        uuid4().hex, params,
+        recipient=NativeRecipientScope("did:recipient", params.tenant),
+        signing_did="did:web:peer.test", dispatch_tool="send_a2a_task", verb="task",
+        interface=AgentInterface(
+            url="https://peer.test/a2a", protocol_binding="JSONRPC",
+            protocol_version=version, tenant=params.tenant,
+        ),
+    )
+    assert reservation.state is DispatchState.RESERVED
+    assert await outbound.get(reservation.dispatch_id) == reservation
+
+
 def task(params, *, task_id="remote-task", state=TaskState.TASK_STATE_SUBMITTED):
     result = Task(
         id=task_id,
@@ -354,7 +370,7 @@ async def test_draft_rows_require_explicit_migration_before_native_startup(outbo
     ) == ("historical",)
 
 
-@pytest.mark.parametrize("fault", ["tenant", "role", "caller-task", "draft-version"])
+@pytest.mark.parametrize("fault", ["tenant", "role", "caller-task", "draft-version", "minor-version", "invalid-version"])
 async def test_bad_native_submission_binding_creates_no_reservation(outbound, fault):
     params = request()
     interface = AgentInterface(
@@ -370,7 +386,9 @@ async def test_bad_native_submission_binding_creates_no_reservation(outbound, fa
     elif fault == "caller-task":
         params.message.task_id = "caller-chosen-task"
     else:
-        interface.protocol_version = "0.3"
+        interface.protocol_version = {
+            "draft-version": "0.3", "minor-version": "1.1", "invalid-version": "invalid",
+        }[fault]
     with pytest.raises(ValueError, match="selected native recipient interface"):
         await outbound.reserve(
             "dispatch",

@@ -217,8 +217,12 @@ async def test_a_live_owners_claim_is_never_taken_over(db_backend):
     request = _request()
     claim = await owner.claim(request)
 
-    assert await retrier.claim(request) is None
     async with owner.hold_claim(claim):
+        # Start the actual heartbeat before observer I/O. The old assertion
+        # ran before hold_claim and could outlive the unrenewed two-second
+        # production lease on CI, making takeover legitimate rather than a
+        # failure of renewal. Keep the real lease and database clock.
+        assert await retrier.claim(request) is None
         claimed_heartbeat = await _outlive_one_lease(owner._db, request)
         assert await retrier.claim(request) is None
 

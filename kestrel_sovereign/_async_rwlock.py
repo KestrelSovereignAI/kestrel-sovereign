@@ -94,12 +94,18 @@ class AsyncReaderWriterLock:
         """Acquire a shared reader lease, respecting queued writers."""
 
         while True:
-            if not self._writer and self._waiting_writers == 0:
-                self._readers += 1
+            if self.try_acquire_read():
                 return
             self._changed.clear()
             if self._writer or self._waiting_writers:
                 await self._changed.wait()
+
+    def try_acquire_read(self) -> bool:
+        """Atomically admit a compatible reader without queuing behind a writer."""
+        if self._writer or self._waiting_writers:
+            return False
+        self._readers += 1
+        return True
 
     def release_read(self) -> None:
         """Release one shared reader lease."""

@@ -28,13 +28,16 @@ from kestrel_sdk.native_a2a.types import (
 from kestrel_sdk.native_a2a.utils.constants import (
     DEFAULT_LIST_TASKS_PAGE_SIZE,
     MAX_LIST_TASKS_PAGE_SIZE,
+    PROTOCOL_VERSION_1_0,
     VERSION_HEADER,
 )
 from kestrel_sdk.native_a2a.utils.errors import InvalidParamsError
 from kestrel_sdk.native_a2a.utils.proto_utils import validate_proto_required_fields
 from kestrel_sdk.native_a2a.utils.signing import SignatureVerificationError
+from kestrel_sdk.native_a2a.utils.versioning import major_minor
 from google.protobuf.json_format import MessageToDict
 from google.protobuf.message import Message as ProtoMessage
+from packaging.version import InvalidVersion
 
 from kestrel_sovereign._async_ownership import await_owned_task, create_owned_task
 from kestrel_sovereign.a2a.extensions import (
@@ -324,11 +327,15 @@ class NativePeerSession:
             for item in snapshot.supported_interfaces
             if item.protocol_binding == interface.protocol_binding
         ]
+        try:
+            interface_release = major_minor(interface.protocol_version)
+        except InvalidVersion as error:
+            raise NativePeerProtocolError("Peer interface has an invalid protocol version") from error
         if (
             interface.protocol_binding not in {"JSONRPC", "HTTP+JSON"}
             or len(candidates) != 1
             or candidates[0] != interface
-            or interface.protocol_version != "1.0"
+            or interface_release != major_minor(PROTOCOL_VERSION_1_0)
             or interface.tenant != recipient.tenant
             or signer.recipient != recipient
             or not REQUIRED_NATIVE_EXTENSIONS <= signer.extensions

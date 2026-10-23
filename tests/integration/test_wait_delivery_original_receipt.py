@@ -342,11 +342,14 @@ async def test_durable_resume_rejects_original_borrowed_native_callback(
 
         native_owner.add_done_callback(completed)
     borrowed = native_owner if projected is None else projected
+    callback_entered = asyncio.Event()
 
     def sync_callback(*args):
+        callback_entered.set()
         return borrowed
 
     async def async_callback(*args):
+        callback_entered.set()
         return borrowed
 
     callback = sync_callback if callback_kind == "sync" else async_callback
@@ -366,6 +369,10 @@ async def test_durable_resume_rejects_original_borrowed_native_callback(
             ),
             retain_originals=True,
         )
+        # Native consumer registration precedes the callback. Its real SQL
+        # must finish before measuring rejection of the borrowed operation;
+        # host scheduling before callback entry is not that observation.
+        await asyncio.wait_for(callback_entered.wait(), 5)
         done, pending = await asyncio.wait({caller}, timeout=0.08)
         failure = owned_task_error(caller) if done else None
         if pending:

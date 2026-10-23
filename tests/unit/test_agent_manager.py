@@ -12955,7 +12955,19 @@ class TestLoadFromConfig:
                 LocalAgentConfig(data_dir="first-ready", port=8801),
             )
         )
-        await asyncio.wait_for(first_entered_readiness.wait(), timeout=1.0)
+        # Real host onboarding constructs/mounts the full FastAPI route tree
+        # before this hook can enter. CI xdist exhausted the old one-second
+        # hang guard before readiness, not a production readiness deadline.
+        # Keep a bounded guard without imposing host CPU speed on this test.
+        from kestrel_sovereign._async_ownership import await_owned_task
+        try:
+            await asyncio.wait_for(first_entered_readiness.wait(), timeout=10.0)
+        except BaseException:
+            fail_first_readiness.set()
+            if not first.done():
+                first.cancel()
+            await await_owned_task(first)
+            raise
         second = await manager.load_agent(
             "SecondReady",
             LocalAgentConfig(data_dir="second-ready", port=8802),

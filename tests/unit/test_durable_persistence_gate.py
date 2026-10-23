@@ -53,6 +53,59 @@ _HANG_GUARD_SECONDS = 30
 _CRON_TASK = "wait_reconcile"
 
 
+@pytest.mark.asyncio
+async def test_original_exclusive_journal_pin_keeps_native_lock_until_child_join():
+    gate = DurablePersistenceGate()
+    entered, release, transitioned = (asyncio.Event() for _ in range(3))
+
+    async def original_journal(hold):
+        async with gate._retain_original_exclusive_hold(hold):
+            entered.set()
+            await release.wait()
+
+    async def transition():
+        async with gate.exclusive():
+            transitioned.set()
+
+    journal = next_transition = None
+    try:
+        async with gate.exclusive():
+            hold = gate._capture_original_exclusive_hold()
+            journal = asyncio.create_task(original_journal(hold))
+            await asyncio.wait_for(entered.wait(), _HANG_GUARD_SECONDS)
+        assert not hold.live
+        assert gate.locked(), 'lexical owner released lock underneath its original journal'
+        next_transition = asyncio.create_task(transition())
+        await asyncio.sleep(0)
+        assert not transitioned.is_set()
+        release.set()
+        await journal
+        await asyncio.wait_for(next_transition, _HANG_GUARD_SECONDS)
+        assert transitioned.is_set()
+        assert not gate.locked()
+    finally:
+        release.set()
+        if journal is not None:
+            await journal
+        if next_transition is not None:
+            await next_transition
+
+
+@pytest.mark.asyncio
+async def test_original_exclusive_pin_cannot_borrow_same_task_replacement_acquisition():
+    gate = DurablePersistenceGate()
+    async with gate.exclusive():
+        original = gate._capture_original_exclusive_hold()
+    async with gate.exclusive():
+        replacement = gate._capture_original_exclusive_hold()
+        assert replacement is not original
+        with pytest.raises(RuntimeError, match='Original exclusive privacy hold retired'):
+            async with gate._retain_original_exclusive_hold(original):
+                pytest.fail('retired original hold borrowed its replacement')
+        assert replacement.live and gate.locked()
+    assert not gate.locked()
+
+
 class _Rig(SimpleNamespace):
     agent: KestrelAgent
     dispatcher: SignalDispatcher
@@ -273,6 +326,10 @@ async def test_privacy_transition_waits_for_in_flight_persist_and_later_persist_
     flipped = asyncio.Event()
     may_finish_transition = asyncio.Event()
     observed_committed: list[bool] = []
+    from kestrel_sovereign.execution_custody import (
+        execution_commit_outcome, execution_native_source_error, _explicit_control_chain,
+    )
+    from kestrel_sovereign.signals.outcome_custody import SignalOutcomeJournalPrivacyRefusal
 
     async def transition_to_ephemeral() -> None:
         async with agent.privacy_transition():
@@ -297,9 +354,28 @@ async def test_privacy_transition_waits_for_in_flight_persist_and_later_persist_
         )
 
         stalled.release.set()
-        assert (await asyncio.wait_for(before, _HANG_GUARD_SECONDS)).status is Status.OK
         await asyncio.wait_for(flipped.wait(), timeout=_HANG_GUARD_SECONDS)
         assert observed_committed == [True]
+        # The actual transition remains held: the original terminal audit
+        # cannot queue behind it, nor commit a stale NORMAL projection.
+        completed, _ = await asyncio.wait({before}, timeout=2)
+        if not completed:
+            may_finish_transition.set()  # real lexical unwind for failing regression
+        assert completed, 'original terminal audit waited on the transition awaiting its dispatch'
+        with pytest.raises(BaseException) as caught:
+            await before
+        refusals = [member for member in _explicit_control_chain(caught.value)
+                    if isinstance(member, SignalOutcomeJournalPrivacyRefusal)]
+        assert len(refusals) == 1 and refusals[0].reason in ('busy', 'superseded')
+        assert refusals[0].signal_result.status is Status.OK
+        assert len(rig.tool_calls) == 1
+        assert execution_native_source_error(caught.value) is None
+        assert execution_commit_outcome(caught.value) is None
+        assert rig.dispatcher._outcome_log_control_error is None
+        assert rig.dispatcher._log_write_failures == 1
+        assert not rig.dispatcher._outcome_log_tasks
+        assert await rig.backend.fetch_val('SELECT COUNT(*) FROM signal_log') == 0
+        assert (await _stored_payloads(rig)) == [{'note': 'normal-before-transition@example.com'}]
 
         # Started while the transition still owns the gate: it must wait, and
         # then project under the mode the transition installed.
@@ -318,6 +394,8 @@ async def test_privacy_transition_waits_for_in_flight_persist_and_later_persist_
         may_finish_transition.set()
         await asyncio.wait_for(transition, timeout=_HANG_GUARD_SECONDS)
         assert (await asyncio.wait_for(after, _HANG_GUARD_SECONDS)).status is Status.OK
+        assert len(rig.tool_calls) == 2
+        assert await rig.backend.fetch_val('SELECT COUNT(*) FROM signal_log') == 1
     finally:
         stalled.release.set()
         may_finish_transition.set()
