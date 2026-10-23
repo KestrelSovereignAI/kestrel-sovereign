@@ -78,10 +78,18 @@ HOST_ADMIN_COMMANDS: Final[frozenset[str]] = frozenset({"!create-agent"})
 AGENT_RUNTIME_MUTATION_COMMANDS: Final[frozenset[str]] = frozenset(
     {"!feature-add", "!feature-remove", "!feature-configure"}
 )
+# Revising an agent's canonical SOUL changes the identity every later boot
+# serves (#3779). It is the Sovereign's action, not an agent self-edit: it is a
+# command, which the agent's own tool calls cannot reach, and only a sovereign
+# caller may run it.
+AGENT_IDENTITY_REVISION_COMMANDS: Final[frozenset[str]] = frozenset(
+    {"!revise-soul"}
+)
 SOVEREIGN_COMMANDS: Final[frozenset[str]] = (
     RECOVERY_SOVEREIGN_COMMANDS
     | HOST_ADMIN_COMMANDS
     | AGENT_RUNTIME_MUTATION_COMMANDS
+    | AGENT_IDENTITY_REVISION_COMMANDS
 )
 
 BOOTSTRAP_CONTROL_COMMANDS: Final[frozenset[str]] = frozenset(

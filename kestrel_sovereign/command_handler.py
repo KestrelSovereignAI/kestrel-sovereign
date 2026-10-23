@@ -20,6 +20,8 @@ from kestrel_sovereign.command_policy import (
 from kestrel_sovereign.command_policy import (
     requires_sovereign_authority,
 )
+from kestrel_sovereign.bootstrap.soul_durability import inspect_soul_file
+from kestrel_sovereign.execution_custody import is_execution_control_error
 from kestrel_sovereign.features.storage_access import (
     AgentIdentityUnavailable,
     resolve_scoped_agent_did,
@@ -70,11 +72,17 @@ BUILTIN_COMMAND_SPECS = [
     # Agent/runtime
     {"cmd": "!create-agent", "handler": "_cmd_create_agent", "description": "Create trusted agent", "args": "<name>", "category": "Agent"},
     {"cmd": "!anchor", "handler": "_cmd_anchor", "description": "Anchor memory state", "category": "Agent"},
+    {"cmd": "!revise-soul", "handler": "_cmd_revise_soul", "description": "Make the edited SOUL.md the canonical SOUL so it survives restarts (Sovereign only)", "args": "<reason>", "category": "Agent"},
     {"cmd": "!set-app-context", "handler": "_cmd_set_app_context", "description": "Set app-specific context for the active session", "args": "<context>", "category": "Runtime"},
     {"cmd": "!legacy-echo", "handler": "_cmd_legacy_echo", "description": "Echo through the legacy app-context path", "args": "<text>", "category": "Runtime"},
     {"cmd": "!tasks", "handler": "_cmd_tasks", "description": "List background tasks", "args": "[all|completed|working|failed]", "category": "Tasks"},
     {"cmd": "!continue", "handler": "_cmd_continue", "description": "Continue a stopped request", "category": "Runtime"},
 ]
+
+
+# Built-in commands whose handler records who ran it, so ``handle`` passes it
+# the caller that passed the authority gate (#3779).
+CALLER_ATTRIBUTED_COMMANDS = frozenset({"!revise-soul"})
 
 
 class CommandCategory(Enum):
@@ -183,7 +191,10 @@ class CommandHandler:
         # Check built-in handlers
         if command in self._command_handlers:
             handler = self._command_handlers[command]
-            result = handler(user_input)
+            if command in CALLER_ATTRIBUTED_COMMANDS:
+                result = handler(user_input, caller=caller)
+            else:
+                result = handler(user_input)
             # Handle both sync and async handlers
             if inspect.isawaitable(result):
                 return await result
@@ -408,6 +419,7 @@ class CommandHandler:
             "Other:",
             "  !create-agent <name> - Create trusted agent",
             "  !anchor              - Anchor memory state",
+            "  !revise-soul <reason> - Make the edited SOUL.md the canonical SOUL [sovereign]",
             "  !send-mail <addr> <file> - Send physical mail",
         ]
 
@@ -843,7 +855,7 @@ class CommandHandler:
         # by sending a continuation request to the LLM
         return None  # Signal to process_input to continue the conversation
 
-    def _cmd_reload_context(self, user_input: str) -> str:
+    async def _cmd_reload_context(self, user_input: str) -> str:
         """Handle !reload-context — hot-reload bootstrap files from disk."""
         try:
             builder = getattr(self.agent, 'context_builder', None)
@@ -855,11 +867,55 @@ class CommandHandler:
                 builder.reload_bootstrap_files()
                 loaded = list(builder._bootstrap_files.keys())
                 if loaded:
-                    return f"Bootstrap files reloaded: {', '.join(loaded)}"
-                return "No bootstrap files found in agent data directory."
+                    message = f"Bootstrap files reloaded: {', '.join(loaded)}"
+                else:
+                    message = "No bootstrap files found in agent data directory."
+                # A reloaded SOUL.md that is not the canonical SOUL reverts at
+                # the next restart; say so rather than imply it stuck (#3779).
+                soul_status = await inspect_soul_file(
+                    getattr(self.agent, "storage", None),
+                    getattr(builder, "agent_data_path", None),
+                )
+                caveat = soul_status.reload_caveat()
+                if caveat:
+                    message += f"\n⚠ {caveat}"
+                return message
             return "Context builder not available."
         except Exception as e:
+            if is_execution_control_error(e):
+                raise
             return f"Error reloading context: {e}"
+
+    async def _cmd_revise_soul(self, user_input: str, *, caller=None) -> str:
+        """Handle !revise-soul <reason> — make the edited SOUL.md canonical.
+
+        ``caller`` already passed the sovereign gate in ``handle``; the
+        service checks it again and records it on the new version.
+        """
+        reason = user_input.strip()[len("!revise-soul"):].strip()
+        if not reason:
+            return (
+                "Usage: !revise-soul <reason>\n\n"
+                "Makes the SOUL.md on disk this agent's canonical SOUL, so the "
+                "edit survives restarts. The reason is recorded on the new version."
+            )
+        service = getattr(self.agent, "bootstrap_service", None)
+        if service is None:
+            return "❌ Bootstrap service not available."
+        try:
+            outcome = await service.revise_soul(reason=reason, revised_by=caller)
+        except PermissionError as e:
+            return f"🚨 Unauthorized: {e}"
+        if not outcome.revised:
+            return f"{'✅' if outcome.unchanged else '❌'} {outcome.message}"
+        builder = getattr(self.agent, "context_builder", None)
+        if builder is None or not await builder.load_canonical_soul_resource():
+            return (
+                f"⚠ {outcome.message}\n"
+                "The running session did not load it; it takes effect at the "
+                "next restart."
+            )
+        return f"✅ {outcome.message}"
 
     async def _cmd_heartbeat(self, user_input: str) -> str:
         """Handle !heartbeat — trigger a manual heartbeat check."""

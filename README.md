@@ -463,6 +463,28 @@ kestrel config ./agent_data/myagent --set-port 8899  # Change port
 kestrel config ./agent_data/myagent --set-name MyAgent  # Change name
 ```
 
+### Revising an agent's SOUL
+
+An agent's SOUL is stored as an encrypted, versioned resource in its database;
+`agent_data/<agent>/SOUL.md` is only a seed and cache. Every boot serves the
+current stored version, so editing the file is not enough. `!bootstrap reload`
+or `!reload-context` loads the edited file into the running session, then
+warns that the next restart serves the stored version. Each boot that serves
+a stored version over a different file logs a `SOUL file drift` warning.
+
+To keep an edit, the Sovereign makes the file the new stored version:
+
+```text
+!revise-soul <reason>
+```
+
+Run it in the console or through the invoke API with the API key. It reads
+`SOUL.md`, stores it as a new version, records the reason and who ran it on
+that version, and loads it into the session. The agent cannot run it on
+itself: it is a sovereign command, not a tool. It is refused in the
+`ephemeral`, `isolated` and `deidentified` privacy modes, which store no SOUL.
+`!bootstrap-status` shows whether `SOUL.md` matches the stored version.
+
 ### Running Multiple Agents
 
 Each agent runs on its own port. Create configs for each:
