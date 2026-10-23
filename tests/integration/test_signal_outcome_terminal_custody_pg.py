@@ -192,8 +192,8 @@ async def test_postgres_reconnect_pins_actual_socket_peer_across_dns_change(disp
                 await retire_original()
 
 
-@pytest.mark.parametrize('direct_tls', [False, True])
-async def test_postgres_pinned_peer_keeps_native_tls_identity_on_reconnect(dispatcher_components, native_pg, monkeypatch, tmp_path, direct_tls):
+@pytest.mark.parametrize('direct_tls,journal_cancel', [(False, False), (True, False), (False, True)])
+async def test_postgres_pinned_peer_keeps_native_tls_identity_on_reconnect(dispatcher_components, native_pg, monkeypatch, tmp_path, direct_tls, journal_cancel=False):
     from kestrel_sovereign._async_ownership import await_owned_task
     from kestrel_sovereign.execution_custody import ExecutionCustody, bind_execution_runtime
     from tests.unit.test_native_journal_programs import _owned_tls_contexts
@@ -217,14 +217,20 @@ async def test_postgres_pinned_peer_keeps_native_tls_identity_on_reconnect(dispa
     endpoint = server.sockets[0].getsockname()[:2]
     original_pool = c.backend._pool
     pool = None
+    locked = []
     try:
         pool = await _fresh_journal_pool(original_pool, min_size=1, max_size=1,
-            host=alias, port=endpoint[1], ssl='verify-full', direct_tls=direct_tls, timeout=3)
+            host=alias, port=endpoint[1], ssl='verify-full', direct_tls=direct_tls, timeout=3, command_timeout=1)
         c.backend._pool = pool
         scope = ExecutionCustody(_OriginalWork(backend_type='postgres'))
         async def handler(payload):
             async with pool.acquire() as connection:
-                await connection.close()
+                if not journal_cancel:
+                    await connection.close()
+            if journal_cancel:
+                await control.execute('BEGIN')
+                locked.append(True)
+                await control.execute(f'LOCK TABLE "{schema}".signal_log IN ACCESS EXCLUSIVE MODE')
             scope.revoke('actual cutoff before native TLS reconnect to original peer')
             return {'genuine': True}
         c.registry.register(_action_reg('native.tls.peer', handler=handler))
@@ -233,14 +239,16 @@ async def test_postgres_pinned_peer_keeps_native_tls_identity_on_reconnect(dispa
             outcome = await await_owned_task(asyncio.create_task(c.dispatcher.dispatch_signal(signal)))
         assert outcome.error is None, 'numeric peer reconnect lost actual TLS hostname verification'
         assert names == [alias, alias], 'original native admission and terminal reconnect must use the same TLS SNI'
-        assert await control.fetchval(f'SELECT COUNT(*) FROM ONLY "{schema}".signal_log WHERE id=$1', signal.id) == 1
+        assert await control.fetchval(f'SELECT COUNT(*) FROM ONLY "{schema}".signal_log WHERE id=$1', signal.id) == int(not journal_cancel)
+        if journal_cancel:
+            assert c.dispatcher._log_write_failures == 1
         # The SDK always uses STARTTLS for cancellation, including when its
         # main connection used direct TLS. Our direct-only test frontend does
         # not implement that dual-protocol server. Exercise actual native query
         # cancellation with the STARTTLS frontend, without claiming direct-
         # frontend cancellation coverage; both original journal modes above
         # still require real hostname verification/SNI/COMMIT/reset.
-        if not direct_tls:
+        if not direct_tls and not journal_cancel:
             async with pool.acquire() as connection:
                 native = connection._con
                 operation = asyncio.create_task(connection.execute('SELECT pg_catalog.pg_sleep(5)'))
@@ -259,9 +267,13 @@ async def test_postgres_pinned_peer_keeps_native_tls_identity_on_reconnect(dispa
     finally:
         c.backend._pool = original_pool
         try:
-            if pool is not None:
-                async with asyncio.timeout(10):
-                    await pool.close()
+            try:
+                if locked:
+                    await control.execute('ROLLBACK')
+            finally:
+                if pool is not None:
+                    async with asyncio.timeout(10):
+                        await pool.close()
         finally:
             await retire_proxy()
 

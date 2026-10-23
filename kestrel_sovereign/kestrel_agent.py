@@ -7360,7 +7360,8 @@ class KestrelAgent(
                 # let the enable endpoint report success after its caller left.
                 transition_task = asyncio.current_task()
                 if (
-                    isinstance(exc, asyncio.CancelledError)
+                    (isinstance(exc, asyncio.CancelledError)
+                     or execution_observer_cancellations(exc))
                     and transition_task is not None
                     and transition_task.cancelling()
                 ):
