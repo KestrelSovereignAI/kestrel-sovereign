@@ -2305,7 +2305,7 @@ class PostgresBackend(DatabaseBackend):
         journal._require_backing()
         native = None
         program_sealed = False
-        connect_token = _ORIGINAL_POSTGRES_CONNECT.set(None)
+        connect_token = _ORIGINAL_POSTGRES_CONNECT.set((journal, self, True))
         try:
             async with self._tracked_pool_checkout(journal._backing, admit_work=True, original_journal=True) as (connection, state):
                 journal._require_backing()
