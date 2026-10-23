@@ -1005,7 +1005,8 @@ async def test_postgres_admission_successor_does_not_wait_for_dispatch_lifetime(
         await asyncio.wait_for(original_effect_entered.wait(), 3)
         _, pending = await asyncio.wait(tasks, timeout=2)
         assert not pending, 'successor holds the actual sole pool slot while waiting for a dispatch that needs that slot'
-        assert all((await await_owned_task(task)).error is None for task in tasks)
+        outcomes = [await await_owned_task(task) for task in tasks]
+        assert all(outcome.error is None for outcome in outcomes)
         assert await control.fetchval(f'SELECT COUNT(*) FROM "{schema}".effects WHERE id IN (101,102)') == 2
         assert await control.fetchval(f'SELECT COUNT(*) FROM "{schema}".signal_log') == 2
     finally:
