@@ -74,6 +74,14 @@ def test_installs_one_browser_and_caches_node_dependencies():
     assert node["with"]["cache"] == "npm"
 
 
+def test_runs_on_a_pinned_runner_the_locked_playwright_supports():
+    """`playwright install --with-deps` refuses an OS its release does not
+    know. ubuntu-latest moved to ubuntu-26.04 under Playwright 1.58.2 and the
+    job failed before the smoke ran, so the runner is pinned and moves only
+    with the @playwright/test lock."""
+    assert _job()["runs-on"] == "ubuntu-24.04"
+
+
 def test_teardown_runs_on_success_failure_and_cancellation():
     """`always()` is the only status function that also runs on cancel, and
     the teardown must follow the smoke and stop the recorded server."""

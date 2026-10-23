@@ -1084,7 +1084,12 @@ jobs:
   # squash-merge to main or a duplicate issue-* push run skips it like the
   # other expensive tiers. Pull requests always run it.
   console-smoke:
-    runs-on: ubuntu-latest
+    # Pinned, not ubuntu-latest: `playwright install --with-deps` only works
+    # on operating systems the locked Playwright release knows. ubuntu-latest
+    # began resolving to ubuntu-26.04 in October 2026, where Playwright 1.58.2
+    # refuses with "Playwright does not support chromium on ubuntu26.04-x64".
+    # Move this together with the @playwright/test lock, never on its own.
+    runs-on: ubuntu-24.04
     # Explicit `contents: read` so this job does NOT inherit the wider grant
     # publish.yml's `ci:` job holds. Jobs of a called workflow inherit the
     # caller's permissions when they declare none, which would hand this
