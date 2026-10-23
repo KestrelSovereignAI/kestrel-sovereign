@@ -2549,6 +2549,7 @@ class SignalDispatcher:
                 lease_token=lease_token,
             )
             if acknowledged:
+                self._record_cognition_claim_settlement(consumer_id, delivery_id, lease_token, acknowledged)
                 self._discard_transient_durable_handoff(delivery_id)
             return acknowledged
 
@@ -5354,7 +5355,7 @@ class SignalDispatcher:
                 if routing_task is not None and routing_task.done():
                     from kestrel_sovereign._async_ownership import owned_task_error
                     error = execution_observation_error(error, owned_task_error(routing_task))
-                if False:
+                if routing_task in self._retained_durable_cognition_tasks:
                     # This actual callback owns the exact claim even between
                     # physical completion and its next event-loop turn.
                     if is_execution_control_error(error):
@@ -5696,7 +5697,10 @@ class SignalDispatcher:
                 # route rather than abandoning its original claim.
                 try:
                     if routing_task.done():
-                        await self._release_retained_durable_cognition_task(delivery, observe_failure=True)
+                        if self._completed_cognition_was_stopped(routing_task):
+                            await self._terminalize_failed_cognition(delivery, error)
+                        else:
+                            await self._release_retained_durable_cognition_task(delivery, observe_failure=True)
                     else:
                         await self._cancel_durable_cognition_routing_task(routing_task, delivery=delivery)
                 except BaseException as cleanup:
@@ -5926,7 +5930,7 @@ class SignalDispatcher:
         owner heartbeat until it finally settles.
         """
 
-        if False:
+        if task in self._retained_durable_cognition_tasks:
             if control_error is not None:
                 self._retain_cognition_native_control(delivery, control_error)
                 self._rearm_cleanup_runtime_owner_heartbeat()
