@@ -4215,7 +4215,7 @@ class SignalDispatcher:
             if isinstance(child_error, asyncio.CancelledError) and not is_execution_control_error(child_error):
                 child_error = None  # Our requested cancellation of the renewer.
             renewal_error = lost.result() if lost.done() else None
-            terminal = execution_finite_error(
+            terminal = execution_observation_error(
                 body_error,
                 renewal_error if isinstance(renewal_error, BaseException) else None,
                 child_error,
@@ -4892,8 +4892,9 @@ class SignalDispatcher:
         """Own an existing recovered claim before its first awaited Hold read."""
         from contextlib import nullcontext
         from kestrel_sovereign._async_ownership import OwnedTaskAdmission
+        journals = _journal_completion if _journal_completion is not None else []
         routing_admission = OwnedTaskAdmission() if claimed_delivery is not None else None
-        guard = (self._own_unrouted_cognition_claim(claimed_delivery, routing_admission)
+        guard = (self._own_unrouted_cognition_claim(claimed_delivery, routing_admission, journal_completion=journals)
                  if routing_admission is not None else nullcontext())
         async with guard:
             return await self._route_durable_cognition_delivery_body(
@@ -4901,7 +4902,7 @@ class SignalDispatcher:
                 consumer_id=consumer_id, durable_admission=durable_admission,
                 durable_created=durable_created, use_live_signal=use_live_signal,
                 verified_terminal_retry=verified_terminal_retry, claimed_delivery=claimed_delivery,
-                retry_delay=retry_delay, _journal_completion=_journal_completion,
+                retry_delay=retry_delay, _journal_completion=journals,
                 _routing_admission=routing_admission)
 
     async def _route_durable_cognition_delivery_body(
@@ -5073,15 +5074,16 @@ class SignalDispatcher:
 
         from contextlib import nullcontext
         from kestrel_sovereign._async_ownership import OwnedTaskAdmission
+        journals = _journal_completion if _journal_completion is not None else []
         routing_admission = _routing_admission if _routing_admission is not None else OwnedTaskAdmission()
-        guard = (self._own_unrouted_cognition_claim(delivery, routing_admission)
+        guard = (self._own_unrouted_cognition_claim(delivery, routing_admission, journal_completion=journals)
                  if _routing_admission is None else nullcontext())
         async with guard:
             return await self._run_original_cognition_claim(
                 signal, registration, start, delivery=delivery, consumer_id=consumer_id,
                 durable_admission=durable_admission, durable_created=durable_created,
                 use_live_signal=use_live_signal, retry_delay=retry_delay,
-                persisted_event_id=persisted_event_id, _journal_completion=_journal_completion,
+                persisted_event_id=persisted_event_id, _journal_completion=journals,
                 _routing_admission=routing_admission)
 
     async def _run_original_cognition_claim(
@@ -5216,10 +5218,12 @@ class SignalDispatcher:
         """Own recovered claim admission and its original journal through join."""
         if _journal_completion is not None and (type(_journal_completion) is not list or _journal_completion):
             raise TypeError('Original resident journal handoff requires a fresh native slot')
+        if _journal_completion is None:
+            _journal_completion = []
         from kestrel_sovereign._async_ownership import OwnedTaskAdmission
         from contextlib import nullcontext
         routing_admission = _routing_admission if _routing_admission is not None else OwnedTaskAdmission()
-        guard = (self._own_unrouted_cognition_claim(delivery, routing_admission)
+        guard = (self._own_unrouted_cognition_claim(delivery, routing_admission, journal_completion=_journal_completion)
                  if _routing_admission is None else nullcontext())
         async with guard, self._admit_durable_operation():
             token = self._original_outcome_admission.set(None)
@@ -5278,7 +5282,7 @@ class SignalDispatcher:
                 self._deferred_outcome_logs.reset(deferred_token)
 
     @asynccontextmanager
-    async def _own_unrouted_cognition_claim(self, delivery, routing_admission):
+    async def _own_unrouted_cognition_claim(self, delivery, routing_admission, *, journal_completion=()):
         """One exact-token owner from claim admission to physical route publication.
 
         Before publication there is no retained child/done callback to settle
@@ -5286,26 +5290,33 @@ class SignalDispatcher:
         withdrawal) must therefore finish its native release here. Once an
         actual Task exists, the established route settlement owns that token.
         """
+        def retain(error):
+            for journal in journal_completion:
+                error = journal.retain_observation(error)
+            return error
         try:
             yield
         except BaseException as error:
             if routing_admission.task is not None:
-                raise
+                raise retain(error)
             try:
                 if is_execution_control_error(error):
                     await self._terminalize_failed_cognition(delivery, error)
                 else:
                     await self._release_retained_durable_cognition_task(delivery, observe_failure=True)
             except BaseException as cleanup:
-                raise execution_observation_error(error, cleanup) from None
-            raise
+                raise retain(execution_observation_error(error, cleanup)) from None
+            raise retain(error)
         else:
             if routing_admission.task is None:
                 # Ordinary refusal paths can return a FAILED/HOLD result.
                 # Their original-token CAS is idempotent if that path already
                 # settled the delivery; no unowned live lease may escape just
                 # because the public result was returned rather than raised.
-                await self._release_retained_durable_cognition_task(delivery, observe_failure=True)
+                try:
+                    await self._release_retained_durable_cognition_task(delivery, observe_failure=True)
+                except BaseException as cleanup:
+                    raise retain(cleanup)
 
     async def _execute_original_claimed_durable_cognition(
         self, signal, registration, start, *, delivery, consumer_id,

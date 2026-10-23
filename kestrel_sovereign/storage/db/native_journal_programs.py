@@ -542,11 +542,12 @@ else:
 
     class NativeJournalPostgresConnection(asyncpg.Connection):
         """Pass as asyncpg.create_pool(connection_class=...) for native journals."""
-        __slots__ = ('_journal_programs_configured', '_journal_program_seal', '_journal_cancel_connection', '_journal_tls_policy_seal')
+        __slots__ = ('_journal_programs_configured', '_journal_program_seal', '_journal_program_completion', '_journal_cancel_connection', '_journal_tls_policy_seal')
 
         def __init__(self, *args, **kwargs):
             self._journal_programs_configured = False
             self._journal_program_seal = None
+            self._journal_program_completion = None
             self._journal_cancel_connection = None
             self._journal_tls_policy_seal = None
             super().__init__(*args, **kwargs)
@@ -620,7 +621,8 @@ else:
             seal = self._journal_program_seal
             if seal is None:
                 return
-            owner, _, completion = seal
+            owner, _ = seal
+            completion = self._journal_program_completion
             if owner is asyncio.current_task():
                 raise NativeJournalConfigurationError('Original journal cannot reenter its native session')
             from kestrel_sovereign._async_ownership import await_owned_task
@@ -643,7 +645,8 @@ else:
                 policy.__exit__(None, None, None)
                 raise
             self._journal_tls_policy_seal = policy
-            self._journal_program_seal = (asyncio.current_task(), native_state, completion)
+            self._journal_program_completion = completion
+            self._journal_program_seal = (asyncio.current_task(), native_state)
 
         def _retire_original_journal_refusal(self):
             # Refusing application configuration must not execute it during
@@ -670,16 +673,18 @@ else:
         def _end_original_journal(self):
             if self._journal_program_seal is None:
                 return False
-            owner, native_state, completion = self._journal_program_seal
+            owner, native_state = self._journal_program_seal
+            completion = self._journal_program_completion
             if owner is not asyncio.current_task():
                 raise NativeJournalConfigurationError('Only the original native journal owner can release its program fence')
+            retirement = native_state.retirement.owner
+            if not self.is_closed() and (retirement is None or not retirement.done()):
+                return False  # Keep an unresolved original retirement sealed.
             try:
-                retirement = native_state.retirement.owner
-                if not self.is_closed() and (retirement is None or not retirement.done()):
-                    return False  # Keep an unresolved original retirement sealed.
                 self._journal_tls_policy_seal.__exit__(None, None, None)
                 self._journal_tls_policy_seal = None
                 self._journal_program_seal = None
+                self._journal_program_completion = None
                 self._journal_cancel_connection = None
                 return True
             finally:

@@ -424,7 +424,7 @@ async def test_cancelled_unstarted_public_resident_settles_original_claim(tmp_pa
         assert accepted and all(task.done() for task in accepted) and not effects
         assert outcome.error is not None
         delivery, = await dispatcher.list_durable_deliveries()
-        assert delivery.status == RETRY and delivery.lease_token is None, 'unstarted accepted resident abandoned its actual native claim'
+        assert delivery.status == RETRY and delivery.lease_expires_at is None, 'unstarted accepted resident abandoned its actual native claim'
     finally:
         loop.set_task_factory(previous)
         if handle is not None:
