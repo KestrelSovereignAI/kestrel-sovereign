@@ -528,6 +528,69 @@ async def test_sqlite_journal_binds_exact_native_projection_text(dispatcher_comp
     assert not adapted
 
 
+async def test_sqlite_journal_never_adapts_after_native_prepare_started(tmp_path, monkeypatch):
+    import sqlite3
+    import threading
+    from kestrel_sovereign.storage.db.native_journal_programs import _NativeJournalSQLiteConnection
+    from kestrel_sovereign.execution_custody import is_execution_control_error
+    from tests.unit.test_durable_signal_delivery import _channel_dispatcher, _close
+    loop = asyncio.get_running_loop()
+    preparing, release = asyncio.Event(), threading.Event()
+    armed, paused, adapted, effects = [], [], [], []
+    authorize = _NativeJournalSQLiteConnection._original_journal_catalog_authorizer
+    def actual_prepare(connection, action, name, value, database, source):
+        result = authorize(connection, action, name, value, database, source)
+        if armed and not paused and action == sqlite3.SQLITE_INSERT and name == 'signal_log':
+            paused.append(True)
+            loop.call_soon_threadsafe(preparing.set)
+            assert release.wait(5), 'original native preparation barrier was not released'
+        return result
+    monkeypatch.setattr(_NativeJournalSQLiteConnection, '_original_journal_catalog_authorizer', actual_prepare)
+    backend, agent, dispatcher = await _channel_dispatcher(tmp_path / 'adapter-race.db', 'did:agent:adapter-race')
+    other = sqlite3.connect(tmp_path / 'independent-adapter-effect.db', check_same_thread=False)
+    other.execute('CREATE TABLE forbidden_effect(value INTEGER)').close()
+    other.commit()
+    key, missing = (str, sqlite3.PrepareProtocol), object()
+    before = sqlite3.adapters.get(key, missing)
+    def application_adapter(value):
+        adapted.append('actual application adapter after cutoff')
+        other.execute('INSERT INTO forbidden_effect VALUES(1)').close()
+        other.commit()  # Independent real commit cannot be undone by journal rollback.
+        return value
+    scope = ExecutionCustody(_OriginalWork())
+    async def handler(payload):
+        effects.append('genuine original handler effect')
+        scope.revoke('actual cutoff before terminal native preparation')
+        armed.append(True)
+        return {'genuine': True}
+    dispatcher._registry.register(_action_reg('native.adapter.race', handler=handler))
+    task = None
+    try:
+        with bind_execution_runtime(SimpleNamespace(_execution_custody=scope)):
+            task = asyncio.create_task(dispatcher.dispatch_signal(_signal('native.adapter.race')))
+            await asyncio.wait_for(preparing.wait(), 3)
+            sqlite3.register_adapter(str, application_adapter)
+            release.set()
+            await await_owned_task(task)
+        assert paused and effects == ['genuine original handler effect']
+        assert not adapted, 'global adapter registered during native prepare executed privileged application code'
+        assert other.execute('SELECT COUNT(*) FROM forbidden_effect').fetchone() == (0,)
+    finally:
+        release.set()
+        if task is not None:
+            await await_owned_task(task)
+        if before is missing:
+            sqlite3.adapters.pop(key, None)
+        else:
+            sqlite3.adapters[key] = before
+        try:
+            await dispatcher.shutdown_durable_delivery()
+        except BaseException as cleanup:
+            assert is_execution_control_error(cleanup)
+        await _close(backend, agent)
+        other.close()
+
+
 async def test_sqlite_journal_refuses_registered_native_scalar_adapter(dispatcher_components):
     import sqlite3
     from kestrel_sovereign.execution_custody import is_execution_control_error
