@@ -576,7 +576,7 @@ async def enter_feature_lifecycle_safe_mode(agent: object, reason: str, *errors,
         and all(error is not prior for prior in withdrawals)
     )
     terminal = execution_terminal_error(
-        agent._feature_lifecycle_control, *controls, *withdrawals, retain_originals=True,
+        agent._feature_lifecycle_control, *withdrawals, retain_originals=True,
         isolate_control_originals=True,
     )
     if terminal is not None:
