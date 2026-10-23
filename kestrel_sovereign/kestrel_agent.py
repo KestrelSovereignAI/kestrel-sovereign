@@ -7559,9 +7559,7 @@ class KestrelAgent(
 
         # Surface the failure only AFTER every independent cleanup step ran.
         if errors:
-            raise execution_terminal_error(
-                *errors, retain_originals=True, isolate_control_originals=True,
-            )
+            raise execution_observation_error(*errors)
         return reported
 
     def _hold_feature(self, feature: "Feature") -> None:
