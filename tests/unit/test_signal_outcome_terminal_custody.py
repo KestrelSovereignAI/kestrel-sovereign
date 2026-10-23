@@ -381,6 +381,51 @@ async def test_terminal_selection_never_calls_application_id_equality(dispatcher
     assert await c.backend.fetch_val('SELECT COUNT(*) FROM signal_log WHERE id=?', (identity,)) == 1
 
 
+async def test_recovered_terminal_selection_uses_native_identity(tmp_path, monkeypatch):
+    import time
+    from kestrel_sovereign.signals import DurableConsumerRegistration
+    from tests.unit.test_durable_signal_delivery import _channel_signal
+    from kestrel_sovereign.signals.sources.channels import DURABLE_COGNITION_CONSUMER_ID
+    backend, agent, dispatcher = await _channel_dispatcher(tmp_path / 'recovered-native-selection.db', 'did:agent:selection')
+    consumer = DurableConsumerRegistration(consumer_id=DURABLE_COGNITION_CONSUMER_ID,
+        source='channel.message', agent_id=agent.did, max_attempts=0)
+    comparisons, recovered = [], []
+    class UnequalText(str):
+        __hash__ = str.__hash__
+        def __eq__(self, other):
+            comparisons.append('application equality after recovered cognition')
+            return False
+    recover = dispatcher._signal_for_durable_retry
+    async def observe_recovery(*args, **kwargs):
+        signal = await recover(*args, **kwargs)
+        recovered.append(signal)
+        return signal
+    monkeypatch.setattr(dispatcher, '_signal_for_durable_retry', observe_recovery)
+    async def cognition(prompt):
+        recovered[0].id = UnequalText(recovered[0].id)
+        return 'genuinely completed cognition'
+    agent.process_input = cognition
+    try:
+        await dispatcher.register_durable_consumer(consumer)
+        original = _channel_signal(agent.did, 'native-selection')
+        persisted = await dispatcher._durable_store.persist_signal(original, agent_id=agent.did,
+            source_event_id='native-selection', retention_days=7,
+            caller_identity=dispatcher._protect_durable_caller_identity(original))
+        delivery = await dispatcher.claim_durable_delivery_for_event(consumer_id=consumer.consumer_id,
+            event_id=persisted.event_id, executor_id=dispatcher._durable_delivery_owner)
+        seed = dispatcher._durable_retry_seed(delivery.event)
+        result = await dispatcher._route_durable_cognition_delivery(seed,
+            dispatcher._registry.get(seed.source), time.monotonic(), persisted_event_id=delivery.event_id,
+            consumer_id=consumer.consumer_id, durable_admission=None, durable_created=False,
+            use_live_signal=False, claimed_delivery=delivery)
+        assert result.status.value == 'ok'
+        assert not comparisons, 'recovered terminal selection executed application equality'
+        assert await backend.fetch_val('SELECT COUNT(*) FROM signal_log WHERE id=?', (seed.id,)) == 1
+    finally:
+        await dispatcher.shutdown_durable_delivery()
+        await _close(backend, agent)
+
+
 @pytest.mark.parametrize('shape', ['expression_index', 'predicate_index', 'predicate_comment', 'check', 'check_comment'])
 async def test_sqlite_journal_rejects_executable_schema_before_routing(dispatcher_components, shape):
     from kestrel_sovereign.execution_custody import is_execution_control_error

@@ -167,6 +167,72 @@ def _owned_tls_contexts(tmp_path, name):
     return server_context, client_context, cert_path
 
 
+@pytest.mark.parametrize('change', ['roots', 'ciphers', 'property'])
+def test_native_tls_policy_seals_public_mutations_and_tracks_restoration(tmp_path, change):
+    from kestrel_sovereign.storage.db.native_journal_programs import (
+        _adopt_native_tls_context, _native_tls_policy_generation, _OriginalNativeTLSPolicy,
+    )
+    _, context, cert = _owned_tls_contexts(tmp_path, 'native-policy.invalid')
+    _adopt_native_tls_context(context)
+    generation = _native_tls_policy_generation(context)
+    def mutate():
+        if change == 'roots':
+            context.load_verify_locations(cafile=str(cert))
+        elif change == 'ciphers':
+            context.set_ciphers('DEFAULT')
+        else:
+            context.minimum_version = context.minimum_version
+    with _OriginalNativeTLSPolicy(context, generation):
+        with pytest.raises(NativeJournalConfigurationError, match='sealed'):
+            mutate()
+        assert _native_tls_policy_generation(context) == generation
+    mutate()  # Ordinary native customization still works outside the seal.
+    assert _native_tls_policy_generation(context) > generation
+    with pytest.raises(NativeJournalConfigurationError, match='changed'):
+        _OriginalNativeTLSPolicy(context, generation)
+
+
+def test_native_tls_failed_mutation_and_program_registration_are_monotonic(tmp_path):
+    import ssl
+    from kestrel_sovereign.storage.db.native_journal_programs import (
+        _adopt_native_tls_context, _native_tls_policy_generation, _OriginalNativeTLSPolicy,
+    )
+    _, context, _ = _owned_tls_contexts(tmp_path, 'native-policy.invalid')
+    _adopt_native_tls_context(context)
+    generation = _native_tls_policy_generation(context)
+    with pytest.raises(ValueError):
+        context.verify_mode = ssl.CERT_NONE  # check_hostname remains true.
+    assert context.check_hostname and context.verify_mode == ssl.CERT_REQUIRED
+    with pytest.raises(NativeJournalConfigurationError, match='changed'):
+        _OriginalNativeTLSPolicy(context, generation)
+    with pytest.raises(ValueError, match='TLS_CLIENT'):
+        context.set_servername_callback(None)
+    with pytest.raises(NativeJournalConfigurationError, match='application programs'):
+        _native_tls_policy_generation(context)
+
+
+def test_native_tls_policy_observation_does_not_wait_for_mutator_thread(tmp_path):
+    import threading
+    from kestrel_sovereign.storage.db.native_journal_programs import _adopt_native_tls_context, _native_tls_policy_generation
+    _, context, _ = _owned_tls_contexts(tmp_path, 'native-policy.invalid')
+    _adopt_native_tls_context(context)
+    entered, release = threading.Event(), threading.Event()
+    def hold_mutation_lock():
+        with context._native_journal_tls_lock:
+            entered.set()
+            release.wait(5)
+    thread = threading.Thread(target=hold_mutation_lock)
+    thread.start()
+    try:
+        assert entered.wait(5)
+        with pytest.raises(NativeJournalConfigurationError, match='mutation is in progress'):
+            _native_tls_policy_generation(context)
+    finally:
+        release.set()
+        thread.join(5)
+    assert not thread.is_alive()
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize('upgrade', [False, True])
 async def test_original_numeric_peer_preserves_actual_tls_hostname(tmp_path, upgrade):

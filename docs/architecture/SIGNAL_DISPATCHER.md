@@ -935,6 +935,17 @@ The independently observed TLS hostname is retained for certificate verification
 and SNI while dialing that numeric peer, for both direct TLS and STARTTLS. A
 connection-local native-loop delegate changes no global resolver. Native query
 cancellation on returned TLS sessions still joins and retires its actual Task.
+Cancellation uses the actual admitted TLS context with plaintext fallback
+disabled, even if the ordinary recipe originally used `allow` or `prefer`.
+The native connection tracks its driver-created TLS policy before application
+exposure. Every public policy setter/mutator advances a monotonic generation;
+restoring a value or a failed mutation cannot restore an earlier receipt.
+Original handshake and transaction/reset seals refuse mutation before native
+processing. Concurrent in-progress policy mutation is refused, not waited on by
+the journal observer. Application TLS callback/class programs are unsupported.
+An otherwise healthy sibling with a different loaded context is retired and
+reconnected through the same bounded pool with the admitted policy; trust-object
+identity is not weakened or inferred from a partial public fingerprint.
 Refusing a customized session clears its application observer/listener state
 before native termination; refusal cannot launch a termination listener as new
 application work after cutoff. Ordinary non-journal termination is unchanged.
@@ -942,13 +953,20 @@ application work after cutoff. Ordinary non-journal termination is unchanged.
 Startup authentication parameters are not the current SQL principal. Original
 admission captures the actual effective user, session user, role and session
 authorization; the sealed terminal checkout must still match them before any
-transaction/INSERT. Native pool reset explicitly resets SESSION AUTHORIZATION
+transaction/INSERT. The same captured session facts include the effective
+`synchronous_commit` setting, not merely startup arguments, so role/database
+default changes cannot silently weaken a replacement session's commit policy.
+Native pool reset explicitly resets SESSION AUTHORIZATION
 and ROLE as well as ordinary settings, since PostgreSQL RESET ALL excludes both.
 Actual rollback/reset observation preserves caller cancellation alongside an
 ordinary SQL error in a finite observation carrier. Healthy physical retirement
 is not fabricated commit uncertainty, and audit-loss handling cannot swallow
 that withdrawal. Accepted signal identity uses canonical native text/enum values,
 never application string equality or hashing as evidence.
+This includes terminal-outcome selection and recovered-claim admission. All
+recovered identity/mode validation and acceptance construction occur inside the
+exact-token cleanup boundary before any routing task can start. Failed cleanup
+retains its original lease debt and cannot be reported as successful settlement.
 
 SQLite admission also captures its actual journal/synchronous/full-fsync/WAL
 checkpoint configuration. The original native relation checks compare that
