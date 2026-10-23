@@ -616,6 +616,7 @@ async def test_sqlite_program_seal_is_atomic_with_public_text_factory(tmp_path, 
     checking, attempted, setter_done = threading.Event(), threading.Event(), threading.Event()
     armed, callbacks, effects, refused = [], [], [], []
     supported = _NativeJournalSQLiteConnection._original_journal_programs_supported
+    begin = _NativeJournalSQLiteConnection._begin_original_journal
     def actual_profile_checked(native):
         allowed = supported(native)
         if (armed and not checking.is_set() and allowed
@@ -626,7 +627,17 @@ async def test_sqlite_program_seal_is_atomic_with_public_text_factory(tmp_path, 
             # setter waits until the native owner has installed its seal.
             setter_done.wait(0.25)
         return allowed
+    def actual_seal_installed(native, *args, **kwargs):
+        result = begin(native, *args, **kwargs)
+        if armed and checking.is_set():
+            # The inner eligibility/seal lock is released here, but real
+            # BEGIN is still active. Let the waiting setter actually acquire
+            # that lock before COMMIT can retire the original seal. Scheduler
+            # delay after the 250ms eligibility probe is not a guard failure.
+            assert setter_done.wait(5), 'public setter never observed the active native seal'
+        return result
     monkeypatch.setattr(_NativeJournalSQLiteConnection, '_original_journal_programs_supported', actual_profile_checked)
+    monkeypatch.setattr(_NativeJournalSQLiteConnection, '_begin_original_journal', actual_seal_installed)
     backend, agent, dispatcher = await _channel_dispatcher(tmp_path / 'text-factory-race.db', 'did:agent:text-factory-race')
     independent = sqlite3.connect(tmp_path / 'independent-factory-effect.db', check_same_thread=False)
     independent.execute('CREATE TABLE forbidden_effect(value INTEGER)')
