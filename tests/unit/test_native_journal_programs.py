@@ -8,6 +8,72 @@ from kestrel_sovereign.storage.db.native_journal_programs import (
 )
 
 
+@pytest.mark.parametrize('value', [None, -(2 ** 63), 2 ** 63 - 1, 1.25, -0.0,
+    float('inf'), float('-inf'), float('nan'), '', "quote' and ?; DROP TABLE kept; --\0雪", b'', b"'\x00\xff"])
+def test_original_sqlite_literal_values_match_native_binding(value):
+    import math
+    from kestrel_sovereign.storage.db.native_journal_programs import _original_sqlite_query
+    native = _NativeJournalSQLiteConnection(':memory:')
+    reference = sqlite3.connect(':memory:')
+    try:
+        native.execute('CREATE TABLE kept(value TEXT)').close()
+        native.commit()
+        expected = reference.execute('SELECT typeof(?), ?', (value, value)).fetchone()
+        compiled = _original_sqlite_query('SELECT typeof(?), ?', (value, value), 100000)
+        assert reference.execute(compiled).fetchone() == expected
+        native._begin_original_journal()
+        actual = native.execute('SELECT typeof(?), ?', (value, value)).fetchone()
+        assert actual == expected
+        if type(value) is float and value == 0:
+            assert math.copysign(1, actual[1]) == math.copysign(1, expected[1])
+        assert native.execute('SELECT COUNT(*) FROM kept').fetchone() == (0,)
+        native.rollback()
+    finally:
+        native.close()
+        reference.close()
+
+
+@pytest.mark.parametrize('value', [2 ** 63, -(2 ** 63) - 1, '\ud800', True, object()])
+def test_original_sqlite_literal_compiler_refuses_noncanonical_or_unrepresentable_data(value):
+    from kestrel_sovereign.storage.db.native_journal_programs import _original_sqlite_query
+    with pytest.raises((OverflowError, UnicodeEncodeError, NativeJournalConfigurationError)):
+        _original_sqlite_query('SELECT ?', (value,), 1000)
+    native = _NativeJournalSQLiteConnection(':memory:')
+    try:
+        native._begin_original_journal()
+        with pytest.raises((OverflowError, UnicodeEncodeError, NativeJournalConfigurationError)):
+            native.execute('SELECT ?', (value,))
+        native.rollback()
+    finally:
+        native.close()
+
+
+def test_original_sqlite_literal_compiler_respects_native_statement_bound():
+    from kestrel_sovereign.storage.db.native_journal_programs import _original_sqlite_query
+    with pytest.raises(sqlite3.DataError):
+        _original_sqlite_query('SELECT ?', ('too long',), 16)
+
+
+def test_original_sqlite_float_literals_preserve_native_ieee_values():
+    import math
+    import random
+    import struct
+    from kestrel_sovereign.storage.db.native_journal_programs import _original_sqlite_query
+    generator = random.Random(0)
+    values = [struct.unpack('!d', generator.getrandbits(64).to_bytes(8, 'big'))[0] for _ in range(2048)]
+    for exponent in (-1074, -1073, -1022, -1000, -1, 0, 1, 1022, 1023):
+        value = math.ldexp(1.0, exponent)
+        values.extend((value, -value, math.nextafter(value, 0), math.nextafter(value, math.inf)))
+    with sqlite3.connect(':memory:') as reference:
+        for value in values:
+            if not math.isfinite(value):
+                continue
+            expected = reference.execute('SELECT ?', (value,)).fetchone()[0]
+            query = _original_sqlite_query('SELECT ?', (value,), 10000)
+            actual = reference.execute(query).fetchone()[0]
+            assert struct.pack('!d', actual) == struct.pack('!d', expected), value.hex()
+
+
 def _owned_tls_contexts(tmp_path, name):
     import ssl
     from datetime import datetime, timedelta, timezone

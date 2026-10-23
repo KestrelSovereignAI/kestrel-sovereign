@@ -1050,6 +1050,18 @@ from their actual string storage before binding/truncation. Verification cannot
 repeat an application adaptation to certify a substituted value. Writer indexing,
 completion and draining use the captured scheduling identity, never a public
 Signal's ID after an emitter mutates it.
+The global SQLite adapter registry can change while native preparation releases
+the GIL, so checking it before parameter binding is not an atomic fence. Fixed
+Core-owned positional journal/proof/catalog SQL instead compiles exact native scalars
+to bounded native literals and executes with zero bound parameters. UTF-8 text
+uses hex BLOB CAST to TEXT, BLOBs use hex, integer bounds and native float/NULL
+semantics are retained. Application text never becomes executable SQL, including
+quotes, placeholder characters, NUL and Unicode. The native statement-length
+limit bounds the compiled query. A late global adapter cannot be invoked by
+binding; ordinary unsealed database execution retains standard parameterization.
+Finite floats use an exact 53-bit integer mantissa and at most19 exact binary
+scaling steps, avoiding decimal-parser rounding differences; signed zero,
+infinities and SQLite's NaN-to-NULL behavior retain their native semantics.
 
 At the real public/recovery return boundary, native journals detach terminal
 result data before invoking projections. A callback retaining the handler's

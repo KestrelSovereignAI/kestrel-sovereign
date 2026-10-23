@@ -2219,6 +2219,7 @@ class SQLiteBackend(DatabaseBackend):
     async def _read_original_signal_outcome_relation(self, journal, *, capture=False):
         from kestrel_sovereign.signals.outcome_custody import _OriginalSignalOutcome, _JOURNAL_ADMISSION
         from kestrel_sovereign.signals.store import _OUTCOME_COLUMNS
+        from kestrel_sovereign.storage.db.native_journal_programs import _original_sqlite_query
         if type(capture) is not bool or type(journal) is not _OriginalSignalOutcome:
             raise ExecutionAuthorityError('Original SQLite journal metadata owner required')
         def require_owner():
@@ -2272,7 +2273,9 @@ class SQLiteBackend(DatabaseBackend):
                     if any(item[5] and (item[1] < 0 or item[4] != 'BINARY') for item in cursor.fetchall()):
                         return None
                     if index[4]:
-                        cursor.execute("SELECT sql FROM main.sqlite_schema WHERE type='index' AND name=?", (index[1],))
+                        cursor.execute(_original_sqlite_query(
+                            "SELECT sql FROM main.sqlite_schema WHERE type='index' AND name=?", (index[1],),
+                            sqlite3.Connection.getlimit(native, sqlite3.SQLITE_LIMIT_SQL_LENGTH)))
                         sql = cursor.fetchone()[0]
                         if not re.fullmatch(r'CREATE\s+INDEX(?:\s+IF\s+NOT\s+EXISTS)?\s+idx_signal_log_constitution_hash\s+ON\s+signal_log\s*\(\s*constitution_hash\s*\)\s+WHERE\s+constitution_hash\s+IS\s+NOT\s+NULL\s*', sql, re.IGNORECASE):
                             return None

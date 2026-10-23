@@ -7,6 +7,7 @@ not SQL executors or grants of work authority.
 """
 import asyncio
 import ipaddress
+import math
 import sqlite3
 from contextvars import ContextVar
 
@@ -84,6 +85,66 @@ def _register_program(connection):
     connection._journal_programs_configured = True
 
 
+def _original_sqlite_query(query, parameters, sql_limit):
+    """Encode ONLY the Core-owned fixed positional journal SQL as native data.
+
+    CPython's parameter adapter lookup can race global register_adapter while
+    prepare releases the GIL. These exact scalar literals leave ZERO native
+    binds, so that process-global registry cannot execute a callback here.
+    Text is UTF-8 hex CAST, never quoted application SQL; BLOBs are hex too.
+    Ordinary database execution does not use this private journal compiler.
+    """
+    if type(query) is not str or type(parameters) is not tuple:
+        raise NativeJournalConfigurationError('Original journal requires fixed native SQL and values')
+    parts = str.split(query, '?')
+    if len(parts) != len(parameters) + 1:
+        raise NativeJournalConfigurationError('Original journal requires fixed positional placeholders')
+    remaining = sql_limit - sum(len(part.encode('utf-8')) for part in parts)
+    literals = []
+    for value in parameters:
+        kind = type(value)
+        if value is None:
+            literal = 'NULL'
+        elif kind is int:
+            if not -(2 ** 63) <= value < 2 ** 63:
+                raise OverflowError('Python int too large to convert to SQLite INTEGER')
+            literal = int.__repr__(value)
+        elif kind is float:
+            if math.isnan(value):
+                literal = 'NULL'  # sqlite3_bind_double maps NaN to NULL.
+            elif math.isinf(value):
+                literal = '9e999' if value > 0 else '-9e999'
+            elif value == 0:
+                literal = '-0.0' if math.copysign(1, value) < 0 else '0.0'
+            else:
+                # SQLite's decimal parser can differ from the original IEEE
+                # value by one ULP. Exact 53-bit mantissa and powers of two
+                # avoid that parser, with <=19 bounded exact binary steps.
+                mantissa, exponent = math.frexp(value)
+                coefficient = int(math.ldexp(mantissa, 53))
+                exponent -= 53
+                terms = ['CAST(' + int.__repr__(coefficient) + ' AS REAL)']
+                while exponent:
+                    shift = min(abs(exponent), 62)
+                    terms.append((' * ' if exponent > 0 else ' / ')
+                        + 'CAST(' + int.__repr__(1 << shift) + ' AS REAL)')
+                    exponent += -shift if exponent > 0 else shift
+                literal = '(' + ''.join(terms) + ')'
+        elif kind is str or kind is bytes:
+            encoded = str.encode(value, 'utf-8') if kind is str else value
+            prefix, suffix = ("CAST(X'", "' AS TEXT)") if kind is str else ("X'", "'")
+            if len(encoded) * 2 + len(prefix) + len(suffix) > remaining:
+                raise sqlite3.DataError('Original journal exceeds native statement length limit')
+            literal = prefix + bytes.hex(encoded) + suffix
+        else:
+            raise NativeJournalConfigurationError('Original journal binds only plain native scalar parameters')
+        remaining -= len(literal)
+        if remaining < 0:
+            raise sqlite3.DataError('Original journal exceeds native statement length limit')
+        literals.append(literal)
+    return ''.join(part + literal for part, literal in zip(parts, literals)) + parts[-1]
+
+
 class _NativeJournalSQLiteCursor(sqlite3.Cursor):
     def execute(self, query, parameters=()):
         native = self.connection
@@ -93,6 +154,9 @@ class _NativeJournalSQLiteCursor(sqlite3.Cursor):
                     or any(not _has_exact_native_type(value, type(None), int, float, str, bytes) for value in parameters)
                     or any((type(value), sqlite3.PrepareProtocol) in sqlite3.adapters for value in parameters)):
                 raise NativeJournalConfigurationError('Original journal binds only plain native scalar parameters')
+            query = _original_sqlite_query(query, parameters,
+                sqlite3.Connection.getlimit(native, sqlite3.SQLITE_LIMIT_SQL_LENGTH))
+            return super().execute(query)  # Zero native binds: no global adapter dispatch.
         return super().execute(query, parameters)
 
 
