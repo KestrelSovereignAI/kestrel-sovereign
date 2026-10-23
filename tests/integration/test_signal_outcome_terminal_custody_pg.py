@@ -200,6 +200,16 @@ async def test_postgres_pinned_peer_keeps_native_tls_identity_on_reconnect(dispa
     from tests.unit.test_signal_outcome_terminal_custody import _OriginalWork
     from tests.unit.test_signals_dispatcher import _action_reg, _signal
     c = dispatcher_components
+    from kestrel_sovereign.storage.db.native_journal_programs import NativeJournalPostgresConnection
+    original_cancel = NativeJournalPostgresConnection._cancel
+    cancellation_requested = asyncio.Event()
+    cancellation_owners = []
+    async def observed_cancel(connection, waiter):
+        if journal_cancel and connection._journal_program_seal is not None:
+            cancellation_owners.append(asyncio.current_task())
+            cancellation_requested.set()
+        return await original_cancel(connection, waiter)
+    monkeypatch.setattr(NativeJournalPostgresConnection, '_cancel', observed_cancel)
     _, control, schema = native_pg
     target = control._transport.get_extra_info('peername')[:2]
     alias = 'original-journal-peer.invalid'
@@ -218,10 +228,21 @@ async def test_postgres_pinned_peer_keeps_native_tls_identity_on_reconnect(dispa
     original_pool = c.backend._pool
     pool = None
     locked = []
+    release_owner = None
     try:
         pool = await _fresh_journal_pool(original_pool, min_size=1, max_size=1,
             host=alias, port=endpoint[1], ssl='verify-full', direct_tls=direct_tls, timeout=3, command_timeout=1)
         c.backend._pool = pool
+        if journal_cancel:
+            async def release_after_cancellation():
+                await cancellation_requested.wait()
+                await await_owned_task(cancellation_owners[0])
+                # A failed TLS cancellation must not leave our independent
+                # blocker waiting for the query it prevented from finishing.
+                if locked:
+                    await control.execute('ROLLBACK')
+                    locked.clear()
+            release_owner = asyncio.create_task(release_after_cancellation())
         scope = ExecutionCustody(_OriginalWork(backend_type='postgres'))
         async def handler(payload):
             async with pool.acquire() as connection:
@@ -237,6 +258,10 @@ async def test_postgres_pinned_peer_keeps_native_tls_identity_on_reconnect(dispa
         signal = _signal('native.tls.peer')
         with bind_execution_runtime(SimpleNamespace(_execution_custody=scope)):
             outcome = await await_owned_task(asyncio.create_task(c.dispatcher.dispatch_signal(signal)))
+        if journal_cancel:
+            assert cancellation_owners and all(owner.done() for owner in cancellation_owners)
+            released = await await_owned_task(release_owner)
+            assert released.error is None
         assert outcome.error is None, 'numeric peer reconnect lost actual TLS hostname verification'
         assert names == [alias, alias], 'original native admission and terminal reconnect must use the same TLS SNI'
         assert await control.fetchval(f'SELECT COUNT(*) FROM ONLY "{schema}".signal_log WHERE id=$1', signal.id) == int(not journal_cancel)
@@ -268,6 +293,10 @@ async def test_postgres_pinned_peer_keeps_native_tls_identity_on_reconnect(dispa
         c.backend._pool = original_pool
         try:
             try:
+                if release_owner is not None:
+                    if not release_owner.done():
+                        release_owner.cancel()
+                    await await_owned_task(release_owner)
                 if locked:
                     await control.execute('ROLLBACK')
             finally:
