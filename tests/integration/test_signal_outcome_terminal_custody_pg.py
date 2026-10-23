@@ -615,6 +615,9 @@ async def test_original_checkout_recipe_refusal_cannot_run_reset_query_logger(di
     pool = await _fresh_journal_pool(original_pool, min_size=1, max_size=1)
     c.backend._pool = pool
     original_args, original_kwargs = pool._connect_args, dict(pool._connect_kwargs)
+    # Complete ordinary schema initialization before holding the sole slot;
+    # the refusal under test belongs to journal capture, not bootstrap DDL.
+    await c.dispatcher.initialize_durable_delivery()
     scope = ExecutionCustody(_OriginalWork(backend_type='postgres'))
     callbacks, callback_tasks, held, effects = [], [], [], []
     acquire_waiting = asyncio.Event()
