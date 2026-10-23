@@ -390,6 +390,70 @@ async def test_route_publication_join_keeps_actual_caller_withdrawal(tmp_path, m
     await _assert_pre_route_claim(tmp_path, monkeypatch, public_handle, False, 'publication_cancel')
 
 
+@pytest.mark.parametrize('public_handle', [False, True])
+async def test_route_cancelled_publication_keeps_its_original_join_failure(tmp_path, monkeypatch, public_handle):
+    await _assert_pre_route_claim(tmp_path, monkeypatch, public_handle, False, 'publication_cancel_source')
+
+
+@pytest.mark.parametrize('public_handle', [False, True])
+async def test_release_terminalization_keeps_caller_withdrawal_after_real_failed_cas(tmp_path, monkeypatch, public_handle):
+    await _assert_pre_route_claim(tmp_path, monkeypatch, public_handle, True, 'terminal_cancel')
+
+
+async def test_ack_lock_withdrawal_keeps_completed_route_claim_owned(tmp_path, monkeypatch):
+    from kestrel_sovereign._async_ownership import await_owned_task
+    backend, agent, dispatcher = await _channel_dispatcher(tmp_path / 'original-ack-lock.db', 'did:agent:ack-lock')
+    consumer = DurableConsumerRegistration(consumer_id=DURABLE_COGNITION_CONSUMER_ID,
+        source='channel.message', agent_id=agent.did, max_attempts=0)
+    blocker_ready, release, ack_entered, ack_withdrawn = (asyncio.Event() for _ in range(4))
+    blockers, effects = [], []
+    handle = None
+    async def hold_actual_transaction():
+        async with backend.transaction():
+            await backend.execute('INSERT INTO original_ack_blocker VALUES (1)')
+            blocker_ready.set()
+            await release.wait()
+    async def effect(prompt):
+        effects.append(prompt)
+        blockers.append(asyncio.create_task(hold_actual_transaction()))
+        await blocker_ready.wait()
+        return 'genuine completed cognition'
+    agent.process_input = effect
+    original_ack = dispatcher.ack_durable_delivery
+    async def observe_ack(*args, **kwargs):
+        ack_entered.set()
+        try:
+            return await original_ack(*args, **kwargs)
+        except asyncio.CancelledError:
+            ack_withdrawn.set()
+            raise
+    monkeypatch.setattr(dispatcher, 'ack_durable_delivery', observe_ack)
+    try:
+        await backend.execute('CREATE TABLE original_ack_blocker (value INTEGER)')
+        await dispatcher.register_durable_consumer(consumer)
+        handle = await dispatcher.enqueue_durable_cognition(_channel_signal(agent.did, 'original-ack-lock'),
+            source_event_id='original-ack-lock', consumer_id=consumer.consumer_id)
+        await asyncio.wait_for(ack_entered.wait(), 5)
+        assert effects and blockers and not blockers[0].done()
+        handle.task.cancel('actual withdrawal before original ACK obtains native write lock')
+        await asyncio.wait_for(ack_withdrawn.wait(), 5)
+        release.set()
+        for blocker in blockers:
+            assert (await await_owned_task(blocker)).error is None
+        outcome = await await_owned_task(handle.task)
+        assert outcome.error is not None
+        delivery, = await dispatcher.list_durable_deliveries()
+        assert delivery.status == RETRY and delivery.lease_expires_at is None, 'completed routing Task was mistaken for a claim settlement owner during ACK withdrawal'
+    finally:
+        release.set()
+        for blocker in blockers:
+            await await_owned_task(blocker)
+        if handle is not None:
+            await await_owned_task(handle.task)
+        await dispatcher.shutdown_durable_delivery()
+        await _close(backend, agent)
+
+
 async def test_rehydration_release_denial_retains_exact_claim_debt(tmp_path, monkeypatch):
     await _assert_pre_route_claim(tmp_path, monkeypatch, False, False, 'revoked_rehydrate')
 
@@ -452,13 +516,20 @@ async def _assert_pre_route_claim(tmp_path, monkeypatch, public_handle, release_
     entered, release = asyncio.Event(), asyncio.Event()
     task = None
     accepted = []
-    publication_error = RuntimeError('actual route close_unstarted publication refused')
+    publication_error = (asyncio.CancelledError('actual publication-source cancellation')
+                         if phase == 'publication_cancel_source' else
+                         RuntimeError('actual route close_unstarted publication refused'))
+    join_error = RuntimeError('actual original publication reconciliation observer refused')
     loop, previous_factory = asyncio.get_running_loop(), asyncio.get_running_loop().get_task_factory()
     if phase.startswith('publication_'):
         from tests.unit.test_host_context_native_cleanup import _actual_operation
         class RefusePublication(asyncio.Task):
             refused = False
+            join_refused = False
             def add_done_callback(self, callback, *args, **kwargs):
+                if phase == 'publication_cancel_source' and not self.join_refused and getattr(callback, '__name__', '') == 'mark_complete':
+                    self.join_refused = True
+                    raise join_error
                 if not self.refused and getattr(callback, '__name__', '') == 'close_unstarted':
                     self.refused = True
                     if phase == 'publication_after':
@@ -510,7 +581,10 @@ async def _assert_pre_route_claim(tmp_path, monkeypatch, public_handle, release_
                     raise BaseExceptionGroup('actual recovery SQL failure and withdrawal', [native_error, cancellation]) from None
                 raise AssertionError('native duplicate INSERT unexpectedly succeeded')
         recovered = True
-        return replace(_channel_signal(agent.did, 'rehydrated-original'), source=source)
+        signal = replace(_channel_signal(agent.did, 'rehydrated-original'), source=source)
+        if phase == 'terminal_cancel':
+            signal.payload['unsupported_original_admission'] = object()
+        return signal
     agent.rehydrate_durable_cognition_signal = rehydrate
     from kestrel_sovereign import hold as hold_module
     original_hold = hold_module.get_effective_hold_state
@@ -519,6 +593,14 @@ async def _assert_pre_route_claim(tmp_path, monkeypatch, public_handle, release_
             await withdraw_here()
         return await original_hold(*args, **kwargs)
     monkeypatch.setattr(hold_module, 'get_effective_hold_state', hold)
+    if phase == 'terminal_cancel':
+        original_terminal = dispatcher._apply_cognition_control_terminal
+        async def observe_actual_terminal(delivery, error):
+            result = await original_terminal(delivery, error)
+            entered.set()  # The real exact-token FAILED CAS has committed.
+            await release.wait()
+            return result
+        monkeypatch.setattr(dispatcher, '_apply_cognition_control_terminal', observe_actual_terminal)
     for method, selected in [('_begin_durable_cognition_execution', 'begin'), ('_hold_durable_cognition_stop_completion', 'guard')]:
         if phase == selected or (phase == 'begin_failure' and selected == 'begin'):
             original_method = getattr(dispatcher, method)
@@ -537,7 +619,8 @@ async def _assert_pre_route_claim(tmp_path, monkeypatch, public_handle, release_
         persisted = await dispatcher._durable_store.persist_signal(live, agent_id=agent.did,
             source_event_id='cancel-rehydrate-original', retention_days=7, caller_identity=None)
         if release_failure:
-            await backend.execute("CREATE TRIGGER refuse_cancel_recovery_release BEFORE UPDATE ON durable_signal_deliveries WHEN OLD.status='leased' AND NEW.status!='leased' BEGIN SELECT RAISE(ABORT, 'actual cancelled recovery release refused'); END")
+            condition = "NEW.status='retry'" if phase == 'terminal_cancel' else "NEW.status!='leased'"
+            await backend.execute("CREATE TRIGGER refuse_cancel_recovery_release BEFORE UPDATE ON durable_signal_deliveries WHEN OLD.status='leased' AND "+condition+" BEGIN SELECT RAISE(ABORT, 'actual cancelled recovery release refused'); END")
         if public_handle:
             handle = await dispatcher.enqueue_durable_cognition(live,
                 source_event_id='cancel-rehydrate-original', consumer_id=consumer.consumer_id)
@@ -558,6 +641,9 @@ async def _assert_pre_route_claim(tmp_path, monkeypatch, public_handle, release_
             if scope is not None:
                 scope.revoke('actual runtime withdrawal before original claim release')
             task.cancel('actual caller withdrawal during source rehydration')
+            if phase == 'terminal_cancel':
+                await asyncio.sleep(0)
+                release.set()
         outcome = await await_owned_task(task)
         errors = tuple(_explicit_control_chain(outcome.error))
         if phase.startswith('publication_'):
@@ -566,11 +652,19 @@ async def _assert_pre_route_claim(tmp_path, monkeypatch, public_handle, release_
             if phase == 'publication_cancel':
                 assert any(isinstance(error, asyncio.CancelledError) for error in errors), 'actual join withdrawal disappeared from public outcome'
                 assert not isinstance(outcome.error, Exception), 'ordinary publication failure demoted actual withdrawal'
+            if phase == 'publication_cancel_source':
+                assert join_error in errors, 'bare cancellation rethrow discarded actual original join failure'
         elif phase != 'begin_failure':
             assert any(isinstance(error, asyncio.CancelledError) for error in errors)
         elif not release_failure:
             assert outcome.error is None and outcome.result.status == Status.FAILED
-        if phase == 'revoked_rehydrate':
+        if phase == 'terminal_cancel':
+            assert any(isinstance(error, asyncio.CancelledError) for error in errors), 'successful terminalization erased this caller withdrawal'
+            assert not isinstance(outcome.error, Exception), 'terminalizer demoted actual withdrawal into an ordinary failure'
+            row, = await dispatcher.list_durable_deliveries()
+            assert row.status == FAILED and row.lease_expires_at is None
+            assert not dispatcher._retained_cognition_control_debt
+        elif phase == 'revoked_rehydrate':
             from kestrel_sovereign.execution_custody import is_execution_control_error
             assert is_execution_control_error(outcome.error)
             debt = dispatcher._retained_cognition_control_debt.get(delivery.delivery_id)
@@ -587,6 +681,8 @@ async def _assert_pre_route_claim(tmp_path, monkeypatch, public_handle, release_
         release.set()
         if task is not None:
             await await_owned_task(task)
+        if release_failure:
+            await backend.execute('DROP TRIGGER IF EXISTS refuse_cancel_recovery_release')
         await await_owned_task(asyncio.create_task(dispatcher.shutdown_durable_delivery()))
         await _close(backend, agent)
 
