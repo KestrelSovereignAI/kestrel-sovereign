@@ -301,13 +301,17 @@ async def normal_close_schedule(*, prejoined: bool = False):
             try:
                 if owners:
                     await settle(owners, step="settling the original SQLite close/join owners")
+            except BaseException as error:  # noqa: BLE001 - attempt every independent original join
+                failures.append(error)
+            try:
                 worker_joins = [
                     asyncio.create_task(asyncio.to_thread(worker.join, HANG_GUARD_SECONDS))
                     for worker in workers
                 ]
                 await settle(worker_joins, step="joining the original SQLite worker on exceptional exit")
-                for worker in workers:
-                    assert not worker.is_alive(), "original SQLite worker did not retire"
+            except BaseException as error:  # noqa: BLE001 - worker observation cannot skip original reaper harvest
+                failures.append(error)
+            try:
                 retirement_tasks = {
                     retained.retirement_task
                     for retained_closes in retirement_maps
@@ -327,6 +331,11 @@ async def normal_close_schedule(*, prejoined: bool = False):
                 # there is no automatic replacement close or successful ACK.
             except BaseException as error:  # noqa: BLE001 - compose, never hide, physical cleanup failure
                 failures.append(error)
+            for worker in workers:
+                try:
+                    assert not worker.is_alive(), "original SQLite worker did not retire"
+                except BaseException as error:  # noqa: BLE001 - validation follows every mandatory harvest attempt
+                    failures.append(error)
             terminal = execution_observation_error(*failures)
             if terminal is not None:
                 raise terminal

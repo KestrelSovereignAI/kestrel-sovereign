@@ -20,8 +20,9 @@ from pathlib import Path
 import pytest
 
 import kestrel_sovereign.storage.db.sqlite as sqlite_backend_module
-from kestrel_sovereign.async_ownership import await_owned_task
+from kestrel_sovereign.async_ownership import await_owned_operation, await_owned_task
 from kestrel_sovereign.execution_custody import (
+    ExecutionCommitOutcomeError,
     execution_observation_error,
     is_execution_control_error,
 )
@@ -40,12 +41,64 @@ from tests.utils.virtual_clock import (
     pinned_loop_clock,
     wait_for_thread_event,
 )
+from tests.utils.original_failure import OriginalFailure
 
 
-async def _normal_backend_close(backend):
-    connection = backend._ensure_connected()
-    async with normal_close_schedule() as finish:
-        await finish(connection, backend.close(), retained_closes=backend._retired_connection_closes)
+async def _normal_backend_close(backend, *, original_connection=None):
+    """Retire the captured original even if an observer lost backend's pointer.
+
+    The existing normal functional-test schedule owns the SAME close. A
+    different current pointer is never adopted or closed on its authority.
+    Every independent worker/reaper join is attempted before validation.
+    """
+    connection = (
+        backend._ensure_connected()
+        if original_connection is None else original_connection
+    )
+    worker = aiosqlite_worker(connection)
+    failures = []
+    try:
+        async with normal_close_schedule() as finish:
+            operation = (
+                backend.close() if backend._connection is connection else
+                sqlite_backend_module._close_aiosqlite_connection(
+                    connection, retained_closes=backend._retired_connection_closes,
+                )
+            )
+            await finish(connection, operation, retained_closes=backend._retired_connection_closes)
+    except BaseException as error:  # noqa: BLE001 - keep validation and original native cleanup outcomes
+        failures.append(error)
+    finally:
+        try:
+            outcome = await await_within_hang_guard(
+                await_owned_operation(
+                    asyncio.to_thread(worker.join, _HANG_GUARD_SECONDS),
+                    retirement_resource=connection, retain_originals=True,
+                ),
+                step="the captured original primary worker joining on every exit",
+            )
+            failures.extend((outcome.error, outcome.cancellation))
+        except BaseException as error:  # noqa: BLE001 - still harvest the original reaper after a join failure
+            failures.append(error)
+        finally:
+            retained = backend._retired_connection_closes.get(connection)
+            if retained is not None and retained.retirement_task is not None:
+                try:
+                    outcome = await await_within_hang_guard(
+                        await_owned_task(retained.retirement_task),
+                        step="the captured original primary retirement outcome",
+                    )
+                    failures.extend((outcome.error, outcome.cancellation))
+                except BaseException as error:  # noqa: BLE001 - preserve the exact retirement source
+                    failures.append(error)
+    try:
+        assert not worker.is_alive()
+        assert not backend.connection_retirement_pending
+    except BaseException as error:  # noqa: BLE001 - assertions cannot gate independent retirement
+        failures.append(error)
+    terminal = execution_observation_error(*failures)
+    if terminal is not None:
+        raise terminal
 
 # The patched worker-shutdown window. Close budgets add one 10ms poll to it.
 _SHORT_WINDOW_S = 0.05
@@ -256,12 +309,15 @@ async def test_snapshot_close_records_actual_native_and_ack_stages(
                 assert backend._connection is primary
                 if transaction is not None and not transaction.cancelled() and transaction.exception() is None:
                     assert await backend.fetch_one("SELECT value FROM snapshot_probe") == (1,)
-                await await_within_hang_guard(backend.close(), step="the actual primary close")
-                await await_within_hang_guard(asyncio.to_thread(primary_worker.join, _HANG_GUARD_SECONDS), step="the original primary worker join")
-                assert not primary_worker.is_alive()
-                assert not backend.connection_retirement_pending
             except BaseException as error:
                 failures.append(error)
+            finally:
+                try:
+                    await _normal_backend_close(backend, original_connection=primary)
+                    assert not primary_worker.is_alive()
+                    assert not backend.connection_retirement_pending
+                except BaseException as error:
+                    failures.append(error)
             record_property("sqlite_snapshot_close_timeline", json.dumps({
                 "stage": stage, "times": timeline,
                 "primary_id": id(primary), "primary_worker_id": id(primary_worker),
@@ -276,6 +332,188 @@ async def test_snapshot_close_records_actual_native_and_ack_stages(
     terminal = execution_observation_error(*failures)
     if terminal is not None:
         raise terminal
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("fault,stage", [
+    pytest.param("row", "before-native", id="row-before-native"),
+    pytest.param("row", "after-native", id="row-after-native"),
+    pytest.param("row", "worker-exit", id="row-worker-exit"),
+    pytest.param("query", "after-native", id="query-error"),
+    pytest.param("pointer", "after-native", id="original-pointer-lost"),
+    pytest.param("retire", "after-native", id="retirement-observer-error"),
+    pytest.param("late-ordinary", "after-native", id="validation-and-late-close-error"),
+    pytest.param("late-unknown", "after-native", id="validation-and-late-close-unknown"),
+])
+async def test_snapshot_validation_failure_still_retires_original_primary(
+    tmp_path, monkeypatch, record_property, fault, stage,
+):
+    """The counterproof owns the real primary even when the inner test fails.
+
+    The outer reconciliation is explicitly NOT the inner original close ACK.
+    In particular, losing backend._connection must not lose the native owner.
+    """
+    original_connect = _connected_wal_backend
+    original_fetch = SQLiteBackend.fetch_one
+    original_await = await_owned_task
+    original_retire = _retire
+    invoking_task = asyncio.current_task()
+    captured = {}
+    facts = {"fault": fault, "stage": stage, "validation_entries": 0,
+             "inner_primary_close_entries": 0, "outer_reconciliation": False}
+    validation_error = (
+        AssertionError("original retirement observer failed") if fault == "retire"
+        else OSError("original final primary query observation failed")
+    )
+    validation_source = OriginalFailure.capture(validation_error)
+    late_error = (
+        ExecutionCommitOutcomeError("unknown") if fault == "late-unknown"
+        else OSError("original primary close epilogue failed")
+    )
+    late_source = OriginalFailure.capture(late_error)
+    body_failure = None
+    cleanup_failures = []
+    owner_errors = []
+    expected_outcomes_asserted = False
+
+    async def record_backend(path):
+        backend = await original_connect(path)
+        primary = backend._ensure_connected()
+        captured.update(backend=backend, primary=primary,
+                        worker=aiosqlite_worker(primary), real_close=primary.close)
+
+        async def observed_primary_close():
+            facts["inner_primary_close_entries"] += 1
+            captured["primary_close_task"] = asyncio.current_task()
+            await captured["real_close"]()
+            if fault in {"late-ordinary", "late-unknown"}:
+                raise late_error
+
+        monkeypatch.setattr(primary, "close", observed_primary_close)
+        return backend
+
+    async def observe_final_query(backend, query, *args, **kwargs):
+        result = await original_fetch(backend, query, *args, **kwargs)
+        if (backend is captured.get("backend")
+                and asyncio.current_task() is invoking_task
+                and query == "SELECT value FROM snapshot_probe"):
+            assert result == (1,), "fault did not reach the real committed final row"
+            facts["validation_entries"] += 1
+            facts["actual_final_row"] = result
+            if fault == "row":
+                return (2,)
+            raise validation_error
+        return result
+
+    async def observe_original_owner(task, **kwargs):
+        outcome = await original_await(task, **kwargs)
+        if (fault == "pointer" and task.done() and outcome.error is None
+                and getattr(task.get_coro(), "cr_code", None) is not None
+                and task.get_coro().cr_code.co_name == "hold_transaction"):
+            assert captured["backend"]._connection is captured["primary"]
+            assert captured["worker"].is_alive()
+            facts["validation_entries"] += 1
+            captured["backend"]._connection = None
+        return outcome
+
+    async def observe_retirement(*args, **kwargs):
+        await original_retire(*args, **kwargs)
+        if fault == "retire":
+            assert not args[2].is_alive(), "observer fault preceded real snapshot retirement"
+            facts["validation_entries"] += 1
+            raise validation_error
+
+    monkeypatch.setattr(sys.modules[__name__], "_connected_wal_backend", record_backend)
+    monkeypatch.setattr(SQLiteBackend, "fetch_one", observe_final_query)
+    monkeypatch.setattr(sys.modules[__name__], "await_owned_task", observe_original_owner)
+    monkeypatch.setattr(sys.modules[__name__], "_retire", observe_retirement)
+    try:
+        try:
+            if fault == "retire":
+                await test_snapshot_close_reports_primary_journal_mode(tmp_path, monkeypatch)
+            else:
+                await test_snapshot_close_records_actual_native_and_ack_stages(
+                    tmp_path, monkeypatch, record_property, stage,
+                )
+        except BaseException as error:  # noqa: BLE001 - inspect the actual original inner failure
+            captured["inner_error"] = error
+        assert facts["validation_entries"] == 1
+        inner_error = captured["inner_error"]
+        if fault in {"row", "pointer"}:
+            assert isinstance(inner_error, AssertionError)
+        else:
+            validation_source.assert_retained(inner_error)
+        facts["primary_alive_before_outer_reconciliation"] = captured["worker"].is_alive()
+        facts["pointer_is_original_before_outer_reconciliation"] = (
+            captured["backend"]._connection is captured["primary"]
+        )
+        assert not captured["worker"].is_alive(), "validation failure skipped original primary retirement"
+        assert facts["inner_primary_close_entries"] == 1
+        if fault in {"late-ordinary", "late-unknown"}:
+            late_source.assert_retained(inner_error)
+        assert not captured["backend"].connection_retirement_pending
+        expected_outcomes_asserted = True
+    except BaseException as error:  # noqa: BLE001 - keep the regression failure through real outer cleanup
+        body_failure = error
+    finally:
+        if "primary" in captured:
+            backend, primary, worker = captured["backend"], captured["primary"], captured["worker"]
+            try:
+                if worker.is_alive():
+                    # No admitted inner closer may be retried. The canonical
+                    # helper reuses its retained Task if present; otherwise
+                    # this is the outer test owner's FIRST physical close.
+                    async def outer_first_close():
+                        captured["outer_close_task"] = asyncio.current_task()
+                        await captured["real_close"]()
+
+                    monkeypatch.setattr(primary, "close", outer_first_close)
+                    facts["outer_reconciliation"] = True
+                    outcome = await await_within_hang_guard(
+                        await_owned_operation(
+                            sqlite_backend_module._close_aiosqlite_connection(
+                                primary, retained_closes=backend._retired_connection_closes,
+                                close_task=captured.get("primary_close_task"),
+                            ),
+                            retirement_resource=primary, retain_originals=True,
+                        ),
+                        step="counterproof reconciliation of the captured original primary",
+                    )
+                    cleanup_failures.extend((outcome.error, outcome.cancellation))
+            except BaseException as error:  # noqa: BLE001 - join the native worker even after close failure
+                cleanup_failures.append(error)
+            finally:
+                try:
+                    await await_within_hang_guard(
+                        asyncio.to_thread(worker.join, _HANG_GUARD_SECONDS),
+                        step="counterproof original primary worker join",
+                    )
+                    assert not worker.is_alive()
+                except BaseException as error:  # noqa: BLE001 - preserve actual physical cleanup failure
+                    cleanup_failures.append(error)
+            original_close = captured.get("primary_close_task")
+            try:
+                if original_close is not None:
+                    outcome = await await_within_hang_guard(
+                        original_await(original_close), step="counterproof original primary close outcome",
+                    )
+                    owner_errors.extend((outcome.error, outcome.cancellation))
+                assert original_close is None or original_close.done()
+                assert not backend.connection_retirement_pending
+            except BaseException as error:  # noqa: BLE001 - retain late owner/validation errors with the body
+                cleanup_failures.append(error)
+            facts["primary_alive_after_outer_reconciliation"] = worker.is_alive()
+            facts["original_close_task_terminal"] = None if original_close is None else original_close.done()
+            outer_close = captured.get("outer_close_task")
+            facts["outer_close_task_terminal"] = None if outer_close is None else outer_close.done()
+            facts["retirement_pending_after_outer_reconciliation"] = backend.connection_retirement_pending
+        record_property("validation_retirement_counterproof", json.dumps(facts, sort_keys=True))
+        terminal = execution_observation_error(
+            body_failure, *cleanup_failures,
+            *(owner_errors if not expected_outcomes_asserted else ()),
+        )
+        if terminal is not None:
+            raise terminal
 
 
 @pytest.mark.asyncio
@@ -562,9 +800,11 @@ async def test_snapshot_close_reports_primary_journal_mode(
     tmp_path, monkeypatch
 ):
     backend = await _connected_wal_backend(tmp_path / "snapshot.db")
+    primary = backend._ensure_connected()
     snapshot = await backend._open_snapshot_read_connection()
     _entered, release = block_aiosqlite_native_close(snapshot)
     worker = aiosqlite_worker(snapshot)
+    failures = []
     try:
         # Only the deliberately stalled snapshot close has a 60ms budget.
         # Its independently owned primary connection is ordinary teardown,
@@ -577,9 +817,21 @@ async def test_snapshot_close_reports_primary_journal_mode(
                     retained_closes=backend._retired_connection_closes,
                     diagnostics=backend._close_diagnostics(),
                 )
+    except BaseException as error:  # noqa: BLE001 - do not let cleanup replace the original diagnostic failure
+        failures.append(error)
     finally:
-        await _retire(backend, release, worker)
-        await _normal_backend_close(backend)
+        try:
+            await _retire(backend, release, worker)
+        except BaseException as error:  # noqa: BLE001 - retirement observation cannot skip the primary
+            failures.append(error)
+        finally:
+            try:
+                await _normal_backend_close(backend, original_connection=primary)
+            except BaseException as error:  # noqa: BLE001 - compose both independent originals
+                failures.append(error)
+    terminal = execution_observation_error(*failures)
+    if terminal is not None:
+        raise terminal
 
     message = str(raised.value)
     assert "database=snapshot.db" in message

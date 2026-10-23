@@ -58,31 +58,41 @@ async def prejoined_snapshot_case(tmp_path):
         failures.append(error)
     finally:
         try:
-            if worker.is_alive():
-                # A different, explicit TEST cleanup after the assertions,
-                # never an ACK/retry inside finish(). Preserve the original map.
-                outcome = await await_within_hang_guard(
-                    await_owned_operation(
-                        real_close(), retirement_resource=snapshot,
-                        retain_originals=True,
-                    ),
-                    step="test-owner reconciliation of the exact snapshot close",
-                )
-                failures.extend((outcome.error, outcome.cancellation))
-            await await_within_hang_guard(
-                asyncio.to_thread(worker.join, HANG_GUARD_SECONDS),
-                step="test-owner reconciliation of the exact snapshot worker",
-            )
-            assert not worker.is_alive()
-            for record in retained_closes.values():
-                if record.retirement_task is not None:
+            try:
+                if worker.is_alive():
+                    # Explicit TEST reconciliation only; never original ACK.
                     outcome = await await_within_hang_guard(
-                        await_owned_task(record.retirement_task),
-                        step="the canonical original snapshot reaper settling",
+                        await_owned_operation(
+                            real_close(), retirement_resource=snapshot,
+                            retain_originals=True,
+                        ),
+                        step="test-owner reconciliation of the exact snapshot close",
                     )
                     failures.extend((outcome.error, outcome.cancellation))
-        except BaseException as error:  # noqa: BLE001 - do not skip primary retirement on snapshot failure
-            failures.append(error)
+            except BaseException as error:  # noqa: BLE001 - independently join the original worker after close failure
+                failures.append(error)
+            try:
+                await await_within_hang_guard(
+                    asyncio.to_thread(worker.join, HANG_GUARD_SECONDS),
+                    step="test-owner reconciliation of the exact snapshot worker",
+                )
+            except BaseException as error:  # noqa: BLE001 - worker observation cannot skip retained owners
+                failures.append(error)
+            finally:
+                for record in tuple(retained_closes.values()):
+                    if record.retirement_task is not None:
+                        try:
+                            outcome = await await_within_hang_guard(
+                                await_owned_task(record.retirement_task),
+                                step="the canonical original snapshot reaper settling",
+                            )
+                            failures.extend((outcome.error, outcome.cancellation))
+                        except BaseException as error:  # noqa: BLE001 - retain each actual original reaper failure
+                            failures.append(error)
+            try:
+                assert not worker.is_alive()
+            except BaseException as error:  # noqa: BLE001 - validation follows mandatory retirement harvest
+                failures.append(error)
         finally:
             try:
                 outcome = await await_within_hang_guard(
