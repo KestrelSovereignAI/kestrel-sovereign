@@ -100,6 +100,25 @@ async def test_append_writes_redacted_summary(store):
 
 
 @pytest.mark.parametrize('projection', ['redaction', 'summary'])
+async def test_ordinary_append_preserves_callback_input_identity(store, projection):
+    from dataclasses import replace
+    signal = _signal()
+    result = _ok_result(signal)
+    registration = _registration()
+    original = signal.payload if projection == 'redaction' else result.action_result
+    def summarize(value):
+        return 'original input' if value is original else 'copied input'
+    if projection == 'redaction':
+        registration.log_redaction = replace(registration.log_redaction, summarize=summarize)
+    else:
+        registration.result_summary = summarize
+    await store.append(signal, registration, result)
+    column = 'payload_redacted' if projection == 'redaction' else 'result_summary'
+    stored = await store.backend.fetch_val('SELECT '+column+' FROM signal_log WHERE id=?', (signal.id,))
+    assert stored == 'original input', 'ordinary append changed its established callback inputs'
+
+
+@pytest.mark.parametrize('projection', ['redaction', 'summary'])
 async def test_ordinary_append_preserves_registered_subclass_adapter(store, projection):
     import sqlite3
     from dataclasses import replace

@@ -22,9 +22,9 @@ cleanup_pg = _cleanup_pg
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize('entry', ['unregister', 'activation'])
+@pytest.mark.parametrize('entry,earlier', [('unregister', False), ('activation', False), ('unregister', True)])
 async def test_finite_sql_rollback_withdrawal_finishes_independent_feature_cleanup(
-    native_pg, onboarding_owner, monkeypatch, entry,
+    native_pg, onboarding_owner, monkeypatch, entry, earlier,
 ):
     backend, observer, schema = native_pg
     _, agent, database = onboarding_owner
@@ -63,6 +63,14 @@ async def test_finite_sql_rollback_withdrawal_finishes_independent_feature_clean
     feature = Feature(agent)
     if entry == 'unregister':
         await agent._activate_feature_runtime(feature)
+    early_error = OriginalFailure.capture(OSError('actual earlier contribution cleanup failure'))
+    if earlier:
+        runtime = agent._ensure_feature_contribution_runtime()
+        deactivate = runtime.deactivate
+        def fail_deactivate(value):
+            deactivate(value)
+            raise early_error.error
+        monkeypatch.setattr(runtime, 'deactivate', fail_deactivate)
     operation = (agent._unregister_feature_runtime(feature) if entry == 'unregister'
                  else agent._activate_feature_runtime(feature))
     owner = create_owned_task(operation, retain_originals=True)
@@ -81,6 +89,8 @@ async def test_finite_sql_rollback_withdrawal_finishes_independent_feature_clean
             assert opening in chain
         else:
             assert rollbacks[0][2] in chain
+        if earlier:
+            early_error.assert_retained(result.error)
         assert await observer.fetchval(f'SELECT value FROM "{schema}".effects WHERE id=315') == 'original seed'
         assert feature.enabled is False
     finally:
