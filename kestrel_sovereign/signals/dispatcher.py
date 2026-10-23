@@ -1178,6 +1178,7 @@ class SignalDispatcher:
         Execution-authority loss and uncertain commits remain typed errors
         so the owning invocation can reconcile instead of retrying effects."""
         self._require_standalone_native_outcome_entry()
+        from kestrel_sovereign.signals.outcome_custody import _native_identity_text
         if _journal_completion is None:
             _journal_completion = []
         elif type(_journal_completion) is not list or _journal_completion:
@@ -1259,7 +1260,7 @@ class SignalDispatcher:
                 self._deferred_outcome_logs.set(None)
                 journal = self._original_outcome_admission.get()
                 selected = [outcome for outcome in original_outcomes
-                    if outcome.result is result and outcome.signal.id == signal.id
+                    if outcome.result is result and _native_identity_text(outcome.signal.id) == _native_identity_text(signal.id)
                     and outcome.registration is registration]
                 if journal is not None:
                     try:
@@ -5168,6 +5169,7 @@ class SignalDispatcher:
         use_live_signal, retry_delay, durable_admission, persisted_event_id, _journal_completion=None,
     ):
         """Own recovered claim admission and its original journal through join."""
+        from kestrel_sovereign.signals.outcome_custody import _native_identity_text
         if _journal_completion is not None and (type(_journal_completion) is not list or _journal_completion):
             raise TypeError('Original resident journal handoff requires a fresh native slot')
         async with self._admit_durable_operation():
@@ -5191,7 +5193,7 @@ class SignalDispatcher:
                     self._deferred_outcome_logs.set(None)
                     if result is not None:
                         selected = [outcome for outcome in original_outcomes
-                            if outcome.result is result and outcome.signal.id == result.signal_id
+                            if outcome.result is result and _native_identity_text(outcome.signal.id) == _native_identity_text(result.signal_id)
                             and outcome.registration is registration]
                         if journal is not None:
                             try:
@@ -5282,24 +5284,27 @@ class SignalDispatcher:
 
         # Recovery has its own native claim, not a copied public dispatch's
         # permission. Capture the canonical retained envelope before callbacks.
-        if (delivery.agent_id != self._agent.did or delivery.consumer_id != consumer_id
-                or delivery.event_id != persisted_event_id
-                or delivery.lease_owner != self._durable_delivery_owner
-                or not delivery.lease_token):
-            from kestrel_sovereign.execution_custody import ExecutionAuthorityError
-            raise ExecutionAuthorityError('Original recovered cognition claim required')
         from kestrel_sovereign.signals.outcome_custody import (
-            _AcceptedSignalOutcome, _OriginalSignalOutcome, _capture_original_outcome,
+            _AcceptedSignalOutcome, _OriginalSignalOutcome, _capture_original_outcome, _native_identity_text,
         )
-        acceptance = _AcceptedSignalOutcome(asyncio.current_task(),
-            _OriginalSignalOutcome._signal_identity(routing_signal), registration)
-        original_acceptances.append(acceptance)
-        self._accepted_signal_outcomes[acceptance] = None
+        acceptance = None
         try:
+            if (_native_identity_text(delivery.agent_id) != _native_identity_text(self._agent.did)
+                    or _native_identity_text(delivery.consumer_id) != _native_identity_text(consumer_id)
+                    or _native_identity_text(delivery.event_id) != _native_identity_text(persisted_event_id)
+                    or _native_identity_text(delivery.lease_owner) != _native_identity_text(self._durable_delivery_owner)
+                    or not delivery.lease_token):
+                from kestrel_sovereign.execution_custody import ExecutionAuthorityError
+                raise ExecutionAuthorityError('Original recovered cognition claim required')
+            acceptance = _AcceptedSignalOutcome(asyncio.current_task(),
+                _OriginalSignalOutcome._signal_identity(routing_signal), registration)
+            original_acceptances.append(acceptance)
+            self._accepted_signal_outcomes[acceptance] = None
             self._original_outcome_admission.set(await _capture_original_outcome(
                 self, routing_signal, registration, acceptance=acceptance))
         except BaseException as error:
-            self._accepted_signal_outcomes.pop(acceptance, None)
+            if acceptance is not None:
+                self._accepted_signal_outcomes.pop(acceptance, None)
             # No routing Task was admitted, so there is no future completion
             # callback to settle this already-claimed lease. Use the same
             # exact-token terminalization/release as a settled route; never

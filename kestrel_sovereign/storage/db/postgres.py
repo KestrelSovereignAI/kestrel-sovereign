@@ -2337,7 +2337,7 @@ class PostgresBackend(DatabaseBackend):
                     journal.require_original(self)
                     if not journal._postgres_pool.matches_actual_connection(native):
                         raise NativeJournalConfigurationError('Original native PostgreSQL endpoint changed')
-                    native._begin_original_journal(state)
+                    native._begin_original_journal(state, tls_generation=journal._postgres_pool.tls_generation)
                     program_sealed = True
                 except NativeJournalConfigurationError as error:
                     native._retire_original_journal_refusal()

@@ -201,7 +201,8 @@ def _native_effective_connect_configuration(connection):
     security = 'disable'
     if tls is not None:
         context = tls.context
-        if type(context) is not ssl.SSLContext:
+        from kestrel_sovereign.storage.db.native_journal_programs import _NativeJournalTLSContext
+        if type(context) is not _NativeJournalTLSContext:
             raise ExecutionAuthorityError('Original native TLS context is unsupported')
         security = ('verify-full' if context.check_hostname else
                     'verify-ca' if context.verify_mode != ssl.CERT_NONE else 'require')
@@ -235,6 +236,7 @@ class _OriginalPostgresJournalPool:
     resolved_configuration: tuple | None = None
     principal: tuple | None = None
     tls_context: object = None
+    tls_generation: int | None = None
 
     @classmethod
     def capture(cls, backing):
@@ -277,6 +279,12 @@ class _OriginalPostgresJournalPool:
                 or _freeze_native_connect_configuration((tuple(native._connect_args), native._connect_kwargs)) != self.configuration
                 or native.is_closing()):
             raise ExecutionAuthorityError('Original signal journal pool configuration retired')
+        from kestrel_sovereign.storage.db.native_journal_programs import _native_tls_policy_generation, NativeJournalConfigurationError
+        try:
+            if _native_tls_policy_generation(self.tls_context) != self.tls_generation:
+                raise NativeJournalConfigurationError('Original native TLS policy changed')
+        except NativeJournalConfigurationError as error:
+            raise ExecutionAuthorityError('Original native TLS policy changed') from error
 
     def parameters_for_connect(self, args, kwargs):
         import asyncpg
@@ -311,8 +319,10 @@ class _OriginalPostgresJournalPool:
 
     def with_actual_connection(self, connection, principal):
         tls = connection._transport.get_extra_info('ssl_object')
+        from kestrel_sovereign.storage.db.native_journal_programs import _native_tls_policy_generation
         return replace(self, resolved_configuration=_native_effective_connect_configuration(connection),
-                       principal=principal, tls_context=tls.context if tls is not None else None)
+                       principal=principal, tls_context=tls.context if tls is not None else None,
+                       tls_generation=_native_tls_policy_generation(tls.context if tls is not None else None))
 
     def matches_actual_connection(self, connection):
         tls = connection._transport.get_extra_info('ssl_object')

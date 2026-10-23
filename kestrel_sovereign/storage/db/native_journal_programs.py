@@ -9,7 +9,9 @@ import asyncio
 import ipaddress
 import math
 import sqlite3
+import ssl
 import threading
+from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
 
@@ -27,6 +29,109 @@ class NativeJournalConfigurationError(RuntimeError):
 
 class NativeJournalDurabilityRefusal(NativeJournalConfigurationError):
     """Native preflight refused BEFORE the original sqlite COMMIT call."""
+
+
+def _native_tls_mutator(name):
+    def mutate(self, *args, **kwargs):
+        with self._native_journal_tls_lock:
+            self._before_native_tls_change(name)
+            return getattr(ssl.SSLContext, name)(self, *args, **kwargs)
+    mutate.__name__ = name
+    return mutate
+
+
+class _NativeJournalTLSContext(ssl.SSLContext):
+    """Original driver-created policy, tracked BEFORE application exposure.
+
+    Ordinary configuration remains usable. Every public setter/mutator changes
+    a monotonic generation, even on failure or restoration; original TLS I/O
+    seals reject mutations BEFORE argument/callback/native processing. There
+    is no policy reconstruction from files or incomplete public fingerprints.
+    """
+
+    def _before_native_tls_change(self, name):
+        if self._native_journal_tls_seals:
+            raise NativeJournalConfigurationError('Original native TLS policy is sealed')
+        ssl.SSLContext.__setattr__(self, '_native_journal_tls_generation', self._native_journal_tls_generation + 1)
+        if name in ('set_servername_callback', 'set_psk_client_callback', 'set_psk_server_callback',
+                    'sni_callback', 'sslobject_class', 'sslsocket_class', '_msg_callback'):
+            ssl.SSLContext.__setattr__(self, '_native_journal_tls_programs', True)
+
+    def __setattr__(self, name, value):
+        with self._native_journal_tls_lock:
+            self._before_native_tls_change(name)
+            return ssl.SSLContext.__setattr__(self, name, value)
+
+    load_cert_chain = _native_tls_mutator('load_cert_chain')
+    load_default_certs = _native_tls_mutator('load_default_certs')
+    load_dh_params = _native_tls_mutator('load_dh_params')
+    load_verify_locations = _native_tls_mutator('load_verify_locations')
+    set_alpn_protocols = _native_tls_mutator('set_alpn_protocols')
+    set_ciphers = _native_tls_mutator('set_ciphers')
+    set_default_verify_paths = _native_tls_mutator('set_default_verify_paths')
+    set_ecdh_curve = _native_tls_mutator('set_ecdh_curve')
+    set_npn_protocols = _native_tls_mutator('set_npn_protocols')
+    set_servername_callback = _native_tls_mutator('set_servername_callback')
+    if hasattr(ssl.SSLContext, 'set_psk_client_callback'):
+        set_psk_client_callback = _native_tls_mutator('set_psk_client_callback')
+    if hasattr(ssl.SSLContext, 'set_psk_server_callback'):
+        set_psk_server_callback = _native_tls_mutator('set_psk_server_callback')
+
+
+def _adopt_native_tls_context(context):
+    # Called by the supported native Connection constructor before the driver
+    # publishes it to pool init/setup or application checkout. Public supplied
+    # contexts remain unsupported original recipes; do not adopt subclasses.
+    if type(context) is ssl.SSLContext:
+        ssl.SSLContext.__setattr__(context, '_native_journal_tls_lock', threading.RLock())
+        ssl.SSLContext.__setattr__(context, '_native_journal_tls_generation', 0)
+        ssl.SSLContext.__setattr__(context, '_native_journal_tls_seals', 0)
+        ssl.SSLContext.__setattr__(context, '_native_journal_tls_programs', False)
+        ssl.SSLContext.__setattr__(context, '__class__', _NativeJournalTLSContext)
+    return context
+
+
+@contextmanager
+def _native_tls_policy_lock(context):
+    if type(context) is not _NativeJournalTLSContext:
+        raise NativeJournalConfigurationError('Original native TLS policy was not captured before exposure')
+    if not context._native_journal_tls_lock.acquire(blocking=False):
+        raise NativeJournalConfigurationError('Original native TLS policy mutation is in progress')
+    try:
+        yield
+    finally:
+        context._native_journal_tls_lock.release()
+
+
+def _native_tls_policy_generation(context):
+    if context is None:
+        return None
+    with _native_tls_policy_lock(context):
+        if context._native_journal_tls_programs:
+            raise NativeJournalConfigurationError('Original native TLS policy refuses application programs')
+        return context._native_journal_tls_generation
+
+
+class _OriginalNativeTLSPolicy:
+    """One finite seal across actual handshake or original transaction/reset."""
+
+    def __init__(self, context, generation):
+        self._context = context
+        if context is not None:
+            with _native_tls_policy_lock(context):
+                if _native_tls_policy_generation(context) != generation:
+                    raise NativeJournalConfigurationError('Original native TLS policy changed')
+                ssl.SSLContext.__setattr__(context, '_native_journal_tls_seals', context._native_journal_tls_seals + 1)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_error):
+        context = self._context
+        if context is not None:
+            with _native_tls_policy_lock(context):
+                ssl.SSLContext.__setattr__(context, '_native_journal_tls_seals', context._native_journal_tls_seals - 1)
+                self._context = None
 
 
 def _native_tcp_endpoint(peer):
@@ -386,13 +491,17 @@ else:
 
     class NativeJournalPostgresConnection(asyncpg.Connection):
         """Pass as asyncpg.create_pool(connection_class=...) for native journals."""
-        __slots__ = ('_journal_programs_configured', '_journal_program_seal', '_journal_cancel_connection')
+        __slots__ = ('_journal_programs_configured', '_journal_program_seal', '_journal_cancel_connection', '_journal_tls_policy_seal')
 
         def __init__(self, *args, **kwargs):
             self._journal_programs_configured = False
             self._journal_program_seal = None
             self._journal_cancel_connection = None
+            self._journal_tls_policy_seal = None
             super().__init__(*args, **kwargs)
+            tls = self._transport.get_extra_info('ssl_object')
+            if tls is not None:
+                _adopt_native_tls_context(tls.context)
 
         async def set_type_codec(self, *args, **kwargs):
             _register_program(self)
@@ -463,10 +572,17 @@ else:
             if self._journal_program_seal is not None:
                 raise NativeJournalConfigurationError('Previous original journal has unresolved native retirement')
 
-        def _begin_original_journal(self, native_state):
+        def _begin_original_journal(self, native_state, *, tls_generation=None):
             if not self._original_journal_programs_supported() or self._journal_program_seal is not None:
                 raise NativeJournalConfigurationError('Original journal requires a plain native PostgreSQL connection')
-            self._journal_cancel_connection = _OriginalJournalCancelConnection.capture(self)
+            tls = self._transport.get_extra_info('ssl_object')
+            policy = _OriginalNativeTLSPolicy(tls.context if tls is not None else None, tls_generation)
+            try:
+                self._journal_cancel_connection = _OriginalJournalCancelConnection.capture(self)
+            except BaseException:
+                policy.__exit__(None, None, None)
+                raise
+            self._journal_tls_policy_seal = policy
             self._journal_program_seal = (asyncio.current_task(), native_state)
 
         def _retire_original_journal_refusal(self):
@@ -500,6 +616,8 @@ else:
             retirement = native_state.retirement.owner
             if not self.is_closed() and (retirement is None or not retirement.done()):
                 return False  # Keep an unresolved original retirement sealed.
+            self._journal_tls_policy_seal.__exit__(None, None, None)
+            self._journal_tls_policy_seal = None
             self._journal_program_seal = None
             self._journal_cancel_connection = None
             return True
@@ -517,9 +635,10 @@ else:
         async def _original_journal_principal(self):
             row = await self.fetchrow('''SELECT CURRENT_USER, SESSION_USER,
                 pg_catalog.current_setting('role'),
-                pg_catalog.current_setting('session_authorization')''')
+                pg_catalog.current_setting('session_authorization'),
+                pg_catalog.current_setting('synchronous_commit')''')
             values = tuple(row)
-            if len(values) != 4 or any(type(value) is not str for value in values):
+            if len(values) != 5 or any(type(value) is not str for value in values):
                 raise NativeJournalConfigurationError('Original native principal is not canonical')
             return values
 
@@ -539,4 +658,6 @@ async def _native_journal_connect(*args, **kwargs):
         from kestrel_sovereign.signals.outcome_custody import _require_original_signal_outcome
         _require_original_signal_outcome(journal, backend)
         args, kwargs = journal._postgres_pool.parameters_for_connect(args, kwargs)
+        with _OriginalNativeTLSPolicy(journal._postgres_pool.tls_context, journal._postgres_pool.tls_generation):
+            return await asyncpg.connection.connect(*args, **kwargs)
     return await asyncpg.connection.connect(*args, **kwargs)
