@@ -4215,7 +4215,7 @@ class SignalDispatcher:
             if isinstance(child_error, asyncio.CancelledError) and not is_execution_control_error(child_error):
                 child_error = None  # Our requested cancellation of the renewer.
             renewal_error = lost.result() if lost.done() else None
-            terminal = execution_finite_error(
+            terminal = execution_observation_error(
                 body_error,
                 renewal_error if isinstance(renewal_error, BaseException) else None,
                 child_error,
@@ -5078,7 +5078,7 @@ class SignalDispatcher:
         routing_admission = _routing_admission if _routing_admission is not None else OwnedTaskAdmission()
         guard = (self._own_unrouted_cognition_claim(delivery, routing_admission, journal_completion=journals)
                  if _routing_admission is None else nullcontext())
-        async with nullcontext():
+        async with guard:
             return await self._run_original_cognition_claim(
                 signal, registration, start, delivery=delivery, consumer_id=consumer_id,
                 durable_admission=durable_admission, durable_created=durable_created,
@@ -5267,7 +5267,7 @@ class SignalDispatcher:
                     cleanup = error
                 cleanup = await self._finish_original_outcomes(
                     journal._identity[0] if journal is not None else signal.id, cleanup)
-                terminal = execution_finite_error(original, cleanup, retain_originals=True)
+                terminal = execution_observation_error(original, cleanup)
                 if terminal is not None:
                     raise terminal
                 return result
@@ -5954,8 +5954,6 @@ class SignalDispatcher:
                 error="Cognition task settled after durable lease loss",
             )
         except BaseException as error:
-            if observe_failure:
-                raise
             if is_execution_control_error(error) or observe_failure:
                 # Observation may report a failed release, but it cannot
                 # withdraw this exact token's existing settlement owner.
