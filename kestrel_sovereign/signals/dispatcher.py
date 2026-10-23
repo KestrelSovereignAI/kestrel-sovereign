@@ -1412,7 +1412,8 @@ class SignalDispatcher:
             _durable_admission_fence=admission_fence,
             _journal_completion=journal_completion,
         )
-        enqueued_signal_id = signal.id
+        from kestrel_sovereign.signals.outcome_custody import _native_identity_text
+        enqueued_signal_id = _native_identity_text(signal.id)
         released = False
         def release_live_admission(_task: asyncio.Task[SignalResult]) -> None:
             nonlocal released
@@ -5307,7 +5308,7 @@ class SignalDispatcher:
                 if is_execution_control_error(error):
                     await self._terminalize_failed_cognition(delivery, error)
                 else:
-                    await self._release_retained_durable_cognition_task(delivery)
+                    await self._release_retained_durable_cognition_task(delivery, observe_failure=True)
             except BaseException as cleanup:
                 raise execution_observation_error(error, cleanup) from None
             raise
@@ -5847,6 +5848,7 @@ class SignalDispatcher:
 
     async def _release_retained_durable_cognition_task(
         self, delivery: DurableDelivery, control_error: BaseException | None = None,
+        *, observe_failure: bool = False,
     ) -> None:
         """Requeue one exact retained lease only after its task is terminal."""
 
@@ -5862,6 +5864,8 @@ class SignalDispatcher:
                 error="Cognition task settled after durable lease loss",
             )
         except BaseException as error:
+            if observe_failure:
+                raise
             if is_execution_control_error(error):
                 await self._terminalize_failed_cognition(delivery, error)
                 raise
