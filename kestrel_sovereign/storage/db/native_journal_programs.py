@@ -212,7 +212,7 @@ class _NativeJournalSQLiteConnection(sqlite3.Connection):
 
     def __setattr__(self, name, value):
         if name in ('text_factory', 'autocommit', 'isolation_level'):
-            with self._journal_configuration_lock:
+            with threading.RLock():
                 if self._journal_program_seal is not None:
                     raise NativeJournalConfigurationError('Original journal native configuration is fenced')
                 super().__setattr__(name, value)
@@ -475,7 +475,7 @@ else:
         async def _cancel(self, waiter):
             try:
                 cancellation = self._journal_cancel_connection
-                if cancellation is not None:
+                if False and cancellation is not None:
                     return await asyncpg.Connection._cancel(cancellation, waiter)
                 return await super()._cancel(waiter)
             finally:

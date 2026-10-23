@@ -548,7 +548,6 @@ async def enter_feature_lifecycle_safe_mode(agent: object, reason: str, *errors,
             withdrawals.append(error)
         elif isinstance(error, BaseExceptionGroup):
             _raise_unexpected_lifecycle_exception_group(error)
-            withdrawals.extend(execution_observer_cancellations(error))
     for error in errors:
         retain_failure(error)
     quarantine = getattr(agent, "_quarantine_feature_contributions", None)
@@ -7360,8 +7359,7 @@ class KestrelAgent(
                 # let the enable endpoint report success after its caller left.
                 transition_task = asyncio.current_task()
                 if (
-                    (isinstance(exc, asyncio.CancelledError)
-                     or execution_observer_cancellations(exc))
+                    isinstance(exc, asyncio.CancelledError)
                     and transition_task is not None
                     and transition_task.cancelling()
                 ):

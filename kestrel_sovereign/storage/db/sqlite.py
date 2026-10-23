@@ -2138,8 +2138,9 @@ class SQLiteBackend(DatabaseBackend):
                     ExecutionAuthorityError('Original signal journal native cleanup failed'), error)
                 terminal = execution_finite_error(original_error, interrupt_error, cleanup_error, withdrawal,
                     retain_originals=True, isolate_control_originals=True)
-                self._cancelled_write_drain_error = execution_native_source_error(
-                    self._cancelled_write_drain_error, terminal)
+                self._cancelled_write_drain_error = execution_finite_error(
+                    self._cancelled_write_drain_error, terminal,
+                    retain_originals=True, isolate_control_originals=True)
                 raise terminal
             if interrupt_error is not None or withdrawal is not None:
                 # A completed cleanup does not erase cancellation of this
