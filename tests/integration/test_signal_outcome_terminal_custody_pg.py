@@ -601,6 +601,89 @@ async def test_postgres_refused_session_retirement_never_invokes_application_lis
             await await_owned_task(task)
 
 
+@pytest.mark.parametrize('admission', ['capture', 'writer'])
+async def test_original_checkout_recipe_refusal_cannot_run_reset_query_logger(dispatcher_components, native_pg, monkeypatch, admission):
+    import asyncpg
+    from kestrel_sovereign._async_ownership import await_owned_task
+    from kestrel_sovereign.execution_custody import ExecutionCustody, bind_execution_runtime, current_execution_custody
+    from tests.unit.test_signal_outcome_terminal_custody import _OriginalWork
+    from tests.unit.test_signals_dispatcher import _action_reg, _signal
+    c = dispatcher_components
+    _, control, schema = native_pg
+    await control.execute(f'CREATE TABLE "{schema}".forbidden_reset_effect(value INTEGER)')
+    original_pool = c.backend._pool
+    pool = await _fresh_journal_pool(original_pool, min_size=1, max_size=1)
+    c.backend._pool = pool
+    original_args, original_kwargs = pool._connect_args, dict(pool._connect_kwargs)
+    scope = ExecutionCustody(_OriginalWork(backend_type='postgres'))
+    callbacks, callback_tasks, held, effects = [], [], [], []
+    acquire_waiting = asyncio.Event()
+    callback_lock = asyncio.Lock()
+    actual_acquire = asyncpg.pool.Pool.acquire
+
+    def observe_acquire(original, *args, **kwargs):
+        if original is pool and held:
+            acquire_waiting.set()
+        return actual_acquire(original, *args, **kwargs)
+
+    async def logger(record):
+        # Parent fixture release is not the original declined checkout. The
+        # actual native reset task retains this dispatch's original scope.
+        if not any(original is scope for original in current_execution_custody(c.backend)):
+            return
+        callbacks.append(record.query)
+        callback_tasks.append(asyncio.current_task())
+        async with callback_lock:
+            await control.execute(f'INSERT INTO "{schema}".forbidden_reset_effect VALUES (1)')
+
+    async def retain_actual_slot():
+        connection = await actual_acquire(pool)
+        connection.add_query_logger(logger)
+        held.append(connection)
+
+    async def handler(payload):
+        effects.append(True)
+        await retain_actual_slot()
+        scope.revoke('actual handler cutoff while terminal writer waits for its native slot')
+        return {'genuine': True}
+
+    c.registry.register(_action_reg('native.checkout.refusal', handler=handler))
+    task = None
+    try:
+        if admission == 'capture':
+            await retain_actual_slot()
+        monkeypatch.setattr(asyncpg.pool.Pool, 'acquire', observe_acquire)
+        with bind_execution_runtime(SimpleNamespace(_execution_custody=scope)):
+            task = asyncio.create_task(c.dispatcher.dispatch_signal(_signal('native.checkout.refusal')))
+        await asyncio.wait_for(acquire_waiting.wait(), 5)
+        changed = {**original_kwargs, 'server_settings': {**original_kwargs.get('server_settings', {}), 'application_name': 'actual-refused-original-recipe'}}
+        pool.set_connect_args(*original_args, **changed)
+        if admission == 'capture':
+            scope.revoke('actual capture cutoff after original slot acquisition began')
+        while held:
+            await pool.release(held.pop())
+        outcome = await await_owned_task(task)
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        for callback in callback_tasks:
+            await await_owned_task(callback)
+        assert outcome.error is not None
+        assert effects == ([True] if admission == 'writer' else [])
+        assert not callbacks, 'declined original checkout executed application query logging during native reset'
+        assert await control.fetchval(f'SELECT COUNT(*) FROM "{schema}".forbidden_reset_effect') == 0
+    finally:
+        while held:
+            await pool.release(held.pop())
+        if task is not None:
+            await await_owned_task(task)
+        pool.set_connect_args(*original_args, **original_kwargs)
+        c.backend._pool = original_pool
+        async with asyncio.timeout(10):
+            await pool.close()
+        for callback in callback_tasks:
+            await await_owned_task(callback)
+
+
 @pytest.mark.parametrize('phase', ['rollback', 'reset'])
 @pytest.mark.parametrize('withdrawn_owner', ['inner', 'outer', 'public'])
 async def test_failed_terminal_insert_keeps_writer_withdrawal_through_native_exit(dispatcher_components, monkeypatch, phase, withdrawn_owner):
