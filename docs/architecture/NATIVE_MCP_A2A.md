@@ -66,11 +66,12 @@ add the shared computer-use, artifact, resource-scope and workspace-transfer
 contracts. Both are included at SDK commit
 `c01a6e933665bf7778c656a9b13dd8b79e371e36`. The immutable `v0.40.0` tag
 at `eff4c1f86bee3a5cf5c40b4d36c95b3ee29e02a8` predates these contracts.
-SDK 0.41.0 is published. The 0.42 cutover adds the shared vendored A2A
-implementation and must pass its own review, publication and installed-artifact
-acceptance before Core's public lock is adopted. Consumer constraints and installed-package
-acceptance tests must verify the complete host feature set. Native-A2A packaged
-dependency and conformance gates still apply.
+SDK 0.42.0 is published and provides the shared vendored A2A implementation.
+Core's public lock resolves its reviewed PyPI wheel and source distribution;
+installed-package custody checks verify the native implementation. Consumer
+constraints and acceptance tests must still verify the complete host feature
+set. Core's native-A2A integration, conformance and deployment gates remain
+required.
 
 The cutover worktree removes `kestrel_sovereign/a2a/types.py` and
 `kestrel_sovereign/a2a/agent_card.py`, which forwarded the draft models from

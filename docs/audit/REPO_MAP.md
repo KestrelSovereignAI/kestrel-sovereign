@@ -19,7 +19,7 @@ Auto-generated file-tree + per-file purpose index. Always-loaded context for the
 GitHub App (issue #791). Do **not** edit by hand — regenerate via `python scripts/generate_repo_map.py`.
 
 **Generated:** 2026-10-23
-**Scope:** 3317 tracked files (2479 `.py`, 366 `.md`, 472 other). Excludes `__pycache__`, `node_modules`, `.venv`, `.claude`, build artifacts.
+**Scope:** 3318 tracked files (2480 `.py`, 366 `.md`, 472 other). Excludes `__pycache__`, `node_modules`, `.venv`, `.claude`, build artifacts.
 
 **Format per file:** `path — one-line purpose` plus the public top-level Python symbols on the next line
 (classes and functions; private `_name` skipped).
@@ -3264,9 +3264,11 @@ Repo entry points and standard project files.
 - **tests/interop/a2a_tck/SOURCE.toml** — (configuration)
 - **tests/interop/a2a_tck/UPSTREAM.patch** — —
 - **tests/interop/conftest.py** — Build public Go dependencies and own isolated native interoperability agents.
-  - `def go_peer(tmp_path_factory)`; `async def native_go_environment(go_peer, tmp_path, monkeypatch)`; `def a2a_tck_source(tmp_path_factory)`
+  - `def go_peer(tmp_path_factory)`; `async def native_go_environment(go_peer, tmp_path, monkeypatch)`; `def a2a_tck_source(tmp_path_factory, go_peer)`
 - **tests/interop/kestrel_tck_auth.py** — TCK-only sender extension client using the TCK's official protobuf schema.
   - `class KestrelTckAuth`; `def create_auth()`
+- **tests/interop/tck_auth_unit.py** — Independent TCK-environment unit checks with the real Go proof signer.
+  - `class TckAuthRoutingTests`
 - **tests/interop/test_a2a_go.py** — Public Go SDK interoperability with an initialized, isolated Kestrel agent.
   - `async def test_foreign_peer_retires_an_active_request_after_its_startup_deadline(native_go_environment)`; `async def test_public_go_sdk_and_booted_kestrel_exchange_native_tasks(native_go_environment)`
 - **tests/interop/test_a2a_tck.py** — Drive real Kestrel through the pinned TCK with its reviewed spec corrections.

@@ -1,8 +1,8 @@
 """Build public Go dependencies and own isolated native interoperability agents."""
 
+import os
 import shutil
 import subprocess
-import os
 from pathlib import Path
 
 import pytest
@@ -35,21 +35,26 @@ async def native_go_environment(go_peer, tmp_path, monkeypatch):
 
 
 @pytest.fixture(scope="session")
-def a2a_tck_source(tmp_path_factory):
+def a2a_tck_source(tmp_path_factory, go_peer):
     """Own the exact patched runner, its locked environment and unit verification."""
     env = {key: value for key, value in os.environ.items() if key not in {
         "VIRTUAL_ENV", "PYTHONPATH", "PYTEST_DISABLE_PLUGIN_AUTOLOAD", "PYTEST_ADDOPTS",
     }}
     with prepared_tck_source(tmp_path_factory.getbasetemp()) as source:
+        env.update(
+            PYTHONPATH=str(source),
+            KESTREL_TCK_GO_PEER=str(go_peer),
+        )
         log_path = source.parent / "tck-source-verification.log"
         with log_path.open("w") as log:
             for command in (
                 ["uv", "sync", "--locked"],
                 ["uv", "run", "--no-sync", "pytest", "tests/unit", "-q"],
+                ["uv", "run", "--no-sync", "python", str(Path(__file__).with_name("tck_auth_unit.py"))],
             ):
                 result = subprocess.run(
                     command, cwd=source, env=env, stdin=subprocess.DEVNULL,
-                    stdout=log, stderr=subprocess.STDOUT, timeout=180,
+                    stdout=log, stderr=subprocess.STDOUT, timeout=180, check=False,
                 )
                 assert result.returncode == 0, log_path.read_text()
         yield source

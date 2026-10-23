@@ -9,4 +9,5 @@ This is not an unmodified upstream TCK or an upstream compatibility certificatio
 
 Corrections include native error identity and normative levels, explicit
 implementor HTTP authentication, required Message fields in every container,
-active-task subscription prerequisites and regenerated reference scenarios.
+active-task subscription prerequisites, regenerated reference scenarios,
+selected-interface tenant routing and unique per-probe message identities.

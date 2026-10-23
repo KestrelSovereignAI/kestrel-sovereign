@@ -35,6 +35,7 @@ class KestrelTckAuth(httpx.Auth):
         binding = {"jsonrpc": "JSONRPC", "http_json": "HTTP+JSON"}[transport]
         endpoint = next(item["url"] for item in agent_card["supportedInterfaces"] if item["protocolBinding"] == binding)
         self._endpoint = urlsplit(endpoint)
+        self._endpoint_path = httpx.URL(endpoint).raw_path.split(b"?", 1)[0].decode("ascii").rstrip("/")
         trusted = urlsplit(self._config["coreCardUrl"])
         if (self._endpoint.scheme, self._endpoint.netloc) != (trusted.scheme, trusted.netloc):
             raise ValueError("TCK card interface is outside the parent-owned recipient origin")
@@ -84,10 +85,14 @@ class KestrelTckAuth(httpx.Auth):
         if self._transport == "jsonrpc":
             operation, params = body.get("method"), body.get("params", {})
         else:
-            prefix = self._endpoint.path.rstrip("/")
-            if not request.url.path.startswith(prefix + "/") and request.url.path != prefix:
+            # Match encoded segments, then decode each captured native field
+            # once. HTTPX's .path has already decoded escapes and can turn an
+            # opaque %2F into a separator or decode a literal %252F twice.
+            prefix = self._endpoint_path
+            request_path = request.url.raw_path.split(b"?", 1)[0].decode("ascii")
+            if not request_path.startswith(prefix + "/") and request_path != prefix:
                 raise ValueError("TCK request left its declared native interface")
-            path = request.url.path[len(prefix):] or "/"
+            path = request_path[len(prefix):] or "/"
             operation, params = None, None
             for verb, pattern, descriptor in self._routes:
                 match = pattern.fullmatch(path)

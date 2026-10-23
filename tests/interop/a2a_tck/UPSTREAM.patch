@@ -1,5 +1,5 @@
 diff --git a/README.md b/README.md
-index 7c815f9..c5a143c 100644
+index 7c815f9e194279c3f55bd091d0395094ffea17b5..c5a143c4cfcdf4925f120e485daad6b300bfd76b 100644
 --- a/README.md
 +++ b/README.md
 @@ -45,6 +45,7 @@ Compatibility reports are generated in the `reports/` directory after every run.
@@ -43,7 +43,7 @@ index 7c815f9..c5a143c 100644
  
  The TCK includes a code generator that produces System Under Test (SUT) implementations from Gherkin scenario files in `scenarios/`. The generator supports a `--target` flag to select the SUT type.
 diff --git a/codegen/java_emitter.py b/codegen/java_emitter.py
-index e4066b5..ade68ac 100644
+index e4066b58e99211f67ee74df28b8e8f294994d8cf..ade68ac6854672cec6d70c9faa9ca98cdac55252 100644
 --- a/codegen/java_emitter.py
 +++ b/codegen/java_emitter.py
 @@ -173,8 +173,8 @@ def _action_to_java(action: object) -> list[str]:
@@ -58,7 +58,7 @@ index e4066b5..ade68ac 100644
  
      msg = f"Unsupported action type: {type(action).__name__}"
 diff --git a/pyproject.toml b/pyproject.toml
-index 9d7a545..90ab982 100644
+index 3bb6059dbd68d3ce9e2dd01776077adebc7c5577..3f928c3232d2c551e99d2ed984bd8bf05b010b7b 100644
 --- a/pyproject.toml
 +++ b/pyproject.toml
 @@ -31,6 +31,7 @@ dependencies = [
@@ -70,7 +70,7 @@ index 9d7a545..90ab982 100644
  
  [project.optional-dependencies]
 diff --git a/run_tck.py b/run_tck.py
-index 06f7052..1e938b7 100755
+index 06f70520f89c2bb60e1f752694781141568ad08b..1e938b75bccb6a290e39c27093515da0e46314db 100755
 --- a/run_tck.py
 +++ b/run_tck.py
 @@ -46,6 +46,9 @@ def build_pytest_command(args: argparse.Namespace) -> list[str]:
@@ -96,7 +96,7 @@ index 06f7052..1e938b7 100755
          "--transport",
          default=None,
 diff --git a/scenarios/core_operations.feature b/scenarios/core_operations.feature
-index 872e932..661f96d 100644
+index 872e93289da1893b0d9dd137e73ebe7b22df99d6..661f96d1d7d28331986870b199260bbf9d0a3b72 100644
 --- a/scenarios/core_operations.feature
 +++ b/scenarios/core_operations.feature
 @@ -65,7 +65,12 @@ Feature: Core Operations
@@ -114,7 +114,7 @@ index 872e932..661f96d 100644
      When a message is received with prefix "tck-input-required"
      Then update the task status to "input_required"
 diff --git a/specification/a2a.json b/specification/a2a.json
-index 7922322..d6ea1ed 100644
+index 7922322aec04ec504150b5a8e45d72ae89330717..d6ea1ed438d788614b597f28009acfc8308aa8db 100644
 --- a/specification/a2a.json
 +++ b/specification/a2a.json
 @@ -19,6 +19,30 @@
@@ -279,7 +279,7 @@ index 7922322..d6ea1ed 100644
          },
          "token": {
 diff --git a/specification/a2a.proto b/specification/a2a.proto
-index 184a555..400cdba 100644
+index 184a555b4b45f281004d534850eb582b6e1a7dcd..400cdbad934654e27d7abbae1e145923eb40ac52 100644
 --- a/specification/a2a.proto
 +++ b/specification/a2a.proto
 @@ -341,7 +341,12 @@ message AgentInterface {
@@ -397,7 +397,7 @@ index 184a555..400cdba 100644
  }
  
 diff --git a/specification/specification.md b/specification/specification.md
-index 7095fc0..382185a 100644
+index 7095fc0bad3d5a05edb6cfaf92e67d96bf91290c..382185a53b312cd6a60f5ac536ec5a356437ce77 100644
 --- a/specification/specification.md
 +++ b/specification/specification.md
 @@ -1,13 +1,11 @@
@@ -897,7 +897,7 @@ index 7095fc0..382185a 100644
  - Architectural consistency
  - Improved discoverability
 diff --git a/specification/version.json b/specification/version.json
-index a64b018..d864514 100644
+index a64b01826afd52e2843b880dbf52c5e45b70fde3..d864514916be8640de3238ceafecd9092b0d95c5 100644
 --- a/specification/version.json
 +++ b/specification/version.json
 @@ -1,10 +1,10 @@
@@ -916,7 +916,7 @@ index a64b018..d864514 100644
      "a2a.proto",
      "buf.lock",
 diff --git a/sut/a2a-jakarta/pom.xml b/sut/a2a-jakarta/pom.xml
-index d232f6d..b7f394d 100644
+index d232f6d6c035f7809e11a165fcd46ec29a962c10..b7f394d516ced44ccfdce28183440c5ad29c8aea 100644
 --- a/sut/a2a-jakarta/pom.xml
 +++ b/sut/a2a-jakarta/pom.xml
 @@ -12,7 +12,7 @@
@@ -929,7 +929,7 @@ index d232f6d..b7f394d 100644
          <version.wildfly>39.0.1.Final</version.wildfly>
          <version.wildfly.grpc>0.1.16.Final</version.wildfly.grpc>
 diff --git a/sut/a2a-jakarta/src/main/java/org/a2aproject/jakarta/sdk/sut/TckAgentExecutorProducer.java b/sut/a2a-jakarta/src/main/java/org/a2aproject/jakarta/sdk/sut/TckAgentExecutorProducer.java
-index 4c7de7e..bc6bbad 100644
+index 4c7de7ea0f8d7ba7270a2060868a884411b661e0..bc6bbad3355ce5a97a7762b2d623129bcad8c9d3 100644
 --- a/sut/a2a-jakarta/src/main/java/org/a2aproject/jakarta/sdk/sut/TckAgentExecutorProducer.java
 +++ b/sut/a2a-jakarta/src/main/java/org/a2aproject/jakarta/sdk/sut/TckAgentExecutorProducer.java
 @@ -131,6 +131,11 @@ public class TckAgentExecutorProducer {
@@ -945,7 +945,7 @@ index 4c7de7e..bc6bbad 100644
                  emitter.complete(A2A.toAgentMessage("Unhandled messageId prefix: " + messageId));
              }
 diff --git a/sut/a2a-python/sut_agent.py b/sut/a2a-python/sut_agent.py
-index 47786dc..381d57d 100644
+index 47786dc755b02439e090ec113d6a98cdbf72c5c7..381d57d5ffaf5f7025994d1b74d518d199a1719a 100644
 --- a/sut/a2a-python/sut_agent.py
 +++ b/sut/a2a-python/sut_agent.py
 @@ -155,6 +155,10 @@ class TckAgentExecutor(AgentExecutor):
@@ -960,7 +960,7 @@ index 47786dc..381d57d 100644
          await updater.complete(
              updater.new_agent_message(
 diff --git a/tck/reporting/aggregator.py b/tck/reporting/aggregator.py
-index 206b720..1d19056 100644
+index 206b7206eb2a5b9e3d6b1f2f4921ba92ab165eff..1d19056214e0f67d930869fcbc08b6b86051cec4 100644
 --- a/tck/reporting/aggregator.py
 +++ b/tck/reporting/aggregator.py
 @@ -11,6 +11,9 @@ from dataclasses import asdict, dataclass, field
@@ -1095,7 +1095,7 @@ index 206b720..1d19056 100644
              return 100.0
          passing = sum(1 for r in reqs if r.status == "PASS")
 diff --git a/tck/reporting/collector.py b/tck/reporting/collector.py
-index efc9e43..b00750c 100644
+index efc9e431e7488c6b5827b86bdabebf73313541ac..b00750c4e9e125df633e91b44620bb7d79a9ecdc 100644
 --- a/tck/reporting/collector.py
 +++ b/tck/reporting/collector.py
 @@ -24,6 +24,15 @@ class TestResult:
@@ -1132,7 +1132,7 @@ index efc9e43..b00750c 100644
                  "level": results[0].level,
                  "status": status,
 diff --git a/tck/reporting/console_formatter.py b/tck/reporting/console_formatter.py
-index ecf0236..a3886f0 100644
+index ecf02363eb8c6882b7be145dff291dd803a0018e..a3886f06e83374c77a87f7908d9ef585b41ce41f 100644
 --- a/tck/reporting/console_formatter.py
 +++ b/tck/reporting/console_formatter.py
 @@ -53,6 +53,7 @@ class ConsoleFormatter:
@@ -1200,7 +1200,7 @@ index ecf0236..a3886f0 100644
  
      def _transport_summary(self, report: CompatibilityReport) -> str:
 diff --git a/tck/reporting/html_formatter.py b/tck/reporting/html_formatter.py
-index eac009d..c183e09 100644
+index eac009d0026f2685e337d5ab4406f078b48a5905..c183e09fac6253cb07c374655465612fea8db069 100644
 --- a/tck/reporting/html_formatter.py
 +++ b/tck/reporting/html_formatter.py
 @@ -71,6 +71,9 @@ class HTMLFormatter:
@@ -1231,7 +1231,7 @@ index eac009d..c183e09 100644
  .bar { background: #e9ecef; border-radius: 4px; height: 18px; width: 100%; }
  .bar-fill { background: #28a745; height: 100%; border-radius: 4px; }
 diff --git a/tck/reporting/json_formatter.py b/tck/reporting/json_formatter.py
-index 04ef6f2..e02ef9b 100644
+index 04ef6f2d85c544516b5210df53d7433df4cb2325..e02ef9b6fa740abd241d66a5d4ee3046f91883e4 100644
 --- a/tck/reporting/json_formatter.py
 +++ b/tck/reporting/json_formatter.py
 @@ -37,6 +37,8 @@ class JSONFormatter:
@@ -1244,7 +1244,7 @@ index 04ef6f2..e02ef9b 100644
                  "sut_url": self._sut_url,
                  "spec_version": self._spec_version,
 diff --git a/tck/requirements/agent_card.py b/tck/requirements/agent_card.py
-index 7f4229e..aa6eb23 100644
+index 7f4229ea1a894d19d3d23aa718a6c24517c0b77d..aa6eb23a75caf5bfc582711622b8c0809cc1bc51 100644
 --- a/tck/requirements/agent_card.py
 +++ b/tck/requirements/agent_card.py
 @@ -17,6 +17,7 @@ from tck.requirements.tags import (
@@ -1278,10 +1278,33 @@ index 7f4229e..aa6eb23 100644
          id="CARD-STRUCT-001",
          section="4.4.1",
 diff --git a/tck/requirements/base.py b/tck/requirements/base.py
-index 665c136..f2e1003 100644
+index 665c136716cf5f6f7b779e6dc3f9888a39e3e44b..9f46d645d8ee794cb765f28f6510505383ce97f8 100644
 --- a/tck/requirements/base.py
 +++ b/tck/requirements/base.py
-@@ -60,6 +60,10 @@ HTTP_GET = "GET"
+@@ -17,18 +17,13 @@ if TYPE_CHECKING:
+     from collections.abc import Callable
+ 
+ 
+-# Session-unique suffix appended to all sample_input IDs so that
+-# separate TCK runs never collide with stale tasks on the SUT.
+-_SESSION = uuid.uuid4().hex[:8]
+-
+-
+ def tck_id(name: str) -> str:
+-    """Generate a session-unique TCK identifier.
++    """Generate an identifier unique to this message or operation.
+ 
+-    Each test run produces fresh IDs, preventing collisions with tasks
+-    left over from previous runs on the same SUT.
++    Preserve the documented scenario prefix while avoiding collisions between
++    distinct messages, bindings and runs on an idempotent SUT.
+     """
+-    return f"tck-{name}-{_SESSION}"
++    return f"tck-{name}-{uuid.uuid4().hex}"
+ 
+ 
+ class RequirementLevel(Enum):
+@@ -60,6 +55,10 @@ HTTP_GET = "GET"
  HTTP_POST = "POST"
  HTTP_DELETE = "DELETE"
  
@@ -1292,7 +1315,7 @@ index 665c136..f2e1003 100644
  # REST URL path constants.
  PATH_MESSAGE_SEND = "/message:send"
  PATH_MESSAGE_STREAM = "/message:stream"
-@@ -269,7 +273,7 @@ TASK_NOT_FOUND_ERROR = ErrorBinding(
+@@ -269,7 +268,7 @@ TASK_NOT_FOUND_ERROR = ErrorBinding(
  TASK_NOT_CANCELABLE_ERROR = ErrorBinding(
      name="TaskNotCancelableError",
      jsonrpc_code=-32002,
@@ -1301,7 +1324,7 @@ index 665c136..f2e1003 100644
      grpc_status="FAILED_PRECONDITION",
      reason="TASK_NOT_CANCELABLE",
  )
-@@ -278,7 +282,7 @@ PUSH_NOTIFICATION_NOT_SUPPORTED_ERROR = ErrorBinding(
+@@ -278,7 +277,7 @@ PUSH_NOTIFICATION_NOT_SUPPORTED_ERROR = ErrorBinding(
      name="PushNotificationNotSupportedError",
      jsonrpc_code=-32003,
      http_status=400,
@@ -1310,7 +1333,7 @@ index 665c136..f2e1003 100644
      reason="PUSH_NOTIFICATION_NOT_SUPPORTED",
  )
  
-@@ -286,14 +290,14 @@ UNSUPPORTED_OPERATION_ERROR = ErrorBinding(
+@@ -286,14 +285,14 @@ UNSUPPORTED_OPERATION_ERROR = ErrorBinding(
      name="UnsupportedOperationError",
      jsonrpc_code=-32004,
      http_status=400,
@@ -1327,7 +1350,7 @@ index 665c136..f2e1003 100644
      grpc_status="INVALID_ARGUMENT",
      reason="CONTENT_TYPE_NOT_SUPPORTED",
  )
-@@ -301,7 +305,7 @@ CONTENT_TYPE_NOT_SUPPORTED_ERROR = ErrorBinding(
+@@ -301,7 +300,7 @@ CONTENT_TYPE_NOT_SUPPORTED_ERROR = ErrorBinding(
  INVALID_AGENT_RESPONSE_ERROR = ErrorBinding(
      name="InvalidAgentResponseError",
      jsonrpc_code=-32006,
@@ -1336,7 +1359,7 @@ index 665c136..f2e1003 100644
      grpc_status="INTERNAL",
      reason="INVALID_AGENT_RESPONSE",
  )
-@@ -326,7 +330,7 @@ VERSION_NOT_SUPPORTED_ERROR = ErrorBinding(
+@@ -326,7 +325,7 @@ VERSION_NOT_SUPPORTED_ERROR = ErrorBinding(
      name="VersionNotSupportedError",
      jsonrpc_code=-32009,
      http_status=400,
@@ -1345,7 +1368,7 @@ index 665c136..f2e1003 100644
      reason="VERSION_NOT_SUPPORTED",
  )
  
-@@ -389,3 +393,15 @@ ERROR_BINDINGS: dict[str, ErrorBinding] = {
+@@ -389,3 +388,15 @@ ERROR_BINDINGS: dict[str, ErrorBinding] = {
  
  # Set of A2A error reasons (excludes standard JSON-RPC errors which have no reason).
  A2A_ERROR_REASONS: set[str] = {e.reason for e in ERROR_BINDINGS.values() if e.reason is not None}
@@ -1362,7 +1385,7 @@ index 665c136..f2e1003 100644
 +            mappings.append(f"{binding.name}={code}")
 +    return ", ".join(mappings)
 diff --git a/tck/requirements/binding_grpc.py b/tck/requirements/binding_grpc.py
-index a1c4865..16e16b6 100644
+index a1c48650deaa4ceeea9a2604335904730ff58af2..16e16b6c58a26f952b77956c31cfc168571bdf1b 100644
 --- a/tck/requirements/binding_grpc.py
 +++ b/tck/requirements/binding_grpc.py
 @@ -10,6 +10,7 @@ from tck.requirements.base import (
@@ -1394,7 +1417,7 @@ index a1c4865..16e16b6 100644
          spec_url=f"{SPEC_BASE}54-error-code-mappings",
          tags=[GRPC, ERROR, MAPPING],
 diff --git a/tck/requirements/binding_http_json.py b/tck/requirements/binding_http_json.py
-index 91b9d4a..73f4d65 100644
+index 91b9d4a7eaff65286c2fa2d4837943951edb9074..73f4d656365fc85c9f6fea46a74a0906cdaa63a4 100644
 --- a/tck/requirements/binding_http_json.py
 +++ b/tck/requirements/binding_http_json.py
 @@ -10,6 +10,7 @@ from tck.requirements.base import (
@@ -1475,7 +1498,7 @@ index 91b9d4a..73f4d65 100644
          id="HTTP_JSON-SSE-001",
          section="11.7",
 diff --git a/tck/requirements/binding_jsonrpc.py b/tck/requirements/binding_jsonrpc.py
-index 3a12256..f89c0b7 100644
+index 3a12256e86bd8b99fa37df67befe39a89ad77bac..f89c0b7a1544790743a297606c87158c88a0bdf7 100644
 --- a/tck/requirements/binding_jsonrpc.py
 +++ b/tck/requirements/binding_jsonrpc.py
 @@ -10,6 +10,7 @@ from tck.requirements.base import (
@@ -1528,7 +1551,7 @@ index 3a12256..f89c0b7 100644
          spec_url=f"{SPEC_BASE}54-error-code-mappings",
          tags=[JSONRPC, ERROR, MAPPING],
 diff --git a/tck/requirements/core_operations.py b/tck/requirements/core_operations.py
-index 77e7692..9cacbab 100644
+index 77e7692ed15d6cafdd913fe221100f862e6f59aa..9cacbabcd276942896fbfe49b351b3748166b095 100644
 --- a/tck/requirements/core_operations.py
 +++ b/tck/requirements/core_operations.py
 @@ -9,6 +9,7 @@ from __future__ import annotations
@@ -1548,7 +1571,7 @@ index 77e7692..9cacbab 100644
          tags=[CORE, SEND_MESSAGE, ERROR],
          sample_input={
 diff --git a/tck/requirements/interop.py b/tck/requirements/interop.py
-index 32beade..330c6d1 100644
+index 32beaded018792f2f4fb6d51e8424f36658898ac..330c6d10675a6d09a21ba02a888af90a15f4e4e3 100644
 --- a/tck/requirements/interop.py
 +++ b/tck/requirements/interop.py
 @@ -18,10 +18,37 @@ from tck.requirements.tags import (
@@ -1590,10 +1613,10 @@ index 32beade..330c6d1 100644
          id="BIND-EQUIV-001",
          section="5.1",
 diff --git a/tck/transport/base.py b/tck/transport/base.py
-index 2dcfdb9..dbc2018 100644
+index 2dcfdb9f44881f86cacc863efdc9d16e897e9f38..f276fda199d8b92965ec3310ba00e8e079d19135 100644
 --- a/tck/transport/base.py
 +++ b/tck/transport/base.py
-@@ -9,7 +9,11 @@ from __future__ import annotations
+@@ -9,7 +9,20 @@ from __future__ import annotations
  
  from abc import ABC, abstractmethod
  from dataclasses import dataclass, field
@@ -1603,24 +1626,84 @@ index 2dcfdb9..dbc2018 100644
 +
 +if TYPE_CHECKING:
 +    import httpx
++
++
++def interface_tenant(value: object) -> str:
++    """Preserve a declared tenant exactly; ProtoJSON null means unset."""
++    if value is None:
++        return ""
++    if not isinstance(value, str):
++        raise TypeError("The selected Agent Interface tenant must be a string")
++    return value
  
  
  @dataclass
-@@ -79,6 +83,11 @@ class BaseTransportClient(ABC):
+@@ -75,9 +88,30 @@ class BaseTransportClient(ABC):
+     Method signatures expose all parameters from the A2A proto request types.
+     """
+ 
+-    def __init__(self, base_url: str, transport: str) -> None:
++    def __init__(self, base_url: str, transport: str, *, tenant: str = "") -> None:
          self.base_url = base_url
          self.transport = transport
- 
++        self.tenant = interface_tenant(tenant)
++
++    def service_parameters(self, params: Any) -> Any:
++        """Bind an omitted tenant in native JSON-RPC service parameters.
++
++        Preserve deliberately malformed or explicit parameters in raw negative
++        probes; typed operations always construct their own parameter objects.
++        """
++        if isinstance(params, dict) and self.tenant and "tenant" not in params:
++            return {**params, "tenant": self.tenant}
++        return params
++
++    def service_url(self, path: str = "") -> str:
++        """Build an HTTP operation URL for this selected interface."""
++        msg = f"Transport {self.transport!r} does not expose HTTP URLs"
++        raise NotImplementedError(msg)
++
 +    def request_http(self, method: str, url: str, **kwargs: Any) -> httpx.Response:
 +        """Send a raw probe on HTTP bindings, preserving their authentication."""
 +        msg = f"Transport {self.transport!r} does not expose HTTP requests"
 +        raise NotImplementedError(msg)
-+
+ 
      @abstractmethod
      def send_message(
-         self,
+diff --git a/tck/transport/grpc_client.py b/tck/transport/grpc_client.py
+index c6b102908f39161d5d695955ad21ee9d027987aa..39b8d82af0d64cc76a9f11225fa61d243c5ac223 100644
+--- a/tck/transport/grpc_client.py
++++ b/tck/transport/grpc_client.py
+@@ -100,8 +100,8 @@ class GrpcClient(BaseTransportClient):
+ 
+     _METADATA = ((A2A_VERSION_HEADER.lower(), A2A_VERSION),)
+ 
+-    def __init__(self, base_url: str) -> None:
+-        super().__init__(base_url, TRANSPORT)
++    def __init__(self, base_url: str, *, tenant: str = "") -> None:
++        super().__init__(base_url, TRANSPORT, tenant=tenant)
+         self._channel: grpc.Channel | None = None
+         self._stub: a2a_pb2_grpc.A2AServiceStub | None = None
+         self._connect()
+@@ -158,6 +158,7 @@ class GrpcClient(BaseTransportClient):
+ 
+     def _unary_call(self, rpc_name: str, request: Any) -> TransportResponse:
+         """Execute a unary gRPC call with one retry on connection errors."""
++        request.tenant = self.tenant
+         return self._call_with_retry(
+             rpc_name, request,
+             make_ok=lambda r: GrpcResponse(
+@@ -189,6 +190,7 @@ class GrpcClient(BaseTransportClient):
+         up to the outer handler so that retriable errors trigger a reconnect
+         and a second attempt.
+         """
++        request.tenant = self.tenant
+         for attempt in range(2):
+             rpc = getattr(self._stub, rpc_name)
+             try:
 diff --git a/tck/transport/http_auth.py b/tck/transport/http_auth.py
 new file mode 100644
-index 0000000..0375bb6
+index 0000000000000000000000000000000000000000..0375bb6b035d30848eeb21c1b66d5bf5661826b7
 --- /dev/null
 +++ b/tck/transport/http_auth.py
 @@ -0,0 +1,33 @@
@@ -1659,15 +1742,16 @@ index 0000000..0375bb6
 +    return auth
 diff --git a/tck/transport/http_client.py b/tck/transport/http_client.py
 new file mode 100644
-index 0000000..1b9a3a6
+index 0000000000000000000000000000000000000000..9f7304027380ed262981bc3000c35f8b92d3c96e
 --- /dev/null
 +++ b/tck/transport/http_client.py
-@@ -0,0 +1,32 @@
+@@ -0,0 +1,40 @@
 +"""One owned HTTP session for native operations and raw compatibility probes."""
 +
 +from __future__ import annotations
 +
 +from typing import Any
++from urllib.parse import urlsplit, urlunsplit
 +
 +import httpx
 +
@@ -1678,8 +1762,8 @@ index 0000000..1b9a3a6
 +class HttpTransportClient(BaseTransportClient):
 +    """Preserve configured authentication on every HTTP request, including SSE."""
 +
-+    def __init__(self, base_url: str, transport: str, *, auth: httpx.Auth | None = None) -> None:
-+        super().__init__(base_url, transport)
++    def __init__(self, base_url: str, transport: str, *, auth: httpx.Auth | None = None, tenant: str = "") -> None:
++        super().__init__(base_url, transport, tenant=tenant)
 +        self._client = httpx.Client(
 +            base_url=base_url,
 +            timeout=httpx.Timeout(5.0, read=30.0),
@@ -1692,14 +1776,29 @@ index 0000000..1b9a3a6
 +        """Send an unmodified raw probe with this client's authentication."""
 +        return self._client.request(method, url, **kwargs)
 +
++    def service_url(self, path: str = "") -> str:
++        """Preserve the declared endpoint prefix and query when adding a path."""
++        if not path:
++            return self.base_url
++        parts = urlsplit(self.base_url)
++        return urlunsplit(parts._replace(path=parts.path.rstrip("/") + path))
++
 +    def close(self) -> None:
 +        """Close the original HTTP session."""
 +        self._client.close()
 diff --git a/tck/transport/http_json_client.py b/tck/transport/http_json_client.py
-index 128e73b..d330683 100644
+index 128e73bbfec1609f534875ef73149b8f08420c69..5ee01120e46213efffe4aade281db2e5f1cacaa8 100644
 --- a/tck/transport/http_json_client.py
 +++ b/tck/transport/http_json_client.py
-@@ -21,6 +21,7 @@ from tck.requirements.base import (
+@@ -11,6 +11,7 @@ import json
+ 
+ from dataclasses import dataclass
+ from typing import Any
++from urllib.parse import quote
+ 
+ import httpx
+ 
+@@ -21,6 +22,7 @@ from tck.requirements.base import (
      GET_EXTENDED_AGENT_CARD_BINDING,
      GET_PUSH_CONFIG_BINDING,
      GET_TASK_BINDING,
@@ -1707,7 +1806,7 @@ index 128e73b..d330683 100644
      LIST_PUSH_CONFIGS_BINDING,
      LIST_TASKS_BINDING,
      PATH_MESSAGE_SEND,
-@@ -28,8 +29,9 @@ from tck.requirements.base import (
+@@ -28,8 +30,9 @@ from tck.requirements.base import (
      SEND_MESSAGE_BINDING,
      SUBSCRIBE_TO_TASK_BINDING,
  )
@@ -1719,7 +1818,7 @@ index 128e73b..d330683 100644
  
  
  TRANSPORT = "http_json"
-@@ -109,21 +111,11 @@ class HttpJsonStreamingResponse(_HttpJsonResponseMixin, StreamingResponse):
+@@ -109,21 +112,16 @@ class HttpJsonStreamingResponse(_HttpJsonResponseMixin, StreamingResponse):
      """HTTP+JSON streaming transport response."""
  
  
@@ -1735,26 +1834,43 @@ index 128e73b..d330683 100644
 -            headers={A2A_VERSION_HEADER: A2A_VERSION},
 -            follow_redirects=True,
 -        )
--
++    def __init__(self, base_url: str, *, auth: httpx.Auth | None = None, tenant: str = "") -> None:
++        super().__init__(base_url, TRANSPORT, auth=auth, tenant=tenant)
+ 
 -    def close(self) -> None:
 -        """Close the HTTP client."""
 -        self._client.close()
-+    def __init__(self, base_url: str, *, auth: httpx.Auth | None = None) -> None:
-+        super().__init__(base_url, TRANSPORT, auth=auth)
++    def service_url(self, path: str = "") -> str:
++        """Bind the selected interface tenant as one encoded path segment."""
++        prefix = "/" + quote(self.tenant, safe="") if self.tenant else ""
++        return super().service_url(prefix + path)
  
      def _request(
          self,
-@@ -140,7 +132,7 @@ class HttpJsonClient(BaseTransportClient):
-                 path,
+@@ -135,12 +133,14 @@ class HttpJsonClient(BaseTransportClient):
+     ) -> TransportResponse:
+         """Make an HTTP request and return a TransportResponse."""
+         try:
++            url = httpx.URL(self.service_url(path))
++            if params is not None:
++                url = url.copy_merge_params(params)
+             response = self._client.request(
+                 method,
+-                path,
++                url,
                  json=json_body,
-                 params=params,
+-                params=params,
 -                headers={"Content-Type": "application/json"} if method.upper() == "POST" else None,
 +                headers={"Content-Type": HTTP_JSON_CONTENT_TYPE} if method.upper() == "POST" else None,
              )
              resp_headers = dict(response.headers)
              if response.status_code >= _HTTP_ERROR_MIN:
-@@ -182,7 +174,7 @@ class HttpJsonClient(BaseTransportClient):
-                 path,
+@@ -179,10 +179,10 @@ class HttpJsonClient(BaseTransportClient):
+         try:
+             request = self._client.build_request(
+                 method,
+-                path,
++                self.service_url(path),
                  json=json_body,
                  headers={
 -                    "Content-Type": "application/json",
@@ -1763,7 +1879,7 @@ index 128e73b..d330683 100644
                  },
              )
 diff --git a/tck/transport/jsonrpc_client.py b/tck/transport/jsonrpc_client.py
-index 7db3e37..e02dbde 100644
+index 7db3e37a61aa4346eb0b331d694233f7076f193a..44aa39e7b4b12ca2e57d667ca4e102588ac0418a 100644
 --- a/tck/transport/jsonrpc_client.py
 +++ b/tck/transport/jsonrpc_client.py
 @@ -14,8 +14,9 @@ from typing import Any
@@ -1788,8 +1904,8 @@ index 7db3e37..e02dbde 100644
  
 -    def __init__(self, base_url: str) -> None:
 -        super().__init__(base_url, TRANSPORT)
-+    def __init__(self, base_url: str, *, auth: httpx.Auth | None = None) -> None:
-+        super().__init__(base_url, TRANSPORT, auth=auth)
++    def __init__(self, base_url: str, *, auth: httpx.Auth | None = None, tenant: str = "") -> None:
++        super().__init__(base_url, TRANSPORT, auth=auth, tenant=tenant)
          self._id_counter = itertools.count(1)
 -        self._client = httpx.Client(
 -            base_url=base_url,
@@ -1804,8 +1920,37 @@ index 7db3e37..e02dbde 100644
  
      def _next_id(self) -> int:
          """Generate the next unique request ID."""
+@@ -99,11 +90,11 @@ class JsonRpcClient(BaseTransportClient):
+             "jsonrpc": "2.0",
+             "id": self._next_id(),
+             "method": method,
+-            "params": params,
++            "params": self.service_parameters(params),
+         }
+         try:
+             response = self._client.post(
+-                "/",
++                self.service_url(),
+                 json=payload,
+                 headers={"Content-Type": "application/json"},
+             )
+@@ -133,12 +124,12 @@ class JsonRpcClient(BaseTransportClient):
+             "jsonrpc": "2.0",
+             "id": self._next_id(),
+             "method": method,
+-            "params": params,
++            "params": self.service_parameters(params),
+         }
+         try:
+             request = self._client.build_request(
+                 "POST",
+-                "/",
++                self.service_url(),
+                 json=payload,
+                 headers={
+                     "Content-Type": "application/json",
 diff --git a/tck/validators/_json.py b/tck/validators/_json.py
-index 7de800b..6d24fe2 100644
+index 7de800b810042706832298150979053f5e548c24..6d24fe28e94652a5744a68a270473f632650988c 100644
 --- a/tck/validators/_json.py
 +++ b/tck/validators/_json.py
 @@ -35,6 +35,28 @@ def extract_message(result: dict[str, Any]) -> Any | None:
@@ -1850,7 +1995,7 @@ index 7de800b..6d24fe2 100644
      actual = task.get("status", {}).get("state", "")
 diff --git a/tck/validators/agent_card.py b/tck/validators/agent_card.py
 new file mode 100644
-index 0000000..bba7a0e
+index 0000000000000000000000000000000000000000..bba7a0e03258584b50549fc9e2aa5ad3095ddd84
 --- /dev/null
 +++ b/tck/validators/agent_card.py
 @@ -0,0 +1,32 @@
@@ -1887,7 +2032,7 @@ index 0000000..bba7a0e
 +        modes.extend(mode.partition(";")[0].strip().lower() for mode in mode_set)
 +    return any(mode in matching for mode in modes)
 diff --git a/tck/validators/error_binding.py b/tck/validators/error_binding.py
-index 0d1a6d0..6b567f6 100644
+index 0d1a6d0bd16865d5095c556ff5f6fd728129935b..6b567f6c5fdce908612452619b318942ff82df5c 100644
 --- a/tck/validators/error_binding.py
 +++ b/tck/validators/error_binding.py
 @@ -6,15 +6,19 @@ from a requirement specification.
@@ -1938,7 +2083,7 @@ index 0d1a6d0..6b567f6 100644
  
      return []
 diff --git a/tck/validators/error_info.py b/tck/validators/error_info.py
-index db8b6da..ac65e56 100644
+index db8b6da0be04f25db805f4c5f03643d2bb086ffb..ac65e56fa2daeff4eb20ff3c3c93831855658fb2 100644
 --- a/tck/validators/error_info.py
 +++ b/tck/validators/error_info.py
 @@ -11,10 +11,36 @@ from __future__ import annotations
@@ -1998,7 +2143,7 @@ index db8b6da..ac65e56 100644
              valid=False,
              message=f"ErrorInfo reason {reason!r} is not a recognised A2A error reason",
 diff --git a/tck/validators/extended_card.py b/tck/validators/extended_card.py
-index 450ad28..7e4bc87 100644
+index 450ad28d283db7d3eb6341f63317d9e096d56ea6..7e4bc87a23b46269eebe72958eb073c1acfa127d 100644
 --- a/tck/validators/extended_card.py
 +++ b/tck/validators/extended_card.py
 @@ -12,6 +12,7 @@ from enum import Enum
@@ -2019,7 +2164,7 @@ index 450ad28..7e4bc87 100644
          return ExtendedCardProbe.NOT_CONFIGURED
      return ExtendedCardProbe.WRONG_ERROR
 diff --git a/tck/validators/grpc/error_validator.py b/tck/validators/grpc/error_validator.py
-index f0f8d7b..449711e 100644
+index f0f8d7b2da91105b504593412da7e13fb5293602..449711e1dff6d70df83f0f091ef1dae89a53e93e 100644
 --- a/tck/validators/grpc/error_validator.py
 +++ b/tck/validators/grpc/error_validator.py
 @@ -10,9 +10,11 @@ from collections import defaultdict
@@ -2102,7 +2247,7 @@ index f0f8d7b..449711e 100644
 -
      return None
 diff --git a/tck/validators/grpc/payload.py b/tck/validators/grpc/payload.py
-index 7f51842..ebf8930 100644
+index 7f51842ae82010e51a8ea477d81a086c80a4c051..ebf8930f66760f7c106f81973ce92911bda5d209 100644
 --- a/tck/validators/grpc/payload.py
 +++ b/tck/validators/grpc/payload.py
 @@ -4,7 +4,10 @@ from __future__ import annotations
@@ -2148,7 +2293,7 @@ index 7f51842..ebf8930 100644
      actual = task.status.state
 diff --git a/tck/validators/http_json/content_type.py b/tck/validators/http_json/content_type.py
 new file mode 100644
-index 0000000..d785b96
+index 0000000000000000000000000000000000000000..d785b96606a3bdda7ed3d69805748ab395b3eef6
 --- /dev/null
 +++ b/tck/validators/http_json/content_type.py
 @@ -0,0 +1,19 @@
@@ -2172,7 +2317,7 @@ index 0000000..d785b96
 +            return value.partition(";")[0].strip().lower() == HTTP_JSON_CONTENT_TYPE
 +    return False
 diff --git a/tck/validators/http_json/error_validator.py b/tck/validators/http_json/error_validator.py
-index 4e3401c..5b6cf2e 100644
+index 4e3401cfb9be03f86d81fecc340da6238ab2b733..5b6cf2e8cd067b3759d902ac65ca2bf2fde46e2d 100644
 --- a/tck/validators/http_json/error_validator.py
 +++ b/tck/validators/http_json/error_validator.py
 @@ -7,9 +7,14 @@ Section 11 of the A2A specification, using the AIP-193 error format.
@@ -2417,7 +2562,7 @@ index 4e3401c..5b6cf2e 100644
  
  def _get_content_type(headers: dict[str, str]) -> str | None:
 diff --git a/tck/validators/http_json/payload.py b/tck/validators/http_json/payload.py
-index ae340e1..407d616 100644
+index ae340e123f06700bad5d9ae20ff960bc34675b12..407d616278743782c4dbbdf17fe11966f7e51cb1 100644
 --- a/tck/validators/http_json/payload.py
 +++ b/tck/validators/http_json/payload.py
 @@ -38,6 +38,11 @@ def extract_message(response: Any) -> Any | None:
@@ -2433,7 +2578,7 @@ index ae340e1..407d616 100644
      """Extract history messages from an HTTP+JSON response."""
      return _json.extract_history(_unwrap(response))
 diff --git a/tck/validators/jsonrpc/payload.py b/tck/validators/jsonrpc/payload.py
-index 8cfc54d..30521cd 100644
+index 8cfc54d65bb97a7eb184dd4af3d705310d8f248e..30521cda91e0544901c4ddff4943975c3e20c0f2 100644
 --- a/tck/validators/jsonrpc/payload.py
 +++ b/tck/validators/jsonrpc/payload.py
 @@ -41,6 +41,11 @@ def extract_message(response: Any) -> Any | None:
@@ -2449,7 +2594,7 @@ index 8cfc54d..30521cd 100644
      """Extract history messages from a JSON-RPC response."""
      return _json.extract_history(_unwrap_result(response))
 diff --git a/tck/validators/payload.py b/tck/validators/payload.py
-index 0c2d84c..a5ccd79 100644
+index 0c2d84c0be9c4a0e8b653a636856ee88fbb5fbca..a5ccd79e12cb86a7cc122cff6245b3bcde9f0535 100644
 --- a/tck/validators/payload.py
 +++ b/tck/validators/payload.py
 @@ -13,6 +13,10 @@ from __future__ import annotations
@@ -2516,7 +2661,7 @@ index 0c2d84c..a5ccd79 100644
      """Extract history messages from a response."""
      mod = _TRANSPORT_MODULES.get(transport)
 diff --git a/tests/compatibility/_task_helpers.py b/tests/compatibility/_task_helpers.py
-index cfe164b..87e3a41 100644
+index bb3c56da7f7f18a6a7ac025fd74abd4c1e5d79be..4855b7e42bfbdc59b6effe7237ff14372dc6c531 100644
 --- a/tests/compatibility/_task_helpers.py
 +++ b/tests/compatibility/_task_helpers.py
 @@ -8,6 +8,8 @@ This module provides transport-agnostic factory functions that call
@@ -2672,7 +2817,7 @@ index cfe164b..87e3a41 100644
 -    info = create_working_task(client)
 +    info = create_input_required_task(client)
  
-     for text in HISTORY_MESSAGES:
+     for index, text in enumerate(HISTORY_MESSAGES, start=1):
          msg: dict[str, Any] = {
 @@ -164,7 +197,7 @@ def create_multiturn_task_with_history(
          }
@@ -2698,19 +2843,91 @@ index cfe164b..87e3a41 100644
      return TaskInfo(
          task_id=info.task_id,
 diff --git a/tests/compatibility/_test_helpers.py b/tests/compatibility/_test_helpers.py
-index 0fb0a88..1be223f 100644
+index 0fb0a88bee77bcdcccbf04ff5ac1514ee597ed4e..b39f4552131b7a0cf1171a3351a84814391bbdd3 100644
 --- a/tests/compatibility/_test_helpers.py
 +++ b/tests/compatibility/_test_helpers.py
-@@ -13,6 +13,8 @@ from typing import TYPE_CHECKING, Any
+@@ -7,18 +7,80 @@ test modules.
+ 
+ from __future__ import annotations
+ 
++import copy
+ import threading
+ 
+ from typing import TYPE_CHECKING, Any
  
  import pytest
  
++from tck.requirements.base import tck_id
++from tck.transport._helpers import A2A_VERSION, A2A_VERSION_HEADER
 +from tck.validators.agent_card import supports_input_media_type
 +
  
  if TYPE_CHECKING:
++    import httpx
++
      from tck.requirements.base import ErrorBinding, RequirementSpec
-@@ -87,6 +89,23 @@ def get_client(
+     from tck.transport.base import BaseTransportClient
+ 
+ 
++def fresh_message(template: dict[str, Any]) -> dict[str, Any]:
++    """Copy a valid-ID probe recipe with a new creator-assigned identity.
++
++    Preserve every other field, including intentionally unsupported content.
++    Malformed-ID negative probes must send their original payload directly.
++    """
++    prefix = template["messageId"]
++    if not isinstance(prefix, str) or not prefix:
++        raise ValueError("A fresh-message recipe requires a non-empty string messageId")
++    return {**copy.deepcopy(template), "messageId": tck_id(prefix.removeprefix("tck-"))}
++
++
++def new_text_message(prefix: str, text: str) -> dict[str, Any]:
++    """Allocate a native user message for this individual probe invocation."""
++    return fresh_message({"role": "ROLE_USER", "parts": [{"text": text}], "messageId": f"tck-{prefix}"})
++
++
++def jsonrpc_probe(
++    client: BaseTransportClient,
++    method: str,
++    params: Any,
++    *,
++    headers: dict[str, str] | None = None,
++) -> httpx.Response:
++    """Make a raw JSON-RPC 2.0 call preserving authentication with custom headers."""
++    payload = {
++        "jsonrpc": "2.0",
++        "id": 1,
++        "method": method,
++        "params": client.service_parameters(params),
++    }
++    hdrs = {"Content-Type": "application/json", A2A_VERSION_HEADER: A2A_VERSION}
++    if headers:
++        hdrs.update(headers)
++    return client.request_http("POST", client.service_url(), json=payload, headers=hdrs)
++
++
++def http_json_probe(
++    client: BaseTransportClient,
++    method: str,
++    path: str,
++    *,
++    json_body: dict | None = None,
++    headers: dict[str, str] | None = None,
++) -> httpx.Response:
++    """Make a raw HTTP request for REST binding."""
++    hdrs = {A2A_VERSION_HEADER: A2A_VERSION}
++    if json_body is not None:
++        hdrs["Content-Type"] = "application/json"
++    if headers:
++        hdrs.update(headers)
++    return client.request_http(method, client.service_url(path), json=json_body, headers=hdrs)
++
++
++
+ def expected_error_of(req: RequirementSpec) -> ErrorBinding:
+     """Return a requirement's declared ``expected_error``, asserting it is set.
+ 
+@@ -87,6 +149,23 @@ def get_client(
      return client
  
  
@@ -2735,7 +2952,7 @@ index 0fb0a88..1be223f 100644
  
  
 diff --git a/tests/compatibility/agent_card/test_agent_card.py b/tests/compatibility/agent_card/test_agent_card.py
-index 1816533..7d25da2 100644
+index 1816533777689a9feec16d7d9134705d3ecabe38..7d25da23532da8b01244f95007c69b3c67109a65 100644
 --- a/tests/compatibility/agent_card/test_agent_card.py
 +++ b/tests/compatibility/agent_card/test_agent_card.py
 @@ -14,8 +14,10 @@ from typing import TYPE_CHECKING, Any
@@ -2827,7 +3044,7 @@ index 1816533..7d25da2 100644
 +        _record(collector=compatibility_collector, req=req, passed=not errors, errors=errors)
 +        assert not errors, _fail_msg(req, "; ".join(errors))
 diff --git a/tests/compatibility/agent_card/test_agent_card_caching.py b/tests/compatibility/agent_card/test_agent_card_caching.py
-index 54e85a0..6b03a5a 100644
+index 54e85a0eb5ce4b3faa845d03f223a12a43a77ab9..6b03a5ada1ffeed09f8a5f8ee286a9c22b4ebd3b 100644
 --- a/tests/compatibility/agent_card/test_agent_card_caching.py
 +++ b/tests/compatibility/agent_card/test_agent_card_caching.py
 @@ -12,6 +12,7 @@ from __future__ import annotations
@@ -2886,7 +3103,7 @@ index 54e85a0..6b03a5a 100644
 +            pytest.skip("Optional Last-Modified header is not provided")
 +        _record(compatibility_collector, req, passed=True)
 diff --git a/tests/compatibility/conftest.py b/tests/compatibility/conftest.py
-index 4c0c48f..8216bc6 100644
+index 4c0c48ffed3d006d3efd80ff03bcc5a656303625..a0c05893f4ca68c1b73e7d32b46a61a7c5d788b3 100644
 --- a/tests/compatibility/conftest.py
 +++ b/tests/compatibility/conftest.py
 @@ -4,6 +4,7 @@ from __future__ import annotations
@@ -2897,16 +3114,18 @@ index 4c0c48f..8216bc6 100644
  from pathlib import Path
  from typing import TYPE_CHECKING, Any
  
-@@ -12,6 +13,8 @@ import pytest
+@@ -11,7 +12,10 @@ import httpx
+ import pytest
  
  from tck.reporting.collector import CompatibilityCollector
++from tck.transport.base import interface_tenant
  from tck.transport.grpc_client import GrpcClient
 +from tck.transport.http_auth import create_http_auth
 +from tck.transport.http_client import HttpTransportClient
  from tck.transport.http_json_client import HttpJsonClient
  from tck.transport.jsonrpc_client import JsonRpcClient
  from tck.validators.json_schema import JSONSchemaValidator
-@@ -46,6 +49,11 @@ _record_count_key = pytest.StashKey[int]()
+@@ -46,6 +50,11 @@ _record_count_key = pytest.StashKey[int]()
  def pytest_addoption(parser: pytest.Parser) -> None:
      """Register A2A TCK CLI options."""
      group = parser.getgroup("a2a-tck", "A2A TCK options")
@@ -2918,7 +3137,7 @@ index 4c0c48f..8216bc6 100644
      group.addoption(
          "--sut-host",
          dest="sut_host",
-@@ -133,37 +141,44 @@ def transport_clients(
+@@ -133,37 +142,45 @@ def transport_clients(
      else:
          transport_filter = {t.strip() for t in raw.split(",") if t.strip()}
  
@@ -2971,15 +3190,16 @@ index 4c0c48f..8216bc6 100644
 +
 +            # First interface per transport wins (preference order)
 +            if transport_name not in clients:
++                tenant = interface_tenant(iface.get("tenant"))
 +                if issubclass(client_class, HttpTransportClient):
 +                    auth = create_http_auth(
 +                        request.config.getoption("--http-auth-provider"),
 +                        transport=transport_name, agent_card=agent_card,
 +                    )
-+                    clients[transport_name] = client_class(url, auth=auth)
++                    clients[transport_name] = client_class(url, auth=auth, tenant=tenant)
 +                    stack.callback(clients[transport_name].close)
 +                else:
-+                    clients[transport_name] = client_class(url)
++                    clients[transport_name] = client_class(url, tenant=tenant)
 +                    stack.callback(clients[transport_name].close)
 +
 +        if not clients:
@@ -2995,7 +3215,7 @@ index 4c0c48f..8216bc6 100644
  
  @pytest.fixture(scope="session")
 diff --git a/tests/compatibility/core_operations/test_artifacts.py b/tests/compatibility/core_operations/test_artifacts.py
-index 48f7e5a..6ff88bd 100644
+index 48f7e5a2cf289b0816bfd2bfde4d3288c9ca6bb1..6ff88bd9d7a97380360d434ee760546ced3ad356 100644
 --- a/tests/compatibility/core_operations/test_artifacts.py
 +++ b/tests/compatibility/core_operations/test_artifacts.py
 @@ -20,7 +20,7 @@ from tck.requirements.registry import get_requirement_by_id
@@ -3090,10 +3310,10 @@ index 48f7e5a..6ff88bd 100644
 +            errors.extend(f"Message[{index}]: {error}" for error in message_errors)
          assert_and_record(compatibility_collector, req, transport, errors)
 diff --git a/tests/compatibility/core_operations/test_data_model.py b/tests/compatibility/core_operations/test_data_model.py
-index 1a1a747..25594e6 100644
+index 1a1a747b8b05d58b058d03ad43ab4d36ab66800b..9418e8d5daec8647911cb03a2548ec0addec3163 100644
 --- a/tests/compatibility/core_operations/test_data_model.py
 +++ b/tests/compatibility/core_operations/test_data_model.py
-@@ -15,7 +15,6 @@ import re
+@@ -15,13 +15,12 @@ import re
  
  from typing import TYPE_CHECKING, Any
  
@@ -3101,124 +3321,212 @@ index 1a1a747..25594e6 100644
  import pytest
  
  from tck.requirements.base import tck_id
-@@ -321,7 +320,8 @@ class TestIgnoreUnrecognizedFields:
+ from tck.requirements.registry import get_requirement_by_id
+ from tck.transport._helpers import A2A_VERSION, A2A_VERSION_HEADER
+-from tests.compatibility._test_helpers import assert_and_record, fail_msg, record
++from tests.compatibility._test_helpers import assert_and_record, fail_msg, new_text_message, record
+ from tests.compatibility.markers import core, must, should
+ 
+ 
+@@ -57,11 +56,6 @@ _ISO_8601_Z_PATTERN = re.compile(
+     r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?Z$"
+ )
+ 
+-_SAMPLE_MESSAGE = {
+-    "role": "ROLE_USER",
+-    "parts": [{"text": "Hello from TCK data model test"}],
+-    "messageId": tck_id("dm-test-001"),
+-}
+ 
+ 
+ # ---------------------------------------------------------------------------
+@@ -116,7 +110,7 @@ def send_message_responses(
+         # gRPC handles serialization differently; skip for JSON-level tests
+         if transport_name == "grpc":
+             continue
+-        response = client.send_message(message=_SAMPLE_MESSAGE)
++        response = client.send_message(message=new_text_message('dm-test-001', 'Hello from TCK data model test'))
+         if response.success and response.raw_response is not None:
+             responses[transport_name] = response.raw_response
+     return responses
+@@ -321,7 +315,9 @@ class TestIgnoreUnrecognizedFields:
                  "tckExtraParam": 42,
              },
          }
 -        response = httpx.post(
++        payload["params"] = client.service_parameters(payload["params"])
 +        response = client.request_http(
 +            "POST",
              client.base_url,
              json=payload,
              headers={"Content-Type": "application/json", A2A_VERSION_HEADER: A2A_VERSION},
-@@ -361,7 +361,8 @@ class TestIgnoreUnrecognizedFields:
+@@ -361,8 +357,9 @@ class TestIgnoreUnrecognizedFields:
              },
              "tckExtraParam": 42,
          }
 -        response = httpx.post(
+-            f"{client.base_url}/message:send",
 +        response = client.request_http(
 +            "POST",
-             f"{client.base_url}/message:send",
++            client.service_url("/message:send"),
              json=body,
              headers={"Content-Type": "application/json", A2A_VERSION_HEADER: A2A_VERSION},
+             timeout=30.0,
 diff --git a/tests/compatibility/core_operations/test_error_handling.py b/tests/compatibility/core_operations/test_error_handling.py
-index baa8597..f8297db 100644
+index baa85974c2da0814a8e48c1c845d3cdba3d2ccd1..a2d77fabde44898e98eb4317df22c1993c2c9417 100644
 --- a/tests/compatibility/core_operations/test_error_handling.py
 +++ b/tests/compatibility/core_operations/test_error_handling.py
-@@ -90,13 +90,13 @@ _TASK_NOT_FOUND_ERROR_CODE = -32001
+@@ -8,8 +8,7 @@ Requirements tested:
+     CORE-CAP-001, CORE-CAP-002, CORE-CAP-003, CORE-CAP-004,
+     CARD-EXT-001, CARD-EXT-002,
+     VER-SERVER-002, VER-SERVER-003,
+-    JSONRPC-ERR-001, JSONRPC-ERR-002, JSONRPC-ERR-003,
+-    HTTP_JSON-ERR-001, HTTP_JSON-ERR-002,
++    JSONRPC-ERR-001, JSONRPC-ERR-002,
+     GRPC-ERR-001, GRPC-ERR-002
+ """
+ 
+@@ -17,15 +16,13 @@ from __future__ import annotations
+ 
+ from typing import TYPE_CHECKING, Any
+ 
+-import httpx
+ import jsonschema
+ import pytest
+ 
+ from tck.requirements.base import EXTENDED_AGENT_CARD_NOT_CONFIGURED_ERROR, tck_id
+ from tck.requirements.registry import get_requirement_by_id
+-from tck.transport._helpers import A2A_VERSION, A2A_VERSION_HEADER
++from tck.transport._helpers import A2A_VERSION_HEADER
+ from tck.validators.error_binding import validate_expected_error
+-from tck.validators.error_info import validate_error_info
+ from tck.validators.extended_card import (
+     ExtendedCardProbe,
+     classify_extended_card_probe,
+@@ -36,6 +33,8 @@ from tests.compatibility._test_helpers import (
+     assert_and_record,
+     expected_error_of,
+     get_client,
++    http_json_probe,
++    jsonrpc_probe,
+     record,
+ )
+ from tests.compatibility.markers import core, grpc, http_json, jsonrpc, must
+@@ -61,10 +60,7 @@ VER_SERVER_002 = get_requirement_by_id("VER-SERVER-002")
+ VER_SERVER_003 = get_requirement_by_id("VER-SERVER-003")
+ JSONRPC_ERR_001 = get_requirement_by_id("JSONRPC-ERR-001")
+ JSONRPC_ERR_002 = get_requirement_by_id("JSONRPC-ERR-002")
+-JSONRPC_ERR_003 = get_requirement_by_id("JSONRPC-ERR-003")
+ JSONRPC_SSE_002 = get_requirement_by_id("JSONRPC-SSE-002")
+-HTTP_JSON_ERR_001 = get_requirement_by_id("HTTP_JSON-ERR-001")
+-HTTP_JSON_ERR_002 = get_requirement_by_id("HTTP_JSON-ERR-002")
+ GRPC_ERR_001 = get_requirement_by_id("GRPC-ERR-001")
+ GRPC_ERR_002 = get_requirement_by_id("GRPC-ERR-002")
+ 
+@@ -89,44 +85,6 @@ _TASK_NOT_FOUND_ERROR_CODE = -32001
+ # ---------------------------------------------------------------------------
  
  
- def _jsonrpc_call(
+-def _jsonrpc_call(
 -    base_url: str,
-+    client: BaseTransportClient,
-     method: str,
-     params: dict,
-     *,
-     headers: dict[str, str] | None = None,
- ) -> httpx.Response:
+-    method: str,
+-    params: dict,
+-    *,
+-    headers: dict[str, str] | None = None,
+-) -> httpx.Response:
 -    """Make a raw JSON-RPC 2.0 call bypassing the client for header control."""
-+    """Make a raw JSON-RPC 2.0 call preserving authentication with custom headers."""
-     payload = {
-         "jsonrpc": "2.0",
-         "id": 1,
-@@ -106,11 +106,11 @@ def _jsonrpc_call(
-     hdrs = {"Content-Type": "application/json", A2A_VERSION_HEADER: A2A_VERSION}
-     if headers:
-         hdrs.update(headers)
+-    payload = {
+-        "jsonrpc": "2.0",
+-        "id": 1,
+-        "method": method,
+-        "params": params,
+-    }
+-    hdrs = {"Content-Type": "application/json", A2A_VERSION_HEADER: A2A_VERSION}
+-    if headers:
+-        hdrs.update(headers)
 -    return httpx.post(base_url, json=payload, headers=hdrs)
-+    return client.request_http("POST", client.base_url, json=payload, headers=hdrs)
- 
- 
- def _rest_call(
+-
+-
+-def _rest_call(
 -    base_url: str,
-+    client: BaseTransportClient,
-     method: str,
-     path: str,
-     *,
-@@ -123,7 +123,7 @@ def _rest_call(
-         hdrs["Content-Type"] = "application/json"
-     if headers:
-         hdrs.update(headers)
+-    method: str,
+-    path: str,
+-    *,
+-    json_body: dict | None = None,
+-    headers: dict[str, str] | None = None,
+-) -> httpx.Response:
+-    """Make a raw HTTP request for REST binding."""
+-    hdrs = {A2A_VERSION_HEADER: A2A_VERSION}
+-    if json_body is not None:
+-        hdrs["Content-Type"] = "application/json"
+-    if headers:
+-        hdrs.update(headers)
 -    return httpx.request(method, f"{base_url}{path}", json=json_body, headers=hdrs)
-+    return client.request_http(method, f"{client.base_url}{path}", json=json_body, headers=hdrs)
- 
- 
- 
-@@ -147,7 +147,7 @@ class TestCoreErrorStructure:
+-
+-
+-
+ # ---------------------------------------------------------------------------
+ # Core error handling
+ # ---------------------------------------------------------------------------
+@@ -147,7 +105,7 @@ class TestCoreErrorStructure:
          transport = "jsonrpc"
          # Raw call needed: invoking a non-existent method.
          client = get_client(transport_clients, transport, compatibility_collector=compatibility_collector, req=req)
 -        response = _jsonrpc_call(client.base_url, "NonExistentMethod", {})
-+        response = _jsonrpc_call(client, "NonExistentMethod", {})
++        response = jsonrpc_probe(client, "NonExistentMethod", {})
          body = response.json()
          if "error" not in body:
              pytest.skip("Server did not return an error for unknown method")
-@@ -189,7 +189,7 @@ class TestCoreInputValidation:
+@@ -189,7 +147,7 @@ class TestCoreInputValidation:
          transport = "jsonrpc"
          # Raw call needed: deliberately malformed params.
          client = get_client(transport_clients, transport, compatibility_collector=compatibility_collector, req=req)
 -        response = _jsonrpc_call(client.base_url, "SendMessage", {})
-+        response = _jsonrpc_call(client, "SendMessage", {})
++        response = jsonrpc_probe(client, "SendMessage", {})
          body = response.json()
          passed = "error" in body
          errors = [] if passed else ["Malformed request must return an error"]
-@@ -205,7 +205,7 @@ class TestCoreInputValidation:
+@@ -205,7 +163,7 @@ class TestCoreInputValidation:
          transport = "http_json"
          # Raw call needed: deliberately malformed body.
          client = get_client(transport_clients, transport, compatibility_collector=compatibility_collector, req=req)
 -        response = _rest_call(client.base_url, "POST", "/message:send", json_body={})
-+        response = _rest_call(client, "POST", "/message:send", json_body={})
++        response = http_json_probe(client, "POST", "/message:send", json_body={})
          passed = response.status_code >= _HTTP_ERROR_STATUS
          errors = [] if passed else [f"Expected error status, got {response.status_code}"]
          assert_and_record(compatibility_collector, req, transport, errors)
-@@ -291,7 +291,7 @@ class TestCapabilityStreaming:
+@@ -290,8 +248,8 @@ class TestCapabilityStreaming:
+             "parts": [{"text": "stream test"}],
              "messageId": tck_id("cap-stream"),
          }
-         response = _jsonrpc_call(
+-        response = _jsonrpc_call(
 -            client.base_url, "SendStreamingMessage", {"message": msg}
++        response = jsonrpc_probe(
 +            client, "SendStreamingMessage", {"message": msg}
          )
          body = response.json()
          result = validate_jsonrpc_error(body, expected_error_of(req).name)
-@@ -333,7 +333,7 @@ class TestCapabilityExtensionRequired:
+@@ -333,7 +291,7 @@ class TestCapabilityExtensionRequired:
              "parts": [{"text": "extension test"}],
              "messageId": tck_id("cap-ext-004-jsonrpc"),
          }
 -        response = _jsonrpc_call(client.base_url, "SendMessage", {"message": msg})
-+        response = _jsonrpc_call(client, "SendMessage", {"message": msg})
++        response = jsonrpc_probe(client, "SendMessage", {"message": msg})
          body = response.json()
          result = validate_jsonrpc_error(body, expected_error_of(req).name)
          errors = [] if result.valid else [result.message]
-@@ -358,7 +358,7 @@ class TestCapabilityExtensionRequired:
+@@ -357,8 +315,8 @@ class TestCapabilityExtensionRequired:
+             "parts": [{"text": "extension test"}],
              "messageId": tck_id("cap-ext-004-http-json"),
          }
-         response = _rest_call(
+-        response = _rest_call(
 -            client.base_url, "POST", "/message:send", json_body={"message": msg},
++        response = http_json_probe(
 +            client, "POST", "/message:send", json_body={"message": msg},
          )
          result = validate_http_json_error(response, expected_error_of(req).name)
          errors = [] if result.valid else [result.message]
-@@ -428,9 +428,9 @@ class TestExtendedCardNotConfigured:
+@@ -428,9 +386,9 @@ class TestExtendedCardNotConfigured:
              []
              if probe is ExtendedCardProbe.NOT_CONFIGURED
              else [
@@ -3230,7 +3538,7 @@ index baa8597..f8297db 100644
              ]
          )
          assert_and_record(compatibility_collector, req, transport, errors)
-@@ -501,8 +501,8 @@ class TestExtendedCardRequiresAuth:
+@@ -501,8 +459,8 @@ class TestExtendedCardRequiresAuth:
              []
              if probe is ExtendedCardProbe.CONFIGURED
              else [
@@ -3241,35 +3549,148 @@ index baa8597..f8297db 100644
              ]
          )
          assert_and_record(compatibility_collector, req, transport, errors)
-@@ -564,7 +564,7 @@ class TestVersionErrors:
+@@ -563,8 +521,8 @@ class TestVersionErrors:
+             "parts": [{"text": "version test"}],
              "messageId": tck_id("ver-002"),
          }
-         response = _jsonrpc_call(
+-        response = _jsonrpc_call(
 -            client.base_url,
++        response = jsonrpc_probe(
 +            client,
              "SendMessage",
              {"message": msg},
              headers={A2A_VERSION_HEADER: "99.0"},
-@@ -590,7 +590,7 @@ class TestVersionErrors:
+@@ -589,8 +547,8 @@ class TestVersionErrors:
+             "parts": [{"text": "version test"}],
              "messageId": tck_id("ver-002-rest"),
          }
-         response = _rest_call(
+-        response = _rest_call(
 -            client.base_url,
++        response = http_json_probe(
 +            client,
              "POST",
              "/message:send",
              json_body={"message": msg},
-@@ -616,7 +616,7 @@ class TestVersionErrors:
+@@ -615,8 +573,8 @@ class TestVersionErrors:
+             "parts": [{"text": "empty version test"}],
              "messageId": tck_id("ver-003"),
          }
-         response = _jsonrpc_call(
+-        response = _jsonrpc_call(
 -            client.base_url,
++        response = jsonrpc_probe(
 +            client,
              "SendMessage",
              {"message": msg},
              headers={A2A_VERSION_HEADER: ""},
+@@ -648,7 +606,7 @@ _JSONRPC_ERROR_SCHEMA = {
+ @must
+ @jsonrpc
+ class TestJsonRpcErrorStructure:
+-    """JSONRPC-ERR-001 / JSONRPC-ERR-002 / JSONRPC-ERR-003: JSON-RPC error object structure."""
++    """JSONRPC-ERR-001 / JSONRPC-ERR-002: JSON-RPC error object structure."""
+ 
+     def test_error_object_structure(
+         self,
+@@ -723,30 +681,6 @@ class TestJsonRpcErrorStructure:
+             )
+         assert_and_record(compatibility_collector, req, transport, errors)
+ 
+-    def test_error_data_contains_error_info(
+-        self,
+-        transport_clients: dict[str, BaseTransportClient],
+-        compatibility_collector: Any,
+-    ) -> None:
+-        """JSONRPC-ERR-003: A2A errors include ErrorInfo in data array."""
+-        req = JSONRPC_ERR_003
+-        transport = "jsonrpc"
+-        client = get_client(transport_clients, transport, compatibility_collector=compatibility_collector, req=req)
+-        response = client.get_task(id=tck_id("nonexistent-errinfo-test"))
+-        body = response.raw_response
+-        if not isinstance(body, dict) or "error" not in body:
+-            pytest.skip("Server did not return a JSON-RPC error for non-existent task")
+-        data = body["error"].get("data")
+-        errors = []
+-        if data is not None and not isinstance(data, list):
+-            errors.append(
+-                f"error.data must be an array, got {type(data).__name__}"
+-            )
+-        elif isinstance(data, list):
+-            result = validate_error_info(data)
+-            if not result.valid:
+-                errors.append(result.message)
+-        assert_and_record(compatibility_collector, req, transport, errors)
+ 
+ 
+ # ---------------------------------------------------------------------------
+@@ -754,66 +688,6 @@ class TestJsonRpcErrorStructure:
+ # ---------------------------------------------------------------------------
+ 
+ 
+-@must
+-@http_json
+-class TestRestErrorStructure:
+-    """HTTP_JSON-ERR-001 / HTTP_JSON-ERR-002: AIP-193 error format."""
+-
+-    def test_error_uses_aip193_format(
+-        self,
+-        transport_clients: dict[str, BaseTransportClient],
+-        compatibility_collector: Any,
+-    ) -> None:
+-        """HTTP_JSON-ERR-001: Error responses use AIP-193 format."""
+-        req = HTTP_JSON_ERR_001
+-        transport = "http_json"
+-        client = get_client(transport_clients, transport, compatibility_collector=compatibility_collector, req=req)
+-        response = client.get_task(id=tck_id("nonexistent-pd-test"))
+-        if response.success:
+-            pytest.skip("Server did not return an error for non-existent task")
+-        raw = response.raw_response
+-        if not isinstance(raw, httpx.Response):
+-            pytest.skip("Error response is not an HTTP response object")
+-        ct = raw.headers.get("content-type", "")
+-        errors = []
+-        if "application/json" not in ct:
+-            errors.append(
+-                f"Error Content-Type must be application/json, got: {ct!r}"
+-            )
+-        else:
+-            body = raw.json()
+-            if "error" not in body:
+-                errors.append(
+-                    "AIP-193 error response must include 'error' object"
+-                )
+-            elif "code" not in body.get("error", {}):
+-                errors.append(
+-                    "AIP-193 error.code field is required"
+-                )
+-        assert_and_record(compatibility_collector, req, transport, errors)
+-
+-    def test_a2a_error_info_in_details(
+-        self,
+-        transport_clients: dict[str, BaseTransportClient],
+-        compatibility_collector: Any,
+-    ) -> None:
+-        """HTTP_JSON-ERR-002: A2A errors include ErrorInfo in details array."""
+-        req = HTTP_JSON_ERR_002
+-        transport = "http_json"
+-        client = get_client(transport_clients, transport, compatibility_collector=compatibility_collector, req=req)
+-        response = client.get_task(id=tck_id("nonexistent-uri-test"))
+-        if response.success:
+-            pytest.skip("Server did not return an error for non-existent task")
+-        raw = response.raw_response
+-        if not isinstance(raw, httpx.Response):
+-            pytest.skip("Error response is not an HTTP response object")
+-        body = raw.json()
+-        if "error" not in body:
+-            pytest.skip("Response is not AIP-193 format")
+-        details = body.get("error", {}).get("details", [])
+-        result = validate_error_info(details)
+-        errors = [] if result.valid else [result.message]
+-        assert_and_record(compatibility_collector, req, transport, errors)
+ 
+ 
+ # ---------------------------------------------------------------------------
 diff --git a/tests/compatibility/core_operations/test_multi_stream.py b/tests/compatibility/core_operations/test_multi_stream.py
-index 69fbc8c..e0b68dc 100644
+index 69fbc8c1afec9c301231bccc6228e6aa57de0ae5..e0b68dc158a15ea10f391469bc228c74e942db28 100644
 --- a/tests/compatibility/core_operations/test_multi_stream.py
 +++ b/tests/compatibility/core_operations/test_multi_stream.py
 @@ -22,7 +22,7 @@ import pytest
@@ -3309,7 +3730,7 @@ index 69fbc8c..e0b68dc 100644
          event_lists = _subscribe_parallel(
              client, info.task_id, n=2, stop_first_early=True,
 diff --git a/tests/compatibility/core_operations/test_push_notifications.py b/tests/compatibility/core_operations/test_push_notifications.py
-index 0c12482..ca2cd10 100644
+index 0c124825e95701bbcb69bf29914d0474b38ec9b1..ca2cd10b1f82a36242d530f942e560e3de56dafe 100644
 --- a/tests/compatibility/core_operations/test_push_notifications.py
 +++ b/tests/compatibility/core_operations/test_push_notifications.py
 @@ -26,7 +26,7 @@ from tck.requirements.base import tck_id
@@ -3355,7 +3776,7 @@ index 0c12482..ca2cd10 100644
          transport_clients: dict[str, BaseTransportClient],
          agent_card: dict[str, Any],
 diff --git a/tests/compatibility/core_operations/test_requirements.py b/tests/compatibility/core_operations/test_requirements.py
-index 59e0afb..cda4446 100644
+index 59e0afbd917ff1c36db797f0365a198b732910da..cda4446d4b62c28952b1e174fb181010eb1ecab6 100644
 --- a/tests/compatibility/core_operations/test_requirements.py
 +++ b/tests/compatibility/core_operations/test_requirements.py
 @@ -10,6 +10,7 @@ from typing import TYPE_CHECKING, Any
@@ -3410,8 +3831,47 @@ index 59e0afb..cda4446 100644
      transport: str,
      requirement: Any,
      transport_clients: dict[str, Any],
+diff --git a/tests/compatibility/core_operations/test_stream_ordering.py b/tests/compatibility/core_operations/test_stream_ordering.py
+index b975842b236177efed60cc30c792042548cad8a3..b663b5cdf80a2cd683c66dc5bc27301b3c958d4b 100644
+--- a/tests/compatibility/core_operations/test_stream_ordering.py
++++ b/tests/compatibility/core_operations/test_stream_ordering.py
+@@ -22,12 +22,11 @@ from tck.requirements.base import (
+     TASK_STATE_REJECTED,
+     TASK_STATE_SUBMITTED,
+     TASK_STATE_WORKING,
+-    tck_id,
+ )
+ from tck.requirements.registry import get_requirement_by_id
+ from tck.transport import ALL_TRANSPORTS
+ from tck.validators import STREAM_RESPONSE
+-from tests.compatibility._test_helpers import assert_and_record, get_client, record
++from tests.compatibility._test_helpers import assert_and_record, get_client, new_text_message, record
+ from tests.compatibility.markers import must, streaming
+ 
+ 
+@@ -48,11 +47,6 @@ STREAM_ORDER_001 = get_requirement_by_id("STREAM-ORDER-001")
+ # Constants
+ # ---------------------------------------------------------------------------
+ 
+-_SAMPLE_MESSAGE = {
+-    "role": "ROLE_USER",
+-    "parts": [{"text": "TCK stream ordering test"}],
+-    "messageId": tck_id("stream-ordering-001"),
+-}
+ 
+ # State ordering: 0 = initial, 1 = active, 2 = terminal.
+ _ALL_STATES_WITH_ORDER = [
+@@ -97,7 +91,7 @@ def _get_streaming_events(
+     if not caps.get("streaming"):
+         pytest.skip("Agent does not support streaming")
+ 
+-    response = client.send_streaming_message(message=_SAMPLE_MESSAGE)
++    response = client.send_streaming_message(message=new_text_message('stream-ordering-001', 'TCK stream ordering test'))
+     if getattr(response, "timed_out", False):
+         pytest.skip("Streaming call timed out")
+     if not response.success:
 diff --git a/tests/compatibility/core_operations/test_task_history.py b/tests/compatibility/core_operations/test_task_history.py
-index 872fed1..395a2d2 100644
+index 872fed13468859ec4a386674931414c9c9c415ca..395a2d2596c5d3efbf6ee3a97e6a9a6e26609a8b 100644
 --- a/tests/compatibility/core_operations/test_task_history.py
 +++ b/tests/compatibility/core_operations/test_task_history.py
 @@ -23,9 +23,9 @@ from tck.transport import ALL_TRANSPORTS
@@ -3435,7 +3895,7 @@ index 872fed1..395a2d2 100644
          # Send follow-up with historyLength=0 to complete the task
          msg = {
 diff --git a/tests/compatibility/core_operations/test_task_lifecycle.py b/tests/compatibility/core_operations/test_task_lifecycle.py
-index 5299964..42160bb 100644
+index 5299964063f424ab496c2db8b59f021cef6e7c7d..42160bb0e86086850ab9c19dcf5f386ba28ded30 100644
 --- a/tests/compatibility/core_operations/test_task_lifecycle.py
 +++ b/tests/compatibility/core_operations/test_task_lifecycle.py
 @@ -27,7 +27,7 @@ from tck.requirements.base import TERMINAL_STATES, tck_id
@@ -3512,7 +3972,7 @@ index 5299964..42160bb 100644
              errors.append("SubscribeToTask returned no events")
          else:
 diff --git a/tests/compatibility/core_operations/test_transport_behavior.py b/tests/compatibility/core_operations/test_transport_behavior.py
-index 019cf0a..8690cd2 100644
+index 019cf0a5aa9646855e7b47fea26f56ec5bf5bcef..5b59aba62feb117913b8a60edaea335b3b9cc569 100644
 --- a/tests/compatibility/core_operations/test_transport_behavior.py
 +++ b/tests/compatibility/core_operations/test_transport_behavior.py
 @@ -16,14 +16,14 @@ from __future__ import annotations
@@ -3526,9 +3986,10 @@ index 019cf0a..8690cd2 100644
 +from tck.requirements.base import HTTP_JSON_CONTENT_TYPE, tck_id
  from tck.requirements.registry import get_requirement_by_id
  from tck.transport._helpers import A2A_VERSION, A2A_VERSION_HEADER
-+from tck.validators.http_json.content_type import uses_a2a_media_type
- from tests.compatibility._test_helpers import assert_and_record, get_client, record
+-from tests.compatibility._test_helpers import assert_and_record, get_client, record
 -from tests.compatibility.markers import grpc, http_json, jsonrpc, must, streaming
++from tck.validators.http_json.content_type import uses_a2a_media_type
++from tests.compatibility._test_helpers import assert_and_record, get_client, new_text_message, record
 +from tests.compatibility.markers import grpc, http_json, jsonrpc, must, should, streaming
  
  
@@ -3541,17 +4002,48 @@ index 019cf0a..8690cd2 100644
  HTTP_JSON_SVC_002 = get_requirement_by_id("HTTP_JSON-SVC-002")
  HTTP_JSON_URL_001 = get_requirement_by_id("HTTP_JSON-URL-001")
  HTTP_JSON_URL_002 = get_requirement_by_id("HTTP_JSON-URL-002")
-@@ -179,7 +180,8 @@ class TestJsonRpcServiceParams:
+@@ -55,11 +56,6 @@ GRPC_ERR_003 = get_requirement_by_id("GRPC-ERR-003")
+ # Helpers
+ # ---------------------------------------------------------------------------
+ 
+-_SAMPLE_MESSAGE = {
+-    "role": "ROLE_USER",
+-    "parts": [{"text": "Hello from TCK transport test"}],
+-    "messageId": tck_id("transport-test-001"),
+-}
+ 
+ 
+ # ---------------------------------------------------------------------------
+@@ -80,7 +76,7 @@ class TestJsonRpcFormat:
+         client = transport_clients.get("jsonrpc")
+         if client is None:
+             pytest.skip("JSON-RPC transport not configured")
+-        return client.send_message(message=_SAMPLE_MESSAGE)
++        return client.send_message(message=new_text_message('transport-test-001', 'Hello from TCK transport test'))
+ 
+     def test_response_validates_jsonrpc_envelope(
+         self,
+@@ -179,7 +175,9 @@ class TestJsonRpcServiceParams:
              "method": "SendMessage",
              "params": {"message": msg},
          }
 -        response = httpx.post(
++        payload["params"] = client.service_parameters(payload["params"])
 +        response = client.request_http(
 +            "POST",
              client.base_url,
              json=payload,
              headers={
-@@ -231,7 +233,6 @@ class TestJsonRpcStreaming:
+@@ -216,7 +214,7 @@ class TestJsonRpcStreaming:
+         if client is None:
+             record(collector=compatibility_collector, req=req, transport=transport, passed=False, skipped=True)
+             pytest.skip("JSON-RPC transport not configured")
+-        response = client.send_streaming_message(message=_SAMPLE_MESSAGE)
++        response = client.send_streaming_message(message=new_text_message('transport-test-001', 'Hello from TCK transport test'))
+         if not response.success:
+             pytest.skip(f"Streaming not supported: {response.error}")
+         ct = response.headers.get("content-type", "")
+@@ -231,7 +229,6 @@ class TestJsonRpcStreaming:
  # ---------------------------------------------------------------------------
  
  
@@ -3559,9 +4051,12 @@ index 019cf0a..8690cd2 100644
  @http_json
  class TestRestFormat:
      """HTTP_JSON-SVC-001: Content-Type and response schema validation."""
-@@ -246,28 +247,30 @@ class TestRestFormat:
+@@ -244,30 +241,32 @@ class TestRestFormat:
+         client = transport_clients.get("http_json")
+         if client is None:
              pytest.skip("HTTP+JSON transport not configured")
-         return client.send_message(message=_SAMPLE_MESSAGE)
+-        return client.send_message(message=_SAMPLE_MESSAGE)
++        return client.send_message(message=new_text_message('transport-test-001', 'Hello from TCK transport test'))
  
 +    @should
      def test_response_content_type(
@@ -3595,14 +4090,15 @@ index 019cf0a..8690cd2 100644
          transport = "http_json"
          if not rest_response.success:
              pytest.skip(f"SendMessage failed: {rest_response.error}")
-@@ -300,11 +303,12 @@ class TestRestServiceParams:
+@@ -300,11 +299,12 @@ class TestRestServiceParams:
              "parts": [{"text": "Extensions header test"}],
              "messageId": tck_id("svc-002-ext"),
          }
 -        response = httpx.post(
+-            f"{client.base_url}/message:send",
 +        response = client.request_http(
 +            "POST",
-             f"{client.base_url}/message:send",
++            client.service_url("/message:send"),
              json={"message": msg},
              headers={
 -                "Content-Type": "application/json",
@@ -3610,8 +4106,53 @@ index 019cf0a..8690cd2 100644
                  A2A_VERSION_HEADER: A2A_VERSION,
                  "A2A-Extensions": "https://example.com/ext/v1,https://example.com/ext/v2",
              },
+@@ -414,7 +414,7 @@ class TestRestStreaming:
+         if client is None:
+             record(collector=compatibility_collector, req=req, transport=transport, passed=False, skipped=True)
+             pytest.skip("HTTP+JSON transport not configured")
+-        response = client.send_streaming_message(message=_SAMPLE_MESSAGE)
++        response = client.send_streaming_message(message=new_text_message('transport-test-001', 'Hello from TCK transport test'))
+         if not response.success:
+             pytest.skip(f"Streaming not supported: {response.error}")
+         ct = response.headers.get("content-type", "")
+@@ -447,7 +447,7 @@ class TestGrpcService:
+         if client is None:
+             record(collector=compatibility_collector, req=req, transport=transport, passed=False, skipped=True)
+             pytest.skip("gRPC transport not configured")
+-        response = client.send_message(message=_SAMPLE_MESSAGE)
++        response = client.send_message(message=new_text_message('transport-test-001', 'Hello from TCK transport test'))
+         errors = []
+         if response is None:
+             errors.append("gRPC service returned no response")
+@@ -484,7 +484,7 @@ class TestGrpcProto3:
+             transport_clients, transport,
+             compatibility_collector=compatibility_collector, req=req,
+         )
+-        response = client.send_message(message=_SAMPLE_MESSAGE)
++        response = client.send_message(message=new_text_message('transport-test-001', 'Hello from TCK transport test'))
+         errors = []
+         if not response.success:
+             errors.append(f"SendMessage failed: {response.error}")
+@@ -535,7 +535,7 @@ class TestGrpcServiceParams:
+             "messageId": tck_id("grpc-meta-001-ext"),
+         }
+         proto_request = ParseDict(
+-            {"message": msg}, a2a_pb2.SendMessageRequest(),
++            client.service_parameters({"message": msg}), a2a_pb2.SendMessageRequest(),
+         )
+         # gRPC metadata keys are lowercase per HTTP/2
+         grpc_metadata = [
+@@ -576,7 +576,7 @@ class TestGrpcStreaming:
+         if client is None:
+             record(collector=compatibility_collector, req=req, transport=transport, passed=False, skipped=True)
+             pytest.skip("gRPC transport not configured")
+-        response = client.send_streaming_message(message=_SAMPLE_MESSAGE)
++        response = client.send_streaming_message(message=new_text_message('transport-test-001', 'Hello from TCK transport test'))
+         if not response.success:
+             pytest.skip(f"gRPC streaming not supported: {response.error}")
+         errors = []
 diff --git a/tests/compatibility/grpc/test_status_codes.py b/tests/compatibility/grpc/test_status_codes.py
-index 250539d..1d88e07 100644
+index 250539d50a6b2630e21abf41f36f8bfa9a84f383..8774f35a97d2ec00330c5d5f55715c18c7d4a9a1 100644
 --- a/tests/compatibility/grpc/test_status_codes.py
 +++ b/tests/compatibility/grpc/test_status_codes.py
 @@ -14,9 +14,10 @@ from typing import TYPE_CHECKING, Any
@@ -3741,6 +4282,15 @@ index 250539d..1d88e07 100644
          req = GRPC_ERR_002
          client = get_client(transport_clients, TRANSPORT, compatibility_collector=compatibility_collector, req=req)
  
+@@ -201,7 +171,7 @@ class TestGrpcStatusCodes:
+                 "messageId": tck_id("grpc-status-ver-005"),
+             }
+         }
+-        proto_request = ParseDict(msg, a2a_pb2.SendMessageRequest())
++        proto_request = ParseDict(client.service_parameters(msg), a2a_pb2.SendMessageRequest())
+ 
+         try:
+             client.stub.SendMessage(
 @@ -210,7 +180,7 @@ class TestGrpcStatusCodes:
              )
              # If the call succeeds, the server did not enforce version checking.
@@ -3751,19 +4301,60 @@ index 250539d..1d88e07 100644
              )
              record(
 diff --git a/tests/compatibility/grpc/test_streaming.py b/tests/compatibility/grpc/test_streaming.py
-index ee99deb..d6d2db7 100644
+index ee99debd1beff92afd1e7c981dab7f578882ca07..0a6348d023996d3fc577475df13f72d3e32fef60 100644
 --- a/tests/compatibility/grpc/test_streaming.py
 +++ b/tests/compatibility/grpc/test_streaming.py
-@@ -24,7 +24,7 @@ from tck.transport.grpc_client import TRANSPORT
+@@ -24,8 +24,8 @@ from tck.transport.grpc_client import TRANSPORT
  from tck.validators import STREAM_RESPONSE
  from tck.validators.grpc.error_validator import validate_grpc_error
  from tck.validators.streaming import drain_stream
 -from tests.compatibility._task_helpers import create_working_task
+-from tests.compatibility._test_helpers import assert_and_record, get_client, record
 +from tests.compatibility._task_helpers import create_input_required_task
- from tests.compatibility._test_helpers import assert_and_record, get_client, record
++from tests.compatibility._test_helpers import assert_and_record, get_client, new_text_message, record
  from tests.compatibility.markers import grpc as grpc_marker
  from tests.compatibility.markers import must, streaming
-@@ -275,7 +275,7 @@ class TestGrpcStreaming:
+ 
+@@ -56,11 +56,6 @@ _TERMINAL_STATES = frozenset({
+     a2a_pb2.TASK_STATE_REJECTED,
+ })
+ 
+-_SAMPLE_MESSAGE = {
+-    "role": "ROLE_USER",
+-    "parts": [{"text": "TCK gRPC streaming test"}],
+-    "messageId": tck_id("grpc-streaming-001"),
+-}
+ 
+ _CONNECTIVITY_CODES = frozenset({
+     grpc.StatusCode.UNAVAILABLE,
+@@ -90,7 +85,7 @@ def _collect_events(
+     """
+     _skip_if_no_streaming(agent_card)
+ 
+-    response = client.send_streaming_message(message=_SAMPLE_MESSAGE)
++    response = client.send_streaming_message(message=new_text_message('grpc-streaming-001', 'TCK gRPC streaming test'))
+     if not response.success:
+         pytest.skip(f"Streaming call failed: {response.error}")
+ 
+@@ -130,7 +125,7 @@ class TestGrpcStreaming:
+             record(collector=compatibility_collector, req=req, transport=TRANSPORT, passed=False, skipped=True)
+         _skip_if_no_streaming(agent_card)
+ 
+-        response = client.send_streaming_message(message=_SAMPLE_MESSAGE)
++        response = client.send_streaming_message(message=new_text_message('grpc-streaming-001', 'TCK gRPC streaming test'))
+         if not response.success:
+             pytest.skip(f"Streaming call failed: {response.error}")
+ 
+@@ -191,7 +186,7 @@ class TestGrpcStreaming:
+             record(collector=compatibility_collector, req=req, transport=TRANSPORT, passed=False, skipped=True)
+         _skip_if_no_streaming(agent_card)
+ 
+-        response = client.send_streaming_message(message=_SAMPLE_MESSAGE)
++        response = client.send_streaming_message(message=new_text_message('grpc-streaming-001', 'TCK gRPC streaming test'))
+         if not response.success:
+             pytest.skip(f"Streaming call failed: {response.error}")
+ 
+@@ -275,7 +270,7 @@ class TestGrpcStreaming:
  
          # Create a non-terminal task so SubscribeToTask is valid
          # (subscribing to a terminal task should be rejected per STREAM-SUB-003)
@@ -3773,10 +4364,10 @@ index ee99deb..d6d2db7 100644
          # Subscribe to the task
          sub_response = client.subscribe_to_task(id=info.task_id)
 diff --git a/tests/compatibility/http_json/test_http_status.py b/tests/compatibility/http_json/test_http_status.py
-index ea0c548..2d1af45 100644
+index ea0c5481886ad517cb30dea6fcf7a2beeb945231..bba7f78dc1b9c68e872e7204fc792a317cb36953 100644
 --- a/tests/compatibility/http_json/test_http_status.py
 +++ b/tests/compatibility/http_json/test_http_status.py
-@@ -9,19 +9,16 @@ Requirements tested:
+@@ -9,19 +9,23 @@ Requirements tested:
  
  from __future__ import annotations
  
@@ -3795,11 +4386,18 @@ index ea0c548..2d1af45 100644
  from tck.transport.http_json_client import TRANSPORT
  from tck.validators.http_json.error_validator import validate_http_json_error
 -from tests.compatibility._test_helpers import assert_and_record, fail_msg, get_client, record
-+from tests.compatibility._test_helpers import assert_and_record, fail_msg, get_client, record, require_unsupported_input_media
++from tests.compatibility._test_helpers import (
++    assert_and_record,
++    fail_msg,
++    fresh_message,
++    get_client,
++    record,
++    require_unsupported_input_media,
++)
  from tests.compatibility.markers import http_json, must
  
  
-@@ -65,9 +62,6 @@ class TestHttpJsonStatusCodes:
+@@ -65,9 +69,6 @@ class TestHttpJsonStatusCodes:
          client = get_client(transport_clients, TRANSPORT, compatibility_collector=compatibility_collector, req=req)
  
          response = client.get_task(id=tck_id("nonexistent-status-001"))
@@ -3809,7 +4407,7 @@ index ea0c548..2d1af45 100644
          result = validate_http_json_error(
              {"status_code": response.status_code, "headers": response.headers, "body": response.raw_response},
              "TaskNotFoundError",
-@@ -75,32 +69,20 @@ class TestHttpJsonStatusCodes:
+@@ -75,32 +76,20 @@ class TestHttpJsonStatusCodes:
          errors = [] if result.valid else [result.message]
          assert_and_record(compatibility_collector, req, TRANSPORT, errors)
  
@@ -3848,7 +4446,7 @@ index ea0c548..2d1af45 100644
          assert_and_record(compatibility_collector, req, TRANSPORT, errors)
  
      def test_unsupported_operation_returns_400(
-@@ -124,9 +106,6 @@ class TestHttpJsonStatusCodes:
+@@ -124,9 +113,6 @@ class TestHttpJsonStatusCodes:
              "messageId": tck_id("status-unsupported-003"),
          }
          response = client.send_streaming_message(message=msg)
@@ -3858,7 +4456,7 @@ index ea0c548..2d1af45 100644
          result = validate_http_json_error(
              {"status_code": response.status_code, "headers": response.headers, "body": response.raw_response},
              "UnsupportedOperationError",
-@@ -134,26 +113,24 @@ class TestHttpJsonStatusCodes:
+@@ -134,26 +120,24 @@ class TestHttpJsonStatusCodes:
          errors = [] if result.valid else [result.message]
          assert_and_record(compatibility_collector, req, TRANSPORT, errors)
  
@@ -3879,7 +4477,7 @@ index ea0c548..2d1af45 100644
 -            f"{client.base_url}{SEND_MESSAGE_BINDING.http_json_path}",
 -            content=json.dumps({"message": {"role": "ROLE_USER", "parts": [{"text": "ct test"}], "messageId": tck_id("status-ct-004")}}).encode(),
 -            headers={"Content-Type": "text/plain", A2A_VERSION_HEADER: A2A_VERSION},
-+        message = get_requirement_by_id("CORE-SEND-003").sample_input["message"]
++        message = fresh_message(get_requirement_by_id("CORE-SEND-003").sample_input["message"])
 +        require_unsupported_input_media(
 +            message, agent_card, collector=compatibility_collector, req=req, transport=TRANSPORT,
 +        )
@@ -3896,7 +4494,7 @@ index ea0c548..2d1af45 100644
          errors = [] if result.valid else [result.message]
          assert_and_record(compatibility_collector, req, TRANSPORT, errors)
  
-@@ -176,9 +153,6 @@ class TestHttpJsonStatusCodes:
+@@ -176,9 +160,6 @@ class TestHttpJsonStatusCodes:
              task_id=tck_id("status-push-005"),
              config={"url": "https://example.com"},
          )
@@ -3906,14 +4504,15 @@ index ea0c548..2d1af45 100644
          result = validate_http_json_error(
              {"status_code": response.status_code, "headers": response.headers, "body": response.raw_response},
              "PushNotificationNotSupportedError",
-@@ -201,11 +175,12 @@ class TestHttpJsonStatusCodes:
+@@ -201,11 +182,12 @@ class TestHttpJsonStatusCodes:
              "parts": [{"text": "version status test"}],
              "messageId": tck_id("status-ver-006"),
          }
 -        response = httpx.post(
+-            f"{client.base_url}{SEND_MESSAGE_BINDING.http_json_path}",
 +        response = client.request_http(
 +            "POST",
-             f"{client.base_url}{SEND_MESSAGE_BINDING.http_json_path}",
++            client.service_url(SEND_MESSAGE_BINDING.http_json_path),
              json={"message": msg},
              headers={
 -                "Content-Type": "application/json",
@@ -3922,7 +4521,7 @@ index ea0c548..2d1af45 100644
              },
          )
 diff --git a/tests/compatibility/http_json/test_problem_details.py b/tests/compatibility/http_json/test_problem_details.py
-index ebb8554..3ae3c0a 100644
+index ebb85541fafa109bb4b7e205cfedab03d77c4c02..b592fb5d8928a5ee2f80d5a589d41aa31ab9f7d0 100644
 --- a/tests/compatibility/http_json/test_problem_details.py
 +++ b/tests/compatibility/http_json/test_problem_details.py
 @@ -13,13 +13,14 @@ from typing import TYPE_CHECKING, Any
@@ -3950,7 +4549,42 @@ index ebb8554..3ae3c0a 100644
  
  
  # ---------------------------------------------------------------------------
-@@ -71,49 +73,42 @@ def _get_error_body(response: Any) -> dict[str, Any] | None:
+@@ -44,76 +46,69 @@ def _get_error_response(
+ ) -> Any:
+     """Request a non-existent task to trigger an error response.
+ 
+-    Returns the raw transport response, or calls pytest.skip if the server
++    Returns the raw transport response, or calls pytest.fail if the server
+     does not return an error.
+     """
+     response = client.get_task(id=tck_id("nonexistent-pd-001"))
+     if response.success:
+-        pytest.skip("Server did not return an error for non-existent task")
++        pytest.fail("Server did not return an error for non-existent task")
+     return response
+ 
+ 
+-def _get_error_body(response: Any) -> dict[str, Any] | None:
++def _get_error_body(response: Any) -> dict[str, Any]:
+     """Extract the AIP-193 error body from a response.
+ 
+-    Returns None (and skips the test) when the response body is not
++    Fails when the response body is not
+     an AIP-193 error object.
+     """
+     raw = response.raw_response
+     if not hasattr(raw, "json"):
+-        pytest.skip("Response does not support JSON parsing")
++        pytest.fail("Response does not support JSON parsing")
+     try:
+         body = raw.json()
+-    except Exception:
+-        pytest.skip("Response body is not valid JSON")
++    except ValueError as error:
++        pytest.fail(f"Response body is not valid JSON: {error}")
+     if not isinstance(body, dict) or "error" not in body:
+-        pytest.skip("Response body is not an AIP-193 error object")
++        pytest.fail("Response body is not an AIP-193 error object")
      return body
  
  
@@ -4048,7 +4682,18 @@ index ebb8554..3ae3c0a 100644
  
      def test_code_field_matches_http_status(
          self,
-@@ -155,8 +155,8 @@ class TestAIP193ErrorFormat:
+@@ -145,18 +145,15 @@ class TestAIP193ErrorFormat:
+         response = _get_error_response(client)
+         body = _get_error_body(response)
+ 
+-        try:
+-            aip_error = AIP193Error.from_dict(body)
+-        except ValueError:
+-            pytest.skip("AIP-193 error missing required fields")
++        aip_error = AIP193Error.from_dict(body)
+ 
+         valid = aip_error.code == response.status_code
+         errors = (
              []
              if valid
              else [
@@ -4059,7 +4704,7 @@ index ebb8554..3ae3c0a 100644
              ]
          )
          record(
-@@ -179,14 +179,7 @@ class TestAIP193ErrorFormat:
+@@ -179,14 +176,7 @@ class TestAIP193ErrorFormat:
          response = _get_error_response(client)
          body = _get_error_body(response)
  
@@ -4075,11 +4720,47 @@ index ebb8554..3ae3c0a 100644
  
  
  # ---------------------------------------------------------------------------
+@@ -210,10 +200,7 @@ class TestAIP193ErrorInfo:
+         response = _get_error_response(client)
+         body = _get_error_body(response)
+ 
+-        try:
+-            aip_error = AIP193Error.from_dict(body)
+-        except ValueError:
+-            pytest.skip("AIP-193 error missing required fields")
++        aip_error = AIP193Error.from_dict(body)
+ 
+         valid = find_error_info(aip_error.details) is not None
+         errors = (
+@@ -243,10 +230,7 @@ class TestAIP193ErrorInfo:
+         response = _get_error_response(client)
+         body = _get_error_body(response)
+ 
+-        try:
+-            aip_error = AIP193Error.from_dict(body)
+-        except ValueError:
+-            pytest.skip("AIP-193 error missing required fields")
++        aip_error = AIP193Error.from_dict(body)
+ 
+         result = validate_error_info(aip_error.details)
+         errors = [] if result.valid else [result.message]
+@@ -270,10 +254,7 @@ class TestAIP193ErrorInfo:
+         response = _get_error_response(client)
+         body = _get_error_body(response)
+ 
+-        try:
+-            aip_error = AIP193Error.from_dict(body)
+-        except ValueError:
+-            pytest.skip("AIP-193 error missing required fields")
++        aip_error = AIP193Error.from_dict(body)
+ 
+         result = validate_error_info(aip_error.details, expected_reason=TASK_NOT_FOUND_ERROR.reason)
+         errors = [] if result.valid else [result.message]
 diff --git a/tests/compatibility/jsonrpc/test_error_codes.py b/tests/compatibility/jsonrpc/test_error_codes.py
-index ea74ef7..371b11d 100644
+index ea74ef728344903b87d403159849898942f900d7..4501f0124098d911f044c44136320212f5a69980 100644
 --- a/tests/compatibility/jsonrpc/test_error_codes.py
 +++ b/tests/compatibility/jsonrpc/test_error_codes.py
-@@ -9,11 +9,8 @@ Requirements tested:
+@@ -9,23 +9,29 @@ Requirements tested:
  
  from __future__ import annotations
  
@@ -4091,47 +4772,55 @@ index ea74ef7..371b11d 100644
  import pytest
  
  from tck.requirements.base import tck_id
-@@ -21,11 +18,13 @@ from tck.requirements.registry import get_requirement_by_id
- from tck.transport._helpers import A2A_VERSION, A2A_VERSION_HEADER
+ from tck.requirements.registry import get_requirement_by_id
+-from tck.transport._helpers import A2A_VERSION, A2A_VERSION_HEADER
++from tck.transport._helpers import A2A_VERSION_HEADER
  from tck.transport.jsonrpc_client import TRANSPORT
  from tck.validators.jsonrpc.error_validator import validate_jsonrpc_error
 -from tests.compatibility._test_helpers import assert_and_record, fail_msg, get_client, record
-+from tests.compatibility._test_helpers import assert_and_record, fail_msg, get_client, record, require_unsupported_input_media
++from tests.compatibility._test_helpers import (
++    assert_and_record,
++    fail_msg,
++    fresh_message,
++    get_client,
++    jsonrpc_probe,
++    record,
++    require_unsupported_input_media,
++)
  from tests.compatibility.markers import jsonrpc, must
  
  
  if TYPE_CHECKING:
-+    import httpx
 +
      from tck.transport.base import BaseTransportClient
  
  
-@@ -55,13 +54,13 @@ _JSONRPC_ERROR_CODE_MAX = -32600
+@@ -54,24 +60,6 @@ _JSONRPC_ERROR_CODE_MAX = -32600
+ # ---------------------------------------------------------------------------
  
  
- def _jsonrpc_call(
+-def _jsonrpc_call(
 -    base_url: str,
-+    client: BaseTransportClient,
-     method: str,
-     params: dict,
-     *,
-     headers: dict[str, str] | None = None,
- ) -> httpx.Response:
+-    method: str,
+-    params: dict,
+-    *,
+-    headers: dict[str, str] | None = None,
+-) -> httpx.Response:
 -    """Make a raw JSON-RPC 2.0 call bypassing the client for header control."""
-+    """Make a raw JSON-RPC 2.0 call preserving authentication with custom headers."""
-     payload = {
-         "jsonrpc": "2.0",
-         "id": 1,
-@@ -71,7 +70,7 @@ def _jsonrpc_call(
-     hdrs = {"Content-Type": "application/json", A2A_VERSION_HEADER: A2A_VERSION}
-     if headers:
-         hdrs.update(headers)
+-    payload = {
+-        "jsonrpc": "2.0",
+-        "id": 1,
+-        "method": method,
+-        "params": params,
+-    }
+-    hdrs = {"Content-Type": "application/json", A2A_VERSION_HEADER: A2A_VERSION}
+-    if headers:
+-        hdrs.update(headers)
 -    return httpx.post(base_url, json=payload, headers=hdrs)
-+    return client.request_http("POST", client.base_url, json=payload, headers=hdrs)
  
  
  # ---------------------------------------------------------------------------
-@@ -103,34 +102,19 @@ class TestJsonRpcErrorCodeMappings:
+@@ -103,34 +91,19 @@ class TestJsonRpcErrorCodeMappings:
          errors = [] if result.valid else [result.message]
          assert_and_record(compatibility_collector, req, transport, errors)
  
@@ -4170,16 +4859,18 @@ index ea74ef7..371b11d 100644
          assert_and_record(compatibility_collector, req, transport, errors)
  
      def test_push_notification_not_supported_error(
-@@ -185,7 +169,7 @@ class TestJsonRpcErrorCodeMappings:
+@@ -184,8 +157,8 @@ class TestJsonRpcErrorCodeMappings:
+             "parts": [{"text": "error code test"}],
              "messageId": tck_id("error-code-004"),
          }
-         response = _jsonrpc_call(
+-        response = _jsonrpc_call(
 -            client.base_url, "SendStreamingMessage", {"message": msg}
++        response = jsonrpc_probe(
 +            client, "SendStreamingMessage", {"message": msg}
          )
          body = response.json()
          if "error" not in body:
-@@ -198,54 +182,19 @@ class TestJsonRpcErrorCodeMappings:
+@@ -198,54 +171,19 @@ class TestJsonRpcErrorCodeMappings:
      def test_content_type_not_supported_error(
          self,
          transport_clients: dict[str, BaseTransportClient],
@@ -4214,7 +4905,7 @@ index ea74ef7..371b11d 100644
 -            # unrelated to what this test means to exercise (GH-216).
 -            content=json.dumps(payload).encode(),
 -            headers={"Content-Type": "text/plain", A2A_VERSION_HEADER: A2A_VERSION},
-+        message = get_requirement_by_id("CORE-SEND-003").sample_input["message"]
++        message = fresh_message(get_requirement_by_id("CORE-SEND-003").sample_input["message"])
 +        require_unsupported_input_media(
 +            message, agent_card, collector=compatibility_collector, req=req, transport=transport,
          )
@@ -4241,25 +4932,29 @@ index ea74ef7..371b11d 100644
          errors = [] if result.valid else [result.message]
          assert_and_record(compatibility_collector, req, transport, errors)
  
-@@ -266,7 +215,7 @@ class TestJsonRpcErrorCodeMappings:
+@@ -265,8 +203,8 @@ class TestJsonRpcErrorCodeMappings:
+             "parts": [{"text": "version error code test"}],
              "messageId": tck_id("error-code-009"),
          }
-         response = _jsonrpc_call(
+-        response = _jsonrpc_call(
 -            client.base_url,
++        response = jsonrpc_probe(
 +            client,
              "SendMessage",
              {"message": msg},
              headers={A2A_VERSION_HEADER: "99.0"},
-@@ -337,7 +286,7 @@ class TestJsonRpcErrorCodeRange:
+@@ -336,8 +274,8 @@ class TestJsonRpcErrorCodeRange:
+                 "parts": [{"text": "range test"}],
                  "messageId": tck_id("range-check-003"),
              }
-             raw = _jsonrpc_call(
+-            raw = _jsonrpc_call(
 -                client.base_url,
++            raw = jsonrpc_probe(
 +                client,
                  "SendMessage",
                  {"message": msg},
                  headers={A2A_VERSION_HEADER: "99.0"},
-@@ -359,10 +308,10 @@ class TestJsonRpcErrorCodeRange:
+@@ -359,10 +297,10 @@ class TestJsonRpcErrorCodeRange:
              []
              if valid
              else [
@@ -4273,7 +4968,7 @@ index ea74ef7..371b11d 100644
          )
          assert_and_record(compatibility_collector, req, transport, errors)
 diff --git a/tests/compatibility/jsonrpc/test_error_info.py b/tests/compatibility/jsonrpc/test_error_info.py
-index d5fed3d..d617ffc 100644
+index d5fed3df50dd8a2fae828719013cf7d183bd4779..d617ffce5ebf57fb023c515fe061013890c7fe23 100644
 --- a/tests/compatibility/jsonrpc/test_error_info.py
 +++ b/tests/compatibility/jsonrpc/test_error_info.py
 @@ -1,12 +1,4 @@
@@ -4487,19 +5182,42 @@ index d5fed3d..d617ffc 100644
 +        errors = [] if uses_well_known_error_details(data) else ["Error details should use well-known google.rpc types"]
 +        assert_and_record(compatibility_collector, req, TRANSPORT, errors)
 diff --git a/tests/compatibility/jsonrpc/test_sse_streaming.py b/tests/compatibility/jsonrpc/test_sse_streaming.py
-index a42e8e8..3db675f 100644
+index a42e8e805245f3eeff34395f8f5e8be5c4a77222..7e14b8e0bdbc86ab5f0e094dae9633d197373948 100644
 --- a/tests/compatibility/jsonrpc/test_sse_streaming.py
 +++ b/tests/compatibility/jsonrpc/test_sse_streaming.py
-@@ -20,7 +20,7 @@ from tck.requirements.registry import get_requirement_by_id
+@@ -20,8 +20,8 @@ from tck.requirements.registry import get_requirement_by_id
  from tck.transport.jsonrpc_client import TRANSPORT
  from tck.validators import STREAM_RESPONSE
  from tck.validators.streaming import drain_stream
 -from tests.compatibility._task_helpers import create_working_task
+-from tests.compatibility._test_helpers import assert_and_record, get_client, record
 +from tests.compatibility._task_helpers import create_input_required_task
- from tests.compatibility._test_helpers import assert_and_record, get_client, record
++from tests.compatibility._test_helpers import assert_and_record, get_client, new_text_message, record
  from tests.compatibility.markers import jsonrpc, must, streaming
  
-@@ -227,7 +227,7 @@ class TestSseSubscribeToTask:
+ 
+@@ -46,11 +46,6 @@ _TASK_NOT_FOUND_CODE = -32001
+ 
+ _STREAM_RESPONSE_KEYS = {"task", "message", "statusUpdate", "artifactUpdate"}
+ 
+-_SAMPLE_MESSAGE = {
+-    "role": "ROLE_USER",
+-    "parts": [{"text": "TCK streaming test"}],
+-    "messageId": tck_id("sse-streaming-001"),
+-}
+ 
+ 
+ # ---------------------------------------------------------------------------
+@@ -71,7 +66,7 @@ def _get_streaming_events(
+     if not caps.get("streaming"):
+         pytest.skip("Agent does not support streaming")
+ 
+-    response = client.send_streaming_message(message=_SAMPLE_MESSAGE)
++    response = client.send_streaming_message(message=new_text_message('sse-streaming-001', 'TCK streaming test'))
+     if response.timed_out:
+         pytest.skip("Streaming call timed out waiting for server to close the connection")
+     if not response.success:
+@@ -227,7 +222,7 @@ class TestSseSubscribeToTask:
  
          # Create a non-terminal task so SubscribeToTask is valid
          # (subscribing to a terminal task should be rejected per STREAM-SUB-003)
@@ -4508,7 +5226,7 @@ index a42e8e8..3db675f 100644
  
          # Subscribe to the task
          sub_response = client.subscribe_to_task(id=info.task_id)
-@@ -245,8 +245,8 @@ class TestSseSubscribeToTask:
+@@ -245,8 +240,8 @@ class TestSseSubscribeToTask:
              []
              if passed
              else [
@@ -4521,7 +5239,7 @@ index a42e8e8..3db675f 100644
  
 diff --git a/tests/unit/codegen/test_checked_in_suts.py b/tests/unit/codegen/test_checked_in_suts.py
 new file mode 100644
-index 0000000..22f5611
+index 0000000000000000000000000000000000000000..22f5611ef091d9352ea39f9b87bb8386c0b87561
 --- /dev/null
 +++ b/tests/unit/codegen/test_checked_in_suts.py
 @@ -0,0 +1,30 @@
@@ -4556,7 +5274,7 @@ index 0000000..22f5611
 +        checked_in = root / "sut" / target / path.relative_to(tmp_path)
 +        assert path.read_bytes() == checked_in.read_bytes(), str(checked_in)
 diff --git a/tests/unit/reporting/test_collector.py b/tests/unit/reporting/test_collector.py
-index 1599396..3a82e60 100644
+index 15993968028f75bb4cc7d05356ec714fab4dd5a1..3a82e60e9a9f203c3d3759563552265ef24397ea 100644
 --- a/tests/unit/reporting/test_collector.py
 +++ b/tests/unit/reporting/test_collector.py
 @@ -50,3 +50,11 @@ class TestRecordCount:
@@ -4573,7 +5291,7 @@ index 1599396..3a82e60 100644
 +        summarize_status([])
 diff --git a/tests/unit/reporting/test_manual_requirements.py b/tests/unit/reporting/test_manual_requirements.py
 new file mode 100644
-index 0000000..c5b9d7e
+index 0000000000000000000000000000000000000000..c5b9d7e33a248930aeabb28602405c5f1df83c12
 --- /dev/null
 +++ b/tests/unit/reporting/test_manual_requirements.py
 @@ -0,0 +1,114 @@
@@ -4691,8 +5409,108 @@ index 0000000..c5b9d7e
 +    assert result.status == "FAIL"
 +    assert result.transports["http_json"] == "FAIL"
 +    assert result.transport_errors == {"http_json": ["witness"]}
+diff --git a/tests/unit/requirements/test_compatibility_probe_contracts.py b/tests/unit/requirements/test_compatibility_probe_contracts.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..8d802082d336ae0005bd54788c6ec99dccb0d77c
+--- /dev/null
++++ b/tests/unit/requirements/test_compatibility_probe_contracts.py
+@@ -0,0 +1,94 @@
++"""Collected probes respect normative levels and native error representations."""
++
++from __future__ import annotations
++
++import ast
++import importlib
++import inspect
++import json
++import textwrap
++
++from http.server import BaseHTTPRequestHandler
++from pathlib import Path
++from typing import TYPE_CHECKING, Any
++
++import pytest
++
++from tck.reporting.collector import CompatibilityCollector
++from tck.transport.http_json_client import HttpJsonClient
++from tests.unit.transport.test_http_json_client import running_server
++
++
++if TYPE_CHECKING:
++    from collections.abc import Iterator
++
++
++def compatibility_probes() -> Iterator[tuple[Any, Any, set[str]]]:
++    """Discover actual pytest methods declaring a registry requirement."""
++    root = Path(__file__).resolve().parents[3]
++    for path in sorted((root / "tests/compatibility").rglob("test_*.py")):
++        module = importlib.import_module(".".join(path.relative_to(root).with_suffix("").parts))
++        for _, cls in inspect.getmembers(module, inspect.isclass):
++            if cls.__module__ != module.__name__ or not cls.__name__.startswith("Test"):
++                continue
++            for name, method in inspect.getmembers(cls, inspect.isfunction):
++                if not name.startswith("test_"):
++                    continue
++                source = ast.parse(textwrap.dedent(inspect.getsource(method)))
++                for node in ast.walk(source):
++                    if not isinstance(node, ast.Assign) or not isinstance(node.value, ast.Name):
++                        continue
++                    if not any(isinstance(target, ast.Name) and target.id == "req" for target in node.targets):
++                        continue
++                    requirement = vars(module).get(node.value.id)
++                    if requirement is None or not hasattr(requirement, "level"):
++                        continue
++                    marks = [*getattr(cls, "pytestmark", []), *getattr(method, "pytestmark", [])]
++                    levels = {mark.name for mark in marks} & {"must", "should", "may"}
++                    yield getattr(cls(), name), requirement, levels
++
++
++def test_actual_probe_filters_match_the_registry_obligations() -> None:
++    """A MUST run cannot silently enforce SHOULD obligations or omit MUSTs."""
++    checked = []
++    for method, requirement, levels in compatibility_probes():
++        assert levels == {requirement.level.value.lower()}, (method.__qualname__, requirement.id, levels)
++        checked.append(requirement.id)
++    assert checked
++
++
++@pytest.mark.parametrize("media_type", ["application/a2a+json", "application/json"])
++def test_every_mandatory_http_error_format_probe_accepts_native_errors(media_type: str) -> None:
++    """Exercise every collected ERR-001 producer, including cross-binding ones."""
++    class NativeErrorServer(BaseHTTPRequestHandler):
++        def do_GET(self) -> None:
++            body = json.dumps({"error": {"code": 404, "status": "NOT_FOUND", "message": "missing", "details": [
++                {"@type": "type.googleapis.com/google.rpc.ErrorInfo", "reason": "TASK_NOT_FOUND", "domain": "a2a-protocol.org"},
++            ]}}).encode()
++            self.send_response(404)
++            self.send_header("Content-Type", media_type)
++            self.send_header("Content-Length", str(len(body)))
++            self.end_headers()
++            self.wfile.write(body)
++
++        def log_message(self, format: str, *args: Any) -> None:
++            pass
++
++    checked = []
++    with running_server(NativeErrorServer) as url:
++        client = HttpJsonClient(url)
++        try:
++            for method, requirement, _ in compatibility_probes():
++                if requirement.id != "HTTP_JSON-ERR-001":
++                    continue
++                collector = CompatibilityCollector()
++                try:
++                    method(transport_clients={"http_json": client}, compatibility_collector=collector)
++                except pytest.skip.Exception as error:
++                    pytest.fail(f"Mandatory native error-format probe skipped: {error}")
++                assert collector.get_results()
++                assert all(result.passed and not result.skipped for result in collector.get_results())
++                checked.append(method.__qualname__)
++        finally:
++            client.close()
++    assert checked
 diff --git a/tests/unit/requirements/test_expected_error_declared.py b/tests/unit/requirements/test_expected_error_declared.py
-index d59e0b8..66d1fbe 100644
+index d59e0b848048f458e7ac11975870d09e1e4c755b..66d1fbeb946220b9f9550a3c425b5eed5febdbcd 100644
 --- a/tests/unit/requirements/test_expected_error_declared.py
 +++ b/tests/unit/requirements/test_expected_error_declared.py
 @@ -15,7 +15,7 @@ import re
@@ -4706,7 +5524,7 @@ index d59e0b8..66d1fbe 100644
  def test_named_error_requirements_declare_expected_error() -> None:
 diff --git a/tests/unit/requirements/test_released_spec_bindings.py b/tests/unit/requirements/test_released_spec_bindings.py
 new file mode 100644
-index 0000000..2ed38e8
+index 0000000000000000000000000000000000000000..2ed38e8196941b6dfc23f094ffe5485b6b3284b4
 --- /dev/null
 +++ b/tests/unit/requirements/test_released_spec_bindings.py
 @@ -0,0 +1,94 @@
@@ -4804,12 +5622,215 @@ index 0000000..2ed38e8
 +
 +    with pytest.raises(ValueError, match="No smtp mapping"):
 +        describe_error_mappings("smtp")
+diff --git a/tests/unit/test_task_helpers.py b/tests/unit/test_task_helpers.py
+index 7da6fb965ee76ffb6ed94c304a08ba89f66d6723..18094fadb4beba899698b449078c2b6c8793f07d 100644
+--- a/tests/unit/test_task_helpers.py
++++ b/tests/unit/test_task_helpers.py
+@@ -1,35 +1,175 @@
+-"""Unit tests for shared compatibility task helpers."""
++"""Actual transport task flows preserve distinct message identities."""
+ 
+ from __future__ import annotations
+ 
+-from types import SimpleNamespace
+-from typing import Any
++import ast
++import json
+ 
++from contextlib import ExitStack, contextmanager
++from http.server import BaseHTTPRequestHandler
++from pathlib import Path
++from typing import TYPE_CHECKING, Any
++
++import pytest
++
++from tck.reporting.collector import CompatibilityCollector
++from tck.requirements.base import tck_id
++from tck.transport.http_json_client import HttpJsonClient
++from tck.transport.jsonrpc_client import JsonRpcClient
++from tck.validators.json_schema import JSONSchemaValidator
++from tck.validators.jsonrpc.response_validator import JsonRpcResponseValidator
+ from tests.compatibility import _task_helpers
++from tests.compatibility._test_helpers import fresh_message
++from tests.compatibility.core_operations import test_stream_ordering as ordering_checks
++from tests.unit.transport.test_http_json_client import running_server
++
+ 
++if TYPE_CHECKING:
++    from collections.abc import Iterator
+ 
+-def test_multiturn_task_with_history_uses_unique_message_ids(monkeypatch: Any) -> None:
+-    """History follow-ups need distinct IDs while matching the input-required fixture."""
+-    monkeypatch.setattr(_task_helpers, "validate_task_state", lambda *_args: [])
+ 
+-    class RecordingClient:
+-        def __init__(self) -> None:
+-            self.messages: list[dict[str, Any]] = []
++@contextmanager
++def task_flow_server() -> Iterator[tuple[str, list[dict[str, Any]]]]:
++    """A real HTTP peer deduplicates message IDs across both native bindings."""
++    messages, tasks, admitted = [], {}, {}
+ 
+-        def send_message(self, *, message: dict[str, Any]) -> SimpleNamespace:
+-            self.messages.append(message)
+-            return SimpleNamespace(
+-                success=True,
+-                error=None,
+-                task_id="task-1",
+-                context_id="context-1",
+-                transport="http_json",
++    class TaskServer(BaseHTTPRequestHandler):
++        def do_GET(self) -> None:
++            self.do_POST()
++
++        def do_POST(self) -> None:
++            body = json.loads(self.rfile.read(int(self.headers.get("Content-Length", 0))) or b"{}")
++            rpc = "jsonrpc" in body
++            params = body.get("params", {}) if rpc else body
++            method = body.get("method") if rpc else (
++                "GetTask" if self.command == "GET" else "CancelTask" if self.path.endswith(":cancel") else "SendMessage"
+             )
++            streaming = method == "SendStreamingMessage" or self.path.endswith("/message:stream")
++            if method == "SendMessage" or streaming:
++                message = params["message"]
++                messages.append(message)
++                identifier = message["messageId"]
++                if identifier in admitted:
++                    if streaming:
++                        self.send_response(400)
++                        self.send_header("Content-Length", "0")
++                        self.end_headers()
++                        return
++                    task = admitted[identifier]
++                else:
++                    task_id = message.get("taskId") or f"task-{len(tasks)}"
++                    state = (
++                        "TASK_STATE_INPUT_REQUIRED" if identifier.startswith("tck-input-required-")
++                        else "TASK_STATE_WORKING" if identifier.startswith("tck-working-") else "TASK_STATE_COMPLETED"
++                    )
++                    task = tasks.setdefault(task_id, {"id": task_id, "contextId": "context"})
++                    task["status"] = {"state": state}
++                    admitted[identifier] = task
++                result = {"task": task}
++            else:
++                task_id = params["id"] if rpc else self.path.rsplit("/", 1)[-1].removesuffix(":cancel")
++                result = tasks[task_id]
++                if method == "CancelTask":
++                    result["status"] = {"state": "TASK_STATE_CANCELED"}
++            payload = {"jsonrpc": "2.0", "id": body["id"], "result": result} if rpc else result
++            content = ("data: " + json.dumps(payload) + "\n\n").encode() if streaming else json.dumps(payload).encode()
++            self.send_response(200)
++            self.send_header("Content-Type", "text/event-stream" if streaming else "application/json")
++            self.send_header("Content-Length", str(len(content)))
++            self.end_headers()
++            self.wfile.write(content)
++
++        def log_message(self, format: str, *args: Any) -> None:
++            pass
++
++    with running_server(TaskServer) as url:
++        yield url, messages
++
++
++def test_identifier_is_unique_per_call_and_preserves_scenario_prefix() -> None:
++    """Same-session operations must not reuse a creator-assigned message ID."""
++    values = [tck_id("working") for _ in range(100)]
++    assert len(set(values)) == len(values)
++    assert all(value.startswith("tck-working-") for value in values)
++
++
++@pytest.mark.parametrize("client_class", [JsonRpcClient, HttpJsonClient])
++def test_multiturn_history_has_distinct_native_messages(client_class: type[JsonRpcClient | HttpJsonClient]) -> None:
++    """The actual helper must keep all continuation inputs and their original task."""
++    with task_flow_server() as (url, messages):
++        client = client_class(url)
++        try:
++            info = _task_helpers.create_multiturn_task_with_history(client)
++        finally:
++            client.close()
++    ids = [message["messageId"] for message in messages]
++    assert len(ids) == len(set(ids))
++    assert [message["parts"][0]["text"] for message in messages[1:3]] == _task_helpers.HISTORY_MESSAGES
++    assert all(message["taskId"] == info.task_id for message in messages[1:])
++    assert all(message["messageId"].startswith("tck-input-required-") for message in messages[:3])
++
++
++def test_cancelled_first_binding_task_is_not_reused_by_second_binding() -> None:
++    """A legal deduplicating peer must observe two distinct WORKING prerequisites."""
++    with task_flow_server() as (url, messages), ExitStack() as cleanup:
++        rpc, rest = JsonRpcClient(url), HttpJsonClient(url)
++        cleanup.callback(rpc.close)
++        cleanup.callback(rest.close)
++        first = _task_helpers.create_working_task(rpc)
++        assert rpc.cancel_task(first.task_id).success
++        second = _task_helpers.create_working_task(rest)
++        assert first.task_id != second.task_id
++    assert len({message["messageId"] for message in messages}) == len(messages)
++
++
++def test_ordering_producer_uses_distinct_messages_for_every_binding_and_invocation() -> None:
++    """A strict uniqueness-checking peer must see a new ordering task each time."""
++    schema = JSONSchemaValidator(Path(__file__).resolve().parents[2] / "specification/a2a.json")
++    validators = {"http_json": schema, "jsonrpc": JsonRpcResponseValidator(schema)}
++    with task_flow_server() as (url, messages), ExitStack() as cleanup:
++        clients = {"jsonrpc": JsonRpcClient(url), "http_json": HttpJsonClient(url)}
++        for client in clients.values():
++            cleanup.callback(client.close)
++        invocations = 2
++        for _ in range(invocations):
++            for transport in clients:
++                collector = CompatibilityCollector()
++                try:
++                    ordering_checks.TestStreamEventOrdering().test_streaming_event_ordering(
++                        transport, clients, {"capabilities": {"streaming": True}}, collector, validators,
++                    )
++                except pytest.skip.Exception as error:
++                    pytest.fail(f"Actual ordering producer skipped its native stream: {error}")
++                assert collector.get_results()
++                assert all(result.passed and not result.skipped for result in collector.get_results())
++    assert len(messages) == len({message["messageId"] for message in messages}) == len(clients) * invocations
++
++
++def test_compatibility_modules_do_not_cache_creator_assigned_message_ids() -> None:
++    """Shared probe templates cannot allocate one message identity at import time."""
++    root = Path(__file__).resolve().parents[1] / "compatibility"
++    cached = []
++    for path in root.rglob("*.py"):
++        for statement in ast.parse(path.read_text()).body:
++            if not isinstance(statement, (ast.Assign, ast.AnnAssign)) or not isinstance(statement.value, ast.Dict):
++                continue
++            if any(isinstance(key, ast.Constant) and key.value == "messageId" for key in statement.value.keys):
++                cached.append(str(path.relative_to(root)))
++    assert not cached, f"Cached native Message identities: {cached}"
++
++
++@pytest.mark.parametrize("identifier", [None, False, 1, {}, ""])
++def test_fresh_message_never_repairs_malformed_id_probes(identifier: Any) -> None:
++    """Only deliberately valid-ID templates may request a new message identity."""
++    with pytest.raises(ValueError, match="non-empty string messageId"):
++        fresh_message({"messageId": identifier})
+ 
+-    client = RecordingClient()
+-    _task_helpers.create_multiturn_task_with_history(client)
+ 
+-    message_ids = [message["messageId"] for message in client.messages]
+-    assert len(message_ids) == len(set(message_ids))
+-    assert client.messages[1]["messageId"].startswith(message_ids[0])
+-    assert client.messages[2]["messageId"].startswith(message_ids[0])
++def test_fresh_message_preserves_all_negative_probe_content_and_template() -> None:
++    """Unsupported content stays intact while separate sends receive unique IDs."""
++    template = {"messageId": "tck-negative-recipe", "role": "ROLE_USER", "parts": [{"raw": "dGNr", "mediaType": "unsupported/type"}]}
++    first, second = fresh_message(template), fresh_message(template)
++    assert first["messageId"] != second["messageId"] != template["messageId"]
++    assert {**first, "messageId": template["messageId"]} == template
++    first["parts"][0]["mediaType"] = "changed-in-one-probe"
++    assert second["parts"] == template["parts"]
 diff --git a/tests/unit/transport/test_http_auth.py b/tests/unit/transport/test_http_auth.py
 new file mode 100644
-index 0000000..a2a1b0d
+index 0000000000000000000000000000000000000000..eb98e616ee4a6b397ee09bf97b70149d07d04c6d
 --- /dev/null
 +++ b/tests/unit/transport/test_http_auth.py
-@@ -0,0 +1,181 @@
+@@ -0,0 +1,189 @@
 +"""Real HTTP authentication reaches native, streaming and raw TCK probes."""
 +
 +from __future__ import annotations
@@ -4940,8 +5961,8 @@ index 0000000..a2a1b0d
 +    assert len(observed) == 1
 +
 +
-+def test_compatibility_fixture_wires_the_provider_into_both_http_clients(pytester: pytest.Pytester) -> None:
-+    """A real pytest compatibility run must reach authenticated HTTP I/O."""
++def test_compatibility_fixture_wires_authentication_and_selected_tenant(pytester: pytest.Pytester) -> None:
++    """Discovery must carry both authentication and the selected tenant into actual I/O."""
 +    observed = []
 +
 +    class FixtureServer(BaseHTTPRequestHandler):
@@ -4949,19 +5970,23 @@ index 0000000..a2a1b0d
 +            if self.path == "/.well-known/agent-card.json":
 +                base = f"http://127.0.0.1:{self.server.server_port}"
 +                body = {"supportedInterfaces": [
-+                    {"protocolBinding": "JSONRPC", "url": base + "/rpc"},
-+                    {"protocolBinding": "HTTP+JSON", "url": base + "/rest"},
++                    {"protocolBinding": "JSONRPC", "url": base + "/rpc", "tenant": "selected"},
++                    {"protocolBinding": "JSONRPC", "url": base + "/ignored", "tenant": "ignored"},
++                    {"protocolBinding": "HTTP+JSON", "url": base + "/rest", "tenant": "selected"},
 +                ]}
 +                self.respond(200, body)
 +            else:
 +                self.do_POST()
 +
 +        def do_POST(self) -> None:
-+            self.rfile.read(int(self.headers.get("Content-Length", 0)))
++            body = json.loads(self.rfile.read(int(self.headers.get("Content-Length", 0))) or b"{}")
 +            authorization = self.headers.get("Authorization")
-+            observed.append(authorization)
++            observed.append((authorization, self.path, body))
 +            authorized = authorization == "Bearer tck-test-credential"
-+            self.respond(200 if authorized else 401, {"error": {"code": -32001, "message": "authorized missing task" if authorized else "authentication required"}})
++            rpc = self.path == "/rpc"
++            error = {"code": -32001 if rpc else 404, "message": "authorized missing task" if authorized else "authentication required"}
++            response = {"jsonrpc": "2.0", "id": body["id"], "error": error} if rpc else {"error": error}
++            self.respond((200 if rpc else 404) if authorized else 401, response)
 +
 +        def respond(self, status: int, body: dict[str, Any]) -> None:
 +            encoded = json.dumps(body).encode()
@@ -4980,9 +6005,9 @@ index 0000000..a2a1b0d
 +def test_authenticated_bindings(transport_clients):
 +    assert set(transport_clients) == {"jsonrpc", "http_json"}
 +    for client in transport_clients.values():
-+        response = client.request_http("POST", client.base_url, content=b"unaltered raw probe")
-+        assert response.status_code == 200
-+        assert response.json()["error"]["message"] == "authorized missing task"
++        response = client.get_task("fixture-task")
++        assert response.status_code == (200 if client.transport == "jsonrpc" else 404)
++        assert "authorized missing task" in response.error
 +''')
 +    with running_server(FixtureServer) as url:
 +        result = pytester.runpytest_subprocess(
@@ -4990,9 +6015,13 @@ index 0000000..a2a1b0d
 +            "--http-auth-provider=tests.unit.transport.test_http_auth:ProbeAuth", "-q", timeout=30,
 +        )
 +    result.assert_outcomes(passed=1)
-+    assert observed == ["Bearer tck-test-credential"] * 2
++    assert [credential for credential, _, _ in observed] == ["Bearer tck-test-credential"] * 2
++    assert observed[0][1] == "/rpc"
++    assert observed[0][2]["params"] == {"id": "fixture-task", "tenant": "selected"}
++    assert observed[1][1] == "/rest/selected/tasks/fixture-task"
++    assert "tenant" not in observed[1][2]
 diff --git a/tests/unit/transport/test_http_json_client.py b/tests/unit/transport/test_http_json_client.py
-index d0ec71e..fde19a9 100644
+index d0ec71eb9e190d63cb5b1a9c66d0f42b874dfee4..baf40e9fcc783809a7d5b1fa664ac4cd5177d195 100644
 --- a/tests/unit/transport/test_http_json_client.py
 +++ b/tests/unit/transport/test_http_json_client.py
 @@ -14,13 +14,27 @@ from __future__ import annotations
@@ -5182,7 +6211,7 @@ index d0ec71e..fde19a9 100644
  
  
  def test_streaming_error_does_not_crash_and_returns_message(error_server: str) -> None:
-@@ -96,3 +221,254 @@ def test_extract_error_on_read_streamed_response(error_server: str) -> None:
+@@ -96,3 +221,259 @@ def test_extract_error_on_read_streamed_response(error_server: str) -> None:
      assert isinstance(result, str)
      assert "[400]" in result
      assert _ERROR_MESSAGE in result
@@ -5390,7 +6419,12 @@ index d0ec71e..fde19a9 100644
 +            result, = collector.get_results()
 +            assert result.skipped is skip
 +            assert result.passed is (not skip)
-+            assert received == ([] if skip else [{"message": message}])
++            if skip:
++                assert received == []
++            else:
++                sent, = received
++                assert sent["message"]["messageId"].startswith(message["messageId"] + "-")
++                assert {**sent["message"], "messageId": message["messageId"]} == message
 +        finally:
 +            client.close()
 +
@@ -5439,10 +6473,10 @@ index d0ec71e..fde19a9 100644
 +            client.close()
 diff --git a/tests/unit/transport/test_jsonrpc_error_probes.py b/tests/unit/transport/test_jsonrpc_error_probes.py
 new file mode 100644
-index 0000000..9bef191
+index 0000000000000000000000000000000000000000..d3509c474d7885431e8219820a41e557e0a02367
 --- /dev/null
 +++ b/tests/unit/transport/test_jsonrpc_error_probes.py
-@@ -0,0 +1,100 @@
+@@ -0,0 +1,103 @@
 +"""Real JSON-RPC probes distinguish missing tasks and unsupported part media."""
 +
 +from __future__ import annotations
@@ -5542,10 +6576,190 @@ index 0000000..9bef191
 +    assert not result.skipped
 +    assert len(observed) == 1
 +    assert observed[0]["content_type"] == "application/json"
-+    assert observed[0]["payload"]["params"] == get_requirement_by_id("CORE-SEND-003").sample_input
++    recipe = get_requirement_by_id("CORE-SEND-003").sample_input["message"]
++    sent = observed[0]["payload"]["params"]["message"]
++    assert sent["messageId"].startswith(recipe["messageId"] + "-")
++    assert {**sent, "messageId": recipe["messageId"]} == recipe
+diff --git a/tests/unit/transport/test_tenant_routing.py b/tests/unit/transport/test_tenant_routing.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..7617a357b19985a25dd52c8e1f4cbf193785f60b
+--- /dev/null
++++ b/tests/unit/transport/test_tenant_routing.py
+@@ -0,0 +1,171 @@
++"""Selected Agent Interface tenants reach actual native HTTP and gRPC requests."""
++
++from __future__ import annotations
++
++import json
++
++from concurrent.futures import ThreadPoolExecutor
++from http.server import BaseHTTPRequestHandler
++from typing import Any
++from urllib.parse import parse_qs, urlsplit
++
++import grpc
++import httpx
++import pytest
++
++from google.protobuf.message_factory import GetMessageClass
++
++from specification.generated import a2a_pb2
++from tck.reporting.collector import CompatibilityCollector
++from tck.transport.grpc_client import GrpcClient
++from tck.transport.http_json_client import HttpJsonClient
++from tck.transport.jsonrpc_client import JsonRpcClient
++from tests.compatibility._test_helpers import jsonrpc_probe
++from tests.compatibility.core_operations import test_transport_behavior as metadata_checks
++from tests.compatibility.grpc import test_status_codes as grpc_checks
++from tests.unit.transport.test_http_json_client import running_server
++from tests.unit.validators.grpc.test_error_validator import status_details
++
++
++def exercise_native_operations(client: Any) -> None:
++    """Use the actual public API for every operation, including both streams."""
++    message = {"messageId": "tenant-message", "role": "ROLE_USER", "parts": [{"text": "tenant probe"}]}
++    calls = [
++        lambda: client.send_message(message),
++        lambda: client.send_streaming_message(message),
++        lambda: client.get_task("task"),
++        lambda: client.list_tasks("context"),
++        lambda: client.cancel_task("task"),
++        lambda: client.subscribe_to_task("task"),
++        lambda: client.create_push_notification_config("task", {"url": "https://callback.example"}),
++        lambda: client.get_push_notification_config("task", "config"),
++        lambda: client.list_push_notification_configs("task"),
++        lambda: client.delete_push_notification_config("task", "config"),
++        client.get_extended_agent_card,
++    ]
++    for call in calls:
++        response = call()
++        if response.is_streaming:
++            assert list(response.events) == []
++        if isinstance(response.raw_response, httpx.Response):
++            response.raw_response.close()
++
++
++@pytest.mark.parametrize("client_class", [JsonRpcClient, HttpJsonClient])
++@pytest.mark.parametrize("endpoint_path", ["/interface", "/interface/"])
++def test_every_http_operation_binds_the_selected_tenant(client_class: type[JsonRpcClient | HttpJsonClient], endpoint_path: str) -> None:
++    """JSON-RPC uses service params; HTTP+JSON uses one encoded path segment."""
++    observed = []
++
++    class TenantServer(BaseHTTPRequestHandler):
++        def do_GET(self) -> None:
++            self.do_POST()
++
++        def do_DELETE(self) -> None:
++            self.do_POST()
++
++        def do_POST(self) -> None:
++            body = json.loads(self.rfile.read(int(self.headers.get("Content-Length", 0))) or b"{}")
++            observed.append((self.path, body))
++            rpc = client_class is JsonRpcClient
++            result = {"jsonrpc": "2.0", "id": body["id"], "error": {"code": -32001, "message": "probe"}} if rpc else {
++                "error": {"code": 404, "message": "probe"},
++            }
++            content = json.dumps(result).encode()
++            self.send_response(200 if rpc else 404)
++            self.send_header("Content-Type", "application/json")
++            self.send_header("Content-Length", str(len(content)))
++            self.end_headers()
++            self.wfile.write(content)
++
++        def log_message(self, format: str, *args: Any) -> None:
++            pass
++
++    with running_server(TenantServer) as url:
++        client = client_class(url + endpoint_path + "?selection=one", tenant="tenant space")
++        try:
++            exercise_native_operations(client)
++        finally:
++            client.close()
++    assert observed
++    for path, body in observed:
++        parsed = urlsplit(path)
++        assert parse_qs(parsed.query)["selection"] == ["one"]
++        if client_class is JsonRpcClient:
++            assert parsed.path == endpoint_path
++            assert body["params"]["tenant"] == "tenant space"
++        else:
++            assert parsed.path.startswith("/interface/tenant%20space/")
++            assert "tenant" not in body
++
++
++def test_every_grpc_operation_binds_the_selected_tenant() -> None:
++    """A real generated service decodes the tenant from every protobuf request."""
++    observed = []
++    service = a2a_pb2.DESCRIPTOR.services_by_name["A2AService"]
++    handlers = {}
++    for method in service.methods:
++        def abort(request: Any, context: grpc.ServicerContext, *, name: str = method.name) -> None:
++            observed.append((name, request.tenant))
++            if dict(context.invocation_metadata()).get("a2a-version") == "99.0":
++                code = grpc.StatusCode.FAILED_PRECONDITION
++                context.set_trailing_metadata((("grpc-status-details-bin", status_details(code, "VERSION_NOT_SUPPORTED")),))
++                context.abort(code, "version observation")
++            context.abort(grpc.StatusCode.NOT_FOUND, "tenant observation")
++
++        factory = grpc.unary_stream_rpc_method_handler if method.server_streaming else grpc.unary_unary_rpc_method_handler
++        handlers[method.name] = factory(abort, request_deserializer=GetMessageClass(method.input_type).FromString)
++    with ThreadPoolExecutor(max_workers=1) as executor:
++        server = grpc.server(executor)
++        server.add_generic_rpc_handlers((grpc.method_handlers_generic_handler(service.full_name, handlers),))
++        port = server.add_insecure_port("127.0.0.1:0")
++        server.start()
++        client = GrpcClient(f"127.0.0.1:{port}", tenant="tenant-exact")
++        try:
++            exercise_native_operations(client)
++            collector = CompatibilityCollector()
++            metadata_checks.TestGrpcServiceParams().test_extensions_metadata_accepted({"grpc": client}, collector)
++            grpc_checks.TestGrpcStatusCodes().test_version_not_supported_returns_failed_precondition({"grpc": client}, collector)
++            assert all(result.passed and not result.skipped for result in collector.get_results())
++        finally:
++            client.close()
++            server.stop(0).wait()
++    assert {name for name, _ in observed} == set(service.methods_by_name)
++    assert len(observed) == len(service.methods) + 2
++    assert all(tenant == "tenant-exact" for _, tenant in observed)
++
++
++def test_raw_jsonrpc_producers_preserve_probe_parameters_and_bind_tenant() -> None:
++    """Tenant propagation cannot repair or replace intentionally invalid input."""
++    observed = []
++
++    class RawServer(BaseHTTPRequestHandler):
++        def do_POST(self) -> None:
++            observed.append(json.loads(self.rfile.read(int(self.headers["Content-Length"]))))
++            self.send_response(200)
++            self.send_header("Content-Length", "2")
++            self.end_headers()
++            self.wfile.write(b"{}")
++
++        def log_message(self, format: str, *args: Any) -> None:
++            pass
++
++    with running_server(RawServer) as url:
++        client = JsonRpcClient(url, tenant="selected")
++        original = {"message": {"invalid": "preserved"}}
++        try:
++            jsonrpc_probe(client, "SendMessage", original)
++            jsonrpc_probe(client, "SendMessage", [])
++        finally:
++            client.close()
++    assert original == {"message": {"invalid": "preserved"}}
++    assert observed[0]["params"] == {**original, "tenant": "selected"}
++    assert observed[1]["params"] == []
++
++
++@pytest.mark.parametrize("client_class", [JsonRpcClient, HttpJsonClient, GrpcClient])
++@pytest.mark.parametrize("tenant", [False, 1, [], {}])
++def test_invalid_tenant_is_rejected_before_connecting(client_class: type[JsonRpcClient | HttpJsonClient | GrpcClient], tenant: Any) -> None:
++    """Invalid card values cannot silently turn into an unscoped request."""
++    with pytest.raises(TypeError, match="tenant must be a string"):
++        client_class("not-a-usable-address", tenant=tenant)
 diff --git a/tests/unit/validators/grpc/test_error_validator.py b/tests/unit/validators/grpc/test_error_validator.py
 new file mode 100644
-index 0000000..bc0a899
+index 0000000000000000000000000000000000000000..bc0a899f27a487ffad1aff3b321731ab96d0f9d5
 --- /dev/null
 +++ b/tests/unit/validators/grpc/test_error_validator.py
 @@ -0,0 +1,142 @@
@@ -5693,7 +6907,7 @@ index 0000000..bc0a899
 +        assert not result.passed and not result.skipped
 diff --git a/tests/unit/validators/http_json/test_content_type.py b/tests/unit/validators/http_json/test_content_type.py
 new file mode 100644
-index 0000000..e7341ac
+index 0000000000000000000000000000000000000000..e7341ac2f9312d641d07519aaec75eeb61baf7e0
 --- /dev/null
 +++ b/tests/unit/validators/http_json/test_content_type.py
 @@ -0,0 +1,25 @@
@@ -5723,7 +6937,7 @@ index 0000000..e7341ac
 +    """Require the response to declare its media type."""
 +    assert not uses_a2a_media_type({})
 diff --git a/tests/unit/validators/http_json/test_error_validator.py b/tests/unit/validators/http_json/test_error_validator.py
-index 928b440..a4a2a44 100644
+index 928b440dacca9dfa9d73da5b5739b7476e4e9759..a4a2a44847643f47ffbfeba9e1ea02cb86d92b98 100644
 --- a/tests/unit/validators/http_json/test_error_validator.py
 +++ b/tests/unit/validators/http_json/test_error_validator.py
 @@ -6,6 +6,7 @@ from http import HTTPStatus
@@ -5881,7 +7095,7 @@ index 928b440..a4a2a44 100644
 +    assert not validate_http_json_error(response, "VersionNotSupportedError").valid
 diff --git a/tests/unit/validators/test_agent_card.py b/tests/unit/validators/test_agent_card.py
 new file mode 100644
-index 0000000..4a4b2ca
+index 0000000000000000000000000000000000000000..4a4b2ca70695d34a55817189dd749264a1ec1160
 --- /dev/null
 +++ b/tests/unit/validators/test_agent_card.py
 @@ -0,0 +1,111 @@
@@ -5998,7 +7212,7 @@ index 0000000..4a4b2ca
 +    assert collector.get_results() == []
 diff --git a/tests/unit/validators/test_error_info.py b/tests/unit/validators/test_error_info.py
 new file mode 100644
-index 0000000..841394a
+index 0000000000000000000000000000000000000000..841394a0667ba62452970b6b8533c6ae16f5140a
 --- /dev/null
 +++ b/tests/unit/validators/test_error_info.py
 @@ -0,0 +1,47 @@
@@ -6050,7 +7264,7 @@ index 0000000..841394a
 +    assert not result.valid
 +    assert "reason" in result.message
 diff --git a/tests/unit/validators/test_extended_card.py b/tests/unit/validators/test_extended_card.py
-index c8ff84c..a21fe0c 100644
+index c8ff84c4bdcbbc77c4d6f1803fd2c8740ece4d8d..a21fe0c2334b7780c1319cb93e3e08592fff1f47 100644
 --- a/tests/unit/validators/test_extended_card.py
 +++ b/tests/unit/validators/test_extended_card.py
 @@ -1,103 +1,109 @@
@@ -6257,7 +7471,7 @@ index c8ff84c..a21fe0c 100644
 +    assert classify_extended_card_probe(response("http_json", status_code=500), "http_json") is ExtendedCardProbe.WRONG_ERROR
 diff --git a/tests/unit/validators/test_response_messages.py b/tests/unit/validators/test_response_messages.py
 new file mode 100644
-index 0000000..2ba8a52
+index 0000000000000000000000000000000000000000..2ba8a52e874b34c593722084ff962afbd771082a
 --- /dev/null
 +++ b/tests/unit/validators/test_response_messages.py
 @@ -0,0 +1,145 @@
@@ -6408,7 +7622,7 @@ index 0000000..2ba8a52
 +    assert invalid == before
 diff --git a/tests/unit/validators/test_task_state_responses.py b/tests/unit/validators/test_task_state_responses.py
 new file mode 100644
-index 0000000..208bda7
+index 0000000000000000000000000000000000000000..208bda7da3c262b345d7e26aa85bbabce612e653
 --- /dev/null
 +++ b/tests/unit/validators/test_task_state_responses.py
 @@ -0,0 +1,88 @@
@@ -6501,16 +7715,18 @@ index 0000000..208bda7
 +    assert observed[0][1]["configuration"] == {"returnImmediately": True}
 +    assert observed[0][1]["message"]["messageId"].startswith("tck-working-")
 diff --git a/uv.lock b/uv.lock
-index 9c17390..df8bc27 100644
+index 9c17390a1441fb70d798baa8f4e71bc24fe95cdb..e22ed5f356163d5b3254f669414810bca8f8b7c8 100644
 --- a/uv.lock
 +++ b/uv.lock
-@@ -1,5 +1,5 @@
+@@ -1,6 +1,6 @@
  version = 1
 -revision = 1
+-requires-python = ">=3.11"
 +revision = 3
- requires-python = ">=3.11"
++requires-python = ">=3.11, <3.15"
  
  [[package]]
+ name = "a2a-tck"
 @@ -17,6 +17,7 @@ dependencies = [
      { name = "pytest" },
      { name = "pytest-asyncio" },
