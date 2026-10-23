@@ -1084,7 +1084,8 @@ jobs:
   # squash-merge to main or a duplicate issue-* push run skips it like the
   # other expensive tiers. Pull requests always run it.
   console-smoke:
-    runs-on: ubuntu-latest
+    # Playwright 1.58.2 supports Ubuntu 24.04, not newer floating hosts (#3809).
+    runs-on: ubuntu-24.04
     # Explicit `contents: read` so this job does NOT inherit the wider grant
     # publish.yml's `ci:` job holds. Jobs of a called workflow inherit the
     # caller's permissions when they declare none, which would hand this

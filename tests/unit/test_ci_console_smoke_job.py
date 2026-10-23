@@ -49,6 +49,15 @@ def test_is_bounded():
     assert int(smoke["timeout-minutes"]) <= 10
 
 
+def test_uses_an_explicit_runner_supported_by_locked_playwright():
+    """Playwright 1.58.2 supports Ubuntu 24.04, not floating future hosts.
+
+    Its version-tagged hostPlatform.ts and registry/index.ts both include
+    Ubuntu 24.04; 26.04 has no Chromium download in that release (#3809).
+    """
+    assert _job()["runs-on"] == "ubuntu-24.04"
+
+
 def test_references_no_secret_and_reads_only():
     """No production key can reach the smoke: the job names no secret."""
     text = yaml.safe_dump(_job())
