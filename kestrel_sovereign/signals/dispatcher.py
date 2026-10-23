@@ -7744,6 +7744,7 @@ class SignalDispatcher:
                 try:
                     prepared = self._store._prepare_outcome(journal._signal_snapshot,
                         journal._registration_snapshot, result,
+                        original_native=True,
                         prompt_template_hash=getattr(signal, _PROMPT_TEMPLATE_HASH_ATTR, None),
                         **_audit_to_log_kwargs(audit))
                 except Exception as error:

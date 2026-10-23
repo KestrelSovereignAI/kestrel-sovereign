@@ -153,6 +153,8 @@ from kestrel_sovereign.command_policy import (
 from kestrel_sovereign.execution_custody import (
     _explicit_control_chain,
     execution_native_source_error,
+    execution_observation_error,
+    execution_observer_cancellations,
     execution_terminal_error,
     execution_work_operation,
     is_execution_control_error,
@@ -7318,6 +7320,11 @@ class KestrelAgent(
                 # Do not retain a third-party cleanup/quarantine exception as a
                 # printable cause; either may contain feature configuration.
                 raise quarantine_error from None
+            if withdrawals:
+                # A settled cleanup can report ordinary SQL failure together
+                # with this caller's withdrawal, without unresolved control.
+                # Retain withdrawal without exposing third-party cleanup text.
+                raise execution_observation_error(activation_error, *withdrawals) from None
             raise
 
         if notify_ready:
@@ -7427,7 +7434,9 @@ class KestrelAgent(
                 and not isinstance(error, Exception)
                 and not is_execution_control_error(error)
             ):
-                raise error
+                _raise_unexpected_lifecycle_exception_group(error)
+                if not execution_observer_cancellations(error):
+                    raise error
             errors.append(error)
             self._remember_shutdown_control(error)
 
@@ -7489,9 +7498,9 @@ class KestrelAgent(
             try:
                 self.task_manager.unregister_agent(feature.get_agent_card().name)
             except (Exception, asyncio.CancelledError, BaseExceptionGroup) as exc:
-                if isinstance(exc, BaseExceptionGroup) and not isinstance(exc, Exception) and not is_execution_control_error(exc):
-                    raise
-                if is_execution_control_error(exc):
+                if isinstance(exc, BaseExceptionGroup) and not isinstance(exc, Exception):
+                    retain_failure(exc)
+                elif is_execution_control_error(exc):
                     retain_failure(exc)
                 logging.warning(
                     "Failed to unregister feature '%s' from task manager: %s",

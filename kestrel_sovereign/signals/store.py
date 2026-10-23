@@ -92,7 +92,6 @@ def _truncate_to_bytes(text: str, max_bytes: int) -> str:
     characters and the suffix was added on top, both of which let
     non-ASCII text exceed the documented byte cap.
     """
-    text = str.__str__(text)
     encoded = text.encode("utf-8")
     if len(encoded) <= max_bytes:
         return text
@@ -126,27 +125,28 @@ class _PreparedSignalOutcome:
     values: tuple
     result_summary: Optional[str]
 
-    def __post_init__(self):
+    def as_native(self):
         from kestrel_sovereign.storage.db.timestamp import TimestamptzParameter
         # SQL parameters are native data, never application adaptation hooks.
         # A str subclass's __conform__ must not substitute the same different
         # value in both INSERT and the later exact-row verification.
         def native(value):
-            if isinstance(value, str):
+            ancestry = type.__getattribute__(type(value), '__mro__')
+            if any(base is str for base in ancestry):
                 return str.__str__(value)
-            if isinstance(value, int):
+            if any(base is int for base in ancestry):
                 return int.__int__(value)
-            if isinstance(value, float):
+            if any(base is float for base in ancestry):
                 return float.__float__(value)
-            if isinstance(value, bytes):
+            if any(base is bytes for base in ancestry):
                 return bytes.__bytes__(value)
             if value is None or type(value) is datetime:
                 return value
             if type(value) is TimestamptzParameter and type(value.value) is datetime:
                 return value
             raise TypeError('Signal journal requires native scalar row data')
-        object.__setattr__(self, 'values', tuple(native(value) for value in self.values))
-        object.__setattr__(self, 'result_summary', native(self.result_summary))
+        return _PreparedSignalOutcome(tuple(native(value) for value in self.values),
+                                      native(self.result_summary))
 
 
 class SignalLogStore(UnifiedStoreBase):
@@ -346,6 +346,7 @@ class SignalLogStore(UnifiedStoreBase):
         injected_clauses: Optional[list[str]] = None,
         dropped_clauses: Optional[list[str]] = None,
         prompt_template_hash: Optional[str] = None,
+        original_native: bool = False,
     ) -> _PreparedSignalOutcome:
         """Prepare immutable native row DATA without granting storage authority.
 
@@ -428,6 +429,8 @@ class SignalLogStore(UnifiedStoreBase):
                 summary = f"<result_summary failed: {type(e).__name__}>"
             if not isinstance(summary, str):
                 summary = str(summary) if summary is not None else ""
+            if original_native:
+                summary = str.__str__(summary)
             result_summary = _truncate_to_bytes(
                 summary, MAX_RESULT_SUMMARY_BYTES
             )
@@ -468,7 +471,7 @@ class SignalLogStore(UnifiedStoreBase):
             json.dumps(dropped_clauses) if dropped_clauses is not None else None
         )
 
-        return _PreparedSignalOutcome(
+        prepared = _PreparedSignalOutcome(
             values=(
                 signal.id,
                 signal.source,
@@ -503,6 +506,10 @@ class SignalLogStore(UnifiedStoreBase):
             ),
             result_summary=result_summary,
         )
+        # This is a data-format choice, not authority: only journal.bind can
+        # admit the exact row to an original native transaction. Ordinary
+        # unsealed append retains its supported native adapter semantics.
+        return prepared.as_native() if original_native else prepared
 
     # ------------------------------------------------------------------
     # Retention sweep
