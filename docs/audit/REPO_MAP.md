@@ -19,7 +19,7 @@ Auto-generated file-tree + per-file purpose index. Always-loaded context for the
 GitHub App (issue #791). Do **not** edit by hand — regenerate via `python scripts/generate_repo_map.py`.
 
 **Generated:** 2026-10-23
-**Scope:** 3453 tracked files (2604 `.py`, 368 `.md`, 481 other). Excludes `__pycache__`, `node_modules`, `.venv`, `.claude`, build artifacts.
+**Scope:** 3455 tracked files (2604 `.py`, 370 `.md`, 481 other). Excludes `__pycache__`, `node_modules`, `.venv`, `.claude`, build artifacts.
 
 **Format per file:** `path — one-line purpose` plus the public top-level Python symbols on the next line
 (classes and functions; private `_name` skipped).
@@ -2295,6 +2295,8 @@ Repo entry points and standard project files.
 - **docs/audit/MEMORY_SYSTEM_ROUND_2_2026-07-10.md** — Memory System Deep Dive — Round 2 — ## Scope and method
 - **docs/audit/OKF_MIGRATION_PLAN.md** — Kestrel Documentation OKF Migration Plan — ## Purpose
 - **docs/audit/README.md** — Kestrel Whole-of-Vision Audit — This directory is the canonical source for the GitHub issue bodies used to track the feature-by-feature audit, inspection, and red-team program derived from `KESTREL_FEATURES.md`.
+- **docs/audit/REPO_MAP.md** — Kestrel Sovereign — Repo Map — Auto-generated file-tree + per-file purpose index.
+- **docs/audit/REPO_MAP.md** — Kestrel Sovereign — Repo Map — Auto-generated file-tree + per-file purpose index.
 - **docs/audit/REPO_MAP.md** — Kestrel Sovereign — Repo Map — Auto-generated file-tree + per-file purpose index.
 - **docs/audit/SEAM_CAMPAIGNS.md** — Cross-Feature Seam Campaigns — This matrix tracks adversarial campaigns that cross feature boundaries.
 - **docs/audit/SYNC_ASYNC_AUDIT.md** — Sync/Async Audit — Control document for the original issue `#300` and the refreshed current-runtime audit in issue `#624`, focused on maintained runtime surfaces.
