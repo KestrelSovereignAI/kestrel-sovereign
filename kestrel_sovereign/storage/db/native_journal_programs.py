@@ -626,7 +626,7 @@ else:
             if owner is asyncio.current_task():
                 raise NativeJournalConfigurationError('Original journal cannot reenter its native session')
             from kestrel_sovereign._async_ownership import await_owned_task
-            outcome = await await_owned_task(completion, defer_cancellation=False)
+            outcome = await await_owned_task(owner, defer_cancellation=False)
             if outcome.error is not None:
                 raise outcome.error
             if self._journal_program_seal is not None:
