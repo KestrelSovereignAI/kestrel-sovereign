@@ -992,6 +992,11 @@ Ordinary writer failures are retained on the original journal through public
 observation/finalization. A healthy caller still treats them as best-effort
 audit loss; a withdrawing caller retains both its actual cancellation and the
 original SQL/publication error without inventing commit uncertainty.
+When an observation already includes native retirement evidence, the canonical
+native composer must associate the failed physical owner with its original
+error before source-only provenance is sealed. Premarking a finite observation
+can otherwise drop an ordinary reset failure from feature/shutdown latches.
+Those latches retain that physical original, but not the caller's withdrawal.
 
 Core-owned SQLite connections likewise track native callback/function/extension
 registration. A customized session remains ineligible for original journals until

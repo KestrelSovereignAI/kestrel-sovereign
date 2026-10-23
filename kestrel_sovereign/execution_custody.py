@@ -437,6 +437,14 @@ def execution_observation_error(*errors: BaseException | None,
     present = _enclosing_original_errors(present)
     if len(present) < 2:
         return present[0] if present else None
+    if any(is_execution_control_error(error) for error in present):
+        # Native composition must first associate an ordinary physical error
+        # with its actual settled retirement owner. Premarking the whole group
+        # as an observation would hide that original from later source-only
+        # lifecycle latches. The canonical composer excludes observer C while
+        # retaining the physical original without changing its graph.
+        return execution_terminal_error(*present, retain_originals=True,
+                                        isolate_control_originals=True)
     terminal = BaseExceptionGroup(message, present)
     terminal._kestrel_finite_native_sources = (_FINITE_NATIVE_SOURCES, tuple(sources))
     return execution_terminal_error(terminal, retain_originals=True, isolate_control_originals=True)
