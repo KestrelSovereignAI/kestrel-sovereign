@@ -1,3 +1,7 @@
+---
+type: Developer Guide
+---
+
 # Public asynchronous-tail ownership
 
 `kestrel_sovereign.async_ownership` exposes five identity aliases of Core's
