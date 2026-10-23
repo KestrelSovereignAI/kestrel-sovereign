@@ -12988,6 +12988,7 @@ class TestLoadFromConfig:
         # before this hook can enter. CI xdist exhausted the old one-second
         # hang guard before readiness, not a production readiness deadline.
         # Keep a bounded guard without imposing host CPU speed on this test.
+        from kestrel_sovereign._async_ownership import await_owned_task
         try:
             await asyncio.wait_for(first_entered_readiness.wait(), timeout=10.0)
         except BaseException:
