@@ -2239,14 +2239,24 @@ class SQLiteBackend(DatabaseBackend):
         conn = journal._backing
         def native_relation():
             native = conn._conn
-            if type(native) is not _NativeJournalSQLiteConnection or not native._original_journal_programs_supported():
+            if type(native) is not _NativeJournalSQLiteConnection:
                 return None
-            cursor = native.cursor()
-            cursor.row_factory = None
-            snapshot = not native.in_transaction
+            admission_seal = None
+            if capture:
+                admission_seal = native._seal_original_journal_programs()
+            elif not native._original_journal_programs_supported():
+                return None
+            cursor = None
+            snapshot = False
             try:
-                if snapshot:
+                # The admission seal has no transaction configuration tuple
+                # yet. Fixed metadata SQL uses a base cursor, just like the
+                # native durability reader, with no application factory/binds.
+                cursor = sqlite3.Connection.cursor(native, factory=sqlite3.Cursor)
+                cursor.row_factory = None
+                if not native.in_transaction:
                     cursor.execute('SAVEPOINT kestrel_original_outcome_catalog')
+                    snapshot = True
                 if _original_sqlite_scalar_adapters_registered():
                     return None
                 cursor.execute('PRAGMA main.schema_version')
@@ -2288,7 +2298,14 @@ class SQLiteBackend(DatabaseBackend):
                         cursor.execute('ROLLBACK TO kestrel_original_outcome_catalog')
                         cursor.execute('RELEASE kestrel_original_outcome_catalog')
                 finally:
-                    cursor.close()
+                    try:
+                        if cursor is not None:
+                            cursor.close()
+                    finally:
+                        if admission_seal is not None:
+                            with native._journal_configuration_lock:
+                                if native._journal_program_seal is admission_seal:
+                                    native._journal_program_seal = None
         if capture:
             async with self._write_guard():
                 result = await conn._execute(native_relation)

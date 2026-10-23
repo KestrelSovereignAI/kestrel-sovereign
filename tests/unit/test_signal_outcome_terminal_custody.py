@@ -701,7 +701,7 @@ async def test_sqlite_program_seal_is_atomic_with_public_text_factory(tmp_path, 
     def actual_profile_checked(native):
         allowed = supported(native)
         if (armed and not checking.is_set() and allowed
-                and inspect.currentframe().f_back.f_code.co_name == '_begin_original_journal'):
+                and inspect.currentframe().f_back.f_code.co_name == '_seal_original_journal_programs'):
             checking.set()
             assert attempted.wait(5), 'actual public setter never reached the seal window'
             # Old unsynchronized setters finish here; a correctly synchronized

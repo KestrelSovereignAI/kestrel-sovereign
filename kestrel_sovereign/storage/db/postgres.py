@@ -120,6 +120,7 @@ class _ExecutionCommitState:
     terminal: BaseException | None = None
     body_failure: BaseException | None = None
     native_observation: Any = None
+    original_journal_checkout: bool = False
 
     def remember(self, scopes: tuple[ExecutionCustody, ...]) -> None:
         # A shared checkout can begin unbound and participate in several
@@ -1089,9 +1090,11 @@ class PostgresBackend(DatabaseBackend):
         return terminal
 
     @asynccontextmanager
-    async def _tracked_pool_checkout(self, pool: Any, *, admit_work: bool) -> AsyncIterator[tuple[Any, _ExecutionCommitState]]:
+    async def _tracked_pool_checkout(self, pool: Any, *, admit_work: bool, original_journal: bool = False) -> AsyncIterator[tuple[Any, _ExecutionCommitState]]:
         await _settle_native_observer_enrollment()
-        state = _ExecutionCommitState()
+        if type(original_journal) is not bool:
+            raise TypeError('Original journal checkout intent must be a boolean')
+        state = _ExecutionCommitState(original_journal_checkout=original_journal)
         state.remember(current_execution_custody(self))
         if isinstance(pool, PostgresPoolAdapter):
             @asynccontextmanager
@@ -1195,6 +1198,15 @@ class PostgresBackend(DatabaseBackend):
             body_failure = error
         finally:
             state.checkout_open = False
+        # An original journal can refuse before its body installs a program
+        # seal (including an admission/recipe check immediately after acquire).
+        # Retire that exact unsealed session BEFORE asyncpg reset can dispatch
+        # application query/log/termination observers. A foreign seal still
+        # belongs to its original retirement owner and must not be terminated.
+        if (state.original_journal_checkout
+                and type(native_connection) is NativeJournalPostgresConnection
+                and native_connection._journal_program_seal is None):
+            native_connection._retire_original_journal_refusal()
         # Only the native reset/return is protected. The checkout body remains
         # in its original task, including every ContextVar token and arbitrary
         # caller await. Cancellation cannot abandon an accepted native reset.
@@ -2301,7 +2313,7 @@ class PostgresBackend(DatabaseBackend):
         native = None
         program_sealed = False
         try:
-            async with self._tracked_pool_checkout(journal._backing, admit_work=True) as (connection, state):
+            async with self._tracked_pool_checkout(journal._backing, admit_work=True, original_journal=True) as (connection, state):
                 journal._require_backing()
                 native = connection._con
                 if type(native) is not NativeJournalPostgresConnection:
@@ -2345,7 +2357,7 @@ class PostgresBackend(DatabaseBackend):
         # out-of-pool connection. Bound churn if concurrent borrowers repeatedly
         # return incompatible siblings before this writer reacquires a slot.
         for _ in range(journal._postgres_pool.pool.get_max_size() + 1):
-            async with self._tracked_pool_checkout(journal._backing, admit_work=False) as owned:
+            async with self._tracked_pool_checkout(journal._backing, admit_work=False, original_journal=True) as owned:
                 connection, _state = owned
                 journal.require_original(self)
                 native = connection._con

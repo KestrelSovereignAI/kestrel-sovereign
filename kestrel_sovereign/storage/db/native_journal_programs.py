@@ -439,16 +439,23 @@ class _NativeJournalSQLiteConnection(sqlite3.Connection):
                 raise BaseExceptionGroup('Original native cursor and cleanup failures', [original, cleanup]) from None
             raise
 
+    def _seal_original_journal_programs(self):
+        # Configuration setters use this same lock. Publish the seal before
+        # releasing it, but never hold a Python lock across native SQL waits.
+        with self._journal_configuration_lock:
+            if not self._original_journal_programs_supported() or self._journal_program_seal is not None:
+                raise NativeJournalConfigurationError('Original journal requires a plain native SQLite connection')
+            seal = object()
+            self._journal_program_seal = seal
+            return seal
+
     def _begin_original_journal(self):
         # This operation is queued by the original writer under the existing
         # write guard. Check+seal+BEGIN run in one native worker operation.
         # Fence application programs before BEGIN can wait for another native
         # writer. The durable configuration belongs to the acquired lock, not
         # to the earlier (possibly stale) external-commit generation.
-        with self._journal_configuration_lock:
-            if not self._original_journal_programs_supported() or self._journal_program_seal is not None:
-                raise NativeJournalConfigurationError('Original journal requires a plain native SQLite connection')
-            self._journal_program_seal = object()
+        self._seal_original_journal_programs()
         try:
             cursor = super().execute('BEGIN IMMEDIATE')
             cursor.close()
