@@ -7434,9 +7434,7 @@ class KestrelAgent(
                 and not isinstance(error, Exception)
                 and not is_execution_control_error(error)
             ):
-                _raise_unexpected_lifecycle_exception_group(error)
-                if not execution_observer_cancellations(error):
-                    raise error
+                raise error
             errors.append(error)
             self._remember_shutdown_control(error)
 
