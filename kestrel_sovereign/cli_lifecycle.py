@@ -38,8 +38,11 @@ from kestrel_sovereign.multi_agent.config import MULTI_AGENT_CONFIG_FILENAME
 from kestrel_sovereign.multi_agent.liveness import AgentHolder
 from kestrel_sovereign.multi_agent.process_manager import (
     DEFAULT_STARTUP_HEALTH_TIMEOUT_SECONDS,
+    SERVER_KILL_GRACE_SECONDS,
+    SERVER_TERMINATE_TIMEOUT_SECONDS,
     PidStatus,
     ProcessManager,
+    server_command,
 )
 
 
@@ -399,8 +402,7 @@ def _start_inprocess_mode(
     env["KESTREL_SERVE_UI"] = "true"
 
     log_file = _host_log_file(project_dir)
-    cmd = [sys.executable, "-m", "uvicorn", "kestrel_sovereign.server:app",
-           "--host", multi_agent.host.bind, "--port", str(multi_agent.host.port)]
+    cmd = server_command(multi_agent.host.bind, multi_agent.host.port)
 
     print(f"   Starting server on :{multi_agent.host.port}...", end="", flush=True)
     # In-process host: ``kestrel start`` is fire-and-exit (returns
@@ -465,6 +467,15 @@ def _await_port_release(port: int, bind: str, attempts: int = 10) -> bool:
     return not ProcessManager.is_port_in_use(port, bind)
 
 
+def _await_exit(pids: list[int], timeout: float) -> bool:
+    """Wait until every process in ``pids`` has exited, under one deadline."""
+    deadline = time.monotonic() + timeout
+    return all(
+        ProcessManager.wait_for_exit(pid, max(0.0, deadline - time.monotonic()))
+        for pid in pids
+    )
+
+
 def _reap_orphans_on_port(
     port: int, label: str, force: bool, bind: str = "0.0.0.0"
 ) -> PortReapResult:
@@ -487,9 +498,17 @@ def _reap_orphans_on_port(
             return PortReapResult.STILL_HELD
         return PortReapResult.NOTHING_FOUND
     print(f"   {label}: orphan listener(s) on :{port} {orphans} — killing")
-    for opid in orphans:
-        ProcessManager.kill_process(opid, force=force)
-    if _await_port_release(port, bind):
+    signalled = [
+        opid for opid in orphans
+        if ProcessManager.kill_process(opid, force=force)
+    ]
+    # A server closes its listening socket first and only then finishes:
+    # uvicorn drains connections for its graceful window and runs the
+    # application's shutdown after that. A free port is therefore not a
+    # stopped server, so wait for the processes the signal reached, under the
+    # deadline a recorded host gets, before the port can decide (#3781).
+    if _await_exit(signalled, SERVER_TERMINATE_TIMEOUT_SECONDS) and \
+            _await_port_release(port, bind):
         return PortReapResult.RELEASED
     for opid in orphans:
         ProcessManager.kill_process(opid, force=True)
@@ -533,8 +552,8 @@ def cmd_terminate(args) -> int:
             print(f"   Terminating {args.name} (PID: {ap.pid})...")
             if not pm.terminate_agent(args.name):
                 print(
-                    f"   {args.name}: PID {ap.pid} is still running after "
-                    f"SIGKILL — not reporting {args.name} as terminated"
+                    f"   {args.name}: PID {ap.pid} {ap.stop_failure} — not "
+                    f"reporting {args.name} as terminated"
                 )
                 return 1
             # The tracked PID being gone does not mean the port is free: a
@@ -565,21 +584,35 @@ def cmd_terminate(args) -> int:
     # clean shutdown over the top of it.
     unterminated: list[str] = []
 
+    host_pid_file = _host_pid_file(project_dir)
+    # The verified read, so "nothing is there" and "something else is there
+    # now" are different answers. A number alone could not tell them apart,
+    # and both used to arrive as the same PID (#2995).
+    host_record = pm.read_pid_record(host_pid_file)
+    host_pid = host_record.pid if host_record.is_running else None
+
     for name, cfg in multi_agent.get_local_agents().items():
         pm.register_agent(name, cfg)
         ap = pm._agents.get(name)
         if ap and ap.pid:
             print(f"   Terminating {name} (PID: {ap.pid})...")
             if not pm.terminate_agent(name):
-                print(
-                    f"   {name}: PID {ap.pid} is still running after SIGKILL"
-                )
+                print(f"   {name}: PID {ap.pid} {ap.stop_failure}")
                 unterminated.append(name)
             elif ProcessManager.is_port_in_use(cfg.port, multi_agent.host.bind):
                 _report_port_still_held(name, cfg.port)
                 unterminated.append(name)
             else:
                 print(f"   {name} terminated")
+        elif host_pid and not ProcessManager.is_port_in_use(
+            cfg.port, multi_agent.host.bind
+        ):
+            # In-process mode: the running host serves this agent and binds
+            # no port for it, and nothing else holds the agent's port, so
+            # there is no orphan to look for. The search runs ``lsof`` where
+            # psutil cannot list sockets (macOS without root): about 0.4s per
+            # agent on every restart (#3781).
+            continue
         elif _reap_orphans_on_port(
             cfg.port, name, force, multi_agent.host.bind
         ) is PortReapResult.STILL_HELD:
@@ -587,12 +620,6 @@ def cmd_terminate(args) -> int:
             unterminated.append(name)
 
     # Terminate host process.
-    host_pid_file = _host_pid_file(project_dir)
-    # The verified read, so "nothing is there" and "something else is there
-    # now" are different answers. A number alone could not tell them apart,
-    # and both used to arrive as the same PID (#2995).
-    host_record = pm.read_pid_record(host_pid_file)
-    host_pid = host_record.pid if host_record.is_running else None
     if host_pid:
         print(f"   Terminating host (PID: {host_pid})...")
         # The instant from the FILE, not a fresh lookup. Looking it up again
@@ -601,14 +628,22 @@ def cmd_terminate(args) -> int:
         # signalled — the exact protection being asked for. None for a legacy
         # record, which signals as before.
         started_at = host_record.started_at
-        pm.kill_process(host_pid, force=force, started_at=started_at)
-        for _ in range(10):
-            if not pm.is_process_running(host_pid):
-                break
-            time.sleep(0.5)
-        if pm.is_process_running(host_pid):
+        signalled = pm.kill_process(host_pid, force=force, started_at=started_at)
+        # Long enough for uvicorn's graceful window and then the
+        # application's own shutdown; a SIGKILL here skips all of it. A host
+        # the signal never reached (another uid, a reused PID) has no shutdown
+        # to wait for, and waiting out the deadline would only delay saying so.
+        if signalled and not pm.wait_for_exit(
+            host_pid, SERVER_TERMINATE_TIMEOUT_SECONDS
+        ):
+            print(
+                f"   host: still running "
+                f"{_format_seconds(SERVER_TERMINATE_TIMEOUT_SECONDS)} after "
+                "the stop signal — sending SIGKILL; its shutdown did not "
+                "complete"
+            )
             pm.kill_process(host_pid, force=True, started_at=started_at)
-            time.sleep(0.5)
+            time.sleep(SERVER_KILL_GRACE_SECONDS)
         # Two independent facts, both required before claiming a stop: the
         # process is gone, and the port it served is free. Neither implies the
         # other — a host that failed to bind leaves the port free while still
@@ -629,6 +664,9 @@ def cmd_terminate(args) -> int:
             if host_alive:
                 print(
                     f"   host: PID {host_pid} is still running after SIGKILL"
+                    if signalled
+                    else f"   host: PID {host_pid} could not be signalled "
+                    "and is still running"
                 )
             if port_held:
                 _report_port_still_held("host", multi_agent.host.port)
@@ -2336,7 +2374,9 @@ def cmd_logs(args) -> int:
     tail_args = ["tail"]
     tail_args.extend(["-n", str(args.lines)])
     if args.follow:
-        tail_args.append("-f")
+        # Follow the name, not the open file: a restart rotates a full log
+        # aside, and ``-f`` would keep reading the rotated one.
+        tail_args.append("-F")
     tail_args.append(str(log_file))
 
     try:
