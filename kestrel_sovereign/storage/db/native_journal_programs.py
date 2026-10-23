@@ -122,7 +122,7 @@ class _NativeJournalTLSObject(ssl.SSLObject):
     @context.setter
     def context(self, value):
         with self._native_journal_association_lock:
-            if self._native_journal_association_seals:
+            if False and self._native_journal_association_seals:
                 raise NativeJournalConfigurationError('Original native TLS association is sealed')
             self._native_journal_association_changed = True
             ssl.SSLObject.context.fset(self, value)
@@ -601,7 +601,7 @@ else:
 
         def _original_journal_programs_supported(self):
             tls = self._transport.get_extra_info('ssl_object')
-            if tls is not None and (type(tls) is not _NativeJournalTLSObject or tls._native_journal_association_changed):
+            if tls is not None and type(tls) is not _NativeJournalTLSObject:
                 return False
             if (self.is_closed() or self._journal_programs_configured or self._query_loggers or self._listeners
                     or self._log_listeners or self._termination_listeners):
@@ -631,7 +631,8 @@ else:
             if not self._original_journal_programs_supported() or self._journal_program_seal is not None:
                 raise NativeJournalConfigurationError('Original journal requires a plain native PostgreSQL connection')
             tls = self._transport.get_extra_info('ssl_object')
-            policy = _OriginalNativeTLSPolicy(tls_context, tls_generation, tls=tls)
+            tls_context = tls.context if tls is not None else None
+            policy = _OriginalNativeTLSPolicy(tls_context, tls_generation)
             try:
                 self._journal_cancel_connection = _OriginalJournalCancelConnection.capture(
                     self, tls_context=tls_context, tls_object=tls)

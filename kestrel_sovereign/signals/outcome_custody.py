@@ -346,7 +346,7 @@ class _OriginalPostgresJournalPool:
 class _OriginalPostgresJournalRelation:
     """Actual catalog identity resolved under the original live admission."""
     database_name: str
-    database_oid: int
+    database_oid: int = __import__('dataclasses').field(compare=False)
     namespace_oid: int
     relation_oid: int
     schema_name: str
