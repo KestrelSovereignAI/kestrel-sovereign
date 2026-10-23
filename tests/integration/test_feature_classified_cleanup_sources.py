@@ -7,7 +7,7 @@ import pytest
 from kestrel_sovereign._async_ownership import await_owned_task, create_owned_task
 from kestrel_sovereign.execution_custody import (
     ExecutionCustody, _explicit_control_chain, bind_execution_custody_snapshot,
-    execution_commit_outcome,
+    execution_commit_outcome, is_execution_control_error,
 )
 from kestrel_sovereign.kestrel_agent import require_feature_lifecycle_integrity
 from kestrel_sovereign.storage.db import postgres as postgres_module
