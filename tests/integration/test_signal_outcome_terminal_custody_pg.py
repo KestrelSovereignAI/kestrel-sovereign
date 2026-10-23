@@ -762,6 +762,32 @@ async def test_admission_reconnect_never_invokes_reconfigured_password(dispatche
             await pool.close()
 
 
+async def test_admission_can_reconnect_with_original_plain_configuration(dispatcher_components):
+    from kestrel_sovereign._async_ownership import await_owned_task
+    from kestrel_sovereign.execution_custody import ExecutionCustody, bind_execution_runtime
+    from tests.unit.test_signal_outcome_terminal_custody import _OriginalWork
+    from tests.unit.test_signals_dispatcher import _action_reg, _signal
+    c = dispatcher_components
+    pool = c.backend._pool
+    await c.dispatcher.initialize_durable_delivery()
+    await pool.expire_connections()  # Genuine cold acquisition BEFORE capture.
+    scope = ExecutionCustody(_OriginalWork(backend_type='postgres'))
+    effects = []
+
+    async def handler(payload):
+        effects.append(True)
+        scope.revoke('genuine effect completed before original native audit')
+        return {'genuine': True}
+
+    c.registry.register(_action_reg('native.admission.plain', handler=handler))
+    signal = _signal('native.admission.plain')
+    with bind_execution_runtime(SimpleNamespace(_execution_custody=scope)):
+        task = asyncio.create_task(c.dispatcher.dispatch_signal(signal))
+    outcome = await await_owned_task(task)
+    assert outcome.error is None and effects == [True]
+    assert await c.backend.fetch_val('SELECT COUNT(*) FROM signal_log WHERE id=$1', (signal.id,)) == 1
+
+
 @pytest.mark.parametrize('phase', ['rollback', 'reset'])
 @pytest.mark.parametrize('withdrawn_owner', ['inner', 'outer', 'public'])
 async def test_failed_terminal_insert_keeps_writer_withdrawal_through_native_exit(dispatcher_components, monkeypatch, phase, withdrawn_owner):

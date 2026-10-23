@@ -2298,20 +2298,14 @@ class PostgresBackend(DatabaseBackend):
         return _OriginalPostgresJournalRelation(**fields)
 
     async def _capture_original_signal_outcome_relation(self, journal):
-        from kestrel_sovereign.signals.outcome_custody import _OriginalSignalOutcome, _JOURNAL_ADMISSION
-        if (type(journal) is not _OriginalSignalOutcome
-                or journal._admission_key is not _JOURNAL_ADMISSION
-                or journal._backend is not self
-                or journal._acceptance.owner is not asyncio.current_task()
-                or journal._phase != 'accepted'
-                or journal._dispatcher._accepted_signal_outcomes.get(journal._acceptance) is not journal):
-            raise ExecutionAuthorityError('Original live acceptance required for native journal destination')
-        require_execution_work(self)
+        from kestrel_sovereign.signals.outcome_custody import _require_original_signal_outcome
+        _require_original_signal_outcome(journal, self, admission=True)
         if self.owns_open_transaction:
             raise ExecutionAuthorityError('Original signal destination refuses an enclosing transaction')
         journal._require_backing()
         native = None
         program_sealed = False
+        connect_token = _ORIGINAL_POSTGRES_CONNECT.set((journal, self, True))
         try:
             async with self._tracked_pool_checkout(journal._backing, admit_work=True, original_journal=True) as (connection, state):
                 journal._require_backing()
@@ -2342,8 +2336,11 @@ class PostgresBackend(DatabaseBackend):
         except NativeJournalConfigurationError as error:
             raise journal.write_refusal('native_programs_changed') from error
         finally:
-            if program_sealed:
-                native._end_original_journal()
+            try:
+                if program_sealed:
+                    native._end_original_journal()
+            finally:
+                _ORIGINAL_POSTGRES_CONNECT.reset(connect_token)
         journal._require_backing()
         require_execution_work(self)
         return relation
@@ -2388,7 +2385,7 @@ class PostgresBackend(DatabaseBackend):
         state = None
         native = None
         program_sealed = False
-        connect_token = _ORIGINAL_POSTGRES_CONNECT.set((journal, self))
+        connect_token = _ORIGINAL_POSTGRES_CONNECT.set((journal, self, False))
         try:
             async with self._original_signal_outcome_checkout(journal) as (connection, state):
                 journal.require_original(self)

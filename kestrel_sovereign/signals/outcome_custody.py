@@ -293,7 +293,7 @@ class _OriginalPostgresJournalPool:
         except NativeJournalConfigurationError as error:
             raise ExecutionAuthorityError('Original native TLS policy changed') from error
 
-    def parameters_for_connect(self, args, kwargs):
+    def parameters_for_connect(self, args, kwargs, *, admission=False):
         import asyncpg
         from kestrel_sovereign.storage.db.native_journal_programs import NativeJournalPostgresConnection
         self.require_original(self.pool)
@@ -307,7 +307,12 @@ class _OriginalPostgresJournalPool:
             raise ExecutionAuthorityError('Original native reconnect parameters differ')
         original_args, original_kwargs = _restore_native_connect_configuration(self.configuration)
         if self.resolved_configuration is None:
-            raise ExecutionAuthorityError('Original native reconnect endpoint was not admitted')
+            if not admission:
+                raise ExecutionAuthorityError('Original native reconnect endpoint was not admitted')
+            # Initial admission may establish its first native endpoint, but
+            # only from the detached original plain recipe under live Work.
+            original_kwargs.update(loop=loop, connection_class=connection_class, record_class=record_class)
+            return original_args, original_kwargs
         resolved = _restore_native_connect_configuration(self.resolved_configuration)
         tls_server_hostname = resolved.pop('tls_server_hostname')
         original_kwargs.update(resolved)
@@ -546,6 +551,18 @@ class _OriginalSignalOutcome:
         self._entry = prepared
         self._phase = 'bound'
 
+    def require_admission(self, backend):
+        """Only the original live public dispatch may resolve its destination."""
+        if (type(self) is not _OriginalSignalOutcome
+                or getattr(self, '_admission_key', None) is not _JOURNAL_ADMISSION
+                or backend is not self._backend
+                or self._acceptance.owner is not asyncio.current_task()
+                or self._phase != 'accepted'
+                or self._dispatcher._accepted_signal_outcomes.get(self._acceptance) is not self):
+            raise ExecutionAuthorityError('Original live acceptance required for native journal destination')
+        self._require_backing()
+        require_execution_work(backend)
+
     def require_original(self, backend):
         from kestrel_sovereign._async_ownership import OwnedTaskAdmission
         if (type(self) is not _OriginalSignalOutcome
@@ -640,10 +657,13 @@ class _OriginalSignalOutcome:
         return finite
 
 
-def _require_original_signal_outcome(journal, backend):
+def _require_original_signal_outcome(journal, backend, *, admission=False):
     if type(journal) is not _OriginalSignalOutcome:
         raise ExecutionAuthorityError('Exact original native signal journal required')
-    journal.require_original(backend)
+    if admission:
+        journal.require_admission(backend)
+    else:
+        journal.require_original(backend)
 
 
 async def _capture_original_outcome(dispatcher, signal, registration, *, acceptance):

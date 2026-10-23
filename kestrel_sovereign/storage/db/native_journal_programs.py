@@ -749,10 +749,10 @@ async def _native_journal_connect(*args, **kwargs):
         raise RuntimeError('Native PostgreSQL driver is unavailable')
     original = _ORIGINAL_POSTGRES_CONNECT.get()
     if original is not None:
-        journal, backend = original
+        journal, backend, admission = original
         from kestrel_sovereign.signals.outcome_custody import _require_original_signal_outcome
-        _require_original_signal_outcome(journal, backend)
-        args, kwargs = journal._postgres_pool.parameters_for_connect(args, kwargs)
+        _require_original_signal_outcome(journal, backend, admission=admission)
+        args, kwargs = journal._postgres_pool.parameters_for_connect(args, kwargs, admission=admission)
         with _OriginalNativeTLSPolicy(journal._postgres_pool.tls_context, journal._postgres_pool.tls_generation):
             return await asyncpg.connection.connect(*args, **kwargs)
     return await asyncpg.connection.connect(*args, **kwargs)
