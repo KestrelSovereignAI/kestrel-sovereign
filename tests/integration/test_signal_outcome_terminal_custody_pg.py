@@ -251,6 +251,21 @@ async def test_postgres_pinned_peer_keeps_native_tls_identity_on_reconnect(dispa
     replacement_dir.mkdir()
     replacement_context, _, replacement_cert = _owned_tls_contexts(replacement_dir, alias)
     replaced = []
+    effects = []
+    association_attempts = []
+    if trust_change == 'admission':
+        import ssl
+        from kestrel_sovereign.storage.db.native_journal_programs import _adopt_native_tls_context
+        replacement_policy = _adopt_native_tls_context(ssl.create_default_context(cafile=str(replacement_cert)))
+        original_principal = NativeJournalPostgresConnection._original_journal_principal
+        async def changed_during_principal(connection):
+            principal = await original_principal(connection)
+            if not association_attempts:
+                association_attempts.append(True)
+                connection._transport.get_extra_info('ssl_object').context = replacement_policy
+                replaced.append(True)
+            return principal
+        monkeypatch.setattr(NativeJournalPostgresConnection, '_original_journal_principal', changed_during_principal)
     names = []
     reject_tls = asyncio.Event()
     plaintext_cancellations = []
@@ -291,6 +306,7 @@ async def test_postgres_pinned_peer_keeps_native_tls_identity_on_reconnect(dispa
             release_owner = asyncio.create_task(release_after_cancellation())
         scope = ExecutionCustody(_OriginalWork(backend_type='postgres'))
         async def handler(payload):
+            effects.append('actual admitted handler')
             if sibling:
                 connection = await pool.acquire()
                 held.append(connection)
@@ -328,6 +344,13 @@ async def test_postgres_pinned_peer_keeps_native_tls_identity_on_reconnect(dispa
             released = await await_owned_task(release_owner)
             assert released.error is None
         assert not plaintext_cancellations, 'admitted TLS cancellation sent the native backend secret in plaintext'
+        if trust_change == 'admission':
+            from kestrel_sovereign.execution_custody import is_execution_control_error
+            assert association_attempts, 'actual admission principal query was not reached'
+            assert is_execution_control_error(outcome.error), 'admission adopted replacement TLS association and committed into it'
+            assert not effects, 'retired TLS association was admitted to the handler'
+            assert await control.fetchval(f'SELECT COUNT(*) FROM ONLY "{schema}".signal_log WHERE id=$1', signal.id) == 0
+            return
         if trust_change in ('context', 'transport'):
             from kestrel_sovereign.execution_custody import is_execution_control_error, execution_commit_outcome
             assert is_execution_control_error(outcome.error), 'mutated admitted TLS policy accepted a replacement certificate'
@@ -387,6 +410,12 @@ async def test_postgres_pinned_peer_keeps_native_tls_identity_on_reconnect(dispa
                         await pool.close()
         finally:
             await retire_proxy()
+
+
+@pytest.mark.parametrize('direct_tls', [False, True])
+async def test_postgres_tls_admission_refuses_context_replacement_during_principal(dispatcher_components, native_pg, monkeypatch, tmp_path, direct_tls):
+    await test_postgres_pinned_peer_keeps_native_tls_identity_on_reconnect(
+        dispatcher_components, native_pg, monkeypatch, tmp_path, direct_tls, False, 'admission', False, 'verify-full')
 
 
 async def test_postgres_database_clone_cannot_inherit_original_journal_identity(dispatcher_components, native_pg):

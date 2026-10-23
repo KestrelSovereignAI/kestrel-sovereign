@@ -370,6 +370,22 @@ async def _a2a_submitted_dispatcher(path, did: str):
 @pytest.mark.parametrize('release_failure', [False, True])
 @pytest.mark.parametrize('phase', ['rehydrate', 'grouped_rehydrate', 'hold', 'begin', 'guard', 'begin_failure'])
 async def test_cancelled_async_rehydration_releases_its_original_claim(tmp_path, monkeypatch, public_handle, release_failure, phase):
+    await _assert_pre_route_claim(tmp_path, monkeypatch, public_handle, release_failure, phase)
+
+
+@pytest.mark.parametrize('release_failure', [False, True])
+async def test_recovered_first_hold_read_owns_original_claim(tmp_path, monkeypatch, release_failure):
+    await _assert_pre_route_claim(tmp_path, monkeypatch, False, release_failure, 'initial_hold')
+
+
+@pytest.mark.parametrize('release_failure', [False, True])
+@pytest.mark.parametrize('published_before_refusal', [False, True])
+async def test_failed_route_task_publication_owns_original_claim(tmp_path, monkeypatch, release_failure, published_before_refusal):
+    await _assert_pre_route_claim(tmp_path, monkeypatch, False, release_failure,
+                                  'publication_after' if published_before_refusal else 'publication_before')
+
+
+async def _assert_pre_route_claim(tmp_path, monkeypatch, public_handle, release_failure, phase):
     import time
     from kestrel_sovereign._async_ownership import await_owned_task
     from kestrel_sovereign.execution_custody import _explicit_control_chain
@@ -387,6 +403,29 @@ async def test_cancelled_async_rehydration_releases_its_original_claim(tmp_path,
         source=source, agent_id=agent.did, max_attempts=0)
     entered, release = asyncio.Event(), asyncio.Event()
     task = None
+    accepted = []
+    publication_error = RuntimeError('actual route close_unstarted publication refused')
+    loop, previous_factory = asyncio.get_running_loop(), asyncio.get_running_loop().get_task_factory()
+    if phase.startswith('publication_'):
+        from tests.unit.test_host_context_native_cleanup import _actual_operation
+        class RefusePublication(asyncio.Task):
+            refused = False
+            def add_done_callback(self, callback, *args, **kwargs):
+                if not self.refused and getattr(callback, '__name__', '') == 'close_unstarted':
+                    self.refused = True
+                    if phase == 'publication_after':
+                        super().add_done_callback(callback, *args, **kwargs)
+                    raise publication_error
+                return super().add_done_callback(callback, *args, **kwargs)
+        def factory(loop, coroutine, **kwargs):
+            operation = _actual_operation(coroutine)
+            if getattr(getattr(operation, 'cr_code', None), 'co_name', '') == 'route_durable_cognition':
+                original_task = RefusePublication(coroutine, loop=loop, **kwargs)
+                accepted.append(original_task)
+                entered.set()
+                return original_task
+            return previous_factory(loop, coroutine, **kwargs) if previous_factory else asyncio.Task(coroutine, loop=loop, **kwargs)
+        loop.set_task_factory(factory)
     recovered = False
     async def withdraw_here():
         entered.set()
@@ -410,7 +449,7 @@ async def test_cancelled_async_rehydration_releases_its_original_claim(tmp_path,
     from kestrel_sovereign import hold as hold_module
     original_hold = hold_module.get_effective_hold_state
     async def hold(*args, **kwargs):
-        if phase == 'hold' and recovered:
+        if (phase == 'hold' and recovered) or (phase == 'initial_hold' and not recovered):
             await withdraw_here()
         return await original_hold(*args, **kwargs)
     monkeypatch.setattr(hold_module, 'get_effective_hold_state', hold)
@@ -446,11 +485,14 @@ async def test_cancelled_async_rehydration_releases_its_original_claim(tmp_path,
                 consumer_id=consumer.consumer_id, durable_admission=None, durable_created=False,
                 use_live_signal=False, claimed_delivery=delivery))
         await asyncio.wait_for(entered.wait(), 5)
-        if phase != 'begin_failure':
+        if phase != 'begin_failure' and not phase.startswith('publication_'):
             task.cancel('actual caller withdrawal during source rehydration')
         outcome = await await_owned_task(task)
         errors = tuple(_explicit_control_chain(outcome.error))
-        if phase != 'begin_failure':
+        if phase.startswith('publication_'):
+            assert accepted and all(original.done() for original in accepted)
+            assert publication_error in errors, 'original callback-publication refusal was not retained'
+        elif phase != 'begin_failure':
             assert any(isinstance(error, asyncio.CancelledError) for error in errors)
         elif not release_failure:
             assert outcome.error is None and outcome.result.status == Status.FAILED
@@ -462,6 +504,7 @@ async def test_cancelled_async_rehydration_releases_its_original_claim(tmp_path,
             assert delivery.status == RETRY, 'rehydration withdrawal left the physically finished claim leased'
             assert delivery.lease_expires_at is None
     finally:
+        loop.set_task_factory(previous_factory)
         release.set()
         if task is not None:
             await await_owned_task(task)

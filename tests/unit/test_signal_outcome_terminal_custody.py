@@ -879,6 +879,33 @@ async def test_sqlite_journal_refuses_registered_native_scalar_adapter(dispatche
     assert c.dispatcher._log_write_failures == 1
 
 
+async def test_legacy_emitter_mutable_hash_cannot_retain_completed_writer(dispatcher_components):
+    from dataclasses import replace
+    from kestrel_sdk.signals import Visibility
+    from kestrel_sovereign.signals import SignalLogStore
+    c = dispatcher_components
+    class LegacyStore(SignalLogStore):
+        pass
+    c.dispatcher._store = LegacyStore(c.backend)
+    class MutableId(str):
+        generation = 0
+        def __hash__(self):
+            return str.__hash__(self) + self.generation
+    identifier = MutableId('legacy-mutable-original')
+    signal = replace(_signal('legacy.mutable.audit'), id=identifier, visibility=Visibility.USER_VISIBLE)
+    emitted = []
+    async def emit(*args):
+        identifier.generation += 1
+        emitted.append(True)
+    c.agent.emit_event = emit
+    c.registry.register(_action_reg('legacy.mutable.audit'))
+    result = await c.dispatcher.dispatch_signal(signal)
+    assert emitted and result.status.value == 'ok'
+    assert not c.dispatcher._outcome_log_tasks
+    assert not c.dispatcher._outcome_log_tasks_by_signal, 'legacy mutable hash stranded a physically completed original writer'
+    assert await c.backend.fetch_val('SELECT COUNT(*) FROM signal_log WHERE id=?', (str.__str__(identifier),)) == 1
+
+
 async def test_emitter_cannot_change_original_writer_tracking_identity(dispatcher_components, monkeypatch):
     from dataclasses import replace
     from kestrel_sdk.signals import Visibility
