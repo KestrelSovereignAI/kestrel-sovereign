@@ -28,8 +28,8 @@ from abc import abstractmethod
 
 # Import public native protocol values directly. The host's a2a package still
 # owns lifecycle services; importing it here would re-enter early feature boot.
-from kestrel_sovereign._vendor.a2a.helpers.proto_helpers import new_raw_artifact, new_text_message
-from kestrel_sovereign._vendor.a2a.types import Task, TaskState, TaskStatus
+from kestrel_sdk.native_a2a.helpers.proto_helpers import new_raw_artifact, new_text_message
+from kestrel_sdk.native_a2a.types import Task, TaskState, TaskStatus
 from google.protobuf.json_format import MessageToDict
 
 # The SDK Feature is the canonical base class for feature packages.

@@ -115,12 +115,12 @@ async def test_push_query_contention_recovers_in_the_same_resident(
     assert owner.done() and not p.backend.is_connected
 
 
+@pytest.mark.parametrize("native_a2a_backend_factory", ["postgres"], indirect=True)
 async def test_push_original_session_loss_recovers_without_replacing_its_owner(
     push_runtime, native_a2a_backend_factory, monkeypatch
 ):
     p = push_runtime
-    if p.backend.backend_type != "postgres":
-        pytest.skip("PostgreSQL session termination requires a real PostgreSQL server")
+    assert p.backend.backend_type == "postgres"
     control = native_a2a_backend_factory()
     await control.connect()
     pending = p.service.worker.outbox.changes.pending

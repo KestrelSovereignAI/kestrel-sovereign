@@ -5,8 +5,8 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 import pytest_asyncio
-from kestrel_sovereign._vendor.a2a.helpers.proto_helpers import new_text_message
-from kestrel_sovereign._vendor.a2a.types import Role, SendMessageRequest, TaskState
+from kestrel_sdk.native_a2a.helpers.proto_helpers import new_text_message
+from kestrel_sdk.native_a2a.types import Role, SendMessageRequest, TaskState
 from kestrel_sdk.signals import Trust
 
 from kestrel_sovereign.a2a.extensions import CAUSATION_URI, QUESTION_CORRELATION_URI
@@ -153,7 +153,7 @@ async def test_immediate_and_restarted_wakes_use_committed_principals_not_metada
 async def test_invalid_declared_extensions_fail_before_context_and_task_admission(
     native_manager, metadata
 ):
-    from kestrel_sovereign._vendor.a2a.utils.errors import InvalidParamsError
+    from kestrel_sdk.native_a2a.utils.errors import InvalidParamsError
 
     with pytest.raises(InvalidParamsError):
         await native_manager.create_task(

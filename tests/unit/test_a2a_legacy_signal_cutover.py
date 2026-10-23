@@ -454,14 +454,14 @@ async def test_retirement_validates_counter_custody_before_deleting_history(
         await backend.close()
 
 
+@pytest.mark.parametrize("native_a2a_backend_factory", ["postgres"], indirect=True)
 async def test_postgres_retirement_owns_source_handoff_before_counter_access(
     native_a2a_backend_factory, monkeypatch
 ):
     from kestrel_sovereign.signals.durable import DurableSourceBoundary
 
     backend, observer = native_a2a_backend_factory(), native_a2a_backend_factory()
-    if backend.backend_type != "postgres":
-        pytest.skip("PostgreSQL source handoff contract")
+    assert backend.backend_type == "postgres"
     await backend.connect()
     await observer.connect()
     try:
@@ -498,12 +498,12 @@ async def test_postgres_retirement_owns_source_handoff_before_counter_access(
         await backend.close()
 
 
+@pytest.mark.parametrize("native_a2a_backend_factory", ["postgres"], indirect=True)
 async def test_postgres_cutover_acquires_source_handoff_before_relation_locks(
     native_a2a_backend_factory, monkeypatch
 ):
     backend = native_a2a_backend_factory()
-    if backend.backend_type != "postgres":
-        pytest.skip("PostgreSQL offline lock ordering contract")
+    assert backend.backend_type == "postgres"
     await backend.connect()
     try:
         store = DurableSignalStore(backend)

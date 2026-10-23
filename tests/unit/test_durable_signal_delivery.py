@@ -2340,7 +2340,7 @@ async def test_held_a2a_submission_wake_survives_restart_without_peer_reemit(
 
     path = tmp_path / "held-a2a-restart.db"
     did = "did:agent:held-a2a-restart"
-    from kestrel_sovereign._vendor.a2a.types import Task, TaskState, TaskStatus
+    from kestrel_sdk.native_a2a.types import Task, TaskState, TaskStatus
     task = Task(
         id="task-held-across-restart",
         context_id="context-held-across-restart",
@@ -2412,7 +2412,7 @@ async def test_privacy_elided_a2a_wake_rehydrates_after_restart_without_peer_ree
 
     from types import MethodType
 
-    from kestrel_sovereign._vendor.a2a.types import Task, TaskState, TaskStatus
+    from kestrel_sdk.native_a2a.types import Task, TaskState, TaskStatus
 
     from kestrel_sovereign.agent.event_manager import EventManagerMixin
     from kestrel_sovereign.privacy import get_privacy_preset
@@ -2807,7 +2807,7 @@ class _ReconcilingA2AAgent(_Agent):
 
     async def validate_cognition_signal_execution(self, signal):
         # EventManagerMixin's rule: a submission wake runs while the task is live.
-        from kestrel_sovereign._vendor.a2a.types import TaskState
+        from kestrel_sdk.native_a2a.types import TaskState
         state = self.task.status.state
         return None if state in {TaskState.TASK_STATE_SUBMITTED, TaskState.TASK_STATE_WORKING} else f"task is {state}"
 
@@ -2837,7 +2837,7 @@ async def test_crash_mid_submission_turn_recovers_one_wake_not_two(tmp_path):
     identity beside it ran the same peer task twice at recovery.
     """
 
-    from kestrel_sovereign._vendor.a2a.types import Task, TaskState, TaskStatus
+    from kestrel_sdk.native_a2a.types import Task, TaskState, TaskStatus
 
     from kestrel_sovereign.signals.sources.a2a_task_submitted import (
         DURABLE_COGNITION_CONSUMER_ID as SUBMITTED_CONSUMER,

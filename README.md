@@ -328,11 +328,13 @@ use the scheduler host's own storage pool, not the agents' advisory pool.
 
 #### Native SDK release requirements
 
-Core requires `kestrel-sovereign-sdk[httpx,tracing]>=0.41.0,<1`; the
+Core requires `kestrel-sovereign-sdk[a2a,httpx,tracing]>=0.42.0,<1`; the
 `observability` extra adds `metrics` under that same base constraint. The 0.40
 release replaces draft A2A contribution types with native `AgentSkill` and
 `get_agent_skills` contracts; the coordinated 0.41.0 floor also includes the
 shared computer-use, artifact, resource-scope and workspace-transfer contracts.
+The 0.42 floor supplies the reviewed vendored native A2A implementation used by
+both Core and feature skill producers through the SDK's `a2a` extra.
 SDK 0.39 lacks the native initialization contract and cannot boot this release.
 The lock records the tested version without excluding future SDK minor
 releases. The SDK
@@ -355,9 +357,9 @@ operator and context-clause contribution contracts, and the awaited
 context-clause preparation hook. It is not a preference that a downstream
 package may relax.
 
-Story Archive 0.3.5 removes its old SDK ceiling and admits SDK 0.41. The public
+Story Archive 0.3.5 removes its old SDK ceiling and admits SDK 0.42. The public
 MCP 0.7.0, Talon 0.2.15, Features 0.3.3, Telegram 0.1.9 and Observability
-0.17.15 releases also declare SDK constraints that admit 0.41. These metadata
+0.17.15 releases also declare SDK constraints that admit 0.42. These metadata
 checks establish resolver compatibility, not runtime acceptance. Editable
 Eye, Flight and Claws installations and the rest of each host's feature
 manifest need their own source and runtime verification before Core ships.

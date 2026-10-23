@@ -4,8 +4,8 @@ import asyncio
 from uuid import uuid4
 
 import pytest
-from kestrel_sovereign._vendor.a2a.helpers.proto_helpers import new_text_message
-from kestrel_sovereign._vendor.a2a.types import (
+from kestrel_sdk.native_a2a.helpers.proto_helpers import new_text_message
+from kestrel_sdk.native_a2a.types import (
     Artifact,
     ListTasksRequest,
     Part,

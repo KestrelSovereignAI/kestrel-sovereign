@@ -5,7 +5,7 @@ description = "Kestrel Sovereign AI Agent Framework - Constitutional AI with cry
 readme = "README.md"
 requires-python = ">=3.11,<3.15"
 license = "Apache-2.0"
-license-files = ["LICENSE", "kestrel_sovereign/_vendor/a2a/LICENSE"]
+license-files = ["LICENSE"]
 authors = [{ name = "UncleSaurus" }]
 maintainers = [{ name = "UncleSaurus" }]
 keywords = [
@@ -101,21 +101,14 @@ dependencies = [
     # get_agent_skills contracts used during agent initialization. The
     # coordinated 0.41.0 floor also includes the shared computer-use,
     # artifact, resource-scope and workspace-transfer contracts (#3679).
-    # The lock records the tested release; future minor versions remain
+    # 0.42 owns the reviewed vendored native A2A SDK shared by the host and
+    # feature skill producers. The lock records the tested release; future minor versions remain
     # admissible. Verify installed host features against the resolved SDK
     # before release rather than preserving an obsolete minor ceiling.
-    "kestrel-sovereign-sdk[httpx,tracing]>=0.41.0,<1",
-    # Modified official A2A SDK is shipped in kestrel_sovereign._vendor.a2a.
-    # Its exact source, fixes, license and custody manifest ship in the wheel.
-    # These are the SDK's runtime and HTTP-server dependencies; never install
-    # a second SDK as an implicit alternative to the reviewed vendored copy.
-    "google-api-core>=1.26.0",
+    "kestrel-sovereign-sdk[a2a,httpx,tracing]>=0.42.0,<1",
+    # Native A2A implementation is owned by the shared SDK [a2a] extra.
+    # Core and feature skill producers use the same reviewed vendored types.
     "protobuf>=5.29.5",
-    "json-rpc>=1.15.0",
-    "googleapis-common-protos>=1.70.0",
-    "culsans>=0.11.0 ; python_full_version < '3.13'",
-    "sse-starlette",
-    "starlette",
     # RFC 8785 for the Kestrel sender extension's complete native request digest.
     "rfc8785>=0.1.4,<1",
     # Core web framework

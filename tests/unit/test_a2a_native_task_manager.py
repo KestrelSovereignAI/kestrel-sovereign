@@ -8,8 +8,8 @@ from dataclasses import replace
 
 import pytest
 import pytest_asyncio
-from kestrel_sovereign._vendor.a2a.helpers.proto_helpers import new_data_artifact, new_text_message
-from kestrel_sovereign._vendor.a2a.types import (
+from kestrel_sdk.native_a2a.helpers.proto_helpers import new_data_artifact, new_text_message
+from kestrel_sdk.native_a2a.types import (
     AgentSkill,
     Part,
     Role,
@@ -20,7 +20,7 @@ from kestrel_sovereign._vendor.a2a.types import (
     TaskStatus,
     TaskStatusUpdateEvent,
 )
-from kestrel_sovereign._vendor.a2a.utils.errors import InvalidParamsError
+from kestrel_sdk.native_a2a.utils.errors import InvalidParamsError
 from google.protobuf.json_format import MessageToDict, ParseDict
 
 from kestrel_sovereign._async_ownership import await_owned_task
@@ -669,7 +669,7 @@ async def test_local_skill_completion_retains_the_current_turn_causation_extensi
 async def test_lost_commit_ack_reconciles_only_the_canonical_payload(
     manager, monkeypatch, readback
 ):
-    from kestrel_sovereign._vendor.a2a.helpers.proto_helpers import new_text_artifact
+    from kestrel_sdk.native_a2a.helpers.proto_helpers import new_text_artifact
 
     from kestrel_sovereign.a2a.stores.unified.task_store import (
         TaskMutationAuthorizationError,

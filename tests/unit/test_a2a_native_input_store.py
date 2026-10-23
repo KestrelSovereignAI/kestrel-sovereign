@@ -75,7 +75,7 @@ async def test_inline_callback_secrets_are_not_persisted_or_exposed_to_cognition
 async def test_inline_secret_changes_conflict_even_when_execution_projection_is_identical(
     manager,
 ):
-    from kestrel_sovereign._vendor.a2a.types import SendMessageRequest
+    from kestrel_sdk.native_a2a.types import SendMessageRequest
 
     from tests.unit.test_a2a_native_input import request as inline_request
 

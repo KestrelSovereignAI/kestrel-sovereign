@@ -2,7 +2,7 @@
 
 import pytest
 import pytest_asyncio
-from kestrel_sovereign._vendor.a2a.types import Artifact, TaskState, TaskStatus
+from kestrel_sdk.native_a2a.types import Artifact, TaskState, TaskStatus
 
 from kestrel_sovereign.a2a.scope import NativeRecipientScope
 from kestrel_sovereign.a2a.stores.unified.base import NativeStoreConflict

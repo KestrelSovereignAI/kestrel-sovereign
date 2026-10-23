@@ -11,12 +11,12 @@ from kestrel_sovereign.a2a.scope import NativeRecipientScope
 from tests.utils.native_a2a import manager_for
 
 
+@pytest.mark.parametrize("native_a2a_backend_factory", ["postgres"], indirect=True)
 async def test_postgres_ready_boot_holds_no_data_table_migration_locks(
     native_a2a_backend_factory, monkeypatch
 ):
     reader, boot_backend = native_a2a_backend_factory(), native_a2a_backend_factory()
-    if reader.backend_type != "postgres":
-        pytest.skip("PostgreSQL relation lock contract")
+    assert reader.backend_type == "postgres"
     await reader.connect()
     await boot_backend.connect()
     first = manager_for(reader, NativeRecipientScope("did:first"))
@@ -188,7 +188,11 @@ async def test_unsupported_or_incomplete_store_versions_refuse_before_writes(
         await manager.close()
 
 
-@pytest.mark.parametrize("failure", ["observability", "memory-fts"])
+@pytest.mark.parametrize(
+    ("native_a2a_backend_factory", "failure"),
+    [("sqlite", "observability"), ("postgres", "observability"), ("sqlite", "memory-fts")],
+    indirect=["native_a2a_backend_factory"],
+)
 async def test_real_schema_failure_rolls_back_core_and_never_publishes_completion(
     native_a2a_backend_factory, monkeypatch, failure
 ):
@@ -196,8 +200,8 @@ async def test_real_schema_failure_rolls_back_core_and_never_publishes_completio
     from kestrel_sovereign.storage.db.interface import QueryError, TransactionError
 
     backend = native_a2a_backend_factory()
-    if failure == "memory-fts" and backend.backend_type != "sqlite":
-        pytest.skip("SQLite FTS5 initialization failure")
+    if failure == "memory-fts":
+        assert backend.backend_type == "sqlite"
     await backend.connect()
     manager = TaskManager.from_backend(
         backend,
@@ -258,14 +262,14 @@ async def test_real_schema_failure_rolls_back_core_and_never_publishes_completio
         await manager.close()
 
 
+@pytest.mark.parametrize("native_a2a_backend_factory", ["postgres"], indirect=True)
 async def test_postgres_memory_trigger_presence_is_scoped_to_its_relation(
     native_a2a_backend_factory,
 ):
     from kestrel_sovereign.a2a.stores.unified.memory_service import MemoryService
 
     backend = native_a2a_backend_factory()
-    if backend.backend_type != "postgres":
-        pytest.skip("PostgreSQL relation-scoped trigger contract")
+    assert backend.backend_type == "postgres"
     await backend.connect()
     memory = MemoryService(backend)
     try:
@@ -286,12 +290,12 @@ async def test_postgres_memory_trigger_presence_is_scoped_to_its_relation(
         await memory.close()
 
 
+@pytest.mark.parametrize("native_a2a_backend_factory", ["postgres"], indirect=True)
 async def test_postgres_table_probe_sees_another_connections_committed_ddl(
     native_a2a_backend_factory,
 ):
     first, second = native_a2a_backend_factory(), native_a2a_backend_factory()
-    if first.backend_type != "postgres":
-        pytest.skip("PostgreSQL catalog visibility contract")
+    assert first.backend_type == "postgres"
     await first.connect()
     await second.connect()
     try:

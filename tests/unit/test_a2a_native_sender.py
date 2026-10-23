@@ -7,7 +7,7 @@ import json
 
 import pytest
 import rfc8785
-from kestrel_sovereign._vendor.a2a.types import GetTaskRequest, SendMessageRequest
+from kestrel_sdk.native_a2a.types import GetTaskRequest, SendMessageRequest
 from google.protobuf.json_format import MessageToDict, ParseDict
 
 from kestrel_sovereign.a2a.native_sender import (
@@ -456,7 +456,7 @@ async def test_unsupported_claims_fail_before_did_resolution(
 
 @pytest.mark.asyncio
 async def test_required_native_fields_are_checked_before_verification(identity):
-    from kestrel_sovereign._vendor.a2a.utils.errors import InvalidParamsError
+    from kestrel_sdk.native_a2a.utils.errors import InvalidParamsError
 
     with pytest.raises(InvalidParamsError):
         _sign(identity, SendMessageRequest())

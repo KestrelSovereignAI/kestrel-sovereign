@@ -146,7 +146,7 @@ async def callback_host(push_host, monkeypatch):
 
 
 async def register_callback(p, url):
-    from kestrel_sovereign._vendor.a2a.types import TaskPushNotificationConfig
+    from kestrel_sdk.native_a2a.types import TaskPushNotificationConfig
     from tests.utils.native_a2a_security import PRINCIPAL, send
 
     task = await p.manager.create_task(send(p), creator_agent_id=PRINCIPAL)
@@ -437,7 +437,7 @@ async def test_transient_journal_read_preserves_original_signed_publication(
         ) as http:
             response = await http.get(native_card_path("registered-agent"))
         assert response.status_code == 200
-        from kestrel_sovereign._vendor.a2a.types import AgentCard
+        from kestrel_sdk.native_a2a.types import AgentCard
         from google.protobuf.json_format import ParseDict
 
         card = ParseDict(response.json(), AgentCard())

@@ -12,13 +12,13 @@ from types import SimpleNamespace
 import httpx
 import pytest
 import rfc8785
-from kestrel_sovereign._vendor.a2a.client import ClientConfig, ClientFactory
-from kestrel_sovereign._vendor.a2a.client.client import ClientCallContext
-from kestrel_sovereign._vendor.a2a.client.interceptors import ClientCallInterceptor
-from kestrel_sovereign._vendor.a2a.server.request_handlers import RequestHandler
-from kestrel_sovereign._vendor.a2a.server.routes.jsonrpc_routes import create_jsonrpc_routes
-from kestrel_sovereign._vendor.a2a.server.routes.rest_routes import create_rest_routes
-from kestrel_sovereign._vendor.a2a.types import (
+from kestrel_sdk.native_a2a.client import ClientConfig, ClientFactory
+from kestrel_sdk.native_a2a.client.client import ClientCallContext
+from kestrel_sdk.native_a2a.client.interceptors import ClientCallInterceptor
+from kestrel_sdk.native_a2a.server.request_handlers import RequestHandler
+from kestrel_sdk.native_a2a.server.routes.jsonrpc_routes import create_jsonrpc_routes
+from kestrel_sdk.native_a2a.server.routes.rest_routes import create_rest_routes
+from kestrel_sdk.native_a2a.types import (
     AgentCapabilities,
     AgentCard,
     AgentInterface,
@@ -32,7 +32,7 @@ from kestrel_sovereign._vendor.a2a.types import (
     TaskState,
     TaskStatus,
 )
-from kestrel_sovereign._vendor.a2a.utils.errors import InvalidParamsError, UnsupportedOperationError
+from kestrel_sdk.native_a2a.utils.errors import InvalidParamsError, UnsupportedOperationError
 from google.protobuf.json_format import MessageToDict
 from starlette.applications import Starlette
 from starlette.requests import Request

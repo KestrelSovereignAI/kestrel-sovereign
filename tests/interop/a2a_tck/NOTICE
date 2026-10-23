@@ -1,0 +1,12 @@
+A2A Protocol Technology Compatibility Kit
+Upstream: https://github.com/a2aproject/a2a-tck
+License: Apache License 2.0 (see LICENSE).
+
+Kestrel-maintained A2A 1.0.1 conformance runner corrections.
+SOURCE.toml identifies the public base, pinned specification and complete
+source/test patch. UPSTREAM.patch preserves the complete changes.
+This is not an unmodified upstream TCK or an upstream compatibility certification.
+
+Corrections include native error identity and normative levels, explicit
+implementor HTTP authentication, required Message fields in every container,
+active-task subscription prerequisites and regenerated reference scenarios.

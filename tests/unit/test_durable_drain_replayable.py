@@ -177,8 +177,8 @@ async def test_rows_only_a_redelivery_can_run_do_not_crowd_out_executable_work(
 
 
 async def _held_elided_a2a_wake(tmp_path, name: str, rehydrate):
-    from kestrel_sovereign._vendor.a2a.helpers.proto_helpers import new_text_message
-    from kestrel_sovereign._vendor.a2a.types import Role, SendMessageRequest
+    from kestrel_sdk.native_a2a.helpers.proto_helpers import new_text_message
+    from kestrel_sdk.native_a2a.types import Role, SendMessageRequest
 
     from kestrel_sovereign.a2a.scope import NativeRecipientScope
     from kestrel_sovereign.signals.sources.a2a_task_submitted import (

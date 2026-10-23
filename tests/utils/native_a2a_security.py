@@ -7,8 +7,8 @@ from uuid import uuid4
 
 import pytest
 import pytest_asyncio
-from kestrel_sovereign._vendor.a2a.helpers.proto_helpers import new_text_message
-from kestrel_sovereign._vendor.a2a.types import Role, SendMessageRequest
+from kestrel_sdk.native_a2a.helpers.proto_helpers import new_text_message
+from kestrel_sdk.native_a2a.types import Role, SendMessageRequest
 from google.protobuf.json_format import MessageToDict
 from starlette.exceptions import HTTPException
 from starlette.requests import Request

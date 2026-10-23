@@ -3,7 +3,7 @@
 from collections.abc import Sequence
 from typing import TypeVar
 
-from kestrel_sovereign._vendor.a2a.types import Artifact, Message, Task
+from kestrel_sdk.native_a2a.types import Artifact, Message, Task
 from google.protobuf.message import Message as ProtoMessage
 
 _Item = TypeVar("_Item", Artifact, Message)

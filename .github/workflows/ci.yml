@@ -965,12 +965,35 @@ jobs:
           GOOGLE_API_KEY: ""
           GEMINI_API_KEY: ""
           XAI_API_KEY: ""
-      - name: Retain interoperability result
+      - name: Verify reviewed A2A 1.0.1 MUST and full conformance scenarios
+        run: >-
+          uv run --no-sync python -m pytest tests/interop/test_a2a_tck.py
+          -p pytest_asyncio.plugin -p pytest_timeout -o addopts=''
+          --basetemp=${{ runner.temp }}/kestrel-a2a-tck
+          -v --tb=short -x --timeout=300 --junitxml=a2a-tck.xml
+        timeout-minutes: 10
+        env:
+          PYTEST_DISABLE_PLUGIN_AUTOLOAD: "1"
+          PYTHON_DOTENV_DISABLED: "1"
+          KESTREL_SKIP_DOTENV: "1"
+          KESTREL_PHOENIX_ENABLED: "0"
+          KESTREL_TRACING_ENABLED: "0"
+          EMAIL_DRY_RUN: "true"
+          OPENAI_API_KEY: ""
+          ANTHROPIC_API_KEY: ""
+          GOOGLE_API_KEY: ""
+          GEMINI_API_KEY: ""
+          XAI_API_KEY: ""
+      - name: Retain interoperability and conformance results
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: a2a-go-interop
-          path: a2a-go-interop.xml
+          path: |
+            a2a-go-interop.xml
+            a2a-tck.xml
+            ${{ runner.temp }}/kestrel-a2a-tck/**/tck-*.log
+            ${{ runner.temp }}/kestrel-a2a-tck/**/tck-*-reports/
           if-no-files-found: error
           retention-days: 14
 

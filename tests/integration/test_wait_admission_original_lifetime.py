@@ -5,7 +5,7 @@ from uuid import uuid4
 
 import asyncpg
 import pytest
-from kestrel_sovereign._vendor.a2a.types import Message, Part, Role, SendMessageRequest, TaskState
+from kestrel_sdk.native_a2a.types import Message, Part, Role, SendMessageRequest, TaskState
 
 from kestrel_sovereign._async_ownership import (
     await_owned_task,

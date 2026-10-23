@@ -504,15 +504,15 @@ async def test_missing_service_key_refuses_push_boot_before_any_schema_change(
     )
 
 
+@pytest.mark.parametrize("native_a2a_backend_factory", ["postgres"], indirect=True)
 async def test_waiting_postgres_mutation_observes_the_new_subscription_at_commit(
     outbox, native_a2a_backend_factory, monkeypatch
 ):
     """A statement begun before registration cannot lose its post-commit change."""
-    from kestrel_sovereign._vendor.a2a.types import TaskState, TaskStatus
+    from kestrel_sdk.native_a2a.types import TaskState, TaskStatus
 
     value, task = outbox
-    if not value.is_postgres:
-        pytest.skip("PostgreSQL statement snapshot after a real row-lock wait")
+    assert value.is_postgres
     second = native_a2a_backend_factory()
     await second.connect()
     store = TaskStore(second, scope=value.configurations.scope, owns_backend=False)

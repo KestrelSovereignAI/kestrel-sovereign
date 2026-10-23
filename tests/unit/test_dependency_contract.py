@@ -59,12 +59,14 @@ SECURITY_FLOORS = {
 # Version 0.40 replaces draft A2A types with native AgentSkill contracts.
 # The coordinated 0.41 floor includes the shared computer-use, artifact,
 # resource-scope and workspace-transfer contracts (#3679).
+# Version 0.42 adds the single vendored native A2A implementation shared with
+# Feature.get_agent_skills; Core must consume its a2a extra.
 # This is a Core-only release gate: sibling packages release independently.
 # Core must never lower its declared/locked line to accommodate an older
 # consumer. Host feature acceptance remains a release prerequisite in README.md.
-SDK_RELEASE_CASCADE_SPECIFIERS = frozenset({(">=", "0.41.0"), ("<", "1")})
+SDK_RELEASE_CASCADE_SPECIFIERS = frozenset({(">=", "0.42.0"), ("<", "1")})
 SDK_RELEASE_CASCADE_CONTRACTS = {
-    "base": frozenset({"httpx", "tracing"}),
+    "base": frozenset({"a2a", "httpx", "tracing"}),
     "observability": frozenset({"metrics"}),
 }
 
@@ -286,8 +288,9 @@ def test_sdk_native_release_cascade_contract_is_declared():
         assert Version("0.39.1") not in specifier
         assert Version("0.39.2") not in specifier
         assert Version("0.40.0") not in specifier
-        assert Version("0.41.0") in specifier
+        assert Version("0.41.0") not in specifier
         assert Version("0.42.0") in specifier
+        assert Version("0.43.0") in specifier
         assert Version("1.0.0") not in specifier
 
 
@@ -323,5 +326,5 @@ def test_sdk_native_release_cascade_contract_is_locked():
     ]
     assert sdk_versions
     assert all(
-        Version("0.41.0") <= version < Version("1.0.0") for version in sdk_versions
+        Version("0.42.0") <= version < Version("1.0.0") for version in sdk_versions
     )

@@ -5,8 +5,8 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 import pytest
-from kestrel_sovereign._vendor.a2a.helpers.proto_helpers import new_task, new_text_artifact, new_text_message
-from kestrel_sovereign._vendor.a2a.types import TaskState
+from kestrel_sdk.native_a2a.helpers.proto_helpers import new_task, new_text_artifact, new_text_message
+from kestrel_sdk.native_a2a.types import TaskState
 from kestrel_sdk.tools.result import ToolResult
 
 from kestrel_sovereign.a2a.projections import embedded_json_value

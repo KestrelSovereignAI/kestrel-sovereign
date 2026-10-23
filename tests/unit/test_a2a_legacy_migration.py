@@ -4,7 +4,7 @@ import copy
 import json
 
 import pytest
-from kestrel_sovereign._vendor.a2a.types import TaskState
+from kestrel_sdk.native_a2a.types import TaskState
 from google.protobuf.json_format import MessageToDict
 
 from kestrel_sovereign.a2a.extensions import (

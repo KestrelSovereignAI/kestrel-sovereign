@@ -20,9 +20,9 @@ from urllib.parse import urlsplit
 import httpx
 import psutil
 import pytest
-from kestrel_sovereign._vendor.a2a.client import A2ACardResolver
-from kestrel_sovereign._vendor.a2a.helpers.proto_helpers import new_text_message
-from kestrel_sovereign._vendor.a2a.types import Role, SendMessageRequest, TaskState
+from kestrel_sdk.native_a2a.client import A2ACardResolver
+from kestrel_sdk.native_a2a.helpers.proto_helpers import new_text_message
+from kestrel_sdk.native_a2a.types import Role, SendMessageRequest, TaskState
 
 from kestrel_sovereign.a2a.native_card import (
     verify_native_agent_card,

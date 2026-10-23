@@ -1,8 +1,8 @@
 """Native outcome deltas preserve committed progress and refuse conflicts."""
 
 import pytest
-from kestrel_sovereign._vendor.a2a.helpers.proto_helpers import new_task, new_text_artifact, new_text_message
-from kestrel_sovereign._vendor.a2a.types import Role, Task, TaskState
+from kestrel_sdk.native_a2a.helpers.proto_helpers import new_task, new_text_artifact, new_text_message
+from kestrel_sdk.native_a2a.types import Role, Task, TaskState
 from google.protobuf.json_format import MessageToDict
 
 from kestrel_sovereign.a2a.outcomes import TaskOutcomeConflictError, merge_task_outcome

@@ -6,19 +6,19 @@ from collections.abc import Awaitable, Callable
 from datetime import timedelta
 
 import httpx
-from kestrel_sovereign._vendor.a2a.server.tasks.push_notification_sender import PushNotificationEvent
-from kestrel_sovereign._vendor.a2a.types import (
+from kestrel_sdk.native_a2a.server.tasks.push_notification_sender import PushNotificationEvent
+from kestrel_sdk.native_a2a.types import (
     Task,
     TaskArtifactUpdateEvent,
     TaskPushNotificationConfig,
     TaskStatusUpdateEvent,
 )
-from kestrel_sovereign._vendor.a2a.utils.constants import (
+from kestrel_sdk.native_a2a.utils.constants import (
     A2A_JSON_MEDIA_TYPE,
     PROTOCOL_VERSION_1_0,
     VERSION_HEADER,
 )
-from kestrel_sovereign._vendor.a2a.utils.proto_utils import to_stream_response, validate_proto_required_fields
+from kestrel_sdk.native_a2a.utils.proto_utils import to_stream_response, validate_proto_required_fields
 from google.protobuf.json_format import MessageToJson
 from kestrel_sdk.security.outbound import assert_safe_url, pinned_httpx_async_transport
 

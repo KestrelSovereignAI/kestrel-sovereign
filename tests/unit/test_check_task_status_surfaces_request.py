@@ -6,13 +6,13 @@ filters query the complete inbox, inputs are Parts, and Artifacts are outputs.
 
 from datetime import UTC, datetime, timedelta
 
-from kestrel_sovereign._vendor.a2a.helpers.proto_helpers import (
+from kestrel_sdk.native_a2a.helpers.proto_helpers import (
     new_data_artifact,
     new_data_part,
     new_text_artifact,
     new_text_message,
 )
-from kestrel_sovereign._vendor.a2a.types import Part, Role, SendMessageRequest, TaskState
+from kestrel_sdk.native_a2a.types import Part, Role, SendMessageRequest, TaskState
 from kestrel_sdk.tools.result import ToolResultStatus
 
 from tests.unit.test_a2a_native_consumers import inbox as inbox  # noqa: PLC0414

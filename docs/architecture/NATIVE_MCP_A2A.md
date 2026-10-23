@@ -29,19 +29,21 @@ and [A2A 1.0.1 specification](https://a2a-protocol.org/v1.0.1/specification/),
 the latest released A2A revision checked on 2026-10-19.
 Use official Python SDK implementations at every network boundary. MCP was tested at 2.3.0.
 Kestrel ships a reviewed, modified copy of the official A2A Python SDK in
-`kestrel_sovereign._vendor.a2a`. Its signing, HTTP authorization, borrowed-client
+`kestrel_sdk.native_a2a`, owned by the shared SDK 0.42 `a2a` extra. Its signing, HTTP authorization, borrowed-client
 ownership and response-decoding fixes preserve the A2A 1.0.1 wire protocol.
 Vendoring is authorized for this cutover; an upstream PyPI release is no longer
 a prerequisite. This is a modified SDK distribution, not an official 2.0 release.
 Earlier spike evidence used public 1.2.3, rechecked on 2026-10-20.
 The packaged `VENDORED.json` records the public base commit, exact reviewed tree,
 every original/relocated file digest, the Apache license and a complete source/test
-patch. `scripts/vendor_a2a.py --check` verifies the snapshot offline and reverses
+patch. The SDK's `uv run python -m scripts.vendor_a2a --check` verifies custody offline and reverses
 the module relocation to verify the reviewed source. Python package names change;
 protobuf descriptors, JSON fields, signatures and HTTP bindings do not.
 Core does not install or import the external `a2a` package. The isolated namespace
 prevents an independently installed SDK from replacing Kestrel's implementation.
-The SDK's runtime dependencies are declared directly and resolved in Core's lock.
+The shared SDK declares the runtime dependencies in its optional `a2a` extra.
+Core consumes that extra and resolves it in its lock; base SDK consumers remain
+lightweight. Feature skill producers and the host use the same native types.
 Clean wheel and sdist installs must exercise the same wire/oracle tests as source.
 Full conformance, interoperability and host acceptance remain release gates.
 Return to the upstream distribution when a released SDK passes these same checks;
@@ -57,22 +59,23 @@ caps are subject to migration, not reasons to downgrade the protocol target.
 | `kestrel-sovereign-sdk` | Remove draft wire models; shared host/feature credential and typed-part contracts; update all consumers |
 | Host manifest packages | Survey published constraints and editable sources; release incompatible consumers before the host floor moves |
 
-The coordinated Core cutover requires **SDK 0.41.0 or newer**. SDK
+The coordinated Core cutover requires **SDK 0.42.0 or newer**. SDK
 [PR #87](https://github.com/KestrelSovereignAI/kestrel-sovereign-sdk/pull/87)
 and [PR #88](https://github.com/KestrelSovereignAI/kestrel-sovereign-sdk/pull/88)
 add the shared computer-use, artifact, resource-scope and workspace-transfer
 contracts. Both are included at SDK commit
 `c01a6e933665bf7778c656a9b13dd8b79e371e36`. The immutable `v0.40.0` tag
 at `eff4c1f86bee3a5cf5c40b4d36c95b3ee29e02a8` predates these contracts.
-SDK 0.41.0 is now published. Core's manifest requires at least 0.41.0 and its
-lock resolves that public release. Consumer constraints and installed-package
+SDK 0.41.0 is published. The 0.42 cutover adds the shared vendored A2A
+implementation and must pass its own review, publication and installed-artifact
+acceptance before Core's public lock is adopted. Consumer constraints and installed-package
 acceptance tests must verify the complete host feature set. Native-A2A packaged
 dependency and conformance gates still apply.
 
 The cutover worktree removes `kestrel_sovereign/a2a/types.py` and
 `kestrel_sovereign/a2a/agent_card.py`, which forwarded the draft models from
 SDK 0.39. SDK 0.40 removed those handwritten models; Core's coordinated
-adoption uses 0.41 and retires the old imports and serialized callers. Keep the SDK lightweight:
+adoption uses 0.42 and retires the old imports and serialized callers. Keep the SDK lightweight:
 the official A2A dependency belongs to consumers of A2A, not every feature.
 The MCP feature owns the direct `mcp` requirement. Core owns the compatible
 lock and Phoenix dependencies; the dependency spike adds protocol packages as
@@ -750,8 +753,29 @@ task completion in both directions over both bindings, durable creator and
 outbound ownership, wrong-recipient refusal, and rejection of an unrelated
 Agent Card trust anchor. Its deterministic business handler completes canonical
 TaskManager tasks; it does not establish LLM quality or a deployed public
-frontdoor. TCK conformance and adoption of published dependencies remain separate
-release requirements.
+frontdoor.
+
+`tests/interop/test_a2a_tck.py` runs a Kestrel-maintained A2A 1.0.1 TCK snapshot
+against the same real native publication and TaskManager. Its public upstream
+base, pinned specification, complete source/test patch and license are recorded
+in `tests/interop/a2a_tck/`. The fixture checks those inputs and the complete
+patched Git tree, creates its own checkout and locked environment, and verifies
+the runner's unit tests. It never borrows an operator checkout or environment.
+The reviewed corrections enforce native error identities and normative levels,
+validate Message fields in direct replies and tasks, and exercise subscription
+closure through an actual WORKING-to-CANCELED transition. Its explicit HTTP auth
+provider adds Kestrel sender proofs and activated-extension headers without
+rewriting protocol requests, responses or assertions.
+
+CI runs MUST checks followed by the full runner on JSON-RPC and HTTP+JSON. Both
+runs require an automated MUST score of 100% and observed Message/terminal-stream
+passes on each binding. Raw JSON, HTML and JUnit reports retain manual obligations,
+optional-capability skips and SHOULD/MAY outcomes. This is a pinned, corrected
+runner, not an unmodified upstream TCK or a claim that automated checks establish
+every manual requirement. Run it locally with
+`uv run pytest tests/interop/test_a2a_tck.py`; no external TCK-source override is
+accepted. Adoption of published dependencies and the full host feature manifest
+remain separate release requirements.
 
 The extension contains sender DID, recipient DID, operation, timestamp, nonce
 and the sender proof. Bind the complete official request payload (including
@@ -776,43 +800,38 @@ and explicitly set optional defaults, and exclude `signatures`. The normative
 [section 8.4.1](https://a2a-protocol.org/v1.0.1/specification/#841-canonicalization-requirements)
 is the canonical-byte oracle, not a same-helper signing round trip.
 
-**Signed-card release gate:** the public `a2a-sdk==1.2.3` still does not implement that oracle:
-its default `MessageToDict` serialization omits required no-presence fields
-at their defaults (including `description` and required repeated fields),
-then its recursive empty cleanup removes explicitly present empties such as
-optional `documentationUrl: ""` and required `capabilities: {}`. Both its signer
-and verifier share these two deviations. Removing only the cleanup still loses
-required defaults. Printing every protobuf default is also wrong: it includes
-implicit optional values that the normative rules omit. The official repair
-must respect each field's required annotation and presence. Resolve
-[#3685](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/3685) by
-upgrading to a corrected official SDK release or contributing the repair to
-that SDK and consuming a tested release. Do not ship a Kestrel canonicalizer,
-relax verification, or remove valid empty fields just to evade the defect.
-The contributed [next-major SDK repair](https://github.com/a2aproject/a2a-python/pull/1360)
-has completed an independent full worktree review and independent signature
-probes. An open PR does not satisfy this release gate: consume a published
-corrected SDK and rerun the vectors before releasing the cutover.
-Check in normative canonical-byte/signature vectors for required empties,
-absent versus explicitly empty optional values, explicit false capabilities,
-and the implicit empty interface tenant. Require both official SDK helpers
-and an independent verifier to pass before releasing signed cards and the
-coordinated A2A cutover. Plain `model_dump()` plus JCS is insufficient.
+**Signed-card release gate:** SDK 0.42.0's reviewed
+`kestrel_sdk.native_a2a` implementation must pass that oracle, the checked-in
+canonical-byte/signature vectors and the independent Go verifier. Core consumes
+the published SDK's `a2a` extra; it does not wait for an upstream major release.
+The [SDK 0.42.0 change](https://github.com/KestrelSovereignAI/kestrel-sovereign-sdk/pull/90)
+vendors the corrected official implementation with pinned source, its complete
+patch, license and source/artifact custody checks. The same implementation
+produces feature skills and handles Core's native requests.
 
-On October 20, 2026, upstream closed the contributed
-[presence repair #1355](https://github.com/a2aproject/a2a-python/pull/1355#issuecomment-6290258412)
-without merging it: changing signed bytes requires a major release under its
-compatibility policy. The upstream reviewer identified
-[#1278](https://github.com/a2aproject/a2a-python/issues/1278) as the active
-discussion and [#1279](https://github.com/a2aproject/a2a-python/pull/1279) as the
-non-breaking warning response. A warning does not satisfy the byte/signature
-gate above. This external gate applies to signed cards and the coordinated
-release; continue the native host, transport, storage and outbound migration
-while it remains unresolved. There is no need to retain the draft wire protocol
-while developing those changes in the cutover worktree.
-The replacement [PR #1360](https://github.com/a2aproject/a2a-python/pull/1360)
-targets a 2.0 release and has completed full worktree review. Its open state
-does not prevent private implementation work or establish published availability.
+The unpatched public `a2a-sdk==1.2.3` does not implement that oracle: its default
+`MessageToDict` serialization omits required no-presence fields at their defaults
+(including `description` and required repeated fields), then recursive empty
+cleanup removes explicitly present empties such as optional
+`documentationUrl: ""` and required `capabilities: {}`. Both its signer and verifier
+share these deviations. Removing only the cleanup still loses required defaults;
+printing every protobuf default includes implicit optional values that the
+normative rules omit. The vendored repair respects each field's required
+annotation and presence. There is no parallel Kestrel canonicalizer, relaxed
+verification or removal of valid empty fields.
+
+The normative canonical-byte/signature vectors cover required empties, absent
+versus explicitly empty optional values, explicit false capabilities and the
+implicit empty interface tenant. Both vendored SDK helpers and an independent
+verifier must pass before releasing signed cards and the coordinated A2A
+cutover. Plain `model_dump()` plus JCS is insufficient.
+
+Upstream required a library major release because correcting signed bytes
+changes its compatibility contract. The contributed
+[PR #1360](https://github.com/a2aproject/a2a-python/pull/1360) targets that release.
+This is upstream release context, not an outstanding dependency for Kestrel's
+published vendored implementation. The protocol remains A2A 1.0.1. Full Core
+conformance, interoperability, feature acceptance and CI remain separate gates.
 
 Use the agent's Ed25519 verification method and a DID-bound `kid`; the existing hybrid message
 proof is not substituted for an interoperable Agent Card signature. Verify the
@@ -1242,11 +1261,11 @@ they do not establish deployment or foreign-framework acceptance.
 3. Add remote connections/OAuth/registry, then Apps and Tasks. Remote write
    scopes remain gated on [#596](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/596).
 4. Complete the native-A2A callers and storage migration, then publish/test
-   the coordinated Core dependency cutover with **SDK >=0.41.0**. Re-survey
+   the coordinated Core dependency cutover with **SDK >=0.42.0**. Re-survey
    consumers and update their actual callers and constraints: the recorded
    survey found Core ceilings below 0.54 in Talon/Features and SDK ceilings
    below 0.40 in Telegram, Talon, Features and editable Claws/Eye/Flight.
-   Verify clean installed SDK 0.41 contracts and the full host feature manifest;
+   Verify clean installed SDK 0.42 contracts and the full host feature manifest;
    an isolated source install does not establish Core compatibility. Reconcile
    this branch with current main before its final full-diff review, preserving
    the architecture/artifact-safety prerequisites and the encrypted-store

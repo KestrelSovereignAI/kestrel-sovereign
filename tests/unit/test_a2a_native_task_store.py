@@ -7,14 +7,14 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 import pytest_asyncio
-from kestrel_sovereign._vendor.a2a.helpers.proto_helpers import (
+from kestrel_sdk.native_a2a.helpers.proto_helpers import (
     new_data_message,
     new_task,
     new_text_artifact,
     new_text_message,
 )
-from kestrel_sovereign._vendor.a2a.types import Task, TaskState, TaskStatus
-from kestrel_sovereign._vendor.a2a.utils.errors import InvalidParamsError
+from kestrel_sdk.native_a2a.types import Task, TaskState, TaskStatus
+from kestrel_sdk.native_a2a.utils.errors import InvalidParamsError
 from google.protobuf.json_format import MessageToDict
 from google.protobuf.timestamp_pb2 import Timestamp
 
@@ -162,9 +162,9 @@ async def test_artifact_progress_never_reopens_an_expired_native_wake_window(sto
     assert snapshot.lifecycle_revision == 2
 
 
+@pytest.mark.parametrize("native_a2a_backend_factory", ["sqlite"], indirect=True)
 async def test_sqlite_wake_boundary_normalizes_native_space_and_iso_timestamps(store):
-    if store.backend.backend_type != "sqlite":
-        pytest.skip("SQLite TEXT timestamp comparison contract")
+    assert store.backend.backend_type == "sqlite"
     value = task()
     await create(store, value)
     now = store.now_utc().replace(microsecond=0)
@@ -177,9 +177,9 @@ async def test_sqlite_wake_boundary_normalizes_native_space_and_iso_timestamps(s
     assert not await wake_candidate_ids(store, live=now, terminal=now - timedelta(hours=1))
 
 
+@pytest.mark.parametrize("native_a2a_backend_factory", ["postgres"], indirect=True)
 async def test_postgres_native_database_fence_versions_direct_status_writes(store):
-    if store.backend.backend_type != "postgres":
-        pytest.skip("PostgreSQL shared native authority trigger contract")
+    assert store.backend.backend_type == "postgres"
     value = task()
     await create(store, value)
     horizon = store.now_utc() - timedelta(days=1)

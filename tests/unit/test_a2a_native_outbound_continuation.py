@@ -4,7 +4,7 @@ from dataclasses import replace
 from uuid import uuid4
 
 import pytest
-from kestrel_sovereign._vendor.a2a.types import AgentInterface, CancelTaskRequest, TaskState
+from kestrel_sdk.native_a2a.types import AgentInterface, CancelTaskRequest, TaskState
 
 from kestrel_sovereign.a2a.scope import NativeRecipientScope
 from kestrel_sovereign.a2a.stores.unified.outbound_store import (
@@ -235,11 +235,11 @@ async def test_retained_lineage_is_revalidated_from_current_rows(outbound, fault
     assert (await outbound.get(child.dispatch_id)).state is DispatchState.RESERVED
 
 
+@pytest.mark.parametrize("native_a2a_backend_factory", ["postgres"], indirect=True)
 async def test_postgres_reservation_locks_its_ancestors_before_insert(
     outbound, monkeypatch
 ):
-    if not outbound.is_postgres:
-        pytest.skip("PostgreSQL row-lock contract")
+    assert outbound.is_postgres
     root = await acknowledged(outbound)
     actual = outbound.require_continuation
     observed = []

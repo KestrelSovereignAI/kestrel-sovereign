@@ -131,7 +131,7 @@ async def test_real_workflow_carries_exact_result_into_the_next_typed_tool(manag
 async def test_exact_result_bytes_survive_primary_storage_and_official_sdk_json(
     manager,
 ):
-    from kestrel_sovereign._vendor.a2a.types import Task
+    from kestrel_sdk.native_a2a.types import Task
     from google.protobuf.json_format import MessageToDict, ParseDict
 
     from kestrel_sovereign.a2a.projections import embedded_json_value

@@ -10,7 +10,7 @@ from enum import StrEnum
 from uuid import uuid4
 
 import rfc8785
-from kestrel_sovereign._vendor.a2a.types import (
+from kestrel_sdk.native_a2a.types import (
     AgentInterface,
     CancelTaskRequest,
     Message,
@@ -18,7 +18,7 @@ from kestrel_sovereign._vendor.a2a.types import (
     SendMessageRequest,
     Task,
 )
-from kestrel_sovereign._vendor.a2a.utils.proto_utils import validate_proto_required_fields
+from kestrel_sdk.native_a2a.utils.proto_utils import validate_proto_required_fields
 from google.protobuf.json_format import MessageToDict, SerializeToJsonError
 
 from kestrel_sovereign.a2a.lifecycle import TERMINAL_STATES, task_state_label

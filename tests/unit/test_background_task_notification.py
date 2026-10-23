@@ -22,8 +22,8 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
-from kestrel_sovereign._vendor.a2a.helpers.proto_helpers import new_text_message
-from kestrel_sovereign._vendor.a2a.types import Role, Task, TaskState, TaskStatus
+from kestrel_sdk.native_a2a.helpers.proto_helpers import new_text_message
+from kestrel_sdk.native_a2a.types import Role, Task, TaskState, TaskStatus
 from kestrel_sdk.signals import CausationFrame
 
 from kestrel_sovereign.a2a.extensions import (

@@ -10,8 +10,8 @@ from typing import TYPE_CHECKING
 from uuid import uuid4
 
 import httpx
-from kestrel_sovereign._vendor.a2a.client import A2ACardResolver
-from kestrel_sovereign._vendor.a2a.types import AgentCard
+from kestrel_sdk.native_a2a.client import A2ACardResolver
+from kestrel_sdk.native_a2a.types import AgentCard
 from starlette.applications import Starlette
 from starlette.exceptions import HTTPException
 

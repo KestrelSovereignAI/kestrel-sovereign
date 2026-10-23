@@ -3,8 +3,8 @@
 import asyncio
 
 import pytest
-from kestrel_sovereign._vendor.a2a.client import ClientConfig, ClientFactory
-from kestrel_sovereign._vendor.a2a.types import GetTaskPushNotificationConfigRequest
+from kestrel_sdk.native_a2a.client import ClientConfig, ClientFactory
+from kestrel_sdk.native_a2a.types import GetTaskPushNotificationConfigRequest
 
 from kestrel_sovereign.a2a.push_outbox import NativePushOutbox
 from kestrel_sovereign.a2a.stores.unified.push_config_store import (
@@ -150,12 +150,12 @@ async def test_two_independent_identical_setters_share_one_generation_and_snapsh
         await other.close()
 
 
+@pytest.mark.parametrize("native_a2a_backend_factory", ["postgres"], indirect=True)
 async def test_postgres_direct_setter_waits_for_the_original_task_boundary(
     push_store, native_a2a_backend_factory, monkeypatch
 ):
     store, task = push_store
-    if not store.is_postgres:
-        pytest.skip("PostgreSQL statement visibility under a real row-lock wait")
+    assert store.is_postgres
     other = native_a2a_backend_factory()
     await other.connect()
     independent = PushConfigStore(TaskStore(other, scope=store.scope, owns_backend=False))

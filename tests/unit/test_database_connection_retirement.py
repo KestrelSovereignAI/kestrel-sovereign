@@ -15,12 +15,12 @@ from kestrel_sovereign.storage.db.polling import is_transient_database_poll_erro
 
 
 @pytest.mark.parametrize("body_failure", [False, True])
+@pytest.mark.parametrize("native_a2a_backend_factory", ["postgres"], indirect=True)
 async def test_terminated_transaction_retires_original_checkout_without_commit(
     native_a2a_backend_factory, body_failure,
 ):
     backend = native_a2a_backend_factory()
-    if backend.backend_type != "postgres":
-        pytest.skip("PostgreSQL session termination requires a real PostgreSQL server")
+    assert backend.backend_type == "postgres"
     control = native_a2a_backend_factory()
     await backend.connect()
     await control.connect()
@@ -69,12 +69,12 @@ async def test_terminated_transaction_retires_original_checkout_without_commit(
         assert done, "the original lost-session checkout leaked its pool lease"
 
 
+@pytest.mark.parametrize("native_a2a_backend_factory", ["postgres"], indirect=True)
 async def test_failed_native_exit_on_a_live_session_retains_original_control(
     native_a2a_backend_factory, monkeypatch,
 ):
     backend = native_a2a_backend_factory()
-    if backend.backend_type != "postgres":
-        pytest.skip("PostgreSQL native transaction ownership requires PostgreSQL")
+    assert backend.backend_type == "postgres"
     await backend.connect()
     original = asyncpg.transaction.Transaction.__aexit__
     originals = []

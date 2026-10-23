@@ -6,8 +6,8 @@ from uuid import uuid4
 
 import pytest
 import pytest_asyncio
-from kestrel_sovereign._vendor.a2a.helpers.proto_helpers import new_text_message
-from kestrel_sovereign._vendor.a2a.types import Role, TaskPushNotificationConfig, TaskState
+from kestrel_sdk.native_a2a.helpers.proto_helpers import new_text_message
+from kestrel_sdk.native_a2a.types import Role, TaskPushNotificationConfig, TaskState
 from kestrel_sdk.signals import Signal, SignalMode
 
 from kestrel_sovereign.storage.db.interface import DatabaseError

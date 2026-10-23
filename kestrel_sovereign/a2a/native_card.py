@@ -2,7 +2,7 @@
 
 from collections.abc import Sequence
 
-from kestrel_sovereign._vendor.a2a.types import (
+from kestrel_sdk.native_a2a.types import (
     AgentCapabilities,
     AgentCard,
     AgentExtension,
@@ -13,9 +13,9 @@ from kestrel_sovereign._vendor.a2a.types import (
     SecurityScheme,
     StringList,
 )
-from kestrel_sovereign._vendor.a2a.utils.proto_utils import validate_proto_required_fields
-from kestrel_sovereign._vendor.a2a.utils.signing import create_agent_card_signer, create_signature_verifier
-from jwt.exceptions import InvalidKeyError
+from kestrel_sdk.native_a2a.utils.proto_utils import validate_proto_required_fields
+from kestrel_sdk.native_a2a.utils.signing import create_agent_card_signer, create_signature_verifier
+from jwt.exceptions import PyJWKError
 
 from kestrel_sovereign.a2a.extensions import (
     NATIVE_EXTENSION_URIS,
@@ -72,7 +72,7 @@ def verify_native_agent_card(
 
     def key_provider(kid, jku):
         if jku is not None or kid not in keys:
-            raise InvalidKeyError("Agent Card key is not in the trusted DID document")
+            raise PyJWKError("Agent Card key is not in the trusted DID document")
         return keys[kid]
 
     create_signature_verifier(key_provider, algorithms=["EdDSA"])(card)

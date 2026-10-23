@@ -133,6 +133,7 @@ async def test_actual_cli_refuses_malformed_or_incomplete_provenance(draft, docu
     assert not plan.exists()
 
 
+@pytest.mark.parametrize("native_a2a_backend_factory", ["postgres"], indirect=True)
 async def test_postgres_apply_refuses_other_live_database_connections(
     native_a2a_backend_factory, tmp_path
 ):
@@ -142,8 +143,7 @@ async def test_postgres_apply_refuses_other_live_database_connections(
     from kestrel_sovereign.cli_migrate_a2a import _run
 
     backend = native_a2a_backend_factory()
-    if backend.backend_type != "postgres":
-        pytest.skip("PostgreSQL connection quiescence contract")
+    assert backend.backend_type == "postgres"
     await backend.connect()
     try:
         await legacy(backend)

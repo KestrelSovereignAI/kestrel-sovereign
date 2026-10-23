@@ -13,9 +13,9 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 
-from kestrel_sovereign._vendor.a2a.helpers.proto_helpers import new_text_message
-from kestrel_sovereign._vendor.a2a.server.tasks.task_manager import append_artifact_to_task
-from kestrel_sovereign._vendor.a2a.types import (
+from kestrel_sdk.native_a2a.helpers.proto_helpers import new_text_message
+from kestrel_sdk.native_a2a.server.tasks.task_manager import append_artifact_to_task
+from kestrel_sdk.native_a2a.types import (
     Artifact,
     ListTasksRequest,
     ListTasksResponse,
@@ -26,10 +26,10 @@ from kestrel_sovereign._vendor.a2a.types import (
     TaskState,
     TaskStatus,
 )
-from kestrel_sovereign._vendor.a2a.utils.constants import DEFAULT_LIST_TASKS_PAGE_SIZE
-from kestrel_sovereign._vendor.a2a.utils.errors import InvalidAgentResponseError, InvalidParamsError
-from kestrel_sovereign._vendor.a2a.utils.proto_utils import validate_proto_required_fields
-from kestrel_sovereign._vendor.a2a.utils.task import (
+from kestrel_sdk.native_a2a.utils.constants import DEFAULT_LIST_TASKS_PAGE_SIZE
+from kestrel_sdk.native_a2a.utils.errors import InvalidAgentResponseError, InvalidParamsError
+from kestrel_sdk.native_a2a.utils.proto_utils import validate_proto_required_fields
+from kestrel_sdk.native_a2a.utils.task import (
     ListTasksCursor,
     apply_history_length,
     decode_list_tasks_cursor,

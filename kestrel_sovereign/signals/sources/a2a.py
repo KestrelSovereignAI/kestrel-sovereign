@@ -13,7 +13,7 @@ from datetime import timedelta
 from pathlib import Path
 from typing import Any
 
-from kestrel_sovereign._vendor.a2a.types import Task
+from kestrel_sdk.native_a2a.types import Task
 from google.protobuf.json_format import MessageToDict
 from kestrel_sdk.signals import (
     AttentionPolicy,

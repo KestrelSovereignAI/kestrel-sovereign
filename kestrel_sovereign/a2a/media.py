@@ -5,8 +5,8 @@ from collections.abc import Sequence
 from email import policy
 from typing import Any
 
-from kestrel_sovereign._vendor.a2a.types import AgentSkill, Part
-from kestrel_sovereign._vendor.a2a.utils.errors import ContentTypeNotSupportedError, InvalidParamsError
+from kestrel_sdk.native_a2a.types import AgentSkill, Part
+from kestrel_sdk.native_a2a.utils.errors import ContentTypeNotSupportedError, InvalidParamsError
 
 DEFAULT_NATIVE_MEDIA_TYPES = ("text/plain", "application/json")
 

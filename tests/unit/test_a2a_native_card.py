@@ -5,9 +5,9 @@ from copy import deepcopy
 
 import pytest
 import rfc8785
-from kestrel_sovereign._vendor.a2a.server.request_handlers.response_helpers import agent_card_to_dict
-from kestrel_sovereign._vendor.a2a.types import AgentCard, AgentSkill
-from kestrel_sovereign._vendor.a2a.utils.signing import InvalidSignaturesError, create_agent_card_signer
+from kestrel_sdk.native_a2a.server.request_handlers.response_helpers import agent_card_to_dict
+from kestrel_sdk.native_a2a.types import AgentCard, AgentSkill
+from kestrel_sdk.native_a2a.utils.signing import InvalidSignaturesError, create_agent_card_signer
 from google.protobuf.json_format import ParseDict
 
 from kestrel_sovereign.a2a.extensions import RECIPIENT_POLICY_URI, SIGNED_SENDER_URI
@@ -183,6 +183,25 @@ def test_card_signature_never_fetches_keys_from_jws(
     )(card)
     with pytest.raises(InvalidSignaturesError):
         verify(card, card_identity)
+
+
+@pytest.mark.parametrize("untrusted", ["jku", "kid"])
+def test_untrusted_signature_cannot_hide_a_later_independently_trusted_signature(
+    card_arguments, card_identity, untrusted
+):
+    card = create_native_agent_card(**card_arguments)
+    trusted = deepcopy(card.signatures[0])
+    card.ClearField("signatures")
+    header = {"alg": "EdDSA", "kid": card_identity[1]["verificationMethod"][0]["id"]}
+    if untrusted == "jku":
+        header["jku"] = "https://attacker.test/keys"
+    else:
+        header["kid"] = "did:web:attacker.test#key-1"
+    create_agent_card_signer(
+        card_identity[0].hybrid_keypair.classical.private_key, header
+    )(card)
+    card.signatures.append(trusted)
+    verify(card, card_identity)
 
 
 def test_card_keys_must_match_current_recipient_identity(card_arguments):

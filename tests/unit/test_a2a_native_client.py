@@ -11,8 +11,8 @@ from uuid import uuid4
 import httpx
 import pytest
 import pytest_asyncio
-from kestrel_sovereign._vendor.a2a.client.errors import A2AClientError
-from kestrel_sovereign._vendor.a2a.types import (
+from kestrel_sdk.native_a2a.client.errors import A2AClientError
+from kestrel_sdk.native_a2a.types import (
     AgentInterface,
     AgentSkill,
     ListTasksRequest,
@@ -23,8 +23,8 @@ from kestrel_sovereign._vendor.a2a.types import (
     SendMessageRequest,
     TaskState,
 )
-from kestrel_sovereign._vendor.a2a.utils.errors import InvalidParamsError
-from kestrel_sovereign._vendor.a2a.utils.signing import (
+from kestrel_sdk.native_a2a.utils.errors import InvalidParamsError
+from kestrel_sdk.native_a2a.utils.signing import (
     InvalidSignaturesError,
     NoSignatureError,
     create_agent_card_signer,
@@ -235,7 +235,7 @@ async def peer_session(native_request_admission, recipient_identity, request):
 @pytest_asyncio.fixture
 async def network_peer(peer_session):
     """Real loopback HTTP; HTTPX ASGITransport buffers a streaming response."""
-    from kestrel_sovereign._vendor.a2a.types import AgentCard
+    from kestrel_sdk.native_a2a.types import AgentCard
 
     from tests.utils.native_a2a import serve_native_app
 
@@ -387,7 +387,7 @@ async def uncertain_peer_history(p, policy, *, question=False):
 async def test_question_reconciliation_retains_full_artifacts_after_losing_the_receipt(
     network_peer,
 ):
-    from kestrel_sovereign._vendor.a2a.types import Artifact
+    from kestrel_sdk.native_a2a.types import Artifact
 
     p = network_peer
     async with uncertain_peer_history(p, NativeReconciliationPolicy(), question=True) as retained:
@@ -595,7 +595,7 @@ def test_reconciliation_budgets_refuse_invalid_operator_values(setting, value):
 
 
 def test_reconciliation_page_size_respects_the_sdk_protocol_maximum():
-    from kestrel_sovereign._vendor.a2a.utils.constants import MAX_LIST_TASKS_PAGE_SIZE
+    from kestrel_sdk.native_a2a.utils.constants import MAX_LIST_TASKS_PAGE_SIZE
 
     with pytest.raises(ValueError, match="page_size"):
         NativeReconciliationPolicy(page_size=MAX_LIST_TASKS_PAGE_SIZE + 1)
@@ -948,7 +948,7 @@ async def test_committed_dispatch_for_another_peer_cannot_use_this_session(
 
 
 async def test_request_observer_cannot_spend_revoked_peer_authority(peer_session):
-    from kestrel_sovereign._vendor.a2a.types import ListTasksRequest
+    from kestrel_sdk.native_a2a.types import ListTasksRequest
 
     p = peer_session
     dispatch, wire = await reserve(p)
@@ -1096,7 +1096,7 @@ async def test_sdk_cancellation_retry_is_blocked_at_actual_native_dispatch(
 async def test_client_mime_preflight_refuses_before_reservation_or_http(
     peer_session, mime
 ):
-    from kestrel_sovereign._vendor.a2a.utils.errors import ContentTypeNotSupportedError, InvalidParamsError
+    from kestrel_sdk.native_a2a.utils.errors import ContentTypeNotSupportedError, InvalidParamsError
 
     p = peer_session
     request = request_for(p)
@@ -1120,7 +1120,7 @@ async def test_client_mime_preflight_refuses_before_reservation_or_http(
 async def test_selected_skill_input_modes_override_card_defaults_before_reserving(
     peer_session, defaults, override, mime, accepted
 ):
-    from kestrel_sovereign._vendor.a2a.utils.errors import ContentTypeNotSupportedError
+    from kestrel_sdk.native_a2a.utils.errors import ContentTypeNotSupportedError
 
     from kestrel_sovereign.a2a.extensions import skill_hint_metadata
 
@@ -1202,7 +1202,7 @@ async def test_blocking_send_rejects_active_result_without_forgetting_delivery(
 async def test_sdk_interceptor_cannot_rewrite_the_retained_request_before_signing(
     peer_session,
 ):
-    from kestrel_sovereign._vendor.a2a.client.interceptors import ClientCallInterceptor
+    from kestrel_sdk.native_a2a.client.interceptors import ClientCallInterceptor
 
     from kestrel_sovereign.a2a.native_sender import NativeSenderProofError
 

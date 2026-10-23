@@ -9,7 +9,7 @@ from uuid import uuid4
 
 import httpx
 import pytest
-from kestrel_sovereign._vendor.a2a.utils.errors import A2AError
+from kestrel_sdk.native_a2a.utils.errors import A2AError
 from google.protobuf.json_format import MessageToDict
 
 from kestrel_sovereign.a2a.extensions import (
@@ -240,7 +240,7 @@ async def test_peer_decode_boundary_preserves_original_execution_and_storage_err
 async def test_identical_working_responses_back_off_but_actual_progress_resets_the_delay(
     questions,
 ):
-    from kestrel_sovereign._vendor.a2a.types import TaskState
+    from kestrel_sdk.native_a2a.types import TaskState
 
     from kestrel_sovereign.a2a.native_client import NativeDispatchReceipt
     from tests.unit.test_a2a_native_question_store import reserve as reserve_question

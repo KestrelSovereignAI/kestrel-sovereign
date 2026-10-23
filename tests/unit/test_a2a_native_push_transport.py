@@ -4,14 +4,14 @@ from datetime import timedelta
 
 import httpx
 import pytest
-from kestrel_sovereign._vendor.a2a.helpers.proto_helpers import new_data_artifact
-from kestrel_sovereign._vendor.a2a.types import (
+from kestrel_sdk.native_a2a.helpers.proto_helpers import new_data_artifact
+from kestrel_sdk.native_a2a.types import (
     TaskArtifactUpdateEvent,
     TaskState,
     TaskStatus,
     TaskStatusUpdateEvent,
 )
-from kestrel_sovereign._vendor.a2a.utils.proto_utils import to_stream_response
+from kestrel_sdk.native_a2a.utils.proto_utils import to_stream_response
 from google.protobuf.json_format import MessageToDict
 from kestrel_sdk.security.outbound import SSRFError
 
@@ -430,7 +430,7 @@ async def test_untyped_retirement_policy_refuses_before_admission(push_store):
 async def test_push_cannot_send_a_different_task_or_a_private_wire_shape(
     push_store, outbound_tls, fault
 ):
-    from kestrel_sovereign._vendor.a2a.types import Task
+    from kestrel_sdk.native_a2a.types import Task
 
     transport, configuration, task = await configured(
         push_store, outbound_tls.url + "/callback"

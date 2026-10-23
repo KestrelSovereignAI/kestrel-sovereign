@@ -7,7 +7,7 @@ from datetime import timedelta
 
 import httpx
 import pytest
-from kestrel_sovereign._vendor.a2a.types import Task
+from kestrel_sdk.native_a2a.types import Task
 
 from kestrel_sovereign.a2a.push_logging import PushLogRedaction
 from kestrel_sovereign.a2a.push_transport import NativePushTransport

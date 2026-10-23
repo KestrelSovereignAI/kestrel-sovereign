@@ -8,8 +8,8 @@ from types import SimpleNamespace
 from uuid import uuid4
 
 import pytest
-from kestrel_sovereign._vendor.a2a.helpers.proto_helpers import new_text_message
-from kestrel_sovereign._vendor.a2a.types import Role, SendMessageRequest
+from kestrel_sdk.native_a2a.helpers.proto_helpers import new_text_message
+from kestrel_sdk.native_a2a.types import Role, SendMessageRequest
 
 from kestrel_sovereign.a2a.did_registry import (
     A2A_PEER_IDENTITY_DOCUMENTS_ENV,

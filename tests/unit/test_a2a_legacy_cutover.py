@@ -5,8 +5,8 @@ from dataclasses import replace
 from datetime import UTC, datetime
 
 import pytest
-from kestrel_sovereign._vendor.a2a.helpers.proto_helpers import new_text_message
-from kestrel_sovereign._vendor.a2a.types import Role, SendMessageRequest, Task, TaskState, TaskStatus
+from kestrel_sdk.native_a2a.helpers.proto_helpers import new_text_message
+from kestrel_sdk.native_a2a.types import Role, SendMessageRequest, Task, TaskState, TaskStatus
 
 from kestrel_sovereign.a2a.legacy_cutover import (
     apply_legacy_migration,
@@ -323,12 +323,12 @@ async def test_failed_cutover_rolls_back_payload_schema_archives_and_marker(
         await backend.close()
 
 
+@pytest.mark.parametrize("native_a2a_backend_factory", ["postgres"], indirect=True)
 async def test_changed_postgres_trigger_function_invalidates_the_review(
     native_a2a_backend_factory,
 ):
     backend = native_a2a_backend_factory()
-    if backend.backend_type != "postgres":
-        pytest.skip("PostgreSQL stores trigger function bodies separately")
+    assert backend.backend_type == "postgres"
     await backend.connect()
     try:
         await legacy(backend, terminal_fence=True)

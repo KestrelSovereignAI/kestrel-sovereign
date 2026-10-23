@@ -6,7 +6,7 @@ from uuid import uuid4
 
 import asyncpg
 import pytest
-from kestrel_sovereign._vendor.a2a.types import Message, Part, Role, SendMessageRequest
+from kestrel_sdk.native_a2a.types import Message, Part, Role, SendMessageRequest
 
 from kestrel_sovereign.a2a.scope import NativeRecipientScope
 from kestrel_sovereign.a2a.stores.unified import (

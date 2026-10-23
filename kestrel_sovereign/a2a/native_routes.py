@@ -4,10 +4,10 @@ import math
 from collections.abc import Awaitable, Callable
 from urllib.parse import urlsplit
 
-from kestrel_sovereign._vendor.a2a.server.routes.agent_card_routes import create_agent_card_routes
-from kestrel_sovereign._vendor.a2a.server.routes.jsonrpc_routes import create_jsonrpc_routes
-from kestrel_sovereign._vendor.a2a.server.routes.rest_routes import create_rest_routes
-from kestrel_sovereign._vendor.a2a.types import AgentCard, AgentInterface
+from kestrel_sdk.native_a2a.server.routes.agent_card_routes import create_agent_card_routes
+from kestrel_sdk.native_a2a.server.routes.jsonrpc_routes import create_jsonrpc_routes
+from kestrel_sdk.native_a2a.server.routes.rest_routes import create_rest_routes
+from kestrel_sdk.native_a2a.types import AgentCard, AgentInterface
 from starlette.applications import Starlette
 from starlette.datastructures import URLPath
 from starlette.routing import BaseRoute, Match, Mount

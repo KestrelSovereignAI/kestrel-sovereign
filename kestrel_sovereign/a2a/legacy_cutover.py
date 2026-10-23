@@ -9,7 +9,7 @@ from dataclasses import asdict, dataclass
 from datetime import datetime
 from uuid import UUID, uuid4
 
-from kestrel_sovereign._vendor.a2a.types import Task
+from kestrel_sdk.native_a2a.types import Task
 
 from kestrel_sovereign.a2a.lifecycle import task_state_label
 from kestrel_sovereign.a2a.migrate_legacy import (

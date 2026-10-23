@@ -3,7 +3,7 @@
 from uuid import uuid4
 
 import pytest
-from kestrel_sovereign._vendor.a2a.types import (
+from kestrel_sdk.native_a2a.types import (
     AgentInterface,
     Message,
     Part,

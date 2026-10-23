@@ -7,8 +7,8 @@ from types import SimpleNamespace
 from uuid import uuid4
 
 import pytest
-from kestrel_sovereign._vendor.a2a.types import TaskState
-from kestrel_sovereign._vendor.a2a.utils.errors import A2AError
+from kestrel_sdk.native_a2a.types import TaskState
+from kestrel_sdk.native_a2a.utils.errors import A2AError
 
 from kestrel_sovereign.a2a.native_client import NativeDispatchReceipt
 from kestrel_sovereign.a2a.question_supervisor import NativeQuestionSupervisor
@@ -66,12 +66,12 @@ async def test_competing_root_claims_have_one_owner_without_storage_error(questi
     assert sum(row.state is DispatchState.SUBMITTING for row in rows) == 1
 
 
+@pytest.mark.parametrize("native_a2a_backend_factory", ["postgres"], indirect=True)
 async def test_postgres_receipt_holds_exact_remote_owner_lock(questions, monkeypatch):
     import json
 
     p = questions
-    if not p.outbound.is_postgres:
-        pytest.skip("PostgreSQL transaction advisory-lock proof")
+    assert p.outbound.is_postgres
     q, d, request = await reserve(p)
     sending = await p.outbound.begin_submission(d, operation_id=uuid4().hex)
     task = response(q, request, state=TaskState.TASK_STATE_WORKING)

@@ -327,8 +327,8 @@ async def test_held_a2a_wake_is_drained_automatically_after_release(
         build_signal_for_submitted_task,
     )
 
-    from kestrel_sovereign._vendor.a2a.helpers.proto_helpers import new_text_message
-    from kestrel_sovereign._vendor.a2a.types import Role, SendMessageRequest
+    from kestrel_sdk.native_a2a.helpers.proto_helpers import new_text_message
+    from kestrel_sdk.native_a2a.types import Role, SendMessageRequest
     from kestrel_sovereign.a2a.scope import NativeRecipientScope
     from tests.utils.native_a2a import manager_for
     from kestrel_sovereign.signals.sources.a2a_task_submitted import submitted_input_identity

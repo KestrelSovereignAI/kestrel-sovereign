@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from typing import ClassVar, Optional
 
-from kestrel_sovereign._vendor.a2a.types import TaskState
+from kestrel_sdk.native_a2a.types import TaskState
 from kestrel_sdk.tools import Outcome, WaitStatus
 
 from kestrel_sovereign.a2a.lifecycle import TERMINAL_STATES, task_state_from_label

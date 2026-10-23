@@ -425,7 +425,7 @@ class PeersFeature(Feature):
 
         from uuid import uuid4
 
-        from kestrel_sovereign._vendor.a2a.types import Message
+        from kestrel_sdk.native_a2a.types import Message
         from kestrel_sdk.signals import Status
 
         from kestrel_sovereign.a2a.projections import embedded_json_value
@@ -739,7 +739,7 @@ class PeersFeature(Feature):
     )
     @execution_work_operation
     async def ask_agent(self, agent_name: str, message: str) -> ToolResult:
-        from kestrel_sovereign._vendor.a2a.types import Message
+        from kestrel_sdk.native_a2a.types import Message
         from google.protobuf.json_format import MessageToDict
 
         from kestrel_sovereign.a2a.projections import message_text
@@ -800,8 +800,8 @@ class PeersFeature(Feature):
         """The common native request, reservation and send path for peer tools."""
         from uuid import uuid4
 
-        from kestrel_sovereign._vendor.a2a.types import Message, Part, Role, SendMessageRequest
-        from kestrel_sovereign._vendor.a2a.utils.errors import A2AError
+        from kestrel_sdk.native_a2a.types import Message, Part, Role, SendMessageRequest
+        from kestrel_sdk.native_a2a.utils.errors import A2AError
         from google.protobuf.json_format import ParseDict, ParseError
 
         from kestrel_sovereign.a2a.extensions import (
@@ -974,7 +974,7 @@ class PeersFeature(Feature):
 
     @staticmethod
     def _native_dispatch_result(receipt, recipient: str) -> ToolResult:
-        from kestrel_sovereign._vendor.a2a.types import Message
+        from kestrel_sdk.native_a2a.types import Message
         from google.protobuf.json_format import MessageToDict
 
         data = {
@@ -1113,7 +1113,7 @@ class PeersFeature(Feature):
     )
     @execution_work_operation
     async def get_peer_task_result(self, dispatch_id: str) -> ToolResult:
-        from kestrel_sovereign._vendor.a2a.utils.errors import A2AError
+        from kestrel_sdk.native_a2a.utils.errors import A2AError
 
         from kestrel_sovereign.a2a.native_client import NativePeerProtocolError
         from kestrel_sovereign.a2a.native_sender import NativeSenderProofError
@@ -1158,7 +1158,7 @@ class PeersFeature(Feature):
 
     @staticmethod
     def _native_peer_result(dispatch, response):
-        from kestrel_sovereign._vendor.a2a.types import Message
+        from kestrel_sdk.native_a2a.types import Message
         from google.protobuf.json_format import MessageToDict
 
         from kestrel_sovereign.a2a.projections import message_text
@@ -1200,7 +1200,7 @@ class PeersFeature(Feature):
         ambiguous evidence always fails closed. The protocol carries no reason
         field, so an optional operator reason remains local presentation.
         """
-        from kestrel_sovereign._vendor.a2a.utils.errors import A2AError
+        from kestrel_sdk.native_a2a.utils.errors import A2AError
 
         from kestrel_sovereign.a2a.native_client import NativePeerProtocolError
         from kestrel_sovereign.a2a.native_sender import NativeSenderProofError

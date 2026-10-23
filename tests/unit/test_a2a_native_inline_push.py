@@ -3,8 +3,8 @@
 import asyncio
 
 import pytest
-from kestrel_sovereign._vendor.a2a.types import SendMessageRequest
-from kestrel_sovereign._vendor.a2a.utils.errors import PushNotificationNotSupportedError
+from kestrel_sdk.native_a2a.types import SendMessageRequest
+from kestrel_sdk.native_a2a.utils.errors import PushNotificationNotSupportedError
 
 from kestrel_sovereign._async_ownership import create_owned_task
 from kestrel_sovereign.a2a.native_input import native_request_digest
