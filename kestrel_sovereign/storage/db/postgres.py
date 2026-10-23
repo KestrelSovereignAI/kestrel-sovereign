@@ -2260,7 +2260,7 @@ class PostgresBackend(DatabaseBackend):
                                                    OR p.oid IS NULL OR p.oid OPERATOR(pg_catalog.>=) $2::pg_catalog.oid
                                                    OR p.pronamespace OPERATOR(pg_catalog.<>) onsp.oid
                                                    OR l.oid IS NULL OR l.oid OPERATOR(pg_catalog.>=) $2::pg_catalog.oid
-                                                   OR l.lanname NOT IN ('internal','c'))))))
+                                                   OR l.lanname NOT IN ('internal','c')))))))
               AND NOT EXISTS (
                   SELECT 1 FROM pg_catalog.pg_attribute AS a
                   JOIN pg_catalog.pg_type AS t ON t.oid OPERATOR(pg_catalog.=) a.atttypid
