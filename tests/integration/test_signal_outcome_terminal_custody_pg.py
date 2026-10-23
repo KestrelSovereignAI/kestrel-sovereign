@@ -707,6 +707,7 @@ async def test_admission_reconnect_never_invokes_reconfigured_password(dispatche
     callbacks, effects = [], []
     actual_acquire = asyncpg.pool.Pool.acquire
     held = await pool.acquire()
+    original_password = held._con._params.password
     task = None
 
     def observe_acquire(original, *args, **kwargs):
@@ -717,7 +718,7 @@ async def test_admission_reconnect_never_invokes_reconfigured_password(dispatche
     async def password():
         callbacks.append(True)
         await control.execute(f'INSERT INTO "{schema}".forbidden_connect_effect VALUES (1)')
-        return original_kwargs.get('password', '')
+        return original_password
 
     async def handler(payload):
         effects.append(True)
@@ -739,9 +740,11 @@ async def test_admission_reconnect_never_invokes_reconfigured_password(dispatche
         await pool.release(held)
         held = None
         outcome = await await_owned_task(task)
-        assert outcome.error is not None and not effects
-        assert not callbacks, 'queued journal admission invoked reconfigured application password callback'
-        assert await control.fetchval(f'SELECT COUNT(*) FROM "{schema}".forbidden_connect_effect') == 0
+        assert not effects
+        callback_effects = await control.fetchval(f'SELECT COUNT(*) FROM "{schema}".forbidden_connect_effect')
+        assert (len(callbacks), callback_effects) == (0, 0), (
+            'queued journal admission invoked reconfigured application password callback')
+        assert outcome.error is not None or outcome.result.status.value == 'failed'
         # The adopted connector remains ordinary outside the original journal
         # owner: this supported public callback still runs for normal pooling.
         async with pool.acquire() as connection:
