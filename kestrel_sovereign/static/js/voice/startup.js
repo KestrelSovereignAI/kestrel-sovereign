@@ -22,6 +22,7 @@ export function createStartupSettlement() {
         // reject a pending worklet with a DIFFERENT AbortError; keep the
         // original public withdrawal too, without mutating either error.
         // A later close observer is not evidence that close won this race.
+        publicStatus: outcome.status,
         publicReason: outcome.status === 'rejected' ? outcome.reason : null,
       }]);
       // This settles the PUBLIC caller promptly. It neither cancels nor

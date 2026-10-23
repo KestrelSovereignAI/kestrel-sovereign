@@ -5171,7 +5171,7 @@ class SignalDispatcher:
             raise TypeError('Original resident journal handoff requires a fresh native slot')
         from kestrel_sovereign._async_ownership import OwnedTaskAdmission
         routing_admission = OwnedTaskAdmission()
-        async with self._admit_durable_operation():
+        async with self._own_unrouted_cognition_claim(delivery, routing_admission), self._admit_durable_operation():
             token = self._original_outcome_admission.set(None)
             original_outcomes = []
             deferred_token = self._deferred_outcome_logs.set(original_outcomes)

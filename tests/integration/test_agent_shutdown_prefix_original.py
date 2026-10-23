@@ -24,12 +24,12 @@ def native_prefix_budget(onboarding_owner, monkeypatch):
         agent_module._minimum_storage_close_timeout(agent.storage),
         agent_module._minimum_storage_potential_preclose_timeout(agent.storage),
     )
-    total = agent_module.SHUTDOWN_TIMEOUT
+    total = max(agent_module.SHUTDOWN_TIMEOUT, tail + 5.0)
     assert 0 < total <= 30, 'native prefix fixture requires a finite coherent budget'
     monkeypatch.setattr(agent_module, 'SHUTDOWN_TIMEOUT', total)
     monkeypatch.setattr(agent_module, 'KESTREL_AGENT_SHUTDOWN_TIMEOUT_S', total)
     prefix, reserved = agent_module._resolve_shutdown_budget(tail)
-    assert prefix >= 0.0 and reserved > 0
+    assert prefix >= 5.0 and reserved >= tail
 
 
 @pytest.mark.asyncio
