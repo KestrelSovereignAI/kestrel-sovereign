@@ -284,6 +284,12 @@ class _CognitionClaimSettlement:
     delivery: DurableDelivery
     receipt: object = None
 
+    @property
+    def retry_pending(self) -> bool:
+        # A native NACK can publish RETRY while retaining the original token
+        # for fixed terminal cleanup. It is not an ACK/final disposition.
+        return isinstance(self.receipt, DurableDelivery) and self.receipt.status == RETRY
+
 
 @dataclass
 class SignalDispatchHandle(SignalHandle):
@@ -5367,9 +5373,11 @@ class SignalDispatcher:
                     else:
                         await self._cancel_durable_cognition_routing_task(routing_task, delivery=delivery)
                 elif settlement.receipt is not None:
-                    # Audit/observer failure cannot undo an actual ACK/NACK
-                    # or manufacture another CAS against its cleared token.
-                    pass
+                    # Never undo an ACK/final receipt. A committed retry NACK
+                    # is different: control loss must retire its still-owned
+                    # retry capability, rather than leave effects replayable.
+                    if settlement.retry_pending and is_execution_control_error(error):
+                        await self._terminalize_failed_cognition(delivery, error)
                 elif is_execution_control_error(error):
                     error = await self._settle_cognition_control(delivery, error, routing_task)
                 elif self._completed_cognition_was_stopped(routing_task):
@@ -6118,7 +6126,7 @@ class SignalDispatcher:
         """Keep irreversible control evidence non-retryable and non-ACKable."""
         settlement = self._cognition_claim_settlement.get()
         if (settlement is not None and settlement.delivery is delivery
-                and settlement.receipt is not None):
+                and settlement.receipt is not None and not settlement.retry_pending):
             self._retained_cognition_control_debt.pop(delivery.delivery_id, None)
             return
         from kestrel_sovereign._async_ownership import (
