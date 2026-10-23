@@ -1404,6 +1404,8 @@ class SignalDispatcher:
             asyncio.get_running_loop().create_future()
         )
         journal_completion = []
+        from kestrel_sovereign.signals.outcome_custody import _native_identity_text
+        enqueued_signal_id = _native_identity_text(signal.id)
         coro = self.dispatch_signal(
             signal,
             source_event_id=source_event_id,
@@ -1412,8 +1414,6 @@ class SignalDispatcher:
             _durable_admission_fence=admission_fence,
             _journal_completion=journal_completion,
         )
-        from kestrel_sovereign.signals.outcome_custody import _native_identity_text
-        enqueued_signal_id = _native_identity_text(signal.id)
         released = False
         def release_live_admission(_task: asyncio.Task[SignalResult]) -> None:
             nonlocal released

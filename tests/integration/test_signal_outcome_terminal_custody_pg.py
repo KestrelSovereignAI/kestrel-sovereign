@@ -301,8 +301,15 @@ async def test_postgres_pinned_peer_keeps_native_tls_identity_on_reconnect(dispa
             assert cancellation_owners and all(owner.done() for owner in cancellation_owners)
             released = await await_owned_task(release_owner)
             assert released.error is None
-        assert outcome.error is None, 'numeric peer reconnect lost actual TLS hostname verification'
         assert not plaintext_cancellations, 'admitted TLS cancellation sent the native backend secret in plaintext'
+        if deny_cancel:
+            from kestrel_sovereign.execution_custody import is_execution_control_error, execution_commit_outcome, _explicit_control_chain
+            assert is_execution_control_error(outcome.error), 'TLS-denied cancellation/rollback cannot report a healthy journal'
+            assert execution_commit_outcome(outcome.error) is None
+            assert any(isinstance(error, ConnectionError) and 'rejected SSL upgrade' in str(error)
+                       for error in _explicit_control_chain(outcome.error))
+        else:
+            assert outcome.error is None, 'numeric peer reconnect lost actual TLS hostname verification'
         assert names == [alias] * (1 if deny_cancel else 3 if sibling else 2), 'original admission, sibling and terminal reconnect must use the same TLS SNI'
         assert await control.fetchval(f'SELECT COUNT(*) FROM ONLY "{schema}".signal_log WHERE id=$1', signal.id) == int(not journal_cancel)
         if journal_cancel:
