@@ -2235,32 +2235,7 @@ class PostgresBackend(DatabaseBackend):
                           AND pg_catalog.pg_get_expr(i.indpred, i.indrelid)  OPERATOR(pg_catalog.<>)  'constitution_hash IS NOT NULL') OR
                          EXISTS (SELECT 1 FROM pg_catalog.pg_opclass AS op
                                  JOIN pg_catalog.pg_namespace AS onsp ON onsp.oid OPERATOR(pg_catalog.=) op.opcnamespace
-                                 WHERE op.oid OPERATOR(pg_catalog.=) ANY(i.indclass)
-                                   AND (onsp.nspname OPERATOR(pg_catalog.<>) 'pg_catalog'
-                                        OR op.oid OPERATOR(pg_catalog.>=) $2::pg_catalog.oid
-                                        OR op.opcfamily OPERATOR(pg_catalog.>=) $2::pg_catalog.oid
-                                        OR op.opcmethod OPERATOR(pg_catalog.>=) $2::pg_catalog.oid
-                                        OR EXISTS (
-                                            SELECT 1 FROM pg_catalog.pg_amproc AS ap
-                                            LEFT JOIN pg_catalog.pg_proc AS p ON p.oid OPERATOR(pg_catalog.=) ap.amproc
-                                            LEFT JOIN pg_catalog.pg_language AS l ON l.oid OPERATOR(pg_catalog.=) p.prolang
-                                            WHERE ap.amprocfamily OPERATOR(pg_catalog.=) op.opcfamily
-                                              AND (p.oid IS NULL OR p.oid OPERATOR(pg_catalog.>=) $2::pg_catalog.oid
-                                                   OR p.pronamespace OPERATOR(pg_catalog.<>) onsp.oid
-                                                   OR l.oid IS NULL OR l.oid OPERATOR(pg_catalog.>=) $2::pg_catalog.oid
-                                                   OR l.lanname NOT IN ('internal','c')))
-                                        OR EXISTS (
-                                            SELECT 1 FROM pg_catalog.pg_amop AS ap
-                                            LEFT JOIN pg_catalog.pg_operator AS o ON o.oid OPERATOR(pg_catalog.=) ap.amopopr
-                                            LEFT JOIN pg_catalog.pg_proc AS p ON p.oid OPERATOR(pg_catalog.=) o.oprcode
-                                            LEFT JOIN pg_catalog.pg_language AS l ON l.oid OPERATOR(pg_catalog.=) p.prolang
-                                            WHERE ap.amopfamily OPERATOR(pg_catalog.=) op.opcfamily
-                                              AND (o.oid IS NULL OR o.oid OPERATOR(pg_catalog.>=) $2::pg_catalog.oid
-                                                   OR o.oprnamespace OPERATOR(pg_catalog.<>) onsp.oid
-                                                   OR p.oid IS NULL OR p.oid OPERATOR(pg_catalog.>=) $2::pg_catalog.oid
-                                                   OR p.pronamespace OPERATOR(pg_catalog.<>) onsp.oid
-                                                   OR l.oid IS NULL OR l.oid OPERATOR(pg_catalog.>=) $2::pg_catalog.oid
-                                                   OR l.lanname NOT IN ('internal','c')))))))
+                                 WHERE op.oid OPERATOR(pg_catalog.=) ANY(i.indclass) AND onsp.nspname OPERATOR(pg_catalog.<>) 'pg_catalog')))
               AND NOT EXISTS (
                   SELECT 1 FROM pg_catalog.pg_attribute AS a
                   JOIN pg_catalog.pg_type AS t ON t.oid OPERATOR(pg_catalog.=) a.atttypid
