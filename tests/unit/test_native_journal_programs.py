@@ -141,6 +141,25 @@ def test_original_sqlite_float_literals_preserve_native_ieee_values():
             assert struct.pack('!d', actual) == struct.pack('!d', expected), value.hex()
 
 
+def test_native_tls_object_association_cannot_change_during_original_policy():
+    import ssl
+    from kestrel_sovereign.storage.db.native_journal_programs import (
+        _adopt_native_tls_context, _adopt_native_tls_object, _native_tls_policy_generation, _OriginalNativeTLSPolicy,
+    )
+    context = _adopt_native_tls_context(ssl.create_default_context())
+    other = _adopt_native_tls_context(ssl.create_default_context())
+    tls = _adopt_native_tls_object(context.wrap_bio(ssl.MemoryBIO(), ssl.MemoryBIO(), server_hostname='owned.invalid'))
+    with _OriginalNativeTLSPolicy(context, _native_tls_policy_generation(context), tls=tls):
+        with pytest.raises(NativeJournalConfigurationError, match='association is sealed'):
+            tls.context = other
+        assert tls.context is context
+    tls.context = other  # Ordinary customization remains available after retirement.
+    tls.context = context
+    with pytest.raises(NativeJournalConfigurationError, match='association changed'):
+        _OriginalNativeTLSPolicy(context, _native_tls_policy_generation(context), tls=tls)
+    assert not tls._native_journal_association_seals and not context._native_journal_tls_seals
+
+
 def _owned_tls_contexts(tmp_path, name):
     import ssl
     from datetime import datetime, timedelta, timezone

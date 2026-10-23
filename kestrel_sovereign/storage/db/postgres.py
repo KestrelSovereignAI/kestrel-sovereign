@@ -2196,6 +2196,8 @@ class PostgresBackend(DatabaseBackend):
         from kestrel_sovereign.signals.store import _OUTCOME_COLUMNS
         row = await connection.fetchrow('''
             SELECT pg_catalog.current_database() AS database_name,
+                   (SELECT d.oid::bigint FROM pg_catalog.pg_database AS d
+                    WHERE d.datname OPERATOR(pg_catalog.=) pg_catalog.current_database()) AS database_oid,
                    n.oid::bigint AS namespace_oid, c.oid::bigint AS relation_oid,
                    n.nspname AS schema_name, c.relname AS relation_name,
                    ARRAY(SELECT a.attname FROM pg_catalog.pg_attribute AS a
@@ -2337,7 +2339,8 @@ class PostgresBackend(DatabaseBackend):
                     journal.require_original(self)
                     if not journal._postgres_pool.matches_actual_connection(native):
                         raise NativeJournalConfigurationError('Original native PostgreSQL endpoint changed')
-                    native._begin_original_journal(state, tls_generation=journal._postgres_pool.tls_generation)
+                    native._begin_original_journal(state, tls_context=journal._postgres_pool.tls_context,
+                                                   tls_generation=journal._postgres_pool.tls_generation)
                     program_sealed = True
                 except NativeJournalConfigurationError as error:
                     native._retire_original_journal_refusal()

@@ -5169,7 +5169,9 @@ class SignalDispatcher:
         """Own recovered claim admission and its original journal through join."""
         if _journal_completion is not None and (type(_journal_completion) is not list or _journal_completion):
             raise TypeError('Original resident journal handoff requires a fresh native slot')
-        async with self._admit_durable_operation():
+        from kestrel_sovereign._async_ownership import OwnedTaskAdmission
+        routing_admission = OwnedTaskAdmission()
+        async with self._own_unrouted_cognition_claim(delivery, routing_admission), self._admit_durable_operation():
             token = self._original_outcome_admission.set(None)
             original_outcomes = []
             deferred_token = self._deferred_outcome_logs.set(original_outcomes)
@@ -5182,7 +5184,7 @@ class SignalDispatcher:
                         signal, registration, start, delivery=delivery, consumer_id=consumer_id,
                         use_live_signal=use_live_signal, retry_delay=retry_delay,
                         durable_admission=durable_admission, persisted_event_id=persisted_event_id,
-                        original_acceptances=acceptances)
+                        original_acceptances=acceptances, routing_admission=routing_admission)
                 except BaseException as error:
                     original = error
                 journal = self._original_outcome_admission.get()
@@ -5225,9 +5227,32 @@ class SignalDispatcher:
                 self._original_outcome_admission.reset(token)
                 self._deferred_outcome_logs.reset(deferred_token)
 
+    @asynccontextmanager
+    async def _own_unrouted_cognition_claim(self, delivery, routing_admission):
+        """One exact-token owner from claim admission to physical route publication.
+
+        Before publication there is no retained child/done callback to settle
+        this claim. Every escaping failure (including finite grouped caller
+        withdrawal) must therefore finish its native release here. Once an
+        actual Task exists, the established route settlement owns that token.
+        """
+        try:
+            yield
+        except BaseException as error:
+            if routing_admission.task is not None:
+                raise
+            try:
+                if is_execution_control_error(error):
+                    await self._terminalize_failed_cognition(delivery, error)
+                else:
+                    await self._release_retained_durable_cognition_task(delivery, observe_failure=True)
+            except BaseException as cleanup:
+                raise execution_observation_error(error, cleanup) from None
+            raise
+
     async def _execute_original_claimed_durable_cognition(
         self, signal, registration, start, *, delivery, consumer_id,
-        use_live_signal, retry_delay, durable_admission, persisted_event_id, original_acceptances,
+        use_live_signal, retry_delay, durable_admission, persisted_event_id, original_acceptances, routing_admission,
     ):
         """Execute the already claimed lease under its existing runtime owner."""
 
@@ -5243,16 +5268,6 @@ class SignalDispatcher:
             )
         except BaseException as error:
             if is_execution_control_error(error):
-                await self._terminalize_failed_cognition(delivery, error)
-                raise
-            if isinstance(error, asyncio.CancelledError):
-                # Rehydration ran in this original owner, before any routing
-                # Task existed. It has now physically unwound: release its
-                # exact token, preserving withdrawal and any native failure.
-                try:
-                    await self._release_retained_durable_cognition_task(delivery, observe_failure=True)
-                except BaseException as cleanup:
-                    raise execution_observation_error(error, cleanup) from None
                 raise
             if not isinstance(error, Exception):
                 raise
@@ -5307,20 +5322,9 @@ class SignalDispatcher:
             self._accepted_signal_outcomes[acceptance] = None
             self._original_outcome_admission.set(await _capture_original_outcome(
                 self, routing_signal, registration, acceptance=acceptance))
-        except BaseException as error:
+        except BaseException:
             if acceptance is not None:
                 self._accepted_signal_outcomes.pop(acceptance, None)
-            # No routing Task was admitted, so there is no future completion
-            # callback to settle this already-claimed lease. Use the same
-            # exact-token terminalization/release as a settled route; never
-            # leave recovery depending on lease expiry after admission fails.
-            try:
-                if is_execution_control_error(error):
-                    await self._terminalize_failed_cognition(delivery, error)
-                else:
-                    await self._release_retained_durable_cognition_task(delivery, observe_failure=True)
-            except BaseException as cleanup:
-                raise execution_observation_error(error, cleanup) from None
             raise
 
         # The managed claim is durably marked admission-pending. Linearize
@@ -5412,8 +5416,6 @@ class SignalDispatcher:
             routing_signal.id
         )
         routing_task: asyncio.Task[SignalResult] | None = None
-        from kestrel_sovereign._async_ownership import OwnedTaskAdmission
-        routing_admission = OwnedTaskAdmission()
         deferred_outcomes: list[_DeferredOutcomeLog] = []
         lease_loss_reason: Optional[str] = None
         lease_loss_error: BaseException | None = None

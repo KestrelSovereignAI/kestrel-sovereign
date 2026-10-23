@@ -112,23 +112,67 @@ def _native_tls_policy_generation(context):
         return context._native_journal_tls_generation
 
 
+class _NativeJournalTLSObject(ssl.SSLObject):
+    """Track the public context association before a native session escapes."""
+
+    @property
+    def context(self):
+        return ssl.SSLObject.context.fget(self)
+
+    @context.setter
+    def context(self, value):
+        with self._native_journal_association_lock:
+            if self._native_journal_association_seals:
+                raise NativeJournalConfigurationError('Original native TLS association is sealed')
+            self._native_journal_association_changed = True
+            ssl.SSLObject.context.fset(self, value)
+
+
+def _adopt_native_tls_object(tls):
+    if type(tls) is ssl.SSLObject:
+        tls._native_journal_association_lock = threading.RLock()
+        tls._native_journal_association_seals = set()
+        tls._native_journal_association_changed = False
+        tls.__class__ = _NativeJournalTLSObject
+    return tls
+
+
 class _OriginalNativeTLSPolicy:
     """One finite seal across actual handshake or original transaction/reset."""
 
-    def __init__(self, context, generation):
+    def __init__(self, context, generation, *, tls=None):
         if type(self) is not _OriginalNativeTLSPolicy:
             raise NativeJournalConfigurationError('Original TLS requires native seal identity')
         self._context = context
-        if context is not None:
-            with _native_tls_policy_lock(context):
-                if _native_tls_policy_generation(context) != generation:
-                    raise NativeJournalConfigurationError('Original native TLS policy changed')
-                set.add(context._native_journal_tls_seals, self)
+        self._tls = None
+        try:
+            if tls is not None:
+                if type(tls) is not _NativeJournalTLSObject or not tls._native_journal_association_lock.acquire(blocking=False):
+                    raise NativeJournalConfigurationError('Original native TLS association is not observable')
+                try:
+                    if tls._native_journal_association_changed or tls.context is not context:
+                        raise NativeJournalConfigurationError('Original native TLS association changed')
+                    set.add(tls._native_journal_association_seals, self)
+                    self._tls = tls
+                finally:
+                    tls._native_journal_association_lock.release()
+            if context is not None:
+                with _native_tls_policy_lock(context):
+                    if _native_tls_policy_generation(context) != generation:
+                        raise NativeJournalConfigurationError('Original native TLS policy changed')
+                    set.add(context._native_journal_tls_seals, self)
+        except BaseException:
+            self.__exit__(None, None, None)
+            raise
 
     def __enter__(self):
         return self
 
     def __exit__(self, *_error):
+        tls = self._tls
+        if tls is not None:
+            set.discard(tls._native_journal_association_seals, self)
+            self._tls = None
         context = self._context
         if context is not None:
             # Retirement is NOT a fallible policy observation. Native set
@@ -472,16 +516,18 @@ else:
         _cancellations: set
 
         @classmethod
-        def capture(cls, connection):
+        def capture(cls, connection, *, tls_context, tls_object):
             peer = connection._transport.get_extra_info('peername')
             loop = connection._loop
             tls = connection._transport.get_extra_info('ssl_object')
+            if tls is not tls_object or (tls.context if tls is not None else None) is not tls_context:
+                raise NativeJournalConfigurationError('Original native TLS association changed during admission')
             # The original recipe may be allow/prefer even when the actual
             # session negotiated TLS. Cancellation carries a backend secret;
             # it must never inherit plaintext fallback from that recipe.
             from asyncpg.connect_utils import SSLMode
             params = connection._params._replace(
-                ssl=tls.context if tls is not None else False,
+                ssl=tls_context if tls is not None else False,
                 sslmode=SSLMode.require if tls is not None else SSLMode.disable)
             if type(peer) is tuple:
                 address = _native_tcp_endpoint(peer)
@@ -507,6 +553,7 @@ else:
             tls = self._transport.get_extra_info('ssl_object')
             if tls is not None:
                 _adopt_native_tls_context(tls.context)
+                _adopt_native_tls_object(tls)
 
         async def set_type_codec(self, *args, **kwargs):
             _register_program(self)
@@ -553,6 +600,9 @@ else:
             return super().remove_termination_listener(*args, **kwargs)
 
         def _original_journal_programs_supported(self):
+            tls = self._transport.get_extra_info('ssl_object')
+            if tls is not None and (type(tls) is not _NativeJournalTLSObject or tls._native_journal_association_changed):
+                return False
             if (self.is_closed() or self._journal_programs_configured or self._query_loggers or self._listeners
                     or self._log_listeners or self._termination_listeners):
                 return False
@@ -577,13 +627,14 @@ else:
             if self._journal_program_seal is not None:
                 raise NativeJournalConfigurationError('Previous original journal has unresolved native retirement')
 
-        def _begin_original_journal(self, native_state, *, tls_generation=None):
+        def _begin_original_journal(self, native_state, *, tls_context=None, tls_generation=None):
             if not self._original_journal_programs_supported() or self._journal_program_seal is not None:
                 raise NativeJournalConfigurationError('Original journal requires a plain native PostgreSQL connection')
             tls = self._transport.get_extra_info('ssl_object')
-            policy = _OriginalNativeTLSPolicy(tls.context if tls is not None else None, tls_generation)
+            policy = _OriginalNativeTLSPolicy(tls_context, tls_generation, tls=tls)
             try:
-                self._journal_cancel_connection = _OriginalJournalCancelConnection.capture(self)
+                self._journal_cancel_connection = _OriginalJournalCancelConnection.capture(
+                    self, tls_context=tls_context, tls_object=tls)
             except BaseException:
                 policy.__exit__(None, None, None)
                 raise

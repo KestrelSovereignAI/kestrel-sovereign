@@ -398,7 +398,7 @@ async def test_postgres_database_clone_cannot_inherit_original_journal_identity(
     _, control, schema = native_pg
     name = 'journal_db_' + uuid.uuid4().hex
     clone, retired = name + '_clone', name + '_retired'
-    old_pool, pool, swapped = c.backend._pool, None, False
+    old_pool, pool = c.backend._pool, None
     await control.execute(f'CREATE DATABASE "{name}" TEMPLATE template0')
     try:
         pool = await _fresh_journal_pool(old_pool, database=name, min_size=1, max_size=1)
@@ -409,14 +409,12 @@ async def test_postgres_database_clone_cannot_inherit_original_journal_identity(
         scope = ExecutionCustody(_OriginalWork(backend_type='postgres'))
         facts = []
         async def handler(payload):
-            nonlocal swapped
             async with pool.acquire() as connection:
                 facts.append(tuple(await connection.fetchrow("SELECT (SELECT oid FROM pg_catalog.pg_database WHERE datname=current_database()), 'signal_log'::regclass::oid")))
                 await connection.close()
             await control.execute(f'CREATE DATABASE "{clone}" TEMPLATE "{name}"')
             await control.execute(f'ALTER DATABASE "{name}" RENAME TO "{retired}"')
             await control.execute(f'ALTER DATABASE "{clone}" RENAME TO "{name}"')
-            swapped = True
             async with pool.acquire() as connection:
                 facts.append(tuple(await connection.fetchrow("SELECT (SELECT oid FROM pg_catalog.pg_database WHERE datname=current_database()), 'signal_log'::regclass::oid")))
             scope.revoke('actual cutoff after database clone/name swap')
@@ -431,14 +429,16 @@ async def test_postgres_database_clone_cannot_inherit_original_journal_identity(
         async with pool.acquire() as connection:
             assert await connection.fetchval('SELECT count(*) FROM signal_log WHERE id=$1', signal.id) == 0
     finally:
-        c.backend._pool = old_pool
         try:
+            if pool is not None:
+                await c.dispatcher.shutdown_durable_delivery()
+        finally:
+            c.backend._pool = old_pool
             if pool is not None:
                 async with asyncio.timeout(10):
                     await pool.close()
-        finally:
-            await control.execute(f'DROP DATABASE IF EXISTS "{name}"')
-            await control.execute(f'DROP DATABASE IF EXISTS "{retired if swapped else clone}"')
+            for owned_name in (name, clone, retired):
+                await control.execute(f'DROP DATABASE IF EXISTS "{owned_name}"')
 
 
 async def test_postgres_original_journal_refuses_effective_durability_drift(dispatcher_components, native_pg, monkeypatch):
