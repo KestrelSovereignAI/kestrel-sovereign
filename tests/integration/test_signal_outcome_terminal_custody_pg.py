@@ -293,9 +293,9 @@ async def test_postgres_pinned_peer_keeps_native_tls_identity_on_reconnect(dispa
                     if not journal_cancel:
                         if trust_change == 'context':
                             context = connection._con._transport.get_extra_info('ssl_object').context
-                            before = len(context.get_ca_certs(binary_form=True))
+                            before = context.cert_store_stats()['x509']
                             context.load_verify_locations(cafile=str(replacement_cert))
-                            assert len(context.get_ca_certs(binary_form=True)) == before + 1
+                            assert context.cert_store_stats()['x509'] == before + 1
                             replaced.append(True)
                         await connection.close()
             if trust_change is True:
