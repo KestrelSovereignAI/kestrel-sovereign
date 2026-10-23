@@ -1258,8 +1258,10 @@ class SignalDispatcher:
                 # No projection/writer is admitted while the handler runs.
                 self._deferred_outcome_logs.set(None)
                 journal = self._original_outcome_admission.get()
+                from kestrel_sovereign.signals.outcome_custody import _native_identity_text
                 selected = [outcome for outcome in original_outcomes
-                    if outcome.result is result and outcome.registration is registration]
+                    if outcome.result is result and outcome.registration is registration
+                    and _native_identity_text(outcome.signal.id) == _native_identity_text(signal.id)]
                 if journal is not None:
                     try:
                         result = _snapshot_terminal_result(result)
@@ -5189,8 +5191,10 @@ class SignalDispatcher:
                 try:
                     self._deferred_outcome_logs.set(None)
                     if result is not None:
+                        from kestrel_sovereign.signals.outcome_custody import _native_identity_text
                         selected = [outcome for outcome in original_outcomes
-                            if outcome.result is result and outcome.registration is registration]
+                            if outcome.result is result and outcome.registration is registration
+                            and _native_identity_text(outcome.signal.id) == _native_identity_text(result.signal_id)]
                         if journal is not None:
                             try:
                                 from kestrel_sovereign.signals.outcome_custody import _snapshot_terminal_result
@@ -5244,15 +5248,6 @@ class SignalDispatcher:
         except BaseException as error:
             if is_execution_control_error(error):
                 await self._terminalize_failed_cognition(delivery, error)
-                raise
-            if isinstance(error, asyncio.CancelledError):
-                # Rehydration ran in this original owner, before any routing
-                # Task existed. It has now physically unwound: release its
-                # exact token, preserving withdrawal and any native failure.
-                try:
-                    await self._release_retained_durable_cognition_task(delivery, observe_failure=True)
-                except BaseException as cleanup:
-                    raise execution_observation_error(error, cleanup) from None
                 raise
             if not isinstance(error, Exception):
                 raise
