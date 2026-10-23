@@ -6126,7 +6126,7 @@ class SignalDispatcher:
         """Keep irreversible control evidence non-retryable and non-ACKable."""
         settlement = self._cognition_claim_settlement.get()
         if (settlement is not None and settlement.delivery is delivery
-                and settlement.receipt is not None and not settlement.retry_pending):
+                and settlement.receipt is not None):
             self._retained_cognition_control_debt.pop(delivery.delivery_id, None)
             return
         from kestrel_sovereign._async_ownership import (

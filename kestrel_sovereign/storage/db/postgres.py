@@ -2313,7 +2313,7 @@ class PostgresBackend(DatabaseBackend):
         native = None
         program_sealed = False
         try:
-            async with self._tracked_pool_checkout(journal._backing, admit_work=True, original_journal=True) as (connection, state):
+            async with self._tracked_pool_checkout(journal._backing, admit_work=True) as (connection, state):
                 journal._require_backing()
                 native = connection._con
                 if type(native) is not NativeJournalPostgresConnection:
@@ -2357,7 +2357,7 @@ class PostgresBackend(DatabaseBackend):
         # out-of-pool connection. Bound churn if concurrent borrowers repeatedly
         # return incompatible siblings before this writer reacquires a slot.
         for _ in range(journal._postgres_pool.pool.get_max_size() + 1):
-            async with self._tracked_pool_checkout(journal._backing, admit_work=False, original_journal=True) as owned:
+            async with self._tracked_pool_checkout(journal._backing, admit_work=False) as owned:
                 connection, _state = owned
                 journal.require_original(self)
                 native = connection._con
