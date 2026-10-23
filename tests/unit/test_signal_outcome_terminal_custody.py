@@ -357,6 +357,30 @@ async def test_application_string_equality_cannot_substitute_accepted_signal_id(
     assert identity != _OriginalSignalOutcome._signal_identity(signal)
 
 
+async def test_terminal_selection_never_calls_application_id_equality(dispatcher_components):
+    c = dispatcher_components
+    comparisons, effects = [], []
+    class UnequalText(str):
+        __hash__ = str.__hash__
+        def __eq__(self, other):
+            comparisons.append('application equality after handler effect')
+            return False
+    signal = _signal('native.terminal.identity')
+    identity = signal.id
+    scope = ExecutionCustody(_OriginalWork(backend_type=c.backend.backend_type))
+    async def handler(payload):
+        effects.append('genuinely completed')
+        signal.id = UnequalText(identity)
+        scope.revoke('actual cutoff before terminal selection')
+        return {'genuine': True}
+    c.registry.register(_action_reg(signal.source, handler=handler))
+    with bind_execution_runtime(SimpleNamespace(_execution_custody=scope)):
+        result = await c.dispatcher.dispatch_signal(signal)
+    assert effects and result.status.value == 'ok'
+    assert not comparisons, 'terminal identity selection executed an application equality hook'
+    assert await c.backend.fetch_val('SELECT COUNT(*) FROM signal_log WHERE id=?', (identity,)) == 1
+
+
 @pytest.mark.parametrize('shape', ['expression_index', 'predicate_index', 'predicate_comment', 'check', 'check_comment'])
 async def test_sqlite_journal_rejects_executable_schema_before_routing(dispatcher_components, shape):
     from kestrel_sovereign.execution_custody import is_execution_control_error

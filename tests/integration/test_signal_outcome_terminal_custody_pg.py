@@ -38,6 +38,7 @@ from tests.unit.test_signal_outcome_terminal_custody import (  # noqa: F401
     test_application_metaclass_cannot_admit_a_foreign_native_backend,
     test_resident_completed_journal_receipt_reaches_withdrawn_ingress,
     test_application_string_equality_cannot_substitute_accepted_signal_id,
+    test_terminal_selection_never_calls_application_id_equality,
 )
 
 pytestmark = [pytest.mark.asyncio, pytest.mark.integration]
@@ -213,7 +214,7 @@ async def test_postgres_reconnect_pins_actual_socket_peer_across_dns_change(disp
                 await retire_original()
 
 
-@pytest.mark.parametrize('direct_tls,journal_cancel,trust_change,sibling,ssl_mode', [(False, False, False, False, 'verify-full'), (True, False, False, False, 'verify-full'), (False, True, False, False, 'verify-full'), (False, False, True, False, 'verify-full'), (True, False, True, False, 'verify-full'), (False, False, False, True, 'verify-full'), (True, False, False, True, 'verify-full'), (False, True, False, False, 'allow'), (False, True, False, False, 'prefer')])
+@pytest.mark.parametrize('direct_tls,journal_cancel,trust_change,sibling,ssl_mode', [(False, False, False, False, 'verify-full'), (True, False, False, False, 'verify-full'), (False, True, False, False, 'verify-full'), (False, False, True, False, 'verify-full'), (True, False, True, False, 'verify-full'), (False, False, False, True, 'verify-full'), (True, False, False, True, 'verify-full'), (False, True, False, False, 'allow'), (False, True, False, False, 'prefer'), (False, False, 'context', False, 'verify-full'), (True, False, 'context', False, 'verify-full')])
 async def test_postgres_pinned_peer_keeps_native_tls_identity_on_reconnect(dispatcher_components, native_pg, monkeypatch, tmp_path, direct_tls, journal_cancel, trust_change, sibling, ssl_mode):
     from kestrel_sovereign._async_ownership import await_owned_task
     from kestrel_sovereign.execution_custody import ExecutionCustody, bind_execution_runtime
@@ -235,11 +236,19 @@ async def test_postgres_pinned_peer_keeps_native_tls_identity_on_reconnect(dispa
     target = control._transport.get_extra_info('peername')[:2]
     alias = 'original-journal-peer.invalid'
     server_context, _, cert_path = _owned_tls_contexts(tmp_path, alias)
+    replacement_dir = tmp_path / 'replacement-tls-policy'
+    replacement_dir.mkdir()
+    replacement_context, _, replacement_cert = _owned_tls_contexts(replacement_dir, alias)
+    replaced = []
     names = []
     reject_tls = asyncio.Event()
     plaintext_cancellations = []
     deny_cancel = ssl_mode in ('allow', 'prefer')
-    server_context.set_servername_callback(lambda obj, name, context: names.append(name))
+    def observe_tls(obj, name, context):
+        names.append(name)
+        if replaced:
+            obj.context = replacement_context
+    server_context.set_servername_callback(observe_tls)
     monkeypatch.setenv('PGSSLROOTCERT', str(cert_path))
     loop = asyncio.get_running_loop()
     resolve = loop.getaddrinfo
@@ -282,8 +291,14 @@ async def test_postgres_pinned_peer_keeps_native_tls_identity_on_reconnect(dispa
             else:
                 async with pool.acquire() as connection:
                     if not journal_cancel:
+                        if trust_change == 'context':
+                            context = connection._con._transport.get_extra_info('ssl_object').context
+                            before = len(context.get_ca_certs(binary_form=True))
+                            context.load_verify_locations(cafile=str(replacement_cert))
+                            assert len(context.get_ca_certs(binary_form=True)) == before + 1
+                            replaced.append(True)
                         await connection.close()
-            if trust_change:
+            if trust_change is True:
                 monkeypatch.setenv('PGSSLROOTCERT', str(tmp_path / 'not-the-admitted-root.pem'))
             if journal_cancel:
                 if deny_cancel:
@@ -302,6 +317,13 @@ async def test_postgres_pinned_peer_keeps_native_tls_identity_on_reconnect(dispa
             released = await await_owned_task(release_owner)
             assert released.error is None
         assert not plaintext_cancellations, 'admitted TLS cancellation sent the native backend secret in plaintext'
+        if trust_change == 'context':
+            from kestrel_sovereign.execution_custody import is_execution_control_error, execution_commit_outcome
+            assert is_execution_control_error(outcome.error), 'mutated admitted TLS policy accepted a replacement certificate'
+            assert execution_commit_outcome(outcome.error) is None
+            assert names == [alias], 'changed TLS policy reached a new native handshake'
+            assert await control.fetchval(f'SELECT COUNT(*) FROM ONLY "{schema}".signal_log WHERE id=$1', signal.id) == 0
+            return
         if deny_cancel:
             from kestrel_sovereign.execution_custody import is_execution_control_error, execution_commit_outcome, _explicit_control_chain
             assert is_execution_control_error(outcome.error), 'TLS-denied cancellation/rollback cannot report a healthy journal'
@@ -354,6 +376,50 @@ async def test_postgres_pinned_peer_keeps_native_tls_identity_on_reconnect(dispa
                         await pool.close()
         finally:
             await retire_proxy()
+
+
+async def test_postgres_original_journal_refuses_effective_durability_drift(dispatcher_components, native_pg, monkeypatch):
+    from kestrel_sovereign._async_ownership import await_owned_task
+    from kestrel_sovereign.execution_custody import ExecutionCustody, bind_execution_runtime, is_execution_control_error, execution_commit_outcome
+    from kestrel_sovereign.storage.db.native_journal_programs import NativeJournalPostgresConnection
+    from tests.unit.test_signal_outcome_terminal_custody import _OriginalWork
+    from tests.unit.test_signals_dispatcher import _action_reg, _signal
+    c = dispatcher_components
+    _, control, schema = native_pg
+    role = await control.fetchval('SELECT SESSION_USER')
+    quoted_role = '"' + role.replace('"', '""') + '"'
+    pool = await _fresh_journal_pool(c.backend._pool, min_size=1, max_size=1, ssl='disable')
+    original_pool = c.backend._pool
+    c.backend._pool = pool
+    observed = []
+    principal = NativeJournalPostgresConnection._original_journal_principal
+    async def observe_principal(connection):
+        observed.append(await connection.fetchval('SHOW synchronous_commit'))
+        return await principal(connection)
+    monkeypatch.setattr(NativeJournalPostgresConnection, '_original_journal_principal', observe_principal)
+    scope = ExecutionCustody(_OriginalWork(backend_type='postgres'))
+    async def handler(payload):
+        await control.execute(f'ALTER ROLE {quoted_role} SET synchronous_commit=off')
+        async with pool.acquire() as connection:
+            await connection.close()
+        scope.revoke('actual work cutoff before changed role-default reconnect')
+        return {'genuine': True}
+    signal = _signal('native.durability.reconnect')
+    c.registry.register(_action_reg(signal.source, handler=handler))
+    try:
+        with bind_execution_runtime(SimpleNamespace(_execution_custody=scope)):
+            outcome = await await_owned_task(asyncio.create_task(c.dispatcher.dispatch_signal(signal)))
+        assert observed == ['on', 'off'], 'actual new session did not inherit changed role durability'
+        assert is_execution_control_error(outcome.error), 'journal acknowledged asynchronously committed replacement session'
+        assert execution_commit_outcome(outcome.error) is None
+        assert await control.fetchval(f'SELECT COUNT(*) FROM ONLY "{schema}".signal_log WHERE id=$1', signal.id) == 0
+    finally:
+        c.backend._pool = original_pool
+        try:
+            await control.execute(f'ALTER ROLE {quoted_role} RESET synchronous_commit')
+        finally:
+            async with asyncio.timeout(10):
+                await pool.close()
 
 
 @pytest.mark.parametrize('direct_tls', [False, True])
