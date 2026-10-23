@@ -299,6 +299,7 @@ class _OriginalPostgresJournalPool:
         # Reuse already-loaded CA/client-key/protocol policy. Rebuilding an
         # SSLContext from a mode string would reread mutable PGSSL* variables
         # and trust files after the original admission.
+        original_kwargs['ssl'] = self.tls_context if self.tls_context is not None else False
         if tls_server_hostname is not None:
             from kestrel_sovereign.storage.db.native_journal_programs import _OriginalJournalConnectLoop
             # asyncpg uses its host both for dialing and TLS identity. Dial the
