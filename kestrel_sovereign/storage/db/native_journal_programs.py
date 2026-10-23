@@ -369,6 +369,7 @@ else:
                 address = _native_tcp_endpoint(peer)
                 tls = connection._transport.get_extra_info('ssl_object')
                 name = tls.server_hostname if tls is not None else None
+                loop = _OriginalJournalConnectLoop(loop, address, name)
             elif type(peer) is str:
                 address = peer
             else:
