@@ -370,7 +370,9 @@ else:
             # session negotiated TLS. Cancellation carries a backend secret;
             # it must never inherit plaintext fallback from that recipe.
             from asyncpg.connect_utils import SSLMode
-            params = connection._params
+            params = connection._params._replace(
+                ssl=tls.context if tls is not None else False,
+                sslmode=SSLMode.require if tls is not None else SSLMode.disable)
             if type(peer) is tuple:
                 address = _native_tcp_endpoint(peer)
                 name = tls.server_hostname if tls is not None else None

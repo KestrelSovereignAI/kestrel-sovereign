@@ -1405,7 +1405,7 @@ class SignalDispatcher:
         )
         journal_completion = []
         from kestrel_sovereign.signals.outcome_custody import _native_identity_text
-        enqueued_signal_id = signal.id
+        enqueued_signal_id = _native_identity_text(signal.id)
         coro = self.dispatch_signal(
             signal,
             source_event_id=source_event_id,
@@ -5308,7 +5308,7 @@ class SignalDispatcher:
                 if is_execution_control_error(error):
                     await self._terminalize_failed_cognition(delivery, error)
                 else:
-                    await self._release_retained_durable_cognition_task(delivery)
+                    await self._release_retained_durable_cognition_task(delivery, observe_failure=True)
             except BaseException as cleanup:
                 raise execution_observation_error(error, cleanup) from None
             raise
