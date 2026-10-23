@@ -23,6 +23,7 @@ from kestrel_sdk.tools.result import ToolResultStatus
 
 from kestrel_sovereign.agent.context_builder import ContextBuilder
 from kestrel_sovereign.auth import CallerContext
+from kestrel_sovereign.bootstrap import service as service_module
 from kestrel_sovereign.bootstrap.service import (
     BootstrapService,
     SoulRevisionOutcome,
@@ -611,6 +612,98 @@ async def test_concurrent_promotions_on_postgresql_allocate_distinct_versions(
 
 
 @pytest.mark.asyncio
+async def test_concurrent_revisions_record_the_version_each_one_replaced(
+    engine, agent_dir, monkeypatch
+):
+    """Both revisions inspect v1; the one stored second replaced v2, not v1.
+
+    The store reads the version it replaces under its version lock. Taken
+    from the revision's own earlier inspection, v3 claimed to replace v1.
+    """
+    await _seed_engine(engine, agent_dir)
+    first_raw, first_storage = await _engine_open(engine)
+    second_raw, second_storage = await _engine_open(engine)
+    real_inspect = service_module.inspect_soul_file
+    interleaved: list = []
+
+    async def inspect_then_let_another_revision_land(storage, agent_data_path):
+        status = await real_inspect(storage, agent_data_path)
+        if storage is first_storage and not interleaved:
+            interleaved.append(status)
+            (agent_dir / "SOUL.md").write_text(THIRD, encoding="utf-8")
+            interleaved.append(
+                await _engine_service(
+                    engine, second_raw, second_storage, agent_dir
+                ).revise_soul(
+                    reason="second operator", revised_by=CallerContext.sovereign()
+                )
+            )
+        return status
+
+    monkeypatch.setattr(
+        service_module, "inspect_soul_file", inspect_then_let_another_revision_land
+    )
+    try:
+        outcome = await _engine_service(
+            engine, first_raw, first_storage, agent_dir
+        ).revise_soul(reason="first operator", revised_by=CallerContext.sovereign())
+    finally:
+        await first_raw.close()
+        await second_raw.close()
+
+    inspected, other = interleaved
+    assert (inspected.state, inspected.canonical_version) == (SoulFileState.FILE_DIFFERS, 1)
+    assert other.revised is True, other.message
+    assert (other.previous_version, other.version) == (1, 2)
+    assert outcome.revised is True, outcome.message
+    assert (outcome.previous_version, outcome.version) == (2, 3)
+    assert "(was v2)" in outcome.message
+
+    raw, _ = await _engine_open(engine)
+    try:
+        v2 = await raw.agent_resources.get_version(version=2)
+        v3 = await raw.get_current_agent_resource()
+        assert (v3.version, v3.content) == (3, REVISED)
+        assert v3.provenance["reason"] == "first operator"
+        assert v3.provenance["previous_version"] == 2
+        assert v3.provenance["previous_content_hash"] == v2.content_hash
+        assert v2.content_hash == soul_sha256(THIRD)
+        assert v2.provenance["reason"] == "second operator"
+        assert v2.provenance["previous_version"] == 1
+        assert v2.provenance["previous_content_hash"] == soul_sha256(ORIGINAL)
+    finally:
+        await raw.close()
+
+
+@pytest.mark.asyncio
+async def test_the_store_records_the_current_version_a_new_one_replaced(engine):
+    """Recorded for every writer, and it names the current version, not the latest."""
+    raw, _ = await _engine_open(engine)
+    try:
+        store = raw.agent_resources
+        first = await store.promote_soul_seed(ORIGINAL, created_by=engine.did)
+        assert "previous_version" not in first.provenance
+        assert "previous_content_hash" not in first.provenance
+
+        draft = await store.create_version(
+            SOUL_MARKDOWN_RESOURCE_TYPE,
+            REVISED,
+            created_by=engine.did,
+            source="draft",
+            make_current=False,
+        )
+        assert draft.version == 2
+        assert "previous_version" not in draft.provenance
+
+        third = await store.promote_soul_seed(THIRD, created_by=engine.did)
+        assert third.version == 3
+        assert third.provenance["previous_version"] == 1
+        assert third.provenance["previous_content_hash"] == soul_sha256(ORIGINAL)
+    finally:
+        await raw.close()
+
+
+@pytest.mark.asyncio
 async def test_a_failed_graph_reference_rolls_the_new_version_back(
     engine, agent_dir, monkeypatch
 ):
@@ -642,6 +735,49 @@ async def test_a_failed_graph_reference_rolls_the_new_version_back(
         await raw.close()
 
     await _assert_restart_keeps_v1(engine, agent_dir, v1, node_before)
+
+
+@pytest.mark.asyncio
+async def test_a_failed_soul_edge_write_keeps_the_published_version(
+    engine, agent_dir, monkeypatch
+):
+    """The agent edge is best-effort inside the unit; its failure costs only itself.
+
+    The edge writer opens its own transaction scope, which nests as a
+    savepoint on PostgreSQL. A statement failing inside it is undone alone;
+    joined without one, it would abort the whole unit and the swallowed error
+    would let the commit discard a version the revision reports as stored.
+    """
+    await _seed_engine(engine, agent_dir)
+    raw, storage = await _engine_open(engine)
+    try:
+        attempted: list[tuple] = []
+
+        async def failing_edge(*args, **kwargs):
+            async with raw.db.transaction():
+                attempted.append(args)
+                await raw.db.execute("SELECT * FROM no_such_table_3779")
+
+        monkeypatch.setattr(raw, "add_edge", failing_edge)
+        outcome = await _engine_service(engine, raw, storage, agent_dir).revise_soul(
+            reason="accept Emma's signing DID", revised_by=CallerContext.sovereign()
+        )
+        monkeypatch.undo()
+
+        assert [args[:2] for args in attempted] == [(engine.did, f"{engine.did}#soul")]
+        assert outcome.revised is True, outcome.message
+        assert outcome.version == 2
+    finally:
+        await raw.close()
+
+    raw, _ = await _engine_open(engine)
+    try:
+        assert await _soul_rows(raw, engine.did) == [(1, False), (2, True)]
+        node = await raw.get_node(f"{engine.did}#soul")
+        assert node.properties["current_version"] == 2
+        assert node.properties["provenance"]["reason"] == "accept Emma's signing DID"
+    finally:
+        await raw.close()
 
 
 @pytest.mark.asyncio
@@ -829,7 +965,14 @@ async def test_inspect_soul_file_reports_an_unreadable_side_as_unverified(agent_
 async def test_extra_provenance_cannot_replace_store_written_fields(tmp_path):
     raw, _ = await _open(tmp_path)
     try:
-        for field in ("created_by", "source", "created_at", "signature"):
+        for field in (
+            "created_by",
+            "source",
+            "created_at",
+            "signature",
+            "previous_version",
+            "previous_content_hash",
+        ):
             with pytest.raises(ValueError, match=field):
                 await raw.promote_soul_seed(
                     ORIGINAL, created_by=AGENT_ID, provenance={field: "forged"}
@@ -897,6 +1040,92 @@ async def test_revise_soul_command_reports_a_refusal_as_a_failure():
     message = await handler.handle("!revise-soul fix", caller=CallerContext.sovereign())
     assert message == "❌ Not revised"
     builder.load_canonical_soul_resource.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("session_loads", [True, False])
+async def test_revise_soul_command_reloads_the_session_when_unchanged(session_loads):
+    agent, _, builder = _command_agent(
+        SoulRevisionOutcome(
+            revised=False, unchanged=True, version=1,
+            message="SOUL.md already is the canonical SOUL (v1); nothing to revise.",
+        )
+    )
+    builder.load_canonical_soul_resource.return_value = session_loads
+    handler = CommandHandler(agent, task_manager=MagicMock())
+    message = await handler.handle("!revise-soul fix", caller=CallerContext.sovereign())
+    builder.load_canonical_soul_resource.assert_awaited_once()
+    if session_loads:
+        assert message.startswith("✅ SOUL.md already is the canonical SOUL (v1)")
+    else:
+        assert message.startswith("⚠")
+        assert "did not load the canonical SOUL" in message
+
+
+def _real_command_handler(raw, builder, agent_dir) -> CommandHandler:
+    agent = SimpleNamespace(
+        bootstrap_service=_service(raw, builder.storage, agent_dir),
+        context_builder=builder,
+        storage=builder.storage,
+    )
+    return CommandHandler(agent, task_manager=MagicMock())
+
+
+@pytest.mark.asyncio
+async def test_an_unchanged_revision_still_reloads_a_divergent_session(
+    tmp_path, agent_dir
+):
+    """A SOUL.md reloaded and then restored leaves the session out of step.
+
+    The file is canonical again, so nothing is stored, but the running
+    session still served the reloaded text until the command reloaded it.
+    """
+    await _seed_canonical(tmp_path, agent_dir)
+    raw, builder = await _boot(tmp_path, agent_dir)
+    try:
+        (agent_dir / "SOUL.md").write_text(REVISED, encoding="utf-8")
+        await _reload_feature(builder.storage, builder, agent_dir).bootstrap_reload()
+        assert builder._soul_content == REVISED
+        (agent_dir / "SOUL.md").write_text(ORIGINAL, encoding="utf-8")
+
+        message = await _real_command_handler(raw, builder, agent_dir).handle(
+            "!revise-soul restore the canonical role", caller=CallerContext.sovereign()
+        )
+
+        assert message.startswith("✅"), message
+        assert "already is the canonical SOUL (v1)" in message
+        assert builder._soul_content == ORIGINAL
+        assert await _version_count(raw) == 1
+    finally:
+        await raw.close()
+
+
+@pytest.mark.asyncio
+async def test_revise_soul_command_end_to_end_survives_a_restart(tmp_path, agent_dir):
+    """Edit, reload, revise through the real command, restart: the edit stays."""
+    await _seed_canonical(tmp_path, agent_dir)
+    raw, builder = await _boot(tmp_path, agent_dir)
+    try:
+        (agent_dir / "SOUL.md").write_text(REVISED, encoding="utf-8")
+        await _reload_feature(builder.storage, builder, agent_dir).bootstrap_reload()
+        message = await _real_command_handler(raw, builder, agent_dir).handle(
+            "!revise-soul accept Emma's signing DID", caller=CallerContext.sovereign()
+        )
+        assert message.startswith("✅ SOUL.md is now canonical SOUL v2 (was v1)"), message
+        assert builder._soul_content == REVISED
+    finally:
+        await raw.close()
+
+    raw, builder = await _boot(tmp_path, agent_dir)
+    try:
+        assert builder._soul_content == REVISED
+        current = await raw.get_current_agent_resource()
+        assert current.version == 2
+        assert current.provenance["reason"] == "accept Emma's signing DID"
+        assert current.provenance["revised_by"]["role"] == "sovereign"
+        assert current.provenance["previous_version"] == 1
+    finally:
+        await raw.close()
 
 
 def test_soul_revision_is_not_an_agent_tool():

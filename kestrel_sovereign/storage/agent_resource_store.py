@@ -27,9 +27,18 @@ SOUL_MARKDOWN_RESOURCE_TYPE = "agent.soul.markdown"
 
 # Provenance fields the store writes itself. A caller's extra provenance (the
 # reason and actor of a SOUL revision, #3779) may add fields but never replace
-# these.
+# these. ``previous_version`` and ``previous_content_hash`` name the version a
+# new current version replaced, read under the version lock, so no caller can
+# claim a predecessor it inspected before another writer replaced it.
 _RESERVED_PROVENANCE_FIELDS = frozenset(
-    {"created_by", "source", "created_at", "signature"}
+    {
+        "created_by",
+        "source",
+        "created_at",
+        "signature",
+        "previous_version",
+        "previous_content_hash",
+    }
 )
 
 
@@ -112,8 +121,13 @@ class AgentResourceStore:
             anchoring_metadata: Optional public anchoring/export pointers.
             public_metadata: Additional safe metadata. The body is never copied.
             provenance: Additional provenance recorded on this version, such
-                as why it was made and by whom. It may not set
-                ``created_by``, ``source``, ``created_at`` or ``signature``.
+                as why it was made and by whom. It may not set a field the
+                store writes itself: ``created_by``, ``source``,
+                ``created_at``, ``signature``, ``previous_version`` or
+                ``previous_content_hash``.
+
+        A version made current records the version it replaced, if one was
+        current, as ``previous_version`` and ``previous_content_hash``.
         """
         check_version_request(resource_type, content, provenance)
 
@@ -146,6 +160,9 @@ class AgentResourceStore:
             }
             if signature:
                 recorded_provenance["signature"] = signature
+            if make_current and existing and existing["is_current"]:
+                recorded_provenance["previous_version"] = existing["version"]
+                recorded_provenance["previous_content_hash"] = existing["content_hash"]
 
             safe_public = {
                 "resource_id": resource_id,
@@ -310,7 +327,8 @@ class AgentResourceStore:
     async def _current_or_latest(self, resource_type: str) -> Optional[Dict[str, Any]]:
         row = await self.db.fetchone(
             """
-            SELECT resource_id FROM agent_identity_resources
+            SELECT resource_id, version, content_hash, is_current
+            FROM agent_identity_resources
             WHERE agent_id = ? AND resource_type = ?
             ORDER BY is_current DESC, version DESC
             LIMIT 1
@@ -319,7 +337,12 @@ class AgentResourceStore:
         )
         if not row:
             return None
-        return {"resource_id": row[0]}
+        return {
+            "resource_id": row[0],
+            "version": int(row[1]),
+            "content_hash": row[2],
+            "is_current": bool(row[3]),
+        }
 
     def _row_to_resource(self, row: tuple[Any, ...]) -> AgentResourceVersion:
         ciphertext = row[6]

@@ -479,8 +479,8 @@ To keep an edit, the Sovereign makes the file the new stored version:
 ```
 
 Run it in the console or through the invoke API with the API key. It reads
-`SOUL.md`, stores it as a new version, records the reason and who ran it on
-that version, and loads it into the session. The agent cannot run it on
+`SOUL.md`, stores it as a new version, records the reason, who ran it and
+the version it replaced on that version, and loads it into the session. The agent cannot run it on
 itself: it is a sovereign command, not a tool. It is refused in the
 `ephemeral`, `isolated` and `deidentified` privacy modes, which store no SOUL.
 `!bootstrap-status` shows whether `SOUL.md` matches the stored version.

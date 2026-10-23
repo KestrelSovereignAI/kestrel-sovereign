@@ -906,14 +906,17 @@ class CommandHandler:
             outcome = await service.revise_soul(reason=reason, revised_by=caller)
         except PermissionError as e:
             return f"🚨 Unauthorized: {e}"
-        if not outcome.revised:
-            return f"{'✅' if outcome.unchanged else '❌'} {outcome.message}"
+        if not (outcome.revised or outcome.unchanged):
+            return f"❌ {outcome.message}"
+        # Unchanged too: the session may still hold a SOUL.md reloaded since,
+        # and a revision stored before a failed session load is retried as
+        # unchanged. Either way the session must serve what boot serves.
         builder = getattr(self.agent, "context_builder", None)
         if builder is None or not await builder.load_canonical_soul_resource():
             return (
                 f"⚠ {outcome.message}\n"
-                "The running session did not load it; it takes effect at the "
-                "next restart."
+                "The running session did not load the canonical SOUL; it "
+                "takes effect at the next restart."
             )
         return f"✅ {outcome.message}"
 
