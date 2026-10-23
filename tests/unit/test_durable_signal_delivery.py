@@ -527,9 +527,6 @@ async def _assert_pre_route_claim(tmp_path, monkeypatch, public_handle, release_
             refused = False
             join_refused = False
             def add_done_callback(self, callback, *args, **kwargs):
-                if phase == 'publication_cancel_source' and not self.join_refused and getattr(callback, '__name__', '') == 'mark_complete':
-                    self.join_refused = True
-                    raise join_error
                 if not self.refused and getattr(callback, '__name__', '') == 'close_unstarted':
                     self.refused = True
                     if phase == 'publication_after':
@@ -538,6 +535,11 @@ async def _assert_pre_route_claim(tmp_path, monkeypatch, public_handle, release_
                         asyncio.current_task().cancel('actual caller withdrawal during physical publication reconciliation')
                     raise publication_error
                 return super().add_done_callback(callback, *args, **kwargs)
+            def remove_done_callback(self, callback):
+                if phase == 'publication_cancel_source' and not self.join_refused and getattr(callback, '__name__', '') == 'mark_complete':
+                    self.join_refused = True
+                    raise join_error
+                return super().remove_done_callback(callback)
         def factory(loop, coroutine, **kwargs):
             operation = _actual_operation(coroutine)
             if getattr(getattr(operation, 'cr_code', None), 'co_name', '') == 'route_durable_cognition':
@@ -9600,8 +9602,11 @@ async def test_stop_completion_waits_for_durable_cognition_terminalization(
         )
         [delivery] = await dispatcher.list_durable_deliveries()
         assert delivery.status == (
-            TERMINAL_ACKABLE if terminalization_succeeds else LEASED
+            TERMINAL_ACKABLE if terminalization_succeeds else FAILED
         )
+        # Failed Stop settlement is non-ACKable, but never replayable or left
+        # on an expiring lease after its original physical route has ended.
+        assert delivery.lease_expires_at is None
     finally:
         allow_terminalization.set()
         # A turn this test never stopped would otherwise hold shutdown until
@@ -9808,7 +9813,7 @@ async def test_cancelled_durable_settlement_abandons_lifecycle_generation(
             is RequestCompletionDisposition.ABANDONED
         )
         [delivery] = await dispatcher.list_durable_deliveries()
-        assert delivery.status == LEASED
+        assert delivery.status == RETRY and delivery.lease_expires_at is None
     finally:
         allow_ack.set()
         if handle is not None and not handle.task.done():

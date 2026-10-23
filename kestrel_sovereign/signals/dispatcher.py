@@ -3000,10 +3000,12 @@ class SignalDispatcher:
         """Harvest cleanup callbacks before their owner can become reclaimable."""
         while self._retained_durable_cognition_cleanup_tasks:
             tasks = tuple(self._retained_durable_cognition_cleanup_tasks)
-            await asyncio.gather(
-                *(asyncio.shield(task) for task in tasks),
-                return_exceptions=True,
-            )
+            # Wait through the completion callback queue as well as physical
+            # Task completion. gather() may return synchronously for an
+            # already-finished batch (3.14), starving the harvest callbacks
+            # that remove it and publish its debt. wait() neither cancels
+            # these owners nor retrieves/overwrites their original errors.
+            await asyncio.wait(tasks)
         # A failed/cancelled fixed terminalizer is retained debt, not permission
         # to stop the owner and let ordinary recovery replay its delivery. One
         # bounded exact-token retry per shutdown attempt; no detached retry loop.
@@ -4894,7 +4896,7 @@ class SignalDispatcher:
         from kestrel_sovereign._async_ownership import OwnedTaskAdmission
         journals = _journal_completion if _journal_completion is not None else []
         routing_admission = OwnedTaskAdmission() if claimed_delivery is not None else None
-        guard = (self._own_unrouted_cognition_claim(claimed_delivery, routing_admission, journal_completion=journals)
+        guard = (self._own_cognition_claim(claimed_delivery, routing_admission, journal_completion=journals)
                  if routing_admission is not None else nullcontext())
         async with guard:
             return await self._route_durable_cognition_delivery_body(
@@ -5076,7 +5078,7 @@ class SignalDispatcher:
         from kestrel_sovereign._async_ownership import OwnedTaskAdmission
         journals = _journal_completion if _journal_completion is not None else []
         routing_admission = _routing_admission if _routing_admission is not None else OwnedTaskAdmission()
-        guard = (self._own_unrouted_cognition_claim(delivery, routing_admission, journal_completion=journals)
+        guard = (self._own_cognition_claim(delivery, routing_admission, journal_completion=journals)
                  if _routing_admission is None else nullcontext())
         async with guard:
             return await self._run_original_cognition_claim(
@@ -5223,7 +5225,7 @@ class SignalDispatcher:
         from kestrel_sovereign._async_ownership import OwnedTaskAdmission
         from contextlib import nullcontext
         routing_admission = _routing_admission if _routing_admission is not None else OwnedTaskAdmission()
-        guard = (self._own_unrouted_cognition_claim(delivery, routing_admission, journal_completion=_journal_completion)
+        guard = (self._own_cognition_claim(delivery, routing_admission, journal_completion=_journal_completion)
                  if _routing_admission is None else nullcontext())
         async with guard, self._admit_durable_operation():
             token = self._original_outcome_admission.set(None)
@@ -5282,13 +5284,12 @@ class SignalDispatcher:
                 self._deferred_outcome_logs.reset(deferred_token)
 
     @asynccontextmanager
-    async def _own_unrouted_cognition_claim(self, delivery, routing_admission, *, journal_completion=()):
-        """One exact-token owner from claim admission to physical route publication.
+    async def _own_cognition_claim(self, delivery, routing_admission, *, journal_completion=()):
+        """Own the exact claim through routing AND its native settlement.
 
-        Before publication there is no retained child/done callback to settle
-        this claim. Every escaping failure (including finite grouped caller
-        withdrawal) must therefore finish its native release here. Once an
-        actual Task exists, the established route settlement owns that token.
+        A published or completed routing Task is not an ACK/NACK receipt.
+        Live effects transfer to the retained child owner; physically finished
+        routes must reconcile the original token before this scope can exit.
         """
         def retain(error):
             for journal in journal_completion:
@@ -5297,10 +5298,18 @@ class SignalDispatcher:
         try:
             yield
         except BaseException as error:
-            if routing_admission.task is not None:
-                raise retain(error)
             try:
+                routing_task = routing_admission.task
                 if is_execution_control_error(error):
+                    error = await self._settle_cognition_control(delivery, error, routing_task)
+                elif routing_task is not None and not routing_task.done():
+                    await self._cancel_durable_cognition_routing_task(routing_task, delivery=delivery)
+                elif (routing_task is not None and not routing_task.cancelled()
+                      and routing_task.exception() is None
+                      and isinstance(routing_task.result(), _StoppedCognitionResult)):
+                    # A proven operator Stop must never become replayable
+                    # merely because its intended terminal NACK failed. Own
+                    # a non-ACKable FAILED receipt, not an ordinary retry.
                     await self._terminalize_failed_cognition(delivery, error)
                 else:
                     await self._release_retained_durable_cognition_task(delivery, observe_failure=True)
@@ -5308,7 +5317,10 @@ class SignalDispatcher:
                 raise retain(execution_observation_error(error, cleanup)) from None
             raise retain(error)
         else:
-            if routing_admission.task is None:
+            routing_task = routing_admission.task
+            if routing_task is not None and not routing_task.done():
+                self._retain_durable_cognition_task(routing_task, delivery=delivery)
+            else:
                 # Ordinary refusal paths can return a FAILED/HOLD result.
                 # Their original-token CAS is idempotent if that path already
                 # settled the delivery; no unowned live lease may escape just
@@ -5597,7 +5609,7 @@ class SignalDispatcher:
                 if not routing_task.done():
                     routing_task.cancel()
                 self._retain_durable_cognition_task(routing_task, delivery=delivery)
-            raise
+            raise error
 
         except BaseException as error:
             if routing_task is None and routing_admission.task is not None:
@@ -6096,9 +6108,8 @@ class SignalDispatcher:
                 owners.pop(key, None)
             self._retained_cognition_control_debt.pop(delivery.delivery_id, None)
         if opening is not None or outcome.error is not None or outcome.cancellation is not None:
-            terminal = execution_finite_error(
+            terminal = execution_observation_error(
                 error, opening, outcome.error, outcome.cancellation,
-                retain_originals=True, isolate_control_originals=True,
             )
             if outcome.error is not None:
                 # An observer's finite C and ordinary retryable metadata error
