@@ -981,10 +981,9 @@ async def test_postgres_successor_journal_reuses_physically_reset_connection(dis
     @asynccontextmanager
     async def observe_checkout(*args, **kwargs):
         async with original_checkout(*args, **kwargs) as acquired:
-            # A successor now seals its admission checkout too, before its
-            # terminal writer exists. Observe that actual earlier borrow.
-            journal = c.dispatcher._original_outcome_writer.get() or c.dispatcher._original_outcome_admission.get()
-            if held and journal is not None and journal._postgres_session is None:
+            # Observe the SAME actual native socket, not a journal ContextVar
+            # which is published only AFTER admission capture has finished.
+            if held and acquired[0]._con is natives[0]:
                 successor_acquired.set()
             yield acquired
     monkeypatch.setattr(c.backend, '_tracked_pool_checkout', observe_checkout)
