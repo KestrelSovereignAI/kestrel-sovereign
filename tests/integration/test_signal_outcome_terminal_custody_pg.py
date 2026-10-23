@@ -192,8 +192,8 @@ async def test_postgres_reconnect_pins_actual_socket_peer_across_dns_change(disp
                 await retire_original()
 
 
-@pytest.mark.parametrize('direct_tls,journal_cancel,trust_change', [(False, False, False), (True, False, False), (False, True, False), (False, False, True), (True, False, True)])
-async def test_postgres_pinned_peer_keeps_native_tls_identity_on_reconnect(dispatcher_components, native_pg, monkeypatch, tmp_path, direct_tls, journal_cancel, trust_change):
+@pytest.mark.parametrize('direct_tls,journal_cancel,trust_change,sibling', [(False, False, False, False), (True, False, False, False), (False, True, False, False), (False, False, True, False), (True, False, True, False), (False, False, False, True), (True, False, False, True)])
+async def test_postgres_pinned_peer_keeps_native_tls_identity_on_reconnect(dispatcher_components, native_pg, monkeypatch, tmp_path, direct_tls, journal_cancel, trust_change, sibling):
     from kestrel_sovereign._async_ownership import await_owned_task
     from kestrel_sovereign.execution_custody import ExecutionCustody, bind_execution_runtime
     from tests.unit.test_native_journal_programs import _owned_tls_contexts
@@ -228,9 +228,10 @@ async def test_postgres_pinned_peer_keeps_native_tls_identity_on_reconnect(dispa
     original_pool = c.backend._pool
     pool = None
     locked = []
+    held = []
     release_owner = None
     try:
-        pool = await _fresh_journal_pool(original_pool, min_size=1, max_size=1,
+        pool = await _fresh_journal_pool(original_pool, min_size=2 if sibling else 1, max_size=2 if sibling else 1,
             host=alias, port=endpoint[1], ssl='verify-full', direct_tls=direct_tls, timeout=3, command_timeout=1)
         c.backend._pool = pool
         if journal_cancel:
@@ -245,9 +246,18 @@ async def test_postgres_pinned_peer_keeps_native_tls_identity_on_reconnect(dispa
             release_owner = asyncio.create_task(release_after_cancellation())
         scope = ExecutionCustody(_OriginalWork(backend_type='postgres'))
         async def handler(payload):
-            async with pool.acquire() as connection:
-                if not journal_cancel:
-                    await connection.close()
+            if sibling:
+                connection = await pool.acquire()
+                held.append(connection)
+                sibling_connection = await pool.acquire()
+                try:
+                    assert sibling_connection._con._transport.get_extra_info('ssl_object').context is not connection._con._transport.get_extra_info('ssl_object').context
+                finally:
+                    await pool.release(sibling_connection)
+            else:
+                async with pool.acquire() as connection:
+                    if not journal_cancel:
+                        await connection.close()
             if trust_change:
                 monkeypatch.setenv('PGSSLROOTCERT', str(tmp_path / 'not-the-admitted-root.pem'))
             if journal_cancel:
@@ -265,7 +275,7 @@ async def test_postgres_pinned_peer_keeps_native_tls_identity_on_reconnect(dispa
             released = await await_owned_task(release_owner)
             assert released.error is None
         assert outcome.error is None, 'numeric peer reconnect lost actual TLS hostname verification'
-        assert names == [alias, alias], 'original native admission and terminal reconnect must use the same TLS SNI'
+        assert names == [alias] * (3 if sibling else 2), 'original admission, sibling and terminal reconnect must use the same TLS SNI'
         assert await control.fetchval(f'SELECT COUNT(*) FROM ONLY "{schema}".signal_log WHERE id=$1', signal.id) == int(not journal_cancel)
         if journal_cancel:
             assert c.dispatcher._log_write_failures == 1
@@ -303,6 +313,8 @@ async def test_postgres_pinned_peer_keeps_native_tls_identity_on_reconnect(dispa
                     await control.execute('ROLLBACK')
             finally:
                 if pool is not None:
+                    for connection in held:
+                        await pool.release(connection)
                     async with asyncio.timeout(10):
                         await pool.close()
         finally:
@@ -340,7 +352,7 @@ async def test_native_tls_proxy_retires_after_actual_pool_close_reports_failure(
     try:
         with pytest.raises(OSError) as caught:
             await test_postgres_pinned_peer_keeps_native_tls_identity_on_reconnect(
-                dispatcher_components, native_pg, monkeypatch, tmp_path, direct_tls, False, False)
+                dispatcher_components, native_pg, monkeypatch, tmp_path, direct_tls, False, False, False)
         assert caught.value is physical
         assert proxies and len(retired) == len(proxies), 'actual pool close failure skipped independent proxy retirement'
         assert all(not server.is_serving() for server, _ in proxies)

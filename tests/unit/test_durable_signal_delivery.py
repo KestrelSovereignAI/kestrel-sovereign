@@ -264,7 +264,8 @@ async def _channel_dispatcher(path, did: str, *, rate_limit: RateLimit | None = 
     return backend, agent, dispatcher
 
 
-async def test_recovery_journal_admission_failure_settles_original_delivery_lease(tmp_path):
+@pytest.mark.parametrize('ordinary_cleanup_failure', [False, True])
+async def test_recovery_journal_admission_failure_settles_original_delivery_lease(tmp_path, monkeypatch, ordinary_cleanup_failure):
     from kestrel_sovereign._async_ownership import await_owned_task
     from kestrel_sovereign.execution_custody import is_execution_control_error
     path = tmp_path / 'actual-recovery-journal-admission.db'
@@ -295,8 +296,25 @@ async def test_recovery_journal_admission_failure_settles_original_delivery_leas
     agent.process_input = must_not_start
     try:
         await dispatcher.register_durable_consumer(consumer)
-        await backend.execute('CREATE TRIGGER unsupported_recovery_audit AFTER INSERT ON signal_log BEGIN SELECT 1; END')
+        if ordinary_cleanup_failure:
+            recover = dispatcher._signal_for_durable_retry
+            async def unsupported_recovery(*args, **kwargs):
+                recovered = await recover(*args, **kwargs)
+                recovered.payload['unsupported'] = object()
+                return recovered
+            monkeypatch.setattr(dispatcher, '_signal_for_durable_retry', unsupported_recovery)
+            await backend.execute("CREATE TRIGGER refuse_actual_release BEFORE UPDATE ON durable_signal_deliveries WHEN OLD.status='leased' AND NEW.status!='leased' BEGIN SELECT RAISE(ABORT, 'actual release refused'); END")
+        else:
+            await backend.execute('CREATE TRIGGER unsupported_recovery_audit AFTER INSERT ON signal_log BEGIN SELECT 1; END')
         result = await await_owned_task(asyncio.create_task(dispatcher._drain_durable_cognition_consumer(consumer.consumer_id)))
+        if ordinary_cleanup_failure:
+            from kestrel_sovereign.execution_custody import _explicit_control_chain
+            errors = tuple(_explicit_control_chain(result.error))
+            assert any(isinstance(error, TypeError) for error in errors)
+            assert any('actual release refused' in str(error) for error in errors), 'admission cleanup hid actual native release failure'
+            assert not calls and not dispatcher._accepted_signal_outcomes
+            await backend.execute('DROP TRIGGER refuse_actual_release')
+            return
         assert is_execution_control_error(result.error)
         (delivery,) = await dispatcher.list_durable_deliveries()
         assert delivery.attempts == 2 and not calls
