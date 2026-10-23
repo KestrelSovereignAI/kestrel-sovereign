@@ -104,7 +104,8 @@ async def _owned_native_pg_proxy(bind_host, bind_port, target, *, tls_context=No
 
 
 @pytest.mark.parametrize('host,changed_host', [('127.0.0.1', '::1'), ('::1', '127.0.0.1')])
-async def test_postgres_reconnect_pins_actual_socket_peer_across_dns_change(dispatcher_components, native_pg, monkeypatch, host, changed_host):
+@pytest.mark.parametrize('reconnect', [True, False])
+async def test_postgres_reconnect_pins_actual_socket_peer_across_dns_change(dispatcher_components, native_pg, monkeypatch, host, changed_host, reconnect):
     from kestrel_sovereign._async_ownership import await_owned_task
     from kestrel_sovereign.execution_custody import ExecutionCustody, bind_execution_runtime
     from tests.unit.test_signal_outcome_terminal_custody import _OriginalWork
@@ -131,17 +132,31 @@ async def test_postgres_reconnect_pins_actual_socket_peer_across_dns_change(disp
     retire_proxy = None
     original_pool = c.backend._pool
     pool = None
+    locked = []
+    cancellations = []
+    from kestrel_sovereign.storage.db.native_journal_programs import NativeJournalPostgresConnection
+    cancel = NativeJournalPostgresConnection._cancel
+    async def observe_cancel(connection, waiter):
+        if connection._journal_program_seal is not None:
+            cancellations.append(asyncio.current_task())
+        return await cancel(connection, waiter)
+    monkeypatch.setattr(NativeJournalPostgresConnection, '_cancel', observe_cancel)
     try:
         _, retire_proxy = await _owned_native_pg_proxy(changed_host, port, target, on_accept=accepted_peers.append)
         pool = await _fresh_journal_pool(original_pool, min_size=1, max_size=1,
-            host=alias, port=port, ssl='disable', timeout=2)
+            host=alias, port=port, ssl='disable', timeout=2, command_timeout=1)
         c.backend._pool = pool
         scope = ExecutionCustody(_OriginalWork(backend_type='postgres'))
         effects = []
         async def handler(payload):
             async with pool.acquire() as connection:
                 assert connection._con._transport.get_extra_info('peername')[:2] == (host, port)
-                await connection.close()
+                if reconnect:
+                    await connection.close()
+            if not reconnect:
+                await control.execute('BEGIN')
+                locked.append(True)
+                await control.execute(f'LOCK TABLE "{schema}".signal_log IN ACCESS EXCLUSIVE MODE')
             effects.append('genuinely completed effect before DNS changes')
             changed.append(True)
             scope.revoke('actual work cutoff after original native session closed')
@@ -150,16 +165,25 @@ async def test_postgres_reconnect_pins_actual_socket_peer_across_dns_change(disp
         signal = _signal('native.socket.peer')
         with bind_execution_runtime(SimpleNamespace(_execution_custody=scope)):
             outcome = await await_owned_task(asyncio.create_task(c.dispatcher.dispatch_signal(signal)))
-        assert effects and outcome.error is None
+        assert effects
+        if reconnect:
+            assert outcome.error is None
+        else:
+            assert cancellations and all(owner.done() for owner in cancellations), 'actual reused-session native cancellation was not physically joined'
+            assert c.dispatcher._log_write_failures == 1
         assert len(original_peers) >= 2, 'original native socket was not actually reconnected'
         assert not accepted_peers, 'terminal reconnect followed changed DNS to a different actual socket peer'
-        assert await control.fetchval(f'SELECT COUNT(*) FROM ONLY "{schema}".signal_log WHERE id=$1', signal.id) == 1
+        assert await control.fetchval(f'SELECT COUNT(*) FROM ONLY "{schema}".signal_log WHERE id=$1', signal.id) == int(reconnect)
     finally:
         c.backend._pool = original_pool
         try:
-            if pool is not None:
-                async with asyncio.timeout(10):
-                    await pool.close()
+            try:
+                if locked:
+                    await control.execute('ROLLBACK')
+            finally:
+                if pool is not None:
+                    async with asyncio.timeout(10):
+                        await pool.close()
         finally:
             try:
                 if retire_proxy is not None:
