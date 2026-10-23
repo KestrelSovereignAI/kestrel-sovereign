@@ -171,8 +171,8 @@ async def test_postgres_reconnect_pins_actual_socket_peer_across_dns_change(disp
         else:
             assert cancellations and all(owner.done() for owner in cancellations), 'actual reused-session native cancellation was not physically joined'
             assert c.dispatcher._log_write_failures == 1
-        assert len(original_peers) >= 2, 'original native socket was not actually reconnected'
         assert not accepted_peers, 'terminal reconnect followed changed DNS to a different actual socket peer'
+        assert len(original_peers) >= 2, 'original native socket was not actually reconnected'
         assert await control.fetchval(f'SELECT COUNT(*) FROM ONLY "{schema}".signal_log WHERE id=$1', signal.id) == int(reconnect)
     finally:
         c.backend._pool = original_pool
@@ -262,6 +262,46 @@ async def test_postgres_pinned_peer_keeps_native_tls_identity_on_reconnect(dispa
             async with asyncio.timeout(10):
                 await pool.close()
         await retire_proxy()
+
+
+@pytest.mark.parametrize('direct_tls', [False, True])
+async def test_native_tls_proxy_retires_after_actual_pool_close_reports_failure(dispatcher_components, native_pg, monkeypatch, tmp_path, direct_tls):
+    import asyncpg
+    import sys
+    module = sys.modules[__name__]
+    proxy = _owned_native_pg_proxy
+    fresh = _fresh_journal_pool
+    close = asyncpg.Pool.close
+    selected, proxies, retired = [], [], []
+    physical = OSError('actual TLS pool closed but reporting failure')
+    async def observed_proxy(*args, **kwargs):
+        server, retire = await proxy(*args, **kwargs)
+        proxies.append((server, retire))
+        async def observed_retire():
+            await retire()
+            retired.append(server)
+        return server, observed_retire
+    async def observed_fresh(*args, **kwargs):
+        pool = await fresh(*args, **kwargs)
+        selected.append(pool)
+        return pool
+    async def failed_close(pool):
+        await close(pool)
+        if any(pool is original for original in selected):
+            raise physical
+    monkeypatch.setattr(module, '_owned_native_pg_proxy', observed_proxy)
+    monkeypatch.setattr(module, '_fresh_journal_pool', observed_fresh)
+    monkeypatch.setattr(asyncpg.Pool, 'close', failed_close)
+    try:
+        with pytest.raises(OSError) as caught:
+            await test_postgres_pinned_peer_keeps_native_tls_identity_on_reconnect(
+                dispatcher_components, native_pg, monkeypatch, tmp_path, direct_tls)
+        assert caught.value is physical
+        assert proxies and len(retired) == len(proxies), 'actual pool close failure skipped independent proxy retirement'
+        assert all(not server.is_serving() for server, _ in proxies)
+    finally:
+        for _server, retire in proxies:
+            await retire()
 
 
 @pytest.mark.parametrize('asynchronous', [False, True])

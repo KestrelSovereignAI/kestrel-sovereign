@@ -22,7 +22,7 @@ cleanup_pg = _cleanup_pg
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize('entry,earlier', [('unregister', False), ('activation', False), ('unregister', True)])
+@pytest.mark.parametrize('entry,earlier', [('unregister', False), ('activation', False), ('unregister', True), ('safe_mode', False)])
 async def test_finite_sql_rollback_withdrawal_finishes_independent_feature_cleanup(
     native_pg, onboarding_owner, monkeypatch, entry, earlier,
 ):
@@ -61,6 +61,10 @@ async def test_finite_sql_rollback_withdrawal_finishes_independent_feature_clean
             await database.execute('INSERT INTO host_rollback_effects VALUES (315)')
             return await super().shutdown()
     feature = Feature(agent)
+    if entry == 'safe_mode':
+        async def persist_safe_mode(reason, *, cause):
+            await feature.on_disable()
+        monkeypatch.setattr(agent, 'enter_safe_mode', persist_safe_mode)
     if entry == 'unregister':
         await agent._activate_feature_runtime(feature)
     early_error = OriginalFailure.capture(OSError('actual earlier contribution cleanup failure'))
@@ -71,8 +75,10 @@ async def test_finite_sql_rollback_withdrawal_finishes_independent_feature_clean
             deactivate(value)
             raise early_error.error
         monkeypatch.setattr(runtime, 'deactivate', fail_deactivate)
+    from kestrel_sovereign.kestrel_agent import enter_feature_lifecycle_safe_mode
     operation = (agent._unregister_feature_runtime(feature) if entry == 'unregister'
-                 else agent._activate_feature_runtime(feature))
+                 else enter_feature_lifecycle_safe_mode(agent, 'actual native persistence failure', features=(feature,))
+                 if entry == 'safe_mode' else agent._activate_feature_runtime(feature))
     owner = create_owned_task(operation, retain_originals=True)
     try:
         await asyncio.wait_for(entered.wait(), 5)
@@ -80,14 +86,14 @@ async def test_finite_sql_rollback_withdrawal_finishes_independent_feature_clean
         await asyncio.sleep(0)
         release.set()
         result = await await_owned_task(owner)
-        assert cleanup == ['actual feature shutdown'], 'finite withdrawal group skipped independent feature cleanup'
-        assert await database.fetchval('SELECT count(*) FROM host_rollback_effects WHERE id=315') == 1
+        assert cleanup == ([] if entry == 'safe_mode' else ['actual feature shutdown']), 'finite withdrawal group skipped independent feature cleanup'
+        assert await database.fetchval('SELECT count(*) FROM host_rollback_effects WHERE id=315') == int(entry != 'safe_mode')
         assert len(rollbacks) == 1 and rollbacks[0][1].done()
         chain = tuple(_explicit_control_chain(result.error))
         assert withdrawals and all(error in chain for error in withdrawals), 'activation cleanup dropped actual caller withdrawal'
         if entry == 'activation':
             assert opening in chain
-        else:
+        elif entry == 'unregister':
             assert rollbacks[0][2] in chain
         if earlier:
             early_error.assert_retained(result.error)

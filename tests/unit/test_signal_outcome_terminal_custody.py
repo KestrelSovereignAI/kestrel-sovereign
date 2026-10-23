@@ -2385,6 +2385,58 @@ async def test_unstarted_journal_writer_loss_is_counted_once_without_relabelling
     assert (await c.dispatcher.dispatch_signal(_signal('unstarted.audit'))).action_result is not None
 
 
+async def test_sqlite_failed_original_cleanup_does_not_lend_observer_withdrawal_to_close(dispatcher_components, monkeypatch):
+    from kestrel_sovereign.execution_custody import _explicit_control_chain
+    c = dispatcher_components
+    c.registry.register(_action_reg('sqlite.failed.cleanup.source'))
+    await c.dispatcher.dispatch_signal(_signal('sqlite.failed.cleanup.source'))
+    await c.backend.execute('CREATE UNIQUE INDEX actual_one_status ON signal_log(status)')
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    attempts, physical = [], []
+    async def cleanup(connection, *, started_at):
+        attempts.append(asyncio.current_task())
+        if len(attempts) == 1:
+            entered.set()
+            await release.wait()
+        await connection.close()
+        try:
+            await connection.rollback()
+        except BaseException as error:
+            physical.append(error)
+            raise
+    monkeypatch.setattr(c.backend, '_rollback_cancelled_write', cleanup)
+    owner = asyncio.create_task(c.dispatcher.dispatch_signal(_signal('sqlite.failed.cleanup.source')))
+    try:
+        await asyncio.wait_for(entered.wait(), 3)
+        journals = [entry[2] for entry in c.dispatcher._outcome_log_reconciliations.values()]
+        journal = next(value for value in journals if value is not None)
+        writer = journal._writer_admission.task
+        writer.cancel('actual withdrawal while observing failed SQLite rollback')
+        result = await await_owned_task(owner)
+        chain = tuple(_explicit_control_chain(result.error))
+        withdrawals = [error for error in chain if isinstance(error, asyncio.CancelledError)
+                       and error.args == ('actual withdrawal while observing failed SQLite rollback',)]
+        assert withdrawals and physical and writer.done()
+        shared = c.backend._cancelled_write_drain_error
+        later = await await_owned_task(asyncio.create_task(c.backend.close()))
+        assert physical[0] in tuple(_explicit_control_chain(later.error))
+        for error in withdrawals:
+            assert error not in tuple(_explicit_control_chain(shared)), 'shared SQLite latch retained observer cancellation'
+            assert error not in tuple(_explicit_control_chain(later.error)), 'unrelated SQLite closer acquired original caller withdrawal'
+    finally:
+        release.set()
+        await await_owned_task(owner)
+        try:
+            await c.dispatcher.shutdown_durable_delivery()
+        except BaseException as error:
+            assert is_execution_control_error(error)
+        try:
+            await c.backend.close()
+        except BaseException as error:
+            assert is_execution_control_error(error)
+
+
 @pytest.mark.parametrize('failure', ['normal', 'allocation', 'publication_before', 'publication_after', 'concurrent_close', 'rollback_failure', 'insert_rollback_failure', 'repeat_cancel'])
 async def test_sqlite_original_journal_privacy_hold_outlives_cancelled_commit_cleanup(dispatcher_components, monkeypatch, failure):
     from tests.unit.test_host_context_native_cleanup import _actual_operation
