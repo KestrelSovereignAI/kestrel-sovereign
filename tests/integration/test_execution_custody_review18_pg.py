@@ -10,11 +10,13 @@ import pytest
 
 from kestrel_sovereign.execution_custody import ExecutionCustody
 from kestrel_sovereign.signals import OrderedLockManager, SignalDispatcher, SignalLogStore, SourceRegistry
-from kestrel_sovereign.signals.sources.channels import DURABLE_COGNITION_CONSUMER_ID
+from kestrel_sovereign.signals.sources.channels import (
+    DURABLE_COGNITION_CONSUMER_ID, build_channel_message_registration,
+)
 from kestrel_sdk.signals import SignalResult, Status
 from tests.integration.test_execution_authority_postgres import GenerationFence, native_pg as _native_pg
 from tests.integration.test_execution_custody_review13_pg import _seed_owned_deliveries
-from tests.unit.test_durable_signal_delivery import _Agent, _channel_signal, _registration
+from tests.unit.test_durable_signal_delivery import _Agent, _channel_signal
 from tests.unit.test_execution_custody_review15 import control_error
 from tests.utils.original_failure import OriginalFailure
 
@@ -26,7 +28,9 @@ async def setup_delivery(native_pg):
     backend, controller, schema = native_pg
     await _seed_owned_deliveries(backend, controller, schema)
     agent = _Agent("original")
-    dispatcher = SignalDispatcher(agent=agent, registry=SourceRegistry(),
+    registry = SourceRegistry()
+    registry.register(build_channel_message_registration())
+    dispatcher = SignalDispatcher(agent=agent, registry=registry,
                                   lock_manager=OrderedLockManager(), store=SignalLogStore(backend))
     # Match production boot before exercising recovered native journal entry.
     # The durable delivery ledger alone does not create the signal audit table.
@@ -49,7 +53,7 @@ async def setup_delivery(native_pg):
 
 async def route(dispatcher, delivery, signal):
     return await dispatcher._route_durable_cognition_delivery(
-        signal, _registration(dispatcher._agent), time.monotonic(),
+        signal, dispatcher._registry.get(delivery.event.source), time.monotonic(),
         persisted_event_id=delivery.event_id, consumer_id=delivery.consumer_id,
         durable_admission=None, durable_created=False, use_live_signal=True, claimed_delivery=delivery,
     )
