@@ -945,6 +945,11 @@ processing. Concurrent in-progress policy mutation is refused, not waited on by
 the journal observer. Retirement removes its exact native seal identity without
 acquiring that observation lock, so an already-refused setter cannot strand a
 physically retired seal. Application TLS callback/class programs are unsupported.
+The native SSLObject's public context association is also tracked before
+exposure. Changing it retires that session's original-journal eligibility;
+restoration cannot revive it. A finite association seal rejects replacement
+through transaction/cancellation/reset, and cancellation receives the admitted
+context explicitly rather than rereading a mutable association after validation.
 An otherwise healthy sibling with a different loaded context is retired and
 reconnected through the same bounded pool with the admitted policy; trust-object
 identity is not weakened or inferred from a partial public fingerprint.
@@ -974,6 +979,13 @@ exact-token cleanup boundary before any routing task can start. Failed cleanup
 retains its original lease debt and cannot be reported as successful settlement.
 Ordinary cancellation while asynchronous caller rehydration is unwinding also
 releases that exact claim; withdrawal and any release failure remain observable.
+One pre-routing owner covers admission, rehydration, Hold reads, execution-phase
+commit and stop-completion guard acquisition, including finite grouped SQL
+failure/cancellation. Its responsibility transfers only when the actual routing
+Task is published, not when a coroutine or admission promise is constructed.
+PostgreSQL relation identity includes the database OID as well as its name and
+namespace/table OIDs; cloning a database and reusing its name cannot redirect
+an original accepted journal into the clone.
 
 SQLite admission also captures its actual journal/synchronous/full-fsync/WAL
 checkpoint configuration. The original native relation checks compare that

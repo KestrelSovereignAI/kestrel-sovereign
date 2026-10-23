@@ -20,7 +20,10 @@ def native_prefix_budget(onboarding_owner, monkeypatch):
     # CI reserves a larger SQLite checkpoint window than local defaults. Keep
     # that complete native reservation AND five seconds for the prefix instead
     # of letting a fixed five-second total silently allocate zero prefix time.
-    tail = agent.storage.minimum_close_timeout_s
+    tail = agent._durable_tail_minimum_budget(
+        agent_module._minimum_storage_close_timeout(agent.storage),
+        agent_module._minimum_storage_potential_preclose_timeout(agent.storage),
+    )
     total = max(agent_module.SHUTDOWN_TIMEOUT, tail + 5.0)
     assert 0 < total <= 30, 'native prefix fixture requires a finite coherent budget'
     monkeypatch.setattr(agent_module, 'SHUTDOWN_TIMEOUT', total)
