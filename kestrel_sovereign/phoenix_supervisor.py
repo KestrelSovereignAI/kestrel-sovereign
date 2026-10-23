@@ -28,6 +28,7 @@ line, ``/phoenix/`` returns a clear 503. Opt out even when installed with
 from __future__ import annotations
 
 import errno
+import importlib.metadata
 import importlib.util
 import logging
 import os
@@ -43,6 +44,7 @@ from typing import Optional
 
 import httpx
 import itsdangerous
+from packaging.version import InvalidVersion, Version
 from starlette.requests import Request
 from starlette.responses import JSONResponse, Response, StreamingResponse
 
@@ -72,6 +74,12 @@ DEFAULT_PHOENIX_GRPC_PORT = 4317
 
 #: Sub-path the UI is served under for same-origin embedding.
 PHOENIX_ROOT_PATH = "/phoenix"
+
+#: The distribution that ships the Phoenix server (``phoenix.server``).
+PHOENIX_SERVER_DISTRIBUTION = "arize-phoenix"
+#: The first Phoenix release that honours ``PHOENIX_HOST_ROOT_PATH``
+#: (Arize-ai/phoenix#3186, "Add ASGI root path parameter to Phoenix server").
+PHOENIX_HOST_ROOT_PATH_SINCE = Version("4.1.0")
 
 PRIVATE_CHILD_UMASK = 0o077
 
@@ -266,23 +274,28 @@ def autowire_otel_project(env: Optional[dict] = None) -> Optional[str]:
 
 
 def supports_host_root_path() -> bool:
-    """Best-effort probe: does the installed Phoenix honour ``PHOENIX_HOST_ROOT_PATH``?
+    """Does the installed Phoenix honour ``PHOENIX_HOST_ROOT_PATH``?
 
-    Newer Phoenix versions expose the config via
-    ``phoenix.config.get_env_host_root_path`` (and the
-    ``PHOENIX_HOST_ROOT_PATH`` env constant). If neither is present we fall back
-    to root-path serving and the proxy strips the ``/phoenix`` prefix instead
-    (see :meth:`PhoenixSupervisor.upstream_url`).
+    Answered from the installed server distribution's version, without
+    importing Phoenix. ``import phoenix.config`` loads the Phoenix server and
+    took 5.7–12.7s on a fleet host, on every boot, even when an already
+    running Phoenix was adopted rather than spawned (#3781). When this is
+    False we fall back to root-path serving and the proxy strips the
+    ``/phoenix`` prefix instead (see :meth:`PhoenixSupervisor.upstream_url`).
     """
     try:
-        import phoenix.config as pc  # type: ignore
-    except Exception:  # noqa: BLE001 - any import failure ⇒ assume unsupported
+        recorded = importlib.metadata.version(PHOENIX_SERVER_DISTRIBUTION)
+    except (importlib.metadata.PackageNotFoundError, KeyError):
+        # KeyError: a damaged install whose metadata has no Version field, on
+        # a Python that raises for a missing field rather than returning None.
         return False
-    return (
-        hasattr(pc, "get_env_host_root_path")
-        or hasattr(pc, "PHOENIX_HOST_ROOT_PATH")
-        or "PHOENIX_HOST_ROOT_PATH" in getattr(pc, "__dict__", {})
-    )
+    if recorded is None:
+        return False
+    try:
+        installed = Version(recorded)
+    except InvalidVersion:
+        return False
+    return installed >= PHOENIX_HOST_ROOT_PATH_SINCE
 
 
 # ---------------------------------------------------------------------------
