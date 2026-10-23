@@ -22,6 +22,73 @@ cleanup_pg = _cleanup_pg
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize('entry', ['unregister', 'activation'])
+async def test_finite_sql_rollback_withdrawal_finishes_independent_feature_cleanup(
+    native_pg, onboarding_owner, monkeypatch, entry,
+):
+    backend, observer, schema = native_pg
+    _, agent, database = onboarding_owner
+    await backend.execute("INSERT INTO effects VALUES (315, 'original seed')")
+    entered, release = asyncio.Event(), asyncio.Event()
+    rollbacks, withdrawals, cleanup = [], [], []
+    opening = OSError('actual original activation failure')
+    original_exit, original_join = asyncpg.transaction.Transaction.__aexit__, postgres_module.await_owned_task
+    async def rollback(transaction, *args):
+        result = await original_exit(transaction, *args)
+        if args[1] is not None and any(isinstance(error, asyncpg.UniqueViolationError)
+                                     for error in _explicit_control_chain(args[1])):
+            rollbacks.append((transaction, asyncio.current_task(), args[1]))
+            entered.set()
+            await release.wait()
+        return result
+    async def join(*args, **kwargs):
+        result = await original_join(*args, **kwargs)
+        if result.cancellation is not None:
+            withdrawals.append(result.cancellation)
+        return result
+    monkeypatch.setattr(asyncpg.transaction.Transaction, '__aexit__', rollback)
+    monkeypatch.setattr(postgres_module, 'await_owned_task', join)
+    class Feature(SDKFixtureFeature):
+        contribution_prefix = 'finite-rollback-cleanup'
+        async def on_enable(self):
+            if entry == 'activation':
+                raise opening
+        async def on_disable(self):
+            with bind_execution_custody_snapshot((ExecutionCustody(GenerationFence()),)):
+                await backend.execute("INSERT INTO effects VALUES (315, 'must roll back')")
+        async def shutdown(self):
+            cleanup.append('actual feature shutdown')
+            await database.execute('INSERT INTO host_rollback_effects VALUES (315)')
+            return await super().shutdown()
+    feature = Feature(agent)
+    if entry == 'unregister':
+        await agent._activate_feature_runtime(feature)
+    operation = (agent._unregister_feature_runtime(feature) if entry == 'unregister'
+                 else agent._activate_feature_runtime(feature))
+    owner = create_owned_task(operation, retain_originals=True)
+    try:
+        await asyncio.wait_for(entered.wait(), 5)
+        owner.cancel('actual caller withdrew during healthy native rollback')
+        await asyncio.sleep(0)
+        release.set()
+        result = await await_owned_task(owner)
+        assert cleanup == ['actual feature shutdown'], 'finite withdrawal group skipped independent feature cleanup'
+        assert await database.fetchval('SELECT count(*) FROM host_rollback_effects WHERE id=315') == 1
+        assert len(rollbacks) == 1 and rollbacks[0][1].done()
+        chain = tuple(_explicit_control_chain(result.error))
+        assert withdrawals and all(error in chain for error in withdrawals), 'activation cleanup dropped actual caller withdrawal'
+        if entry == 'activation':
+            assert opening in chain
+        else:
+            assert rollbacks[0][2] in chain
+        assert await observer.fetchval(f'SELECT value FROM "{schema}".effects WHERE id=315') == 'original seed'
+        assert feature.enabled is False
+    finally:
+        release.set()
+        await await_owned_task(owner)
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("source_cancel", [False, True])
 async def test_unregister_shared_retention_does_not_mutate_two_native_sources(
     native_pg, cleanup_pg, onboarding_owner, monkeypatch, source_cancel,

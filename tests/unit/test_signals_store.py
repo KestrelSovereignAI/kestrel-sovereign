@@ -99,6 +99,37 @@ async def test_append_writes_redacted_summary(store):
     assert rows[0][1] is None  # store_raw_trusted=False by default
 
 
+@pytest.mark.parametrize('projection', ['redaction', 'summary'])
+async def test_ordinary_append_preserves_registered_subclass_adapter(store, projection):
+    import sqlite3
+    from dataclasses import replace
+    class OrdinaryText(str):
+        pass
+    original = OrdinaryText('ordinary callback text')
+    calls = []
+    def adapt(value):
+        calls.append(value)
+        return 'ordinary native adapter value'
+    key = (OrdinaryText, sqlite3.PrepareProtocol)
+    sqlite3.register_adapter(OrdinaryText, adapt)
+    registration = _registration()
+    if projection == 'redaction':
+        registration.log_redaction = replace(registration.log_redaction, summarize=lambda payload: original)
+    else:
+        registration.result_summary = lambda result: original
+    signal = _signal()
+    try:
+        returned = await store.append(signal, registration, _ok_result(signal))
+        column = 'payload_redacted' if projection == 'redaction' else 'result_summary'
+        stored = await store.backend.fetch_val('SELECT ' + column + ' FROM signal_log WHERE id=?', (signal.id,))
+        assert stored == 'ordinary native adapter value', 'ordinary append coerced away its supported adapter'
+        assert len(calls) == 1 and calls[0] is original
+        if projection == 'summary':
+            assert returned is original, 'bounded ordinary summary lost its existing subtype identity'
+    finally:
+        sqlite3.adapters.pop(key, None)
+
+
 @pytest.mark.asyncio
 async def test_trusted_opt_in_stores_raw(store):
     sig = _signal()
