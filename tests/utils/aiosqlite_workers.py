@@ -7,14 +7,19 @@ import enum
 import threading
 import time
 from collections.abc import Awaitable, Callable, Iterator
-from contextlib import asynccontextmanager, contextmanager, suppress
+from contextlib import asynccontextmanager, contextmanager, nullcontext, suppress
 from typing import Any
 from unittest.mock import patch
 
 import aiosqlite
 
 import kestrel_sovereign.storage.db.sqlite as sqlite_module
-from kestrel_sovereign._async_ownership import create_owned_task, owned_task_error
+from kestrel_sovereign._async_ownership import (
+    OwnedTaskAdmission,
+    create_owned_task,
+    owned_task_admission_error,
+    owned_task_error,
+)
 from kestrel_sovereign.execution_custody import execution_observation_error
 from tests.utils.virtual_clock import (
     HANG_GUARD_SECONDS,
@@ -31,15 +36,28 @@ def aiosqlite_worker(connection: aiosqlite.Connection) -> threading.Thread:
 class _SlowCloseConnection:
     """Hold a real native close at the same boundary as stalled disk I/O."""
 
-    def __init__(self, real, entered: threading.Event, release: threading.Event):
+    def __init__(
+        self, real, entered: threading.Event, release: threading.Event, *,
+        after_native_close: bool = False, timeline: dict[str, float] | None = None,
+    ):
         self._real = real
         self._entered = entered
         self._release = release
+        self._after_native_close = after_native_close
+        self._timeline = timeline
 
     def close(self) -> None:
-        self._entered.set()
-        self._release.wait(HANG_GUARD_SECONDS)
+        if not self._after_native_close:
+            self._entered.set()
+            self._release.wait(HANG_GUARD_SECONDS)
+        if self._timeline is not None:
+            self._timeline["native_close_started_at"] = time.monotonic()
         self._real.close()
+        if self._timeline is not None:
+            self._timeline["native_close_returned_at"] = time.monotonic()
+        if self._after_native_close:
+            self._entered.set()
+            self._release.wait(HANG_GUARD_SECONDS)
 
     def __getattr__(self, name):
         return getattr(self._real, name)
@@ -47,12 +65,20 @@ class _SlowCloseConnection:
 
 def block_aiosqlite_native_close(
     connection: aiosqlite.Connection,
+    *,
+    after_native_close: bool = False,
+    timeline: dict[str, float] | None = None,
 ) -> tuple[threading.Event, threading.Event]:
-    """Block the next native close; return its entered and release events."""
+    """Hold before/after the same native close; optionally observe real time.
+
+    Defaults preserve existing before-close injection. AFTER means sqlite's
+    handle has closed, not that its aiosqlite Task/worker has acknowledged it.
+    """
     entered = threading.Event()
     release = threading.Event()
     connection._connection = _SlowCloseConnection(
-        connection._connection, entered, release
+        connection._connection, entered, release,
+        after_native_close=after_native_close, timeline=timeline,
     )
     return entered, release
 
@@ -83,6 +109,7 @@ class BoundedCloseStages:
         self.deadlines: dict[aiosqlite.Connection, float] = {}
         #: The original native close Task, including caller-supplied owners.
         self.close_tasks: dict[aiosqlite.Connection, asyncio.Task[None]] = {}
+        self.entered_at: dict[tuple[CloseStage, aiosqlite.Connection], float] = {}
 
     def _event(
         self, stage: CloseStage, connection: aiosqlite.Connection
@@ -92,6 +119,7 @@ class BoundedCloseStages:
     def _enter(
         self, stage: CloseStage, connection: aiosqlite.Connection
     ) -> None:
+        self.entered_at[(stage, connection)] = time.monotonic()
         self._event(stage, connection).set()
 
     def has_reached(
@@ -140,18 +168,26 @@ def observe_bounded_close_stages() -> Iterator[BoundedCloseStages]:
 
 
 @asynccontextmanager
-async def normal_close_schedule():
+async def normal_close_schedule(*, prejoined: bool = False):
     """Exercise real closes before their deadlines, not a disk-speed claim.
 
     Pin before the enclosing operation captures its deadline. Each original
     close and worker must actually finish; only then wake its worker poll.
     Thread-based guards bound real hangs independently of the pinned clock.
     Production close budgets and deadline-expiry behavior are not changed.
+
+    ``prejoined=True`` instead keeps REAL loop time and accepts a factory
+    ``operation(original_close_task)``. The fixture admits connection.close
+    exactly once, physically joins that same Task/worker, then passes the
+    same terminal Task to the existing bounded closer for acknowledgement.
+    This is deliberately normal functional-test scheduling BEFORE the Core
+    ACK budget, not production close-admission/latency coverage or WORK rights.
     """
     owners = []
     workers = []
     retirement_maps = []
     failures = []
+    unstarted_connections = set()
 
     async def settle(tasks, *, step):
         # The guard observes this exact completion Future, so withdrawing a
@@ -176,15 +212,50 @@ async def normal_close_schedule():
     # Late cleanup still needs the real stage observer after clock restoration.
     with observe_bounded_close_stages() as stages:
         try:
-            with pinned_loop_clock() as clock:
+            with (nullcontext(None) if prejoined else pinned_loop_clock()) as clock:
                 async def finish(connection, operation, *, retained_closes):
                     retirement_maps.append(retained_closes)
                     worker = aiosqlite_worker(connection)
-                    workers.append(worker)
-                    close_task = create_owned_task(operation, retain_originals=True)
+                    if prejoined:
+                        native_admission = OwnedTaskAdmission()
+                        try:
+                            close_task = create_owned_task(
+                                connection.close(), retain_originals=True,
+                                retirement_resource=connection,
+                                admission=native_admission,
+                            )
+                        except BaseException as error:  # noqa: BLE001 - retain the exact native admission and debt
+                            # The failed start gate never entered close(). A
+                            # live worker is unresolved original debt, not an
+                            # operation this fixture can silently retry.
+                            if native_admission.task is not None:
+                                owners.append(native_admission.task)
+                            unstarted_connections.add(connection)
+                            terminal = owned_task_admission_error(
+                                connection, native_admission, error
+                            )
+                            sqlite_module._retain_aiosqlite_close(
+                                connection, native_admission.task,
+                                retained_closes, control_error=terminal,
+                            )
+                            raise terminal
+                    else:
+                        workers.append(worker)
+                        close_task = create_owned_task(operation, retain_originals=True)
                     owners.append(close_task)
-                    await stages.reached(connection, CloseStage.CONNECTION_CLOSE)
-                    deadline = stages.deadlines[connection]
+                    if prejoined:
+                        workers.append(worker)
+                    if not prejoined:
+                        await stages.reached(connection, CloseStage.CONNECTION_CLOSE)
+                        deadline = stages.deadlines[connection]
+                    else:
+                        # Worker exit alone does not prove the actual close
+                        # coroutine's epilogue finished. No ACK recipe may be
+                        # constructed until this SAME Task is terminal.
+                        await await_within_hang_guard(
+                            close_task, step="the original native SQLite close Task completing"
+                        )
+                        assert close_task.done()
                     join_task = asyncio.create_task(
                         asyncio.to_thread(worker.join, HANG_GUARD_SECONDS)
                     )
@@ -193,6 +264,28 @@ async def normal_close_schedule():
                         join_task, step="the original SQLite worker retiring"
                     )
                     assert not worker.is_alive()
+                    if prejoined:
+                        acknowledgement_admission = OwnedTaskAdmission()
+                        try:
+                            acknowledgement = create_owned_task(
+                                operation(close_task), retain_originals=True,
+                                admission=acknowledgement_admission,
+                            )
+                        except BaseException as error:  # noqa: BLE001 - join an admitted failed ACK gate too
+                            if acknowledgement_admission.task is not None:
+                                owners.append(acknowledgement_admission.task)
+                            raise owned_task_admission_error(
+                                None, acknowledgement_admission, error
+                            )
+                        owners.append(acknowledgement)
+                        await stages.reached(connection, CloseStage.CONNECTION_CLOSE)
+                        assert stages.close_tasks[connection] is close_task, (
+                            "prejoined ACK substituted the original close Task"
+                        )
+                        return await await_within_hang_guard(
+                            acknowledgement,
+                            step="the original prejoined SQLite close acknowledgement",
+                        )
                     clock.advance(sqlite_module._AIOSQLITE_WORKER_SHUTDOWN_POLL_S * 1.1)
                     assert clock.time() < deadline
                     return await await_within_hang_guard(
@@ -218,10 +311,20 @@ async def normal_close_schedule():
                 retirement_tasks = {
                     retained.retirement_task
                     for retained_closes in retirement_maps
-                    for retained in retained_closes.values()
+                    for connection, retained in retained_closes.items()
                     if retained.retirement_task is not None
+                    and not (
+                        connection in unstarted_connections
+                        and aiosqlite_worker(connection).is_alive()
+                    )
                 }
                 await settle(retirement_tasks, step="joining original SQLite retirement tasks")
+                # Known-unstarted native admissions are intentionally not a
+                # normal worker join: the failed close never queued STOP.
+                # Their original Task-or-None, worker and error remain rooted
+                # in the supplied canonical retained map. The test owner must
+                # explicitly reconcile that resource after observing failure;
+                # there is no automatic replacement close or successful ACK.
             except BaseException as error:  # noqa: BLE001 - compose, never hide, physical cleanup failure
                 failures.append(error)
             terminal = execution_observation_error(*failures)

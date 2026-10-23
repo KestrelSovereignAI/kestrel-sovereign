@@ -7,17 +7,25 @@ how much WAL the close had to checkpoint without any extra step.
 """
 
 import asyncio
+import json
 import logging
 import re
+import sqlite3
 import sys
 import threading
-from contextlib import contextmanager
+import time
+from contextlib import contextmanager, nullcontext
 from pathlib import Path
 
 import pytest
 
 import kestrel_sovereign.storage.db.sqlite as sqlite_backend_module
-from kestrel_sovereign.storage.db import ConnectionError, SQLiteBackend
+from kestrel_sovereign.async_ownership import await_owned_task
+from kestrel_sovereign.execution_custody import (
+    execution_observation_error,
+    is_execution_control_error,
+)
+from kestrel_sovereign.storage.db import ConnectionError, QueryError, SQLiteBackend
 from tests.utils.aiosqlite_workers import (
     CloseStage,
     aiosqlite_worker,
@@ -118,6 +126,156 @@ def _overrun_warnings(caplog) -> list[logging.LogRecord]:
         if record.name == sqlite_backend_module.__name__
         and record.levelno == logging.WARNING
     ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stage", ["before-native", "after-native", "worker-exit"])
+async def test_snapshot_close_records_actual_native_and_ack_stages(
+    tmp_path, monkeypatch, record_property, stage
+):
+    """Closed native handle is not an acknowledged close or worker retirement."""
+    backend = await _connected_wal_backend(tmp_path / "snapshot-stages.db")
+    primary = backend._ensure_connected()
+    primary_worker = aiosqlite_worker(primary)
+    opened = asyncio.Event()
+    transaction_entered = asyncio.Event()
+    release_transaction = asyncio.Event()
+    release_worker_exit = threading.Event()
+    worker_exit_entered = threading.Event()
+    captured = {}
+    timeline = {"test_started_at": time.monotonic()}
+    transaction = snapshot_read = original_close = None
+    retirement_tasks = set()
+    expected_read_error = None
+    failures = []
+    original_open_snapshot = backend._open_snapshot_read_connection
+
+    async def observed_open_snapshot():
+        connection = await original_open_snapshot()
+        captured["connection"] = connection
+        captured["worker"] = aiosqlite_worker(connection)
+        entered, release = block_aiosqlite_native_close(
+            connection, after_native_close=stage == "after-native", timeline=timeline
+        )
+        captured["native_entered"], captured["native_release"] = entered, release
+        if stage == "worker-exit":
+            release.set()
+        opened.set()
+        return connection
+
+    async def hold_transaction():
+        async with backend.transaction():
+            await backend.execute("UPDATE snapshot_probe SET value=1")
+            captured["transaction_owner"] = backend._txn_owner
+            transaction_entered.set()
+            await release_transaction.wait()
+
+    exit_delay = (
+        delay_aiosqlite_worker_exit(
+            release_worker_exit, worker_exit_entered,
+            should_delay=lambda worker: worker is captured.get("worker"),
+        )
+        if stage == "worker-exit" else nullcontext()
+    )
+    with observe_bounded_close_stages() as stages, exit_delay:
+        try:
+            await backend.execute("CREATE TABLE snapshot_probe (value INTEGER NOT NULL)")
+            await backend.execute("INSERT INTO snapshot_probe VALUES (0)")
+            monkeypatch.setattr(backend, "_open_snapshot_read_connection", observed_open_snapshot)
+            transaction = asyncio.create_task(hold_transaction())
+            await await_within_hang_guard(transaction_entered.wait(), step="the original snapshot blocker")
+            assert captured["transaction_owner"] is transaction
+            snapshot_read = asyncio.create_task(backend.fetch_one("SELECT value FROM snapshot_probe"))
+            await await_within_hang_guard(opened.wait(), step="the actual independent snapshot opening")
+            connection, worker = captured["connection"], captured["worker"]
+            assert connection is not primary and worker is not primary_worker
+            await wait_for_thread_event(captured["native_entered"], step="the actual native close boundary")
+            await stages.reached(connection, CloseStage.CONNECTION_CLOSE)
+            original_close = stages.close_tasks[connection]
+            timeline["deadline"] = stages.deadlines[connection]
+            timeline["close_wait_entered_at"] = stages.entered_at[(CloseStage.CONNECTION_CLOSE, connection)]
+            timeline["loop_observed_at"] = asyncio.get_running_loop().time()
+            if stage == "worker-exit":
+                await wait_for_thread_event(worker_exit_entered, step="the original snapshot worker exit hold")
+                await stages.reached(connection, CloseStage.WORKER_EXIT)
+                timeline["worker_wait_entered_at"] = stages.entered_at[(CloseStage.WORKER_EXIT, connection)]
+                assert original_close.done() and not original_close.cancelled()
+                assert original_close.exception() is None
+                assert worker.is_alive()
+            with pytest.raises(QueryError) as raised:
+                await await_within_hang_guard(snapshot_read, step="the unchanged actual snapshot close deadline")
+            expected_read_error = raised.value
+            assert isinstance(expected_read_error.__cause__, ConnectionError)
+            if stage == "after-native":
+                assert "native_close_returned_at" in timeline
+                assert isinstance(expected_read_error.__cause__.__cause__, sqlite3.ProgrammingError)
+            assert worker.is_alive()
+            assert backend.connection_retirement_pending
+            retained = backend._retired_connection_closes[connection]
+            assert retained.close_task is original_close
+            assert retained.retirement_task is not None
+            retirement_tasks.add(retained.retirement_task)
+            timeline["read_observed_at"] = time.monotonic()
+            assert backend._connection is primary and primary_worker.is_alive()
+        except BaseException as error:
+            failures.append(error)
+        finally:
+            release_worker_exit.set()
+            if "native_release" in captured:
+                captured["native_release"].set()
+            release_transaction.set()
+            if "connection" in captured:
+                try:
+                    # Reuse the existing exact-owned retirement helper. Harvest
+                    # every captured original outcome below; never clear a map.
+                    await _retire(backend, captured["native_release"], captured["worker"], close_task=snapshot_read)
+                    timeline["snapshot_worker_join_observed_at"] = time.monotonic()
+                except BaseException as error:
+                    failures.append(error)
+            originals = {task for task in (snapshot_read, original_close, transaction) if task is not None}
+            originals.update(retirement_tasks)
+            for task in originals:
+                try:
+                    outcome = await await_within_hang_guard(await_owned_task(task), step="harvesting an original snapshot owner")
+                    if outcome.error is not None and outcome.error is not expected_read_error:
+                        deadline_cancel = (
+                            stage in {"before-native", "after-native"}
+                            and (task is original_close or task in retirement_tasks)
+                            and type(outcome.error) is asyncio.CancelledError
+                            and not is_execution_control_error(outcome.error)
+                            and outcome.error.__cause__ is None
+                        )
+                        if not deadline_cancel:
+                            failures.append(outcome.error)
+                    if outcome.cancellation is not None:
+                        failures.append(outcome.cancellation)
+                    assert task.done()
+                except BaseException as error:
+                    failures.append(error)
+            try:
+                assert backend._connection is primary
+                if transaction is not None and not transaction.cancelled() and transaction.exception() is None:
+                    assert await backend.fetch_one("SELECT value FROM snapshot_probe") == (1,)
+                await await_within_hang_guard(backend.close(), step="the actual primary close")
+                await await_within_hang_guard(asyncio.to_thread(primary_worker.join, _HANG_GUARD_SECONDS), step="the original primary worker join")
+                assert not primary_worker.is_alive()
+                assert not backend.connection_retirement_pending
+            except BaseException as error:
+                failures.append(error)
+            record_property("sqlite_snapshot_close_timeline", json.dumps({
+                "stage": stage, "times": timeline,
+                "primary_id": id(primary), "primary_worker_id": id(primary_worker),
+                "snapshot_id": id(captured.get("connection")),
+                "snapshot_worker_id": id(captured.get("worker")),
+                "transaction_task_id": id(transaction), "read_task_id": id(snapshot_read),
+                "original_close_task_id": id(original_close),
+                "retirement_task_ids": sorted(id(task) for task in retirement_tasks),
+                "product_budget_seconds": sqlite_backend_module._minimum_close_timeout_s(),
+                "unchanged_real_clock": True, "no_provider_or_pg": True,
+            }, sort_keys=True))
+    terminal = execution_observation_error(*failures)
+    if terminal is not None:
+        raise terminal
 
 
 @pytest.mark.asyncio
