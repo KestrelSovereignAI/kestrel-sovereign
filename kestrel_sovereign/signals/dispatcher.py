@@ -5249,6 +5249,13 @@ class SignalDispatcher:
             except BaseException as cleanup:
                 raise execution_observation_error(error, cleanup) from None
             raise
+        else:
+            if routing_admission.task is None:
+                # Ordinary refusal paths can return a FAILED/HOLD result.
+                # Their original-token CAS is idempotent if that path already
+                # settled the delivery; no unowned live lease may escape just
+                # because the public result was returned rather than raised.
+                await self._release_retained_durable_cognition_task(delivery, observe_failure=True)
 
     async def _execute_original_claimed_durable_cognition(
         self, signal, registration, start, *, delivery, consumer_id,
@@ -5890,7 +5897,7 @@ class SignalDispatcher:
                 delivery.delivery_id,
             )
             return
-        if released is None:
+        if released is None and not observe_failure:
             logger.warning(
                 "Retained durable cognition lease was no longer owned at cleanup: "
                 "delivery=%s",

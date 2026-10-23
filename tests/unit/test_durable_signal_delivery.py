@@ -368,7 +368,7 @@ async def _a2a_submitted_dispatcher(path, did: str):
 
 @pytest.mark.parametrize('public_handle', [False, True])
 @pytest.mark.parametrize('release_failure', [False, True])
-@pytest.mark.parametrize('phase', ['rehydrate', 'grouped_rehydrate', 'hold', 'begin', 'guard'])
+@pytest.mark.parametrize('phase', ['rehydrate', 'grouped_rehydrate', 'hold', 'begin', 'guard', 'begin_failure'])
 async def test_cancelled_async_rehydration_releases_its_original_claim(tmp_path, monkeypatch, public_handle, release_failure, phase):
     import time
     from kestrel_sovereign._async_ownership import await_owned_task
@@ -415,9 +415,12 @@ async def test_cancelled_async_rehydration_releases_its_original_claim(tmp_path,
         return await original_hold(*args, **kwargs)
     monkeypatch.setattr(hold_module, 'get_effective_hold_state', hold)
     for method, selected in [('_begin_durable_cognition_execution', 'begin'), ('_hold_durable_cognition_stop_completion', 'guard')]:
-        if phase == selected:
+        if phase == selected or (phase == 'begin_failure' and selected == 'begin'):
             original_method = getattr(dispatcher, method)
             async def paused(*args, **kwargs):
+                if phase == 'begin_failure':
+                    entered.set()
+                    return await backend.execute('INSERT INTO recovery_failure VALUES (1)')
                 await withdraw_here()
                 return await original_method(*args, **kwargs)
             monkeypatch.setattr(dispatcher, method, paused)
@@ -443,10 +446,14 @@ async def test_cancelled_async_rehydration_releases_its_original_claim(tmp_path,
                 consumer_id=consumer.consumer_id, durable_admission=None, durable_created=False,
                 use_live_signal=False, claimed_delivery=delivery))
         await asyncio.wait_for(entered.wait(), 5)
-        task.cancel('actual caller withdrawal during source rehydration')
+        if phase != 'begin_failure':
+            task.cancel('actual caller withdrawal during source rehydration')
         outcome = await await_owned_task(task)
         errors = tuple(_explicit_control_chain(outcome.error))
-        assert any(isinstance(error, asyncio.CancelledError) for error in errors)
+        if phase != 'begin_failure':
+            assert any(isinstance(error, asyncio.CancelledError) for error in errors)
+        elif not release_failure:
+            assert outcome.error is None and outcome.result.status == Status.FAILED
         if release_failure:
             assert any('actual cancelled recovery release refused' in str(error) for error in errors), 'rehydration cancellation hid native release failure'
             await backend.execute('DROP TRIGGER refuse_cancel_recovery_release')
