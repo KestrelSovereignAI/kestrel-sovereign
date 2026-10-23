@@ -980,6 +980,12 @@ Original-connection writes do not advance this engine evidence. Native BEGIN
 IMMEDIATE excludes external commits through the final profile/row proof/COMMIT.
 The native program fence is installed before BEGIN can wait, but its final
 configuration seal is sampled only after the actual transaction lock is held.
+Eligibility plus fence installation share a native connection-local lock with
+public text/transaction configuration setters and program-registration marks.
+A cross-thread setter cannot pass an absent-seal check and then install an
+application text factory after the worker has acquired journal custody. The
+short eligibility lock is released before potentially waiting native BEGIN;
+the installed seal continues to refuse customization through transaction exit.
 An unrelated writer committing during that wait does not leave a stale COMMIT
 seal after the original still-live work legitimately refreshes its generation.
 Ordinary writer failures are retained on the original journal through public
@@ -1053,12 +1059,18 @@ Signal's ID after an emitter mutates it.
 The global SQLite adapter registry can change while native preparation releases
 the GIL, so checking it before parameter binding is not an atomic fence. Fixed
 Core-owned positional journal/proof/catalog SQL instead compiles exact native scalars
-to bounded native literals and executes with zero bound parameters. UTF-8 text
-uses hex BLOB CAST to TEXT, BLOBs use hex, integer bounds and native float/NULL
+to bounded native literals and executes with zero bound parameters. Text uses
+the actual native database encoding (UTF-8, UTF-16le or UTF-16be) for hex BLOB
+CAST to TEXT, including initial catalog lookup; that encoding is part of the
+captured native configuration. BLOBs use hex, integer bounds and native float/NULL
 semantics are retained. Application text never becomes executable SQL, including
 quotes, placeholder characters, NUL and Unicode. The native statement-length
 limit bounds the compiled query. A late global adapter cannot be invoked by
 binding; ordinary unsealed database execution retains standard parameterization.
+The conservative scalar-adapter eligibility checks snapshot native registry keys
+and compare exact types/identities only. Dictionary membership is not safe here:
+a publicly registered custom type can supply application metaclass equality on
+a hash collision, even when no native parameter is ever bound.
 Finite floats use an exact 53-bit integer mantissa and at most19 exact binary
 scaling steps, avoiding decimal-parser rounding differences; signed zero,
 infinities and SQLite's NaN-to-NULL behavior retain their native semantics.

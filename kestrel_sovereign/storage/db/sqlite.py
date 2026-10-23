@@ -2219,7 +2219,9 @@ class SQLiteBackend(DatabaseBackend):
     async def _read_original_signal_outcome_relation(self, journal, *, capture=False):
         from kestrel_sovereign.signals.outcome_custody import _OriginalSignalOutcome, _JOURNAL_ADMISSION
         from kestrel_sovereign.signals.store import _OUTCOME_COLUMNS
-        from kestrel_sovereign.storage.db.native_journal_programs import _original_sqlite_query
+        from kestrel_sovereign.storage.db.native_journal_programs import (
+            _original_sqlite_query, _original_sqlite_scalar_adapters_registered,
+        )
         if type(capture) is not bool or type(journal) is not _OriginalSignalOutcome:
             raise ExecutionAuthorityError('Original SQLite journal metadata owner required')
         def require_owner():
@@ -2245,8 +2247,7 @@ class SQLiteBackend(DatabaseBackend):
             try:
                 if snapshot:
                     cursor.execute('SAVEPOINT kestrel_original_outcome_catalog')
-                if any((kind, sqlite3.PrepareProtocol) in sqlite3.adapters
-                       for kind in (type(None), bool, int, float, str, bytes)):
+                if _original_sqlite_scalar_adapters_registered():
                     return None
                 cursor.execute('PRAGMA main.schema_version')
                 version = cursor.fetchone()[0]
@@ -2275,7 +2276,8 @@ class SQLiteBackend(DatabaseBackend):
                     if index[4]:
                         cursor.execute(_original_sqlite_query(
                             "SELECT sql FROM main.sqlite_schema WHERE type='index' AND name=?", (index[1],),
-                            sqlite3.Connection.getlimit(native, sqlite3.SQLITE_LIMIT_SQL_LENGTH)))
+                            sqlite3.Connection.getlimit(native, sqlite3.SQLITE_LIMIT_SQL_LENGTH),
+                            database_encoding=native._original_journal_configuration()[-2]))
                         sql = cursor.fetchone()[0]
                         if not re.fullmatch(r'CREATE\s+INDEX(?:\s+IF\s+NOT\s+EXISTS)?\s+idx_signal_log_constitution_hash\s+ON\s+signal_log\s*\(\s*constitution_hash\s*\)\s+WHERE\s+constitution_hash\s+IS\s+NOT\s+NULL\s*', sql, re.IGNORECASE):
                             return None

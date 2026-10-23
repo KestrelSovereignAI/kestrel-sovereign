@@ -29,12 +29,15 @@ async def _close_native_counterexample_dispatch(backend, agent, dispatcher):
 
 
 @pytest.mark.parametrize('encoding', ['UTF-8', 'UTF-16le', 'UTF-16be'])
-async def test_real_original_dispatch_preserves_native_database_text(tmp_path, encoding):
+@pytest.mark.parametrize('keep_partial_index', [False, True])
+async def test_real_original_dispatch_preserves_native_database_text(tmp_path, encoding, keep_partial_index):
     path = tmp_path / 'native-text.db'
     with sqlite3.connect(path) as initial:
         initial.execute('PRAGMA encoding="' + encoding + '"')
         initial.execute('CREATE TABLE original_encoding_marker (value TEXT)')
     backend, agent, dispatcher = await _channel_dispatcher(path, 'did:agent:native-text')
+    if not keep_partial_index:
+        await backend.execute('DROP INDEX idx_signal_log_constitution_hash')
     scope = ExecutionCustody(_OriginalWork())
     effects = []
     async def handler(payload):
@@ -56,6 +59,9 @@ async def test_real_original_dispatch_preserves_native_database_text(tmp_path, e
 
 async def test_real_original_dispatch_never_compares_adapter_key_types(tmp_path):
     backend, agent, dispatcher = await _channel_dispatcher(tmp_path / 'adapter-key.db', 'did:agent:adapter-key')
+    independent = sqlite3.connect(tmp_path / 'independent-key-effect.db', check_same_thread=False)
+    independent.execute('CREATE TABLE forbidden_effect(value INTEGER)')
+    independent.commit()
     effects, callbacks = [], []
     armed = False
     class AdapterType(type):
@@ -64,6 +70,8 @@ async def test_real_original_dispatch_never_compares_adapter_key_types(tmp_path)
         def __eq__(cls, other):
             if armed:
                 callbacks.append('application equality after actual cutoff')
+                independent.execute('INSERT INTO forbidden_effect VALUES(1)')
+                independent.commit()
             return False
     class ApplicationValue(metaclass=AdapterType):
         pass
@@ -82,12 +90,14 @@ async def test_real_original_dispatch_never_compares_adapter_key_types(tmp_path)
             outcome = await await_owned_task(asyncio.create_task(dispatcher.dispatch_signal(_signal('native.adapter.key'))))
         assert effects and outcome.error is None
         assert not callbacks, 'original catalog/cursor eligibility executed application adapter key equality'
+        assert independent.execute('SELECT COUNT(*) FROM forbidden_effect').fetchone() == (0,)
         assert await backend.fetch_val('SELECT COUNT(*) FROM signal_log') == 1
     finally:
         armed = False
         sqlite3.adapters.clear()
         sqlite3.adapters.update(before)
         await _close_native_counterexample_dispatch(backend, agent, dispatcher)
+        independent.close()
 
 @dataclass
 class _OriginalWork:

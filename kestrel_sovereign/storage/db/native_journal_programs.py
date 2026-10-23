@@ -9,6 +9,7 @@ import asyncio
 import ipaddress
 import math
 import sqlite3
+import threading
 from contextvars import ContextVar
 
 _ORIGINAL_POSTGRES_CONNECT = ContextVar('original_postgres_journal_connect', default=None)
@@ -78,24 +79,41 @@ class _OriginalJournalConnectLoop:
 
 
 def _register_program(connection):
-    if connection._journal_program_seal is not None:
-        raise NativeJournalConfigurationError('Native program configuration is fenced by an original journal')
-    # Monotonic, including failed registration and later removal. Reconnect is
-    # the supported way to obtain another demonstrably plain native session.
-    connection._journal_programs_configured = True
+    with connection._journal_configuration_lock:
+        if connection._journal_program_seal is not None:
+            raise NativeJournalConfigurationError('Native program configuration is fenced by an original journal')
+        # Monotonic before the actual registration, including failed/removal
+        # calls. Begin cannot acquire eligibility between this check and mark.
+        connection._journal_programs_configured = True
 
 
-def _original_sqlite_query(query, parameters, sql_limit):
+def _original_sqlite_scalar_adapters_registered():
+    # Registry membership can call an application's metaclass __eq__ on hash
+    # collisions. Snapshot native keys and compare identities only instead.
+    registry = sqlite3.adapters
+    if type(registry) is not dict:
+        raise NativeJournalConfigurationError('Original journal requires the native adapter registry')
+    for key in tuple(dict.keys(registry)):
+        if (type(key) is tuple and len(key) == 2 and key[1] is sqlite3.PrepareProtocol
+                and any(key[0] is kind for kind in (type(None), bool, int, float, str, bytes))):
+            return True
+    return False
+
+
+def _original_sqlite_query(query, parameters, sql_limit, *, database_encoding='UTF-8'):
     """Encode ONLY the Core-owned fixed positional journal SQL as native data.
 
     CPython's parameter adapter lookup can race global register_adapter while
     prepare releases the GIL. These exact scalar literals leave ZERO native
     binds, so that process-global registry cannot execute a callback here.
-    Text is UTF-8 hex CAST, never quoted application SQL; BLOBs are hex too.
+    Text is native-database-encoding hex CAST, never application SQL; BLOBs
+    are hex too. SQLite interprets CAST(BLOB AS TEXT) in that database encoding.
     Ordinary database execution does not use this private journal compiler.
     """
     if type(query) is not str or type(parameters) is not tuple:
         raise NativeJournalConfigurationError('Original journal requires fixed native SQL and values')
+    if type(database_encoding) is not str or database_encoding not in ('UTF-8', 'UTF-16le', 'UTF-16be'):
+        raise NativeJournalConfigurationError('Original journal native text encoding is unsupported')
     if not parameters:
         # Trusted parameter-free catalog SQL may contain '?' inside a quoted
         # identifier/literal. With no native binds there is no adapter lookup.
@@ -137,7 +155,7 @@ def _original_sqlite_query(query, parameters, sql_limit):
                     exponent += -shift if exponent > 0 else shift
                 literal = '(' + ''.join(terms) + ')'
         elif kind is str or kind is bytes:
-            encoded = str.encode(value, 'utf-8') if kind is str else value
+            encoded = str.encode(value, database_encoding) if kind is str else value
             prefix, suffix = ("CAST(X'", "' AS TEXT)") if kind is str else ("X'", "'")
             if len(encoded) * 2 + len(prefix) + len(suffix) > remaining:
                 raise sqlite3.DataError('Original journal exceeds native statement length limit')
@@ -158,16 +176,18 @@ class _NativeJournalSQLiteCursor(sqlite3.Cursor):
             if (not native._original_journal_programs_supported()
                     or type(parameters) is not tuple
                     or any(not _has_exact_native_type(value, type(None), int, float, str, bytes) for value in parameters)
-                    or any((type(value), sqlite3.PrepareProtocol) in sqlite3.adapters for value in parameters)):
+                    or _original_sqlite_scalar_adapters_registered()):
                 raise NativeJournalConfigurationError('Original journal binds only plain native scalar parameters')
             query = _original_sqlite_query(query, parameters,
-                sqlite3.Connection.getlimit(native, sqlite3.SQLITE_LIMIT_SQL_LENGTH))
+                sqlite3.Connection.getlimit(native, sqlite3.SQLITE_LIMIT_SQL_LENGTH),
+                database_encoding=native._journal_program_seal[-2])
             return super().execute(query)  # Zero native binds: no global adapter dispatch.
         return super().execute(query, parameters)
 
 
 class _NativeJournalSQLiteConnection(sqlite3.Connection):
     def __init__(self, *args, **kwargs):
+        self._journal_configuration_lock = threading.RLock()
         self._journal_programs_configured = False
         self._journal_program_seal = None
         super().__init__(*args, **kwargs)
@@ -190,11 +210,15 @@ class _NativeJournalSQLiteConnection(sqlite3.Connection):
         return sqlite3.SQLITE_OK
 
     def __setattr__(self, name, value):
-        if name in ('text_factory', 'autocommit', 'isolation_level') and self._journal_program_seal is not None:
-            raise NativeJournalConfigurationError('Original journal native configuration is fenced')
+        if name in ('text_factory', 'autocommit', 'isolation_level'):
+            with self._journal_configuration_lock:
+                if self._journal_program_seal is not None:
+                    raise NativeJournalConfigurationError('Original journal native configuration is fenced')
+                super().__setattr__(name, value)
+                if name == 'autocommit':
+                    self._journal_autocommit_legacy = self.autocommit == sqlite3.LEGACY_TRANSACTION_CONTROL
+            return
         super().__setattr__(name, value)
-        if name == 'autocommit':
-            self._journal_autocommit_legacy = self.autocommit == sqlite3.LEGACY_TRANSACTION_CONTROL
 
     def _program_call(self, method_name, /, *args, **kwargs):
         _register_program(self)
@@ -262,12 +286,13 @@ class _NativeJournalSQLiteConnection(sqlite3.Connection):
     def _begin_original_journal(self):
         # This operation is queued by the original writer under the existing
         # write guard. Check+seal+BEGIN run in one native worker operation.
-        if not self._original_journal_programs_supported() or self._journal_program_seal is not None:
-            raise NativeJournalConfigurationError('Original journal requires a plain native SQLite connection')
         # Fence application programs before BEGIN can wait for another native
         # writer. The durable configuration belongs to the acquired lock, not
         # to the earlier (possibly stale) external-commit generation.
-        self._journal_program_seal = object()
+        with self._journal_configuration_lock:
+            if not self._original_journal_programs_supported() or self._journal_program_seal is not None:
+                raise NativeJournalConfigurationError('Original journal requires a plain native SQLite connection')
+            self._journal_program_seal = object()
         try:
             cursor = super().execute('BEGIN IMMEDIATE')
             cursor.close()
@@ -286,7 +311,7 @@ class _NativeJournalSQLiteConnection(sqlite3.Connection):
         try:
             values = []
             for name in ('journal_mode', 'synchronous', 'fullfsync',
-                         'checkpoint_fullfsync', 'wal_autocheckpoint', 'data_version'):
+                         'checkpoint_fullfsync', 'wal_autocheckpoint', 'encoding', 'data_version'):
                 cursor.execute('PRAGMA main.' + name)
                 row = cursor.fetchone()
                 if row is None or len(row) != 1 or not _has_exact_native_type(row[0], str, int):
