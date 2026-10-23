@@ -258,10 +258,12 @@ async def test_postgres_pinned_peer_keeps_native_tls_identity_on_reconnect(dispa
             assert not native._cancellations, 'original native cancellation Task remained retained after physical completion'
     finally:
         c.backend._pool = original_pool
-        if pool is not None:
-            async with asyncio.timeout(10):
-                await pool.close()
-        await retire_proxy()
+        try:
+            if pool is not None:
+                async with asyncio.timeout(10):
+                    await pool.close()
+        finally:
+            await retire_proxy()
 
 
 @pytest.mark.parametrize('direct_tls', [False, True])

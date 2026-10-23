@@ -540,9 +540,17 @@ async def enter_feature_lifecycle_safe_mode(agent: object, reason: str, *errors,
     """
     cause = SafeModeCause.FEATURE_LIFECYCLE_UNCERTAIN.value
     _retain_feature_lifecycle_safe_mode(agent, reason, *errors)
-    controls = [error for error in errors if is_execution_control_error(error)]
-    withdrawals = [error for error in errors if isinstance(error, asyncio.CancelledError)
-                   and not is_execution_control_error(error)]
+    controls, withdrawals = [], []
+    def retain_failure(error):
+        if is_execution_control_error(error):
+            controls.append(error)
+        elif isinstance(error, asyncio.CancelledError):
+            withdrawals.append(error)
+        elif isinstance(error, BaseExceptionGroup):
+            _raise_unexpected_lifecycle_exception_group(error)
+            withdrawals.extend(execution_observer_cancellations(error))
+    for error in errors:
+        retain_failure(error)
     quarantine = getattr(agent, "_quarantine_feature_contributions", None)
     for feature in features:
         feature.enabled = False
@@ -550,12 +558,7 @@ async def enter_feature_lifecycle_safe_mode(agent: object, reason: str, *errors,
             try:
                 quarantine(feature)
             except (Exception, asyncio.CancelledError, BaseExceptionGroup) as error:
-                if is_execution_control_error(error):
-                    controls.append(error)
-                elif isinstance(error, asyncio.CancelledError):
-                    withdrawals.append(error)
-                elif isinstance(error, BaseExceptionGroup):
-                    _raise_unexpected_lifecycle_exception_group(error)
+                retain_failure(error)
     try:
         enter = getattr(agent, "enter_safe_mode", None)
         if callable(enter):
@@ -563,12 +566,7 @@ async def enter_feature_lifecycle_safe_mode(agent: object, reason: str, *errors,
             if inspect.isawaitable(result):
                 await result
     except (Exception, asyncio.CancelledError, BaseExceptionGroup) as error:
-        if is_execution_control_error(error):
-            controls.append(error)
-        elif isinstance(error, asyncio.CancelledError):
-            withdrawals.append(error)
-        elif isinstance(error, BaseExceptionGroup):
-            _raise_unexpected_lifecycle_exception_group(error)
+        retain_failure(error)
     finally:
         _retain_feature_lifecycle_safe_mode(agent, reason, *controls)
     withdrawals.extend(

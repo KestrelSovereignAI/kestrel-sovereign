@@ -11,6 +11,7 @@ import math
 import sqlite3
 import threading
 from contextvars import ContextVar
+from dataclasses import dataclass
 
 _ORIGINAL_POSTGRES_CONNECT = ContextVar('original_postgres_journal_connect', default=None)
 
@@ -346,13 +347,44 @@ except ImportError:
     asyncpg = None
     NativeJournalPostgresConnection = None
 else:
+    @dataclass(frozen=True, slots=True, repr=False)
+    class _OriginalJournalCancelConnection:
+        """Read-only native cancellation view; reuse asyncpg's actual executor.
+
+        A reused session still remembers its DNS alias in _addr. Capture its
+        actual socket and independent TLS name before sealing, without changing
+        the live connection's ordinary loop/recipe or copying cancellation I/O.
+        """
+        _loop: object
+        _addr: object
+        _params: object
+        _protocol: object
+        _cancellations: set
+
+        @classmethod
+        def capture(cls, connection):
+            peer = connection._transport.get_extra_info('peername')
+            loop = connection._loop
+            if type(peer) is tuple:
+                address = _native_tcp_endpoint(peer)
+                tls = connection._transport.get_extra_info('ssl_object')
+                name = tls.server_hostname if tls is not None else None
+                loop = _OriginalJournalConnectLoop(loop, address, name)
+            elif type(peer) is str:
+                address = peer
+            else:
+                raise NativeJournalConfigurationError('Original native cancellation socket is unsupported')
+            return cls(loop, address, connection._params, connection._protocol,
+                       connection._cancellations)
+
     class NativeJournalPostgresConnection(asyncpg.Connection):
         """Pass as asyncpg.create_pool(connection_class=...) for native journals."""
-        __slots__ = ('_journal_programs_configured', '_journal_program_seal')
+        __slots__ = ('_journal_programs_configured', '_journal_program_seal', '_journal_cancel_connection')
 
         def __init__(self, *args, **kwargs):
             self._journal_programs_configured = False
             self._journal_program_seal = None
+            self._journal_cancel_connection = None
             super().__init__(*args, **kwargs)
 
         async def set_type_codec(self, *args, **kwargs):
@@ -427,6 +459,7 @@ else:
         def _begin_original_journal(self, native_state):
             if not self._original_journal_programs_supported() or self._journal_program_seal is not None:
                 raise NativeJournalConfigurationError('Original journal requires a plain native PostgreSQL connection')
+            self._journal_cancel_connection = _OriginalJournalCancelConnection.capture(self)
             self._journal_program_seal = (asyncio.current_task(), native_state)
 
         def _retire_original_journal_refusal(self):
@@ -441,6 +474,9 @@ else:
 
         async def _cancel(self, waiter):
             try:
+                cancellation = self._journal_cancel_connection
+                if cancellation is not None:
+                    return await asyncpg.Connection._cancel(cancellation, waiter)
                 return await super()._cancel(waiter)
             finally:
                 # asyncpg queries current_task(self._loop). Its connection-
@@ -458,6 +494,7 @@ else:
             if not self.is_closed() and (retirement is None or not retirement.done()):
                 return False  # Keep an unresolved original retirement sealed.
             self._journal_program_seal = None
+            self._journal_cancel_connection = None
             return True
 
         def get_reset_query(self):
