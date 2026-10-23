@@ -613,23 +613,27 @@ else:
                        for fmt in (-1, 0, 1))
 
         async def _wait_original_journal_retirement(self):
-            # Pool return precedes its old writer's final fence release. A
-            # successor borrows observation of that exact original task; it
-            # neither clears its seal nor cancels/adopts its native cleanup.
+            # Pool return precedes its old journal's final fence release.
+            # Admission's owner is the entire dispatch, which can need this
+            # same slot again. Observe ONLY that finite native seal, never
+            # wait for a dispatch while retaining a slot it needs to finish.
             seal = self._journal_program_seal
             if seal is None:
                 return
-            owner, _ = seal
+            owner, _, completion = seal
             if owner is asyncio.current_task():
                 raise NativeJournalConfigurationError('Original journal cannot reenter its native session')
             from kestrel_sovereign._async_ownership import await_owned_task
-            await await_owned_task(owner, defer_cancellation=False)
+            outcome = await await_owned_task(completion, defer_cancellation=False)
+            if outcome.error is not None:
+                raise outcome.error
             if self._journal_program_seal is not None:
                 raise NativeJournalConfigurationError('Previous original journal has unresolved native retirement')
 
         def _begin_original_journal(self, native_state, *, tls_context=None, tls_generation=None):
             if not self._original_journal_programs_supported() or self._journal_program_seal is not None:
                 raise NativeJournalConfigurationError('Original journal requires a plain native PostgreSQL connection')
+            completion = asyncio.get_running_loop().create_future()
             tls = self._transport.get_extra_info('ssl_object')
             policy = _OriginalNativeTLSPolicy(tls_context, tls_generation, tls=tls)
             try:
@@ -639,7 +643,7 @@ else:
                 policy.__exit__(None, None, None)
                 raise
             self._journal_tls_policy_seal = policy
-            self._journal_program_seal = (asyncio.current_task(), native_state)
+            self._journal_program_seal = (asyncio.current_task(), native_state, completion)
 
         def _retire_original_journal_refusal(self):
             # Refusing application configuration must not execute it during
@@ -666,17 +670,24 @@ else:
         def _end_original_journal(self):
             if self._journal_program_seal is None:
                 return False
-            owner, native_state = self._journal_program_seal
+            owner, native_state, completion = self._journal_program_seal
             if owner is not asyncio.current_task():
                 raise NativeJournalConfigurationError('Only the original native journal owner can release its program fence')
-            retirement = native_state.retirement.owner
-            if not self.is_closed() and (retirement is None or not retirement.done()):
-                return False  # Keep an unresolved original retirement sealed.
-            self._journal_tls_policy_seal.__exit__(None, None, None)
-            self._journal_tls_policy_seal = None
-            self._journal_program_seal = None
-            self._journal_cancel_connection = None
-            return True
+            try:
+                retirement = native_state.retirement.owner
+                if not self.is_closed() and (retirement is None or not retirement.done()):
+                    return False  # Keep an unresolved original retirement sealed.
+                self._journal_tls_policy_seal.__exit__(None, None, None)
+                self._journal_tls_policy_seal = None
+                self._journal_program_seal = None
+                self._journal_cancel_connection = None
+                return True
+            finally:
+                # Every original epilogue publishes its finite disposition,
+                # even an unresolved retirement. Successors then inspect the
+                # same seal and fail closed, not wait for unrelated Work.
+                if not completion.done():
+                    completion.set_result(None)
 
         def get_reset_query(self):
             # The stock reset runs AFTER COMMIT/local search_path restoration.

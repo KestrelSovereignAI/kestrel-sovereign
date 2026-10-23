@@ -5071,6 +5071,25 @@ class SignalDispatcher:
                 registration=registration,
             )
 
+        from contextlib import nullcontext
+        from kestrel_sovereign._async_ownership import OwnedTaskAdmission
+        routing_admission = _routing_admission if _routing_admission is not None else OwnedTaskAdmission()
+        guard = (self._own_unrouted_cognition_claim(delivery, routing_admission)
+                 if _routing_admission is None else nullcontext())
+        async with guard:
+            return await self._run_original_cognition_claim(
+                signal, registration, start, delivery=delivery, consumer_id=consumer_id,
+                durable_admission=durable_admission, durable_created=durable_created,
+                use_live_signal=use_live_signal, retry_delay=retry_delay,
+                persisted_event_id=persisted_event_id, _journal_completion=_journal_completion,
+                _routing_admission=routing_admission)
+
+    async def _run_original_cognition_claim(
+        self, signal, registration, start, *, delivery, consumer_id,
+        durable_admission, durable_created, use_live_signal, retry_delay,
+        persisted_event_id, _journal_completion, _routing_admission,
+    ):
+        """Keep the acquired token owned through resident startup and routing."""
         if durable_admission is not None:
             # The exact claim was obtained under live ingress authority. Its
             # remaining work must be owned before any early cursor receipt:
@@ -5244,7 +5263,7 @@ class SignalDispatcher:
                     cleanup = error
                 cleanup = await self._finish_original_outcomes(
                     journal._identity[0] if journal is not None else signal.id, cleanup)
-                terminal = execution_finite_error(original, cleanup, retain_originals=True)
+                terminal = execution_observation_error(original, cleanup)
                 if terminal is not None:
                     raise terminal
                 return result
@@ -5555,9 +5574,8 @@ class SignalDispatcher:
                 from kestrel_sovereign._async_ownership import await_owned_task
                 routing_task = routing_admission.task
                 outcome = await await_owned_task(routing_task)
-                error = execution_finite_error(error, outcome.error, outcome.cancellation,
-                                               retain_originals=True, isolate_control_originals=True)
-            error = execution_finite_error(lease_loss_error, error)
+                error = execution_observation_error(error, outcome.error, outcome.cancellation)
+            error = execution_observation_error(lease_loss_error, error)
             if is_execution_control_error(error):
                 error = await self._settle_cognition_control(delivery, error, routing_task)
                 raise error
@@ -5575,9 +5593,8 @@ class SignalDispatcher:
                 from kestrel_sovereign._async_ownership import await_owned_task
                 routing_task = routing_admission.task
                 outcome = await await_owned_task(routing_task)
-                error = execution_finite_error(error, outcome.error, outcome.cancellation,
-                                               retain_originals=True, isolate_control_originals=True)
-            error = execution_finite_error(lease_loss_error, error)
+                error = execution_observation_error(error, outcome.error, outcome.cancellation)
+            error = execution_observation_error(lease_loss_error, error)
             if is_execution_control_error(error):
                 error = await self._settle_cognition_control(delivery, error, routing_task)
             elif routing_task is not None:
@@ -5926,10 +5943,14 @@ class SignalDispatcher:
                 error="Cognition task settled after durable lease loss",
             )
         except BaseException as error:
-            if observe_failure:
-                raise
-            if is_execution_control_error(error):
-                await self._terminalize_failed_cognition(delivery, error)
+            if is_execution_control_error(error) or observe_failure:
+                # Observation may report a failed release, but it cannot
+                # withdraw this exact token's existing settlement owner.
+                # The canonical terminalizer retains debt BEFORE any await.
+                try:
+                    await self._terminalize_failed_cognition(delivery, error)
+                except BaseException as cleanup:
+                    raise execution_observation_error(error, cleanup) from None
                 raise
             if isinstance(error, _DurableDeliveryShuttingDownError):
                 return
