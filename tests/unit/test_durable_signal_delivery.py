@@ -430,6 +430,17 @@ async def _assert_pre_route_claim(tmp_path, monkeypatch, public_handle, release_
     async def withdraw_here():
         entered.set()
         await release.wait()
+    if phase == 'initial_hold':
+        original_held = dispatcher._agent_is_held
+        async def first_hold():
+            # Registration/claim acquisition also reads Hold. Block only
+            # AFTER the genuine native claim exists, at recovered routing.
+            if task is not None and asyncio.current_task() is task:
+                deliveries = await dispatcher.list_durable_deliveries()
+                if any(delivery.status == LEASED and delivery.lease_token for delivery in deliveries):
+                    await withdraw_here()
+            return await original_held()
+        monkeypatch.setattr(dispatcher, '_agent_is_held', first_hold)
     async def rehydrate(event, *, dispatch_signal):
         nonlocal recovered
         if phase in ('rehydrate', 'grouped_rehydrate'):

@@ -983,6 +983,16 @@ One pre-routing owner covers admission, rehydration, Hold reads, execution-phase
 commit and stop-completion guard acquisition, including finite grouped SQL
 failure/cancellation. Its responsibility transfers only when the actual routing
 Task is published, not when a coroutine or admission promise is constructed.
+Recovered entry owns an already-selected claim before its first awaited Hold
+read. An accepted-but-unstarted routing Task whose callback publication fails
+is physically joined and its exact claim released; Task existence alone is not
+a settlement-owner receipt. Ordinary failures with a live route retain that
+original child through the existing bounded cancellation/cleanup owner.
+Legacy unscoped writers also capture native-text tracking and drain keys, so a
+string-subclass hash change during UI emission cannot strand completed Tasks.
+PostgreSQL admission itself seals native programs and the SSLObject/policy
+association before awaiting principal/catalog reads, through actual pool reset;
+the later writer seal cannot repair an already-substituted admission snapshot.
 PostgreSQL relation identity includes the database OID as well as its name and
 namespace/table OIDs; cloning a database and reusing its name cannot redirect
 an original accepted journal into the clone.

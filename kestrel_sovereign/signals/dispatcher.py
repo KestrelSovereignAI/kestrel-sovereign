@@ -3033,6 +3033,8 @@ class SignalDispatcher:
 
     async def _finish_original_outcomes(self, signal_id, original=None):
         """An accepted writer cannot outlive its throwing original owner."""
+        from kestrel_sovereign.signals.outcome_custody import _native_identity_text
+        signal_id = _native_identity_text(signal_id)
         journal = self._original_outcome_admission.get()
         identity = journal._identity[0] if journal is not None else signal_id
         cleanup = None
@@ -3065,6 +3067,8 @@ class SignalDispatcher:
 
     async def _drain_outcome_logs_for_signal(self, signal_id: str) -> None:
         """Join this dispatch's outcome writers before returning its result."""
+        from kestrel_sovereign.signals.outcome_custody import _native_identity_text
+        signal_id = _native_identity_text(signal_id)
         while tasks := self._outcome_log_tasks_by_signal.get(signal_id):
             await self._join_outcome_log_tasks(tuple(tasks))
         if self._outcome_log_control_error is not None:
@@ -4880,6 +4884,27 @@ class SignalDispatcher:
         return self._success(signal, start, registration)
 
     async def _route_durable_cognition_delivery(
+        self, signal, registration, start, *, persisted_event_id, consumer_id,
+        durable_admission, durable_created, use_live_signal,
+        verified_terminal_retry=False, claimed_delivery=None, retry_delay=timedelta(),
+        _journal_completion=None,
+    ):
+        """Own an existing recovered claim before its first awaited Hold read."""
+        from contextlib import nullcontext
+        from kestrel_sovereign._async_ownership import OwnedTaskAdmission
+        routing_admission = OwnedTaskAdmission() if claimed_delivery is not None else None
+        guard = (self._own_unrouted_cognition_claim(claimed_delivery, routing_admission)
+                 if routing_admission is not None else nullcontext())
+        async with guard:
+            return await self._route_durable_cognition_delivery_body(
+                signal, registration, start, persisted_event_id=persisted_event_id,
+                consumer_id=consumer_id, durable_admission=durable_admission,
+                durable_created=durable_created, use_live_signal=use_live_signal,
+                verified_terminal_retry=verified_terminal_retry, claimed_delivery=claimed_delivery,
+                retry_delay=retry_delay, _journal_completion=_journal_completion,
+                _routing_admission=routing_admission)
+
+    async def _route_durable_cognition_delivery_body(
         self,
         signal: Signal,
         registration: SourceRegistration,
@@ -4894,6 +4919,7 @@ class SignalDispatcher:
         claimed_delivery: DurableDelivery | None = None,
         retry_delay: timedelta = timedelta(),
         _journal_completion=None,
+        _routing_admission=None,
     ) -> SignalResult:
         """Route cursor-owned work and ACK only its durable cognition lease."""
         delivery = claimed_delivery
@@ -5065,7 +5091,7 @@ class SignalDispatcher:
                             consumer_id=consumer_id, use_live_signal=use_live_signal,
                             retry_delay=retry_delay, durable_admission=durable_admission,
                             persisted_event_id=persisted_event_id,
-                            _journal_completion=resident_journals,
+                            _journal_completion=resident_journals, _routing_admission=_routing_admission,
                         )
                     finally:
                         await self._drain_outcome_logs_for_signal(signal.id)
@@ -5160,18 +5186,23 @@ class SignalDispatcher:
             durable_admission=durable_admission,
             persisted_event_id=persisted_event_id,
             _journal_completion=_journal_completion,
+            _routing_admission=_routing_admission,
         )
 
     async def _execute_claimed_durable_cognition(
         self, signal, registration, start, *, delivery, consumer_id,
         use_live_signal, retry_delay, durable_admission, persisted_event_id, _journal_completion=None,
+        _routing_admission=None,
     ):
         """Own recovered claim admission and its original journal through join."""
         if _journal_completion is not None and (type(_journal_completion) is not list or _journal_completion):
             raise TypeError('Original resident journal handoff requires a fresh native slot')
         from kestrel_sovereign._async_ownership import OwnedTaskAdmission
-        routing_admission = OwnedTaskAdmission()
-        async with self._own_unrouted_cognition_claim(delivery, routing_admission), self._admit_durable_operation():
+        from contextlib import nullcontext
+        routing_admission = _routing_admission if _routing_admission is not None else OwnedTaskAdmission()
+        guard = (self._own_unrouted_cognition_claim(delivery, routing_admission)
+                 if _routing_admission is None else nullcontext())
+        async with guard, self._admit_durable_operation():
             token = self._original_outcome_admission.set(None)
             original_outcomes = []
             deferred_token = self._deferred_outcome_logs.set(original_outcomes)
@@ -5549,6 +5580,18 @@ class SignalDispatcher:
             error = execution_finite_error(lease_loss_error, error)
             if is_execution_control_error(error):
                 error = await self._settle_cognition_control(delivery, error, routing_task)
+            elif routing_task is not None:
+                # Acceptance is not successful publication. A failed start
+                # gate was physically joined above and has no settlement
+                # callback. Later ordinary failures must also retain a live
+                # route rather than abandoning its original claim.
+                try:
+                    if routing_task.done():
+                        await self._release_retained_durable_cognition_task(delivery, observe_failure=True)
+                    else:
+                        await self._cancel_durable_cognition_routing_task(routing_task, delivery=delivery)
+                except BaseException as cleanup:
+                    raise execution_observation_error(error, cleanup) from None
             raise error
 
         if result is None:
@@ -7767,7 +7810,8 @@ class SignalDispatcher:
             # Only actual pipeline-return boundaries seal _completed_result.
             # Reentrant/helper attempts cannot reserve/consume the real row.
             journal.require_preparation(result)
-        scheduling_id = journal._identity[0] if journal is not None else signal.id
+        from kestrel_sovereign.signals.outcome_custody import _native_identity_text
+        scheduling_id = journal._identity[0] if journal is not None else _native_identity_text(signal.id)
         reservation = self._reserve_durable_admission()
         token = None
         from kestrel_sovereign._async_ownership import OwnedTaskAdmission

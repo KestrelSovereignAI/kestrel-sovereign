@@ -231,7 +231,8 @@ async def test_postgres_pinned_peer_keeps_native_tls_identity_on_reconnect(dispa
         def change_transport(connection, *args, **kwargs):
             # This is the actual public SSLObject setter after checkout's
             # endpoint comparison, not a fabricated transport or TLS result.
-            connection._transport.get_extra_info('ssl_object').context = replacement_policy
+            if c.dispatcher._original_outcome_writer.get() is not None:
+                connection._transport.get_extra_info('ssl_object').context = replacement_policy
             return original_begin(connection, *args, **kwargs)
         monkeypatch.setattr(NativeJournalPostgresConnection, '_begin_original_journal', change_transport)
     original_cancel = NativeJournalPostgresConnection._cancel

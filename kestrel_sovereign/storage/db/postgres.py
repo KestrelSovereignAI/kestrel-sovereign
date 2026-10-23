@@ -2269,20 +2269,40 @@ class PostgresBackend(DatabaseBackend):
         if self.owns_open_transaction:
             raise ExecutionAuthorityError('Original signal destination refuses an enclosing transaction')
         journal._require_backing()
-        async with self._tracked_pool_checkout(journal._backing, admit_work=True) as (connection, _):
-            journal._require_backing()
-            native = connection._con
-            if type(native) is not NativeJournalPostgresConnection or not native._original_journal_programs_supported():
-                raise ExecutionAuthorityError('Original journal requires a plain fenced native PostgreSQL session')
-            principal = await native._original_journal_principal()
-            journal._require_backing()
-            require_execution_work(self)
-            journal._postgres_pool = journal._postgres_pool.with_actual_connection(native, principal)
-            relation = await self._read_original_signal_outcome_relation(connection, 'signal_log')
-            if relation is None:
-                raise ExecutionAuthorityError('Original native signal journal requires its plain permanent audit table')
-            journal._require_backing()
-            require_execution_work(self)
+        native = None
+        program_sealed = False
+        try:
+            async with self._tracked_pool_checkout(journal._backing, admit_work=True) as (connection, state):
+                journal._require_backing()
+                native = connection._con
+                if type(native) is not NativeJournalPostgresConnection:
+                    raise NativeJournalConfigurationError('Original journal requires a fenced native PostgreSQL session')
+                await native._wait_original_journal_retirement()
+                journal._require_backing()
+                require_execution_work(self)
+                tls = native._transport.get_extra_info('ssl_object')
+                context = tls.context if tls is not None else None
+                from .native_journal_programs import _native_tls_policy_generation
+                # Capture has awaits too. Seal native programs, the actual
+                # association and its policy BEFORE the first principal read,
+                # through the same physical pool-reset retirement as a writer.
+                native._begin_original_journal(state, tls_context=context,
+                    tls_generation=_native_tls_policy_generation(context))
+                program_sealed = True
+                principal = await native._original_journal_principal()
+                journal._require_backing()
+                require_execution_work(self)
+                journal._postgres_pool = journal._postgres_pool.with_actual_connection(native, principal)
+                relation = await self._read_original_signal_outcome_relation(connection, 'signal_log')
+                if relation is None:
+                    raise ExecutionAuthorityError('Original native signal journal requires its plain permanent audit table')
+                journal._require_backing()
+                require_execution_work(self)
+        except NativeJournalConfigurationError as error:
+            raise journal.write_refusal('native_programs_changed') from error
+        finally:
+            if program_sealed:
+                native._end_original_journal()
         journal._require_backing()
         require_execution_work(self)
         return relation
