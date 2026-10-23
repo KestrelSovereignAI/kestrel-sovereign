@@ -2243,8 +2243,7 @@ class SQLiteBackend(DatabaseBackend):
                 return None
             admission_seal = None
             if capture:
-                if not native._original_journal_programs_supported():
-                    return None
+                admission_seal = native._seal_original_journal_programs()
             elif not native._original_journal_programs_supported():
                 return None
             cursor = None
