@@ -18,8 +18,8 @@ generated: true
 Auto-generated file-tree + per-file purpose index. Always-loaded context for the kestrel-agent
 GitHub App (issue #791). Do **not** edit by hand — regenerate via `python scripts/generate_repo_map.py`.
 
-**Generated:** 2026-10-22
-**Scope:** 3307 tracked files (2473 `.py`, 366 `.md`, 468 other). Excludes `__pycache__`, `node_modules`, `.venv`, `.claude`, build artifacts.
+**Generated:** 2026-10-23
+**Scope:** 3453 tracked files (2604 `.py`, 368 `.md`, 481 other). Excludes `__pycache__`, `node_modules`, `.venv`, `.claude`, build artifacts.
 
 **Format per file:** `path — one-line purpose` plus the public top-level Python symbols on the next line
 (classes and functions; private `_name` skipped).
@@ -88,6 +88,254 @@ Repo entry points and standard project files.
   - `class ProbeError`; `class ProbeConnectionError`; `class ProbeQueryError`; `def fetch_rows_in_process(dsn, sql, params)`; `def main()`
 - **kestrel_sovereign/_subprocess_helpers.py** — Shared subprocess helpers for the host-side bash-to-Python ports (epic #1050).
   - `def is_windows()`; `def new_process_group_kwargs()`; `def run_streaming(cmd)`; `def start_background_process(cmd)`; `def stop_process(proc)`; `def wait_for_health(port)`
+- **kestrel_sovereign/_vendor/__init__.py** — Licensed third-party dependencies shipped in isolated package namespaces.
+- **kestrel_sovereign/_vendor/a2a/LICENSE** — —
+- **kestrel_sovereign/_vendor/a2a/NOTICE** — —
+- **kestrel_sovereign/_vendor/a2a/UPSTREAM-PYPROJECT.toml** — (configuration)
+- **kestrel_sovereign/_vendor/a2a/UPSTREAM.patch** — —
+- **kestrel_sovereign/_vendor/a2a/VENDORED.json** — (configuration)
+- **kestrel_sovereign/_vendor/a2a/__init__.py** — The A2A Python SDK.
+- **kestrel_sovereign/_vendor/a2a/_base.py** — —
+  - `def to_camel_custom(snake)`; `class A2ABaseModel`
+- **kestrel_sovereign/_vendor/a2a/a2a_db_cli.py** — —
+  - `def create_parser()`; `def run_migrations()`
+- **kestrel_sovereign/_vendor/a2a/alembic.ini** — (configuration)
+- **kestrel_sovereign/_vendor/a2a/auth/__init__.py** — —
+- **kestrel_sovereign/_vendor/a2a/auth/user.py** — Authenticated user information.
+  - `class User`; `class UnauthenticatedUser`
+- **kestrel_sovereign/_vendor/a2a/client/__init__.py** — Client-side components for interacting with an A2A agent.
+- **kestrel_sovereign/_vendor/a2a/client/auth/__init__.py** — Client-side authentication components for the A2A Python SDK.
+- **kestrel_sovereign/_vendor/a2a/client/auth/credentials.py** — —
+  - `class CredentialService`; `class InMemoryContextCredentialStore`
+- **kestrel_sovereign/_vendor/a2a/client/auth/interceptor.py** — —
+  - `class AuthInterceptor`
+- **kestrel_sovereign/_vendor/a2a/client/base_client.py** — —
+  - `class BaseClient`
+- **kestrel_sovereign/_vendor/a2a/client/card_resolver.py** — —
+  - `def parse_agent_card(agent_card_data)`; `class A2ACardResolver`
+- **kestrel_sovereign/_vendor/a2a/client/client.py** — —
+  - `class ClientConfig`; `class ClientCallContext`; `class Client`
+- **kestrel_sovereign/_vendor/a2a/client/client_factory.py** — —
+  - `def major_minor(version)`; `class ClientFactory`; `async def create_client(agent, client_config, interceptors, relative_card_path, …)`; `def minimal_agent_card(url, transports)`
+- **kestrel_sovereign/_vendor/a2a/client/errors.py** — Custom exceptions for the A2A client.
+  - `class A2AClientError`; `class AgentCardResolutionError`; `class A2AClientTimeoutError`
+- **kestrel_sovereign/_vendor/a2a/client/interceptors.py** — —
+  - `class BeforeArgs`; `class AfterArgs`; `class ClientCallInterceptor`
+- **kestrel_sovereign/_vendor/a2a/client/optionals.py** — —
+- **kestrel_sovereign/_vendor/a2a/client/service_parameters.py** — —
+  - `class ServiceParametersFactory`; `def with_a2a_extensions(extensions)`
+- **kestrel_sovereign/_vendor/a2a/client/transports/__init__.py** — A2A Client Transports.
+- **kestrel_sovereign/_vendor/a2a/client/transports/base.py** — —
+  - `class ClientTransport`
+- **kestrel_sovereign/_vendor/a2a/client/transports/grpc.py** — —
+  - `class GrpcTransport`
+- **kestrel_sovereign/_vendor/a2a/client/transports/http_helpers.py** — —
+  - `def handle_http_exceptions(status_error_handler)`; `def get_http_args(context)`; `async def send_http_request(httpx_client, request, status_error_handler)`; `async def parse_sse_stream(response)`; `async def send_http_stream_request(httpx_client, method, url, status_error_handler, …)`
+- **kestrel_sovereign/_vendor/a2a/client/transports/jsonrpc.py** — —
+  - `class JsonRpcTransport`
+- **kestrel_sovereign/_vendor/a2a/client/transports/response_parsing.py** — Decode peer response data separately from transport and admission failures.
+  - `def load_json_value(payload)`; `def load_json_response(payload)`; `def decode_response_text(payload)`; `def parse_jsonrpc_response(payload)`; `def parse_protobuf_response(payload, message)`
+- **kestrel_sovereign/_vendor/a2a/client/transports/rest.py** — —
+  - `class RestTransport`
+- **kestrel_sovereign/_vendor/a2a/client/transports/tenant_decorator.py** — —
+  - `class TenantTransportDecorator`
+- **kestrel_sovereign/_vendor/a2a/compat/__init__.py** — —
+- **kestrel_sovereign/_vendor/a2a/compat/v0_3/README.md** — A2A Protocol Backward Compatibility (v0.3) — This directory (`src/a2a/compat/v0_3/`) provides the foundational types and translation layers necessary for modern `v1.0` clients and servers to interoperate with legacy `v0.3` A2A systems.
+- **kestrel_sovereign/_vendor/a2a/compat/v0_3/__init__.py** — —
+- **kestrel_sovereign/_vendor/a2a/compat/v0_3/a2a_v0_3.proto** — —
+- **kestrel_sovereign/_vendor/a2a/compat/v0_3/a2a_v0_3_pb2.py** — Generated protocol buffer code.
+- **kestrel_sovereign/_vendor/a2a/compat/v0_3/a2a_v0_3_pb2.pyi** — —
+- **kestrel_sovereign/_vendor/a2a/compat/v0_3/a2a_v0_3_pb2_grpc.py** — Client and server classes corresponding to protobuf-defined services.
+  - `class A2AServiceStub`; `class A2AServiceServicer`; `def add_A2AServiceServicer_to_server(servicer, server)`; `class A2AService`
+- **kestrel_sovereign/_vendor/a2a/compat/v0_3/buf.lock** — —
+- **kestrel_sovereign/_vendor/a2a/compat/v0_3/buf.yaml** — (configuration)
+- **kestrel_sovereign/_vendor/a2a/compat/v0_3/context_builders.py** — Context builders that add v0.3 backwards-compatibility for extensions.
+  - `class V03ServerCallContextBuilder`; `class V03GrpcServerCallContextBuilder`
+- **kestrel_sovereign/_vendor/a2a/compat/v0_3/conversions.py** — —
+  - `def to_core_part(compat_part)`; `def to_compat_part(core_part)`; `def to_core_message(compat_msg)`; `def to_compat_message(core_msg)`; `def to_core_task_status(compat_status)`; `def to_compat_task_status(core_status)`; `def to_core_task(compat_task)`; `def to_compat_task(core_task)`; `…`
+- **kestrel_sovereign/_vendor/a2a/compat/v0_3/extension_headers.py** — Shared header name constants for v0.3 extension compatibility.
+  - `def add_legacy_extension_header(parameters)`
+- **kestrel_sovereign/_vendor/a2a/compat/v0_3/grpc_handler.py** — —
+  - `class CompatGrpcHandler`
+- **kestrel_sovereign/_vendor/a2a/compat/v0_3/grpc_transport.py** — —
+  - `class CompatGrpcTransport`
+- **kestrel_sovereign/_vendor/a2a/compat/v0_3/jsonrpc_adapter.py** — —
+  - `class JSONRPC03Adapter`
+- **kestrel_sovereign/_vendor/a2a/compat/v0_3/jsonrpc_transport.py** — —
+  - `class CompatJsonRpcTransport`
+- **kestrel_sovereign/_vendor/a2a/compat/v0_3/model_conversions.py** — Database model conversions for v0.3 compatibility.
+  - `def core_to_compat_task_model(task, owner)`; `def compat_task_model_to_core(task_model)`; `def core_to_compat_push_notification_config_model(task_id, config, owner, fernet)`; `def compat_push_notification_config_model_to_core(model_instance, task_id)`
+- **kestrel_sovereign/_vendor/a2a/compat/v0_3/proto_utils.py** — This file was migrated from the a2a-python SDK version 0.3.
+  - `def dict_to_struct(dictionary)`; `def make_dict_serializable(value)`; `def normalize_large_integers_to_strings(value, max_safe_digits)`; `def parse_string_integers_in_dict(value, max_safe_digits)`; `class ToProto`; `class FromProto`
+- **kestrel_sovereign/_vendor/a2a/compat/v0_3/request_handler.py** — —
+  - `class RequestHandler03`
+- **kestrel_sovereign/_vendor/a2a/compat/v0_3/rest_adapter.py** — —
+  - `class REST03Adapter`
+- **kestrel_sovereign/_vendor/a2a/compat/v0_3/rest_handler.py** — —
+  - `class REST03Handler`
+- **kestrel_sovereign/_vendor/a2a/compat/v0_3/rest_transport.py** — —
+  - `class CompatRestTransport`
+- **kestrel_sovereign/_vendor/a2a/compat/v0_3/types.py** — —
+  - `class A2A`; `class In`; `class APIKeySecurityScheme`; `class AgentCardSignature`; `class AgentExtension`; `class AgentInterface`; `class AgentProvider`; `class AgentSkill`; `…`
+- **kestrel_sovereign/_vendor/a2a/compat/v0_3/versions.py** — Utility functions for protocol version comparison and validation.
+  - `def is_legacy_version(version)`
+- **kestrel_sovereign/_vendor/a2a/extensions/__init__.py** — —
+- **kestrel_sovereign/_vendor/a2a/extensions/common.py** — —
+  - `def get_requested_extensions(values)`; `def find_extension_by_uri(card, uri)`
+- **kestrel_sovereign/_vendor/a2a/helpers/__init__.py** — Helper functions for the A2A Python SDK.
+- **kestrel_sovereign/_vendor/a2a/helpers/agent_card.py** — Utility functions for inspecting AgentCard instances.
+  - `def display_agent_card(card)`
+- **kestrel_sovereign/_vendor/a2a/helpers/proto_helpers.py** — Unified helper functions for creating and handling A2A types.
+  - `def new_message(parts, context_id, task_id, role)`; `def new_text_message(text, media_type, context_id, task_id, …)`; `def get_message_text(message, delimiter)`; `def new_data_message(data, media_type, context_id, task_id, …)`; `def new_raw_message(raw, media_type, filename, context_id, …)`; `def new_url_message(url, media_type, filename, context_id, …)`; `def new_artifact(parts, name, description, artifact_id)`; `def new_text_artifact(name, text, media_type, description, …)`; `…`
+- **kestrel_sovereign/_vendor/a2a/migrations/README.md** — A2A SDK Database Migrations — This directory handles the database schema updates for the A2A SDK.
+- **kestrel_sovereign/_vendor/a2a/migrations/__init__.py** — Alembic database migration package.
+- **kestrel_sovereign/_vendor/a2a/migrations/env.py** — —
+  - `def run_migrations_offline()`; `def do_run_migrations(connection)`; `async def run_async_migrations()`; `def run_migrations_online()`
+- **kestrel_sovereign/_vendor/a2a/migrations/migration_utils.py** — Utility functions for Alembic migrations.
+  - `def table_exists(table_name)`; `def column_exists(table_name, column_name, downgrade_mode)`; `def index_exists(table_name, index_name, downgrade_mode)`; `def add_column(table, column_name, nullable, type_, …)`; `def drop_column(table, column_name)`; `def add_index(table, index_name, columns)`; `def drop_index(table, index_name)`
+- **kestrel_sovereign/_vendor/a2a/migrations/script.py.mako** — —
+- **kestrel_sovereign/_vendor/a2a/migrations/versions/38ce57e08137_add_column_protocol_version.py** — add column protocol version
+  - `def upgrade()`; `def downgrade()`
+- **kestrel_sovereign/_vendor/a2a/migrations/versions/6419d2d130f6_add_columns_owner_last_updated.py** — add_columns_owner_last_updated.
+  - `def upgrade()`; `def downgrade()`
+- **kestrel_sovereign/_vendor/a2a/migrations/versions/__init__.py** — Alembic migrations scripts for the A2A project.
+- **kestrel_sovereign/_vendor/a2a/migrations/versions/b5e3d1c8a2f7_add_task_version_and_task_events.py** — add task_versions and task_events tables
+  - `def upgrade()`; `def downgrade()`
+- **kestrel_sovereign/_vendor/a2a/py.typed** — —
+- **kestrel_sovereign/_vendor/a2a/server/__init__.py** — Server-side components for implementing an A2A agent.
+- **kestrel_sovereign/_vendor/a2a/server/agent_execution/__init__.py** — Components for executing agent logic within the A2A server.
+- **kestrel_sovereign/_vendor/a2a/server/agent_execution/active_task.py** — Active Task execution and data flow architecture.
+  - `class EventConsumer`; `class ActiveTask`
+- **kestrel_sovereign/_vendor/a2a/server/agent_execution/active_task_registry.py** — —
+  - `class ActiveTaskRegistry`
+- **kestrel_sovereign/_vendor/a2a/server/agent_execution/agent_executor.py** — —
+  - `class AgentExecutor`
+- **kestrel_sovereign/_vendor/a2a/server/agent_execution/context.py** — —
+  - `class RequestContext`
+- **kestrel_sovereign/_vendor/a2a/server/agent_execution/request_context_builder.py** — —
+  - `class RequestContextBuilder`
+- **kestrel_sovereign/_vendor/a2a/server/agent_execution/simple_request_context_builder.py** — —
+  - `class SimpleRequestContextBuilder`
+- **kestrel_sovereign/_vendor/a2a/server/cluster/__init__.py** — —
+- **kestrel_sovereign/_vendor/a2a/server/cluster/database_event_stream.py** — —
+  - `def stream_response_to_event(response)`; `class DatabaseTaskEventStream`
+- **kestrel_sovereign/_vendor/a2a/server/cluster/database_task_store.py** — —
+  - `class VersionedDatabaseTaskStore`
+- **kestrel_sovereign/_vendor/a2a/server/cluster/event_stream.py** — —
+  - `class VersionedEvent`; `class TaskEventStream`
+- **kestrel_sovereign/_vendor/a2a/server/cluster/task_store.py** — —
+  - `class StoredTask`; `class ConcurrentTaskModificationError`; `class VersionedTaskStore`; `class LegacyTaskStoreAdapter`
+- **kestrel_sovereign/_vendor/a2a/server/cluster/version.py** — —
+  - `class TaskVersion`
+- **kestrel_sovereign/_vendor/a2a/server/context.py** — Defines the ServerCallContext class.
+  - `class ServerCallContext`
+- **kestrel_sovereign/_vendor/a2a/server/events/__init__.py** — Event handling components for the A2A server.
+- **kestrel_sovereign/_vendor/a2a/server/events/event_consumer.py** — —
+  - `class EventConsumer`
+- **kestrel_sovereign/_vendor/a2a/server/events/event_queue.py** — —
+  - `class EventQueue`; `class EventQueueLegacy`
+- **kestrel_sovereign/_vendor/a2a/server/events/event_queue_v2.py** — —
+  - `class EventQueueSource`; `class EventQueueSink`
+- **kestrel_sovereign/_vendor/a2a/server/events/in_memory_queue_manager.py** — —
+  - `class InMemoryQueueManager`
+- **kestrel_sovereign/_vendor/a2a/server/events/queue_manager.py** — —
+  - `class QueueManager`; `class TaskQueueExists`; `class NoTaskQueue`
+- **kestrel_sovereign/_vendor/a2a/server/id_generator.py** — —
+  - `class IDGeneratorContext`; `class IDGenerator`; `class UUIDGenerator`
+- **kestrel_sovereign/_vendor/a2a/server/jsonrpc_models.py** — —
+  - `class JSONRPCBaseModel`; `class JSONRPCError`; `class JSONParseError`; `class InvalidRequestError`; `class MethodNotFoundError`; `class InvalidParamsError`; `class InternalError`
+- **kestrel_sovereign/_vendor/a2a/server/models.py** — —
+  - `class Base`; `class TaskMixin`; `def create_task_model(table_name, base)`; `class TaskModel`; `class PushNotificationConfigMixin`; `def create_push_notification_config_model(table_name, base)`; `class PushNotificationConfigModel`; `class TaskEventMixin`; `…`
+- **kestrel_sovereign/_vendor/a2a/server/owner_resolver.py** — —
+  - `def resolve_user_scope(context)`
+- **kestrel_sovereign/_vendor/a2a/server/request_handlers/__init__.py** — Request handler components for the A2A server.
+- **kestrel_sovereign/_vendor/a2a/server/request_handlers/default_request_handler.py** — —
+  - `class LegacyRequestHandler`
+- **kestrel_sovereign/_vendor/a2a/server/request_handlers/default_request_handler_v2.py** — —
+  - `class DefaultRequestHandlerV2`
+- **kestrel_sovereign/_vendor/a2a/server/request_handlers/grpc_handler.py** — —
+  - `class GrpcServerCallContextBuilder`; `class DefaultGrpcServerCallContextBuilder`; `class GrpcHandler`
+- **kestrel_sovereign/_vendor/a2a/server/request_handlers/request_handler.py** — —
+  - `class RequestHandler`; `def validate_request_params(method)`; `def validate(expression, error_message, error_type)`
+- **kestrel_sovereign/_vendor/a2a/server/request_handlers/response_helpers.py** — Helper functions for building A2A JSON-RPC responses.
+  - `def agent_card_to_dict(card)`; `def build_error_response(request_id, error)`; `def prepare_response_object(request_id, response, success_response_types)`
+- **kestrel_sovereign/_vendor/a2a/server/routes/__init__.py** — A2A Routes.
+- **kestrel_sovereign/_vendor/a2a/server/routes/_jsonrpc_schema.py** — JSON-RPC envelope schema utilities for A2A server routes.
+  - `def envelope_schema(components)`
+- **kestrel_sovereign/_vendor/a2a/server/routes/_proto_schema.py** — Proto → JSON Schema utilities for A2A server routes.
+  - `def field_schema(field, components)`; `def message_schema(descriptor, components)`
+- **kestrel_sovereign/_vendor/a2a/server/routes/agent_card_routes.py** — —
+  - `def create_agent_card_routes(agent_card, card_modifier, card_url, cache_control)`
+- **kestrel_sovereign/_vendor/a2a/server/routes/common.py** — —
+  - `def serialize_list_tasks_response(response, include_artifacts)`; `def create_event_source_response(content, shutdown_grace_period)`; `class StarletteUser`; `class ServerCallContextBuilder`; `class DefaultServerCallContextBuilder`
+- **kestrel_sovereign/_vendor/a2a/server/routes/fastapi_routes.py** — —
+  - `def add_a2a_routes_to_fastapi(app)`
+- **kestrel_sovereign/_vendor/a2a/server/routes/jsonrpc_dispatcher.py** — JSON-RPC application for A2A server.
+  - `class JsonRpcDispatcher`
+- **kestrel_sovereign/_vendor/a2a/server/routes/jsonrpc_routes.py** — —
+  - `def create_jsonrpc_routes(request_handler, rpc_url, context_builder, enable_v0_3_compat, …)`
+- **kestrel_sovereign/_vendor/a2a/server/routes/rest_dispatcher.py** — —
+  - `class RestDispatcher`
+- **kestrel_sovereign/_vendor/a2a/server/routes/rest_routes.py** — —
+  - `def create_rest_routes(request_handler, context_builder, enable_v0_3_compat, path_prefix, …)`
+- **kestrel_sovereign/_vendor/a2a/server/tasks/__init__.py** — Components for managing tasks within the A2A server.
+- **kestrel_sovereign/_vendor/a2a/server/tasks/base_push_notification_sender.py** — —
+  - `class BasePushNotificationSender`
+- **kestrel_sovereign/_vendor/a2a/server/tasks/copying_task_store.py** — —
+  - `class CopyingTaskStoreAdapter`
+- **kestrel_sovereign/_vendor/a2a/server/tasks/database_push_notification_config_store.py** — —
+  - `class DatabasePushNotificationConfigStore`
+- **kestrel_sovereign/_vendor/a2a/server/tasks/database_task_store.py** — —
+  - `class DatabaseTaskStore`
+- **kestrel_sovereign/_vendor/a2a/server/tasks/inmemory_push_notification_config_store.py** — —
+  - `class InMemoryPushNotificationConfigStore`
+- **kestrel_sovereign/_vendor/a2a/server/tasks/inmemory_task_store.py** — —
+  - `class InMemoryTaskStore`
+- **kestrel_sovereign/_vendor/a2a/server/tasks/push_notification_config_store.py** — —
+  - `def normalize_push_notification_config(task_id, notification_config)`; `class PushNotificationConfigStore`
+- **kestrel_sovereign/_vendor/a2a/server/tasks/push_notification_sender.py** — —
+  - `class PushNotificationSender`
+- **kestrel_sovereign/_vendor/a2a/server/tasks/result_aggregator.py** — —
+  - `class ResultAggregator`
+- **kestrel_sovereign/_vendor/a2a/server/tasks/task_manager.py** — —
+  - `def append_artifact_to_task(task, event)`; `class TaskManager`
+- **kestrel_sovereign/_vendor/a2a/server/tasks/task_store.py** — —
+  - `class TaskStore`
+- **kestrel_sovereign/_vendor/a2a/server/tasks/task_updater.py** — —
+  - `class TaskUpdater`
+- **kestrel_sovereign/_vendor/a2a/types/__init__.py** — A2A Types Package - Protocol Buffer and SDK-specific types.
+- **kestrel_sovereign/_vendor/a2a/types/a2a_pb2.py** — Generated protocol buffer code.
+- **kestrel_sovereign/_vendor/a2a/types/a2a_pb2.pyi** — —
+- **kestrel_sovereign/_vendor/a2a/types/a2a_pb2_grpc.py** — Client and server classes corresponding to protobuf-defined services.
+  - `class A2AServiceStub`; `class A2AServiceServicer`; `def add_A2AServiceServicer_to_server(servicer, server)`; `class A2AService`
+- **kestrel_sovereign/_vendor/a2a/utils/__init__.py** — Utility functions for the A2A Python SDK.
+- **kestrel_sovereign/_vendor/a2a/utils/_async_queue_compat.py** — Cross-version aliases for async queue primitives.
+- **kestrel_sovereign/_vendor/a2a/utils/_jcs.py** — RFC 8785 JSON Canonicalization Scheme (JCS).
+  - `class CanonicalizationError`; `def canonicalize(obj)`
+- **kestrel_sovereign/_vendor/a2a/utils/constants.py** — Constants for well-known URIs used throughout the A2A Python SDK.
+  - `class TransportProtocol`
+- **kestrel_sovereign/_vendor/a2a/utils/error_handlers.py** — —
+  - `def build_error_details(error)`; `def build_rest_error_payload(error)`; `def rest_error_handler(func)`; `def rest_stream_error_handler(func)`
+- **kestrel_sovereign/_vendor/a2a/utils/errors.py** — Custom exceptions and error types for A2A server-side errors.
+  - `class ErrorMapping`; `class A2AError`; `class TaskNotFoundError`; `class TaskNotCancelableError`; `class PushNotificationNotSupportedError`; `class UnsupportedOperationError`; `class ContentTypeNotSupportedError`; `class InternalError`; `…`
+- **kestrel_sovereign/_vendor/a2a/utils/grpc_status.py** — —
+  - `class GrpcStatus`; `def status_to_grpc(status)`; `def status_from_call(call)`
+- **kestrel_sovereign/_vendor/a2a/utils/input_mode_validator.py** — Shared policy for checking message parts against an agent's declared input modes.
+  - `def validate_input_modes(message, agent_card)`
+- **kestrel_sovereign/_vendor/a2a/utils/json_utils.py** — JSON serialization helpers for the A2A Python SDK.
+  - `def dumps(obj)`
+- **kestrel_sovereign/_vendor/a2a/utils/proto_utils.py** — Utilities for working with proto types.
+  - `def parse_lenient(data, message)`; `def to_stream_response(event)`; `def make_dict_serializable(value)`; `def normalize_large_integers_to_strings(value, max_safe_digits)`; `def parse_string_integers_in_dict(value, max_safe_digits)`; `def parse_params(params, message)`; `class ValidationDetail`; `def validate_proto_required_fields(msg)`; `…`
+- **kestrel_sovereign/_vendor/a2a/utils/push_url_validator.py** — Shared policy for screening client-supplied push-notification URLs.
+  - `async def validate_push_notification_url(url)`
+- **kestrel_sovereign/_vendor/a2a/utils/signing.py** — —
+  - `class SignatureVerificationError`; `class NoSignatureError`; `class InvalidSignaturesError`; `class ProtectedHeader`; `def create_agent_card_signer(signing_key, protected_header, header)`; `def create_signature_verifier(key_provider, algorithms)`
+- **kestrel_sovereign/_vendor/a2a/utils/task.py** — Utility functions for creating A2A Task objects.
+  - `class HistoryLengthConfig`; `def validate_history_length(config)`; `def apply_history_length(task, config)`; `def validate_page_size(page_size)`; `def encode_page_token(task_id)`; `def decode_page_token(page_token)`; `class ListTasksCursor`; `def encode_list_tasks_cursor(cursor)`; `…`
+- **kestrel_sovereign/_vendor/a2a/utils/telemetry.py** — OpenTelemetry Tracing Utilities for A2A Python SDK.
+  - `def trace_function(func)`; `def trace_class(include_list, exclude_list, kind)`
+- **kestrel_sovereign/_vendor/a2a/utils/version_validator.py** — General utility functions for the A2A Python SDK.
+  - `def validate_version(expected_version)`
 - **kestrel_sovereign/a2a/__init__.py** — Kestrel's native A2A host integration.
 - **kestrel_sovereign/a2a/did_registry.py** — Verification-document lookup for signed A2A envelopes.
   - `def same_a2a_sender_identity_witness(before, after)`; `class ProcessA2ADidResolverConfigurationError`; `def stage_process_a2a_did_registry(documents)`; `def launcher_attested_a2a_verification_document(identity_root)`; `class ProcessA2ADidResolver`; `def install_process_a2a_did_resolver(agent)`; `def local_a2a_verification_document(agent, did)`; `class HostA2ADidResolver`; `…`
@@ -1822,6 +2070,8 @@ Repo entry points and standard project files.
   - `async def main()`
 - **scripts/validate_vector_lift_e2e.py** — End-to-end validation of the vector-lift architecture on real PG.
   - `async def main()`
+- **scripts/vendor_a2a.py** — Import and verify the reviewed A2A SDK in Kestrel's isolated namespace.
+  - `def relocate(text)`; `def import_vendor(root, source, revision, base)`; `def check_vendor(root)`; `def main()`
 - **scripts/verify_character_consistency.py** — Character Consistency Verification using Claude.
   - `def resolve_verification_model()`; `def get_anthropic_client()`; `def load_image_as_base64(path)`; `def get_image_media_type(path)`; `def verify_character_consistency(manifest)`; `def main()`
 - **scripts/verify_visual_browser_sandbox.py** — Build and verify the local browser substrate using only owned Docker resources.
@@ -5513,6 +5763,8 @@ Repo entry points and standard project files.
   - `def test_spec_rejects_non_positive_dimension()`; `def test_spec_rejects_tenant_key_not_in_required_keys()`; `def test_factory_picks_pg_for_postgresql()`; `def test_factory_falls_back_to_pure_python_for_sqlite()`; `def test_factory_falls_back_to_pure_python_for_unknown_dialect()`; `async def test_pure_python_raises_when_required_filter_missing()`; `async def test_pure_python_raises_when_filter_is_none()`; `async def test_pure_python_raises_on_wrong_size_embedding()`; `…`
 - **tests/unit/test_vendor_wide_pin_discovery_outage.py** — A vendor-wide persisted pin must survive a discovery outage at use time (#3196).
   - `async def outage()`; `class TestPersistedVendorWidePinIsTrustedAtUse`; `class TestNonPersistedSelectionsKeepTheGuard`; `class TestTheAuditStillFailsClosedButNamesTheStaleCatalog`; `class TestRouteQualifiedPinIsUnchanged`; `class TestMandatePinIsSetByTheBranchThatChoseTheRoutes`
+- **tests/unit/test_vendored_a2a.py** — Custody, isolation and packaging contracts for the modified official SDK.
+  - `def test_import_uses_the_pinned_git_tree_and_refuses_overwrite(tmp_path)`; `def test_relocation_changes_modules_but_preserves_protocol_identifiers()`; `def test_checked_in_sdk_reproduces_reviewed_source_and_license()`; `def test_vendor_custody_rejects_changed_sources_and_provenance(tmp_path, mutation)`; `def test_sdk_imports_never_load_the_external_a2a_package()`; `def test_vendored_runtime_dependencies_are_declared_without_external_sdk()`
 - **tests/unit/test_verify_policy.py** — verify_policy tests — Wave 1 sub-PR 4 (#916).
   - `def test_archival_import_defaults_to_legacy_allowed()`; `def test_live_identity_defaults_to_legacy_allowed_pre_wave_2()`; `def test_new_identity_issuance_defaults_to_hybrid_required()`; `def test_constitution_checkpoint_defaults_to_pq_required()`; `def test_every_context_has_a_default()`; `def test_legacy_allowed_accepts_classical_only()`; `def test_legacy_allowed_accepts_pq_only()`; `def test_legacy_allowed_accepts_hybrid()`; `…`
 - **tests/unit/test_vertex_tool_calling.py** — #2811: the Vertex adapter sends its tools, and reads the calls that come back.

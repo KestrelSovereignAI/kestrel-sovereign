@@ -6,8 +6,8 @@ from contextlib import AbstractAsyncContextManager, asynccontextmanager
 from dataclasses import dataclass
 from typing import Generic, TypeVar
 
-from a2a.server.context import ServerCallContext
-from a2a.utils.errors import ExtensionSupportRequiredError, InternalError
+from kestrel_sovereign._vendor.a2a.server.context import ServerCallContext
+from kestrel_sovereign._vendor.a2a.utils.errors import ExtensionSupportRequiredError, InternalError
 from google.protobuf.message import Message as ProtoMessage
 from starlette.exceptions import HTTPException
 

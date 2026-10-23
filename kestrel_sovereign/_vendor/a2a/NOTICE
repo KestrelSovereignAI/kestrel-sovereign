@@ -1,0 +1,9 @@
+A2A Python SDK
+Copyright Google LLC and A2A Python SDK contributors.
+Licensed under the Apache License, Version 2.0; see LICENSE.
+
+This copy is modified and maintained by Kestrel. It is not an official
+A2A Python SDK release. VENDORED.json identifies the source and file digests;
+UPSTREAM.patch records the functional changes and their regression tests.
+Python imports are relocated into kestrel_sovereign._vendor.a2a.
+The Agent2Agent wire protocol remains A2A 1.0.1.

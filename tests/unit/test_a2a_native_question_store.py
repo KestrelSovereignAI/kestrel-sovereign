@@ -9,7 +9,7 @@ from uuid import uuid4
 
 import pytest
 import pytest_asyncio
-from a2a.types import (
+from kestrel_sovereign._vendor.a2a.types import (
     AgentInterface,
     Message,
     Part,

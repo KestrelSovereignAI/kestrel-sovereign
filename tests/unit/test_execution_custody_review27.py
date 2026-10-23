@@ -2,8 +2,8 @@
 import asyncio
 
 import pytest
-from a2a.helpers.proto_helpers import new_text_message
-from a2a.types import Role, SendMessageRequest, TaskState
+from kestrel_sovereign._vendor.a2a.helpers.proto_helpers import new_text_message
+from kestrel_sovereign._vendor.a2a.types import Role, SendMessageRequest, TaskState
 from kestrel_sdk.storage.database import QueryError
 
 from kestrel_sovereign.a2a.scope import NativeRecipientScope

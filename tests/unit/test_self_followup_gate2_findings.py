@@ -65,7 +65,7 @@ def _bind_inline_executor(agent, execute_named_tool):
 
 async def _task_manager(tmp_path, agent):
     """Canonical native task manager using the live parent chain provider."""
-    from a2a.types import AgentSkill
+    from kestrel_sovereign._vendor.a2a.types import AgentSkill
 
     from kestrel_sovereign.a2a.scope import NativeRecipientScope
     from kestrel_sovereign.kestrel_agent import KestrelAgent

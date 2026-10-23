@@ -5,7 +5,7 @@ from uuid import uuid4
 
 import pytest
 import pytest_asyncio
-from a2a.types import (
+from kestrel_sovereign._vendor.a2a.types import (
     AgentInterface,
     Message,
     Part,
@@ -660,7 +660,7 @@ async def test_primary_actor_contract_refuses_another_connection_even_with_same_
 
 
 async def test_cancellation_intent_has_one_claim_and_keeps_original_receipt(outbound):
-    from a2a.types import CancelTaskRequest
+    from kestrel_sovereign._vendor.a2a.types import CancelTaskRequest
 
     params = request()
     original = await reserve(outbound, params)
@@ -710,7 +710,7 @@ async def test_cancellation_intent_has_one_claim_and_keeps_original_receipt(outb
 
 
 async def test_cancellation_claim_refuses_foreign_remote_task_or_tenant(outbound):
-    from a2a.types import CancelTaskRequest
+    from kestrel_sovereign._vendor.a2a.types import CancelTaskRequest
 
     params = request()
     original = await reserve(outbound, params)

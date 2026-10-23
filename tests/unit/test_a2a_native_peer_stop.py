@@ -7,10 +7,10 @@ from types import SimpleNamespace
 import httpx
 import pytest
 import pytest_asyncio
-from a2a.client.errors import A2AClientError
-from a2a.helpers.proto_helpers import new_text_message
-from a2a.types import Message, Role, SendMessageRequest
-from a2a.utils.errors import ContentTypeNotSupportedError, InvalidParamsError
+from kestrel_sovereign._vendor.a2a.client.errors import A2AClientError
+from kestrel_sovereign._vendor.a2a.helpers.proto_helpers import new_text_message
+from kestrel_sovereign._vendor.a2a.types import Message, Role, SendMessageRequest
+from kestrel_sovereign._vendor.a2a.utils.errors import ContentTypeNotSupportedError, InvalidParamsError
 from starlette.applications import Starlette
 
 from kestrel_sovereign.a2a.extensions import (

@@ -3,9 +3,9 @@
 import hashlib
 
 import pytest
-from a2a.helpers.proto_helpers import new_text_message
-from a2a.types import Role, SendMessageRequest
-from a2a.utils.errors import InvalidParamsError
+from kestrel_sovereign._vendor.a2a.helpers.proto_helpers import new_text_message
+from kestrel_sovereign._vendor.a2a.types import Role, SendMessageRequest
+from kestrel_sovereign._vendor.a2a.utils.errors import InvalidParamsError
 from google.protobuf.json_format import MessageToDict
 
 from kestrel_sovereign.a2a.native_input import (

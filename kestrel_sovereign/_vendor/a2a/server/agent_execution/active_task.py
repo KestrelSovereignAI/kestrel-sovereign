@@ -1,0 +1,1013 @@
+# Modified by Kestrel: isolated SDK namespace; see VENDORED.json.
+# ruff: noqa: TRY301, SLF001
+"""Active Task execution and data flow architecture.
+
+This module manages the lifecycle, execution, and data flow of an active A2A task.
+
+High-Level Architecture:
+- `AgentExecutor`: An interface with two main methods, `execute(...)` and `cancel(...)`,
+  responsible for running the core agent logic.
+- `ActiveTask`: Coordinates the execution. It runs a main agent loop in `ActiveTask._run_producer()`.
+
+Data Flow and Event Handling:
+1. Producer (`ActiveTask._run_producer`):
+   - Listens for incoming requests from `ActiveTask._request_queue`.
+   - Acquires `ActiveTask._request_lock` to ensure requests are processed sequentially.
+   - Calls `AgentExecutor.execute()` passing `ActiveTask._event_queue_agent` as the primary communication channel.
+   - Enqueues internal lifecycle events (e.g., `_RequestStarted`, `_RequestCompleted`) and
+     exceptions to the same `ActiveTask._event_queue_agent`.
+
+2. Consumer (`EventConsumer`):
+   - Consumes events from `ActiveTask._event_queue_agent`.
+   - Processes all events, updating task state and the database (`TaskManager`).
+   - Upon receiving `_RequestCompleted`, it releases `ActiveTask._request_lock`, making the producer
+     ready to process the next queued request.
+   - Propagates relevant agent updates and state changes to `ActiveTask._event_queue_subscribers`.
+   - Exception Handling: Re-raises exceptions dequeued from the agent queue, or raises its own validation
+     errors (e.g., 'Received Message object in task mode.'). In case of failure, it updates the task
+     state to failed and propagates the exception to `ActiveTask._event_queue_subscribers`.
+
+3. Subscribers (`ActiveTask.subscribe`):
+   - `ActiveTask._event_queue_subscribers` is not consumed directly. Instead, it is consumed by tapped
+     queues created within the `ActiveTask.subscribe()` method.
+   - The `ActiveTask.subscribe()` method is also used to actively run requests, creating a temporary
+     subscription that yields events and automatically finishes once the request is completed.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import contextvars
+import logging
+import uuid
+
+from typing import TYPE_CHECKING, Any, cast
+
+from kestrel_sovereign._vendor.a2a.server.agent_execution.context import RequestContext
+
+
+if TYPE_CHECKING:
+    from collections.abc import AsyncGenerator, Callable
+
+    from kestrel_sovereign._vendor.a2a.server.agent_execution.agent_executor import AgentExecutor
+    from kestrel_sovereign._vendor.a2a.server.cluster.event_stream import TaskEventStream
+    from kestrel_sovereign._vendor.a2a.server.context import ServerCallContext
+    from kestrel_sovereign._vendor.a2a.server.tasks.push_notification_sender import (
+        PushNotificationSender,
+    )
+    from kestrel_sovereign._vendor.a2a.server.tasks.task_manager import TaskManager
+
+from kestrel_sovereign._vendor.a2a.server.cluster.event_stream import VersionedEvent
+from kestrel_sovereign._vendor.a2a.server.cluster.task_store import ConcurrentTaskModificationError
+from kestrel_sovereign._vendor.a2a.server.events.event_queue_v2 import (
+    AsyncQueue,
+    Event,
+    EventQueueSource,
+    QueueShutDown,
+    create_async_queue,
+)
+from kestrel_sovereign._vendor.a2a.server.tasks import PushNotificationEvent
+from kestrel_sovereign._vendor.a2a.types.a2a_pb2 import (
+    Message,
+    Task,
+    TaskArtifactUpdateEvent,
+    TaskState,
+    TaskStatus,
+    TaskStatusUpdateEvent,
+)
+from kestrel_sovereign._vendor.a2a.utils.errors import (
+    InternalError,
+    InvalidAgentResponseError,
+    TaskNotFoundError,
+    UnsupportedOperationError,
+)
+
+
+logger = logging.getLogger(__name__)
+
+
+TERMINAL_TASK_STATES = {
+    TaskState.TASK_STATE_COMPLETED,
+    TaskState.TASK_STATE_CANCELED,
+    TaskState.TASK_STATE_FAILED,
+    TaskState.TASK_STATE_REJECTED,
+}
+INTERRUPTED_TASK_STATES = {
+    TaskState.TASK_STATE_AUTH_REQUIRED,
+    TaskState.TASK_STATE_INPUT_REQUIRED,
+}
+
+
+class _RequestStarted:
+    def __init__(self, request_id: uuid.UUID, request_context: RequestContext):
+        self.request_id = request_id
+        self.request_context = request_context
+
+
+class _RequestCompleted:
+    def __init__(self, request_id: uuid.UUID):
+        self.request_id = request_id
+
+
+class EventConsumer:
+    """Consumes events from the agent and updates system state."""
+
+    def __init__(self, active_task: ActiveTask) -> None:
+        self.active_task = active_task
+        self.task_mode: bool | None = None
+        self.message_to_save: Message | None = None
+
+    async def run(self) -> None:
+        """Consumes events from the agent and updates system state."""
+        logger.debug('Consumer[%s]: Started', self.active_task._task_id)
+        try:
+            while True:
+                logger.debug(
+                    'Consumer[%s]: Waiting for event',
+                    self.active_task._task_id,
+                )
+                event = (
+                    await self.active_task._event_queue_agent.dequeue_event()
+                )
+                logger.debug(
+                    'Consumer[%s]: Dequeued event %s',
+                    self.active_task._task_id,
+                    type(event).__name__,
+                )
+
+                await self._process_event(event)
+
+        except QueueShutDown:
+            logger.debug(
+                'Consumer[%s]: Event queue shut down',
+                self.active_task._task_id,
+            )
+        except Exception as e:
+            logger.exception('Consumer[%s]: Failed', self.active_task._task_id)
+
+            error: Exception = e
+            if isinstance(e, ConcurrentTaskModificationError):
+                # Other writers kept advancing the task; report a protocol error.
+                error = InternalError(message=str(e))
+
+            updated_task = None
+            try:
+                updated_task = await self._write_failed_status()
+            finally:
+                # Subscribers must always hear about the failure, or the
+                # request waiting on them never returns.
+                await self._enqueue_to_subscribers(
+                    cast('Event', error), updated_task
+                )
+
+    async def _write_failed_status(self) -> Task | None:
+        task = await self.active_task._task_manager.get_task()
+        if not task or task.status.state in TERMINAL_TASK_STATES:
+            return None
+        handled_event = TaskStatusUpdateEvent(
+            task_id=task.id,
+            context_id=task.context_id,
+            status=TaskStatus(state=TaskState.TASK_STATE_FAILED),
+        )
+        try:
+            return await self._handle_task_event(handled_event)
+        except ConcurrentTaskModificationError:
+            # Another writer advanced the task; keep its state.
+            self.active_task._task_manager.invalidate()
+            return None
+
+    async def _process_event(self, event: Event) -> None:
+        try:
+            await self._process_event_inner(event)
+        except ConcurrentTaskModificationError:
+            # Another writer advanced this task
+            logger.info(
+                'Consumer[%s]: concurrent modification, reloading',
+                self.active_task._task_id,
+            )
+            self.active_task._task_manager.invalidate()
+            task = await self.active_task._task_manager.get_task()
+            if task is not None and task.status.state in TERMINAL_TASK_STATES:
+                await self._enqueue_to_subscribers(task, task)
+                producer = self.active_task._producer_task
+                if producer is not None and not producer.done():
+                    producer.cancel()
+                await self._handle_terminal_state(task)
+                await self.active_task._event_queue_subscribers.close(
+                    immediate=False
+                )
+                return
+            await self._process_event_inner(event)
+
+    async def _process_event_inner(self, event: Event) -> None:
+        updated_task = None
+        handled_event: (
+            Task
+            | TaskStatusUpdateEvent
+            | TaskArtifactUpdateEvent
+            | PushNotificationEvent
+            | None
+        ) = None
+
+        if isinstance(event, _RequestCompleted):
+            logger.debug(
+                'Consumer[%s]: Request completed', self.active_task._task_id
+            )
+            self.active_task._request_lock.release()
+        elif isinstance(event, _RequestStarted):
+            logger.debug(
+                'Consumer[%s]: Request started', self.active_task._task_id
+            )
+            self.message_to_save = event.request_context.message
+        elif isinstance(event, BaseException):
+            raise event
+        elif isinstance(event, Message):
+            self._handle_message_event(event)
+        elif isinstance(
+            event,
+            TaskStatusUpdateEvent
+            | TaskArtifactUpdateEvent
+            | PushNotificationEvent
+            | Task,
+        ):
+            updated_task = await self._handle_task_event(event)
+            handled_event = updated_task if isinstance(event, Task) else event
+
+        if updated_task is not None and handled_event is not None:
+            await self._update_task_state(updated_task, handled_event)
+            self.active_task._task_created.set()
+
+        await self._enqueue_to_subscribers(event, updated_task)
+
+        if isinstance(event, Message):
+            self._handle_message_completion()
+
+    def _handle_message_completion(self) -> None:
+        # A direct Message has no task to continue, so finish like a terminal state.
+        logger.debug(
+            'Consumer[%s]: Message response, finishing',
+            self.active_task._task_id,
+        )
+        self.active_task._is_finished.set()
+        self.active_task._request_queue.shutdown(immediate=True)
+
+    def _handle_message_event(self, event: Message) -> None:
+        if self.task_mode is True:
+            raise InvalidAgentResponseError(
+                'Received Message object in task mode. Use TaskStatusUpdateEvent or TaskArtifactUpdateEvent instead.'
+            )
+        if self.task_mode is False:
+            raise InvalidAgentResponseError(
+                'Multiple Message objects received.'
+            )
+        self.task_mode = False
+
+    async def _handle_task_event(
+        self,
+        event: Task
+        | TaskStatusUpdateEvent
+        | TaskArtifactUpdateEvent
+        | PushNotificationEvent,
+    ) -> Task:
+        if self.task_mode is False:
+            raise InvalidAgentResponseError(
+                f'Received {type(event).__name__} in message mode. Use Task with TaskStatusUpdateEvent and TaskArtifactUpdateEvent instead.'
+            )
+
+        if isinstance(event, Task):
+            await self._handle_initial_task(event)
+        else:
+            await self._handle_task_modification_event(event)
+
+        self.task_mode = True
+        task = await self.active_task._task_manager.get_task()
+        if task is None:
+            raise RuntimeError(f'Task {self.active_task.task_id} not found')
+        return task
+
+    async def _handle_initial_task(self, event: Task) -> None:
+        existing_task = await self.active_task._task_manager.get_task()
+        if existing_task:
+            logger.error(
+                'Task %s already exists. Ignoring task replacement.',
+                self.active_task._task_id,
+            )
+        else:
+            await self.active_task._task_manager.save_task_event(event)
+        self.message_to_save = None
+
+    async def _handle_task_modification_event(
+        self,
+        event: TaskStatusUpdateEvent
+        | TaskArtifactUpdateEvent
+        | PushNotificationEvent,
+    ) -> None:
+        if (
+            isinstance(event, TaskStatusUpdateEvent)
+            and not self.active_task._task_created.is_set()
+        ):
+            task = await self.active_task._task_manager.get_task()
+            if task is None:
+                raise InvalidAgentResponseError(
+                    f'Agent should enqueue Task before {type(event).__name__} event'
+                )
+
+        updated_task = await self.active_task._task_manager.ensure_task_id(
+            self.active_task._task_id,
+            event.context_id,
+        )
+
+        if self.message_to_save is not None:
+            message_already_saved = any(
+                message.message_id == self.message_to_save.message_id
+                for message in updated_task.history
+            )
+            if not message_already_saved:
+                updated_task = (
+                    self.active_task._task_manager.update_with_message(
+                        self.message_to_save,
+                        updated_task,
+                    )
+                )
+                await self.active_task._task_manager.save_task_event(
+                    updated_task
+                )
+            self.message_to_save = None
+
+        self.active_task._task_manager.context_id = event.context_id
+        await self.active_task._task_manager.process(event)
+
+    async def _update_task_state(
+        self,
+        updated_task: Task,
+        event: Task
+        | TaskStatusUpdateEvent
+        | TaskArtifactUpdateEvent
+        | PushNotificationEvent,
+    ) -> None:
+        is_terminal = updated_task.status.state in TERMINAL_TASK_STATES
+
+        if is_terminal:
+            await self._handle_terminal_state(updated_task)
+
+        if (
+            self.active_task._push_sender
+            and self.active_task._task_id
+            and isinstance(event, PushNotificationEvent)
+        ):
+            logger.debug(
+                'Consumer[%s]: Sending push notification',
+                self.active_task._task_id,
+            )
+            try:
+                await self.active_task._push_sender.send_notification(
+                    self.active_task._task_id, event
+                )
+            except Exception:
+                # Push delivery is best-effort: a sender failure must not
+                # fail the task or disturb the event stream. This guard is
+                # defense-in-depth on top of the boundary inside
+                # BasePushNotificationSender, and also protects against
+                # custom PushNotificationSender implementations.
+                logger.exception(
+                    'Consumer[%s]: Push notification sender raised; '
+                    'ignoring the failure.',
+                    self.active_task._task_id,
+                )
+
+    async def _handle_terminal_state(self, updated_task: Task) -> None:
+        logger.debug(
+            'Consumer[%s]: Reached terminal state %s',
+            self.active_task._task_id,
+            updated_task.status.state,
+        )
+        self.active_task._is_finished.set()
+        self.active_task._request_queue.shutdown(immediate=True)
+
+    async def _enqueue_to_subscribers(
+        self, event: Event, updated_task: Task | None
+    ) -> None:
+        if updated_task is not None:
+            updated_task_copy = Task()
+            updated_task_copy.CopyFrom(updated_task)
+            if event is updated_task:
+                event = updated_task_copy
+            updated_task = updated_task_copy
+
+        logger.debug(
+            'Consumer[%s]: Enqueuing\nEvent: %s\nUpdated Task: %s\n',
+            self.active_task._task_id,
+            event,
+            updated_task,
+        )
+        await self.active_task._event_queue_subscribers.enqueue_event(
+            cast('Any', (event, updated_task))
+        )
+
+        # Fan out to other replicas
+        stream = self.active_task._event_stream
+        if stream is not None and isinstance(event, Event):
+            version = self.active_task._task_manager.current_version
+            await stream.publish(
+                self.active_task._task_id,
+                VersionedEvent(event=event, version=version),
+            )
+
+        self.active_task._event_queue_agent.task_done()
+
+
+class ActiveTask:
+    """Manages the lifecycle and execution of an active A2A task.
+
+    It coordinates between the agent's execution (the producer), the
+    persistence and state management (the TaskManager), and the event
+    distribution to subscribers (the consumer).
+
+    Concurrency Guarantees:
+    - This class is designed to be highly concurrent. It manages an internal
+      producer-consumer model using `asyncio.Task`s.
+    - `self._lock` (asyncio.Lock) ensures mutually exclusive access for critical
+      lifecycle state changes, such as starting the task, subscribing, and
+      determining if cleanup is safe to trigger.
+    - `self._is_finished` (asyncio.Event) provides a thread-safe, non-blocking way
+      for external observers and internal loops to check if the ActiveTask has
+      permanently ceased execution and closed its queues.
+    """
+
+    def __init__(  # noqa: PLR0913
+        self,
+        agent_executor: AgentExecutor,
+        task_id: str,
+        task_manager: TaskManager,
+        push_sender: PushNotificationSender | None = None,
+        on_cleanup: Callable[[ActiveTask], None] | None = None,
+        event_stream: TaskEventStream | None = None,
+    ) -> None:
+        """Initializes the ActiveTask.
+
+        Args:
+            agent_executor: The executor to run the agent logic (producer).
+            task_id: The unique identifier of the task being managed.
+            task_manager: The manager for task state and database persistence.
+            push_sender: Optional sender for out-of-band push notifications.
+            on_cleanup: Optional callback triggered when the task is fully finished
+                        and the last subscriber has disconnected. Used to prune
+                        the task from the ActiveTaskRegistry.
+            event_stream: Optional cross-replica stream; applied events are
+                        published to it so other replicas can observe them.
+        """
+        # --- Core Dependencies ---
+        self._agent_executor = agent_executor
+        self._task_id = task_id
+        self._event_queue_agent = EventQueueSource()
+        self._event_queue_subscribers = EventQueueSource(
+            create_default_sink=False
+        )
+        self._task_manager = task_manager
+        self._push_sender = push_sender
+        self._on_cleanup = on_cleanup
+        self._event_stream = event_stream
+
+        # --- Synchronization Primitives ---
+        # `_lock` protects structural lifecycle changes: start(), subscribe() counting,
+        # and _maybe_cleanup() race conditions.
+        self._lock = asyncio.Lock()
+
+        # `_request_lock` protects parallel request processing.
+        self._request_lock = asyncio.Lock()
+
+        # _task_created is set when initial version of task is stored in DB.
+        self._task_created = asyncio.Event()
+
+        # `_is_finished` is set EXACTLY ONCE when the consumer loop exits, signifying
+        # the absolute end of the task's active lifecycle.
+        self._is_finished = asyncio.Event()
+
+        # --- Lifecycle State ---
+        # The background task executing the agent logic.
+        self._producer_task: asyncio.Task[None] | None = None
+        # The background task reading from _event_queue and updating the DB.
+        self._consumer_task: asyncio.Task[None] | None = None
+
+        # Tracks how many active SSE/gRPC streams are currently tailing this task.
+        # Protected by `_lock`.
+        self._reference_count = 0
+
+        # Queue for incoming requests
+        self._request_queue: AsyncQueue[
+            tuple[RequestContext, uuid.UUID, contextvars.Context]
+        ] = create_async_queue()
+
+    @property
+    def task_id(self) -> str:
+        """The ID of the task."""
+        return self._task_id
+
+    async def enqueue_request(
+        self, request_context: RequestContext
+    ) -> uuid.UUID:
+        """Enqueues a request for the active task to process.
+
+        The caller's contextvars are captured so the producer runs
+        `AgentExecutor.execute` in the context of the request that sent the
+        message, not the request that started the producer.
+        """
+        request_id = uuid.uuid4()
+        await self._request_queue.put(
+            (request_context, request_id, contextvars.copy_context())
+        )
+        return request_id
+
+    async def start(
+        self,
+        call_context: ServerCallContext,
+        create_task_if_missing: bool = False,
+    ) -> None:
+        """Starts the active task background processes.
+
+        Concurrency Guarantee:
+        Uses `self._lock` to ensure the producer and consumer tasks are strictly
+        singleton instances for the lifetime of this ActiveTask.
+        """
+        logger.debug('ActiveTask[%s]: Starting', self._task_id)
+        async with self._lock:
+            if self._is_finished.is_set():
+                raise UnsupportedOperationError(
+                    f'Task {self._task_id} is already completed. Cannot start it again.'
+                )
+
+            if (
+                self._producer_task is not None
+                and self._consumer_task is not None
+            ):
+                logger.debug(
+                    'ActiveTask[%s]: Already started, ignoring start request',
+                    self._task_id,
+                )
+                return
+
+            logger.debug(
+                'ActiveTask[%s]: Executing setup (call_context: %s, create_task_if_missing: %s)',
+                self._task_id,
+                call_context,
+                create_task_if_missing,
+            )
+            try:
+                self._task_manager._call_context = call_context
+                task = await self._task_manager.get_task()
+                logger.debug('TASK (start): %s', task)
+
+                if task:
+                    self._task_created.set()
+                    if task.status.state in TERMINAL_TASK_STATES:
+                        raise UnsupportedOperationError(
+                            message=f'Task {task.id} is in terminal state: {TaskState.Name(task.status.state)}'
+                        )
+                elif not create_task_if_missing:
+                    raise TaskNotFoundError
+
+            except Exception:
+                logger.debug(
+                    'ActiveTask[%s]: Setup failed, cleaning up',
+                    self._task_id,
+                )
+                self._is_finished.set()
+                if self._reference_count == 0 and self._on_cleanup:
+                    self._on_cleanup(self)
+                raise
+
+            # Spawn the background tasks that drive the lifecycle.
+            self._reference_count += 1
+            self._producer_task = asyncio.create_task(
+                self._run_producer(), name=f'producer:{self._task_id}'
+            )
+            self._consumer_task = asyncio.create_task(
+                self._run_consumer(), name=f'consumer:{self._task_id}'
+            )
+            logger.debug(
+                'ActiveTask[%s]: Background tasks created', self._task_id
+            )
+
+    async def _run_producer(self) -> None:
+        """Executes the agent logic.
+
+        This method encapsulates the external `AgentExecutor.execute` call. It ensures
+        that regardless of how the agent finishes (success, unhandled exception, or
+        cancellation), the underlying `_event_queue` is safely closed, which signals
+        the consumer to wind down.
+
+        Concurrency Guarantee:
+        Runs as a detached asyncio.Task. Safe to cancel.
+        """
+        logger.debug('Producer[%s]: Started', self._task_id)
+        request_context = None
+        try:
+            while True:
+                (
+                    request_context,
+                    request_id,
+                    sender_context,
+                ) = await self._request_queue.get()
+                await self._request_lock.acquire()
+                # TODO: Should we create task manager every time?
+                self._task_manager._call_context = request_context.call_context
+
+                # Drop the cached snapshot and re-read to pick
+                # up state another replica may have advanced.
+                self._task_manager.invalidate()
+                task = await self._task_manager.get_task()
+                # In cluster mode another replica may have finished the task
+                # while this one waited for input.
+                if (
+                    self._event_stream is not None
+                    and task is not None
+                    and task.status.state in TERMINAL_TASK_STATES
+                ):
+                    raise UnsupportedOperationError(
+                        message=f'Task {task.id} is in terminal state: {TaskState.Name(task.status.state)}'
+                    )
+                request_context.current_task = task
+
+                logger.debug(
+                    'Producer[%s]: Executing agent task %s',
+                    self._task_id,
+                    request_context.current_task,
+                )
+
+                try:
+                    await self._event_queue_agent.enqueue_event(
+                        cast(
+                            'Event',
+                            _RequestStarted(request_id, request_context),
+                        )
+                    )
+                    # Awaiting the child task propagates producer cancellation.
+                    await sender_context.run(
+                        asyncio.create_task,
+                        self._agent_executor.execute(
+                            request_context, self._event_queue_agent
+                        ),
+                    )
+                    logger.debug(
+                        'Producer[%s]: Execution finished successfully',
+                        self._task_id,
+                    )
+                    await self._event_queue_agent.enqueue_event(
+                        cast('Event', _RequestCompleted(request_id))
+                    )
+                finally:
+                    self._request_queue.task_done()
+        except asyncio.CancelledError:
+            logger.debug('Producer[%s]: Cancelled', self._task_id)
+
+        except QueueShutDown:
+            logger.debug('Producer[%s]: Queue shut down', self._task_id)
+
+        except Exception as e:
+            logger.exception(
+                'Producer[%s]: Execution failed',
+                self._task_id,
+            )
+            # Persist the failure directly instead of relying on the closing
+            # event queue to carry a final status update.
+            if request_context:
+                task = await self._task_manager.ensure_task_id(
+                    self._task_id,
+                    request_context.context_id or '',
+                )
+                if task.status.state not in TERMINAL_TASK_STATES:
+                    task.status.state = TaskState.TASK_STATE_FAILED
+                    await self._task_manager.save_task_event(task)
+                self._task_created.set()
+            await self._event_queue_agent.enqueue_event(cast('Event', e))
+
+        finally:
+            self._request_queue.shutdown(immediate=True)
+            await self._event_queue_agent.close(immediate=False)
+            await self._event_queue_subscribers.close(immediate=False)
+            logger.debug('Producer[%s]: Completed', self._task_id)
+
+    async def _run_consumer(self) -> None:
+        """Consumes events from the agent and updates system state."""
+        try:
+            await EventConsumer(self).run()
+        finally:
+            self._is_finished.set()
+            self._request_queue.shutdown(immediate=True)
+            await self._event_queue_agent.close(immediate=True)
+
+            if self._producer_task and not self._producer_task.done():
+                try:
+                    await self._producer_task
+                except asyncio.CancelledError:
+                    pass
+                except Exception as e:  # noqa: BLE001
+                    logger.debug(
+                        'Consumer[%s]: Awaited producer_task raised %r',
+                        self._task_id,
+                        e,
+                    )
+
+            async with self._lock:
+                self._reference_count -= 1
+            logger.debug('Consumer[%s]: Finishing', self._task_id)
+            await self._maybe_cleanup()
+
+    async def subscribe(
+        self,
+        *,
+        request: RequestContext | None = None,
+        include_initial_task: bool = False,
+        replace_status_update_with_task: bool = False,
+    ) -> AsyncGenerator[Event, None]:
+        """Creates a queue tap and yields events as they are produced.
+
+        Concurrency Guarantee:
+        Uses `_lock` to safely increment and decrement `_reference_count`.
+        Safely detaches its queue tap when the client disconnects or the task finishes,
+        triggering `_maybe_cleanup()` to potentially garbage collect the ActiveTask.
+        """
+        logger.debug('Subscribe[%s]: New subscriber', self._task_id)
+
+        async with self._lock:
+            if self._is_finished.is_set():
+                raise UnsupportedOperationError(
+                    f'Task {self._task_id} is already completed.'
+                )
+            self._reference_count += 1
+            logger.debug(
+                'Subscribe[%s]: Subscribers count: %d',
+                self._task_id,
+                self._reference_count,
+            )
+
+        # evict_on_full=True: a subscriber that falls behind is dropped, so it
+        # cannot wedge dispatch for the others. See _deliver_to_sink().
+        tapped_queue = await self._event_queue_subscribers.tap(
+            evict_on_full=True
+        )
+        request_id = await self.enqueue_request(request) if request else None
+
+        try:
+            if include_initial_task:
+                logger.debug(
+                    'Subscribe[%s]: Including initial task',
+                    self._task_id,
+                )
+                task = await self.get_task()
+                yield task
+
+            while True:
+                try:
+                    dequeued = await tapped_queue.dequeue_event()
+                    event, updated_task = cast('Any', dequeued)
+                    logger.debug(
+                        'Subscriber[%s] Dequeued event [%s]:\n %s\nUpdated task:\n%s\n',
+                        self._task_id,
+                        type(event).__name__,
+                        event,
+                        updated_task,
+                    )
+                    if isinstance(event, BaseException):
+                        logger.debug(
+                            'Subscriber[%s]: Raising exception: %s',
+                            self._task_id,
+                            event,
+                        )
+                        tapped_queue.task_done()
+                        raise event
+
+                    if replace_status_update_with_task and isinstance(
+                        event, TaskStatusUpdateEvent
+                    ):
+                        logger.debug(
+                            'Subscriber[%s]: Replacing TaskStatusUpdateEvent with Task: %s',
+                            self._task_id,
+                            updated_task,
+                        )
+                        event = updated_task
+                    # Acknowledge internal lifecycle events before skipping them.
+                    if isinstance(event, _RequestStarted | _RequestCompleted):
+                        tapped_queue.task_done()
+                    if isinstance(event, _RequestCompleted):
+                        if (
+                            request_id is not None
+                            and event.request_id == request_id
+                        ):
+                            logger.debug(
+                                'Subscriber[%s]: Request completed',
+                                self._task_id,
+                            )
+                            return
+                        continue
+                    elif isinstance(event, _RequestStarted):
+                        logger.debug(
+                            'Subscriber[%s]: Request started',
+                            self._task_id,
+                        )
+                        continue
+                    try:
+                        yield event
+                    finally:
+                        tapped_queue.task_done()
+                except (QueueShutDown, asyncio.CancelledError):
+                    break
+        finally:
+            logger.debug('Subscribe[%s]: Unsubscribing', self._task_id)
+            await tapped_queue.close(immediate=True)
+            async with self._lock:
+                self._reference_count -= 1
+            # Evaluate if this was the last subscriber on a finished task.
+            await self._maybe_cleanup()
+
+    async def cancel(self, call_context: ServerCallContext) -> Task:
+        """Cancels the running active task.
+
+        The returned task carries a terminal state, which is written to the
+        task store. That write is not guaranteed to reach an active subscriber
+        stream: by the time cancel writes it the event queues may already be
+        closed, so a client that was streaming may have to re-read the task to
+        observe the terminal state.
+
+        Concurrency Guarantee:
+        Uses `_lock` to ensure we don't attempt to cancel a producer that is
+        already winding down or hasn't started. It fires the cancellation signal
+        and blocks until the consumer processes the cancellation events.
+        """
+        logger.debug('Cancel[%s]: Cancelling task', self._task_id)
+
+        # TODO: Conflicts with call_context on the pending request.
+        self._task_manager._call_context = call_context
+
+        task = await self._task_manager.get_task()
+        request_context = RequestContext(
+            call_context=call_context,
+            task_id=self._task_id,
+            context_id=task.context_id if task else None,
+            task=task,
+        )
+
+        async with self._lock:
+            if not self._is_finished.is_set() and self._producer_task:
+                logger.debug(
+                    'Cancel[%s]: Cancelling producer task', self._task_id
+                )
+                # Await the executor's cancel before cancelling the producer,
+                # so the component that owns the task's terminal state can
+                # still write to the still-open event queue. Cancelling the
+                # producer first can tear the queue down first and drop that
+                # write. Mirrors the V1 handler ordering. The producer cancel
+                # is in a finally so it still runs when executor.cancel() raises
+                # a BaseException such as asyncio.CancelledError, which
+                # `except Exception` does not catch; otherwise the producer
+                # would leak as a pending task. Cancelling after
+                # _mark_task_as_failed also keeps the FAILED write ahead of the
+                # queue teardown, so it is not dropped as QueueShutDown.
+                #
+                # Residual: if executor.cancel() raises a BaseException (e.g.
+                # asyncio.CancelledError), it propagates out of cancel() from
+                # the finally before the _is_finished.wait() and the CANCELED
+                # write below, leaving the task non-terminal with no producer
+                # behind it. This is not the #1170 silent-success shape (the
+                # caller receives the exception), and it is recoverable: a
+                # later cancel() takes the else branch and reaches the
+                # terminal write.
+                try:
+                    await self._agent_executor.cancel(
+                        request_context, self._event_queue_agent
+                    )
+                except Exception as e:
+                    logger.exception(
+                        'Cancel[%s]: Agent cancel failed', self._task_id
+                    )
+                    await self._mark_task_as_failed(e)
+                    raise
+                finally:
+                    self._producer_task.cancel()
+            else:
+                logger.debug(
+                    'Cancel[%s]: Task already finished [%s] or producer not started [%s], not cancelling',
+                    self._task_id,
+                    self._is_finished.is_set(),
+                    self._producer_task,
+                )
+
+        await self._is_finished.wait()
+        self._task_manager.invalidate()
+        task = await self._task_manager.get_task()
+        if not task:
+            raise RuntimeError('Task should have been created')
+        # A cleanup-only executor.cancel() may not write a terminal state, and
+        # a task parked in a non-terminal state (e.g. input-required) has no
+        # running producer to write one either. Close it out as CANCELED so a
+        # caller that cancelled is never left polling a live task. Mirrors the
+        # V1 handler, which made a non-cancelled outcome visible instead of
+        # reporting success and changing nothing.
+        if task.status.state not in TERMINAL_TASK_STATES:
+            # Write a copy rather than mutating the task in place: get_task()
+            # returns the shared _task_manager._current_task, which may already
+            # have been yielded to a subscriber. Copying keeps THIS terminal
+            # write off the yielded reference. It is not a file-wide guarantee:
+            # ordinary status writes (save_task_event -> ensure_task -> CopyFrom,
+            # and the producer-failure write above) still update the shared
+            # object in place. Making every write copy-on-yield is the general
+            # property tracked in #1175 and #1191.
+            updated = Task()
+            updated.CopyFrom(task)
+            updated.status.state = TaskState.TASK_STATE_CANCELED
+            await self._task_manager.save_task_event(updated)
+            task = updated
+        return task
+
+    async def aclose(self) -> None:
+        """Force-closes the task's queues and drains its background tasks.
+
+        Provides a bounded, public teardown for the producer and consumer
+        ``asyncio.Task``s spawned in ``start()``. Without it, a producer
+        wedged in its ``finally`` closing an abandoned subscriber sink can
+        survive until event-loop shutdown and surface as
+        ``Task was destroyed but it is pending!``.
+
+        Always forces: the queues are closed with ``immediate=True`` and the
+        background tasks are cancelled, so teardown is bounded even when a
+        subscriber sink was never drained. It is safe to call multiple times.
+        """
+        # Shut down the request queue first, mirroring the producer's
+        # ``finally``. If `start()` was never called, the producer/consumer
+        # ``finally`` blocks never run, and without this a caller parked in
+        # `enqueue_request()` would wait forever.
+        self._request_queue.shutdown(immediate=True)
+        await self._event_queue_agent.close(immediate=True)
+        await self._event_queue_subscribers.close(immediate=True)
+        # Set `_is_finished` and collect the background tasks under `_lock` so
+        # this is mutually exclusive with `start()`, which refuses to spawn
+        # once `_is_finished` is set. The lock is released before awaiting the
+        # tasks, because their teardown re-acquires it.
+        async with self._lock:
+            self._is_finished.set()
+            background_tasks = [
+                task
+                for task in (self._producer_task, self._consumer_task)
+                if task is not None
+            ]
+            for task in background_tasks:
+                task.cancel()
+        if background_tasks:
+            results = await asyncio.gather(
+                *background_tasks, return_exceptions=True
+            )
+            for result in results:
+                # CancelledError is a BaseException, so it is excluded here.
+                if isinstance(result, Exception):
+                    logger.error('Error during aclose', exc_info=result)
+
+    async def _maybe_cleanup(self) -> None:
+        """Triggers cleanup if task is finished and has no subscribers.
+
+        Concurrency Guarantee:
+        Protected by `_lock` to prevent race conditions where a new subscriber
+        attaches at the exact moment the task decides to garbage collect itself.
+        """
+        async with self._lock:
+            logger.debug(
+                'Cleanup[%s]: Subscribers count: %d is_finished: %s',
+                self._task_id,
+                self._reference_count,
+                self._is_finished.is_set(),
+            )
+
+            if (
+                self._is_finished.is_set()
+                and self._reference_count == 0
+                and self._on_cleanup
+            ):
+                logger.debug('Cleanup[%s]: Triggering cleanup', self._task_id)
+                self._on_cleanup(self)
+
+    async def _mark_task_as_failed(self, exception: Exception) -> Task | None:
+        logger.debug('Marking task %s as failed: %s', self._task_id, exception)
+        task = None
+        if self._task_created.is_set():
+            try:
+                task = await self._task_manager.get_task()
+                if task is not None:
+                    await self._event_queue_agent.enqueue_event(
+                        TaskStatusUpdateEvent(
+                            task_id=task.id,
+                            context_id=task.context_id,
+                            status=TaskStatus(
+                                state=TaskState.TASK_STATE_FAILED,
+                            ),
+                        )
+                    )
+            except QueueShutDown:
+                pass
+        return task
+
+    async def get_task(self) -> Task:
+        """Get task from db."""
+        await self._task_created.wait()
+        task = await self._task_manager.get_task()
+        if not task:
+            raise RuntimeError('Task should have been created')
+        return task

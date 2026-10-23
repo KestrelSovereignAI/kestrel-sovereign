@@ -6,9 +6,9 @@ import threading
 
 import httpx
 import pytest
-from a2a.client.errors import A2AClientError
-from a2a.types import GetTaskRequest
-from a2a.utils.errors import InternalError
+from kestrel_sovereign._vendor.a2a.client.errors import A2AClientError
+from kestrel_sovereign._vendor.a2a.types import GetTaskRequest
+from kestrel_sovereign._vendor.a2a.utils.errors import InternalError
 from kestrel_sdk.security import outbound
 
 from tests.unit.test_a2a_native_http import submit

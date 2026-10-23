@@ -9,10 +9,10 @@ import json
 from dataclasses import dataclass
 from typing import TypeVar
 
-from a2a.server.context import ServerCallContext
-from a2a.server.routes.common import DefaultServerCallContextBuilder
-from a2a.utils.errors import InvalidParamsError
-from a2a.utils.proto_utils import validate_proto_required_fields
+from kestrel_sovereign._vendor.a2a.server.context import ServerCallContext
+from kestrel_sovereign._vendor.a2a.server.routes.common import DefaultServerCallContextBuilder
+from kestrel_sovereign._vendor.a2a.utils.errors import InvalidParamsError
+from kestrel_sovereign._vendor.a2a.utils.proto_utils import validate_proto_required_fields
 from google.protobuf.descriptor import FieldDescriptor
 from google.protobuf.message import Message as ProtoMessage
 from starlette.requests import Request

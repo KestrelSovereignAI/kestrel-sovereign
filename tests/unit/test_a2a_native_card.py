@@ -5,9 +5,9 @@ from copy import deepcopy
 
 import pytest
 import rfc8785
-from a2a.server.request_handlers.response_helpers import agent_card_to_dict
-from a2a.types import AgentCard, AgentSkill
-from a2a.utils.signing import InvalidSignaturesError, create_agent_card_signer
+from kestrel_sovereign._vendor.a2a.server.request_handlers.response_helpers import agent_card_to_dict
+from kestrel_sovereign._vendor.a2a.types import AgentCard, AgentSkill
+from kestrel_sovereign._vendor.a2a.utils.signing import InvalidSignaturesError, create_agent_card_signer
 from google.protobuf.json_format import ParseDict
 
 from kestrel_sovereign.a2a.extensions import RECIPIENT_POLICY_URI, SIGNED_SENDER_URI

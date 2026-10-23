@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from a2a.types import TaskState
+from kestrel_sovereign._vendor.a2a.types import TaskState
 
 TERMINAL_STATES = frozenset(
     {

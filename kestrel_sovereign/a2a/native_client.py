@@ -8,11 +8,11 @@ from dataclasses import dataclass, field, fields
 from uuid import uuid4
 
 import httpx
-from a2a.client import ClientConfig, ClientFactory
-from a2a.client.client import ClientCallContext
-from a2a.client.interceptors import AfterArgs, BeforeArgs, ClientCallInterceptor
-from a2a.extensions.common import HTTP_EXTENSION_HEADER
-from a2a.types import (
+from kestrel_sovereign._vendor.a2a.client import ClientConfig, ClientFactory
+from kestrel_sovereign._vendor.a2a.client.client import ClientCallContext
+from kestrel_sovereign._vendor.a2a.client.interceptors import AfterArgs, BeforeArgs, ClientCallInterceptor
+from kestrel_sovereign._vendor.a2a.extensions.common import HTTP_EXTENSION_HEADER
+from kestrel_sovereign._vendor.a2a.types import (
     AgentCard,
     AgentInterface,
     CancelTaskRequest,
@@ -25,14 +25,14 @@ from a2a.types import (
     Task,
     TaskState,
 )
-from a2a.utils.constants import (
+from kestrel_sovereign._vendor.a2a.utils.constants import (
     DEFAULT_LIST_TASKS_PAGE_SIZE,
     MAX_LIST_TASKS_PAGE_SIZE,
     VERSION_HEADER,
 )
-from a2a.utils.errors import InvalidParamsError
-from a2a.utils.proto_utils import validate_proto_required_fields
-from a2a.utils.signing import SignatureVerificationError
+from kestrel_sovereign._vendor.a2a.utils.errors import InvalidParamsError
+from kestrel_sovereign._vendor.a2a.utils.proto_utils import validate_proto_required_fields
+from kestrel_sovereign._vendor.a2a.utils.signing import SignatureVerificationError
 from google.protobuf.json_format import MessageToDict
 from google.protobuf.message import Message as ProtoMessage
 

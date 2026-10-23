@@ -2,7 +2,7 @@
 
 from typing import Any, Protocol, runtime_checkable
 
-from a2a.types import Task
+from kestrel_sovereign._vendor.a2a.types import Task
 
 
 @runtime_checkable

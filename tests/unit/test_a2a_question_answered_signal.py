@@ -79,8 +79,8 @@ class TestRegistration:
 
 
 def native_payload(**changes):
-    from a2a.helpers.proto_helpers import new_text_message
-    from a2a.types import Role
+    from kestrel_sovereign._vendor.a2a.helpers.proto_helpers import new_text_message
+    from kestrel_sovereign._vendor.a2a.types import Role
     from google.protobuf.json_format import MessageToDict
 
     return {

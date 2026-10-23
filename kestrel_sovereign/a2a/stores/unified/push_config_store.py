@@ -5,8 +5,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from uuid import uuid4
 
-from a2a.types import TaskPushNotificationConfig
-from a2a.utils.proto_utils import validate_proto_required_fields
+from kestrel_sovereign._vendor.a2a.types import TaskPushNotificationConfig
+from kestrel_sovereign._vendor.a2a.utils.proto_utils import validate_proto_required_fields
 from kestrel_sdk.security.aead import AEADCipher
 from kestrel_sdk.security.encryption import get_agent_key
 

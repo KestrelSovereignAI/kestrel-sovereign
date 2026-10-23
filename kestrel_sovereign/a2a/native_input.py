@@ -4,9 +4,9 @@ import hashlib
 from dataclasses import dataclass, field
 
 import rfc8785
-from a2a.types import SendMessageRequest, TaskPushNotificationConfig
-from a2a.utils.errors import InvalidParamsError
-from a2a.utils.proto_utils import validate_proto_required_fields
+from kestrel_sovereign._vendor.a2a.types import SendMessageRequest, TaskPushNotificationConfig
+from kestrel_sovereign._vendor.a2a.utils.errors import InvalidParamsError
+from kestrel_sovereign._vendor.a2a.utils.proto_utils import validate_proto_required_fields
 from google.protobuf.json_format import MessageToDict, MessageToJson
 from google.protobuf.message import Message as ProtoMessage
 

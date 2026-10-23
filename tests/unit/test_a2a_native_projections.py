@@ -1,7 +1,7 @@
 """Native oneof selection is preserved in text-only presentation."""
 
 import pytest
-from a2a.types import Message, Part
+from kestrel_sovereign._vendor.a2a.types import Message, Part
 from google.protobuf.json_format import ParseDict
 from google.protobuf.struct_pb2 import Value
 

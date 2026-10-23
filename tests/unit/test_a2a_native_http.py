@@ -8,12 +8,12 @@ from uuid import uuid4
 import httpx
 import pytest
 import pytest_asyncio
-from a2a.client import ClientConfig, ClientFactory
-from a2a.client.client import ClientCallContext
-from a2a.client.errors import A2AClientError
-from a2a.client.interceptors import BeforeArgs
-from a2a.helpers.proto_helpers import new_text_artifact
-from a2a.types import (
+from kestrel_sovereign._vendor.a2a.client import ClientConfig, ClientFactory
+from kestrel_sovereign._vendor.a2a.client.client import ClientCallContext
+from kestrel_sovereign._vendor.a2a.client.errors import A2AClientError
+from kestrel_sovereign._vendor.a2a.client.interceptors import BeforeArgs
+from kestrel_sovereign._vendor.a2a.helpers.proto_helpers import new_text_artifact
+from kestrel_sovereign._vendor.a2a.types import (
     AgentCapabilities,
     AgentCard,
     AgentExtension,
@@ -29,7 +29,7 @@ from a2a.types import (
     TaskPushNotificationConfig,
     TaskState,
 )
-from a2a.utils.errors import (
+from kestrel_sovereign._vendor.a2a.utils.errors import (
     InternalError,
     InvalidParamsError,
     PushNotificationNotSupportedError,
@@ -810,8 +810,8 @@ async def test_sender_interceptor_preserves_the_callers_context_and_signs_each_r
 async def test_native_server_refuses_unsupported_or_malformed_input_before_task_admission(
     wire, mime
 ):
-    from a2a.types import Part
-    from a2a.utils.errors import ContentTypeNotSupportedError, InvalidParamsError
+    from kestrel_sovereign._vendor.a2a.types import Part
+    from kestrel_sovereign._vendor.a2a.utils.errors import ContentTypeNotSupportedError, InvalidParamsError
 
     params = send(wire.admission)
     params.message.parts.append(Part(raw=b"not fetched or admitted", media_type=mime))
@@ -831,7 +831,7 @@ async def test_native_server_refuses_unsupported_or_malformed_input_before_task_
 
 
 async def test_native_metadata_cannot_activate_its_own_optional_extension(wire):
-    from a2a.utils.errors import InvalidParamsError
+    from kestrel_sovereign._vendor.a2a.utils.errors import InvalidParamsError
 
     from kestrel_sovereign.a2a.extensions import CAUSATION_URI
 

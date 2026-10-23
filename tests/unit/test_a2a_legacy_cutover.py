@@ -5,8 +5,8 @@ from dataclasses import replace
 from datetime import UTC, datetime
 
 import pytest
-from a2a.helpers.proto_helpers import new_text_message
-from a2a.types import Role, SendMessageRequest, Task, TaskState, TaskStatus
+from kestrel_sovereign._vendor.a2a.helpers.proto_helpers import new_text_message
+from kestrel_sovereign._vendor.a2a.types import Role, SendMessageRequest, Task, TaskState, TaskStatus
 
 from kestrel_sovereign.a2a.legacy_cutover import (
     apply_legacy_migration,

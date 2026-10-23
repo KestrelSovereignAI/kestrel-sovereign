@@ -20,7 +20,7 @@ import pytest
 import pytest_asyncio
 from pathlib import Path
 
-from a2a.types import TaskState
+from kestrel_sovereign._vendor.a2a.types import TaskState
 
 from kestrel_sdk.tools.base import AgentTool, ToolSchema, ToolParameter, ToolCategory
 from kestrel_sovereign.features.model import ModelAgent
@@ -373,8 +373,8 @@ async def test_e2e_feature_as_a2a_agent(kestrel_agent, usable_model_list, live_c
 
     # The feature contributes native skills; the host publishes its signed card.
     assert "list_models" in {skill.id for skill in model_feature.get_agent_skills()}
-    from a2a.helpers.proto_helpers import new_task, new_text_message
-    from a2a.types import Role
+    from kestrel_sovereign._vendor.a2a.helpers.proto_helpers import new_task, new_text_message
+    from kestrel_sovereign._vendor.a2a.types import Role
 
     task = new_task(
         "test-task-001", "test-context", TaskState.TASK_STATE_SUBMITTED,

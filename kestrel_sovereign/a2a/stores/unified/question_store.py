@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from uuid import NAMESPACE_URL, uuid4, uuid5
 
-from a2a.types import Message, Role, SendMessageRequest, Task
+from kestrel_sovereign._vendor.a2a.types import Message, Role, SendMessageRequest, Task
 from google.protobuf.json_format import MessageToDict, ParseDict
 
 from kestrel_sovereign.a2a.extensions import parse_question_correlation

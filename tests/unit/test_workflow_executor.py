@@ -5,7 +5,7 @@ import json
 from types import SimpleNamespace
 
 import pytest
-from a2a.types import Task, TaskState
+from kestrel_sovereign._vendor.a2a.types import Task, TaskState
 from kestrel_sdk.tools.result import ToolResult, ToolResultStatus
 
 from kestrel_sovereign.a2a.projections import embedded_json_value

@@ -1,8 +1,8 @@
 """Standard same-task continuation through both official SDK HTTP bindings."""
 
 import pytest
-from a2a.helpers.proto_helpers import new_text_message
-from a2a.types import Role, SendMessageRequest, TaskState
+from kestrel_sovereign._vendor.a2a.helpers.proto_helpers import new_text_message
+from kestrel_sovereign._vendor.a2a.types import Role, SendMessageRequest, TaskState
 
 from tests.unit.test_a2a_native_http import submit
 from tests.unit.test_a2a_native_http import wire as wire
@@ -55,7 +55,7 @@ async def test_continuation_infers_context_and_preserves_the_same_task_and_histo
 async def test_continuation_returns_standard_errors_without_changing_the_task(
     wire, fault
 ):
-    from a2a.utils.errors import (
+    from kestrel_sovereign._vendor.a2a.utils.errors import (
         InvalidParamsError,
         TaskNotFoundError,
         UnsupportedOperationError,

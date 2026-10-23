@@ -13,35 +13,6 @@ resolution-markers = [
 ]
 
 [[package]]
-name = "a2a-sdk"
-version = "1.2.3"
-source = { registry = "https://pypi.org/simple" }
-dependencies = [
-    { name = "culsans", marker = "python_full_version < '3.13'" },
-    { name = "google-api-core", version = "2.25.2", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.14'" },
-    { name = "google-api-core", version = "2.28.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.14'" },
-    { name = "googleapis-common-protos" },
-    { name = "httpx" },
-    { name = "json-rpc" },
-    { name = "packaging" },
-    { name = "protobuf" },
-    { name = "pydantic" },
-]
-sdist = { url = "https://files.pythonhosted.org/packages/e7/5a/2b5ff74f3f0dbec13787c7139cb1047a562544c9b8b062d0eaa9392c79f9/a2a_sdk-1.2.3.tar.gz", hash = "sha256:a28bc40b010d088ea4a10d05a5ba021d183f02cacab15929072ea5b34cde3fe6", size = 434137, upload-time = "2026-10-19T10:11:31.052Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/7b/df/138f64f3138db7b44b9798426909357d27429c868715af8751ace6083238/a2a_sdk-1.2.3-py3-none-any.whl", hash = "sha256:a89529ab7d026900170aefc1515f35c68d9a14b6a9133f8cc775c8fe598f8ae7", size = 278339, upload-time = "2026-10-19T10:11:29.102Z" },
-]
-
-[package.optional-dependencies]
-http-server = [
-    { name = "sse-starlette" },
-    { name = "starlette" },
-]
-signing = [
-    { name = "pyjwt" },
-]
-
-[[package]]
 name = "accelerate"
 version = "1.12.0"
 source = { registry = "https://pypi.org/simple" }
@@ -3197,7 +3168,6 @@ name = "kestrel-sovereign"
 version = "0.53.41"
 source = { editable = "." }
 dependencies = [
-    { name = "a2a-sdk", extra = ["http-server", "signing"] },
     { name = "aiohttp" },
     { name = "aiosqlite" },
     { name = "anthropic" },
@@ -3208,20 +3178,25 @@ dependencies = [
     { name = "certifi" },
     { name = "charset-normalizer" },
     { name = "cryptography" },
+    { name = "culsans", marker = "python_full_version < '3.13'" },
     { name = "email-validator" },
     { name = "fastapi" },
+    { name = "google-api-core", version = "2.25.2", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.14'" },
+    { name = "google-api-core", version = "2.28.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.14'" },
     { name = "google-auth" },
     { name = "google-cloud-logging" },
     { name = "google-cloud-secret-manager" },
     { name = "google-cloud-storage" },
     { name = "google-genai" },
     { name = "google-generativeai" },
+    { name = "googleapis-common-protos" },
     { name = "httplib2" },
     { name = "httpx" },
     { name = "httpx2" },
     { name = "idna" },
     { name = "iniconfig" },
     { name = "itsdangerous" },
+    { name = "json-rpc" },
     { name = "kestrel-llms", extra = ["all"] },
     { name = "kestrel-sovereign-sdk", extra = ["httpx", "tracing"] },
     { name = "networkx" },
@@ -3233,6 +3208,7 @@ dependencies = [
     { name = "pillow" },
     { name = "pluggy" },
     { name = "pqcrypto" },
+    { name = "protobuf" },
     { name = "psutil" },
     { name = "psycopg2-binary" },
     { name = "pycryptodome" },
@@ -3252,6 +3228,8 @@ dependencies = [
     { name = "slowapi" },
     { name = "soupsieve" },
     { name = "sqlalchemy", extra = ["asyncio"] },
+    { name = "sse-starlette" },
+    { name = "starlette" },
     { name = "tiktoken" },
     { name = "toml" },
     { name = "tree-sitter" },
@@ -3400,7 +3378,6 @@ test = [
 
 [package.metadata]
 requires-dist = [
-    { name = "a2a-sdk", extras = ["http-server", "signing"], specifier = ">=1.2.3,<2" },
     { name = "accelerate", marker = "extra == 'ml'", specifier = ">=1.12.0" },
     { name = "aiohttp", specifier = ">=3.14.1" },
     { name = "aiosqlite", specifier = ">=0.21.0" },
@@ -3416,9 +3393,11 @@ requires-dist = [
     { name = "certifi", specifier = "==2026.5.20" },
     { name = "charset-normalizer", specifier = "==3.4.7" },
     { name = "cryptography", specifier = ">=48.0.1" },
+    { name = "culsans", marker = "python_full_version < '3.13'", specifier = ">=0.11.0" },
     { name = "diffusers", marker = "extra == 'ml'", specifier = ">=0.38.0" },
     { name = "email-validator", specifier = ">=2.3.0" },
     { name = "fastapi", specifier = ">=0.143.3,<0.144" },
+    { name = "google-api-core", specifier = ">=1.26.0" },
     { name = "google-auth", specifier = ">=2.40.3" },
     { name = "google-cloud-logging", specifier = ">=3.5.0" },
     { name = "google-cloud-run", marker = "extra == 'cloud'", specifier = ">=0.10.0" },
@@ -3426,12 +3405,14 @@ requires-dist = [
     { name = "google-cloud-storage", specifier = ">=3.4.1" },
     { name = "google-genai", specifier = ">=1.0.0" },
     { name = "google-generativeai", specifier = ">=0.8.6" },
+    { name = "googleapis-common-protos", specifier = ">=1.70.0" },
     { name = "httplib2", specifier = ">=0.32.0" },
-    { name = "httpx", specifier = ">=0.27.0" },
+    { name = "httpx", specifier = ">=0.28.1" },
     { name = "httpx2", specifier = ">=2.10,<3" },
     { name = "idna", specifier = ">=3.20,<4" },
     { name = "iniconfig", specifier = "==2.3.0" },
     { name = "itsdangerous", specifier = ">=2.2.0" },
+    { name = "json-rpc", specifier = ">=1.15.0" },
     { name = "kestrel-feature-mcp", marker = "extra == 'mcp-integration'", specifier = ">=0.7,<1" },
     { name = "kestrel-llms", extras = ["all"], specifier = "==0.1.8" },
     { name = "kestrel-sovereign", extras = ["all-features"], marker = "extra == 'full'" },
@@ -3461,6 +3442,7 @@ requires-dist = [
     { name = "pillow", specifier = ">=12.2.0" },
     { name = "pluggy", specifier = "==1.6.0" },
     { name = "pqcrypto", specifier = ">=1.0,<2.0" },
+    { name = "protobuf", specifier = ">=5.29.5" },
     { name = "psutil", specifier = ">=7.1.3" },
     { name = "psycopg2-binary", specifier = ">=2.9.10" },
     { name = "pycryptodome", specifier = "==3.23.0" },
@@ -3492,6 +3474,8 @@ requires-dist = [
     { name = "soupsieve", specifier = ">=2.8.4" },
     { name = "spacy", marker = "extra == 'local'", specifier = ">=3.7.0" },
     { name = "sqlalchemy", extras = ["asyncio"], specifier = ">=2.0" },
+    { name = "sse-starlette" },
+    { name = "starlette" },
     { name = "stripe", marker = "extra == 'wallet'", specifier = ">=10.0.0" },
     { name = "tavily-python", marker = "extra == 'search'", specifier = ">=0.3.0" },
     { name = "tiktoken", specifier = ">=0.13.0,<1" },

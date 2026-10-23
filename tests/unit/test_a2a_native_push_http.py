@@ -6,13 +6,13 @@ import sys
 
 import pytest
 import pytest_asyncio
-from a2a.types import (
+from kestrel_sovereign._vendor.a2a.types import (
     DeleteTaskPushNotificationConfigRequest,
     GetTaskPushNotificationConfigRequest,
     ListTaskPushNotificationConfigsRequest,
     TaskPushNotificationConfig,
 )
-from a2a.utils.errors import InternalError, InvalidParamsError, TaskNotFoundError
+from kestrel_sovereign._vendor.a2a.utils.errors import InternalError, InvalidParamsError, TaskNotFoundError
 
 from kestrel_sovereign.a2a.push_worker import NativePushWorker
 from kestrel_sovereign.a2a.request_handler import NativeA2ARequestHandler, _push_errors

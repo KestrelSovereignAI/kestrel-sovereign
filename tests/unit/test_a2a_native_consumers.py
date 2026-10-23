@@ -4,8 +4,8 @@ from types import SimpleNamespace
 
 import pytest
 import pytest_asyncio
-from a2a.helpers.proto_helpers import new_data_artifact, new_text_message
-from a2a.types import Part, Role, SendMessageRequest, TaskState
+from kestrel_sovereign._vendor.a2a.helpers.proto_helpers import new_data_artifact, new_text_message
+from kestrel_sovereign._vendor.a2a.types import Part, Role, SendMessageRequest, TaskState
 from kestrel_sdk.tools.result import ToolResult, ToolResultStatus
 
 from kestrel_sovereign.a2a.lifecycle import task_state_from_label

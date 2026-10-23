@@ -27,11 +27,26 @@ and open gates are recorded in [the spike report](NATIVE_PROTOCOL_SPIKES.md).
 Use the published [MCP 2026-07-28 specification](https://modelcontextprotocol.io/specification/2026-07-28)
 and [A2A 1.0.1 specification](https://a2a-protocol.org/v1.0.1/specification/),
 the latest released A2A revision checked on 2026-10-19.
-Use official Python SDKs at every network boundary. MCP was tested at 2.3.0.
-The native A2A migration currently uses a private `a2a-sdk` 2.0 development
-candidate with the signed-card, HTTP authorization and response-decoding fixes;
-public dependency acceptance remains a release gate. Earlier spike evidence
-used public 1.2.3, rechecked on 2026-10-20. Exact versions belong in dependency locks,
+Use official Python SDK implementations at every network boundary. MCP was tested at 2.3.0.
+Kestrel ships a reviewed, modified copy of the official A2A Python SDK in
+`kestrel_sovereign._vendor.a2a`. Its signing, HTTP authorization, borrowed-client
+ownership and response-decoding fixes preserve the A2A 1.0.1 wire protocol.
+Vendoring is authorized for this cutover; an upstream PyPI release is no longer
+a prerequisite. This is a modified SDK distribution, not an official 2.0 release.
+Earlier spike evidence used public 1.2.3, rechecked on 2026-10-20.
+The packaged `VENDORED.json` records the public base commit, exact reviewed tree,
+every original/relocated file digest, the Apache license and a complete source/test
+patch. `scripts/vendor_a2a.py --check` verifies the snapshot offline and reverses
+the module relocation to verify the reviewed source. Python package names change;
+protobuf descriptors, JSON fields, signatures and HTTP bindings do not.
+Core does not install or import the external `a2a` package. The isolated namespace
+prevents an independently installed SDK from replacing Kestrel's implementation.
+The SDK's runtime dependencies are declared directly and resolved in Core's lock.
+Clean wheel and sdist installs must exercise the same wire/oracle tests as source.
+Full conformance, interoperability and host acceptance remain release gates.
+Return to the upstream distribution when a released SDK passes these same checks;
+remove the vendored implementation and switch all callers together.
+Exact versions belong in dependency locks,
 and dependency ranges must admit the releases we actually test. Old dependency
 caps are subject to migration, not reasons to downgrade the protocol target.
 
@@ -51,7 +66,7 @@ contracts. Both are included at SDK commit
 at `eff4c1f86bee3a5cf5c40b4d36c95b3ee29e02a8` predates these contracts.
 SDK 0.41.0 is now published. Core's manifest requires at least 0.41.0 and its
 lock resolves that public release. Consumer constraints and installed-package
-acceptance tests must verify the complete host feature set. Native-A2A public
+acceptance tests must verify the complete host feature set. Native-A2A packaged
 dependency and conformance gates still apply.
 
 The cutover worktree removes `kestrel_sovereign/a2a/types.py` and

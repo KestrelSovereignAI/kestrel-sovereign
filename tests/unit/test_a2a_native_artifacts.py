@@ -5,9 +5,9 @@ from types import SimpleNamespace
 
 import pytest
 import pytest_asyncio
-from a2a.helpers.proto_helpers import new_text_artifact, new_text_message
-from a2a.server.tasks.task_manager import append_artifact_to_task
-from a2a.types import (
+from kestrel_sovereign._vendor.a2a.helpers.proto_helpers import new_text_artifact, new_text_message
+from kestrel_sovereign._vendor.a2a.server.tasks.task_manager import append_artifact_to_task
+from kestrel_sovereign._vendor.a2a.types import (
     AgentSkill,
     Artifact,
     Part,
@@ -18,7 +18,7 @@ from a2a.types import (
     TaskState,
     TaskStatusUpdateEvent,
 )
-from a2a.utils.errors import InvalidAgentResponseError, InvalidParamsError
+from kestrel_sovereign._vendor.a2a.utils.errors import InvalidAgentResponseError, InvalidParamsError
 from google.protobuf.json_format import MessageToDict
 from kestrel_sdk.tools.result import ToolResultStatus
 

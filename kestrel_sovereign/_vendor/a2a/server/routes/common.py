@@ -1,0 +1,136 @@
+# Modified by Kestrel: isolated SDK namespace; see VENDORED.json.
+from abc import ABC, abstractmethod
+from inspect import signature
+from typing import TYPE_CHECKING, Any
+
+from google.protobuf.json_format import MessageToDict
+
+from kestrel_sovereign._vendor.a2a.types.a2a_pb2 import ListTasksResponse
+
+
+if TYPE_CHECKING:
+    from sse_starlette.sse import EventSourceResponse
+    from starlette.authentication import BaseUser
+    from starlette.requests import Request
+else:
+    try:
+        from sse_starlette.sse import EventSourceResponse
+        from starlette.authentication import BaseUser
+        from starlette.requests import Request
+    except ImportError:
+        EventSourceResponse = Any
+        Request = Any
+        BaseUser = Any
+
+from kestrel_sovereign._vendor.a2a.auth.user import UnauthenticatedUser, User
+from kestrel_sovereign._vendor.a2a.extensions.common import (
+    HTTP_EXTENSION_HEADER,
+    get_requested_extensions,
+)
+from kestrel_sovereign._vendor.a2a.server.context import ServerCallContext
+
+
+def serialize_list_tasks_response(
+    response: ListTasksResponse, include_artifacts: bool
+) -> dict[str, Any]:
+    """Serializes a ListTasks response according to artifact semantics."""
+    result = MessageToDict(
+        response,
+        preserving_proto_field_name=False,
+        always_print_fields_with_no_presence=True,
+    )
+    if not include_artifacts:
+        for task in result['tasks']:
+            task.pop('artifacts', None)
+    return result
+
+
+def create_event_source_response(
+    content: Any,
+    shutdown_grace_period: float = 0,
+) -> 'EventSourceResponse':
+    """Creates an SSE response, preserving support for older sse-starlette.
+
+    A non-zero grace period requires cooperative shutdown support from
+    sse-starlette, provided by the HTTP server optional dependencies.
+    """
+    if shutdown_grace_period < 0:
+        raise ValueError('shutdown_grace_period must be >= 0')
+    if shutdown_grace_period:
+        if (
+            'shutdown_grace_period'
+            not in signature(EventSourceResponse.__init__).parameters
+        ):
+            raise RuntimeError(
+                'Configuring shutdown_grace_period requires sse-starlette with '
+                'cooperative shutdown support. Upgrade the dependencies for '
+                'a2a-sdk[http-server].'
+            )
+        return EventSourceResponse(
+            content, shutdown_grace_period=shutdown_grace_period
+        )
+    return EventSourceResponse(content)
+
+
+class StarletteUser(User):
+    """Adapts a Starlette BaseUser to the A2A User interface."""
+
+    def __init__(self, user: BaseUser):
+        self._user = user
+
+    @property
+    def is_authenticated(self) -> bool:
+        """Returns whether the current user is authenticated."""
+        return self._user.is_authenticated
+
+    @property
+    def user_name(self) -> str:
+        """Returns the user name of the current user."""
+        return self._user.display_name
+
+
+class ServerCallContextBuilder(ABC):
+    """A class for building ServerCallContexts using the Starlette Request."""
+
+    @abstractmethod
+    def build(self, request: Request) -> ServerCallContext:
+        """Builds a ServerCallContext from a Starlette Request."""
+
+
+class DefaultServerCallContextBuilder(ServerCallContextBuilder):
+    """A default implementation of ServerCallContextBuilder."""
+
+    def build(self, request: Request) -> ServerCallContext:
+        """Builds a ServerCallContext from a Starlette Request.
+
+        Args:
+            request: The incoming Starlette Request object.
+
+        Returns:
+            A ServerCallContext instance populated with user and state
+            information from the request.
+        """
+        state = {}
+        if 'auth' in request.scope:
+            state['auth'] = request.auth
+        state['headers'] = dict(request.headers)
+        return ServerCallContext(
+            user=self.build_user(request),
+            state=state,
+            requested_extensions=get_requested_extensions(
+                request.headers.getlist(HTTP_EXTENSION_HEADER)
+            ),
+        )
+
+    def build_user(self, request: Request) -> User:
+        """Builds a User from a Starlette Request.
+
+        Args:
+            request: The incoming Starlette Request object.
+
+        Returns:
+            A User instance populated with user information from the request.
+        """
+        if 'user' in request.scope:
+            return StarletteUser(request.user)
+        return UnauthenticatedUser()

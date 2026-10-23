@@ -3,8 +3,8 @@
 from datetime import UTC, datetime
 
 import pytest
-from a2a.helpers.proto_helpers import new_text_message
-from a2a.types import SendMessageRequest
+from kestrel_sovereign._vendor.a2a.helpers.proto_helpers import new_text_message
+from kestrel_sovereign._vendor.a2a.types import SendMessageRequest
 from google.protobuf.json_format import MessageToDict
 from kestrel_sdk.signals import CausationFrame
 

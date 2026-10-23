@@ -1,8 +1,8 @@
 """Native part MIME defaults, ranges and refusal without malformed fallback."""
 
 import pytest
-from a2a.types import AgentSkill, Part
-from a2a.utils.errors import ContentTypeNotSupportedError, InvalidParamsError
+from kestrel_sovereign._vendor.a2a.types import AgentSkill, Part
+from kestrel_sovereign._vendor.a2a.utils.errors import ContentTypeNotSupportedError, InvalidParamsError
 from google.protobuf.json_format import ParseDict
 
 from kestrel_sovereign.a2a.media import (

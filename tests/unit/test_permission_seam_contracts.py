@@ -5,7 +5,7 @@ from types import SimpleNamespace
 
 import pytest
 import pytest_asyncio
-from a2a.types import AgentSkill, Artifact, Part, TaskState, TaskStatus
+from kestrel_sovereign._vendor.a2a.types import AgentSkill, Artifact, Part, TaskState, TaskStatus
 from kestrel_sdk.hooks.base import HookEvent, HookInput, HookOutput
 
 from kestrel_sovereign.a2a.scope import NativeRecipientScope

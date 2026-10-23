@@ -10,7 +10,7 @@ from datetime import timedelta
 from types import SimpleNamespace
 
 import pytest
-from a2a.types import TaskState
+from kestrel_sovereign._vendor.a2a.types import TaskState
 
 from kestrel_sovereign._async_ownership import await_owned_task, create_owned_task
 from kestrel_sovereign.a2a.question_supervisor import NativeQuestionSupervisor

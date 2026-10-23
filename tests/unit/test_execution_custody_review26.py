@@ -63,8 +63,8 @@ async def test_actual_a2a_store_retirement_joins_every_owner_and_preserves_contr
     "worker", "worker_cancel", "command", "cancel_callback",
 ])
 async def test_actual_a2a_producers_and_projections_propagate_original_control(tmp_path, monkeypatch, stage):
-    from a2a.helpers.proto_helpers import new_text_message
-    from a2a.types import AgentSkill, Role, SendMessageRequest, TaskState
+    from kestrel_sovereign._vendor.a2a.helpers.proto_helpers import new_text_message
+    from kestrel_sovereign._vendor.a2a.types import AgentSkill, Role, SendMessageRequest, TaskState
     from kestrel_sdk.storage.database import QueryError
 
     from kestrel_sovereign.a2a.scope import NativeRecipientScope
@@ -140,8 +140,8 @@ async def test_actual_a2a_producers_and_projections_propagate_original_control(t
 @pytest.mark.parametrize("stage", ["save", "payload"])
 @pytest.mark.parametrize("control", ["denied", "unknown"])
 async def test_actual_a2a_terminal_outcome_never_normalizes_control_into_completion(tmp_path, monkeypatch, stage, control):
-    from a2a.helpers.proto_helpers import new_text_message
-    from a2a.types import Role, SendMessageRequest, Task, TaskState
+    from kestrel_sovereign._vendor.a2a.helpers.proto_helpers import new_text_message
+    from kestrel_sovereign._vendor.a2a.types import Role, SendMessageRequest, Task, TaskState
     from kestrel_sdk.storage.database import QueryError
 
     from kestrel_sovereign.a2a.scope import NativeRecipientScope
@@ -298,8 +298,8 @@ async def test_actual_host_factory_preserves_interrupted_schema_commit_and_retir
 @pytest.mark.asyncio
 @pytest.mark.parametrize("reconciliation", ["cancel", "error"])
 async def test_actual_a2a_cancel_commit_receipt_survives_failed_readback(tmp_path, monkeypatch, reconciliation):
-    from a2a.helpers.proto_helpers import new_text_message
-    from a2a.types import Role, SendMessageRequest, TaskState
+    from kestrel_sovereign._vendor.a2a.helpers.proto_helpers import new_text_message
+    from kestrel_sovereign._vendor.a2a.types import Role, SendMessageRequest, TaskState
     from kestrel_sdk.storage.database import QueryError
 
     from kestrel_sovereign.a2a.scope import NativeRecipientScope

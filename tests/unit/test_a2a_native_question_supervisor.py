@@ -7,7 +7,7 @@ from datetime import timedelta
 from types import SimpleNamespace
 
 import pytest
-from a2a.types import TaskState
+from kestrel_sovereign._vendor.a2a.types import TaskState
 
 from kestrel_sovereign.a2a.question_supervisor import NativeQuestionSupervisor
 from kestrel_sovereign.a2a.stores.unified.outbound_store import DispatchState
@@ -153,7 +153,7 @@ async def test_answer_after_clock_deadline_creates_ordered_deadline_and_late_wav
 
 
 async def test_unknown_cancellation_is_read_without_resending(questions):
-    from a2a.types import CancelTaskRequest
+    from kestrel_sovereign._vendor.a2a.types import CancelTaskRequest
 
     p = questions
     q, d, request = await reserve(p)
@@ -439,7 +439,7 @@ async def test_full_taskless_question_result_is_read_locally_and_detects_corrupt
 async def test_data_only_answer_retains_native_parts_and_can_hand_off_without_text(
     questions,
 ):
-    from a2a.types import Part
+    from kestrel_sovereign._vendor.a2a.types import Part
     from google.protobuf.json_format import MessageToDict, ParseDict
 
     p = questions

@@ -6,9 +6,9 @@ from types import SimpleNamespace
 
 import pytest
 import pytest_asyncio
-from a2a.helpers.proto_helpers import new_text_message
-from a2a.types import Role, SendMessageRequest
-from a2a.utils.errors import InternalError
+from kestrel_sovereign._vendor.a2a.helpers.proto_helpers import new_text_message
+from kestrel_sovereign._vendor.a2a.types import Role, SendMessageRequest
+from kestrel_sovereign._vendor.a2a.utils.errors import InternalError
 
 from kestrel_sovereign.a2a.did_registry import HostA2ADidResolver
 from kestrel_sovereign.a2a.inbound_authorization import RecipientA2ASenderAuthorizer
@@ -29,7 +29,7 @@ from tests.utils.native_a2a_security import (
 
 @pytest_asyncio.fixture
 async def publication(hosted, hosted_recipient_signing, request):
-    from a2a.types import AgentSkill
+    from kestrel_sovereign._vendor.a2a.types import AgentSkill
     from fastapi import FastAPI
 
     from kestrel_sovereign.a2a.native_publication import (
@@ -80,7 +80,7 @@ async def publication(hosted, hosted_recipient_signing, request):
 
 async def test_manager_commits_native_routes_and_card_as_one_publication(publication):
     import httpx
-    from a2a.types import AgentCard
+    from kestrel_sovereign._vendor.a2a.types import AgentCard
     from google.protobuf.json_format import ParseDict
     from starlette.exceptions import HTTPException
 
@@ -295,10 +295,10 @@ async def test_actual_host_onboarding_publication_discovery_and_sdk_request(
     from uuid import uuid4
 
     import httpx
-    from a2a.client import ClientConfig, ClientFactory
-    from a2a.client.card_resolver import A2ACardResolver
-    from a2a.types import GetTaskRequest
-    from a2a.utils.errors import TaskNotFoundError
+    from kestrel_sovereign._vendor.a2a.client import ClientConfig, ClientFactory
+    from kestrel_sovereign._vendor.a2a.client.card_resolver import A2ACardResolver
+    from kestrel_sovereign._vendor.a2a.types import GetTaskRequest
+    from kestrel_sovereign._vendor.a2a.utils.errors import TaskNotFoundError
     from fastapi import FastAPI
     from starlette.middleware.sessions import SessionMiddleware
 
@@ -992,7 +992,7 @@ async def local_native_peer(publication, request):
 async def test_same_host_session_uses_real_sdk_binding_and_creator_ledger(
     local_native_peer,
 ):
-    from a2a.types import Message, Part, Role, SendMessageRequest
+    from kestrel_sovereign._vendor.a2a.types import Message, Part, Role, SendMessageRequest
 
     p = local_native_peer
     async with p.directory.open_a2a_session(p.requester, p.peer) as session:
@@ -1028,7 +1028,7 @@ async def test_hosted_peer_uses_configured_reconciliation_bounds_before_receipt_
     local_native_peer, monkeypatch
 ):
     import httpx
-    from a2a.client.errors import A2AClientError
+    from kestrel_sovereign._vendor.a2a.client.errors import A2AClientError
 
     from kestrel_sovereign.a2a.native_client import NativePeerProtocolError
     from kestrel_sovereign.a2a.stores.unified.outbound_store import DispatchState
@@ -1147,8 +1147,8 @@ async def test_json_only_skill_refuses_incompatible_or_empty_tool_input(
 async def test_receiver_enforces_skill_input_modes_for_an_independent_sdk_client(
     local_native_peer, protocol
 ):
-    from a2a.client import ClientConfig, ClientFactory
-    from a2a.utils.errors import ContentTypeNotSupportedError
+    from kestrel_sovereign._vendor.a2a.client import ClientConfig, ClientFactory
+    from kestrel_sovereign._vendor.a2a.utils.errors import ContentTypeNotSupportedError
 
     from kestrel_sovereign.a2a.extensions import skill_hint_metadata
 
@@ -1178,7 +1178,7 @@ async def test_receiver_enforces_skill_input_modes_for_an_independent_sdk_client
 async def test_same_host_session_rechecks_sender_directory_before_submission(
     local_native_peer,
 ):
-    from a2a.types import Message, Part, Role, SendMessageRequest
+    from kestrel_sovereign._vendor.a2a.types import Message, Part, Role, SendMessageRequest
 
     from kestrel_sovereign.features.peers.directory import PeerAccessDeniedError
 
@@ -1203,7 +1203,7 @@ async def test_same_host_session_rechecks_sender_directory_before_submission(
         assert (
             await p.sender_manager.outbound_store.get(dispatch.dispatch_id)
         ).state.value == "not-sent"
-        from a2a.types import ListTasksRequest
+        from kestrel_sovereign._vendor.a2a.types import ListTasksRequest
 
         listed = await p.manager.task_store.list_for_creator(
             ListTasksRequest(tenant=p.scope.tenant),
@@ -1214,7 +1214,7 @@ async def test_same_host_session_rechecks_sender_directory_before_submission(
 
 
 async def test_native_message_tool_reports_lost_ack_as_unknown(local_native_peer):
-    from a2a.types import ListTasksRequest
+    from kestrel_sovereign._vendor.a2a.types import ListTasksRequest
 
     from kestrel_sovereign.features.peers.feature import PeersFeature
 
@@ -1314,7 +1314,7 @@ async def test_actual_server_refresh_wires_native_message_tool_and_local_directo
 async def test_native_tool_does_not_report_acknowledged_race_as_not_sent(
     local_native_peer,
 ):
-    from a2a.types import ListTasksRequest
+    from kestrel_sovereign._vendor.a2a.types import ListTasksRequest
 
     from kestrel_sovereign.features.peers.feature import PeersFeature
 
@@ -1381,7 +1381,7 @@ async def test_native_tool_does_not_report_acknowledged_race_as_not_sent(
 async def test_same_host_session_cannot_spend_a_replaced_generation(
     local_native_peer, fault
 ):
-    from a2a.types import Message, Part, Role, SendMessageRequest
+    from kestrel_sovereign._vendor.a2a.types import Message, Part, Role, SendMessageRequest
 
     from kestrel_sovereign.a2a.stores.unified.task_store import TaskStore
     from kestrel_sovereign.features.peers.directory import PeerAccessDeniedError
@@ -1628,7 +1628,7 @@ async def test_native_result_and_public_cancel_use_local_dispatch_handle(
 
 
 async def test_native_retained_tool_cannot_retarget_a_revoked_peer(local_native_peer):
-    from a2a.types import TaskState
+    from kestrel_sovereign._vendor.a2a.types import TaskState
 
     from kestrel_sovereign.features.peers.feature import PeersFeature
 
@@ -1744,7 +1744,7 @@ async def test_native_question_requires_pre_dispatch_intent_and_correlates_recip
     from datetime import UTC, datetime, timedelta
     from uuid import uuid4
 
-    from a2a.types import Message, Part, Role, SendMessageRequest
+    from kestrel_sovereign._vendor.a2a.types import Message, Part, Role, SendMessageRequest
     from google.protobuf.json_format import MessageToDict
 
     from kestrel_sovereign.a2a.extensions import (
@@ -1826,7 +1826,7 @@ async def test_native_question_deadline_is_rechecked_at_actual_http_dispatch(
     from datetime import UTC, datetime, timedelta
     from uuid import uuid4
 
-    from a2a.types import ListTasksRequest, Message, Part, Role, SendMessageRequest
+    from kestrel_sovereign._vendor.a2a.types import ListTasksRequest, Message, Part, Role, SendMessageRequest
 
     from kestrel_sovereign.a2a.extensions import question_correlation_metadata
     from kestrel_sovereign.a2a.stores.unified.question_store import QuestionConflict
@@ -1878,8 +1878,8 @@ async def test_unsolicited_answer_request_cannot_create_a_native_task_or_wake(
 ):
     from uuid import uuid4
 
-    from a2a.types import ListTasksRequest, Message, Part, Role, SendMessageRequest
-    from a2a.utils.errors import InvalidParamsError
+    from kestrel_sovereign._vendor.a2a.types import ListTasksRequest, Message, Part, Role, SendMessageRequest
+    from kestrel_sovereign._vendor.a2a.utils.errors import InvalidParamsError
 
     from kestrel_sovereign.a2a.extensions import question_correlation_metadata
 
@@ -1914,7 +1914,7 @@ async def test_committed_dispatch_label_cannot_bypass_actual_question_intent(
 ):
     from uuid import uuid4
 
-    from a2a.types import ListTasksRequest, Message, Part, Role, SendMessageRequest
+    from kestrel_sovereign._vendor.a2a.types import ListTasksRequest, Message, Part, Role, SendMessageRequest
 
     from kestrel_sovereign.a2a.extensions import question_correlation_metadata
     from kestrel_sovereign.a2a.native_client import NativePeerProtocolError
@@ -2024,7 +2024,7 @@ async def test_blocking_peer_timeout_retires_http_subscription_without_replaying
     local_native_peer,
 ):
     import httpx
-    from a2a.types import ListTasksRequest
+    from kestrel_sovereign._vendor.a2a.types import ListTasksRequest
 
     from kestrel_sovereign.a2a.native_publication import open_hosted_native_peer_session
     from kestrel_sovereign.features.peers.feature import PeersFeature
@@ -2062,7 +2062,7 @@ async def test_blocking_peer_timeout_retires_http_subscription_without_replaying
         len(tasks.tasks) == 1
         and tasks.tasks[0].status.state
         == __import__(
-            "a2a.types", fromlist=["TaskState"]
+            "kestrel_sovereign._vendor.a2a.types", fromlist=["TaskState"]
         ).TaskState.TASK_STATE_SUBMITTED
     )
 
@@ -2437,7 +2437,7 @@ async def test_question_follow_up_deadline_is_rechecked_at_native_http(
     from datetime import UTC, datetime, timedelta
     from uuid import uuid4
 
-    from a2a.types import Message, Part, Role, SendMessageRequest
+    from kestrel_sovereign._vendor.a2a.types import Message, Part, Role, SendMessageRequest
 
     from kestrel_sovereign.a2a.extensions import question_correlation_metadata
     from kestrel_sovereign.a2a.stores.unified.question_store import QuestionConflict

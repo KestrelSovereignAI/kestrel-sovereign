@@ -9,8 +9,8 @@ from uuid import uuid4
 import httpx
 import pytest
 import pytest_asyncio
-from a2a.client import ClientConfig, ClientFactory
-from a2a.types import AgentCard, AgentSkill, GetTaskRequest
+from kestrel_sovereign._vendor.a2a.client import ClientConfig, ClientFactory
+from kestrel_sovereign._vendor.a2a.types import AgentCard, AgentSkill, GetTaskRequest
 from google.protobuf.json_format import ParseDict
 from starlette.applications import Starlette
 from starlette.exceptions import HTTPException

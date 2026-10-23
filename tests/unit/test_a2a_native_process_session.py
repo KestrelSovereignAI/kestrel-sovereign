@@ -6,8 +6,8 @@ from types import SimpleNamespace
 import httpx
 import pytest
 import pytest_asyncio
-from a2a.helpers.proto_helpers import new_text_message
-from a2a.types import Role, SendMessageRequest
+from kestrel_sovereign._vendor.a2a.helpers.proto_helpers import new_text_message
+from kestrel_sovereign._vendor.a2a.types import Role, SendMessageRequest
 from starlette.applications import Starlette
 from starlette.responses import JSONResponse
 from starlette.routing import Route

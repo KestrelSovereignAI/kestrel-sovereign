@@ -8,10 +8,10 @@ from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager, contextmanager
 from uuid import uuid4
 
-from a2a.server.context import ServerCallContext
-from a2a.server.events.event_queue import Event
-from a2a.server.request_handlers import RequestHandler
-from a2a.types import (
+from kestrel_sovereign._vendor.a2a.server.context import ServerCallContext
+from kestrel_sovereign._vendor.a2a.server.events.event_queue import Event
+from kestrel_sovereign._vendor.a2a.server.request_handlers import RequestHandler
+from kestrel_sovereign._vendor.a2a.types import (
     AgentCard,
     CancelTaskRequest,
     DeleteTaskPushNotificationConfigRequest,
@@ -30,8 +30,8 @@ from a2a.types import (
     Task,
     TaskPushNotificationConfig,
 )
-from a2a.utils.constants import DEFAULT_LIST_TASKS_PAGE_SIZE
-from a2a.utils.errors import (
+from kestrel_sovereign._vendor.a2a.utils.constants import DEFAULT_LIST_TASKS_PAGE_SIZE
+from kestrel_sovereign._vendor.a2a.utils.errors import (
     ContentTypeNotSupportedError,
     InternalError,
     InvalidAgentResponseError,
@@ -41,8 +41,8 @@ from a2a.utils.errors import (
     TaskNotFoundError,
     UnsupportedOperationError,
 )
-from a2a.utils.proto_utils import validate_proto_required_fields
-from a2a.utils.task import (
+from kestrel_sovereign._vendor.a2a.utils.proto_utils import validate_proto_required_fields
+from kestrel_sovereign._vendor.a2a.utils.task import (
     apply_history_length,
     validate_history_length,
     validate_page_size,

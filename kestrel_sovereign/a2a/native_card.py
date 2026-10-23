@@ -2,7 +2,7 @@
 
 from collections.abc import Sequence
 
-from a2a.types import (
+from kestrel_sovereign._vendor.a2a.types import (
     AgentCapabilities,
     AgentCard,
     AgentExtension,
@@ -13,8 +13,8 @@ from a2a.types import (
     SecurityScheme,
     StringList,
 )
-from a2a.utils.proto_utils import validate_proto_required_fields
-from a2a.utils.signing import create_agent_card_signer, create_signature_verifier
+from kestrel_sovereign._vendor.a2a.utils.proto_utils import validate_proto_required_fields
+from kestrel_sovereign._vendor.a2a.utils.signing import create_agent_card_signer, create_signature_verifier
 from jwt.exceptions import InvalidKeyError
 
 from kestrel_sovereign.a2a.extensions import (

@@ -4,7 +4,7 @@ from dataclasses import replace
 from uuid import uuid4
 
 import pytest
-from a2a.types import AgentInterface, CancelTaskRequest, TaskState
+from kestrel_sovereign._vendor.a2a.types import AgentInterface, CancelTaskRequest, TaskState
 
 from kestrel_sovereign.a2a.scope import NativeRecipientScope
 from kestrel_sovereign.a2a.stores.unified.outbound_store import (

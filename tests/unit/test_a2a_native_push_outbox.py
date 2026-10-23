@@ -508,7 +508,7 @@ async def test_waiting_postgres_mutation_observes_the_new_subscription_at_commit
     outbox, native_a2a_backend_factory, monkeypatch
 ):
     """A statement begun before registration cannot lose its post-commit change."""
-    from a2a.types import TaskState, TaskStatus
+    from kestrel_sovereign._vendor.a2a.types import TaskState, TaskStatus
 
     value, task = outbox
     if not value.is_postgres:

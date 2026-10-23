@@ -4,7 +4,7 @@ import asyncio
 
 import httpx
 import pytest
-from a2a.types import AgentCard
+from kestrel_sovereign._vendor.a2a.types import AgentCard
 from fastapi import FastAPI
 from google.protobuf.json_format import ParseDict
 

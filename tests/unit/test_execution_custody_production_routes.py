@@ -137,7 +137,7 @@ async def test_peer_send_retains_runtime_and_rechecks_actual_rpc(peer_session, r
 @pytest.mark.asyncio
 async def test_inbound_a2a_operation_binds_original_runtime_through_authorization(peer_session, monkeypatch):
     from dataclasses import replace
-    from a2a.types import ListTasksRequest
+    from kestrel_sovereign._vendor.a2a.types import ListTasksRequest
     from kestrel_sovereign.a2a.request_handler import NativeA2ARequestHandler
     from kestrel_sovereign.execution_custody import current_execution_custody
     from tests.utils.native_a2a_security import signed_context, PRINCIPAL

@@ -4,7 +4,7 @@ import asyncio
 import logging
 from contextvars import ContextVar
 
-from a2a.types import TaskPushNotificationConfig
+from kestrel_sovereign._vendor.a2a.types import TaskPushNotificationConfig
 
 from kestrel_sovereign.execution_custody import (
     _explicit_control_chain,

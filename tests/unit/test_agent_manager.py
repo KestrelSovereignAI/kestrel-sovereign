@@ -11318,8 +11318,8 @@ class TestAgentManagerBasics:
         native_a2a_backend_factory,
     ):
         """A scheduler-loaded tenant is integrated like an autostart tenant."""
-        from a2a.helpers.proto_helpers import new_text_message
-        from a2a.types import AgentSkill, Role, SendMessageRequest
+        from kestrel_sovereign._vendor.a2a.helpers.proto_helpers import new_text_message
+        from kestrel_sovereign._vendor.a2a.types import AgentSkill, Role, SendMessageRequest
 
         from kestrel_sovereign import server
         from kestrel_sovereign.a2a.did_registry import install_a2a_did_resolver

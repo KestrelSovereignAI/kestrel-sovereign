@@ -9,7 +9,7 @@ from uuid import uuid4
 
 import asyncpg
 import pytest
-from a2a.types import AgentInterface, Message, Part, Role, SendMessageRequest
+from kestrel_sovereign._vendor.a2a.types import AgentInterface, Message, Part, Role, SendMessageRequest
 from kestrel_sdk.tools import Outcome, WaitStatus
 from kestrel_sdk.tools.result import ToolResult
 

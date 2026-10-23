@@ -27,7 +27,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from a2a.types import TaskState
+from kestrel_sovereign._vendor.a2a.types import TaskState
 
 from google.protobuf.json_format import MessageToDict
 

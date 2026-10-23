@@ -7,8 +7,8 @@ from types import SimpleNamespace
 from uuid import uuid4
 
 import pytest
-from a2a.types import TaskState
-from a2a.utils.errors import A2AError
+from kestrel_sovereign._vendor.a2a.types import TaskState
+from kestrel_sovereign._vendor.a2a.utils.errors import A2AError
 
 from kestrel_sovereign.a2a.native_client import NativeDispatchReceipt
 from kestrel_sovereign.a2a.question_supervisor import NativeQuestionSupervisor

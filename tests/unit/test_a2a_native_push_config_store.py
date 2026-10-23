@@ -4,8 +4,8 @@ from dataclasses import replace
 
 import pytest
 import pytest_asyncio
-from a2a.helpers.proto_helpers import new_text_message
-from a2a.types import Role, SendMessageRequest, TaskPushNotificationConfig
+from kestrel_sovereign._vendor.a2a.helpers.proto_helpers import new_text_message
+from kestrel_sovereign._vendor.a2a.types import Role, SendMessageRequest, TaskPushNotificationConfig
 from kestrel_sdk.security.exceptions import DecryptionError, MasterKeyNotConfiguredError
 
 from kestrel_sovereign.a2a.scope import NativeRecipientScope

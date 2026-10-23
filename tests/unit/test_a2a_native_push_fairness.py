@@ -5,7 +5,7 @@ from datetime import timedelta
 from uuid import uuid4
 
 import pytest
-from a2a.types import TaskPushNotificationConfig
+from kestrel_sovereign._vendor.a2a.types import TaskPushNotificationConfig
 
 from kestrel_sovereign._async_ownership import await_owned_task
 from kestrel_sovereign.execution_custody import (

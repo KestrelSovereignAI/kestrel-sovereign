@@ -6,8 +6,8 @@ from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 
 import pytest
-from a2a.helpers.proto_helpers import new_text_message
-from a2a.types import Role, SendMessageRequest, TaskState, TaskStatus
+from kestrel_sovereign._vendor.a2a.helpers.proto_helpers import new_text_message
+from kestrel_sovereign._vendor.a2a.types import Role, SendMessageRequest, TaskState, TaskStatus
 from kestrel_sdk.tools.result import ToolResult
 
 from kestrel_sovereign.features.base import Feature, tool

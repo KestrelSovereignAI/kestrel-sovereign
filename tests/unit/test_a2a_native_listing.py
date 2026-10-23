@@ -4,11 +4,11 @@ import base64
 
 import pytest
 import pytest_asyncio
-from a2a.helpers.proto_helpers import new_data_artifact, new_task, new_text_message
-from a2a.server.routes.common import serialize_list_tasks_response
-from a2a.types import ListTasksRequest, TaskState
-from a2a.utils.errors import InvalidParamsError
-from a2a.utils.task import ListTasksCursor, encode_list_tasks_cursor
+from kestrel_sovereign._vendor.a2a.helpers.proto_helpers import new_data_artifact, new_task, new_text_message
+from kestrel_sovereign._vendor.a2a.server.routes.common import serialize_list_tasks_response
+from kestrel_sovereign._vendor.a2a.types import ListTasksRequest, TaskState
+from kestrel_sovereign._vendor.a2a.utils.errors import InvalidParamsError
+from kestrel_sovereign._vendor.a2a.utils.task import ListTasksCursor, encode_list_tasks_cursor
 from google.protobuf.timestamp_pb2 import Timestamp
 
 from kestrel_sovereign.a2a.scope import NativeRecipientScope

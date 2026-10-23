@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import pytest
-from a2a.types import TaskState
+from kestrel_sovereign._vendor.a2a.types import TaskState
 
 from kestrel_sovereign.a2a.lifecycle import (
     TERMINAL_STATES,

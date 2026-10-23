@@ -1,0 +1,257 @@
+# Modified by Kestrel: isolated SDK namespace; see VENDORED.json.
+import logging
+import threading
+
+from collections.abc import Sequence
+
+from kestrel_sovereign._vendor.a2a.server.context import ServerCallContext
+from kestrel_sovereign._vendor.a2a.server.owner_resolver import OwnerResolver, resolve_user_scope
+from kestrel_sovereign._vendor.a2a.server.tasks.copying_task_store import CopyingTaskStoreAdapter
+from kestrel_sovereign._vendor.a2a.server.tasks.task_store import TaskStore
+from kestrel_sovereign._vendor.a2a.types import a2a_pb2
+from kestrel_sovereign._vendor.a2a.types.a2a_pb2 import Task
+from kestrel_sovereign._vendor.a2a.utils.constants import DEFAULT_LIST_TASKS_PAGE_SIZE
+from kestrel_sovereign._vendor.a2a.utils.errors import InvalidParamsError
+from kestrel_sovereign._vendor.a2a.utils.task import (
+    ListTasksCursor,
+    decode_list_tasks_cursor,
+    decode_page_token,
+    encode_list_tasks_cursor,
+)
+
+
+logger = logging.getLogger(__name__)
+
+
+def _list_sort_key(task: Task) -> tuple[bool, int, str]:
+    """`ListTasks` sort key: `(has timestamp, timestamp, id)`, sorted descending."""
+    has_timestamp = task.HasField('status') and task.status.HasField(
+        'timestamp'
+    )
+    return (
+        has_timestamp,
+        task.status.timestamp.ToNanoseconds() if has_timestamp else 0,
+        task.id,
+    )
+
+
+def _cursor_for(task: Task) -> ListTasksCursor:
+    has_timestamp, timestamp_ns, task_id = _list_sort_key(task)
+    return ListTasksCursor(
+        timestamp_ns=timestamp_ns if has_timestamp else None, task_id=task_id
+    )
+
+
+class _InMemoryTaskStoreImpl(TaskStore):
+    """Internal In-memory implementation of TaskStore.
+
+    Stores task objects in a nested dictionary in memory, keyed by owner then task_id.
+    Task data is lost when the server process stops.
+    """
+
+    def __init__(
+        self,
+        owner_resolver: OwnerResolver = resolve_user_scope,
+    ) -> None:
+        """Initializes the internal _InMemoryTaskStoreImpl."""
+        logger.debug('Initializing _InMemoryTaskStoreImpl')
+        self.tasks: dict[str, dict[str, Task]] = {}
+        self.lock = threading.RLock()
+        self.owner_resolver = owner_resolver
+
+    def _get_owner_tasks(self, owner: str) -> dict[str, Task]:
+        return self.tasks.get(owner, {})
+
+    async def save(self, task: Task, context: ServerCallContext) -> None:
+        """Saves or updates a task in the in-memory store for the resolved owner."""
+        owner = self.owner_resolver(context)
+        with self.lock:
+            owner_tasks = self.tasks.setdefault(owner, {})
+            owner_tasks[task.id] = task
+            logger.debug(
+                'Task %s for owner %s saved successfully.', task.id, owner
+            )
+
+    async def get(
+        self, task_id: str, context: ServerCallContext
+    ) -> Task | None:
+        """Retrieves a task from the in-memory store by ID, for the given owner."""
+        owner = self.owner_resolver(context)
+        with self.lock:
+            logger.debug(
+                'Attempting to get task with id: %s for owner: %s',
+                task_id,
+                owner,
+            )
+            owner_tasks = self._get_owner_tasks(owner)
+            task = owner_tasks.get(task_id)
+            if task:
+                logger.debug(
+                    'Task %s retrieved successfully for owner %s.',
+                    task_id,
+                    owner,
+                )
+                return task
+            logger.debug(
+                'Task %s not found in store for owner %s.', task_id, owner
+            )
+            return None
+
+    async def list(
+        self,
+        params: a2a_pb2.ListTasksRequest,
+        context: ServerCallContext,
+    ) -> a2a_pb2.ListTasksResponse:
+        """Retrieves a list of tasks from the store, for the given owner."""
+        owner = self.owner_resolver(context)
+        logger.debug('Listing tasks for owner %s with params %s', owner, params)
+
+        with self.lock:
+            owner_tasks = self._get_owner_tasks(owner)
+            tasks = list(owner_tasks.values())
+
+        # Filter tasks
+        if params.context_id:
+            tasks = [
+                task for task in tasks if task.context_id == params.context_id
+            ]
+        if params.status:
+            tasks = [
+                task for task in tasks if task.status.state == params.status
+            ]
+        if params.HasField('status_timestamp_after'):
+            last_updated_after_ns = (
+                params.status_timestamp_after.ToNanoseconds()
+            )
+            tasks = [
+                task
+                for task in tasks
+                if (
+                    task.HasField('status')
+                    and task.status.HasField('timestamp')
+                    and task.status.timestamp.ToNanoseconds()
+                    >= last_updated_after_ns
+                )
+            ]
+
+        # Order tasks by last update time. To ensure stable sorting, in cases where timestamps are null or not unique, do a second order comparison of IDs.
+        tasks.sort(key=_list_sort_key, reverse=True)
+
+        # Paginate tasks. The page token carries the position of the last task
+        # returned, so it stays valid if that task is updated or deleted. A
+        # task updated mid-listing can move above the cursor and be skipped.
+        total_size = len(tasks)
+        start_idx = 0
+        if params.page_token:
+            cursor = decode_list_tasks_cursor(params.page_token)
+            if cursor is None:
+                start_idx = self._legacy_start_index(tasks, params.page_token)
+            else:
+                after = cursor.sort_key()
+                start_idx = next(
+                    (
+                        i
+                        for i, task in enumerate(tasks)
+                        if _list_sort_key(task) < after
+                    ),
+                    total_size,
+                )
+        page_size = params.page_size or DEFAULT_LIST_TASKS_PAGE_SIZE
+        end_idx = start_idx + page_size
+        next_page_token = (
+            encode_list_tasks_cursor(_cursor_for(tasks[end_idx - 1]))
+            if end_idx < total_size
+            else None
+        )
+        tasks = tasks[start_idx:end_idx]
+
+        return a2a_pb2.ListTasksResponse(
+            next_page_token=next_page_token,
+            tasks=tasks,
+            total_size=total_size,
+            page_size=page_size,
+        )
+
+    @staticmethod
+    def _legacy_start_index(tasks: Sequence[Task], page_token: str) -> int:
+        """Resolves a legacy page token, which names the first task of the page."""
+        start_task_id = decode_page_token(page_token)
+        for i, task in enumerate(tasks):
+            if task.id == start_task_id:
+                return i
+        raise InvalidParamsError(f'Invalid page token: {page_token}')
+
+    async def delete(self, task_id: str, context: ServerCallContext) -> None:
+        """Deletes a task from the in-memory store by ID, for the given owner."""
+        owner = self.owner_resolver(context)
+        with self.lock:
+            logger.debug(
+                'Attempting to delete task with id: %s for owner %s',
+                task_id,
+                owner,
+            )
+
+            owner_tasks = self._get_owner_tasks(owner)
+            if task_id not in owner_tasks:
+                logger.warning(
+                    'Attempted to delete nonexistent task with id: %s for owner %s',
+                    task_id,
+                    owner,
+                )
+                return
+
+            del owner_tasks[task_id]
+            logger.debug(
+                'Task %s deleted successfully for owner %s.', task_id, owner
+            )
+            if not owner_tasks:
+                del self.tasks[owner]
+                logger.debug('Removed empty owner %s from store.', owner)
+
+
+class InMemoryTaskStore(TaskStore):
+    """In-memory implementation of TaskStore.
+
+    Can optionally use CopyingTaskStoreAdapter to wrap the internal dictionary-based
+    implementation, preventing shared mutable state issues by always returning and
+    storing deep copies.
+    """
+
+    def __init__(
+        self,
+        owner_resolver: OwnerResolver = resolve_user_scope,
+        use_copying: bool = True,
+    ) -> None:
+        """Initializes the InMemoryTaskStore.
+
+        Args:
+            owner_resolver: Resolver for task owners.
+            use_copying: If True, the store will return and save deep copies of tasks.
+              Copying behavior is consistent with database task stores.
+        """
+        self._impl = _InMemoryTaskStoreImpl(owner_resolver=owner_resolver)
+        self._store: TaskStore = (
+            CopyingTaskStoreAdapter(self._impl) if use_copying else self._impl
+        )
+
+    async def save(self, task: Task, context: ServerCallContext) -> None:
+        """Saves or updates a task in the store."""
+        await self._store.save(task, context)
+
+    async def get(
+        self, task_id: str, context: ServerCallContext
+    ) -> Task | None:
+        """Retrieves a task from the store by ID."""
+        return await self._store.get(task_id, context)
+
+    async def list(
+        self,
+        params: a2a_pb2.ListTasksRequest,
+        context: ServerCallContext,
+    ) -> a2a_pb2.ListTasksResponse:
+        """Retrieves a list of tasks from the store."""
+        return await self._store.list(params, context)
+
+    async def delete(self, task_id: str, context: ServerCallContext) -> None:
+        """Deletes a task from the store by ID."""
+        await self._store.delete(task_id, context)

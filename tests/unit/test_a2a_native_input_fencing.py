@@ -5,8 +5,8 @@ from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 
 import pytest
-from a2a.helpers.proto_helpers import new_data_artifact, new_text_message
-from a2a.types import Role, SendMessageRequest, Task, TaskState, TaskStatus
+from kestrel_sovereign._vendor.a2a.helpers.proto_helpers import new_data_artifact, new_text_message
+from kestrel_sovereign._vendor.a2a.types import Role, SendMessageRequest, Task, TaskState, TaskStatus
 
 from kestrel_sovereign.a2a.stores.unified.task_store import (
     TaskInputConflictError,

@@ -22,8 +22,8 @@ from types import SimpleNamespace
 from uuid import uuid4
 
 import pytest
-from a2a.helpers.proto_helpers import new_text_message
-from a2a.types import (
+from kestrel_sovereign._vendor.a2a.helpers.proto_helpers import new_text_message
+from kestrel_sovereign._vendor.a2a.types import (
     AgentInterface,
     Role,
     SendMessageRequest,

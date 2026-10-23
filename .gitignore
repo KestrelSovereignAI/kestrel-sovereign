@@ -27,6 +27,8 @@
 !kestrel_sovereign/data/semantic/profiles/*.json
 !kestrel_sovereign/data/semantic/rules/
 !kestrel_sovereign/data/semantic/rules/*.json
+# The vendored SDK custody manifest is public build metadata, not credentials.
+!kestrel_sovereign/_vendor/a2a/VENDORED.json
 **/*.pem
 **/*.key
 

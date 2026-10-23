@@ -4,8 +4,8 @@ import asyncio
 from dataclasses import FrozenInstanceError, replace
 
 import pytest
-from a2a.types import GetTaskRequest
-from a2a.utils.errors import (
+from kestrel_sovereign._vendor.a2a.types import GetTaskRequest
+from kestrel_sovereign._vendor.a2a.utils.errors import (
     ExtensionSupportRequiredError,
     InternalError,
     InvalidParamsError,
@@ -123,7 +123,7 @@ async def test_verified_sender_policy_supplies_the_only_durable_creator(
 async def test_each_native_read_or_mutation_authenticates_its_actual_operation(
     native_request_admission, operation
 ):
-    from a2a.types import CancelTaskRequest, SubscribeToTaskRequest
+    from kestrel_sovereign._vendor.a2a.types import CancelTaskRequest, SubscribeToTaskRequest
 
     cls = {
         "GetTask": GetTaskRequest,

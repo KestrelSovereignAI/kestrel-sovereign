@@ -162,7 +162,7 @@ async def test_http_failure_uses_the_existing_retry_ledger_without_secret_diagno
 async def test_terminal_callback_has_a_persisted_retry_budget_and_capped_backoff(
     outbox, outbound_tls, check
 ):
-    from a2a.types import Task, TaskState
+    from kestrel_sovereign._vendor.a2a.types import Task, TaskState
 
     value, original = outbox
     terminal = Task.FromString(original.SerializeToString())

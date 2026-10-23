@@ -24,9 +24,9 @@ import re
 import time
 from typing import Any, Dict, List, Optional
 
-from a2a.helpers.proto_helpers import new_text_artifact, new_text_message
-from a2a.types import Role, TaskState
-from a2a.utils.errors import InvalidAgentResponseError
+from kestrel_sovereign._vendor.a2a.helpers.proto_helpers import new_text_artifact, new_text_message
+from kestrel_sovereign._vendor.a2a.types import Role, TaskState
+from kestrel_sovereign._vendor.a2a.utils.errors import InvalidAgentResponseError
 from google.protobuf.json_format import MessageToDict
 from kestrel_sdk.tools.base import ToolCategory
 from kestrel_sdk.tools.result import ToolResult, ToolResultStatus

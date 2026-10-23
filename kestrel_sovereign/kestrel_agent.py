@@ -181,7 +181,7 @@ from kestrel_sovereign.telemetry import (
 )
 
 if TYPE_CHECKING:
-    from a2a.types import AgentCard
+    from kestrel_sovereign._vendor.a2a.types import AgentCard
     from kestrel_sovereign.execution_custody import ExecutionCustody
     from kestrel_sovereign.features.peers.directory import (
         PeerDirectoryRouter,

@@ -3,7 +3,7 @@
 import hashlib
 from dataclasses import dataclass, field
 
-from a2a.types import TaskPushNotificationConfig
+from kestrel_sovereign._vendor.a2a.types import TaskPushNotificationConfig
 from kestrel_sdk.signals import Signal, SignalMode
 
 from kestrel_sovereign.a2a.push_transport import validate_push_configuration

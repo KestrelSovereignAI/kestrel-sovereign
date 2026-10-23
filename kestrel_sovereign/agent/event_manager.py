@@ -12,7 +12,7 @@ from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
-from a2a.types import TaskState
+from kestrel_sovereign._vendor.a2a.types import TaskState
 from google.protobuf.json_format import MessageToDict
 
 from kestrel_sovereign.a2a.extensions import deserialize_causation_chain

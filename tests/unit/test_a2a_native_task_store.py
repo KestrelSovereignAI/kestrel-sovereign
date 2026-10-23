@@ -7,14 +7,14 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 import pytest_asyncio
-from a2a.helpers.proto_helpers import (
+from kestrel_sovereign._vendor.a2a.helpers.proto_helpers import (
     new_data_message,
     new_task,
     new_text_artifact,
     new_text_message,
 )
-from a2a.types import Task, TaskState, TaskStatus
-from a2a.utils.errors import InvalidParamsError
+from kestrel_sovereign._vendor.a2a.types import Task, TaskState, TaskStatus
+from kestrel_sovereign._vendor.a2a.utils.errors import InvalidParamsError
 from google.protobuf.json_format import MessageToDict
 from google.protobuf.timestamp_pb2 import Timestamp
 

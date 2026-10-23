@@ -14,7 +14,7 @@ import logging
 from datetime import timedelta
 from pathlib import Path
 
-from a2a.types import Role, TaskState
+from kestrel_sovereign._vendor.a2a.types import Role, TaskState
 from google.protobuf.json_format import MessageToDict
 from kestrel_sdk.signals import (
     AttentionPolicy,

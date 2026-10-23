@@ -12,8 +12,8 @@ import json
 from collections.abc import Mapping
 from uuid import NAMESPACE_URL, uuid5
 
-from a2a.types import Artifact, Message, Part, Role, Task, TaskState, TaskStatus
-from a2a.utils.proto_utils import validate_proto_required_fields
+from kestrel_sovereign._vendor.a2a.types import Artifact, Message, Part, Role, Task, TaskState, TaskStatus
+from kestrel_sovereign._vendor.a2a.utils.proto_utils import validate_proto_required_fields
 from google.protobuf.json_format import MessageToDict, ParseDict
 from google.protobuf.struct_pb2 import Struct
 

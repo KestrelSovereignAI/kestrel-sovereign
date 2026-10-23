@@ -3,8 +3,8 @@
 import asyncio
 
 import pytest
-from a2a.client import ClientConfig, ClientFactory
-from a2a.types import GetTaskPushNotificationConfigRequest
+from kestrel_sovereign._vendor.a2a.client import ClientConfig, ClientFactory
+from kestrel_sovereign._vendor.a2a.types import GetTaskPushNotificationConfigRequest
 
 from kestrel_sovereign.a2a.push_outbox import NativePushOutbox
 from kestrel_sovereign.a2a.stores.unified.push_config_store import (

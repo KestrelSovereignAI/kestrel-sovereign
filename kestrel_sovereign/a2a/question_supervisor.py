@@ -7,7 +7,7 @@ import math
 from dataclasses import replace
 from time import monotonic
 
-from a2a.utils.errors import A2AError
+from kestrel_sovereign._vendor.a2a.utils.errors import A2AError
 
 from kestrel_sovereign._async_ownership import gather_owned
 from kestrel_sovereign.a2a.native_client import NativePeerProtocolError

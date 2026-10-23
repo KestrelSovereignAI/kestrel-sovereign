@@ -22,8 +22,8 @@ from typing import (
 )
 from uuid import uuid4
 
-from a2a.helpers.proto_helpers import new_task_from_user_message, new_text_message
-from a2a.types import (
+from kestrel_sovereign._vendor.a2a.helpers.proto_helpers import new_task_from_user_message, new_text_message
+from kestrel_sovereign._vendor.a2a.types import (
     AgentSkill,
     Artifact,
     Message,
@@ -36,8 +36,8 @@ from a2a.types import (
     TaskStatus,
     TaskStatusUpdateEvent,
 )
-from a2a.utils.errors import InvalidParamsError, PushNotificationNotSupportedError
-from a2a.utils.proto_utils import validate_proto_required_fields
+from kestrel_sovereign._vendor.a2a.utils.errors import InvalidParamsError, PushNotificationNotSupportedError
+from kestrel_sovereign._vendor.a2a.utils.proto_utils import validate_proto_required_fields
 from google.protobuf.json_format import MessageToDict
 
 from kestrel_sovereign._async_ownership import (
