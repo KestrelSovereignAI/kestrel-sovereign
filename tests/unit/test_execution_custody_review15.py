@@ -45,8 +45,10 @@ def test_normal_generator_close_does_not_consume_late_caller_cancellation():
 
 
 def dispatcher_fixture(error):
+    import contextvars
     from kestrel_sovereign.signals.dispatcher import SignalDispatcher
     dispatcher = SignalDispatcher.__new__(SignalDispatcher)
+    dispatcher._cognition_claim_settlement = contextvars.ContextVar('test_claim_settlement', default=None)
     dispatcher._agent = SimpleNamespace(did="original")
     dispatcher._durable_delivery_owner = "dispatcher:original"
     dispatcher._discard_transient_durable_handoff = Mock()

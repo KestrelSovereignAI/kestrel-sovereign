@@ -697,6 +697,69 @@ async def test_original_journal_requires_native_heap_access_method(dispatcher_co
         await control.execute(f'DROP ACCESS METHOD "{method}"')
 
 
+@pytest.mark.parametrize('installed', ['before', 'handler'])
+async def test_original_journal_rejects_application_opclass_in_catalog(dispatcher_components, native_pg, installed):
+    from kestrel_sovereign.execution_custody import ExecutionCustody, bind_execution_runtime, is_execution_control_error
+    from tests.unit.test_signal_outcome_terminal_custody import _OriginalWork
+    from tests.unit.test_signals_dispatcher import _action_reg, _signal
+    c = dispatcher_components
+    _, control, schema = native_pg
+    name = schema + '_text_ops'
+    await control.execute(f'CREATE SEQUENCE "{schema}".opclass_calls')
+    await control.execute(f'''CREATE FUNCTION "{schema}".opclass_compare(TEXT,TEXT)
+        RETURNS INTEGER LANGUAGE plpgsql AS $$ BEGIN
+        PERFORM pg_catalog.nextval('"{schema}".opclass_calls'::regclass);
+        RETURN pg_catalog.bttextcmp($1,$2); END $$''')
+    c.registry.register(_action_reg('opclass.seed'))
+    await c.dispatcher.dispatch_signal(_signal('opclass.seed'))
+    await c.dispatcher.dispatch_signal(_signal('opclass.seed'))
+    async def install_actual_program():
+        # New supported DDL objects only; no builtin/catalog row replacement.
+        await control.execute(f'''CREATE OPERATOR CLASS pg_catalog."{name}"
+            FOR TYPE TEXT USING btree AS
+            OPERATOR 1 pg_catalog.< (TEXT,TEXT),
+            OPERATOR 2 pg_catalog.<= (TEXT,TEXT),
+            OPERATOR 3 pg_catalog.= (TEXT,TEXT),
+            OPERATOR 4 pg_catalog.>= (TEXT,TEXT),
+            OPERATOR 5 pg_catalog.> (TEXT,TEXT),
+            FUNCTION 1 "{schema}".opclass_compare(TEXT,TEXT)''')
+        await control.execute(f'CREATE INDEX opclass_probe ON "{schema}".signal_log(source pg_catalog."{name}")')
+    installed_program = False
+    scope = ExecutionCustody(_OriginalWork(backend_type='postgres'))
+    effects, counts = [], []
+    async def handler(payload):
+        nonlocal installed_program
+        effects.append(True)
+        if installed == 'handler':
+            await install_actual_program()
+            installed_program = True
+            counts.append(tuple(await control.fetchrow(f'SELECT last_value,is_called FROM "{schema}".opclass_calls')))
+        scope.revoke('actual work cutoff before original terminal row INSERT')
+        return {'genuine': True}
+    c.registry.register(_action_reg('opclass.refusal', handler=handler))
+    try:
+        if installed == 'before':
+            await install_actual_program()
+            installed_program = True
+            counts.append(tuple(await control.fetchrow(f'SELECT last_value,is_called FROM "{schema}".opclass_calls')))
+        error = None
+        with bind_execution_runtime(SimpleNamespace(_execution_custody=scope)):
+            try:
+                await c.dispatcher.dispatch_signal(_signal('opclass.refusal'))
+            except BaseException as caught:
+                error = caught
+        after = tuple(await control.fetchrow(f'SELECT last_value,is_called FROM "{schema}".opclass_calls'))
+        assert counts == [after], 'application index comparator ran after original Work cutoff'
+        assert is_execution_control_error(error), 'pg_catalog namespace was mistaken for builtin operator-class identity'
+        assert effects == ([True] if installed == 'handler' else [])
+        assert await control.fetchval(f'SELECT COUNT(*) FROM "{schema}".signal_log') == 2
+    finally:
+        if installed_program:
+            await control.execute(f'DROP INDEX IF EXISTS "{schema}".opclass_probe')
+            await control.execute(f'DROP OPERATOR CLASS IF EXISTS pg_catalog."{name}" USING btree CASCADE')
+            await control.execute(f'DROP OPERATOR FAMILY IF EXISTS pg_catalog."{name}" USING btree CASCADE')
+
+
 @pytest.mark.parametrize('setting', ['ROLE', 'SESSION AUTHORIZATION'])
 async def test_original_journal_does_not_inherit_reused_session_principal(dispatcher_components, native_pg, setting):
     from kestrel_sovereign.execution_custody import ExecutionCustody, bind_execution_runtime

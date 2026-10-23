@@ -278,6 +278,14 @@ class _StoppedCognitionResult(SignalResult):
 
 
 @dataclass
+class _CognitionClaimSettlement:
+    """Original claim plus its actual native CAS receipt, never authority."""
+
+    delivery: DurableDelivery
+    receipt: object = None
+
+
+@dataclass
 class SignalDispatchHandle(SignalHandle):
     """SDK terminal handle plus the earlier durable-admission receipt.
 
@@ -870,6 +878,8 @@ class SignalDispatcher:
         )
         self._original_outcome_admission = contextvars.ContextVar(
             f"original_outcome_admission:{id(self)}", default=None)
+        self._cognition_claim_settlement = contextvars.ContextVar(
+            f"cognition_claim_settlement:{id(self)}", default=None)
         self._original_outcome_writer = contextvars.ContextVar(
             f"original_outcome_writer:{id(self)}", default=None)
         self._accepted_signal_outcomes = {}
@@ -2539,6 +2549,7 @@ class SignalDispatcher:
                 lease_token=lease_token,
             )
             if acknowledged:
+                self._record_cognition_claim_settlement(consumer_id, delivery_id, lease_token, acknowledged)
                 self._discard_transient_durable_handoff(delivery_id)
             return acknowledged
 
@@ -2566,6 +2577,8 @@ class SignalDispatcher:
                 terminal=terminal,
                 terminal_ackable=terminal_ackable,
             )
+            if delivery is not None:
+                self._record_cognition_claim_settlement(consumer_id, delivery_id, lease_token, delivery)
             if delivery is not None and delivery.status in {FAILED, TERMINAL_ACKABLE}:
                 self._discard_transient_durable_handoff(delivery_id)
             if (
@@ -2619,6 +2632,7 @@ class SignalDispatcher:
             self._pending_cognition_admissions.pop(delivery_id, None)
         if not released:
             return False
+        self._record_cognition_claim_settlement(consumer_id, delivery_id, lease_token, released)
         handoff = self._transient_durable_handoffs.get(delivery_id)
         if handoff is not None and handoff.initial_lease_token == lease_token:
             handoff.initial_lease_token = None
@@ -2711,6 +2725,8 @@ class SignalDispatcher:
                 terminal=terminal,
                 terminal_ackable=terminal_ackable,
             )
+            if delivery is not None:
+                self._record_cognition_claim_settlement(consumer_id, delivery_id, lease_token, delivery)
             if delivery is not None and delivery.status in {FAILED, TERMINAL_ACKABLE}:
                 self._discard_transient_durable_handoff(delivery_id)
             return delivery
@@ -5099,12 +5115,17 @@ class SignalDispatcher:
             # remaining work must be owned before any early cursor receipt:
             # caller recovery, cognition, renewal, settlement AND audit tails.
             resident_journals = _journal_completion if _journal_completion is not None else []
+            # The production resident publisher intentionally scrubs ambient
+            # caller ContextVars. Hand off this original claim's receipt
+            # explicitly; it is a completion fact, never a Work capability.
+            claim_settlement = self._cognition_claim_settlement.get()
             async def resident_delivery():
                 from kestrel_sovereign.signals.context import (
                     reset_current_signal, set_current_signal,
                 )
                 owner = asyncio.current_task()
                 token = self._durable_admission.set((owner, 1))
+                claim_token = self._cognition_claim_settlement.set(claim_settlement)
                 signal_token = set_current_signal(signal)
                 self._durable_admission_owners.add(owner)
                 try:
@@ -5122,6 +5143,7 @@ class SignalDispatcher:
                     self._durable_admission_owners.discard(owner)
                     reset_current_signal(signal_token)
                     self._durable_admission.reset(token)
+                    self._cognition_claim_settlement.reset(claim_token)
 
             from kestrel_sovereign._async_ownership import OwnedTaskAdmission, await_owned_task
             from kestrel_sovereign.execution_custody import execution_observation_error
@@ -5283,8 +5305,38 @@ class SignalDispatcher:
                 self._original_outcome_admission.reset(token)
                 self._deferred_outcome_logs.reset(deferred_token)
 
+    def _record_cognition_claim_settlement(self, consumer_id, delivery_id, lease_token, receipt):
+        """Publish only the just-returned native operation's exact-token fact."""
+        settlement = self._cognition_claim_settlement.get()
+        if settlement is None:
+            return
+        from kestrel_sovereign.signals.outcome_custody import _native_identity_text
+        original = settlement.delivery
+        expected = (original.consumer_id, original.delivery_id, original.lease_token)
+        actual = (consumer_id, delivery_id, lease_token)
+        if tuple(map(_native_identity_text, expected)) == tuple(map(_native_identity_text, actual)):
+            settlement.receipt = receipt
+
+    @staticmethod
+    def _completed_cognition_was_stopped(task):
+        from kestrel_sovereign._async_ownership import owned_task_error
+        return (task is not None and task.done() and owned_task_error(task) is None
+                and isinstance(task.result(), _StoppedCognitionResult))
+
     @asynccontextmanager
     async def _own_cognition_claim(self, delivery, routing_admission, *, journal_completion=()):
+        current = self._cognition_claim_settlement.get()
+        settlement = current if current is not None and current.delivery is delivery else _CognitionClaimSettlement(delivery)
+        token = self._cognition_claim_settlement.set(settlement)
+        try:
+            async with self._own_cognition_claim_body(delivery, routing_admission,
+                    settlement=settlement, journal_completion=journal_completion):
+                yield
+        finally:
+            self._cognition_claim_settlement.reset(token)
+
+    @asynccontextmanager
+    async def _own_cognition_claim_body(self, delivery, routing_admission, *, settlement, journal_completion=()):
         """Own the exact claim through routing AND its native settlement.
 
         A published or completed routing Task is not an ACK/NACK receipt.
@@ -5300,13 +5352,27 @@ class SignalDispatcher:
         except BaseException as error:
             try:
                 routing_task = routing_admission.task
-                if is_execution_control_error(error):
-                    error = await self._settle_cognition_control(delivery, error, routing_task)
+                if routing_task is not None and routing_task.done():
+                    from kestrel_sovereign._async_ownership import owned_task_error
+                    error = execution_observation_error(error, owned_task_error(routing_task))
+                if routing_task in self._retained_durable_cognition_tasks:
+                    # This actual callback owns the exact claim even between
+                    # physical completion and its next event-loop turn.
+                    if is_execution_control_error(error):
+                        self._retain_cognition_native_control(delivery, error)
+                        self._rearm_cleanup_runtime_owner_heartbeat()
                 elif routing_task is not None and not routing_task.done():
-                    await self._cancel_durable_cognition_routing_task(routing_task, delivery=delivery)
-                elif (routing_task is not None and not routing_task.cancelled()
-                      and routing_task.exception() is None
-                      and isinstance(routing_task.result(), _StoppedCognitionResult)):
+                    if is_execution_control_error(error):
+                        error = await self._settle_cognition_control(delivery, error, routing_task)
+                    else:
+                        await self._cancel_durable_cognition_routing_task(routing_task, delivery=delivery)
+                elif settlement.receipt is not None:
+                    # Audit/observer failure cannot undo an actual ACK/NACK
+                    # or manufacture another CAS against its cleared token.
+                    pass
+                elif is_execution_control_error(error):
+                    error = await self._settle_cognition_control(delivery, error, routing_task)
+                elif self._completed_cognition_was_stopped(routing_task):
                     # A proven operator Stop must never become replayable
                     # merely because its intended terminal NACK failed. Own
                     # a non-ACKable FAILED receipt, not an ordinary retry.
@@ -5320,7 +5386,7 @@ class SignalDispatcher:
             routing_task = routing_admission.task
             if routing_task is not None and not routing_task.done():
                 self._retain_durable_cognition_task(routing_task, delivery=delivery)
-            elif routing_task is None:
+            elif routing_task is None and settlement.receipt is None:
                 # Ordinary refusal paths can return a FAILED/HOLD result.
                 # Their original-token CAS is idempotent if that path already
                 # settled the delivery; no unowned live lease may escape just
@@ -5631,7 +5697,10 @@ class SignalDispatcher:
                 # route rather than abandoning its original claim.
                 try:
                     if routing_task.done():
-                        await self._release_retained_durable_cognition_task(delivery, observe_failure=True)
+                        if self._completed_cognition_was_stopped(routing_task):
+                            await self._terminalize_failed_cognition(delivery, error)
+                        else:
+                            await self._release_retained_durable_cognition_task(delivery, observe_failure=True)
                     else:
                         await self._cancel_durable_cognition_routing_task(routing_task, delivery=delivery)
                 except BaseException as cleanup:
@@ -5861,6 +5930,11 @@ class SignalDispatcher:
         owner heartbeat until it finally settles.
         """
 
+        if task in self._retained_durable_cognition_tasks:
+            if control_error is not None:
+                self._retain_cognition_native_control(delivery, control_error)
+                self._rearm_cleanup_runtime_owner_heartbeat()
+            return False
         if not task.done():
             task.cancel()
         try:
@@ -6005,7 +6079,8 @@ class SignalDispatcher:
             # A late renewal control can replace cancellation of the context
             # body before the ordinary cancellation handler reaches this route.
             # Publish debt first, then interrupt and retain the original child.
-            routing_task.cancel()
+            if routing_task not in self._retained_durable_cognition_tasks:
+                routing_task.cancel()
             self._retain_durable_cognition_task(routing_task, delivery=delivery, control_error=error)
         else:
             if routing_task is not None:
@@ -6041,6 +6116,11 @@ class SignalDispatcher:
         self, delivery: DurableDelivery, error: BaseException,
     ) -> None:
         """Keep irreversible control evidence non-retryable and non-ACKable."""
+        settlement = self._cognition_claim_settlement.get()
+        if (settlement is not None and settlement.delivery is delivery
+                and settlement.receipt is not None):
+            self._retained_cognition_control_debt.pop(delivery.delivery_id, None)
+            return
         from kestrel_sovereign._async_ownership import (
             OwnedTaskAdmission, await_owned_task, create_owned_task, owned_task_error,
             owned_task_admission_error,
@@ -6142,6 +6222,8 @@ class SignalDispatcher:
                 if note not in getattr(error, "__notes__", ()):
                     error.add_note(note)
                 raise error
+            self._record_cognition_claim_settlement(delivery.consumer_id,
+                delivery.delivery_id, delivery.lease_token or "", terminalized)
             self._discard_transient_durable_handoff(delivery.delivery_id)
         else:
             terminalized = await self.release_durable_delivery_after_task(
