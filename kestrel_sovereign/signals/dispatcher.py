@@ -5297,8 +5297,19 @@ class SignalDispatcher:
         try:
             self._original_outcome_admission.set(await _capture_original_outcome(
                 self, routing_signal, registration, acceptance=acceptance))
-        except BaseException:
+        except BaseException as error:
             self._accepted_signal_outcomes.pop(acceptance, None)
+            # No routing Task was admitted, so there is no future completion
+            # callback to settle this already-claimed lease. Use the same
+            # exact-token terminalization/release as a settled route; never
+            # leave recovery depending on lease expiry after admission fails.
+            try:
+                if is_execution_control_error(error):
+                    await self._terminalize_failed_cognition(delivery, error)
+                else:
+                    await self._release_retained_durable_cognition_task(delivery)
+            except BaseException as cleanup:
+                raise execution_observation_error(error, cleanup) from None
             raise
 
         # The managed claim is durably marked admission-pending. Linearize

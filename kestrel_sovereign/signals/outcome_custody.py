@@ -8,6 +8,7 @@ in the ambient context and native commit/cleanup evidence retains them.
 import asyncio
 import sys
 import os
+import ssl
 from dataclasses import dataclass, fields, replace
 from datetime import date, datetime, time, timedelta, timezone
 from decimal import Decimal
@@ -193,11 +194,22 @@ def _native_effective_connect_configuration(connection):
     tls_server_hostname = tls.server_hostname if tls is not None else None
     if tls_server_hostname is not None and type(tls_server_hostname) is not str:
         raise ExecutionAuthorityError('Original native TLS hostname is unsupported')
+    # Compare actual transport verification, not asyncpg's SSL-mode enum:
+    # passing the retained SSLContext can change that enum without changing
+    # its native verification policy. Plaintext admission stays plaintext;
+    # an admitted TLS session never falls back to plaintext on reconnect.
+    security = 'disable'
+    if tls is not None:
+        context = tls.context
+        if type(context) is not ssl.SSLContext:
+            raise ExecutionAuthorityError('Original native TLS context is unsupported')
+        security = ('verify-full' if context.check_hostname else
+                    'verify-ca' if context.verify_mode != ssl.CERT_NONE else 'require')
     return _freeze_native_connect_configuration({
         'host': host, 'port': port, 'user': params.user, 'database': params.database,
         'password': params.password if params.password is not None else '',
         'server_settings': params.server_settings if params.server_settings is not None else {},
-        'ssl': params.sslmode.name.replace('_', '-'),
+        'ssl': security,
         'direct_tls': params.ssl_negotiation.value == 'direct',
         'target_session_attrs': params.target_session_attrs.value,
         'krbsrvname': params.krbsrvname if params.krbsrvname is not None else 'postgres',
@@ -222,6 +234,7 @@ class _OriginalPostgresJournalPool:
     configuration: tuple
     resolved_configuration: tuple | None = None
     principal: tuple | None = None
+    tls_context: object = None
 
     @classmethod
     def capture(cls, backing):
@@ -283,6 +296,10 @@ class _OriginalPostgresJournalPool:
         resolved = _restore_native_connect_configuration(self.resolved_configuration)
         tls_server_hostname = resolved.pop('tls_server_hostname')
         original_kwargs.update(resolved)
+        # Reuse already-loaded CA/client-key/protocol policy. Rebuilding an
+        # SSLContext from a mode string would reread mutable PGSSL* variables
+        # and trust files after the original admission.
+        original_kwargs['ssl'] = self.tls_context if self.tls_context is not None else False
         if tls_server_hostname is not None:
             from kestrel_sovereign.storage.db.native_journal_programs import _OriginalJournalConnectLoop
             # asyncpg uses its host both for dialing and TLS identity. Dial the
@@ -293,12 +310,15 @@ class _OriginalPostgresJournalPool:
         return original_args, original_kwargs
 
     def with_actual_connection(self, connection, principal):
+        tls = connection._transport.get_extra_info('ssl_object')
         return replace(self, resolved_configuration=_native_effective_connect_configuration(connection),
-                       principal=principal)
+                       principal=principal, tls_context=tls.context if tls is not None else None)
 
     def matches_actual_connection(self, connection):
+        tls = connection._transport.get_extra_info('ssl_object')
         return (self.resolved_configuration is not None
-                and _native_effective_connect_configuration(connection) == self.resolved_configuration)
+                and _native_effective_connect_configuration(connection) == self.resolved_configuration
+                and (tls.context if tls is not None else None) is self.tls_context)
 
 
 @dataclass(frozen=True)
