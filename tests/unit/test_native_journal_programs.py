@@ -70,6 +70,47 @@ def test_original_sqlite_text_matches_native_database_encoding(encoding):
         native.close()
 
 
+def test_sqlite_program_registration_shares_atomic_begin_fence(monkeypatch):
+    import threading
+    checking, attempted, done = threading.Event(), threading.Event(), threading.Event()
+    refused, unexpected = [], []
+    native = _NativeJournalSQLiteConnection(':memory:', check_same_thread=False)
+    supported = _NativeJournalSQLiteConnection._original_journal_programs_supported
+    def checked(connection):
+        allowed = supported(connection)
+        if not checking.is_set():
+            checking.set()
+            assert attempted.wait(5)
+            done.wait(0.25)
+        return allowed
+    monkeypatch.setattr(_NativeJournalSQLiteConnection, '_original_journal_programs_supported', checked)
+    def register():
+        try:
+            assert checking.wait(5)
+            attempted.set()
+            try:
+                native.create_function('application_function', 0, lambda: 'application result')
+            except NativeJournalConfigurationError:
+                refused.append(True)
+        except BaseException as error:
+            unexpected.append(error)
+        finally:
+            done.set()
+    thread = threading.Thread(target=register)
+    thread.start()
+    try:
+        native._begin_original_journal()
+        thread.join(5)
+        assert not thread.is_alive() and not unexpected
+        assert refused, 'program registration crossed original eligibility/seal acquisition'
+        assert native.execute('SELECT 1').fetchone() == (1,)
+        native.rollback()
+    finally:
+        checking.set()
+        thread.join(5)
+        native.close()
+
+
 def test_original_sqlite_parameter_free_literals_keep_quoted_placeholder_text():
     native = _NativeJournalSQLiteConnection(':memory:')
     try:

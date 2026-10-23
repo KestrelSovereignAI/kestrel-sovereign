@@ -79,12 +79,12 @@ class _OriginalJournalConnectLoop:
 
 
 def _register_program(connection):
-    with connection._journal_configuration_lock:
-        if connection._journal_program_seal is not None:
-            raise NativeJournalConfigurationError('Native program configuration is fenced by an original journal')
-        # Monotonic before the actual registration, including failed/removal
-        # calls. Begin cannot acquire eligibility between this check and mark.
-        connection._journal_programs_configured = True
+    if connection._journal_program_seal is not None:
+        raise NativeJournalConfigurationError('Native program configuration is fenced by an original journal')
+    # Monotonic before actual registration, including failed/removal calls.
+    # SQLite's caller holds its configuration lock across this check+mark;
+    # asyncpg's supported configuration entry runs on its original event loop.
+    connection._journal_programs_configured = True
 
 
 def _original_sqlite_scalar_adapters_registered():
@@ -221,7 +221,8 @@ class _NativeJournalSQLiteConnection(sqlite3.Connection):
         super().__setattr__(name, value)
 
     def _program_call(self, method_name, /, *args, **kwargs):
-        _register_program(self)
+        with self._journal_configuration_lock:
+            _register_program(self)
         return getattr(super(), method_name)(*args, **kwargs)
 
     def create_function(self, *args, **kwargs):
