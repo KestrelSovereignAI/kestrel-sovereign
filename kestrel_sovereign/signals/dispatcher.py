@@ -5467,15 +5467,29 @@ class SignalDispatcher:
         )
         acceptance = None
         try:
+            # The immutable native claim supplies envelope identity. A public
+            # rehydrator may recover payload/caller, never mint a new source,
+            # recipient or mode and then validate that substitution against
+            # itself. Recheck the actual registry after the hook's await too.
+            event = delivery.event
+            claimed_identity = (_native_identity_text(signal.id),
+                _native_identity_text(event.source), _native_identity_text(event.target_agent),
+                SignalMode(_native_identity_text(event.mode)))
             if (_native_identity_text(delivery.agent_id) != _native_identity_text(self._agent.did)
                     or _native_identity_text(delivery.consumer_id) != _native_identity_text(consumer_id)
                     or _native_identity_text(delivery.event_id) != _native_identity_text(persisted_event_id)
                     or _native_identity_text(delivery.lease_owner) != _native_identity_text(self._durable_delivery_owner)
-                    or not delivery.lease_token):
+                    or not delivery.lease_token
+                    or _native_identity_text(event.event_id) != _native_identity_text(delivery.event_id)
+                    or _native_identity_text(event.agent_id) != _native_identity_text(delivery.agent_id)
+                    or _OriginalSignalOutcome._signal_identity(routing_signal) != claimed_identity
+                    or _native_identity_text(registration.name) != claimed_identity[1]
+                    or self._registry.get(claimed_identity[1]) is not registration
+                    or claimed_identity[3] not in registration.allowed_modes):
                 from kestrel_sovereign.execution_custody import ExecutionAuthorityError
-                raise ExecutionAuthorityError('Original recovered cognition claim required')
+                raise ExecutionAuthorityError('Original recovered cognition claim and registered envelope required')
             acceptance = _AcceptedSignalOutcome(asyncio.current_task(),
-                _OriginalSignalOutcome._signal_identity(routing_signal), registration)
+                claimed_identity, registration)
             original_acceptances.append(acceptance)
             self._accepted_signal_outcomes[acceptance] = None
             self._original_outcome_admission.set(await _capture_original_outcome(
