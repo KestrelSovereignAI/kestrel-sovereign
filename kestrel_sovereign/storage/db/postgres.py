@@ -2286,8 +2286,9 @@ class PostgresBackend(DatabaseBackend):
                 # Capture has awaits too. Seal native programs, the actual
                 # association and its policy BEFORE the first principal read,
                 # through the same physical pool-reset retirement as a writer.
-                if not native._original_journal_programs_supported():
-                    raise NativeJournalConfigurationError('Original journal requires a plain native session')
+                native._begin_original_journal(state, tls_context=context,
+                    tls_generation=_native_tls_policy_generation(context))
+                program_sealed = True
                 principal = await native._original_journal_principal()
                 journal._require_backing()
                 require_execution_work(self)
