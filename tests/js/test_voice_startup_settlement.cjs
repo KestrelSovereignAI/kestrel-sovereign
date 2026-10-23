@@ -8,6 +8,22 @@ async function factory() {
   return (await import(`data:text/javascript;base64,${Buffer.from(source).toString('base64')}`)).createStartupSettlement;
 }
 
+test('null public withdrawal remains distinct from late native success', async () => {
+  const settlement = (await factory())();
+  let finish;
+  const pending = new Promise(resolve => { finish = resolve; });
+  const caller = settlement.run(() => pending);
+  const rejected = caller.then(() => false, reason => reason === null);
+  settlement.close(null);
+  assert.equal(await rejected, true);
+  finish('actual late acquisition');
+  const [record] = await settlement.whenSettled();
+  assert.equal(record.status, 'fulfilled');
+  assert.equal(record.value, 'actual late acquisition');
+  assert.equal(record.publicStatus, 'rejected', 'null withdrawal must not look like public fulfillment');
+  assert.equal(record.publicReason, null);
+});
+
 for (const original of [new Error('original public playback failure'), null, false, 0, '']) {
 test(`public withdrawal ${String(original)} and real late native rejection retain separate identities`, async () => {
   const settlement = (await factory())();

@@ -368,7 +368,8 @@ async def _a2a_submitted_dispatcher(path, did: str):
 
 @pytest.mark.parametrize('public_handle', [False, True])
 @pytest.mark.parametrize('release_failure', [False, True])
-async def test_cancelled_async_rehydration_releases_its_original_claim(tmp_path, public_handle, release_failure):
+@pytest.mark.parametrize('phase', ['rehydrate', 'grouped_rehydrate', 'hold', 'begin', 'guard'])
+async def test_cancelled_async_rehydration_releases_its_original_claim(tmp_path, monkeypatch, public_handle, release_failure, phase):
     import time
     from kestrel_sovereign._async_ownership import await_owned_task
     from kestrel_sovereign.execution_custody import _explicit_control_chain
@@ -386,12 +387,43 @@ async def test_cancelled_async_rehydration_releases_its_original_claim(tmp_path,
         source=source, agent_id=agent.did, max_attempts=0)
     entered, release = asyncio.Event(), asyncio.Event()
     task = None
-    async def rehydrate(event, *, dispatch_signal):
+    recovered = False
+    async def withdraw_here():
         entered.set()
         await release.wait()
+    async def rehydrate(event, *, dispatch_signal):
+        nonlocal recovered
+        if phase in ('rehydrate', 'grouped_rehydrate'):
+            try:
+                await withdraw_here()
+            except asyncio.CancelledError as cancellation:
+                if phase != 'grouped_rehydrate':
+                    raise
+                try:
+                    await backend.execute('INSERT INTO recovery_failure VALUES (1)')
+                except Exception as native_error:
+                    raise BaseExceptionGroup('actual recovery SQL failure and withdrawal', [native_error, cancellation]) from None
+                raise AssertionError('native duplicate INSERT unexpectedly succeeded')
+        recovered = True
         return replace(_channel_signal(agent.did, 'rehydrated-original'), source=source)
     agent.rehydrate_durable_cognition_signal = rehydrate
+    from kestrel_sovereign import hold as hold_module
+    original_hold = hold_module.get_effective_hold_state
+    async def hold(*args, **kwargs):
+        if phase == 'hold' and recovered:
+            await withdraw_here()
+        return await original_hold(*args, **kwargs)
+    monkeypatch.setattr(hold_module, 'get_effective_hold_state', hold)
+    for method, selected in [('_begin_durable_cognition_execution', 'begin'), ('_hold_durable_cognition_stop_completion', 'guard')]:
+        if phase == selected:
+            original_method = getattr(dispatcher, method)
+            async def paused(*args, **kwargs):
+                await withdraw_here()
+                return await original_method(*args, **kwargs)
+            monkeypatch.setattr(dispatcher, method, paused)
     try:
+        await backend.execute('CREATE TABLE recovery_failure (id INTEGER PRIMARY KEY)')
+        await backend.execute('INSERT INTO recovery_failure VALUES (1)')
         await dispatcher.register_durable_consumer(consumer)
         live = replace(_channel_signal(agent.did, 'cancel-rehydrate'), source=source)
         persisted = await dispatcher._durable_store.persist_signal(live, agent_id=agent.did,

@@ -214,7 +214,7 @@ async def test_postgres_reconnect_pins_actual_socket_peer_across_dns_change(disp
                 await retire_original()
 
 
-@pytest.mark.parametrize('direct_tls,journal_cancel,trust_change,sibling,ssl_mode', [(False, False, False, False, 'verify-full'), (True, False, False, False, 'verify-full'), (False, True, False, False, 'verify-full'), (False, False, True, False, 'verify-full'), (True, False, True, False, 'verify-full'), (False, False, False, True, 'verify-full'), (True, False, False, True, 'verify-full'), (False, True, False, False, 'allow'), (False, True, False, False, 'prefer'), (False, False, 'context', False, 'verify-full'), (True, False, 'context', False, 'verify-full')])
+@pytest.mark.parametrize('direct_tls,journal_cancel,trust_change,sibling,ssl_mode', [(False, False, False, False, 'verify-full'), (True, False, False, False, 'verify-full'), (False, True, False, False, 'verify-full'), (False, False, True, False, 'verify-full'), (True, False, True, False, 'verify-full'), (False, False, False, True, 'verify-full'), (True, False, False, True, 'verify-full'), (False, True, False, False, 'allow'), (False, True, False, False, 'prefer'), (False, False, 'context', False, 'verify-full'), (True, False, 'context', False, 'verify-full'), (False, False, 'transport', False, 'verify-full'), (True, False, 'transport', False, 'verify-full')])
 async def test_postgres_pinned_peer_keeps_native_tls_identity_on_reconnect(dispatcher_components, native_pg, monkeypatch, tmp_path, direct_tls, journal_cancel, trust_change, sibling, ssl_mode):
     from kestrel_sovereign._async_ownership import await_owned_task
     from kestrel_sovereign.execution_custody import ExecutionCustody, bind_execution_runtime
@@ -223,6 +223,17 @@ async def test_postgres_pinned_peer_keeps_native_tls_identity_on_reconnect(dispa
     from tests.unit.test_signals_dispatcher import _action_reg, _signal
     c = dispatcher_components
     from kestrel_sovereign.storage.db.native_journal_programs import NativeJournalPostgresConnection
+    if trust_change == 'transport':
+        from kestrel_sovereign.storage.db.native_journal_programs import _adopt_native_tls_context
+        import ssl
+        replacement_policy = _adopt_native_tls_context(ssl.create_default_context())
+        original_begin = NativeJournalPostgresConnection._begin_original_journal
+        def change_transport(connection, *args, **kwargs):
+            # This is the actual public SSLObject setter after checkout's
+            # endpoint comparison, not a fabricated transport or TLS result.
+            connection._transport.get_extra_info('ssl_object').context = replacement_policy
+            return original_begin(connection, *args, **kwargs)
+        monkeypatch.setattr(NativeJournalPostgresConnection, '_begin_original_journal', change_transport)
     original_cancel = NativeJournalPostgresConnection._cancel
     cancellation_requested = asyncio.Event()
     cancellation_owners = []
@@ -317,11 +328,11 @@ async def test_postgres_pinned_peer_keeps_native_tls_identity_on_reconnect(dispa
             released = await await_owned_task(release_owner)
             assert released.error is None
         assert not plaintext_cancellations, 'admitted TLS cancellation sent the native backend secret in plaintext'
-        if trust_change == 'context':
+        if trust_change in ('context', 'transport'):
             from kestrel_sovereign.execution_custody import is_execution_control_error, execution_commit_outcome
             assert is_execution_control_error(outcome.error), 'mutated admitted TLS policy accepted a replacement certificate'
             assert execution_commit_outcome(outcome.error) is None
-            assert names == [alias], 'changed TLS policy reached a new native handshake'
+            assert names == [alias] * (2 if trust_change == 'transport' else 1), 'changed TLS policy reached an unexpected native handshake'
             assert await control.fetchval(f'SELECT COUNT(*) FROM ONLY "{schema}".signal_log WHERE id=$1', signal.id) == 0
             return
         if deny_cancel:
@@ -376,6 +387,58 @@ async def test_postgres_pinned_peer_keeps_native_tls_identity_on_reconnect(dispa
                         await pool.close()
         finally:
             await retire_proxy()
+
+
+async def test_postgres_database_clone_cannot_inherit_original_journal_identity(dispatcher_components, native_pg):
+    import uuid
+    from kestrel_sovereign.execution_custody import ExecutionCustody, bind_execution_runtime, is_execution_control_error
+    from tests.unit.test_signal_outcome_terminal_custody import _OriginalWork
+    from tests.unit.test_signals_dispatcher import _action_reg, _signal
+    c = dispatcher_components
+    _, control, schema = native_pg
+    name = 'journal_db_' + uuid.uuid4().hex
+    clone, retired = name + '_clone', name + '_retired'
+    old_pool, pool, swapped = c.backend._pool, None, False
+    await control.execute(f'CREATE DATABASE "{name}" TEMPLATE template0')
+    try:
+        pool = await _fresh_journal_pool(old_pool, database=name, min_size=1, max_size=1)
+        c.backend._pool = pool
+        async with pool.acquire() as connection:
+            await connection.execute(f'CREATE SCHEMA "{schema}"')
+        await c.store.initialize()
+        scope = ExecutionCustody(_OriginalWork(backend_type='postgres'))
+        facts = []
+        async def handler(payload):
+            nonlocal swapped
+            async with pool.acquire() as connection:
+                facts.append(tuple(await connection.fetchrow("SELECT (SELECT oid FROM pg_catalog.pg_database WHERE datname=current_database()), 'signal_log'::regclass::oid")))
+                await connection.close()
+            await control.execute(f'CREATE DATABASE "{clone}" TEMPLATE "{name}"')
+            await control.execute(f'ALTER DATABASE "{name}" RENAME TO "{retired}"')
+            await control.execute(f'ALTER DATABASE "{clone}" RENAME TO "{name}"')
+            swapped = True
+            async with pool.acquire() as connection:
+                facts.append(tuple(await connection.fetchrow("SELECT (SELECT oid FROM pg_catalog.pg_database WHERE datname=current_database()), 'signal_log'::regclass::oid")))
+            scope.revoke('actual cutoff after database clone/name swap')
+            return {'genuine': True}
+        c.registry.register(_action_reg('database.clone.audit', handler=handler))
+        signal = _signal('database.clone.audit')
+        from kestrel_sovereign._async_ownership import await_owned_task
+        with bind_execution_runtime(SimpleNamespace(_execution_custody=scope)):
+            outcome = await await_owned_task(asyncio.create_task(c.dispatcher.dispatch_signal(signal)))
+        assert len(facts) == 2 and facts[0][0] != facts[1][0] and facts[0][1] == facts[1][1], 'fixture must preserve relation OID but replace database OID'
+        assert is_execution_control_error(outcome.error), 'cloned database inherited an original journal receipt'
+        async with pool.acquire() as connection:
+            assert await connection.fetchval('SELECT count(*) FROM signal_log WHERE id=$1', signal.id) == 0
+    finally:
+        c.backend._pool = old_pool
+        try:
+            if pool is not None:
+                async with asyncio.timeout(10):
+                    await pool.close()
+        finally:
+            await control.execute(f'DROP DATABASE IF EXISTS "{name}"')
+            await control.execute(f'DROP DATABASE IF EXISTS "{retired if swapped else clone}"')
 
 
 async def test_postgres_original_journal_refuses_effective_durability_drift(dispatcher_components, native_pg, monkeypatch):
