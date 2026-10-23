@@ -2242,7 +2242,7 @@ class PostgresBackend(DatabaseBackend):
                   JOIN pg_catalog.pg_namespace AS tn ON tn.oid OPERATOR(pg_catalog.=) t.typnamespace
                   WHERE a.attrelid OPERATOR(pg_catalog.=) c.oid AND a.attnum OPERATOR(pg_catalog.>) 0 AND NOT a.attisdropped
                     AND (tn.nspname OPERATOR(pg_catalog.<>) 'pg_catalog' OR a.attgenerated OPERATOR(pg_catalog.<>) '' OR a.attidentity OPERATOR(pg_catalog.<>) ''))
-        ''', name, _POSTGRES_FIRST_NORMAL_OBJECT_ID)
+        ''', name)
         if row is None or row['relation_name'] != 'signal_log':
             return None
         fields = dict(row)
