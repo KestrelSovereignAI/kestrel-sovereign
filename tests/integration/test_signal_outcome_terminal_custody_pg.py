@@ -964,7 +964,7 @@ async def test_postgres_admission_successor_does_not_wait_for_dispatch_lifetime(
     original_pool = c.backend._pool
     pool = await _fresh_journal_pool(original_pool, min_size=1, max_size=1)
     c.backend._pool = pool
-    retired, release, successor_acquired, original_effect_entered = (asyncio.Event() for _ in range(4))
+    retired, release, successor_acquired, original_seal_released = (asyncio.Event() for _ in range(4))
     original_join = pg.await_owned_task
     original_checkout = c.backend._tracked_pool_checkout
     held, tasks = [], []
@@ -980,6 +980,13 @@ async def test_postgres_admission_successor_does_not_wait_for_dispatch_lifetime(
             await release.wait()
         return outcome
     monkeypatch.setattr(pg, 'await_owned_task', observe_reset)
+    original_end = pg.NativeJournalPostgresConnection._end_original_journal
+    def observe_end(native):
+        result = original_end(native)
+        if held and native is held[0] and asyncio.current_task().get_name() == 'original-admission-cycle' and result:
+            original_seal_released.set()
+        return result
+    monkeypatch.setattr(pg.NativeJournalPostgresConnection, '_end_original_journal', observe_end)
     @asynccontextmanager
     async def observe_checkout(*args, **kwargs):
         async with original_checkout(*args, **kwargs) as acquired:
@@ -988,7 +995,6 @@ async def test_postgres_admission_successor_does_not_wait_for_dispatch_lifetime(
             yield acquired
     monkeypatch.setattr(c.backend, '_tracked_pool_checkout', observe_checkout)
     async def effect(payload):
-        original_effect_entered.set()
         await c.backend.execute('INSERT INTO effects (id, value) VALUES (?, ?)', (payload['id'], 'genuine'))
         return {'genuine': True}
     c.registry.register(_action_reg('healthy.admission.cycle', handler=effect))
@@ -1002,7 +1008,7 @@ async def test_postgres_admission_successor_does_not_wait_for_dispatch_lifetime(
         tasks.append(create_owned_task(c.dispatcher.dispatch_signal(second), name='successor-admission-cycle'))
         await asyncio.wait_for(successor_acquired.wait(), 3)
         release.set()
-        await asyncio.wait_for(original_effect_entered.wait(), 3)
+        await asyncio.wait_for(original_seal_released.wait(), 3)
         _, pending = await asyncio.wait(tasks, timeout=2)
         assert not pending, 'successor holds the actual sole pool slot while waiting for a dispatch that needs that slot'
         outcomes = [await await_owned_task(task) for task in tasks]
