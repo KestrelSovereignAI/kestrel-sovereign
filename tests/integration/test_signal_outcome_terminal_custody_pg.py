@@ -50,7 +50,7 @@ async def _fresh_journal_pool(original, **options):
     return await asyncpg.create_pool(*original._connect_args, **original._connect_kwargs, **options)
 
 
-async def _owned_native_pg_proxy(bind_host, bind_port, target, *, tls_context=None, starttls=False, on_accept=None):
+async def _owned_native_pg_proxy(bind_host, bind_port, target, *, tls_context=None, starttls=False, on_accept=None, tls_required=False, reject_tls=None, plaintext_cancellations=None):
     import struct
     from kestrel_sovereign._async_ownership import await_owned_task
     relays, writers = [], []
@@ -64,7 +64,28 @@ async def _owned_native_pg_proxy(bind_host, bind_port, target, *, tls_context=No
         writers.append(writer)
         try:
             if starttls:
-                assert await reader.readexactly(8) == struct.pack('!ll', 8, 80877103)
+                length, code = struct.unpack('!ll', await reader.readexactly(8))
+                if code == 80877102 and length == 16 and plaintext_cancellations is not None:
+                    await reader.readexactly(8)
+                    plaintext_cancellations.append(True)  # Never retain/log backend secret bytes.
+                    return
+                if tls_required and code == 196608:
+                    await reader.readexactly(length - 8)
+                    fields = b'SFATAL\0VFATAL\0C28000\0MSSL required\0\0'
+                    writer.write(b'E' + struct.pack('!l', 4 + len(fields)) + fields)
+                    await writer.drain()
+                    return
+                assert (length, code) == (8, 80877103)
+                if reject_tls is not None and reject_tls.is_set():
+                    writer.write(b'N')
+                    await writer.drain()
+                    try:
+                        packet = await reader.readexactly(16)
+                    except asyncio.IncompleteReadError:
+                        return
+                    if packet[:8] == struct.pack('!ll', 16, 80877102):
+                        plaintext_cancellations.append(True)
+                    return
                 writer.write(b'S')
                 await writer.drain()
                 await writer.start_tls(tls_context, ssl_handshake_timeout=3)
@@ -192,8 +213,8 @@ async def test_postgres_reconnect_pins_actual_socket_peer_across_dns_change(disp
                 await retire_original()
 
 
-@pytest.mark.parametrize('direct_tls,journal_cancel,trust_change,sibling', [(False, False, False, False), (True, False, False, False), (False, True, False, False), (False, False, True, False), (True, False, True, False), (False, False, False, True), (True, False, False, True)])
-async def test_postgres_pinned_peer_keeps_native_tls_identity_on_reconnect(dispatcher_components, native_pg, monkeypatch, tmp_path, direct_tls, journal_cancel, trust_change, sibling):
+@pytest.mark.parametrize('direct_tls,journal_cancel,trust_change,sibling,ssl_mode', [(False, False, False, False, 'verify-full'), (True, False, False, False, 'verify-full'), (False, True, False, False, 'verify-full'), (False, False, True, False, 'verify-full'), (True, False, True, False, 'verify-full'), (False, False, False, True, 'verify-full'), (True, False, False, True, 'verify-full'), (False, True, False, False, 'allow'), (False, True, False, False, 'prefer')])
+async def test_postgres_pinned_peer_keeps_native_tls_identity_on_reconnect(dispatcher_components, native_pg, monkeypatch, tmp_path, direct_tls, journal_cancel, trust_change, sibling, ssl_mode):
     from kestrel_sovereign._async_ownership import await_owned_task
     from kestrel_sovereign.execution_custody import ExecutionCustody, bind_execution_runtime
     from tests.unit.test_native_journal_programs import _owned_tls_contexts
@@ -215,6 +236,9 @@ async def test_postgres_pinned_peer_keeps_native_tls_identity_on_reconnect(dispa
     alias = 'original-journal-peer.invalid'
     server_context, _, cert_path = _owned_tls_contexts(tmp_path, alias)
     names = []
+    reject_tls = asyncio.Event()
+    plaintext_cancellations = []
+    deny_cancel = ssl_mode in ('allow', 'prefer')
     server_context.set_servername_callback(lambda obj, name, context: names.append(name))
     monkeypatch.setenv('PGSSLROOTCERT', str(cert_path))
     loop = asyncio.get_running_loop()
@@ -223,7 +247,8 @@ async def test_postgres_pinned_peer_keeps_native_tls_identity_on_reconnect(dispa
         return await resolve('127.0.0.1' if name == alias else name, port, *args, **kwargs)
     monkeypatch.setattr(loop, 'getaddrinfo', actual_resolution)
     server, retire_proxy = await _owned_native_pg_proxy('127.0.0.1', 0, target,
-        tls_context=server_context, starttls=not direct_tls)
+        tls_context=server_context, starttls=not direct_tls, tls_required=deny_cancel,
+        reject_tls=reject_tls, plaintext_cancellations=plaintext_cancellations)
     endpoint = server.sockets[0].getsockname()[:2]
     original_pool = c.backend._pool
     pool = None
@@ -232,7 +257,7 @@ async def test_postgres_pinned_peer_keeps_native_tls_identity_on_reconnect(dispa
     release_owner = None
     try:
         pool = await _fresh_journal_pool(original_pool, min_size=2 if sibling else 1, max_size=2 if sibling else 1,
-            host=alias, port=endpoint[1], ssl='verify-full', direct_tls=direct_tls, timeout=3, command_timeout=1)
+            host=alias, port=endpoint[1], ssl=ssl_mode, direct_tls=direct_tls, timeout=3, command_timeout=1)
         c.backend._pool = pool
         if journal_cancel:
             async def release_after_cancellation():
@@ -261,6 +286,8 @@ async def test_postgres_pinned_peer_keeps_native_tls_identity_on_reconnect(dispa
             if trust_change:
                 monkeypatch.setenv('PGSSLROOTCERT', str(tmp_path / 'not-the-admitted-root.pem'))
             if journal_cancel:
+                if deny_cancel:
+                    reject_tls.set()
                 await control.execute('BEGIN')
                 locked.append(True)
                 await control.execute(f'LOCK TABLE "{schema}".signal_log IN ACCESS EXCLUSIVE MODE')
@@ -275,7 +302,8 @@ async def test_postgres_pinned_peer_keeps_native_tls_identity_on_reconnect(dispa
             released = await await_owned_task(release_owner)
             assert released.error is None
         assert outcome.error is None, 'numeric peer reconnect lost actual TLS hostname verification'
-        assert names == [alias] * (3 if sibling else 2), 'original admission, sibling and terminal reconnect must use the same TLS SNI'
+        assert not plaintext_cancellations, 'admitted TLS cancellation sent the native backend secret in plaintext'
+        assert names == [alias] * (1 if deny_cancel else 3 if sibling else 2), 'original admission, sibling and terminal reconnect must use the same TLS SNI'
         assert await control.fetchval(f'SELECT COUNT(*) FROM ONLY "{schema}".signal_log WHERE id=$1', signal.id) == int(not journal_cancel)
         if journal_cancel:
             assert c.dispatcher._log_write_failures == 1
@@ -352,7 +380,7 @@ async def test_native_tls_proxy_retires_after_actual_pool_close_reports_failure(
     try:
         with pytest.raises(OSError) as caught:
             await test_postgres_pinned_peer_keeps_native_tls_identity_on_reconnect(
-                dispatcher_components, native_pg, monkeypatch, tmp_path, direct_tls, False, False, False)
+                dispatcher_components, native_pg, monkeypatch, tmp_path, direct_tls, False, False, False, 'verify-full')
         assert caught.value is physical
         assert proxies and len(retired) == len(proxies), 'actual pool close failure skipped independent proxy retirement'
         assert all(not server.is_serving() for server, _ in proxies)
