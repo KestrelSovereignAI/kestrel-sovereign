@@ -385,6 +385,54 @@ async def test_failed_route_task_publication_owns_original_claim(tmp_path, monke
                                   'publication_after' if published_before_refusal else 'publication_before')
 
 
+@pytest.mark.parametrize('public_handle', [False, True])
+async def test_route_publication_join_keeps_actual_caller_withdrawal(tmp_path, monkeypatch, public_handle):
+    await _assert_pre_route_claim(tmp_path, monkeypatch, public_handle, False, 'publication_cancel')
+
+
+async def test_rehydration_release_denial_retains_exact_claim_debt(tmp_path, monkeypatch):
+    await _assert_pre_route_claim(tmp_path, monkeypatch, False, False, 'revoked_rehydrate')
+
+
+async def test_cancelled_unstarted_public_resident_settles_original_claim(tmp_path):
+    from kestrel_sovereign._async_ownership import await_owned_task
+    from tests.unit.test_host_context_native_cleanup import _actual_operation
+    backend, agent, dispatcher = await _channel_dispatcher(tmp_path / 'unstarted-resident.db', 'did:agent:unstarted-resident')
+    consumer = DurableConsumerRegistration(consumer_id=DURABLE_COGNITION_CONSUMER_ID,
+        source='channel.message', agent_id=agent.did, max_attempts=0)
+    loop = asyncio.get_running_loop()
+    previous = loop.get_task_factory()
+    accepted, effects = [], []
+    handle = None
+    async def effect(prompt):
+        effects.append(prompt)
+        return 'genuine effect'
+    agent.process_input = effect
+    def factory(loop, coroutine, **kwargs):
+        operation = _actual_operation(coroutine)
+        task = previous(loop, coroutine, **kwargs) if previous else asyncio.Task(coroutine, loop=loop, **kwargs)
+        if getattr(getattr(operation, 'cr_code', None), 'co_name', '') == 'resident_delivery':
+            accepted.append(task)
+            task.cancel('actual lifecycle withdrawal before resident startup')
+        return task
+    try:
+        await dispatcher.register_durable_consumer(consumer)
+        loop.set_task_factory(factory)
+        handle = await dispatcher.enqueue_durable_cognition(_channel_signal(agent.did, 'unstarted-resident'),
+            source_event_id='original-unstarted-resident', consumer_id=consumer.consumer_id)
+        outcome = await await_owned_task(handle.task)
+        assert accepted and all(task.done() for task in accepted) and not effects
+        assert outcome.error is not None
+        delivery, = await dispatcher.list_durable_deliveries()
+        assert delivery.status == RETRY and delivery.lease_token is None, 'unstarted accepted resident abandoned its actual native claim'
+    finally:
+        loop.set_task_factory(previous)
+        if handle is not None:
+            await await_owned_task(handle.task)
+        await dispatcher.shutdown_durable_delivery()
+        await _close(backend, agent)
+
+
 async def _assert_pre_route_claim(tmp_path, monkeypatch, public_handle, release_failure, phase):
     import time
     from kestrel_sovereign._async_ownership import await_owned_task
@@ -415,6 +463,8 @@ async def _assert_pre_route_claim(tmp_path, monkeypatch, public_handle, release_
                     self.refused = True
                     if phase == 'publication_after':
                         super().add_done_callback(callback, *args, **kwargs)
+                    if phase == 'publication_cancel':
+                        asyncio.current_task().cancel('actual caller withdrawal during physical publication reconciliation')
                     raise publication_error
                 return super().add_done_callback(callback, *args, **kwargs)
         def factory(loop, coroutine, **kwargs):
@@ -427,6 +477,11 @@ async def _assert_pre_route_claim(tmp_path, monkeypatch, public_handle, release_
             return previous_factory(loop, coroutine, **kwargs) if previous_factory else asyncio.Task(coroutine, loop=loop, **kwargs)
         loop.set_task_factory(factory)
     recovered = False
+    scope = None
+    if phase == 'revoked_rehydrate':
+        from kestrel_sovereign.execution_custody import ExecutionCustody
+        from tests.unit.test_signal_outcome_terminal_custody import _OriginalWork
+        scope = ExecutionCustody(_OriginalWork())
     async def withdraw_here():
         entered.set()
         await release.wait()
@@ -443,7 +498,7 @@ async def _assert_pre_route_claim(tmp_path, monkeypatch, public_handle, release_
         monkeypatch.setattr(dispatcher, '_agent_is_held', first_hold)
     async def rehydrate(event, *, dispatch_signal):
         nonlocal recovered
-        if phase in ('rehydrate', 'grouped_rehydrate'):
+        if phase in ('rehydrate', 'grouped_rehydrate', 'revoked_rehydrate'):
             try:
                 await withdraw_here()
             except asyncio.CancelledError as cancellation:
@@ -491,23 +546,36 @@ async def _assert_pre_route_claim(tmp_path, monkeypatch, public_handle, release_
             delivery = await dispatcher.claim_durable_delivery_for_event(consumer_id=consumer.consumer_id,
                 event_id=persisted.event_id, executor_id=dispatcher._durable_delivery_owner)
             seed = dispatcher._durable_retry_seed(delivery.event)
-            task = asyncio.create_task(dispatcher._route_durable_cognition_delivery(seed,
-                dispatcher._registry.get(seed.source), time.monotonic(), persisted_event_id=delivery.event_id,
-                consumer_id=consumer.consumer_id, durable_admission=None, durable_created=False,
-                use_live_signal=False, claimed_delivery=delivery))
+            from contextlib import nullcontext
+            from kestrel_sovereign.execution_custody import bind_execution_runtime
+            with bind_execution_runtime(SimpleNamespace(_execution_custody=scope)) if scope is not None else nullcontext():
+                task = asyncio.create_task(dispatcher._route_durable_cognition_delivery(seed,
+                    dispatcher._registry.get(seed.source), time.monotonic(), persisted_event_id=delivery.event_id,
+                    consumer_id=consumer.consumer_id, durable_admission=None, durable_created=False,
+                    use_live_signal=False, claimed_delivery=delivery))
         await asyncio.wait_for(entered.wait(), 5)
         if phase != 'begin_failure' and not phase.startswith('publication_'):
+            if scope is not None:
+                scope.revoke('actual runtime withdrawal before original claim release')
             task.cancel('actual caller withdrawal during source rehydration')
         outcome = await await_owned_task(task)
         errors = tuple(_explicit_control_chain(outcome.error))
         if phase.startswith('publication_'):
             assert accepted and all(original.done() for original in accepted)
             assert publication_error in errors, 'original callback-publication refusal was not retained'
+            if phase == 'publication_cancel':
+                assert any(isinstance(error, asyncio.CancelledError) for error in errors), 'actual join withdrawal disappeared from public outcome'
+                assert not isinstance(outcome.error, Exception), 'ordinary publication failure demoted actual withdrawal'
         elif phase != 'begin_failure':
             assert any(isinstance(error, asyncio.CancelledError) for error in errors)
         elif not release_failure:
             assert outcome.error is None and outcome.result.status == Status.FAILED
-        if release_failure:
+        if phase == 'revoked_rehydrate':
+            from kestrel_sovereign.execution_custody import is_execution_control_error
+            assert is_execution_control_error(outcome.error)
+            debt = dispatcher._retained_cognition_control_debt.get(delivery.delivery_id)
+            assert debt is not None and debt[0].lease_token == delivery.lease_token, 'authority-denied release forgot its exact original claim debt'
+        elif release_failure:
             assert any('actual cancelled recovery release refused' in str(error) for error in errors), 'rehydration cancellation hid native release failure'
             await backend.execute('DROP TRIGGER refuse_cancel_recovery_release')
         else:

@@ -954,6 +954,72 @@ async def test_postgres_proof_never_scans_unvalidated_foreign_inheritance(dispat
         await control.execute(f'DROP SERVER "{server}" CASCADE')
 
 
+async def test_postgres_admission_successor_does_not_wait_for_dispatch_lifetime(dispatcher_components, native_pg, monkeypatch):
+    from contextlib import asynccontextmanager
+    from kestrel_sovereign._async_ownership import create_owned_task, await_owned_task
+    from kestrel_sovereign.storage.db import postgres as pg
+    from tests.unit.test_signals_dispatcher import _action_reg, _signal
+    c = dispatcher_components
+    _, control, schema = native_pg
+    original_pool = c.backend._pool
+    pool = await _fresh_journal_pool(original_pool, min_size=1, max_size=1)
+    c.backend._pool = pool
+    retired, release, successor_acquired, original_effect_entered = (asyncio.Event() for _ in range(4))
+    original_join = pg.await_owned_task
+    original_checkout = c.backend._tracked_pool_checkout
+    held, tasks = [], []
+    async def observe_reset(task, *args, **kwargs):
+        outcome = await original_join(task, *args, **kwargs)
+        native = pool._holders[0]._con
+        seal = native._journal_program_seal if native is not None else None
+        if (not held and seal is not None and seal[0] is asyncio.current_task()
+                and asyncio.current_task().get_name() == 'original-admission-cycle'
+                and seal[1].retirement.owner is task):
+            held.append(native)
+            retired.set()
+            await release.wait()
+        return outcome
+    monkeypatch.setattr(pg, 'await_owned_task', observe_reset)
+    @asynccontextmanager
+    async def observe_checkout(*args, **kwargs):
+        async with original_checkout(*args, **kwargs) as acquired:
+            if held and acquired[0]._con is held[0] and asyncio.current_task().get_name() == 'successor-admission-cycle':
+                successor_acquired.set()
+            yield acquired
+    monkeypatch.setattr(c.backend, '_tracked_pool_checkout', observe_checkout)
+    async def effect(payload):
+        original_effect_entered.set()
+        await c.backend.execute('INSERT INTO effects (id, value) VALUES (?, ?)', (payload['id'], 'genuine'))
+        return {'genuine': True}
+    c.registry.register(_action_reg('healthy.admission.cycle', handler=effect))
+    try:
+        first = _signal('healthy.admission.cycle')
+        first.payload['id'] = 101
+        second = _signal('healthy.admission.cycle')
+        second.payload['id'] = 102
+        tasks.append(create_owned_task(c.dispatcher.dispatch_signal(first), name='original-admission-cycle'))
+        await asyncio.wait_for(retired.wait(), 3)
+        tasks.append(create_owned_task(c.dispatcher.dispatch_signal(second), name='successor-admission-cycle'))
+        await asyncio.wait_for(successor_acquired.wait(), 3)
+        release.set()
+        await asyncio.wait_for(original_effect_entered.wait(), 3)
+        _, pending = await asyncio.wait(tasks, timeout=2)
+        assert not pending, 'successor holds the actual sole pool slot while waiting for a dispatch that needs that slot'
+        assert all((await await_owned_task(task)).error is None for task in tasks)
+        assert await control.fetchval(f'SELECT COUNT(*) FROM "{schema}".effects WHERE id IN (101,102)') == 2
+        assert await control.fetchval(f'SELECT COUNT(*) FROM "{schema}".signal_log') == 2
+    finally:
+        release.set()
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        for task in tasks:
+            await await_owned_task(task)
+        c.backend._pool = original_pool
+        async with asyncio.timeout(10):
+            await pool.close()
+
+
 async def test_postgres_successor_journal_reuses_physically_reset_connection(dispatcher_components, native_pg, monkeypatch):
     from contextlib import asynccontextmanager
     from kestrel_sovereign._async_ownership import create_owned_task, await_owned_task
