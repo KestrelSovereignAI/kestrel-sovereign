@@ -49,8 +49,9 @@ async def test_unregister_shared_retention_does_not_mutate_two_native_sources(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize('withdraw', [False, True])
 async def test_classified_reset_failure_keeps_caller_out_of_both_shared_latches(
-    native_pg, onboarding_owner, monkeypatch,
+    native_pg, onboarding_owner, monkeypatch, withdraw,
 ):
     backend, observer, schema = native_pg
     _, agent, _database = onboarding_owner
@@ -82,12 +83,14 @@ async def test_classified_reset_failure_keeps_caller_out_of_both_shared_latches(
     owner = create_owned_task(agent._activate_feature_runtime(Feature(agent)), retain_originals=True)
     try:
         await asyncio.wait_for(entered.wait(), 5)
-        owner.cancel("actual classified native cleanup observer withdrew")
-        await asyncio.sleep(0)
+        if withdraw:
+            owner.cancel("actual classified native cleanup observer withdrew")
+            await asyncio.sleep(0)
         release.set()
         result = await await_owned_task(owner)
         physical.assert_retained(result.error)
-        assert withdrawals and all(error in tuple(_explicit_control_chain(result.error)) for error in withdrawals)
+        assert bool(withdrawals) is withdraw
+        assert all(error in tuple(_explicit_control_chain(result.error)) for error in withdrawals)
         for shared in (agent._feature_lifecycle_control, agent._shutdown_control):
             physical.assert_retained(shared)
             assert execution_commit_outcome(shared) == "committed"
