@@ -96,6 +96,12 @@ def _original_sqlite_query(query, parameters, sql_limit):
     """
     if type(query) is not str or type(parameters) is not tuple:
         raise NativeJournalConfigurationError('Original journal requires fixed native SQL and values')
+    if not parameters:
+        # Trusted parameter-free catalog SQL may contain '?' inside a quoted
+        # identifier/literal. With no native binds there is no adapter lookup.
+        if len(query.encode('utf-8')) > sql_limit:
+            raise sqlite3.DataError('Original journal exceeds native statement length limit')
+        return query
     parts = str.split(query, '?')
     if len(parts) != len(parameters) + 1:
         raise NativeJournalConfigurationError('Original journal requires fixed positional placeholders')

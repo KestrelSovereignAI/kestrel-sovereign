@@ -528,6 +528,22 @@ async def test_sqlite_journal_binds_exact_native_projection_text(dispatcher_comp
     assert not adapted
 
 
+async def test_sqlite_plain_index_name_with_placeholder_keeps_original_journal(dispatcher_components):
+    c = dispatcher_components
+    await c.backend.execute('CREATE INDEX "native?plain_index" ON signal_log(source)')
+    scope = ExecutionCustody(_OriginalWork())
+    effects = []
+    async def handler(payload):
+        effects.append(True)
+        scope.revoke('actual cutoff after genuine handler with native plain index')
+        return {'genuine': True}
+    c.registry.register(_action_reg('native.plain.index.name', handler=handler))
+    with bind_execution_runtime(SimpleNamespace(_execution_custody=scope)):
+        outcome = await await_owned_task(asyncio.create_task(c.dispatcher.dispatch_signal(_signal('native.plain.index.name'))))
+    assert effects and outcome.error is None, 'quoted native catalog name was interpreted as parameter SQL'
+    assert await c.backend.fetch_val('SELECT COUNT(*) FROM signal_log') == 1
+
+
 async def test_sqlite_journal_never_adapts_after_native_prepare_started(tmp_path, monkeypatch):
     import sqlite3
     import threading

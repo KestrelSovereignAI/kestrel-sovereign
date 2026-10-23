@@ -54,6 +54,16 @@ def test_original_sqlite_literal_compiler_respects_native_statement_bound():
         _original_sqlite_query('SELECT ?', ('too long',), 16)
 
 
+def test_original_sqlite_parameter_free_literals_keep_quoted_placeholder_text():
+    native = _NativeJournalSQLiteConnection(':memory:')
+    try:
+        native._begin_original_journal()
+        assert native.execute("SELECT '?' AS \"native?name\"").fetchone() == ('?',)
+        native.rollback()
+    finally:
+        native.close()
+
+
 def test_original_sqlite_float_literals_preserve_native_ieee_values():
     import math
     import random
