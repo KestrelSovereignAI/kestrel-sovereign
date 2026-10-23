@@ -617,26 +617,36 @@ async def _booted_agent(tmp_path):
     """A real agent on real storage; only the daemons are scripted. Beyond
     the mandatory features it loads only the one whose tool the turns call,
     so an installed optional package adds no model call of its own."""
-    async with booted_agent(
-        tmp_path, name="Gate", provenance="test:generation_gate",
-        features={"StateOfMindFeature"},
-    ) as agent:
-        # This table tests generation/Stop outcomes, not cold database startup.
-        # Initialize the actual owned usage DB before a one-second watchdog can
-        # interrupt its native schema COMMIT on a loaded unit-test worker.
-        await agent.llm_service._ensure_db_initialized()
-        yield agent
+    from kestrel_sovereign.storage.db import sqlite
+    with pytest.MonkeyPatch.context() as cleanup:
+        # A measured 2.3MiB usage-WAL close exceeded 1.01s in the full suite.
+        # Generation/Stop semantics do not benchmark checkpoint/fsync speed.
+        # Reserve finite native fixture cleanup, restoring the production
+        # default and leaving dedicated deadline tests completely unchanged.
+        cleanup.setattr(sqlite, "AIOSQLITE_WORKER_SHUTDOWN_TIMEOUT_S",
+            max(5.0, sqlite.AIOSQLITE_WORKER_SHUTDOWN_TIMEOUT_S))
+        async with booted_agent(
+            tmp_path, name="Gate", provenance="test:generation_gate",
+            features={"StateOfMindFeature"},
+        ) as agent:
+            # Keep cold migrations outside the generation's own watchdog.
+            await agent.llm_service._ensure_db_initialized()
+            yield agent
 
 
 @pytest.mark.asyncio
 async def test_generation_fixture_opens_usage_database_before_timed_calls(tmp_path):
     """The generation watchdog must not race unrelated usage-DB migrations."""
+    from kestrel_sovereign.storage.db import sqlite
+    original_cleanup_budget = sqlite.AIOSQLITE_WORKER_SHUTDOWN_TIMEOUT_S
     async with _booted_agent(tmp_path) as agent:
+        assert sqlite.AIOSQLITE_WORKER_SHUTDOWN_TIMEOUT_S == max(5.0, original_cleanup_budget)
         service = agent.llm_service
         assert service._db_initialized and service._usage_db is not None, (
             "generation fixture handed a cold usage database to a timed call"
         )
         assert await service._usage_db.fetchval("SELECT COUNT(*) FROM model_usage") == 0
+    assert sqlite.AIOSQLITE_WORKER_SHUTDOWN_TIMEOUT_S == original_cleanup_budget
 
 
 @asynccontextmanager

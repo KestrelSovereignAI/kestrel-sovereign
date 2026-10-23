@@ -113,6 +113,13 @@ def _snapshot_terminal_result(result):
                            for field in fields(SignalResult)})
 
 
+def _snapshot_signal(signal):
+    """One canonical detached envelope; never application copy protocols."""
+    from kestrel_sdk.signals.models import Signal
+    return Signal(**{field.name: _snapshot_outcome_data(getattr(signal, field.name))
+                     for field in fields(Signal)})
+
+
 class SignalOutcomeJournalPrivacyRefusal(ExecutionAuthorityError):
     """Terminal audit refused; the original completed effect did not roll back."""
 
@@ -404,10 +411,7 @@ class _OriginalSignalOutcome:
         self._registration = registration
         # Payload containers and privacy settings belong to acceptance, not
         # to a handler's mutable arguments after revocation.
-        from kestrel_sdk.signals.models import Signal
-        self._signal_snapshot = Signal(**{
-            field.name: _snapshot_outcome_data(getattr(signal, field.name))
-            for field in fields(Signal)})
+        self._signal_snapshot = _snapshot_signal(signal)
         self._registration_snapshot = replace(registration,
             log_redaction=replace(registration.log_redaction))
         table = 'main.signal_log' if type(backend) is SQLiteBackend else 'signal_log'

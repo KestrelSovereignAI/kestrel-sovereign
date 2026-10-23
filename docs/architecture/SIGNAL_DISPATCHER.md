@@ -985,6 +985,11 @@ exact-token cleanup boundary before any routing task can start.
 Source, target and mode come from that immutable claimed event and must match
 the current registered source; a rehydration hook supplies payload/caller, not
 a replacement envelope identity or registration.
+Recovery also snapshots the fresh attempt before application hooks and gives
+rehydration a detached envelope, not the dispatcher's published seed. Its ID
+and arrival time are retained before invocation/await, never read back from
+hook-owned mutable input. The same canonical snapshot routine owns journal
+envelopes; application copy protocols cannot retain a mutable alias.
 Failed cleanup retains its original lease debt and cannot be reported as successful settlement.
 Ordinary cancellation while asynchronous caller rehydration is unwinding also
 releases that exact claim; withdrawal and any release failure remain observable.

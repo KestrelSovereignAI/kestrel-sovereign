@@ -4120,7 +4120,13 @@ class SignalDispatcher:
         rehydrate = getattr(self._agent, "rehydrate_durable_cognition_signal", None)
         if not callable(rehydrate):
             return None
-        recovered = rehydrate(event, dispatch_signal=dispatch_signal)
+        from kestrel_sovereign.signals.outcome_custody import _snapshot_signal, _native_identity_text
+        # Application recovery receives detached data, not the published seed
+        # owned by its dispatcher/handle. Freeze attempt metadata BEFORE both
+        # invoking and awaiting the hook; never read it back from its input.
+        hook_seed = _snapshot_signal(dispatch_signal)
+        attempt_id, arrived_at = _native_identity_text(hook_seed.id), hook_seed.arrived_at
+        recovered = rehydrate(event, dispatch_signal=hook_seed)
         if inspect.isawaitable(recovered):
             recovered = await recovered
         if recovered is None:
@@ -4128,7 +4134,7 @@ class SignalDispatcher:
         # The source rehydrates payload/caller data, not attempt authority.
         # First-party hooks already preserve this fresh identity; enforce it
         # here for supported legacy hooks as well.
-        return replace(recovered, id=dispatch_signal.id, arrived_at=dispatch_signal.arrived_at)
+        return replace(recovered, id=attempt_id, arrived_at=arrived_at)
 
     @staticmethod
     def _durable_retry_seed(event) -> Signal:
@@ -5413,6 +5419,12 @@ class SignalDispatcher:
         use_live_signal, retry_delay, durable_admission, persisted_event_id, original_acceptances, routing_admission,
     ):
         """Execute the already claimed lease under its existing runtime owner."""
+        from kestrel_sovereign.signals.outcome_custody import (
+            _AcceptedSignalOutcome, _OriginalSignalOutcome, _capture_original_outcome, _native_identity_text,
+            _snapshot_signal,
+        )
+        original_seed = signal if use_live_signal else _snapshot_signal(signal)
+        original_attempt_id = _native_identity_text(original_seed.id)
 
         # A retried persistence-allowed event must execute the canonical
         # durable envelope, not whatever a duplicate provider callback happens
@@ -5421,7 +5433,7 @@ class SignalDispatcher:
         try:
             routing_signal = await self._signal_for_durable_retry(
                 delivery,
-                dispatch_signal=signal,
+                dispatch_signal=original_seed,
                 use_live_signal=use_live_signal,
             )
         except BaseException as error:
@@ -5462,9 +5474,6 @@ class SignalDispatcher:
 
         # Recovery has its own native claim, not a copied public dispatch's
         # permission. Capture the canonical retained envelope before callbacks.
-        from kestrel_sovereign.signals.outcome_custody import (
-            _AcceptedSignalOutcome, _OriginalSignalOutcome, _capture_original_outcome, _native_identity_text,
-        )
         acceptance = None
         try:
             # The immutable native claim supplies envelope identity. A public
@@ -5472,7 +5481,7 @@ class SignalDispatcher:
             # recipient or mode and then validate that substitution against
             # itself. Recheck the actual registry after the hook's await too.
             event = delivery.event
-            claimed_identity = (_native_identity_text(signal.id),
+            claimed_identity = (original_attempt_id,
                 _native_identity_text(event.source), _native_identity_text(event.target_agent),
                 SignalMode(_native_identity_text(event.mode)))
             if (_native_identity_text(delivery.agent_id) != _native_identity_text(self._agent.did)
