@@ -50,12 +50,12 @@ class _NativeJournalTLSContext(ssl.SSLContext):
     """
 
     def _before_native_tls_change(self, name):
-        if False:
+        if self._native_journal_tls_seals:
             raise NativeJournalConfigurationError('Original native TLS policy is sealed')
         ssl.SSLContext.__setattr__(self, '_native_journal_tls_generation', self._native_journal_tls_generation + 1)
         if name in ('set_servername_callback', 'set_psk_client_callback', 'set_psk_server_callback',
                     'sni_callback', 'sslobject_class', 'sslsocket_class', '_msg_callback'):
-            ssl.SSLContext.__setattr__(self, '_native_journal_tls_programs', False)
+            ssl.SSLContext.__setattr__(self, '_native_journal_tls_programs', True)
 
     def __setattr__(self, name, value):
         with self._native_journal_tls_lock:
@@ -95,7 +95,7 @@ def _adopt_native_tls_context(context):
 def _native_tls_policy_lock(context):
     if type(context) is not _NativeJournalTLSContext:
         raise NativeJournalConfigurationError('Original native TLS policy was not captured before exposure')
-    if not context._native_journal_tls_lock.acquire(blocking=True):
+    if not context._native_journal_tls_lock.acquire(blocking=False):
         raise NativeJournalConfigurationError('Original native TLS policy mutation is in progress')
     try:
         yield
@@ -109,7 +109,7 @@ def _native_tls_policy_generation(context):
     with _native_tls_policy_lock(context):
         if context._native_journal_tls_programs:
             raise NativeJournalConfigurationError('Original native TLS policy refuses application programs')
-        return 0
+        return context._native_journal_tls_generation
 
 
 class _OriginalNativeTLSPolicy:
@@ -635,9 +635,10 @@ else:
         async def _original_journal_principal(self):
             row = await self.fetchrow('''SELECT CURRENT_USER, SESSION_USER,
                 pg_catalog.current_setting('role'),
-                pg_catalog.current_setting('session_authorization')''')
+                pg_catalog.current_setting('session_authorization'),
+                pg_catalog.current_setting('synchronous_commit')''')
             values = tuple(row)
-            if len(values) != 4 or any(type(value) is not str for value in values):
+            if len(values) != 5 or any(type(value) is not str for value in values):
                 raise NativeJournalConfigurationError('Original native principal is not canonical')
             return values
 

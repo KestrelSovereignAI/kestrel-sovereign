@@ -1260,7 +1260,7 @@ class SignalDispatcher:
                 self._deferred_outcome_logs.set(None)
                 journal = self._original_outcome_admission.get()
                 selected = [outcome for outcome in original_outcomes
-                    if outcome.result is result and outcome.signal.id == signal.id
+                    if outcome.result is result and _native_identity_text(outcome.signal.id) == _native_identity_text(signal.id)
                     and outcome.registration is registration]
                 if journal is not None:
                     try:
@@ -5193,7 +5193,7 @@ class SignalDispatcher:
                     self._deferred_outcome_logs.set(None)
                     if result is not None:
                         selected = [outcome for outcome in original_outcomes
-                            if outcome.result is result and outcome.signal.id == result.signal_id
+                            if outcome.result is result and _native_identity_text(outcome.signal.id) == _native_identity_text(result.signal_id)
                             and outcome.registration is registration]
                         if journal is not None:
                             try:
@@ -5288,9 +5288,8 @@ class SignalDispatcher:
             _AcceptedSignalOutcome, _OriginalSignalOutcome, _capture_original_outcome, _native_identity_text,
         )
         acceptance = None
-        _OriginalSignalOutcome._signal_identity(routing_signal)
         try:
-            if (delivery.agent_id != self._agent.did
+            if (_native_identity_text(delivery.agent_id) != _native_identity_text(self._agent.did)
                     or _native_identity_text(delivery.consumer_id) != _native_identity_text(consumer_id)
                     or _native_identity_text(delivery.event_id) != _native_identity_text(persisted_event_id)
                     or _native_identity_text(delivery.lease_owner) != _native_identity_text(self._durable_delivery_owner)
