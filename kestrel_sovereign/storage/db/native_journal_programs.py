@@ -35,6 +35,15 @@ def _native_tls_mutator(name):
     def mutate(self, *args, **kwargs):
         with self._native_journal_tls_lock:
             self._before_native_tls_change(name)
+            # OpenSSL retains directory/default lookup methods, loading new
+            # certificates lazily even while Python configuration is sealed.
+            # Ordinary customization still runs; original journal custody
+            # must refuse this profile permanently, including partial errors.
+            if (name in ('set_default_verify_paths', 'load_default_certs')
+                    or (name == 'load_verify_locations'
+                        and ((len(args) > 1 and args[1] is not None)
+                             or kwargs.get('capath') is not None))):
+                ssl.SSLContext.__setattr__(self, '_native_journal_tls_external_trust', True)
             return getattr(ssl.SSLContext, name)(self, *args, **kwargs)
     mutate.__name__ = name
     return mutate
@@ -87,6 +96,11 @@ def _adopt_native_tls_context(context):
         ssl.SSLContext.__setattr__(context, '_native_journal_tls_generation', 0)
         ssl.SSLContext.__setattr__(context, '_native_journal_tls_seals', set())
         ssl.SSLContext.__setattr__(context, '_native_journal_tls_programs', False)
+        # Only the native driver-created context reaches an original recipe:
+        # supplied SSLContext/custom connector recipes are refused by pool
+        # capture. asyncpg initializes this context from eagerly loaded CA/CRL
+        # files, not CA directories/default lookup methods, before exposure.
+        ssl.SSLContext.__setattr__(context, '_native_journal_tls_external_trust', False)
         ssl.SSLContext.__setattr__(context, '__class__', _NativeJournalTLSContext)
     return context
 
@@ -109,6 +123,8 @@ def _native_tls_policy_generation(context):
     with _native_tls_policy_lock(context):
         if context._native_journal_tls_programs:
             raise NativeJournalConfigurationError('Original native TLS policy refuses application programs')
+        if context._native_journal_tls_external_trust:
+            raise NativeJournalConfigurationError('Original native TLS policy refuses lazy external trust lookups')
         return context._native_journal_tls_generation
 
 

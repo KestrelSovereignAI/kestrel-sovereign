@@ -945,6 +945,12 @@ processing. Concurrent in-progress policy mutation is refused, not waited on by
 the journal observer. Retirement removes its exact native seal identity without
 acquiring that observation lock, so an already-refused setter cannot strand a
 physically retired seal. Application TLS callback/class programs are unsupported.
+Lazy CA-directory and default-trust lookups are also ineligible: OpenSSL can
+load new files without a Python mutation or generation change. Native driver
+CA/CRL files are eagerly loaded; later `capath`, `set_default_verify_paths` or
+`load_default_certs` configuration permanently retires journal eligibility,
+including failed attempts. Ordinary TLS customization remains usable; only
+original-journal policy admission/reconnect is refused.
 The native SSLObject's public context association is also tracked before
 exposure. Changing it retires that session's original-journal eligibility;
 restoration cannot revive it. A finite association seal rejects replacement
@@ -975,8 +981,11 @@ terminal selection uses genuine result/producer identity; mutable envelope IDs
 are checked against the captured journal at binding, where a mismatch records
 audit loss and refuses rather than silently dropping an accepted outcome. All
 recovered identity/mode validation and acceptance construction occur inside the
-exact-token cleanup boundary before any routing task can start. Failed cleanup
-retains its original lease debt and cannot be reported as successful settlement.
+exact-token cleanup boundary before any routing task can start.
+Source, target and mode come from that immutable claimed event and must match
+the current registered source; a rehydration hook supplies payload/caller, not
+a replacement envelope identity or registration.
+Failed cleanup retains its original lease debt and cannot be reported as successful settlement.
 Ordinary cancellation while asynchronous caller rehydration is unwinding also
 releases that exact claim; withdrawal and any release failure remain observable.
 One pre-routing owner covers admission, rehydration, Hold reads, execution-phase
