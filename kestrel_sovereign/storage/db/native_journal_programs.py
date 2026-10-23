@@ -365,16 +365,23 @@ else:
         def capture(cls, connection):
             peer = connection._transport.get_extra_info('peername')
             loop = connection._loop
+            tls = connection._transport.get_extra_info('ssl_object')
+            # The original recipe may be allow/prefer even when the actual
+            # session negotiated TLS. Cancellation carries a backend secret;
+            # it must never inherit plaintext fallback from that recipe.
+            from asyncpg.connect_utils import SSLMode
+            params = connection._params._replace(
+                ssl=tls.context if tls is not None else False,
+                sslmode=SSLMode.require if tls is not None else SSLMode.disable)
             if type(peer) is tuple:
                 address = _native_tcp_endpoint(peer)
-                tls = connection._transport.get_extra_info('ssl_object')
                 name = tls.server_hostname if tls is not None else None
                 loop = _OriginalJournalConnectLoop(loop, address, name)
             elif type(peer) is str:
                 address = peer
             else:
                 raise NativeJournalConfigurationError('Original native cancellation socket is unsupported')
-            return cls(loop, address, connection._params, connection._protocol,
+            return cls(loop, address, params, connection._protocol,
                        connection._cancellations)
 
     class NativeJournalPostgresConnection(asyncpg.Connection):

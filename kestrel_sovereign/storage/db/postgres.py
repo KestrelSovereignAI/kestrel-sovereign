@@ -2285,6 +2285,32 @@ class PostgresBackend(DatabaseBackend):
         require_execution_work(self)
         return relation
 
+    @asynccontextmanager
+    async def _original_signal_outcome_checkout(self, journal):
+        # Keep the ordinary pool's slot budget. A healthy sibling can have a
+        # separately loaded SSLContext: retire it, join its native checkout,
+        # then let the canonical pool connector reuse that slot with the
+        # original context. Never equate distinct trust objects or create an
+        # out-of-pool connection. Bound churn if concurrent borrowers repeatedly
+        # return incompatible siblings before this writer reacquires a slot.
+        for _ in range(journal._postgres_pool.pool.get_max_size() + 1):
+            async with self._tracked_pool_checkout(journal._backing, admit_work=False) as owned:
+                connection, _state = owned
+                journal.require_original(self)
+                native = connection._con
+                if type(native) is NativeJournalPostgresConnection:
+                    await native._wait_original_journal_retirement()
+                    journal.require_original(self)
+                    if journal._postgres_pool.requires_tls_reconnect(native):
+                        if not native._original_journal_programs_supported():
+                            native._retire_original_journal_refusal()
+                            raise journal.write_refusal('native_programs_changed')
+                        native._retire_original_journal_refusal()
+                        continue
+                yield owned
+                return
+        raise journal.write_refusal('native_tls_pool_churn')
+
     async def _append_original_signal_outcome(self, journal):
         from kestrel_sovereign.signals.outcome_custody import _require_original_signal_outcome
         _require_original_signal_outcome(journal, self)
@@ -2301,7 +2327,7 @@ class PostgresBackend(DatabaseBackend):
         program_sealed = False
         connect_token = _ORIGINAL_POSTGRES_CONNECT.set((journal, self))
         try:
-            async with self._tracked_pool_checkout(journal._backing, admit_work=False) as (connection, state):
+            async with self._original_signal_outcome_checkout(journal) as (connection, state):
                 journal.require_original(self)
                 native = connection._con
                 try:

@@ -320,6 +320,17 @@ class _OriginalPostgresJournalPool:
                 and _native_effective_connect_configuration(connection) == self.resolved_configuration
                 and (tls.context if tls is not None else None) is self.tls_context)
 
+    def requires_tls_reconnect(self, connection):
+        """An otherwise matching sibling must redial with the admitted trust.
+
+        Separate ordinary pool sessions can have distinct loaded contexts.
+        Do not infer trust equivalence or weaken the final identity fence.
+        """
+        tls = connection._transport.get_extra_info('ssl_object')
+        return (self.tls_context is not None and tls is not None
+                and tls.context is not self.tls_context
+                and _native_effective_connect_configuration(connection) == self.resolved_configuration)
+
 
 @dataclass(frozen=True)
 class _OriginalPostgresJournalRelation:
