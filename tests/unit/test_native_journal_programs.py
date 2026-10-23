@@ -54,6 +54,22 @@ def test_original_sqlite_literal_compiler_respects_native_statement_bound():
         _original_sqlite_query('SELECT ?', ('too long',), 16)
 
 
+@pytest.mark.parametrize('encoding', ['UTF-8', 'UTF-16le', 'UTF-16be'])
+def test_original_sqlite_text_matches_native_database_encoding(encoding):
+    native = _NativeJournalSQLiteConnection(':memory:')
+    try:
+        native.execute('PRAGMA encoding="' + encoding + '"')
+        native.execute('CREATE TABLE encoding_marker(value TEXT)')
+        values = ('', 'ascii', "quote' and ?", 'α雪😀', '\0', 'α\0雪😀')
+        expected = [native.execute('SELECT ?', (value,)).fetchone() for value in values]
+        native._begin_original_journal()
+        actual = [native.execute('SELECT ?', (value,)).fetchone() for value in values]
+        native.rollback()
+        assert actual == expected, 'original SQL changed native text encoding'
+    finally:
+        native.close()
+
+
 def test_original_sqlite_parameter_free_literals_keep_quoted_placeholder_text():
     native = _NativeJournalSQLiteConnection(':memory:')
     try:

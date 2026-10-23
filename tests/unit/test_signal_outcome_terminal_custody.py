@@ -1,5 +1,6 @@
 """Original fixed native audit outlives work admission, never grants work."""
 import asyncio
+import sqlite3
 from dataclasses import dataclass
 from types import SimpleNamespace
 
@@ -7,16 +8,86 @@ import pytest
 
 from kestrel_sovereign._async_ownership import await_owned_task
 from kestrel_sovereign.execution_custody import (
-    ExecutionAuthorityError, ExecutionCustody, bind_execution_runtime,
+    ExecutionAuthorityError, ExecutionCustody, bind_execution_runtime, is_execution_control_error,
 )
 from kestrel_sovereign.signals.outcome_custody import _OriginalSignalOutcome
 from tests.unit.test_signals_dispatcher import (
     db_path as _db_path_fixture, dispatcher_components as _dispatcher_fixture, _action_reg, _signal,
 )
+from tests.unit.test_durable_signal_delivery import _channel_dispatcher, _close
 
 db_path = _db_path_fixture
 dispatcher_components = _dispatcher_fixture
 
+
+async def _close_native_counterexample_dispatch(backend, agent, dispatcher):
+    try:
+        await dispatcher.shutdown_durable_delivery()
+    except BaseException as error:
+        assert is_execution_control_error(error)
+    await _close(backend, agent)
+
+
+@pytest.mark.parametrize('encoding', ['UTF-8', 'UTF-16le', 'UTF-16be'])
+async def test_real_original_dispatch_preserves_native_database_text(tmp_path, encoding):
+    path = tmp_path / 'native-text.db'
+    with sqlite3.connect(path) as initial:
+        initial.execute('PRAGMA encoding="' + encoding + '"')
+        initial.execute('CREATE TABLE original_encoding_marker (value TEXT)')
+    backend, agent, dispatcher = await _channel_dispatcher(path, 'did:agent:native-text')
+    scope = ExecutionCustody(_OriginalWork())
+    effects = []
+    async def handler(payload):
+        effects.append('genuine handler effect')
+        scope.revoke('actual cutoff before encoded original journal')
+        return {'genuine': 'α雪\0tail'}
+    registration = _action_reg('native.database.encoding', handler=handler)
+    registration.result_summary = lambda result: 'α雪\0tail'
+    dispatcher._registry.register(registration)
+    signal = _signal('native.database.encoding')
+    try:
+        with bind_execution_runtime(SimpleNamespace(_execution_custody=scope)):
+            outcome = await await_owned_task(asyncio.create_task(dispatcher.dispatch_signal(signal)))
+        assert effects and outcome.error is None
+        assert await backend.fetch_val('SELECT result_summary FROM signal_log WHERE id=?', (signal.id,)) == 'α雪\0tail'
+    finally:
+        await _close_native_counterexample_dispatch(backend, agent, dispatcher)
+
+
+async def test_real_original_dispatch_never_compares_adapter_key_types(tmp_path):
+    backend, agent, dispatcher = await _channel_dispatcher(tmp_path / 'adapter-key.db', 'did:agent:adapter-key')
+    effects, callbacks = [], []
+    armed = False
+    class AdapterType(type):
+        def __hash__(cls):
+            return hash(str)
+        def __eq__(cls, other):
+            if armed:
+                callbacks.append('application equality after actual cutoff')
+            return False
+    class ApplicationValue(metaclass=AdapterType):
+        pass
+    before = dict(sqlite3.adapters)
+    scope = ExecutionCustody(_OriginalWork())
+    async def handler(payload):
+        nonlocal armed
+        sqlite3.register_adapter(ApplicationValue, lambda value: 'application adaptation')
+        effects.append('genuine handler effect')
+        scope.revoke('actual cutoff before adapter-key comparison')
+        armed = True
+        return {'genuine': True}
+    dispatcher._registry.register(_action_reg('native.adapter.key', handler=handler))
+    try:
+        with bind_execution_runtime(SimpleNamespace(_execution_custody=scope)):
+            outcome = await await_owned_task(asyncio.create_task(dispatcher.dispatch_signal(_signal('native.adapter.key'))))
+        assert effects and outcome.error is None
+        assert not callbacks, 'original catalog/cursor eligibility executed application adapter key equality'
+        assert await backend.fetch_val('SELECT COUNT(*) FROM signal_log') == 1
+    finally:
+        armed = False
+        sqlite3.adapters.clear()
+        sqlite3.adapters.update(before)
+        await _close_native_counterexample_dispatch(backend, agent, dispatcher)
 
 @dataclass
 class _OriginalWork:
@@ -526,6 +597,70 @@ async def test_sqlite_journal_binds_exact_native_projection_text(dispatcher_comp
     stored = await c.backend.fetch_val('SELECT '+column+' FROM signal_log WHERE id=?', (signal.id,))
     assert stored == 'genuine-projection', 'native binding substituted canonical prepared text'
     assert not adapted
+
+
+async def test_sqlite_program_seal_is_atomic_with_public_text_factory(tmp_path, monkeypatch):
+    import inspect
+    import threading
+    from kestrel_sovereign.storage.db.native_journal_programs import _NativeJournalSQLiteConnection, NativeJournalConfigurationError
+    checking, attempted, setter_done = threading.Event(), threading.Event(), threading.Event()
+    armed, callbacks, effects, refused = [], [], [], []
+    supported = _NativeJournalSQLiteConnection._original_journal_programs_supported
+    def actual_profile_checked(native):
+        allowed = supported(native)
+        if (armed and not checking.is_set() and allowed
+                and inspect.currentframe().f_back.f_code.co_name == '_begin_original_journal'):
+            checking.set()
+            assert attempted.wait(5), 'actual public setter never reached the seal window'
+            # Old unsynchronized setters finish here; a correctly synchronized
+            # setter waits until the native owner has installed its seal.
+            setter_done.wait(0.25)
+        return allowed
+    monkeypatch.setattr(_NativeJournalSQLiteConnection, '_original_journal_programs_supported', actual_profile_checked)
+    backend, agent, dispatcher = await _channel_dispatcher(tmp_path / 'text-factory-race.db', 'did:agent:text-factory-race')
+    independent = sqlite3.connect(tmp_path / 'independent-factory-effect.db', check_same_thread=False)
+    independent.execute('CREATE TABLE forbidden_effect(value INTEGER)')
+    independent.commit()
+    scope = ExecutionCustody(_OriginalWork())
+    def factory(raw):
+        callbacks.append('application text factory after cutoff')
+        independent.execute('INSERT INTO forbidden_effect VALUES(1)')
+        independent.commit()
+        return raw.decode()
+    def mutate_public_factory():
+        assert checking.wait(5), 'original journal never reached its native eligibility check'
+        attempted.set()
+        try:
+            backend._connection.text_factory = factory
+        except NativeJournalConfigurationError:
+            refused.append(True)
+        finally:
+            setter_done.set()
+    async def handler(payload):
+        effects.append('genuine handler effect')
+        scope.revoke('actual cutoff before native seal installation')
+        armed.append(True)
+        return {'genuine': True}
+    dispatcher._registry.register(_action_reg('native.text.factory.race', handler=handler))
+    mutation = asyncio.create_task(asyncio.to_thread(mutate_public_factory))
+    error = None
+    try:
+        with bind_execution_runtime(SimpleNamespace(_execution_custody=scope)):
+            try:
+                await await_owned_task(asyncio.create_task(dispatcher.dispatch_signal(_signal('native.text.factory.race'))))
+            except BaseException as caught:
+                error = caught
+        await await_owned_task(mutation)
+        assert checking.is_set() and setter_done.is_set() and effects
+        assert not callbacks, 'text factory crossed actual native eligibility/seal boundary'
+        assert independent.execute('SELECT COUNT(*) FROM forbidden_effect').fetchone() == (0,)
+        assert refused and error is None
+    finally:
+        checking.set()
+        await await_owned_task(mutation)
+        backend._connection.text_factory = str
+        await _close_native_counterexample_dispatch(backend, agent, dispatcher)
+        independent.close()
 
 
 async def test_sqlite_plain_index_name_with_placeholder_keeps_original_journal(dispatcher_components):
