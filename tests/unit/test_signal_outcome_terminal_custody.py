@@ -1,5 +1,6 @@
 """Original fixed native audit outlives work admission, never grants work."""
 import asyncio
+import contextlib
 import sqlite3
 from dataclasses import dataclass
 from types import SimpleNamespace
@@ -32,7 +33,7 @@ async def _close_native_counterexample_dispatch(backend, agent, dispatcher):
 @pytest.mark.parametrize('keep_partial_index', [False, True])
 async def test_real_original_dispatch_preserves_native_database_text(tmp_path, encoding, keep_partial_index):
     path = tmp_path / 'native-text.db'
-    with sqlite3.connect(path) as initial:
+    with contextlib.closing(sqlite3.connect(path)) as initial, initial:
         initial.execute('PRAGMA encoding="' + encoding + '"')
         initial.execute('CREATE TABLE original_encoding_marker (value TEXT)')
     backend, agent, dispatcher = await _channel_dispatcher(path, 'did:agent:native-text')
@@ -509,7 +510,7 @@ async def test_original_sqlite_refuses_deserialized_main_destination(dispatcher_
             await c.dispatcher.dispatch_signal(signal)
         except BaseException as caught:
             error = caught
-    with sqlite3.connect(db_path) as independent:
+    with contextlib.closing(sqlite3.connect(db_path)) as independent, independent:
         assert independent.execute('SELECT COUNT(*) FROM signal_log WHERE id=?', (signal.id,)).fetchone()[0] == 0
     assert is_execution_control_error(error), 'journal acknowledged an in-memory replacement instead of its actual file'
 
