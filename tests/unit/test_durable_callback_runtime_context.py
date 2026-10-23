@@ -30,6 +30,9 @@ def resident_dispatcher():
     agent._background_tasks = set()
     dispatcher = SignalDispatcher.__new__(SignalDispatcher)
     dispatcher._agent = agent
+    # This fixture exercises publisher callbacks, not native row ownership;
+    # dispatch_signal below is an explicit finite callback seam.
+    dispatcher._store = SimpleNamespace(_backend=None)
     dispatcher._durable_shutdown = False
     dispatcher._live_durable_cognition_event_ids = set()
     dispatcher._started_durable_cognition_consumers = {"channel"}
@@ -139,3 +142,28 @@ async def test_drainer_completion_rerun_uses_original_runtime_not_publisher_scop
         release.set()
         await retire(agent, dispatcher)
         loop.set_exception_handler(previous)
+
+
+@pytest.mark.asyncio
+async def test_durable_enqueue_reservation_uses_native_text_not_mutable_hash():
+    agent, dispatcher = resident_dispatcher()
+    class MutableHash(str):
+        salt = 0
+        def __hash__(self):
+            return str.__hash__(self) + self.salt
+    identity = MutableHash('original-event')
+    async def dispatch(*args, **kwargs):
+        identity.salt = 1
+    async def drain(consumer_id):
+        pass
+    dispatcher.dispatch_signal = dispatch
+    dispatcher._drain_durable_cognition_consumer = drain
+    try:
+        handle = await dispatcher.enqueue_durable_cognition(SimpleNamespace(id=identity),
+            source_event_id='telegram:update:mutable', consumer_id='channel')
+        await handle.task
+        await asyncio.sleep(0)
+        assert not dispatcher._live_durable_cognition_event_ids, 'changed application hash stranded original ingress reservation'
+        assert type(handle.signal_id) is str
+    finally:
+        await retire(agent, dispatcher)
