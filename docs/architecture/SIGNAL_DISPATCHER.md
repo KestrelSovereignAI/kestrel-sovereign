@@ -924,6 +924,10 @@ this stronger journal contract. Core adopts its neutral native connector while
 admitted: outside a journal it behaves like ordinary asyncpg connect; inside a
 journal it checks the original recipe at actual reconnect, AFTER any pool wait,
 and detaches its inputs. A pre-queue check alone cannot fence late mutations.
+This includes initial destination capture, not only terminal writing: its
+actual accepted dispatch owner and live Work are revalidated at the connector.
+Only that live admission may establish a first endpoint from its frozen plain
+recipe; terminal writing still requires the already-admitted endpoint/policy.
 The actual admitted session supplies resolved endpoint, authentication identity
 and startup defaults; later PGHOST/PGDATABASE or related environment changes
 cannot redirect a terminal reconnect. Reused sessions must match that original
