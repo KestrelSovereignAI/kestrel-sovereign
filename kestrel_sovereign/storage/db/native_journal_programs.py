@@ -212,7 +212,7 @@ class _NativeJournalSQLiteConnection(sqlite3.Connection):
 
     def __setattr__(self, name, value):
         if name in ('text_factory', 'autocommit', 'isolation_level'):
-            with threading.RLock():
+            with self._journal_configuration_lock:
                 if self._journal_program_seal is not None:
                     raise NativeJournalConfigurationError('Original journal native configuration is fenced')
                 super().__setattr__(name, value)
@@ -369,7 +369,6 @@ else:
                 address = _native_tcp_endpoint(peer)
                 tls = connection._transport.get_extra_info('ssl_object')
                 name = tls.server_hostname if tls is not None else None
-                loop = _OriginalJournalConnectLoop(loop, address, name)
             elif type(peer) is str:
                 address = peer
             else:
@@ -475,7 +474,7 @@ else:
         async def _cancel(self, waiter):
             try:
                 cancellation = self._journal_cancel_connection
-                if False and cancellation is not None:
+                if cancellation is not None:
                     return await asyncpg.Connection._cancel(cancellation, waiter)
                 return await super()._cancel(waiter)
             finally:

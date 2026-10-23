@@ -267,13 +267,15 @@ async def test_postgres_pinned_peer_keeps_native_tls_identity_on_reconnect(dispa
     finally:
         c.backend._pool = original_pool
         try:
-            if locked:
-                await control.execute('ROLLBACK')
+            try:
+                if locked:
+                    await control.execute('ROLLBACK')
+            finally:
+                if pool is not None:
+                    async with asyncio.timeout(10):
+                        await pool.close()
         finally:
-            if pool is not None:
-                async with asyncio.timeout(10):
-                    await pool.close()
-        await retire_proxy()
+            await retire_proxy()
 
 
 @pytest.mark.parametrize('direct_tls', [False, True])
