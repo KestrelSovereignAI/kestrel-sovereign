@@ -7,6 +7,7 @@ Implementation of DatabaseBackend using aiosqlite.
 import asyncio
 import logging
 import os
+import re
 import sqlite3
 import time
 import uuid
@@ -26,8 +27,10 @@ from typing import (
 )
 
 import aiosqlite
+from .native_journal_programs import _NativeJournalSQLiteConnection, NativeJournalConfigurationError
 
 from kestrel_sovereign.execution_custody import (
+    ExecutionAuthorityError,
     ExecutionCommitOutcomeError,
     _capture_host_identity_anchor_access,
     current_execution_custody,
@@ -1278,11 +1281,13 @@ class SQLiteBackend(DatabaseBackend):
                     self._cold_read_uri(),
                     uri=True,
                     timeout=_SQLITE_BUSY_TIMEOUT_S,
+                    factory=_NativeJournalSQLiteConnection,
                 )
             else:
                 self._connection = await aiosqlite.connect(
                     str(self._resolved_path) if self._resolved_path is not None else ":memory:",
                     timeout=_SQLITE_BUSY_TIMEOUT_S,
+                    factory=_NativeJournalSQLiteConnection,
                 )
 
             if self._resolved_path is not None:
@@ -1642,7 +1647,7 @@ class SQLiteBackend(DatabaseBackend):
         yield conn
     
     @asynccontextmanager
-    async def _write_guard(self) -> AsyncIterator[None]:
+    async def _write_guard(self, *, original_outcome=None) -> AsyncIterator[None]:
         """Hold the shared-connection lock for one atomic operation unit.
 
         Re-entrant only for the task that owns an open transaction: that task's
@@ -1653,7 +1658,7 @@ class SQLiteBackend(DatabaseBackend):
         """
         if self._txn_owner is not None and self._txn_owner is asyncio.current_task():
             self._require_native_transaction()
-            self._require_execution_backend()
+            self._require_write_admission(original_outcome)
             yield
             return
 
@@ -1668,7 +1673,7 @@ class SQLiteBackend(DatabaseBackend):
                 if self._cancelled_write_drain is not None:
                     continue
                 self._raise_cancelled_write_drain_error()
-                self._require_execution_backend()
+                self._require_write_admission(original_outcome)
                 yield
                 return
 
@@ -2061,8 +2066,12 @@ class SQLiteBackend(DatabaseBackend):
 
     async def _rollback_after_failure(
         self, conn: aiosqlite.Connection, *, error: BaseException | None = None,
+        original_outcome=None,
     ) -> None:
         """Rollback inline, handing off if cancellation reaches cleanup."""
+        if original_outcome is not None:
+            await self._rollback_original_signal_outcome(conn, original_outcome, error)
+            return
         if (error is not None and execution_commit_outcome(error) is not None
                 and isinstance(error.__cause__, asyncio.CancelledError)):
             # COMMIT uncertainty now has an explicit receipt instead of a raw
@@ -2094,6 +2103,53 @@ class SQLiteBackend(DatabaseBackend):
                 raise terminal
             raise
 
+    async def _rollback_original_signal_outcome(self, conn, journal, original_error):
+        """Retire this fixed unit on its original writer, under BOTH held gates.
+
+        A Task acceptance/failed wrapper cannot prove the SQLite worker crossed
+        COMMIT. This path never detaches cleanup or needs another Task to start.
+        The existing native rollback/cursor fence establishes queue completion.
+        Repeated direct cancellation is retained and cannot release the original
+        write lock/privacy hold ahead of that physical fence.
+        """
+        from kestrel_sovereign.execution_custody import (
+            execution_finite_error, execution_error_with_cause, execution_observation_error,
+            execution_native_source_error,
+        )
+        journal.require_sqlite_cleanup(self, conn)
+        started_at = time.monotonic()
+        withdrawal = interrupt_error = None
+        while True:
+            try:
+                try:
+                    await conn.interrupt()
+                except asyncio.CancelledError:
+                    raise
+                except BaseException as error:
+                    interrupt_error = execution_finite_error(interrupt_error, error,
+                        retain_originals=True, isolate_control_originals=True)
+                await self._rollback_cancelled_write(conn, started_at=started_at)
+            except asyncio.CancelledError as error:
+                withdrawal = execution_finite_error(withdrawal, error,
+                    retain_originals=True, isolate_control_originals=True)
+                continue
+            except BaseException as error:
+                cleanup_error = execution_error_with_cause(
+                    ExecutionAuthorityError('Original signal journal native cleanup failed'), error)
+                terminal = execution_finite_error(original_error, interrupt_error, cleanup_error, withdrawal,
+                    retain_originals=True, isolate_control_originals=True)
+                self._cancelled_write_drain_error = execution_native_source_error(
+                    self._cancelled_write_drain_error, terminal)
+                raise terminal
+            if interrupt_error is not None or withdrawal is not None:
+                # A completed cleanup does not erase cancellation of this
+                # writer. Canonical composition keeps its actual C as a Base
+                # carrier instead of selecting an ordinary INSERT error that
+                # best-effort audit handling would suppress.
+                raise execution_observation_error(original_error, interrupt_error, withdrawal,
+                    message='original SQLite journal cleanup withdrawal')
+            return
+
     def _execution_commit_scopes(self):
         """Every original admission whose native file write this owner holds."""
         scopes = current_execution_custody(self)
@@ -2101,13 +2157,25 @@ class SQLiteBackend(DatabaseBackend):
             scopes = (*self._identity_anchor_access.scopes, *scopes)
         return tuple(dict.fromkeys(scopes))
 
-    async def _commit_write(self, conn: aiosqlite.Connection) -> None:
+    def _require_write_admission(self, original_outcome=None):
+        if original_outcome is None:
+            self._require_execution_backend()
+        else:
+            from kestrel_sovereign.signals.outcome_custody import _require_original_signal_outcome
+            _require_original_signal_outcome(original_outcome, self)
+
+    async def _commit_write(self, conn: aiosqlite.Connection, *, original_outcome=None) -> None:
         """One native COMMIT handoff, including host/local-anchor receipts."""
         scopes = self._execution_commit_scopes()
-        self._require_execution_backend()
+        self._require_write_admission(original_outcome)
         try:
             await conn.commit()
         except BaseException as error:
+            from kestrel_sovereign.storage.db.native_journal_programs import NativeJournalDurabilityRefusal
+            if original_outcome is not None and type(error) is NativeJournalDurabilityRefusal:
+                # This exact native preflight never called COMMIT. Retain the
+                # actual writer through rollback; do not invent lost-ACK debt.
+                raise original_outcome.write_refusal('durability_changed') from error
             # aiosqlite queues COMMIT on its native worker. A lost await/ACK
             # cannot prove rollback; latch every original admission first.
             outcome = execution_commit_outcome(error) or "unknown"
@@ -2116,11 +2184,23 @@ class SQLiteBackend(DatabaseBackend):
             if execution_commit_outcome(error) is not None:
                 raise
             raise ExecutionCommitOutcomeError(outcome) from error
+        if original_outcome is not None:
+            # ONLY this actual native COMMIT-return boundary can seal the
+            # fact. A callable journal helper must not let a reentrant privacy
+            # getter manufacture it before INSERT/COMMIT.
+            original_outcome.require_sqlite_cleanup(self, conn)
+            original_outcome._sqlite_committed_connection = conn
         try:
-            self._require_execution_backend()
-            for scope in scopes:
-                scope.require_work()
+            self._require_write_admission(original_outcome)
+            if original_outcome is None:
+                for scope in scopes:
+                    scope.require_work()
         except BaseException as error:
+            if original_outcome is not None:
+                # A healthy original COMMIT followed by a finite observation
+                # refusal must not create native uncertainty on healthy scopes.
+                # Genuine native-source/cleanup failures keep their provenance.
+                raise original_outcome.retain_committed(error)
             outcome = execution_commit_outcome(error) or "committed"
             for scope in scopes:
                 scope.preserve_commit_uncertainty(outcome)
@@ -2134,28 +2214,212 @@ class SQLiteBackend(DatabaseBackend):
             reject_transaction_control(query, dialect="sqlite")
         record_write_query(query)
         conn = self._ensure_connected()
-        async with self._write_guard():
+        return await self._execute_write_operation(conn, query, params)
+
+    async def _read_original_signal_outcome_relation(self, journal, *, capture=False):
+        from kestrel_sovereign.signals.outcome_custody import _OriginalSignalOutcome, _JOURNAL_ADMISSION
+        from kestrel_sovereign.signals.store import _OUTCOME_COLUMNS
+        from kestrel_sovereign.storage.db.native_journal_programs import (
+            _original_sqlite_query, _original_sqlite_scalar_adapters_registered,
+        )
+        if type(capture) is not bool or type(journal) is not _OriginalSignalOutcome:
+            raise ExecutionAuthorityError('Original SQLite journal metadata owner required')
+        def require_owner():
+            if capture:
+                if (journal._admission_key is not _JOURNAL_ADMISSION or journal._backend is not self
+                        or journal._phase != 'accepted' or journal._acceptance.owner is not asyncio.current_task()
+                        or journal._dispatcher._accepted_signal_outcomes.get(journal._acceptance) is not journal):
+                    raise ExecutionAuthorityError('Original SQLite acceptance metadata owner differs')
+                self._require_write_admission()
+                journal._require_backing()
+            else:
+                journal.require_original(self)
+                journal.require_sqlite_cleanup(self, journal._backing)
+        require_owner()
+        conn = journal._backing
+        def native_relation():
+            native = conn._conn
+            if type(native) is not _NativeJournalSQLiteConnection:
+                return None
+            admission_seal = None
+            if capture:
+                admission_seal = native._seal_original_journal_programs()
+            elif not native._original_journal_programs_supported():
+                return None
+            cursor = None
+            snapshot = False
+            try:
+                # The admission seal has no transaction configuration tuple
+                # yet. Fixed metadata SQL uses a base cursor, just like the
+                # native durability reader, with no application factory/binds.
+                cursor = sqlite3.Connection.cursor(native, factory=sqlite3.Cursor)
+                cursor.row_factory = None
+                if not native.in_transaction:
+                    cursor.execute('SAVEPOINT kestrel_original_outcome_catalog')
+                    snapshot = True
+                if _original_sqlite_scalar_adapters_registered():
+                    return None
+                cursor.execute('PRAGMA main.schema_version')
+                version = cursor.fetchone()[0]
+                cursor.execute("SELECT rowid,rootpage,sql FROM main.sqlite_schema WHERE type='table' AND name='signal_log' COLLATE NOCASE")
+                row = cursor.fetchone()
+                if row is None or row[1] <= 0:
+                    return None
+                if re.search(r'\b(?:CHECK|COLLATE|REFERENCES|FOREIGN|CONFLICT|AUTOINCREMENT)\b', row[2], re.IGNORECASE):
+                    return None
+                cursor.execute("SELECT 1 FROM main.sqlite_schema WHERE type='trigger' AND tbl_name='signal_log' COLLATE NOCASE UNION ALL SELECT 1 FROM temp.sqlite_schema WHERE type='trigger' AND tbl_name='signal_log' COLLATE NOCASE LIMIT 1")
+                if cursor.fetchone() is not None:
+                    return None
+                cursor.execute("PRAGMA main.table_xinfo('signal_log')")
+                columns = tuple(cursor.fetchall())
+                if {column[1] for column in columns} != set(_OUTCOME_COLUMNS) or any(column[6] for column in columns):
+                    return None
+                if any(column[2].upper() != ('INTEGER' if column[1] == 'duration_ms' else 'TEXT') for column in columns):
+                    return None
+                cursor.execute("PRAGMA main.index_list('signal_log')")
+                indexes = cursor.fetchall()
+                for index in indexes:
+                    quoted = '"' + index[1].replace('"', '""') + '"'
+                    cursor.execute('PRAGMA main.index_xinfo(' + quoted + ')')
+                    if any(item[5] and (item[1] < 0 or item[4] != 'BINARY') for item in cursor.fetchall()):
+                        return None
+                    if index[4]:
+                        cursor.execute(_original_sqlite_query(
+                            "SELECT sql FROM main.sqlite_schema WHERE type='index' AND name=?", (index[1],),
+                            sqlite3.Connection.getlimit(native, sqlite3.SQLITE_LIMIT_SQL_LENGTH),
+                            database_encoding=native._original_journal_configuration()[-2]))
+                        sql = cursor.fetchone()[0]
+                        if not re.fullmatch(r'CREATE\s+INDEX(?:\s+IF\s+NOT\s+EXISTS)?\s+idx_signal_log_constitution_hash\s+ON\s+signal_log\s*\(\s*constitution_hash\s*\)\s+WHERE\s+constitution_hash\s+IS\s+NOT\s+NULL\s*', sql, re.IGNORECASE):
+                            return None
+                return (version, *row, columns, native._original_journal_configuration())
+            finally:
+                try:
+                    if snapshot:
+                        cursor.execute('ROLLBACK TO kestrel_original_outcome_catalog')
+                        cursor.execute('RELEASE kestrel_original_outcome_catalog')
+                finally:
+                    try:
+                        if cursor is not None:
+                            cursor.close()
+                    finally:
+                        if admission_seal is not None:
+                            with native._journal_configuration_lock:
+                                if native._journal_program_seal is admission_seal:
+                                    native._journal_program_seal = None
+        if capture:
+            async with self._write_guard():
+                result = await conn._execute(native_relation)
+        else:
+            result = await conn._execute(native_relation)
+        require_owner()
+        return result
+
+    async def _verify_original_signal_outcome(self, conn, journal):
+        journal.require_original(self)
+        journal.require_sqlite_cleanup(self, conn)
+        def exact_native_row():
+            # One atomic native worker operation, with no application row
+            # factory and no cursor left pending when it returns or raises.
+            cursor = conn._conn.cursor()
+            cursor.row_factory = None
+            try:
+                cursor.execute(journal._match_query, journal._entry.values)
+                return cursor.fetchmany(2) == [(1,)]
+            finally:
+                cursor.close()
+        matches = await conn._execute(exact_native_row)
+        journal.require_original(self)
+        if not matches:
+            raise journal.write_refusal('row_missing_or_changed')
+        if await self._read_original_signal_outcome_relation(journal) != journal._sqlite_relation:
+            raise journal.write_refusal('destination_changed')
+
+    async def _execute_write_operation(self, conn, query, params, *, original_outcome=None):
+        if original_outcome is not None:
+            self._require_write_admission(original_outcome)
+            if (query is not original_outcome._query
+                    or params is not original_outcome._entry.values):
+                raise ExecutionAuthorityError('Original native signal journal SQL differs')
+            original_outcome.require_sqlite_cleanup(self, conn)
+        guard = self._write_guard() if original_outcome is None else self._write_guard(original_outcome=original_outcome)
+        async with guard:
             with self._write_operation():
                 try:
+                    if original_outcome is not None:
+                        # Exclude external DDL before inspecting the original
+                        # relation and BEFORE a trigger program could execute.
+                        await conn._execute(conn._conn._begin_original_journal)
+                        self._require_write_admission(original_outcome)
+                        observed = await self._read_original_signal_outcome_relation(original_outcome)
+                        accepted = original_outcome._sqlite_relation
+                        if observed != accepted:
+                            if (observed is None or observed[:-1] != accepted[:-1]
+                                    or observed[-1][:-1] != accepted[-1][:-1]):
+                                raise original_outcome.write_refusal('destination_changed')
+                            # Only the engine's external-commit generation
+                            # changed. A still-live ORIGINAL writer may make a
+                            # fresh ordinary admission on this exact locked
+                            # relation. Revocation never borrows that privilege.
+                            original_outcome._observer_depth += 1
+                            try:
+                                self._require_execution_backend()
+                            except BaseException as denial:
+                                from kestrel_sovereign.execution_custody import is_scope_local_execution_control, _FINITE_NATIVE_SOURCES
+                                if is_scope_local_execution_control(denial, original_outcome._backend_work_scopes):
+                                    # This producer performed the actual work
+                                    # check. Its original invocation cutoff is
+                                    # not a failed native storage source. Never
+                                    # localize UNKNOWN, foreign scope or debt.
+                                    finite = BaseExceptionGroup('original writer live admission refused', [denial])
+                                    finite._kestrel_finite_native_sources = (_FINITE_NATIVE_SOURCES, ())
+                                    denial = finite
+                                raise original_outcome.write_refusal('external_generation_changed', denial)
+                            finally:
+                                original_outcome._observer_depth -= 1
+                            original_outcome._sqlite_relation = observed
                     cursor = await conn.execute(query, params)
-                    self._require_execution_backend()
+                    self._require_write_admission(original_outcome)
+                    if original_outcome is not None:
+                        if cursor.rowcount != 1:
+                            raise original_outcome.write_refusal('row_count')
+                        await self._verify_original_signal_outcome(conn, original_outcome)
                     if not self._in_transaction:
-                        await self._commit_write(conn)
+                        if original_outcome is None:
+                            await self._commit_write(conn)
+                        else:
+                            await self._commit_write(conn, original_outcome=original_outcome)
                     return cursor.rowcount
                 except asyncio.CancelledError as error:
                     if not self._in_transaction:
-                        self._handoff_cancelled_write(conn, error=error)
+                        if original_outcome is None:
+                            self._handoff_cancelled_write(conn, error=error)
+                        else:
+                            await self._rollback_original_signal_outcome(conn, original_outcome, error)
                     raise
+
                 except Exception as e:
                     if not self._in_transaction:
-                        await self._rollback_after_failure(conn, error=e)
+                        await self._rollback_after_failure(conn, error=e, original_outcome=original_outcome)
+                    if original_outcome is not None and type(e) is NativeJournalConfigurationError:
+                        raise original_outcome.write_refusal('native_programs_changed') from e
                     if is_execution_control_error(e):
                         raise
                     raise QueryError(f"Query failed: {e}\nQuery: {query}") from e
                 except BaseException as error:
                     if not self._in_transaction:
-                        await self._rollback_after_failure(conn, error=error)
+                        await self._rollback_after_failure(conn, error=error, original_outcome=original_outcome)
                     raise
+
+    async def _append_original_signal_outcome(self, journal):
+        from kestrel_sovereign.signals.outcome_custody import _require_original_signal_outcome
+        _require_original_signal_outcome(journal, self)
+        if self.owns_open_transaction:
+            raise ExecutionAuthorityError('Original signal journal refuses an enclosing transaction')
+        entry = journal.begin(self)
+        await self._execute_write_operation(self._connection,
+            journal._query, entry.values, original_outcome=journal)
+        journal.acknowledged(self)
+        return entry.result_summary
 
     async def execute_many(self, query: str, params_list: List[Params]) -> int:
         """Execute query with multiple parameter sets."""

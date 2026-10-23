@@ -286,8 +286,10 @@ async def test_published_source_callback_is_new_runtime_ingress_not_retired_boot
 @pytest.mark.asyncio
 @pytest.mark.parametrize("cancel", [False, True])
 async def test_control_terminalizer_failure_or_cancel_retains_exact_cleanup_debt(cancel, monkeypatch):
+    import contextvars
     from kestrel_sovereign.signals.dispatcher import SignalDispatcher
     dispatcher = SignalDispatcher.__new__(SignalDispatcher)
+    dispatcher._cognition_claim_settlement = contextvars.ContextVar('test_claim_settlement', default=None)
     dispatcher._retained_cognition_control_debt = {}
     dispatcher._retained_durable_cognition_tasks = set()
     dispatcher._retained_durable_cognition_cleanup_tasks = set()

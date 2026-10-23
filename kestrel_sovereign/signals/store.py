@@ -21,7 +21,8 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
-from dataclasses import asdict
+from copy import deepcopy
+from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
@@ -103,6 +104,49 @@ def _truncate_to_bytes(text: str, max_bytes: int) -> str:
         )
     truncated_body = encoded[:body_budget].decode("utf-8", errors="ignore")
     return truncated_body + _TRUNCATION_SUFFIX
+
+
+_OUTCOME_COLUMNS = (
+    'id', 'source', 'kind', 'mode', 'urgency', 'dedupe_key',
+    'target_agent', 'session_id', 'caller_redacted', 'visibility',
+    'dispatched_at', 'completed_at', 'status', 'duration_ms',
+    'turn_id', 'artifact_digest', 'action_result_digest',
+    'payload_digest', 'payload_redacted', 'payload_raw', 'result_summary',
+    'causation_chain_digest', 'error', 'retention_until',
+    'constitution_hash', 'doctrine_bundle_hash', 'echo_canary_status',
+    'injected_clauses_json', 'dropped_clauses_json', 'prompt_template_hash',
+)
+
+
+@dataclass(frozen=True, slots=True)
+class _PreparedSignalOutcome:
+    """Immutable native row data, not SQL authority or a storage executor."""
+
+    values: tuple
+    result_summary: Optional[str]
+
+    def as_native(self):
+        from kestrel_sovereign.storage.db.timestamp import TimestamptzParameter
+        # SQL parameters are native data, never application adaptation hooks.
+        # A str subclass's __conform__ must not substitute the same different
+        # value in both INSERT and the later exact-row verification.
+        def native(value):
+            ancestry = type.__getattribute__(type(value), '__mro__')
+            if any(base is str for base in ancestry):
+                return str.__str__(value)
+            if any(base is int for base in ancestry):
+                return int.__int__(value)
+            if any(base is float for base in ancestry):
+                return float.__float__(value)
+            if any(base is bytes for base in ancestry):
+                return bytes.__bytes__(value)
+            if value is None or type(value) is datetime:
+                return value
+            if type(value) is TimestamptzParameter and type(value.value) is datetime:
+                return value
+            raise TypeError('Signal journal requires native scalar row data')
+        return _PreparedSignalOutcome(tuple(native(value) for value in self.values),
+                                      native(self.result_summary))
 
 
 class SignalLogStore(UnifiedStoreBase):
@@ -234,6 +278,63 @@ class SignalLogStore(UnifiedStoreBase):
     # ------------------------------------------------------------------
 
     async def append(
+        self, signal: Signal, registration: SourceRegistration, result: SignalResult, *,
+        constitution_hash: Optional[str] = None,
+        doctrine_bundle_hash: Optional[str] = None,
+        echo_canary_status: Optional[str] = None,
+        injected_clauses: Optional[list[str]] = None,
+        dropped_clauses: Optional[list[str]] = None,
+        prompt_template_hash: Optional[str] = None,
+    ) -> Optional[str]:
+        """Ordinary append retains its original work-admission semantics."""
+        prepared = self._prepare_outcome(signal, registration, result,
+            constitution_hash=constitution_hash, doctrine_bundle_hash=doctrine_bundle_hash,
+            echo_canary_status=echo_canary_status, injected_clauses=injected_clauses,
+            dropped_clauses=dropped_clauses, prompt_template_hash=prompt_template_hash)
+        await self._backend.execute(self._outcome_insert_query(self.TABLE), prepared.values)
+        return prepared.result_summary
+
+    async def _append_original_outcome(self, journal) -> Optional[str]:
+        from kestrel_sovereign.signals.outcome_custody import _require_original_signal_outcome
+        _require_original_signal_outcome(journal, self._backend)
+        if journal._store is not self:
+            from kestrel_sovereign.execution_custody import ExecutionAuthorityError
+            raise ExecutionAuthorityError('Original native signal journal store differs')
+        from kestrel_sovereign.storage.privacy_wrapper import (
+            DurablePersistenceGate, _OriginalJournalGateBusy, optional_durable_persistence_gate,
+        )
+        # Reuse the SAME original privacy gate, never reacquire a new policy
+        # or a work admission. A queued transition wins before this shared
+        # hold, or waits through original COMMIT/reset. Recheck under the hold.
+        gate = journal._privacy_gate
+        if gate is not None and type(gate) is not DurablePersistenceGate:
+            raise journal.privacy_refusal('unsupported_gate')
+        protection = (gate._original_journal(journal._privacy_exclusive_hold)
+            if gate is not None else optional_durable_persistence_gate(None))
+        try:
+            async with protection:
+                _require_original_signal_outcome(journal, self._backend)
+                return await self._backend._append_original_signal_outcome(journal)
+        except _OriginalJournalGateBusy as error:
+            raise journal.privacy_refusal('busy', error)
+
+    @staticmethod
+    def _outcome_insert_query(table: str = 'signal_log') -> str:
+        # Only ordinary append supplies its supported TABLE override. Native
+        # custody captures the fixed default statement before handler execution.
+        return (f"INSERT INTO {table} ({', '.join(_OUTCOME_COLUMNS)}) "
+                f"VALUES ({', '.join('?' for _ in _OUTCOME_COLUMNS)})")
+
+    @staticmethod
+    def _outcome_match_query(table: str, *, postgres: bool) -> str:
+        # Only the original native journal uses this fixed, bounded proof.
+        # SQL-side null-safe comparison also handles native JSONB normalization.
+        operator = 'IS NOT DISTINCT FROM' if postgres else 'IS'
+        predicates = ' AND '.join(f'{column} {operator} ?' for column in _OUTCOME_COLUMNS)
+        physical = f'ONLY {table}' if postgres else table
+        return f'SELECT 1 FROM {physical} WHERE {predicates} LIMIT 2'
+
+    def _prepare_outcome(
         self,
         signal: Signal,
         registration: SourceRegistration,
@@ -245,8 +346,11 @@ class SignalLogStore(UnifiedStoreBase):
         injected_clauses: Optional[list[str]] = None,
         dropped_clauses: Optional[list[str]] = None,
         prompt_template_hash: Optional[str] = None,
-    ) -> Optional[str]:
-        """Persist a dispatch outcome. Payload redaction runs HERE
+        original_native: bool = False,
+    ) -> _PreparedSignalOutcome:
+        """Prepare immutable native row DATA without granting storage authority.
+
+        Payload redaction runs HERE
         (the dispatcher does not see the redacted form before this
         call); per-source result UI summarization also runs here so
         the bounded body is stored AND returned for the SSE payload.
@@ -286,8 +390,11 @@ class SignalLogStore(UnifiedStoreBase):
         # args. Raw UNTRUSTED stays in memory until this point and
         # never touches the wire if the policy is honest.
         try:
-            payload_redacted = policy.summarize(signal.payload)
+            payload_redacted = policy.summarize(deepcopy(signal.payload) if original_native else signal.payload)
         except Exception as e:
+            from kestrel_sovereign.execution_custody import is_execution_control_error, execution_commit_outcome
+            if is_execution_control_error(e) or execution_commit_outcome(e) is not None:
+                raise
             logger.exception(
                 "RedactionPolicy.summarize raised for source '%s'; "
                 "storing only digest. Fix the policy.",
@@ -309,8 +416,11 @@ class SignalLogStore(UnifiedStoreBase):
         )
         if registration.result_summary is not None and result_body is not None:
             try:
-                summary = registration.result_summary(result_body)
+                summary = registration.result_summary(deepcopy(result_body) if original_native else result_body)
             except Exception as e:
+                from kestrel_sovereign.execution_custody import is_execution_control_error, execution_commit_outcome
+                if is_execution_control_error(e) or execution_commit_outcome(e) is not None:
+                    raise
                 logger.exception(
                     "result_summary callback raised for source '%s'; "
                     "result_summary will be a placeholder. Fix the callback.",
@@ -319,6 +429,8 @@ class SignalLogStore(UnifiedStoreBase):
                 summary = f"<result_summary failed: {type(e).__name__}>"
             if not isinstance(summary, str):
                 summary = str(summary) if summary is not None else ""
+            if original_native:
+                summary = str.__str__(summary)
             result_summary = _truncate_to_bytes(
                 summary, MAX_RESULT_SUMMARY_BYTES
             )
@@ -359,22 +471,8 @@ class SignalLogStore(UnifiedStoreBase):
             json.dumps(dropped_clauses) if dropped_clauses is not None else None
         )
 
-        await self._backend.execute(
-            f"""
-            INSERT INTO {self.TABLE} (
-                id, source, kind, mode, urgency, dedupe_key,
-                target_agent, session_id, caller_redacted, visibility,
-                dispatched_at, completed_at, status, duration_ms,
-                turn_id, artifact_digest, action_result_digest,
-                payload_digest, payload_redacted, payload_raw,
-                result_summary,
-                causation_chain_digest, error, retention_until,
-                constitution_hash, doctrine_bundle_hash, echo_canary_status,
-                injected_clauses_json, dropped_clauses_json,
-                prompt_template_hash
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
+        prepared = _PreparedSignalOutcome(
+            values=(
                 signal.id,
                 signal.source,
                 signal.kind,
@@ -406,9 +504,12 @@ class SignalLogStore(UnifiedStoreBase):
                 dropped_clauses_json,
                 prompt_template_hash,
             ),
+            result_summary=result_summary,
         )
-
-        return result_summary
+        # This is a data-format choice, not authority: only journal.bind can
+        # admit the exact row to an original native transaction. Ordinary
+        # unsealed append retains its supported native adapter semantics.
+        return prepared.as_native() if original_native else prepared
 
     # ------------------------------------------------------------------
     # Retention sweep

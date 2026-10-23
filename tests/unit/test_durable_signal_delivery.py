@@ -264,6 +264,86 @@ async def _channel_dispatcher(path, did: str, *, rate_limit: RateLimit | None = 
     return backend, agent, dispatcher
 
 
+@pytest.mark.parametrize('ordinary_cleanup_failure', [False, True, 'bad_mode', 'changed_did'])
+async def test_recovery_journal_admission_failure_settles_original_delivery_lease(tmp_path, monkeypatch, ordinary_cleanup_failure):
+    from kestrel_sovereign._async_ownership import await_owned_task
+    from kestrel_sovereign.execution_custody import is_execution_control_error
+    path = tmp_path / 'actual-recovery-journal-admission.db'
+    backend, agent, dispatcher = await _channel_dispatcher(path, 'did:agent:journal-admission')
+    consumer = DurableConsumerRegistration(
+        consumer_id=DURABLE_COGNITION_CONSUMER_ID, source='channel.message', agent_id=agent.did,
+        correlation_selector=f'payload.{DURABLE_COGNITION_MARKER}={DURABLE_COGNITION_MARKER_VALUE}', max_attempts=0)
+    async def leave_retry(prompt):
+        raise OSError('actual original route failed before restart')
+    agent.process_input = leave_retry
+    try:
+        await dispatcher.register_durable_consumer(consumer)
+        handle = await dispatcher.enqueue_durable_cognition(_channel_signal(agent.did, 'admission-recovery'),
+            source_event_id='actual-journal-admission-recovery', consumer_id=consumer.consumer_id)
+        assert (await handle.wait()).status is Status.FAILED
+        assert (await dispatcher.list_durable_deliveries())[0].status == RETRY
+    finally:
+        await dispatcher.shutdown_durable_delivery()
+        await _close(backend, agent)
+    # Wait for the actual one-second retry deadline; never rewrite leases or
+    # clocks to manufacture a recoverable row.
+    await asyncio.sleep(1.1)
+    backend, agent, dispatcher = await _channel_dispatcher(path, 'did:agent:journal-admission')
+    calls = []
+    async def must_not_start(prompt):
+        calls.append(prompt)
+        return 'must not start before native audit admission'
+    agent.process_input = must_not_start
+    try:
+        await dispatcher.register_durable_consumer(consumer)
+        if ordinary_cleanup_failure:
+            recover = dispatcher._signal_for_durable_retry
+            class EqualIdentity(str):
+                __hash__ = str.__hash__
+                def __eq__(self, other):
+                    return True
+                def __ne__(self, other):
+                    return False
+            async def unsupported_recovery(*args, **kwargs):
+                recovered = await recover(*args, **kwargs)
+                if ordinary_cleanup_failure == 'bad_mode':
+                    recovered.mode = 'cognition'
+                elif ordinary_cleanup_failure == 'changed_did':
+                    agent._did = EqualIdentity('did:agent:different-runtime')
+                else:
+                    recovered.payload['unsupported'] = object()
+                return recovered
+            monkeypatch.setattr(dispatcher, '_signal_for_durable_retry', unsupported_recovery)
+            if ordinary_cleanup_failure is True:
+                await backend.execute("CREATE TRIGGER refuse_actual_release BEFORE UPDATE ON durable_signal_deliveries WHEN OLD.status='leased' AND NEW.status!='leased' BEGIN SELECT RAISE(ABORT, 'actual release refused'); END")
+        else:
+            await backend.execute('CREATE TRIGGER unsupported_recovery_audit AFTER INSERT ON signal_log BEGIN SELECT 1; END')
+        result = await await_owned_task(asyncio.create_task(dispatcher._drain_durable_cognition_consumer(consumer.consumer_id)))
+        if ordinary_cleanup_failure is True:
+            from kestrel_sovereign.execution_custody import _explicit_control_chain
+            errors = tuple(_explicit_control_chain(result.error))
+            assert any(isinstance(error, TypeError) for error in errors)
+            assert any('actual release refused' in str(error) for error in errors), 'admission cleanup hid actual native release failure'
+            assert not calls and not dispatcher._accepted_signal_outcomes
+            await backend.execute('DROP TRIGGER refuse_actual_release')
+            return
+        assert is_execution_control_error(result.error)
+        if ordinary_cleanup_failure == 'changed_did':
+            assert not calls, 'foreign native DID was admitted through application equality'
+            assert dispatcher._retained_cognition_control_debt, 'failed original-identity cleanup lost its exact lease debt'
+            return
+        (delivery,) = await dispatcher.list_durable_deliveries()
+        assert delivery.attempts == 2 and not calls
+        assert delivery.status == FAILED, 'journal admission failure stranded the original claimed delivery'
+        assert delivery.lease_token is None and delivery.lease_owner is None
+        assert delivery.is_terminal and delivery.acknowledged_at is None
+        assert not dispatcher._accepted_signal_outcomes
+    finally:
+        agent._did = 'did:agent:journal-admission'
+        await await_owned_task(asyncio.create_task(dispatcher.shutdown_durable_delivery()))
+        await _close(backend, agent)
+
+
 async def _a2a_submitted_dispatcher(path, did: str):
     from kestrel_sovereign.signals.sources.a2a_task_submitted import (
         build_a2a_task_submitted_registration,
@@ -284,6 +364,329 @@ async def _a2a_submitted_dispatcher(path, did: str):
     )
     await dispatcher.initialize_durable_delivery()
     return backend, agent, dispatcher
+
+
+@pytest.mark.parametrize('public_handle', [False, True])
+@pytest.mark.parametrize('release_failure', [False, True])
+@pytest.mark.parametrize('phase', ['rehydrate', 'grouped_rehydrate', 'hold', 'begin', 'guard', 'begin_failure'])
+async def test_cancelled_async_rehydration_releases_its_original_claim(tmp_path, monkeypatch, public_handle, release_failure, phase):
+    await _assert_pre_route_claim(tmp_path, monkeypatch, public_handle, release_failure, phase)
+
+
+@pytest.mark.parametrize('release_failure', [False, True])
+async def test_recovered_first_hold_read_owns_original_claim(tmp_path, monkeypatch, release_failure):
+    await _assert_pre_route_claim(tmp_path, monkeypatch, False, release_failure, 'initial_hold')
+
+
+@pytest.mark.parametrize('release_failure', [False, True])
+@pytest.mark.parametrize('published_before_refusal', [False, True])
+async def test_failed_route_task_publication_owns_original_claim(tmp_path, monkeypatch, release_failure, published_before_refusal):
+    await _assert_pre_route_claim(tmp_path, monkeypatch, False, release_failure,
+                                  'publication_after' if published_before_refusal else 'publication_before')
+
+
+@pytest.mark.parametrize('public_handle', [False, True])
+async def test_route_publication_join_keeps_actual_caller_withdrawal(tmp_path, monkeypatch, public_handle):
+    await _assert_pre_route_claim(tmp_path, monkeypatch, public_handle, False, 'publication_cancel')
+
+
+@pytest.mark.parametrize('public_handle', [False, True])
+async def test_route_cancelled_publication_keeps_its_original_join_failure(tmp_path, monkeypatch, public_handle):
+    await _assert_pre_route_claim(tmp_path, monkeypatch, public_handle, False, 'publication_cancel_source')
+
+
+@pytest.mark.parametrize('public_handle', [False, True])
+async def test_release_terminalization_keeps_caller_withdrawal_after_real_failed_cas(tmp_path, monkeypatch, public_handle):
+    await _assert_pre_route_claim(tmp_path, monkeypatch, public_handle, True, 'terminal_cancel')
+
+
+async def test_ack_lock_withdrawal_keeps_completed_route_claim_owned(tmp_path, monkeypatch):
+    from kestrel_sovereign._async_ownership import await_owned_task
+    backend, agent, dispatcher = await _channel_dispatcher(tmp_path / 'original-ack-lock.db', 'did:agent:ack-lock')
+    consumer = DurableConsumerRegistration(consumer_id=DURABLE_COGNITION_CONSUMER_ID,
+        source='channel.message', agent_id=agent.did, max_attempts=0)
+    blocker_ready, release, ack_entered, ack_withdrawn = (asyncio.Event() for _ in range(4))
+    blockers, effects = [], []
+    handle = None
+    async def hold_actual_transaction():
+        async with backend.transaction():
+            await backend.execute('INSERT INTO original_ack_blocker VALUES (1)')
+            blocker_ready.set()
+            await release.wait()
+    async def effect(prompt):
+        effects.append(prompt)
+        blockers.append(asyncio.create_task(hold_actual_transaction()))
+        await blocker_ready.wait()
+        return 'genuine completed cognition'
+    agent.process_input = effect
+    original_ack = dispatcher.ack_durable_delivery
+    async def observe_ack(*args, **kwargs):
+        ack_entered.set()
+        try:
+            return await original_ack(*args, **kwargs)
+        except asyncio.CancelledError:
+            ack_withdrawn.set()
+            raise
+    monkeypatch.setattr(dispatcher, 'ack_durable_delivery', observe_ack)
+    try:
+        await backend.execute('CREATE TABLE original_ack_blocker (value INTEGER)')
+        await dispatcher.register_durable_consumer(consumer)
+        handle = await dispatcher.enqueue_durable_cognition(_channel_signal(agent.did, 'original-ack-lock'),
+            source_event_id='original-ack-lock', consumer_id=consumer.consumer_id)
+        await asyncio.wait_for(ack_entered.wait(), 5)
+        assert effects and blockers and not blockers[0].done()
+        handle.task.cancel('actual withdrawal before original ACK obtains native write lock')
+        await asyncio.wait_for(ack_withdrawn.wait(), 5)
+        release.set()
+        for blocker in blockers:
+            assert (await await_owned_task(blocker)).error is None
+        outcome = await await_owned_task(handle.task)
+        assert outcome.error is not None
+        delivery, = await dispatcher.list_durable_deliveries()
+        assert delivery.status == RETRY and delivery.lease_expires_at is None, 'completed routing Task was mistaken for a claim settlement owner during ACK withdrawal'
+    finally:
+        release.set()
+        for blocker in blockers:
+            await await_owned_task(blocker)
+        if handle is not None:
+            await await_owned_task(handle.task)
+        await dispatcher.shutdown_durable_delivery()
+        await _close(backend, agent)
+
+
+async def test_rehydration_release_denial_retains_exact_claim_debt(tmp_path, monkeypatch):
+    await _assert_pre_route_claim(tmp_path, monkeypatch, False, False, 'revoked_rehydrate')
+
+
+async def test_cancelled_unstarted_public_resident_settles_original_claim(tmp_path):
+    from kestrel_sovereign._async_ownership import await_owned_task
+    from tests.unit.test_host_context_native_cleanup import _actual_operation
+    backend, agent, dispatcher = await _channel_dispatcher(tmp_path / 'unstarted-resident.db', 'did:agent:unstarted-resident')
+    consumer = DurableConsumerRegistration(consumer_id=DURABLE_COGNITION_CONSUMER_ID,
+        source='channel.message', agent_id=agent.did, max_attempts=0)
+    loop = asyncio.get_running_loop()
+    previous = loop.get_task_factory()
+    accepted, effects = [], []
+    handle = None
+    async def effect(prompt):
+        effects.append(prompt)
+        return 'genuine effect'
+    agent.process_input = effect
+    def factory(loop, coroutine, **kwargs):
+        operation = _actual_operation(coroutine)
+        task = previous(loop, coroutine, **kwargs) if previous else asyncio.Task(coroutine, loop=loop, **kwargs)
+        if getattr(getattr(operation, 'cr_code', None), 'co_name', '') == 'resident_delivery':
+            accepted.append(task)
+            task.cancel('actual lifecycle withdrawal before resident startup')
+        return task
+    try:
+        await dispatcher.register_durable_consumer(consumer)
+        loop.set_task_factory(factory)
+        handle = await dispatcher.enqueue_durable_cognition(_channel_signal(agent.did, 'unstarted-resident'),
+            source_event_id='original-unstarted-resident', consumer_id=consumer.consumer_id)
+        outcome = await await_owned_task(handle.task)
+        assert accepted and all(task.done() for task in accepted) and not effects
+        assert outcome.error is not None
+        delivery, = await dispatcher.list_durable_deliveries()
+        assert delivery.status == RETRY and delivery.lease_expires_at is None, 'unstarted accepted resident abandoned its actual native claim'
+    finally:
+        loop.set_task_factory(previous)
+        if handle is not None:
+            await await_owned_task(handle.task)
+        await dispatcher.shutdown_durable_delivery()
+        await _close(backend, agent)
+
+
+async def _assert_pre_route_claim(tmp_path, monkeypatch, public_handle, release_failure, phase):
+    import time
+    from kestrel_sovereign._async_ownership import await_owned_task
+    from kestrel_sovereign.execution_custody import _explicit_control_chain
+    from kestrel_sovereign.privacy import get_privacy_preset
+    backend, agent, dispatcher = await _channel_dispatcher(tmp_path / 'cancelled-rehydrate.db', 'did:agent:rehydration')
+    source = 'test.async-rehydration' if public_handle else 'channel.message'
+    agent.privacy_config = get_privacy_preset('normal' if public_handle else 'ephemeral')
+    agent.durable_rehydratable_sources = frozenset({source})
+    if public_handle:
+        # A privacy-elided channel redelivery must use its MAC-verified live
+        # envelope, not a recovery hook. Exercise the supported generic source
+        # hook through a REAL public handle rather than bypassing that policy.
+        dispatcher._registry.register(replace(build_channel_message_registration(), name=source))
+    consumer = DurableConsumerRegistration(consumer_id='test.rehydration-cognition' if public_handle else DURABLE_COGNITION_CONSUMER_ID,
+        source=source, agent_id=agent.did, max_attempts=0)
+    entered, release = asyncio.Event(), asyncio.Event()
+    task = None
+    accepted = []
+    publication_error = (asyncio.CancelledError('actual publication-source cancellation')
+                         if phase == 'publication_cancel_source' else
+                         RuntimeError('actual route close_unstarted publication refused'))
+    join_error = RuntimeError('actual original publication reconciliation observer refused')
+    loop, previous_factory = asyncio.get_running_loop(), asyncio.get_running_loop().get_task_factory()
+    if phase.startswith('publication_'):
+        from tests.unit.test_host_context_native_cleanup import _actual_operation
+        class RefusePublication(asyncio.Task):
+            refused = False
+            join_refused = False
+            def add_done_callback(self, callback, *args, **kwargs):
+                if not self.refused and getattr(callback, '__name__', '') == 'close_unstarted':
+                    self.refused = True
+                    if phase == 'publication_after':
+                        super().add_done_callback(callback, *args, **kwargs)
+                    if phase == 'publication_cancel':
+                        asyncio.current_task().cancel('actual caller withdrawal during physical publication reconciliation')
+                    raise publication_error
+                return super().add_done_callback(callback, *args, **kwargs)
+            def remove_done_callback(self, callback):
+                if phase == 'publication_cancel_source' and not self.join_refused and getattr(callback, '__name__', '') == 'mark_complete':
+                    self.join_refused = True
+                    raise join_error
+                return super().remove_done_callback(callback)
+        def factory(loop, coroutine, **kwargs):
+            operation = _actual_operation(coroutine)
+            if getattr(getattr(operation, 'cr_code', None), 'co_name', '') == 'route_durable_cognition':
+                original_task = RefusePublication(coroutine, loop=loop, **kwargs)
+                accepted.append(original_task)
+                entered.set()
+                return original_task
+            return previous_factory(loop, coroutine, **kwargs) if previous_factory else asyncio.Task(coroutine, loop=loop, **kwargs)
+        loop.set_task_factory(factory)
+    recovered = False
+    scope = None
+    if phase == 'revoked_rehydrate':
+        from kestrel_sovereign.execution_custody import ExecutionCustody
+        from tests.unit.test_signal_outcome_terminal_custody import _OriginalWork
+        scope = ExecutionCustody(_OriginalWork())
+    async def withdraw_here():
+        entered.set()
+        await release.wait()
+    if phase == 'initial_hold':
+        original_held = dispatcher._agent_is_held
+        async def first_hold():
+            # Registration/claim acquisition also reads Hold. Block only
+            # AFTER the genuine native claim exists, at recovered routing.
+            if task is not None and asyncio.current_task() is task:
+                deliveries = await dispatcher.list_durable_deliveries()
+                if any(delivery.status == LEASED and delivery.lease_token for delivery in deliveries):
+                    await withdraw_here()
+            return await original_held()
+        monkeypatch.setattr(dispatcher, '_agent_is_held', first_hold)
+    async def rehydrate(event, *, dispatch_signal):
+        nonlocal recovered
+        if phase in ('rehydrate', 'grouped_rehydrate', 'revoked_rehydrate'):
+            try:
+                await withdraw_here()
+            except asyncio.CancelledError as cancellation:
+                if phase != 'grouped_rehydrate':
+                    raise
+                try:
+                    await backend.execute('INSERT INTO recovery_failure VALUES (1)')
+                except Exception as native_error:
+                    raise BaseExceptionGroup('actual recovery SQL failure and withdrawal', [native_error, cancellation]) from None
+                raise AssertionError('native duplicate INSERT unexpectedly succeeded')
+        recovered = True
+        signal = replace(_channel_signal(agent.did, 'rehydrated-original'), source=source)
+        if phase == 'terminal_cancel':
+            signal.payload['unsupported_original_admission'] = object()
+        return signal
+    agent.rehydrate_durable_cognition_signal = rehydrate
+    from kestrel_sovereign import hold as hold_module
+    original_hold = hold_module.get_effective_hold_state
+    async def hold(*args, **kwargs):
+        if (phase == 'hold' and recovered) or (phase == 'initial_hold' and not recovered):
+            await withdraw_here()
+        return await original_hold(*args, **kwargs)
+    monkeypatch.setattr(hold_module, 'get_effective_hold_state', hold)
+    if phase == 'terminal_cancel':
+        original_terminal = dispatcher._apply_cognition_control_terminal
+        async def observe_actual_terminal(delivery, error):
+            result = await original_terminal(delivery, error)
+            entered.set()  # The real exact-token FAILED CAS has committed.
+            await release.wait()
+            return result
+        monkeypatch.setattr(dispatcher, '_apply_cognition_control_terminal', observe_actual_terminal)
+    for method, selected in [('_begin_durable_cognition_execution', 'begin'), ('_hold_durable_cognition_stop_completion', 'guard')]:
+        if phase == selected or (phase == 'begin_failure' and selected == 'begin'):
+            original_method = getattr(dispatcher, method)
+            async def paused(*args, **kwargs):
+                if phase == 'begin_failure':
+                    entered.set()
+                    return await backend.execute('INSERT INTO recovery_failure VALUES (1)')
+                await withdraw_here()
+                return await original_method(*args, **kwargs)
+            monkeypatch.setattr(dispatcher, method, paused)
+    try:
+        await backend.execute('CREATE TABLE recovery_failure (id INTEGER PRIMARY KEY)')
+        await backend.execute('INSERT INTO recovery_failure VALUES (1)')
+        await dispatcher.register_durable_consumer(consumer)
+        live = replace(_channel_signal(agent.did, 'cancel-rehydrate'), source=source)
+        persisted = await dispatcher._durable_store.persist_signal(live, agent_id=agent.did,
+            source_event_id='cancel-rehydrate-original', retention_days=7, caller_identity=None)
+        if release_failure:
+            condition = "NEW.status='retry'" if phase == 'terminal_cancel' else "NEW.status!='leased'"
+            await backend.execute("CREATE TRIGGER refuse_cancel_recovery_release BEFORE UPDATE ON durable_signal_deliveries WHEN OLD.status='leased' AND "+condition+" BEGIN SELECT RAISE(ABORT, 'actual cancelled recovery release refused'); END")
+        if public_handle:
+            handle = await dispatcher.enqueue_durable_cognition(live,
+                source_event_id='cancel-rehydrate-original', consumer_id=consumer.consumer_id)
+            task = handle.task
+        else:
+            delivery = await dispatcher.claim_durable_delivery_for_event(consumer_id=consumer.consumer_id,
+                event_id=persisted.event_id, executor_id=dispatcher._durable_delivery_owner)
+            seed = dispatcher._durable_retry_seed(delivery.event)
+            from contextlib import nullcontext
+            from kestrel_sovereign.execution_custody import bind_execution_runtime
+            with bind_execution_runtime(SimpleNamespace(_execution_custody=scope)) if scope is not None else nullcontext():
+                task = asyncio.create_task(dispatcher._route_durable_cognition_delivery(seed,
+                    dispatcher._registry.get(seed.source), time.monotonic(), persisted_event_id=delivery.event_id,
+                    consumer_id=consumer.consumer_id, durable_admission=None, durable_created=False,
+                    use_live_signal=False, claimed_delivery=delivery))
+        await asyncio.wait_for(entered.wait(), 5)
+        if phase != 'begin_failure' and not phase.startswith('publication_'):
+            if scope is not None:
+                scope.revoke('actual runtime withdrawal before original claim release')
+            task.cancel('actual caller withdrawal during source rehydration')
+            if phase == 'terminal_cancel':
+                await asyncio.sleep(0)
+                release.set()
+        outcome = await await_owned_task(task)
+        errors = tuple(_explicit_control_chain(outcome.error))
+        if phase.startswith('publication_'):
+            assert accepted and all(original.done() for original in accepted)
+            assert publication_error in errors, 'original callback-publication refusal was not retained'
+            if phase == 'publication_cancel':
+                assert any(isinstance(error, asyncio.CancelledError) for error in errors), 'actual join withdrawal disappeared from public outcome'
+                assert not isinstance(outcome.error, Exception), 'ordinary publication failure demoted actual withdrawal'
+            if phase == 'publication_cancel_source':
+                assert join_error in errors, 'bare cancellation rethrow discarded actual original join failure'
+        elif phase != 'begin_failure':
+            assert any(isinstance(error, asyncio.CancelledError) for error in errors)
+        elif not release_failure:
+            assert outcome.error is None and outcome.result.status == Status.FAILED
+        if phase == 'terminal_cancel':
+            assert any(isinstance(error, asyncio.CancelledError) for error in errors), 'successful terminalization erased this caller withdrawal'
+            assert not isinstance(outcome.error, Exception), 'terminalizer demoted actual withdrawal into an ordinary failure'
+            row, = await dispatcher.list_durable_deliveries()
+            assert row.status == FAILED and row.lease_expires_at is None
+            assert not dispatcher._retained_cognition_control_debt
+        elif phase == 'revoked_rehydrate':
+            from kestrel_sovereign.execution_custody import is_execution_control_error
+            assert is_execution_control_error(outcome.error)
+            debt = dispatcher._retained_cognition_control_debt.get(delivery.delivery_id)
+            assert debt is not None and debt[0].lease_token == delivery.lease_token, 'authority-denied release forgot its exact original claim debt'
+        elif release_failure:
+            assert any('actual cancelled recovery release refused' in str(error) for error in errors), 'rehydration cancellation hid native release failure'
+            await backend.execute('DROP TRIGGER refuse_cancel_recovery_release')
+        else:
+            (delivery,) = await dispatcher.list_durable_deliveries()
+            assert delivery.status == RETRY, 'rehydration withdrawal left the physically finished claim leased'
+            assert delivery.lease_expires_at is None
+    finally:
+        loop.set_task_factory(previous_factory)
+        release.set()
+        if task is not None:
+            await await_owned_task(task)
+        if release_failure:
+            await backend.execute('DROP TRIGGER IF EXISTS refuse_cancel_recovery_release')
+        await await_owned_task(asyncio.create_task(dispatcher.shutdown_durable_delivery()))
+        await _close(backend, agent)
 
 
 async def _assert_sync_shutdown_drained(
@@ -1983,6 +2386,217 @@ async def test_hold_read_failure_after_claim_releases_exact_lease(
         assert deferred.attempts == 0
         assert deferred.lease_owner is None
         assert deferred.lease_token is None
+    finally:
+        await dispatcher.shutdown_durable_delivery()
+        await _close(backend, agent)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('registered_before_refusal', [False, True])
+async def test_failed_enqueue_callback_publication_joins_and_releases_original(tmp_path, registered_before_refusal):
+    from kestrel_sovereign._async_ownership import await_owned_task
+    from kestrel_sovereign.hold import HoldTurnRefusal
+    backend, agent, dispatcher = await _channel_dispatcher(
+        tmp_path / 'failed-enqueue-publication.db', 'did:agent:failed-enqueue-publication')
+    consumer = DurableConsumerRegistration(consumer_id=DURABLE_COGNITION_CONSUMER_ID,
+        source='channel.message', agent_id=agent.did,
+        correlation_selector=f'payload.{DURABLE_COGNITION_MARKER}={DURABLE_COGNITION_MARKER_VALUE}', max_attempts=1)
+    signal = _channel_signal(agent.did, 'publication-failure')
+    rejected = RuntimeError('actual durable reservation callback publication refused')
+    loop = asyncio.get_running_loop()
+    factory = loop.get_task_factory()
+    accepted = []
+    class RejectRelease(asyncio.Task):
+        def add_done_callback(self, callback, *, context=None):
+            if getattr(callback, '__name__', '') == 'release_live_admission':
+                if registered_before_refusal:
+                    super().add_done_callback(callback, context=context)
+                raise rejected
+            return super().add_done_callback(callback, context=context)
+    def rejecting_factory(loop, coro, **kwargs):
+        task = RejectRelease(coro, loop=loop, **kwargs)
+        accepted.append(task)
+        return task
+    async def defer(prompt):
+        raise HoldTurnRefusal(agent_id=agent.did, effective_state=_held_state(agent.did))
+    agent.process_input = defer
+    try:
+        await dispatcher.register_durable_consumer(consumer)
+        loop.set_task_factory(rejecting_factory)
+        try:
+            with pytest.raises(BaseException) as caught:
+                await dispatcher.enqueue_durable_cognition(signal,
+                    source_event_id='telegram:update:publication-failure', consumer_id=consumer.consumer_id)
+        finally:
+            loop.set_task_factory(factory)
+        original_dispatch = next(task for task in agent.tasks if task.get_name().startswith('durable_cognition:'))
+        joined_before_manual_cleanup = original_dispatch.done()
+        await await_owned_task(original_dispatch)
+        await asyncio.sleep(0)
+        assert joined_before_manual_cleanup, 'enqueue unwound without joining its accepted dispatch'
+        from kestrel_sovereign.execution_custody import _explicit_control_chain
+        assert any(error is rejected for error in _explicit_control_chain(caught.value))
+        assert signal.id not in dispatcher._live_durable_cognition_event_ids
+        [delivery] = await dispatcher.list_durable_deliveries(consumer_id=consumer.consumer_id)
+        assert delivery.status == RETRY and delivery.attempts == 0
+        async def resume(prompt):
+            return 'genuine resumed turn after refused callback publication'
+        agent.process_input = resume
+        dispatcher._start_durable_cognition_drain(consumer.consumer_id)
+        async with asyncio.timeout(_HANG_GUARD_SECONDS):
+            while True:
+                [delivery] = await dispatcher.list_durable_deliveries(consumer_id=consumer.consumer_id)
+                if delivery.status == ACKNOWLEDGED:
+                    break
+                await asyncio.sleep(0.01)
+        assert delivery.attempts == 1
+    finally:
+        loop.set_task_factory(factory)
+        for task in accepted:
+            await await_owned_task(task)
+        await dispatcher.shutdown_durable_delivery()
+        await _close(backend, agent)
+
+
+@pytest.mark.asyncio
+async def test_enqueue_publication_join_preserves_actual_caller_withdrawal(tmp_path):
+    from kestrel_sovereign._async_ownership import create_owned_task, await_owned_task
+    from kestrel_sovereign.execution_custody import _explicit_control_chain
+    backend, agent, dispatcher = await _channel_dispatcher(
+        tmp_path / 'cancelled-enqueue-publication.db', 'did:agent:cancelled-enqueue-publication')
+    consumer = DurableConsumerRegistration(consumer_id=DURABLE_COGNITION_CONSUMER_ID,
+        source='channel.message', agent_id=agent.did,
+        correlation_selector=f'payload.{DURABLE_COGNITION_MARKER}={DURABLE_COGNITION_MARKER_VALUE}', max_attempts=1)
+    entered, release = asyncio.Event(), asyncio.Event()
+    async def actual_turn(prompt):
+        entered.set()
+        await release.wait()
+        return 'genuine completed turn'
+    agent.process_input = actual_turn
+    rejected = RuntimeError('actual enqueue callback publication failure before caller withdrawal')
+    loop = asyncio.get_running_loop()
+    factory = loop.get_task_factory()
+    class RejectRelease(asyncio.Task):
+        def add_done_callback(self, callback, *, context=None):
+            if getattr(callback, '__name__', '') == 'release_live_admission':
+                raise rejected
+            return super().add_done_callback(callback, context=context)
+    caller = None
+    try:
+        await dispatcher.register_durable_consumer(consumer)
+        loop.set_task_factory(lambda loop, coro, **kwargs: RejectRelease(coro, loop=loop, **kwargs))
+        caller = create_owned_task(dispatcher.enqueue_durable_cognition(
+            _channel_signal(agent.did, 'caller-cancel'), source_event_id='telegram:update:caller-cancel',
+            consumer_id=consumer.consumer_id))
+        await asyncio.wait_for(entered.wait(), _HANG_GUARD_SECONDS)
+        loop.set_task_factory(factory)
+        caller.cancel('actual caller withdrawal during original join')
+        await asyncio.sleep(0)
+        assert not caller.done(), 'caller escaped its accepted actual turn'
+        release.set()
+        outcome = await await_owned_task(caller)
+        assert outcome.error is not None and not isinstance(outcome.error, Exception), 'actual withdrawal was demoted to an ordinary exception'
+        chain = tuple(_explicit_control_chain(outcome.error))
+        assert any(error is rejected for error in chain)
+        assert any(isinstance(error, asyncio.CancelledError) and error.args == ('actual caller withdrawal during original join',) for error in chain)
+        assert all(task.done() for task in agent.tasks)
+        assert not dispatcher._live_durable_cognition_event_ids
+    finally:
+        loop.set_task_factory(factory)
+        release.set()
+        if caller is not None:
+            await await_owned_task(caller)
+        await dispatcher.shutdown_durable_delivery()
+        await _close(backend, agent)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('failure', ['allocation', 'publication_before', 'publication_after'])
+async def test_unstarted_durable_enqueue_refusal_releases_original_reservation(tmp_path, failure):
+    from kestrel_sovereign._async_ownership import await_owned_task
+    backend, agent, dispatcher = await _channel_dispatcher(
+        tmp_path / 'unstarted-enqueue.db', 'did:agent:unstarted-enqueue')
+    signal = _channel_signal(agent.did, 'unstarted-enqueue')
+    rejected = RuntimeError('actual original durable dispatch admission refused')
+    loop = asyncio.get_running_loop()
+    factory = loop.get_task_factory()
+    accepted = []
+    class RejectStart(asyncio.Task):
+        def add_done_callback(self, callback, *, context=None):
+            if getattr(callback, '__name__', '') == 'close_unstarted':
+                if failure == 'publication_after':
+                    super().add_done_callback(callback, context=context)
+                raise rejected
+            return super().add_done_callback(callback, context=context)
+    def rejecting_factory(loop, coro, **kwargs):
+        if failure == 'allocation':
+            raise rejected
+        task = RejectStart(coro, loop=loop, **kwargs)
+        accepted.append(task)
+        return task
+    try:
+        loop.set_task_factory(rejecting_factory)
+        try:
+            with pytest.raises(BaseException) as caught:
+                await dispatcher.enqueue_durable_cognition(signal,
+                    source_event_id='telegram:update:unstarted', consumer_id=DURABLE_COGNITION_CONSUMER_ID)
+        finally:
+            loop.set_task_factory(factory)
+        from kestrel_sovereign.execution_custody import _explicit_control_chain
+        assert any(error is rejected for error in _explicit_control_chain(caught.value))
+        assert all(task.done() for task in accepted), 'unstarted accepted owner was abandoned'
+        assert signal.id not in dispatcher._live_durable_cognition_event_ids
+        assert await backend.fetch_val('SELECT COUNT(*) FROM durable_signal_events') == 0
+    finally:
+        loop.set_task_factory(factory)
+        for task in accepted:
+            await await_owned_task(task)
+        await dispatcher.shutdown_durable_delivery()
+        await _close(backend, agent)
+
+
+@pytest.mark.asyncio
+async def test_mutable_enqueued_id_releases_original_first_claim_fence(tmp_path):
+    from kestrel_sdk.signals import Visibility
+    from kestrel_sovereign.hold import HoldTurnRefusal
+    backend, agent, dispatcher = await _channel_dispatcher(
+        tmp_path / 'mutable-enqueue-identity.db', 'did:agent:mutable-enqueue')
+    consumer = DurableConsumerRegistration(
+        consumer_id=DURABLE_COGNITION_CONSUMER_ID, source='channel.message', agent_id=agent.did,
+        correlation_selector=f'payload.{DURABLE_COGNITION_MARKER}={DURABLE_COGNITION_MARKER_VALUE}',
+        max_attempts=1)
+    signal = replace(_channel_signal(agent.did, 'mutable-id'), visibility=Visibility.USER_VISIBLE)
+    original_id = signal.id
+    emitted = []
+    async def emit(kind, payload):
+        if kind == 'signal_completed':
+            emitted.append(True)
+            signal.id = 'public-id-changed-after-terminal-emission'
+    agent.emit_event = emit
+    async def defer(prompt):
+        raise HoldTurnRefusal(agent_id=agent.did, effective_state=_held_state(agent.did))
+    agent.process_input = defer
+    try:
+        await dispatcher.register_durable_consumer(consumer)
+        handle = await dispatcher.enqueue_durable_cognition(signal,
+            source_event_id='telegram:update:mutable-id', consumer_id=consumer.consumer_id)
+        result = await asyncio.wait_for(handle.wait(), _HANG_GUARD_SECONDS)
+        await asyncio.sleep(0)
+        [delivery] = await dispatcher.list_durable_deliveries(consumer_id=consumer.consumer_id)
+        assert result.status is Status.COALESCED and emitted
+        assert delivery.status == RETRY and delivery.attempts == 0
+        assert original_id not in dispatcher._live_durable_cognition_event_ids, 'completed enqueue stranded its original live-event reservation'
+        async def resume(prompt):
+            return 'genuine resumed turn'
+        agent.process_input = resume
+        dispatcher._start_durable_cognition_drain(consumer.consumer_id)
+        async with asyncio.timeout(_HANG_GUARD_SECONDS):
+            while True:
+                [delivery] = await dispatcher.list_durable_deliveries(consumer_id=consumer.consumer_id)
+                if delivery.status == ACKNOWLEDGED:
+                    break
+                await asyncio.sleep(0.01)
+        assert delivery.attempts == 1
     finally:
         await dispatcher.shutdown_durable_delivery()
         await _close(backend, agent)
@@ -7955,7 +8569,7 @@ async def test_sync_shutdown_drains_an_admitted_outcome_log_before_releasing_own
     consumer = DurableConsumerRegistration(
         consumer_id="workflow-wait", source="provider.message", agent_id=agent.did
     )
-    original_append = dispatcher._store.append
+    original_append = dispatcher._store._append_original_outcome
     append_entered = asyncio.Event()
     allow_append = asyncio.Event()
     dispatch_task = None
@@ -7967,7 +8581,7 @@ async def test_sync_shutdown_drains_an_admitted_outcome_log_before_releasing_own
         await allow_append.wait()
         return await original_append(*args, **kwargs)
 
-    dispatcher._store.append = block_append
+    dispatcher._store._append_original_outcome = block_append
     try:
         dispatch_task = asyncio.create_task(
             dispatcher.dispatch_signal(
@@ -7991,7 +8605,7 @@ async def test_sync_shutdown_drains_an_admitted_outcome_log_before_releasing_own
         backend_closed = True
     finally:
         allow_append.set()
-        dispatcher._store.append = original_append
+        dispatcher._store._append_original_outcome = original_append
         if dispatch_task is not None and not dispatch_task.done():
             await dispatch_task
         if not backend_closed:
@@ -8672,7 +9286,7 @@ async def test_repeated_cancellation_releases_admission_without_waiting_on_lifec
     backend, agent, dispatcher = await _dispatcher(
         tmp_path / "admission-release-cancellation.db", "did:agent:one"
     )
-    original_append = dispatcher._store.append
+    original_append = dispatcher._store._append_original_outcome
     append_entered = asyncio.Event()
     allow_append = asyncio.Event()
     dispatch_task = None
@@ -8682,7 +9296,7 @@ async def test_repeated_cancellation_releases_admission_without_waiting_on_lifec
         await allow_append.wait()
         return await original_append(*args, **kwargs)
 
-    dispatcher._store.append = block_append
+    dispatcher._store._append_original_outcome = block_append
     try:
         dispatch_task = asyncio.create_task(
             dispatcher.dispatch_signal(
@@ -8711,7 +9325,7 @@ async def test_repeated_cancellation_releases_admission_without_waiting_on_lifec
         assert dispatcher._durable_runtime_owner_registered is False
     finally:
         allow_append.set()
-        dispatcher._store.append = original_append
+        dispatcher._store._append_original_outcome = original_append
         if dispatcher._durable_lifecycle_lock.locked():
             dispatcher._durable_lifecycle_lock.release()
         if dispatch_task is not None and not dispatch_task.done():
@@ -8988,8 +9602,11 @@ async def test_stop_completion_waits_for_durable_cognition_terminalization(
         )
         [delivery] = await dispatcher.list_durable_deliveries()
         assert delivery.status == (
-            TERMINAL_ACKABLE if terminalization_succeeds else LEASED
+            TERMINAL_ACKABLE if terminalization_succeeds else FAILED
         )
+        # Failed Stop settlement is non-ACKable, but never replayable or left
+        # on an expiring lease after its original physical route has ended.
+        assert delivery.lease_expires_at is None
     finally:
         allow_terminalization.set()
         # A turn this test never stopped would otherwise hold shutdown until
@@ -9196,7 +9813,7 @@ async def test_cancelled_durable_settlement_abandons_lifecycle_generation(
             is RequestCompletionDisposition.ABANDONED
         )
         [delivery] = await dispatcher.list_durable_deliveries()
-        assert delivery.status == LEASED
+        assert delivery.status == RETRY and delivery.lease_expires_at is None
     finally:
         allow_ack.set()
         if handle is not None and not handle.task.done():
