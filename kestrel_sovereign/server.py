@@ -5763,7 +5763,20 @@ def main(argv: Sequence[str] | None = None) -> None:
 
     import uvicorn
 
-    uvicorn.run(app, host=args.host, port=args.port)
+    from kestrel_sovereign.multi_agent.process_manager import (
+        SERVER_GRACEFUL_SHUTDOWN_SECONDS,
+    )
+
+    # ``log_config=None``: importing this module already configured logging,
+    # and uvicorn's default config would give its own loggers back their
+    # untimestamped format.
+    uvicorn.run(
+        app,
+        host=args.host,
+        port=args.port,
+        timeout_graceful_shutdown=SERVER_GRACEFUL_SHUTDOWN_SECONDS,
+        log_config=None,
+    )
 
 
 if __name__ == "__main__":

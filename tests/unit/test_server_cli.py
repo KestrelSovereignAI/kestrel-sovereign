@@ -13,6 +13,9 @@ import uvicorn
 
 import kestrel_sovereign.server as server
 from kestrel_sovereign.multi_agent.config import MultiAgentConfig
+from kestrel_sovereign.multi_agent.process_manager import (
+    SERVER_GRACEFUL_SHUTDOWN_SECONDS,
+)
 from tests.shared.environment_guard import unset_environment
 
 
@@ -68,7 +71,17 @@ def test_main_honors_cli_environment_and_default_precedence(
 
     server.main(arguments)
 
-    assert calls == [((server.app,), {"host": expected_host, "port": expected_port})]
+    assert calls == [
+        (
+            (server.app,),
+            {
+                "host": expected_host,
+                "port": expected_port,
+                "timeout_graceful_shutdown": SERVER_GRACEFUL_SHUTDOWN_SECONDS,
+                "log_config": None,
+            },
+        )
+    ]
     assert os.environ["KESTREL_SERVER_HOST"] == expected_host
     assert os.environ["PORT"] == str(expected_port)
 

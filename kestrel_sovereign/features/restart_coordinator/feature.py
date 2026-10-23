@@ -48,6 +48,10 @@ from kestrel_sovereign.features.storage_access import (
     resolve_feature_database,
     resolve_scoped_agent_did,
 )
+from kestrel_sovereign.multi_agent.process_manager import (
+    SERVER_KILL_GRACE_SECONDS,
+    SERVER_TERMINATE_TIMEOUT_SECONDS,
+)
 from kestrel_sovereign.storage.database_clock import database_clock
 from kestrel_sovereign.storage.db.interface import TransactionError
 
@@ -120,12 +124,8 @@ STALE_ACTIVE_REQUEST_SECONDS = 900
 # coordinator capable of applying its restart forever.
 MAX_IDLE_ONLY_DEFERRAL_SECONDS = 1800
 
-# How long to wait after spawning the detached restart before concluding the
-# dispatch failed. A real restart kills this process well inside the window;
-# still being alive with a dead child means it did not happen (#2667).
-RESTART_DISPATCH_GRACE_SECONDS = 10
-
-# How often to check the child within that window.
+# How often the dispatch watchdog checks the restart child (see
+# ``RESTART_DISPATCH_GRACE_SECONDS``).
 _DISPATCH_POLL_SECONDS = 0.5
 
 # Failed dispatch attempts for one request in one boot before the coordinator
@@ -157,6 +157,28 @@ def _canonical_update_repo_path(path: str) -> Optional[str]:
 # between the status write and the spawn) and which would otherwise sit in
 # ``executing`` forever with no path back (#2667).
 STALE_EXECUTING_SECONDS = 600
+
+# How long the watchdog follows a detached restart. A child that exits while
+# this process is still alive did not restart it (#2667), and the watch acts on
+# that. It ends sooner on either outcome that needs no action: a restart that
+# works stops this process, and its shutdown cancels the watch with the rest of
+# the feature's tasks. The deadline only bounds a child that hangs.
+#
+# It is the restart's own stop of this host: ``kestrel terminate`` waits
+# ``SERVER_TERMINATE_TIMEOUT_SECONDS`` for it to exit, sends SIGKILL, and
+# waits ``SERVER_KILL_GRACE_SECONDS`` more before it judges. Derived from
+# those, not set beside them, so a longer stop cannot silently outlast the
+# watch and leave a failed restart's row ``executing`` until the stranded-row
+# sweep (#3781). The window starts at dispatch, before the child's start-up
+# and constitution check, and that offset is no gap: a child refused before
+# its stop signal reaches this host exits within seconds, and once the signal
+# arrives this host is stopping, so its shutdown or the SIGKILL ends the watch.
+#
+# This is the in-process host's stop. A fleet of standalone agents is stopped
+# one deadline after another before the host, which can outlast it (#3791).
+RESTART_DISPATCH_GRACE_SECONDS = (
+    SERVER_TERMINATE_TIMEOUT_SECONDS + SERVER_KILL_GRACE_SECONDS
+)
 
 # Per-process boot identifier (#1796). Generated once at import, so it is
 # stable for the lifetime of THIS host process and differs from any prior
@@ -3520,7 +3542,8 @@ class RestartCoordinatorFeature(Feature):
 
         Runs as a background task rather than inline: the coordinator tick
         must not block for the grace window, and on the happy path this
-        process is killed mid-wait and the task simply never finishes.
+        process stops mid-wait: its shutdown cancels the task, or the restart's
+        SIGKILL ends it, and either way it never finishes.
 
         Without this the failure had no record at all — ``Popen`` returning is
         not evidence the restart happened, so the row sat ``executing``
@@ -3528,14 +3551,14 @@ class RestartCoordinatorFeature(Feature):
         kept running old code with the update's new dependencies already
         installed underneath it (#2667).
         """
-        # POLL to the deadline rather than checking once at the end. The
-        # realistic failure — ``os.kill`` refused (EPERM: host under another
-        # uid, pid-file mismatch) — has ``cmd_terminate`` burn ~5.5s on
-        # SIGTERM/poll/SIGKILL before ``cmd_start`` fails on the port, so the
-        # child dies around 7-10s. A single check at 10.0s is a coin flip
-        # against that, and losing it means the watchdog declares the dispatch
-        # healthy and recovery silently falls through to the 600s reconciler.
-        # We are alive for the whole window by definition, so polling is free.
+        # POLL until the child exits rather than checking once at a deadline.
+        # A child that fails can exit at any point in the window: at once (no
+        # ``kestrel`` binary, a refused constitution check) or only after
+        # ``cmd_terminate`` has given a host it signalled the whole stop
+        # deadline and a SIGKILL that did not take. A single late check would
+        # report the early failure late, and a single early one would miss
+        # the late failure and leave recovery to the 600s reconciler. We are
+        # alive for the whole window by definition, so polling is free.
         grace = getattr(
             self, "_restart_dispatch_grace", RESTART_DISPATCH_GRACE_SECONDS,
         )

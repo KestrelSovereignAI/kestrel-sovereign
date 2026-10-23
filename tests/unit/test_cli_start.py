@@ -18,6 +18,7 @@ from kestrel_sovereign.multi_agent.process_manager import (
     PidRecord,
     PidStatus,
     ProcessManager,
+    server_command,
 )
 from kestrel_sovereign.setup.steps.agent import DEFAULT_QUICKSTART_AGENT_NAME
 
@@ -56,6 +57,24 @@ def test_host_start_output_uses_configured_host_port(tmp_path, capsys):
     assert f"Starting server on :{DEFAULT_HOST_PORT}" in output
     assert f"MultiAgent ready: http://localhost:{DEFAULT_HOST_PORT}" in output
     assert "host-test-key" not in output
+
+
+def test_host_start_launches_the_server_command(tmp_path):
+    """The host stops like every other server: within uvicorn's graceful
+    window, then through the application's shutdown (#3781)."""
+    config = _quickstart_config(tmp_path)
+    process_manager = MagicMock(spec=ProcessManager)
+    process_manager.read_pid_record.return_value = PidRecord(
+        PidStatus.ABSENT, None, None, None, "no PID file"
+    )
+    process_manager.is_port_in_use.return_value = False
+    process_manager._load_env.return_value = {"KESTREL_API_KEY": "host-test-key"}
+    process_manager.wait_for_health.return_value = True
+
+    assert _start_inprocess_mode(tmp_path, config, process_manager) == 0
+
+    cmd = process_manager._spawn_detached.call_args.args[0]
+    assert cmd == server_command(DEFAULT_HOST_BIND, DEFAULT_HOST_PORT)
 
 
 def test_host_start_rejects_missing_out_of_band_api_key(tmp_path, capsys):
