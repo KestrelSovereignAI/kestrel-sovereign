@@ -103,28 +103,36 @@ async def _owned_native_pg_proxy(bind_host, bind_port, target, *, tls_context=No
     return server, retire
 
 
-async def test_postgres_reconnect_pins_actual_socket_peer_across_dns_change(dispatcher_components, native_pg, monkeypatch):
+@pytest.mark.parametrize('host,changed_host', [('127.0.0.1', '::1'), ('::1', '127.0.0.1')])
+async def test_postgres_reconnect_pins_actual_socket_peer_across_dns_change(dispatcher_components, native_pg, monkeypatch, host, changed_host):
     from kestrel_sovereign._async_ownership import await_owned_task
     from kestrel_sovereign.execution_custody import ExecutionCustody, bind_execution_runtime
     from tests.unit.test_signal_outcome_terminal_custody import _OriginalWork
     from tests.unit.test_signals_dispatcher import _action_reg, _signal
     c = dispatcher_components
     _, control, schema = native_pg
-    host, port = control._transport.get_extra_info('peername')[:2]
-    assert host == '127.0.0.1'
+    # The real fixture can resolve localhost to either address family. Own
+    # both endpoints rather than assuming its socket is IPv4 or binding its
+    # occupied IPv6 port. Both proxies relay to the SAME actual owned server.
+    target = control._transport.get_extra_info('peername')[:2]
+    original_peers = []
+    original_proxy, retire_original = await _owned_native_pg_proxy(
+        host, 0, target, on_accept=original_peers.append)
+    port = original_proxy.sockets[0].getsockname()[1]
     alias = 'original-journal-peer.invalid'
     changed, accepted_peers = [], []
     loop = asyncio.get_running_loop()
     resolve = loop.getaddrinfo
     async def actual_resolution(name, requested_port, *args, **kwargs):
         if name == alias:
-            name = '::1' if changed else host
+            name = changed_host if changed else host
         return await resolve(name, requested_port, *args, **kwargs)
     monkeypatch.setattr(loop, 'getaddrinfo', actual_resolution)
-    _, retire_proxy = await _owned_native_pg_proxy('::1', port, (host, port), on_accept=accepted_peers.append)
+    retire_proxy = None
     original_pool = c.backend._pool
     pool = None
     try:
+        _, retire_proxy = await _owned_native_pg_proxy(changed_host, port, target, on_accept=accepted_peers.append)
         pool = await _fresh_journal_pool(original_pool, min_size=1, max_size=1,
             host=alias, port=port, ssl='disable', timeout=2)
         c.backend._pool = pool
@@ -143,14 +151,21 @@ async def test_postgres_reconnect_pins_actual_socket_peer_across_dns_change(disp
         with bind_execution_runtime(SimpleNamespace(_execution_custody=scope)):
             outcome = await await_owned_task(asyncio.create_task(c.dispatcher.dispatch_signal(signal)))
         assert effects and outcome.error is None
+        assert len(original_peers) >= 2, 'original native socket was not actually reconnected'
         assert not accepted_peers, 'terminal reconnect followed changed DNS to a different actual socket peer'
         assert await control.fetchval(f'SELECT COUNT(*) FROM ONLY "{schema}".signal_log WHERE id=$1', signal.id) == 1
     finally:
         c.backend._pool = original_pool
-        if pool is not None:
-            async with asyncio.timeout(10):
-                await pool.close()
-        await retire_proxy()
+        try:
+            if pool is not None:
+                async with asyncio.timeout(10):
+                    await pool.close()
+        finally:
+            try:
+                if retire_proxy is not None:
+                    await retire_proxy()
+            finally:
+                await retire_original()
 
 
 @pytest.mark.parametrize('direct_tls', [False, True])
