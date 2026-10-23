@@ -687,6 +687,78 @@ async def test_original_checkout_recipe_refusal_cannot_run_reset_query_logger(di
             await await_owned_task(callback)
 
 
+@pytest.mark.parametrize('revoke', [False, True])
+async def test_admission_reconnect_never_invokes_reconfigured_password(dispatcher_components, native_pg, monkeypatch, revoke):
+    import asyncpg
+    from kestrel_sovereign._async_ownership import await_owned_task
+    from kestrel_sovereign.execution_custody import ExecutionCustody, bind_execution_runtime
+    from tests.unit.test_signal_outcome_terminal_custody import _OriginalWork
+    from tests.unit.test_signals_dispatcher import _action_reg, _signal
+    c = dispatcher_components
+    _, control, schema = native_pg
+    await control.execute(f'CREATE TABLE "{schema}".forbidden_connect_effect(value INTEGER)')
+    original_pool = c.backend._pool
+    pool = await _fresh_journal_pool(original_pool, min_size=1, max_size=1)
+    c.backend._pool = pool
+    original_args, original_kwargs = pool._connect_args, dict(pool._connect_kwargs)
+    await c.dispatcher.initialize_durable_delivery()
+    scope = ExecutionCustody(_OriginalWork(backend_type='postgres'))
+    waiting = asyncio.Event()
+    callbacks, effects = [], []
+    actual_acquire = asyncpg.pool.Pool.acquire
+    held = await pool.acquire()
+    task = None
+
+    def observe_acquire(original, *args, **kwargs):
+        if original is pool:
+            waiting.set()
+        return actual_acquire(original, *args, **kwargs)
+
+    async def password():
+        callbacks.append(True)
+        await control.execute(f'INSERT INTO "{schema}".forbidden_connect_effect VALUES (1)')
+        return original_kwargs.get('password', '')
+
+    async def handler(payload):
+        effects.append(True)
+        return {'genuine': True}
+
+    c.registry.register(_action_reg('native.admission.reconnect', handler=handler))
+    try:
+        monkeypatch.setattr(asyncpg.pool.Pool, 'acquire', observe_acquire)
+        with bind_execution_runtime(SimpleNamespace(_execution_custody=scope)):
+            task = asyncio.create_task(c.dispatcher.dispatch_signal(_signal('native.admission.reconnect')))
+        await asyncio.wait_for(waiting.wait(), 5)
+        assert not task.done() and not effects
+        pool.set_connect_args(*original_args, **{**original_kwargs, 'password': password})
+        if revoke:
+            scope.revoke('actual Work cutoff while original admission waits for sole pool slot')
+        # Public physical retirement releases the real queued slot. The
+        # ensuing connector must fence BEFORE asyncpg calls its password.
+        held.terminate()
+        await pool.release(held)
+        held = None
+        outcome = await await_owned_task(task)
+        assert outcome.error is not None and not effects
+        assert not callbacks, 'queued journal admission invoked reconfigured application password callback'
+        assert await control.fetchval(f'SELECT COUNT(*) FROM "{schema}".forbidden_connect_effect') == 0
+        # The adopted connector remains ordinary outside the original journal
+        # owner: this supported public callback still runs for normal pooling.
+        async with pool.acquire() as connection:
+            assert await connection.fetchval('SELECT 1') == 1
+        assert callbacks == [True]
+        assert await control.fetchval(f'SELECT COUNT(*) FROM "{schema}".forbidden_connect_effect') == 1
+    finally:
+        if held is not None:
+            await pool.release(held)
+        if task is not None:
+            await await_owned_task(task)
+        pool.set_connect_args(*original_args, **original_kwargs)
+        c.backend._pool = original_pool
+        async with asyncio.timeout(10):
+            await pool.close()
+
+
 @pytest.mark.parametrize('phase', ['rollback', 'reset'])
 @pytest.mark.parametrize('withdrawn_owner', ['inner', 'outer', 'public'])
 async def test_failed_terminal_insert_keeps_writer_withdrawal_through_native_exit(dispatcher_components, monkeypatch, phase, withdrawn_owner):
