@@ -19,7 +19,7 @@ Auto-generated file-tree + per-file purpose index. Always-loaded context for the
 GitHub App (issue #791). Do **not** edit by hand — regenerate via `python scripts/generate_repo_map.py`.
 
 **Generated:** 2026-10-24
-**Scope:** 3343 tracked files (2501 `.py`, 367 `.md`, 475 other). Excludes `__pycache__`, `node_modules`, `.venv`, `.claude`, build artifacts.
+**Scope:** 3345 tracked files (2503 `.py`, 367 `.md`, 475 other). Excludes `__pycache__`, `node_modules`, `.venv`, `.claude`, build artifacts.
 
 **Format per file:** `path — one-line purpose` plus the public top-level Python symbols on the next line
 (classes and functions; private `_name` skipped).
@@ -275,7 +275,9 @@ Repo entry points and standard project files.
   - `def normalize_api_key(value)`; `class AuthMethod`; `class CallerRole`; `class CallerContext`; `def current_caller_context()`; `def capture_caller_context_binding()`; `def caller_context_lifetime(caller)`; `def caller_context_binding_scope(binding)`; `…`
 - **kestrel_sovereign/bootstrap/__init__.py** — Bootstrap module for Kestrel agent wake-up and personality discovery.
 - **kestrel_sovereign/bootstrap/service.py** — Bootstrap Service for Kestrel agent wake-up and personality discovery.
-  - `class PersistOutcome`; `def derive_description_from_soul(content)`; `async def persist_agent_description(db, storage, agent_id, description)`; `class BootstrapState`; `class RestartDiscoveryResult`; `class BootstrapStaleness`; `class BootstrapService`
+  - `class PersistOutcome`; `def derive_description_from_soul(content)`; `async def persist_agent_description(db, storage, agent_id, description)`; `class BootstrapState`; `class RestartDiscoveryResult`; `class SoulRevisionOutcome`; `class BootstrapStaleness`; `class BootstrapService`
+- **kestrel_sovereign/bootstrap/soul_durability.py** — Whether the SOUL.md on disk is the SOUL the next boot will serve (#3779).
+  - `def soul_sha256(content)`; `class SoulFileState`; `class SoulFileStatus`; `async def inspect_soul_file(storage, agent_data_path)`
 - **kestrel_sovereign/callbacks.py** — Canonical return-value ownership contract for host/provider callbacks.
   - `class HostCallbackOwnershipError`; `def require_callback_result(value)`; `async def invoke_host_callback(operation)`
 - **kestrel_sovereign/cli.py** — Unified Kestrel CLI for host and agent management.
@@ -1481,7 +1483,7 @@ Repo entry points and standard project files.
 - **kestrel_sovereign/storage/active_embedding_profile.py** — The embedding profile a running agent resolves, recorded for offline tools (#3420).
   - `class ActiveEmbeddingProfileError`; `class RecordedEmbeddingProfile`; `class ActiveProfileLookup`; `async def record_active_embedding_profile(db, agent_id, embedding_service)`; `async def load_active_embedding_profiles(db, agent_id)`
 - **kestrel_sovereign/storage/agent_resource_store.py** — Private agent identity resources.
-  - `class AgentResourceVersion`; `class AgentResourceStore`
+  - `def check_version_request(resource_type, content, provenance)`; `class AgentResourceVersion`; `class AgentResourceStore`
 - **kestrel_sovereign/storage/associative_linker.py** — Concept association using existing GraphStore.
   - `def classify_label(label)`; `class LinkedConcept`; `class AssociativeLinker`
 - **kestrel_sovereign/storage/async_assertion_store.py** — Tenant-bound persistence for canonical semantic assertions.
@@ -5320,6 +5322,8 @@ Repo entry points and standard project files.
   - `def test_pqcrypto_slh_dsa_installed_and_importable()`; `def test_slhdsa_suite_self_registers()`; `def test_slhdsa_classified_as_post_quantum()`; `def test_slhdsa_listed_in_registry()`; `def test_class_size_constants_match_nist_fips_205_128s()`; `def suite()`; `def keypair(suite)`; `def signed_data(suite, keypair)`; `…`
 - **tests/unit/test_soft_delete_analytics_sweep.py** — Soft-deleted conversation content must not feed derived agent state (#2051).
   - `async def store()`; `async def test_personality_responses_exclude_soft_deleted(store)`; `async def test_calibration_examples_exclude_soft_deleted_pair(store)`; `async def test_wellness_content_read_excludes_soft_deleted(store)`; `async def test_salvage_and_next_id_still_see_soft_deleted(store)`
+- **tests/unit/test_soul_revision.py** — A durable, audited SOUL revision path, and honest reporting of file-only edits (#3779).
+  - `def data_key(monkeypatch)`; `def agent_dir(tmp_path)`; `async def test_revision_survives_a_restart_and_records_who_and_why(tmp_path, agent_dir)`; `async def test_revision_of_an_unchanged_file_writes_no_version(tmp_path, agent_dir)`; `async def test_revision_refuses_a_non_sovereign_caller(tmp_path, agent_dir, caller)`; `async def test_revision_requires_a_reason(tmp_path, agent_dir)`; `async def test_revision_reports_a_failed_promotion_instead_of_succeeding(tmp_path, agent_dir, monkeypatch)`; `async def test_revision_is_refused_in_a_volatile_privacy_mode(tmp_path, agent_dir, mode)`; `…`
 - **tests/unit/test_sovereign_override_pins.py** — Tests for sovereign override of memory pins.
   - `class FakeDB`; `async def test_sovereign_delete_cleans_up_pins()`; `async def test_sovereign_override_all_pins()`; `async def test_sovereign_override_specific_pins()`; `async def test_sovereign_override_clears_decay_protected_flag()`; `async def test_pins_cannot_resist_sovereign_deletion()`; `async def test_sovereign_override_with_custom_reason()`; `async def test_sovereign_override_all_preserves_released_pins()`
 - **tests/unit/test_sovereign_persistence.py** — Tests for sovereign-first persistence architecture.

@@ -124,6 +124,12 @@ async def test_original_native_soul_control_is_not_seed_or_bootstrap_fallback(
     for name in ("execute", "fetch_one", "fetch_all", "fetch_val"):
         monkeypatch.setattr(backend, name, forward(name, getattr(backend, name)))
     monkeypatch.setattr(storage, "add_edge", forward("add_edge", storage.add_edge))
+    # The SOUL version and its graph link commit as one unit (#3779), so the
+    # graph link's commit is the promotion's and surfaces through it.
+    monkeypatch.setattr(
+        storage, "promote_soul_seed",
+        forward("promote_soul_seed", storage.promote_soul_seed),
+    )
     backend._execution_custody = ExecutionCustody(GenerationFence())
     monkeypatch.setattr(asyncpg.pool.PoolAcquireContext, "__aexit__", lose_actual_ack)
     failure, result = None, None

@@ -18,7 +18,7 @@ import shutil
 import hashlib
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, UTC
-from typing import Dict, Optional, List, Any, Union
+from typing import Any, Awaitable, Callable, Dict, List, Mapping, Optional, Union
 
 from .async_database import AsyncDatabase
 from .async_file_store import AsyncFileStore
@@ -42,6 +42,7 @@ from .agent_resource_store import (
     AgentResourceStore,
     AgentResourceVersion,
     SOUL_MARKDOWN_RESOURCE_TYPE,
+    check_version_request,
 )
 from .semantic_binding import SemanticAssertionBinding
 from .conversation_created_at import (
@@ -2586,22 +2587,31 @@ class AsyncStorage:
         anchoring_metadata: Optional[Dict[str, Any]] = None,
         public_metadata: Optional[Dict[str, Any]] = None,
     ) -> AgentResourceVersion:
-        """Create an encrypted private identity-resource version."""
+        """Create an encrypted private identity-resource version.
+
+        A SOUL version and its graph reference are published as one unit; see
+        :meth:`promote_soul_seed`.
+        """
         if not self._initialized:
             await self.initialize()
-        resource = await self._require_agent_resource_store().create_version(
-            resource_type,
-            content,
-            created_by=created_by,
-            source=source,
-            make_current=make_current,
-            signature=signature,
-            anchoring_metadata=anchoring_metadata,
-            public_metadata=public_metadata,
-        )
+        store = self._require_agent_resource_store()
+        check_version_request(resource_type, content)
+
+        def create() -> Awaitable[AgentResourceVersion]:
+            return store.create_version(
+                resource_type,
+                content,
+                created_by=created_by,
+                source=source,
+                make_current=make_current,
+                signature=signature,
+                anchoring_metadata=anchoring_metadata,
+                public_metadata=public_metadata,
+            )
+
         if resource_type == SOUL_MARKDOWN_RESOURCE_TYPE:
-            await self._record_soul_resource_reference(resource)
-        return resource
+            return await self._publish_soul_version(create)
+        return await create()
 
     async def get_current_agent_resource(
         self,
@@ -2629,22 +2639,59 @@ class AsyncStorage:
         *,
         created_by: Optional[str] = None,
         source: str = "agent_data/SOUL.md",
+        provenance: Optional[Mapping[str, Any]] = None,
     ) -> AgentResourceVersion:
-        """Promote a local SOUL.md seed/cache body into canonical storage."""
+        """Promote a local SOUL.md seed/cache body into canonical storage.
+
+        ``provenance`` adds fields such as a revision's reason and actor to
+        the version's provenance (#3779).
+
+        The new version, the deselection of the previous one and the graph
+        reference to it commit together or not at all, so a failure leaves
+        the previous version current, with its own provenance, rather than no
+        version current for the next boot to replace with SOUL.md (#3779).
+        """
         if not self._initialized:
             await self.initialize()
-        resource = await self._require_agent_resource_store().promote_soul_seed(
-            content,
-            created_by=created_by or self.agent_id,
-            source=source,
+        store = self._require_agent_resource_store()
+        check_version_request(SOUL_MARKDOWN_RESOURCE_TYPE, content, provenance)
+        return await self._publish_soul_version(
+            lambda: store.promote_soul_seed(
+                content,
+                created_by=created_by or self.agent_id,
+                source=source,
+                provenance=provenance,
+            )
         )
-        await self._record_soul_resource_reference(resource)
+
+    @property
+    def _soul_node_id(self) -> str:
+        return f"{self.agent_id}#soul"
+
+    async def _publish_soul_version(
+        self, create: Callable[[], Awaitable[AgentResourceVersion]]
+    ) -> AgentResourceVersion:
+        """Create a SOUL version and its graph reference as one unit (#3779).
+
+        ``create`` makes the version; its transaction joins this one.
+        """
+        async with self.transaction(immediate=True):
+            # The reference writes two graph nodes inside this transaction.
+            # PostgreSQL refuses a nested graph write whose reservation shard
+            # sorts before one already held, so take the whole set first.
+            await self.lock_nodes_for_update([self.agent_id, self._soul_node_id])
+            resource = await create()
+            await self._record_soul_resource_reference(resource)
         return resource
 
     async def _record_soul_resource_reference(
         self, resource: AgentResourceVersion
     ) -> None:
-        """Record body-free KG facts that the SOUL resource exists."""
+        """Record body-free KG facts that the SOUL resource exists.
+
+        Call inside :meth:`_publish_soul_version`, which holds the graph
+        write set.
+        """
         properties = {
             "agent_id": self.agent_id,
             "resource_id": resource.resource_id,
@@ -2658,7 +2705,7 @@ class AsyncStorage:
         }
         await self.add_node(
             GraphNode(
-                node_id=f"{self.agent_id}#soul",
+                node_id=self._soul_node_id,
                 node_type="agent_identity_resource",
                 label="Private SOUL resource",
                 properties=properties,
@@ -2667,7 +2714,7 @@ class AsyncStorage:
         try:
             await self.add_edge(
                 self.agent_id,
-                f"{self.agent_id}#soul",
+                self._soul_node_id,
                 "has_private_identity_resource",
                 {"resource_type": resource.resource_type},
             )

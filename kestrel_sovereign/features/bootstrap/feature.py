@@ -17,7 +17,6 @@ kestrel-sovereign #1042 narration-honesty contract (#1061).
 
 import logging
 import re
-from copy import copy
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional
@@ -27,6 +26,7 @@ from kestrel_sovereign.execution_custody import is_execution_control_error
 from kestrel_sdk.tools.base import ToolCategory
 from kestrel_sdk.tools.result import ToolResult
 from kestrel_sovereign.bootstrap import BootstrapState
+from kestrel_sovereign.bootstrap.soul_durability import inspect_soul_file
 from kestrel_sovereign.storage.privacy_wrapper import (
     acquire_control_plane_capability,
     optional_transition_lock,
@@ -431,7 +431,7 @@ class BootstrapFeature(Feature):
 
     @tool(
         name="bootstrap_reload",
-        description="Force reload all bootstrap files from disk. Use after editing SOUL.md or other bootstrap files.",
+        description="Force reload all bootstrap files from disk into this session. A SOUL.md edit loaded this way lasts only until restart unless the Sovereign makes it canonical with !revise-soul; the result says when it will not survive.",
         category=ToolCategory.SYSTEM,
         command_prefix="!bootstrap reload"
     )
@@ -443,7 +443,9 @@ class BootstrapFeature(Feature):
             !bootstrap reload
 
         This re-reads every bootstrap file, picking up any edits
-        made since the agent started.
+        made since the agent started. Every boot serves the canonical
+        SOUL, not SOUL.md, so a reloaded SOUL.md that differs from it is
+        reported as live for this session only (#3779).
         """
         loader = self._get_loader()
         if loader is None:
@@ -458,6 +460,11 @@ class BootstrapFeature(Feature):
                 raise
             logger.error(f"bootstrap_reload failed during loader.reload(): {e}", exc_info=True)
             return ToolResult.failed(str(e))
+
+        soul_status = await inspect_soul_file(
+            getattr(self.agent, "storage", None), self._get_agent_data_path()
+        )
+        soul_caveat = soul_status.reload_caveat()
 
         # Also refresh the context_builder cache if it wraps the loader
         if hasattr(self.agent, 'context_builder'):
@@ -492,10 +499,11 @@ class BootstrapFeature(Feature):
                             f"Reloaded {loader.file_count} file(s) from disk; "
                             f"{loader.total_chars} char(s) total"
                         ),
-                        error=(
+                        error="; ".join(filter(None, [
                             f"context_builder cache refresh failed: {e}; "
-                            "stale prompt assembly until next agent restart"
-                        ),
+                            "stale prompt assembly until next agent restart",
+                            soul_caveat,
+                        ])),
                         data={
                             "loaded_count": loader.file_count,
                             "total_chars": loader.total_chars,
@@ -503,6 +511,7 @@ class BootstrapFeature(Feature):
                             "file_details": files,
                             "truncated_files": truncated_files,
                             "cache_refresh_error": str(e),
+                            "soul_file": soul_status.to_dict(),
                         },
                     )
 
@@ -527,7 +536,7 @@ class BootstrapFeature(Feature):
             f["name"] for f in files
             if (f.get("status") or "").startswith("skipped")
         ]
-        if dropped or truncated_files:
+        if dropped or truncated_files or soul_caveat:
             errors = []
             if dropped:
                 errors.append(
@@ -542,6 +551,8 @@ class BootstrapFeature(Feature):
                     f"loaded partially due to bootstrap size budgets: "
                     f"{', '.join(truncated_files)}"
                 )
+            if soul_caveat:
+                errors.append(soul_caveat)
             return ToolResult.partial(
                 confirmation=(
                     f"Reloaded {len(loaded)} file(s) from disk; "
@@ -555,6 +566,7 @@ class BootstrapFeature(Feature):
                     "file_details": files,
                     "dropped_files": dropped,
                     "truncated_files": truncated_files,
+                    "soul_file": soul_status.to_dict(),
                 },
             )
         return ToolResult.ok(
@@ -569,6 +581,7 @@ class BootstrapFeature(Feature):
                 "files": loaded,
                 "file_details": files,
                 "truncated_files": [],
+                "soul_file": soul_status.to_dict(),
             },
         )
 
@@ -1152,6 +1165,7 @@ class BootstrapFeature(Feature):
         - Current bootstrap state (pending, discovery, complete)
         - Number of discovery exchanges
         - Whether SOUL.md exists
+        - Whether SOUL.md is the canonical SOUL the next boot serves
         """
         if not hasattr(self.agent, 'bootstrap_service') or not self.agent.bootstrap_service:
             return ToolResult.failed("Bootstrap service not available.")
@@ -1173,6 +1187,7 @@ class BootstrapFeature(Feature):
         state_value: Optional[str] = None
         exchange_count: Optional[int] = None
         soul_exists: Optional[bool] = None
+        soul_file: Optional[dict] = None
         try:
             state = await service.get_bootstrap_state()
             state_value = state.value if hasattr(state, "value") else str(state)
@@ -1181,6 +1196,11 @@ class BootstrapFeature(Feature):
             agent_data_path = getattr(service, "agent_data_path", None)
             if agent_data_path:
                 soul_exists = (Path(agent_data_path) / "SOUL.md").exists()
+                soul_file = (
+                    await inspect_soul_file(
+                        getattr(service, "storage", None), agent_data_path
+                    )
+                ).to_dict()
         except Exception as e:
             if is_execution_control_error(e):
                 raise
@@ -1192,6 +1212,7 @@ class BootstrapFeature(Feature):
                 "state": state_value,
                 "exchange_count": exchange_count,
                 "soul_exists": soul_exists,
+                "soul_file": soul_file,
                 "status": str(status),
             },
         )
