@@ -18,6 +18,8 @@ Tied to issue #879 follow-up.  See
 grant API and the production background.
 """
 
+from tests.shared.native_shutdown_budget import shutdown_fixture_agent
+
 import asyncio
 
 import pytest
@@ -73,7 +75,7 @@ async def bare_agent(temp_db):
 
     yield agent
 
-    await agent.shutdown()
+    await shutdown_fixture_agent(agent)
     await llm_service.close()
 
 

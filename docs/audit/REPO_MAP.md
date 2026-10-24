@@ -19,7 +19,7 @@ Auto-generated file-tree + per-file purpose index. Always-loaded context for the
 GitHub App (issue #791). Do **not** edit by hand — regenerate via `python scripts/generate_repo_map.py`.
 
 **Generated:** 2026-10-23
-**Scope:** 3337 tracked files (2495 `.py`, 367 `.md`, 475 other). Excludes `__pycache__`, `node_modules`, `.venv`, `.claude`, build artifacts.
+**Scope:** 3338 tracked files (2496 `.py`, 367 `.md`, 475 other). Excludes `__pycache__`, `node_modules`, `.venv`, `.claude`, build artifacts.
 
 **Format per file:** `path — one-line purpose` plus the public top-level Python symbols on the next line
 (classes and functions; private `_name` skipped).
@@ -3337,7 +3337,7 @@ Repo entry points and standard project files.
 - **tests/shared/host_runtime_isolation.py** — Keep every test away from the operator's real runtime state (#3286).
   - `def allowed_storage_roots(basetemp)`; `def allow_storage_roots(roots)`; `def pin_runtime_paths(root, setenv, delenv)`; `def isolate_host_runtime_paths(root, monkeypatch)`; `def install_session_guard()`; `class Refusal`; `class RefusalRecorder`; `def refusal_failure_message(refusals)`
 - **tests/shared/native_shutdown_budget.py** — Compose fixture lifecycle guards with real backend close reservations.
-  - `def reserve_native_shutdown_budget(agent, monkeypatch)`
+  - `def reserve_native_shutdown_budget(agent, monkeypatch)`; `async def shutdown_fixture_agent(agent)`
 - **tests/shared/node_id_length.py** — Refuse a test ID too long for the tools that read a CI log (#3669).
   - `def refuse_overlong_node_ids(items)`; `def pytest_xdist_node_collection_finished(node, ids)`
 - **tests/shared/postgres_requirement.py** — Make the PostgreSQL leg of dual-backend tests fail instead of skip (#3381).
@@ -4814,6 +4814,8 @@ Repo entry points and standard project files.
   - `def test_native_postgres_cancel_signature_accepts_both_driver_waiters()`; `async def test_native_postgres_cancel_joins_the_original_query_acknowledgement(native_a2a_backend_factory, pinned)`; `async def test_original_postgres_cancel_view_reuses_driver_and_native_termination(native_a2a_backend_factory)`; `async def test_original_postgres_pool_initializes_without_autonomous_reconnect(native_a2a_backend_factory)`; `async def test_original_postgres_journal_refuses_autonomous_pool_floor(native_a2a_backend_factory)`; `async def test_original_postgres_cancel_abort_retains_physical_failure(native_a2a_backend_factory, sealed)`; `async def test_native_postgres_cancel_releases_the_pool_for_reuse(native_a2a_backend_factory, pinned)`; `def test_original_sqlite_literal_values_match_native_binding(value)`; `…`
 - **tests/unit/test_native_memory_timestamp.py** — One stored UTC instant decays equally as SQLite text or PostgreSQL datetime.
   - `def test_native_memory_timestamp_does_not_become_neutral_fallback(form)`
+- **tests/unit/test_native_shutdown_budget.py** — Real fixture cleanup keeps backend reservations and restores lifecycle guards.
+  - `async def test_fixture_cleanup_closes_real_workers_and_restores_guards(tmp_path, monkeypatch, worker_budget, body_error)`
 - **tests/unit/test_native_task_admission_inventory.py** — Explicit native Task sites must publish an acceptance receipt before callbacks.
   - `def test_explicit_native_owned_task_admissions_have_original_receipts()`
 - **tests/unit/test_native_tck_business.py** — TCK business examples are persisted by the real native task lifecycle.

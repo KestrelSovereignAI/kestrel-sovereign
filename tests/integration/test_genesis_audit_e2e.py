@@ -2,6 +2,8 @@
 Integration tests for genesis audit (CW-001 fix).
 Tests that genesis audit properly validates constitutions during agent creation.
 """
+
+from tests.shared.native_shutdown_budget import shutdown_fixture_agent
 import pytest
 import pytest_asyncio
 import asyncio
@@ -132,7 +134,7 @@ async def test_pending_first_turn_blocks_then_completes_once_across_restart(tmp_
         assert audit_calls == 2
         assert cognition_calls == 1
     finally:
-        await agent.shutdown()
+        await shutdown_fixture_agent(agent)
 
     # A completed receipt survives process restart and cannot silently rerun.
     restarted = KestrelAgent(
@@ -197,7 +199,7 @@ async def test_deferred_audit_uses_exact_hash_bound_bytes(tmp_path):
         assert stored.decode("utf-8") in observed_prompt
         assert marker not in observed_prompt
     finally:
-        await agent.shutdown()
+        await shutdown_fixture_agent(agent)
         await service.close()
 
 
@@ -249,7 +251,7 @@ async def test_deferred_audit_refuses_hash_mismatched_storage(tmp_path):
         await agent._raw_storage.db.execute_commit(
             "UPDATE files SET content=?,metadata=? WHERE content_hash=?", (*physical, digest),
         )
-        await agent.shutdown()
+        await shutdown_fixture_agent(agent)
         await service.close()
 
 
@@ -288,7 +290,7 @@ async def test_concurrent_first_turns_share_one_genesis_audit(tmp_path):
         assert audit_calls == 1
         assert agent._process_input_traced_locked.await_count == 2
     finally:
-        await agent.shutdown()
+        await shutdown_fixture_agent(agent)
 
 
 @pytest.mark.asyncio
@@ -319,7 +321,7 @@ async def test_streaming_first_turn_is_blocked_before_stream_setup(tmp_path):
         assert "GENESIS AUDIT PENDING" in chunks[0]
         agent.get_audit_response.assert_awaited_once()
     finally:
-        await agent.shutdown()
+        await shutdown_fixture_agent(agent)
 
 
 @pytest.mark.asyncio
@@ -354,7 +356,7 @@ async def test_deferred_risk_three_failure_is_durable_and_not_retried(tmp_path):
         audit.assert_awaited_once()
         agent._process_input_traced_locked.assert_not_awaited()
     finally:
-        await agent.shutdown()
+        await shutdown_fixture_agent(agent)
 
 
 @pytest.mark.asyncio
@@ -393,7 +395,7 @@ async def test_unincepted_shape_cannot_bypass_genesis_readiness(tmp_path):
             == "runtime:first_cognition"
         )
     finally:
-        await agent.shutdown()
+        await shutdown_fixture_agent(agent)
 
 
 @pytest.mark.asyncio
@@ -439,7 +441,7 @@ async def test_legacy_completed_receipt_migrates_without_rerunning_auditor(tmp_p
         assert receipt["audited"] is True
         assert receipt["provenance"] == "runtime:migrated_legacy_receipt"
     finally:
-        await agent.shutdown()
+        await shutdown_fixture_agent(agent)
 
 
 @pytest.fixture
@@ -471,7 +473,7 @@ async def kestrel_agent(temp_db, llm_service):
     )
     await agent.initialize()
     yield agent
-    await agent.shutdown()
+    await shutdown_fixture_agent(agent)
 
 
 @pytest.mark.asyncio
@@ -533,7 +535,7 @@ async def test_genesis_audit_with_malicious_constitution(temp_db, llm_service):
             # Restore audit method
             agent.get_audit_response = original_get_audit_response
     finally:
-        await agent.shutdown()
+        await shutdown_fixture_agent(agent)
 
 
 @pytest.mark.asyncio
@@ -578,7 +580,7 @@ async def test_genesis_audit_with_missing_constitution(temp_db, llm_service):
                 "INSERT OR IGNORE INTO files (content_hash,original_name,content,metadata) VALUES (?,?,?,?)",
                 (digest, *row),
             )
-        await agent.shutdown()
+        await shutdown_fixture_agent(agent)
 
 
 @pytest.mark.asyncio
@@ -643,7 +645,7 @@ This agent follows ethical AI principles:
             agent._get_governing_constitution = original_get_constitution
             agent.get_audit_response = original_get_audit_response
     finally:
-        await agent.shutdown()
+        await shutdown_fixture_agent(agent)
 
 
 @pytest.mark.asyncio
@@ -725,7 +727,7 @@ This agent follows ethical AI principles:
             agent._get_governing_constitution = original_get_constitution
             agent.get_audit_response = original_get_audit_response
     finally:
-        await agent.shutdown()
+        await shutdown_fixture_agent(agent)
 
 
 if __name__ == "__main__":

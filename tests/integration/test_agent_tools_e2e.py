@@ -15,6 +15,8 @@ A test's probe and calls share its ``live_call_budget``, so their deadlines
 together fit inside the test's timeout.
 """
 
+from tests.shared.native_shutdown_budget import shutdown_fixture_agent
+
 import os
 import pytest
 import pytest_asyncio
@@ -114,7 +116,7 @@ async def kestrel_agent(llm_service, temp_db):
     yield agent
 
     # Async cleanup for MCP and other resources
-    await agent.shutdown()
+    await shutdown_fixture_agent(agent)
 
 
 @pytest_asyncio.fixture

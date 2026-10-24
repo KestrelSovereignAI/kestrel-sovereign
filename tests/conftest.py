@@ -7,6 +7,8 @@ This module provides reusable fixtures for:
 - Mock agent environments
 - Common test utilities
 """
+
+from tests.shared.native_shutdown_budget import shutdown_fixture_agent
 import pytest
 import tempfile
 import shutil
@@ -869,7 +871,7 @@ async def async_kestrel_agent(temp_dir: Path, monkeypatch):
     yield agent
 
     # Cleanup both agent and llm_service
-    await agent.shutdown()
+    await shutdown_fixture_agent(agent)
     await llm_service.close()
 
 

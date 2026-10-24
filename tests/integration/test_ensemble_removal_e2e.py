@@ -21,6 +21,8 @@ than left as dead skip markers.
 """
 from __future__ import annotations
 
+from tests.shared.native_shutdown_budget import shutdown_fixture_agent
+
 import os
 import re
 import tempfile
@@ -107,7 +109,7 @@ async def real_llm_agent(temp_db):
     try:
         yield agent
     finally:
-        await agent.shutdown()
+        await shutdown_fixture_agent(agent)
         await llm.close()
 
 

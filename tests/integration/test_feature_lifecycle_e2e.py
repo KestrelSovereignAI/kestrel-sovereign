@@ -12,6 +12,8 @@ Tests the complete cycle:
 5. Config persists across enable/disable cycles
 """
 
+from tests.shared.native_shutdown_budget import shutdown_fixture_agent
+
 import pytest
 import pytest_asyncio
 import logging
@@ -552,7 +554,7 @@ class TestAgentLevelLifecycle:
 
         yield agent, feature
 
-        await agent.shutdown()
+        await shutdown_fixture_agent(agent)
         await llm_service.close()
 
     @pytest.mark.asyncio

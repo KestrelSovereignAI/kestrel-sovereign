@@ -1,5 +1,7 @@
 """The actual health-query COMMIT survives its own expired observer deadline."""
 
+from tests.shared.native_shutdown_budget import shutdown_fixture_agent
+
 import asyncio
 
 import asyncpg
@@ -82,5 +84,5 @@ async def test_real_health_query_deadline_retains_original_committed_cancellatio
         await await_owned_task(owner)
         backend._execution_custody = None
         await feature.shutdown()
-        await agent.shutdown()
+        await shutdown_fixture_agent(agent)
         await original_db.close()

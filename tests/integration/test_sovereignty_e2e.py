@@ -8,6 +8,8 @@ Tests use REAL IPFS (if available) or gracefully degrade to local cache.
 NO MOCKS - we test actual sovereignty, not simulations.
 """
 
+from tests.shared.native_shutdown_budget import shutdown_fixture_agent
+
 import pytest
 import pytest_asyncio
 import tempfile
@@ -168,5 +170,5 @@ async def test_agent_command_integration(temp_db, llm_service, monkeypatch):
         print(f"✅ Agent Command Output:\n{result}")
     finally:
         if agent is not None:
-            await agent.shutdown()
+            await shutdown_fixture_agent(agent)
         FilecoinAdapter.ipfs_is_available = original_check

@@ -1,3 +1,5 @@
+
+from tests.shared.native_shutdown_budget import shutdown_fixture_agent
 import pytest
 import pytest_asyncio
 import tempfile
@@ -164,4 +166,4 @@ async def test_agent_export_command(temp_db, skip_bootstrap):
             # Accept either format of output
             assert "QmMockCID" in result or "Export" in result or "CID" in result
     finally:
-        await agent.shutdown()
+        await shutdown_fixture_agent(agent)
