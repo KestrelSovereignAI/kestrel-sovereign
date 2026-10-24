@@ -19,6 +19,7 @@ from kestrel_sovereign.stop import (
     StopCleanupRegistry,
     StopDisposition,
     StopDoor,
+    StopOperationClaim,
     StopOutcome,
     StopReceipt,
     StopReceiptConflict,
@@ -28,6 +29,7 @@ from kestrel_sovereign.stop import (
     StopScope,
 )
 from kestrel_sovereign.stop.receipt import opaque_stop_identifier
+from tests.utils.virtual_clock import await_within_hang_guard, pinned_loop_clock
 
 
 class _EndpointReplayStore:
@@ -950,6 +952,139 @@ async def test_failed_receipt_write_never_reports_unwitnessed_stop(
     assert outcomes[0].disposition is StopDisposition.REFUSED
     assert outcomes[0].receipt_id is None
     assert "may have completed" in (outcomes[0].detail or "")
+
+
+@pytest.mark.asyncio
+async def test_claim_heartbeat_uses_quarter_lease_cadence_and_joins_on_exit(
+    monkeypatch,
+):
+    """The heartbeat schedule and owner join do not depend on wall time."""
+
+    lease_seconds = 4.0
+    interval = lease_seconds / 4
+    store = StopReceiptStore(object(), claim_lease_seconds=lease_seconds)
+    claim = StopOperationClaim(
+        operation_id="heartbeat-cadence",
+        request_fingerprint="fingerprint",
+        claim_id="claim-heartbeat-cadence",
+    )
+    claim_held = asyncio.Event()
+    body_release = asyncio.Event()
+    body_left = asyncio.Event()
+    renewal_entered = [asyncio.Event() for _ in range(3)]
+    renewal_release = [asyncio.Event() for _ in range(3)]
+    renewal_finished = [asyncio.Event() for _ in range(3)]
+    renewal_times = []
+    timer_armed = [asyncio.Event() for _ in range(3)]
+    timer_observations = []
+    renewal_owner = None
+
+    loop = asyncio.get_running_loop()
+    call_at = loop.call_at
+
+    def observe_renewal_timer(when, callback, *args, context=None):
+        nonlocal renewal_owner
+        handle = call_at(when, callback, *args, context=context)
+        current = asyncio.current_task()
+        if (
+            current is not None
+            and current.get_name() == "stop-operation-claim-lease"
+            and (renewal_owner is None or current is renewal_owner)
+        ):
+            renewal_owner = current
+            if len(timer_observations) < len(timer_armed):
+                index = len(timer_observations)
+                timer_observations.append((when, handle))
+                timer_armed[index].set()
+        return handle
+
+    monkeypatch.setattr(loop, "call_at", observe_renewal_timer)
+
+    async def controlled_renew(actual_claim):
+        assert actual_claim is claim
+        index = len(renewal_times)
+        renewal_times.append(asyncio.get_running_loop().time())
+        renewal_entered[index].set()
+        await renewal_release[index].wait()
+        renewal_finished[index].set()
+        return True
+
+    monkeypatch.setattr(store, "renew_claim", controlled_renew)
+
+    async def hold() -> None:
+        async with store.hold_claim(claim):
+            try:
+                claim_held.set()
+                await body_release.wait()
+            finally:
+                body_left.set()
+
+    task = asyncio.create_task(hold())
+    settled = None
+    with pinned_loop_clock() as clock:
+        started = clock.time()
+        try:
+            await await_within_hang_guard(
+                claim_held.wait(), step="the Stop claim being held"
+            )
+            await await_within_hang_guard(
+                timer_armed[0].wait(), step="Stop claim renewal timer 1 arming"
+            )
+            for index in range(2):
+                clock.advance(interval)
+                await await_within_hang_guard(
+                    renewal_entered[index].wait(),
+                    step=f"Stop claim renewal {index + 1} starting",
+                )
+                renewal_release[index].set()
+                await await_within_hang_guard(
+                    renewal_finished[index].wait(),
+                    step=f"Stop claim renewal {index + 1} finishing",
+                )
+                await await_within_hang_guard(
+                    timer_armed[index + 1].wait(),
+                    step=f"Stop claim renewal timer {index + 2} arming",
+                )
+
+            clock.advance(interval)
+            await await_within_hang_guard(
+                renewal_entered[2].wait(),
+                step="Stop claim renewal 3 starting",
+            )
+            body_release.set()
+            await await_within_hang_guard(
+                body_left.wait(), step="the claim body leaving"
+            )
+            await asyncio.sleep(0)
+            assert task.done() is False
+
+            renewal_release[2].set()
+            settled = await await_within_hang_guard(
+                asyncio.gather(task, return_exceptions=True),
+                step="the claim heartbeat owner joining",
+            )
+        finally:
+            body_release.set()
+            for release in renewal_release:
+                release.set()
+            if settled is None:
+                settled = await await_within_hang_guard(
+                    asyncio.gather(task, return_exceptions=True),
+                    step="the claim heartbeat fixture settling",
+                )
+
+    assert settled == [None]
+    assert [renewed - started for renewed in renewal_times] == pytest.approx(
+        [interval, 2 * interval, 3 * interval]
+    )
+    assert renewal_owner is not None
+    assert renewal_owner.get_name() == "stop-operation-claim-lease"
+    assert [when - started for when, _handle in timer_observations] == pytest.approx(
+        [interval, 2 * interval, 3 * interval]
+    )
+    assert all(handle.when() == when for when, handle in timer_observations)
+    assert len({id(handle) for _when, handle in timer_observations}) == 3
+    assert all(event.is_set() for event in renewal_finished)
 
 
 @pytest.mark.asyncio
