@@ -6409,11 +6409,12 @@ class SignalDispatcher:
                 if note not in getattr(error, "__notes__", ()):
                     error.add_note(note)
                 raise error
-            self._record_cognition_claim_settlement(delivery.consumer_id,
-                delivery.delivery_id, delivery.lease_token or "", terminalized)
-            self._discard_transient_durable_handoff(delivery.delivery_id)
         else:
-            terminalized = await self.release_durable_delivery_after_task(
+            # This exact original lease already owns cleanup. Public work
+            # admission is closed during shutdown; entering it again would
+            # leave known native uncertainty reclaimable after owner death.
+            terminalized = await self._durable_store.release_managed_delivery_after_task(
+                agent_id=self._agent.did, owner_id=self._durable_delivery_owner,
                 consumer_id=delivery.consumer_id, delivery_id=delivery.delivery_id,
                 lease_token=delivery.lease_token or "", error=reason,
                 terminal=True, terminal_ackable=False,
@@ -6424,6 +6425,9 @@ class SignalDispatcher:
                     error.add_note(note)
                 raise error
 
+        self._record_cognition_claim_settlement(delivery.consumer_id,
+            delivery.delivery_id, delivery.lease_token or "", terminalized)
+        self._discard_transient_durable_handoff(delivery.delivery_id)
         self._durable_store._failed_retry_release_receipts.discard(
             (self._agent.did, delivery.consumer_id, delivery.delivery_id)
         )
