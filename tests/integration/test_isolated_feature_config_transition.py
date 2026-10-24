@@ -1,6 +1,5 @@
 """Real SDK config-transition exchange through the isolated host proxy."""
 
-
 import asyncio
 import json
 import os
