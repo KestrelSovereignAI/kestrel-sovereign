@@ -356,6 +356,8 @@ async def test_shutdown_terminalizes_an_original_cognition_commit_with_lost_ack(
     release_owner = ledger.release_initial_reservations
     terminalize = ledger.release_managed_delivery_after_task
     drain_cleanup = dispatcher._drain_retained_durable_cognition_cleanup_tasks
+    complete_fenced = dispatcher._complete_fenced_durable_shutdown
+    fence_entered, release_fence = asyncio.Event(), asyncio.Event()
     drain_entered = asyncio.Event()
     terminal_entered, release_terminal, terminal_returned = (
         asyncio.Event(), asyncio.Event(), asyncio.Event()
@@ -411,11 +413,20 @@ async def test_shutdown_terminalizes_an_original_cognition_commit_with_lost_ack(
         drain_entered.set()
         return await drain_cleanup()
 
+    async def hold_original_fenced_completion():
+        # Initial cancellation already established the retained fence. Keep
+        # its repeated cancellation off the body until the selected native
+        # COMMIT has finished and only its original acknowledgement is held.
+        fence_entered.set()
+        await release_fence.wait()
+        return await complete_fenced()
+
     monkeypatch.setattr(agent, "process_input", paused_input)
     monkeypatch.setattr(agent.privacy_agent, "add_conversation", original_conversation)
     monkeypatch.setattr(ledger, "release_initial_reservations", observe_owner_release)
     monkeypatch.setattr(ledger, "release_managed_delivery_after_task", hold_original_terminal_receipt)
     monkeypatch.setattr(dispatcher, "_drain_retained_durable_cognition_cleanup_tasks", observe_cleanup_drain)
+    monkeypatch.setattr(dispatcher, "_complete_fenced_durable_shutdown", hold_original_fenced_completion)
     monkeypatch.setattr(dispatcher_module, "_DURABLE_COGNITION_CANCELLATION_GRACE", 0.01)
     closing = None
     with hold_original_sqlite_commit_ack(
@@ -427,9 +438,11 @@ async def test_shutdown_terminalizes_an_original_cognition_commit_with_lost_ack(
             closing = asyncio.create_task(dispatcher.shutdown_durable_delivery())
             await asyncio.wait_for(cancelled.wait(), 5)
             assert await asyncio.wait_for(asyncio.shield(closing), 5) is False
+            await asyncio.wait_for(fence_entered.wait(), 5)
             assert dispatcher.durable_shutdown_owner_fenced
             release.set()
             await asyncio.wait_for(acknowledgement.entered.wait(), 5)
+            release_fence.set()
             await asyncio.wait_for(terminal_entered.wait(), 5)
             await asyncio.wait_for(drain_entered.wait(), 5)
             assert not stopped_after_terminal.is_set()
@@ -459,6 +472,7 @@ async def test_shutdown_terminalizes_an_original_cognition_commit_with_lost_ack(
             ) == 0
         finally:
             release.set()
+            release_fence.set()
             release_terminal.set()
             acknowledgement.release.set()
             if closing is not None:
