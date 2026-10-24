@@ -85,6 +85,12 @@ class SensitiveQueryStringRedactionMiddleware:
         if not artifact and redacted_query == query:
             return await self.app(scope, receive, send)
 
+        def redact_scope() -> None:
+            scope["query_string"] = redacted_query
+            if artifact:
+                scope["path"] = "/api/artifacts"
+                scope["raw_path"] = b"/api/artifacts"
+
         async def send_with_redacted_scope(message: dict) -> None:
             if message.get("type") == "http.response.start":
                 # Uvicorn's RequestResponseCycle.send reads this exact scope
@@ -92,10 +98,7 @@ class SensitiveQueryStringRedactionMiddleware:
                 original_query = scope.get("query_string", b"")
                 original_path = scope.get("path", "")
                 original_raw_path = scope.get("raw_path")
-                scope["query_string"] = redacted_query
-                if artifact:
-                    scope["path"] = "/api/artifacts"
-                    scope["raw_path"] = b"/api/artifacts"
+                redact_scope()
                 try:
                     await send(message)
                 finally:
@@ -112,4 +115,13 @@ class SensitiveQueryStringRedactionMiddleware:
                 return
             await send(message)
 
-        return await self.app(scope, receive, send_with_redacted_scope)
+        try:
+            return await self.app(scope, receive, send_with_redacted_scope)
+        except BaseException:
+            # ServerErrorMiddleware sits outside user middleware. Its fallback
+            # response and error handler see this scope after an escaped error,
+            # including an outer delivery refusal before response-start. Keep
+            # that terminal path redacted too; successful streams still restore
+            # their request semantics after each start-send as above.
+            redact_scope()
+            raise

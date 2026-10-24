@@ -481,3 +481,94 @@ async def test_host_metrics_use_route_templates_without_private_identifiers(host
     assert "/api/artifacts/publications/{key}" in paths
     assert "/api/artifacts/{artifact_id}/head" in paths
     assert all("private-publication-key" not in item and ref["artifact_id"] not in item for item in paths)
+
+
+@pytest.mark.asyncio
+async def test_live_outer_delivery_refusal_redacts_access_and_error_logs(host, monkeypatch):
+    import io
+    import logging
+    import socket
+    import uvicorn
+    from kestrel_sdk import metrics
+    client, agents, app = host
+    ref, _ = await publish(client, content=b"undelivered-private-bytes")
+    feature = agents["kite"].features["ArtifactsFeature"]
+    withdrawals = []
+    def labelled(**values):
+        def inc():
+            if values.get("path", "").endswith("/file") and not withdrawals:
+                withdrawals.append(asyncio.create_task(feature.on_disable()))
+        return SimpleNamespace(inc=inc, observe=lambda _: None)
+    monkeypatch.setattr(metrics, "PROMETHEUS_AVAILABLE", True)
+    monkeypatch.setattr(metrics, "REQUEST_COUNT", SimpleNamespace(labels=labelled))
+    monkeypatch.setattr(metrics, "REQUEST_DURATION", SimpleNamespace(labels=labelled))
+    output = io.StringIO()
+    handler = logging.StreamHandler(output)
+    loggers = [logging.getLogger("uvicorn.access"), logging.getLogger("kestrel_sovereign.api_errors")]
+    for logger in loggers:
+        monkeypatch.setattr(logger, "handlers", [handler])
+        monkeypatch.setattr(logger, "level", logging.INFO)
+        monkeypatch.setattr(logger, "propagate", False)
+    sock = socket.socket()
+    sock.bind(("127.0.0.1", 0))
+    port = sock.getsockname()[1]
+    server = uvicorn.Server(uvicorn.Config(app, log_config=None, access_log=True, lifespan="off"))
+    serving = asyncio.create_task(server.serve(sockets=[sock]))
+    try:
+        async with asyncio.timeout(10):
+            while not server.started:
+                await asyncio.sleep(.01)
+        async with httpx.AsyncClient(base_url=f"http://127.0.0.1:{port}", timeout=10) as live:
+            response = await live.get(path() + f'/{ref["artifact_id"]}/revisions/{ref["revision_id"]}/file',
+                                      headers=AUTH, params={"path": "report.txt"})
+        assert response.status_code == 500
+        assert b"undelivered-private-bytes" not in response.content
+        await asyncio.wait_for(asyncio.gather(*withdrawals), 5)
+        logs = output.getvalue()
+        assert 'GET /api/artifacts HTTP/' in logs
+        assert "Unhandled API error for GET /api/artifacts\n" in logs
+        for private in (ref["artifact_id"], ref["revision_id"], "report.txt", "undelivered-private-bytes"):
+            assert private not in logs
+    finally:
+        server.should_exit = True
+        await asyncio.wait_for(serving, 10)
+        sock.close()
+
+
+@pytest.mark.asyncio
+async def test_outer_delivery_carries_complete_original_scope(host, monkeypatch):
+    from contextlib import contextmanager
+    from contextvars import ContextVar
+    from kestrel_sovereign import turn_scope
+    from kestrel_sovereign.features.artifacts import feature as feature_module
+    client, _, _ = host
+    value = ContextVar("artifact-test-scope", default=None)
+    marker = object()
+    owner = None
+    foreign_checks = []
+    @contextmanager
+    def bind(captured):
+        token = value.set(captured)
+        try:
+            yield
+        finally:
+            value.reset(token)
+    carrier = turn_scope.TurnScopedCarrier("artifact-test-scope", (value,), lambda _: value.get(), bind)
+    monkeypatch.setattr(turn_scope, "_CARRIERS", {**turn_scope._CARRIERS, carrier.name: carrier})
+    def capture(agent):
+        nonlocal owner
+        owner = asyncio.current_task()
+        with bind(marker):
+            return turn_scope.capture_turn_scope(agent)
+    original_require = feature_module.require_sovereign_caller
+    def require(operation):
+        if owner is not None and asyncio.current_task() is not owner:
+            assert value.get() is marker
+            foreign_checks.append(True)
+        return original_require(operation)
+    monkeypatch.setattr(feature_module, "capture_turn_scope", capture)
+    monkeypatch.setattr(feature_module, "require_sovereign_caller", require)
+    response = await client.get(path(), headers=AUTH)
+    assert response.status_code == 200
+    assert foreign_checks
+    assert value.get() is None

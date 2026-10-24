@@ -29,8 +29,7 @@ from kestrel_sovereign.artifacts.service import (
     AuthorizedArtifactService,
 )
 from kestrel_sovereign.auth import (
-    AuthMethod, CallerContext, caller_context_binding_scope,
-    caller_context_scope, capture_caller_context_binding,
+    AuthMethod, CallerContext, caller_context_scope,
 )
 from kestrel_sovereign.endpoints.agent_helpers import get_caller
 from kestrel_sovereign.features.base import Feature
@@ -43,6 +42,7 @@ from kestrel_sovereign.security.host_authority import (
 )
 from kestrel_sovereign.execution_custody import is_execution_control_error
 from kestrel_sovereign.storage.privacy_wrapper import require_durable_persistence_gate
+from kestrel_sovereign.turn_scope import capture_turn_scope
 
 
 class ArtifactsFeature(Feature):
@@ -192,7 +192,7 @@ class ArtifactsFeature(Feature):
                     raise HostAuthorityError("explicit artifact credential required")
             except HostAuthorityError:
                 raise ArtifactAccessDenied("artifact authority is unavailable") from None
-            caller_binding = capture_caller_context_binding()
+            request_scope = capture_turn_scope(self.agent)
             authority = self._service.authority
             now = authority.clock()
             context = OperatorContext(
@@ -213,8 +213,9 @@ class ArtifactsFeature(Feature):
                 if get_caller(request) is not caller or link is not None:
                     raise ArtifactAccessDenied("artifact authority changed")
                 # The outer transport task predates this request's context.
-                # Re-present the SAME revocable lifetime, never mint a new one.
-                with caller_context_binding_scope(caller_binding):
+                # Carry every declared context through the canonical registry,
+                # including the SAME revocable caller lifetime, never a new one.
+                with request_scope.bind():
                     require_sovereign_caller("artifact access")
 
             with authority.bind_authenticated(
