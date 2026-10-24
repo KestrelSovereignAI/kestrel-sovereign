@@ -47,6 +47,7 @@ async def host(repository, monkeypatch):
     app = server.app
     original_agent = getattr(app.state, "agent", None)
     original_manager = getattr(app.state, "agent_manager", None)
+    original_lifespan = app.router.lifespan_context
     app.state.agent = None
     app.state.agent_manager = SimpleNamespace(
         list_agents=lambda: dict(agents), get_agent=lambda name: agents.get(name),
@@ -58,11 +59,16 @@ async def host(repository, monkeypatch):
         ) as client:
             yield client, agents, app
     finally:
-        for agent in agents.values():
-            await agent.features["ArtifactsFeature"].shutdown()
-        server._unmount_feature_routers(app)
-        app.state.agent = original_agent
-        app.state.agent_manager = original_manager
+        try:
+            for agent in agents.values():
+                await agent.features["ArtifactsFeature"].shutdown()
+        finally:
+            server._unmount_feature_routers(app)
+            # FastAPI inclusion also wraps the shared app's lifespan. Route
+            # removal alone leaves those wrappers on later TestClient boots.
+            app.router.lifespan_context = original_lifespan
+            app.state.agent = original_agent
+            app.state.agent_manager = original_manager
 
 
 def path(name="kite"):
