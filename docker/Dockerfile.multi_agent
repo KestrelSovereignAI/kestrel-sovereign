@@ -41,7 +41,9 @@ RUN --mount=type=secret,id=github_token \
     uv pip install --python /app/.venv/bin/python \
         "kestrel-feature-github-app @ git+https://github.com/KestrelSovereignAI/kestrel-feature-github-app.git" && \
     (uv pip uninstall --python /app/.venv/bin/python ollama || true) && \
-    git config --global --unset-all url."https://${GIT_AUTH}@github.com/".insteadOf 2>/dev/null || true
+    if [ -n "$GIT_AUTH" ]; then \
+        git config --global --unset-all url."https://${GIT_AUTH}@github.com/".insteadOf; \
+    fi
 
 # Cloud LLM config — LLMService reads [llm] from /app/kestrel.toml directly.
 COPY docker/kestrel.cloudrun.toml /app/kestrel.toml
