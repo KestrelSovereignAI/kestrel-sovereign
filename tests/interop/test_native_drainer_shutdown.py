@@ -1,6 +1,8 @@
 """A real resident claim must finish its original COMMIT before shutdown joins it."""
 
 import asyncio
+import contextvars
+from datetime import datetime, timedelta, timezone
 
 import aiosqlite
 import pytest
@@ -13,6 +15,7 @@ from kestrel_sdk.signals import (
 )
 
 from kestrel_sovereign.signals.durable import DurableConsumerRegistration
+from tests.utils.original_failure import hold_original_sqlite_commit_ack
 
 
 async def read_owned_delivery(environment, consumer):
@@ -267,8 +270,14 @@ async def test_shutdown_stops_cognition_and_retains_its_exact_lease_until_safe(
     agent, dispatcher, ledger, consumer = await prepare_owned_cognition(native_go_environment)
     entered, cancelled, release = asyncio.Event(), asyncio.Event(), asyncio.Event()
     original_process_input = agent.process_input
+    conversations_before = (await ledger.backend.fetch_one(
+        "SELECT COUNT(*) FROM conversation_history"
+    ))[0]
 
     async def paused_input(*args, **kwargs):
+        # Finish the real body before this deliberately cancellation-resistant
+        # tail. Lost native COMMIT acknowledgements have their own test below.
+        result = await original_process_input(*args, **kwargs)
         entered.set()
         while not release.is_set():
             try:
@@ -277,7 +286,7 @@ async def test_shutdown_stops_cognition_and_retains_its_exact_lease_until_safe(
                 cancelled.set()
                 if not resist_cancellation:
                     raise
-        return await original_process_input(*args, **kwargs)
+        return result
 
     monkeypatch.setattr(agent, "process_input", paused_input)
     monkeypatch.setattr(dispatcher_module, "_DURABLE_COGNITION_CANCELLATION_GRACE", 0.01)
@@ -285,6 +294,9 @@ async def test_shutdown_stops_cognition_and_retains_its_exact_lease_until_safe(
     try:
         await dispatcher.start_durable_cognition_consumer(consumer)
         await asyncio.wait_for(entered.wait(), 5)
+        assert (await ledger.backend.fetch_one(
+            "SELECT COUNT(*) FROM conversation_history"
+        ))[0] > conversations_before
         drainer = dispatcher._durable_cognition_drainers[consumer]
         original_lease = await ledger.backend.fetch_one(
             "SELECT lease_token, status, attempts FROM durable_signal_deliveries WHERE consumer_id=?", (consumer,),
@@ -318,9 +330,151 @@ async def test_shutdown_stops_cognition_and_retains_its_exact_lease_until_safe(
             (agent.did, dispatcher._durable_delivery_owner),
         )
         assert owner[0] is not None
+        assert await ledger.backend.fetch_one(
+            "SELECT lease_token, status, attempts FROM durable_signal_deliveries WHERE consumer_id=?",
+            (consumer,),
+        ) == original_lease
         assert dispatcher._outcome_log_control_error is None
     finally:
         release.set()
         if closing is not None:
             await asyncio.gather(closing, return_exceptions=True)
             await dispatcher.wait_for_durable_shutdown_release()
+
+
+@pytest.mark.timeout(120)
+async def test_shutdown_terminalizes_an_original_cognition_commit_with_lost_ack(
+    native_go_environment, monkeypatch,
+):
+    from kestrel_sovereign.signals import dispatcher as dispatcher_module
+
+    agent, dispatcher, ledger, consumer = await prepare_owned_cognition(native_go_environment)
+    entered, cancelled, release = asyncio.Event(), asyncio.Event(), asyncio.Event()
+    conversation_body = contextvars.ContextVar("owned_original_conversation", default=False)
+    process_input = agent.process_input
+    add_conversation = agent.privacy_agent.add_conversation
+    release_owner = ledger.release_initial_reservations
+    terminalize = ledger.release_managed_delivery_after_task
+    drain_cleanup = dispatcher._drain_retained_durable_cognition_cleanup_tasks
+    complete_fenced = dispatcher._complete_fenced_durable_shutdown
+    fence_entered, release_fence = asyncio.Event(), asyncio.Event()
+    drain_entered = asyncio.Event()
+    terminal_entered, release_terminal, terminal_returned = (
+        asyncio.Event(), asyncio.Event(), asyncio.Event()
+    )
+    stopped_after_terminal = asyncio.Event()
+    conversation_writers = set()
+    conversations_before = (await ledger.backend.fetch_one(
+        "SELECT COUNT(*) FROM conversation_history"
+    ))[0]
+
+    async def original_conversation(*args, **kwargs):
+        token = conversation_body.set(True)
+        try:
+            return await add_conversation(*args, **kwargs)
+        finally:
+            conversation_body.reset(token)
+
+    def owns_conversation_commit(_connection, function, arguments):
+        if (
+            conversation_body.get()
+            and function.__name__ == "execute"
+            and arguments
+            and str(arguments[0]).lstrip().startswith("INSERT INTO conversation_history ")
+        ):
+            conversation_writers.add(asyncio.current_task())
+        return asyncio.current_task() in conversation_writers
+
+    async def paused_input(*args, **kwargs):
+        entered.set()
+        while not release.is_set():
+            try:
+                await release.wait()
+            except asyncio.CancelledError:
+                cancelled.set()
+        return await process_input(*args, **kwargs)
+
+    async def observe_owner_release(*args, **kwargs):
+        if kwargs["mark_owner_stopped"]:
+            assert terminal_returned.is_set(), "owner stopped before its original terminal receipt"
+            assert (await read_owned_delivery(native_go_environment, consumer))[0] == "failed"
+            stopped_after_terminal.set()
+        return await release_owner(*args, **kwargs)
+
+    async def hold_original_terminal_receipt(*args, **kwargs):
+        result = await terminalize(*args, **kwargs)
+        assert result.status == "failed"
+        terminal_entered.set()
+        await release_terminal.wait()
+        terminal_returned.set()
+        return result
+
+    async def observe_cleanup_drain():
+        drain_entered.set()
+        return await drain_cleanup()
+
+    async def hold_original_fenced_completion():
+        # Initial cancellation already established the retained fence. Keep
+        # its repeated cancellation off the body until the selected native
+        # COMMIT has finished and only its original acknowledgement is held.
+        fence_entered.set()
+        await release_fence.wait()
+        return await complete_fenced()
+
+    monkeypatch.setattr(agent, "process_input", paused_input)
+    monkeypatch.setattr(agent.privacy_agent, "add_conversation", original_conversation)
+    monkeypatch.setattr(ledger, "release_initial_reservations", observe_owner_release)
+    monkeypatch.setattr(ledger, "release_managed_delivery_after_task", hold_original_terminal_receipt)
+    monkeypatch.setattr(dispatcher, "_drain_retained_durable_cognition_cleanup_tasks", observe_cleanup_drain)
+    monkeypatch.setattr(dispatcher, "_complete_fenced_durable_shutdown", hold_original_fenced_completion)
+    monkeypatch.setattr(dispatcher_module, "_DURABLE_COGNITION_CANCELLATION_GRACE", 0.01)
+    closing = None
+    with hold_original_sqlite_commit_ack(
+        monkeypatch, owns_conversation_commit,
+    ) as acknowledgement:
+        try:
+            await dispatcher.start_durable_cognition_consumer(consumer)
+            await asyncio.wait_for(entered.wait(), 5)
+            closing = asyncio.create_task(dispatcher.shutdown_durable_delivery())
+            await asyncio.wait_for(cancelled.wait(), 5)
+            assert await asyncio.wait_for(asyncio.shield(closing), 5) is False
+            await asyncio.wait_for(fence_entered.wait(), 5)
+            assert dispatcher.durable_shutdown_owner_fenced
+            release.set()
+            await asyncio.wait_for(acknowledgement.entered.wait(), 5)
+            release_fence.set()
+            await asyncio.wait_for(terminal_entered.wait(), 5)
+            await asyncio.wait_for(drain_entered.wait(), 5)
+            assert not stopped_after_terminal.is_set()
+            release_terminal.set()
+            await asyncio.wait_for(dispatcher.wait_for_durable_shutdown_release(), 10)
+            row = await ledger.backend.fetch_one(
+                "SELECT status, lease_owner, lease_token, lease_expires_at, next_attempt_at, last_error "
+                "FROM durable_signal_deliveries WHERE consumer_id=?", (consumer,),
+            )
+            assert row[:5] == ("failed", None, None, None, None)
+            assert row[5].startswith("execution_control_unresolved: ExecutionCommitOutcomeError")
+            assert stopped_after_terminal.is_set()
+            assert not dispatcher._retained_cognition_control_debt
+            assert not dispatcher.durable_shutdown_owner_fenced
+            assert (await ledger.backend.fetch_one(
+                "SELECT COUNT(*) FROM conversation_history"
+            ))[0] > conversations_before, "the original worker never committed the body effect"
+            with pytest.raises(RuntimeError, match="shutting down"):
+                await dispatcher.release_durable_delivery_after_task(
+                    consumer_id=consumer, delivery_id="not-admitted", lease_token="not-admitted",
+                    error="closed ordinary release",
+                )
+            now = datetime.now(timezone.utc)
+            assert await ledger.recover_abandoned_leases(
+                agent_id=agent.did, recovering_owner_id="dispatcher:foreign",
+                stale_before=now + timedelta(seconds=1), now=now,
+            ) == 0
+        finally:
+            release.set()
+            release_fence.set()
+            release_terminal.set()
+            acknowledgement.release.set()
+            if closing is not None:
+                await asyncio.gather(closing, return_exceptions=True)
+                await dispatcher.wait_for_durable_shutdown_release()

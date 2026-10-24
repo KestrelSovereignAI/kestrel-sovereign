@@ -5256,6 +5256,10 @@ class DurableSignalStore(UnifiedStoreBase):
         safe even after the nominal deadline: no other claimant could have
         acquired the row while the owner was live.  The owner predicate keeps
         this narrow escape hatch unavailable to public or unknown executors.
+
+        Non-ACKable terminal cleanup may also match the original capability
+        retained by a committed retry whose acknowledgement was lost. Ordinary
+        release and terminal-ACKable settlement still require a leased row.
         """
 
         self._require_nonempty("agent_id", agent_id)
@@ -5290,7 +5294,7 @@ class DurableSignalStore(UnifiedStoreBase):
                 END,
                 updated_at = ?
             WHERE agent_id = ? AND consumer_id = ? AND delivery_id = ?
-              AND status = ? AND lease_owner = ? AND lease_token = ?
+              AND status IN (?, ?) AND lease_owner = ? AND lease_token = ?
             """,
             (
                 self.to_bool_param(terminal_ackable),
@@ -5310,6 +5314,7 @@ class DurableSignalStore(UnifiedStoreBase):
                 consumer_id,
                 delivery_id,
                 LEASED,
+                RETRY if terminal and not terminal_ackable else LEASED,
                 owner_id,
                 lease_token,
             ),

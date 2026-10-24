@@ -19,7 +19,7 @@ Auto-generated file-tree + per-file purpose index. Always-loaded context for the
 GitHub App (issue #791). Do **not** edit by hand — regenerate via `python scripts/generate_repo_map.py`.
 
 **Generated:** 2026-10-24
-**Scope:** 3345 tracked files (2503 `.py`, 367 `.md`, 475 other). Excludes `__pycache__`, `node_modules`, `.venv`, `.claude`, build artifacts.
+**Scope:** 3346 tracked files (2504 `.py`, 367 `.md`, 475 other). Excludes `__pycache__`, `node_modules`, `.venv`, `.claude`, build artifacts.
 
 **Format per file:** `path — one-line purpose` plus the public top-level Python symbols on the next line
 (classes and functions; private `_name` skipped).
@@ -5364,6 +5364,8 @@ Repo entry points and standard project files.
   - `def test_subset_ok_when_features_are_a_subset()`; `def test_spawn_tool_max_tokens_constraint_validates()`; `def test_refuses_features_not_available_to_parent()`; `def test_refuses_capability_granting_constraint()`; `async def test_direct_create_rejects_mandate_before_inception(monkeypatch, tmp_path)`; `async def test_omitted_allowlist_inherits_parent_ceiling_not_all(monkeypatch, tmp_path)`
 - **tests/unit/test_sql_utils.py** — Tests for kestrel_sovereign.sql_utils — SQL identifier validation.
   - `class TestSafeTableName`; `class TestSafeColumnName`
+- **tests/unit/test_sqlite_cognition_shutdown_terminal.py** — Real SQLite control receipts must settle their exact lease after close.
+  - `async def owned_delivery(tmp_path)`; `async def original_commit_uncertainty(backend, dispatcher, delivery, monkeypatch, …)`; `async def test_closed_sqlite_cognition_persists_original_control_before_owner_release(tmp_path, monkeypatch, phase)`; `async def test_closed_sqlite_cognition_retains_control_on_exact_identity_mismatch(tmp_path, monkeypatch, mismatch)`; `async def test_original_retry_capability_does_not_admit_release_or_cursor_ack(tmp_path, terminal_ackable)`
 - **tests/unit/test_sqlite_journal_admission_fence.py** — Admission metadata must never invoke a concurrently installed factory.
   - `async def test_admission_snapshot_atomically_fences_actual_text_factory(dispatcher_components, monkeypatch, tmp_path)`
 - **tests/unit/test_sse_approval_events.py** — Tests that the /agent/notifications/sse endpoint forwards events from the agent's event bus (e.g.
@@ -5676,7 +5678,7 @@ Repo entry points and standard project files.
 - **tests/utils/native_tck_source.py** — Materialize the pinned, reviewed TCK in a test-owned temporary checkout.
   - `def prepared_tck_source(parent)`
 - **tests/utils/original_failure.py** — Source identity and physical-retirement assertions shared by custody tests.
-  - `class OriginalFailure`
+  - `class OriginalSQLiteCommitAck`; `def hold_original_sqlite_commit_ack(monkeypatch, owns_commit)`; `class OriginalFailure`
 - **tests/utils/outbound_tls.py** — One verified public-origin TLS fixture for production GET and POST callers.
   - `def hold_outbound_response_close(monkeypatch)`; `def outbound_close_barrier(monkeypatch)`; `def route_outbound_tls_peer(monkeypatch)`; `def outbound_tls(tmp_path, monkeypatch, request)`
 - **tests/utils/override_writers.py** — Name the operator as the writer of a model mandate a test pins (#2652).

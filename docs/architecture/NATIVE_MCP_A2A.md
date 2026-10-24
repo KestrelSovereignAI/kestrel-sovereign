@@ -444,10 +444,11 @@ the registration key served at the authority-root well-known path. Other
 recipients expose only their directly configured card URLs. Blank or invalid
 configuration refuses publication.
 
-This is a private implementation candidate, exercised with unpublished SDK
-builds containing the reviewed signing and HTTP-authorization repairs. Push
-delivery and draft-route retirement are implemented. Released dependency
-adoption, TCK and cross-framework interoperability remain acceptance work.
+The implementation uses published SDK 0.42.2, including the reviewed signing
+and HTTP-authorization repairs. Push delivery and draft-route retirement are
+implemented. The pinned TCK observation matrix and independent Go peer below
+record the measured interoperability scope; public release and deployment
+evidence remain in epic #3679.
 The offline reviewed migration is implemented; it has not been run on
 operator data. The isolated HTTP tests do not establish release acceptance.
 
@@ -1270,6 +1271,17 @@ Process-session tests drive the actual startup factory,
 SDK HTTP routes and durable creator/outbound rows over a loopback listener,
 including a proxy prefix and revoked roster. These are implementation checks;
 they do not establish deployment or foreign-framework acceptance.
+
+Shutdown keeps public durable-work admission closed while an already-retained
+SQLite cognition settles its exact original lease. A lost native COMMIT
+acknowledgement is recorded as a non-ACKable failed delivery before the runtime
+owner is stopped. The same cleanup can settle an original owner/token retained
+by a retry whose acknowledgement was lost; it cannot release or acknowledge
+ordinary retry work or alter a successor's identity. Clean resistant-tail and
+lost-COMMIT tests select those phases separately and check the actual committed
+effect, terminal receipt, owner-release ordering and restart recovery. This
+does not eliminate the existing at-least-once crash window between a business
+effect and its durable terminal record.
 
 ## Review, verification and release order
 
