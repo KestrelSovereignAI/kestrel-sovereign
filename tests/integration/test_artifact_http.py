@@ -10,7 +10,7 @@ import pytest_asyncio
 from fastapi import FastAPI
 from kestrel_sdk.operator import OperatorAuthorizationError
 
-from kestrel_sovereign.artifacts.http import create_artifact_router
+from kestrel_sovereign.artifacts.http import ArtifactDeliveryMiddleware, create_artifact_router
 from tests.integration.test_artifact_repository import repository as _repository_fixture
 from tests.integration.test_artifact_service import access as _access_fixture
 
@@ -29,6 +29,7 @@ async def api(access):
         with access.bind(context):
             yield context
     app = FastAPI()
+    app.add_middleware(ArtifactDeliveryMiddleware)
     app.include_router(create_artifact_router(access.service, resolve_context=resolve))
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
         yield client, app
@@ -180,6 +181,7 @@ async def test_slow_upload_has_deadline_and_releases_authority(access):
         with access.bind(access.context()) as context:
             yield context
     app = FastAPI()
+    app.add_middleware(ArtifactDeliveryMiddleware)
     app.include_router(create_artifact_router(access.service, resolve_context=resolve, timeout_seconds=0.05))
     entered = asyncio.Event()
 
@@ -351,3 +353,67 @@ async def test_corrupt_head_is_storage_failure_not_a_deletion_signal(api, access
     response = await client.get(f'/api/artifacts/{ref["artifact_id"]}/head', headers=AUTH)
     assert response.status_code == 503
     assert response.json() == {"error": {"code": "artifact_integrity_failure"}}
+
+
+@pytest.mark.asyncio
+async def test_missing_outer_delivery_boundary_refuses_before_repository_access(access):
+    resolved = False
+    @asynccontextmanager
+    async def resolve(request):
+        nonlocal resolved
+        resolved = True
+        with access.bind(access.context()) as context:
+            yield context
+    app = FastAPI()
+    app.include_router(create_artifact_router(access.service, resolve_context=resolve))
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.get("/api/artifacts")
+    assert response.status_code == 403
+    assert not resolved
+
+
+@pytest.mark.asyncio
+async def test_blocked_outer_send_obeys_deadline_and_releases_original_leases(access):
+    @asynccontextmanager
+    async def resolve(request):
+        with access.bind(access.context()) as context:
+            yield context
+    app = FastAPI()
+    @app.middleware("http")
+    async def buffering(request, call_next):
+        return await call_next(request)
+    app.add_middleware(ArtifactDeliveryMiddleware)
+    app.include_router(create_artifact_router(access.service, resolve_context=resolve, timeout_seconds=0.05))
+    entered, cancelled = asyncio.Event(), asyncio.Event()
+    bodies = []
+    async def receive():
+        return {"type": "http.request", "body": b"", "more_body": False}
+    async def send(message):
+        if message["type"] == "http.response.start" and message["status"] == 200:
+            entered.set()
+            try:
+                await asyncio.Event().wait()
+            finally:
+                cancelled.set()
+        if message["type"] == "http.response.body":
+            bodies.append(message.get("body", b""))
+    scope = {"type": "http", "asgi": {"version": "3.0", "spec_version": "2.4"},
+             "http_version": "1.1", "method": "GET", "scheme": "http", "path": "/api/artifacts",
+             "raw_path": b"/api/artifacts", "query_string": b"", "root_path": "",
+             "server": ("test", 80), "client": ("test", 1), "headers": []}
+    serving = asyncio.create_task(app(scope, receive, send))
+    try:
+        await asyncio.wait_for(entered.wait(), 2)
+        # Observe cancellation by the artifact deadline, not by our test timeout.
+        await asyncio.wait_for(cancelled.wait(), 0.5)
+        outcome = await asyncio.wait_for(asyncio.gather(serving, return_exceptions=True), 2)
+        assert isinstance(outcome[0], BaseException)
+        assert b'"items"' not in b"".join(bodies)
+        assert not access.authority_gate.locked()
+        assert not access.holder.gate.locked()
+        assert not access.authority._bindings
+        assert not access.authority._operations
+    finally:
+        if not serving.done():
+            serving.cancel()
+        await asyncio.gather(serving, return_exceptions=True)

@@ -28,7 +28,7 @@ from pydantic import BaseModel, ConfigDict, ValidationError
 from starlette.responses import JSONResponse, Response
 
 from .repository import ArtifactIntegrityError, ArtifactQuotaExceeded
-from .service import ArtifactAction, AuthorizedArtifactService
+from .service import ArtifactAccessDenied, ArtifactAction, AuthorizedArtifactService
 
 ContextResolver = Callable[[Request], AbstractAsyncContextManager[OperatorContext]]
 _HEADERS = {
@@ -38,6 +38,71 @@ _HEADERS = {
     "Referrer-Policy": "no-referrer",
     "Content-Security-Policy": "sandbox; default-src 'none'",
 }
+
+_DELIVERY_KEY = "kestrel.artifact_delivery"
+
+
+class _ArtifactDelivery:
+    """One response's acknowledgement from the host's outer ASGI boundary."""
+
+    def __init__(self):
+        self.check_current = None
+        self.deadline = None
+        self.active = False
+        self.failed = False
+        self.finished = asyncio.Event()
+
+    def begin(self, check, deadline):
+        if self.check_current is not None:
+            raise ArtifactAccessDenied("artifact delivery already bound")
+        self.check_current, self.deadline, self.active = check, deadline, True
+
+    def check(self):
+        if not self.active or self.failed:
+            raise ArtifactAccessDenied("artifact delivery is no longer active")
+        self.check_current()
+
+
+class ArtifactDeliveryMiddleware:
+    """Install outside every buffering middleware on an artifact-serving host.
+
+    BaseHTTPMiddleware forwards messages through task queues. Its inner send
+    is not a delivery acknowledgement. Keep the endpoint's original leases
+    alive until this boundary sends the final body, and run its current-policy
+    checker here before each actual transport handoff. No second lease is
+    acquired on this task, which would deadlock behind a queued policy writer.
+    """
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+        delivery = _ArtifactDelivery()
+        scope[_DELIVERY_KEY] = delivery
+
+        async def guarded_send(message):
+            if delivery.check_current is None:
+                await send(message)
+                return
+            try:
+                async with asyncio.timeout_at(delivery.deadline):
+                    delivery.check()
+                    await send(message)
+            except BaseException:
+                delivery.failed = True
+                delivery.finished.set()
+                raise
+            if message["type"] == "http.response.body" and not message.get("more_body", False):
+                delivery.finished.set()
+
+        try:
+            await self.app(scope, receive, guarded_send)
+        finally:
+            delivery.active = False
+            delivery.finished.set()
 
 
 class _InvalidRequest(ValueError):
@@ -106,6 +171,7 @@ class _AuthorizedResponse(Response):
     async def __call__(self, scope, receive, send):
         started = False
         prepared = False
+        delivery = scope.get(_DELIVERY_KEY)
         async def guarded_send(message):
             nonlocal started
             check()
@@ -114,9 +180,12 @@ class _AuthorizedResponse(Response):
             await send(message)
 
         try:
-            async with asyncio.timeout(self.timeout_seconds):
+            if not isinstance(delivery, _ArtifactDelivery):
+                raise ArtifactAccessDenied("artifact transport custody is unavailable")
+            async with asyncio.timeout(self.timeout_seconds) as request_timeout:
                 async with self.resolve_context(self.request) as context:
                     remaining = (context.expires_at - self.service.authority.clock()).total_seconds()
+                    context_deadline = asyncio.get_running_loop().time() + max(0, remaining)
                     async with asyncio.timeout(max(0, remaining)):
                         # Authentication owns the context, but untrusted input
                         # must not retain a privacy/revocation lease while it
@@ -129,7 +198,13 @@ class _AuthorizedResponse(Response):
                             response = await self.build(context, value) if self.prepare is not None else await self.build(context)
                             prepared = True
                             check()
-                            await response(scope, receive, guarded_send)
+                            delivery.begin(check, min(request_timeout.when(), context_deadline))
+                            try:
+                                await response(scope, receive, guarded_send)
+                                await delivery.finished.wait()
+                                delivery.check()
+                            finally:
+                                delivery.active = False
         except Exception as error:
             # Headers already sent cannot be replaced by a second response.
             # Abort a partial transfer; never send private bytes after denial.

@@ -77,7 +77,9 @@ predates these contracts and is not an artifact runtime dependency.
 host's existing feature lifecycle. Add `ArtifactsFeature` to an agent's feature
 allowlist when one is configured. Initialization requires that agent's durable
 database, encryption key and privacy persistence gate. It refuses an unavailable
-dependency rather than publishing a plaintext or in-memory substitute. Routes
+dependency rather than publishing a plaintext or in-memory substitute. Keyless
+hosts omit this optional feature during discovery, retain a health diagnostic,
+and continue booting their other features. Routes
 follow the selected agent and current feature instance, including reloads.
 
 The initial host policy admits only a current, configured sovereign API key in
@@ -89,7 +91,9 @@ rotation does not change that owner. Request bodies and URLs cannot select it.
 
 The host binds the exact context for the response lifetime, rechecks the current
 credential and feature generation at every operation and send, and holds the
-existing privacy gate through private delivery. Disable/shutdown revoke admission
+existing privacy gate through private delivery. An outer ASGI delivery boundary
+acknowledges the final transport send; queuing bytes inside host middleware does
+not release that lease. Disable/shutdown revoke admission
 before joining active operations; re-enable cannot revive old upload contexts.
 Lock order is privacy, authority, database. These gates require one owning host
 process and do not coordinate multiple processes. Encryption-key maintenance is
@@ -97,6 +101,10 @@ offline: stop the host, rotate the same agent database, and restart. Native comm
 expiry or lost delivery requires publication reconciliation, not a failed-save
 claim. Host registration does not by itself complete workspace transfers, producer
 tools, delegated grants or the end-to-end computer-use epic.
+
+While enabled, the feature sweeps up to 100 owners' expired staging every minute,
+including owners who never return. Disable/shutdown join the current sweep and
+stop its owned task; re-enable starts it again. Published revisions are retained.
 
 Private responses remain authorized through body delivery, use no-store caching
 and serve source bytes as attachments with nosniff and a sandbox policy. The

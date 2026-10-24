@@ -37,6 +37,7 @@ async def host(repository, monkeypatch):
         agent.did = "did:test:" + name
         agent._raw_storage = SimpleNamespace(db=store.db)
         agent.features = {}
+        agent._track_background_task = lambda coro, *, name: asyncio.create_task(coro, name=name)
         feature = ArtifactsFeature(agent)
         await feature.initialize()
         agent.features[feature.name] = feature
@@ -132,6 +133,18 @@ async def test_only_current_explicit_sovereign_credentials(host, monkeypatch):
     monkeypatch.setenv("KESTREL_API_KEY", "rotated-artifact-test-key")
     assert (await client.get(path(), headers=AUTH)).status_code == 401
     assert (await client.get(path(), headers={"X-API-Key": "rotated-artifact-test-key"})).status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_query_key_exception_cannot_authorize_artifact_receipts(host):
+    client, _, _ = host
+    ref, _ = await publish(client, key="link-qr.png")
+    url = path() + "/publications/link-qr.png"
+    for headers in ({}, {"X-API-Key": "wrong"}, {"Authorization": "Bearer wrong"}):
+        denied = await client.get(url, params={"api_key": KEY}, headers=headers)
+        assert denied.status_code == 403
+        assert ref["artifact_id"] not in denied.text
+    assert (await client.get(url, headers=AUTH)).json()["ref"] == ref
 
 
 @pytest.mark.asyncio
@@ -240,3 +253,136 @@ async def test_shutdown_joins_inflight_read_and_denies_private_delivery(host, mo
     assert response.status_code == 403
     assert response.json() == {"error": {"code": "artifact_access_denied"}}
     assert (await repository.db.fetchone("SELECT COUNT(*) FROM artifact_heads"))[0] == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("transition", ["shutdown", "credential", "privacy", "cancel"])
+async def test_real_middleware_retains_custody_through_outer_send(host, monkeypatch, transition):
+    client, agents, app = host
+    ref, _ = await publish(client, content=b"private-outer-send")
+    agent = agents["kite"]
+    feature = agent.features["ArtifactsFeature"]
+    entered, release = asyncio.Event(), asyncio.Event()
+    messages = []
+    url = path() + f'/{ref["artifact_id"]}/revisions/{ref["revision_id"]}/file'
+    scope = {"type": "http", "asgi": {"version": "3.0", "spec_version": "2.4"},
+             "http_version": "1.1", "method": "GET", "scheme": "http", "path": url,
+             "raw_path": url.encode(), "query_string": b"path=report.txt", "root_path": "",
+             "server": ("test", 80), "client": ("test", 1), "headers": [(b"x-api-key", KEY.encode())]}
+
+    async def receive():
+        return {"type": "http.request", "body": b"", "more_body": False}
+
+    async def send(message):
+        if message["type"] == "http.response.start":
+            entered.set()
+            await release.wait()
+        messages.append(message)
+
+    async def change_privacy():
+        async with agent.gate.exclusive():
+            agent.set_mode(PrivacyMode.EPHEMERAL)
+
+    serving = asyncio.create_task(app(scope, receive, send))
+    changing = None
+    try:
+        await asyncio.wait_for(entered.wait(), 5)
+        if transition == "credential":
+            monkeypatch.setenv("KESTREL_API_KEY", "rotated-artifact-test-key")
+        elif transition == "cancel":
+            serving.cancel()
+        else:
+            changing = asyncio.create_task(feature.shutdown() if transition == "shutdown" else change_privacy())
+            await asyncio.sleep(0)
+            assert not changing.done(), "transition completed before outer transport released the response"
+        release.set()
+        outcome = await asyncio.wait_for(asyncio.gather(serving, return_exceptions=True), 5)
+        if changing is not None:
+            await asyncio.wait_for(changing, 5)
+        body = b"".join(message.get("body", b"") for message in messages)
+        if transition == "privacy":
+            assert body == b"private-outer-send"
+            assert agent.privacy_mode == PrivacyMode.EPHEMERAL
+            assert outcome == [None]
+        else:
+            assert b"private-outer-send" not in body
+            assert isinstance(outcome[0], BaseException)
+        assert not feature._service.authority._bindings
+        assert not feature._service.authority._operations
+        assert not agent.gate.locked()
+    finally:
+        release.set()
+        tasks = [serving] + ([changing] if changing is not None else [])
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_actual_host_reenables_same_instance(repository, tmp_path):
+    from kestrel_sovereign.kestrel_agent import KestrelAgent
+    agent = KestrelAgent(did="did:test:reenable-artifacts", storage_path=str(tmp_path / "host.db"))
+    agent.features = {}
+    agent._raw_storage = SimpleNamespace(db=repository[0].db)
+    feature = ArtifactsFeature(agent)
+    try:
+        await agent._register_feature(feature)
+        service = feature._service
+        first_sweep = feature._sweep_task
+        await agent._unregister_feature_runtime(feature, unload=False)
+        feature.enabled = False
+        assert first_sweep.done()
+        await agent._activate_feature_runtime(feature)
+        assert agent.features[feature.name] is feature
+        assert feature._service is service
+        assert feature.enabled and feature._accepting
+        assert feature._sweep_task is not first_sweep
+        assert not feature._sweep_task.done()
+    finally:
+        await agent._unregister_feature_runtime(feature, unload=False)
+    assert feature._sweep_task.done()
+
+
+@pytest.mark.asyncio
+async def test_active_host_sweeps_expired_staging_without_owner_return(host, monkeypatch):
+    from datetime import timedelta
+    client, agents, _ = host
+    feature = agents["kite"].features["ArtifactsFeature"]
+    repo = feature._service.repository
+    await client.post(path() + "/staging", headers=AUTH, json={
+        "publication_key": "abandoned", "path": "a.txt", "media_type": "text/plain", "content_base64": "YQ==",
+    })
+    assert (await repo.db.fetchone("SELECT COUNT(*) FROM artifact_staging"))[0] == 1
+    await feature.on_disable()
+    now = repo.clock()
+    monkeypatch.setattr(repo, "clock", lambda: now + timedelta(hours=2))
+    monkeypatch.setattr(feature, "_sweep_seconds", 0.01)
+    await feature.on_enable()
+    async with asyncio.timeout(3):
+        while (await repo.db.fetchone("SELECT COUNT(*) FROM artifact_staging"))[0]:
+            await asyncio.sleep(0.01)
+    assert (await repo.db.fetchone("SELECT COUNT(*) FROM artifact_blobs"))[0] == 0
+    await feature.on_disable()
+    assert feature._sweep_task.done()
+
+
+@pytest.mark.asyncio
+async def test_keyless_agent_boots_without_advertising_artifacts(temp_db, monkeypatch):
+    from kestrel_sovereign.kestrel_agent import KestrelAgent
+    from kestrel_sovereign.llm.service import LLMService
+    from tests.shared.native_shutdown_budget import shutdown_fixture_agent
+    monkeypatch.delenv("KESTREL_DATA_KEY", raising=False)
+    monkeypatch.delenv("KESTREL_DATA_KEY_FILE", raising=False)
+    llm = LLMService()
+    agent = KestrelAgent(did="did:test:keyless-artifact-boot", storage_path=str(temp_db),
+                         llm_service=llm, privacy_mode=PrivacyMode.NORMAL)
+    try:
+        await agent.initialize()
+        assert agent.features
+        assert "ArtifactsFeature" not in agent.features
+        assert any(item.feature_name == "ArtifactsFeature" and "KESTREL_DATA_KEY" in item.reason
+                   for item in agent.rejected_feature_contributions)
+    finally:
+        await shutdown_fixture_agent(agent)
+        await llm.close()
