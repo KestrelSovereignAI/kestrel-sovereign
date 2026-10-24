@@ -337,6 +337,9 @@ The 0.42 floor supplies the reviewed vendored native A2A implementation used by
 both Core and feature skill producers through the SDK's `a2a` extra.
 SDK 0.42.2 also supplies the standard version query carrier and validation
 of repeated version headers required by Core's native bindings.
+Core requires `sse-starlette>=3.5.0` so stopping one server does not cancel
+streams served by a later server in the same process; automatic stream
+draining remains enabled.
 SDK 0.39 lacks the native initialization contract and cannot boot this release.
 The lock records the tested version without excluding future SDK minor
 releases. The SDK
@@ -366,8 +369,8 @@ checks establish resolver compatibility, not runtime acceptance. Editable
 Eye, Flight and Claws installations and the rest of each host's feature
 manifest need their own source and runtime verification before Core ships.
 
-Core 0.54 additionally requires the published Features 0.3.4 and Talon 0.3.0
-lines in the host profile. Talon's discovery tool is `talon_scan_stale_work`;
+Core 0.54 host profiles that enable Features or Talon need their published
+0.3.4 and 0.3.0 lines respectively. Talon's discovery tool is `talon_scan_stale_work`;
 GitHub's separate issue/PR scanner keeps `scan_stale_work`. The Talon package
 and host-manifest bounds must advance together before the Core release.
 

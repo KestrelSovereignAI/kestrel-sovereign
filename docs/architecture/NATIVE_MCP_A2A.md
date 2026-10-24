@@ -77,6 +77,12 @@ version headers, resolving SDK
 The retained optional gRPC handler's version negotiation remains tracked in SDK
 [#91](https://github.com/KestrelSovereignAI/kestrel-sovereign-sdk/issues/91);
 Core does not serve gRPC.
+Core also requires `sse-starlette>=3.5.0`. Earlier releases can latch a stopped
+server's shutdown state across later servers in the same process, truncating
+native streams. The [3.5.0 fix](https://github.com/sysid/sse-starlette/releases/tag/v3.5.0)
+keeps ordinary shutdown scoped to the server while preserving automatic stream
+draining. The MUST and full TCK profiles must both run consecutively against
+fresh native hosts.
 Core's public lock resolves its reviewed PyPI wheel and source distribution;
 installed-package custody checks verify the native implementation. Consumer
 constraints and acceptance tests must still verify the complete host feature

@@ -116,6 +116,9 @@ dependencies = [
     # current line with the native router/CSRF/frontend acceptance checks.
     "fastapi>=0.143.3,<0.144",
     "uvicorn==0.48.0",
+    # 3.5.0 fixes stopped servers cancelling later native A2A streams in the
+    # same process (sse-starlette#211). Keep automatic stream draining enabled.
+    "sse-starlette>=3.5.0",
     "pydantic==2.13.4",
     # HTTP clients
     # >=3.14.1 fixes request-smuggling, parser, and decompression advisories

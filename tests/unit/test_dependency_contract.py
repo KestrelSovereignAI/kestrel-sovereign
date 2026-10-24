@@ -101,6 +101,23 @@ def test_installed_remote_mcp_campaign_requires_the_public_feature_contract():
     assert package["source"] == {"registry": "https://pypi.org/simple"}
 
 
+def test_native_a2a_streams_require_server_scoped_shutdown():
+    """MUST then full TCK boots must not share a latched SSE shutdown flag."""
+    (requirement,) = [
+        Requirement(raw)
+        for raw in _pyproject()["project"]["dependencies"]
+        if canonicalize_name(Requirement(raw).name) == "sse-starlette"
+    ]
+    assert Version("3.4.11") not in requirement.specifier
+    assert Version("3.5.0") in requirement.specifier
+    assert Version("3.6.0") in requirement.specifier
+    (package,) = [
+        item for item in _lock()["package"] if item["name"] == "sse-starlette"
+    ]
+    assert Version(package["version"]) >= Version("3.5.0")
+    assert package["source"] == {"registry": "https://pypi.org/simple"}
+
+
 def _locked_root_package(lock: dict) -> dict:
     return next(
         package
