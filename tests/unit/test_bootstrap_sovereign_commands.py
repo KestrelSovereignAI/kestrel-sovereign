@@ -9,6 +9,7 @@ import pytest
 from kestrel_sovereign.auth import CallerContext
 from kestrel_sovereign.command_handler import CommandHandler
 from kestrel_sovereign.command_policy import (
+    AGENT_IDENTITY_REVISION_COMMANDS,
     AGENT_RUNTIME_MUTATION_COMMANDS,
     HOST_ADMIN_COMMANDS,
     RECOVERY_COMMAND_POLICY,
@@ -220,6 +221,9 @@ def test_recovery_policy_is_complete_immutable_and_authority_derived():
             "!feature-add",
             "!feature-remove",
             "!feature-configure",
+            # #3779: revising the canonical SOUL is the Sovereign's act, not
+            # an agent self-edit.
+            "!revise-soul",
         }
     )
     assert RECOVERY_SOVEREIGN_COMMANDS == frozenset(
@@ -231,10 +235,12 @@ def test_recovery_policy_is_complete_immutable_and_authority_derived():
     assert AGENT_RUNTIME_MUTATION_COMMANDS == frozenset(
         {"!feature-add", "!feature-remove", "!feature-configure"}
     )
+    assert AGENT_IDENTITY_REVISION_COMMANDS == frozenset({"!revise-soul"})
     assert SOVEREIGN_COMMANDS == (
         RECOVERY_SOVEREIGN_COMMANDS
         | HOST_ADMIN_COMMANDS
         | AGENT_RUNTIME_MUTATION_COMMANDS
+        | AGENT_IDENTITY_REVISION_COMMANDS
     )
     with pytest.raises(TypeError):
         RECOVERY_COMMAND_POLICY["!status"] = True

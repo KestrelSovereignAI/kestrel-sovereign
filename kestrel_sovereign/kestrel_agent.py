@@ -138,6 +138,7 @@ from kestrel_sovereign.agent.tool_allowlist import bump_registry_generation
 from kestrel_sovereign.agent.turn_lifecycle import TurnLifecycleMixin
 from kestrel_sovereign.agent.turn_outcome import settle_turn_outcome
 from kestrel_sovereign.bootstrap import BootstrapService, BootstrapState
+from kestrel_sovereign.bootstrap.soul_durability import inspect_soul_file
 from kestrel_sovereign.command_handler import CommandHandler
 from kestrel_sovereign.command_policy import (
     BOOTSTRAP_ALLOWED_COMMANDS,
@@ -2469,15 +2470,24 @@ class KestrelAgent(
     async def _load_or_promote_soul_resource(
         self, agent_data_dir: Optional[str]
     ) -> None:
-        """Prefer canonical encrypted SOUL, else promote a disk seed/cache."""
+        """Prefer canonical encrypted SOUL, else promote a disk seed/cache.
+
+        Serving canonical over a SOUL.md that differs from it is reported, not
+        done silently (#3779): the file's edits are not in effect until the
+        Sovereign makes the file canonical with ``!revise-soul``.
+        """
         try:
             loaded = await self.context_builder.load_canonical_soul_resource()
-            if loaded:
-                return
         except Exception as exc:
             if is_execution_control_error(exc):
                 raise
             logging.warning("Canonical SOUL resource load failed: %s", exc)
+            loaded = False
+        if loaded:
+            drift = (await inspect_soul_file(self.storage, agent_data_dir)).boot_warning()
+            if drift:
+                logging.warning("SOUL file drift for %s: %s", self.agent_id, drift)
+            return
 
         if not agent_data_dir:
             return
