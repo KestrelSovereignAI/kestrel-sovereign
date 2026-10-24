@@ -14,6 +14,7 @@ from kestrel_sovereign.a2a.native_card import verify_native_agent_card
 from kestrel_sovereign.features.peers.directory import PeerRequester
 from kestrel_sovereign.inception_service import create_kestrel_identity_async
 from tests.shared.genesis_audit import deterministic_safe_genesis_auditor
+from tests.shared.native_shutdown_budget import reserve_native_shutdown_budget
 
 
 @pytest.mark.parametrize("push", ["false", "true"])
@@ -74,6 +75,10 @@ async def test_actual_single_lifespan_publishes_after_boot_and_withdraws_before_
     async with server.lifespan(app):
         assert len(candidates) == 1 and app.state.agent is candidates[0]
         agent = candidates[0]
+        # CI's worker-retirement reservation can exceed the complete default
+        # server guard. Compose both lifecycle guards with that real backend
+        # reservation; keep the original prefix and every physical-close check.
+        reserve_native_shutdown_budget(agent, monkeypatch, lifecycle_module=server)
         assert agent._runtime_publication_ready.is_set()
         publication = getattr(agent, "_native_a2a_publication", None)
         assert publication is not None and publication.is_published, (

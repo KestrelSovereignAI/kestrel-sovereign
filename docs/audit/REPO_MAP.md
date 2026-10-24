@@ -19,7 +19,7 @@ Auto-generated file-tree + per-file purpose index. Always-loaded context for the
 GitHub App (issue #791). Do **not** edit by hand — regenerate via `python scripts/generate_repo_map.py`.
 
 **Generated:** 2026-10-23
-**Scope:** 3336 tracked files (2494 `.py`, 367 `.md`, 475 other). Excludes `__pycache__`, `node_modules`, `.venv`, `.claude`, build artifacts.
+**Scope:** 3337 tracked files (2495 `.py`, 367 `.md`, 475 other). Excludes `__pycache__`, `node_modules`, `.venv`, `.claude`, build artifacts.
 
 **Format per file:** `path — one-line purpose` plus the public top-level Python symbols on the next line
 (classes and functions; private `_name` skipped).
@@ -3336,6 +3336,8 @@ Repo entry points and standard project files.
   - `def configure(config)`; `def pytest_configure_node(node)`; `def pytest_handlecrashitem(crashitem, report, sched)`; `def pytest_runtest_protocol(item, nextitem)`; `def pytest_exception_interact(node, call, report)`; `def pytest_enter_pdb(config, pdb)`
 - **tests/shared/host_runtime_isolation.py** — Keep every test away from the operator's real runtime state (#3286).
   - `def allowed_storage_roots(basetemp)`; `def allow_storage_roots(roots)`; `def pin_runtime_paths(root, setenv, delenv)`; `def isolate_host_runtime_paths(root, monkeypatch)`; `def install_session_guard()`; `class Refusal`; `class RefusalRecorder`; `def refusal_failure_message(refusals)`
+- **tests/shared/native_shutdown_budget.py** — Compose fixture lifecycle guards with real backend close reservations.
+  - `def reserve_native_shutdown_budget(agent, monkeypatch)`
 - **tests/shared/node_id_length.py** — Refuse a test ID too long for the tools that read a CI log (#3669).
   - `def refuse_overlong_node_ids(items)`; `def pytest_xdist_node_collection_finished(node, ids)`
 - **tests/shared/postgres_requirement.py** — Make the PostgreSQL leg of dual-backend tests fail instead of skip (#3381).

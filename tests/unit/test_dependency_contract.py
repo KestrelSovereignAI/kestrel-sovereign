@@ -83,6 +83,19 @@ def _lock() -> dict:
         return tomllib.load(f)
 
 
+def _assert_requirement_floor(requirement: Requirement, floor: Version) -> None:
+    lower_bounds = [
+        Version(specifier.version)
+        for specifier in requirement.specifier
+        if specifier.operator in {">=", "==", "==="}
+        and "*" not in specifier.version
+    ]
+    assert lower_bounds and max(lower_bounds) >= floor, (
+        f"{requirement} permits a version below the required floor "
+        f"{requirement.name}>={floor}"
+    )
+
+
 def test_installed_remote_mcp_campaign_requires_the_public_feature_contract():
     """The real HTTPS campaign cannot resolve a Docker-only feature release."""
     dependencies = _pyproject()["project"]["optional-dependencies"]["mcp-integration"]
@@ -108,7 +121,7 @@ def test_native_a2a_streams_require_server_scoped_shutdown():
         for raw in _pyproject()["project"]["dependencies"]
         if canonicalize_name(Requirement(raw).name) == "sse-starlette"
     ]
-    assert Version("3.4.11") not in requirement.specifier
+    _assert_requirement_floor(requirement, Version("3.5.0"))
     assert Version("3.5.0") in requirement.specifier
     assert Version("3.6.0") in requirement.specifier
     (package,) = [
@@ -184,16 +197,7 @@ def test_security_floors_are_declared():
         assert declarations, f"Missing security-floored dependency: {package}"
 
         for requirement in declarations:
-            lower_bounds = [
-                Version(specifier.version)
-                for specifier in requirement.specifier
-                if specifier.operator in {">=", "==", "==="}
-                and "*" not in specifier.version
-            ]
-            assert lower_bounds and max(lower_bounds) >= floor, (
-                f"{requirement} permits a version below the security floor "
-                f"{package}>={floor}"
-            )
+            _assert_requirement_floor(requirement, floor)
 
 
 def test_security_floors_are_locked():

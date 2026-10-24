@@ -618,7 +618,6 @@ async def _booted_agent(tmp_path):
     the mandatory features it loads only the one whose tool the turns call,
     so an installed optional package adds no model call of its own."""
     from kestrel_sovereign.storage.db import sqlite
-    from kestrel_sovereign import kestrel_agent as ka
     with pytest.MonkeyPatch.context() as cleanup:
         # A measured 2.3MiB usage-WAL close exceeded 1.01s in the full suite.
         # Generation/Stop semantics do not benchmark checkpoint/fsync speed.
@@ -634,15 +633,9 @@ async def _booted_agent(tmp_path):
             # native close reservation. Otherwise the larger storage floor
             # consumes the entire default five-second shutdown and gives the
             # LLM/client prefix zero time, cancelling its original closers.
-            required_tail = agent._durable_tail_minimum_budget(
-                ka._minimum_storage_close_timeout(agent.storage),
-                ka._minimum_storage_potential_preclose_timeout(agent.storage),
-            )
-            shutdown_budget = required_tail + max(
-                float(ka.SHUTDOWN_TIMEOUT), ka.KESTREL_AGENT_SHUTDOWN_TIMEOUT_S,
-            )
-            cleanup.setattr(ka, "SHUTDOWN_TIMEOUT", shutdown_budget)
-            cleanup.setattr(ka, "KESTREL_AGENT_SHUTDOWN_TIMEOUT_S", shutdown_budget)
+            from tests.shared.native_shutdown_budget import reserve_native_shutdown_budget
+
+            reserve_native_shutdown_budget(agent, cleanup)
             # Keep cold migrations outside the generation's own watchdog.
             await agent.llm_service._ensure_db_initialized()
             yield agent

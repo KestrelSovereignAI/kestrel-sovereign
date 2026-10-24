@@ -10,26 +10,17 @@ from tests.integration.test_host_onboarding_original_admission import onboarding
 from tests.integration.test_maintenance_original_retirement import _original_control
 from tests.unit.test_host_context_native_cleanup import _actual_operation
 from tests.utils.original_failure import OriginalFailure
+from tests.shared.native_shutdown_budget import reserve_native_shutdown_budget
 
 
 @pytest.fixture(autouse=True)
 def native_prefix_budget(onboarding_owner, monkeypatch):
-    from kestrel_sovereign import kestrel_agent as agent_module
     _manager, agent, _database = onboarding_owner
     # These tests must enter a real fallible prefix before the durable tail.
     # CI reserves a larger SQLite checkpoint window than local defaults. Keep
     # that complete native reservation AND five seconds for the prefix instead
     # of letting a fixed five-second total silently allocate zero prefix time.
-    tail = agent._durable_tail_minimum_budget(
-        agent_module._minimum_storage_close_timeout(agent.storage),
-        agent_module._minimum_storage_potential_preclose_timeout(agent.storage),
-    )
-    total = max(agent_module.SHUTDOWN_TIMEOUT, tail + 5.0)
-    assert 0 < total <= 30, 'native prefix fixture requires a finite coherent budget'
-    monkeypatch.setattr(agent_module, 'SHUTDOWN_TIMEOUT', total)
-    monkeypatch.setattr(agent_module, 'KESTREL_AGENT_SHUTDOWN_TIMEOUT_S', total)
-    prefix, reserved = agent_module._resolve_shutdown_budget(tail)
-    assert prefix >= 5.0 and reserved >= tail
+    reserve_native_shutdown_budget(agent, monkeypatch)
 
 
 @pytest.mark.asyncio
