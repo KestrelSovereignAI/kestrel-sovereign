@@ -6,13 +6,14 @@ These tests download actual models from Ollama. They require:
 - Sufficient disk space (~500MB for test model)
 - Internet connection for model downloads
 
-Run with: pytest tests/integration/test_llm_model_pulling_e2e.py -x -v
+Only run against a disposable local daemon:
+RUN_OLLAMA_MODEL_MUTATION_TESTS=1 pytest tests/integration/test_llm_model_pulling_e2e.py -x -v
 """
 import pytest
 import pytest_asyncio
-import requests
 import asyncio
 from kestrel_sovereign.llm.service import LLMService
+from tests.shared.live_ollama import skip_if_no_ollama as skip_if_no_ollama
 
 
 @pytest.fixture(autouse=True)
@@ -26,17 +27,6 @@ def sovereign_turn(monkeypatch):
     monkeypatch.setenv("KESTREL_API_KEY", key)
     with caller_context_scope(CallerContext.sovereign(identity="integration", credential=key)):
         yield
-
-
-@pytest.fixture(scope="module")
-def skip_if_no_ollama():
-    """Check if Ollama is running"""
-    try:
-        response = requests.get("http://localhost:11434/api/tags", timeout=2)
-        if response.status_code != 200:
-            pytest.skip("Ollama not running on localhost:11434")
-    except Exception:
-        pytest.skip("Ollama not accessible")
 
 
 @pytest.fixture(scope="module")
@@ -57,7 +47,7 @@ async def llm_service():
 
 
 @pytest_asyncio.fixture
-async def cleanup_test_model(test_model_name):
+async def cleanup_test_model(test_model_name, skip_if_no_ollama):
     """Clean up test model after tests"""
     yield
     # Cleanup

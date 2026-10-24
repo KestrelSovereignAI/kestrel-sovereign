@@ -18,8 +18,8 @@ generated: true
 Auto-generated file-tree + per-file purpose index. Always-loaded context for the kestrel-agent
 GitHub App (issue #791). Do **not** edit by hand — regenerate via `python scripts/generate_repo_map.py`.
 
-**Generated:** 2026-10-23
-**Scope:** 3338 tracked files (2496 `.py`, 367 `.md`, 475 other). Excludes `__pycache__`, `node_modules`, `.venv`, `.claude`, build artifacts.
+**Generated:** 2026-10-24
+**Scope:** 3340 tracked files (2498 `.py`, 367 `.md`, 475 other). Excludes `__pycache__`, `node_modules`, `.venv`, `.claude`, build artifacts.
 
 **Format per file:** `path — one-line purpose` plus the public top-level Python symbols on the next line
 (classes and functions; private `_name` skipped).
@@ -2889,7 +2889,7 @@ Repo entry points and standard project files.
 - **tests/integration/test_llm_completion_original_withdrawal.py** — Repeated observer withdrawal cannot erase original writer COMMIT control.
   - `async def test_original_writer_control_survives_second_completion_checkpoint_cancel(native_pg, tmp_path, monkeypatch)`
 - **tests/integration/test_llm_model_pulling_e2e.py** — Integration tests for LLM model pulling - REAL TESTS, NO MOCKS
-  - `def sovereign_turn(monkeypatch)`; `def skip_if_no_ollama()`; `def test_model_name()`; `async def llm_service()`; `async def cleanup_test_model(test_model_name)`; `class TestStorageInfo`; `class TestModelPulling`; `class TestModelUsageTracking`
+  - `def sovereign_turn(monkeypatch)`; `def test_model_name()`; `async def llm_service()`; `async def cleanup_test_model(test_model_name, skip_if_no_ollama)`; `class TestStorageInfo`; `class TestModelPulling`; `class TestModelUsageTracking`
 - **tests/integration/test_llm_original_writer_control.py** — Bounded unpublished cleanup preserves original native writer control.
   - `async def test_default_unpublished_close_keeps_original_failed_writer_control(native_pg, tmp_path, monkeypatch)`
 - **tests/integration/test_llm_outer_private_close.py** — Original private SDK transport survives refusal of its outer cleanup wrapper.
@@ -2897,7 +2897,7 @@ Repo entry points and standard project files.
 - **tests/integration/test_llm_real_calls.py** — Integration tests for LLMService.generate() with REAL API calls.
   - `async def test_basic_generate()`; `async def test_generate_with_tools_returns_llm_response()`; `async def test_generate_with_messages()`; `async def test_generate_returns_coherent_response()`; `async def test_generate_handles_empty_system_prompt()`
 - **tests/integration/test_llm_space_mgmt_e2e.py** — Integration tests for LLM space management - REAL TESTS, NO MOCKS
-  - `def sovereign_turn(monkeypatch)`; `def skip_if_no_ollama()`; `async def llm_service()`; `def test_model_name()`; `class TestSpaceManagement`; `class TestDatabaseIntegration`
+  - `def sovereign_turn(monkeypatch)`; `async def llm_service()`; `def test_model_name()`; `class TestSpaceManagement`; `class TestDatabaseIntegration`
 - **tests/integration/test_maintenance_original_retirement.py** — Actual maintenance/storage/sleep cannot normalize native original control.
   - `async def test_maintenance_keeps_original_body_and_lease_retirement_control(native_pg, assertion_store, monkeypatch, door, …)`; `async def test_maintenance_domain_handlers_preserve_original_control_graph(native_pg, assertion_store, monkeypatch, target)`; `async def test_maintenance_postgres_report_source_preserves_original_graph(native_pg, native_pg_maintenance, tmp_path, monkeypatch)`; `async def test_maintenance_close_receipt_publication_retains_original_unstarted_lease(native_pg, assertion_store, monkeypatch, after, …)`; `async def test_handled_worker_with_successful_diagnostics_survives_retirement_control(native_pg, assertion_store, monkeypatch, body_kind, …)`
 - **tests/integration/test_manager_complete_exit_policy.py** — Reader/drain/fence terminal exits keep original control and observations.
@@ -3336,6 +3336,8 @@ Repo entry points and standard project files.
   - `def configure(config)`; `def pytest_configure_node(node)`; `def pytest_handlecrashitem(crashitem, report, sched)`; `def pytest_runtest_protocol(item, nextitem)`; `def pytest_exception_interact(node, call, report)`; `def pytest_enter_pdb(config, pdb)`
 - **tests/shared/host_runtime_isolation.py** — Keep every test away from the operator's real runtime state (#3286).
   - `def allowed_storage_roots(basetemp)`; `def allow_storage_roots(roots)`; `def pin_runtime_paths(root, setenv, delenv)`; `def isolate_host_runtime_paths(root, monkeypatch)`; `def install_session_guard()`; `class Refusal`; `class RefusalRecorder`; `def refusal_failure_message(refusals)`
+- **tests/shared/live_ollama.py** — Explicit opt-in for tests that mutate a shared local model daemon.
+  - `def skip_if_no_ollama()`
 - **tests/shared/native_shutdown_budget.py** — Compose fixture lifecycle guards with real backend close reservations.
   - `def reserve_native_shutdown_budget(agent, monkeypatch)`; `async def shutdown_fixture_agent(agent)`
 - **tests/shared/node_id_length.py** — Refuse a test ID too long for the tools that read a CI log (#3669).
@@ -4666,6 +4668,8 @@ Repo entry points and standard project files.
   - `async def test_a_car_larger_than_one_tls_write_is_uploaded_in_bounded_writes()`; `async def test_the_upload_door_sovereignty_exports_use_is_bounded_too()`; `async def test_a_snapshot_whose_car_outgrows_one_tls_write_is_backed_up(tmp_path, monkeypatch)`; `async def test_a_snapshot_over_2_gib_is_never_held_whole_in_memory(tmp_path, monkeypatch)`; `async def test_an_upload_failure_logs_type_errno_bytes_sent_and_elapsed(tmp_path, monkeypatch, caplog)`; `async def test_a_refused_upload_logs_its_status_and_the_whole_body_sent(caplog)`; `def test_the_failure_line_finds_the_errno_beneath_httpx_and_anyio()`; `def test_the_failure_line_for_emmas_error()`; `…`
 - **tests/unit/test_list_trashed_messages_tool.py** — Message-level trash navigation (#2025).
   - `async def store()`; `async def test_lists_only_trashed_messages(store)`; `async def test_discover_then_restore_round_trip(store)`; `async def test_preview_unwraps_sent_form(store)`; `async def test_trashed_session_markers_are_hidden(store)`; `async def test_empty_trash_returns_zero(store)`; `async def test_ephemeral_and_isolated_expose_no_trash(store)`
+- **tests/unit/test_live_ollama.py** — An ordinary test invocation cannot opt itself into host model mutation.
+  - `def test_live_model_mutation_requires_explicit_opt_in(monkeypatch, configured)`
 - **tests/unit/test_llm_call_watchdog.py** — #3552: every orchestrator LLM call a turn makes has one inactivity bound.
   - `def test_a_call_that_never_answers_is_abandoned_and_its_read_cancelled()`; `def test_time_the_consumer_spends_on_an_item_is_not_provider_silence()`; `def test_a_timeout_raised_by_the_provider_itself_is_not_relabelled()`; `def test_an_inline_tool_running_inside_the_call_is_not_provider_silence()`; `def test_the_bound_is_the_turn_timeout_unless_a_local_route_allows_longer()`; `def test_a_non_streaming_bound_counts_every_candidate_clients_timeout()`; `def test_a_non_streaming_call_that_never_answers_is_abandoned()`; `def test_progress_a_non_streaming_call_reports_keeps_it_alive()`; `…`
 - **tests/unit/test_llm_content_redaction_audit.py** — #2674 finding 3 — content-redaction of provider telemetry under an enforcing response audit.
@@ -4893,7 +4897,7 @@ Repo entry points and standard project files.
 - **tests/unit/test_ownership_backfill_once.py** — Regression: #2649 ownership backfills must run once, not on every from_pool.
   - `async def db(tmp_path)`; `async def test_first_init_records_marker(db)`; `async def test_backfills_skip_when_marker_present(db, monkeypatch)`; `async def test_backfills_rerun_if_marker_absent(db, monkeypatch)`; `async def test_document_chunk_backfill_assigns_only_single_owner_files(db)`; `async def test_migration_lock_rolls_the_whole_body_back(db)`; `async def test_migration_lock_serializes_concurrent_holders(db)`; `async def test_migration_lock_takes_the_sqlite_writer_slot_up_front(db)`; `…`
 - **tests/unit/test_packaging_typed_marker.py** — The ``Typing :: Typed`` classifier must be backed by a PEP 561 marker (#2683).
-  - `def built_wheel(tmp_path_factory)`; `def test_pyproject_declares_typed_classifier()`; `def test_source_tree_carries_full_package_marker()`; `def test_wheel_contents_agree_with_its_metadata(built_wheel)`; `def test_clean_wheel_install_exposes_marker(built_wheel, tmp_path)`
+  - `def built_distributions(tmp_path_factory, request)`; `def built_wheel(built_distributions)`; `def test_distributions_ship_only_canonical_package_files(built_distributions, tmp_path)`; `def test_pyproject_declares_typed_classifier()`; `def test_source_tree_carries_full_package_marker()`; `def test_wheel_contents_agree_with_its_metadata(built_wheel)`; `def test_clean_wheel_install_exposes_marker(built_wheel, tmp_path)`
 - **tests/unit/test_path_identity.py** — Physical and spelling aliases cannot cross host custody boundaries.
   - `def test_future_descendants_below_aliased_existing_ancestors_overlap(tmp_path, monkeypatch, module, function_name)`; `def test_unicode_normalization_aliases_do_not_depend_on_case_behavior(tmp_path, monkeypatch, module, function_name)`; `def test_unknown_case_semantics_fail_closed_for_future_aliases(tmp_path, monkeypatch, module, function_name)`; `def test_equal_identity_fails_closed_when_case_semantics_are_unknown(tmp_path, monkeypatch)`; `def test_equal_identity_uses_aliased_ancestor_suffixes(tmp_path, monkeypatch)`; `def test_case_probe_uses_entry_inside_mount_root(tmp_path, monkeypatch, module)`
 - **tests/unit/test_path_safety.py** — Tests for path-safety primitives (#834).
