@@ -505,9 +505,13 @@ async def test_live_outer_delivery_refusal_redacts_access_and_error_logs(host, m
     output = io.StringIO()
     handler = logging.StreamHandler(output)
     loggers = [logging.getLogger("uvicorn.access"), logging.getLogger("kestrel_sovereign.api_errors")]
+    original_levels = {logger: logger.level for logger in loggers}
     for logger in loggers:
         monkeypatch.setattr(logger, "handlers", [handler])
-        monkeypatch.setattr(logger, "level", logging.INFO)
+        monkeypatch.setattr(logger, "disabled", False)
+        # setLevel also invalidates isEnabledFor's cache. Direct assignment
+        # can leave INFO disabled after earlier tests configured this logger.
+        logger.setLevel(logging.INFO)
         monkeypatch.setattr(logger, "propagate", False)
     sock = socket.socket()
     sock.bind(("127.0.0.1", 0))
@@ -531,8 +535,12 @@ async def test_live_outer_delivery_refusal_redacts_access_and_error_logs(host, m
             assert private not in logs
     finally:
         server.should_exit = True
-        await asyncio.wait_for(serving, 10)
-        sock.close()
+        try:
+            await asyncio.wait_for(serving, 10)
+        finally:
+            sock.close()
+            for logger, level in original_levels.items():
+                logger.setLevel(level)
 
 
 @pytest.mark.asyncio
