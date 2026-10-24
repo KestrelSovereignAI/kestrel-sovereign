@@ -176,6 +176,44 @@ async def submit(wire):
     return events[0].task
 
 
+@pytest.mark.parametrize('headers,query,accepted', [
+    ([], ['1.0.9'], True),
+    ([], ['0.3'], False),
+    (['1.0'], ['0.3'], False),
+    (['0.3'], ['1.0'], False),
+    (['1.0', '0.3'], ['1.0'], False),
+    ([], ['1.0', '0.3'], False),
+    (['1.0'], ['1.0.9'], True),
+    ([], [], False),
+])
+async def test_signed_http_version_carriers_are_validated_before_task_admission(wire, headers, query, accepted):
+    from kestrel_sdk.native_a2a.utils.errors import VersionNotSupportedError
+
+    async def carry_version(outgoing):
+        # Leave the actual SDK request and DID proof intact. Choose only the
+        # standard HTTP version carriers at the real transport boundary.
+        outgoing.headers.pop('A2A-Version', None)
+        outgoing.headers = httpx.Headers([
+            *outgoing.headers.multi_items(),
+            *(('A2A-Version', value) for value in headers),
+        ])
+        url = outgoing.url
+        for value in query:
+            url = url.copy_add_param('A2A-Version', value)
+        outgoing.url = url
+
+    wire.http.event_hooks['request'].append(carry_version)
+    if accepted:
+        task = await submit(wire)
+        assert task.id and task.status.HasField('timestamp')
+        assert len(wire.submissions) == 1
+    else:
+        with pytest.raises(VersionNotSupportedError):
+            await submit(wire)
+        assert wire.submissions == []
+        assert await wire.manager.task_store.backend.fetch_all('SELECT id FROM a2a_tasks') == []
+
+
 async def test_inline_callback_requires_the_advertised_push_capability(wire):
     params = send(wire.admission)
     params.configuration.task_push_notification_config.url = "https://8.8.8.8/callback"

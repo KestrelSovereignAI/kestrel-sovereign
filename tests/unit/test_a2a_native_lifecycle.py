@@ -50,3 +50,39 @@ def test_private_unknown_state_is_not_a_native_state():
 def test_unspecified_filter_cannot_silently_list_every_state():
     with pytest.raises(ValueError, match="concrete lifecycle"):
         task_state_from_label("unspecified")
+
+
+@pytest.mark.parametrize('native', [False, True])
+def test_transition_timestamp_uses_explicit_instant_and_preserves_nanoseconds(native):
+    from datetime import datetime, timedelta, timezone
+
+    from google.protobuf.json_format import MessageToDict
+    from google.protobuf.timestamp_pb2 import Timestamp
+    from kestrel_sdk.native_a2a.helpers.proto_helpers import new_text_message
+
+    from kestrel_sovereign.a2a.lifecycle import new_task_status
+
+    at = (Timestamp(seconds=0, nanos=123456789) if native else
+          datetime(1970, 1, 1, 1, 0, 0, 123456, tzinfo=timezone(timedelta(hours=1))))
+    status = new_task_status(TaskState.TASK_STATE_WORKING, at=at, message=new_text_message('working'))
+    assert MessageToDict(status)['timestamp'] == ('1970-01-01T00:00:00.123456789Z' if native else '1970-01-01T00:00:00.123456Z')
+    assert status.message.parts[0].text == 'working'
+    if native:
+        at.nanos = 0
+        assert status.timestamp.nanos == 123456789
+
+
+@pytest.mark.parametrize('invalid', ['naive', 'overflow', 'wrong-type', 'unknown-state'])
+def test_invalid_transition_timestamp_or_state_is_refused(invalid):
+    from datetime import datetime
+
+    from google.protobuf.timestamp_pb2 import Timestamp
+
+    from kestrel_sovereign.a2a.lifecycle import new_task_status
+
+    naive = datetime(2026, 1, 1, tzinfo=None)  # noqa: DTZ001 - intentionally invalid status input
+    at = (naive if invalid == 'naive' else
+          Timestamp(seconds=253402300800) if invalid == 'overflow' else
+          '2026-01-01' if invalid == 'wrong-type' else Timestamp())
+    with pytest.raises((ValueError, TypeError)):
+        new_task_status(-1 if invalid == 'unknown-state' else TaskState.TASK_STATE_WORKING, at=at)

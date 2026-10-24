@@ -22,7 +22,11 @@ from typing import (
 )
 from uuid import uuid4
 
-from kestrel_sdk.native_a2a.helpers.proto_helpers import new_task_from_user_message, new_text_message
+from google.protobuf.json_format import MessageToDict
+from kestrel_sdk.native_a2a.helpers.proto_helpers import (
+    new_task_from_user_message,
+    new_text_message,
+)
 from kestrel_sdk.native_a2a.types import (
     AgentSkill,
     Artifact,
@@ -33,12 +37,13 @@ from kestrel_sdk.native_a2a.types import (
     Task,
     TaskArtifactUpdateEvent,
     TaskState,
-    TaskStatus,
     TaskStatusUpdateEvent,
 )
-from kestrel_sdk.native_a2a.utils.errors import InvalidParamsError, PushNotificationNotSupportedError
+from kestrel_sdk.native_a2a.utils.errors import (
+    InvalidParamsError,
+    PushNotificationNotSupportedError,
+)
 from kestrel_sdk.native_a2a.utils.proto_utils import validate_proto_required_fields
-from google.protobuf.json_format import MessageToDict
 
 from kestrel_sovereign._async_ownership import (
     await_owned_task,
@@ -54,6 +59,7 @@ from kestrel_sovereign.a2a.extensions import (
 from kestrel_sovereign.a2a.lifecycle import (
     STREAM_STOP_STATES,
     TERMINAL_STATES,
+    new_task_status,
     task_state_label,
 )
 from kestrel_sovereign.a2a.media import encode_inline_json
@@ -636,7 +642,8 @@ class TaskManager:
         if denied_reason is not None:
             task.metadata.update({"denied": True})
             task.status.CopyFrom(
-                TaskStatus(
+                new_task_status(
+                    at=self.task_store.now_utc(),
                     state=TaskState.TASK_STATE_REJECTED,
                     message=new_text_message(
                         f"Permission denied: {denied_reason}",
@@ -855,7 +862,8 @@ class TaskManager:
         """Retain interruption through the original recipient's outcome writer."""
         canceled = Task.FromString(baseline.SerializeToString())
         canceled.status.CopyFrom(
-            TaskStatus(
+            new_task_status(
+                at=self.task_store.now_utc(),
                 state=TaskState.TASK_STATE_CANCELED,
                 message=new_text_message(
                     "Task execution was interrupted",
@@ -897,7 +905,8 @@ class TaskManager:
                     raise
                 logger.exception("Async task handler failed for %s", task.id)
                 task.status.CopyFrom(
-                    TaskStatus(
+                    new_task_status(
+                        at=self.task_store.now_utc(),
                         state=TaskState.TASK_STATE_FAILED,
                         message=new_text_message(
                             str(error), task_id=task.id, context_id=task.context_id
@@ -935,6 +944,17 @@ class TaskManager:
         expected_state: TaskState,
     ) -> tuple[Task, bool]:
         """Persist a worker result and report ownership of terminal notification."""
+
+        if task.status != baseline.status and (
+            not task.status.HasField("timestamp")
+            or task.status.timestamp == baseline.status.timestamp
+        ):
+            # A local handler can return a changed status on its input Task.
+            # Record that transition here if it supplied no new native time.
+            task.status.CopyFrom(new_task_status(
+                task.status.state, at=self.task_store.now_utc(),
+                message=task.status.message if task.status.HasField("message") else None,
+            ))
 
         if task.status.state == TaskState.TASK_STATE_CANCELED:
             return (
@@ -1371,6 +1391,7 @@ class TaskManager:
         push_outbox, push_config = await self._prepare_task_push(prepared_input)
         params = prepared_input.request
         task = new_task_from_user_message(params.message)
+        task.status.CopyFrom(new_task_status(task.status.state, at=self.task_store.now_utc()))
         task.metadata.update(
             without_reserved_cancellation_receipt(MessageToDict(params.metadata))
         )
@@ -1581,7 +1602,7 @@ class TaskManager:
             if answer_metadata != reply_metadata:
                 message = Message.FromString(message.SerializeToString())
                 message.metadata.update(answer_metadata)
-        task.status.CopyFrom(TaskStatus(state=new_state, message=message))
+        task.status.CopyFrom(new_task_status(new_state, at=self.task_store.now_utc(), message=message))
 
         # Add message to history if provided
         if message is not None:

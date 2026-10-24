@@ -13,6 +13,8 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 
+from google.protobuf.json_format import MessageToDict, MessageToJson, ParseDict
+from google.protobuf.timestamp_pb2 import Timestamp
 from kestrel_sdk.native_a2a.helpers.proto_helpers import new_text_message
 from kestrel_sdk.native_a2a.server.tasks.task_manager import append_artifact_to_task
 from kestrel_sdk.native_a2a.types import (
@@ -27,7 +29,10 @@ from kestrel_sdk.native_a2a.types import (
     TaskStatus,
 )
 from kestrel_sdk.native_a2a.utils.constants import DEFAULT_LIST_TASKS_PAGE_SIZE
-from kestrel_sdk.native_a2a.utils.errors import InvalidAgentResponseError, InvalidParamsError
+from kestrel_sdk.native_a2a.utils.errors import (
+    InvalidAgentResponseError,
+    InvalidParamsError,
+)
 from kestrel_sdk.native_a2a.utils.proto_utils import validate_proto_required_fields
 from kestrel_sdk.native_a2a.utils.task import (
     ListTasksCursor,
@@ -37,10 +42,8 @@ from kestrel_sdk.native_a2a.utils.task import (
     validate_history_length,
     validate_page_size,
 )
-from google.protobuf.json_format import MessageToDict, MessageToJson, ParseDict
-from google.protobuf.timestamp_pb2 import Timestamp
 
-from kestrel_sovereign.a2a.lifecycle import TERMINAL_STATES
+from kestrel_sovereign.a2a.lifecycle import TERMINAL_STATES, new_task_status
 from kestrel_sovereign.a2a.lifecycle import task_state_from_label as _native_state
 from kestrel_sovereign.a2a.lifecycle import task_state_label as _stored_state
 from kestrel_sovereign.a2a.native_input import (
@@ -1134,14 +1137,10 @@ class TaskStore(UnifiedStoreBase):
                                 )
                             else:
                                 task.history.append(request.message)
-                                stamp = Timestamp()
-                                stamp.FromDatetime(self.now_utc())
                                 task.status.CopyFrom(
-                                    TaskStatus(
-                                        state=_native_state("submitted"),
-                                        timestamp=stamp,
-                                    )
+                                    new_task_status(_native_state("submitted"), at=self.now_utc())
                                 )
+                                stamp = task.status.timestamp
                                 message, artifacts, history, task_metadata = (
                                     _task_payload(task)
                                 )
@@ -1537,10 +1536,8 @@ class TaskStore(UnifiedStoreBase):
                     context_id=merged.context_id,
                 )
                 merged.status.CopyFrom(
-                    TaskStatus(
-                        state=TaskState.TASK_STATE_CANCELED,
-                        message=message,
-                        timestamp=timestamp,
+                    new_task_status(
+                        TaskState.TASK_STATE_CANCELED, at=timestamp, message=message,
                     )
                 )
                 merged.history.append(message)

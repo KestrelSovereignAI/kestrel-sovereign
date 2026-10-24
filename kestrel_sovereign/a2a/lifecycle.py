@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
-from kestrel_sdk.native_a2a.types import TaskState
+from datetime import datetime
+
+from google.protobuf.timestamp_pb2 import Timestamp
+from kestrel_sdk.native_a2a.types import Message, TaskState, TaskStatus
 
 TERMINAL_STATES = frozenset(
     {
@@ -31,3 +34,25 @@ def task_state_from_label(state: str) -> int:
     result = TaskState.Value("TASK_STATE_" + state.upper().replace("-", "_"))
     task_state_label(result)
     return result
+
+
+def new_task_status(
+    state: int, *, at: datetime | Timestamp, message: Message | None = None
+) -> TaskStatus:
+    """Record an actual lifecycle transition using its owner's explicit clock.
+
+    Native timestamps retain nanoseconds. Validate before persistence and never
+    synthesize a new transition time when reading an existing status.
+    """
+    task_state_label(state)
+    stamp = Timestamp()
+    if isinstance(at, datetime):
+        if at.utcoffset() is None:
+            raise ValueError("A task status timestamp requires a timezone")
+        stamp.FromDatetime(at)
+    elif isinstance(at, Timestamp):
+        stamp.CopyFrom(at)
+    else:
+        raise TypeError("A task status timestamp requires datetime or Timestamp")
+    stamp.ToJsonString()
+    return TaskStatus(state=state, timestamp=stamp, message=message)

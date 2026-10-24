@@ -433,7 +433,9 @@ class PostgresBackend(DatabaseBackend):
             database: Database name
             user: Database user
             password: Database password
-            min_pool_size: Minimum pool connections
+            min_pool_size: Connections established during pool initialization.
+                Reconnection belongs to actual checkouts, never an autonomous
+                background pool floor.
             max_pool_size: Maximum operational pool connections.
             advisory_max_pool_size: Optional advisory-lock pool bound. A
                 multi-tenant host sharing this backend should set an explicit
@@ -841,26 +843,32 @@ class PostgresBackend(DatabaseBackend):
             return
         
         try:
+            # asyncpg 0.32 separates initialization from a maintained floor.
+            # A maintenance Task would inherit an original journal's context
+            # without owning its finite checkout or reconnect permission.
+            pool_options = {
+                "connection_class": NativeJournalPostgresConnection,
+                "init_size": self._min_pool_size,
+                "min_size": 0,
+                "max_size": self._max_pool_size,
+            }
             if self._dsn:
                 self._pool = await asyncpg.create_pool(
                     self._dsn,
-                    connection_class=NativeJournalPostgresConnection,
-                    min_size=self._min_pool_size,
-                    max_size=self._max_pool_size,
+                    **pool_options,
                 )
             else:
                 self._pool = await asyncpg.create_pool(
                     host=self._host,
-                    connection_class=NativeJournalPostgresConnection,
                     port=self._port,
                     database=self._database,
                     user=self._user,
                     password=self._password,
-                    min_size=self._min_pool_size,
-                    max_size=self._max_pool_size,
+                    **pool_options,
                 )
             
-            logger.debug(f"Connected to PostgreSQL pool (size: {self._min_pool_size}-{self._max_pool_size})")
+            logger.debug("Connected to PostgreSQL pool (initial: %s, maximum: %s)",
+                         self._min_pool_size, self._max_pool_size)
             
         except Exception as e:
             raise execution_error_with_cause(ConnectionError(f"Failed to connect to PostgreSQL: {e}"), e)
@@ -1244,6 +1252,18 @@ class PostgresBackend(DatabaseBackend):
                 phase.owner = retirement
             state.retirement.owner = retirement
             retired = await await_owned_task(retirement)
+            if (state.original_journal_checkout
+                    and type(native_connection) is NativeJournalPostgresConnection
+                    and native_connection._journal_cancel_failure is not None):
+                # asyncpg 0.32 terminates the physical session and suppresses
+                # failed CancelRequest I/O. The original native executor's
+                # termination is still a fatal observation after its reset
+                # owner has joined; it cannot become ordinary projection loss.
+                cancellation_failure = execution_error_with_cause(
+                    ExecutionAuthorityError("Original native journal cancellation failed"),
+                    native_connection._journal_cancel_failure,
+                )
+                body_failure = execution_observation_error(body_failure, cancellation_failure)
             if retired.error is not None:
                 if phase is not None:
                     phase.record_native_failure(retired.error, commit_outcome=state.outcome, cancellation=retired.cancellation)

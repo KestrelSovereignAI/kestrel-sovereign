@@ -8,7 +8,11 @@ from dataclasses import replace
 
 import pytest
 import pytest_asyncio
-from kestrel_sdk.native_a2a.helpers.proto_helpers import new_data_artifact, new_text_message
+from google.protobuf.json_format import MessageToDict, ParseDict
+from kestrel_sdk.native_a2a.helpers.proto_helpers import (
+    new_data_artifact,
+    new_text_message,
+)
 from kestrel_sdk.native_a2a.types import (
     AgentSkill,
     Part,
@@ -21,7 +25,6 @@ from kestrel_sdk.native_a2a.types import (
     TaskStatusUpdateEvent,
 )
 from kestrel_sdk.native_a2a.utils.errors import InvalidParamsError
-from google.protobuf.json_format import MessageToDict, ParseDict
 
 from kestrel_sovereign._async_ownership import await_owned_task
 from kestrel_sovereign.a2a.lifecycle import TERMINAL_STATES
@@ -293,6 +296,33 @@ async def test_projection_namespaces_include_both_recipient_and_tenant(
     )
 
 
+async def test_lifecycle_timestamps_are_recorded_once_at_each_transition(manager, monkeypatch):
+    from datetime import UTC, datetime, timedelta
+
+    from google.protobuf.timestamp_pb2 import Timestamp
+
+    instant = datetime(2026, 10, 23, 13, 14, 15, 123456, tzinfo=UTC)
+    clock = [instant]
+    monkeypatch.setattr(manager.task_store, 'now_utc', lambda: clock[0])
+    task = await admit(manager)
+    expected = Timestamp()
+    expected.FromDatetime(instant)
+    assert task.status.HasField('timestamp')
+    assert task.status.timestamp == expected
+    recipient = manager.task_store.scope.recipient_id
+    for state in (TaskState.TASK_STATE_WORKING, TaskState.TASK_STATE_INPUT_REQUIRED,
+                  TaskState.TASK_STATE_WORKING, TaskState.TASK_STATE_COMPLETED):
+        clock[0] += timedelta(seconds=1)
+        expected.FromDatetime(clock[0])
+        changed = await manager.update_status(task.id, state, recipient_agent_id=recipient)
+        assert changed.status.timestamp == expected
+        clock[0] += timedelta(hours=1)
+        for _ in range(2):
+            stored = await manager.task_store.get_for_recipient(task.id, recipient)
+            assert stored.status == changed.status, 'reading a status invented a new transition time'
+        assert MessageToDict(changed.status)['timestamp'].endswith('Z')
+
+
 @pytest.mark.parametrize(
     "state", [TaskState.TASK_STATE_INPUT_REQUIRED, TaskState.TASK_STATE_AUTH_REQUIRED]
 )
@@ -391,6 +421,40 @@ class CompletingProvider:
 
     def get_skill_for_command(self, command):
         return None
+
+
+@pytest.mark.parametrize('timestamp_mode', ['absent', 'inherited', 'native'])
+async def test_local_worker_status_records_its_transition_time(manager, monkeypatch, timestamp_mode):
+    from datetime import UTC, datetime, timedelta
+
+    from google.protobuf.timestamp_pb2 import Timestamp
+
+    start = datetime(2026, 10, 23, 13, tzinfo=UTC)
+    finish = start + timedelta(seconds=5)
+    clock = [start]
+    monkeypatch.setattr(manager.task_store, 'now_utc', lambda: clock[0])
+    supplied = Timestamp(seconds=123, nanos=987654321)
+
+    class TimedProvider(CompletingProvider):
+        async def handle_task(self, task, *, arguments=None):
+            clock[0] = finish
+            if timestamp_mode == 'absent':
+                return await super().handle_task(task, arguments=arguments)
+            task.status.state = TaskState.TASK_STATE_COMPLETED
+            if timestamp_mode == 'native':
+                task.status.timestamp.CopyFrom(supplied)
+            return task
+
+    manager.register_provider('feature', [AgentSkill(
+        id='timed', name='Timed', description='Timed local result', tags=['test']),
+    ], TimedProvider())
+    result = await manager.execute_skill('feature', 'timed', {})
+    expected = Timestamp()
+    expected.FromDatetime(finish)
+    assert result.status.timestamp == (supplied if timestamp_mode == 'native' else expected)
+    clock[0] += timedelta(hours=1)
+    stored = await manager.task_store.get_for_recipient(result.id, manager.did)
+    assert stored.status == result.status
 
 
 class GatedCompletingProvider(CompletingProvider):
