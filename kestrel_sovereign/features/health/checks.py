@@ -32,6 +32,7 @@ from kestrel_sovereign.storage.consolidation_drain import (
     HOLDER_THIS_CONNECTION,
     reconcile_consolidation_drains,
 )
+from kestrel_sovereign.storage.footprint import measure_database_size
 
 logger = logging.getLogger(__name__)
 
@@ -512,6 +513,58 @@ async def check_disk_space(threshold_mb: int = 100) -> Dict[str, Any]:
             "message": f"Disk space check failed: {e}",
             "duration_ms": _elapsed(start),
         }
+
+
+async def check_database_size(db) -> Dict[str, Any]:
+    """Report how large the agent database is (#3785).
+
+    Report-only: a large database neither warns nor fails the probe. It is
+    measured every tick so the agent, and anyone reading its health history,
+    can watch the file grow; Meridian's reached 1.89 GB before anyone looked.
+    ``free pages`` is space only ``VACUUM`` returns to the filesystem.
+    ``memory_status`` names the largest tables.
+
+    Args:
+        db: AsyncDatabase instance (may be None)
+    """
+    start = time.monotonic()
+
+    if db is None:
+        # The database check already fails for a missing connection.
+        return {
+            "name": "database_size",
+            "status": "pass",
+            "message": "No database connection to measure",
+            "duration_ms": _elapsed(start),
+        }
+
+    try:
+        size = await measure_database_size(db)
+    except Exception as e:
+        if is_execution_control_error(e):
+            raise
+        return {
+            "name": "database_size",
+            "status": "warn",
+            "message": f"Database size could not be measured: {e}",
+            "duration_ms": _elapsed(start),
+        }
+
+    if size is None:
+        return {
+            "name": "database_size",
+            "status": "pass",
+            "message": "Database size is not measured for this database adapter",
+            "duration_ms": _elapsed(start),
+        }
+
+    return {
+        "name": "database_size",
+        "status": "pass",
+        "message": f"Database {size.describe()}",
+        "duration_ms": _elapsed(start),
+        "details": size.to_dict(),
+    }
 
 
 async def check_context_budget(agent) -> Dict[str, Any]:
@@ -1373,6 +1426,9 @@ async def run_standard_checks(agent, db) -> List[Dict[str, Any]]:
         await check_llm_service(agent),
         await check_memory_system(agent),
         await check_disk_space(),
+        await _run_database_bound_check(
+            "database_size", check_database_size(db)
+        ),
         await check_context_budget(agent),
         await _run_database_bound_check(
             "scheduler_liveness",

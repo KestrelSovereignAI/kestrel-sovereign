@@ -17,7 +17,9 @@ This feature never invokes the LLM.
 
 Results are stored in the ``health_log`` table and exposed via tool
 commands (``!health``, ``!health-history``, ``!health-interval``) and
-the ``/agent/health/*`` HTTP endpoints.
+the ``/agent/health/*`` HTTP endpoints. Rows older than the
+``[telemetry_retention]`` window are removed by the ``trash_retention``
+maintenance rail (see :func:`purge_health_log`).
 
 Legacy aliases ``!heartbeat``, ``!heartbeat-status``, ``!heartbeat-interval``
 are retained for one release and emit a deprecation warning when invoked;
@@ -51,6 +53,7 @@ from kestrel_sovereign.execution_custody import (
 )
 from kestrel_sovereign.features.base import Feature, tool
 from kestrel_sovereign.features.storage_access import resolve_feature_database
+from kestrel_sovereign.storage.retention import delete_rows_in_batches
 
 from . import checks as health_checks
 from .checks import derive_overall_status as _derive_overall_status
@@ -62,6 +65,27 @@ DEFAULT_INTERVAL_SECONDS = 60
 
 # Maximum health results to keep in memory.
 MAX_IN_MEMORY_HISTORY = 100
+
+
+async def purge_health_log(
+    db, *, agent_id: str, older_than: str, max_rows: int
+) -> int:
+    """Delete this agent's ``health_log`` rows written before *older_than*.
+
+    The probe writes one full result a minute, and before #3785 nothing ever
+    removed one: ~860 MB per agent. The ``trash_retention`` maintenance rail
+    calls this with the ``[telemetry_retention]`` window. Returns the number
+    of rows deleted, at most *max_rows*.
+    """
+    if not isinstance(agent_id, str) or not agent_id.strip():
+        raise ValueError("agent_id must identify a durable agent principal")
+    return await delete_rows_in_batches(
+        db,
+        table="health_log",
+        predicate="candidate.agent_id = ? AND candidate.created_at < ?",
+        params=(agent_id, older_than),
+        max_rows=max_rows,
+    )
 
 
 class HealthFeature(Feature):

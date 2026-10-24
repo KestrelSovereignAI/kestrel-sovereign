@@ -896,6 +896,31 @@ role = "technical_reviewer"
 
 
 # ---------------------------------------------------------------------------
+# [telemetry_retention] — operational telemetry windows (#3785)
+# ---------------------------------------------------------------------------
+# The rows an agent writes about itself on a cadence: one liveness-probe
+# result a minute (health_log), one row per scheduled run including the
+# every-minute no-op ticks (task_execution_log), and one row per restart
+# coordinator poll (restart_status_events). The trash_retention maintenance
+# cron (every 6 hours) deletes rows older than these windows. signal_log is
+# swept on the same cron, by the per-source retention_days each row was
+# written with. Without this, these tables were most of every agent database.
+#
+# A task_execution_log row survives its window while something still reads
+# it: each schedule's newest run, an in-flight or current claim, the run a
+# failure streak reports, and any run with a recorded outcome signal.
+#
+# A window of 0 keeps that table forever. Deleted rows leave free pages that
+# new rows reuse; only VACUUM, with the host stopped, shrinks the file.
+#
+# [telemetry_retention]
+# health_log_days = 7
+# task_execution_log_days = 30
+# restart_status_events_days = 30
+# max_rows_per_sweep = 50000   # per table, per run of the cron
+
+
+# ---------------------------------------------------------------------------
 # [heartbeat] — periodic HEARTBEAT.md self-check
 # ---------------------------------------------------------------------------
 # Each tick runs one agent turn over HEARTBEAT.md in the agent's data

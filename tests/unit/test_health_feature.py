@@ -1025,6 +1025,8 @@ class TestHeartbeatCheck:
         assert "context_budget" in check_names
         assert "scheduler_liveness" in check_names
         assert "bootstrap_state" in check_names
+        # #3785 — the database grew to 1.89 GB with nothing reporting its size.
+        assert "database_size" in check_names
         # #2871 — a birth record the runtime database could not be given is a
         # capability the agent boots WITHOUT. Registration here is what makes
         # that loss visible; unregistered, it is silent again, which was the

@@ -61,8 +61,6 @@ from __future__ import annotations
 import hashlib
 import logging
 import os
-import shutil
-import time
 from collections.abc import Mapping
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
@@ -1679,14 +1677,15 @@ async def _reindex_constitution_rag(
 
 
 def _backup_db(db_path: Path) -> Path:
-    """Copy the agent DB to a timestamped sibling. ``shutil.copy2``
-    preserves mtime + permissions so the backup is restorable by
-    ``cp`` / ``mv`` without surprises.
+    """Copy the agent DB to a timestamped sibling. The copy keeps the
+    DB's mtime + permissions so it is restorable by ``cp`` / ``mv``
+    without surprises, and appears under its final name only once it is
+    complete. ``kestrel storage backups`` applies the retention policy to
+    these copies.
     """
-    ts = time.strftime("%Y%m%d-%H%M%S")
-    backup = db_path.with_name(f"{db_path.name}.backup-{ts}")
-    shutil.copy2(db_path, backup)
-    return backup
+    from kestrel_sovereign.storage.db_backups import write_reanchor_backup
+
+    return write_reanchor_backup(db_path)
 
 
 def _now_iso() -> str:

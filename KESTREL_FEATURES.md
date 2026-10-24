@@ -436,7 +436,7 @@ Runtime security policy can still deny a discovered tool at call time; static ge
 | `mark_superseded` | `!memory supersede` | `memory` | `old_id`, `new_id`, `reason` | 140 | `enabled` |
 | `memory_consolidate` | `!memory consolidate` | `memory` |  | 72 | `enabled` |
 | `memory_index_backfill` | `!memory index-backfill` | `system` | `batch_size` | 67 | `enabled` |
-| `memory_status` | `!memory status` | `system` |  | 36 | `enabled` |
+| `memory_status` | `!memory status` | `system` |  | 53 | `enabled` |
 | `purge_conversation` | `!memory purge-conversation` | `memory` | `session_id`, `confirm`, `reason` | 155 | `enabled` |
 | `purge_message_by_id` | `!memory purge-message` | `memory` | `message_id`, `confirm`, `session_id`, `reason` | 210 | `enabled` |
 | `recall_action_items` | `!memory actions` | `memory` | `status`, `days`, `assignee_concept_id`, `limit`, `include_superseded` | 240 | `enabled` |
@@ -1044,7 +1044,7 @@ Runtime security policy can still deny a discovered tool at call time; static ge
 | `!memory restore-conversation` | `memory` | `<session_id>` | Restore a soft-deleted conversation session from Trash, bringing its messages back into normal history. Find restorable sessions with list_conversations(include_trashed=True). |
 | `!memory restore-message` | `memory` | `<message_id> [session_id]` | Restore a single soft-deleted message from Trash by its message_id, bringing it back into normal history. Pass session_id to guard against acting on the wrong message. |
 | `!memory search` | `memory` | `<query> [limit] [session_id]` | PRIMARY TOOL for recalling past conversations. Use this when asked 'do you remember', 'what did we discuss', or any question about past conversations. Decrypts and searches conversation history client-side for reliable results. Pass session_id to scope to a single conversation thread. |
-| `!memory status` | `memory` |  | Check memory system health and statistics. Use this to understand my memory capabilities and current state. |
+| `!memory status` | `memory` |  | Check memory system health and statistics, including how large my database is and which tables take the space. Use this to understand my memory capabilities and current state. |
 | `!memory supersede` | `memory` | `<old_id> <new_id> [reason]` | Mark a claim node (decision or action_item) as superseded by a newer one. Creates a 'supersedes' edge from new to old and sets superseded_by on the old node. |
 | `!memory trash` | `memory` | `[limit]` | List soft-deleted (trashed) individual messages so you can find one to restore_message_by_id or purge_message_by_id. Returns message_id, session_id, role, a short preview, and when it was trashed — most-recently-trashed first. This is the message-level counterpart to list_conversations(include_trashed=True), which lists whole trashed sessions; use this to find messages that were trashed individually (e.g. by delete_messages) inside otherwise-live conversations. |
 | `!memory-admin-unpin-all` | `memory_agency` |  | Administrative command: remove ALL active pins for this agent. Sovereign/admin use only. |

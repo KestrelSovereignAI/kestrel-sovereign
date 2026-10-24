@@ -29,11 +29,16 @@ Resolution priority (most specific wins):
 A resolved value of zero or negative is treated as "skip this agent" —
 purging on a same-day cutoff would scrub rows the user might still be
 reaching for.
+
+The same rail also ages out operational telemetry under
+``[telemetry_retention]`` (#3785); see that section below.
 """
 from __future__ import annotations
 
 import logging
-from typing import Any, Dict, Optional
+from dataclasses import dataclass
+from datetime import datetime, timedelta
+from typing import Any, Dict, Mapping, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -235,3 +240,139 @@ def agent_privacy_mode(agent: Any) -> Optional[str]:
     if isinstance(mode, str):
         return mode.lower()
     return None
+
+
+# --------------------------------------------------------------------------
+# Operational telemetry (#3785) — the rows an agent writes about itself on a
+# fixed cadence: liveness probes, scheduler executions, restart-coordinator
+# polls. None of them had a retention window, and on the production fleet
+# they were most of every agent database: ``health_log`` alone was ~860 MB
+# per agent (one ~2.4 KB row a minute), while conversation history was 14 MB.
+# The ``trash_retention`` maintenance rail ages them out with the windows
+# below. ``signal_log`` is swept on the same rail, but its window is the
+# per-source ``retention_days`` each row was stamped with when it was written.
+#
+# Operators tune the windows through ``[telemetry_retention]`` in
+# ``kestrel.toml``::
+#
+#     [telemetry_retention]
+#     health_log_days = 7
+#     task_execution_log_days = 30
+#     restart_status_events_days = 30
+#     max_rows_per_sweep = 50000   # per table, per run of the rail
+#
+# A window of zero or less keeps that table forever. A malformed value falls
+# back to the default with a warning rather than silently disabling the sweep.
+# --------------------------------------------------------------------------
+
+#: Tables swept by age, with their default window in days.
+DEFAULT_TELEMETRY_RETENTION_DAYS: Mapping[str, int] = {
+    "health_log": 7,
+    "task_execution_log": 30,
+    "restart_status_events": 30,
+}
+
+#: Rows one run of the rail may delete from one table. The first runs after
+#: an upgrade meet months of backlog (356k ``health_log`` rows on one agent):
+#: at the 6-hourly cadence that clears in about two days, and no single run
+#: holds the database for long.
+DEFAULT_TELEMETRY_MAX_ROWS_PER_SWEEP = 50_000
+
+#: Rows deleted per statement. Each batch commits on its own, so other writers
+#: on the shared connection interleave between batches instead of waiting for
+#: the whole sweep.
+TELEMETRY_DELETE_BATCH_SIZE = 2_000
+
+
+@dataclass(frozen=True)
+class TelemetryRetention:
+    """The resolved ``[telemetry_retention]`` policy.
+
+    ``days`` maps each age-swept table to its window, or ``None`` when the
+    operator keeps that table forever.
+    """
+
+    days: Mapping[str, Optional[int]]
+    max_rows_per_sweep: int
+
+    def cutoff(self, table: str, now: datetime) -> Optional[str]:
+        """The ISO-8601 instant before which *table*'s rows expire.
+
+        ``None`` when the table is kept forever. The rows' own timestamps are
+        timezone-aware ISO text, so pass an aware *now*.
+        """
+        days = self.days.get(table)
+        if days is None:
+            return None
+        return (now - timedelta(days=days)).isoformat()
+
+
+def load_telemetry_retention() -> TelemetryRetention:
+    """Resolve ``[telemetry_retention]`` from ``kestrel.toml``, with defaults."""
+    section: Dict[str, Any] = {}
+    try:
+        from kestrel_sovereign.config import load_section
+        section = load_section("telemetry_retention") or {}
+    except Exception as e:
+        logger.debug("[telemetry_retention] config load failed (using defaults): %s", e)
+    return resolve_telemetry_retention(section)
+
+
+def resolve_telemetry_retention(section: Mapping[str, Any]) -> TelemetryRetention:
+    """Build the policy from a ``[telemetry_retention]`` mapping."""
+    days: Dict[str, Optional[int]] = {}
+    for table, default in DEFAULT_TELEMETRY_RETENTION_DAYS.items():
+        key = f"{table}_days"
+        value = _telemetry_int(section.get(key), default, key)
+        days[table] = value if value > 0 else None
+    max_rows = _telemetry_int(
+        section.get("max_rows_per_sweep"),
+        DEFAULT_TELEMETRY_MAX_ROWS_PER_SWEEP,
+        "max_rows_per_sweep",
+    )
+    if max_rows <= 0:
+        logger.warning(
+            "[telemetry_retention] max_rows_per_sweep must be > 0: %r", max_rows,
+        )
+        max_rows = DEFAULT_TELEMETRY_MAX_ROWS_PER_SWEEP
+    return TelemetryRetention(days=days, max_rows_per_sweep=max_rows)
+
+
+def _telemetry_int(value: Any, fallback: int, key: str) -> int:
+    if value is None:
+        return fallback
+    if isinstance(value, bool) or not isinstance(value, int):
+        logger.warning("[telemetry_retention] %s is not an int: %r", key, value)
+        return fallback
+    return value
+
+
+async def delete_rows_in_batches(
+    db: Any,
+    *,
+    table: str,
+    predicate: str,
+    params: tuple,
+    max_rows: int,
+    batch_size: int = TELEMETRY_DELETE_BATCH_SIZE,
+) -> int:
+    """Delete up to *max_rows* rows of *table* matching *predicate*.
+
+    *predicate* is a trusted SQL fragment over the alias ``candidate`` (never
+    caller input); *params* bind its placeholders. Rows go *batch_size* per
+    statement, each committing on its own, until a batch comes back short or
+    *max_rows* is reached. Returns the number of rows deleted.
+    """
+    deleted = 0
+    while deleted < max_rows:
+        limit = min(batch_size, max_rows - deleted)
+        count = await db.execute(
+            f"DELETE FROM {table} WHERE id IN ("
+            f"SELECT candidate.id FROM {table} AS candidate "
+            f"WHERE {predicate} LIMIT ?)",
+            (*params, limit),
+        )
+        deleted += count
+        if count < limit:
+            break
+    return deleted

@@ -819,7 +819,9 @@ signal_log
 - **UNTRUSTED raw payloads are never stored.** Only digest + redacted summary.
 - **TRUSTED payloads** stored in full only if registration explicitly opts in.
 - **Encryption parity** — `signal_log` honors the same privacy mode as the agent's primary storage (defer to existing privacy infrastructure).
-- **Retention** is per-source; a retention sweep runs as an ACTION signal.
+- **Retention** is per-source: each row carries `retention_until` from its
+  registration's `retention_days`, and the `trash_retention` maintenance
+  cron deletes this agent's expired rows in bounded batches (#3785).
 - **Caller identity** redacted by default to role/scope; opt-in for full identifier.
 - **Causation chain** stored as digest; full chain reconstructible from individual entries.
 - **Prompt-template provenance** is stored for COGNITION dispatches after prompt render. The hash covers the exact template body chosen for that dispatch, including per-signal overrides.

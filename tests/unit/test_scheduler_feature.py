@@ -3169,6 +3169,26 @@ class TestScheduleEngagement:
         assert result.data["tasks"][1]["signals"] == 0
 
     @pytest.mark.asyncio
+    async def test_says_when_the_window_outlives_execution_log_retention(
+        self, feature,
+    ):
+        """#3785: unrated runs are pruned after the retention window, so a
+        longer window undercounts executions and must say so."""
+        feature._db.fetchall = AsyncMock(return_value=[])
+        with patch(
+            "kestrel_sovereign.config.load_section",
+            side_effect=lambda name: (
+                {"task_execution_log_days": 30}
+                if name == "telemetry_retention" else {}
+            ),
+        ):
+            inside = await feature.schedule_engagement(days=30)
+            beyond = await feature.schedule_engagement(days=90)
+        assert inside.data["execution_log_retention_days"] == 30
+        assert "pruned" not in inside.confirmation
+        assert "older than 30 days are pruned" in beyond.confirmation
+
+    @pytest.mark.asyncio
     async def test_rejects_zero_or_negative_days(self, feature):
         result = await feature.schedule_engagement(days=0)
         assert result.status is ToolResultStatus.ERROR

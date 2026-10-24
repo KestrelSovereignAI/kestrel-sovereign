@@ -31,6 +31,8 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
+from kestrel_sovereign.storage.retention import delete_rows_in_batches
+
 logger = logging.getLogger(__name__)
 
 
@@ -167,7 +169,8 @@ async def record_event(
     """Append one typed event row. Always inserts — no per-signature
     dedupe at the DB layer; the audit trail must be complete so the
     operator can see every coordinator poll. Frontend dedupe collapses
-    same-signature rows into a single visible bubble.
+    same-signature rows into a single visible bubble. The trail is complete
+    within the ``[telemetry_retention]`` window; see :func:`purge_events_before`.
     """
     event_id = uuid.uuid4().hex
     now = datetime.now(timezone.utc).isoformat()
@@ -298,3 +301,32 @@ async def latest_event_for_signature(
     if not rows:
         return None
     return RestartStatusEvent.from_row(rows[0])
+
+
+async def purge_events_before(
+    db, *, agent_id: str, older_than: str, max_rows: int,
+) -> int:
+    """Delete one agent's events written before *older_than* (#3785).
+
+    The coordinator polls every minute and records every poll, so a request
+    left pending accumulates a row a minute. The newest event of each request
+    is kept whatever its age, so a request's last known state stays readable
+    after its poll trail has aged out. Called by the ``trash_retention``
+    maintenance rail; returns the number of rows deleted, at most *max_rows*.
+    """
+    principal = str(agent_id).strip()
+    if not principal:
+        raise ValueError("agent_id must identify a durable agent principal")
+    return await delete_rows_in_batches(
+        db,
+        table="restart_status_events",
+        predicate=(
+            "candidate.agent_id = ? AND candidate.created_at < ? "
+            "AND EXISTS ("
+            "SELECT 1 FROM restart_status_events newer "
+            "WHERE newer.request_id = candidate.request_id "
+            "AND newer.created_at > candidate.created_at)"
+        ),
+        params=(principal, str(older_than)),
+        max_rows=max_rows,
+    )

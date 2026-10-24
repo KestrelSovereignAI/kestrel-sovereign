@@ -415,6 +415,63 @@ dependency-contract test checks the Core base/observability declarations and
 lockfile only, so downstream release verification remains an explicit release
 gate.
 
+### Agent database size, retention and backups
+
+Most of a large agent database is operational telemetry, not memory. Before
+#3785 four tables had no effective retention: `health_log` (one liveness
+result a minute, ~860 MB per agent), `task_execution_log` (every scheduled
+run, including the every-minute no-op ticks), `signal_log` (rows carried a
+per-source expiry, but nothing removed them) and `restart_status_events`.
+The `trash_retention` maintenance cron, every 6 hours, now removes their
+expired rows: up to `max_rows_per_sweep` per table per run, in small batches.
+The windows are `[telemetry_retention]` in `kestrel.toml`; see
+`kestrel.toml.example`. The cron's result in `!schedule history` reports each
+table's `rows_purged`, and `capped: true` while a backlog remains.
+
+To see where an agent's bytes are, from the agent itself:
+
+- `!health` includes a `database_size` check: the file size, the free pages
+  only `VACUUM` returns to the filesystem, and the write-ahead log.
+- `!memory status` adds the largest tables, each with its indexes. On SQLite
+  it reads every page on a separate read-only connection, so it takes seconds
+  on a large file.
+
+Removing rows does not shrink a SQLite file: freed pages are reused by later
+writes, so the file stops growing. To return the space once the cron reports
+no table `capped`, stop the host and vacuum each agent database. `VACUUM`
+needs about as much free disk as the database it rewrites.
+
+```bash
+kestrel terminate
+sqlite3 agent_data/<agent>/kestrel_prime.db "PRAGMA wal_checkpoint(TRUNCATE); VACUUM;"
+kestrel start
+```
+
+On PostgreSQL, autovacuum makes the freed rows reusable; `VACUUM FULL`
+returns the space but locks each table it rewrites.
+
+`kestrel constitution reanchor --force` leaves a full copy of a SQLite agent
+database beside it, `kestrel_prime.db.backup-<YYYYmmdd-HHMMSS>`, every time
+it writes. The copy is written as `kestrel_prime.db.partial-backup-<random>`,
+flushed to disk, and only then given its final name, which is never
+overwritten; a copy that fails part-way leaves nothing behind.
+`kestrel storage backups` applies the retention policy to those copies: it
+keeps the newest three distinct copies (`--keep N`), treats byte-identical
+copies as one (same size, then same SHA-256), and only reports. A copy counts
+toward the three only once SQLite has read every page of it
+(`PRAGMA quick_check` on a read-only connection), so when the policy would
+remove something it first reads each copy it keeps in full. A truncated or
+damaged copy, such as one a failed copy left under its final name before
+this check existed, is kept and reported with the reason but never counted,
+so it cannot displace a usable older copy. `--apply`
+removes what the report marks `remove`, and is the Sovereign's approval to do
+so; it skips any removal whose justifying copies changed since the report.
+It never touches any other file: hand-made forensic copies such as
+`.damaged-<date>`, a staging file a crashed reanchor left, and a forced
+inception's `kestrel_prime.db.backup-<stamp>-<hex>` archives, which inception
+reads as evidence of an earlier constitutional lifetime, are listed as not
+managed. When the live database is missing, every copy is kept.
+
 ## Typical dev deploy flow
 
 ```bash

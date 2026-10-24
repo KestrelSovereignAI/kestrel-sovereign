@@ -790,12 +790,113 @@ def cmd_storage(args) -> int:
     storage_commands = {
         "health": cmd_storage_health,
         "stamp-sessions": cmd_storage_stamp_sessions,
+        "backups": cmd_storage_backups,
     }
     handler = storage_commands.get(args.storage_command)
     if handler is None:
-        print("Usage: kestrel storage {health,stamp-sessions}")
+        print("Usage: kestrel storage {health,stamp-sessions,backups}")
         return 1
     return handler(args)
+
+
+def cmd_storage_backups(args) -> int:
+    """Apply the reanchor-copy retention policy beside each agent DB (#3785).
+
+    Reports what the policy keeps and removes; removes only with ``--apply``,
+    which is the Sovereign's approval. Files the policy does not manage are
+    never touched (see :mod:`kestrel_sovereign.storage.db_backups`).
+    """
+    from kestrel_sovereign.storage.db_backups import (
+        apply_backup_retention,
+        plan_backup_retention,
+    )
+    from kestrel_sovereign.storage.footprint import format_bytes
+
+    if args.keep < 1:
+        print("error: --keep must be at least 1", file=sys.stderr)
+        return 2
+    if args.db:
+        targets = {args.db: Path(args.db)}
+    else:
+        project_dir = _get_project_dir()
+        try:
+            agents = MultiAgentConfig.load(
+                project_dir / MULTI_AGENT_CONFIG_FILENAME,
+                auto_discover_fallback=False,
+            ).get_local_agents()
+        except (OSError, ValueError) as exc:
+            print(
+                f"error: {MULTI_AGENT_CONFIG_FILENAME} cannot be read: {exc}",
+                file=sys.stderr,
+            )
+            return 2
+        if args.agent is not None:
+            if args.agent not in agents:
+                print(
+                    f"error: '{args.agent}' not in multi_agent. "
+                    f"Available: {', '.join(agents) or '(none)'}",
+                    file=sys.stderr,
+                )
+                return 2
+            agents = {args.agent: agents[args.agent]}
+        targets = {
+            name: (project_dir / config.data_dir).resolve() / "kestrel_prime.db"
+            for name, config in agents.items()
+        }
+
+    failed = False
+    report = {}
+    for name, db_path in targets.items():
+        try:
+            plan = plan_backup_retention(db_path, keep=args.keep)
+        except OSError as exc:
+            failed = True
+            report[name] = {"database": str(db_path), "error": str(exc)}
+            continue
+        entry = plan.to_dict()
+        if args.apply:
+            removals = apply_backup_retention(plan)
+            entry["removed"] = [str(r.path) for r in removals if r.removed]
+            entry["not_removed"] = [
+                {"path": str(r.path), "reason": r.reason}
+                for r in removals if not r.removed
+            ]
+            failed = failed or bool(entry["not_removed"])
+        report[name] = entry
+
+    if args.json:
+        print(json.dumps({"applied": bool(args.apply), "agents": report}, indent=2))
+        return 1 if failed else 0
+
+    for name, entry in report.items():
+        if "error" in entry:
+            print(f"{name}: cannot read {entry['database']}: {entry['error']}")
+            continue
+        size = entry["database_bytes"]
+        print(
+            f"{name}: {entry['database']} "
+            f"({format_bytes(size) if size is not None else 'missing'})"
+        )
+        for copy in entry["copies"]:
+            print(
+                f"  {copy['action']:<7} {Path(copy['path']).name}  "
+                f"{format_bytes(copy['bytes'])}  {copy['reason']}"
+            )
+        for path in entry["preserved"]:
+            print(f"  {'keep':<7} {Path(path).name}  not managed by this policy")
+        if not entry["copies"] and not entry["preserved"]:
+            print("  no database copies")
+        print(f"  reclaimable: {format_bytes(entry['reclaimable_bytes'])}")
+        for path in entry.get("removed", []):
+            print(f"  removed {Path(path).name}")
+        for skipped in entry.get("not_removed", []):
+            print(f"  NOT removed {Path(skipped['path']).name}: {skipped['reason']}")
+    if not args.apply:
+        print(
+            "Nothing was removed. Re-run with --apply to remove the copies "
+            "marked 'remove'."
+        )
+    return 1 if failed else 0
 
 
 def cmd_storage_stamp_sessions(args) -> int:
@@ -2539,7 +2640,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="Set eligible legacy identity export directories/files to 0700/0600",
     )
 
-    # kestrel storage {health}
+    # kestrel storage {health,stamp-sessions,backups}
     storage_p = subparsers.add_parser(
         "storage", help="Storage health and operations"
     )
@@ -2577,6 +2678,36 @@ def build_parser() -> argparse.ArgumentParser:
         help="GCS prefix used by GCSTarget (default: kestrel/)",
     )
     storage_health_p.add_argument(
+        "--json", action="store_true", help="Print machine-readable JSON"
+    )
+    backups_p = storage_sub.add_parser(
+        "backups",
+        help=(
+            "Report the database copies a reanchor left beside each agent "
+            "database; remove those past the retention policy with --apply"
+        ),
+    )
+    backups_p.add_argument(
+        "--agent", default=None, help="Only this local agent (multi_agent.toml name)",
+    )
+    backups_p.add_argument(
+        "--db", default=None,
+        help="Apply the policy beside this database file instead of the agents'",
+    )
+    from kestrel_sovereign.storage.db_backups import DEFAULT_KEEP
+
+    backups_p.add_argument(
+        "--keep", type=int, default=DEFAULT_KEEP,
+        help=(
+            "Distinct copies kept per database, newest first "
+            f"(default: {DEFAULT_KEEP})"
+        ),
+    )
+    backups_p.add_argument(
+        "--apply", action="store_true",
+        help="Remove the copies the report marks 'remove' (default: report only)",
+    )
+    backups_p.add_argument(
         "--json", action="store_true", help="Print machine-readable JSON"
     )
     stamp_p = storage_sub.add_parser(
