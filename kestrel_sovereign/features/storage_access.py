@@ -115,7 +115,8 @@ def resolve_scoped_agent_did(agent: Any) -> str:
     check, or a scope taken from a manager's ``host_agent_id``) is NOT in
     that scan. The other-table copies #3251 named (the reflection-status
     route, the wait reconciler, the scheduler's notice retention sweep, the
-    restart coordinator, the memory reflection hook, the scheduler liveness
+    restart coordinator, the artifact host feature (``features/artifacts``),
+    the memory reflection hook, the scheduler liveness
     check, and the service-key resolver) are routed here. Before adding a
     copy of either kind, route through here; if a site genuinely cannot,
     register it in that test with its reason.

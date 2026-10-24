@@ -226,6 +226,16 @@ tags = ["core", "keys", "api"]
 icon = "key"
 core = true
 
+[artifacts]
+boundary = "bundled"
+package = "kestrel-sovereign"
+git = "https://github.com/KestrelSovereignAI/kestrel-sovereign.git"
+features = ["ArtifactsFeature"]
+description = "Encrypted artifact revisions with sovereign-key access and live privacy enforcement"
+tags = ["core", "artifacts", "storage"]
+icon = "file"
+core = true
+
 [save]
 boundary = "bundled"
 package = "kestrel-sovereign"
