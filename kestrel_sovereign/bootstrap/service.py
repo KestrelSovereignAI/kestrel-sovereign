@@ -14,7 +14,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Dict, List, Mapping, Optional, Tuple
 
 from kestrel_sovereign.execution_custody import (
     is_execution_control_error,
@@ -23,11 +23,22 @@ from kestrel_sovereign.execution_custody import (
 from kestrel_sovereign.llm.invocation_context import LLMInvocationContext
 from kestrel_sovereign.storage.agent_resource_store import (
     SOUL_MARKDOWN_RESOURCE_TYPE,
+    AgentResourceVersion,
 )
 from kestrel_sovereign.storage.privacy_wrapper import (
     acquire_control_plane_capability,
     optional_transition_lock,
 )
+
+from .soul_durability import (
+    SOUL_FILENAME,
+    SoulFileState,
+    SoulFileStatus,
+    inspect_soul_file,
+)
+
+if TYPE_CHECKING:
+    from kestrel_sovereign.auth import CallerContext
 
 logger = logging.getLogger(__name__)
 
@@ -277,6 +288,53 @@ class RestartDiscoveryResult:
     def lower(self) -> str:
         """Backward-compatible string-like helper for older tests/callers."""
         return self.message.lower()
+
+
+@dataclass(frozen=True)
+class SoulRevisionOutcome:
+    """What :meth:`BootstrapService.revise_soul` did (#3779).
+
+    ``revised`` is True only once the new canonical version is confirmed
+    current, i.e. the revision survives a restart. ``unchanged`` means the file
+    already was the canonical SOUL, so there was nothing to revise.
+    """
+
+    revised: bool
+    message: str
+    version: Optional[int] = None
+    previous_version: Optional[int] = None
+    content_sha256: Optional[str] = None
+    unchanged: bool = False
+    skipped_privacy: bool = False
+
+
+@dataclass(frozen=True)
+class _SoulSave:
+    """What the write behind :meth:`BootstrapService.save_soul_md` did.
+
+    ``canonical`` is the version promoted, or ``None`` when a best-effort
+    promotion failed or the save did not happen.
+    """
+
+    saved: bool
+    canonical: Optional[AgentResourceVersion] = None
+
+
+def _next_boot_after_failed_revision(status: SoulFileStatus) -> str:
+    """What the next boot serves after a SOUL revision failed to store."""
+    if status.state in (SoulFileState.FILE_DIFFERS, SoulFileState.FILE_MISSING):
+        return f"the next restart serves canonical v{status.canonical_version}."
+    if status.state is SoulFileState.NO_CANONICAL:
+        return (
+            "no canonical SOUL is current, so the next restart promotes SOUL.md "
+            "as a seed, without this revision's reason or attribution."
+        )
+    if status.state is SoulFileState.IN_SYNC:
+        return (
+            f"the canonical SOUL v{status.canonical_version} matches it although "
+            "the write reported a failure; see the agent log."
+        )
+    return f"what the next restart serves is unknown: {status.error}"
 
 
 @dataclass(frozen=True)
@@ -1226,9 +1284,34 @@ Your preferences matter - tell me what works and what doesn't.
         Returns:
             True if saved successfully
         """
+        return (await self._save_soul(content)).saved
+
+    async def _save_soul(
+        self,
+        content: str,
+        *,
+        created_by: Optional[str] = None,
+        source: Optional[str] = None,
+        provenance: Optional[Mapping[str, Any]] = None,
+        require_canonical: bool = False,
+    ) -> _SoulSave:
+        """The write behind :meth:`save_soul_md`, reporting the version it promoted.
+
+        Args:
+            content: The SOUL body.
+            created_by: Who the new canonical version is attributed to
+                (default: this agent).
+            source: Provenance source of the new version (default: the
+                SOUL.md path).
+            provenance: Extra provenance recorded on the new version, such as
+                a revision's reason and actor.
+            require_canonical: Report failure when the canonical promotion
+                fails. Off, a failed promotion is logged and the save still
+                succeeds, leaving a file the next boot does not serve.
+        """
         if not self.agent_data_path:
             logger.warning("No agent_data_path configured, cannot save SOUL.md")
-            return False
+            return _SoulSave(saved=False)
 
         # Privacy boundary (#2672 review P1): the SOUL body is user-derived — it
         # is generated from the discovery conversation. In a volatile privacy mode
@@ -1253,14 +1336,20 @@ Your preferences matter - tell me what works and what doesn't.
                     "are disabled in the current privacy mode (#2672)",
                     self.agent_id,
                 )
-                return False
+                return _SoulSave(saved=False)
 
             try:
-                soul_path = self.agent_data_path / "SOUL.md"
+                soul_path = self.agent_data_path / SOUL_FILENAME
                 soul_path.parent.mkdir(parents=True, exist_ok=True)
                 soul_path.write_text(content, encoding="utf-8")
                 logger.info(f"Saved SOUL.md to {soul_path}")
-                await self._promote_soul_resource(content, source=str(soul_path))
+                canonical = await self._promote_soul_resource(
+                    content,
+                    source=source or str(soul_path),
+                    created_by=created_by,
+                    provenance=provenance,
+                    raise_on_failure=require_canonical,
+                )
 
                 # Derive the agent's public description from its own SOUL.md.
                 # This replaces the hardcoded "Constitutional AI Agent..."
@@ -1279,25 +1368,196 @@ Your preferences matter - tell me what works and what doesn't.
                         raise
                     logger.warning("Could not derive description from SOUL.md: %s", exc)
 
-                return True
+                return _SoulSave(saved=True, canonical=canonical)
             except Exception as e:
                 if is_execution_control_error(e):
                     raise
                 logger.error(f"Failed to save SOUL.md: {e}")
-                return False
+                return _SoulSave(saved=False)
 
-    async def _promote_soul_resource(self, content: str, *, source: str) -> None:
-        """Best-effort promotion of SOUL.md content into private resources."""
+    async def _promote_soul_resource(
+        self,
+        content: str,
+        *,
+        source: str,
+        created_by: Optional[str] = None,
+        provenance: Optional[Mapping[str, Any]] = None,
+        raise_on_failure: bool = False,
+    ) -> Optional[AgentResourceVersion]:
+        """Promote SOUL.md content into private resources.
+
+        Returns the version promoted. Best-effort unless ``raise_on_failure``:
+        a failure is logged, ``None`` is returned and the caller carries on.
+        """
+        extra = {"provenance": provenance} if provenance is not None else {}
         try:
-            await self.storage.promote_soul_seed(
+            return await self.storage.promote_soul_seed(
                 content,
-                created_by=self.agent_id,
+                created_by=created_by or self.agent_id,
                 source=source,
+                **extra,
             )
         except Exception as exc:
-            if is_execution_control_error(exc):
+            if is_execution_control_error(exc) or raise_on_failure:
                 raise
             logger.warning("Failed to promote SOUL.md to private resource: %s", exc)
+            return None
+
+    async def revise_soul(
+        self, *, reason: str, revised_by: "CallerContext"
+    ) -> SoulRevisionOutcome:
+        """Make the SOUL.md on disk this agent's canonical SOUL (#3779).
+
+        The canonical SOUL, not the file, is what every boot serves, so an
+        edit to SOUL.md lasts only until the next restart unless it becomes a
+        new canonical version. This is that step. It makes the write
+        :meth:`save_soul_md` makes (file plus new canonical version), so it is
+        refused in a volatile privacy mode (#2672), and records ``reason`` and
+        ``revised_by`` on the new version. The store records the version it
+        replaced.
+
+        Revising the SOUL is a Sovereign action, not an agent self-edit:
+        ``revised_by`` must be a sovereign caller.
+
+        Raises:
+            PermissionError: ``revised_by`` is not a sovereign caller.
+            ValueError: ``reason`` is empty.
+        """
+        if revised_by is None or not revised_by.is_sovereign:
+            raise PermissionError("Revising the SOUL requires sovereign authority.")
+        reason = (reason or "").strip()
+        if not reason:
+            raise ValueError("A SOUL revision needs a reason.")
+        if not self.agent_data_path:
+            return SoulRevisionOutcome(
+                revised=False, message="No agent data path is configured; there is no SOUL.md."
+            )
+        soul_path = self.agent_data_path / SOUL_FILENAME
+        try:
+            content = soul_path.read_text(encoding="utf-8")
+        except FileNotFoundError:
+            return SoulRevisionOutcome(revised=False, message=f"No SOUL.md at {soul_path}.")
+        except (OSError, UnicodeDecodeError) as exc:
+            return SoulRevisionOutcome(
+                revised=False, message=f"Could not read {soul_path}: {exc}"
+            )
+        if not content.strip():
+            return SoulRevisionOutcome(
+                revised=False, message=f"{soul_path} is empty; there is nothing to revise to."
+            )
+
+        if not _durable_user_writes_permitted(self.storage):
+            return self._soul_revision_privacy_refusal()
+
+        before = await inspect_soul_file(self.storage, self.agent_data_path)
+        if before.state is SoulFileState.UNVERIFIED:
+            return SoulRevisionOutcome(
+                revised=False,
+                message=f"Could not read the canonical SOUL: {before.error}",
+            )
+        if before.state is SoulFileState.IN_SYNC:
+            return SoulRevisionOutcome(
+                revised=False,
+                unchanged=True,
+                version=before.canonical_version,
+                content_sha256=before.canonical_sha256,
+                message=(
+                    f"SOUL.md already is the canonical SOUL (v{before.canonical_version}); "
+                    "nothing to revise."
+                ),
+            )
+
+        identity = revised_by.identity or revised_by.auth_method.value
+        # The version this one replaces is recorded by the store under its
+        # version lock, not taken from ``before``: another revision may
+        # replace the version inspected above before this one is stored.
+        save = await self._save_soul(
+            content,
+            created_by=f"{revised_by.role.value}:{identity}",
+            source=f"soul_revision:{soul_path}",
+            provenance={
+                "reason": reason,
+                "revised_by": {
+                    "role": revised_by.role.value,
+                    "auth_method": revised_by.auth_method.value,
+                    "identity": revised_by.identity,
+                },
+            },
+            require_canonical=True,
+        )
+        if not save.saved:
+            if not _durable_user_writes_permitted(self.storage):
+                return self._soul_revision_privacy_refusal()
+            # The canonical write is atomic, so a failed one should leave the
+            # previous version current. Report what the next boot will serve
+            # as read back, not as assumed.
+            after = await inspect_soul_file(self.storage, self.agent_data_path)
+            return SoulRevisionOutcome(
+                revised=False,
+                previous_version=after.canonical_version,
+                message=(
+                    "The new canonical SOUL version could not be stored. SOUL.md "
+                    "still holds the edit, but "
+                    + _next_boot_after_failed_revision(after)
+                ),
+            )
+
+        published = save.canonical
+        if published is None:
+            return SoulRevisionOutcome(
+                revised=False,
+                message=(
+                    "SOUL.md was written but the storage reported no canonical "
+                    "version; it may not survive a restart."
+                ),
+            )
+        replaced = published.provenance.get("previous_version")
+        after = await inspect_soul_file(self.storage, self.agent_data_path)
+        if after.state is not SoulFileState.IN_SYNC:
+            return SoulRevisionOutcome(
+                revised=False,
+                version=published.version,
+                previous_version=replaced,
+                message=(
+                    f"The revision was stored as v{published.version} but the "
+                    "canonical SOUL does not match SOUL.md afterwards "
+                    f"({after.state.value}"
+                    + (f": {after.error}" if after.error else "")
+                    + "); it may not survive a restart."
+                ),
+            )
+        logger.info(
+            "SOUL revised for %s: canonical v%s -> v%s by %s",
+            self.agent_id, replaced, published.version, identity,
+        )
+        message = f"SOUL.md is now canonical SOUL v{published.version}"
+        if replaced is not None:
+            message += f" (was v{replaced})"
+        message += f"; it survives restarts. Reason recorded: {reason}"
+        if after.canonical_version != published.version:
+            message += (
+                f" A later revision, v{after.canonical_version}, is now current "
+                "and matches SOUL.md."
+            )
+        return SoulRevisionOutcome(
+            revised=True,
+            version=published.version,
+            previous_version=replaced,
+            content_sha256=published.content_hash,
+            message=message,
+        )
+
+    @staticmethod
+    def _soul_revision_privacy_refusal() -> SoulRevisionOutcome:
+        return SoulRevisionOutcome(
+            revised=False,
+            skipped_privacy=True,
+            message=(
+                "Not revised: the current privacy mode persists no SOUL (#2672). "
+                "The SOUL.md edit applies to this session only after a reload "
+                "and the next restart serves the canonical SOUL."
+            ),
+        )
 
     async def complete_bootstrap(self, avatar_description: Optional[str] = None) -> str:
         """
@@ -1443,7 +1703,12 @@ What would you like to help with?"""
         ]
 
         if self.agent_data_path:
-            soul_path = self.agent_data_path / "SOUL.md"
+            soul_path = self.agent_data_path / SOUL_FILENAME
             status_lines.append(f"**SOUL.md Exists:** {'Yes' if soul_path.exists() else 'No'}")
+            soul_status = await inspect_soul_file(self.storage, self.agent_data_path)
+            status_lines.append(f"**SOUL.md vs canonical SOUL:** {soul_status.state.value}")
+            warning = soul_status.revert_warning()
+            if warning:
+                status_lines.append(f"**Warning:** {warning}")
 
         return "\n".join(status_lines)

@@ -220,7 +220,7 @@ Runtime security policy can still deny a discovered tool at call time; static ge
 |---|---|---|---|---:|---|
 | `bootstrap_add` | `!bootstrap add` | `system` | `file_path` | 98 | `enabled` |
 | `bootstrap_list` | `!bootstrap list` | `system` |  | 42 | `enabled` |
-| `bootstrap_reload` | `!bootstrap reload` | `system` |  | 33 | `enabled` |
+| `bootstrap_reload` | `!bootstrap reload` | `system` |  | 64 | `enabled` |
 | `bootstrap_remove` | `!bootstrap remove` | `system` | `name` | 72 | `enabled` |
 | `bootstrap_status` | `!bootstrap-status` | `system` |  | 21 | `enabled` |
 | `rename_agent` | `!rename` | `system` | `new_name` | 52 | `enabled` |
@@ -913,6 +913,7 @@ Runtime security policy can still deny a discovered tool at call time; static ge
 |---|---|---|---|
 | `!anchor` | `built-in` |  | Anchor memory state |
 | `!create-agent` | `built-in` | `<name>` | Create trusted agent |
+| `!revise-soul` | `built-in` | `<reason>` | Make the edited SOUL.md the canonical SOUL so it survives restarts (Sovereign only) |
 | `!backup` | `built-in` | `[--tier local|ipfs|filecoin]` | Create a backup |
 | `!promote-backup` | `built-in` | `[--tier ...]` | Save isolated session and backup |
 | `!reanchor-constitution` | `built-in` | `<signed_artifact.json> [expected_hash]` | Re-anchor to current constitution after legitimate update |
@@ -942,7 +943,7 @@ Runtime security policy can still deny a discovered tool at call time; static ge
 | `!audit-verify` | `audit_anchor` |  | Verify audit trail integrity against anchors |
 | `!bootstrap add` | `bootstrap` | `<file_path>` | Add a new bootstrap file to be loaded at startup. file_path resolves relative to the agent data dir when not absolute; the file is registered by BASENAME, so a basename collision loads the search-root copy instead. |
 | `!bootstrap list` | `bootstrap` |  | Show all loaded bootstrap files and their paths, sizes, and per-file status (one of: loaded, partial, not found, skipped (budget)). |
-| `!bootstrap reload` | `bootstrap` |  | Force reload all bootstrap files from disk. Use after editing SOUL.md or other bootstrap files. |
+| `!bootstrap reload` | `bootstrap` |  | Force reload all bootstrap files from disk into this session. A SOUL.md edit loaded this way lasts only until restart unless the Sovereign makes it canonical with !revise-soul; the result says when it will not survive. |
 | `!bootstrap remove` | `bootstrap` | `<name>` | Remove a bootstrap file from the loading convention. name is the basename as shown by bootstrap_list (the file is not deleted from disk). |
 | `!bootstrap-status` | `bootstrap` |  | Show the current bootstrap/discovery status. |
 | `!rename` | `bootstrap` | `<new_name>` | Rename this agent. new_name must be 1-64 characters. |
