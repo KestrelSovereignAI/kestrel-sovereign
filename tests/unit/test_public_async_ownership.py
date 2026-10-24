@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import sys
 import threading
 
 import pytest
@@ -12,20 +13,30 @@ from kestrel_sovereign import _async_ownership as canonical
 from kestrel_sovereign import async_ownership as public
 from kestrel_sovereign.execution_custody import (
     ExecutionAuthorityError,
+    ExecutionCommitOutcomeError,
     ProcessRuntimeExecutionFence,
     bind_execution_custody,
+    execution_cleanup_debts,
     execution_denial_scopes,
+    execution_commit_outcome,
+    execution_observation_error,
+    execution_terminal_error,
     run_execution_blocking_operation,
 )
 
 
 def test_public_owned_tail_api_is_exact_canonical_identity_and_signature():
     names = {
+        "OwnedTaskAdmission",
         "OwnedTaskOutcome",
         "await_owned_operation",
         "await_owned_task",
+        "create_owned_task",
+        "owned_task_error",
+        "pending_owned_retirement_error",
         "raise_owned_outcome",
         "run_blocking_operation",
+        "wait_owned_tasks_until",
     }
     assert set(public.__all__) == names
     for name in names:
@@ -33,8 +44,6 @@ def test_public_owned_tail_api_is_exact_canonical_identity_and_signature():
         original = getattr(canonical, name)
         assert alias is original
         assert inspect.signature(alias) == inspect.signature(original)
-    assert not hasattr(public, "create_owned_task")
-    assert not hasattr(public, "OwnedTaskAdmission")
 
 
 @pytest.mark.asyncio
@@ -178,3 +187,199 @@ async def test_public_cleanup_joins_original_tail_after_work_revocation():
             await public.await_owned_task(owner)
             if cleanup is not None:
                 await public.await_owned_task(cleanup)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["allocation", "callback-before", "callback-after"])
+async def test_public_admission_keeps_exact_native_task_across_publication_failure(failure):
+    loop = asyncio.get_running_loop()
+    previous_factory = loop.get_task_factory()
+    receipt = public.OwnedTaskAdmission()
+    refusal = RuntimeError("original public admission refusal: " + failure)
+    accepted = []
+    entered = []
+
+    async def original():
+        entered.append(asyncio.current_task())
+
+    operation = original()
+
+    class PublicationTask(asyncio.Task):
+        def add_done_callback(self, callback, *, context=None):
+            if getattr(callback, "__name__", "") == "close_unstarted":
+                assert receipt.task is self
+                assert not entered
+                if failure == "callback-after":
+                    super().add_done_callback(callback, context=context)
+                raise refusal
+            return super().add_done_callback(callback, context=context)
+
+    def factory(loop, coroutine, **kwargs):
+        if failure == "allocation":
+            raise refusal
+        task = PublicationTask(coroutine, loop=loop, **kwargs)
+        accepted.append(task)
+        return task
+
+    try:
+        # This factory is installed only across this synchronous admission.
+        loop.set_task_factory(factory)
+        with pytest.raises(RuntimeError) as caught:
+            public.create_owned_task(operation, admission=receipt, retain_originals=True)
+        assert caught.value is refusal
+    finally:
+        loop.set_task_factory(previous_factory)
+        primary = sys.exception()
+        joined = None
+        if receipt.task is not None:
+            joined = await public.await_owned_task(receipt.task)
+        terminal = execution_observation_error(
+            primary,
+            None if joined is None or joined.error is refusal else joined.error,
+            None if joined is None else joined.cancellation,
+        )
+        if terminal is not None:
+            raise terminal
+
+    assert inspect.getcoroutinestate(operation) == inspect.CORO_CLOSED
+    assert entered == []
+    if failure == "allocation":
+        assert receipt.task is None and accepted == []
+    else:
+        assert accepted == [receipt.task]
+        assert receipt.task.done() and not receipt.task.cancelled()
+        assert joined.error is refusal
+        assert public.owned_task_error(receipt.task) is refusal
+        assert public.owned_task_error(receipt.task) is refusal
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["ordinary", "control", "unknown", "cancellation"])
+async def test_public_expired_deadline_retains_error_and_pending_original_debt(failure):
+    errors = {
+        "ordinary": LookupError("original producer error"),
+        "control": ExecutionAuthorityError("original producer denial"),
+        "unknown": ExecutionCommitOutcomeError("unknown"),
+        "cancellation": asyncio.CancelledError("original producer cancellation"),
+    }
+    original_error = errors[failure]
+    release = asyncio.Event()
+    entered = asyncio.Event()
+    retired = []
+    resource = object()
+
+    async def fail():
+        raise original_error
+
+    async def pending():
+        entered.set()
+        try:
+            await release.wait()
+        finally:
+            retired.append(asyncio.current_task())
+
+    failed_owner = public.create_owned_task(fail(), retain_originals=True)
+    pending_owner = public.create_owned_task(pending(), retain_originals=True)
+    try:
+        async with asyncio.timeout(5):
+            await entered.wait()
+        failed = await public.await_owned_task(failed_owner)
+        assert failed.error is original_error
+        assert public.owned_task_error(failed_owner) is original_error
+        assert public.owned_task_error(failed_owner) is original_error
+        with pytest.raises(RuntimeError, match="has not reached terminal state"):
+            public.owned_task_error(pending_owner)
+
+        observed = await public.wait_owned_tasks_until(
+            (failed_owner, pending_owner), deadline=asyncio.get_running_loop().time()
+        )
+        assert observed.result == ({failed_owner}, {pending_owner})
+        assert observed.error is None and observed.cancellation is None
+        assert not pending_owner.done() and not pending_owner.cancelling()
+        assert retired == []
+        debt = public.pending_owned_retirement_error(
+            resource, (pending_owner, pending_owner, failed_owner),
+            message="original public retirement remains pending",
+        )
+        assert type(debt) is TimeoutError
+        assert execution_cleanup_debts(debt) == ((resource, pending_owner),)
+        terminal = execution_terminal_error(original_error, debt, retain_originals=True)
+        assert execution_cleanup_debts(terminal) == ((resource, pending_owner),)
+        assert original_error is terminal or original_error is terminal.__cause__
+        if failure == "unknown":
+            # A genuine typed unit receipt, not an observed database COMMIT.
+            assert execution_commit_outcome(terminal) == "unknown"
+    finally:
+        primary = sys.exception()
+        release.set()
+        failed = await public.await_owned_task(failed_owner)
+        pending_outcome = await public.await_owned_task(pending_owner)
+        terminal = execution_observation_error(
+            primary,
+            None if failed.error is original_error else failed.error,
+            failed.cancellation, pending_outcome.error, pending_outcome.cancellation,
+        )
+        if terminal is not None:
+            raise terminal
+    assert retired == [pending_owner]
+    assert public.pending_owned_retirement_error(
+        resource, (pending_owner,), message="already retired original"
+    ) is None
+    # Completing the owner does not rewrite an earlier finite debt snapshot.
+    assert execution_cleanup_debts(debt) == ((resource, pending_owner),)
+
+
+@pytest.mark.asyncio
+async def test_public_bounded_wait_retains_repeated_observer_cancellation_without_cancelling_owner():
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    retired = []
+
+    async def original():
+        try:
+            await release.wait()
+            return "same original result"
+        finally:
+            retired.append(asyncio.current_task())
+
+    owner = public.create_owned_task(original(), retain_originals=True)
+    # A test hang bound, not a production work/retirement SLA.
+    deadline = asyncio.get_running_loop().time() + 5
+
+    async def observe():
+        entered.set()
+        return await public.wait_owned_tasks_until((owner,), deadline=deadline)
+
+    observer = public.create_owned_task(observe(), retain_originals=True)
+    try:
+        await entered.wait()
+        observer.cancel("first observer withdrawal")
+        await asyncio.sleep(0)
+        assert not observer.done() and not owner.done() and not owner.cancelling()
+        observer.cancel("second observer withdrawal")
+        await asyncio.sleep(0)
+        assert not observer.done() and not owner.done() and not owner.cancelling()
+        release.set()
+        joined = await public.await_owned_task(observer)
+        assert joined.error is None and joined.cancellation is None
+        observed = joined.result
+        assert observed.result == ({owner}, set()) and observed.error is None
+        assert isinstance(observed.cancellation, asyncio.CancelledError)
+        assert observed.cancellation.args == ("first observer withdrawal",)
+        assert isinstance(observed.cancellation.__cause__, asyncio.CancelledError)
+        assert observed.cancellation.__cause__.args == ("second observer withdrawal",)
+        assert retired == [owner]
+        with pytest.raises(asyncio.CancelledError) as caught:
+            public.raise_owned_outcome(observed, operation="bounded public observation", retain_originals=True)
+        assert caught.value is observed.cancellation
+    finally:
+        primary = sys.exception()
+        release.set()
+        joined = await public.await_owned_task(observer)
+        original_outcome = await public.await_owned_task(owner)
+        terminal = execution_observation_error(
+            primary, joined.error, joined.cancellation,
+            original_outcome.error, original_outcome.cancellation,
+        )
+        if terminal is not None:
+            raise terminal
