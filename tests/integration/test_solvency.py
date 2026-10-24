@@ -1,3 +1,5 @@
+
+from tests.shared.native_shutdown_budget import shutdown_fixture_agent
 import pytest  # noqa: E402
 pytest.importorskip('kestrel_feature_wallet', reason='Extracted package not installed')
 
@@ -60,7 +62,7 @@ async def agent(temp_db):
     await agent.initialize()
     yield agent
     # Cleanup both agent and LLM service
-    await agent.shutdown()
+    await shutdown_fixture_agent(agent)
     await llm_service.close()
 
 def _set_fil_balance(agent, amount: Decimal):

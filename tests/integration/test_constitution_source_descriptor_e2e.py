@@ -16,6 +16,8 @@ real offline reanchor writer. What these prove together:
 
 from __future__ import annotations
 
+from tests.shared.native_shutdown_budget import shutdown_fixture_agent
+
 import hashlib
 import json
 import os
@@ -117,7 +119,7 @@ async def _verify(credentials, **agent_kwargs) -> tuple[bool, str]:
     try:
         return await agent._verify_constitution_integrity()
     finally:
-        await agent.shutdown()
+        await shutdown_fixture_agent(agent)
 
 
 async def _agent_properties(db_path, agent_did) -> dict:

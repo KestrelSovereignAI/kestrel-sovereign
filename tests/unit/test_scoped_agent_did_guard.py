@@ -65,11 +65,11 @@ async def test_tasks_command_scopes_by_the_guarded_did():
     agent = MagicMock()
     agent.did = "did:test:recipient"
     task_manager = MagicMock()
-    task_manager.task_store.list_tasks = AsyncMock(return_value=[])
+    task_manager.list_task_snapshots = AsyncMock(return_value=[])
     handler = CommandHandler(agent, task_manager=task_manager)
 
     assert await handler._cmd_tasks("!tasks") == "📋 No tasks found"
-    task_manager.task_store.list_tasks.assert_awaited_once_with(
+    task_manager.list_task_snapshots.assert_awaited_once_with(
         recipient_agent_id="did:test:recipient", limit=10
     )
 
@@ -82,11 +82,11 @@ async def test_tasks_command_refuses_without_a_did():
 
     agent = MagicMock()  # a fabricated `did`, not an identity
     task_manager = MagicMock()
-    task_manager.task_store.list_tasks = AsyncMock(return_value=[])
+    task_manager.list_task_snapshots = AsyncMock(return_value=[])
     handler = CommandHandler(agent, task_manager=task_manager)
 
     assert await handler._cmd_tasks("!tasks") == "❌ Task recipient identity unavailable"
-    task_manager.task_store.list_tasks.assert_not_awaited()
+    task_manager.list_task_snapshots.assert_not_awaited()
 
 
 # ---------------------------------------------------------------------------
@@ -114,52 +114,41 @@ def _identity_cases():
 # -- endpoints/agent.py: the A2A task routes' recipient --------------------
 
 
-def test_task_recipient_is_the_did_not_agent_id():
-    from kestrel_sovereign.endpoints.agent import _task_recipient_principal
-
-    agent = SimpleNamespace(agent_id=OTHER, did=ME)
-    assert _task_recipient_principal(agent) == ME
+async def test_task_recipient_is_the_did_not_agent_id(native_inbox_manager):
+    from kestrel_sovereign.endpoints.task_inbox import _manager
+    agent = SimpleNamespace(agent_id=OTHER, did=ME, task_manager=native_inbox_manager)
+    request = SimpleNamespace(state=SimpleNamespace(agent=agent))
+    assert _manager(request) == (native_inbox_manager, ME)
 
 
 @pytest.mark.parametrize("agent", _identity_cases())
-def test_task_recipient_refuses_with_503(agent):
+async def test_task_recipient_refuses_with_503(agent, native_inbox_manager):
     from fastapi import HTTPException
 
-    from kestrel_sovereign.endpoints.agent import _task_recipient_principal
+    from kestrel_sovereign.endpoints.task_inbox import _manager
+    agent.task_manager = native_inbox_manager
+    request = SimpleNamespace(state=SimpleNamespace(agent=agent))
+    with pytest.raises(HTTPException) as caught:
+        _manager(request)
+    assert caught.value.status_code == 503
+    assert "durable recipient identity" in caught.value.detail
 
-    with pytest.raises(HTTPException) as excinfo:
-        _task_recipient_principal(agent)
-    assert excinfo.value.status_code == 503
-    assert "durable recipient identity" in excinfo.value.detail
 
-
-@pytest.mark.asyncio
-async def test_get_tasks_and_the_tasks_command_scope_one_table_the_same_way():
-    """The ticket's concrete divergence: `GET /tasks` read `agent_id` first,
-    `!tasks` read `did`. One agent object carrying both, distinct, must list
-    the same rows on both surfaces."""
+async def test_get_tasks_and_the_tasks_command_scope_one_table_the_same_way(native_inbox_manager, monkeypatch):
     from unittest.mock import AsyncMock
 
     from kestrel_sovereign.command_handler import CommandHandler
-    from kestrel_sovereign.endpoints.agent import list_tasks
-
-    task_manager = MagicMock()
-    task_manager.task_store.list_tasks = AsyncMock(return_value=[])
-    agent = SimpleNamespace(agent_id=OTHER, did=ME, task_manager=task_manager)
-
+    from kestrel_sovereign.endpoints.task_inbox import list_inbox
+    manager = native_inbox_manager
+    reads = AsyncMock(wraps=manager.list_task_snapshots)
+    monkeypatch.setattr(manager, "list_task_snapshots", reads)
+    agent = SimpleNamespace(agent_id=OTHER, did=ME, task_manager=manager)
     request = SimpleNamespace(state=SimpleNamespace(agent=agent))
-    body = await list_tasks(request, status=None, limit=50)
-    assert body["total"] == 0
-    task_manager.task_store.list_tasks.assert_awaited_once_with(
-        recipient_agent_id=ME, status=None, limit=50
-    )
-
-    task_manager.task_store.list_tasks.reset_mock()
-    handler = CommandHandler(agent, task_manager=task_manager)
-    assert await handler._cmd_tasks("!tasks") == "📋 No tasks found"
-    task_manager.task_store.list_tasks.assert_awaited_once_with(
-        recipient_agent_id=ME, limit=10
-    )
+    assert (await list_inbox(request, status=None, limit=50))["total"] == 0
+    reads.assert_awaited_once_with(recipient_agent_id=ME, status=None, limit=50)
+    reads.reset_mock()
+    assert await CommandHandler(agent, task_manager=manager)._cmd_tasks("!tasks") == "📋 No tasks found"
+    reads.assert_awaited_once_with(recipient_agent_id=ME, limit=10)
 
 
 @pytest.mark.asyncio
@@ -172,11 +161,11 @@ async def test_tasks_command_ignores_a_distinct_agent_id():
     agent.did = ME
     agent.agent_id = OTHER
     task_manager = MagicMock()
-    task_manager.task_store.list_tasks = AsyncMock(return_value=[])
+    task_manager.list_task_snapshots = AsyncMock(return_value=[])
     handler = CommandHandler(agent, task_manager=task_manager)
 
     await handler._cmd_tasks("!tasks")
-    task_manager.task_store.list_tasks.assert_awaited_once_with(
+    task_manager.list_task_snapshots.assert_awaited_once_with(
         recipient_agent_id=ME, limit=10
     )
 
@@ -232,7 +221,7 @@ def _inbox_agent(**identity):
     from unittest.mock import AsyncMock
 
     task_manager = MagicMock()
-    task_manager.task_store.list_tasks = AsyncMock(return_value=[])
+    task_manager.list_task_snapshots = AsyncMock(return_value=[])
     return SimpleNamespace(task_manager=task_manager, **identity), task_manager
 
 
@@ -242,7 +231,7 @@ async def test_inbox_section_scopes_by_the_did_not_agent_id():
 
     agent, task_manager = _inbox_agent(agent_id=OTHER, did=ME)
     assert await _a2a_inbox_section(agent) == "A2A inbox: no pending tasks"
-    task_manager.task_store.list_tasks.assert_awaited_once_with(
+    task_manager.list_task_snapshots.assert_awaited_once_with(
         recipient_agent_id=ME, limit=50
     )
 
@@ -255,10 +244,10 @@ async def test_inbox_section_is_silent_without_a_did(agent):
     from kestrel_sovereign.agent.preturn_state import _a2a_inbox_section
 
     task_manager = MagicMock()
-    task_manager.task_store.list_tasks = AsyncMock(return_value=[])
+    task_manager.list_task_snapshots = AsyncMock(return_value=[])
     agent.task_manager = task_manager
     assert await _a2a_inbox_section(agent) is None
-    task_manager.task_store.list_tasks.assert_not_awaited()
+    task_manager.list_task_snapshots.assert_not_awaited()
 
 
 def _restart_agent(monkeypatch, **identity):
@@ -395,179 +384,6 @@ def test_task_feature_has_no_durable_identity_without_a_did(agent):
         feature._recipient_agent_id()
 
 
-def _post_cancel(monkeypatch, agent):
-    """POST the cancel route on a real app: the route is rate-limited and
-    needs a real Starlette request."""
-    from fastapi.testclient import TestClient
-
-    from tests.unit.test_a2a_principal_reads import _principal_endpoint_app
-
-    app = _principal_endpoint_app(monkeypatch, agent)
-    body = {
-        "reason": "stop",
-        "sessionId": "s-1",
-        "metadata": {"a2a_verb": "cancel_task"},
-    }
-    with TestClient(app) as client:
-        return client.post("/api/agent/tasks/task-1/cancel", json=body)
-
-
-def test_cancel_route_refuses_when_only_the_task_manager_carries_an_id(monkeypatch):
-    """The route used to take ``task_manager.host_agent_id`` before the
-    agent's own DID. A manager that carries one while the agent has none
-    is now a 503, not a cancellation on the manager's copy."""
-    agent = SimpleNamespace(did="", task_manager=SimpleNamespace(host_agent_id=OTHER))
-    response = _post_cancel(monkeypatch, agent)
-    assert response.status_code == 503
-    assert "cancellation requires a durable recipient identity" in response.json()["detail"]
-
-
-def test_cancel_route_resolves_its_recipient_through_the_shared_helper(monkeypatch):
-    """Wiring: the route asks the one helper, with the agent (not the task
-    manager) and its own verb. A sentinel refusal proves the call site."""
-    from fastapi import HTTPException
-
-    from kestrel_sovereign.endpoints import agent as agent_endpoint
-
-    asked = []
-
-    def sentinel(agent, *, verb="reads require"):
-        asked.append((agent, verb))
-        raise HTTPException(status_code=503, detail="sentinel")
-
-    monkeypatch.setattr(agent_endpoint, "_task_recipient_principal", sentinel)
-    agent = SimpleNamespace(did=ME, task_manager=SimpleNamespace(host_agent_id=OTHER))
-    response = _post_cancel(monkeypatch, agent)
-    assert response.status_code == 503
-    assert response.json()["detail"] == "sentinel"
-    assert asked == [(agent, "cancellation requires")]
-
-
-# -- the write side of the same table (review r2) ---------------------------
-
-
-def _send_params():
-    from kestrel_sovereign.a2a.types import Message, TaskSendParams, TextPart
-
-    return TaskSendParams(
-        id="task-1",
-        sessionId="sess-1",
-        message=Message(role="user", parts=[TextPart(text="do it")]),
-        metadata={"sender": OTHER},
-    )
-
-
-@pytest.mark.asyncio
-async def test_task_creation_refuses_a_recipient_without_a_did_before_verifying():
-    """The creation path used to file the row under ``did``, else the display
-    name, else ``"unknown"`` — a fourth resolution order over the same table
-    the reads now guard. No identity: 503, and nothing is verified or
-    created."""
-    from fastapi import HTTPException
-    from unittest.mock import AsyncMock
-
-    from kestrel_sovereign.endpoints import agent as agent_endpoint
-
-    task_manager = MagicMock()
-    task_manager.create_task = AsyncMock()
-    agent = SimpleNamespace(did="", _agent_name="recipient", task_manager=task_manager)
-    params = _send_params()
-    with pytest.raises(HTTPException) as excinfo:
-        await agent_endpoint._create_a2a_task_under_lifecycle_lease(
-            agent, params, params.message.parts, [], [], manager=None
-        )
-    assert excinfo.value.status_code == 503
-    assert "creation requires a durable recipient identity" in excinfo.value.detail
-    task_manager.create_task.assert_not_awaited()
-
-
-@pytest.mark.asyncio
-async def test_task_creation_resolves_its_recipient_through_the_shared_helper(monkeypatch):
-    """Wiring: creation asks the one helper with the agent and its own verb,
-    and an action carrying a ``commit`` does not (its route already did)."""
-    from fastapi import HTTPException
-
-    from kestrel_sovereign.endpoints import agent as agent_endpoint
-
-    asked = []
-
-    def sentinel(agent, *, verb="reads require"):
-        asked.append((agent, verb))
-        raise HTTPException(status_code=503, detail="sentinel")
-
-    monkeypatch.setattr(agent_endpoint, "_task_recipient_principal", sentinel)
-    agent = SimpleNamespace(did=ME, _agent_name=OTHER, task_manager=MagicMock())
-    params = _send_params()
-    with pytest.raises(HTTPException, match="sentinel"):
-        await agent_endpoint._create_a2a_task_under_lifecycle_lease(
-            agent, params, params.message.parts, [], [], manager=None
-        )
-    assert asked == [(agent, "creation requires")]
-
-    # An action carrying a commit resolved its recipient at its route: the
-    # creation guard is not consulted. The sentinel would raise first if it
-    # were; instead the unsigned envelope is what refuses, later.
-    asked.clear()
-    from unittest.mock import AsyncMock
-
-    commit = AsyncMock(return_value="committed")
-    with pytest.raises(HTTPException) as excinfo:
-        await agent_endpoint._create_a2a_task_under_lifecycle_lease(
-            agent, params, params.message.parts, [], [], manager=None, commit=commit
-        )
-    assert excinfo.value.detail != "sentinel"
-    assert asked == []
-    commit.assert_not_awaited()
-
-
-@pytest.mark.asyncio
-async def test_task_creation_refuses_before_any_verification_work(monkeypatch):
-    """Review r3: the ordering is load-bearing. Verification reserves the
-    replay nonce with no rollback, so a refusal AFTER it would burn a
-    correctly signed envelope that a repaired recipient could otherwise
-    accept on retry. With no identity, neither the verifier nor the replay
-    store is touched."""
-    from fastapi import HTTPException
-    from unittest.mock import AsyncMock
-
-    from kestrel_sovereign.a2a import envelope_signing
-    from kestrel_sovereign.endpoints import agent as agent_endpoint
-
-    verifier = AsyncMock(side_effect=AssertionError("verified before the guard"))
-    monkeypatch.setattr(envelope_signing, "verify_inbound_envelope", verifier)
-    replay = MagicMock(side_effect=AssertionError("replay store touched"))
-    monkeypatch.setattr(agent_endpoint, "_a2a_replay_store", replay)
-
-    task_manager = MagicMock()
-    task_manager.create_task = AsyncMock()
-    agent = SimpleNamespace(did="", _agent_name="recipient", task_manager=task_manager)
-    params = _send_params()
-    with pytest.raises(HTTPException) as excinfo:
-        await agent_endpoint._create_a2a_task_under_lifecycle_lease(
-            agent, params, params.message.parts, [], [], manager=None
-        )
-    assert excinfo.value.status_code == 503
-    verifier.assert_not_awaited()
-    replay.assert_not_called()
-    task_manager.create_task.assert_not_awaited()
-
-
-# -- a2a/local_submission: the host-attested local writer ------------------
-
-
-def test_local_submission_recipient_is_the_did_not_agent_id():
-    from kestrel_sovereign.a2a.local_submission import _stable_agent_id
-
-    assert _stable_agent_id(SimpleNamespace(agent_id=OTHER, did=ME)) == ME
-
-
-@pytest.mark.parametrize("agent", _identity_cases() + [pytest.param(None, id="no-agent")])
-def test_local_submission_has_no_recipient_without_a_did(agent):
-    from kestrel_sovereign.a2a.local_submission import _stable_agent_id
-
-    assert _stable_agent_id(agent) is None
-
-
 # ---------------------------------------------------------------------------
 # The census (review r4): every inline resolution left in the package is a
 # known exception with a reason, and this test is the register — not a
@@ -621,11 +437,6 @@ def _count_inline(text: str) -> int:
 # path (relative to the package) -> (count, why it is not routed through the guard)
 KNOWN_INLINE_RESOLUTIONS = {
     # #3251: other shared tables, filed separately from the a2a_tasks work.
-    "endpoints/agent.py": (
-        1,
-        "the local-witness loop resolves the SENDER's stable identity from a "
-        "witnessed peer object, not this agent's own scope",
-    ),
     "features/todo/feature.py": (1, "todo table scope, falls back to 'default' (#3251)"),
     "waits/reconciler.py": (1, "a signal's TARGET agent, not this agent's own scope"),
     "features/skills/feature.py": (1, "reflection_insights scope, '' fallback (#3251)"),
@@ -719,9 +530,11 @@ def test_inbound_authorizer_has_no_recipient_without_a_did(agent):
 ROUTED_MODULES = {
     "agent/preturn_state.py",
     "a2a/inbound_authorization.py",
-    "a2a/local_submission.py",
+    "a2a/native_standalone.py",  # standalone native publication owner
     "command_handler.py",
     "endpoints/agent.py",
+    "endpoints/task_inbox.py",  # native operator inbox owner
+    "features/peers/feature.py",  # native outbound sender owner
     "endpoints/hold.py",  # the host Hold door's latch target (#3164)
     "endpoints/observability.py",
     "endpoints/restart_events.py",
@@ -754,3 +567,20 @@ def test_every_routed_site_is_named_here():
         "new callers (add them here and to the guard's docstring)": sorted(callers - ROUTED_MODULES),
         "callers gone (a site un-routed?)": sorted(ROUTED_MODULES - callers),
     }
+
+
+import pytest_asyncio
+
+
+@pytest_asyncio.fixture
+async def native_inbox_manager(native_a2a_backend_factory):
+    from kestrel_sovereign.a2a.scope import NativeRecipientScope
+    from tests.utils.native_a2a import manager_for
+    backend = native_a2a_backend_factory()
+    await backend.connect()
+    manager = manager_for(backend, NativeRecipientScope(ME))
+    await manager.initialize()
+    try:
+        yield manager
+    finally:
+        await manager.close()

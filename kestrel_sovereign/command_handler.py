@@ -11,6 +11,8 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Callable, Dict, Optional
 
+from google.protobuf.json_format import MessageToDict
+
 from kestrel_sovereign.command_policy import (
     RECOVERY_COMMANDS as CANONICAL_RECOVERY_COMMANDS,
 )
@@ -308,16 +310,7 @@ class CommandHandler:
         if not self.task_manager:
             return commands
 
-        # Get all registered agents and their skills
-        for agent_id, (agent_card, handler) in self.task_manager._agents.items():
-            for skill in agent_card.skills:
-                # Get the tool from the handler to access command_prefix
-                if hasattr(handler, 'get_tools'):
-                    for tool in handler.get_tools():
-                        if tool.schema.command_prefix:
-                            commands[tool.schema.command_prefix] = tool.schema.description
-
-        return commands
+        return self.task_manager.get_commands()
 
     def _format_result(self, result) -> str:
         """
@@ -769,10 +762,15 @@ class CommandHandler:
             arg = parts[1].lower()
             if arg == "all":
                 limit = 1000
-            elif arg in ("completed", "working", "failed", "submitted", "canceled"):
-                status_filter = arg.upper()
             elif arg.isdigit():
                 limit = int(arg)
+            else:
+                from kestrel_sovereign.a2a.lifecycle import task_state_from_label
+                try:
+                    task_state_from_label(arg)
+                except ValueError:
+                    return f"❌ Unknown task status: {arg}"
+                status_filter = arg
 
         try:
             # Get tasks from store
@@ -780,7 +778,7 @@ class CommandHandler:
                 recipient_agent_id = resolve_scoped_agent_did(self.agent)
             except AgentIdentityUnavailable:
                 return "❌ Task recipient identity unavailable"
-            tasks = await self.task_manager.task_store.list_tasks(
+            tasks = await self.task_manager.list_task_snapshots(
                 recipient_agent_id=recipient_agent_id,
                 limit=limit,
             )
@@ -790,12 +788,9 @@ class CommandHandler:
 
             # Filter by status if specified
             if status_filter:
-                from kestrel_sovereign.a2a.types import TaskState
-                try:
-                    filter_state = TaskState[status_filter]
-                    tasks = [t for t in tasks if t.status.state == filter_state]
-                except KeyError:
-                    pass
+                from kestrel_sovereign.a2a.lifecycle import task_state_from_label
+                filter_state = task_state_from_label(status_filter)
+                tasks = [snapshot for snapshot in tasks if snapshot.task.status.state == filter_state]
 
             if not tasks:
                 return f"📋 No {status_filter.lower()} tasks found"
@@ -811,16 +806,20 @@ class CommandHandler:
                 "SUBMITTED": "📥",
                 "CANCELED": "⚫",
                 "INPUT_REQUIRED": "❓",
+                "AUTH_REQUIRED": "🔑",
+                "REJECTED": "⛔",
             }
 
-            for task in tasks:
-                state = task.status.state.value
-                emoji = state_emoji.get(state, "❓")
+            for snapshot in tasks:
+                task = snapshot.task
+                from kestrel_sovereign.a2a.lifecycle import task_state_label
+                state = task_state_label(task.status.state)
+                emoji = state_emoji.get(state.upper().replace("-", "_"), "❓")
                 task_id = task.id[:8]
 
                 # Get description from metadata
-                agent_id = task.metadata.get("agent_id", "unknown") if task.metadata else "unknown"
-                skill_id = task.metadata.get("skill", "") if task.metadata else ""
+                agent_id = snapshot.ownership.creator_agent_id
+                skill_id = MessageToDict(task.metadata).get("skill", "") if task.metadata else ""
 
                 # Build task line
                 desc = f"{agent_id}/{skill_id}" if skill_id else agent_id

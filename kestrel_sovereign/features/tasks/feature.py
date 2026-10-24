@@ -24,11 +24,27 @@ import re
 import time
 from typing import Any, Dict, List, Optional
 
-from kestrel_sovereign.features.base import Feature, tool
-from kestrel_sovereign.execution_custody import is_execution_control_error
-from kestrel_sovereign.features.tasks.wait_provider import TaskWaitable
+from kestrel_sdk.native_a2a.helpers.proto_helpers import new_text_artifact, new_text_message
+from kestrel_sdk.native_a2a.types import Role, TaskState
+from kestrel_sdk.native_a2a.utils.errors import InvalidAgentResponseError
+from google.protobuf.json_format import MessageToDict
 from kestrel_sdk.tools.base import ToolCategory
 from kestrel_sdk.tools.result import ToolResult, ToolResultStatus
+
+from kestrel_sovereign.a2a.lifecycle import (
+    TERMINAL_STATES,
+    task_state_from_label,
+    task_state_label,
+)
+from kestrel_sovereign.a2a.projections import (
+    embedded_json_value,
+    message_text,
+    task_presentation,
+)
+from kestrel_sovereign.execution_custody import is_execution_control_error
+from kestrel_sovereign.features.base import Feature, is_flat_toolresult_envelope, tool
+from kestrel_sovereign.features.tasks.wait_provider import TaskWaitable
+from kestrel_sovereign.storage.db.interface import DatabaseError
 
 logger = logging.getLogger(__name__)
 
@@ -132,107 +148,21 @@ class TaskFeature(Feature):
             return None
 
     async def _get_task_status_data(self, task_id: str) -> Dict[str, Any]:
-        """Fetch a task and shape its status into a dict.
-
-        Returns either ``{"ok": False, "error": str}`` or
-        ``{"ok": True, "task_id": str, "status": str, "message": str|None,
-        "task_type": str|None, "artifacts": list, "created_at": str}``.
-
-        ``ok`` is the local discriminator — the @tool wrappers translate
-        it into ToolResult.ok / ToolResult.failed.
-        """
+        """Present a native task with its committed sender and real status time."""
         if not self.task_manager:
             return {"ok": False, "error": "Task manager not available"}
-
         try:
-            recipient_agent_id = self._recipient_agent_id()
-            task = await self.task_manager.get_task_for_recipient(
-                task_id,
-                recipient_agent_id,
+            snapshot = await self.task_manager.get_task_snapshot(
+                task_id, recipient_agent_id=self._recipient_agent_id(),
             )
-        except Exception as e:
-            if is_execution_control_error(e):
+        except DatabaseError as error:
+            if is_execution_control_error(error):
                 raise
-            logger.error(f"Failed to fetch task {task_id}: {e}")
-            return {"ok": False, "error": str(e)}
-
-        if not task:
+            logger.error("Failed to fetch task %s: %s", task_id, error)
+            return {"ok": False, "error": str(error)}
+        if snapshot is None:
             return {"ok": False, "error": f"Task {task_id} not found"}
-
-        # ``status.message`` is the AGENT'S response message (set when the
-        # receiver calls ``respond_to_a2a_task``). For a fresh inbound task
-        # it's None until the agent replies — DO NOT mistake it for the
-        # sender's question. The incoming request body lives in
-        # ``task.history[0]`` (where ``create_task`` puts ``params.message``).
-        # Surface both so the LLM inspecting an inbox task sees what was
-        # ASKED (request_content) AND what was answered if anything
-        # (status_message). Conflating the two caused #1433 — the receiver
-        # read None and concluded the body was null when in fact it just
-        # hadn't been replied to yet.
-        status_message = None
-        if task.status.message and task.status.message.parts:
-            status_message = task.status.message.parts[0].text
-
-        request_content: Optional[str] = None
-        sender: Optional[str] = None
-        history = getattr(task, "history", None) or []
-        if history:
-            first = history[0]
-            parts = getattr(first, "parts", None) or []
-            for part in parts:
-                text = getattr(part, "text", None)
-                if isinstance(text, str) and text:
-                    request_content = text
-                    break
-        if task.metadata and isinstance(task.metadata, dict):
-            raw_sender = task.metadata.get("sender")
-            if isinstance(raw_sender, str) and raw_sender:
-                sender = raw_sender
-
-        artifacts: List[Dict[str, Any]] = []
-        if task.artifacts:
-            for artifact in task.artifacts:
-                artifact_data: Dict[str, Any] = {
-                    "name": artifact.name,
-                    "description": artifact.description,
-                }
-                if artifact.parts:
-                    text_segments: List[str] = []
-                    for part in artifact.parts:
-                        if hasattr(part, "data"):
-                            # Same hazard as run_workflow: a migrated
-                            # tool's artifact data can carry a raw
-                            # ToolResult inside the DynamicTool wrapper
-                            # (only serialized on wire output, not on
-                            # in-process reads). Serialize here so
-                            # check_task_status / get_task_result and the
-                            # task waitable all read JSON-clean payloads.
-                            # Round 6 codex finding.
-                            artifact_data["data"] = self._serialize_step_payload(
-                                part.data
-                            )
-                        elif getattr(part, "text", None) is not None:
-                            # Surface text-part bodies too so a recipient
-                            # can read sender-attached text artifacts
-                            # (e.g. a handoff plan) — not just structured
-                            # data parts (#1525). Concatenated in part
-                            # order to reassemble a chunked body.
-                            text_segments.append(part.text or "")
-                    if text_segments:
-                        artifact_data["text"] = "".join(text_segments)
-                artifacts.append(artifact_data)
-
-        return {
-            "ok": True,
-            "task_id": task_id,
-            "status": task.status.state.value,
-            "message": status_message,
-            "request_content": request_content,
-            "sender": sender,
-            "task_type": task.metadata.get("task_type") if task.metadata else None,
-            "artifacts": artifacts,
-            "created_at": task.id[:8],  # task ID prefix encodes timestamp
-        }
+        return {"ok": True, **task_presentation(snapshot)}
 
     @tool(
         name="list_available_skills",
@@ -259,24 +189,11 @@ class TaskFeature(Feature):
                 data={"reason": "TaskFeature has no connected TaskManager"},
             )
 
-        features: Dict[str, Dict[str, Any]] = {}
-        try:
-            for agent_id, (agent_card, _handler) in self.task_manager._agents.items():
-                skills = []
-                for skill in agent_card.skills:
-                    skills.append({
-                        "skill": skill.id,
-                        "description": skill.description,
-                    })
-                features[agent_id] = {
-                    "description": agent_card.description,
-                    "skills": skills,
-                }
-        except Exception as e:
-            if is_execution_control_error(e):
-                raise
-            logger.error(f"list_available_skills failed: {e}", exc_info=True)
-            return ToolResult.failed(str(e))
+        features = {
+            provider_id: {"skills": [{"skill": skill.id, "description": skill.description}
+                                     for skill in skills]}
+            for provider_id, skills in self.task_manager.get_provider_skills().items()
+        }
 
         total_skills = sum(len(f["skills"]) for f in features.values())
         return ToolResult.ok(
@@ -299,8 +216,8 @@ class TaskFeature(Feature):
             "are returned together. Use this instead of making individual subagent calls "
             "when you need to gather information from multiple features. "
             "Steps format: [{\"feature\": \"feature_name\", \"skill\": \"skill_name\", \"args\": {}}]. "
-            "Feature names match the tool names shown in your available tools (e.g., model_agent, "
-            "memory_feature, wallet_feature). Skill names are the individual tool methods within "
+            "Use the exact feature identifiers returned by list_available_skills. "
+            "Skill names are the individual tool methods within "
             "each feature (e.g., list_models, memory_status, check_balance). "
             "Args can reference prior step outputs with {{steps.N.result}} or {{prev.result}}. "
             "Steps can optionally include max_retries (default 0) and retry_delay_ms (default 1000)."
@@ -313,7 +230,7 @@ class TaskFeature(Feature):
         Execute a multi-step workflow plan.
 
         Args:
-            steps: List of workflow steps. Each step is an object with 'feature' (the feature's tool_name like 'model_agent'), 'skill' (the tool method name like 'list_models'), and optional 'args' (dict of arguments to pass).
+            steps: List of workflow steps. Each step is an object with 'feature' (the registered identifier returned by list_available_skills), 'skill' (the tool method name like 'list_models'), and optional 'args' (dict of arguments to pass).
                    Args values can include {{steps.N.result}} or {{prev.result}} placeholders
                    to reference outputs from earlier steps.
                    Optional 'max_retries' (int, default 0) and 'retry_delay_ms' (int, default 1000).
@@ -418,32 +335,21 @@ class TaskFeature(Feature):
                         for artifact in task.artifacts:
                             if artifact.parts:
                                 for part in artifact.parts:
-                                    if hasattr(part, 'data'):
-                                        result_data = part.data
+                                    recognized, value = embedded_json_value(part)
+                                    if recognized:
+                                        result_data = value
 
                     step_duration = int((time.time() - step_start) * 1000)
 
-                    # Honesty: A2A's task.status reports the *transport*
-                    # outcome — the call returned without raising — not
-                    # the *semantic* outcome. A migrated step that
-                    # returned ``ToolResult.failed`` lands here with
-                    # ``task.status.state == COMPLETED`` and would be
-                    # counted as a success in the workflow rollup.
-                    # Inspect the wire-shape (status / error fields)
-                    # and downgrade. Old-style dict tools with
-                    # ``success: False`` are also surfaced as failed so
-                    # the rollup is honest during the migration window.
+                    # Preserve native rejection/failure reasons and inspect
+                    # the business result of a completed tool before rollup.
                     semantic_status, semantic_error = self._classify_step_result(
-                        task.status.state.value, result_data,
+                        task_state_label(task.status.state), result_data,
+                        failure_message=(message_text(task.status.message)
+                                         if task.status.HasField("message") else None),
                     )
-                    # Serialize the result before storing it in the
-                    # workflow's data dict. ``DynamicTool.execute`` may
-                    # store a raw ``ToolResult`` under ``result``; if
-                    # we leave that in place, downstream JSON
-                    # serialization for the LLM tool-history wire will
-                    # blow up. Walk the dict and ``.to_dict()`` any
-                    # ToolResult instances we find. (Round 5 codex
-                    # finding.)
+                    # All native artifacts are decoded through the shared
+                    # JSON projector before constructing the workflow result.
                     serialized_result = self._serialize_step_payload(result_data)
                     step_record = {
                         "step": i,
@@ -459,7 +365,7 @@ class TaskFeature(Feature):
                     results.append(step_record)
                     logger.info(
                         f"[WORKFLOW] Step {i}: {feature_name}.{skill_name} "
-                        f"-> {semantic_status} (transport={task.status.state.value}, "
+                        f"-> {semantic_status} (transport={task_state_label(task.status.state)}, "
                         f"{step_duration}ms, attempt {attempt + 1})"
                     )
                     last_error = None
@@ -621,99 +527,49 @@ class TaskFeature(Feature):
     def _classify_step_result(
         transport_state: str,
         result_data: Any,
+        *,
+        failure_message: str | None = None,
     ) -> tuple[str, Optional[str]]:
-        """Translate the A2A task state + tool wire-data into a
-        workflow-step status.
+        """Combine native execution state with the returned business outcome.
 
-        A2A's ``task.status.state`` is transport-level: COMPLETED means
-        "the python call returned." A migrated tool that returns
-        ``ToolResult.failed`` is *transport-completed* but *semantically
-        failed*. To keep the workflow rollup honest, this helper
-        inspects the wire-shape.
-
-        Wire shapes seen in the wild (in order of how widely they
-        appear in production paths):
-
-          1. **In-process DynamicTool wrapper, raw ToolResult**
-             ``{"success": True, "result": <ToolResult instance>,
-             "tool": "<name>"}``.
-             ``Feature.handle_task`` → ``DynamicTool.execute``
-             stores the raw return value in ``result``. The
-             ToolResult object is only converted to a dict when
-             the artifact is serialized for the wire (Pydantic
-             ``model_dump()``); a synchronous in-process workflow
-             reads the raw object before that happens. **This is
-             the path codex round 4 caught.**
-          2. **Wire-serialized DynamicTool wrapper, dict ToolResult**
-             ``{"success": True, "result": <ToolResult.to_dict()>,
-             "tool": "..."}``. Same path after serialization.
-          3. **Bare ToolResult envelope** (handlers that bypass
-             DynamicTool): ``{"status": "ok"|"error"|"partial", ...}``.
-          4. **Bare ToolResult instance** (rare; some custom handlers).
-          5. **Pre-migration dict** ``{"success": False, "error": ...}``.
-          6. Anything else → defer to the transport state.
-
-        Returns ``(status, error_or_None)``. ``status`` is one of
-        ``"completed" | "failed" | "partial"``.
+        A failed/canceled/rejected native task always fails its workflow step.
+        A completed tool can still return a partial or unsuccessful business
+        result. Recognize the canonical ToolResult envelope before inspecting
+        a dictionary return carried by DynamicTool's result wrapper.
         """
-        if transport_state == "failed":
-            return "failed", None
+        native_state = task_state_from_label(transport_state)
+        if native_state in TERMINAL_STATES and native_state != TaskState.TASK_STATE_COMPLETED:
+            return "failed", failure_message
 
-        # Normalize a raw ToolResult instance to its dict form so the
-        # rest of the helper is purely structural.
-        def _normalize(candidate: Any) -> Any:
-            if isinstance(candidate, ToolResult):
-                return candidate.to_dict()
-            return candidate
+        def normalize(candidate: Any) -> Any:
+            return candidate.to_dict() if isinstance(candidate, ToolResult) else candidate
 
-        result_data = _normalize(result_data)
-
+        result_data = normalize(result_data)
         if not isinstance(result_data, dict):
-            return ("completed" if transport_state == "completed"
-                    else transport_state), None
-
-        # Resolve to whichever shape carries the @tool's return:
-        #  - bare envelope: result_data IS the ToolResult.to_dict()
-        #  - wrapped: result_data['result'] is the ToolResult — either
-        #    a dict (post-serialize) or a raw ToolResult instance
-        #    (pre-serialize, in-process)
-        candidates: List[Any] = [result_data]
+            return transport_state, None
+        candidates = [result_data]
         if "tool" in result_data and "success" in result_data:
-            inner = _normalize(result_data.get("result"))
+            inner = normalize(result_data.get("result"))
             if isinstance(inner, dict):
                 candidates.append(inner)
 
         for candidate in candidates:
-            if not isinstance(candidate, dict):
+            if not is_flat_toolresult_envelope(candidate):
                 continue
-            envelope_status = candidate.get("status")
-            # Coerce the enum to its wire token for comparison so
-            # both raw ToolResultStatus values (post-normalize from a
-            # raw ToolResult) and bare strings (post-serialize) match.
-            if isinstance(envelope_status, ToolResultStatus):
-                envelope_status = envelope_status.value
-            if envelope_status == "ok":
-                # The @tool said OK explicitly. Even if the outer
-                # wrapper had its own success flag, this is the
-                # source of truth.
+            status = candidate["status"]
+            if status == ToolResultStatus.OK:
                 return "completed", None
-            if envelope_status == "error":
+            if status == ToolResultStatus.ERROR:
                 return "failed", candidate.get("error")
-            if envelope_status == "partial":
+            if status == ToolResultStatus.PARTIAL:
                 return "partial", candidate.get("error")
 
-        # Pre-migration dict shape on the OUTER result_data only —
-        # the wrapper's own ``success: True`` is not authoritative
-        # (it just means DynamicTool.execute didn't raise), so don't
-        # treat outer success=True as a clean completion if we
-        # didn't find an envelope above.
-        if result_data.get("success") is False:
-            return "failed", result_data.get("error")
-        if result_data.get("error") and result_data.get("success") is not True:
-            return "failed", result_data.get("error")
-
-        return ("completed" if transport_state == "completed"
-                else transport_state), None
+        for candidate in candidates:
+            if candidate.get("success") is False or (
+                candidate.get("error") and candidate.get("success") is not True
+            ):
+                return "failed", candidate.get("error")
+        return transport_state, None
 
     @staticmethod
     def _resolve_step_refs(
@@ -828,164 +684,57 @@ class TaskFeature(Feature):
             bits.append(f"reply: {preview!r}")
         return ToolResult.ok(
             confirmation=" — ".join(bits),
-            data={
-                "task_id": data["task_id"],
-                "status": data["status"],
-                "message": data["message"],
-                "request_content": data["request_content"],
-                "sender": data["sender"],
-                "task_type": data["task_type"],
-                "artifacts": data["artifacts"],
-                "created_at": data["created_at"],
-            },
+            data={key: value for key, value in data.items() if key != "ok"},
         )
 
     @tool(
         name="list_my_tasks",
-        description="List background tasks, optionally filtered by status or type. status must be one of the TaskState values: submitted, working, completed, failed, canceled (case-insensitive). With no status, returns the pending (submitted) inbox; a status filter queries tasks across ALL states.",
+        description="List background tasks, optionally filtered by status or type. status is a native lifecycle label such as submitted, working, input-required, auth-required, completed, failed, canceled, or rejected (case-insensitive). With no status, returns the pending (submitted) inbox; a status filter queries tasks across ALL states.",
         category=ToolCategory.UTILITY,
         command_prefix="!tasks"
     )
     async def list_my_tasks(
-        self,
-        status: Optional[str] = None,
-        task_type: Optional[str] = None,
-        limit: int = 10
+        self, status: Optional[str] = None, task_type: Optional[str] = None,
+        limit: int = 10,
     ) -> ToolResult:
-        """
-        List tasks, optionally filtered.
-
-        Args:
-            status: Filter by status — one of the TaskState values submitted,
-                    working, completed, failed, canceled. Case-insensitive
-                    (normalized to lowercase before matching).
-            task_type: Filter by type (selfie_generation, lora_training, etc.)
-            limit: Maximum number of tasks to return (the request — actual
-                   count returned may be lower if fewer tasks exist).
-        """
+        """List native inbox tasks using committed sender ownership."""
         if not self.task_manager:
             return ToolResult.failed("Task manager not available")
-
         try:
             limit_val = int(limit)
         except (TypeError, ValueError):
-            return ToolResult.failed(
-                f"limit must be an integer, got {limit!r}"
-            )
+            return ToolResult.failed(f"limit must be an integer, got {limit!r}")
         if limit_val < 1:
             return ToolResult.failed("limit must be >= 1")
-
         try:
-            from kestrel_sovereign.a2a.types import TaskState
-
-            task_state = None
-            if status:
-                normalized_status = status.strip().lower()
-                try:
-                    task_state = TaskState(normalized_status)
-                except ValueError:
-                    return ToolResult.failed(
-                        f"Invalid status: {status!r}. Valid: submitted, "
-                        "working, completed, failed, canceled"
-                    )
-
-            # ``task_type`` is a metadata field with no SQL column, so it is
-            # filtered in Python below. When it is set, over-fetch (bounded)
-            # so ``limit`` bounds the count of MATCHING tasks rather than
-            # pre-filter rows — otherwise a page of non-matching tasks could
-            # hide matches just beyond it. The final truncation to ``limit_val``
-            # happens after the filter.
-            # The cap is a FLOOR on the over-fetch, not a ceiling on the
-            # caller's limit — honour a requested limit larger than the cap.
-            fetch_limit = (
-                limit_val if not task_type
-                else max(limit_val, _TASK_TYPE_FILTER_FETCH_CAP)
+            task_state = task_state_from_label(status.strip()) if status else TaskState.TASK_STATE_SUBMITTED
+        except ValueError:
+            return ToolResult.failed(f"Invalid task status: {status!r}")
+        fetch_limit = max(limit_val, _TASK_TYPE_FILTER_FETCH_CAP) if task_type else limit_val
+        try:
+            snapshots = await self.task_manager.list_task_snapshots(
+                recipient_agent_id=self._recipient_agent_id(), status=task_state,
+                limit=fetch_limit,
             )
-
-            if task_state is not None:
-                # A status filter must query the full task table — get_pending_tasks
-                # only ever returns SUBMITTED rows, so any other state would come
-                # back empty in production (#1946). Route through the store-level
-                # list_tasks passthrough which filters by state in SQL.
-                tasks = await self.task_manager.list_tasks(
-                    recipient_agent_id=self._recipient_agent_id(),
-                    status=task_state,
-                    limit=fetch_limit,
-                )
-            else:
-                # No status filter — the inbox view (pending/submitted work).
-                tasks = await self.task_manager.get_pending_tasks(
-                    recipient_agent_id=self._recipient_agent_id(),
-                    limit=fetch_limit,
-                )
-
-            if task_type:
-                tasks = [
-                    t for t in tasks
-                    if t.metadata and t.metadata.get("task_type") == task_type
-                ]
-                # Truncate to the caller's limit AFTER the metadata filter.
-                tasks = tasks[:limit_val]
-
-            task_list = []
-            for task in tasks:
-                status_msg = None
-                if task.status.message and task.status.message.parts:
-                    status_msg = task.status.message.parts[0].text
-
-                # Same conflation guard as `_get_task_status_data`: surface
-                # the incoming sender content from `history[0]` so an inbox
-                # listing actually shows what was ASKED, not just the
-                # currently-empty reply slot. See #1433.
-                request_text = None
-                history = getattr(task, "history", None) or []
-                if history:
-                    parts = getattr(history[0], "parts", None) or []
-                    for part in parts:
-                        text = getattr(part, "text", None)
-                        if isinstance(text, str) and text:
-                            request_text = text
-                            break
-                sender_name = None
-                if task.metadata and isinstance(task.metadata, dict):
-                    raw_sender = task.metadata.get("sender")
-                    if isinstance(raw_sender, str) and raw_sender:
-                        sender_name = raw_sender
-
-                task_list.append({
-                    "task_id": task.id,
-                    "status": task.status.state.value,
-                    "task_type": task.metadata.get("task_type") if task.metadata else None,
-                    "message": status_msg,
-                    "request_content": request_text,
-                    "sender": sender_name,
-                })
-        except Exception as e:
-            if is_execution_control_error(e):
+        except DatabaseError as error:
+            if is_execution_control_error(error):
                 raise
-            logger.error(f"Failed to list tasks: {e}", exc_info=True)
-            return ToolResult.failed(str(e))
-
-        # Honesty: phrase the confirmation as the request + the actual
-        # count so the LLM cannot claim "Retrieved N tasks" when fewer
-        # came back.
-        filter_clause = ""
-        if status:
-            filter_clause += f" with status={status}"
-        if task_type:
-            filter_clause += f" of type={task_type}"
+            logger.error("Failed to list tasks: %s", error, exc_info=True)
+            return ToolResult.failed(str(error))
+        task_list = []
+        for snapshot in snapshots:
+            task = snapshot.task
+            metadata = MessageToDict(task.metadata)
+            if task_type and metadata.get("task_type") != task_type:
+                continue
+            task_list.append(task_presentation(snapshot, include_artifacts=False))
+            if len(task_list) == limit_val:
+                break
+        filters = (f" with status={status}" if status else "") + (f" of type={task_type}" if task_type else "")
         return ToolResult.ok(
-            confirmation=(
-                f"Retrieved {len(task_list)} task(s){filter_clause} "
-                f"(limit requested: {limit_val})"
-            ),
-            data={
-                "tasks": task_list,
-                "count": len(task_list),
-                "limit_requested": limit_val,
-                "filter_status": status,
-                "filter_task_type": task_type,
-            },
+            confirmation=f"Retrieved {len(task_list)} task(s){filters} (limit requested: {limit_val})",
+            data={"tasks": task_list, "count": len(task_list), "limit_requested": limit_val,
+                  "filter_status": status, "filter_task_type": task_type},
         )
 
     @tool(
@@ -1013,7 +762,7 @@ class TaskFeature(Feature):
             # Surface the actual status in the error so the LLM doesn't
             # narrate a "results retrieved" success.
             return ToolResult.failed(
-                f"Task not completed yet. Current status: {data['status']}",
+                f"Task is not completed. Current status: {data['status']}",
                 data={
                     "task_id": data["task_id"],
                     "status": data["status"],
@@ -1033,6 +782,9 @@ class TaskFeature(Feature):
                 "artifacts": data["artifacts"],
                 "message": data["message"],
                 "request_content": data["request_content"],
+                "request": data["request"],
+                "context_id": data["context_id"],
+                "skill_hint": data["skill_hint"],
                 "sender": data["sender"],
             },
         )
@@ -1046,298 +798,94 @@ class TaskFeature(Feature):
             "(fire-and-resume — sender's turn ended, they wake on the "
             "a2a.question_answered signal when you transition), "
             "send_a2a_message (FYI, brief receipt), or send_a2a_task "
-            "(delegated work, full result). The sender's subscription "
-            "supervisor on the SSE stream picks up your terminal frame "
-            "and fires their resumption signal. Without this tool the "
-            "sender's send_a2a_question lineage never resumes until the "
-            "hourly expiry sweep fires a state='expired' signal."
+            "(delegated work, full result). The sender's resident question "
+            "recovery reads your native result and queues a durable resumption "
+            "signal after your terminal reply. Unanswered questions use their "
+            "recorded deadline; a later reply produces a late-answer wake."
         ),
         category=ToolCategory.COMMUNICATION,
         command_prefix="!a2a respond",
     )
     async def respond_to_a2a_task(
-        self,
-        task_id: str,
-        content: str,
-        state: str = "completed",
+        self, task_id: str, content: str, state: str = "completed",
     ) -> ToolResult:
-        """
-        Receiver-side completion of an A2A task.
-
-        Transitions the named task to a terminal state (COMPLETED by
-        default; FAILED or CANCELED via the ``state`` argument) and
-        attaches ``content`` as the response text in
-        ``status.message.parts[].text``. The sender's subscription
-        supervisor on ``GET /tasks/{id}/subscribe`` picks up the
-        terminal SSE frame and fires their ``a2a.question_answered``
-        resumption signal (#1444).
-
-        A2A state machine constraint: SUBMITTED cannot go directly to
-        COMPLETED — it must pass through WORKING first. This tool
-        chains the two transitions automatically when the current
-        state is SUBMITTED, so the caller can ignore the intermediate
-        bookkeeping.
-
-        Args:
-            task_id: The id of the incoming task to respond to.
-                Find it via ``list_my_tasks(status='submitted')``
-                or directly from the ``a2a.task_submitted`` signal
-                payload that woke this cognition turn.
-            content: The response text (one part, plain text).
-                Becomes ``status.message.parts[0].text`` on the task.
-            state: Terminal state. ``"completed"`` (default) for
-                normal success; ``"failed"`` if you couldn't fulfill
-                the request and want the sender to see the error;
-                ``"canceled"`` to decline the task.
-        """
-        from kestrel_sovereign.a2a.types import (
-            Message,
-            TaskState,
-            TextPart,
-        )
-
+        """Respond to an inbox task using native terminal states and message IDs."""
         if not self.task_manager:
             return ToolResult.failed("Task manager not available")
-
-        normalized_state = (state or "completed").strip().lower()
         try:
-            terminal = TaskState(normalized_state)
+            terminal = task_state_from_label((state or "completed").strip())
         except ValueError:
-            return ToolResult.failed(
-                f"Invalid state {state!r}. Use 'completed', 'failed', or 'canceled'.",
-                data={"task_id": task_id, "state": state},
-            )
-        if terminal not in (TaskState.COMPLETED, TaskState.FAILED, TaskState.CANCELED):
-            return ToolResult.failed(
-                f"State {terminal.value!r} is not terminal — must be "
-                f"completed, failed, or canceled.",
-                data={"task_id": task_id, "state": terminal.value},
-            )
-
-        # CANCELED is not an ordinary response-state write. Delegate before a
-        # local task lookup: with the normal per-agent SQLite topology, an
-        # outbound row exists only in the recipient store and the sender must
-        # resolve it through its durable PeersFeature route. Shared PostgreSQL
-        # visibility likewise cannot replace current peer-scope authorization.
-        if terminal == TaskState.CANCELED:
+            return ToolResult.failed(f"Invalid terminal state: {state!r}")
+        if terminal not in TERMINAL_STATES:
+            return ToolResult.failed(f"State {state!r} is not terminal")
+        if terminal == TaskState.TASK_STATE_CANCELED:
             return await self.cancel_task(task_id, reason=content)
-
-        actor_agent_id = self._durable_agent_id()
-        if actor_agent_id is None:
-            return ToolResult.failed(
-                "Task response requires this agent's durable identity",
-                data={"task_id": task_id},
-            )
-
-        try:
-            task = await self.task_manager.get_task_for_recipient(
-                task_id,
-                self._recipient_agent_id(),
-            )
-        except Exception as e:
-            if is_execution_control_error(e):
-                raise
-            logger.error(f"Failed to fetch task {task_id} for respond: {e}")
-            return ToolResult.failed(str(e))
-        if not task:
-            return ToolResult.failed(
-                f"Task {task_id} not found in this agent's task store. "
-                f"(Senders see their own outbound; you can only respond "
-                f"to incoming tasks that landed in YOUR store.)",
-                data={"task_id": task_id},
-            )
-
+        actor = self._durable_agent_id()
+        if actor is None:
+            return ToolResult.failed("Task response requires this agent's durable identity")
+        task = await self.task_manager.get_task_for_recipient(task_id, self._recipient_agent_id())
+        if task is None:
+            return ToolResult.failed(f"Task {task_id} not found in this agent's task store")
         current = task.status.state
-        if current in (TaskState.COMPLETED, TaskState.FAILED, TaskState.CANCELED):
-            return ToolResult.failed(
-                f"Task {task_id} is already terminal: {current.value}",
-                data={"task_id": task_id, "state": current.value},
-            )
-
-        response_message = Message(
-            role="agent",
-            parts=[TextPart(text=content)],
-        )
-
-        # SUBMITTED → COMPLETED is not a valid direct transition
-        # (VALID_TRANSITIONS in task_manager); SUBMITTED must pass
-        # through WORKING first. Chain automatically so the receiver
-        # doesn't need to know about the intermediate step.
+        if current in TERMINAL_STATES:
+            return ToolResult.failed(f"Task {task_id} is already terminal: {task_state_label(current)}")
+        response = new_text_message(content, role=Role.ROLE_AGENT,
+                                    task_id=task.id, context_id=task.context_id)
         try:
-            if current == TaskState.SUBMITTED:
-                await self.task_manager.update_status(
-                    task_id=task_id,
-                    new_state=TaskState.WORKING,
-                    agent_name=actor_agent_id,
-                    recipient_agent_id=actor_agent_id,
-                )
-                updated = await self.task_manager.update_status(
-                    task_id=task_id,
-                    new_state=terminal,
-                    message=response_message,
-                    agent_name=actor_agent_id,
-                    recipient_agent_id=actor_agent_id,
-                )
-            else:
-                updated = await self.task_manager.update_status(
-                    task_id=task_id,
-                    new_state=terminal,
-                    message=response_message,
-                    agent_name=actor_agent_id,
-                    recipient_agent_id=actor_agent_id,
-                )
-        except ValueError as e:
-            if is_execution_control_error(e):
+            updated = await self.task_manager.update_status(
+                task_id=task_id, new_state=terminal, message=response,
+                agent_name=actor, recipient_agent_id=actor,
+            )
+        except (ValueError, PermissionError, DatabaseError) as error:
+            if is_execution_control_error(error):
                 raise
-            # Transition validator caught an illegal sequence (rare —
-            # only happens if another path mutates the task between
-            # our get_task and update_status).
-            return ToolResult.failed(
-                str(e),
-                data={"task_id": task_id, "state_before": current.value},
-            )
-        except Exception as e:
-            if is_execution_control_error(e):
-                raise
-            logger.error(
-                f"Failed to respond to task {task_id}: {e}", exc_info=True,
-            )
-            return ToolResult.failed(
-                str(e),
-                data={"task_id": task_id, "state_before": current.value},
-            )
-
+            logger.error("Failed to respond to task %s: %s", task_id, error)
+            return ToolResult.failed(str(error), data={"task_id": task_id, "state_before": task_state_label(current)})
+        label = task_state_label(updated.status.state)
         return ToolResult.ok(
-            confirmation=(
-                f"Responded to task {task_id[:8]} "
-                f"({current.value} → {updated.status.state.value}); "
-                f"sender's poll will now see your answer."
-            ),
-            data={
-                "task_id": task_id,
-                "state": updated.status.state.value,
-                "state_before": current.value,
-                "response": content,
-            },
+            confirmation=f"Responded to task {task_id[:8]} ({task_state_label(current)} → {label})",
+            data={"task_id": task_id, "state": label, "state_before": task_state_label(current), "response": content},
         )
 
     @tool(
         name="attach_artifact_to_a2a_task",
         description=(
-            "RESPONDER-SIDE artifact attach: the RECIPIENT of an "
-            "incoming A2A task uses this to attach its own output. To "
-            "attach payload as the SENDER of an outgoing task, pass "
-            "``artifacts``/``references`` to send_a2a_task / "
-            "send_a2a_question instead. "
-            "Attach one chunk of long-form output as an Artifact to "
-            "an incoming A2A task BEFORE calling respond_to_a2a_task. "
-            "Use this when your reply exceeds the per-tool argument "
-            "cap (10K chars) — chunk the body into segments of <=9000 "
-            "chars each, call this tool once per segment with "
-            "monotonically-increasing index (0, 1, 2, ...) and "
-            "last_chunk=False on every segment except the final one. "
-            "The sender's get_peer_task_result returns the artifacts "
-            "in order so the resumed turn can reassemble the full "
-            "body. After all segments are attached, call "
-            "respond_to_a2a_task with a SHORT content like "
-            "'See attached artifacts (N segments).' so the sender "
-            "knows where to look."
+            "Attach text output to an incoming task. The first call returns an artifact_id. "
+            "For longer output, pass that same artifact_id with each later chunk; "
+            "set last_chunk=False until the final chunk. Finish the task with respond_to_a2a_task."
         ),
         category=ToolCategory.COMMUNICATION,
         command_prefix="!a2a attach",
     )
     async def attach_artifact_to_a2a_task(
-        self,
-        task_id: str,
-        name: str,
-        content: str,
-        index: int = 0,
-        last_chunk: bool = True,
+        self, task_id: str, name: str, content: str,
+        artifact_id: Optional[str] = None, last_chunk: bool = True,
     ) -> ToolResult:
-        """Attach a single artifact segment to an incoming A2A task.
-
-        For replies up to ~9K chars one call with ``last_chunk=True``
-        is enough. For longer replies, chunk into segments and call
-        repeatedly with monotonically-increasing ``index`` and
-        ``last_chunk=False`` until the final segment.
-
-        Args:
-            task_id: The incoming task to attach to.
-            name: Artifact name. Use the SAME name across all
-                segments of one logical body so the sender's
-                resumed turn can group them — e.g.
-                ``"reply_body"``.
-            content: The segment text. Bounded by the system-wide
-                10K tool-arg cap; keep segments at ~9000 chars to
-                leave headroom.
-            index: Segment order, 0-based. Matters because the
-                sender's reassembly walks artifacts in index order.
-            last_chunk: ``True`` on the final segment (or on the
-                only segment for short replies). The sender's
-                resumed-turn prompt uses this to decide whether the
-                body it received is complete.
-        """
-        from kestrel_sovereign.a2a.types import Artifact, TextPart
-
+        """Create an artifact or append text to the artifact ID already returned."""
         if not self.task_manager:
-            return ToolResult.failed(
-                "No A2A task manager available — not running in a "
-                "multi_agent environment with inbox support.",
-                data={"task_id": task_id},
-            )
-
-        actor_agent_id = self._durable_agent_id()
-        if actor_agent_id is None:
-            return ToolResult.failed(
-                "Task artifact attachment requires this agent's durable identity",
-                data={"task_id": task_id, "name": name, "index": index},
-            )
-        artifact = Artifact(
-            name=name,
-            parts=[TextPart(text=content)],
-            index=index,
-            lastChunk=last_chunk,
-        )
+            return ToolResult.failed("Task manager not available")
+        actor = self._durable_agent_id()
+        if actor is None:
+            return ToolResult.failed("Task artifact attachment requires this agent's durable identity")
+        if artifact_id is not None and (not isinstance(artifact_id, str) or not artifact_id.strip()):
+            return ToolResult.failed("artifact_id must be the non-empty ID returned by the first chunk")
+        artifact = new_text_artifact(name, content, artifact_id=artifact_id)
+        append = artifact_id is not None
         try:
             updated = await self.task_manager.add_artifact(
-                task_id=task_id,
-                artifact=artifact,
-                agent_name=actor_agent_id,
-                recipient_agent_id=actor_agent_id,
+                task_id, artifact, agent_name=actor, recipient_agent_id=actor,
+                append=append, last_chunk=last_chunk,
             )
-        except ValueError as e:
-            if is_execution_control_error(e):
+        except (ValueError, TypeError, PermissionError, DatabaseError, InvalidAgentResponseError) as error:
+            if is_execution_control_error(error):
                 raise
-            return ToolResult.failed(
-                f"Failed to attach artifact to task {task_id}: {e}",
-                data={"task_id": task_id, "name": name, "index": index},
-            )
-        except Exception as e:
-            if is_execution_control_error(e):
-                raise
-            logger.error(
-                "attach_artifact_to_a2a_task failed for task=%s: %s",
-                task_id, e, exc_info=True,
-            )
-            return ToolResult.failed(
-                str(e),
-                data={"task_id": task_id, "name": name, "index": index},
-            )
-
+            logger.error("Failed to attach artifact to task %s: %s", task_id, error)
+            return ToolResult.failed(str(error), data={"task_id": task_id, "artifact_id": artifact.artifact_id})
         return ToolResult.ok(
-            confirmation=(
-                f"Attached artifact '{name}' (index={index}, "
-                f"last_chunk={last_chunk}, {len(content)} chars) to "
-                f"task {task_id[:8]}."
-            ),
-            data={
-                "task_id": task_id,
-                "name": name,
-                "index": index,
-                "last_chunk": last_chunk,
-                "content_chars": len(content),
-                "artifact_count": len(updated.artifacts or []),
-            },
+            confirmation=f"Attached {len(content)} chars to artifact {artifact.artifact_id} on task {task_id[:8]}",
+            data={"task_id": task_id, "artifact_id": artifact.artifact_id,
+                  "append": append, "last_chunk": last_chunk,
+                  "content_chars": len(content), "artifact_count": len(updated.artifacts)},
         )
 
     @tool(
@@ -1440,7 +988,7 @@ class TaskFeature(Feature):
                 data={"task_id": task_id},
             )
 
-        receipt = (task.metadata or {}).get("cancellation_receipt") or {}
+        receipt = MessageToDict(task.metadata).get("cancellation_receipt") or {}
         current_state = receipt.get("status_before")
         durable_reason = receipt.get("reason")
 

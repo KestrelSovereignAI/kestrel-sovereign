@@ -9,6 +9,200 @@ from kestrel_sovereign.storage.db.native_journal_programs import (
 )
 
 
+def test_native_postgres_cancel_signature_accepts_both_driver_waiters():
+    import inspect
+    import asyncpg
+    from kestrel_sovereign.storage.db.native_journal_programs import NativeJournalPostgresConnection
+
+    arguments = (object(), object(), object())
+    inspect.signature(asyncpg.Connection._cancel).bind(*arguments)
+    inspect.signature(NativeJournalPostgresConnection._cancel).bind(*arguments)
+
+
+@pytest.mark.parametrize('native_a2a_backend_factory', ['postgres'], indirect=True)
+@pytest.mark.parametrize('pinned', [False, True])
+async def test_native_postgres_cancel_joins_the_original_query_acknowledgement(native_a2a_backend_factory, pinned):
+    import asyncio
+    from kestrel_sovereign.storage.db.native_journal_programs import _OriginalJournalCancelConnection
+
+    backend = native_a2a_backend_factory()
+    await backend.connect()
+    try:
+        async with backend._pool.acquire() as connection:
+            native = connection._con
+            if pinned:
+                native._journal_cancel_connection = _OriginalJournalCancelConnection.capture(
+                    native, tls_context=None, tls_object=None)
+            sent = asyncio.get_running_loop().create_future()
+            acknowledged = asyncio.get_running_loop().create_future()
+            owner = asyncio.create_task(native._cancel(sent, acknowledged))
+            try:
+                # This is a real CancelRequest and a real caller-owned query
+                # acknowledgement gate. The executor must retain both facts.
+                await asyncio.wait_for(asyncio.shield(sent), 3)
+                await asyncio.sleep(0)
+                assert not owner.done(), 'native cancellation discarded the original acknowledgement waiter'
+                acknowledged.set_result(None)
+                done, _ = await asyncio.wait({owner}, timeout=3)
+                assert done
+                await owner
+            finally:
+                if not acknowledged.done():
+                    acknowledged.set_result(None)
+                # No query was running, so retire this exact test-owned session
+                # rather than race an idle CancelRequest against another query.
+                native.terminate()
+                await asyncio.gather(owner, return_exceptions=True)
+                native._journal_cancel_connection = None
+    finally:
+        await backend.close()
+
+
+@pytest.mark.parametrize('native_a2a_backend_factory', ['postgres'], indirect=True)
+async def test_original_postgres_cancel_view_reuses_driver_and_native_termination(native_a2a_backend_factory):
+    from kestrel_sovereign.storage.db.native_journal_programs import _OriginalJournalCancelConnection
+
+    backend = native_a2a_backend_factory()
+    await backend.connect()
+    try:
+        async with backend._pool.acquire() as connection:
+            native = connection._con
+            view = _OriginalJournalCancelConnection.capture(native, tls_context=None, tls_object=None)
+            assert view._config is native._config
+            assert not view._aborted
+            view.terminate()
+            assert native.is_closed() and view._aborted
+    finally:
+        await backend.close()
+
+
+@pytest.mark.parametrize('native_a2a_backend_factory', ['postgres'], indirect=True)
+async def test_original_postgres_pool_initializes_without_autonomous_reconnect(native_a2a_backend_factory):
+    backend = native_a2a_backend_factory()
+    await backend.connect()
+    try:
+        pool = backend._pool
+        assert pool.get_size() == 1, 'configured initial native capacity was not established'
+        assert pool.get_min_size() == 0, 'native session creation escaped the checkout owner'
+        async with pool.acquire() as connection:
+            connection.terminate()
+        # Closing a native connection must not schedule a context-inheriting
+        # maintenance owner. Only the next actual checkout may reconnect.
+        assert pool._maintenance_task is None
+        assert pool.get_size() == 0
+        assert await backend.fetch_one('SELECT 42') == (42,)
+    finally:
+        await backend.close()
+
+
+@pytest.mark.parametrize('native_a2a_backend_factory', ['postgres'], indirect=True)
+async def test_original_postgres_journal_refuses_autonomous_pool_floor(native_a2a_backend_factory):
+    import asyncpg
+
+    from kestrel_sovereign.execution_custody import ExecutionAuthorityError
+    from kestrel_sovereign.signals.outcome_custody import _OriginalPostgresJournalPool
+    from kestrel_sovereign.storage.db.native_journal_programs import (
+        NativeJournalPostgresConnection,
+    )
+
+    backend = native_a2a_backend_factory()
+    pool = await asyncpg.create_pool(backend._dsn, init_size=1, min_size=1,
+                                    max_size=2, connection_class=NativeJournalPostgresConnection)
+    try:
+        with pytest.raises(ExecutionAuthorityError, match='autonomous'):
+            _OriginalPostgresJournalPool.capture(pool)
+        assert pool._connect is asyncpg.connection.connect
+    finally:
+        await pool.close()
+
+
+@pytest.mark.parametrize('native_a2a_backend_factory', ['postgres'], indirect=True)
+@pytest.mark.parametrize('sealed', [False, True])
+async def test_original_postgres_cancel_abort_retains_physical_failure(native_a2a_backend_factory, sealed):
+    from kestrel_sovereign.storage.db.native_journal_programs import (
+        _OriginalJournalCancelConnection,
+    )
+    from kestrel_sovereign.storage.db.postgres import _ExecutionCommitState
+
+    backend = native_a2a_backend_factory()
+    await backend.connect()
+    try:
+        async with backend._pool.acquire() as connection:
+            native = connection._con
+            if sealed:
+                native._begin_original_journal(_ExecutionCommitState(original_journal_checkout=True))
+                view = native._journal_cancel_connection
+            else:
+                view = _OriginalJournalCancelConnection.capture(native, tls_context=None, tls_object=None)
+            try:
+                view.terminate()
+                assert native.is_closed() and view._aborted
+                failure = native._journal_cancel_failure
+                if sealed:
+                    assert isinstance(failure, NativeJournalConfigurationError)
+                    assert 'CancelRequest failed' in str(failure)
+                    # The physical event remains one fact if termination repeats.
+                    view.terminate()
+                    assert native._journal_cancel_failure is failure
+                else:
+                    assert failure is None
+            finally:
+                if sealed:
+                    assert native._end_original_journal()
+    finally:
+        await backend.close()
+
+
+@pytest.mark.parametrize('native_a2a_backend_factory', ['postgres'], indirect=True)
+@pytest.mark.parametrize('pinned', [False, True])
+async def test_native_postgres_cancel_releases_the_pool_for_reuse(native_a2a_backend_factory, pinned):
+    import asyncio
+    import asyncpg
+
+    backend = native_a2a_backend_factory()
+    await backend.connect()
+    observer = await asyncpg.connect(backend._dsn)
+    query = None
+    async def run_query():
+        from kestrel_sovereign.storage.db.native_journal_programs import _OriginalJournalCancelConnection
+        native = None
+        try:
+            async with backend._pool.acquire() as connection:
+                native = connection._con
+                if pinned:
+                    native._journal_cancel_connection = _OriginalJournalCancelConnection.capture(
+                        native, tls_context=None, tls_object=None)
+                return await connection.fetchval('SELECT pg_sleep(30)')
+        finally:
+            # Preserve the captured view until the actual pool return has
+            # joined the driver's query acknowledgement and CancelRequest.
+            if pinned and native is not None:
+                native._journal_cancel_connection = None
+    try:
+        query = asyncio.create_task(run_query())
+        async with asyncio.timeout(5):
+            while not await observer.fetchval(
+                "SELECT EXISTS (SELECT 1 FROM pg_stat_activity WHERE datname=current_database() "
+                "AND pid<>pg_backend_pid() AND state='active' AND query='SELECT pg_sleep(30)')"
+            ):
+                await asyncio.sleep(0)
+        query.cancel('genuine cancellation while PostgreSQL executes the original query')
+        done, _ = await asyncio.wait({query}, timeout=3)
+        assert done, 'native cancellation left the physical pool release waiting forever'
+        with pytest.raises(asyncio.CancelledError):
+            await query
+        assert await backend.fetch_one('SELECT 42') == (42,)
+    finally:
+        if query is not None and not query.done():
+            # This test owns the entire pool. Retire failed native I/O before
+            # its fixture drops the database, even when the assertion fails.
+            backend._pool.terminate()
+            done, _ = await asyncio.wait({query}, timeout=3)
+            assert done, 'failed cancellation did not retire after the owned pool terminated'
+        await observer.close()
+        await backend.close()
+
+
 @pytest.mark.parametrize('value', [None, -(2 ** 63), 2 ** 63 - 1, 1.25, -0.0,
     float('inf'), float('-inf'), float('nan'), '', "quote' and ?; DROP TABLE kept; --\0雪", b'', b"'\x00\xff"])
 def test_original_sqlite_literal_values_match_native_binding(value):

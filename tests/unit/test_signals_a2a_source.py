@@ -4,7 +4,7 @@ exercise.
 
 The headline test is `test_AB_A_ping_pong_rejected_at_depth_2` —
 demonstrates that an A→B→A loop is caught by the dispatcher's cycle
-check using the chain plumbed through `task.metadata["causation_chain"]`.
+check using the chain plumbed through `the declared native causation extension`.
 TTL exhaustion is the catch-all when chains get long enough to wrap
 around without same-source repetition.
 """
@@ -14,16 +14,21 @@ from __future__ import annotations
 import asyncio
 from datetime import datetime, timezone
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock
 
 import pytest
-
+from kestrel_sdk.native_a2a.helpers.proto_helpers import new_text_message
+from kestrel_sdk.native_a2a.types import AgentSkill, Role, SendMessageRequest, Task, TaskStatus
+from google.protobuf.json_format import MessageToDict
 from kestrel_sdk.signals import (
     CausationFrame,
     SignalMode,
     Status,
-    Visibility,
 )
+
+from kestrel_sovereign.a2a.lifecycle import task_state_from_label
+from kestrel_sovereign.a2a.scope import NativeRecipientScope
+from kestrel_sovereign.a2a.stores.unified.context_store import ContextOwnership
+from kestrel_sovereign.a2a.stores.unified.task_store import NativeTaskSnapshot
 from kestrel_sovereign.signals import (
     OrderedLockManager,
     SignalDispatcher,
@@ -38,30 +43,22 @@ from kestrel_sovereign.signals.sources.a2a import (
     serialize_chain_for_metadata,
 )
 from kestrel_sovereign.storage.db import SQLiteBackend
-
+from tests.unit.test_a2a_native_task_manager import CompletingProvider
+from tests.utils.native_a2a import manager_for
 
 # ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------
 
 
-def _fake_task(
-    task_id: str = "task-001",
-    state: str = "completed",
-    summary_text: str = "all done",
-    metadata: dict | None = None,
-):
-    """Duck-typed Task object — avoids constructing a real pydantic
-    Task in unit tests. The signal builder reads .id, .status.state,
-    .status.message.parts[*].text, .metadata."""
-
-    class _State:
-        value = state
-
-    part = SimpleNamespace(text=summary_text) if summary_text else None
-    message = SimpleNamespace(parts=[part]) if part else None
-    status = SimpleNamespace(state=_State(), message=message)
-    return SimpleNamespace(id=task_id, status=status, metadata=metadata or {})
+def _task_snapshot(task_id="task-001", state="completed", summary_text="all done", metadata=None, *, recipient="did:test:A"):
+    task = Task(id=task_id, context_id="context-" + task_id,
+                status=TaskStatus(state=task_state_from_label(state)), metadata=metadata or {})
+    if summary_text:
+        task.status.message.CopyFrom(new_text_message(summary_text, role=Role.ROLE_AGENT))
+    return NativeTaskSnapshot(task=task, lifecycle_revision=0, ownership=ContextOwnership(
+        context_id=task.context_id, tenant="", creator_agent_id="did:test:sender", recipient_agent_id=recipient,
+    ))
 
 
 from kestrel_sovereign.agent.turn_lifecycle import TurnLifecycleMixin
@@ -72,7 +69,7 @@ class _FakeAgent(TurnLifecycleMixin):
     can call `_set_current_chain` / `_clear_current_chain` (#905 review
     P1 plumbing). Production `KestrelAgent` has the same inheritance."""
 
-    def __init__(self, did: str = "did:test:agent-A"):
+    def __init__(self, did: str = "did:test:A"):
         self._did = did
         self.background_tasks: list[asyncio.Task] = []
         self.process_input_calls: list[str] = []
@@ -159,7 +156,7 @@ def test_registration_redaction_caps_long_summaries():
 
 
 def test_build_signal_extracts_text_from_status_message():
-    task = _fake_task(
+    task = _task_snapshot(
         task_id="t-1", state="completed", summary_text="briefing ready"
     )
     sig = build_signal_for_completed_task(task, target_agent="did:test:A")
@@ -171,7 +168,7 @@ def test_build_signal_extracts_text_from_status_message():
 
 
 def test_build_signal_falls_back_when_no_status_message():
-    task = _fake_task(
+    task = _task_snapshot(
         task_id="t-2", state="failed", summary_text=""
     )
     sig = build_signal_for_completed_task(task, target_agent="did:test:A")
@@ -180,7 +177,7 @@ def test_build_signal_falls_back_when_no_status_message():
 
 
 def test_build_signal_with_no_metadata_yields_empty_chain():
-    task = _fake_task(metadata={})
+    task = _task_snapshot(metadata={})
     sig = build_signal_for_completed_task(task, target_agent="did:test:A")
     assert sig.causation_chain == []
 
@@ -194,8 +191,8 @@ def test_build_signal_rehydrates_chain_from_metadata():
         depth=1,
         emitted_at=datetime(2026, 5, 1, 9, 0, tzinfo=timezone.utc),
     )
-    task = _fake_task(metadata={
-        METADATA_KEY: serialize_chain_for_metadata([earlier_frame]),
+    task = _task_snapshot(metadata={
+        METADATA_KEY: {"version": 1, "chain": serialize_chain_for_metadata([earlier_frame])},
     })
     sig = build_signal_for_completed_task(task, target_agent="did:test:A")
     assert len(sig.causation_chain) == 1
@@ -207,26 +204,10 @@ def test_build_signal_rehydrates_chain_from_metadata():
     assert rehydrated == earlier_frame
 
 
-def test_build_signal_drops_malformed_frames_in_metadata():
-    """Defensive: A2A messages cross the wire; metadata could be
-    corrupted. Drop bad frames silently rather than crashing the signal
-    builder (the dispatcher's logs will show the partial chain)."""
-    task = _fake_task(metadata={
-        METADATA_KEY: [
-            {"not_a_frame": True},
-            {
-                "agent_id": "did:test:B",
-                "source": "a2a.task_complete",
-                "signal_id": "sig-good",
-                "turn_id": None,
-                "depth": 2,
-                "emitted_at": "2026-05-01T09:00:00+00:00",
-            },
-        ],
-    })
-    sig = build_signal_for_completed_task(task, target_agent="did:test:A")
-    assert len(sig.causation_chain) == 1
-    assert sig.causation_chain[0].source == "a2a.task_complete"
+def test_build_signal_refuses_malformed_frames_in_declared_extension():
+    snapshot = _task_snapshot(metadata={METADATA_KEY: {"version":1, "chain":[{"not_a_frame":True}]}})
+    with pytest.raises(ValueError, match="causation frame has invalid fields"):
+        build_signal_for_completed_task(snapshot, target_agent="did:test:A")
 
 
 # ---------------------------------------------------------------------------
@@ -240,7 +221,7 @@ async def test_completed_task_wakes_the_bird(components):
     envelope → dispatcher routes COGNITION → agent.process_input
     receives the rendered prompt."""
     c = components
-    task = _fake_task(task_id="t-happy", summary_text="briefing X done")
+    task = _task_snapshot(task_id="t-happy", summary_text="briefing X done")
     sig = build_signal_for_completed_task(task, target_agent=c.agent.did)
 
     result = await c.dispatcher.dispatch_signal(sig)
@@ -275,8 +256,8 @@ async def test_AB_A_ping_pong_rejected_at_depth_2(components):
         depth=1,
         emitted_at=datetime.now(timezone.utc),
     )
-    task = _fake_task(metadata={
-        METADATA_KEY: serialize_chain_for_metadata([prior_frame]),
+    task = _task_snapshot(metadata={
+        METADATA_KEY: {"version": 1, "chain": serialize_chain_for_metadata([prior_frame])},
     })
     sig = build_signal_for_completed_task(task, target_agent=c.agent.did)
 
@@ -299,7 +280,7 @@ async def test_AB_A_first_round_trip_passes(components):
     # First round trip: A's outbound task carried no prior frames
     # (or only frames from non-A agents). Empty chain is the most
     # common case for v1 since outbound chain plumbing is a follow-up.
-    task = _fake_task(metadata={})
+    task = _task_snapshot(metadata={})
     sig = build_signal_for_completed_task(task, target_agent=c.agent.did)
 
     result = await c.dispatcher.dispatch_signal(sig)
@@ -326,8 +307,8 @@ async def test_ttl_exhaustion_rejected(components):
         )
         for i in range(1, 6)
     ]
-    task = _fake_task(metadata={
-        METADATA_KEY: serialize_chain_for_metadata(chain),
+    task = _task_snapshot(metadata={
+        METADATA_KEY: {"version": 1, "chain": serialize_chain_for_metadata(chain)},
     })
     sig = build_signal_for_completed_task(task, target_agent=c.agent.did)
     # Adding one more frame puts depth at 6 > TTL (5).
@@ -342,86 +323,50 @@ async def test_ttl_exhaustion_rejected(components):
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.asyncio
-async def test_event_manager_callback_keeps_sse_notification_when_dispatcher_present(
-    tmp_path,
-):
-    """Phase 5 requirement: SSE notification path must survive the
-    cognition signal addition. Existing browser/UI consumers don't
-    care about signals — they read pending_task_notifications."""
+async def test_event_manager_callback_keeps_ui_notification_and_native_cognition(tmp_path):
     from kestrel_sovereign.agent.event_manager import EventManagerMixin
-    from kestrel_sovereign.a2a.types import (
-        Message, Task, TaskState, TaskStatus, TextPart,
-    )
-
-    backend = SQLiteBackend(str(tmp_path / "sse.db"))
+    backend = SQLiteBackend(str(tmp_path / "native-ui.db"))
     await backend.connect()
-    store = SignalLogStore(backend)
-    await store.initialize()
-    registry = SourceRegistry()
-    registry.register(build_a2a_task_complete_registration())
-
-    class _AgentLikeWithDispatcher(EventManagerMixin):
-        did = "did:test:sse"
-        def __init__(self):
-            self._event_listeners = []
-            self._pending_task_notifications = []
-            self._background_tasks = []
-            self.dispatcher = SignalDispatcher(
-                agent=self, registry=registry,
-                lock_manager=OrderedLockManager(), store=store,
-            )
-
-        async def process_input(self, prompt):
-            return "ack"
-
-        def _track_background_task(self, coro, *, name):
-            task = asyncio.create_task(coro, name=name)
-            self._background_tasks.append(task)
-            return task
-
-    agent = _AgentLikeWithDispatcher()
-
-    real_task = Task(
-        id="task-sse-001",
-        sessionId="session-1",
-        status=TaskStatus(
-            state=TaskState.COMPLETED,
-            message=Message(role="agent", parts=[TextPart(text="done")]),
-        ),
-        metadata={"agent_id": "PeerAgent", "skill": "do_thing"},
-    )
-
-    agent._on_background_task_complete(real_task)
-
-    # SSE notification appended (legacy path).
-    assert len(agent._pending_task_notifications) == 1
-    assert "Background task completed" in agent._pending_task_notifications[0]
-    assert "PeerAgent/do_thing" in agent._pending_task_notifications[0]
-
-    # And the cognition signal was enqueued (new path).
-    assert len(agent._background_tasks) >= 1
-
-    # Drain the background dispatch.
-    # Dispatch schedules its audit write through the same tracker after the
-    # route completes. Drain until quiescent: one snapshot can otherwise miss
-    # that child task when source normalization/persistence lengthens the
-    # dispatch before `_success` schedules the signal_log write.
-    while True:
-        pending = [t for t in agent._background_tasks if not t.done()]
-        if not pending:
-            break
-        await asyncio.gather(*pending, return_exceptions=True)
-
-    # Confirm the signal landed in signal_log.
-    rows = await backend.fetch_all(
-        "SELECT source, status FROM signal_log WHERE source=?",
-        (SOURCE_NAME,),
-    )
-    assert len(rows) == 1
-    assert rows[0][1] == Status.OK.value
-
-    await backend.close()
+    manager = manager_for(backend, NativeRecipientScope("did:test:sse"), owns_backend=False)
+    try:
+        await manager.initialize()
+        store = SignalLogStore(backend)
+        await store.initialize()
+        registry = SourceRegistry()
+        registry.register(build_a2a_task_complete_registration())
+        class NativeAgent(EventManagerMixin):
+            did = "did:test:sse"
+            def __init__(self):
+                self.task_manager = manager
+                self._event_listeners = []
+                self._pending_task_notifications = []
+                self._background_tasks = []
+                self.dispatcher = SignalDispatcher(agent=self, registry=registry, lock_manager=OrderedLockManager(), store=store)
+            async def process_input(self, prompt):
+                return "ack"
+            def _track_background_task(self, coro, *, name):
+                task = asyncio.create_task(coro, name=name)
+                self._background_tasks.append(task)
+                return task
+        agent = NativeAgent()
+        accepted = await manager.create_task(
+            SendMessageRequest(message=new_text_message("Work", role=Role.ROLE_USER), metadata={"skill":"do_thing"}),
+            creator_agent_id="did:test:sender",
+        )
+        await manager.complete_task(accepted.id, "Done", recipient_agent_id=agent.did)
+        candidate = await manager.get_task_snapshot(accepted.id, recipient_agent_id=agent.did)
+        agent._on_background_task_complete(candidate)
+        assert len(agent._pending_task_notifications) == 1
+        assert "Background task completed" in agent._pending_task_notifications[0]
+        assert "did:test:sender/do_thing" in agent._pending_task_notifications[0]
+        assert agent._background_tasks
+        while pending := [t for t in agent._background_tasks if not t.done()]:
+            await asyncio.gather(*pending, return_exceptions=True)
+        rows = await backend.fetch_all("SELECT source, status FROM signal_log WHERE source=?", (SOURCE_NAME,))
+        assert rows == [(SOURCE_NAME, Status.OK.value)]
+    finally:
+        await manager.close()
+        await backend.close()
 
 
 @pytest.mark.asyncio
@@ -433,7 +378,7 @@ async def test_duplicate_terminal_completions_coalesced(components):
     the dispatcher coalescing pipeline can't fire — dedupe_key=None
     skips coalescing entirely."""
     c = components
-    task = _fake_task(task_id="dup-1", state="completed", summary_text="done")
+    task = _task_snapshot(task_id="dup-1", state="completed", summary_text="done")
 
     sig1 = build_signal_for_completed_task(task, target_agent=c.agent.did)
     sig2 = build_signal_for_completed_task(task, target_agent=c.agent.did)
@@ -458,212 +403,64 @@ async def test_duplicate_terminal_completions_coalesced(components):
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.asyncio
-async def test_taskmanager_create_task_attaches_chain_via_provider(tmp_path):
-    """`TaskManager.create_task` reads the agent's in-flight causation
-    chain via the registered provider and attaches it to outbound task
-    metadata. The receive side rehydrates from this metadata.
-
-    Verifies the wiring without a full agent — uses a stub provider
-    returning a known chain and asserts it lands in task.metadata.
-    """
-    from kestrel_sovereign.a2a.stores import (
-        SQLiteSessionService, SQLiteTaskStore, SQLiteObservabilityStore,
-    )
-    from kestrel_sovereign.a2a.task_manager import TaskManager
-    from kestrel_sovereign.a2a.types import (
-        Message, TaskSendParams, TextPart,
-    )
-
-    db_path = str(tmp_path / "tm.db")
-    task_store = SQLiteTaskStore(db_path)
-    session_service = SQLiteSessionService(db_path)
-    observability_store = SQLiteObservabilityStore(db_path)
-
-    # Provider returns an already-serialized chain — same shape
-    # KestrelAgent._provide_causation_chain emits.
-    serialized_chain = [
-        {
-            "agent_id": "did:test:A",
-            "source": SOURCE_NAME,
-            "signal_id": "sig-prior",
-            "turn_id": "turn-prior",
-            "depth": 1,
-            "emitted_at": datetime(2026, 5, 1, 9, 0, tzinfo=timezone.utc).isoformat(),
-        }
-    ]
-    tm = TaskManager(
-        task_store=task_store,
-        session_service=session_service,
-        observability_store=observability_store,
-        causation_chain_provider=lambda: serialized_chain,
-    )
-    await tm.initialize()
-
-    params = TaskSendParams(
-        id="outbound-1",
-        sessionId="session-1",
-        message=Message(role="user", parts=[TextPart(text="do thing")]),
-        metadata={"agent_id": "PeerB", "skill": "do_thing"},
-    )
-    task = await tm.create_task(params, agent_name="PeerB")
-
-    # Original metadata preserved + chain appended.
-    assert task.metadata["agent_id"] == "PeerB"
-    assert task.metadata["skill"] == "do_thing"
-    assert task.metadata["causation_chain"] == serialized_chain
-
-    await tm.close()
+async def test_native_local_task_attaches_the_current_causation_extension(tmp_path):
+    frame = CausationFrame(agent_id="did:test:prior", source=SOURCE_NAME, signal_id="prior", turn_id="prior-turn", depth=1, emitted_at=datetime.now(timezone.utc))
+    chain = serialize_chain_for_metadata([frame])
+    manager = await _manager_with_chain(tmp_path, lambda: chain)
+    try:
+        accepted = await manager.execute_skill("feature", "do_thing", {}, sync=False)
+        await manager.drain_execution_tasks()
+        candidate = await manager.get_task_snapshot(accepted.id, recipient_agent_id="did:test:A")
+        metadata = MessageToDict(candidate.task.metadata)
+        assert metadata["provider_id"] == "feature" and metadata["skill"] == "do_thing"
+        assert metadata[METADATA_KEY] == {"version":1, "chain":chain}
+        assert build_signal_for_completed_task(candidate, target_agent="did:test:A").causation_chain == [frame]
+    finally:
+        await manager.close()
 
 
-@pytest.mark.asyncio
-async def test_taskmanager_create_task_omits_chain_when_provider_returns_none(
-    tmp_path,
-):
-    """No active turn → provider returns None → no causation_chain in
-    metadata. Avoids bloating the task row with empty chain entries
-    for direct HTTP user input or tests that don't drive cognition."""
-    from kestrel_sovereign.a2a.stores import (
-        SQLiteSessionService, SQLiteTaskStore, SQLiteObservabilityStore,
-    )
-    from kestrel_sovereign.a2a.task_manager import TaskManager
-    from kestrel_sovereign.a2a.types import (
-        Message, TaskSendParams, TextPart,
-    )
-
-    db_path = str(tmp_path / "tm.db")
-    tm = TaskManager(
-        task_store=SQLiteTaskStore(db_path),
-        session_service=SQLiteSessionService(db_path),
-        observability_store=SQLiteObservabilityStore(db_path),
-        causation_chain_provider=lambda: None,
-    )
-    await tm.initialize()
-
-    params = TaskSendParams(
-        id="outbound-2",
-        sessionId="session-1",
-        message=Message(role="user", parts=[TextPart(text="x")]),
-        metadata={"agent_id": "PeerB"},
-    )
-    task = await tm.create_task(params, agent_name="PeerB")
-    assert "causation_chain" not in task.metadata
-
-    await tm.close()
+async def test_native_local_task_omits_causation_when_no_turn_exists(tmp_path):
+    manager = await _manager_with_chain(tmp_path, lambda: None)
+    try:
+        accepted = await manager.execute_skill("feature", "do_thing", {}, sync=False)
+        await manager.drain_execution_tasks()
+        candidate = await manager.get_task_snapshot(accepted.id, recipient_agent_id="did:test:A")
+        assert METADATA_KEY not in MessageToDict(candidate.task.metadata)
+    finally:
+        await manager.close()
 
 
-@pytest.mark.asyncio
-async def test_full_AB_A_loop_via_real_taskmanager_rejected_at_depth_2(
-    components, tmp_path,
-):
-    """End-to-end: simulate the agent dispatching an A2A completion
-    cognition, the resulting turn spawning an outbound A2A task that
-    PICKS UP the chain via the agent's _current_chain (set by the
-    dispatcher), the receiving side reading the chain back from
-    metadata, and the SECOND completion signal being rejected at
-    depth 2 by cycle detection.
-
-    This is the test that Phase 5's headline test (with manual
-    metadata setup) didn't actually validate end-to-end."""
-    from kestrel_sovereign.a2a.stores import (
-        SQLiteSessionService, SQLiteTaskStore, SQLiteObservabilityStore,
-    )
-    from kestrel_sovereign.a2a.task_manager import TaskManager
-    from kestrel_sovereign.a2a.types import (
-        Message, TaskSendParams, TextPart,
-    )
-
+async def test_completion_cycle_via_native_local_taskmanager_is_rejected(components, tmp_path):
     c = components
-
-    # Wire the agent's chain provider — same as KestrelAgent.initialize().
-    # The chain lives in a ContextVar (#906 review P1 fix). Reading via
-    # `_get_current_chain` ensures we see the value the dispatcher set
-    # for THIS task — earlier the test reached into a now-removed
-    # `_current_chain` attribute and silently saw None.
-    def _provide_chain():
-        chain = c.agent._get_current_chain()
-        if not chain:
-            return None
-        return serialize_chain_for_metadata(chain)
-
-    db_path = str(tmp_path / "loop.db")
-    tm = TaskManager(
-        task_store=SQLiteTaskStore(db_path),
-        session_service=SQLiteSessionService(db_path),
-        observability_store=SQLiteObservabilityStore(db_path),
-        causation_chain_provider=_provide_chain,
-    )
-    await tm.initialize()
-
-    # ---- First completion: dispatcher sets chain on agent, turn runs.
-    initial_task = _fake_task(task_id="t-loop-1", metadata={})
-    sig1 = build_signal_for_completed_task(initial_task, target_agent=c.agent.did)
-
-    # Stub process_input to simulate the in-turn outbound task creation
-    # — like the real agent would when a feature decides to spawn work
-    # on a peer in response to receiving the completion notification.
-    outbound_tasks_seen = []
-
-    async def turn_emits_outbound(prompt):
-        params = TaskSendParams(
-            id=f"outbound-{len(outbound_tasks_seen) + 1}",
-            sessionId="session-loop",
-            message=Message(role="user", parts=[TextPart(text="follow-up")]),
-            metadata={"agent_id": "PeerB", "skill": "do_thing"},
-        )
-        new_task = await tm.create_task(params, agent_name="PeerB")
-        outbound_tasks_seen.append(new_task)
+    def current_chain():
+        frames = c.agent._get_current_chain()
+        return serialize_chain_for_metadata(frames) if frames else None
+    manager = await _manager_with_chain(tmp_path, current_chain)
+    accepted = []
+    async def turn_emits_native_work(prompt):
+        accepted.append(await manager.execute_skill("feature", "do_thing", {}, sync=False))
         return "ack"
-
-    c.agent.process_input = turn_emits_outbound  # patch for this test
-
-    r1 = await c.dispatcher.dispatch_signal(sig1)
-    assert r1.status == Status.OK
-    assert len(outbound_tasks_seen) == 1
-
-    # ---- Outbound task carries the chain (depth 1: agent A frame).
-    outbound_task = outbound_tasks_seen[0]
-    assert "causation_chain" in outbound_task.metadata
-    chain_in_metadata = outbound_task.metadata["causation_chain"]
-    assert len(chain_in_metadata) == 1
-    assert chain_in_metadata[0]["agent_id"] == c.agent.did
-    assert chain_in_metadata[0]["source"] == SOURCE_NAME
-
-    # ---- Second completion: peer finishes the outbound task and the
-    # callback fires locally. The receive-side signal builder rehydrates
-    # the chain from metadata → the new signal carries A's prior frame.
-    completed_outbound = _fake_task(
-        task_id=outbound_task.id,
-        state="completed",
-        metadata=outbound_task.metadata,
-    )
-    sig2 = build_signal_for_completed_task(
-        completed_outbound, target_agent=c.agent.did
-    )
-    assert len(sig2.causation_chain) == 1, (
-        "rehydrated chain must carry the prior A frame"
-    )
-
-    r2 = await c.dispatcher.dispatch_signal(sig2)
-    assert r2.status == Status.DROPPED_CYCLE, (
-        f"second completion must be rejected as cycle (A appears "
-        f"in chain with same source); got {r2.status}"
-    )
-    # No second outbound task was created — the cycle was caught.
-    assert len(outbound_tasks_seen) == 1
-
-    await tm.close()
+    c.agent.process_input = turn_emits_native_work
+    try:
+        first = build_signal_for_completed_task(_task_snapshot("first"), target_agent=c.agent.did)
+        assert (await c.dispatcher.dispatch_signal(first)).status is Status.OK
+        assert len(accepted) == 1
+        await manager.drain_execution_tasks()
+        candidate = await manager.get_task_snapshot(accepted[0].id, recipient_agent_id=c.agent.did)
+        restored = build_signal_for_completed_task(candidate, target_agent=c.agent.did)
+        assert len(restored.causation_chain) == 1
+        assert restored.causation_chain[0].agent_id == c.agent.did
+        assert restored.causation_chain[0].source == SOURCE_NAME
+        assert (await c.dispatcher.dispatch_signal(restored)).status is Status.DROPPED_CYCLE
+        assert len(accepted) == 1
+    finally:
+        await manager.close()
 
 
-@pytest.mark.asyncio
 async def test_event_manager_callback_works_without_dispatcher(tmp_path):
-    """Backward compat: agents without a dispatcher (pre-Phase-5
-    fixtures, partially-initialized agents) keep getting the SSE
-    notification — they just don't get the cognition signal."""
+    """A partially initialized agent still queues the task UI notification."""
     from kestrel_sovereign.agent.event_manager import EventManagerMixin
-    from kestrel_sovereign.a2a.types import (
-        Message, Task, TaskState, TaskStatus, TextPart,
-    )
+
 
     class _AgentLikeNoDispatcher(EventManagerMixin):
         did = "did:test:no-dispatcher"
@@ -674,11 +471,8 @@ async def test_event_manager_callback_works_without_dispatcher(tmp_path):
 
     agent = _AgentLikeNoDispatcher()
 
-    real_task = Task(
-        id="task-x",
-        sessionId="session-1",
-        status=TaskStatus(state=TaskState.COMPLETED),
-        metadata={},
+    real_task = _task_snapshot(
+        task_id="task-ui", recipient=agent.did, metadata={"skill":"do_thing"},
     )
 
     # Must not raise even though dispatcher is absent.
@@ -758,6 +552,7 @@ async def test_an_ask_tool_in_a_woken_turn_is_denied_not_queued(
     approval nobody in the conversation can answer. Outside the turn the
     chain is unbound again."""
     from kestrel_sdk.hooks.base import HookInput, PermissionDecision
+
     from kestrel_sovereign.agent.turn_lifecycle import (
         current_turn_is_signal_driven,
     )
@@ -797,7 +592,7 @@ async def test_an_ask_tool_in_a_woken_turn_is_denied_not_queued(
 
     c.agent.process_input = turn_calls_ask_tool
     sig = build_signal_for_completed_task(
-        _fake_task(task_id="t-ask"), target_agent=c.agent.did
+        _task_snapshot(task_id="t-ask"), target_agent=c.agent.did
     )
     result = await c.dispatcher.dispatch_signal(sig)
 
@@ -807,3 +602,17 @@ async def test_an_ask_tool_in_a_woken_turn_is_denied_not_queued(
     assert "MemoryFeature.memory_status" in outputs[0].permission_reason
     assert queue.pending_requests == []
     assert current_turn_is_signal_driven() is False
+
+
+
+
+
+async def _manager_with_chain(tmp_path, provider):
+    backend = SQLiteBackend(str(tmp_path / "native-causation.db"))
+    await backend.connect()
+    manager = manager_for(backend, NativeRecipientScope("did:test:A"), causation_chain_provider=provider)
+    await manager.initialize()
+    manager.register_provider("feature", [AgentSkill(
+        id="do_thing", name="Do thing", description="Native causation", tags=["test"],
+    )], CompletingProvider())
+    return manager

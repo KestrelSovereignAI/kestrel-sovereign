@@ -11,6 +11,8 @@ Tests the !compact command and context compaction:
 Uses REAL services - minimal mocking for LLM only.
 """
 
+from tests.shared.native_shutdown_budget import shutdown_fixture_agent
+
 import pytest
 import pytest_asyncio
 import os
@@ -60,7 +62,7 @@ async def agent_with_messages(temp_dir):
     try:
         yield agent
     finally:
-        await agent.shutdown()
+        await shutdown_fixture_agent(agent)
 
     assert runner is None or (
         runner._task is None
@@ -100,7 +102,7 @@ async def agent_with_few_messages(temp_dir):
     try:
         yield agent
     finally:
-        await agent.shutdown()
+        await shutdown_fixture_agent(agent)
 
 
 class TestCompactCommand:

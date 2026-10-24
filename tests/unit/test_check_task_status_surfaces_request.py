@@ -1,350 +1,178 @@
-"""``check_task_status``, ``get_task_result`` and ``list_my_tasks`` must
-surface the SENDER'S request text — not just the (often empty) agent
-reply slot.
+"""Native inbox regressions for #1433, #1946 and #1525 on real storage.
 
-#1433: Meridian's cognition turn called ``check_task_status`` on a fresh
-inbound A2A task, saw ``message: None`` (because ``status.message`` is
-the agent's reply, set only after ``respond_to_a2a_task``), and
-concluded the body was null. The actual question text sat in
-``task.history[0]`` the whole time. Conflating those two fields meant
-every inbox-poll loop hallucinated "null payload" for legitimate
-inbound requests.
+Requests and replies remain distinct, sender identity comes from ownership,
+filters query the complete inbox, inputs are Parts, and Artifacts are outputs.
 """
 
-from __future__ import annotations
+from datetime import UTC, datetime, timedelta
 
-import pytest
-from types import SimpleNamespace
-from unittest.mock import MagicMock
-
-from kestrel_sovereign.a2a.types import (
-    Message,
-    Task,
-    TaskState,
-    TaskStatus,
-    TextPart,
+from kestrel_sdk.native_a2a.helpers.proto_helpers import (
+    new_data_artifact,
+    new_data_part,
+    new_text_artifact,
+    new_text_message,
 )
-from kestrel_sovereign.features.tasks.feature import TaskFeature
+from kestrel_sdk.native_a2a.types import Part, Role, SendMessageRequest, TaskState
+from kestrel_sdk.tools.result import ToolResultStatus
+
+from tests.unit.test_a2a_native_consumers import inbox as inbox  # noqa: PLC0414
 
 
-RECIPIENT = "did:kestrel:recipient"
-
-
-def _recipient_feature() -> TaskFeature:
-    feature = TaskFeature(agent=None)
-    feature.agent = SimpleNamespace(did=RECIPIENT)
-    feature.task_manager = MagicMock()
-    return feature
-
-
-def _make_feature_with_inbox_task(
-    request_text: str = "PING-1428",
-    sender: str = "Emma",
-    state: TaskState = TaskState.SUBMITTED,
-    reply_text: str | None = None,
+async def admit(
+    inbox, text="PING-1428", *, sender="did:kestrel:emma", task_type="peer", parts=()
 ):
-    user_message = Message(role="user", parts=[TextPart(text=request_text)])
-    history = [user_message]
-
-    status_message = None
-    if reply_text is not None:
-        status_message = Message(
-            role="agent", parts=[TextPart(text=reply_text)]
-        )
-
-    task = Task(
-        id="task-1433",
-        sessionId="sess-1",
-        status=TaskStatus(state=state, message=status_message),
-        history=history,
-        metadata={"sender": sender, "a2a_verb": "question"},
-    )
-
-    async def get_task_for_recipient(task_id, recipient_agent_id):
-        assert recipient_agent_id == RECIPIENT
-        return task if task_id == task.id else None
-
-    feature = _recipient_feature()
-    feature.task_manager.get_task_for_recipient = get_task_for_recipient
-    return feature, task
-
-
-@pytest.mark.asyncio
-async def test_check_task_status_returns_request_content_for_submitted_task():
-    """Inbound SUBMITTED task: the receiver must see what was ASKED."""
-    feature, task = _make_feature_with_inbox_task(
-        request_text="PING-1428", sender="Emma",
-    )
-    result = await feature.check_task_status(task_id=task.id)
-    assert result.status.value == "ok", result
-    data = result.data or {}
-    assert data["request_content"] == "PING-1428", (
-        f"Expected request_content='PING-1428' (the sender's actual question "
-        f"text from history[0]), got {data.get('request_content')!r}. See "
-        "#1433 — without this, the receiver hallucinates 'null body' for "
-        "every inbound task and never answers them."
-    )
-    assert data["sender"] == "Emma"
-    assert data["status"] == "submitted"
-    # status.message slot is still None until respond_to_a2a_task runs
-    assert data["message"] is None
-    # Confirmation text must include the request so the LLM sees it even
-    # if it only reads the confirmation line.
-    assert "PING-1428" in result.confirmation, result.confirmation
-    assert "Emma" in result.confirmation
-
-
-@pytest.mark.asyncio
-async def test_check_task_status_returns_both_request_and_reply_for_completed_task():
-    """Terminal COMPLETED task: receiver/sender both see request AND reply."""
-    feature, task = _make_feature_with_inbox_task(
-        request_text="ping?",
-        sender="Emma",
-        state=TaskState.COMPLETED,
-        reply_text="pong",
-    )
-    result = await feature.check_task_status(task_id=task.id)
-    assert result.status.value == "ok"
-    data = result.data or {}
-    assert data["request_content"] == "ping?"
-    assert data["message"] == "pong"
-    # Confirmation surfaces both
-    assert "ping?" in result.confirmation
-    assert "pong" in result.confirmation
-
-
-@pytest.mark.asyncio
-async def test_list_my_tasks_includes_request_content_per_row():
-    """Inbox listing must show what each task is ASKING, not just the
-    state. Otherwise the LLM has to call check_task_status per row just
-    to learn what the inbox contains."""
-    user_message = Message(
-        role="user", parts=[TextPart(text="please reply with PONG")]
-    )
-    task_a = Task(
-        id="task-A",
-        sessionId="sess-A",
-        status=TaskStatus(state=TaskState.SUBMITTED),
-        history=[user_message],
-        metadata={"sender": "Emma", "a2a_verb": "question"},
-    )
-    task_b = Task(
-        id="task-B",
-        sessionId="sess-B",
-        status=TaskStatus(state=TaskState.SUBMITTED),
-        history=[Message(role="user", parts=[TextPart(text="urgent: status")])],
-        metadata={"sender": "Claw", "a2a_verb": "question"},
-    )
-
-    async def get_pending_tasks(limit=10, *, recipient_agent_id):
-        assert recipient_agent_id == RECIPIENT
-        return [task_a, task_b][:limit]
-
-    feature = _recipient_feature()
-    feature.task_manager.get_pending_tasks = get_pending_tasks
-
-    result = await feature.list_my_tasks(limit=10)
-    assert result.status.value == "ok"
-    rows = (result.data or {}).get("tasks") or []
-    assert len(rows) == 2
-    row_by_id = {row["task_id"]: row for row in rows}
-    assert row_by_id["task-A"]["request_content"] == "please reply with PONG"
-    assert row_by_id["task-A"]["sender"] == "Emma"
-    assert row_by_id["task-B"]["request_content"] == "urgent: status"
-    assert row_by_id["task-B"]["sender"] == "Claw"
-
-
-@pytest.mark.asyncio
-async def test_list_my_tasks_status_filter_queries_full_table_not_pending():
-    """A ``status`` filter must query the full task table, not the pending
-    (SUBMITTED-only) inbox.
-
-    Regression for #1946: ``list_my_tasks`` advertised filters for all
-    TaskState values but always called ``get_pending_tasks()``, whose store
-    query is ``WHERE status = 'submitted'``. So ``status="completed"`` (and
-    working/failed/canceled) returned empty in production even when matching
-    tasks existed. The fix routes a status filter through ``list_tasks`` so the
-    DB filters by that state. Here ``get_pending_tasks`` returns nothing (as
-    the real store would for non-submitted states); only ``list_tasks``
-    surfaces the completed task.
-    """
-    completed_task = Task(
-        id="task-done",
-        sessionId="sess-done",
-        status=TaskStatus(
-            state=TaskState.COMPLETED,
-            message=Message(role="agent", parts=[TextPart(text="PONG")]),
+    manager, _feature, _agent = inbox
+    message = new_text_message(text, role=Role.ROLE_USER)
+    message.parts.extend(parts)
+    return await manager.create_task(
+        SendMessageRequest(
+            tenant="tenant",
+            message=message,
+            metadata={"sender": "untrusted metadata", "task_type": task_type},
         ),
-        history=[Message(role="user", parts=[TextPart(text="ping")])],
-        metadata={"sender": "Emma"},
+        creator_agent_id=sender,
     )
 
-    async def get_pending_tasks(limit=10, *, recipient_agent_id):
-        assert recipient_agent_id == RECIPIENT
-        # The real store returns ONLY submitted tasks here — no completed ones.
-        return []
 
-    captured = {}
+async def test_check_task_status_returns_request_content_for_submitted_task(inbox):
+    _manager, feature, _agent = inbox
+    task = await admit(inbox)
+    result = await feature.check_task_status(task.id)
+    assert result.status is ToolResultStatus.OK
+    assert result.data["request_content"] == "PING-1428"
+    assert result.data["sender"] == "did:kestrel:emma"
+    assert result.data["status"] == "submitted"
+    assert result.data["message"] is None
+    assert "PING-1428" in result.confirmation
+    assert "did:kestrel:emma" in result.confirmation
+    assert "untrusted metadata" not in result.confirmation
 
-    async def list_tasks(
-        status=None,
-        limit=100,
-        session_id=None,
-        user_id=None,
-        *,
-        recipient_agent_id,
-    ):
-        assert recipient_agent_id == RECIPIENT
-        captured["status"] = status
-        captured["limit"] = limit
-        return [completed_task] if status == TaskState.COMPLETED else []
 
-    feature = _recipient_feature()
-    feature.task_manager.get_pending_tasks = get_pending_tasks
-    feature.task_manager.list_tasks = list_tasks
+async def test_check_task_status_returns_both_request_and_reply_for_completed_task(
+    inbox,
+):
+    _manager, feature, _agent = inbox
+    task = await admit(inbox, "ping?")
+    assert (
+        await feature.respond_to_a2a_task(task.id, "pong")
+    ).status is ToolResultStatus.OK
+    result = await feature.check_task_status(task.id)
+    assert result.status is ToolResultStatus.OK
+    assert result.data["request_content"] == "ping?"
+    assert result.data["message"] == "pong"
+    assert "ping?" in result.confirmation and "pong" in result.confirmation
 
+
+async def test_list_my_tasks_includes_request_content_per_row(inbox):
+    _manager, feature, _agent = inbox
+    first = await admit(inbox, "please reply with PONG")
+    second = await admit(inbox, "urgent: status", sender="did:kestrel:claw")
+    result = await feature.list_my_tasks(limit=10)
+    assert result.status is ToolResultStatus.OK
+    rows = {row["task_id"]: row for row in result.data["tasks"]}
+    assert len(rows) == 2
+    assert rows[first.id]["request_content"] == "please reply with PONG"
+    assert rows[first.id]["sender"] == "did:kestrel:emma"
+    assert rows[second.id]["request_content"] == "urgent: status"
+    assert rows[second.id]["sender"] == "did:kestrel:claw"
+
+
+async def test_list_my_tasks_status_filter_queries_full_table_not_pending(inbox):
+    _manager, feature, _agent = inbox
+    completed = await admit(inbox, "ping")
+    await feature.respond_to_a2a_task(completed.id, "PONG")
+    pending = await admit(inbox, "waiting")
+    default = await feature.list_my_tasks()
+    assert [row["task_id"] for row in default.data["tasks"]] == [pending.id]
     result = await feature.list_my_tasks(status="completed", limit=5)
-    assert result.status.value == "ok", result
-
-    # It must have queried list_tasks with the COMPLETED state, NOT relied on
-    # the pending inbox.
-    assert captured.get("status") == TaskState.COMPLETED
-    assert captured.get("limit") == 5
-
-    rows = (result.data or {}).get("tasks") or []
-    assert len(rows) == 1
-    assert rows[0]["task_id"] == "task-done"
-    assert rows[0]["status"] == "completed"
+    assert result.status is ToolResultStatus.OK
+    assert [row["task_id"] for row in result.data["tasks"]] == [completed.id]
+    assert result.data["tasks"][0]["status"] == "completed"
 
 
-@pytest.mark.asyncio
-async def test_list_my_tasks_invalid_status_rejected():
-    """An unknown status is rejected up-front (case-insensitive validation)."""
-    feature = _recipient_feature()
-
+async def test_list_my_tasks_invalid_status_rejected(inbox):
+    _manager, feature, _agent = inbox
     result = await feature.list_my_tasks(status="bogus")
-    assert result.status.value == "error"
-    assert "Invalid status" in (result.error or "")
+    assert result.status is ToolResultStatus.ERROR
+    assert "Invalid task status" in result.error
 
 
-@pytest.mark.asyncio
-async def test_list_my_tasks_type_filter_overfetches_then_truncates():
-    """With a ``task_type`` filter, ``limit`` must bound MATCHING tasks, not
-    pre-filter rows.
-
-    Codex P2 on #1946: the store ``LIMIT`` was applied by status BEFORE the
-    Python-side ``task_type`` filter, so a page of non-matching tasks could hide
-    matches just beyond it — ``list_my_tasks(status="completed",
-    task_type="foo", limit=1)`` could return empty even though a ``foo`` task
-    existed. The fix over-fetches (bounded) before the metadata filter and
-    truncates to ``limit`` after. Here only the 3rd row matches ``task_type``;
-    with ``limit=1`` a naive pre-filter limit would fetch just the 1st row and
-    miss it."""
-
-    def _task(i, ttype):
-        return Task(
-            id=f"task-{i}",
-            sessionId=f"sess-{i}",
-            status=TaskStatus(
-                state=TaskState.COMPLETED,
-                message=Message(role="agent", parts=[TextPart(text="done")]),
+async def test_list_my_tasks_type_filter_overfetches_then_truncates(inbox):
+    manager, feature, agent = inbox
+    matching = await admit(inbox, "matching request", task_type="foo")
+    created = [matching]
+    for _ in range(2):
+        other = await admit(inbox, "unrelated request", task_type="other")
+        created.append(other)
+    for offset, task in enumerate(created):
+        await manager.task_store.backend.execute(
+            "UPDATE a2a_tasks SET created_at = ? WHERE id = ?",
+            (
+                manager.task_store.to_timestamp_param(
+                    datetime(2026, 10, 20, tzinfo=UTC) + timedelta(seconds=offset)
+                ),
+                task.id,
             ),
-            history=[Message(role="user", parts=[TextPart(text="do it")])],
-            metadata={"task_type": ttype},
         )
-
-    rows = [_task(0, "other"), _task(1, "other"), _task(2, "foo")]
-    captured = {}
-
-    async def list_tasks(
-        status=None,
-        limit=100,
-        session_id=None,
-        user_id=None,
-        *,
-        recipient_agent_id,
-    ):
-        assert recipient_agent_id == RECIPIENT
-        captured["limit"] = limit
-        # The store honours whatever limit it is given; return up to that many.
-        return rows[:limit]
-
-    feature = _recipient_feature()
-    feature.task_manager.list_tasks = list_tasks
-
-    result = await feature.list_my_tasks(status="completed", task_type="foo", limit=1)
-    assert result.status.value == "ok", result
-
-    # It must have over-fetched past the caller's limit=1 so the matching row
-    # (index 2) was in the fetched window.
-    assert captured["limit"] > 1
-
-    out = (result.data or {}).get("tasks") or []
-    # Exactly the one matching task, truncated to limit.
-    assert len(out) == 1
-    assert out[0]["task_id"] == "task-2"
-    assert out[0]["task_type"] == "foo"
-
-
-@pytest.mark.asyncio
-async def test_get_task_result_includes_request_content_for_completed_task():
-    feature, task = _make_feature_with_inbox_task(
-        request_text="please ack",
-        state=TaskState.COMPLETED,
-        reply_text="acknowledged",
+        await feature.respond_to_a2a_task(task.id, "done")
+    latest = await manager.list_task_snapshots(
+        recipient_agent_id=agent.did,
+        status=TaskState.TASK_STATE_COMPLETED,
+        limit=1,
     )
-    result = await feature.get_task_result(task_id=task.id)
-    assert result.status.value == "ok"
-    data = result.data or {}
-    assert data["request_content"] == "please ack"
-    assert data["message"] == "acknowledged"
-    assert data["sender"] == "Emma"
+    assert len(latest) == 1 and latest[0].task.id != matching.id
+    result = await feature.list_my_tasks(status="completed", task_type="foo", limit=1)
+    assert result.status is ToolResultStatus.OK
+    assert [row["task_id"] for row in result.data["tasks"]] == [matching.id]
+    assert result.data["tasks"][0]["task_type"] == "foo"
 
 
-@pytest.mark.asyncio
-async def test_check_task_status_surfaces_sender_attached_artifacts():
-    """Recipient retrieval (#1525): a SENDER-attached artifact (text body
-    + a structured-data reference) must be readable by the recipient via
-    ``check_task_status``. The text part is surfaced as ``text`` and the
-    data part as ``data``, with ordering and metadata preserved."""
-    from kestrel_sovereign.a2a.types import Artifact, DataPart
+async def test_get_task_result_includes_request_content_for_completed_task(inbox):
+    _manager, feature, _agent = inbox
+    task = await admit(inbox, "please ack")
+    await feature.respond_to_a2a_task(task.id, "acknowledged")
+    result = await feature.get_task_result(task.id)
+    assert result.status is ToolResultStatus.OK
+    assert result.data["request_content"] == "please ack"
+    assert result.data["message"] == "acknowledged"
+    assert result.data["sender"] == "did:kestrel:emma"
 
-    user_message = Message(role="user", parts=[TextPart(text="orchestrate")])
-    task = Task(
-        id="task-1525",
-        sessionId="sess-1",
-        status=TaskStatus(state=TaskState.SUBMITTED),
-        history=[user_message],
-        metadata={"sender": "Emma", "a2a_verb": "task"},
-        artifacts=[
-            Artifact(
-                name="plan",
-                description="proactive operating model",
-                parts=[TextPart(text="step one"), TextPart(text=" step two")],
-                index=0,
-            ),
-            Artifact(
-                name="references",
-                parts=[DataPart(data={"ref_type": "memory", "id": "m1"})],
-                index=0,
-                metadata={"kind": "reference"},
-            ),
+
+async def test_check_task_status_preserves_sender_input_parts(inbox):
+    _manager, feature, _agent = inbox
+    task = await admit(
+        inbox,
+        "orchestrate",
+        parts=[
+            Part(text="step one", filename="plan.txt"),
+            Part(text="step two"),
+            new_data_part({"ref_type": "memory", "id": "m1"}),
         ],
     )
+    result = await feature.check_task_status(task.id)
+    assert result.status is ToolResultStatus.OK
+    assert result.data["request_content"] == "orchestrate\nstep one\nstep two"
+    parts = result.data["request"]["parts"]
+    assert parts[1] == {"text": "step one", "filename": "plan.txt"}
+    assert parts[2] == {"text": "step two"}
+    assert parts[3]["data"] == {"ref_type": "memory", "id": "m1"}
+    assert result.data["artifacts"] == []
 
-    async def get_task_for_recipient(task_id, recipient_agent_id):
-        assert recipient_agent_id == RECIPIENT
-        return task if task_id == task.id else None
 
-    feature = _recipient_feature()
-    feature.task_manager.get_task_for_recipient = get_task_for_recipient
-
-    result = await feature.check_task_status(task_id=task.id)
-    assert result.status.value == "ok", result
-    arts = (result.data or {}).get("artifacts") or []
-    assert [a["name"] for a in arts] == ["plan", "references"]
-    # Text parts concatenated in order so a chunked body reassembles.
-    assert arts[0]["text"] == "step one step two"
-    assert arts[0]["description"] == "proactive operating model"
-    # Structured reference survives as data, not stringified.
-    assert arts[1]["data"] == {"ref_type": "memory", "id": "m1"}
+async def test_check_task_status_preserves_ordered_native_output_artifacts(inbox):
+    manager, feature, agent = inbox
+    task = await admit(inbox)
+    plan = new_text_artifact("plan", "step one", description="operating model")
+    plan.parts.append(Part(text="step two"))
+    reference = new_data_artifact("references", {"ref_type": "memory", "id": "m1"})
+    reference.metadata.update({"kind": "reference"})
+    for artifact in (plan, reference):
+        await manager.add_artifact(task.id, artifact, recipient_agent_id=agent.did)
+    result = await feature.check_task_status(task.id)
+    assert result.status is ToolResultStatus.OK
+    artifacts = result.data["artifacts"]
+    assert [artifact["name"] for artifact in artifacts] == ["plan", "references"]
+    assert [part["text"] for part in artifacts[0]["parts"]] == ["step one", "step two"]
+    assert artifacts[0]["description"] == "operating model"
+    assert artifacts[1]["metadata"] == {"kind": "reference"}
+    assert artifacts[1]["parts"][0]["data"] == {"ref_type": "memory", "id": "m1"}

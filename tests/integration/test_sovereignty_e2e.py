@@ -8,6 +8,8 @@ Tests use REAL IPFS (if available) or gracefully degrade to local cache.
 NO MOCKS - we test actual sovereignty, not simulations.
 """
 
+from tests.shared.native_shutdown_budget import shutdown_fixture_agent
+
 import pytest
 import pytest_asyncio
 import tempfile
@@ -18,7 +20,7 @@ from datetime import datetime, UTC
 
 from kestrel_sovereign.storage import Storage, GraphNode
 from kestrel_sovereign.storage.sovereign_adapter import SovereignStorageAdapter, RootManifest, ShardMetadata
-from kestrel_sovereign.filecoin_adapter import FilecoinAdapter, StorageTier
+from kestrel_sovereign.filecoin_adapter import StorageTier
 from kestrel_sovereign.llm.service import LLMService
 from kestrel_sovereign.privacy import PrivacyMode
 from kestrel_sovereign.kestrel_agent import KestrelAgent
@@ -168,5 +170,5 @@ async def test_agent_command_integration(temp_db, llm_service, monkeypatch):
         print(f"✅ Agent Command Output:\n{result}")
     finally:
         if agent is not None:
-            await agent.shutdown()
+            await shutdown_fixture_agent(agent)
         FilecoinAdapter.ipfs_is_available = original_check

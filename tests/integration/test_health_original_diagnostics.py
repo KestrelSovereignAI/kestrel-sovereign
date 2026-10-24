@@ -1,5 +1,7 @@
 """Actual PostgreSQL commit uncertainty cannot become an ordinary health report."""
 
+from tests.shared.native_shutdown_budget import shutdown_fixture_agent
+
 import pytest
 from fastapi import FastAPI
 from starlette.requests import Request
@@ -120,5 +122,5 @@ async def test_health_diagnostics_preserve_actual_native_unknown(
     finally:
         backend._execution_custody = None
         agent.features = {}
-        await agent.shutdown()
+        await shutdown_fixture_agent(agent)
         await original_db.close()

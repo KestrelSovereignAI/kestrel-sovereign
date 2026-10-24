@@ -10,665 +10,62 @@ Tests all 6 core datastores with SQLite implementations:
 6. FeedbackStore - Agent self-diagnosis
 """
 
-import os
-import tempfile
-from datetime import datetime, timedelta, timezone
 
 import pytest
+import pytest_asyncio
 
-from kestrel_sovereign.a2a.types import (
-    Task,
-    TaskState,
-    TaskStatus,
-    Message,
-    TextPart,
-    Artifact,
-)
 from kestrel_sovereign.a2a.stores import (
-    # Stores
-    TaskStore,
-    SessionService,
-    MemoryService,
-    ObservabilityStore,
-    OrchestrationStore,
-    FeedbackStore,
-    # Data models
-    OrchestrationStatus,
     FeedbackCategory,
     FeedbackSeverity,
-    FeedbackStatus,
     FeedbackSource,
+    FeedbackStatus,
+    FeedbackStore,
+    MemoryService,
+    ObservabilityStore,
+    # Data models
+    OrchestrationStatus,
+    OrchestrationStore,
+    # Stores
+    SessionService,
 )
 from kestrel_sovereign.storage.db import SQLiteBackend
 
-
-import pytest_asyncio
-
-
-@pytest.fixture
-def db_path():
-    """Create a temporary database file."""
-    fd, path = tempfile.mkstemp(suffix=".db")
-    os.close(fd)
-    yield path
-    try:
-        os.unlink(path)
-    except PermissionError:
-        import time
-        time.sleep(0.1)
-        try:
-            os.unlink(path)
-        except PermissionError:
-            pass  # Windows file locking; temp dir cleanup handles it
-
-
 # Registry to track stores that need cleanup
-_stores_to_close = []
 
 
-@pytest.fixture(autouse=True)
-def _cleanup_stores():
-    """Auto-cleanup any stores created during tests."""
-    _stores_to_close.clear()
-    yield
     # Cleanup is handled by the async cleanup fixture
 
 
-@pytest_asyncio.fixture(autouse=True)
-async def _async_cleanup_stores():
-    """Async cleanup for stores after each test."""
-    yield
-    for store in _stores_to_close:
-        try:
+
+
+
+
+
+
+@pytest.fixture
+def db_path(tmp_path):
+    return str(tmp_path / "stores.db")
+
+
+@pytest_asyncio.fixture
+async def track_store():
+    stores = []
+
+    def retain(store):
+        stores.append(store)
+        return store
+
+    try:
+        yield retain
+    finally:
+        for store in reversed(stores):
             await store.close()
-        except Exception:
-            pass
-    _stores_to_close.clear()
-
-
-def track_store(store):
-    """Register a store for cleanup after the test."""
-    _stores_to_close.append(store)
-    return store
 
 
 # =============================================================================
 # TaskStore Tests
 # =============================================================================
 
-class TestTaskStore:
-    """Tests for TaskStore with SQLite backend."""
-
-    @pytest.mark.asyncio
-    async def test_initialize_migrates_legacy_user_id_and_preserves_rows(
-        self, db_path
-    ):
-        """Legacy task databases gain user_id without losing existing rows."""
-        backend = SQLiteBackend(db_path)
-        await backend.connect()
-        await backend.execute_script("""
-            CREATE TABLE a2a_tasks (
-                id TEXT PRIMARY KEY,
-                session_id TEXT,
-                task_type TEXT NOT NULL,
-                status TEXT DEFAULT 'submitted',
-                message TEXT,
-                artifacts TEXT DEFAULT '[]',
-                history TEXT DEFAULT '[]',
-                metadata TEXT DEFAULT '{}',
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            );
-            INSERT INTO a2a_tasks (id, task_type, status)
-            VALUES ('legacy-task', 'generic', 'submitted');
-        """)
-        store = track_store(TaskStore(backend))
-        await store.initialize()
-        await store.initialize()
-
-        columns = {
-            row[1]
-            for row in await backend.fetch_all("PRAGMA table_info('a2a_tasks')")
-        }
-        assert "user_id" in columns
-        legacy_row = await backend.fetch_one(
-            "SELECT id FROM a2a_tasks WHERE id = ?", ("legacy-task",)
-        )
-        assert legacy_row[0] == "legacy-task"
-
-        await store.save(
-            Task(
-                id="new-task",
-                status=TaskStatus(state=TaskState.SUBMITTED),
-                metadata={"user_id": "user-123"},
-            ),
-            creator_agent_id="did:test:creator",
-            recipient_agent_id="did:test:recipient",
-        )
-        row = await backend.fetch_one(
-            "SELECT user_id FROM a2a_tasks WHERE id = ?", ("new-task",)
-        )
-        assert row[0] == "user-123"
-
-    @pytest.mark.asyncio
-    async def test_save_and_get(self, db_path):
-        """Test saving and retrieving a task."""
-        backend = SQLiteBackend(db_path)
-        await backend.connect()
-        store = track_store(TaskStore(backend))
-        await store.initialize()
-
-        task = Task(
-            id="task-001",
-            sessionId="session-001",
-            status=TaskStatus(state=TaskState.SUBMITTED),
-            history=[
-                Message(role="user", parts=[TextPart(text="Hello")])
-            ],
-            metadata={"key": "value"},
-        )
-
-        await store.save(
-            task,
-            creator_agent_id="did:test:creator",
-            recipient_agent_id="did:test:recipient",
-        )
-        retrieved = await store._get_unscoped("task-001")
-
-        assert retrieved is not None
-        assert retrieved.id == "task-001"
-        assert retrieved.sessionId == "session-001"
-        assert retrieved.status.state == TaskState.SUBMITTED
-        assert len(retrieved.history) == 1
-        assert retrieved.metadata["key"] == "value"
-
-    @pytest.mark.asyncio
-    async def test_get_nonexistent(self, db_path):
-        """Test getting a nonexistent task returns None."""
-        backend = SQLiteBackend(db_path)
-        await backend.connect()
-        store = track_store(TaskStore(backend))
-        await store.initialize()
-
-        result = await store._get_unscoped("nonexistent")
-        assert result is None
-
-    @pytest.mark.asyncio
-    async def test_update_status(self, db_path):
-        """Test updating task status."""
-        backend = SQLiteBackend(db_path)
-        await backend.connect()
-        store = track_store(TaskStore(backend))
-        await store.initialize()
-
-        task = Task(
-            id="task-002",
-            status=TaskStatus(state=TaskState.SUBMITTED),
-        )
-        await store.save(
-            task,
-            creator_agent_id="did:test:creator",
-            recipient_agent_id="did:test:recipient",
-        )
-
-        new_status = TaskStatus(state=TaskState.WORKING)
-        await store.update_status(
-            "task-002",
-            new_status,
-            recipient_agent_id="did:test:recipient",
-            expected_state=TaskState.SUBMITTED,
-        )
-
-        retrieved = await store._get_unscoped("task-002")
-        assert retrieved.status.state == TaskState.WORKING
-
-    @pytest.mark.asyncio
-    async def test_add_artifact(self, db_path):
-        """Test adding artifacts to a task."""
-        backend = SQLiteBackend(db_path)
-        await backend.connect()
-        store = track_store(TaskStore(backend))
-        await store.initialize()
-
-        task = Task(
-            id="task-003",
-            status=TaskStatus(state=TaskState.WORKING),
-        )
-        await store.save(
-            task,
-            creator_agent_id="did:test:creator",
-            recipient_agent_id="did:test:recipient",
-        )
-
-        artifact = Artifact(
-            name="result.txt",
-            description="Output file",
-            parts=[TextPart(text="Result content")],
-        )
-        await store.add_artifact(
-            "task-003",
-            artifact,
-            recipient_agent_id="did:test:recipient",
-        )
-
-        retrieved = await store._get_unscoped("task-003")
-        assert retrieved.artifacts is not None
-        assert len(retrieved.artifacts) == 1
-        assert retrieved.artifacts[0].name == "result.txt"
-
-    @pytest.mark.asyncio
-    async def test_get_pending_tasks(self, db_path):
-        """Test getting pending (submitted) tasks."""
-        backend = SQLiteBackend(db_path)
-        await backend.connect()
-        store = track_store(TaskStore(backend))
-        await store.initialize()
-
-        # Create tasks in different states
-        for i, state in enumerate([TaskState.SUBMITTED, TaskState.WORKING, TaskState.SUBMITTED, TaskState.COMPLETED]):
-            task = Task(
-                id=f"task-{i}",
-                status=TaskStatus(state=state),
-            )
-            await store.save(
-                task,
-                creator_agent_id="did:test:creator",
-                recipient_agent_id="did:test:recipient",
-            )
-
-        pending = await store.get_pending_tasks(
-            recipient_agent_id="did:test:recipient"
-        )
-        assert len(pending) == 2
-        assert all(t.status.state == TaskState.SUBMITTED for t in pending)
-
-    @pytest.mark.asyncio
-    async def test_list_tasks_status_filter_each_of_five_states(self, db_path):
-        """``list_tasks(status=...)`` must filter by SQL status for every state.
-
-        Regression for #1946 / F309: ``list_my_tasks`` advertised a status
-        filter but the underlying fetch was hardwired to ``get_pending_tasks``
-        (SUBMITTED only), so any other status silently returned the wrong set.
-        The fix routes status filters through ``list_tasks``; this exercises
-        that passthrough against a REAL store instance for each of the five
-        user-facing TaskStates and asserts the right rows come back.
-        """
-        backend = SQLiteBackend(db_path)
-        await backend.connect()
-        store = track_store(TaskStore(backend))
-        await store.initialize()
-
-        five_states = [
-            TaskState.SUBMITTED,
-            TaskState.WORKING,
-            TaskState.COMPLETED,
-            TaskState.FAILED,
-            TaskState.CANCELED,
-        ]
-        # One task per state so each filter must select exactly its own row.
-        for state in five_states:
-            initial_state = (
-                TaskState.SUBMITTED
-                if state is TaskState.CANCELED
-                else state
-            )
-            await store.save(
-                Task(
-                    id=f"task-{state.value}",
-                    status=TaskStatus(state=initial_state),
-                ),
-                creator_agent_id="did:test:creator",
-                recipient_agent_id="did:test:recipient",
-            )
-            if state is TaskState.CANCELED:
-                canceled = await store.cancel_if_authorized(
-                    f"task-{state.value}",
-                    actor_agent_id="did:test:creator",
-                )
-                assert canceled is not None
-
-        for state in five_states:
-            rows = await store.list_tasks(
-                recipient_agent_id="did:test:recipient",
-                status=state,
-            )
-            assert len(rows) == 1, (
-                f"status={state.value} returned {len(rows)} rows, expected 1"
-            )
-            assert rows[0].id == f"task-{state.value}"
-            assert rows[0].status.state == state
-
-        # The worker drain path must remain submitted-only and unaffected.
-        pending = await store.get_pending_tasks(
-            recipient_agent_id="did:test:recipient"
-        )
-        assert len(pending) == 1
-        assert pending[0].status.state == TaskState.SUBMITTED
-
-    @pytest.mark.asyncio
-    async def test_cognition_wake_candidates_bound_each_group_by_its_own_horizon(
-        self,
-        db_path,
-    ):
-        """Live and terminal rows are each bounded by their source's window."""
-
-        backend = SQLiteBackend(db_path)
-        await backend.connect()
-        store = track_store(TaskStore(backend))
-        await store.initialize()
-        for task_id, state, recipient in (
-            ("live-submitted", TaskState.SUBMITTED, "did:test:recipient"),
-            ("live-working", TaskState.WORKING, "did:test:recipient"),
-            ("terminal", TaskState.COMPLETED, "did:test:recipient"),
-            ("foreign-live", TaskState.SUBMITTED, "did:test:other"),
-        ):
-            await store.save(
-                Task(id=task_id, status=TaskStatus(state=state)),
-                creator_agent_id="did:test:creator",
-                recipient_agent_id=recipient,
-            )
-
-        future = datetime.now(timezone.utc) + timedelta(days=1)
-        past = datetime.now(timezone.utc) - timedelta(days=1)
-
-        async def candidate_ids(*, live, terminal):
-            return {
-                candidate.task.id
-                for candidate in await store.list_cognition_wake_candidates(
-                    recipient_agent_id="did:test:recipient",
-                    live_changed_since=live,
-                    terminal_changed_since=terminal,
-                )
-            }
-
-        assert await candidate_ids(live=past, terminal=future) == {
-            "live-submitted",
-            "live-working",
-        }
-        assert await candidate_ids(live=future, terminal=past) == {"terminal"}
-        assert await candidate_ids(live=past, terminal=past) == {
-            "live-submitted",
-            "live-working",
-            "terminal",
-        }
-
-        # SQLite task transitions use ``datetime('now')`` and therefore store
-        # a space-separated timestamp. The ISO ``T`` in a Python cutoff must
-        # not turn lexical formatting into the retention decision. This row
-        # also names no lifecycle_updated_at, as a writer that predates the
-        # column would not, so it is read through updated_at.
-        await backend.execute(
-            "INSERT INTO a2a_tasks "
-            "(id, task_type, status, updated_at, creator_agent_id, "
-            "recipient_agent_id) VALUES (?, ?, ?, ?, ?, ?)",
-            (
-                "boundary-terminal",
-                "generic",
-                "completed",
-                "2026-08-26 20:00:00",
-                "did:test:creator",
-                "did:test:recipient",
-            ),
-        )
-        near_boundary = await store.list_cognition_wake_candidates(
-            recipient_agent_id="did:test:recipient",
-            live_changed_since=future,
-            terminal_changed_since=datetime(
-                2026, 8, 26, 18, 0, 0, tzinfo=timezone.utc
-            ),
-        )
-        assert "boundary-terminal" in {
-            candidate.task.id for candidate in near_boundary
-        }
-
-        # SQLite's wall clock is only second-resolution. Lifecycle identity is
-        # therefore a persisted monotonic counter, not a timestamp: two valid
-        # transitions back into WORKING in one second must remain distinct.
-        await store.update_status(
-            "live-submitted",
-            TaskStatus(state=TaskState.WORKING),
-            recipient_agent_id="did:test:recipient",
-            expected_state=TaskState.SUBMITTED,
-        )
-        [first_working] = [
-            candidate
-            for candidate in await store.list_cognition_wake_candidates(
-                recipient_agent_id="did:test:recipient",
-                live_changed_since=past,
-                terminal_changed_since=datetime.now(timezone.utc),
-            )
-            if candidate.task.id == "live-submitted"
-        ]
-        await store.update_status(
-            "live-submitted",
-            TaskStatus(state=TaskState.INPUT_REQUIRED),
-            recipient_agent_id="did:test:recipient",
-            expected_state=TaskState.WORKING,
-        )
-        await store.update_status(
-            "live-submitted",
-            TaskStatus(state=TaskState.WORKING),
-            recipient_agent_id="did:test:recipient",
-            expected_state=TaskState.INPUT_REQUIRED,
-        )
-        [second_working] = [
-            candidate
-            for candidate in await store.list_cognition_wake_candidates(
-                recipient_agent_id="did:test:recipient",
-                live_changed_since=past,
-                terminal_changed_since=datetime.now(timezone.utc),
-            )
-            if candidate.task.id == "live-submitted"
-        ]
-        assert first_working.lifecycle_revision == 1
-        assert second_working.lifecycle_revision == 3
-
-    @pytest.mark.asyncio
-    @pytest.mark.parametrize(
-        "transition",
-        ["lifecycle_save", "terminal_outcome", "cancel"],
-    )
-    async def test_every_lifecycle_revision_restamps_its_change_time(
-        self,
-        db_path,
-        transition,
-    ):
-        """A revision minted weeks after submission is still reconcilable.
-
-        Each write that mints a new wake identity must restamp when that
-        revision began; otherwise the window measures it from the old one.
-        """
-
-        backend = SQLiteBackend(db_path)
-        await backend.connect()
-        store = track_store(TaskStore(backend))
-        await store.initialize()
-        await store.save(
-            Task(id="aged", status=TaskStatus(state=TaskState.SUBMITTED)),
-            creator_agent_id="did:test:creator",
-            recipient_agent_id="did:test:recipient",
-        )
-        await backend.execute(
-            "UPDATE a2a_tasks SET lifecycle_updated_at = "
-            "datetime('now', '-30 days') WHERE id = ?",
-            ("aged",),
-        )
-        if transition == "lifecycle_save":
-            assert await store.save_recipient_lifecycle(
-                Task(id="aged", status=TaskStatus(state=TaskState.WORKING)),
-                recipient_agent_id="did:test:recipient",
-                expected_state=TaskState.SUBMITTED,
-            )
-        elif transition == "terminal_outcome":
-            assert await store.save_recipient_terminal_outcome(
-                Task(id="aged", status=TaskStatus(state=TaskState.COMPLETED)),
-                recipient_agent_id="did:test:recipient",
-                operation_id="op-aged",
-            )
-        else:
-            assert await store.cancel_if_authorized(
-                "aged",
-                actor_agent_id="did:test:creator",
-            ) is not None
-
-        row = await backend.fetch_one(
-            "SELECT lifecycle_revision, "
-            "datetime(lifecycle_updated_at) > datetime('now', '-1 day') "
-            "FROM a2a_tasks WHERE id = ?",
-            ("aged",),
-        )
-        assert tuple(row) == (1, 1)
-        horizon = datetime.now(timezone.utc) - timedelta(days=14)
-        listed = await store.list_cognition_wake_candidates(
-            recipient_agent_id="did:test:recipient",
-            live_changed_since=horizon,
-            terminal_changed_since=horizon,
-        )
-        assert [candidate.task.id for candidate in listed] == ["aged"]
-
-    @pytest.mark.asyncio
-    async def test_artifact_append_keeps_no_stale_wake_inside_the_window(
-        self,
-        db_path,
-    ):
-        """An artifact moves updated_at but not the wake identity (#3163).
-
-        Bounding live work by updated_at would keep a month-old WORKING
-        revision listed after retention deleted the row that deduplicates its
-        wake, recreating that wake every retention period.
-        """
-
-        backend = SQLiteBackend(db_path)
-        await backend.connect()
-        store = track_store(TaskStore(backend))
-        await store.initialize()
-        await store.save(
-            Task(id="long-running", status=TaskStatus(state=TaskState.WORKING)),
-            creator_agent_id="did:test:creator",
-            recipient_agent_id="did:test:recipient",
-        )
-        stamped = await backend.fetch_one(
-            "SELECT lifecycle_updated_at IS NOT NULL FROM a2a_tasks WHERE id = ?",
-            ("long-running",),
-        )
-        assert stamped[0] == 1
-        await backend.execute(
-            "UPDATE a2a_tasks SET lifecycle_updated_at = "
-            "datetime('now', '-30 days'), updated_at = "
-            "datetime('now', '-30 days') WHERE id = ?",
-            ("long-running",),
-        )
-        await store.add_artifact(
-            "long-running",
-            Artifact(name="progress.txt", parts=[TextPart(text="still going")]),
-            recipient_agent_id="did:test:recipient",
-        )
-        row = await backend.fetch_one(
-            "SELECT lifecycle_revision, "
-            "datetime(updated_at) > datetime('now', '-1 day'), "
-            "datetime(lifecycle_updated_at) < datetime('now', '-1 day') "
-            "FROM a2a_tasks WHERE id = ?",
-            ("long-running",),
-        )
-        assert tuple(row) == (0, 1, 1)
-        horizon = datetime.now(timezone.utc) - timedelta(days=14)
-
-        async def listed():
-            return [
-                candidate
-                for candidate in await store.list_cognition_wake_candidates(
-                    recipient_agent_id="did:test:recipient",
-                    live_changed_since=horizon,
-                    terminal_changed_since=horizon,
-                )
-                if candidate.task.id == "long-running"
-            ]
-
-        assert await listed() == []
-
-        # A new revision is a new wake identity, and it is inside the window.
-        await store.update_status(
-            "long-running",
-            TaskStatus(state=TaskState.INPUT_REQUIRED),
-            recipient_agent_id="did:test:recipient",
-            expected_state=TaskState.WORKING,
-        )
-        await store.update_status(
-            "long-running",
-            TaskStatus(state=TaskState.WORKING),
-            recipient_agent_id="did:test:recipient",
-            expected_state=TaskState.INPUT_REQUIRED,
-        )
-        [candidate] = await listed()
-        assert candidate.lifecycle_revision == 2
-
-    @pytest.mark.asyncio
-    async def test_list_tasks_by_session(self, db_path):
-        """Test listing tasks filtered by session."""
-        backend = SQLiteBackend(db_path)
-        await backend.connect()
-        store = track_store(TaskStore(backend))
-        await store.initialize()
-
-        for i in range(3):
-            task = Task(
-                id=f"task-a-{i}",
-                sessionId="session-a",
-                status=TaskStatus(state=TaskState.COMPLETED),
-            )
-            await store.save(
-                task,
-                creator_agent_id="did:test:creator",
-                recipient_agent_id="did:test:recipient",
-            )
-
-        for i in range(2):
-            task = Task(
-                id=f"task-b-{i}",
-                sessionId="session-b",
-                status=TaskStatus(state=TaskState.COMPLETED),
-            )
-            await store.save(
-                task,
-                creator_agent_id="did:test:creator",
-                recipient_agent_id="did:test:recipient",
-            )
-
-        session_a_tasks = await store.list_tasks(
-            recipient_agent_id="did:test:recipient",
-            session_id="session-a",
-        )
-        assert len(session_a_tasks) == 3
-
-        session_b_tasks = await store.list_tasks(
-            recipient_agent_id="did:test:recipient",
-            session_id="session-b",
-        )
-        assert len(session_b_tasks) == 2
-
-    @pytest.mark.asyncio
-    async def test_delete_task(self, db_path):
-        """Test deleting a task."""
-        backend = SQLiteBackend(db_path)
-        await backend.connect()
-        store = track_store(TaskStore(backend))
-        await store.initialize()
-
-        task = Task(
-            id="task-delete",
-            status=TaskStatus(state=TaskState.COMPLETED),
-        )
-        await store.save(
-            task,
-            creator_agent_id="did:test:creator",
-            recipient_agent_id="did:test:recipient",
-        )
-
-        result = await store.delete("task-delete")
-        assert result is True
-
-        retrieved = await store._get_unscoped("task-delete")
-        assert retrieved is None
 
 
 # =============================================================================
@@ -679,7 +76,7 @@ class TestSessionService:
     """Tests for SQLiteSessionService."""
 
     @pytest.mark.asyncio
-    async def test_create_and_get_session(self, db_path):
+    async def test_create_and_get_session(self, db_path, track_store):
         """Test creating and retrieving a session."""
         backend = SQLiteBackend(db_path)
         await backend.connect()
@@ -699,7 +96,7 @@ class TestSessionService:
         assert session.metadata["context"] == "test"
 
     @pytest.mark.asyncio
-    async def test_append_event(self, db_path):
+    async def test_append_event(self, db_path, track_store):
         """Test appending events to session history."""
         backend = SQLiteBackend(db_path)
         await backend.connect()
@@ -725,7 +122,7 @@ class TestSessionService:
         assert session.events[1]["event_type"] == "agent_response"
 
     @pytest.mark.asyncio
-    async def test_update_session_state(self, db_path):
+    async def test_update_session_state(self, db_path, track_store):
         """Test updating session state."""
         backend = SQLiteBackend(db_path)
         await backend.connect()
@@ -745,7 +142,7 @@ class TestSessionService:
         assert session.metadata["updated"] is True
 
     @pytest.mark.asyncio
-    async def test_list_sessions(self, db_path):
+    async def test_list_sessions(self, db_path, track_store):
         """Test listing sessions."""
         backend = SQLiteBackend(db_path)
         await backend.connect()
@@ -764,7 +161,7 @@ class TestSessionService:
         assert len(agent_0_sessions) == 2
 
     @pytest.mark.asyncio
-    async def test_delete_session(self, db_path):
+    async def test_delete_session(self, db_path, track_store):
         """Test deleting a session."""
         backend = SQLiteBackend(db_path)
         await backend.connect()
@@ -788,7 +185,7 @@ class TestMemoryService:
     """Tests for SQLiteMemoryService."""
 
     @pytest.mark.asyncio
-    async def test_add_and_get_memory(self, db_path):
+    async def test_add_and_get_memory(self, db_path, track_store):
         """Test adding and retrieving memory."""
         backend = SQLiteBackend(db_path)
         await backend.connect()
@@ -809,7 +206,7 @@ class TestMemoryService:
         assert memory.metadata["importance"] == "high"
 
     @pytest.mark.asyncio
-    async def test_search_memory_fts(self, db_path):
+    async def test_search_memory_fts(self, db_path, track_store):
         """Test full-text search on memories."""
         backend = SQLiteBackend(db_path)
         await backend.connect()
@@ -827,7 +224,7 @@ class TestMemoryService:
         assert all("pizza" in m.content.lower() for m in results)
 
     @pytest.mark.asyncio
-    async def test_search_memory_by_tags(self, db_path):
+    async def test_search_memory_by_tags(self, db_path, track_store):
         """Test searching memories by tags."""
         backend = SQLiteBackend(db_path)
         await backend.connect()
@@ -842,7 +239,7 @@ class TestMemoryService:
         assert len(results) == 2
 
     @pytest.mark.asyncio
-    async def test_get_session_history(self, db_path):
+    async def test_get_session_history(self, db_path, track_store):
         """Test getting all memories for a session."""
         backend = SQLiteBackend(db_path)
         await backend.connect()
@@ -859,7 +256,7 @@ class TestMemoryService:
         assert len(history) == 5
 
     @pytest.mark.asyncio
-    async def test_delete_memory(self, db_path):
+    async def test_delete_memory(self, db_path, track_store):
         """Test deleting a memory."""
         backend = SQLiteBackend(db_path)
         await backend.connect()
@@ -888,7 +285,7 @@ class TestObservabilityStore:
     @pytest.mark.asyncio
     async def test_initialize_migrates_legacy_agent_did_and_preserves_rows(
         self, db_path
-    ):
+    , track_store):
         """Legacy LLM-call rows survive the additive agent_did migration."""
         backend = SQLiteBackend(db_path)
         await backend.connect()
@@ -943,7 +340,7 @@ class TestObservabilityStore:
         assert calls[0].agent_did == "did:test:new-agent"
 
     @pytest.mark.asyncio
-    async def test_log_tool_call_and_response(self, db_path):
+    async def test_log_tool_call_and_response(self, db_path, track_store):
         """Test logging tool calls with timing."""
         backend = SQLiteBackend(db_path)
         await backend.connect()
@@ -971,7 +368,7 @@ class TestObservabilityStore:
         assert event.success is True
 
     @pytest.mark.asyncio
-    async def test_log_error(self, db_path):
+    async def test_log_error(self, db_path, track_store):
         """Test logging errors."""
         backend = SQLiteBackend(db_path)
         await backend.connect()
@@ -993,7 +390,7 @@ class TestObservabilityStore:
         assert "Invalid input" in event.error_message
 
     @pytest.mark.asyncio
-    async def test_log_metric(self, db_path):
+    async def test_log_metric(self, db_path, track_store):
         """Test logging metrics."""
         backend = SQLiteBackend(db_path)
         await backend.connect()
@@ -1014,7 +411,7 @@ class TestObservabilityStore:
         assert event.metadata["metric_value"] == 1500.0
 
     @pytest.mark.asyncio
-    async def test_query_events(self, db_path):
+    async def test_query_events(self, db_path, track_store):
         """Test querying events with filters."""
         backend = SQLiteBackend(db_path)
         await backend.connect()
@@ -1036,7 +433,7 @@ class TestObservabilityStore:
         assert len(errors) == 1
 
     @pytest.mark.asyncio
-    async def test_prune_old_events(self, db_path):
+    async def test_prune_old_events(self, db_path, track_store):
         """Pruning deletes only events older than the requested cutoff."""
         backend = SQLiteBackend(db_path)
         await backend.connect()
@@ -1069,7 +466,7 @@ class TestOrchestrationStore:
     """Tests for SQLiteOrchestrationStore."""
 
     @pytest.mark.asyncio
-    async def test_create_workflow_and_add_tasks(self, db_path):
+    async def test_create_workflow_and_add_tasks(self, db_path, track_store):
         """Test creating a workflow with tasks."""
         backend = SQLiteBackend(db_path)
         await backend.connect()
@@ -1098,7 +495,7 @@ class TestOrchestrationStore:
         assert tasks[1].step_number == 2
 
     @pytest.mark.asyncio
-    async def test_delegate_task(self, db_path):
+    async def test_delegate_task(self, db_path, track_store):
         """Test delegating a task to another agent."""
         backend = SQLiteBackend(db_path)
         await backend.connect()
@@ -1120,7 +517,7 @@ class TestOrchestrationStore:
         assert task.status == OrchestrationStatus.DELEGATED
 
     @pytest.mark.asyncio
-    async def test_update_task_status(self, db_path):
+    async def test_update_task_status(self, db_path, track_store):
         """Test updating orchestration task status."""
         backend = SQLiteBackend(db_path)
         await backend.connect()
@@ -1152,7 +549,7 @@ class TestOrchestrationStore:
         assert task.completed_at is not None
 
     @pytest.mark.asyncio
-    async def test_get_pending_delegations(self, db_path):
+    async def test_get_pending_delegations(self, db_path, track_store):
         """Test getting tasks delegated to an agent."""
         backend = SQLiteBackend(db_path)
         await backend.connect()
@@ -1185,7 +582,7 @@ class TestOrchestrationStore:
         assert pending[0].task_id == task2_id
 
     @pytest.mark.asyncio
-    async def test_is_workflow_complete(self, db_path):
+    async def test_is_workflow_complete(self, db_path, track_store):
         """Test checking workflow completion."""
         backend = SQLiteBackend(db_path)
         await backend.connect()
@@ -1219,7 +616,7 @@ class TestOrchestrationStore:
         assert await store.is_workflow_complete(workflow_id) is True
 
     @pytest.mark.asyncio
-    async def test_parent_child_tasks(self, db_path):
+    async def test_parent_child_tasks(self, db_path, track_store):
         """Test parent-child task relationships."""
         backend = SQLiteBackend(db_path)
         await backend.connect()
@@ -1263,7 +660,7 @@ class TestFeedbackStore:
     """Tests for SQLiteFeedbackStore."""
 
     @pytest.mark.asyncio
-    async def test_submit_and_get_feedback(self, db_path):
+    async def test_submit_and_get_feedback(self, db_path, track_store):
         """Test submitting and retrieving feedback."""
         backend = SQLiteBackend(db_path)
         await backend.connect()
@@ -1289,7 +686,7 @@ class TestFeedbackStore:
         assert feedback.status == FeedbackStatus.OPEN
 
     @pytest.mark.asyncio
-    async def test_agent_self_diagnosis(self, db_path):
+    async def test_agent_self_diagnosis(self, db_path, track_store):
         """Test agent submitting self-diagnosed feedback."""
         backend = SQLiteBackend(db_path)
         await backend.connect()
@@ -1311,7 +708,7 @@ class TestFeedbackStore:
         assert feedback.category == FeedbackCategory.CONFUSION
 
     @pytest.mark.asyncio
-    async def test_update_feedback_status(self, db_path):
+    async def test_update_feedback_status(self, db_path, track_store):
         """Test updating feedback status."""
         backend = SQLiteBackend(db_path)
         await backend.connect()
@@ -1347,7 +744,7 @@ class TestFeedbackStore:
         assert feedback.resolved_at is not None
 
     @pytest.mark.asyncio
-    async def test_query_feedback(self, db_path):
+    async def test_query_feedback(self, db_path, track_store):
         """Test querying feedback with filters."""
         backend = SQLiteBackend(db_path)
         await backend.connect()
@@ -1393,7 +790,7 @@ class TestFeedbackStore:
         assert len(critical) == 1
 
     @pytest.mark.asyncio
-    async def test_get_open_feedback(self, db_path):
+    async def test_get_open_feedback(self, db_path, track_store):
         """Test getting open feedback with severity filter."""
         backend = SQLiteBackend(db_path)
         await backend.connect()
@@ -1423,7 +820,7 @@ class TestFeedbackStore:
         assert high_priority[0].severity == FeedbackSeverity.CRITICAL
 
     @pytest.mark.asyncio
-    async def test_get_feedback_stats(self, db_path):
+    async def test_get_feedback_stats(self, db_path, track_store):
         """Test getting feedback statistics."""
         backend = SQLiteBackend(db_path)
         await backend.connect()
@@ -1457,7 +854,7 @@ class TestFeedbackStore:
         assert stats["by_source"]["agent"] == 1
 
     @pytest.mark.asyncio
-    async def test_delete_feedback(self, db_path):
+    async def test_delete_feedback(self, db_path, track_store):
         """Test deleting feedback."""
         backend = SQLiteBackend(db_path)
         await backend.connect()

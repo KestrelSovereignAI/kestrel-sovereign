@@ -89,6 +89,16 @@ logger = logging.getLogger(__name__)
 _POSTGRES_FIRST_NORMAL_OBJECT_ID = 16384
 
 
+class PostgresSessionLostError(TransactionError):
+    """The original session closed before this transaction accepted COMMIT.
+
+    Emitted only after the original native rollback owner has finished. The
+    enclosing checkout still owns its exact pool reset and may add retirement
+    control before exposing this error. This disposition neither settles an
+    accepted COMMIT nor replaces an execution admission.
+    """
+
+
 def _failure_detail(error: BaseException) -> str:
     outcome = execution_commit_outcome(error)
     if outcome is not None:
@@ -423,7 +433,9 @@ class PostgresBackend(DatabaseBackend):
             database: Database name
             user: Database user
             password: Database password
-            min_pool_size: Minimum pool connections
+            min_pool_size: Connections established during pool initialization.
+                Reconnection belongs to actual checkouts, never an autonomous
+                background pool floor.
             max_pool_size: Maximum operational pool connections.
             advisory_max_pool_size: Optional advisory-lock pool bound. A
                 multi-tenant host sharing this backend should set an explicit
@@ -831,26 +843,32 @@ class PostgresBackend(DatabaseBackend):
             return
         
         try:
+            # asyncpg 0.32 separates initialization from a maintained floor.
+            # A maintenance Task would inherit an original journal's context
+            # without owning its finite checkout or reconnect permission.
+            pool_options = {
+                "connection_class": NativeJournalPostgresConnection,
+                "init_size": self._min_pool_size,
+                "min_size": 0,
+                "max_size": self._max_pool_size,
+            }
             if self._dsn:
                 self._pool = await asyncpg.create_pool(
                     self._dsn,
-                    connection_class=NativeJournalPostgresConnection,
-                    min_size=self._min_pool_size,
-                    max_size=self._max_pool_size,
+                    **pool_options,
                 )
             else:
                 self._pool = await asyncpg.create_pool(
                     host=self._host,
-                    connection_class=NativeJournalPostgresConnection,
                     port=self._port,
                     database=self._database,
                     user=self._user,
                     password=self._password,
-                    min_size=self._min_pool_size,
-                    max_size=self._max_pool_size,
+                    **pool_options,
                 )
             
-            logger.debug(f"Connected to PostgreSQL pool (size: {self._min_pool_size}-{self._max_pool_size})")
+            logger.debug("Connected to PostgreSQL pool (initial: %s, maximum: %s)",
+                         self._min_pool_size, self._max_pool_size)
             
         except Exception as e:
             raise execution_error_with_cause(ConnectionError(f"Failed to connect to PostgreSQL: {e}"), e)
@@ -1234,6 +1252,18 @@ class PostgresBackend(DatabaseBackend):
                 phase.owner = retirement
             state.retirement.owner = retirement
             retired = await await_owned_task(retirement)
+            if (state.original_journal_checkout
+                    and type(native_connection) is NativeJournalPostgresConnection
+                    and native_connection._journal_cancel_failure is not None):
+                # asyncpg 0.32 terminates the physical session and suppresses
+                # failed CancelRequest I/O. The original native executor's
+                # termination is still a fatal observation after its reset
+                # owner has joined; it cannot become ordinary projection loss.
+                cancellation_failure = execution_error_with_cause(
+                    ExecutionAuthorityError("Original native journal cancellation failed"),
+                    native_connection._journal_cancel_failure,
+                )
+                body_failure = execution_observation_error(body_failure, cancellation_failure)
             if retired.error is not None:
                 if phase is not None:
                     phase.record_native_failure(retired.error, commit_outcome=state.outcome, cancellation=retired.cancellation)
@@ -1406,6 +1436,21 @@ class PostgresBackend(DatabaseBackend):
                 commit_state.outcome = "unknown"
             completed = await await_owned_task(completion)
             if completed.error is not None:
+                if not committing and native_connection.is_closed():
+                    # No COMMIT owner was accepted. The original native exit
+                    # is joined, and the same session is physically closed;
+                    # asyncpg may already have detached its pool proxy. There
+                    # is no live rollback owner to invent. Retain every cause
+                    # and observer withdrawal; the enclosing checkout must
+                    # still finish its own original reset before publication.
+                    failure = PostgresSessionLostError(
+                        "Original PostgreSQL session closed before COMMIT"
+                    )
+                    failure.__cause__ = execution_terminal_error(
+                        body_failure, completed.error, completed.cancellation,
+                        retain_originals=True, isolate_control_originals=True,
+                    )
+                    raise failure
                 if phase is not None:
                     phase.record_native_failure(completed.error, commit_outcome="unknown" if committing else None, cancellation=completed.cancellation)
                 if committing:
@@ -2092,15 +2137,20 @@ class PostgresBackend(DatabaseBackend):
                     raise await self._close_failed_advisory_session(conn, original)
     
     async def table_exists(self, table_name: str) -> bool:
-        """Check whether an unqualified relation resolves on this connection.
+        """Check a literal unqualified relation name in the active search path.
 
-        ``to_regclass`` follows PostgreSQL's active ``search_path``.  That
-        preserves the normal production ``public`` behavior while allowing a
-        transaction-local schema to be inspected on the connection that owns
-        it, rather than accidentally observing an unrelated public table.
+        Read the MVCC catalog directly so a fresh statement sees DDL another
+        initializer committed while this transaction waited for its lease.
+        A previously negative ``to_regclass`` name lookup can remain stale.
+        The name is a bound value, as on SQLite; it is not SQL identifier text.
         """
         return bool(await self.fetch_val(
-            "SELECT to_regclass(?) IS NOT NULL",
+            "SELECT EXISTS ("
+            "SELECT 1 FROM pg_catalog.pg_class relation "
+            "JOIN pg_catalog.pg_namespace namespace "
+            "ON namespace.oid = relation.relnamespace "
+            "WHERE relation.relname = ? "
+            "AND namespace.nspname = ANY(current_schemas(true)))",
             (table_name,),
         ))
 

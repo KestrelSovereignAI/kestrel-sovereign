@@ -1,3 +1,5 @@
+
+from tests.shared.native_shutdown_budget import shutdown_fixture_agent
 import pytest
 import pytest_asyncio
 import logging
@@ -40,7 +42,7 @@ async def kestrel_agent(temp_db):
     yield agent
 
     # Cleanup agent resources (temp_db cleanup handled by fixture)
-    await agent.shutdown()
+    await shutdown_fixture_agent(agent)
     # Close LLM service to cleanup aiosqlite connections
     await llm_service.close()
 

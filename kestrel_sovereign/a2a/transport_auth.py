@@ -4,14 +4,13 @@ The sovereign API key authorizes an operator. Automatic peer routing must
 never receive that credential: doing so lets a peer turn transport admission
 into operator authority at legacy HTTP views. This module owns the separate
 transport credential and the deliberately small set of routes it may reach.
-Principal authority for task reads and mutations is still established by the
-signed A2A envelope inside those routes.
+Native task operations use their exact SDK route registrations and signed
+request admission, independently of this discovery credential.
 """
 
 from __future__ import annotations
 
 import os
-import re
 import secrets
 import stat
 import tempfile
@@ -20,7 +19,6 @@ from pathlib import Path
 
 from kestrel_sovereign.auth import normalize_api_key
 
-
 A2A_TRANSPORT_KEY_ENV = "KESTREL_A2A_TRANSPORT_KEY"
 A2A_TRANSPORT_KEY_HEADER = "X-Kestrel-A2A-Key"
 A2A_TRANSPORT_KEY_FILE = ".kestrel-a2a-transport.key"
@@ -28,10 +26,6 @@ A2A_TRANSPORT_ONLY_ENV = "KESTREL_A2A_TRANSPORT_ONLY"
 _MAX_TRANSPORT_KEY_BYTES = 4096
 _SOVEREIGN_API_KEY_ENV = "KESTREL_API_KEY"
 
-_ROUTED_A2A_PATH = re.compile(
-    r"^(?:/api/agents/[^/]+)?/api/agent/"
-    r"(?:invoke|peer/stop|tasks/send|tasks/.+/(?:read|cancel|subscribe))$"
-)
 
 
 class A2ATransportKeyError(RuntimeError):
@@ -238,22 +232,6 @@ def ensure_a2a_transport_key(
     return selected
 
 
-def is_a2a_transport_path(method: str, path: str) -> bool:
-    """Whether the peer credential may enter this HTTP route.
-
-    Roster discovery is transport metadata. Every task read/mutation route
-    admitted here performs its own signed-principal verification. Legacy GET
-    task list/detail/subscription views are intentionally absent: those are
-    operator/UI surfaces and remain on the sovereign lane.
-    """
-
-    normalized_method = method.upper()
-    if normalized_method == "GET" and path == "/api/agents":
-        return True
-    return (
-        normalized_method == "POST"
-        and _ROUTED_A2A_PATH.fullmatch(path) is not None
-    )
 
 
 def is_a2a_transport_only_process(
@@ -277,6 +255,15 @@ __all__ = [
     "A2A_TRANSPORT_ONLY_ENV",
     "A2ATransportKeyError",
     "ensure_a2a_transport_key",
-    "is_a2a_transport_path",
+    "is_peer_directory_request",
     "is_a2a_transport_only_process",
 ]
+
+
+def is_peer_directory_request(method: str, path: str) -> bool:
+    """The roster credential admits discovery, never peer task operations.
+
+    Native A2A routes are classified by the exact SDK registration and perform
+    their own signed-sender admission. No private path pattern remains here.
+    """
+    return method.upper() == "GET" and path == "/api/agents"

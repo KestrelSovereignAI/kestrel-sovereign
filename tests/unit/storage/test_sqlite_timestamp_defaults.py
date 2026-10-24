@@ -19,11 +19,10 @@ carried no default, where the authored schema gives 28 of them one.
 from __future__ import annotations
 
 import re
-from datetime import datetime, timezone
 
 import pytest
 
-from kestrel_sovereign.storage.async_database import AsyncDatabase, CORE_SCHEMA
+from kestrel_sovereign.storage.async_database import CORE_SCHEMA, AsyncDatabase
 from kestrel_sovereign.storage.db.placeholder import normalize_schema
 
 
@@ -102,65 +101,19 @@ async def test_every_authored_default_reaches_a_real_sqlite_database(tmp_path):
         await db.close()
 
 
-@pytest.mark.asyncio
-async def test_a_writer_stamps_the_column_without_help_from_the_schema(tmp_path):
-    """The fix has to reach databases that already exist, and the schema cannot.
-
-    SQLite has no ``ALTER TABLE ... SET DEFAULT``: every database created before
-    #3048 keeps its defaultless columns for ever, and rebuilding 26 tables to
-    add a default is a migration out of all proportion to the fault. So the
-    writers that used to lean on the default now supply the value themselves,
-    which repairs old and new databases alike and leaves the schema default as
-    belt and braces for whatever is written next.
-
-    This recreates the pre-fix shape — the table with its default stripped, as
-    the old ``normalize_schema`` would have produced — and then drives the real
-    store.
-    """
-    from kestrel_sovereign.storage.async_pending_a2a_question_store import (
-        PendingA2AQuestionStore,
-    )
-
-    db = await AsyncDatabase.sqlite(str(tmp_path / "legacy-shape.db"))
+async def test_an_active_writer_stamps_a_column_without_a_schema_default(tmp_path):
+    """The active wait ledger must stamp pre-existing defaultless columns."""
+    from kestrel_sovereign.storage.async_wait_signal_store import WaitSignalStore
+    db = await AsyncDatabase.sqlite(str(tmp_path / "defaultless-wait-ledger.db"))
     try:
-        created = await db.fetchone(
-            "SELECT sql FROM sqlite_master WHERE name = 'pending_a2a_questions'"
-        )
-        assert created and "CURRENT_TIMESTAMP" in created[0], (
-            "the fixture needs the fixed schema to strip, or it proves nothing"
-        )
-        # Exactly what the old rule produced: the clause removed entirely.
-        await db.execute("DROP TABLE pending_a2a_questions")
-        await db.execute(
-            re.sub(
-                r"\s+DEFAULT\s+CURRENT_TIMESTAMP", "", created[0],
-                flags=re.IGNORECASE,
-            )
-        )
-        assert "CURRENT_TIMESTAMP" not in (await db.fetchone(
-            "SELECT sql FROM sqlite_master WHERE name = 'pending_a2a_questions'"
-        ))[0]
-
-        store = PendingA2AQuestionStore(db, "did:test:stamps")
-        await store.insert(
-            task_id="t-1",
-            recipient="someone",
-            original_question="are you there",
-            origin_turn_id="turn-1",
-            origin_session_id="sess-1",
-            deadline=datetime(2026, 5, 1, 9, 0, 0, tzinfo=timezone.utc),
-        )
-
-        stamped = await db.fetchval(
-            "SELECT created_at FROM pending_a2a_questions WHERE task_id = 't-1'"
-        )
-        assert stamped is not None, (
-            "the writer left created_at NULL on a database whose schema has no "
-            "default — which is every database created before this fix"
-        )
-        # ...and the shape the NULL used to take on the way out: the row is read
-        # back through `str(r[7])` into a `str` field, so NULL surfaced as the
-        # literal "None" rather than as an absent value.
-        assert str(stamped) != "None"
+        created = await db.fetchone("SELECT sql FROM sqlite_master WHERE name = 'wait_signal_state'")
+        assert created and "CURRENT_TIMESTAMP" in created[0]
+        await db.execute("DROP TABLE wait_signal_state")
+        await db.execute(re.sub(r"\s+DEFAULT\s+CURRENT_TIMESTAMP", "", created[0], flags=re.IGNORECASE))
+        assert "CURRENT_TIMESTAMP" not in (await db.fetchone("SELECT sql FROM sqlite_master WHERE name = 'wait_signal_state'"))[0]
+        store = WaitSignalStore(db, "did:test:stamps")
+        await store.record_pending("task", "local-dispatch", signal_id="signal", target="done", attempts=1)
+        stamped = await db.fetchval("SELECT updated_at FROM wait_signal_state WHERE handle = ?", ("local-dispatch",))
+        assert stamped is not None and str(stamped) != "None"
     finally:
         await db.close()

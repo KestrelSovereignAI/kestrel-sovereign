@@ -10,6 +10,7 @@ from uuid import uuid4
 
 import asyncpg
 import pytest
+from kestrel_sdk.native_a2a.types import Message, Part, Role, SendMessageRequest, TaskState
 from kestrel_sdk.signals.models import SignalHandle
 from kestrel_sdk.tools import Outcome, WaitStatus
 
@@ -18,13 +19,7 @@ from kestrel_sovereign._async_ownership import (
     create_owned_task,
     owned_task_error,
 )
-from kestrel_sovereign.a2a.stores.unified import (
-    ObservabilityStore,
-    SessionService,
-    TaskStore,
-)
-from kestrel_sovereign.a2a.task_manager import TaskManager
-from kestrel_sovereign.a2a.types import Message, TaskSendParams, TaskState, TextPart
+from kestrel_sovereign.a2a.scope import NativeRecipientScope
 from kestrel_sovereign.execution_custody import (
     ExecutionCustody,
     _explicit_control_chain,
@@ -44,6 +39,7 @@ from kestrel_sovereign.waits.reconciler import (
 )
 from tests.integration.test_execution_authority_postgres import GenerationFence
 from tests.integration.test_execution_authority_postgres import native_pg as native_pg
+from tests.utils.native_a2a import manager_for
 
 
 @dataclass
@@ -63,19 +59,10 @@ class NativeWaitRuntime:
 @pytest.fixture
 async def wait_native_runtime(native_pg, tmp_path):
     backend, observer, schema = native_pg
-    manager = TaskManager(
-        TaskStore(backend), SessionService(backend), ObservabilityStore(backend)
-    )
-    await manager.initialize()
     did = "did:web:native-wait-consumer:" + uuid4().hex
-    task = await manager.create_task(
-        TaskSendParams(
-            id=uuid4().hex,
-            sessionId=uuid4().hex,
-            message=Message(role="user", parts=[TextPart(text="native consumer")]),
-        ),
-        agent_name=did,
-    )
+    manager = manager_for(backend, NativeRecipientScope(did), owns_backend=False)
+    await manager.initialize()
+    task = await manager.create_task(SendMessageRequest(message=Message(role=Role.ROLE_USER, parts=[Part(text='native consumer')], message_id=uuid4().hex, context_id=uuid4().hex)), creator_agent_id=did)
     local = SQLiteBackend(str(tmp_path / "actual-wait-consumer.db"))
     await local.connect()
     storage = AsyncStorage.from_backend(local, agent_id=did)
@@ -127,7 +114,7 @@ async def test_native_control_survives_actual_wait_consumers(
     backend, manager, task, runtime, wait_feature, errors = wait_native_runtime
     did = runtime.did
     if route in {"fallback-origin", "enqueue", "harvest"}:
-        await manager.update_status(task.id, TaskState.WORKING, recipient_agent_id=did)
+        await manager.update_status(task.id, TaskState.TASK_STATE_WORKING, recipient_agent_id=did)
         await manager.complete_task(
             task.id, "actual final task row", recipient_agent_id=did
         )
@@ -148,14 +135,14 @@ async def test_native_control_survives_actual_wait_consumers(
 
         async def poll(self, handle):
             row = await manager.get_task_for_recipient(handle, did)
-            terminal = row is not None and row.status.state == TaskState.COMPLETED
+            terminal = row is not None and row.status.state == TaskState.TASK_STATE_COMPLETED
             return WaitStatus(
                 Outcome.DONE if terminal else Outcome.PENDING, "actual task state"
             )
 
         async def origin_session_id(self, handle):
             row = await manager.get_task_for_recipient(handle, did)
-            return row.sessionId if row is not None else None
+            return row.context_id if row is not None else None
 
     class NativeMonitor(NativeProvider):
         async def active_handles(self):
@@ -181,6 +168,7 @@ async def test_native_control_survives_actual_wait_consumers(
     reconciler = getattr(runtime, "_wait_reconciler", None) or WaitReconciler(runtime)
     runtime._wait_reconciler = reconciler
     original_get = manager.get_task_for_recipient
+    original_snapshot = manager.get_task_snapshot
     original_release = asyncpg.pool.PoolAcquireContext.__aexit__
     releases = []
     failed = asyncio.Event()
@@ -189,6 +177,14 @@ async def test_native_control_survives_actual_wait_consumers(
     async def observe_get(*args, **kwargs):
         try:
             return await original_get(*args, **kwargs)
+        except BaseException as error:
+            errors.append(error)
+            failed.set()
+            raise
+
+    async def observe_snapshot(*args, **kwargs):
+        try:
+            return await original_snapshot(*args, **kwargs)
         except BaseException as error:
             errors.append(error)
             failed.set()
@@ -221,6 +217,7 @@ async def test_native_control_survives_actual_wait_consumers(
         runtime.dispatcher = NativeDispatcher()
     backend._execution_custody = ExecutionCustody(GenerationFence())
     monkeypatch.setattr(manager, "get_task_for_recipient", observe_get)
+    monkeypatch.setattr(manager, "get_task_snapshot", observe_snapshot)
     monkeypatch.setattr(asyncpg.pool.PoolAcquireContext, "__aexit__", lose_ack)
     failure = None
     try:
@@ -337,7 +334,7 @@ async def test_borrowed_native_callback_is_not_an_ownership_or_session_answer(
             assert row is None
             return None
         return (
-            row.sessionId if role == "origin" and row is not None else row is not None
+            row.context_id if role == "origin" and row is not None else row is not None
         )
 
     backend._execution_custody = ExecutionCustody(GenerationFence())
@@ -425,7 +422,7 @@ async def test_borrowed_native_callback_is_not_an_ownership_or_session_answer(
         else:
             assert result.error is None
             expected = (
-                task.sessionId
+                task.context_id
                 if role == "origin"
                 else False
                 if role == "ownership"

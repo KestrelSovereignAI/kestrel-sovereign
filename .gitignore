@@ -21,6 +21,8 @@
 # Stream fixture the server and chat-client test suites both assert against.
 !tests/fixtures/stream_tool_join_cases.json
 !tests/fixtures/artifacts/publication-digest.json
+# Reviewed TCK observations contain requirement statuses, never credentials.
+!tests/interop/a2a_tck/COVERAGE.json
 # These are immutable, digest-pinned semantic package resources—not local
 # credentials—and must be versioned so installed wheels can resolve them.
 !kestrel_sovereign/data/semantic/profiles/

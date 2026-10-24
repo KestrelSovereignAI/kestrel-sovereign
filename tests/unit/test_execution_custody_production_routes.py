@@ -16,6 +16,13 @@ from kestrel_sovereign.execution_custody import (
     require_execution_work,
 )
 from tests.unit.test_execution_custody import Authority
+from tests.unit.test_a2a_native_client import (
+    native_signing as native_signing,  # noqa: PLC0414 - pytest fixture export
+    peer_session as peer_session,  # noqa: PLC0414 - pytest fixture export
+    recipient_identity as recipient_identity,  # noqa: PLC0414 - pytest fixture export
+    request_for, reserve,
+)
+
 
 
 def uncertain(*args, **kwargs):
@@ -41,14 +48,14 @@ async def test_a2a_boot_reuses_guarded_native_backend_without_new_pool(monkeypat
     class ReachedStores(Exception):
         pass
 
-    class Manager:
-        def __init__(self, **kwargs):
-            stores.extend(kwargs[name] for name in (
-                "task_store", "session_service", "observability_store",
-                "memory_service", "feedback_store",
-            ))
+    from kestrel_sovereign.a2a.task_manager import TaskManager
 
+    class Manager(TaskManager):
         async def initialize(self):
+            stores.extend(getattr(self, name) for name in (
+                "task_store", "context_store", "session_service", "observability_store",
+                "memory_service", "feedback_store", "outbound_store", "question_store",
+            ))
             raise ReachedStores
 
     monkeypatch.setattr(agent_module, "TaskManager", Manager)
@@ -61,7 +68,7 @@ async def test_a2a_boot_reuses_guarded_native_backend_without_new_pool(monkeypat
     owner.hooks_manager = None
     with pytest.raises(ReachedStores):
         await owner._boot_phase_a2a_observability_signals(BootContext())
-    assert len(stores) == 5
+    assert len(stores) == 8
     assert all(store.backend is backend for store in stores)
     scope.revoke("original runtime retired")
     for store in stores:
@@ -88,74 +95,105 @@ async def test_feature_subagent_preserves_wrapped_commit_uncertainty(boundary):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("route", ["invoke", "send"])
-@pytest.mark.parametrize("loss", ["authorization", "client_entry"])
-async def test_peer_send_retains_runtime_and_rechecks_actual_rpc(route, loss):
-    from kestrel_sovereign.features.peers.directory import LocalHostPeerDirectory, PeerIdentity, PeerRequester
+@pytest.mark.parametrize("route", ["reserve", "send"])
+@pytest.mark.parametrize("loss", ["authorization", "http_dispatch"])
+async def test_peer_send_retains_runtime_and_rechecks_actual_rpc(peer_session, route, loss):
+    p = peer_session
+    if p.admission.backend.backend_type != "postgres":
+        pytest.skip("Transaction-bound runtime custody requires PostgreSQL")
+    from kestrel_sovereign.execution_custody import ProcessRuntimeExecutionFence
 
-    scope = ExecutionCustody(Authority())
-    sends = AsyncMock(return_value=SimpleNamespace(
-        status_code=200, raise_for_status=lambda: None, json=lambda: {},
-    ))
+    scope = ExecutionCustody(ProcessRuntimeExecutionFence(p.admission.scope.recipient_id))
+    p.session._execution_custody = scope
+    dispatch, wire = await reserve(p)
+    authorize = p.session._authorize
+
+    async def revoke_during_authorization():
+        await authorize()
+        await asyncio.sleep(0)
+        scope.revoke("retired during authorization")
+
+    async def revoke_at_http(request):
+        scope.revoke("retired during HTTP dispatch")
+
+    if loss == "authorization":
+        p.session._authorize = revoke_during_authorization
+    else:
+        p.http.event_hooks["request"].append(revoke_at_http)
+    with pytest.raises(ExecutionAuthorityError, match="retired during"):
+        if route == "reserve":
+            if loss == "http_dispatch":
+                # Reservation is local. The first actual RPC must still recheck.
+                dispatch, wire = await reserve(p)
+                await p.session.send(dispatch, wire)
+            else:
+                await reserve(p)
+        else:
+            await p.session.send(dispatch, wire)
+    assert p.state.received_messages == 0
+
+
+
+@pytest.mark.asyncio
+async def test_inbound_a2a_operation_binds_original_runtime_through_authorization(peer_session, monkeypatch):
+    from dataclasses import replace
+    from kestrel_sdk.native_a2a.types import ListTasksRequest
+    from kestrel_sovereign.a2a.request_handler import NativeA2ARequestHandler
+    from kestrel_sovereign.execution_custody import current_execution_custody
+    from tests.utils.native_a2a_security import signed_context, PRINCIPAL
+
+    p = peer_session
+    if p.admission.backend.backend_type != "postgres":
+        pytest.skip("Transaction-bound runtime custody requires PostgreSQL")
+    from kestrel_sovereign.execution_custody import ProcessRuntimeExecutionFence
+
+    scope = ExecutionCustody(ProcessRuntimeExecutionFence(p.admission.scope.recipient_id))
+    guard = p.admission.guard
+    original_lease, authority = guard.lifecycle_lease, guard.authority_factory()
 
     @asynccontextmanager
-    async def client():
-        await asyncio.sleep(0)
-        if loss == "client_entry":
-            scope.revoke("retired during client entry")
-        yield SimpleNamespace(post=sends)
+    async def lease():
+        from kestrel_sovereign.execution_custody import bind_execution_custody_snapshot
 
-    router = LocalHostPeerDirectory("http://synthetic.test", client_factory=client)
-    router._execution_custody = scope
-    peer = PeerIdentity("did:test:peer", "peer", "peer", "Peer", "online", "")
-    requester = PeerRequester("did:test:source", object())
+        with bind_execution_custody_snapshot((scope,)):
+            async with original_lease():
+                yield
 
-    async def authorize(*args):
-        await asyncio.sleep(0)
-        if loss == "authorization":
-            scope.revoke("retired during authorization")
-        return peer
-
-    router._authorize_peer = authorize
-    with pytest.raises(ExecutionAuthorityError, match="retired during"):
-        if route == "invoke":
-            await router.invoke(requester, peer, "message")
-        else:
-            await router.send_a2a_task(requester, peer, {})
-    sends.assert_not_awaited()
-
-
-@pytest.mark.asyncio
-async def test_inbound_a2a_operation_binds_original_runtime_through_authorization(monkeypatch):
-    from kestrel_sovereign.endpoints import agent as endpoint
-    from kestrel_sovereign.execution_custody import current_execution_custody
-
-    scope = ExecutionCustody(Authority())
-    owner = SimpleNamespace(_execution_custody=scope)
-    committed = []
-
-    async def verified_operation(agent, *args):
-        # This continuation represents the asynchronous verifier/authorizer
-        # which also writes a replay nonce on native storage.
+    async def authorize(sender):
         assert scope in current_execution_custody()
-        await asyncio.sleep(0)
+        principal = await authority.authorize_sender(sender)
         scope.revoke("retired during inbound authorization")
-        require_execution_work()
-        committed.append(True)
+        return principal
 
-    monkeypatch.setattr(endpoint, "_create_a2a_task_under_lifecycle_lease", verified_operation)
+    guard = replace(guard, lifecycle_lease=lease, authority_factory=lambda: replace(authority, authorize_sender=authorize))
+    params = request_for(p)
+    handler = NativeA2ARequestHandler(p.admission.manager, guard, p.session.agent_card)
     with pytest.raises(ExecutionAuthorityError, match="inbound authorization"):
-        await endpoint._create_verified_a2a_task(owner, None, None, None, None)
-    assert committed == []
+        await handler.on_message_send(params, signed_context(p.admission, params, operation="SendMessage", proof_changes={
+            "classical_kid": p.arguments["signer"].classical_kid,
+            "pq_kid": p.arguments["signer"].pq_kid,
+        }))
+    tasks = await p.admission.manager.task_store.list_for_creator(
+        ListTasksRequest(tenant=p.admission.scope.tenant), creator_agent_id=PRINCIPAL,
+        recipient_agent_id=p.admission.scope.recipient_id,
+    )
+    assert list(tasks.tasks) == []
+
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("route", ["resolve", "list", "invoke"])
+@pytest.mark.parametrize("route", ["resolve", "list", "session"])
 @pytest.mark.parametrize("wrapper", ["runtime", "peer"])
-async def test_peer_feature_preserves_control_evidence_at_provider_boundaries(route, wrapper):
+async def test_peer_feature_preserves_control_evidence_at_provider_boundaries(peer_session, route, wrapper):
     from kestrel_sovereign.features.peers.feature import PeersFeature
     from kestrel_sovereign.features.peers.directory import PeerIdentity, PeerRequester, PeerTransportError
+    from kestrel_sovereign.a2a.scope import NativeRecipientScope
+    from tests.utils.native_a2a import manager_for
+    from tests.utils.native_a2a_security import PRINCIPAL
 
+    p = peer_session
+    manager = manager_for(p.admission.backend, NativeRecipientScope(PRINCIPAL, "sender-tenant"), owns_backend=False)
+    await manager.initialize()
     async def fail(*args):
         try:
             uncertain()
@@ -164,23 +202,33 @@ async def test_peer_feature_preserves_control_evidence_at_provider_boundaries(ro
                 raise PeerTransportError("transport extension") from error
             raise
 
-    peer = PeerIdentity("did:test:peer", "peer", "peer", "Peer", "online", "")
-    owner = SimpleNamespace(did="did:test:source", _agent_name="source")
+    @asynccontextmanager
+    async def session(*args):
+        await fail()
+        yield p.session
+
+    peer = PeerIdentity(p.admission.scope.recipient_id, "peer", "peer", "Peer", "online", "")
+    owner = SimpleNamespace(did=PRINCIPAL, _agent_name="source", task_manager=manager)
     feature = PeersFeature(owner)
     router = SimpleNamespace(
         resolve_peer=AsyncMock(return_value=peer),
         list_peers=AsyncMock(return_value=[]),
-        invoke=AsyncMock(return_value={}),
+        open_a2a_session=session,
     )
-    getattr(router, {"resolve": "resolve_peer", "list": "list_peers", "invoke": "invoke"}[route]).side_effect = fail
+    if route != "session":
+        getattr(router, {"resolve": "resolve_peer", "list": "list_peers"}[route]).side_effect = fail
     feature._peer_router = router
     feature._peer_requester = PeerRequester(owner.did, object())
-    with pytest.raises(Exception) as caught:
-        if route == "list":
-            await feature.list_peers()
-        else:
-            await feature.ask_agent("peer", "message")
-    assert execution_commit_outcome(caught.value) == "unknown"
+    try:
+        with pytest.raises(Exception) as caught:
+            if route == "list":
+                await feature.list_peers()
+            else:
+                await feature.ask_agent("peer", "message")
+        assert execution_commit_outcome(caught.value) == "unknown"
+    finally:
+        await manager.close()
+
 
 
 @pytest.mark.asyncio

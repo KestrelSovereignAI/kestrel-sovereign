@@ -614,6 +614,8 @@ class TestStartAgent:
     ):
         """Child storage and export roots both bind to this agent."""
         monkeypatch.delenv("KESTREL_A2A_TRANSPORT_KEY", raising=False)
+        monkeypatch.setenv("KESTREL_BASE_URL", "https://process-front-door.test/proxy")
+        monkeypatch.setenv("KESTREL_A2A_DISCOVERY_AGENT", "inherited-wrong-recipient")
         cfg = LocalAgentConfig(
             data_dir=Path("agent_data/claw"), port=8801,
         )
@@ -630,6 +632,8 @@ class TestStartAgent:
         assert env["KESTREL_IDENTITY_EXPORT_DIR"] == str(expected_root)
         assert "KESTREL_DATA_DIR" not in env
         assert env["PORT"] == "8801"
+        assert env["KESTREL_BASE_URL"] == "https://process-front-door.test/proxy"
+        assert env["KESTREL_A2A_DISCOVERY_AGENT"] == "claw"
         assert env["KESTREL_SERVE_UI"] == "false"
         assert env["KESTREL_A2A_TRANSPORT_KEY"]
         assert env["KESTREL_API_KEY"] == ""

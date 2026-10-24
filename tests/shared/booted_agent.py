@@ -10,6 +10,8 @@ answer that CI, without the package, never hands out (#3578).
 
 from __future__ import annotations
 
+from tests.shared.native_shutdown_budget import shutdown_fixture_agent
+
 import os
 from contextlib import asynccontextmanager
 from typing import AbstractSet
@@ -57,5 +59,5 @@ async def booted_agent(
         await agent.bootstrap_service.set_bootstrap_state(BootstrapState.COMPLETE)
         yield agent
     finally:
-        await agent.shutdown()
+        await shutdown_fixture_agent(agent)
         await llm_service.close()

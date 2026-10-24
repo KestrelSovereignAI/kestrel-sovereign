@@ -31,6 +31,10 @@ class NativeJournalDurabilityRefusal(NativeJournalConfigurationError):
     """Native preflight refused BEFORE the original sqlite COMMIT call."""
 
 
+class NativeJournalCancellationError(NativeJournalConfigurationError):
+    """The native CancelRequest executor aborted an original journal session."""
+
+
 def _native_tls_mutator(name):
     def mutate(self, *args, **kwargs):
         with self._native_journal_tls_lock:
@@ -537,6 +541,24 @@ else:
         _params: object
         _protocol: object
         _cancellations: set
+        _native_connection: object
+
+        @property
+        def _config(self):
+            return self._native_connection._config
+
+        @property
+        def _aborted(self):
+            return self._native_connection._aborted
+
+        def terminate(self):
+            # The original native connection owns protocol retirement. Keep
+            # asyncpg's failure handling without substituting cancellation I/O.
+            native = self._native_connection
+            if native._journal_program_seal is not None and native._journal_cancel_failure is None:
+                native._journal_cancel_failure = NativeJournalCancellationError(
+                    'Original native CancelRequest failed; asyncpg terminated the session')
+            asyncpg.Connection.terminate(self._native_connection)
 
         @classmethod
         def capture(cls, connection, *, tls_context, tls_object):
@@ -561,17 +583,18 @@ else:
             else:
                 raise NativeJournalConfigurationError('Original native cancellation socket is unsupported')
             return cls(loop, address, params, connection._protocol,
-                       connection._cancellations)
+                       connection._cancellations, connection)
 
     class NativeJournalPostgresConnection(asyncpg.Connection):
         """Pass as asyncpg.create_pool(connection_class=...) for native journals."""
-        __slots__ = ('_journal_programs_configured', '_journal_program_seal', '_journal_program_completion', '_journal_cancel_connection', '_journal_tls_policy_seal')
+        __slots__ = ('_journal_programs_configured', '_journal_program_seal', '_journal_program_completion', '_journal_cancel_connection', '_journal_cancel_failure', '_journal_tls_policy_seal')
 
         def __init__(self, *args, **kwargs):
             self._journal_programs_configured = False
             self._journal_program_seal = None
             self._journal_program_completion = None
             self._journal_cancel_connection = None
+            self._journal_cancel_failure = None
             self._journal_tls_policy_seal = None
             super().__init__(*args, **kwargs)
             tls = self._transport.get_extra_info('ssl_object')
@@ -668,6 +691,7 @@ else:
                 policy.__exit__(None, None, None)
                 raise
             self._journal_tls_policy_seal = policy
+            self._journal_cancel_failure = None
             self._journal_program_completion = completion
             self._journal_program_seal = (asyncio.current_task(), native_state)
 
@@ -681,12 +705,12 @@ else:
             self._query_loggers.clear()
             super().terminate()
 
-        async def _cancel(self, waiter):
+        async def _cancel(self, waiter, cancel_waiter=None):
             try:
                 cancellation = self._journal_cancel_connection
                 if cancellation is not None:
-                    return await asyncpg.Connection._cancel(cancellation, waiter)
-                return await super()._cancel(waiter)
+                    return await asyncpg.Connection._cancel(cancellation, waiter, cancel_waiter)
+                return await super()._cancel(waiter, cancel_waiter)
             finally:
                 # asyncpg queries current_task(self._loop). Its connection-
                 # local TLS delegate still schedules on the actual native

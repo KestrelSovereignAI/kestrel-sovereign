@@ -9,6 +9,8 @@ scripted tool calls, but the features and their tools are real. This
 verifies the full dispatch pipeline.
 """
 
+from tests.shared.native_shutdown_budget import shutdown_fixture_agent
+
 import logging
 import logging.handlers
 from contextlib import contextmanager
@@ -89,7 +91,7 @@ async def agent(temp_db):
 
     yield a
 
-    await a.shutdown()
+    await shutdown_fixture_agent(a)
     await llm_service.close()
 
 

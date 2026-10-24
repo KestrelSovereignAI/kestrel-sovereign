@@ -28,6 +28,7 @@ Skipped when that is not set, so CI stays green.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import os
@@ -497,17 +498,12 @@ def test_runtime_rejected_startup_setting_is_not_reported_healthy(
     assert any("governance NOT verified" in message for message in report.fail)
 
 
-def test_asyncpg_031_service_file_reaches_doctor_unchanged(
+def test_asyncpg_service_file_reaches_doctor_unchanged(
     tmp_path, monkeypatch, canonical, runtime_db
 ):
-    """The current minor's public service/servicefile behavior needs no mirror."""
-    from importlib.metadata import version
-
-    from packaging.version import Version
+    """Doctor must read the exact database selected by the runtime's service."""
+    import asyncpg
     from psycopg2.extensions import parse_dsn
-
-    if Version(version("asyncpg")) < Version("0.31"):
-        pytest.skip("asyncpg 0.31 service-file support is not installed")
 
     _seed_project(tmp_path, anchored_hash=canonical)
     runtime_db(
@@ -527,10 +523,21 @@ def test_asyncpg_031_service_file_reaches_doctor_unchanged(
         + "\n"
     )
     monkeypatch.setenv("KESTREL_DB_BACKEND", "postgres")
+    # Omit the database path entirely: '/' supplies an explicit empty database
+    # to asyncpg and prevents the service file's dbname from being selected.
     monkeypatch.setenv(
-        "KESTREL_DATABASE_URL", "postgresql:///?service=doctor_runtime"
+        "KESTREL_DATABASE_URL", "postgresql://?service=doctor_runtime"
     )
     monkeypatch.setenv("PGSERVICEFILE", str(service_file))
+
+    async def verify_native_service_database():
+        connection = await asyncpg.connect(os.environ["KESTREL_DATABASE_URL"])
+        try:
+            assert await connection.fetchval("SELECT current_database()") == parsed["dbname"]
+        finally:
+            await connection.close()
+
+    asyncio.run(verify_native_service_database())
 
     report = diagnose(tmp_path)
 

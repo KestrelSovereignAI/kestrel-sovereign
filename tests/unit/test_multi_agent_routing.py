@@ -29,15 +29,10 @@ def _make_mock_agent(agent_id: str = "did:pkh:eip155:1:0xABC", name: str = "Test
     agent.observability_store = MagicMock()
     agent.observability_store.query_events = AsyncMock(return_value=[])
 
-    # Mock get_agent_card for /api/agents endpoint
-    mock_card = MagicMock()
-    mock_card.model_dump.return_value = {
+    agent.get_public_profile = AsyncMock(return_value={
         "name": name,
         "description": f"Test agent {name}",
-        "url": f"http://localhost:8080",
-        "version": "1.0",
-    }
-    agent.get_agent_card = AsyncMock(return_value=mock_card)
+    })
 
     # Mock basic agent methods used by endpoints
     agent.privacy_mode = MagicMock()

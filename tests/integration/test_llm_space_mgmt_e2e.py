@@ -6,14 +6,29 @@ These tests manage actual disk space and delete real models. They require:
 - At least one installed model
 - Permission to delete models
 
-Run with: pytest tests/integration/test_llm_space_mgmt_e2e.py -x -v
+Only run the destructive cases against a disposable local daemon:
+RUN_OLLAMA_MODEL_MUTATION_TESTS=1 pytest tests/integration/test_llm_space_mgmt_e2e.py -x -v
 """
 import pytest
 import pytest_asyncio
-import requests
 import asyncio
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from kestrel_sovereign.llm.service import LLMService
+from kestrel_sovereign.storage.timestamps import (
+    timestamp_column_value,
+    utc_timestamp_parameter,
+)
+from tests.shared.live_ollama import skip_if_no_ollama as skip_if_no_ollama
+
+
+async def _seed_model_usage(service, model_id, last_used):
+    await service._usage_db.execute("""
+        INSERT OR REPLACE INTO model_usage (model_id, provider, last_used, use_count)
+        VALUES (?, ?, ?, ?)
+    """, (
+        model_id, "ollama",
+        utc_timestamp_parameter(service._usage_db.backend_type, last_used), 1,
+    ))
 
 
 @pytest.fixture(autouse=True)
@@ -27,17 +42,6 @@ def sovereign_turn(monkeypatch):
     monkeypatch.setenv("KESTREL_API_KEY", key)
     with caller_context_scope(CallerContext.sovereign(identity="integration", credential=key)):
         yield
-
-
-@pytest.fixture(scope="module")
-def skip_if_no_ollama():
-    """Check if Ollama is running"""
-    try:
-        response = requests.get("http://localhost:11434/api/tags", timeout=2)
-        if response.status_code != 200:
-            pytest.skip("Ollama not running on localhost:11434")
-    except Exception:
-        pytest.skip("Ollama not accessible")
 
 
 @pytest_asyncio.fixture
@@ -157,11 +161,8 @@ class TestSpaceManagement:
 
         # Manually set last_used to 60 days ago using async database
         if hasattr(llm_service, '_usage_db') and llm_service._usage_db:
-            old_date = (datetime.now() - timedelta(days=60)).isoformat()
-            await llm_service._usage_db.execute("""
-                INSERT OR REPLACE INTO model_usage (model_id, provider, last_used, use_count)
-                VALUES (?, ?, ?, ?)
-            """, (test_model_name, "ollama", old_date, 1))
+            old_date = datetime.now(timezone.utc) - timedelta(days=60)
+            await _seed_model_usage(llm_service, test_model_name, old_date)
             print(f"Set {test_model_name} last_used to {old_date}")
         else:
             pytest.skip("Database not initialized")
@@ -313,6 +314,18 @@ class TestSpaceManagement:
 
 class TestDatabaseIntegration:
     """Test database integration for usage tracking"""
+
+    @pytest.mark.asyncio
+    async def test_historical_usage_timestamp_round_trips(self, llm_service):
+        """Seed historical usage on real storage without touching any daemon."""
+        model_id = "fixture-historical-usage"
+        old_date = datetime.now(timezone.utc) - timedelta(days=60)
+        await _seed_model_usage(llm_service, model_id, old_date)
+        row = await llm_service._usage_db.fetchone(
+            "SELECT last_used FROM model_usage WHERE model_id = ?", (model_id,),
+        )
+        assert row is not None
+        assert timestamp_column_value(row[0]).replace(tzinfo=timezone.utc) == old_date
 
     @pytest.mark.asyncio
     async def test_usage_database_created(self, llm_service):

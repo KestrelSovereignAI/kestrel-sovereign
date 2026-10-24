@@ -264,6 +264,8 @@ class _OriginalPostgresJournalPool:
     def _require_native_programs(native, wrapper):
         import asyncpg
         from kestrel_sovereign.storage.db.native_journal_programs import NativeJournalPostgresConnection, _native_journal_connect
+        if type(native) is asyncpg.Pool and (native._minsize != 0 or native._maintenance_task is not None):
+            raise ExecutionAuthorityError('Original signal journal refuses autonomous pool maintenance')
         if (type(native) is not asyncpg.Pool or wrapper is not None or native._setup is not None
                 or native._init is not None or native._reset is not None
                 or (native._connect is not asyncpg.connection.connect and native._connect is not _native_journal_connect)

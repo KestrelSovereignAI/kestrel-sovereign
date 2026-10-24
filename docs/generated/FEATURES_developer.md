@@ -285,8 +285,8 @@ bearer JWT, or OAuth session and returns operator diagnostics.
 | `GET` | `/agent/notifications/sse` |
 | `GET` | `/agent/context-status` |
 | `GET` | `/agent/reflection/status` |
-| `GET` | `/agent/tasks` |
-| `POST` | `/agent/tasks/send` |
+| `GET` | `/api/agent/task-inbox` |
+| `GET` | `/api/agent/task-inbox/{task_id}` |
 | `GET` | `/agent/heartbeat/status` |
 | `POST` | `/agent/heartbeat/trigger` |
 

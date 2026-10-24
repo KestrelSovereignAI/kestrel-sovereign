@@ -9,6 +9,8 @@ All key storage is agent-scoped - each agent has isolated key storage.
 Run with: uv run pytest tests/integration/test_agent_own_key.py -v
 """
 
+from tests.shared.native_shutdown_budget import shutdown_fixture_agent
+
 import os
 import tempfile
 import pytest
@@ -223,7 +225,7 @@ async def test_kestrel_agent_activates_key_on_initialize():
             ]
             assert openrouter_routes, "No openrouter route initialized"
 
-            await agent.shutdown()
+            await shutdown_fixture_agent(agent)
 
         finally:
             # Always clean up the OpenRouter key

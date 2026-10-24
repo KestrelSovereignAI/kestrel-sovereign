@@ -50,7 +50,7 @@ Every change to a delivered row that does NOT wake the agent — a re-key of
 ``last_signaled_outcome`` to the token the same event is now polled under —
 is also appended to ``wait_signal_rekeys`` in the same transaction (#3390).
 
-Like :class:`PendingA2AQuestionStore`, every query is filtered by
+Every query is filtered by
 ``agent_id`` so a shared backend (e.g. Postgres) cannot leak rows between
 agents. ``agent_id`` is the owning agent's DID; tests can pass any string.
 
@@ -133,7 +133,7 @@ def _parse_utc(
 def _coerce_ts(value: TimeArg) -> Optional[datetime]:
     """Normalize a timestamp argument to a naive-UTC datetime.
 
-    Mirrors :meth:`PendingA2AQuestionStore.insert`'s tzinfo-strip: Postgres
+    Uses the canonical database timestamp representation: Postgres
     TIMESTAMP columns reject tz-aware datetimes and ISO strings, while SQLite
     accepts datetime values via aiosqlite's adapter. So we parse ISO strings
     to datetimes and strip tzinfo for backend portability.
@@ -254,7 +254,7 @@ class WaitSignalStore:
             )
         self._db = db
         # Empty string is the back-compat default for solo-agent SQLite
-        # (the schema default is also ''), matching PendingA2AQuestionStore.
+        # (the schema default is also ''), using the same canonical scope.
         self._agent_id = agent_id
 
     # ------------------------------------------------------------------
@@ -310,7 +310,7 @@ class WaitSignalStore:
         translation (storage/db/placeholder.py) rewrites ``INSERT OR IGNORE
         INTO`` to ``... ON CONFLICT DO NOTHING`` for Postgres, with matching
         rowcount semantics (0 on conflict). This is the same pattern
-        ``PendingA2AQuestionStore.insert`` relies on.
+        all canonical wait writes rely on.
         """
         rowcount = await self._db.execute(
             """

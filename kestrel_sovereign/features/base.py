@@ -15,36 +15,22 @@ from typing import (
     List,
     Mapping,
     Optional,
-    Protocol,
-    Type as Type,
     Union,
-    runtime_checkable,
+)
+from typing import (
+    Type as Type,
 )
 
 if TYPE_CHECKING:
     from kestrel_sdk.hooks.base import Hook
-from abc import ABC as ABC, abstractmethod
+from abc import ABC as ABC
+from abc import abstractmethod
 
-# Import the A2A types from the SDK directly rather than the
-# ``kestrel_sovereign.a2a`` re-export package. Importing the sovereign a2a
-# package runs its ``__init__`` which eagerly pulls in task_manager/task_worker
-# → the A2A stores → the storage SQLA models, and those models size a vector
-# column at import time via ``get_provider_embedding_service()``. When
-# ``features.base`` is still being initialized (it is imported very early), that
-# chain re-enters ``from kestrel_sovereign.features.base import Feature`` against
-# the half-built module and raises a circular ImportError that silently disables
-# provider embeddings (#1792). The sovereign modules are pure re-exports of
-# these same SDK symbols, so importing them from the SDK is equivalent.
-from kestrel_sdk.a2a.agent_card import AgentCapabilities, AgentCard, AgentSkill
-from kestrel_sdk.a2a.types import (
-    Artifact,
-    DataPart,
-    Message,
-    Task,
-    TaskState,
-    TaskStatus,
-    TextPart,
-)
+# Import public native protocol values directly. The host's a2a package still
+# owns lifecycle services; importing it here would re-enter early feature boot.
+from kestrel_sdk.native_a2a.helpers.proto_helpers import new_raw_artifact, new_text_message
+from kestrel_sdk.native_a2a.types import Task, TaskState, TaskStatus
+from google.protobuf.json_format import MessageToDict
 
 # The SDK Feature is the canonical base class for feature packages.
 # Sovereign's richer Feature inherits from it so extracted packages that
@@ -59,9 +45,12 @@ from kestrel_sdk.features.base import Feature as _SdkFeature
 # real JSON types instead of silently degrading to "string" (review finding
 # F003). The two former in-tree copies were verified behaviourally identical to
 # these across every feature docstring in the tree before removal.
-from kestrel_sdk.features.base import parse_docstring_params as parse_docstring_params, tool as tool
+from kestrel_sdk.features.base import parse_docstring_params as parse_docstring_params
+from kestrel_sdk.features.base import tool as tool
 from kestrel_sdk.features.ui import UIContributions
-from kestrel_sdk.tools.base import AgentTool, ToolCategory as ToolCategory, ToolParameter as ToolParameter, ToolSchema
+from kestrel_sdk.tools.base import AgentTool, ToolSchema
+from kestrel_sdk.tools.base import ToolCategory as ToolCategory
+from kestrel_sdk.tools.base import ToolParameter as ToolParameter
 from kestrel_sdk.tools.result import ToolResult, ToolResultStatus
 
 from kestrel_sovereign.execution_custody import (
@@ -310,12 +299,6 @@ def _subagent_turn_identity(session_id: Optional[str]):
     return LLMInvocationContext(session_id=session_id)
 
 
-@runtime_checkable
-class TaskHandler(Protocol):
-    """Protocol for A2A task handling. Features implement this."""
-    async def handle_task(self, task: Task) -> Task:
-        """Handle an A2A task and return the updated task."""
-        ...
 
 
 class Feature(_SdkFeature):
@@ -1302,126 +1285,92 @@ class Feature(_SdkFeature):
     # A2A Protocol Implementation
     # =========================================================================
 
-    def get_agent_card(self) -> AgentCard:
+    async def handle_task(
+        self, task: Task, *, arguments: dict[str, Any] | None = None
+    ) -> Task:
+        """Execute an explicit skill using native A2A task and artifact values.
+
+        The SDK Feature contributes skills from ToolSchema. The host owns its
+        signed Agent Card; features do not publish cards or wire identities.
         """
-        Generate an AgentCard for this Feature.
-
-        This allows the Feature to be discovered and called as an A2A agent.
-        The AgentCard describes the Feature's capabilities (skills) to other agents.
-
-        Uses the canonical AgentSkill attached by the @tool decorator — same
-        metadata source as get_tools(), no parallel construction.
-        Skills in ``self.disabled_skills`` are excluded (get_tools() already
-        filters them, so the card stays in sync).
-        """
-        skills = []
-        for tool in self.get_tools():
-            if hasattr(tool, 'agent_skill') and tool.agent_skill is not None:
-                skills.append(tool.agent_skill)
-            else:
-                # Fallback for tools without a decorator-attached AgentSkill
-                schema = tool.schema
-                skills.append(AgentSkill(
-                    id=schema.name,
-                    name=schema.name,
-                    description=schema.description,
-                    tags=[schema.category.value] if schema.category else None,
-                    inputModes=["application/json"],
-                    outputModes=["application/json"],
-                    category=schema.category.value if schema.category else None,
-                ))
-
-        return AgentCard(
-            name=self.tool_name,
-            description=self.tool_description,
-            url=f"/agents/{self.tool_name}",
-            version="1.0.0",
-            capabilities=AgentCapabilities(
-                streaming=False,
-                pushNotifications=False,
-                stateTransitionHistory=False,
-            ),
-            skills=skills,
-        )
-
-    async def handle_task(self, task: Task) -> Task:
-        """
-        Handle an A2A task by routing to the appropriate skill/tool.
-
-        This is the A2A TaskHandler implementation. When TaskManager routes
-        a task to this Feature, this method:
-        1. Extracts the skill name from task metadata
-        2. Finds the corresponding @tool method
-        3. Executes it with the provided arguments
-        4. Returns the updated task with results
-
-        Args:
-            task: The A2A Task to handle
-
-        Returns:
-            Updated Task with status and artifacts
-        """
+        if not isinstance(task, Task):
+            raise TypeError("Feature task handling requires an official A2A Task")
+        metadata = MessageToDict(task.metadata)
+        skill_name = metadata.get("skill")
+        args = metadata.get("args", {}) if arguments is None else arguments
+        if not isinstance(skill_name, str) or not skill_name:
+            task.status.CopyFrom(
+                TaskStatus(
+                    state=TaskState.TASK_STATE_REJECTED,
+                    message=new_text_message(
+                        "An explicit skill is required",
+                        task_id=task.id,
+                        context_id=task.context_id,
+                    ),
+                )
+            )
+            return task
+        selected = self._get_tool_by_name(skill_name)
+        if selected is None or not isinstance(args, dict):
+            task.status.CopyFrom(
+                TaskStatus(
+                    state=TaskState.TASK_STATE_REJECTED,
+                    message=new_text_message(
+                        f"Unknown skill or invalid arguments: {skill_name}",
+                        task_id=task.id,
+                        context_id=task.context_id,
+                    ),
+                )
+            )
+            return task
+        task.status.CopyFrom(TaskStatus(state=TaskState.TASK_STATE_WORKING))
         try:
-            # Update task to WORKING state
-            task.status = TaskStatus(state=TaskState.WORKING)
+            result = await selected.execute(**args)
+            result = _serialize_tool_result(result)
+            # Inline standard JSON preserves integer types and identifiers
+            # beyond binary64 precision. Encoding must succeed before the
+            # task may claim completion after its tool effect.
+            from kestrel_sovereign.a2a.media import encode_inline_json
 
-            # Extract skill and args from task metadata
-            metadata = task.metadata or {}
-            skill_name = metadata.get("skill")
-            args = metadata.get("args", {})
-
-            if not skill_name:
-                # If no skill specified, try to infer from message
-                if task.history and task.history[-1].parts:
-                    for part in task.history[-1].parts:
-                        if hasattr(part, 'text'):
-                            # Could parse command from text here
-                            pass
-
-                # Default to first skill if only one exists
-                tools = self.get_tools()
-                if len(tools) == 1:
-                    skill_name = tools[0].name
-                else:
-                    raise ValueError(f"No skill specified. Available: {[t.name for t in tools]}")
-
-            # Find and execute the tool
-            tool = self._get_tool_by_name(skill_name)
-            if not tool:
-                raise ValueError(f"Unknown skill: {skill_name}")
-
-            result = await tool.execute(**args)
-
-            # Create artifact with result
-            artifact = Artifact(
-                name=f"{skill_name}_result",
-                parts=[DataPart(data=result)],
+            payload = encode_inline_json(result)
+            artifact = new_raw_artifact(
+                f"{skill_name}_result", payload, media_type="application/json"
             )
-            task.artifacts = [artifact]
-
-            # Mark completed
-            task.status = TaskStatus(
-                state=TaskState.COMPLETED,
-                message=Message(
-                    role="agent",
-                    parts=[TextPart(text=f"Completed {skill_name}")]
-                )
-            )
-
-            return task
-
-        except Exception as e:
-            if is_execution_control_error(e):
+        except Exception as error:
+            if is_execution_control_error(error):
                 raise
-            logger.error(f"Feature {self.name} task handling failed: {e}")
-            task.status = TaskStatus(
-                state=TaskState.FAILED,
-                message=Message(
-                    role="agent",
-                    parts=[TextPart(text=f"Error: {str(e)}")]
+            logger.exception(
+                "Feature %s task handling failed for %s", self.name, skill_name
+            )
+            task.status.CopyFrom(
+                TaskStatus(
+                    state=TaskState.TASK_STATE_FAILED,
+                    message=new_text_message(
+                        str(error), task_id=task.id, context_id=task.context_id
+                    ),
                 )
             )
             return task
+        task.artifacts.append(artifact)
+        failed = (
+            isinstance(result, dict) and (
+                result.get("success") is False
+                or (is_flat_toolresult_envelope(result) and result["status"] == ToolResultStatus.ERROR)
+            )
+        )
+        task.status.CopyFrom(
+            TaskStatus(
+                state=TaskState.TASK_STATE_FAILED
+                if failed
+                else TaskState.TASK_STATE_COMPLETED,
+                message=new_text_message(
+                    str(result.get("error") or "Tool reported failure without error details") if failed else f"Completed {skill_name}",
+                    task_id=task.id,
+                    context_id=task.context_id,
+                ),
+            )
+        )
+        return task
 
     def _get_tool_by_name(self, name: str) -> Optional[AgentTool]:
         """Get a tool by its name."""
@@ -2423,8 +2372,8 @@ ABSOLUTE PROHIBITION - NEVER FABRICATE:
         """
         Auto-discover methods decorated with @tool and return them as AgentTool instances.
 
-        Each returned tool carries the canonical AgentSkill created by the @tool
-        decorator, so get_agent_card() can reuse it without rebuilding metadata.
+        ToolSchema is the capability source. The SDK Feature projects native
+        AgentSkill values from these schemas when the host builds its card.
 
         Tools whose names appear in ``self.disabled_skills`` are excluded.
         """
@@ -2437,14 +2386,11 @@ ABSOLUTE PROHIBITION - NEVER FABRICATE:
                 if schema_data["name"] in self.disabled_skills:
                     continue
 
-                agent_skill = getattr(method, "_agent_skill", None)
-
                 # Create a dynamic AgentTool wrapper
                 class DynamicTool(AgentTool):
-                    def __init__(self, func, schema_data, agent_skill):
+                    def __init__(self, func, schema_data):
                         self.func = func
                         self._schema_data = schema_data
-                        self.agent_skill = agent_skill
                         self._execution_custody = getattr(func.__self__.agent, "_execution_custody", None)
 
                     @property
@@ -2580,5 +2526,5 @@ ABSOLUTE PROHIBITION - NEVER FABRICATE:
                         _attach_envelope_parts(response, None, pending_parts)
                         return response
 
-                tools.append(DynamicTool(method, schema_data, agent_skill))
+                tools.append(DynamicTool(method, schema_data))
         return tools

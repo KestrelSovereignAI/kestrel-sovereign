@@ -11,15 +11,15 @@ Tests the new lifecycle methods on the Feature base class:
 - Config persistence via graph store
 """
 
-import pytest
 from typing import Dict, List, Optional
 from unittest.mock import AsyncMock, MagicMock, patch
 
-from kestrel_sovereign.features.base import Feature, tool
-from kestrel_sovereign.hooks import HooksManager
+import pytest
 from kestrel_sdk.hooks.base import Hook, HookEvent, HookInput, HookOutput
 from kestrel_sdk.tools.base import ToolCategory
 
+from kestrel_sovereign.features.base import Feature, tool
+from kestrel_sovereign.hooks import HooksManager
 
 # === Test Hook Implementation ===
 
@@ -418,11 +418,11 @@ class TestDisabledSkills:
         assert "skill_alpha" not in names
         assert "skill_beta" in names
 
-    def test_disabled_skill_excluded_from_agent_card(self, mock_agent):
+    def test_disabled_skill_excluded_from_native_skills(self, mock_agent):
         feature = ToolFeature(mock_agent)
         feature.disabled_skills = {"skill_beta"}
-        card = feature.get_agent_card()
-        skill_names = {s.name for s in card.skills}
+        skills = feature.get_agent_skills()
+        skill_names = {s.id for s in skills}
         assert "skill_beta" not in skill_names
         assert "skill_alpha" in skill_names
 
@@ -430,8 +430,8 @@ class TestDisabledSkills:
         feature = ToolFeature(mock_agent)
         feature.disabled_skills = {"skill_alpha", "skill_beta"}
         assert feature.get_tools() == []
-        card = feature.get_agent_card()
-        assert card.skills == []
+        skills = feature.get_agent_skills()
+        assert skills == []
 
     def test_disabled_skills_initialized_empty(self, mock_agent):
         feature = SimpleFeature(mock_agent)

@@ -45,9 +45,10 @@ pytestmark = [pytest.mark.asyncio, pytest.mark.integration]
 native_pg = _native_pg_fixture
 
 
-async def _fresh_journal_pool(original, **options):
+async def _fresh_journal_pool(original, *, initial_size=0, **options):
     import asyncpg
     options.setdefault('connection_class', original._connection_class)
+    options.update(init_size=initial_size, min_size=0)
     return await asyncpg.create_pool(*original._connect_args, **original._connect_kwargs, **options)
 
 
@@ -158,14 +159,14 @@ async def test_postgres_reconnect_pins_actual_socket_peer_across_dns_change(disp
     cancellations = []
     from kestrel_sovereign.storage.db.native_journal_programs import NativeJournalPostgresConnection
     cancel = NativeJournalPostgresConnection._cancel
-    async def observe_cancel(connection, waiter):
+    async def observe_cancel(connection, waiter, cancel_waiter=None):
         if connection._journal_program_seal is not None:
             cancellations.append(asyncio.current_task())
-        return await cancel(connection, waiter)
+        return await cancel(connection, waiter, cancel_waiter)
     monkeypatch.setattr(NativeJournalPostgresConnection, '_cancel', observe_cancel)
     try:
         _, retire_proxy = await _owned_native_pg_proxy(changed_host, port, target, on_accept=accepted_peers.append)
-        pool = await _fresh_journal_pool(original_pool, min_size=1, max_size=1,
+        pool = await _fresh_journal_pool(original_pool, initial_size=1, max_size=1,
             host=alias, port=port, ssl='disable', timeout=2, command_timeout=1)
         c.backend._pool = pool
         scope = ExecutionCustody(_OriginalWork(backend_type='postgres'))
@@ -217,15 +218,23 @@ async def test_postgres_reconnect_pins_actual_socket_peer_across_dns_change(disp
 @pytest.mark.parametrize('direct_tls,journal_cancel,trust_change,sibling,ssl_mode', [(False, False, False, False, 'verify-full'), (True, False, False, False, 'verify-full'), (False, True, False, False, 'verify-full'), (False, False, True, False, 'verify-full'), (True, False, True, False, 'verify-full'), (False, False, False, True, 'verify-full'), (True, False, False, True, 'verify-full'), (False, True, False, False, 'allow'), (False, True, False, False, 'prefer'), (False, False, 'context', False, 'verify-full'), (True, False, 'context', False, 'verify-full'), (False, False, 'transport', False, 'verify-full'), (True, False, 'transport', False, 'verify-full')])
 async def test_postgres_pinned_peer_keeps_native_tls_identity_on_reconnect(dispatcher_components, native_pg, monkeypatch, tmp_path, direct_tls, journal_cancel, trust_change, sibling, ssl_mode):
     from kestrel_sovereign._async_ownership import await_owned_task
-    from kestrel_sovereign.execution_custody import ExecutionCustody, bind_execution_runtime
+    from kestrel_sovereign.execution_custody import (
+        ExecutionCustody,
+        bind_execution_runtime,
+    )
     from tests.unit.test_native_journal_programs import _owned_tls_contexts
     from tests.unit.test_signal_outcome_terminal_custody import _OriginalWork
     from tests.unit.test_signals_dispatcher import _action_reg, _signal
     c = dispatcher_components
-    from kestrel_sovereign.storage.db.native_journal_programs import NativeJournalPostgresConnection
+    from kestrel_sovereign.storage.db.native_journal_programs import (
+        NativeJournalPostgresConnection,
+    )
     if trust_change == 'transport':
-        from kestrel_sovereign.storage.db.native_journal_programs import _adopt_native_tls_context
         import ssl
+
+        from kestrel_sovereign.storage.db.native_journal_programs import (
+            _adopt_native_tls_context,
+        )
         replacement_policy = _adopt_native_tls_context(ssl.create_default_context())
         original_begin = NativeJournalPostgresConnection._begin_original_journal
         def change_transport(connection, *args, **kwargs):
@@ -238,11 +247,11 @@ async def test_postgres_pinned_peer_keeps_native_tls_identity_on_reconnect(dispa
     original_cancel = NativeJournalPostgresConnection._cancel
     cancellation_requested = asyncio.Event()
     cancellation_owners = []
-    async def observed_cancel(connection, waiter):
+    async def observed_cancel(connection, waiter, cancel_waiter=None):
         if journal_cancel and connection._journal_program_seal is not None:
             cancellation_owners.append(asyncio.current_task())
             cancellation_requested.set()
-        return await original_cancel(connection, waiter)
+        return await original_cancel(connection, waiter, cancel_waiter)
     monkeypatch.setattr(NativeJournalPostgresConnection, '_cancel', observed_cancel)
     _, control, schema = native_pg
     target = control._transport.get_extra_info('peername')[:2]
@@ -256,7 +265,10 @@ async def test_postgres_pinned_peer_keeps_native_tls_identity_on_reconnect(dispa
     association_attempts = []
     if trust_change == 'admission':
         import ssl
-        from kestrel_sovereign.storage.db.native_journal_programs import _adopt_native_tls_context
+
+        from kestrel_sovereign.storage.db.native_journal_programs import (
+            _adopt_native_tls_context,
+        )
         replacement_policy = _adopt_native_tls_context(ssl.create_default_context(cafile=str(replacement_cert)))
         original_principal = NativeJournalPostgresConnection._original_journal_principal
         async def changed_during_principal(connection):
@@ -292,7 +304,7 @@ async def test_postgres_pinned_peer_keeps_native_tls_identity_on_reconnect(dispa
     held = []
     release_owner = None
     try:
-        pool = await _fresh_journal_pool(original_pool, min_size=2 if sibling else 1, max_size=2 if sibling else 1,
+        pool = await _fresh_journal_pool(original_pool, initial_size=2 if sibling else 1, max_size=2 if sibling else 1,
             host=alias, port=endpoint[1], ssl=ssl_mode, direct_tls=direct_tls, timeout=3, command_timeout=1)
         c.backend._pool = pool
         if journal_cancel:
@@ -353,17 +365,30 @@ async def test_postgres_pinned_peer_keeps_native_tls_identity_on_reconnect(dispa
             assert await control.fetchval(f'SELECT COUNT(*) FROM ONLY "{schema}".signal_log WHERE id=$1', signal.id) == 0
             return
         if trust_change in ('context', 'transport'):
-            from kestrel_sovereign.execution_custody import is_execution_control_error, execution_commit_outcome
+            from kestrel_sovereign.execution_custody import (
+                execution_commit_outcome,
+                is_execution_control_error,
+            )
             assert is_execution_control_error(outcome.error), 'mutated admitted TLS policy accepted a replacement certificate'
             assert execution_commit_outcome(outcome.error) is None
             assert names == [alias] * (2 if trust_change == 'transport' else 1), 'changed TLS policy reached an unexpected native handshake'
             assert await control.fetchval(f'SELECT COUNT(*) FROM ONLY "{schema}".signal_log WHERE id=$1', signal.id) == 0
             return
         if deny_cancel:
-            from kestrel_sovereign.execution_custody import is_execution_control_error, execution_commit_outcome, _explicit_control_chain
+            from kestrel_sovereign.execution_custody import (
+                _explicit_control_chain,
+                execution_commit_outcome,
+                is_execution_control_error,
+            )
             assert is_execution_control_error(outcome.error), 'TLS-denied cancellation/rollback cannot report a healthy journal'
             assert execution_commit_outcome(outcome.error) is None
-            assert any(isinstance(error, ConnectionError) and 'rejected SSL upgrade' in str(error)
+            from kestrel_sovereign.storage.db.native_journal_programs import (
+                NativeJournalCancellationError,
+            )
+            # asyncpg 0.32 suppresses the underlying TLS exception after its
+            # native CancelRequest executor aborts the session. Preserve that
+            # actual physical failure, without inventing the lost SSL cause.
+            assert any(isinstance(error, NativeJournalCancellationError)
                        for error in _explicit_control_chain(outcome.error))
         else:
             assert outcome.error is None, 'numeric peer reconnect lost actual TLS hostname verification'
@@ -431,7 +456,7 @@ async def test_postgres_database_clone_cannot_inherit_original_journal_identity(
     old_pool, pool = c.backend._pool, None
     await control.execute(f'CREATE DATABASE "{name}" TEMPLATE template0')
     try:
-        pool = await _fresh_journal_pool(old_pool, database=name, min_size=1, max_size=1)
+        pool = await _fresh_journal_pool(old_pool, database=name, initial_size=1, max_size=1)
         c.backend._pool = pool
         async with pool.acquire() as connection:
             await connection.execute(f'CREATE SCHEMA "{schema}"')
@@ -481,7 +506,7 @@ async def test_postgres_original_journal_refuses_effective_durability_drift(disp
     _, control, schema = native_pg
     role = await control.fetchval('SELECT SESSION_USER')
     quoted_role = '"' + role.replace('"', '""') + '"'
-    pool = await _fresh_journal_pool(c.backend._pool, min_size=1, max_size=1, ssl='disable')
+    pool = await _fresh_journal_pool(c.backend._pool, initial_size=1, max_size=1, ssl='disable')
     original_pool = c.backend._pool
     c.backend._pool = pool
     observed = []
@@ -565,7 +590,7 @@ async def test_postgres_refused_session_retirement_never_invokes_application_lis
     _, control, schema = native_pg
     await control.execute(f'CREATE TABLE "{schema}".forbidden_termination_effect(value INTEGER)')
     original_pool = c.backend._pool
-    pool = await _fresh_journal_pool(original_pool, min_size=1, max_size=1)
+    pool = await _fresh_journal_pool(original_pool, initial_size=1, max_size=1)
     c.backend._pool = pool
     scope = ExecutionCustody(_OriginalWork(backend_type='postgres'))
     calls, callbacks, effects = [], [], []
@@ -612,7 +637,7 @@ async def test_original_checkout_recipe_refusal_cannot_run_reset_query_logger(di
     _, control, schema = native_pg
     await control.execute(f'CREATE TABLE "{schema}".forbidden_reset_effect(value INTEGER)')
     original_pool = c.backend._pool
-    pool = await _fresh_journal_pool(original_pool, min_size=1, max_size=1)
+    pool = await _fresh_journal_pool(original_pool, initial_size=1, max_size=1)
     c.backend._pool = pool
     original_args, original_kwargs = pool._connect_args, dict(pool._connect_kwargs)
     # Complete ordinary schema initialization before holding the sole slot;
@@ -698,7 +723,7 @@ async def test_admission_reconnect_never_invokes_reconfigured_password(dispatche
     _, control, schema = native_pg
     await control.execute(f'CREATE TABLE "{schema}".forbidden_connect_effect(value INTEGER)')
     original_pool = c.backend._pool
-    pool = await _fresh_journal_pool(original_pool, min_size=1, max_size=1)
+    pool = await _fresh_journal_pool(original_pool, initial_size=1, max_size=1)
     c.backend._pool = pool
     original_args, original_kwargs = pool._connect_args, dict(pool._connect_kwargs)
     await c.dispatcher.initialize_durable_delivery()
@@ -959,7 +984,7 @@ async def test_original_journal_does_not_inherit_reused_session_principal(dispat
     await control.execute(f'GRANT USAGE ON SCHEMA "{schema}" TO "{role}"')
     await control.execute(f'GRANT ALL ON "{schema}".signal_log TO "{role}"')
     original_pool = c.backend._pool
-    pool = await _fresh_journal_pool(original_pool, min_size=1, max_size=1)
+    pool = await _fresh_journal_pool(original_pool, initial_size=1, max_size=1)
     c.backend._pool = pool
     original_user = await control.fetchval('SELECT CURRENT_USER')
     scope = ExecutionCustody(_OriginalWork(backend_type='postgres'))
@@ -1042,7 +1067,7 @@ async def test_postgres_reconnect_never_invokes_application_password_provider(di
         return credential
     async def async_password():
         return password()
-    pool = await _fresh_journal_pool(original_pool, min_size=1, max_size=1,
+    pool = await _fresh_journal_pool(original_pool, initial_size=1, max_size=1,
         password=async_password if asynchronous else password)
     c.backend._pool = pool
     scope = ExecutionCustody(_OriginalWork(backend_type='postgres'))
@@ -1080,7 +1105,7 @@ async def test_postgres_original_recipe_detects_nested_host_mutation_before_reco
     _, control, _ = native_pg
     original_pool = c.backend._pool
     hosts = [control._addr[0]]
-    pool = await _fresh_journal_pool(original_pool, min_size=1, max_size=1,
+    pool = await _fresh_journal_pool(original_pool, initial_size=1, max_size=1,
         host=hosts, port=control._addr[1], password=control._params.password, timeout=2)
     c.backend._pool = pool
     scope = ExecutionCustody(_OriginalWork(backend_type='postgres'))
@@ -1140,7 +1165,7 @@ async def test_postgres_original_reconnect_pins_effective_endpoint_not_late_envi
     _, control, schema = native_pg
     original_pool = c.backend._pool
     monkeypatch.setenv('PGHOST', control._addr[0])
-    pool = await asyncpg.create_pool(min_size=1, max_size=1, host=None, port=control._addr[1],
+    pool = await asyncpg.create_pool(init_size=1, min_size=0, max_size=1, host=None, port=control._addr[1],
         user=control._params.user, password=control._params.password, database=control._params.database,
         connection_class=NativeJournalPostgresConnection, server_settings={'search_path': schema}, timeout=2)
     c.backend._pool = pool
@@ -1212,7 +1237,7 @@ async def test_postgres_admission_successor_does_not_wait_for_dispatch_lifetime(
     c = dispatcher_components
     _, control, schema = native_pg
     original_pool = c.backend._pool
-    pool = await _fresh_journal_pool(original_pool, min_size=1, max_size=1)
+    pool = await _fresh_journal_pool(original_pool, initial_size=1, max_size=1)
     c.backend._pool = pool
     retired, release, successor_acquired, original_seal_released = (asyncio.Event() for _ in range(4))
     original_join = pg.await_owned_task
@@ -1285,7 +1310,7 @@ async def test_postgres_successor_journal_reuses_physically_reset_connection(dis
     c = dispatcher_components
     _, control, schema = native_pg
     original_pool = c.backend._pool
-    pool = await _fresh_journal_pool(original_pool, min_size=1, max_size=1)
+    pool = await _fresh_journal_pool(original_pool, initial_size=1, max_size=1)
     c.backend._pool = pool
     retired, release, successor_acquired = asyncio.Event(), asyncio.Event(), asyncio.Event()
     original_join = pg.await_owned_task
@@ -1397,7 +1422,7 @@ async def test_postgres_journal_refuses_custom_connection_codecs(dispatcher_comp
     c = dispatcher_components
     _, control, schema = native_pg
     original_pool = c.backend._pool
-    pool = await _fresh_journal_pool(original_pool, min_size=0, max_size=1)
+    pool = await _fresh_journal_pool(original_pool, initial_size=0, max_size=1)
     c.backend._pool = pool
     effects, substituted = [], []
     def encode(value):
@@ -1501,7 +1526,7 @@ async def test_postgres_journal_refuses_application_pool_programs(dispatcher_com
               {'connect': connect} if callback_kind == 'connect' else
               {'connection_class': CustomConnection} if callback_kind == 'connection_class' else
               {'record_class': CustomRecord} if callback_kind == 'record_class' else {})
-    pool = await _fresh_journal_pool(original_pool, min_size=0, max_size=2, **custom)
+    pool = await _fresh_journal_pool(original_pool, initial_size=0, max_size=2, **custom)
     c.backend._pool = PostgresPoolAdapter(pool, wrapper) if callback_kind == 'adapter' else pool
     scope = ExecutionCustody(_OriginalWork(backend_type='postgres'))
     async def handler(payload):
@@ -1696,7 +1721,7 @@ async def test_postgres_original_journal_rejects_temporary_relation_at_admission
     c = dispatcher_components
     _, control, schema = native_pg
     original_pool = c.backend._pool
-    pool = await _fresh_journal_pool(original_pool, min_size=0, max_size=1)
+    pool = await _fresh_journal_pool(original_pool, initial_size=0, max_size=1)
     c.backend._pool = pool
     effects = []
     scope = ExecutionCustody(_OriginalWork(backend_type='postgres'))
@@ -1741,7 +1766,7 @@ async def test_original_journal_refuses_enclosing_transaction_before_destination
     from tests.unit.test_signals_dispatcher import _action_reg, _signal
     c = dispatcher_components
     original_pool = c.backend._pool
-    pool = await _fresh_journal_pool(original_pool, min_size=0, max_size=pool_size)
+    pool = await _fresh_journal_pool(original_pool, initial_size=0, max_size=pool_size)
     c.backend._pool = pool
     effects = []
     async def handler(payload):
@@ -1803,7 +1828,7 @@ async def test_original_journal_native_setup_cannot_redirect_or_forge_commit(dis
             attempted.append(True)
             journal.acknowledged(c.backend)
     original_pool = c.backend._pool
-    pool = await _fresh_journal_pool(original_pool, min_size=0, max_size=2, setup=setup)
+    pool = await _fresh_journal_pool(original_pool, initial_size=0, max_size=2, setup=setup)
     c.backend._pool = pool
     entered, release = asyncio.Event(), asyncio.Event()
     effects = []

@@ -5,13 +5,19 @@ Provides common functionality for all stores using DatabaseBackend.
 """
 
 import logging
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from typing import Any, Optional
 
-from kestrel_sovereign.storage.db.interface import DatabaseBackend
+from kestrel_sovereign.execution_custody import is_execution_control_error
+from kestrel_sovereign.storage.db.interface import DatabaseBackend, TransactionError
 from kestrel_sovereign.storage.db.timestamp import TimestamptzParameter
 
 logger = logging.getLogger(__name__)
+
+
+class NativeStoreConflict(ValueError):
+    """A native domain refusal, distinct from a failed database operation."""
 
 
 class UnifiedStoreBase:
@@ -24,14 +30,19 @@ class UnifiedStoreBase:
     - Common patterns for row conversion
     """
 
-    def __init__(self, backend: DatabaseBackend):
+    def __init__(self, backend: DatabaseBackend, *, owns_backend: bool = True):
         """
         Initialize store with database backend.
 
         Args:
             backend: DatabaseBackend instance (SQLite or PostgreSQL)
+            owns_backend: Whether this store owns resource retirement. Host
+                services borrowing primary storage must set this to False.
         """
+        if not isinstance(owns_backend, bool):
+            raise TypeError("Store backend ownership must be explicit boolean policy")
         self._backend = backend
+        self._owns_backend = owns_backend
 
     @property
     def backend(self) -> DatabaseBackend:
@@ -47,6 +58,28 @@ class UnifiedStoreBase:
     def is_sqlite(self) -> bool:
         """Check if using SQLite backend."""
         return self._backend.backend_type == "sqlite"
+
+    @asynccontextmanager
+    async def write_transaction(self):
+        """Serialize a read/modify/write unit on the supported canonical backend."""
+        if self.is_sqlite:
+            transaction = self._backend.transaction(immediate=True)
+        elif self.is_postgres:
+            transaction = self._backend.transaction()
+        else:
+            raise ValueError("Native stores require a SQLite or PostgreSQL backend")
+        try:
+            async with transaction:
+                yield
+        except TransactionError as error:
+            # Backends roll back before wrapping a body failure. Retain typed
+            # domain refusals after that rollback, while preserving actual SQL,
+            # commit, cleanup and custody failures as infrastructure failures.
+            if isinstance(
+                error.__cause__, NativeStoreConflict
+            ) and not is_execution_control_error(error):
+                raise error.__cause__
+            raise
 
     # ==========================================================================
     # SQL Dialect Helpers
@@ -234,7 +267,7 @@ class UnifiedStoreBase:
 
     async def close(self) -> None:
         """
-        Close the underlying database backend connection.
+        Close an owned backend; leave a borrowed host backend to its owner.
 
         Should be called when the store is no longer needed to prevent
         resource leaks from open database connections.
@@ -244,4 +277,5 @@ class UnifiedStoreBase:
         still being released, and only the backend can say whether they now
         are (#3558).
         """
-        await self._backend.close()
+        if self._owns_backend:
+            await self._backend.close()

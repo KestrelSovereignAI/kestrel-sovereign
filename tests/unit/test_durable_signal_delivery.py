@@ -22,34 +22,6 @@ from kestrel_sdk.signals import (
     Trust,
 )
 
-from kestrel_sovereign.signals import (
-    ACKNOWLEDGED,
-    FAILED,
-    INITIAL_RESERVED,
-    LEASED,
-    PENDING,
-    RETRY,
-    TERMINAL_ACKABLE,
-    DurableAdmissionDisposition,
-    DurableConsumerRegistration,
-    DurableSourceBoundary,
-    DurableSignalStore,
-    OrderedLockManager,
-    SignalDispatcher,
-    SignalLogStore,
-    SignalWithDurableCorrelation,
-    SourceRegistry,
-)
-from kestrel_sovereign.signals import dispatcher as dispatcher_module
-from kestrel_sovereign.signals.sources.channels import (
-    DURABLE_COGNITION_CONSUMER_ID,
-    DURABLE_COGNITION_MARKER,
-    DURABLE_COGNITION_MARKER_VALUE,
-    DURABLE_TERMINAL_CONSUMER_ID,
-    DURABLE_TERMINAL_MARKER,
-    DURABLE_TERMINAL_MARKER_VALUE,
-    build_channel_message_registration,
-)
 from kestrel_sovereign.agent.invocation import (
     InvocationCancelledError,
     InvocationSelfFencedError,
@@ -64,6 +36,37 @@ from kestrel_sovereign.hold import (
     HoldEnforcementUnavailableError,
     HoldScope,
     HoldState,
+)
+from kestrel_sovereign.signals import (
+    ACKNOWLEDGED,
+    FAILED,
+    INITIAL_RESERVED,
+    LEASED,
+    PENDING,
+    RETRY,
+    TERMINAL_ACKABLE,
+    DurableAdmissionDisposition,
+    DurableConsumerRegistration,
+    DurableSignalStore,
+    DurableSourceBoundary,
+    OrderedLockManager,
+    SignalDispatcher,
+    SignalLogStore,
+    SignalWithDurableCorrelation,
+    SourceRegistry,
+)
+from kestrel_sovereign.signals import dispatcher as dispatcher_module
+from kestrel_sovereign.signals.sources.a2a_task_submitted import (
+    submitted_input_identity,
+)
+from kestrel_sovereign.signals.sources.channels import (
+    DURABLE_COGNITION_CONSUMER_ID,
+    DURABLE_COGNITION_MARKER,
+    DURABLE_COGNITION_MARKER_VALUE,
+    DURABLE_TERMINAL_CONSUMER_ID,
+    DURABLE_TERMINAL_MARKER,
+    DURABLE_TERMINAL_MARKER_VALUE,
+    build_channel_message_registration,
 )
 from kestrel_sovereign.storage.db import SQLiteBackend
 from kestrel_sovereign.storage.db.interface import QueryError, TransactionError
@@ -189,6 +192,81 @@ async def _dispatcher(path, did: str):
     )
     await dispatcher.initialize_durable_delivery()
     return backend, agent, dispatcher
+
+
+@pytest.mark.asyncio
+async def test_shutdown_preserves_pending_claim_until_attempt_neutral_recovery(tmp_path):
+    """A close before cognition begins must not consume the only attempt."""
+    path = tmp_path / "shutdown-before-cognition-begin.db"
+    did = "did:agent:shutdown-before-begin"
+    backend, agent, dispatcher = await _channel_dispatcher(path, did)
+    consumer = DurableConsumerRegistration(
+        consumer_id=DURABLE_COGNITION_CONSUMER_ID,
+        source="channel.message",
+        agent_id=did,
+        correlation_selector=(
+            f"payload.{DURABLE_COGNITION_MARKER}={DURABLE_COGNITION_MARKER_VALUE}"
+        ),
+        max_attempts=1,
+    )
+    signal = _channel_signal(did, "shutdown-before-begin")
+    try:
+        await dispatcher.register_durable_consumer(consumer)
+        await dispatcher.durable_store.persist_signal(
+            signal, agent_id=did, source_event_id="shutdown-before-begin",
+            retention_days=1,
+            caller_identity_factory=lambda: dispatcher._protect_durable_caller_identity(signal),
+        )
+        async with dispatcher._admit_durable_operation():
+            delivery = await dispatcher.claim_durable_delivery_for_event(
+                consumer_id=consumer.consumer_id, event_id=signal.id,
+                executor_id=dispatcher._durable_delivery_owner,
+            )
+            assert delivery is not None
+            dispatcher.shutdown()
+            result = await dispatcher._route_durable_cognition_delivery(
+                signal, dispatcher._registry.get(signal.source), time.monotonic(),
+                persisted_event_id=signal.id, consumer_id=consumer.consumer_id,
+                durable_admission=None, durable_created=False, use_live_signal=False,
+                claimed_delivery=delivery,
+            )
+            assert result.status is Status.FAILED
+            assert result.error == "Durable cognition admission closed for shutdown"
+        await dispatcher.shutdown_durable_delivery()
+        row = await backend.fetch_one(
+            "SELECT status, attempts, last_error FROM durable_signal_deliveries "
+            "WHERE consumer_id = ?", (consumer.consumer_id,),
+        )
+        assert row[0] == LEASED
+        assert row[1] == 1
+        assert row[2] == "cognition admission pending"
+    finally:
+        await dispatcher.shutdown_durable_delivery()
+        await _close(backend, agent)
+
+    backend, agent, dispatcher = await _channel_dispatcher(path, did)
+    calls = []
+
+    async def complete(prompt):
+        calls.append(prompt)
+        return "handled"
+
+    agent.process_input = complete
+    try:
+        [recovered] = await dispatcher.list_durable_deliveries()
+        assert recovered.status == RETRY
+        assert recovered.attempts == 0
+        await dispatcher.register_durable_consumer(consumer)
+        await dispatcher.start_durable_cognition_consumer(consumer.consumer_id)
+        drainer = dispatcher._durable_cognition_drainers[consumer.consumer_id]
+        await asyncio.wait_for(drainer, _HANG_GUARD_SECONDS)
+        [settled] = await dispatcher.list_durable_deliveries()
+        assert settled.status == ACKNOWLEDGED
+        assert settled.attempts == 1
+        assert len(calls) == 1
+    finally:
+        await dispatcher.shutdown_durable_delivery()
+        await _close(backend, agent)
 
 
 async def _close(backend, agent: _Agent) -> None:
@@ -475,7 +553,13 @@ async def test_cancelled_unstarted_public_resident_settles_original_claim(tmp_pa
     def factory(loop, coroutine, **kwargs):
         operation = _actual_operation(coroutine)
         task = previous(loop, coroutine, **kwargs) if previous else asyncio.Task(coroutine, loop=loop, **kwargs)
-        if getattr(getattr(operation, 'cr_code', None), 'co_name', '') == 'resident_delivery':
+        # Cancel the physical task before its admission wrapper can call the
+        # resident closure. That closure is not itself a scheduled coroutine.
+        frame = getattr(operation, 'cr_frame', None)
+        resident = frame.f_locals.get('operation') if frame is not None else None
+        if (getattr(getattr(operation, 'cr_code', None), 'co_qualname', '')
+                == 'SignalDispatcher._run_with_lent_durable_admission'
+                and getattr(resident, '__name__', '') == 'resident_delivery'):
             accepted.append(task)
             task.cancel('actual lifecycle withdrawal before resident startup')
         return task
@@ -945,7 +1029,7 @@ async def test_sqlite_high_water_survives_newest_purge_and_exact_row_loss(tmp_pa
             persisted[2].event_id,
         ),
     )
-    assert await store.purge_expired(agent_id=agent_id) == 1
+    assert len(await store.purge_expired(agent_id=agent_id)) == 1
     for relation in (
         store.SOURCE_SEQUENCE_SEEN,
         store.SOURCE_SEQUENCES,
@@ -1020,7 +1104,7 @@ async def test_sqlite_fails_closed_when_all_exact_evidence_is_lost(tmp_path):
                 persisted[2].event_id,
             ),
         )
-        assert await store.purge_expired(agent_id=agent_id) == 1
+        assert len(await store.purge_expired(agent_id=agent_id)) == 1
         for relation in (
             store.SOURCE_SEQUENCE_SEEN,
             store.SOURCE_SEQUENCES,
@@ -1980,7 +2064,7 @@ async def test_sqlite_mixed_writer_mirrors_a_sequence_newer_than_retained_maximu
                 second_event_id,
             ),
         )
-        assert await store.purge_expired(agent_id=agent_id) == 1
+        assert len(await store.purge_expired(agent_id=agent_id)) == 1
         await backend.execute("DROP TABLE durable_signal_source_sequences")
 
         recovered = DurableSignalStore(backend)
@@ -2046,7 +2130,7 @@ async def test_positive_exact_counters_repair_missing_seen_before_history_loss(
                 persisted.event_id,
             ),
         )
-        assert await store.purge_expired(agent_id=agent_id) == 1
+        assert len(await store.purge_expired(agent_id=agent_id)) == 1
         await backend.execute(
             "DELETE FROM durable_signal_source_sequences "
             "WHERE agent_id = ? AND source = ?",
@@ -2113,7 +2197,7 @@ async def test_seen_scope_refuses_loss_of_both_exact_rows_after_any_retention_sh
                 "WHERE event_id = ?",
                 (expired, persisted[index].event_id),
             )
-        assert await store.purge_expired(agent_id=agent_id) == len(purged_indices)
+        assert len(await store.purge_expired(agent_id=agent_id)) == len(purged_indices)
 
         await backend.execute(
             "DELETE FROM durable_signal_source_sequences "
@@ -2927,6 +3011,15 @@ async def test_held_durable_cognition_survives_restart_and_runs_once_after_relea
         await _close(backend_b, agent_b)
 
 
+def _native_a2a_snapshot(task, recipient_id, lifecycle_revision=0):
+    from kestrel_sovereign.a2a.stores.unified.context_store import ContextOwnership
+    from kestrel_sovereign.a2a.stores.unified.task_store import NativeTaskSnapshot
+    return NativeTaskSnapshot(
+        task=task, lifecycle_revision=lifecycle_revision,
+        ownership=ContextOwnership(task.context_id, "", recipient_id, "did:peer:creator"),
+    )
+
+
 @pytest.mark.asyncio
 async def test_held_a2a_submission_wake_survives_restart_without_peer_reemit(
     tmp_path,
@@ -2935,16 +3028,18 @@ async def test_held_a2a_submission_wake_survives_restart_without_peer_reemit(
 
     from kestrel_sovereign.signals.sources.a2a_task_submitted import (
         DURABLE_COGNITION_CONSUMER_ID as A2A_CONSUMER,
+    )
+    from kestrel_sovereign.signals.sources.a2a_task_submitted import (
         build_signal_for_submitted_task,
     )
 
     path = tmp_path / "held-a2a-restart.db"
     did = "did:agent:held-a2a-restart"
-    task = SimpleNamespace(
+    from kestrel_sdk.native_a2a.types import Task, TaskState, TaskStatus
+    task = Task(
         id="task-held-across-restart",
-        sessionId="session-held-across-restart",
-        metadata={},
-        history=[],
+        context_id="context-held-across-restart",
+        status=TaskStatus(state=TaskState.TASK_STATE_SUBMITTED),
     )
     consumer = DurableConsumerRegistration(
         consumer_id=A2A_CONSUMER,
@@ -2959,8 +3054,8 @@ async def test_held_a2a_submission_wake_survives_restart_without_peer_reemit(
     try:
         await dispatcher_a.register_durable_consumer(consumer)
         handle = await dispatcher_a.enqueue_durable_cognition(
-            build_signal_for_submitted_task(task, target_agent=did),
-            source_event_id=task.id,
+            build_signal_for_submitted_task(_native_a2a_snapshot(task, did), target_agent=did),
+            source_event_id=submitted_input_identity(task.id, 0),
             consumer_id=A2A_CONSUMER,
         )
         assert (
@@ -3012,22 +3107,22 @@ async def test_privacy_elided_a2a_wake_rehydrates_after_restart_without_peer_ree
 
     from types import MethodType
 
+    from kestrel_sdk.native_a2a.types import Task, TaskState, TaskStatus
+
     from kestrel_sovereign.agent.event_manager import EventManagerMixin
-    from kestrel_sovereign.a2a.types import TaskState
     from kestrel_sovereign.privacy import get_privacy_preset
     from kestrel_sovereign.signals.sources.a2a_task_submitted import (
         DURABLE_COGNITION_CONSUMER_ID as A2A_CONSUMER,
+    )
+    from kestrel_sovereign.signals.sources.a2a_task_submitted import (
         build_signal_for_submitted_task,
     )
 
     path = tmp_path / "private-held-a2a-restart.db"
     did = "did:agent:private-held-a2a-restart"
-    task = SimpleNamespace(
-        id="private-task-held-across-restart",
-        sessionId="private-session",
-        metadata={},
-        history=[],
-        status=SimpleNamespace(state=TaskState.SUBMITTED),
+    task = Task(
+        id="private-task-held-across-restart", context_id="private-context",
+        status=TaskStatus(state=TaskState.TASK_STATE_SUBMITTED),
     )
     consumer = DurableConsumerRegistration(
         consumer_id=A2A_CONSUMER,
@@ -3042,8 +3137,8 @@ async def test_privacy_elided_a2a_wake_rehydrates_after_restart_without_peer_ree
     try:
         await dispatcher_a.register_durable_consumer(consumer)
         handle = await dispatcher_a.enqueue_durable_cognition(
-            build_signal_for_submitted_task(task, target_agent=did),
-            source_event_id=task.id,
+            build_signal_for_submitted_task(_native_a2a_snapshot(task, did), target_agent=did),
+            source_event_id=submitted_input_identity(task.id, 0),
             consumer_id=A2A_CONSUMER,
         )
         assert (
@@ -3059,7 +3154,7 @@ async def test_privacy_elided_a2a_wake_rehydrates_after_restart_without_peer_ree
     agent_b._hold_store = _HoldSnapshots(EffectiveHoldState(host=None, agent=None))
     agent_b.process_input = AsyncMock(return_value="rehydrated")
     agent_b.task_manager = SimpleNamespace(
-        get_task_for_recipient=AsyncMock(return_value=task),
+        get_task_snapshot=AsyncMock(return_value=_native_a2a_snapshot(task, did)),
     )
     agent_b.rehydrate_durable_cognition_signal = MethodType(
         EventManagerMixin.rehydrate_durable_cognition_signal,
@@ -3082,9 +3177,9 @@ async def test_privacy_elided_a2a_wake_rehydrates_after_restart_without_peer_ree
         assert delivery.status == ACKNOWLEDGED
         agent_b.process_input.assert_awaited_once()
         assert task.id in agent_b.process_input.await_args.args[0]
-        agent_b.task_manager.get_task_for_recipient.assert_awaited_once_with(
+        agent_b.task_manager.get_task_snapshot.assert_awaited_once_with(
             task.id,
-            did,
+            recipient_agent_id=did,
         )
     finally:
         await dispatcher_b.shutdown_durable_delivery()
@@ -3376,9 +3471,6 @@ class _ReconcilingA2AAgent(_Agent):
     reconcile_a2a_cognition_wakes = _Mixin.reconcile_a2a_cognition_wakes
 
     def __init__(self, did: str, task, lifecycle_revision: int):
-        from kestrel_sovereign.a2a.stores.unified.task_store import (
-            TaskCognitionWakeCandidate,
-        )
         from kestrel_sovereign.signals.sources.a2a import (
             build_a2a_task_complete_registration,
         )
@@ -3397,9 +3489,7 @@ class _ReconcilingA2AAgent(_Agent):
         self.task_manager = SimpleNamespace(
             list_cognition_wake_candidates=AsyncMock(
                 return_value=[
-                    TaskCognitionWakeCandidate(
-                        task=task, lifecycle_revision=lifecycle_revision
-                    )
+                    _native_a2a_snapshot(task, did, lifecycle_revision)
                 ]
             )
         )
@@ -3412,8 +3502,9 @@ class _ReconcilingA2AAgent(_Agent):
 
     async def validate_cognition_signal_execution(self, signal):
         # EventManagerMixin's rule: a submission wake runs while the task is live.
-        state = self.task.status.state.value
-        return None if state in {"submitted", "working"} else f"task is {state}"
+        from kestrel_sdk.native_a2a.types import TaskState
+        state = self.task.status.state
+        return None if state in {TaskState.TASK_STATE_SUBMITTED, TaskState.TASK_STATE_WORKING} else f"task is {state}"
 
 
 async def _reconciling_a2a_dispatcher(path, did: str, task, lifecycle_revision: int):
@@ -3441,16 +3532,19 @@ async def test_crash_mid_submission_turn_recovers_one_wake_not_two(tmp_path):
     identity beside it ran the same peer task twice at recovery.
     """
 
-    from kestrel_sovereign.a2a.types import Task, TaskState, TaskStatus
+    from kestrel_sdk.native_a2a.types import Task, TaskState, TaskStatus
+
     from kestrel_sovereign.signals.sources.a2a_task_submitted import (
         DURABLE_COGNITION_CONSUMER_ID as SUBMITTED_CONSUMER,
+    )
+    from kestrel_sovereign.signals.sources.a2a_task_submitted import (
         build_signal_for_submitted_task,
     )
 
     path = tmp_path / "crash-mid-submission.db"
     did = "did:agent:crash-mid-submission"
     submitted = Task(
-        id="peer-task", sessionId="s1", status=TaskStatus(state=TaskState.SUBMITTED)
+        id="peer-task", context_id="c1", status=TaskStatus(state=TaskState.TASK_STATE_SUBMITTED)
     )
     consumer = DurableConsumerRegistration(
         consumer_id=SUBMITTED_CONSUMER,
@@ -3464,8 +3558,8 @@ async def test_crash_mid_submission_turn_recovers_one_wake_not_two(tmp_path):
     agent_a.hang_turns = True
     await dispatcher_a.register_durable_consumer(consumer)
     handle = await dispatcher_a.enqueue_durable_cognition(
-        build_signal_for_submitted_task(submitted, target_agent=did),
-        source_event_id=submitted.id,
+        build_signal_for_submitted_task(_native_a2a_snapshot(submitted, did), target_agent=did),
+        source_event_id=submitted_input_identity(submitted.id, 0),
         consumer_id=SUBMITTED_CONSUMER,
     )
     await handle.wait_for_durable_admission()
@@ -3480,9 +3574,8 @@ async def test_crash_mid_submission_turn_recovers_one_wake_not_two(tmp_path):
     await asyncio.gather(*agent_a.tasks, return_exceptions=True)
     await backend_a.close()
 
-    working = submitted.model_copy(
-        update={"status": TaskStatus(state=TaskState.WORKING)}
-    )
+    working = Task.FromString(submitted.SerializeToString())
+    working.status.state = TaskState.TASK_STATE_WORKING
     backend_b, agent_b, dispatcher_b = await _reconciling_a2a_dispatcher(
         path, did, working, 1
     )
@@ -3511,7 +3604,7 @@ async def test_crash_mid_submission_turn_recovers_one_wake_not_two(tmp_path):
         [recovered] = await dispatcher_b.list_durable_deliveries(
             consumer_id=SUBMITTED_CONSUMER
         )
-        assert recovered.event.source_event_id == "peer-task"
+        assert recovered.event.source_event_id == submitted_input_identity("peer-task", 0)
         assert recovered.status == ACKNOWLEDGED
         assert len(agent_b.prompts) == 1
     finally:
@@ -6758,9 +6851,9 @@ async def test_nack_retry_lease_expiry_terminal_failure_and_retention_are_observ
     assert "lease expired" in terminal.last_error
     # Retention does not erase non-terminal work, but it removes retained
     # terminal history after its configured lifetime.
-    assert await store.purge_expired(
+    assert len(await store.purge_expired(
         agent_id=agent_id, now=now + timedelta(days=2)
-    ) == 1
+    )) == 1
     assert await store.list_deliveries(agent_id=agent_id) == []
     await backend.close()
 

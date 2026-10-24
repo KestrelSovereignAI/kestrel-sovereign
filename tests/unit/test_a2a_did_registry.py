@@ -1,14 +1,15 @@
 """A2A verification-document lookup and signed-envelope verification."""
 from __future__ import annotations
 
-import asyncio
 import hashlib
 import json
 import os
-from datetime import datetime, timezone
 from types import SimpleNamespace
+from uuid import uuid4
 
 import pytest
+from kestrel_sdk.native_a2a.helpers.proto_helpers import new_text_message
+from kestrel_sdk.native_a2a.types import Role, SendMessageRequest
 
 from kestrel_sovereign.a2a.did_registry import (
     A2A_PEER_IDENTITY_DOCUMENTS_ENV,
@@ -24,21 +25,27 @@ from kestrel_sovereign.a2a.did_registry import (
     launcher_attested_a2a_verification_document,
     stage_process_a2a_did_registry,
 )
-from kestrel_sovereign.a2a.envelope_signing import (
-    bound_envelope_fields,
-    sign_envelope,
-    verify_inbound_envelope,
+from kestrel_sovereign.a2a.native_card import REQUIRED_NATIVE_EXTENSIONS
+from kestrel_sovereign.a2a.native_client import NativeSenderInterceptor
+from kestrel_sovereign.a2a.native_sender import (
+    NativeProofPolicy,
+    NativeSenderProofError,
+    sign_native_request,
+    verify_native_request,
 )
+from kestrel_sovereign.a2a.scope import NativeRecipientScope
 from kestrel_sovereign.identity.did_web import build_verification_methods
 from kestrel_sovereign.identity.hybrid_keypair import generate_hybrid_keypair
+from kestrel_sovereign.identity.runtime_identity import AgentIdentity
+from tests.utils.native_a2a_security import NOW
 
 
 def _hybrid_agent(signing_did: str, *, agent_id: str | None = None):
     """Return a stand-in agent and the keypair used by its hybrid identity."""
     keypair = generate_hybrid_keypair()
-    identity = SimpleNamespace(
-        is_hybrid=True,
-        signing_did=signing_did,
+    identity = AgentIdentity(
+        hybrid_keypair=keypair,
+        new_did=signing_did,
         new_verification_methods=build_verification_methods(
             signing_did,
             keypair.public_keys(),
@@ -142,59 +149,25 @@ def test_resolver_is_document_lookup_not_peer_authorization():
     assert document["id"] == DID_A
 
 
-def test_resolver_composes_with_envelope_verifier_end_to_end():
-    sender, sender_keypair = _hybrid_agent(DID_A)
+async def test_resolver_composes_with_native_proof_verifier(native_request_admission):
+    sender, keypair = _hybrid_agent(DID_A)
     recipient, _ = _hybrid_agent(DID_B)
-    manager = _Manager({"emma": sender, "claw": recipient})
-    install_a2a_did_resolver(manager)
-    metadata = {"sender": DID_A}
-    metadata["signature"] = sign_envelope(
-        sender_keypair,
-        sender=DID_A,
-        task_id="t1",
-        message="hello",
-        timestamp=datetime.now(timezone.utc).isoformat(),
-        session_id="s1",
-        bound=bound_envelope_fields(metadata),
+    install_a2a_did_resolver(_Manager({"emma": sender, "claw": recipient}))
+    verified = await _verify_native_lookup(
+        native_request_admission, sender=sender, keypair=keypair, recipient=recipient
     )
-
-    verdict = asyncio.run(
-        verify_inbound_envelope(
-            metadata,
-            task_id="t1",
-            message="hello",
-            session_id="s1",
-            resolver=recipient.a2a_did_resolver,
-        )
-    )
-
-    assert verdict.ok is True
-    assert verdict.verified is True
+    assert verified.sender == DID_A
 
 
-def test_tampered_envelope_rejected_through_resolver():
-    sender, sender_keypair = _hybrid_agent(DID_A)
+async def test_tampered_native_request_rejected_through_resolver(native_request_admission):
+    sender, keypair = _hybrid_agent(DID_A)
     recipient, _ = _hybrid_agent(DID_B)
-    manager = _Manager({"emma": sender, "claw": recipient})
-    install_a2a_did_resolver(manager)
-    signature = sign_envelope(
-        sender_keypair,
-        sender=DID_A,
-        task_id="t1",
-        message="hello",
-        timestamp=datetime.now(timezone.utc).isoformat(),
-    )
-
-    verdict = asyncio.run(
-        verify_inbound_envelope(
-            {"sender": DID_A, "signature": signature},
-            task_id="t1",
-            message="TAMPERED",
-            resolver=recipient.a2a_did_resolver,
+    install_a2a_did_resolver(_Manager({"emma": sender, "claw": recipient}))
+    with pytest.raises(NativeSenderProofError):
+        await _verify_native_lookup(
+            native_request_admission, sender=sender, keypair=keypair,
+            recipient=recipient, tampered=True,
         )
-    )
-
-    assert verdict.ok is False
 
 
 def test_cold_registration_installs_only_new_recipient_resolver():
@@ -213,53 +186,25 @@ def test_cold_registration_installs_only_new_recipient_resolver():
     assert cold.a2a_did_resolver(DID_A)["id"] == DID_A
 
 
-def test_process_registry_installs_local_peer_verification(
-    tmp_path,
-    monkeypatch,
+async def test_process_registry_installs_local_peer_verification(
+    tmp_path, monkeypatch, native_request_admission,
 ):
     from kestrel_sovereign.a2a.transport_auth import A2A_TRANSPORT_KEY_ENV
     from kestrel_sovereign.features.peers.feature import PeersFeature
 
-    sender, sender_keypair = _hybrid_agent(DID_A)
+    sender, keypair = _hybrid_agent(DID_A)
     recipient, _ = _hybrid_agent(DID_B)
-    monkeypatch.setenv(
-        A2A_PEER_IDENTITY_DOCUMENTS_ENV,
-        json.dumps(
-            [
-                {
-                    "id": DID_A,
-                    "verificationMethod": sender.identity.new_verification_methods,
-                }
-            ]
-        ),
-    )
+    monkeypatch.setenv(A2A_PEER_IDENTITY_DOCUMENTS_ENV, json.dumps([{
+        "id": DID_A,
+        "verificationMethod": sender.identity.new_verification_methods,
+    }]))
     monkeypatch.setenv(A2A_TRANSPORT_KEY_ENV, "process-transport-key")
-    feature = PeersFeature(recipient)
-    asyncio.run(feature.initialize())
-    metadata = {"sender": DID_A, "a2a_verb": "read_task"}
-    metadata["signature"] = sign_envelope(
-        sender_keypair,
-        sender=DID_A,
-        task_id="process-read",
-        message="read_task:process-read",
-        timestamp=datetime.now(timezone.utc).isoformat(),
-        session_id="a2a-read_task:process-read",
-        bound=bound_envelope_fields(metadata),
-    )
-
-    verdict = asyncio.run(
-        verify_inbound_envelope(
-            metadata,
-            task_id="process-read",
-            message="read_task:process-read",
-            session_id="a2a-read_task:process-read",
-            resolver=recipient.a2a_did_resolver,
-        )
-    )
-
+    await PeersFeature(recipient).initialize()
     assert callable(recipient.a2a_did_resolver)
-    assert verdict.ok is True
-    assert verdict.sender == DID_A
+    verified = await _verify_native_lookup(
+        native_request_admission, sender=sender, keypair=keypair, recipient=recipient
+    )
+    assert verified.sender == DID_A
 
 
 def test_process_registry_resolves_launcher_attested_successor_material():
@@ -291,6 +236,9 @@ def test_process_registry_maps_signing_did_to_attested_stable_agent_id():
 
     assert resolver.directory_agent_id(DID_A) == stable_agent_id
     assert resolver.directory_agent_id("did:web:example.test:unknown") is None
+    assert resolver.signing_did_for_agent_id(stable_agent_id) == DID_A
+    assert resolver.signing_did_for_agent_id("unknown") is None
+    assert resolver.signing_did_for_agent_id(None) is None
     # The internal launcher binding is not part of the DID document passed to
     # the cryptographic envelope verifier.
     assert A2A_PEER_STABLE_AGENT_ID_FIELD not in resolver.resolve(DID_A)
@@ -653,3 +601,26 @@ def test_launcher_attestation_rejects_did_document_without_matching_custody(
             expected_agent_did=identity.did,
             master_key=master_key,
         )
+
+
+async def _verify_native_lookup(admission, *, sender, keypair, recipient, tampered=False):
+    scope = NativeRecipientScope(recipient.did)
+    policy = NativeProofPolicy()
+    signer = NativeSenderInterceptor.for_identity(
+        sender.identity, recipient=scope, extensions=REQUIRED_NATIVE_EXTENSIONS,
+        policy=policy, clock=lambda: NOW, nonce=lambda: uuid4().hex,
+    )
+    params = SendMessageRequest(message=new_text_message("hello", role=Role.ROLE_USER))
+    proof = sign_native_request(
+        keypair, params, sender=sender.identity.signing_did, recipient=scope.recipient_id,
+        operation="SendMessage", timestamp=NOW, nonce=uuid4().hex,
+        extensions=REQUIRED_NATIVE_EXTENSIONS, classical_kid=signer.classical_kid,
+        pq_kid=signer.pq_kid, policy=policy,
+    )
+    if tampered:
+        params.message.parts[0].text = "TAMPERED"
+    return await verify_native_request(
+        [proof], params, recipient=scope.recipient_id, operation="SendMessage",
+        extensions=REQUIRED_NATIVE_EXTENSIONS, resolver=recipient.a2a_did_resolver,
+        replay_store=admission.guard.replay_store, policy=policy, now_ts=NOW,
+    )

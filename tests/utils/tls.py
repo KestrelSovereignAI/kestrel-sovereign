@@ -17,6 +17,8 @@ from cryptography.x509.oid import NameOID
 class _NumericLoopbackHTTPServer(ThreadingHTTPServer):
     """Actual local TCP/TLS fixture without HTTPServer's reverse DNS lookup."""
 
+    daemon_threads = False
+
     def server_bind(self):
         if self.server_address[0] != "127.0.0.1":
             raise ValueError("TLS test server requires numeric IPv4 loopback")

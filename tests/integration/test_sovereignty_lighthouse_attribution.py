@@ -25,6 +25,8 @@ Lighthouse provider then takes the IPFS tier, and serves it back.
 
 from __future__ import annotations
 
+from tests.shared.native_shutdown_budget import shutdown_fixture_agent
+
 import asyncio
 import base64
 import hashlib
@@ -1369,7 +1371,7 @@ async def _booted(did, db_path):
         await agent.initialize()
         yield agent
     finally:
-        await agent.shutdown()
+        await shutdown_fixture_agent(agent)
         await llm_service.close()
 
 

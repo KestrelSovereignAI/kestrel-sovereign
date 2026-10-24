@@ -365,8 +365,8 @@ def _tail(raw: Any) -> str:
 # tracked and still defer restart, as do active requests and signal dispatch.
 # None is user/signal work; real work (``signal_dispatch:*``) still
 # defers a restart. The name is already stamped on the task at creation —
-# it was just never read here. New long-lived/bookkeeping daemons must be
-# named with a prefix listed here (or excluded from ``_background_tasks``).
+# it was just never read here. Runtime-owned services carry their ownership
+# marker; these names cover bookkeeping published through the ordinary tracker.
 _INFRA_TASK_PREFIXES = (
     "durable_signal_log",
     "a2a_question_expiry_sweep",
@@ -385,12 +385,15 @@ _INFRA_TASK_NAMES = frozenset({
     # Feature-owned bookkeeping: any workflow effect it admits is separately
     # tracked. The resident daemon is joined on disable/shutdown, not user work.
     "workflows:lease-recovery",
+    "native_a2a_question_recovery",
 })
 
 
 def _is_infra_background_task(task) -> bool:
     """True if ``task`` is fire-and-forget infrastructure bookkeeping that
     must not gate an idle restart (e.g. ``signal_log:*`` writes)."""
+    if getattr(task, "_kestrel_runtime_service", False) is True:
+        return True
     try:
         name = task.get_name() or ""
     except Exception:

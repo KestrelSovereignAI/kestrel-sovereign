@@ -19,8 +19,10 @@ from __future__ import annotations
 
 import email
 import os
+import shutil
 import subprocess
 import sys
+import tarfile
 import tomllib
 import zipfile
 from pathlib import Path
@@ -48,18 +50,74 @@ def _isolated_environment() -> dict[str, str]:
     return environment
 
 
-@pytest.fixture(scope="module")
-def built_wheel(tmp_path_factory) -> Path:
+@pytest.fixture(scope="module", params=[True, False], ids=["checkout", "source-archive"])
+def built_distributions(tmp_path_factory, request):
+    project_dir = tmp_path_factory.mktemp("distribution-source")
+    tracked = subprocess.check_output(
+        [
+            "git", "ls-files", "-z", "--", "kestrel_sovereign", ".gitignore",
+            "pyproject.toml", "README.md", "LICENSE", "uv.lock",
+        ],
+        cwd=REPOSITORY,
+    ).decode().split("\0")
+    package_files = set()
+    for name in filter(None, tracked):
+        target = project_dir / name
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(REPOSITORY / name, target)
+        if name.startswith("kestrel_sovereign/"):
+            package_files.add(name)
+    if not request.param:
+        (project_dir / ".gitignore").unlink()
+    # Discovery writes this ignored cache during ordinary runtime and tests.
+    # Build from an owned copy so the probe cannot alter the real catalog.
+    (project_dir / "kestrel_sovereign/model_discovery_cache.json").write_text(
+        '{"models": [{"id": "private-catalog-release-probe"}]}', encoding="utf-8",
+    )
     dist_dir = tmp_path_factory.mktemp("typed-marker-dist")
     subprocess.run(
-        ["uv", "build", "--wheel", "--out-dir", str(dist_dir)],
-        cwd=REPOSITORY,
+        ["uv", "build", "--out-dir", str(dist_dir)],
+        cwd=project_dir,
         env=_isolated_environment(),
         check=True,
     )
     wheels = list(dist_dir.glob("kestrel_sovereign-*.whl"))
+    sdists = list(dist_dir.glob("kestrel_sovereign-*.tar.gz"))
     assert len(wheels) == 1, f"expected one Kestrel wheel, found {wheels}"
-    return wheels[0]
+    assert len(sdists) == 1, f"expected one Kestrel sdist, found {sdists}"
+    return {
+        "wheel": wheels[0], "sdist": sdists[0], "source": project_dir,
+        "package_files": package_files,
+    }
+
+
+@pytest.fixture(scope="module")
+def built_wheel(built_distributions) -> Path:
+    return built_distributions["wheel"]
+
+
+def test_distributions_ship_only_canonical_package_files(built_distributions, tmp_path):
+    with zipfile.ZipFile(built_distributions["wheel"]) as archive:
+        wheel = {
+            name: archive.read(name) for name in archive.namelist()
+            if name.startswith("kestrel_sovereign/") and not name.endswith("/")
+        }
+    with tarfile.open(built_distributions["sdist"]) as archive:
+        sdist = {
+            member.name.split("/", 1)[1]: archive.extractfile(member).read()
+            for member in archive.getmembers()
+            if member.isfile() and "/kestrel_sovereign/" in member.name
+        }
+    assert set(wheel) == set(sdist) == built_distributions["package_files"]
+    for name in wheel:
+        assert wheel[name] == sdist[name] == (built_distributions["source"] / name).read_bytes()
+    rebuilt_dir = tmp_path / "rebuilt"
+    subprocess.run(
+        ["uv", "build", str(built_distributions["sdist"]), "--wheel", "--out-dir", str(rebuilt_dir)],
+        cwd=tmp_path, env=_isolated_environment(), check=True,
+    )
+    (rebuilt,) = rebuilt_dir.glob("kestrel_sovereign-*.whl")
+    assert rebuilt.read_bytes() == built_distributions["wheel"].read_bytes()
 
 
 def test_pyproject_declares_typed_classifier():

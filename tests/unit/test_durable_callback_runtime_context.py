@@ -34,6 +34,10 @@ def resident_dispatcher():
     # dispatch_signal below is an explicit finite callback seam.
     dispatcher._store = SimpleNamespace(_backend=None)
     dispatcher._durable_shutdown = False
+    dispatcher._durable_owned_tasks = set()
+    dispatcher._durable_cognition_stop = None
+    dispatcher._entered_durable_cognition_drainers = set()
+    dispatcher._runtime_owner_heartbeat_task = None
     dispatcher._live_durable_cognition_event_ids = set()
     dispatcher._started_durable_cognition_consumers = {"channel"}
     dispatcher._durable_cognition_drainers = {}

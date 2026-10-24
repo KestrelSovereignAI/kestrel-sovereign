@@ -22,26 +22,31 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
+from kestrel_sdk.native_a2a.helpers.proto_helpers import new_text_message
+from kestrel_sdk.native_a2a.types import Role, Task, TaskState, TaskStatus
 from kestrel_sdk.signals import CausationFrame
+
+from kestrel_sovereign.a2a.extensions import (
+    causation_metadata,
+    serialize_chain_for_metadata,
+)
+from kestrel_sovereign.a2a.stores.unified.context_store import ContextOwnership
+from kestrel_sovereign.a2a.stores.unified.task_store import NativeTaskSnapshot
 from kestrel_sovereign.agent.event_manager import (
     EventManagerMixin,
     background_task_identifiers,
     describe_background_task,
 )
-from kestrel_sovereign.signals.sources.a2a import serialize_chain_for_metadata
-from kestrel_sovereign.a2a.types import (
-    Message,
-    Task,
-    TaskState,
-    TaskStatus,
-    TextPart,
-)
 
 
 def _task(metadata, *, task_id="task-1526-full-id-0001",
-          state=TaskState.COMPLETED, message=None):
-    status = TaskStatus(state=state, message=message)
-    return Task(id=task_id, sessionId="s-1", status=status, metadata=metadata)
+          state=TaskState.TASK_STATE_COMPLETED, message=None):
+    task = Task(id=task_id, context_id="context-" + task_id,
+                status=TaskStatus(state=state, message=message), metadata=metadata or {})
+    return NativeTaskSnapshot(task=task, lifecycle_revision=0, ownership=ContextOwnership(
+        context_id=task.context_id, tenant="", recipient_agent_id="did:test:1526",
+        creator_agent_id="did:test:creator",
+    ))
 
 
 def _cron_chain_metadata(*sources):
@@ -60,7 +65,7 @@ def _cron_chain_metadata(*sources):
         )
         for i, src in enumerate(sources)
     ]
-    return {"causation_chain": serialize_chain_for_metadata(frames)}
+    return causation_metadata(serialize_chain_for_metadata(frames))
 
 
 class _AgentLike(EventManagerMixin):
@@ -82,9 +87,9 @@ def test_execute_skill_metadata_preserved():
     """The A2A skill path (agent_id + skill, stamped by execute_skill)
     yields ``<agent>/<skill>``."""
     source, name = describe_background_task(
-        _task({"agent_id": "PeerAgent", "skill": "do_thing"})
+        _task({"provider_id": "PeerAgent", "skill": "do_thing"})
     )
-    assert (source, name) == ("PeerAgent", "do_thing")
+    assert (source, name) == ("did:test:creator", "do_thing")
 
 
 def test_inbound_sender_and_task_type_used():
@@ -93,7 +98,7 @@ def test_inbound_sender_and_task_type_used():
     source, name = describe_background_task(
         _task({"sender": "did:peer:9", "task_type": "lora_training"})
     )
-    assert (source, name) == ("did:peer:9", "lora_training")
+    assert (source, name) == ("did:test:creator", "lora_training")
 
 
 def test_scheduler_origin_via_causation_chain():
@@ -122,20 +127,20 @@ def test_real_producer_keys_win_over_causation_chain():
     """When a direct producer key is present it is preferred over the
     causation-chain fallback (more specific identifies the actual work)."""
     md = _cron_chain_metadata("cron.restart_coordinator")
-    md.update({"agent_id": "PeerAgent", "skill": "do_thing"})
-    assert describe_background_task(_task(md)) == ("PeerAgent", "do_thing")
+    md.update({"provider_id": "PeerAgent", "skill": "do_thing"})
+    assert describe_background_task(_task(md)) == ("did:test:creator", "do_thing")
 
 
 def test_empty_metadata_falls_back_to_unknown_task():
     """No usable metadata still degrades gracefully to the historical
     label (but the full task id is exposed separately)."""
-    assert describe_background_task(_task({})) == ("unknown", "task")
-    assert describe_background_task(_task(None)) == ("unknown", "task")
+    assert describe_background_task(_task({})) == ("did:test:creator", "task")
+    assert describe_background_task(_task(None)) == ("did:test:creator", "task")
 
 
 def test_task_type_only_metadata():
     source, name = describe_background_task(_task({"task_type": "lora_training"}))
-    assert (source, name) == ("unknown", "lora_training")
+    assert (source, name) == ("did:test:creator", "lora_training")
 
 
 # ---------------------------------------------------------------------------
@@ -146,7 +151,7 @@ def test_task_type_only_metadata():
 def test_identifiers_expose_full_task_id():
     """The full (untruncated) task id must appear so it is resolvable via
     check_task_status (#1526 acceptance criterion 3)."""
-    ids = background_task_identifiers(_task({}, task_id="abcd1234-full-uuid"))
+    ids = background_task_identifiers((_task({}, task_id="abcd1234-full-uuid")).task)
     # Not the truncated 8-char prefix that the old format emitted.
     assert ids == "task: abcd1234-full-uuid"
 
@@ -156,7 +161,7 @@ def test_identifiers_ignore_unproduced_execution_id():
     execution id is born after the run, in task_execution_log), so the
     identifier suffix never surfaces one even if a stray key is present."""
     ids = background_task_identifiers(
-        _task({"execution_id": "should-not-appear"}, task_id="45a190ee-task")
+        (_task({"execution_id": "should-not-appear"}, task_id="45a190ee-task")).task
     )
     assert ids == "task: 45a190ee-task"
 
@@ -192,8 +197,8 @@ def test_failed_notification_includes_label_and_error():
     task = _task(
         _cron_chain_metadata("cron.wait_reconcile"),
         task_id="6314e1ea-41a8-4074-87ba-4f191551de61",
-        state=TaskState.FAILED,
-        message=Message(role="agent", parts=[TextPart(text="boom")]),
+        state=TaskState.TASK_STATE_FAILED,
+        message=new_text_message("boom", role=Role.ROLE_AGENT),
     )
 
     agent._on_background_task_complete(task)
@@ -207,7 +212,7 @@ def test_failed_notification_includes_label_and_error():
 
 def test_canceled_notification_uses_full_id():
     agent = _AgentLike()
-    task = _task({}, task_id="2ea43cc2-full-id", state=TaskState.CANCELED)
+    task = _task({}, task_id="2ea43cc2-full-id", state=TaskState.TASK_STATE_CANCELED)
 
     agent._on_background_task_complete(task)
 

@@ -2,20 +2,25 @@
 import asyncio
 
 import pytest
-
+from kestrel_sdk.native_a2a.helpers.proto_helpers import new_text_message
+from kestrel_sdk.native_a2a.types import Role, SendMessageRequest, TaskState
 from kestrel_sdk.storage.database import QueryError
+
+from kestrel_sovereign.a2a.scope import NativeRecipientScope
 from kestrel_sovereign.a2a.task_manager import create_task_manager
-from kestrel_sovereign.a2a.types import Message, TaskSendParams, TaskState, TextPart
-from kestrel_sovereign.execution_custody import ExecutionCommitOutcomeError, execution_commit_outcome
+from kestrel_sovereign.execution_custody import (
+    ExecutionCommitOutcomeError,
+    execution_commit_outcome,
+)
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("carrier", [QueryError, ValueError])
 async def test_actual_shutdown_joins_every_store_without_losing_native_cancel_receipt(tmp_path, monkeypatch, carrier):
-    manager = await create_task_manager(str(tmp_path / "shutdown.db"))
+    manager = await create_task_manager(str(tmp_path / "shutdown.db"), scope=NativeRecipientScope("did:test:recipient"))
     task = await manager.create_task(
-        TaskSendParams(message=Message(role="user", parts=[TextPart(text="fixture")])),
-        agent_name="did:test:recipient", creator_agent_id="did:test:creator",
+        SendMessageRequest(message=new_text_message("fixture", role=Role.ROLE_USER)),
+        creator_agent_id="did:test:creator",
     )
     entered = asyncio.Event()
 
@@ -29,7 +34,7 @@ async def test_actual_shutdown_joins_every_store_without_losing_native_cancel_re
 
     async def lost_ack(*args, **kwargs):
         committed = await original_cancel(*args, **kwargs)
-        assert committed.status.state is TaskState.CANCELED
+        assert committed.status.state == TaskState.TASK_STATE_CANCELED
         raise carrier("original shutdown COMMIT acknowledgement lost") from ExecutionCommitOutcomeError("unknown")
 
     async def read_failed(*args, **kwargs):
@@ -58,7 +63,10 @@ async def test_actual_shutdown_joins_every_store_without_losing_native_cancel_re
 
 from types import SimpleNamespace
 
-from kestrel_sovereign.execution_custody import ExecutionAuthorityError, is_execution_control_error
+from kestrel_sovereign.execution_custody import (
+    ExecutionAuthorityError,
+    is_execution_control_error,
+)
 
 
 @pytest.mark.asyncio
@@ -68,16 +76,16 @@ async def test_public_task_tools_preserve_native_control_receipts(tmp_path, monk
     from kestrel_sovereign.features.tasks.feature import TaskFeature
 
     recipient = "did:test:recipient"
-    manager = await create_task_manager(str(tmp_path / "public-tools.db"))
+    manager = await create_task_manager(str(tmp_path / "public-tools.db"), scope=NativeRecipientScope("did:test:recipient"))
     task = await manager.create_task(
-        TaskSendParams(message=Message(role="user", parts=[TextPart(text="fixture")])),
-        agent_name=recipient, creator_agent_id="did:test:creator",
+        SendMessageRequest(message=new_text_message("fixture", role=Role.ROLE_USER)),
+        creator_agent_id="did:test:creator",
     )
     feature = TaskFeature(SimpleNamespace(did=recipient, features={}))
     feature.set_task_manager(manager)
     marker = ExecutionCommitOutcomeError("unknown")
     method = {
-        "status": "get_task_for_recipient", "list": "get_pending_tasks",
+        "status": "get_task_snapshot", "list": "list_task_snapshots",
         "respond_read": "get_task_for_recipient", "respond_write": "update_status",
         "artifact": "add_artifact", "cancel_direction": "is_task_recipient",
         "cancel_write": "cancel_task",
@@ -107,8 +115,8 @@ async def test_public_task_tools_preserve_native_control_receipts(tmp_path, monk
         assert execution_commit_outcome(caught.value) == "unknown"
         assert calls == [True], "native operation was retried after an unresolved receipt"
         durable = await manager.task_store._get_unscoped(task.id)
-        expected = TaskState.WORKING if route == "respond_write" else TaskState.CANCELED if route == "cancel_write" else TaskState.SUBMITTED
-        assert durable.status.state is expected
+        expected = TaskState.TASK_STATE_COMPLETED if route == "respond_write" else TaskState.TASK_STATE_CANCELED if route == "cancel_write" else TaskState.TASK_STATE_SUBMITTED
+        assert durable.status.state == expected
         assert len(durable.artifacts or []) == (route == "artifact")
     finally:
         await manager.close()
@@ -122,18 +130,19 @@ async def test_registered_feature_and_actual_workflow_never_publish_or_retry_con
     from kestrel_sovereign.features.tasks.feature import TaskFeature
     from kestrel_sovereign.storage.async_database import AsyncDatabase
 
-    manager = await create_task_manager(str(tmp_path / "registered.db"))
+    manager = await create_task_manager(str(tmp_path / "registered.db"), scope=NativeRecipientScope("did:test:recipient"))
     effects = await AsyncDatabase.sqlite(str(tmp_path / "effects.db"))
     await effects.execute("CREATE TABLE effects (id INTEGER PRIMARY KEY)")
     marker = ExecutionCommitOutcomeError("unknown") if control == "unknown" else ExecutionAuthorityError("narrower child authority lost")
     calls, submitted = [], []
-    original_save = manager.task_store.save
+    original_create = manager.create_task
 
-    async def observe_save(task, *args, **kwargs):
+    async def observe_create(*args, **kwargs):
+        task = await original_create(*args, **kwargs)
         submitted.append(task.id)
-        return await original_save(task, *args, **kwargs)
+        return task
 
-    monkeypatch.setattr(manager.task_store, "save", observe_save)
+    monkeypatch.setattr(manager, "create_task", observe_create)
 
     class Effects(Feature):
         async def initialize(self):
@@ -151,9 +160,9 @@ async def test_registered_feature_and_actual_workflow_never_publish_or_retry_con
                 raise asyncio.CancelledError("original child cancellation carrier") from marker
             raise QueryError("child custody wrapper after durable effect") from marker
 
-    feature = Effects(SimpleNamespace())
-    manager.register_agent(feature.get_agent_card(), feature)
-    workflow = TaskFeature(SimpleNamespace())
+    feature = Effects(SimpleNamespace(did=manager.did, task_manager=manager))
+    manager.register_provider(feature.tool_name, feature.get_agent_skills(), feature)
+    workflow = TaskFeature(SimpleNamespace(did=manager.did, task_manager=manager))
     workflow.set_task_manager(manager)
     try:
         with pytest.raises(BaseException) as caught:
@@ -172,7 +181,7 @@ async def test_registered_feature_and_actual_workflow_never_publish_or_retry_con
         assert await effects.fetchval("SELECT COUNT(*) FROM effects") == 1
         assert len(submitted) == 1
         durable = await manager.task_store._get_unscoped(submitted[0])
-        assert durable.status.state is TaskState.SUBMITTED, "registered handler published control as a new FAILED result"
+        assert durable.status.state == TaskState.TASK_STATE_SUBMITTED, "registered handler published control as a new FAILED result"
     finally:
         try:
             await manager.close()
@@ -269,7 +278,7 @@ async def test_actual_agent_shutdown_retains_control_through_prefix_and_native_t
     storage.db = db
     agent.storage = agent._raw_storage = storage
     agent.features = {}
-    agent.task_manager = await create_task_manager(str(tmp_path / "manager.db"))
+    agent.task_manager = await create_task_manager(str(tmp_path / "manager.db"), scope=NativeRecipientScope(agent.did))
     completed = []
     marker = ExecutionCommitOutcomeError("unknown")
 

@@ -14,6 +14,7 @@ the WebSocket path is verified, not assumed.
 from __future__ import annotations
 
 import json
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import MagicMock
 
@@ -23,11 +24,10 @@ import pytest
 def _make_middleware(monkeypatch, agent_for: dict[str, Any] | None = None):
     """Build the middleware with a stubbed agent_manager.
 
-    Imports server.py late to avoid loading the whole app at module-import
-    time. Patches the module-level `app.state.agent_manager` so the
-    middleware sees the stub.
+    Import the canonical server late and supply an isolated application in
+    the ASGI scope, as Starlette does for a real request.
     """
-    import server as server_module
+    import kestrel_sovereign.server as server_module
 
     inner_calls: list[dict] = []
 
@@ -42,10 +42,13 @@ def _make_middleware(monkeypatch, agent_for: dict[str, Any] | None = None):
     fake_manager = MagicMock()
     fake_manager.get_agent = MagicMock(side_effect=lambda name: (agent_for or {}).get(name))
 
-    # Monkeypatch spans the entire async test and restores the exact original
-    # owner afterwards. A direct assignment leaks into the next server lifespan.
-    monkeypatch.setattr(server_module.app.state, "agent_manager", fake_manager, raising=False)
-    return mw, inner_calls, fake_manager
+    application = SimpleNamespace(state=SimpleNamespace(agent_manager=fake_manager))
+
+    async def call(scope, receive, send):
+        scope["app"] = application
+        await mw(scope, receive, send)
+
+    return call, inner_calls, fake_manager
 
 
 @pytest.mark.asyncio
@@ -235,7 +238,7 @@ async def test_non_agent_path_passes_through_unchanged(monkeypatch):
 @pytest.mark.asyncio
 async def test_no_agent_manager_passes_through(monkeypatch):
     """Single-agent mode (no agent_manager on app.state) — middleware no-op."""
-    import server as server_module
+    import kestrel_sovereign.server as server_module
 
     inner_calls: list[dict] = []
 
@@ -243,8 +246,7 @@ async def test_no_agent_manager_passes_through(monkeypatch):
         inner_calls.append({"scope": dict(scope), "called": True})
 
     mw = server_module.MultiAgentAgentRoutingMiddleware(_inner)
-    # Force agent_manager to None.
-    monkeypatch.setattr(server_module.app.state, "agent_manager", None, raising=False)
+    # No application/manager was supplied in this isolated ASGI scope.
 
     scope = {
         "type": "http",

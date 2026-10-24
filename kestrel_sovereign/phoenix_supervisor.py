@@ -28,7 +28,6 @@ line, ``/phoenix/`` returns a clear 503. Opt out even when installed with
 from __future__ import annotations
 
 import errno
-import importlib.metadata
 import importlib.util
 import logging
 import os
@@ -44,7 +43,6 @@ from typing import Optional
 
 import httpx
 import itsdangerous
-from packaging.version import InvalidVersion, Version
 from starlette.requests import Request
 from starlette.responses import JSONResponse, Response, StreamingResponse
 
@@ -74,12 +72,6 @@ DEFAULT_PHOENIX_GRPC_PORT = 4317
 
 #: Sub-path the UI is served under for same-origin embedding.
 PHOENIX_ROOT_PATH = "/phoenix"
-
-#: The distribution that ships the Phoenix server (``phoenix.server``).
-PHOENIX_SERVER_DISTRIBUTION = "arize-phoenix"
-#: The first Phoenix release that honours ``PHOENIX_HOST_ROOT_PATH``
-#: (Arize-ai/phoenix#3186, "Add ASGI root path parameter to Phoenix server").
-PHOENIX_HOST_ROOT_PATH_SINCE = Version("4.1.0")
 
 PRIVATE_CHILD_UMASK = 0o077
 
@@ -273,31 +265,6 @@ def autowire_otel_project(env: Optional[dict] = None) -> Optional[str]:
     return DEFAULT_OTEL_PROJECT
 
 
-def supports_host_root_path() -> bool:
-    """Does the installed Phoenix honour ``PHOENIX_HOST_ROOT_PATH``?
-
-    Answered from the installed server distribution's version, without
-    importing Phoenix. ``import phoenix.config`` loads the Phoenix server and
-    took 5.7–12.7s on a fleet host, on every boot, even when an already
-    running Phoenix was adopted rather than spawned (#3781). When this is
-    False we fall back to root-path serving and the proxy strips the
-    ``/phoenix`` prefix instead (see :meth:`PhoenixSupervisor.upstream_url`).
-    """
-    try:
-        recorded = importlib.metadata.version(PHOENIX_SERVER_DISTRIBUTION)
-    except (importlib.metadata.PackageNotFoundError, KeyError):
-        # KeyError: a damaged install whose metadata has no Version field, on
-        # a Python that raises for a missing field rather than returning None.
-        return False
-    if recorded is None:
-        return False
-    try:
-        installed = Version(recorded)
-    except InvalidVersion:
-        return False
-    return installed >= PHOENIX_HOST_ROOT_PATH_SINCE
-
-
 # ---------------------------------------------------------------------------
 # Private storage custody
 # ---------------------------------------------------------------------------
@@ -439,9 +406,8 @@ class PhoenixSupervisor:
             else phoenix_working_dir()
         )
         self._storage_prepared = False
-        # ``None`` means "auto-detect from the installed Phoenix". Resolved on
-        # start() so tests can force a value.
-        self._root_path_override = root_path
+        # The required Phoenix release supports the host root path. Keep its
+        # imports and configuration side effects inside the supervised child.
         self.root_path = root_path if root_path is not None else PHOENIX_ROOT_PATH
         self.process: Optional[subprocess.Popen] = None
         # PID of an orphaned Phoenix this supervisor *adopted* rather than spawned
@@ -950,19 +916,6 @@ class PhoenixSupervisor:
             )
             return False
 
-        # Resolve the effective root-path against the installed Phoenix unless a
-        # value was pinned by the caller/tests.
-        if self._root_path_override is None:
-            if supports_host_root_path():
-                self.root_path = PHOENIX_ROOT_PATH
-            else:
-                logger.warning(
-                    "Installed Phoenix does not support PHOENIX_HOST_ROOT_PATH — "
-                    "falling back to root-path serving; the proxy will strip the "
-                    "/phoenix prefix. Some absolute UI links may not embed cleanly."
-                )
-                self.root_path = ""
-
         # Adopt-or-reap: never spawn a second child into a port an orphaned
         # Phoenix already holds (#2589 split-brain). Adopt a still-serving child,
         # or reap a non-serving leak so our fresh child can bind. Never blocks
@@ -1326,7 +1279,6 @@ __all__ = [
     "phoenix_otlp_endpoint",
     "autowire_otlp_endpoint",
     "autowire_otel_project",
-    "supports_host_root_path",
     "mint_embed_token",
     "issue_embed_cookie",
     "verify_embed_cookie",

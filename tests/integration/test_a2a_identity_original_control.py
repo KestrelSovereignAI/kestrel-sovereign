@@ -1,6 +1,6 @@
 """A2A identity/policy consumers preserve original PostgreSQL control.
 
-The roster, requester capability and legacy identity fields are explicit
+The roster, requester capability and durable identity fields are explicit
 private component inputs, not Agent READY/genesis or authenticated peer grants.
 The directory never authorizes a sender: native failure or ordinary refusal
 must create no task. Actual SQL, topology leases and immutable policy are used.
@@ -13,19 +13,9 @@ import pytest
 from fastapi import HTTPException, Request
 
 from kestrel_sovereign.a2a.inbound_authorization import RecipientA2ASenderAuthorizer
-from kestrel_sovereign.a2a.stores.unified import (
-    ObservabilityStore,
-    SessionService,
-    TaskStore,
-)
-from kestrel_sovereign.a2a.task_manager import TaskManager
-from kestrel_sovereign.a2a.types import Message, TaskSendParams, TextPart
-from kestrel_sovereign.endpoints.agent import (
-    _create_a2a_task_under_lifecycle_lease,
-    _scoped_agent_did_or_503,
-    _task_recipient_principal,
-    list_tasks,
-)
+from kestrel_sovereign.a2a.scope import NativeRecipientScope
+from kestrel_sovereign.endpoints.agent import _scoped_agent_did_or_503
+from kestrel_sovereign.endpoints.task_inbox import list_inbox, read_inbox
 from kestrel_sovereign.execution_custody import (
     ExecutionCustody,
     _explicit_control_chain,
@@ -41,6 +31,7 @@ from tests.integration.native_memory_original_control import (
 )
 from tests.integration.test_execution_authority_postgres import GenerationFence
 from tests.integration.test_execution_authority_postgres import native_pg as native_pg
+from tests.utils.native_a2a import manager_for
 
 
 @pytest.mark.asyncio
@@ -48,8 +39,6 @@ from tests.integration.test_execution_authority_postgres import native_pg as nat
     "door",
     [
         "manager-policy",
-        "endpoint-policy",
-        "published-name",
         "inbound-identity",
         "task-recipient",
         "task-scope",
@@ -61,9 +50,7 @@ async def test_a2a_policy_identity_does_not_turn_original_control_into_refusal(
     native_memory_owners, tmp_path, door, kind
 ):
     n = native_memory_owners
-    tasks = TaskManager(
-        TaskStore(n.backend), SessionService(n.backend), ObservabilityStore(n.backend)
-    )
+    tasks = manager_for(n.backend, NativeRecipientScope(n.did), owns_backend=False)
     await tasks.initialize()
     original = OSError("original A2A policy native release acknowledgement lost")
     ordinary = OSError("ordinary policy callback refused after acknowledged SQL")
@@ -135,30 +122,12 @@ async def test_a2a_policy_identity_does_not_turn_original_control_into_refusal(
     n.backend._execution_custody = ExecutionCustody(GenerationFence())
     failure = result = None
     try:
-        if door in {"manager-policy", "endpoint-policy"}:
+        if door == "manager-policy":
             try:
                 async with manager.a2a_execution_lease():
-                    if door == "manager-policy":
-                        result = await manager.authorize_a2a_legacy_unsigned_sender(
-                            recipient, sender._agent_name, policy
-                        )
-                    else:
-                        parts = [TextPart(text="must not create a task")]
-                        params = TaskSendParams(
-                            id="never-authorized",
-                            sessionId="private-component-session",
-                            message=Message(role="user", parts=parts),
-                            metadata={"sender": sender._agent_name},
-                        )
-                        result = await _create_a2a_task_under_lifecycle_lease(
-                            recipient,
-                            params,
-                            parts,
-                            [],
-                            [],
-                            manager,
-                            hosted_policy=policy,
-                        )
+                    result = await policy.authorizer.authorize_principal_with_policy(
+                        sender.did, router=policy.router, requester=policy.requester,
+                    )
             except BaseException as error:
                 failure = error
         else:
@@ -180,19 +149,15 @@ async def test_a2a_policy_identity_does_not_turn_original_control_into_refusal(
                         ) from retained
                     raise AgentIdentityUnavailable("ordinary missing identity")
 
-            class DisplayReadback:
-                def resolve_effective_name(self, **kwargs):
-                    raise retained
-
             try:
-                if door == "published-name":
-                    result = manager._published_a2a_display_identity(DisplayReadback())
-                elif door == "inbound-identity":
+                if door == "inbound-identity":
                     result = authorizer._stable_agent_id(IdentityReadback())
                 elif door == "task-recipient":
-                    result = _task_recipient_principal(IdentityReadback())
+                    result = await read_inbox(
+                        Request({"type": "http", "state": {"agent": IdentityReadback()}}), "absent-task",
+                    )
                 elif door == "task-list":
-                    result = await list_tasks(
+                    result = await list_inbox(
                         Request({"type": "http", "state": {"agent": IdentityReadback()}}),
                         status=None,
                         limit=50,
@@ -221,9 +186,12 @@ async def test_a2a_policy_identity_does_not_turn_original_control_into_refusal(
             )
             assert sources[0] in tuple(_explicit_control_chain(failure))
             assert execution_commit_outcome(failure) == "committed"
-        elif door in {"endpoint-policy", "task-recipient", "task-scope", "task-list"}:
+        elif door in {"task-recipient", "task-scope", "task-list"}:
             assert isinstance(failure, HTTPException)
-            assert failure.status_code == (403 if door == "endpoint-policy" else 503)
+            assert failure.status_code == 503
+            assert not is_execution_control_error(failure)
+        elif door == "manager-policy":
+            assert failure is ordinary and result is None
             assert not is_execution_control_error(failure)
         else:
             assert failure is None and result is None

@@ -15,7 +15,7 @@ Every test runs a real dispatcher over a real SQLite ledger.
 from __future__ import annotations
 
 import asyncio
-from types import MethodType, SimpleNamespace
+from types import MethodType
 from unittest.mock import AsyncMock
 
 import pytest
@@ -177,22 +177,19 @@ async def test_rows_only_a_redelivery_can_run_do_not_crowd_out_executable_work(
 
 
 async def _held_elided_a2a_wake(tmp_path, name: str, rehydrate):
-    from kestrel_sovereign.a2a.types import TaskState
+    from kestrel_sdk.native_a2a.helpers.proto_helpers import new_text_message
+    from kestrel_sdk.native_a2a.types import Role, SendMessageRequest
+
+    from kestrel_sovereign.a2a.scope import NativeRecipientScope
     from kestrel_sovereign.signals.sources.a2a_task_submitted import (
         DURABLE_COGNITION_CONSUMER_ID as A2A_CONSUMER,
     )
     from kestrel_sovereign.signals.sources.a2a_task_submitted import (
         build_signal_for_submitted_task,
+        submitted_input_identity,
     )
-
+    from tests.utils.native_a2a import manager_for
     did = f"did:agent:drain-replayable:{name}"
-    task = SimpleNamespace(
-        id=f"task-{name}",
-        sessionId="session",
-        metadata={},
-        history=[],
-        status=SimpleNamespace(state=TaskState.SUBMITTED),
-    )
     consumer = DurableConsumerRegistration(
         consumer_id=A2A_CONSUMER,
         source="a2a.task_submitted",
@@ -206,15 +203,20 @@ async def _held_elided_a2a_wake(tmp_path, name: str, rehydrate):
     hold = _HoldSnapshots(_held_state(did))
     agent._hold_store = hold
     agent.process_input = AsyncMock(return_value="ran")
-    agent.task_manager = SimpleNamespace(
-        get_task_for_recipient=AsyncMock(return_value=task)
+    manager = manager_for(backend, NativeRecipientScope(did), owns_backend=False)
+    await manager.initialize()
+    agent.task_manager = manager
+    task = await manager.create_task(
+        SendMessageRequest(message=new_text_message("Research request", role=Role.ROLE_USER)),
+        creator_agent_id="did:test:sender",
     )
+    candidate = await manager.get_task_snapshot(task.id, recipient_agent_id=did)
     agent.rehydrate_durable_cognition_signal = rehydrate(agent)
     agent.durable_rehydratable_sources = frozenset({"a2a.task_submitted"})
     await dispatcher.register_durable_consumer(consumer)
     handle = await dispatcher.enqueue_durable_cognition(
-        build_signal_for_submitted_task(task, target_agent=did),
-        source_event_id=task.id,
+        build_signal_for_submitted_task(candidate, target_agent=did),
+        source_event_id=submitted_input_identity(task.id, candidate.input_revision),
         consumer_id=A2A_CONSUMER,
     )
     assert (
@@ -253,6 +255,7 @@ async def test_drain_rehydrates_a_held_elided_a2a_wake_with_its_sidecar_attached
         assert task.id in agent.process_input.await_args.args[0]
     finally:
         await dispatcher.shutdown_durable_delivery()
+        await agent.task_manager.close()
         await _close(backend, agent)
 
 
@@ -280,6 +283,7 @@ async def test_drain_still_claims_a_row_whose_store_fails_to_answer(tmp_path):
         agent.process_input.assert_not_awaited()
     finally:
         await dispatcher.shutdown_durable_delivery()
+        await agent.task_manager.close()
         await _close(backend, agent)
 
 
