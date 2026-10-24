@@ -1,6 +1,5 @@
 """Real SDK config-transition exchange through the isolated host proxy."""
 
-from tests.shared.native_shutdown_budget import shutdown_fixture_agent
 
 import asyncio
 import json
@@ -1140,6 +1139,6 @@ async def test_real_sdk_fenced_transition_promotion_failure_restores_durable_con
     finally:
         release_transition.set()
         if fresh is not None:
-            await shutdown_fixture_agent(fresh)
+            await fresh.shutdown()
         await feature.shutdown()
         await asyncio.gather(*service_tasks)
