@@ -153,7 +153,7 @@ async def test_pending_first_turn_blocks_then_completes_once_across_restart(tmp_
         assert await restarted.process_input("PONG") == "PONG"
         restarted.get_audit_response.assert_not_awaited()
     finally:
-        await restarted.shutdown()
+        await shutdown_fixture_agent(restarted)
 
 
 @pytest.mark.asyncio
