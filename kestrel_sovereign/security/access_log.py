@@ -11,11 +11,13 @@ request semantics remain unchanged.
 from __future__ import annotations
 
 from collections.abc import Awaitable, Callable
+import re
 from typing import Any
 from urllib.parse import parse_qsl, urlencode
 
 
 _REDACTED_VALUE = "redacted"
+_ARTIFACT_TARGET = re.compile(r"/api/artifacts(?:/|$)")
 _SENSITIVE_QUERY_NAMES = frozenset(
     {
         "apikey",
@@ -72,19 +74,31 @@ class SensitiveQueryStringRedactionMiddleware:
         self.app = app
 
     async def __call__(self, scope: dict, receive: Callable, send: Callable) -> Any:
-        if scope.get("type") != "http" or not scope.get("query_string"):
+        if scope.get("type") != "http":
             return await self.app(scope, receive, send)
 
-        redacted_query = redact_sensitive_query_string(scope["query_string"])
-        if redacted_query == scope["query_string"]:
+        # Artifact IDs, publication keys and file paths are private metadata,
+        # including on failed/unauthenticated requests and agent-prefixed URLs.
+        artifact = bool(_ARTIFACT_TARGET.search(scope.get("path", "")))
+        query = scope.get("query_string", b"")
+        redacted_query = b"" if artifact else redact_sensitive_query_string(query)
+        if not artifact and redacted_query == query:
             return await self.app(scope, receive, send)
+
+        def redact_scope() -> None:
+            scope["query_string"] = redacted_query
+            if artifact:
+                scope["path"] = "/api/artifacts"
+                scope["raw_path"] = b"/api/artifacts"
 
         async def send_with_redacted_scope(message: dict) -> None:
             if message.get("type") == "http.response.start":
                 # Uvicorn's RequestResponseCycle.send reads this exact scope
                 # immediately after the wrapped send is entered.
-                original_query = scope["query_string"]
-                scope["query_string"] = redacted_query
+                original_query = scope.get("query_string", b"")
+                original_path = scope.get("path", "")
+                original_raw_path = scope.get("raw_path")
+                redact_scope()
                 try:
                     await send(message)
                 finally:
@@ -92,7 +106,22 @@ class SensitiveQueryStringRedactionMiddleware:
                     # code after response-start. Keep its request semantics
                     # unchanged after the synchronous access-log seam.
                     scope["query_string"] = original_query
+                    if artifact:
+                        scope["path"] = original_path
+                        if original_raw_path is None:
+                            scope.pop("raw_path", None)
+                        else:
+                            scope["raw_path"] = original_raw_path
                 return
             await send(message)
 
-        return await self.app(scope, receive, send_with_redacted_scope)
+        try:
+            return await self.app(scope, receive, send_with_redacted_scope)
+        except BaseException:
+            # ServerErrorMiddleware sits outside user middleware. Its fallback
+            # response and error handler see this scope after an escaped error,
+            # including an outer delivery refusal before response-start. Keep
+            # that terminal path redacted too; successful streams still restore
+            # their request semantics after each start-send as above.
+            redact_scope()
+            raise

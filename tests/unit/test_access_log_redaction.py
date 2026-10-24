@@ -83,3 +83,43 @@ async def test_multi_agent_request_is_redacted_only_during_response_start_send()
     assert secret.decode() not in target
     assert "api_key=redacted" in target
     assert "session_id=chat-7" in target
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("prefix", ["", "/agent", "/api/agents/Kite", "/api/agent-routes/a2l0ZQ"])
+@pytest.mark.parametrize("query", [b"", b"path=private%2Ffile.md&cursor=private-cursor"])
+async def test_artifact_identifiers_are_redacted_without_changing_handler_semantics(prefix, query):
+    path = prefix + "/api/artifacts/publications/private-publication-key"
+    scope = {"type": "http", "path": path, "raw_path": path.encode(), "query_string": query}
+    observed = []
+    async def inner(inner_scope, receive, send):
+        assert inner_scope["path"] == path and inner_scope["query_string"] == query
+        await send({"type": "http.response.start", "status": 403, "headers": []})
+        assert inner_scope["path"] == path and inner_scope["query_string"] == query
+    async def receive():
+        return {"type": "http.disconnect"}
+    async def send(message):
+        observed.append(get_path_with_query_string(scope))
+    await SensitiveQueryStringRedactionMiddleware(inner)(scope, receive, send)
+    assert observed == ["/api/artifacts"]
+    assert scope["path"] == path and scope["raw_path"] == path.encode() and scope["query_string"] == query
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("during_send", [False, True])
+@pytest.mark.parametrize("artifact", [False, True])
+async def test_escaped_error_keeps_scope_redacted_for_outer_error_handler(during_send, artifact):
+    path = "/api/artifacts/private-id/file" if artifact else "/events"
+    query = b"path=private-file" if artifact else b"api_key=private-key"
+    scope = {"type": "http", "path": path, "raw_path": path.encode(), "query_string": query}
+    failure = RuntimeError("refused before response start")
+    async def inner(scope, receive, send):
+        if during_send:
+            await send({"type": "http.response.start", "status": 200, "headers": []})
+        raise failure
+    async def send(message):
+        raise failure
+    with pytest.raises(RuntimeError) as error:
+        await SensitiveQueryStringRedactionMiddleware(inner)(scope, None, send)
+    assert error.value is failure
+    assert get_path_with_query_string(scope) == ("/api/artifacts" if artifact else "/events?api_key=redacted")

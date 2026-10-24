@@ -52,6 +52,7 @@ def _make_tool(name: str):
 
 def _make_feature(tool_name: str, tools: list, *, name: str | None = None):
     feature = MagicMock()
+    feature.supports_subagent_dispatch = True
     feature.tool_name = tool_name
     feature.name = name or "".join(p.title() for p in tool_name.split("_"))
     feature.enabled = True

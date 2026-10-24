@@ -35,6 +35,7 @@ def _make_mock_tool(name: str, description: str = "test tool"):
 def _make_mock_feature(tool_name: str, tools: list):
     """Create a mock Feature with given tool_name and tools."""
     feature = MagicMock()
+    feature.supports_subagent_dispatch = True
     feature.tool_name = tool_name
     feature.get_tools.return_value = tools
     feature.name = tool_name.replace("_", " ").title()

@@ -189,7 +189,13 @@ The generated inventory below lists bundled Feature lifecycle modules only: the 
 Installed entry point feature classes are included in JSON output when present in the active environment.
 Runtime security policy can still deny a discovered tool at call time; static generation marks source-discovered tools as enabled unless their feature is disabled.
 
-- Current audited snapshot: `37` discoverable modules and `37` exported `Feature` subclasses.
+- Current audited snapshot: `38` discoverable modules and `38` exported `Feature` subclasses.
+
+### `artifacts` (ArtifactsFeature)
+
+- Source: [`kestrel_sovereign/features/artifacts/feature.py`](kestrel_sovereign/features/artifacts/feature.py)
+- Enablement state: `enabled`
+- Tools: none discovered
 
 ### `attachments` (AttachmentsFeature)
 

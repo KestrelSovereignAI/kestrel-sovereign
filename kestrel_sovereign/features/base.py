@@ -303,7 +303,7 @@ def _subagent_turn_identity(session_id: Optional[str]):
 
 class Feature(_SdkFeature):
     """
-    Base class for Kestrel Features - each Feature IS a subagent.
+    Base class for Kestrel Features, including host services and subagents.
 
     Extends the SDK's minimal Feature interface with sovereign-specific runtime
     behavior (LLM calls, subagent execution, hook enforcement). Packages that
@@ -317,6 +317,11 @@ class Feature(_SdkFeature):
 
     # Node type used for persisting feature config in the knowledge graph.
     _CONFIG_NODE_TYPE = "feature_config"
+
+    # Services that only contribute HTTP/lifecycle capabilities must opt out
+    # until they have executable model-facing tools. The registry uses this
+    # same gate for schemas, prompts, and actual subagent dispatch targets.
+    supports_subagent_dispatch: ClassVar[bool] = True
 
     #: The closed vocabulary of ``data["reason_code"]`` values each of this
     #: feature's tools may return in a failed result, keyed by tool name.

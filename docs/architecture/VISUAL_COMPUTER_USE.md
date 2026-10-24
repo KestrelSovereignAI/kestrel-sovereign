@@ -69,11 +69,58 @@ There are no known external consumers requiring compatibility with these new
 interfaces. Replace conflicting ownership semantics deliberately; do not add
 aliases or a parallel artifact service to avoid a coordinated cutover.
 
-SDK main is 0.40, including the independently tracked native-A2A migration.
-Core main currently constrains SDK below 0.40 and imports the removed legacy
-A2A API. The Core SDK upgrade must land through #3679 before a runtime PR can
-claim normal installation/boot. Candidate-SDK tests in an isolated worktree are
-useful development evidence, but do not substitute for the combined host suite.
+Core's native A2A cutover (#3803, under #3679) uses published SDK 0.42.2,
+which includes the computer/artifact contracts introduced in 0.41. SDK 0.40
+predates these contracts and is not an artifact runtime dependency.
+
+`ArtifactsFeature` registers the private `/api/artifacts` router through the
+host's existing feature lifecycle. Add `ArtifactsFeature` to an agent's feature
+allowlist when one is configured. Initialization requires that agent's durable
+database, encryption key and privacy persistence gate. It refuses an unavailable
+dependency rather than publishing a plaintext or in-memory substitute. Keyless
+hosts omit this optional feature during discovery, retain a health diagnostic,
+and continue booting their other features. Routes
+follow the selected agent and current feature instance, including reloads.
+The repository opens lazily inside the first authorized operation. An unavailable
+or incorrectly keyed artifact store returns an explicit storage failure without
+preventing the agent's other capabilities from starting. Original ciphertext and
+envelope keys are preserved; there is no replacement-key fallback. This HTTP
+service opts out of model subagent dispatch until producer tools are implemented.
+
+The initial host policy admits only a current, configured sovereign API key in
+`X-API-Key` or `Authorization: Bearer`. Cookie, JWT, peer, unattended and delegated
+callers have no artifact grant. CSRF tokens do not confer one. Context links are
+also denied until their destinations have an explicit authority resolver. The
+owner is the host sovereign within the original agent DID's tenant; credential
+rotation does not change that owner. Request bodies and URLs cannot select it.
+
+The host binds the exact context for the response lifetime, rechecks the current
+credential and feature generation at every operation and send, and holds the
+existing privacy gate through private delivery. An outer ASGI delivery boundary
+acknowledges the final transport send; queuing bytes inside host middleware does
+not release that lease. Disable/shutdown revoke admission
+before joining active operations; re-enable cannot revive old upload contexts.
+Lock order is privacy, authority, database. These gates require one owning host
+process and do not coordinate multiple processes. Encryption-key maintenance is
+offline: stop the host, rotate the same agent database, and restart. Native commit
+expiry or lost delivery requires publication reconciliation, not a failed-save
+claim. Host registration does not by itself complete workspace transfers, producer
+tools, delegated grants or the end-to-end computer-use epic.
+
+While enabled, the feature sweeps up to 100 owners' expired staging every minute,
+including owners who never return. Disable/shutdown join the current sweep and
+stop its owned task; re-enable starts it again. Published revisions are retained.
+
+Private responses remain authorized through body delivery, use no-store caching
+and serve source bytes as attachments with nosniff and a sandbox policy. The
+host redacts artifact request targets in access logs and uses route templates
+for metrics, so file paths and publication keys do not become telemetry labels.
+The bounded upload body is parsed before taking privacy/grant gates, so an idle
+uploader cannot prevent revocation. Authorization is rechecked after parsing.
+Any authority failure after durable acceptance requires reconciliation.
+The viewer chooses safe renderers after an authorized fetch. Raw artifact access is
+refused in volatile, anonymized and deidentified modes; generic binary content
+has no approved transform. Explicit authorized deletion remains available.
 
 ## Ownership, authority and publication
 
@@ -100,6 +147,12 @@ persist the complete request digest and receipt atomically. A caller-owned
 outer transaction cannot produce a durable receipt. Return success only after
 the outermost commit is acknowledged. A lost commit response is reconciled with
 the original publication key; no generated replacement key or blind retry.
+
+Conflict comparison resolves the current revision through the authorized
+`head` operation and `GET /api/artifacts/{artifact_id}/head`. A single database
+snapshot joins the committed head pointer to its immutable revision; history
+timestamps and revision IDs cannot establish the head. This read is not a lock:
+the subsequent publication still compares the selected expected revision.
 
 Staging has a bounded lifetime and owner quota. Expired unreferenced staging may
 be collected; committed source revisions may not. Edits conflict rather than

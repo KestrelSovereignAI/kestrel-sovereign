@@ -54,8 +54,9 @@ The encrypted-table registry in
 - `artifact_keys.wrapped_key`, when the artifact envelope table exists in the
   same database. An existing envelope table must contain valid key rows.
 
-Artifact support here prepares the rotation boundary for the saved-output
-repository; it does not enable an artifact service. Rewrapping an envelope root
+`ArtifactsFeature` uses this rotation boundary for its encrypted saved-output
+repository in the agent's database. Stop the host before rotating its key and
+restart it with the new key after verification. Rewrapping an envelope root
 preserves artifact addresses and content keys. It is not recovery from a
 compromised envelope root. Graph properties, external backups and unregistered
 stores are outside this service's coverage. In particular, encrypted channel
