@@ -59,7 +59,7 @@ caps are subject to migration, not reasons to downgrade the protocol target.
 | `kestrel-sovereign-sdk` | Remove draft wire models; shared host/feature credential and typed-part contracts; update all consumers |
 | Host manifest packages | Survey published constraints and editable sources; release incompatible consumers before the host floor moves |
 
-The coordinated Core cutover requires **SDK 0.42.1 or newer**. SDK
+The coordinated Core cutover requires **SDK 0.42.2 or newer**. SDK
 [PR #87](https://github.com/KestrelSovereignAI/kestrel-sovereign-sdk/pull/87)
 and [PR #88](https://github.com/KestrelSovereignAI/kestrel-sovereign-sdk/pull/88)
 add the shared computer-use, artifact, resource-scope and workspace-transfer
@@ -69,11 +69,13 @@ at `eff4c1f86bee3a5cf5c40b4d36c95b3ee29e02a8` predates these contracts.
 SDK 0.42.0 is published and provides the shared vendored A2A implementation.
 SDK 0.42.1 ([PR #93](https://github.com/KestrelSovereignAI/kestrel-sovereign-sdk/pull/93))
 is also published. It corrects native HTTP Major.Minor version negotiation while
-ignoring specification patch numbers. The retained optional gRPC handler's
-version negotiation and the alternative HTTP version query carrier remain
-tracked limitations in SDK [#91](https://github.com/KestrelSovereignAI/kestrel-sovereign-sdk/issues/91)
-and [#92](https://github.com/KestrelSovereignAI/kestrel-sovereign-sdk/issues/92).
-The query carrier needs correction before claiming complete Core conformance;
+ignoring specification patch numbers. SDK 0.42.2
+([PR #94](https://github.com/KestrelSovereignAI/kestrel-sovereign-sdk/pull/94))
+adds the standard alternative HTTP version query carrier and validates repeated
+version headers, resolving SDK
+[#92](https://github.com/KestrelSovereignAI/kestrel-sovereign-sdk/issues/92).
+The retained optional gRPC handler's version negotiation remains tracked in SDK
+[#91](https://github.com/KestrelSovereignAI/kestrel-sovereign-sdk/issues/91);
 Core does not serve gRPC.
 Core's public lock resolves its reviewed PyPI wheel and source distribution;
 installed-package custody checks verify the native implementation. Consumer
