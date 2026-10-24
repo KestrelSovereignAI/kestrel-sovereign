@@ -128,10 +128,13 @@ object (e.g. `kestrel restart <name>`) does **not** reload changed module code.
    ```bash
    env -u VIRTUAL_ENV KESTREL_HOME=<test-home> \
      <worktree>/.venv/bin/python -m uvicorn kestrel_sovereign.server:app \
-     --host 0.0.0.0 --port 8777 >> <test-log> 2>&1 &
+     --host 0.0.0.0 --port 8777 --timeout-graceful-shutdown 5 >> <test-log> 2>&1 &
    ```
    This runbook deliberately invokes Uvicorn directly so the test host is
-   byte-identical to Kestrel's managed process launcher. For a human-operated
+   byte-identical to Kestrel's managed process launcher
+   (`process_manager.server_command`). Without `--timeout-graceful-shutdown`
+   an open console stream keeps a `kill` from ever running the app's
+   lifespan shutdown. For a human-operated
    direct server, use the validated
    [`python -m kestrel_sovereign.server` contract](../core/SERVER_LAUNCH_CONTRACT.md)
    instead; it rejects unsupported arguments and makes bind precedence explicit.

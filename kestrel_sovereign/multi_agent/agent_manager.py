@@ -28,9 +28,20 @@ from decimal import Decimal
 from pathlib import Path
 from typing import AsyncIterator, Awaitable, Callable, List, Mapping, Optional
 
+from kestrel_sovereign._async_ownership import (
+    OwnedTaskAdmission,
+    await_owned_task,
+    create_owned_task,
+    owned_task_error,
+)
 from kestrel_sovereign._async_rwlock import AsyncReaderWriterLock
-from kestrel_sovereign._async_ownership import OwnedTaskAdmission, await_owned_task, create_owned_task, owned_task_error
-from kestrel_sovereign.execution_custody import ExecutionAuthorityError, _explicit_control_chain, execution_finite_error, execution_observation_error, is_execution_control_error
+from kestrel_sovereign.execution_custody import (
+    ExecutionAuthorityError,
+    _explicit_control_chain,
+    execution_finite_error,
+    execution_observation_error,
+    is_execution_control_error,
+)
 from kestrel_sovereign.identity.local_anchor import (
     AgentDIDLookupMode,
     read_anchor_agent_did,
@@ -46,10 +57,12 @@ from kestrel_sovereign.kestrel_agent import (
     expire_host_authority_deadline,
 )
 from kestrel_sovereign.kestrel_config.constants import SHUTDOWN_TIMEOUT
-from kestrel_sovereign.llm.service import LLMService
 from kestrel_sovereign.llm.lifecycle import (
-    UnpublishedLLMOwner, drain_unpublished_llm_owners, retire_unpublished_llm,
+    UnpublishedLLMOwner,
+    drain_unpublished_llm_owners,
+    retire_unpublished_llm,
 )
+from kestrel_sovereign.llm.service import LLMService
 from kestrel_sovereign.spawn.authority_registry import (
     PendingSpawnAuthority,
     SpawnAuthorityRegistry,
@@ -115,8 +128,10 @@ def _merge_manager_cleanup_control(previous, error):
     reset contract, so only those confirmed retired receipts can be compacted.
     """
     from kestrel_sovereign.execution_custody import (
-        AcknowledgedExecutionCommit, _native_source_originals,
-        execution_cleanup_debts, execution_commit_outcome,
+        AcknowledgedExecutionCommit,
+        _native_source_originals,
+        execution_cleanup_debts,
+        execution_commit_outcome,
         execution_denial_scopes,
     )
     root = previous.__cause__ if isinstance(previous, _ManagerCleanupControl) else None
@@ -801,7 +816,9 @@ class _OwnedLifecycleOperation:
             )
             if physical is not None:
                 debt = RuntimeError("original lifecycle operation did not retire")
-                from kestrel_sovereign.execution_custody import execution_native_source_error
+                from kestrel_sovereign.execution_custody import (
+                    execution_native_source_error,
+                )
                 debt.__cause__ = execution_native_source_error(physical) or physical
                 debt._kestrel_native_retirement_debts = ((self.resource if self.resource is not None else self, task),)
                 self.failure = execution_finite_error(
@@ -1345,7 +1362,10 @@ class AgentManager:
         operational pool plus this factory. A bound shared backend cannot be
         silently replaced by a different per-agent admission.
         """
-        from kestrel_sovereign.execution_custody import ExecutionCustody, ExecutionAuthorityError
+        from kestrel_sovereign.execution_custody import (
+            ExecutionAuthorityError,
+            ExecutionCustody,
+        )
 
         retained = getattr(self._shared_postgres_backend, "_execution_custody", None)
         custody = (
@@ -1841,101 +1861,15 @@ class AgentManager:
             return None
         return policy
 
-    async def authorize_a2a_legacy_unsigned_sender(
-        self,
-        recipient: object,
-        claimed_sender: str,
-        policy: A2AHostedPolicy,
-    ) -> Optional[str]:
-        """Authorize the sole hosted unsigned compatibility path.
 
-        A pre-ceremony sender has no cryptographic signing DID, so accepting
-        its ``metadata.sender`` is safe only when it is the unambiguous current
-        *published display identity* of a loaded local agent, that agent is
-        incapable of hybrid signing, and the recipient's immutable directory
-        policy authorizes the sender's stable agent id. The display identity is
-        resolved back through the manager's immutable routing mapping before
-        authorization; an unsigned caller never chooses a routing key. This
-        method is called while :meth:`a2a_execution_lease` is held;
-        registration/removal/replacement therefore cannot change either
-        endpoint or the policy during the directory await.
-        """
-
-        if (
-            not isinstance(claimed_sender, str)
-            or not claimed_sender
-            or self.a2a_hosted_policy_for(recipient) is not policy
-        ):
-            return None
-        matches: list[tuple[str, KestrelAgent, str]] = []
-        for routing_name, candidate in self._agents.items():
-            sender_id = _loaded_agent_did(candidate)
-            if (
-                not isinstance(sender_id, str)
-                or self._agent_names.get(sender_id) != routing_name
-                or self._agents.get(routing_name) is not candidate
-                or self._spawn_route_is_fenced(routing_name, candidate)
-                or self._published_a2a_display_identity(candidate) != claimed_sender
-            ):
-                continue
-            matches.append((routing_name, candidate, sender_id))
-
-        # Display names are mutable and not unique by construction. An
-        # unsigned compatibility sender may be accepted only when the current
-        # hosted fleet has exactly one matching published display identity.
-        if len(matches) != 1:
-            return None
-        routing_name, sender, sender_id = matches[0]
-        if sender is recipient or (
-            self._agent_names.get(sender_id) != routing_name
-            or self._agents.get(routing_name) is not sender
-        ):
-            return None
-
-        identity = getattr(sender, "identity", None)
-        # A loaded hybrid identity must never deliberately downgrade to the
-        # unsigned transport.  Treat any retained hybrid key/material as a
-        # signing capability even if a caller corrupts ``is_hybrid``.
-        if identity is not None and (
-            getattr(identity, "is_hybrid", False) is True
-            or getattr(identity, "hybrid_keypair", None) is not None
-            or bool(getattr(identity, "new_verification_methods", None))
-        ):
-            return None
-
-        authorize = getattr(
-            policy.authorizer,
-            "authorize_legacy_local_sender_with_policy",
-            None,
-        )
-        if not callable(authorize):
-            return None
-        try:
-            result = authorize(
-                sender_id,
-                router=policy.router,
-                requester=policy.requester,
-            )
-            if inspect.isawaitable(result):
-                result = await result
-        except Exception as error:  # noqa: BLE001 - recipient policy provider boundary
-            if is_execution_control_error(error):
-                raise
-            logger.warning(
-                "Hosted legacy A2A sender authorization failed",
-                exc_info=True,
-            )
-            return None
-        return sender_id if result is True else None
-
-    async def _authorize_host_attested_local_a2a_route(
+    def _resolve_hosted_a2a_route_binding(
         self,
         *,
         sender: object,
         requester: object,
         peer: object,
     ) -> tuple[str, object]:
-        """Resolve one live sender→recipient route under the caller's lease."""
+        """Resolve cached peer identities under the caller's lease, without recipient I/O."""
 
         from kestrel_sovereign.features.peers.directory import (
             PeerAccessDeniedError,
@@ -1977,319 +1911,32 @@ class AgentManager:
         ):
             raise PeerNotFoundError("Local A2A recipient is no longer published")
 
-        authorize = getattr(
-            recipient_policy.router,
-            "authorize_inbound_sender",
-            None,
-        )
-        if not callable(authorize):
-            raise PeerAccessDeniedError("Local A2A recipient policy is unavailable")
-        authorized = authorize(recipient_policy.requester, sender_id)
-        if inspect.isawaitable(authorized):
-            authorized = await authorized
-        if (
-            authorized is not True
-            or self.a2a_hosted_policy_for(sender) is not sender_policy
-            or self.a2a_hosted_policy_for(recipient) is not recipient_policy
-        ):
-            raise PeerAccessDeniedError("Local A2A sender is not authorized")
         return sender_id, recipient
 
-    async def get_host_attested_local_a2a_task(
-        self,
-        *,
-        sender: object,
-        requester: object,
-        peer: object,
-        task_id: str,
-    ) -> dict[str, object]:
-        """Read a same-host result only through its durable creator."""
 
-        from kestrel_sovereign.features.peers.directory import (
-            PeerNotFoundError,
-            PeerProtocolError,
-        )
 
-        if not isinstance(task_id, str) or not task_id:
-            raise PeerProtocolError("Local A2A task read is malformed")
-        async with self.a2a_execution_lease():
-            sender_id, recipient = await self._authorize_host_attested_local_a2a_route(
-                sender=sender,
-                requester=requester,
-                peer=peer,
-            )
-            task_manager = getattr(recipient, "task_manager", None)
-            if task_manager is None:
-                raise PeerNotFoundError("Local A2A task does not exist")
-            recipient_id = _loaded_agent_did(recipient)
-            if recipient_id is None:
-                raise PeerNotFoundError("Local A2A task does not exist")
-            task = await task_manager.get_task_for_creator(
-                task_id,
-                sender_id,
-                recipient_agent_id=recipient_id,
-            )
-            if task is None:
-                # Unknown and cross-principal ids share one public result.
-                raise PeerNotFoundError("Local A2A task does not exist")
-            return task.model_dump()
 
-    async def subscribe_host_attested_local_a2a_task(
-        self,
-        *,
-        sender: object,
-        requester: object,
-        peer: object,
-        task_id: str,
-    ):
-        """Stream a same-host task only after creator-scoped admission."""
 
-        from kestrel_sovereign.features.peers.directory import (
-            PeerNotFoundError,
-            PeerProtocolError,
-            PeerSubscriptionEvent,
-        )
 
-        if not isinstance(task_id, str) or not task_id:
-            raise PeerProtocolError("Local A2A task subscription is malformed")
-        subscription = None
-        async with self.a2a_execution_lease():
-            sender_id, recipient = await self._authorize_host_attested_local_a2a_route(
-                sender=sender,
-                requester=requester,
-                peer=peer,
-            )
-            task_manager = getattr(recipient, "task_manager", None)
-            recipient_id = _loaded_agent_did(recipient)
-            if recipient_id is None:
-                raise PeerNotFoundError("Local A2A task does not exist")
-            if task_manager is None or await task_manager.get_task_for_creator(
-                task_id,
-                sender_id,
-                recipient_agent_id=recipient_id,
-            ) is None:
-                raise PeerNotFoundError("Local A2A task does not exist")
-            subscription = task_manager.subscribe(
-                task_id,
-                creator_agent_id=sender_id,
-                recipient_agent_id=recipient_id,
-            )
-            try:
-                first = await anext(subscription)
-            except StopAsyncIteration as exc:
-                raise PeerNotFoundError("Local A2A task does not exist") from exc
-        try:
-            yield PeerSubscriptionEvent(
-                event=first.get("event"),
-                data=first.get("data"),
-            )
-            async for event in subscription:
-                yield PeerSubscriptionEvent(
-                    event=event.get("event"),
-                    data=event.get("data"),
-                )
-        finally:
-            await subscription.aclose()
-
-    async def cancel_host_attested_local_a2a_task(
-        self,
-        *,
-        sender: object,
-        requester: object,
-        peer: object,
-        task_id: str,
-        payload: object,
-    ) -> dict[str, object]:
-        """Cancel same-host work through a non-serializable authority seam.
-
-        Pre-ceremony agents cannot sign a cancellation envelope. The local
-        router capability is bound to the exact published sender during host
-        onboarding; this method revalidates both endpoints and the recipient's
-        live directory policy under one lifecycle lease before the recipient
-        store applies its atomic creator/recipient predicate.
-        """
-
-        from collections.abc import Mapping
-
-        from kestrel_sovereign.a2a.task_manager import (
-            TaskCancellationAuthorizationError,
-        )
-        from kestrel_sovereign.features.peers.directory import (
-            PeerAccessDeniedError,
-            PeerNotFoundError,
-            PeerProtocolError,
-            PeerTaskConflictError,
-        )
-
-        if (
-            not isinstance(task_id, str)
-            or not task_id
-            or not isinstance(payload, Mapping)
-        ):
-            raise PeerProtocolError("Local cancellation request is malformed")
-        reason = payload.get("reason")
-        if not isinstance(reason, str) or not reason.strip() or len(reason) > 4096:
-            raise PeerProtocolError("Local cancellation reason is invalid")
-
-        async with self.a2a_execution_lease():
-            sender_id, recipient = await self._authorize_host_attested_local_a2a_route(
-                sender=sender,
-                requester=requester,
-                peer=peer,
-            )
-
-            task_manager = getattr(recipient, "task_manager", None)
-            if task_manager is None:
-                raise PeerNotFoundError("Local cancellation recipient is unavailable")
-            recipient_id = _loaded_agent_did(recipient)
-            if recipient_id is None:
-                raise PeerNotFoundError("Local cancellation recipient is unavailable")
-            current = await task_manager.get_task_for_creator(
-                task_id,
-                sender_id,
-                recipient_agent_id=recipient_id,
-            )
-            if current is None:
-                raise PeerNotFoundError("Local cancellation task does not exist")
-            try:
-                task = await task_manager.cancel_task(
-                    task_id,
-                    reason=reason,
-                    agent_name=sender_id,
-                    recipient_agent_id=peer.agent_id,
-                )
-            except TaskCancellationAuthorizationError as exc:
-                raise PeerAccessDeniedError(
-                    "Local cancellation actor is not authorized"
-                ) from exc
-            except ValueError as exc:
-                raise PeerTaskConflictError(
-                    "Local cancellation conflicts with task state"
-                ) from exc
-
-            state = getattr(getattr(task, "status", None), "state", None)
-            return {
-                "id": getattr(task, "id", task_id),
-                "status": getattr(state, "value", state),
-                "cancellation_receipt": (
-                    getattr(task, "metadata", None) or {}
-                ).get("cancellation_receipt"),
-            }
-
-    async def stop_host_attested_local_peer(
-        self,
-        *,
-        sender: object,
-        requester: object,
-        peer: object,
-        payload: object,
-    ) -> dict[str, object]:
-        """Dispatch a same-host peer Stop using manager-attested principals.
-
-        Pre-ceremony local agents cannot produce a hybrid wire signature.  The
-        router capability instead binds the exact published sender object; the
-        manager revalidates both ends and the recipient's directory policy
-        under its lifecycle lease.  It then takes the same signal rail as the
-        signed HTTP path (#3169).  No local path may call cancellation directly.
-        """
-
-        from collections.abc import Mapping
-
-        from kestrel_sovereign.features.peers.directory import (
-            PeerAccessDeniedError,
-            PeerProtocolError,
-            PeerUnavailableError,
-        )
-        from kestrel_sovereign.signals.sources.a2a import _deserialize_chain
-        from kestrel_sovereign.signals.sources.peer_stop import (
-            PeerStopIntentError,
-            decode_peer_stop_action_envelope,
-            dispatch_peer_stop,
-            peer_stop_audience,
-        )
-
-        if not isinstance(payload, Mapping):
-            raise PeerProtocolError("Local peer Stop request is malformed")
-        try:
-            intent, _correlation_id, _session_id, metadata = (
-                decode_peer_stop_action_envelope(payload)
-            )
-        except PeerStopIntentError as error:
-            raise PeerProtocolError("Local peer Stop request is malformed") from error
-
-        async with self.a2a_execution_lease():
-            sender_id, recipient = await self._authorize_host_attested_local_a2a_route(
-                sender=sender,
-                requester=requester,
-                peer=peer,
-            )
-            recipient_id = _loaded_agent_did(recipient)
-            if (
-                recipient_id is None
-                or peer_stop_audience(metadata) != recipient_id
-            ):
-                raise PeerAccessDeniedError(
-                    "Local peer Stop audience does not match the routed recipient"
-                )
-            dispatcher = getattr(recipient, "dispatcher", None)
-            if dispatcher is None or not callable(
-                getattr(dispatcher, "dispatch_signal", None)
-            ):
-                raise PeerUnavailableError(
-                    "Local peer Stop signal dispatcher is unavailable"
-                )
-
-            # Causation is host-observed from the exact live sender task.  The
-            # payload's metadata may be caller-shaped in this compatibility
-            # lane and therefore never controls the loop-detection chain.
-            serialized_chain = None
-            chain_provider = getattr(sender, "_provide_causation_chain", None)
-            if callable(chain_provider):
-                serialized_chain = chain_provider()
-            chain = _deserialize_chain(
-                {"causation_chain": serialized_chain}
-                if serialized_chain
-                else {}
-            )
-            return await dispatch_peer_stop(
-                recipient,
-                actor_id=sender_id,
-                intent=intent,
-                causation_chain=chain,
-            )
-
-    @staticmethod
-    def _published_a2a_display_identity(agent: object) -> Optional[str]:
-        """Return the live display identity published by ``/api/agents``.
-
-        Agent cards (and therefore ``PeersFeature``) expose the agent's live
-        effective name, not the manager's immutable routing key. Keep this
-        lookup synchronous and in-memory so it is safe under the A2A lifecycle
-        lease and cannot race a storage read with unpublication. Test doubles
-        may not implement ``resolve_effective_name``; their live ``_agent_name``
-        remains the equivalent published identity.
-        """
-
-        resolver = getattr(agent, "resolve_effective_name", None)
-        if callable(resolver):
-            try:
-                value = resolver(default=None)
-            except Exception as error:  # noqa: BLE001 - fail closed at identity boundary
-                if is_execution_control_error(error):
-                    raise
-                return None
-        else:
-            value = getattr(agent, "_agent_name", None)
-        return value if isinstance(value, str) and value.strip() else None
 
     def _revoke_a2a_hosted_policy(self, recipient: object) -> None:
         recipient_id = _loaded_agent_did(recipient)
-        if not isinstance(recipient_id, str):
-            return
-        policy = self._a2a_hosted_policies.get(recipient_id)
-        if policy is not None and policy.recipient is recipient:
-            self._a2a_policy_generation += 1
-            self._a2a_hosted_policies.pop(recipient_id, None)
+        if isinstance(recipient_id, str):
+            policy = self._a2a_hosted_policies.get(recipient_id)
+            if policy is not None and policy.recipient is recipient:
+                self._a2a_policy_generation += 1
+                self._a2a_hosted_policies.pop(recipient_id, None)
+        # Revoke authority before retiring routes. Corrupt app routing must
+        # never leave a stale handler's recipient policy usable after removal.
+        publication = vars(recipient).get("_native_a2a_publication")
+        if publication is not None:
+            from kestrel_sovereign.a2a.native_publication import (
+                NativeA2APublication,
+            )
+
+            if not isinstance(publication, NativeA2APublication):
+                raise TypeError("Native publication must be owned by the host")
+            publication.withdraw()
 
     def a2a_sender_identity_witness(
         self,
@@ -2305,7 +1952,7 @@ class AgentManager:
         from kestrel_sovereign.a2a.did_registry import (
             local_a2a_verification_document,
         )
-        from kestrel_sovereign.a2a.envelope_signing import (
+        from kestrel_sovereign.a2a.native_sender import (
             verification_document_fingerprint,
         )
 
@@ -3200,7 +2847,10 @@ class AgentManager:
                     active_boot_semaphore.release()
                     active_boot_slot_held = False
         except BaseException as initialization_failure:
-            from kestrel_sovereign.execution_custody import execution_finite_error, is_execution_control_error
+            from kestrel_sovereign.execution_custody import (
+                execution_finite_error,
+                is_execution_control_error,
+            )
             if agent is not None:
                 # The constructed candidate owns the initialization receipt as
                 # well as its native resources. Rollback cannot replace that
@@ -3232,7 +2882,9 @@ class AgentManager:
                         data_dir=config.resolve_data_dir(self._base_data_dir),
                     )
             else:
-                from kestrel_sovereign.execution_custody import retire_process_runtime_custody
+                from kestrel_sovereign.execution_custody import (
+                    retire_process_runtime_custody,
+                )
                 retire_process_runtime_custody(execution_custody)
                 cleanup_failure = None
                 if scheduler_registration is not None:
@@ -3254,7 +2906,9 @@ class AgentManager:
                             self._unpublished_llm_owners, name, llm_service, captured,
                         )
                     except BaseException as error:
-                        from kestrel_sovereign.execution_custody import execution_finite_error
+                        from kestrel_sovereign.execution_custody import (
+                            execution_finite_error,
+                        )
                         cleanup_failure = execution_finite_error(
                             cleanup_failure, error, retain_originals=True,
                             isolate_control_originals=True,
@@ -3265,7 +2919,10 @@ class AgentManager:
                             exc_info=True,
                         )
                 if cleanup_failure is not None:
-                    from kestrel_sovereign.execution_custody import execution_finite_error, is_execution_control_error
+                    from kestrel_sovereign.execution_custody import (
+                        execution_finite_error,
+                        is_execution_control_error,
+                    )
                     terminal = execution_finite_error(
                         initialization_failure, cleanup_failure, retain_originals=True,
                         isolate_control_originals=True,
@@ -6131,6 +5788,19 @@ class AgentManager:
         if arm_restored_ttl:
             try:
                 self._commit_restored_child_ttl(name, agent)
+            except BaseException:
+                self._withdraw_initialized_agent(name, agent)
+                raise
+        publication = vars(agent).get("_native_a2a_publication")
+        if publication is not None:
+            from kestrel_sovereign.a2a.native_publication import (
+                NativeA2APublication,
+            )
+
+            try:
+                if not isinstance(publication, NativeA2APublication):
+                    raise TypeError("Native publication must be owned by the host")
+                publication.publish()
             except BaseException:
                 self._withdraw_initialized_agent(name, agent)
                 raise
@@ -9286,8 +8956,8 @@ class AgentManager:
 
         from kestrel_sovereign.features.isolated_runtime import (
             remove_runtime_namespace,
-            resolve_legacy_isolated_runtime_root,
             resolve_isolated_runtime_namespace,
+            resolve_legacy_isolated_runtime_root,
         )
 
         scope = None
@@ -11478,7 +11148,10 @@ class AgentManager:
         self._next_removal_budget_release_id += 1
         release_id = f"ordinary-budget-release:{self._next_removal_budget_release_id}"
         started_monotonic = time.monotonic()
-        from kestrel_sovereign._async_ownership import OwnedTaskAdmission, owned_task_admission_error
+        from kestrel_sovereign._async_ownership import (
+            OwnedTaskAdmission,
+            owned_task_admission_error,
+        )
         admission = OwnedTaskAdmission()
         try:
             release_awaitable = (
@@ -13055,7 +12728,9 @@ class AgentManager:
         slot_transferred = False
 
         async def revoke_then_shutdown() -> None:
-            from kestrel_sovereign.execution_custody import execution_observer_cancellations
+            from kestrel_sovereign.execution_custody import (
+                execution_observer_cancellations,
+            )
             outcomes: list[BaseException] = []
             control: BaseException | None = None
 

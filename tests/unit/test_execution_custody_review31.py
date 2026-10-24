@@ -8,7 +8,8 @@ import threading
 import pytest
 from kestrel_sovereign._async_ownership import await_owned_task
 from kestrel_sovereign.execution_custody import ExecutionCommitOutcomeError, _explicit_control_chain, execution_commit_outcome
-from kestrel_sovereign.a2a.task_manager import TaskManager
+from kestrel_sovereign.a2a.scope import NativeRecipientScope
+from tests.utils.native_a2a import manager_for
 from kestrel_sovereign.features.base import Feature
 from tests.unit.test_execution_custody_proxy_ingress import owner
 from tests.unit.test_execution_custody_review29 import native_owner, retire
@@ -74,7 +75,10 @@ async def test_late_native_effect_receipt_survives_facade_retirement(monkeypatch
 @pytest.mark.asyncio
 @pytest.mark.parametrize("route", ["agent", "feature", "runtime", "feature-runtime", "a2a"])
 @pytest.mark.parametrize("finite", [False, True])
-async def test_completed_native_background_owners_retain_one_strongest_receipt(tmp_path, route, finite):
+async def test_completed_native_background_owners_retain_one_strongest_receipt(tmp_path, route, finite, caplog):
+    import logging
+
+    caplog.set_level(logging.CRITICAL, logger="kestrel_sovereign.a2a.task_manager")
     agent, db = await native_owner(tmp_path)
     from kestrel_sovereign.execution_custody import _explicit_control_chain
 
@@ -96,7 +100,7 @@ async def test_completed_native_background_owners_retain_one_strongest_receipt(t
         pass
 
     feature = Native(agent)
-    manager = TaskManager(None, None, None)
+    manager = manager_for(db.backend, NativeRecipientScope(agent.did), owns_backend=False)
     payloads, strongest, strongest_source = [], None, None
     try:
         for index in range(40):
@@ -127,6 +131,8 @@ async def test_completed_native_background_owners_retain_one_strongest_receipt(t
             task.add_done_callback(lambda done: completed.set())
             await asyncio.wait_for(completed.wait(), 5)
             del task, error, effect
+        # Captured LogRecords hold exception tracebacks independently of the owner.
+        caplog.clear()
         gc.collect()
         assert await db.fetchval("SELECT COUNT(*) FROM effects") == 40
         assert not agent._background_tasks

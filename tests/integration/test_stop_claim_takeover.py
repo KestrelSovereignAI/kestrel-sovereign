@@ -207,24 +207,47 @@ async def test_a_claim_records_its_owner_and_heartbeat(db_backend):
 @pytest.mark.asyncio
 @pytest.mark.dual_backend
 async def test_a_live_owners_claim_is_never_taken_over(db_backend):
-    """Renewal keeps a claim live past its lease; retries refuse.
+    """A retry refuses a claim proven live against the database clock.
 
-    This uses the production lease. A scaled-down lease turned a CI stall of a
-    few hundred milliseconds between heartbeats into a lost live claim.
+    The claim/CAS integration contract is independent of event-loop heartbeat
+    cadence, which has a pinned-clock unit test. Give this database operation
+    one bounded test epoch, renew immediately before it, and prove the exact
+    row remained inside its database-clock lease before interpreting the
+    contender's result.
     """
 
-    owner, retrier = await _stores(db_backend, 2)
+    owner, retrier = await _stores(
+        db_backend, 2, claim_lease_seconds=_RACE_LEASE_SECONDS
+    )
     request = _request()
     claim = await owner.claim(request)
 
-    assert await retrier.claim(request) is None
-    async with owner.hold_claim(claim):
-        claimed_heartbeat = await _outlive_one_lease(owner._db, request)
-        assert await retrier.claim(request) is None
+    assert await owner.renew_claim(claim) is True
+    claimed_row = await _claim_row(owner._db, request)
+    assert claimed_row[:2] == (claim.claim_id, owner.owner_id)
+    cutoff_sql, cutoff_args = database_lease_cutoff_sql(
+        owner._db, _RACE_LEASE_SECONDS
+    )
+    assert await owner._db.fetchval(
+        f"SELECT CASE WHEN heartbeat_at > {cutoff_sql} THEN 1 ELSE 0 END "
+        "FROM stop_operation_claims WHERE operation_id = ? AND claim_id = ?",
+        (*cutoff_args, _operation_id(request), claim.claim_id),
+    ) == 1
+    began = await database_clock(owner._db)
 
-    claim_id, owner_id, heartbeat_at = await _claim_row(owner._db, request)
-    assert (claim_id, owner_id) == (claim.claim_id, owner.owner_id)
-    assert heartbeat_at > claimed_heartbeat
+    retry = await retrier.claim(request)
+
+    observed = await database_clock(owner._db)
+    current_row = await _claim_row(owner._db, request)
+    current_is_live = await owner._db.fetchval(
+        f"SELECT CASE WHEN heartbeat_at > {cutoff_sql} THEN 1 ELSE 0 END "
+        "FROM stop_operation_claims WHERE operation_id = ? AND claim_id = ?",
+        (*cutoff_args, _operation_id(request), claim.claim_id),
+    )
+    assert 0 <= (observed - began).total_seconds() < _RACE_LEASE_SECONDS
+    assert current_row == claimed_row
+    assert current_is_live == 1
+    assert retry is None
     receipt = await owner.persist(
         request,
         _outcomes(request, StopDisposition.STOPPED),

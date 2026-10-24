@@ -15,6 +15,8 @@ ExternalMonitorFeature) that do NOT exist in the local features/ directory,
 ensuring that the entry_point discovery path is properly tested.
 """
 
+from tests.shared.native_shutdown_budget import shutdown_fixture_agent
+
 import os
 import logging
 from unittest.mock import MagicMock, Mock, patch
@@ -155,7 +157,7 @@ async def core_only_agent(temp_db, monkeypatch):
 
     yield agent
 
-    await agent.shutdown()
+    await shutdown_fixture_agent(agent)
     await llm_service.close()
 
 
@@ -188,7 +190,7 @@ async def agent_with_ext_features(temp_db, monkeypatch):
 
     yield agent
 
-    await agent.shutdown()
+    await shutdown_fixture_agent(agent)
     await llm_service.close()
 
 
@@ -431,7 +433,7 @@ class TestDisableEnableCycle:
                 f"ExternalMonitorFeature should still be present in {feature_names}"
             )
         finally:
-            await agent.shutdown()
+            await shutdown_fixture_agent(agent)
             await llm_service.close()
 
     @pytest.mark.asyncio
@@ -462,7 +464,7 @@ class TestDisableEnableCycle:
             # ExternalStorageFeature should remain
             assert "ExternalStorageFeature" in feature_names
         finally:
-            await agent.shutdown()
+            await shutdown_fixture_agent(agent)
             await llm_service.close()
 
     @pytest.mark.asyncio
@@ -489,7 +491,7 @@ class TestDisableEnableCycle:
 
         assert "ExternalGPUFeature" not in agent1.features
         assert "ExternalStorageFeature" in agent1.features
-        await agent1.shutdown()
+        await shutdown_fixture_agent(agent1)
         await llm_service1.close()
 
         # Step 2: "Re-enable" by removing from disabled list and restarting
@@ -517,7 +519,7 @@ class TestDisableEnableCycle:
             assert "ExternalStorageFeature" in agent2.features
             assert "ExternalMonitorFeature" in agent2.features
         finally:
-            await agent2.shutdown()
+            await shutdown_fixture_agent(agent2)
             await llm_service2.close()
 
     def test_discover_features_respects_disabled_env(self):
@@ -559,6 +561,8 @@ class TestFeatureStoreAPI:
         with tempfile.TemporaryDirectory() as agent_dir:
             monkeypatch.setenv("KESTREL_DB_PATH", agent_dir)
             monkeypatch.setenv("KESTREL_DATA_KEY", "test-key-for-feature-e2e-32chars!")
+            # Without one the server mints a key into the environment (#3671).
+            monkeypatch.setenv("KESTREL_API_KEY", "test-key-for-feature-e2e-api")
             monkeypatch.delenv("OPENROUTER_MANAGEMENT_API_KEY", raising=False)
             monkeypatch.delenv(DISABLED_FEATURES_ENV, raising=False)
             monkeypatch.setattr(storage, "get_default_agent_data_dir", lambda: agent_dir)
@@ -593,6 +597,8 @@ class TestFeatureStoreAPI:
         with tempfile.TemporaryDirectory() as agent_dir:
             monkeypatch.setenv("KESTREL_DB_PATH", agent_dir)
             monkeypatch.setenv("KESTREL_DATA_KEY", "test-key-for-feature-e2e-32chars!")
+            # Without one the server mints a key into the environment (#3671).
+            monkeypatch.setenv("KESTREL_API_KEY", "test-key-for-feature-e2e-api")
             monkeypatch.delenv("OPENROUTER_MANAGEMENT_API_KEY", raising=False)
             monkeypatch.setenv(DISABLED_FEATURES_ENV, "ExternalGPUFeature")
             monkeypatch.setattr(storage, "get_default_agent_data_dir", lambda: agent_dir)

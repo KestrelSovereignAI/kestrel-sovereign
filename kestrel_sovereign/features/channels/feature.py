@@ -19,7 +19,7 @@ import uuid
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from enum import Enum
-from typing import AsyncIterator, Dict, Optional
+from typing import Any, AsyncIterator, Dict, Optional
 
 from kestrel_sdk.signals import Status
 from kestrel_sdk.tools.base import ToolCategory
@@ -40,6 +40,7 @@ from kestrel_sovereign.security.encryption import (
     get_fernet,
 )
 from kestrel_sovereign.signals import DurableAdmissionDisposition
+from kestrel_sovereign.storage.timestamps import utc_timestamp_parameter
 from kestrel_sovereign.signals.sources.channels import (
     DURABLE_COGNITION_CONSUMER_ID,
     DURABLE_COGNITION_MARKER,
@@ -49,6 +50,7 @@ from kestrel_sovereign.signals.sources.channels import (
     DURABLE_TERMINAL_MARKER_VALUE,
     build_channel_message_registration,
     build_signal_for_channel_message,
+    validate_channel_session_id,
 )
 
 from .models import (
@@ -741,7 +743,7 @@ class ChannelFeature(Feature):
                     stored_content,
                     status,
                     json.dumps(meta) if meta else None,
-                    message.timestamp.isoformat(),
+                    utc_timestamp_parameter(self._db.backend_type, message.timestamp),
                 ),
             )
         except Exception as exc:
@@ -985,7 +987,8 @@ class ChannelFeature(Feature):
     # ------------------------------------------------------------------
 
     async def handle_terminal_inbound(
-        self, message: ChannelMessage, *, disposition: str
+        self, message: ChannelMessage, *, disposition: str, session_id: str | None = None,
+        admission_fence: Any = None,
     ) -> InboundAdmission:
         """Durably own a bounded Telegram terminal update without cognition."""
 
@@ -995,6 +998,12 @@ class ChannelFeature(Feature):
             or getattr(message, "_kestrel_cursor_owned_protocol", False) is not True
             or _CANONICAL_TELEGRAM_UPDATE_ID.fullmatch(message.id or "") is None
         ):
+            return InboundAdmission(InboundAdmissionDisposition.REJECTED)
+        if session_id is not None and disposition != "care_acknowledgement":
+            return InboundAdmission(InboundAdmissionDisposition.REJECTED)
+        try:
+            session_id = validate_channel_session_id(session_id)
+        except ValueError:
             return InboundAdmission(InboundAdmissionDisposition.REJECTED)
         metadata = message.metadata if isinstance(message.metadata, dict) else {}
         if metadata.get("dedupe_key") != message.id:
@@ -1025,12 +1034,14 @@ class ChannelFeature(Feature):
             signal = build_signal_for_channel_message(
                 message,
                 target_agent=getattr(self.agent, "did", self._agent_id),
+                session_id=session_id,
             )
             signal.payload[DURABLE_TERMINAL_MARKER] = DURABLE_TERMINAL_MARKER_VALUE
             handle = await enqueue_terminal(
                 signal,
                 source_event_id=message.id,
                 consumer_id=DURABLE_TERMINAL_CONSUMER_ID,
+                **({"admission_fence": admission_fence} if admission_fence is not None else {}),
             )
             receipt = await handle.wait_for_durable_admission()
         except Exception as error:
@@ -1044,7 +1055,7 @@ class ChannelFeature(Feature):
             return InboundAdmission(InboundAdmissionDisposition.DURABLY_ADMITTED)
         return InboundAdmission(InboundAdmissionDisposition.RETRYABLE)
 
-    async def handle_inbound(self, message: ChannelMessage) -> InboundAdmission:
+    async def handle_inbound(self, message: ChannelMessage, *, admission_fence: Any = None) -> InboundAdmission:
         """
         Process an inbound message from a channel adapter.
 
@@ -1100,7 +1111,16 @@ class ChannelFeature(Feature):
         message.agent_id = self._authoritative_agent_id
 
         # Log inbound message
-        await self._log_message(message, status="received")
+        if admission_fence is None:
+            await self._log_message(message, status="received")
+        else:
+            from kestrel_sovereign.execution_custody import bind_execution_custody
+
+            # Logging and event admission are separate original commits; each
+            # must serialize against revocation, without leaking a finite
+            # constraint into the resident cognition that follows.
+            with bind_execution_custody(admission_fence):
+                await self._log_message(message, status="received")
 
         durable_admission = False
         durable_cognition_attempted = False
@@ -1135,6 +1155,7 @@ class ChannelFeature(Feature):
                         signal,
                         source_event_id=message.id,
                         consumer_id=DURABLE_COGNITION_CONSUMER_ID,
+                        **({"admission_fence": admission_fence} if admission_fence is not None else {}),
                     )
                 elif cursor_owning:
                     # Telegram polling owns a provider cursor. It has an

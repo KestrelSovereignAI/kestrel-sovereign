@@ -1,6 +1,6 @@
 [project]
 name = "kestrel_sovereign"
-version = "0.53.35"
+version = "0.54.0"
 description = "Kestrel Sovereign AI Agent Framework - Constitutional AI with cryptographic identity"
 readme = "README.md"
 requires-python = ">=3.11,<3.15"
@@ -97,30 +97,34 @@ dependencies = [
     # synchronous rendering and per-agent activation. The 0.38 line adds the
     # optional awaited preparation hook used before those synchronous renders;
     # legacy features remain supported through defensive hook resolution.
-    # The ceiling tracks the MINOR, not the major, and 0.35.0 is itself the
-    # evidence for that: it added a required member to a runtime-checkable
-    # protocol and tightened validate_for, so leases that validated under
-    # 0.34.0 are now rejected. An SDK minor can therefore break inference-lease
-    # providers. Under a minor ceiling that lands as an unresolvable install;
-    # under <1 it would resolve silently. InferenceLeaseFeature.initialize
-    # catches discovery errors and keeps the agent up with providers={} - so every
-    # installed provider would become "not installed" on an unchanged Core.
-    # Widen this only with a Core release that has tested the newer minor.
-    # Release cascade: Frinz and the observability fleet must publish/test
-    # constraints that admit this line before Core is released. Do not weaken
-    # Core's safety floor to make an older downstream resolver succeed.
-    "kestrel-sovereign-sdk[httpx,tracing]>=0.39.2,<0.40",
+    # 0.40 replaces draft A2A contribution types with native AgentSkill and
+    # get_agent_skills contracts used during agent initialization. The
+    # coordinated 0.41.0 floor also includes the shared computer-use,
+    # artifact, resource-scope and workspace-transfer contracts (#3679).
+    # 0.42 owns the reviewed vendored native A2A SDK shared by the host and
+    # feature skill producers. The lock records the tested release; future minor versions remain
+    # admissible. Verify installed host features against the resolved SDK
+    # before release rather than preserving an obsolete minor ceiling.
+    "kestrel-sovereign-sdk[a2a,httpx,tracing]>=0.42.2,<1",
+    # Native A2A implementation is owned by the shared SDK [a2a] extra.
+    # Core and feature skill producers use the same reviewed vendored types.
+    "protobuf>=5.29.5",
+    # RFC 8785 for the Kestrel sender extension's complete native request digest.
+    "rfc8785>=0.1.4,<1",
     # Core web framework
     # Pre-1.0 router internals changed in a minor release. Advance this tested
     # current line with the native router/CSRF/frontend acceptance checks.
     "fastapi>=0.143.3,<0.144",
     "uvicorn==0.48.0",
+    # 3.5.0 fixes stopped servers cancelling later native A2A streams in the
+    # same process (sse-starlette#211). Keep automatic stream draining enabled.
+    "sse-starlette>=3.5.0",
     "pydantic==2.13.4",
     # HTTP clients
     # >=3.14.1 fixes request-smuggling, parser, and decompression advisories
     # present in the 3.13/3.14.0 lines (#2546).
     "aiohttp>=3.14.1",
-    "httpx>=0.27.0",
+    "httpx>=0.28.1",
     "httpx2>=2.10,<3",
     # >=2.33.0 fixes unsafe .netrc credential handling (#2546).
     "requests>=2.33.0",
@@ -135,7 +139,7 @@ dependencies = [
     "ollama>=0.6.1",
     # Database
     "aiosqlite>=0.21.0",
-    "asyncpg>=0.30.0",
+    "asyncpg>=0.32.0",
     "psycopg2-binary>=2.9.10",
     # SQLAlchemy (used by the generic vector_search backends in
     # kestrel_sovereign.storage.vector — feature packages already pull this
@@ -433,17 +437,8 @@ build-backend = "hatchling.build"
 [tool.hatch.metadata]
 allow-direct-references = true
 
-# Only the in-repo package. The kestrel_feature_*, kestrel_voice_*, and
-# kestrel_cloud_* packages used to be listed here from the pre-extraction
-# era — they live in their own repos now and ship as separate distributions
-# discovered via the `kestrel_sovereign.features` entry-point group.
-# Hatchling silently skipped the missing dirs at build time so the
-# published wheel was always correct; the listing was just misleading.
-# Caught in the Noel post-launch review (2026-05-06).
+# Both formats share package selection and exclude mutable discovery data,
+# including builds from source archives without a VCS ignore file.
+[tool.hatch.build]
 packages = ["kestrel_sovereign"]
-
-[tool.hatch.build.targets.wheel]
-packages = ["kestrel_sovereign"]
-
-[tool.hatch.build.targets.sdist]
-include = ["kestrel_sovereign/**/*"]
+exclude = ["kestrel_sovereign/model_discovery_cache.json"]

@@ -617,26 +617,56 @@ async def _booted_agent(tmp_path):
     """A real agent on real storage; only the daemons are scripted. Beyond
     the mandatory features it loads only the one whose tool the turns call,
     so an installed optional package adds no model call of its own."""
-    async with booted_agent(
-        tmp_path, name="Gate", provenance="test:generation_gate",
-        features={"StateOfMindFeature"},
-    ) as agent:
-        # This table tests generation/Stop outcomes, not cold database startup.
-        # Initialize the actual owned usage DB before a one-second watchdog can
-        # interrupt its native schema COMMIT on a loaded unit-test worker.
-        await agent.llm_service._ensure_db_initialized()
-        yield agent
+    from kestrel_sovereign.storage.db import sqlite
+    with pytest.MonkeyPatch.context() as cleanup:
+        # A measured 2.3MiB usage-WAL close exceeded 1.01s in the full suite.
+        # Generation/Stop semantics do not benchmark checkpoint/fsync speed.
+        # Reserve finite native fixture cleanup, restoring the production
+        # default and leaving dedicated deadline tests completely unchanged.
+        cleanup.setattr(sqlite, "AIOSQLITE_WORKER_SHUTDOWN_TIMEOUT_S",
+            max(5.0, sqlite.AIOSQLITE_WORKER_SHUTDOWN_TIMEOUT_S))
+        async with booted_agent(
+            tmp_path, name="Gate", provenance="test:generation_gate",
+            features={"StateOfMindFeature"},
+        ) as agent:
+            # Keep the outer lifecycle budget coherent with this fixture's
+            # native close reservation. Otherwise the larger storage floor
+            # consumes the entire default five-second shutdown and gives the
+            # LLM/client prefix zero time, cancelling its original closers.
+            from tests.shared.native_shutdown_budget import reserve_native_shutdown_budget
+
+            reserve_native_shutdown_budget(agent, cleanup)
+            # Keep cold migrations outside the generation's own watchdog.
+            await agent.llm_service._ensure_db_initialized()
+            yield agent
 
 
 @pytest.mark.asyncio
 async def test_generation_fixture_opens_usage_database_before_timed_calls(tmp_path):
     """The generation watchdog must not race unrelated usage-DB migrations."""
+    from kestrel_sovereign.storage.db import sqlite
+    from kestrel_sovereign import kestrel_agent as ka
+    original_cleanup_budget = sqlite.AIOSQLITE_WORKER_SHUTDOWN_TIMEOUT_S
+    original_outer = ka.SHUTDOWN_TIMEOUT
+    original_internal = ka.KESTREL_AGENT_SHUTDOWN_TIMEOUT_S
     async with _booted_agent(tmp_path) as agent:
+        assert sqlite.AIOSQLITE_WORKER_SHUTDOWN_TIMEOUT_S == max(5.0, original_cleanup_budget)
+        required_tail = agent._durable_tail_minimum_budget(
+            ka._minimum_storage_close_timeout(agent.storage),
+            ka._minimum_storage_potential_preclose_timeout(agent.storage),
+        )
+        prefix, reserve = ka._resolve_shutdown_budget(required_tail)
+        assert prefix >= max(float(original_outer), original_internal)
+        assert reserve >= required_tail
         service = agent.llm_service
         assert service._db_initialized and service._usage_db is not None, (
             "generation fixture handed a cold usage database to a timed call"
         )
         assert await service._usage_db.fetchval("SELECT COUNT(*) FROM model_usage") == 0
+    assert sqlite.AIOSQLITE_WORKER_SHUTDOWN_TIMEOUT_S == original_cleanup_budget
+    assert ka.SHUTDOWN_TIMEOUT == original_outer
+    assert ka.KESTREL_AGENT_SHUTDOWN_TIMEOUT_S == original_internal
+    assert all(task is None for task in service._llm_close_tasks.values())
 
 
 @asynccontextmanager

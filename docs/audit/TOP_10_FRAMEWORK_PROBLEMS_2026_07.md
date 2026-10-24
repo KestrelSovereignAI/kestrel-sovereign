@@ -246,7 +246,9 @@ for agents with no identity. It also catches every exception raised while a
 loaded hybrid agent signs, logs "sending unsigned," and lets dispatch continue
 ([`peers/feature.py:301`](../../kestrel_sovereign/features/peers/feature.py#L301)).
 The existing unit test encodes that fallback as expected behavior
-([`test_a2a_sign_on_send.py:117`](../../tests/unit/test_a2a_sign_on_send.py#L117)).
+([historical signing test](https://github.com/KestrelSovereignAI/kestrel-sovereign/blob/0b59ab494f71de14415a794e9f09910f366ded06/tests/unit/test_a2a_sign_on_send.py#L117)).
+The native cutover retires that surface; its replacement checks are mapped in
+[the native A2A architecture](../architecture/NATIVE_MCP_A2A.md#retired-surface-coverage).
 
 Receivers cannot distinguish a legitimate pre-ceremony sender from a hybrid
 peer whose custody or signing path failed. A transient signer error therefore

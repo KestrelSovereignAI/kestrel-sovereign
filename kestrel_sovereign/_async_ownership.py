@@ -1022,16 +1022,20 @@ async def await_owned_task(
     """
     if not defer_cancellation and (cancel_on_caller_cancellation or pending_cancellation is not None):
         raise ValueError("borrowed observation cannot forward or own pending cancellation")
-    completion: asyncio.Future[None] = asyncio.get_running_loop().create_future()
+    completion: asyncio.Future[None] | None = None
+    publication_errors = []
 
     def mark_complete(_task: asyncio.Future[_T]) -> None:
-        if not completion.done():
+        if completion is not None and not completion.done():
             completion.set_result(None)
 
     cancellation_forwarded = False
     forwarding_error: BaseException | None = None
-    publication_errors = []
     try:
+        # Observation admission is fallible too. Its allocation refusal must
+        # use the SAME positive-interval, original-task must-join path as
+        # callback publication refusal, not unwind an accepted native owner.
+        completion = asyncio.get_running_loop().create_future()
         task.add_done_callback(mark_complete)
     except BaseException as error:
         publication_errors.append(error)
@@ -1069,18 +1073,22 @@ async def await_owned_task(
                             task.cancel()
                     except BaseException as failure:  # noqa: BLE001 - forwarding failure cannot abandon its owner
                         forwarding_error = failure
+            except BaseException as error:  # noqa: BLE001 - observing a producer never discharges its ownership
+                # Shield creates and publishes another plain observer Future.
+                # Its failure is observation debt, not physical completion.
+                # Reuse the existing positive-interval must-join path; borrowed
+                # observers may leave, but original owners must still join.
+                publication_errors.append(error)
     finally:
-        try:
-            task.remove_done_callback(mark_complete)
-        except BaseException as error:
-            publication_errors.append(error)
+        if completion is not None:
+            try:
+                task.remove_done_callback(mark_complete)
+            except BaseException as error:
+                publication_errors.append(error)
 
     if not defer_cancellation and pending_cancellation is not None:
-        from kestrel_sovereign.execution_custody import execution_terminal_error
-        raise execution_terminal_error(
-            pending_cancellation, *publication_errors, retain_originals=True,
-            isolate_control_originals=True,
-        )
+        from kestrel_sovereign.execution_custody import execution_observation_error
+        raise execution_observation_error(pending_cancellation, *publication_errors)
     if not task.done():
         # Only an explicitly borrowed observer may leave before settlement.
         assert not defer_cancellation and publication_errors

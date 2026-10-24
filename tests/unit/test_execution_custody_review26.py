@@ -8,24 +8,33 @@ from types import SimpleNamespace
 import pytest
 
 from kestrel_sovereign.execution_custody import (
-    ExecutionAuthorityError, ExecutionCustody, ProcessRuntimeExecutionFence,
-    bind_execution_runtime, execution_commit_outcome, is_execution_control_error,
+    ExecutionAuthorityError,
+    ExecutionCustody,
+    ProcessRuntimeExecutionFence,
+    bind_execution_runtime,
+    execution_commit_outcome,
+    is_execution_control_error,
 )
 from kestrel_sovereign.services.payer_resolver import open_host_db
 from kestrel_sovereign.services.process_host_database import _ProcessHostBackend
-from kestrel_sovereign.storage.async_database import AsyncDatabase, DatabaseInitializationCleanupError
+from kestrel_sovereign.storage.async_database import (
+    AsyncDatabase,
+    DatabaseInitializationCleanupError,
+)
 from tests.unit.test_execution_custody_review24 import host_accessor
 
 
 @pytest.mark.asyncio
 async def test_actual_a2a_store_retirement_joins_every_owner_and_preserves_control(tmp_path, monkeypatch):
     from kestrel_sdk.storage.database import QueryError
+
+    from kestrel_sovereign.a2a.scope import NativeRecipientScope
     from kestrel_sovereign.a2a.task_manager import create_task_manager
     from kestrel_sovereign.execution_custody import ExecutionCommitOutcomeError
-
-    manager = await create_task_manager(str(tmp_path / "all-stores.db"))
+    manager = await create_task_manager(str(tmp_path / "all-stores.db"), scope=NativeRecipientScope("did:test:recipient"))
     stores = [manager.feedback_store, manager.memory_service, manager.observability_store, manager.session_service, manager.task_store]
     completed = []
+    closers = [(store, store.close) for store in stores]
     for index, store in enumerate(stores):
         original = store.close
 
@@ -42,6 +51,9 @@ async def test_actual_a2a_store_retirement_joins_every_owner_and_preserves_contr
         await manager.close()
     assert completed == list(range(5)), "a failed store retirement skipped another resource owner"
     assert execution_commit_outcome(result.value) == "unknown", "first ordinary failure eclipsed original control"
+    for store, closer in closers:
+        monkeypatch.setattr(store, "close", closer)
+    await manager.close()
 
 
 @pytest.mark.asyncio
@@ -51,12 +63,15 @@ async def test_actual_a2a_store_retirement_joins_every_owner_and_preserves_contr
     "worker", "worker_cancel", "command", "cancel_callback",
 ])
 async def test_actual_a2a_producers_and_projections_propagate_original_control(tmp_path, monkeypatch, stage):
+    from kestrel_sdk.native_a2a.helpers.proto_helpers import new_text_message
+    from kestrel_sdk.native_a2a.types import AgentSkill, Role, SendMessageRequest, TaskState
     from kestrel_sdk.storage.database import QueryError
+
+    from kestrel_sovereign.a2a.scope import NativeRecipientScope
     from kestrel_sovereign.a2a.task_manager import create_task_manager
-    from kestrel_sovereign.a2a.types import TaskSendParams, Message, TextPart, TaskState
     from kestrel_sovereign.execution_custody import ExecutionCommitOutcomeError
 
-    manager = await create_task_manager(str(tmp_path / "producer.db"))
+    manager = await create_task_manager(str(tmp_path / 'producer.db'), scope=NativeRecipientScope('did:test:recipient'))
     marker = ExecutionCommitOutcomeError("unknown")
 
     def fail_sync(*args, **kwargs):
@@ -65,10 +80,10 @@ async def test_actual_a2a_producers_and_projections_propagate_original_control(t
     async def fail_async(*args, **kwargs):
         fail_sync()
 
-    params = TaskSendParams(message=Message(role="user", parts=[TextPart(text="fixture")]))
-    task = await manager.create_task(params, agent_name="did:test:recipient", creator_agent_id="did:test:creator")
+    params = SendMessageRequest(message=new_text_message('fixture', role=Role.ROLE_USER))
+    task = await manager.create_task(params,  creator_agent_id="did:test:creator")
     if stage.startswith("status_") or stage == "completion_callback":
-        task = await manager.update_status(task.id, TaskState.WORKING, agent_name="did:test:recipient", recipient_agent_id="did:test:recipient")
+        task = await manager.update_status(task.id, TaskState.TASK_STATE_WORKING, agent_name="did:test:recipient", recipient_agent_id="did:test:recipient")
     targets = {
         "causation": (manager, "_causation_chain_provider", fail_sync),
         "submitted": (manager, "_on_task_submitted", fail_sync),
@@ -88,27 +103,35 @@ async def test_actual_a2a_producers_and_projections_propagate_original_control(t
         monkeypatch.setattr(owner, attribute, function)
     try:
         with pytest.raises(BaseException) as result:
-            if stage in {"causation", "submitted"} or stage.startswith("create_"):
-                fresh_params = TaskSendParams(message=Message(role="user", parts=[TextPart(text="new fixture")]))
-                await manager.create_task(fresh_params, agent_name="did:test:recipient", creator_agent_id="did:test:creator")
+            if stage == "causation":
+                manager.register_provider(
+                    "feature", [AgentSkill(id="fixture", name="Fixture", description="Fixture", tags=["test"])],
+                    SimpleNamespace(handle_task=fail_async),
+                )
+                await manager.execute_skill("feature", "fixture", {}, sync=True)
+            elif stage == "submitted" or stage.startswith("create_"):
+                fresh_params = SendMessageRequest(message=new_text_message('new fixture', role=Role.ROLE_USER))
+                await manager.create_task(fresh_params,  creator_agent_id="did:test:creator")
             elif stage == "cancel_callback":
                 await manager.cancel_task(task.id, agent_name="did:test:creator")
             elif stage in {"worker", "worker_cancel"}:
-                async def handler_failure(_task):
+                async def handler_failure(_task, *, arguments=None):
                     if stage == "worker_cancel":
                         raise asyncio.CancelledError("wrapped original custody") from marker
                     fail_sync()
                 await manager._execute_async(SimpleNamespace(handle_task=handler_failure), task, "did:test:recipient")
             elif stage == "command":
-                manager._agents["did:test:recipient"] = (SimpleNamespace(), SimpleNamespace(handle_task=fail_async))
-                manager._command_to_skill["!fixture"] = ("did:test:recipient", "fixture")
+                manager.register_provider(
+                    "feature", [AgentSkill(id="fixture", name="Fixture", description="Fixture", tags=["test"])],
+                    SimpleNamespace(handle_task=fail_async), command_prefixes={"!fixture":"fixture"},
+                )
                 await manager.execute_command("!fixture")
             else:
                 await manager.complete_task(task.id, "fixture completion", agent_name="did:test:recipient", recipient_agent_id="did:test:recipient")
         assert execution_commit_outcome(result.value) == "unknown", "A2A producer/projection erased original control"
         assert is_execution_control_error(result.value)
         if stage in {"worker", "worker_cancel"}:
-            assert (await manager.task_store._get_unscoped(task.id)).status.state is TaskState.SUBMITTED, "original control became a fresh FAILED/CANCELED write"
+            assert (await manager.task_store._get_unscoped(task.id)).status.state == TaskState.TASK_STATE_SUBMITTED, "original control became a fresh FAILED/CANCELED write"
     finally:
         await manager.close()
 
@@ -117,18 +140,22 @@ async def test_actual_a2a_producers_and_projections_propagate_original_control(t
 @pytest.mark.parametrize("stage", ["save", "payload"])
 @pytest.mark.parametrize("control", ["denied", "unknown"])
 async def test_actual_a2a_terminal_outcome_never_normalizes_control_into_completion(tmp_path, monkeypatch, stage, control):
+    from kestrel_sdk.native_a2a.helpers.proto_helpers import new_text_message
+    from kestrel_sdk.native_a2a.types import Role, SendMessageRequest, Task, TaskState
     from kestrel_sdk.storage.database import QueryError
+
+    from kestrel_sovereign.a2a.scope import NativeRecipientScope
     from kestrel_sovereign.a2a.task_manager import create_task_manager
-    from kestrel_sovereign.a2a.types import TaskSendParams, Message, TextPart, TaskState
     from kestrel_sovereign.execution_custody import ExecutionCommitOutcomeError
 
-    manager = await create_task_manager(str(tmp_path / "terminal.db"))
+    manager = await create_task_manager(str(tmp_path / 'terminal.db'), scope=NativeRecipientScope('did:test:recipient'))
     task = await manager.create_task(
-        TaskSendParams(message=Message(role="user", parts=[TextPart(text="fixture")])),
-        agent_name="did:test:recipient",
+        SendMessageRequest(message=new_text_message('fixture', role=Role.ROLE_USER)),
+
         creator_agent_id="did:test:creator",
     )
-    task.status.state = TaskState.COMPLETED
+    baseline = Task.FromString(task.SerializeToString())
+    task.status.state = TaskState.TASK_STATE_COMPLETED
     original_save = manager._save_recipient_execution_result
     original_read = manager.task_store._get_unscoped
     marker = ExecutionCommitOutcomeError("unknown") if control == "unknown" else ExecutionAuthorityError("original authority retired")
@@ -151,11 +178,11 @@ async def test_actual_a2a_terminal_outcome_never_normalizes_control_into_complet
     try:
         with pytest.raises(BaseException) as result:
             await manager._persist_execution_outcome(
-                task, authority_agent_id="did:test:recipient", expected_state=TaskState.SUBMITTED,
+                task, baseline=baseline, authority_agent_id="did:test:recipient", expected_state=TaskState.TASK_STATE_SUBMITTED,
             )
         assert is_execution_control_error(result.value), "durable reconciliation normalized control into completion"
         assert execution_commit_outcome(result.value) == ("unknown" if control == "unknown" else None)
-        assert (await original_read(task.id)).status.state is TaskState.COMPLETED
+        assert (await original_read(task.id)).status.state == TaskState.TASK_STATE_COMPLETED
     finally:
         await manager.close()
 
@@ -271,15 +298,18 @@ async def test_actual_host_factory_preserves_interrupted_schema_commit_and_retir
 @pytest.mark.asyncio
 @pytest.mark.parametrize("reconciliation", ["cancel", "error"])
 async def test_actual_a2a_cancel_commit_receipt_survives_failed_readback(tmp_path, monkeypatch, reconciliation):
+    from kestrel_sdk.native_a2a.helpers.proto_helpers import new_text_message
+    from kestrel_sdk.native_a2a.types import Role, SendMessageRequest, TaskState
     from kestrel_sdk.storage.database import QueryError
+
+    from kestrel_sovereign.a2a.scope import NativeRecipientScope
     from kestrel_sovereign.a2a.task_manager import create_task_manager
-    from kestrel_sovereign.a2a.types import TaskSendParams, Message, TextPart, TaskState
     from kestrel_sovereign.execution_custody import ExecutionCommitOutcomeError
 
-    manager = await create_task_manager(str(tmp_path / "task.db"))
+    manager = await create_task_manager(str(tmp_path / 'task.db'), scope=NativeRecipientScope('did:test:recipient'))
     task = await manager.create_task(
-        TaskSendParams(message=Message(role="user", parts=[TextPart(text="fixture")]), metadata={"sender": "did:test:creator"}),
-        agent_name="did:test:recipient",
+        SendMessageRequest(message=new_text_message('fixture', role=Role.ROLE_USER), metadata={"sender": "did:test:creator"}),
+
         creator_agent_id="did:test:creator",
     )
     original_cancel = manager.task_store.cancel_if_authorized
@@ -287,7 +317,7 @@ async def test_actual_a2a_cancel_commit_receipt_survives_failed_readback(tmp_pat
 
     async def commit_then_lose_wrapped_ack(*args, **kwargs):
         committed = await original_cancel(*args, **kwargs)
-        assert committed is not None and committed.status.state is TaskState.CANCELED
+        assert committed is not None and committed.status.state == TaskState.TASK_STATE_CANCELED
         try:
             raise ExecutionCommitOutcomeError("unknown")
         except ExecutionCommitOutcomeError as control:
@@ -305,7 +335,7 @@ async def test_actual_a2a_cancel_commit_receipt_survives_failed_readback(tmp_pat
             await manager.cancel_task(task.id, agent_name="did:test:creator")
         assert execution_commit_outcome(caught.value) == "unknown", "readback replaced original committed cancellation cause"
         assert is_execution_control_error(caught.value)
-        assert (await original_read(task.id)).status.state is TaskState.CANCELED
+        assert (await original_read(task.id)).status.state == TaskState.TASK_STATE_CANCELED
     finally:
         await manager.close()
 
@@ -314,6 +344,7 @@ async def test_actual_a2a_cancel_commit_receipt_survives_failed_readback(tmp_pat
 @pytest.mark.parametrize("source", ["backend", "factory", "backend_cancel", "factory_cancel", "dual_cancel"])
 async def test_actual_database_close_preserves_wrapped_control_from_either_owner(tmp_path, monkeypatch, source):
     from kestrel_sdk.storage.database import QueryError
+
     from kestrel_sovereign.execution_custody import ExecutionCommitOutcomeError
 
     database = await AsyncDatabase.sqlite(str(tmp_path / "close.db"))

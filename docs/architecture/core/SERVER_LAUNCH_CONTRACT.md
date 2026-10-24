@@ -78,6 +78,26 @@ selected agent's registered port. The command intentionally does not accept
 direct-server `--host` or `--port` options. Edit the registry when changing a
 managed fleet address.
 
+Both forms launch the command built by
+`kestrel_sovereign.multi_agent.process_manager.server_command`, which passes
+`--timeout-graceful-shutdown` (`SERVER_GRACEFUL_SHUTDOWN_SECONDS`). After a
+stop signal uvicorn waits at most that long for open connections, such as a
+console's event stream, then cancels them and runs the application's lifespan
+shutdown. `kestrel terminate` waits up to `SERVER_TERMINATE_TIMEOUT_SECONDS`
+for the process to exit before it sends SIGKILL, and says so when it has to,
+then allows `SERVER_KILL_GRACE_SECONDS` before it judges. The restart
+coordinator watches a `kestrel restart` it dispatched for as long as that stop
+can last, so a restart that fails to stop the host is caught when it exits.
+A host with no PID record is stopped through its port, under the same
+deadline: uvicorn frees the port before its shutdown has run, so the wait is
+for the process, not the port. A host or agent the stop signal could not
+reach is reported at once rather than waited for.
+The direct `python -m kestrel_sovereign.server` command uses the same graceful
+window. Each launch first moves a log of `LOG_ROTATION_MAX_BYTES` or more aside
+(`host.log` becomes `host.log.1`, keeping `LOG_ROTATION_BACKUPS` generations).
+The container entrypoints below do not bound the graceful window yet
+([#3791](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/3791)).
+
 ## Managed deployments
 
 Kestrel's process manager and container entrypoints invoke Uvicorn directly

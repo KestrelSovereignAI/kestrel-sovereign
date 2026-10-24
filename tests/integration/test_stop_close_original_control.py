@@ -1,5 +1,7 @@
 """Original PostgreSQL control survives direct distributed close interruption."""
 
+from tests.shared.native_shutdown_budget import shutdown_fixture_agent
+
 import asyncio
 import inspect
 
@@ -223,6 +225,6 @@ async def test_direct_stop_close_retains_original_commit_and_accepted_children(
             if not is_execution_control_error(error):
                 raise
         backend._execution_custody = None
-        await agent.shutdown()
+        await shutdown_fixture_agent(agent)
         await agent_db.close()
         await db.close()

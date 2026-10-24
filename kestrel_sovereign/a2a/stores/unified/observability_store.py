@@ -20,8 +20,8 @@ from pydantic import BaseModel
 
 from kestrel_sovereign.a2a.stores.base import generate_id, json_dumps, json_loads
 from kestrel_sovereign.a2a.stores.unified.base import UnifiedStoreBase
-from kestrel_sovereign.storage.db.interface import DatabaseBackend
 from kestrel_sovereign.execution_custody import execution_terminal_error
+from kestrel_sovereign.storage.db.interface import DatabaseBackend
 
 logger = logging.getLogger(__name__)
 
@@ -155,14 +155,14 @@ class ObservabilityStore(UnifiedStoreBase):
     with a single implementation that works with any DatabaseBackend.
     """
 
-    def __init__(self, backend: DatabaseBackend):
+    def __init__(self, backend: DatabaseBackend, *, owns_backend: bool = True):
         """
         Initialize observability store with database backend.
 
         Args:
             backend: DatabaseBackend instance (SQLite or PostgreSQL)
         """
-        super().__init__(backend)
+        super().__init__(backend, owns_backend=owns_backend)
         # Privacy gate for content-bearing payloads (F076). The agent binds a
         # callable returning the live ``PrivacyConfig`` via
         # :meth:`set_privacy_config_provider`; captured by reference so
@@ -238,9 +238,7 @@ class ObservabilityStore(UnifiedStoreBase):
             if config.requires_anonymization():
                 return _anonymize_deep(meta, _get_anonymize_text())
         except Exception as exc:  # noqa: BLE001 - fail closed to gated
-            logger.debug(
-                "privacy gate for metadata failed (%s); eliding payload", exc
-            )
+            logger.debug("privacy gate for metadata failed (%s); eliding payload", exc)
             return {_CONTENT_GATED_MARKER: "error"}
         return meta
 
@@ -332,10 +330,7 @@ class ObservabilityStore(UnifiedStoreBase):
         await self._backend.execute(
             "CREATE INDEX IF NOT EXISTS idx_llm_calls_timestamp ON a2a_llm_calls(timestamp)"
         )
-        try:
-            await self.add_column_if_missing("a2a_llm_calls", "agent_did", "TEXT")
-        except Exception as exc:
-            logger.debug("Migration check for a2a_llm_calls.agent_did: %s", exc)
+        await self.add_column_if_missing("a2a_llm_calls", "agent_did", "TEXT")
         await self._backend.execute(
             "CREATE INDEX IF NOT EXISTS idx_llm_calls_agent ON a2a_llm_calls(agent_did)"
         )
@@ -582,7 +577,9 @@ class ObservabilityStore(UnifiedStoreBase):
                 tuple(dispatch_params),
             )
         except Exception as exc:  # noqa: BLE001 - retained, never collapsed to a clean 0
-            logger.warning("purge_observability_since: tool-dispatch sweep failed: %s", exc)
+            logger.warning(
+                "purge_observability_since: tool-dispatch sweep failed: %s", exc
+            )
             failures["a2a_tool_dispatches"] = repr(exc)
             original_errors.append(exc)
 
@@ -597,7 +594,9 @@ class ObservabilityStore(UnifiedStoreBase):
                 tuple(obs_params),
             )
         except Exception as exc:  # noqa: BLE001 - retained, never collapsed to a clean 0
-            logger.warning("purge_observability_since: observability sweep failed: %s", exc)
+            logger.warning(
+                "purge_observability_since: observability sweep failed: %s", exc
+            )
             failures["a2a_observability"] = repr(exc)
             original_errors.append(exc)
 
@@ -608,9 +607,9 @@ class ObservabilityStore(UnifiedStoreBase):
             # Keep the existing table/count diagnostics without reducing
             # native outcome/debt owners to strings. The explicit chain is
             # required by privacy cleanup's fatal-control classification.
-            raise ObservabilityPurgeError(counts, failures) from execution_terminal_error(
-                *original_errors, retain_originals=True
-            )
+            raise ObservabilityPurgeError(
+                counts, failures
+            ) from execution_terminal_error(*original_errors, retain_originals=True)
 
         return counts
 
@@ -992,7 +991,6 @@ class ObservabilityStore(UnifiedStoreBase):
             metadata=json_loads(row[9]) if row[9] else {},
         )
 
-
     # ==========================================================================
     # LLM Call Observability (A2A-compatible)
     # ==========================================================================
@@ -1324,7 +1322,9 @@ def _anonymize_deep(value: Any, anonymize: Callable[[str], str], depth: int = 0)
     if depth > 8:
         return value
     if isinstance(value, dict):
-        return {str(k): _anonymize_deep(v, anonymize, depth + 1) for k, v in value.items()}
+        return {
+            str(k): _anonymize_deep(v, anonymize, depth + 1) for k, v in value.items()
+        }
     if isinstance(value, (list, tuple)):
         return [_anonymize_deep(item, anonymize, depth + 1) for item in value]
     if isinstance(value, str):
@@ -1346,7 +1346,11 @@ def infer_tool_result_status(result: Any, status_hint: Optional[str] = None) -> 
         error_text = str(result.get("error", ""))
         if error_text.lower().startswith("permission denied"):
             return "policy_denied"
-        if success is False or status in {"error", "failed", "failure"} or result.get("error"):
+        if (
+            success is False
+            or status in {"error", "failed", "failure"}
+            or result.get("error")
+        ):
             return "error"
     if getattr(result, "failed", False):
         return "error"

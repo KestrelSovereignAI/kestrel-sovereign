@@ -42,15 +42,15 @@ const statuses = [
     'submitted',
     'working',
     'canceled',
-    'input_required',
+    'input-required',
 ];
 
 API.request = async () => ({
     tasks: statuses.map((status, index) => ({
-        id: `task-${String(index).padStart(8, '0')}`,
+        task_id: `task-${String(index).padStart(8, '0')}`,
         status,
-        agent_id: 'Kite',
-        skill: 'test',
+        sender: 'did:kestrel:Kite',
+        skill_hint: 'test',
         artifacts_count: 0,
     })),
 });
@@ -90,7 +90,7 @@ test('A2A wire statuses map onto the canonical visual vocabulary', () => {
         submitted: 'status-queued',
         working: 'status-running',
         canceled: 'status-cancelled',
-        input_required: 'status-input-required',
+        'input-required': 'status-input-required',
     };
 
     for (const [status, className] of Object.entries(expected)) {
@@ -110,7 +110,7 @@ test('artifact names render as text without creating executable HTML', async () 
     document.body.append(target);
     const priorRequest = API.request;
     const names = ['<img src=x onerror="alert(1)">', '<svg onload="alert(1)"></svg>', 'Report & <notes>', ''];
-    API.request = async () => ({ artifacts: names.map(name => ({ name, data: { text: 'saved content' } })) });
+    API.request = async () => ({ task: { artifacts: names.map(name => ({ name, parts: [{ text: 'saved content' }] })) } });
     try {
         await window.loadTaskArtifacts('title-test');
         assert.equal(target.querySelector('img, svg, script, [onerror], [onload]'), null);
@@ -120,5 +120,48 @@ test('artifact names render as text without creating executable HTML', async () 
     } finally {
         API.request = priorRequest;
         target.remove();
+    }
+});
+
+
+test('task reads use the operator inbox namespace and encode task identifiers', async () => {
+    const target = document.createElement('div');
+    target.id = 'artifacts-task/with space';
+    document.body.append(target);
+    const priorRequest = API.request;
+    const paths = [];
+    API.request = async (path) => {
+        paths.push(path);
+        return path.includes('?') ? { tasks: [] } : { task: { artifacts: [] } };
+    };
+    try {
+        await loadTasks();
+        await window.loadTaskArtifacts('task/with space');
+        assert.match(paths[0], /^\/api\/agent\/task-inbox\?/);
+        assert.equal(paths[1], '/api/agent/task-inbox/task%2Fwith%20space');
+    } finally {
+        API.request = priorRequest;
+        target.remove();
+    }
+});
+
+test('native status timestamps render without inventing creation or update times', async () => {
+    const priorRequest = API.request;
+    const timestamp = '2026-10-22T07:00:00.123Z';
+    const task = {
+        task_id: 'native-timestamp', status: 'working',
+        status_timestamp: timestamp, artifacts_count: 0,
+    };
+    API.request = async () => ({ tasks: [task] });
+    try {
+        await loadTasks();
+        const details = document.getElementById('task-details-native-timestamp');
+        assert.ok(details.textContent.includes(`Status changed: ${new Date(timestamp).toLocaleString()}`));
+        assert.doesNotMatch(details.textContent, /Created:|Updated:/);
+        task.status_timestamp = null;
+        await loadTasks();
+        assert.doesNotMatch(document.getElementById('task-details-native-timestamp').textContent, /Status changed:|Invalid Date|undefined/);
+    } finally {
+        API.request = priorRequest;
     }
 });

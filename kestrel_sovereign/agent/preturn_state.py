@@ -27,6 +27,12 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from kestrel_sdk.native_a2a.types import TaskState
+
+from google.protobuf.json_format import MessageToDict
+
+from kestrel_sovereign.a2a.lifecycle import task_state_label
+from kestrel_sovereign.a2a.projections import message_text
 from kestrel_sovereign.features.storage_access import (
     AgentIdentityUnavailable,
     resolve_scoped_agent_did,
@@ -158,35 +164,28 @@ async def _a2a_inbox_section(agent: Any) -> Optional[str]:
     except AgentIdentityUnavailable:
         return None
     try:
-        from kestrel_sovereign.a2a.types import TaskState
-        tasks = await task_manager.task_store.list_tasks(
+        snapshots = await task_manager.list_task_snapshots(
             recipient_agent_id=recipient_agent_id,
             limit=50,
         )
     except Exception:
         return None
     pending = [
-        t for t in tasks
-        if t.status.state in (TaskState.SUBMITTED, TaskState.WORKING)
+        snapshot for snapshot in snapshots
+        if snapshot.task.status.state in (TaskState.TASK_STATE_SUBMITTED, TaskState.TASK_STATE_WORKING)
     ]
     n = len(pending)
     if n == 0:
         return "A2A inbox: no pending tasks"
     lines = [f"A2A inbox: {n} pending task(s); last 3:"]
-    for task in pending[-3:][::-1]:
-        meta = task.metadata or {}
-        sender = str(meta.get("sender") or "?")
-        skill = str(meta.get("skill") or "")
-        first_text = ""
-        if task.history:
-            for part in task.history[0].parts:
-                if hasattr(part, "text"):
-                    first_text = part.text
-                    break
-        first_text = first_text.replace("\n", " ").strip()
-        label = f"{skill or 'task'} from {sender}"
+    for snapshot in pending[:3]:
+        task = snapshot.task
+        skill = str(MessageToDict(task.metadata).get("skill") or "")
+        first_text = message_text(task.history[0]) if task.history else None
+        first_text = (first_text or "").replace("\n", " ").strip()
+        label = f"{skill or 'task'} from {snapshot.ownership.creator_agent_id}"
         lines.append(
-            f"  - [{task.status.state.value}] {label}: {first_text[:90]}"
+            f"  - [{task_state_label(task.status.state)}] {label}: {first_text[:90]}"
         )
     return "\n".join(lines)
 

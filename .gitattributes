@@ -2,3 +2,8 @@
 # SHA-256 pins.  Preserve their repository bytes on Windows instead of letting
 # core.autocrlf rewrite LF to CRLF during checkout or wheel construction.
 /kestrel_sovereign/data/semantic/** text eol=lf
+
+# Reproducible custody bytes, independent of an operator's Git line endings.
+tests/interop/a2a_tck/* text eol=lf
+# A unified diff's empty context lines contain a required space prefix.
+tests/interop/a2a_tck/UPSTREAM.patch -whitespace

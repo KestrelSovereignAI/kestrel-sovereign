@@ -4844,7 +4844,7 @@ def test_isolated_service_requires_safe_console_or_callable_target(
 
 
 @pytest.mark.asyncio
-async def test_supervision_registered_and_child_stopped_on_cancel(tmp_path):
+async def test_supervision_registered_and_child_stopped_on_cancel(tmp_path, monkeypatch):
     """Leak guard: supervision task registers with the agent's background-task
     lifecycle, and cancelling it (agent shutdown path) stops the child."""
     import asyncio
@@ -4870,23 +4870,19 @@ async def test_supervision_registered_and_child_stopped_on_cancel(tmp_path):
     feature = ProxyFeature(FakeAgent(), runtime, client_factory=FakeIsolatedClient)
     feature._client_factory = lambda **kw: FakeIsolatedClient(**kw)
     monkey_bin = tmp_path  # avoid real venv work
-    import os
-    os.environ["KESTREL_FEATURE_SVCFEATURE_BIN"] = str(monkey_bin / "svc-bin")
+    monkeypatch.setenv("KESTREL_FEATURE_SVCFEATURE_BIN", str(monkey_bin / "svc-bin"))
+    await feature.initialize()
+    # registered through the agent's tracker, not a bare task
+    assert feature._supervision_task in tracked
+    client = feature._client
+    await asyncio.sleep(0.05)  # let the supervision loop enter its body
+    # simulate agent shutdown cancelling tracked background tasks
+    feature._supervision_task.cancel()
     try:
-        await feature.initialize()
-        # registered through the agent's tracker, not a bare task
-        assert feature._supervision_task in tracked
-        client = feature._client
-        await asyncio.sleep(0.05)  # let the supervision loop enter its body
-        # simulate agent shutdown cancelling tracked background tasks
-        feature._supervision_task.cancel()
-        try:
-            await feature._supervision_task
-        except asyncio.CancelledError:
-            pass
-        assert client.stopped is True  # child torn down despite no shutdown() call
-    finally:
-        os.environ.pop("KESTREL_FEATURE_SVCFEATURE_BIN", None)
+        await feature._supervision_task
+    except asyncio.CancelledError:
+        pass
+    assert client.stopped is True  # child torn down despite no shutdown() call
 
 
 class FakeChannelRegistry:
@@ -9797,7 +9793,7 @@ async def test_hosted_workspace_survives_failed_start_and_restarts_in_same_scope
 
 
 @pytest.mark.asyncio
-async def test_supervision_restarts_child_on_wedged_health_probe(tmp_path):
+async def test_supervision_restarts_child_on_wedged_health_probe(tmp_path, monkeypatch):
     """F013: a health() that never returns must not wedge supervision forever —
     the probe is bounded and a timeout drops through to stop()/start()."""
     import asyncio
@@ -9836,8 +9832,7 @@ async def test_supervision_restarts_child_on_wedged_health_probe(tmp_path):
 
     feature = ProxyFeature(Mock(storage_path=str(tmp_path / "a" / "db.db"), features={}),
                            runtime, client_factory=factory)
-    import os
-    os.environ["KESTREL_FEATURE_WEDGEFEATURE_BIN"] = str(tmp_path / "w-bin")
+    monkeypatch.setenv("KESTREL_FEATURE_WEDGEFEATURE_BIN", str(tmp_path / "w-bin"))
     # Shrink the probe bound and backoff so the test is fast.
     monkey = pytest.MonkeyPatch()
     monkey.setattr(ir, "_HEALTH_PROBE_TIMEOUT", 0.05)
@@ -9864,7 +9859,6 @@ async def test_supervision_restarts_child_on_wedged_health_probe(tmp_path):
             except asyncio.CancelledError:
                 pass
         monkey.undo()
-        os.environ.pop("KESTREL_FEATURE_WEDGEFEATURE_BIN", None)
 
 
 def test_ensure_venv_reprovisions_when_host_sdk_upgrades(tmp_path, monkeypatch):
@@ -14348,7 +14342,7 @@ async def test_persisted_config_survives_restart(monkeypatch, tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_reenable_restarts_live_health_supervisor(tmp_path):
+async def test_reenable_restarts_live_health_supervisor(tmp_path, monkeypatch):
     """Runtime disable → re-enable on the SAME ProxyFeature instance must leave a
     LIVE health supervisor.
 
@@ -14361,7 +14355,6 @@ async def test_reenable_restarts_live_health_supervisor(tmp_path):
     initialize lifecycle and proves the second supervisor stays alive AND
     actively probes the freshly launched client."""
     import asyncio
-    import os
 
     import kestrel_sovereign.features.isolated_runtime as ir
 
@@ -14390,7 +14383,7 @@ async def test_reenable_restarts_live_health_supervisor(tmp_path):
     )
     agent = Mock(did=_TEST_AGENT_DID, storage_path=str(tmp_path / "a" / "db.db"), features={})
     feature = ProxyFeature(agent, runtime, client_factory=factory)
-    os.environ["KESTREL_FEATURE_REENABLEFEATURE_BIN"] = str(tmp_path / "r-bin")
+    monkeypatch.setenv("KESTREL_FEATURE_REENABLEFEATURE_BIN", str(tmp_path / "r-bin"))
 
     monkey = pytest.MonkeyPatch()
     monkey.setattr(ir, "_HEALTH_PROBE_TIMEOUT", 0.05)
@@ -14436,7 +14429,6 @@ async def test_reenable_restarts_live_health_supervisor(tmp_path):
             except asyncio.CancelledError:
                 pass
         monkey.undo()
-        os.environ.pop("KESTREL_FEATURE_REENABLEFEATURE_BIN", None)
 
 
 @pytest.mark.asyncio
@@ -16892,6 +16884,42 @@ async def test_hosted_telegram_ingress_is_admitted_only_through_the_durable_rout
         cursor_owned_protocol=True,
         telegram_terminal_disposition="unsupported_update",
     )
+
+
+@pytest.mark.asyncio
+async def test_hosted_ack_correlation_is_selected_only_by_trusted_host():
+    feature = object.__new__(ProxyFeature)
+    feature._is_telegram_runtime = lambda: True
+    feature._hosted_telegram_startup_attested = True
+    feature._route_validated_inbound = AsyncMock(return_value={"durably_admitted": True})
+    payload = {"id": "telegram:v2:bot:42:update:12", "content": "OK",
+               "session_id": "forged", "acknowledgement_session_id": "forged"}
+    assert await feature.admit_hosted_telegram_ingress(
+        payload, acknowledgement_only=True, acknowledgement_session_id="original-run",
+    ) == {"durably_admitted": True}
+    feature._route_validated_inbound.assert_awaited_once_with(
+        payload, cursor_owned_protocol=True,
+        telegram_terminal_disposition="care_acknowledgement",
+        acknowledgement_session_id="original-run",
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("acknowledgement_only,session_id", [
+    (False, "original-run"), (True, True), (True, 42), (True, ""),
+    (True, " leading"), (True, "line\nbreak"), (True, "x" * 257),
+])
+async def test_hosted_ack_session_rejects_other_purposes_and_bad_identity(acknowledgement_only, session_id):
+    feature = object.__new__(ProxyFeature)
+    feature._is_telegram_runtime = lambda: True
+    feature._hosted_telegram_startup_attested = True
+    feature._route_validated_inbound = AsyncMock()
+    with pytest.raises(isolated_runtime.ProtocolError):
+        await feature.admit_hosted_telegram_ingress(
+            {"id": "telegram:v2:bot:42:update:12"},
+            acknowledgement_only=acknowledgement_only, acknowledgement_session_id=session_id,
+        )
+    feature._route_validated_inbound.assert_not_awaited()
 
 
 def test_explicit_isolated_feature_data_directory_wins_over_storage_path(tmp_path):

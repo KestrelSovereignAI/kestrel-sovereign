@@ -9,40 +9,19 @@ from types import SimpleNamespace
 from uuid import uuid4
 
 import pytest
+from kestrel_sdk.native_a2a.helpers.proto_helpers import new_text_message
+from kestrel_sdk.native_a2a.types import Artifact, Part, Role, SendMessageRequest, TaskState
+from google.protobuf.json_format import MessageToDict
 
+from kestrel_sovereign.a2a.scope import NativeRecipientScope
+from kestrel_sovereign.a2a.stores.unified import ObservabilityStore
 from kestrel_sovereign.endpoints.database import (
     _get_table_columns,
     _list_table_names,
     list_database_tables,
     query_database_table,
 )
-from kestrel_sovereign.a2a.stores.unified import ObservabilityStore, TaskStore
-from kestrel_sovereign.a2a.types import (
-    Artifact,
-    Message,
-    Task,
-    TaskState,
-    TaskStatus,
-    TextPart,
-)
 from kestrel_sovereign.features.webhooks.feature import WebhookFeature
-from kestrel_sovereign.privacy import PrivacyMode
-from kestrel_sovereign.storage.associative_linker import AssociativeLinker
-from kestrel_sovereign.storage.async_file_store import AsyncFileStore
-from kestrel_sovereign.storage.async_graph_store import AsyncGraphStore, GraphNode
-from kestrel_sovereign.storage.async_rag_store import AsyncRAGStore
-from kestrel_sovereign.storage.async_storage import AsyncStorage
-from kestrel_sovereign.storage.db.interface import QueryError, TransactionError
-from kestrel_sovereign.storage.privacy_wrapper import PrivacyEnforcingStorage, PrivacyViolationError
-from kestrel_sovereign.storage.saved_items_store import SavedItemsStore
-from kestrel_sovereign.storage.schema_router import SchemaRouter
-from kestrel_sovereign.storage.sqla.migrations import (
-    _SEMANTIC_MAINTENANCE_LEASE_PRECISION_SCHEMA_VERSION,
-    migrate_semantic_maintenance,
-)
-from kestrel_sovereign.security.assertion_tenant_resolver import (
-    _resolve_authenticated_agent_assertion_capability,
-)
 from kestrel_sovereign.identity.runtime_identity import (
     AgentIdentity,
     load_agent_identity,
@@ -50,6 +29,27 @@ from kestrel_sovereign.identity.runtime_identity import (
 from kestrel_sovereign.inception_service import create_kestrel_identity_async
 from kestrel_sovereign.knowledge import InferenceProfile, OntologyRef
 from kestrel_sovereign.knowledge.capabilities import semantic_capabilities_from_config
+from kestrel_sovereign.privacy import PrivacyMode
+from kestrel_sovereign.security.assertion_tenant_resolver import (
+    _resolve_authenticated_agent_assertion_capability,
+)
+from kestrel_sovereign.storage.associative_linker import AssociativeLinker
+from kestrel_sovereign.storage.async_file_store import AsyncFileStore
+from kestrel_sovereign.storage.async_graph_store import AsyncGraphStore, GraphNode
+from kestrel_sovereign.storage.async_rag_store import AsyncRAGStore
+from kestrel_sovereign.storage.async_storage import AsyncStorage
+from kestrel_sovereign.storage.db.interface import QueryError, TransactionError
+from kestrel_sovereign.storage.privacy_wrapper import (
+    PrivacyEnforcingStorage,
+    PrivacyViolationError,
+)
+from kestrel_sovereign.storage.saved_items_store import SavedItemsStore
+from kestrel_sovereign.storage.schema_router import SchemaRouter
+from kestrel_sovereign.storage.sqla.migrations import (
+    _SEMANTIC_MAINTENANCE_LEASE_PRECISION_SCHEMA_VERSION,
+    migrate_semantic_maintenance,
+)
+from tests.utils.native_a2a import manager_for
 
 
 @pytest.mark.asyncio
@@ -60,6 +60,7 @@ async def test_governed_artifact_erasure_lifecycle_has_backend_parity(
     """SQLite/PostgreSQL share authenticated registration, expiry, and ACK semantics."""
     from cryptography.hazmat.primitives import serialization
     from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+
     from kestrel_sovereign.knowledge import (
         GovernedArtifactConsumerAuthentication,
         GovernedArtifactDeletionOwner,
@@ -145,6 +146,7 @@ async def test_empty_export_and_corpus_expiry_have_backend_parity(
     """Zero-lineage artifacts remain legitimate, revocable, and non-resurrectable."""
     from cryptography.hazmat.primitives import serialization
     from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+
     from kestrel_sovereign.knowledge import (
         EpistemicState,
         GovernedArtifactConsumerAuthentication,
@@ -280,13 +282,13 @@ def _semantic_assertion(
     tenant_id: str, revision_id: str, *, value: str = "value", source_id: str = "parity-source",
 ):
     from kestrel_sovereign.knowledge import (
+        IRI,
+        XSD_STRING,
         Assertion,
         DirectLineage,
         EpistemicState,
-        IRI,
         Literal,
         OntologyRef,
-        XSD_STRING,
     )
     return Assertion(
         tenant_id=tenant_id,
@@ -424,13 +426,13 @@ def _explicit_fact_proposal(
 
 def _derived_semantic_assertion(tenant_id: str, revision_id: str, input_revision_id: str, marker: str):
     from kestrel_sovereign.knowledge import (
+        IRI,
+        XSD_STRING,
         Assertion,
         DerivedLineage,
         EpistemicState,
-        IRI,
         Literal,
         OntologyRef,
-        XSD_STRING,
     )
 
     return Assertion(
@@ -721,7 +723,8 @@ async def _assert_constitution_runtime_state_round_trip(db_backend):
 @pytest.mark.dual_backend
 async def test_constitution_state_cas_rejects_stale_clear_and_due_marker_clobber(db_backend):
     from kestrel_sovereign.constitution.runtime_state import (
-        ConstitutionRuntimeState, ConstitutionRuntimeStateStore,
+        ConstitutionRuntimeState,
+        ConstitutionRuntimeStateStore,
         ConstitutionStateConflictError,
     )
 
@@ -763,7 +766,8 @@ async def test_constitution_state_cas_rejects_stale_clear_and_due_marker_clobber
 async def test_deleted_revision_zero_runtime_state_is_not_recreated(db_backend):
     """A loaded pre-fence record is never a request for first creation."""
     from kestrel_sovereign.constitution.runtime_state import (
-        ConstitutionRuntimeState, ConstitutionRuntimeStateStore,
+        ConstitutionRuntimeState,
+        ConstitutionRuntimeStateStore,
         ConstitutionStateConflictError,
     )
 
@@ -803,7 +807,8 @@ async def test_postgres_delete_committing_during_runtime_write_cannot_recreate(d
     if db_backend.backend_type != "postgres":
         pytest.skip("PostgreSQL-specific concurrent delete semantics")
     from kestrel_sovereign.constitution.runtime_state import (
-        ConstitutionRuntimeState, ConstitutionRuntimeStateStore,
+        ConstitutionRuntimeState,
+        ConstitutionRuntimeStateStore,
         ConstitutionStateConflictError,
     )
 
@@ -848,7 +853,8 @@ async def test_postgres_delete_committing_during_runtime_write_cannot_recreate(d
 async def test_recreated_runtime_generation_rejects_prior_authorized_exit(db_backend):
     """Equal revision numbers from different row lifetimes confer no custody."""
     from kestrel_sovereign.constitution.runtime_state import (
-        ConstitutionRuntimeState, ConstitutionRuntimeStateStore,
+        ConstitutionRuntimeState,
+        ConstitutionRuntimeStateStore,
         ConstitutionStateConflictError,
     )
 
@@ -881,9 +887,10 @@ async def test_recreated_runtime_generation_rejects_prior_authorized_exit(db_bac
 @pytest.mark.asyncio
 @pytest.mark.dual_backend
 async def test_native_bootstrap_rollback_preserves_lifecycle_fence_on_both_backends(db_backend):
+    from unittest.mock import AsyncMock
+
     from kestrel_sovereign.agent.constitution import ConstitutionMixin, SafeModeCause
     from tests.unit.test_constitution_audit import _DurableConstitutionHarness
-    from unittest.mock import AsyncMock
 
     now = datetime.now(timezone.utc)
     storage = AsyncStorage(backend=db_backend, agent_id="did:test:rollback:" + uuid4().hex)
@@ -916,7 +923,9 @@ async def test_native_bootstrap_rollback_preserves_lifecycle_fence_on_both_backe
 @pytest.mark.dual_backend
 async def test_committed_native_anchor_custody_is_single_use_on_both_backends(db_backend):
     from kestrel_sovereign.agent.constitution import ConstitutionMixin
-    from kestrel_sovereign.constitution.runtime_state import ConstitutionStateConflictError
+    from kestrel_sovereign.constitution.runtime_state import (
+        ConstitutionStateConflictError,
+    )
     from kestrel_sovereign.kestrel_agent import KestrelAgent
     from tests.unit.test_constitution_audit import _DurableConstitutionHarness
 
@@ -965,13 +974,23 @@ async def test_signed_native_anchor_consumes_bootstrap_custody_on_both_backends(
     import hashlib
     from contextlib import asynccontextmanager
     from unittest.mock import AsyncMock
+
     from kestrel_sovereign.agent.constitution import ConstitutionMixin
-    from kestrel_sovereign.constitution.amendment_artifact import load_verified_reanchor_artifact
-    from kestrel_sovereign.constitution.resolver import resolve_governing_constitution_bytes
-    from kestrel_sovereign.constitution.runtime_state import ConstitutionRuntimeStateStore
+    from kestrel_sovereign.constitution.amendment_artifact import (
+        load_verified_reanchor_artifact,
+    )
+    from kestrel_sovereign.constitution.resolver import (
+        resolve_governing_constitution_bytes,
+    )
+    from kestrel_sovereign.constitution.runtime_state import (
+        ConstitutionRuntimeStateStore,
+    )
     from kestrel_sovereign.kestrel_agent import KestrelAgent
     from kestrel_sovereign.setup import constitution_reanchor as offline
-    from tests.integration.test_constitution_reanchor_e2e import _write_authority_files, _ROOT_DID_DOCUMENT
+    from tests.integration.test_constitution_reanchor_e2e import (
+        _ROOT_DID_DOCUMENT,
+        _write_authority_files,
+    )
     from tests.unit.test_constitution_audit import _DurableConstitutionHarness
 
     now = datetime.now(timezone.utc)
@@ -1038,7 +1057,9 @@ async def test_signed_native_anchor_consumes_bootstrap_custody_on_both_backends(
                 expected_constitution_sha256=digest,
             )
             source = ConstitutionMixin._governing_constitution_source(first)
-            from kestrel_sovereign.constitution.anchored_bytes import governance_evidence
+            from kestrel_sovereign.constitution.anchored_bytes import (
+                governance_evidence,
+            )
             governance_rows = await storage.db.fetchall("SELECT target_id FROM graph_edges WHERE source_id = ? AND label = 'governed_by'", (first.agent_id,))
             governance_preflight = governance_evidence((await storage.get_node(first.agent_id)).properties, (row[0] for row in governance_rows))
             operation = offline._write_reanchor(
@@ -1094,8 +1115,11 @@ async def test_signed_native_anchor_consumes_bootstrap_custody_on_both_backends(
 @pytest.mark.parametrize("new_generation", [False, True])
 async def test_signed_live_anchor_refuses_stale_custody_on_both_backends(db_backend, tmp_path, same_hash, new_generation):
     import hashlib
+
     from kestrel_sovereign.agent.constitution import ConstitutionMixin
-    from kestrel_sovereign.constitution.resolver import resolve_governing_constitution_bytes
+    from kestrel_sovereign.constitution.resolver import (
+        resolve_governing_constitution_bytes,
+    )
     from kestrel_sovereign.kestrel_agent import KestrelAgent
     from tests.integration.test_constitution_reanchor_e2e import _write_authority_files
     from tests.unit.test_constitution_audit import _DurableConstitutionHarness
@@ -1142,10 +1166,16 @@ async def test_signed_live_anchor_refuses_stale_custody_on_both_backends(db_back
 async def test_public_offline_signed_missing_anchor_recovery_on_both_backends(db_backend, tmp_path, monkeypatch, mode):
     """The public operator entry point, not just its inner writer, must work."""
     import hashlib
-    from pathlib import Path
     from contextlib import asynccontextmanager
-    from kestrel_sovereign.constitution.resolver import resolve_governing_constitution_bytes
-    from kestrel_sovereign.constitution.emancipation import EmancipationContract, contract_to_json
+    from pathlib import Path
+
+    from kestrel_sovereign.constitution.emancipation import (
+        EmancipationContract,
+        contract_to_json,
+    )
+    from kestrel_sovereign.constitution.resolver import (
+        resolve_governing_constitution_bytes,
+    )
     from kestrel_sovereign.kestrel_agent import KestrelAgent
     from kestrel_sovereign.security.crypto_suite import Secp256k1Suite
     from kestrel_sovereign.setup import constitution_reanchor as offline
@@ -1246,7 +1276,9 @@ async def test_public_offline_signed_missing_anchor_recovery_on_both_backends(db
         environ={},
     )
     async with target.open_storage() as restored:
-        from kestrel_sovereign.constitution.runtime_state import ConstitutionRuntimeStateStore
+        from kestrel_sovereign.constitution.runtime_state import (
+            ConstitutionRuntimeStateStore,
+        )
         state_store = ConstitutionRuntimeStateStore(restored._backend)
         current = await state_store.load(agent_id)
         if mode in ("signed", "receipt", "same_custody", "legacy_state"):
@@ -1261,7 +1293,9 @@ async def test_public_offline_signed_missing_anchor_recovery_on_both_backends(db
             assert current.updated_at >= now
             assert (await state_store.list_events(agent_id))[-1]["occurred_at"] == current.updated_at
             if mode == "legacy_state":
-                from kestrel_sovereign.constitution.runtime_state import ConstitutionStateConflictError
+                from kestrel_sovereign.constitution.runtime_state import (
+                    ConstitutionStateConflictError,
+                )
                 with pytest.raises(ConstitutionStateConflictError):
                     await state_store.write(replace(before, revision=None, generation=None, bootstrap_pending=True))
         else:
@@ -1286,8 +1320,11 @@ async def test_public_offline_signed_missing_anchor_recovery_on_both_backends(db
 async def test_live_constitution_publication_refuses_outer_rollback_authority_alias(db_backend, tmp_path, monkeypatch, writer, unknown_ownership):
     """A local transaction exit is not a commit of the caller's outer unit."""
     import hashlib
+
     from kestrel_sovereign.agent.constitution import ConstitutionMixin, SafeModeCause
-    from kestrel_sovereign.constitution.resolver import resolve_governing_constitution_bytes
+    from kestrel_sovereign.constitution.resolver import (
+        resolve_governing_constitution_bytes,
+    )
     from kestrel_sovereign.kestrel_agent import KestrelAgent
     from tests.integration.test_constitution_reanchor_e2e import _write_authority_files
     from tests.unit.test_constitution_audit import _DurableConstitutionHarness
@@ -1415,7 +1452,9 @@ async def test_authoritative_read_only_constitution_allows_an_outer_transaction(
 async def test_live_missing_pointer_preserves_surviving_irrevocable_receipts(db_backend, tmp_path, receipt_key):
     from kestrel_sovereign.agent.constitution import ConstitutionMixin
     from kestrel_sovereign.constitution.emancipation import EmancipationContract
-    from kestrel_sovereign.constitution.resolver import resolve_governing_constitution_bytes
+    from kestrel_sovereign.constitution.resolver import (
+        resolve_governing_constitution_bytes,
+    )
     from tests.integration.test_constitution_reanchor_e2e import _write_authority_files
     from tests.unit.test_constitution_audit import _DurableConstitutionHarness
 
@@ -1451,11 +1490,17 @@ async def test_committed_reanchor_fences_in_flight_native_exit_after_bootstrap(d
     """Two independent database replicas: old full verification cannot clear a new anchor."""
     import hashlib
     from contextlib import asynccontextmanager
+
     from kestrel_sovereign.agent.constitution import ConstitutionMixin
-    from kestrel_sovereign.constitution.emancipation import EmancipationContract, contract_to_json
-    from kestrel_sovereign.constitution.resolver import resolve_governing_constitution_bytes
-    from kestrel_sovereign.setup import constitution_reanchor as offline
+    from kestrel_sovereign.constitution.emancipation import (
+        EmancipationContract,
+        contract_to_json,
+    )
+    from kestrel_sovereign.constitution.resolver import (
+        resolve_governing_constitution_bytes,
+    )
     from kestrel_sovereign.kestrel_agent import KestrelAgent
+    from kestrel_sovereign.setup import constitution_reanchor as offline
     from tests.integration.test_constitution_reanchor_e2e import _write_authority_files
     from tests.unit.test_constitution_audit import _DurableConstitutionHarness
 
@@ -1578,8 +1623,11 @@ async def test_migrated_pending_audit_is_not_unused_anchor_authority(db_backend,
         from kestrel_sovereign.storage.async_database import AsyncDatabase
         from kestrel_sovereign.storage.db.postgres import PostgresBackend
         from tests.utils.postgres_schema import (
-            disposable_postgres_schema, postgres_test_url, with_search_path,
-            pgvector_schema, quoted_search_path,
+            disposable_postgres_schema,
+            pgvector_schema,
+            postgres_test_url,
+            quoted_search_path,
+            with_search_path,
         )
         async def no_schema_ddl(db):
             return None
@@ -1660,7 +1708,8 @@ async def _assert_migrated_anchor_custody_refused(backend, advance_legacy_revisi
 async def test_pre_revision_writer_cannot_clear_new_runtime_state(db_backend):
     """Mixed-version replicas must fail closed, not bypass the new CAS."""
     from kestrel_sovereign.constitution.runtime_state import (
-        ConstitutionRuntimeState, ConstitutionRuntimeStateStore,
+        ConstitutionRuntimeState,
+        ConstitutionRuntimeStateStore,
     )
 
     store = ConstitutionRuntimeStateStore(db_backend)
@@ -1687,7 +1736,8 @@ async def test_pre_revision_writer_cannot_clear_new_runtime_state(db_backend):
 async def test_pre_generation_writer_cannot_recreate_deleted_runtime_row(db_backend):
     """Legacy INSERT defaults must not reintroduce a reusable empty epoch."""
     from kestrel_sovereign.constitution.runtime_state import (
-        ConstitutionRuntimeState, ConstitutionRuntimeStateStore,
+        ConstitutionRuntimeState,
+        ConstitutionRuntimeStateStore,
     )
 
     store = ConstitutionRuntimeStateStore(db_backend)
@@ -1806,7 +1856,9 @@ async def test_canonical_assertion_store_has_tenant_and_lifecycle_parity(
 @pytest.mark.dual_backend
 async def test_governed_semantic_recall_storage_seam_has_backend_parity(db_backend, tmp_path):
     """Discovery and final provenance hydration use the same SQL contract."""
-    from kestrel_sovereign.storage.async_assertion_store import SemanticRecallUnavailableError
+    from kestrel_sovereign.storage.async_assertion_store import (
+        SemanticRecallUnavailableError,
+    )
 
     tenant, identity = await _incepted_assertion_identity(tmp_path, "recall-parity")
     storage = await _assertion_storage_for_backend(db_backend, tenant, identity)
@@ -1857,7 +1909,9 @@ async def test_assertion_vector_projection_cursor_and_lineage_have_backend_parit
     from kestrel_sovereign.storage.async_assertion_store import (
         _issue_raw_assertion_mutation_capability,
     )
-    from kestrel_sovereign.storage.semantic_vector_projection import SemanticVectorProfile
+    from kestrel_sovereign.storage.semantic_vector_projection import (
+        SemanticVectorProfile,
+    )
 
     async def embed(text: str):
         return [float(len(text)), 1.0]
@@ -1932,6 +1986,7 @@ async def test_vector_export_erasure_lifecycle_has_backend_parity(db_backend, tm
     """One physical erase fences vector recall and external artifact serving."""
     from cryptography.hazmat.primitives import serialization
     from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+
     from kestrel_sovereign.knowledge import (
         GovernedArtifactConsumerAuthentication,
         GovernedArtifactDeletionOwner,
@@ -4064,7 +4119,7 @@ async def test_canonical_assertion_iri_object_query_has_backend_parity(
     tmp_path,
 ):
     """IRI-object lookups do not bind untyped NULLs on PostgreSQL."""
-    from kestrel_sovereign.knowledge import AssertionQuery, IRI
+    from kestrel_sovereign.knowledge import IRI, AssertionQuery
 
     tenant, identity = await _incepted_assertion_identity(tmp_path, "iri-object-query")
     storage = await _assertion_storage_for_backend(db_backend, tenant, identity)
@@ -4145,13 +4200,13 @@ async def test_semantic_inference_ledger_retracts_invalid_proofs_on_both_backend
 ):
     """PostgreSQL and SQLite deactivate stale alternate-proof rows identically."""
     from kestrel_sovereign.knowledge import (
+        IRI,
         Assertion,
         AssertionQuery,
         BoundedInferenceService,
         DirectLineage,
         EpistemicState,
         InferenceProfile,
-        IRI,
         OntologyRef,
         SourceOccurrence,
     )
@@ -4653,98 +4708,50 @@ async def test_conversation_session_queries_are_backend_neutral(db_backend):
 @pytest.mark.asyncio
 @pytest.mark.dual_backend
 async def test_a2a_task_store_filters_and_payloads_are_backend_neutral(db_backend):
-    store = TaskStore(db_backend)
-    await store.initialize()
+    first = manager_for(db_backend, NativeRecipientScope("did:test:recipient-a"), owns_backend=False)
+    second = manager_for(db_backend, NativeRecipientScope("did:test:recipient-b"), owns_backend=False)
+    await first.initialize()
+    await second.initialize()
+    context_a, context_b = uuid4().hex, uuid4().hex
+    user_a, user_b = uuid4().hex, uuid4().hex
 
-    session_a = f"session-{uuid4()}"
-    session_b = f"session-{uuid4()}"
-    user_a = f"user-{uuid4()}"
-    user_b = f"user-{uuid4()}"
-    task_a = f"task-{uuid4()}"
-    task_b = f"task-{uuid4()}"
-    other_task = f"task-{uuid4()}"
+    async def create(manager, creator, context, user, marker):
+        return await manager.create_task(
+            SendMessageRequest(
+                message=new_text_message("build the thing", role=Role.ROLE_USER, context_id=context),
+                metadata={"task_type": "audit", "user_id": user, "marker": marker},
+            ), creator_agent_id=creator,
+        )
 
-    await store.save(
-        Task(
-            id=task_a,
-            sessionId=session_a,
-            status=TaskStatus(state=TaskState.SUBMITTED),
-            history=[Message(role="user", parts=[TextPart(text="build the thing")])],
-            metadata={"task_type": "audit", "user_id": user_a, "marker": "first"},
-        ),
-        creator_agent_id="did:test:creator-a",
-        recipient_agent_id="did:test:recipient-a",
-    )
-    await store.save(
-        Task(
-            id=task_b,
-            sessionId=session_a,
-            status=TaskStatus(state=TaskState.COMPLETED),
-            metadata={"task_type": "audit", "user_id": user_a, "marker": "second"},
-        ),
-        creator_agent_id="did:test:creator-a",
-        recipient_agent_id="did:test:recipient-a",
-    )
-    await store.save(
-        Task(
-            id=other_task,
-            sessionId=session_b,
-            status=TaskStatus(state=TaskState.SUBMITTED),
-            metadata={"task_type": "audit", "user_id": user_b, "marker": "other"},
-        ),
-        creator_agent_id="did:test:creator-b",
-        recipient_agent_id="did:test:recipient-b",
-    )
+    try:
+        task_a = await create(first, "did:test:creator-a", context_a, user_a, "first")
+        task_b = await create(first, "did:test:creator-a", context_a, user_a, "second")
+        other = await create(second, "did:test:creator-b", context_b, user_b, "other")
+        await first.update_status(task_a.id, TaskState.TASK_STATE_WORKING, message=new_text_message("underway"), recipient_agent_id=first.did)
+        await first.update_status(task_b.id, TaskState.TASK_STATE_WORKING, recipient_agent_id=first.did)
+        await first.complete_task(task_b.id, "done", recipient_agent_id=first.did)
+        await first.task_store.add_artifact(
+            task_a.id, Artifact(artifact_id=uuid4().hex, name="result.txt", parts=[Part(text="semantic parity")]),
+            recipient_agent_id=first.did,
+        )
+        retrieved = await first.get_task_for_recipient(task_a.id, first.did)
+        assert retrieved.context_id == context_a and retrieved.status.state == TaskState.TASK_STATE_WORKING
+        assert retrieved.status.message.parts[0].text == "underway"
+        assert retrieved.history[0].parts[0].text == "build the thing"
+        assert retrieved.artifacts[0].parts[0].text == "semantic parity"
+        assert MessageToDict(retrieved.metadata) == {"task_type": "audit", "user_id": user_a, "marker": "first"}
+        tasks = await first.task_store.list_tasks(recipient_agent_id=first.did, context_id=context_a, user_id=user_a, limit=10)
+        assert {task.id for task in tasks} == {task_a.id, task_b.id}
+        assert {MessageToDict(task.metadata)["marker"] for task in tasks} == {"first", "second"}
+        working = await first.task_store.list_tasks(recipient_agent_id=first.did, user_id=user_a, status=TaskState.TASK_STATE_WORKING, limit=10)
+        assert [task.id for task in working] == [task_a.id]
+        assert await first.task_store.get_for_recipient(other.id, second.did) is None
+        assert await first.task_store.delete(task_a.id)
+        assert await first.get_task_for_recipient(task_a.id, first.did) is None
+    finally:
+        await first.close()
+        await second.close()
 
-    await store.update_status(
-        task_a,
-        TaskStatus(
-            state=TaskState.WORKING,
-            message=Message(role="agent", parts=[TextPart(text="underway")]),
-        ),
-        recipient_agent_id="did:test:recipient-a",
-        expected_state=TaskState.SUBMITTED,
-    )
-    await store.add_artifact(
-        task_a,
-        Artifact(
-            name="result.txt",
-            parts=[TextPart(text="semantic parity")],
-        ),
-        recipient_agent_id="did:test:recipient-a",
-    )
-
-    retrieved = await store._get_unscoped(task_a)
-    assert retrieved is not None
-    assert retrieved.sessionId == session_a
-    assert retrieved.status.state == TaskState.WORKING
-    assert retrieved.status.message is not None
-    assert retrieved.status.message.parts[0].text == "underway"
-    assert retrieved.history is not None
-    assert retrieved.history[0].parts[0].text == "build the thing"
-    assert retrieved.artifacts is not None
-    assert retrieved.artifacts[0].parts[0].text == "semantic parity"
-    assert retrieved.metadata == {"task_type": "audit", "user_id": user_a, "marker": "first"}
-
-    session_tasks = await store.list_tasks(
-        recipient_agent_id="did:test:recipient-a",
-        session_id=session_a,
-        user_id=user_a,
-        limit=10,
-    )
-    assert {task.id for task in session_tasks} == {task_a, task_b}
-    assert {task.metadata["marker"] for task in session_tasks} == {"first", "second"}
-
-    working_tasks = await store.list_tasks(
-        recipient_agent_id="did:test:recipient-a",
-        user_id=user_a,
-        status=TaskState.WORKING,
-        limit=10,
-    )
-    assert [task.id for task in working_tasks] == [task_a]
-
-    assert await store.delete(task_a) is True
-    assert await store._get_unscoped(task_a) is None
 
 
 @pytest.mark.asyncio

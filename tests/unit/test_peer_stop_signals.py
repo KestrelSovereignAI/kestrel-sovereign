@@ -41,10 +41,7 @@ from kestrel_sovereign.signals.sources.peer_stop import (
     attach_stop_evidence,
     build_peer_stop_registration,
     build_peer_stop_signal,
-    decode_peer_stop_action_envelope,
-    decode_peer_stop_intent,
     dispatch_peer_stop,
-    encode_peer_stop_intent,
     peer_stop_operation_id,
     resolve_peer_stop_circuit_policy,
 )
@@ -251,38 +248,8 @@ def test_agent_scope_target_comes_from_routing_not_payload() -> None:
         peer_stop.parse_peer_stop_intent(_intent(target="did:test:elsewhere"))
 
 
-def test_intent_round_trips_only_in_canonical_form() -> None:
-    message = encode_peer_stop_intent(
-        scope="agent",
-        target=None,
-        reason="r",
-        cascade=False,
-        correlation_id="c-1",
-    )
-    assert decode_peer_stop_intent(message)["correlation_id"] == "c-1"
-    with pytest.raises(PeerStopIntentError):
-        decode_peer_stop_intent(message.replace(",", ", "))
 
 
-def test_envelope_requires_verb_audience_and_matching_correlation() -> None:
-    message = encode_peer_stop_intent(**_intent())
-    envelope = {
-        "id": "peer-stop-1",
-        "sessionId": "peer-stop-session",
-        "message": {"role": "user", "parts": [{"type": "text", "text": message}]},
-        "metadata": {"a2a_verb": "peer_stop", "a2a_audience": TARGET_DID},
-    }
-    intent, correlation, _session, _metadata = decode_peer_stop_action_envelope(
-        envelope
-    )
-    assert intent["correlation_id"] == correlation == "peer-stop-1"
-    for broken in (
-        {**envelope, "metadata": {"a2a_verb": "cancel_task", "a2a_audience": "x"}},
-        {**envelope, "metadata": {"a2a_verb": "peer_stop"}},
-        {**envelope, "id": "another-id"},
-    ):
-        with pytest.raises(PeerStopIntentError):
-            decode_peer_stop_action_envelope(broken)
 
 
 def test_cascade_is_grammatical_so_its_refusal_can_be_receipted() -> None:
@@ -1129,7 +1096,7 @@ def _source(relative: str) -> str:
 
 
 def test_local_door_census() -> None:
-    """Only the two peer doors build a peer Stop, and neither cancels."""
+    """The native peer door builds a Stop signal and never cancels directly."""
 
     users = sorted(
         str(path.relative_to(REPO_ROOT))
@@ -1140,18 +1107,16 @@ def test_local_door_census() -> None:
         )
     )
     assert users == [
-        "kestrel_sovereign/endpoints/agent.py",
-        "kestrel_sovereign/multi_agent/agent_manager.py",
+        "kestrel_sovereign/a2a/request_handler.py",
         "kestrel_sovereign/signals/sources/peer_stop.py",
     ]
 
+    from kestrel_sovereign.a2a.request_handler import NativeA2ARequestHandler
     from kestrel_sovereign.endpoints import agent as agent_endpoints
     from kestrel_sovereign.endpoints import host_stop
-    from kestrel_sovereign.multi_agent.agent_manager import AgentManager
 
     for door in (
-        agent_endpoints.stop_from_peer,
-        AgentManager.stop_host_attested_local_peer,
+        NativeA2ARequestHandler._submit,
     ):
         source = inspect.getsource(door)
         assert "dispatch_peer_stop(" in source
@@ -1170,12 +1135,12 @@ def test_local_door_census() -> None:
 
 
 def test_operator_stop_is_not_reachable_on_the_a2a_transport_lane() -> None:
-    from kestrel_sovereign.a2a.transport_auth import is_a2a_transport_path
+    from kestrel_sovereign.a2a.transport_auth import is_peer_directory_request
 
-    assert is_a2a_transport_path("POST", "/api/agent/peer/stop")
-    assert is_a2a_transport_path("POST", "/api/agents/kite/api/agent/peer/stop")
-    assert not is_a2a_transport_path("POST", "/api/agent/stop")
-    assert not is_a2a_transport_path("POST", "/api/host/stop")
+    assert not is_peer_directory_request("POST", "/api/agent/peer/stop")
+    assert not is_peer_directory_request("POST", "/api/agents/kite/api/agent/peer/stop")
+    assert not is_peer_directory_request("POST", "/api/agent/stop")
+    assert not is_peer_directory_request("POST", "/api/host/stop")
 
 
 def test_registration_is_wired_into_agent_boot() -> None:

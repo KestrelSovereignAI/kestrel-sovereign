@@ -6,14 +6,15 @@ from uuid import uuid4
 
 import asyncpg
 import pytest
+from kestrel_sdk.native_a2a.types import Message, Part, Role, SendMessageRequest
 
+from kestrel_sovereign.a2a.scope import NativeRecipientScope
 from kestrel_sovereign.a2a.stores.unified import (
     ObservabilityStore,
     SessionService,
     TaskStore,
 )
 from kestrel_sovereign.a2a.task_manager import TaskManager
-from kestrel_sovereign.a2a.types import Message, TaskSendParams, TextPart
 from kestrel_sovereign.execution_custody import (
     ExecutionCustody,
     ProcessRuntimeExecutionFence,
@@ -34,24 +35,16 @@ async def test_public_cancel_native_unknown_survives_real_reconciliation_and_lat
     projection_backend = PostgresBackend.from_pool(
         backend._pool, execution_custody=ExecutionCustody(GenerationFence())
     )
+    from kestrel_sovereign.a2a.stores.unified.context_store import ContextStore
+
     task_store, sessions, observations = (
-        TaskStore(backend),
-        SessionService(projection_backend),
-        ObservabilityStore(backend),
+        TaskStore(backend, scope=NativeRecipientScope("did:test:original-cancel"), owns_backend=False),
+        SessionService(projection_backend, owns_backend=False),
+        ObservabilityStore(backend, owns_backend=False),
     )
-    for store in (task_store, sessions, observations):
-        await store.initialize()
-    manager = TaskManager(task_store, sessions, observations)
-    task = await manager.create_task(
-        TaskSendParams(
-            id=uuid4().hex,
-            sessionId=uuid4().hex,
-            message=Message(
-                role="user", parts=[TextPart(text="native cancellation receipt")]
-            ),
-        ),
-        agent_name="did:test:original-cancel",
-    )
+    manager = TaskManager(task_store, sessions, observations, context_store=ContextStore(backend, owns_backend=False))
+    await manager.initialize()
+    task = await manager.create_task(SendMessageRequest(message=Message(role=Role.ROLE_USER, parts=[Part(text='native cancellation receipt')], message_id=uuid4().hex, context_id=uuid4().hex)), creator_agent_id='did:test:original-cancel')
     first, second = (
         OSError("original native cancellation COMMIT ACK lost"),
         OSError("original native projection COMMIT ACK lost"),

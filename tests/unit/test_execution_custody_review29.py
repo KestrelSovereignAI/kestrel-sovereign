@@ -1,7 +1,7 @@
 """Native effects cannot become retryable signal non-delivery (#3569)."""
 
 import asyncio
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from types import SimpleNamespace
 
 import pytest
@@ -15,7 +15,7 @@ from kestrel_sovereign.execution_custody import (
     is_execution_control_error,
 )
 from kestrel_sovereign.features.base import Feature
-from kestrel_sovereign.features.peers.feature import PeersFeature, _QuestionClaim
+from kestrel_sovereign.features.peers.feature import PeersFeature
 from kestrel_sovereign.kestrel_agent import KestrelAgent
 from kestrel_sovereign.signals import (
     OrderedLockManager,
@@ -28,9 +28,6 @@ from kestrel_sovereign.signals.sources.a2a_question_answered import (
     build_a2a_question_answered_registration,
 )
 from kestrel_sovereign.storage.async_database import AsyncDatabase
-from kestrel_sovereign.storage.async_pending_a2a_question_store import (
-    PendingA2AQuestionStore,
-)
 from kestrel_sovereign.storage.async_storage import AsyncStorage
 
 
@@ -159,13 +156,16 @@ async def test_terminal_delivery_retains_control_before_retry_normalization(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "kind", ["error", "cancel", "unknown", "cancel_unknown", "group"]
-)
+@pytest.mark.parametrize("kind", ["error", "cancel", "unknown", "cancel_unknown", "group"])
 @pytest.mark.parametrize("inline", [True, False])
-async def test_actual_peer_delivery_does_not_restore_native_effect_as_waiting(
-    tmp_path, kind, inline
-):
+async def test_actual_peer_delivery_does_not_restore_native_effect_as_waiting(tmp_path, monkeypatch, kind, inline):
+    from kestrel_sovereign.a2a.question_supervisor import NativeQuestionSupervisor
+    from kestrel_sovereign.a2a.scope import NativeRecipientScope
+    from kestrel_sovereign.signals import DurableConsumerRegistration
+    from kestrel_sovereign.signals.sources.a2a_question_answered import DURABLE_COGNITION_CONSUMER_ID
+    from tests.unit.test_a2a_native_question_store import reserve, response
+    from tests.utils.native_a2a import manager_for
+
     failure = control_carrier(kind)
 
     class NativeAgent(KestrelAgent):
@@ -174,68 +174,54 @@ async def test_actual_peer_delivery_does_not_restore_native_effect_as_waiting(
             raise failure
 
     agent, db = await native_owner(tmp_path, agent_class=NativeAgent)
-    store = PendingA2AQuestionStore(db, agent.did)
-    agent.pending_a2a_questions = store
-    await store.insert(
-        task_id="question",
-        recipient="Peer",
-        original_question="question",
-        origin_turn_id=None,
-        origin_session_id="session",
-        deadline=datetime.now(timezone.utc) + timedelta(hours=1),
-    )
-    assert await store.mark_resolved(
-        "question", state="completed", reply_text="reply", claim="original-claim",
-    )
+    manager = manager_for(db.backend, NativeRecipientScope(agent.did), owns_backend=False)
+    await manager.initialize()
+    agent.task_manager = manager
+    store = manager.question_store
+    clock = SimpleNamespace(now=datetime.now(timezone.utc))
+    p = SimpleNamespace(outbound=manager.outbound_store, store=store, clock=clock)
+    question, dispatch, request = await reserve(p)
+    submitting = await manager.outbound_store.begin_submission(dispatch, operation_id="native-send")
+    await store.acknowledge(submitting, response(question, request), operation_id="native-answer")
     logs = SignalLogStore(db.backend)
     await logs.initialize()
     registry = SourceRegistry()
     registry.register(build_a2a_question_answered_registration())
-    dispatcher = SignalDispatcher(
-        agent=agent, registry=registry, lock_manager=OrderedLockManager(), store=logs
-    )
+    dispatcher = SignalDispatcher(agent=agent, registry=registry, lock_manager=OrderedLockManager(), store=logs)
     agent.dispatcher = dispatcher
+    await dispatcher.initialize_durable_delivery()
+    await dispatcher.register_durable_consumer(DurableConsumerRegistration(
+        consumer_id=DURABLE_COGNITION_CONSUMER_ID, source="a2a.question_answered", agent_id=agent.did, max_attempts=0,
+    ))
+    handles = []
+    enqueue = dispatcher.enqueue_durable_cognition
+
+    async def remember(*args, **kwargs):
+        handle = await enqueue(*args, **kwargs)
+        handles.append(handle)
+        return handle
+
+    monkeypatch.setattr(dispatcher, "enqueue_durable_cognition", remember)
     feature = PeersFeature(agent)
-    feature._own_name = "Sender"
     agent.features = {"Peers": feature}
-    args = dict(
-        task_id="question",
-        recipient="Peer",
-        original_question="question",
-        sess_id="session",
-        state="completed",
-        reply_text="reply",
-        causation_chain=None,
-        claim=_QuestionClaim(store, "original-claim"),
-    )
+    supervisor = NativeQuestionSupervisor(store=store, open_dispatch=None, dispatcher=dispatcher, interval=1, is_current=lambda: True)
     try:
         if inline:
-            with pytest.raises(BaseException) as caught:
-                fired = await feature._fire_question_answered_signal(**args)
-                if not fired:
-                    await feature._restore_pending_question_waiting(**args)
-            assert is_execution_control_error(caught.value)
+            await supervisor.handoff_wakes()
         else:
-            assert await feature._fire_question_answered_signal(
-                **args, await_delivery=False
-            )
-            tasks = tuple(feature._owned_background_tasks)
-            assert len(tasks) == 1
-            outcome = await await_owned_task(tasks[0])
-            assert outcome.error is not None and is_execution_control_error(
-                outcome.error
-            )
+            owner = feature._track_owned_runtime_task(supervisor.handoff_wakes(), name="native-question-handoff")
+            outcome = await await_owned_task(owner)
+            if outcome.error is not None:
+                raise outcome.error
+        assert len(handles) == 1
+        terminal = await await_owned_task(handles[0].task)
+        assert terminal.error is not None and is_execution_control_error(terminal.error)
         assert await db.fetchval("SELECT COUNT(*) FROM effects") == 1
-        assert (await store.get("question")).status == "RESOLVED"
-        assert not any(
-            task.get_name().startswith("a2a_question_answered_retry:")
-            for task in agent._background_tasks
-        )
+        assert (await store.get(question.question_id)).status == "RESOLVED"
+        assert not any(task.get_name().startswith("a2a_question_answered_retry:") for task in agent._background_tasks)
     finally:
-        try:
-            assert await db.fetchval("SELECT COUNT(*) FROM effects") == 1
-        finally:
-            await retire(agent)
+        await retire(agent)
+
 
 
 @pytest.mark.asyncio

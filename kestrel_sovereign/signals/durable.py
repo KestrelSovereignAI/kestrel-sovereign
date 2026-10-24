@@ -18,9 +18,9 @@ import hashlib
 import json
 import re
 import secrets
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
-from contextlib import asynccontextmanager
 from functools import wraps
 from typing import (
     Any,
@@ -63,6 +63,25 @@ EXPIRED_INITIAL_HANDOFF_ERROR = "initial handoff expired before a worker claimed
 _COGNITION_ADMISSION_PENDING = "cognition admission pending"
 _SELECTOR_KEY = re.compile(r"^(?:payload\.[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+)*|session_id|kind)=(.+)$")
 _PERSISTED_PAYLOAD = object()
+
+
+def _with_admission_fence(method):
+    """Constrain ONLY the original event/delivery persistence transaction.
+
+    The fence is trusted host input, never signal payload or persisted policy.
+    Creating its finite native scope here prevents that scope from leaking
+    into the resident cognition task after the admission COMMIT has settled.
+    """
+    @wraps(method)
+    async def guarded(self, *args, **kwargs):
+        fence = kwargs.get("admission_fence")
+        if fence is None:
+            return await method(self, *args, **kwargs)
+        from kestrel_sovereign.execution_custody import bind_execution_custody
+
+        with bind_execution_custody(fence):
+            return await method(self, *args, **kwargs)
+    return guarded
 # Callers that own a managed dispatcher normally supply their configured
 # threshold explicitly.  Keep direct-store compatibility conservative: a
 # recently registered dispatcher must not lose a lease simply because a
@@ -794,6 +813,10 @@ class DurableConsumerRegistration:
     max_attempts: int = 5
     lease_seconds: int = 60
     active: bool = True
+    # Future-only consumers own their initial snapshot separately. Registration
+    # and event fan-out still share the source handoff lock, so every event
+    # committed after registration receives its original delivery atomically.
+    replay_retained: bool = True
 
 
 @dataclass(frozen=True)
@@ -1104,7 +1127,9 @@ def _owns_retry_release_receipt(method):
     """
     @wraps(method)
     async def owned(self, **kwargs):
-        from kestrel_sovereign.signals.sources.channels import DURABLE_COGNITION_CONSUMER_ID
+        from kestrel_sovereign.signals.sources.channels import (
+            DURABLE_COGNITION_CONSUMER_ID,
+        )
         if kwargs["consumer_id"] != DURABLE_COGNITION_CONSUMER_ID:
             return await method(self, **kwargs)
         key = (kwargs["agent_id"], kwargs["consumer_id"], kwargs["delivery_id"])
@@ -1356,6 +1381,7 @@ class DurableSignalStore(UnifiedStoreBase):
                 max_attempts INTEGER NOT NULL,
                 lease_seconds INTEGER NOT NULL,
                 active {bool_type} NOT NULL,
+                replay_retained {bool_type} NOT NULL DEFAULT {'TRUE' if self.is_postgres else '1'},
                 created_at {ts_type} {ts_default},
                 updated_at {ts_type} {ts_default},
                 PRIMARY KEY (agent_id, consumer_id)
@@ -1442,7 +1468,12 @@ class DurableSignalStore(UnifiedStoreBase):
             # ledger. Keep the caller representation additive: legacy rows
             # lack it and are rejected for caller-bearing replay rather than
             # silently accepting an unbound live caller.
-            await self._ensure_caller_identity_column()
+            await self._ensure_column(self.EVENTS, "caller_identity", "TEXT")
+            await self._ensure_column(
+                self.CONSUMERS,
+                "replay_retained",
+                f"{bool_type} NOT NULL DEFAULT {'TRUE' if self.is_postgres else '1'}",
+            )
             source_state = await self._source_sequence_schema_state()
             await self._ensure_source_sequence_state()
             if self.is_postgres:
@@ -1960,8 +1991,13 @@ class DurableSignalStore(UnifiedStoreBase):
             """
         )
 
-    async def _ensure_caller_identity_column(self) -> None:
-        """Apply the additive caller-identity migration under the schema lock."""
+    async def _ensure_column(self, table: str, column: str, definition: str) -> None:
+        """Apply an additive owned column change under the schema lock.
+
+        Identifiers and definitions come only from this store's fixed DDL.
+        Existing caller bindings and consumer replay semantics retain their
+        explicit defaults; a missing migration is never handled at read time.
+        """
 
         if self.is_postgres:
             exists = await self._backend.fetch_val(
@@ -1970,22 +2006,22 @@ class DurableSignalStore(UnifiedStoreBase):
                     SELECT 1
                     FROM pg_attribute
                     WHERE attrelid = to_regclass(?)
-                      AND attname = 'caller_identity'
+                      AND attname = ?
                       AND NOT attisdropped
                 )
                 """,
-                (self.EVENTS,),
+                (table, column),
             )
             if exists:
                 return
             await self._backend.execute(
-                f"ALTER TABLE {self.EVENTS} ADD COLUMN IF NOT EXISTS caller_identity TEXT"
+                f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS {column} {definition}"
             )
             return
-        columns = await self._backend.fetch_all(f"PRAGMA table_info({self.EVENTS})")
-        if not any(row[1] == "caller_identity" for row in columns):
+        columns = await self._backend.fetch_all(f"PRAGMA table_info({table})")
+        if not any(row[1] == column for row in columns):
             await self._backend.execute(
-                f"ALTER TABLE {self.EVENTS} ADD COLUMN caller_identity TEXT"
+                f"ALTER TABLE {table} ADD COLUMN {column} {definition}"
             )
 
     async def _source_sequence_schema_state(self) -> _SourceSequenceSchemaState:
@@ -3385,6 +3421,16 @@ class DurableSignalStore(UnifiedStoreBase):
             f"ON {self.DELIVERIES}(agent_id, consumer_id, lease_expires_at)"
         )
         await self._backend.execute(
+            f"CREATE INDEX IF NOT EXISTS idx_{self.DELIVERIES}_live_due "
+            f"ON {self.DELIVERIES}(agent_id, status, next_attempt_at, "
+            "lease_expires_at, consumer_id, created_at, attempts, max_attempts) "
+            f"WHERE status IN ('{PENDING}', '{RETRY}', '{LEASED}')"
+        )
+        await self._backend.execute(
+            f"CREATE INDEX IF NOT EXISTS idx_{self.DELIVERIES}_event "
+            f"ON {self.DELIVERIES}(event_id, status)"
+        )
+        await self._backend.execute(
             f"CREATE INDEX IF NOT EXISTS idx_{self.RUNTIME_OWNERS}_liveness "
             f"ON {self.RUNTIME_OWNERS}(agent_id, heartbeat_at, stopped_at)"
         )
@@ -3460,14 +3506,8 @@ class DurableSignalStore(UnifiedStoreBase):
             # backfill admit an event that is already expired by the time this
             # transaction owns the handoff.
             now = self.now_utc()
-            row = await self._backend.fetch_one(
-                f"""
-                SELECT source, correlation_selector, max_attempts,
-                       lease_seconds, active
-                FROM {self.CONSUMERS}
-                WHERE agent_id = ? AND consumer_id = ?
-                """,
-                (registration.agent_id, registration.consumer_id),
+            row = await self._get_consumer(
+                registration.agent_id, registration.consumer_id
             )
             expected = (
                 registration.source,
@@ -3475,9 +3515,10 @@ class DurableSignalStore(UnifiedStoreBase):
                 registration.max_attempts,
                 registration.lease_seconds,
                 self.to_bool_param(registration.active),
+                self.to_bool_param(registration.replay_retained),
             )
             if row is not None:
-                actual = (row[0], row[1], int(row[2]), int(row[3]), row[4])
+                actual = (row[0], row[1], int(row[2]), int(row[3]), row[4], row[5])
                 if actual != expected:
                     raise ValueError(
                         "Durable consumer registration conflicts with the "
@@ -3488,8 +3529,9 @@ class DurableSignalStore(UnifiedStoreBase):
                     f"""
                     INSERT INTO {self.CONSUMERS} (
                         agent_id, consumer_id, source, correlation_selector,
-                        max_attempts, lease_seconds, active, created_at, updated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        max_attempts, lease_seconds, active, replay_retained,
+                        created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         registration.agent_id,
@@ -3499,6 +3541,7 @@ class DurableSignalStore(UnifiedStoreBase):
                         registration.max_attempts,
                         registration.lease_seconds,
                         self.to_bool_param(registration.active),
+                        self.to_bool_param(registration.replay_retained),
                         self.to_timestamp_param(now),
                         self.to_timestamp_param(now),
                     ),
@@ -3579,6 +3622,7 @@ class DurableSignalStore(UnifiedStoreBase):
             )
         return True
 
+    @_with_admission_fence
     async def persist_signal(
         self,
         signal: Signal,
@@ -3594,6 +3638,7 @@ class DurableSignalStore(UnifiedStoreBase):
         before_commit: Optional[Callable[[DurableEventPersistence], None]] = None,
         on_rollback: Optional[Callable[[DurableEventPersistence], None]] = None,
         ingress_attestation: Optional[DurableIngressAttestation] = None,
+        admission_fence: Any = None,
     ) -> DurableEventPersistence:
         """Commit a persisted signal and all matching initial deliveries.
 
@@ -3630,6 +3675,10 @@ class DurableSignalStore(UnifiedStoreBase):
         ingress as the event's immutable ingress trust receipt, inserted in
         this same transaction. A duplicate source event keeps the receipt (or
         the absence of one) written with its original event.
+
+        ``admission_fence`` is an optional host-owned native transaction
+        validator. It is applied only while this method persists the event
+        and deliveries; no consumer or later cognition inherits its scope.
         """
         if retention_days < 0:
             raise ValueError("retention_days must be >= 0")
@@ -3848,6 +3897,7 @@ class DurableSignalStore(UnifiedStoreBase):
         assert persistence is not None
         return persistence
 
+    @_with_admission_fence
     async def upgrade_legacy_delivery_for_redelivery(
         self,
         *,
@@ -3857,6 +3907,7 @@ class DurableSignalStore(UnifiedStoreBase):
         source_event_id: str,
         expected_signal: Signal,
         caller_identity_factory: Callable[[], str],
+        admission_fence: Any = None,
     ) -> bool:
         """Atomically add one delivery to a verified pre-consumer event.
 
@@ -3867,6 +3918,8 @@ class DurableSignalStore(UnifiedStoreBase):
         pre-upgrade schema, so it is sealed and the exact delivery is created
         in the same transaction.  Privacy-elided rows carry an integrity row
         and are refused here; their keyed-MAC retry path remains fail-closed.
+        A live host admission fence applies to this new delivery COMMIT too:
+        deduplicating an older event does not authorize a later upgrade.
         """
 
         self._require_nonempty("agent_id", agent_id)
@@ -3968,6 +4021,58 @@ class DurableSignalStore(UnifiedStoreBase):
     # Claim / lease / acknowledgement API
     # ------------------------------------------------------------------
 
+    async def due_consumer_ids(
+        self,
+        *,
+        agent_id: str,
+        source: str,
+        limit: int,
+        now: datetime | None = None,
+    ) -> list[str]:
+        """Hint at a bounded set of consumers with materialized ordinary work.
+
+        This reads the live-delivery index, never retained event payloads or
+        inactive subscriptions. It neither backfills nor grants ownership.
+        claim_delivery remains the sole lease/recovery authority, including
+        original runtime receipts and retry-release fences. Initial reserved
+        cognition has its separate emitting-owner handoff and is not ordinary
+        claimable work. Future-only subscribers need no historical scan when
+        this inventory is empty.
+        """
+        self._require_nonempty("agent_id", agent_id)
+        self._require_nonempty("source", source)
+        if type(limit) is not int or limit <= 0:
+            raise ValueError("Due consumer limit must be a positive integer")
+        clock = self.to_timestamp_param(_as_utc(now or self.now_utc()))
+        rows = await self._backend.fetch_all(
+            f"""
+            WITH live_due AS MATERIALIZED (
+                SELECT d.agent_id, d.consumer_id,
+                  CASE WHEN d.status = '{LEASED}' THEN d.lease_expires_at
+                    ELSE COALESCE(d.next_attempt_at, d.created_at) END AS due_at
+                FROM {self.DELIVERIES} d
+                WHERE d.agent_id = ?
+                  AND d.status IN ('{PENDING}', '{RETRY}', '{LEASED}')
+                  AND (
+                    (d.status IN ('{PENDING}', '{RETRY}')
+                      AND (d.max_attempts = 0 OR d.attempts < d.max_attempts)
+                      AND (d.next_attempt_at IS NULL OR d.next_attempt_at <= ?))
+                    OR (d.status = '{LEASED}' AND d.lease_expires_at <= ?)
+                  )
+            )
+            SELECT due.consumer_id
+            FROM live_due due
+            JOIN {self.CONSUMERS} c
+              ON c.agent_id = due.agent_id AND c.consumer_id = due.consumer_id
+            WHERE c.source = ? AND c.active = ?
+            GROUP BY due.consumer_id
+            ORDER BY MIN(due.due_at), due.consumer_id
+            LIMIT ?
+            """,
+            (agent_id, clock, clock, source, self.to_bool_param(True), limit),
+        )
+        return [str(row[0]) for row in rows]
+
     async def claim_delivery(
         self,
         *,
@@ -4002,6 +4107,7 @@ class DurableSignalStore(UnifiedStoreBase):
             max_attempts=int(consumer[2]),
             lease_seconds=int(consumer[3]),
             active=bool(consumer[4]),
+            replay_retained=bool(consumer[5]),
         )
         # Claim, recovery, and restart backfill all serialize with event
         # persistence for this source.  Besides avoiding a registration/event
@@ -4269,7 +4375,9 @@ class DurableSignalStore(UnifiedStoreBase):
         )"""
 
     def _managed_retry_claim_params(self, executor_id: str, stale_before: datetime) -> tuple:
-        from kestrel_sovereign.signals.sources.channels import DURABLE_COGNITION_CONSUMER_ID
+        from kestrel_sovereign.signals.sources.channels import (
+            DURABLE_COGNITION_CONSUMER_ID,
+        )
         return (DURABLE_COGNITION_CONSUMER_ID, executor_id, self.to_timestamp_param(stale_before))
 
     @staticmethod
@@ -4280,7 +4388,9 @@ class DurableSignalStore(UnifiedStoreBase):
         still require LEASED. Fixed native cleanup can settle this exact old
         token even when the release committed before its ACK was lost.
         """
-        from kestrel_sovereign.signals.sources.channels import DURABLE_COGNITION_CONSUMER_ID
+        from kestrel_sovereign.signals.sources.channels import (
+            DURABLE_COGNITION_CONSUMER_ID,
+        )
         if terminal:
             return "lease_owner = NULL, lease_token = NULL, lease_expires_at = NULL"
         predicate = (
@@ -4938,10 +5048,24 @@ class DurableSignalStore(UnifiedStoreBase):
         consumer_id: str,
         delivery_id: str,
         lease_token: str,
+        complete_consumer: bool = False,
         now: Optional[datetime] = None,
     ) -> bool:
-        """Acknowledge a live lease.  Stale/foreign tokens cannot ack it."""
+        """Acknowledge the original live lease and optionally finish its contract.
+
+        Completing a subscriber preserves this ACK and terminalizes its other
+        work atomically. It takes the source handoff before the delivery lock,
+        matching registration/claim ordering. Stale or foreign tokens cannot
+        acknowledge a delivery or retire a subscriber.
+        """
+        if type(complete_consumer) is not bool:
+            raise ValueError("Consumer completion must be an explicit bool")
         async with self._backend.transaction():
+            if complete_consumer:
+                consumer = await self._get_consumer(agent_id, consumer_id)
+                if consumer is None:
+                    return False
+                await self._lock_scope_handoff(agent_id=agent_id, source=consumer[0])
             now = await self._lock_live_delivery_lease(
                 agent_id=agent_id, consumer_id=consumer_id, delivery_id=delivery_id,
                 lease_token=lease_token, now=now,
@@ -4970,6 +5094,12 @@ class DurableSignalStore(UnifiedStoreBase):
                     self.to_timestamp_param(now),
                 ),
             )
+            if updated == 1 and complete_consumer and (
+                not await self.deactivate_consumer(
+                    agent_id=agent_id, consumer_id=consumer_id
+                )
+            ):
+                raise RuntimeError("Acknowledged delivery lost its original consumer")
             return updated == 1
 
     @_owns_retry_release_receipt
@@ -5397,31 +5527,108 @@ class DurableSignalStore(UnifiedStoreBase):
         )
         return [self._row_to_delivery(row) for row in rows]
 
+    async def source_history_is_drained(
+        self, boundary: DurableSourceBoundary
+    ) -> bool:
+        """Inspect every selected delivery through one source boundary.
+
+        This operation is read-only, including during preview. Retirement
+        holds the source handoff transaction shared by registration, claims,
+        event persistence and provider redelivery before checking this state.
+        """
+        if not isinstance(boundary, DurableSourceBoundary):
+            raise TypeError("Source history requires a durable source boundary")
+        rows = await self._backend.fetch_all(
+            f"SELECT d.status FROM {self.DELIVERIES} d "
+            f"JOIN {self.EVENTS} e ON e.event_id = d.event_id "
+            "WHERE e.agent_id = ? AND e.source = ? AND e.source_sequence <= ?",
+            (boundary.agent_id, boundary.source, boundary.sequence),
+        )
+        return all(row[0] in _TERMINAL_STATUSES for row in rows)
+
+    async def retire_source_history(self, boundary: DurableSourceBoundary) -> int:
+        """Retire drained protocol history after its caller archives it.
+
+        This explicit offline operation leaves source counters, high-water
+        witnesses, consumer registrations and newer events intact. Event-owned
+        deliveries, integrity bindings and ingress receipts follow their normal
+        cascade, exactly as in retention. No event identity or receipt is edited.
+        """
+        if not isinstance(boundary, DurableSourceBoundary):
+            raise TypeError("Source retirement requires a durable source boundary")
+        refusal = None
+        deleted = 0
+        async with self._backend.transaction():
+            await self._lock_scope_handoff(
+                agent_id=boundary.agent_id, source=boundary.source
+            )
+            sequence = await self._source_sequence_locked(
+                agent_id=boundary.agent_id, source=boundary.source
+            )
+            if boundary.sequence > sequence:
+                refusal = "Source retirement boundary is beyond committed history"
+            elif not await self.source_history_is_drained(boundary):
+                refusal = "Owed durable source deliveries must drain before retirement"
+            else:
+                deleted = await self._backend.execute(
+                    f"DELETE FROM {self.EVENTS} "
+                    "WHERE agent_id = ? AND source = ? AND source_sequence <= ?",
+                    (boundary.agent_id, boundary.source, boundary.sequence),
+                )
+        if refusal is not None:
+            raise ValueError(refusal)
+        return deleted
+
     async def purge_expired(
-        self, *, agent_id: str, now: Optional[datetime] = None
-    ) -> int:
-        """Delete only this agent's retained, terminal event histories.
+        self,
+        *,
+        agent_id: str,
+        source: str | None = None,
+        limit: int | None = None,
+        now: datetime | None = None,
+    ) -> tuple[str, ...]:
+        """Return the exact deleted IDs of this agent's terminal event history.
 
         Pending, retriable, and leased work is never cleaned up by retention;
         operators must first resolve it to an observable terminal state.
-        ``agent_id`` is mandatory because the periodic sweep is owned by one
-        dispatcher even when multiple agents share a PostgreSQL database.
+        Source-owned producers may limit one indexed source batch and remove
+        their references to these exact IDs in the SAME enclosing transaction.
+        Dispatcher-facing sweeps report len(result). A deletion count alone
+        cannot safely identify another ledger's original references to retire.
         """
         self._require_nonempty("agent_id", agent_id)
+        if source is not None:
+            self._require_nonempty("source", source)
+        if limit is not None and (type(limit) is not int or limit <= 0):
+            raise ValueError("Retention batch limit must be a positive integer")
         now = _as_utc(now or self.now_utc())
-        return await self._backend.execute(
-            f"""
-            DELETE FROM {self.EVENTS}
-            WHERE agent_id = ?
-              AND retention_until < ?
-              AND NOT EXISTS (
-                  SELECT 1 FROM {self.DELIVERIES} d
-                  WHERE d.event_id = {self.EVENTS}.event_id
-                    AND d.status NOT IN ('{ACKNOWLEDGED}', '{FAILED}', '{TERMINAL_ACKABLE}')
-              )
-            """,
-            (agent_id, self.to_timestamp_param(now)),
+        where = ["e.agent_id = ?", "e.retention_until < ?"]
+        parameters: list[Any] = [agent_id, self.to_timestamp_param(now)]
+        if source is not None:
+            where.append("e.source = ?")
+            parameters.append(source)
+        where.append(
+            f"NOT EXISTS (SELECT 1 FROM {self.DELIVERIES} d "
+            "WHERE d.event_id = e.event_id "
+            f"AND d.status NOT IN ('{ACKNOWLEDGED}', '{FAILED}', '{TERMINAL_ACKABLE}'))"
         )
+        bound = ""
+        if limit is not None:
+            bound = "LIMIT ?"
+            parameters.append(limit)
+        async with self._backend.transaction():
+            rows = await self._backend.fetch_all(
+                f"""
+                DELETE FROM {self.EVENTS}
+                WHERE event_id IN (
+                    SELECT e.event_id FROM {self.EVENTS} e
+                    WHERE {' AND '.join(where)}
+                    ORDER BY e.retention_until, e.event_id {bound}
+                ) RETURNING event_id
+                """,
+                tuple(parameters),
+            )
+        return tuple(str(row[0]) for row in rows)
 
     # ------------------------------------------------------------------
     # Internal storage helpers
@@ -5436,6 +5643,8 @@ class DurableSignalStore(UnifiedStoreBase):
         self._require_nonempty("consumer_id", registration.consumer_id)
         self._require_nonempty("source", registration.source)
         self._require_nonempty("agent_id", registration.agent_id)
+        if type(registration.replay_retained) is not bool:
+            raise ValueError("replay_retained must be a bool")
         if (
             not isinstance(registration.max_attempts, int)
             or isinstance(registration.max_attempts, bool)
@@ -5916,14 +6125,18 @@ class DurableSignalStore(UnifiedStoreBase):
     async def _get_consumer(
         self, agent_id: str, consumer_id: str
     ) -> Optional[tuple[Any, ...]]:
-        return await self._backend.fetch_one(
+        row = await self._backend.fetch_one(
             f"""
-            SELECT source, correlation_selector, max_attempts, lease_seconds, active
+            SELECT source, correlation_selector, max_attempts, lease_seconds,
+                   active, replay_retained
             FROM {self.CONSUMERS}
             WHERE agent_id = ? AND consumer_id = ?
             """,
             (agent_id, consumer_id),
         )
+        if row is not None and _stored_strict_bool(row[5]) is None:
+            raise RuntimeError("Stored durable consumer replay policy is invalid")
+        return row
 
     async def _touch_runtime_owner_locked(
         self, *, agent_id: str, owner_id: str, now: datetime
@@ -6067,6 +6280,8 @@ class DurableSignalStore(UnifiedStoreBase):
     async def _backfill_consumer(
         self, registration: DurableConsumerRegistration, *, now: datetime
     ) -> None:
+        if not registration.replay_retained:
+            return
         rows = await self._backend.fetch_all(
             f"""
             SELECT event_id, source_event_id, agent_id, target_agent, source, kind, mode, payload,

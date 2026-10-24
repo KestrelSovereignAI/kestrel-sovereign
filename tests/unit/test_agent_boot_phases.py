@@ -23,6 +23,8 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+import pytest_asyncio
+from kestrel_sdk.payer_policy import PayerKind, PayerPolicy, PayerSpec
 
 from kestrel_sovereign.agent.boot import (
     AgentBootError,
@@ -363,7 +365,7 @@ def _durable_backend_double() -> MagicMock:
 
 
 @contextlib.contextmanager
-def _boot_mocks(real_task_manager: bool = False):
+def _boot_mocks(real_task_manager: bool = False, *, primary_backend=None):
     """Patch the heavy boot collaborators; yield handles for leak assertions.
 
     Mirrors the doubles the existing ``TestInitialize`` tests rely on: real
@@ -402,7 +404,13 @@ def _boot_mocks(real_task_manager: bool = False):
         storage.compare_and_swap_node = AsyncMock(return_value=NodeSwapResult.SWAPPED)
         storage.db = MagicMock()
         storage.close = AsyncMock()
-        storage._backend = _durable_backend_double()
+        if real_task_manager and primary_backend is None:
+            raise ValueError("Real native task-manager boot requires its actual primary backend")
+        storage._backend = (
+            _durable_backend_double() if primary_backend is None else primary_backend
+        )
+        if primary_backend is not None:
+            storage.close.side_effect = primary_backend.close
         MockStorage.return_value = storage
 
         memory = AsyncMock()
@@ -416,13 +424,13 @@ def _boot_mocks(real_task_manager: bool = False):
         if not real_task_manager:
             task_manager = AsyncMock()
             task_manager.initialize = AsyncMock()
-            task_manager.register_agent = MagicMock()
-            # unregister_agent is synchronous on the real TaskManager; make the
+            task_manager.register_provider = MagicMock()
+            # unregister_provider is synchronous on the real TaskManager; make the
             # mock sync too so feature teardown doesn't leave an un-awaited
             # coroutine.
-            task_manager.unregister_agent = MagicMock()
+            task_manager.unregister_provider = MagicMock()
             task_manager.close = AsyncMock()
-            MockTaskManager.return_value = task_manager
+            MockTaskManager.from_backend.return_value = task_manager
 
         yield SimpleNamespace(
             storage=storage,
@@ -451,8 +459,15 @@ async def _cleanup(agent: KestrelAgent) -> None:
 def _make_agent(tmp_path) -> KestrelAgent:
     # Keep the real default LLMService used by the phase-6 readiness check, but
     # prevent its constructor (which runs before _boot_mocks) from reading the
-    # operator's process-wide on-disk model catalog. Model discovery itself is
-    # lazy and is not called by these boot phases.
+    # operator's process-wide on-disk model catalog. These lifecycle fixtures
+    # perform no inference: declare that through the real NONE payer contract
+    # rather than depending on ambient keys or disabling the readiness check.
+    host = PayerPolicy.host_env_default()
+    policy = PayerPolicy(
+        llm=PayerSpec(vendor="openrouter", kind=PayerKind.NONE),
+        storage=host.storage, compute=host.compute,
+        tools=host.tools, comms=host.comms,
+    )
     with patch(
         "kestrel_sovereign.llm.service.LLMService._load_from_disk_cache",
         return_value=False,
@@ -462,6 +477,7 @@ def _make_agent(tmp_path) -> KestrelAgent:
             storage_path=str(tmp_path / "boot.db"),
             db_backend="sqlite",
             sync_enabled=True,
+            payer_policy=policy,
         )
     load_disk_cache.assert_called_once_with()
     return agent
@@ -672,7 +688,7 @@ _BOOT_OWNERS = (
 
 @contextlib.contextmanager
 def _boot_holding_every_resource(
-    features=(_CustodyFeature,), real_task_manager: bool = False
+    features=(_CustodyFeature,), real_task_manager: bool = False, *, primary_backend=None
 ):
     """``_boot_mocks`` plus the optional resources a boot can acquire.
 
@@ -688,7 +704,7 @@ def _boot_holding_every_resource(
     sync_service.start = AsyncMock()
     sync_service.stop = AsyncMock()
     sync_service.force_snapshot = AsyncMock()
-    with _boot_mocks(real_task_manager) as mocks, patch.dict(
+    with _boot_mocks(real_task_manager, primary_backend=primary_backend) as mocks, patch.dict(
         os.environ, {"GCS_BACKUP_BUCKET": "unit-test-bucket"}
     ), patch(
         "kestrel_sovereign.storage.sync.service.SyncService",
@@ -885,7 +901,7 @@ async def test_one_unconverted_owner_keeps_the_record_when_the_agent_stops(
             await agent.initialize()
             await _stop(agent)
 
-            assert _owners_held(agent) == {owner}
+            assert _owners_held(agent) == ({owner} | ({"storage"} if owner == "task_manager" else set()))
             _assert_guards_report_this_process(tmp_path)
     finally:
         await _cleanup(agent)
@@ -906,12 +922,12 @@ async def test_one_unconverted_owner_keeps_the_record_through_a_rollback(
 
             # LLM now has a native-joined rollback step too. The audit still
             # retains whichever owner has not been certified truthful.
-            assert _owners_held(agent) == {owner}
+            assert _owners_held(agent) == ({owner} | ({"storage"} if owner == "task_manager" else set()))
             assert "serving record" in agent._boot_context.retained_resources
             _assert_guards_report_this_process(tmp_path)
 
             await _stop(agent)
-            assert _owners_held(agent) == {owner}
+            assert _owners_held(agent) == ({owner} | ({"storage"} if owner == "task_manager" else set()))
             _assert_guards_report_this_process(tmp_path)
     finally:
         await _cleanup(agent)
@@ -936,22 +952,34 @@ def _trust_every_owner_but_the_task_manager(monkeypatch) -> None:
 
 
 def _fail_store_close(manager: TaskManager):
-    """Make the session store's close fail, leaving its connection open."""
+    """Keep a borrowed session service held without closing the primary DB."""
     return patch.object(
-        manager.session_service.backend,
+        manager.session_service,
         "close",
         side_effect=OSError("injected store close failure"),
     )
 
 
+@pytest_asyncio.fixture
+async def native_boot_backend(tmp_path):
+    from kestrel_sovereign.storage.db.sqlite import SQLiteBackend
+
+    backend = SQLiteBackend(str(tmp_path / "boot.db"))
+    await backend.connect()
+    try:
+        yield backend
+    finally:
+        await backend.close()
+
+
 @pytest.mark.asyncio
 async def test_a_failed_task_manager_close_keeps_custody_until_a_retry_closes_it(
-    tmp_path, monkeypatch
+    tmp_path, monkeypatch, native_boot_backend
 ):
     _trust_every_owner_but_the_task_manager(monkeypatch)
     agent = _make_agent(tmp_path)
     try:
-        with _boot_holding_every_resource(real_task_manager=True):
+        with _boot_holding_every_resource(real_task_manager=True, primary_backend=native_boot_backend):
             await agent.initialize()
             manager = agent.task_manager
             assert isinstance(manager, TaskManager)
@@ -962,7 +990,7 @@ async def test_a_failed_task_manager_close_keeps_custody_until_a_retry_closes_it
 
             assert store.is_connected, "the store did not close"
             assert agent.task_manager is manager, "kept for a retry"
-            assert _owners_held(agent) == {"task_manager"}
+            assert _owners_held(agent) == {"task_manager", "storage"}
             _assert_guards_report_this_process(tmp_path)
 
             await _stop(agent)
@@ -976,12 +1004,12 @@ async def test_a_failed_task_manager_close_keeps_custody_until_a_retry_closes_it
 
 @pytest.mark.asyncio
 async def test_a_failed_task_manager_rollback_keeps_the_manager_for_shutdown(
-    tmp_path, monkeypatch
+    tmp_path, monkeypatch, native_boot_backend
 ):
     _trust_every_owner_but_the_task_manager(monkeypatch)
     agent = _make_agent(tmp_path)
     try:
-        with _boot_holding_every_resource(real_task_manager=True):
+        with _boot_holding_every_resource(real_task_manager=True, primary_backend=native_boot_backend):
             with contextlib.ExitStack() as failing:
 
                 async def fail_with_a_store_that_cannot_close(_ctx):
@@ -1000,7 +1028,7 @@ async def test_a_failed_task_manager_rollback_keeps_the_manager_for_shutdown(
                 assert store.is_connected, "the store did not close"
 
             # Independent native LLM rollback has already joined its owners.
-            assert _owners_held(agent) == {"task_manager"}
+            assert _owners_held(agent) == {"task_manager", "storage"}
             assert "serving record" in agent._boot_context.retained_resources
             _assert_guards_report_this_process(tmp_path)
 
@@ -1036,7 +1064,7 @@ async def test_a_truthful_owner_whose_release_raises_keeps_the_record(
             )
             await _stop(agent)
 
-            assert _owners_held(agent) == {owner}
+            assert _owners_held(agent) == ({owner} | ({"storage"} if owner == "task_manager" else set()))
             _assert_guards_report_this_process(tmp_path)
     finally:
         await _cleanup(agent)
@@ -1059,13 +1087,13 @@ async def test_a_truthful_owner_whose_close_reports_retained_keeps_the_record(
                 with patch.object(agent, PHASE_METHODS[-1], _fail_last_phase):
                     with pytest.raises(RuntimeError, match="every resource"):
                         await agent.initialize()
-                assert _owners_held(agent) == {owner}
+                assert _owners_held(agent) == ({owner} | ({"storage"} if owner == "task_manager" else set()))
             else:
                 await agent.initialize()
                 _RELEASE_STEPS[owner](mocks).return_value = retained
             await _stop(agent)
 
-            assert _owners_held(agent) == {owner}
+            assert _owners_held(agent) == ({owner} | ({"storage"} if owner == "task_manager" else set()))
             _assert_guards_report_this_process(tmp_path)
     finally:
         await _cleanup(agent)
@@ -1654,7 +1682,8 @@ async def test_a_boot_rollback_keeps_storage_open_beneath_a_fenced_dispatcher(
 
 
 def test_a_symlinked_store_records_in_the_registered_data_dir(tmp_path):
-    """A guard looks in the data directory, not where its database points."""
+    """Both the profile and canonical database target retain live ownership."""
+    from kestrel_sovereign.multi_agent.liveness import serving_holder
     data_dir = tmp_path / "agent_data" / "emma"
     data_dir.mkdir(parents=True)
     volume = tmp_path / "volume"
@@ -1665,6 +1694,13 @@ def test_a_symlinked_store_records_in_the_registered_data_dir(tmp_path):
     agent.storage_path = str(data_dir / "kestrel_prime.db")
 
     assert agent._serving_data_dir() == data_dir.resolve()
+    agent._record_serving()
+    try:
+        assert serving_holder(data_dir) is not None
+        assert serving_holder(volume) is not None
+    finally:
+        assert agent._release_serving_record() is True
+    assert serving_holder(data_dir) is None and serving_holder(volume) is None
 
 
 def test_an_agent_without_an_on_disk_store_records_nothing(tmp_path):

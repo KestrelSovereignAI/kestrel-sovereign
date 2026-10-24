@@ -1,34 +1,22 @@
-"""Source registration for A2A task completion (Phase 5 of #889).
+"""Native A2A completion wakes from committed task ownership.
 
-When a peer agent finishes work an agent spawned, the local
-`TaskManager._notify_status_update` callback fires. Today that callback
-queues an SSE notification for the browser. Under the dispatcher, it
-ALSO enqueues a COGNITION signal so the bird wakes up and decides what
-to do with the result.
-
-Causation chain propagation:
-- When a turn dispatches an outbound A2A task, the caller attaches the
-  current causation chain (serialized) to `task.metadata["causation_chain"]`.
-- When the task completes locally, `build_signal_for_completed_task`
-  rehydrates the chain and threads it into the Signal envelope.
-- The dispatcher's append-and-cycle-check rejects A→B→A ping-pong at
-  depth 2 by spotting `(A, a2a.task_complete)` as a repeated frame.
-
-Outbound task creation reads the in-flight causation chain from the
-agent/TaskManager seam and serializes it into task metadata. The receive
-side (this module) rehydrates that chain whenever a completion arrives.
+The task manager passes an official Task together with its durable creator,
+recipient, tenant and lifecycle revision. Metadata supplies application labels
+and the versioned causation extension; it never establishes wake authority.
+The dispatcher uses the restored causation frames for depth and cycle checks.
 """
 
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timedelta
+from datetime import timedelta
 from pathlib import Path
 from typing import Any
 
+from kestrel_sdk.native_a2a.types import Task
+from google.protobuf.json_format import MessageToDict
 from kestrel_sdk.signals import (
     AttentionPolicy,
-    CausationFrame,
     RateLimit,
     RedactionPolicy,
     Signal,
@@ -37,6 +25,16 @@ from kestrel_sdk.signals import (
     Trust,
     Urgency,
     Visibility,
+)
+
+from kestrel_sovereign.a2a.extensions import CAUSATION_URI, deserialize_causation_chain
+from kestrel_sovereign.a2a.extensions import (
+    serialize_chain_for_metadata as serialize_chain_for_metadata,
+)
+from kestrel_sovereign.a2a.lifecycle import TERMINAL_STATES, task_state_label
+from kestrel_sovereign.a2a.stores.unified.task_store import (
+    NativeTaskSnapshot,
+    require_native_task_snapshot,
 )
 
 logger = logging.getLogger(__name__)
@@ -52,10 +50,9 @@ PROMPT_TEMPLATE = (
     # install — every COGNITION wake-up using this source raised
     # FileNotFoundError in ``_render_prompt`` and the recipient agent
     # was never woken.
-    Path(__file__).resolve().parents[2]
-    / "prompts" / "signals" / "a2a_task_complete.md"
+    Path(__file__).resolve().parents[2] / "prompts" / "signals" / "a2a_task_complete.md"
 )
-METADATA_KEY = "causation_chain"
+METADATA_KEY = CAUSATION_URI
 
 
 # ---------------------------------------------------------------------------
@@ -164,105 +161,38 @@ def build_a2a_task_complete_registration() -> SourceRegistration:
 # ---------------------------------------------------------------------------
 
 
-def build_signal_for_completed_task(task: Any, target_agent: str) -> Signal:
-    """Build a COGNITION signal envelope for a terminal A2A task.
-
-    Reads the causation chain from `task.metadata["causation_chain"]`
-    if present (serialized as a list of dicts). Falls back to an empty
-    chain for tasks created without dispatcher awareness — those signals
-    pass cycle detection by definition (no prior frames).
-
-    `task` is duck-typed (anything with .id, .status.state, .metadata,
-    optionally .artifacts) so this helper is testable without
-    constructing real pydantic Task objects.
-    """
-    chain = _deserialize_chain(getattr(task, "metadata", None) or {})
-    task_id = str(getattr(task, "id", "<unknown>"))
-    task_state = _state_to_str(task)
-
+def build_signal_for_completed_task(
+    candidate: NativeTaskSnapshot, target_agent: str
+) -> Signal:
+    """Build a terminal wake from the native row and its durable principals."""
+    candidate = require_native_task_snapshot(candidate, target_agent)
+    task = candidate.task
+    if not candidate.cognition_wake_eligible:
+        raise ValueError("This task is not eligible for a cognition wake")
+    if task.status.state not in TERMINAL_STATES:
+        raise ValueError("Task completion wake requires a terminal native task")
+    chain = deserialize_causation_chain(MessageToDict(task.metadata))
+    state = task_state_label(task.status.state)
     return Signal(
         source=SOURCE_NAME,
         kind="terminal",
         mode=SignalMode.COGNITION,
         payload={
-            "task_id": task_id,
-            "task_state": task_state,
+            "task_id": task.id,
+            "task_state": state,
             "result_summary": _summarize_task_result(task),
         },
         target_agent=target_agent,
+        caller=candidate.ownership.creator_agent_id,
         visibility=Visibility.INTERNAL,
         urgency=Urgency.NORMAL,
-        # dedupe_key is (task_id, terminal_state) so retry storms or
-        # double-fired terminal callbacks for the same task collapse
-        # within the registration's coalescing_window. Without this
-        # the dispatcher can't coalesce — see #905 review P2.
-        dedupe_key=f"{task_id}:{task_state}",
+        origin_trust=Trust.TRUSTED,
+        dedupe_key=f"{task.id}:{state}",
         causation_chain=list(chain),
     )
 
 
-def serialize_chain_for_metadata(chain: list[CausationFrame]) -> list[dict]:
-    """Serialize a causation chain for storage in `task.metadata`. Use
-    when an in-flight turn spawns an outbound A2A task — the receiver
-    (us, when the task completes) reconstructs the chain via
-    `_deserialize_chain`."""
-    return [
-        {
-            "agent_id": f.agent_id,
-            "source": f.source,
-            "signal_id": f.signal_id,
-            "turn_id": f.turn_id,
-            "depth": f.depth,
-            "emitted_at": f.emitted_at.isoformat(),
-        }
-        for f in chain
-    ]
-
-
-def _deserialize_chain(metadata: dict) -> list[CausationFrame]:
-    """Inverse of `serialize_chain_for_metadata`. Defensive against
-    missing keys / wrong shapes (peer-supplied metadata is TRUSTED but
-    A2A messages traverse the wire — corruption is possible)."""
-    raw = metadata.get(METADATA_KEY)
-    if not raw or not isinstance(raw, list):
-        return []
-    frames: list[CausationFrame] = []
-    for entry in raw:
-        if not isinstance(entry, dict):
-            continue
-        try:
-            frames.append(
-                CausationFrame(
-                    agent_id=str(entry["agent_id"]),
-                    source=str(entry["source"]),
-                    signal_id=str(entry["signal_id"]),
-                    turn_id=entry.get("turn_id"),
-                    depth=int(entry["depth"]),
-                    emitted_at=_parse_iso(entry["emitted_at"]),
-                )
-            )
-        except (KeyError, ValueError, TypeError) as e:
-            logger.warning(
-                "Dropping malformed CausationFrame from a2a metadata: %s", e
-            )
-    return frames
-
-
-def _parse_iso(value: Any) -> datetime:
-    if isinstance(value, datetime):
-        return value
-    return datetime.fromisoformat(str(value))
-
-
-def _state_to_str(task: Any) -> str:
-    state = getattr(getattr(task, "status", None), "state", None)
-    if state is None:
-        return "unknown"
-    # TaskState is a str-Enum; .value is the canonical string.
-    return getattr(state, "value", str(state))
-
-
-def _summarize_task_result(task: Any) -> str:
+def _summarize_task_result(task: Task) -> str:
     """Return a short text summary of the task outcome. Uses the last
     status message text if present, else the task state. Bounded to
     keep the prompt template render manageable."""
@@ -272,4 +202,4 @@ def _summarize_task_result(task: Any) -> str:
             text = getattr(part, "text", None)
             if isinstance(text, str) and text:
                 return text if len(text) <= 1000 else text[:1000] + "...(truncated)"
-    return f"<no message; final state: {_state_to_str(task)}>"
+    return f"<no message; final state: {task_state_label(task.status.state)}>"

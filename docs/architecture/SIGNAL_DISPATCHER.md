@@ -826,6 +826,407 @@ signal_log
 
 If a registration doesn't specify a redaction policy, the dispatcher refuses to register the source. No defaults; this is too important to default.
 
+### Original terminal journals and revoked work
+
+An accepted native dispatch retains custody of its one terminal `signal_log`
+row even when its original execution scope is revoked before the handler or
+writer finishes. This is a private dispatcher-to-native-storage contract, not
+a caller capability or a general cleanup/work exemption. Acceptance fixes the
+canonical envelope (after sanitization, schema/caller normalization and
+causation stamping, before handler execution), registration, runtime and backend identity, connection or
+pool generation, and SQL destination. Only the genuine returned pipeline
+result can bind the immutable row; handler calls to scheduling helpers cannot
+publish a premature result. The original admitted writer Tasks remain owned
+until physically joined, including failures after Task acceptance but before
+callback publication.
+Signal identity and runtime agent DID use the same native-text normalization at
+capture and observation. Supported string subclasses cannot supply equality,
+inequality, or hashing evidence that conceals a changed runtime identity.
+Native dispatch/enqueue must start outside an enclosing backend transaction.
+Public parent entries refuse it before initialization or child Task creation;
+commit the enclosing transaction before publishing a signal. This prevents both
+independent audit publication ahead of the caller's transaction and waiting on
+the caller's occupied pool slot while it waits for dispatch completion.
+Result authorization is sealed only where the original public/recovered
+pipeline actually returns, never by a deferred-finalization helper. Projection
+is a non-reentrant phase entered before callbacks; a helper attempt cannot
+reserve another writer or overwrite that result. Throwing dispatch owners
+still join their already accepted writers before acceptance custody is retired.
+Projection callbacks receive isolated deep copies; neither redaction nor result
+summarization can rewrite canonical raw data/digests or the genuine returned
+result by mutating its callback argument.
+
+PostgreSQL resolves the actual database, namespace and relation identity under
+the original live admission, before the handler. The terminal INSERT uses that
+qualified table and checks its catalog identity before and after SQL inside the
+native transaction. A checkout `setup` callback changing `search_path` cannot
+redirect it, and a dropped/recreated relation cannot inherit its permission.
+Pool generation, connection-argument identities and adapter identity remain
+fixed as well. Phase transitions are not COMMIT evidence: acknowledgment needs
+the original backend's actual native COMMIT fact/receipt. An absent row cannot
+become committed merely by calling an acknowledgment helper from setup.
+Both backends verify one INSERT and the exact canonical row inside the native
+transaction before COMMIT, using one shared column definition and a null-safe
+query bounded to two matches. Trigger-suppressed, deleted or rewritten rows
+raise finite `SignalOutcomeJournalWriteRefusal` with the genuine completed
+result and one audit loss; a healthy rollback is not a native-source failure.
+SQLite performs the proof on its same native worker without an application row
+factory and closes the proof cursor there. A transient post-COMMIT privacy
+observation preserves the real committed fact without adding uncertainty to
+otherwise healthy scopes; independent native failures retain their provenance.
+SQLite also captures the actual main-schema generation, catalog row/root page,
+table definition and column inventory at live admission. Its original write
+begins IMMEDIATE before rechecking that identity and main/TEMP trigger absence.
+Main-schema DDL across an invocation conservatively retires that original
+permission, even if the same table name or root page is reused; ordinary work
+can acquire a fresh invocation, never replay the completed original effect.
+The same write lock and native transaction exclude racing destination DDL
+through final row/identity proof and COMMIT/rollback.
+PostgreSQL original journals require the plain permanent audit table, not a
+partitioned parent, TEMP/UNLOGGED relation, or a table with triggers, rewrite
+rules, row-security policies, custom CHECKs, generated/identity columns,
+non-native column types, expression indexes or non-native index predicates/operator
+classes. The only partial-index predicate is the canonical constitution-hash
+non-null filter. The column inventory must match the canonical row.
+Ordinary store append retains its separate customization contract. The native
+writer takes the relation's share-update-exclusive lock before checking shape and
+holds it through COMMIT/rollback, excluding racing trigger/rule/shape DDL and
+concurrent index installation. It never
+executes custom database hooks with terminal-journal privilege. A constraint
+flush alone cannot prove this: a trigger can re-defer another deletion until
+COMMIT. Unsupported shape before admission refuses routing; shape changed by
+the handler produces finite audit loss with the genuine result, not replay or
+native-source poisoning after healthy rollback.
+Privileged PostgreSQL catalog operators are schema-qualified; its standalone
+native transaction also pins search_path to pg_catalog for proof equality and
+restores the caller's setting on transaction exit. An application operator may
+not delete a row while claiming that its equality proof succeeded.
+Privileged PostgreSQL journals also require a plain native pool: application
+setup/init/connect/reset programs, custom connection/record classes and
+application checkout adapters are unsupported and refused before the handler.
+The same fence is rechecked through the writer lifetime. Pool callbacks may
+otherwise perform unrelated work during checkout or delete an already committed
+row during reset. Ordinary backend operations retain their separate adapter
+contract. Configure journal namespace through native `server_settings`, not a
+setup callback.
+
+Core-created PostgreSQL pools use `NativeJournalPostgresConnection`, exported
+from `kestrel_sovereign.storage.db.postgres`. Hosts constructing external pools
+must pass this as `asyncpg.create_pool(connection_class=...)` and set
+`min_size=0` before opting into scoped native journals. With asyncpg 0.32,
+use `init_size` for startup warmup; `min_size` instead maintains a background
+connection floor. Autonomous maintenance cannot inherit original execution
+authority, so a nonzero floor or an active maintenance task refuses admission.
+Core uses the configured warmup count as `init_size` and sets `min_size=0`.
+Unscoped legacy pools retain ordinary append; an
+unfenced external pool cannot claim the stronger scoped contract. No additional
+connection or database slot is allocated by this connection class.
+
+Original pool admission also snapshots plain native connection arguments and
+nested startup settings. Callable password providers and opaque application
+configuration objects (including application SSLContext objects) cannot carry
+this stronger journal contract. Core adopts its neutral native connector while
+admitted: outside a journal it behaves like ordinary asyncpg connect; inside a
+journal it checks the original recipe at actual reconnect, AFTER any pool wait,
+and detaches its inputs. A pre-queue check alone cannot fence late mutations.
+This includes initial destination capture, not only terminal writing: its
+actual accepted dispatch owner and live Work are revalidated at the connector.
+Only that live admission may establish a first endpoint from its frozen plain
+recipe; terminal writing still requires the already-admitted endpoint/policy.
+The actual admitted session supplies resolved endpoint, authentication identity
+and startup defaults; later PGHOST/PGDATABASE or related environment changes
+cannot redirect a terminal reconnect. Reused sessions must match that original
+resolved binding. These private in-memory recipes contain credentials and are
+never serialized or included in diagnostics.
+TCP identity comes from the actual connected socket peer, not asyncpg's retained
+requested hostname: later DNS changes cannot redirect the original reconnect.
+The independently observed TLS hostname is retained for certificate verification
+and SNI while dialing that numeric peer, for both direct TLS and STARTTLS. A
+connection-local native-loop delegate changes no global resolver. Native query
+cancellation on returned TLS sessions still joins and retires its actual Task.
+Cancellation uses the actual admitted TLS context with plaintext fallback
+disabled, even if the ordinary recipe originally used `allow` or `prefer`.
+The native connection tracks its driver-created TLS policy before application
+exposure. Every public policy setter/mutator advances a monotonic generation;
+restoring a value or a failed mutation cannot restore an earlier receipt.
+Original handshake and transaction/reset seals refuse mutation before native
+processing. Concurrent in-progress policy mutation is refused, not waited on by
+the journal observer. Retirement removes its exact native seal identity without
+acquiring that observation lock, so an already-refused setter cannot strand a
+physically retired seal. Application TLS callback/class programs are unsupported.
+Lazy CA-directory and default-trust lookups are also ineligible: OpenSSL can
+load new files without a Python mutation or generation change. Native driver
+CA/CRL files are eagerly loaded; later `capath`, `set_default_verify_paths` or
+`load_default_certs` configuration permanently retires journal eligibility,
+including failed attempts. Ordinary TLS customization remains usable; only
+original-journal policy admission/reconnect is refused.
+The native SSLObject's public context association is also tracked before
+exposure. Changing it retires that session's original-journal eligibility;
+restoration cannot revive it. A finite association seal rejects replacement
+through transaction/cancellation/reset, and cancellation receives the admitted
+context explicitly rather than rereading a mutable association after validation.
+An otherwise healthy sibling with a different loaded context is retired and
+reconnected through the same bounded pool with the admitted policy; trust-object
+identity is not weakened or inferred from a partial public fingerprint.
+Refusing a customized session clears its application observer/listener state
+before native termination; refusal cannot launch a termination listener as new
+application work after cutoff. Ordinary non-journal termination is unchanged.
+
+Startup authentication parameters are not the current SQL principal. Original
+admission captures the actual effective user, session user, role and session
+authorization; the sealed terminal checkout must still match them before any
+transaction/INSERT. The same captured session facts include the effective
+`synchronous_commit` setting, not merely startup arguments, so role/database
+default changes cannot silently weaken a replacement session's commit policy.
+Native pool reset explicitly resets SESSION AUTHORIZATION
+and ROLE as well as ordinary settings, since PostgreSQL RESET ALL excludes both.
+Actual rollback/reset observation preserves caller cancellation alongside an
+ordinary SQL error in a finite observation carrier. Healthy physical retirement
+is not fabricated commit uncertainty, and audit-loss handling cannot swallow
+that withdrawal. Accepted signal identity uses canonical native text/enum values,
+never application string equality or hashing as evidence.
+This includes terminal-outcome selection and recovered-claim admission. All
+terminal selection uses genuine result/producer identity; mutable envelope IDs
+are checked against the captured journal at binding, where a mismatch records
+audit loss and refuses rather than silently dropping an accepted outcome. All
+recovered identity/mode validation and acceptance construction occur inside the
+exact-token cleanup boundary before any routing task can start.
+Source, target and mode come from that immutable claimed event and must match
+the current registered source; a rehydration hook supplies payload/caller, not
+a replacement envelope identity or registration.
+Recovery also snapshots the fresh attempt before application hooks and gives
+rehydration a detached envelope, not the dispatcher's published seed. Its ID
+and arrival time are retained before invocation/await, never read back from
+hook-owned mutable input. The same canonical snapshot routine owns journal
+envelopes; application copy protocols cannot retain a mutable alias.
+Failed cleanup retains its original lease debt and cannot be reported as successful settlement.
+Ordinary cancellation while asynchronous caller rehydration is unwinding also
+releases that exact claim; withdrawal and any release failure remain observable.
+One pre-routing owner covers admission, rehydration, Hold reads, execution-phase
+commit and stop-completion guard acquisition, including finite grouped SQL
+failure/cancellation. Its responsibility transfers only when the actual routing
+Task is published, not when a coroutine or admission promise is constructed.
+Recovered entry owns an already-selected claim before its first awaited Hold
+read. An accepted-but-unstarted routing Task whose callback publication fails
+is physically joined and its exact claim released; Task existence alone is not
+a settlement-owner receipt. Ordinary failures with a live route retain that
+original child through the existing bounded cancellation/cleanup owner.
+Legacy unscoped writers also capture native-text tracking and drain keys, so a
+string-subclass hash change during UI emission cannot strand completed Tasks.
+PostgreSQL admission itself seals native programs and the SSLObject/policy
+association before awaiting principal/catalog reads, through actual pool reset;
+the later writer seal cannot repair an already-substituted admission snapshot.
+PostgreSQL relation identity includes the database OID as well as its name and
+namespace/table OIDs; cloning a database and reusing its name cannot redirect
+an original accepted journal into the clone.
+
+SQLite admission also captures its actual journal/synchronous/full-fsync/WAL
+checkpoint configuration. The original native relation checks compare that
+configuration before and after INSERT, and native COMMIT rechecks it atomically
+on the same worker before invoking SQLite COMMIT. A changed configuration refuses
+the row; a known pre-COMMIT refusal is rolled back, not labeled a lost ACK. This
+preserves the accepted backend settings; it does not strengthen SQLite's own
+power-loss guarantees. PostgreSQL admission and both locked relation checks also
+require the actual native heap table access method and native heap handler,
+not merely a permanent relation whose columns happen to match.
+
+The Core-owned SQLite native authorizer also monotonically observes SQL writes
+to `schema_version` or `writable_schema`. Either retires the original-journal
+profile until reconnect, even if later restored or prepared-statement cached.
+Otherwise public writable-schema SQL could replace a table and transplant its
+original schema row/cookie, defeating a value-only catalog fingerprint. Ordinary
+SQL configuration remains available; it cannot retain the stronger journal
+permission. Application authorizer replacement remains separately unsupported.
+
+The original SQLite connection also pins its native read-only `data_version`.
+An externally committed write retires the old generation, even when another
+connection restores every catalog value and schema cookie. Before INSERT, a
+still-live original writer may make a fresh ordinary work admission on the
+same locked relation ONLY if every other captured catalog/configuration value
+matches. The work validator is an observer and cannot reenter privileged
+helpers. Revoked work cannot refresh this generation; it receives a finite
+refusal even after an unrelated external commit, never handler replay.
+Original-connection writes do not advance this engine evidence. Native BEGIN
+IMMEDIATE excludes external commits through the final profile/row proof/COMMIT.
+The native program fence is installed before BEGIN can wait, but its final
+configuration seal is sampled only after the actual transaction lock is held.
+Eligibility plus fence installation share a native connection-local lock with
+public text/transaction configuration setters and program-registration marks.
+A cross-thread setter cannot pass an absent-seal check and then install an
+application text factory after the worker has acquired journal custody. The
+short eligibility lock is released before potentially waiting native BEGIN;
+the installed seal continues to refuse customization through transaction exit.
+An unrelated writer committing during that wait does not leave a stale COMMIT
+seal after the original still-live work legitimately refreshes its generation.
+Ordinary writer failures are retained on the original journal through public
+observation/finalization. A healthy caller still treats them as best-effort
+audit loss; a withdrawing caller retains both its actual cancellation and the
+original SQL/publication error without inventing commit uncertainty.
+When an observation already includes native retirement evidence, the canonical
+native composer must associate the failed physical owner with its original
+error before source-only provenance is sealed. Premarking a finite observation
+can otherwise drop an ordinary reset failure from feature/shutdown latches.
+Those latches retain that physical original, but not the caller's withdrawal.
+
+Core-owned SQLite connections likewise track native callback/function/extension
+registration. A customized session remains ineligible for original journals until
+reconnect, including after callback removal. This is a supported configuration
+boundary, not a Python/native-code sandbox. SQLite deserialization, native limits
+and database configuration are fenced alongside callbacks;
+replacing main with an identical serialized schema cannot retain the old file's
+journal capability. PostgreSQL proofs target ONLY the captured physical relation,
+and the supported shape excludes ordinary/foreign inheritance in both directions.
+Inherited foreign scans cannot borrow terminal-journal privilege.
+Actual journal BEGIN seals SQLite
+program configuration through actual COMMIT/rollback; PostgreSQL configuration
+is sealed through actual transaction and pool reset. Native connection codecs
+and callback state are checked, not only the pool recipe. PostgreSQL reset's
+advisory-unlock function is catalog-qualified after local search-path restoration.
+No caller attestation or synthetic native completion substitutes for these fences.
+Original SQLite journals require legacy explicit transaction control, not Python's
+autocommit/implicit-reopening modes. Configuration changes are fenced, and the
+actual native worker verifies COMMIT/rollback ended its transaction before
+clearing its seal. A pooled PostgreSQL successor observes the previous original
+journal task through physical retirement before beginning its own journal; pool
+availability alone does not prove that previous owner's fence has retired.
+
+PostgreSQL audit columns must have their canonical types and unmodified typmods;
+catalog namespace alone cannot exclude CHAR padding/truncation. SQLite partial
+indexes are accepted only as the complete native constitution-hash declaration,
+not by finding a WHERE-like suffix inside arbitrary SQL/comments. Durable enqueue
+reserves and releases its captured original ID even when a UI emitter changes
+the caller's public Signal, so a genuinely NACKed delivery can be reclaimed.
+Allocation and callback-publication refusal also release that reservation only
+after any accepted original dispatch task physically joins. Cleanup is idempotent
+even when a callback registered before raising, and retains the original failure.
+Caller withdrawal during that join remains a Base cancellation/control carrier,
+not an ordinary publication exception with cancellation hidden only as its cause.
+The resident also passes its own original journal evidence to its waiting
+ingress, so a cancellation observed AFTER successful resident COMMIT/reset keeps
+that actual classification and original PostgreSQL receipts. This handoff is
+finite completion evidence, never a grant of work or an invented receipt. An
+invocation-private completion slot also crosses durable enqueue, public dispatch
+and resident completion. Failed enqueue publication joins its actual accepted
+dispatch and reservation cleanup, then observes those same original journals;
+a best-effort successful result cannot discard their COMMIT facts or retained
+SQL errors. The canonical journal observation combines actual withdrawal/errors
+with that evidence, while no observation error keeps healthy best-effort behavior.
+Every nested public dispatch starts with a fresh slot, not an inherited collector.
+An
+ordinary Stop with no independent failure retains CancelledError/lifecycle
+semantics; independent failures and borrowed-wait publication errors use the
+canonical finite Base observation carrier without abandoning the producer.
+
+SQLite's plain audit shape excludes CHECK programs, column collations,
+expression/custom-collation indexes and noncanonical partial predicates; the
+native constitution-hash non-null index remains supported. CHECK keywords are
+rejected even with intervening SQL comments; declared column affinities must
+match native audit types so coercion cannot fool SQL equality. Foreign-key,
+conflict-replacement and autoincrement programs are also outside this plain
+shape, as are application text factories. Registered adapters
+for native scalar types also retire the original journal. Prepared row values
+are exact native scalars (with the explicit PostgreSQL timestamp marker), never
+application `__conform__` objects. Projection string subclasses are normalized
+from their actual string storage before binding/truncation. Verification cannot
+repeat an application adaptation to certify a substituted value. Writer indexing,
+completion and draining use the captured scheduling identity, never a public
+Signal's ID after an emitter mutates it.
+The global SQLite adapter registry can change while native preparation releases
+the GIL, so checking it before parameter binding is not an atomic fence. Fixed
+Core-owned positional journal/proof/catalog SQL instead compiles exact native scalars
+to bounded native literals and executes with zero bound parameters. Text uses
+the actual native database encoding (UTF-8, UTF-16le or UTF-16be) for hex BLOB
+CAST to TEXT, including initial catalog lookup; that encoding is part of the
+captured native configuration. BLOBs use hex, integer bounds and native float/NULL
+semantics are retained. Application text never becomes executable SQL, including
+quotes, placeholder characters, NUL and Unicode. The native statement-length
+limit bounds the compiled query. A late global adapter cannot be invoked by
+binding; ordinary unsealed database execution retains standard parameterization.
+The conservative scalar-adapter eligibility checks snapshot native registry keys
+and compare exact types/identities only. Dictionary membership is not safe here:
+a publicly registered custom type can supply application metaclass equality on
+a hash collision, even when no native parameter is ever bound.
+Finite floats use an exact 53-bit integer mantissa and at most19 exact binary
+scaling steps, avoiding decimal-parser rounding differences; signed zero,
+infinities and SQLite's NaN-to-NULL behavior retain their native semantics.
+
+At the real public/recovery return boundary, native journals detach terminal
+result data before invoking projections. A callback retaining the handler's
+original mutable dictionary cannot change the caller's result or audit digest.
+Canonical builtin containers are copied from their native storage, not through
+application `__deepcopy__`, iteration overrides or constructors. The same
+data-only contract snapshots the accepted signal envelope. Native frozen scalar
+type checks use identity, not equality: an application metaclass cannot claim
+that a mutable container is an immutable scalar or that an adapter is a native
+backend. Native container storage is checked without consulting an application's
+`__class__` property.
+Native frozen scalar
+records (`ScheduledTaskOutcome`, `CausationFrame`) retain their identity;
+mutable application objects and mutable fields in those records are unsupported.
+Core's native reviewed reply text retains its boolean post-response verdicts in
+a detached text value; changing the handler's original flags cannot alter the
+returned reply's verdict. Other string subclasses normalize from native text
+storage without invoking application copy hooks.
+Container cycles remain detached, with ordinary serialization/audit-loss semantics.
+An unsupported result fails finitely before projection, carrying the genuine
+completed return and one audit loss, not a failed/replayed handler.
+
+The original privacy-policy epoch and persistence-gate identity also remain
+fixed. The native INSERT retains that same gate through COMMIT/reset and
+rechecks the epoch under the hold. An inline dispatch inside an exclusive
+transition pins that exact native acquisition, not the owner's next acquisition
+or general child work. Otherwise the journal reuses a still-live inherited
+shared lease, or atomically acquires a compatible shared hold without waiting.
+Ordinary ingress still queues behind transitions; routing never holds this
+leaf gate. A terminal journal cannot queue behind a transition that may itself
+await dispatch completion. Contention (`busy`) is distinct from an actually
+changed policy (`superseded`); neither permits stale plaintext SQL.
+
+Such a refusal propagates finite typed `SignalOutcomeJournalPrivacyRefusal`
+evidence (in `kestrel_sovereign.signals.outcome_custody`) carrying `reason` and
+the genuine completed `signal_result`. It records one observable audit loss,
+not a failed/rolled-back handler or a fabricated terminal COMMIT. Without an
+independent native failure it does not poison future dispatch admission.
+These gate holds and evidence never restore revoked work authority.
+
+Public, resident, and recovered cognition each retain their original owner;
+recovery uses the canonical envelope from its own claimed delivery. Native
+COMMIT acknowledgment, reset/retirement debt, cancellation, and later identity
+denial retain their original evidence. An acknowledged audit row is never
+evidence that fresh work is authorized or that an external effect is replayable.
+SQLite records its actual native COMMIT return before the later identity
+recheck, directly at the backend return boundary, never through a caller-facing
+recording helper. Its fixed INSERT targets `main.signal_log`; a handler-created
+temporary table cannot shadow the durable destination. That fact is not a
+fabricated PostgreSQL COMMIT/reset receipt. A
+cancellation does not transfer this native journal to a separately allocated
+drain: its original writer retains both the write lock and privacy protection
+through the existing native rollback/cursor fence. Refused or unstarted Tasks
+cannot stand in for that physical completion. Cleanup failures and repeated
+cancellation remain in the original caller's finite evidence.
+Successful cleanup preserves an actual withdrawal as a cancellation/Base
+carrier even when the original INSERT failed ordinarily. Healthy SQLite
+committed-observation errors use a typed finite classifier without becoming
+native-failure sources; actual cancellation retains its cancellation shape.
+Projection, preparation, and publication boundaries preserve both typed and
+legacy commit-bearing errors rather than substituting audit placeholders.
+Audit-loss accounting is per original row, including accepted-but-unstarted
+writers, and does not count the same failure again at another join boundary.
+Projection callbacks and UI emission remain ordinary work: control failures
+propagate, and UI emission after revocation is refused even if the row committed.
+The canonical pre-emission work check classifies a refusal of its exact original
+typed invocation scopes as finite observation, preserving the caller's denial
+and committed row without poisoning later healthy dispatches. This is not an
+emitter-error catch-all: foreign/unscoped controls, uncertainty and cleanup debt
+retain their original source classification, and revoked work is never resumed.
+An ordinary projection failure records an observable audit loss without
+relabelling an already completed effect as failed.
+
+Ordinary `SignalLogStore.append` still requires ordinary storage authority and
+honors supported table overrides; it does not acquire terminal-journal custody.
+Unsupported legacy unscoped embeddings retain that ordinary append behavior.
+There is no schema migration or new public signal API for this custody boundary.
+
 ### Audit persistence is not pending-delivery durability
 
 `signal_log` is appended after a route succeeds or fails.  It remains the

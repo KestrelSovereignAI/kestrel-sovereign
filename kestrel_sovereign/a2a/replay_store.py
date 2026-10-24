@@ -1,10 +1,8 @@
-"""Shared replay-nonce reservation for A2A signed envelopes.
+"""Shared replay-nonce reservation for native A2A signed-sender proofs.
 
-The in-process ``ReplayGuard`` in :mod:`kestrel_sovereign.a2a.envelope_signing`
-is still useful as a fast path and as a degraded-mode fallback, but it cannot
-see replays that land on another worker. This store provides the shared,
-atomic reservation keyed by ``(sender, nonce)`` for deployments whose primary
-database is shared across workers or instances.
+:mod:`kestrel_sovereign.a2a.native_sender` requires this atomic reservation
+keyed by ``(sender, nonce)`` before admitting the authenticated request. The
+primary database shares that replay decision across workers or instances.
 """
 from __future__ import annotations
 

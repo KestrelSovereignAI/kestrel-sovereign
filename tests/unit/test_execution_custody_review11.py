@@ -1,9 +1,6 @@
 """Provider-free probes of review11's remaining production consumers."""
 
 import asyncio
-from datetime import datetime, timedelta, timezone
-from types import SimpleNamespace
-from unittest.mock import AsyncMock
 
 import pytest
 
@@ -11,11 +8,13 @@ from kestrel_sovereign.execution_custody import (
     ExecutionAuthorityError,
     ExecutionCommitOutcomeError,
     ExecutionCustody,
+    ProcessRuntimeExecutionFence,
+    _explicit_control_chain,
     bind_execution_custody,
+    is_execution_control_error,
     require_execution_work,
 )
 from tests.unit.test_execution_custody import Authority
-from tests.unit.test_execution_custody_review10 import runtime_owner
 from tests.unit.test_streaming_usage_metering import _FakeService
 
 
@@ -119,184 +118,204 @@ async def test_ordinary_live_stream_failure_keeps_native_accounting(partial):
         await stream.aclose()
 
 
-@pytest.mark.asyncio
-async def test_boot_peer_replay_and_sweep_survive_only_original_runtime():
-    from kestrel_sovereign.features.peers.feature import PeersFeature
-    owner = runtime_owner()
-    observed = asyncio.Event()
-    release = asyncio.Event()
-    row = SimpleNamespace(
-        task_id="restored", recipient="peer", original_question="question",
-        origin_session_id="session", recipient_agent_id="did:test:peer",
-        deadline=(datetime.now(timezone.utc) + timedelta(hours=1)).isoformat(),
-        retry_state=None,
-    )
-    store = SimpleNamespace(
-        list_waiting=AsyncMock(return_value=[row]),
-        reclaim_abandoned_wakes=AsyncMock(return_value=[]),
-        list_expired_awaiting_receiver=AsyncMock(return_value=[]),
-        list_waiting_past_deadline=AsyncMock(
-            side_effect=lambda: require_execution_work(owner) or [],
-        ),
-    )
-    owner.pending_a2a_questions = store
-    feature = PeersFeature(owner)
-    feature._peer_directory_context = lambda: object()
-    feature.EXPIRY_SWEEP_INTERVAL_SECONDS = 0.001
-    outcomes = ()
 
-    async def supervisor(**kwargs):
-        await owner._runtime_publication_ready.wait()
+
+
+
+
+
+# The native host fixture supplies real SDK bindings, signed sender proofs,
+# primary sender/recipient ledgers and a durable cognition dispatcher.
+from contextlib import asynccontextmanager
+from types import SimpleNamespace
+
+from kestrel_sovereign._async_ownership import await_owned_task
+from tests.unit.test_a2a_native_host import (
+    hosted as hosted,  # noqa: PLC0414 - pytest fixture export
+)
+from tests.unit.test_a2a_native_host import (
+    hosted_recipient_signing as hosted_recipient_signing,  # noqa: PLC0414 - pytest fixture export
+)
+from tests.unit.test_a2a_native_host import (
+    local_native_peer as local_native_peer,  # noqa: PLC0414 - pytest fixture export
+)
+from tests.unit.test_a2a_native_host import (
+    native_question_peer as native_question_peer,  # noqa: PLC0414 - pytest fixture export
+)
+from tests.unit.test_a2a_native_host import (
+    publication as publication,  # noqa: PLC0414 - pytest fixture export
+)
+
+
+async def _use_original_runtime(p, tmp_path):
+    await p.feature.shutdown()
+    from kestrel_sovereign.kestrel_agent import KestrelAgent
+
+    owner = KestrelAgent(
+        did=p.sender.did,
+        storage_path=str(tmp_path / "question-runtime.db"),
+    )
+    owner._execution_custody = ExecutionCustody(ProcessRuntimeExecutionFence(p.sender.did))
+    owner.identity = p.sender.identity
+    owner.task_manager = p.sender_manager
+    owner.dispatcher = p.dispatcher
+    # The real dispatcher must share the same original runtime owner. Its
+    # default fixture agent deliberately has no hosted resident handoff.
+    previous_agent = p.dispatcher._agent
+    owner.process_input = previous_agent.process_input
+    owner._durable_persistence_gate = previous_agent._get_durable_persistence_gate()
+    p.dispatcher._agent = owner
+    owner.get_current_turn_id = lambda: "original-question-turn"
+    owner.get_turn_bound_session_id = lambda: "original-question-session"
+    p.feature.agent = owner
+    owner.features = {"Peers": p.feature}
+    return owner
+
+
+def _assert_original_runtime_retirement(error):
+    assert is_execution_control_error(error)
+    assert any(
+        isinstance(original, ExecutionAuthorityError)
+        and "original runtime retired" in str(original)
+        for original in _explicit_control_chain(error)
+    )
+
+
+async def test_native_question_resident_waits_for_ready_and_outlives_boot_claim(
+    native_question_peer, monkeypatch, tmp_path,
+):
+    p = native_question_peer
+    if p.backend.backend_type != "postgres":
+        pytest.skip("Transaction-bound execution custody requires PostgreSQL")
+    owner = await _use_original_runtime(p, tmp_path)
+    observed = asyncio.Event()
+    original = p.sender_manager.question_store.unsettled
+    async def observed_read():
         require_execution_work(owner)
         observed.set()
-        await release.wait()
-        require_execution_work(owner)
-
-    feature._supervise_a2a_question = supervisor
-    try:
-        with bind_execution_custody(Authority()):
-            await feature.post_all_features_loaded(owner)
-        owner._runtime_publication_ready.set()
-        for _ in range(100):
-            await asyncio.sleep(0.001)
-            if observed.is_set() and store.list_waiting_past_deadline.await_count:
-                break
-        assert observed.is_set(), "restored peer inherited retired cold-boot claim"
-        assert store.list_waiting_past_deadline.await_count, "sweep inherited boot claim"
-        tasks = tuple(owner._background_tasks)
-        assert len(tasks) == 3
-        assert sum(task.get_name() == "a2a_question_expiry_sweep" for task in tasks) == 1
-        assert sum(task.get_name() == "a2a_question_wake_recovery:replay" for task in tasks) == 1
-        owner._execution_custody.revoke("original runtime replaced")
-        # Interrupt the lease-delay sleeper too: it must retire, rather than
-        # retaining the replaced resident authority for a full claim lease.
-        for task in tasks:
-            if task.get_name() == "a2a_question_wake_recovery:replay":
-                task.cancel()
-        release.set()
-        outcomes = await asyncio.wait_for(asyncio.gather(*tasks, return_exceptions=True), 1)
-        assert all(isinstance(error, (ExecutionAuthorityError, asyncio.CancelledError)) for error in outcomes)
-        assert not feature._owned_background_tasks
-    finally:
-        release.set()
-        try:
-            await feature._cancel_owned_background_tasks()
-        except ExecutionAuthorityError as retained:
-            assert any(retained is error for error in outcomes)
-        finally:
-            tasks = tuple(owner._background_tasks)
-            for task in tasks:
-                task.cancel()
-            await asyncio.gather(*tasks, return_exceptions=True)
-
-
-@pytest.mark.asyncio
-async def test_committed_question_subscription_outlives_requesting_turn():
-    from kestrel_sovereign.features.peers.feature import PeersFeature
-    owner = runtime_owner()
+        return await original()
+    monkeypatch.setattr(p.sender_manager.question_store, "unsettled", observed_read)
+    with bind_execution_custody(owner._execution_custody.fence) as boot_claim:
+        await p.feature.post_all_features_loaded(owner)
+    resident = p.feature._question_supervisor_task
+    assert resident.get_name() == "native_a2a_question_recovery"
+    assert not observed.is_set()
+    boot_claim.revoke("cold boot finished")
     owner._runtime_publication_ready.set()
-    owner.pending_a2a_questions = SimpleNamespace(insert=AsyncMock())
-    feature = PeersFeature(owner)
-    feature._post_a2a_task = AsyncMock(return_value=(
-        {"id": "task", "sessionId": "session"}, None, "did:test:peer", None,
-    ))
-    observed = []
-
-    async def subscription(**kwargs):
-        require_execution_work(owner)
-        observed.append(kwargs["task_id"])
-
-    feature._supervise_a2a_question = subscription
-    try:
-        with bind_execution_custody(Authority()):
-            await feature.send_a2a_question("peer", "question")
-        tasks = tuple(owner._background_tasks)
-        assert len(tasks) == 1
-        assert await asyncio.gather(*tasks, return_exceptions=True) == [None]
-        assert observed == ["task"]
-        owner.pending_a2a_questions.insert.assert_awaited_once()
-    finally:
-        await feature._cancel_owned_background_tasks()
-        for task in tuple(owner._background_tasks):
-            task.cancel()
-        await asyncio.gather(*tuple(owner._background_tasks), return_exceptions=True)
+    await asyncio.wait_for(observed.wait(), 2)
+    assert not resident.done(), "resident retained the completed boot claim"
+    await p.feature.shutdown()
+    assert resident.done() and not p.feature._owned_background_tasks
 
 
-@pytest.mark.asyncio
-@pytest.mark.parametrize("retirement", ["none", "generation", "disable"])
-async def test_actual_live_question_subscription_retains_only_original_runtime(retirement):
-    from kestrel_sovereign.features.peers.directory import PeerSubscriptionEvent
-    from kestrel_sovereign.features.peers.feature import PeersFeature
-    from tests.unit.test_send_a2a_question_supervisor import _DeliveredSignalHandle
-
-    owner = runtime_owner()
-    owner.did = "did:test:sender"
+@pytest.mark.parametrize("retirement,deadline_query", [
+    ("none", False), ("generation", False), ("disable", False),
+    ("generation", True),
+])
+async def test_native_question_recovery_retains_original_runtime_after_request_turn(
+    native_question_peer, retirement, deadline_query, tmp_path, monkeypatch,
+):
+    p = native_question_peer
+    if p.backend.backend_type != "postgres":
+        pytest.skip("Transaction-bound execution custody requires PostgreSQL")
+    owner = await _use_original_runtime(p, tmp_path)
     owner._runtime_publication_ready.set()
-    owner.pending_a2a_questions = SimpleNamespace(
-        insert=AsyncMock(), mark_resolved=AsyncMock(return_value=True),
-        renew_claim_lease=AsyncMock(return_value=True),
-        confirm_wake_delivered=AsyncMock(return_value=True),
-    )
-    owner.dispatcher = SimpleNamespace(enqueue_signal=AsyncMock(return_value=_DeliveredSignalHandle()))
-    feature = PeersFeature(owner)
-    feature._post_a2a_task = AsyncMock(return_value=(
-        {"id": "task", "sessionId": "session"}, None, "did:test:peer", None,
-    ))
-    feature._outbound_recipient_agent_id = AsyncMock(return_value="did:test:peer")
     entered, release, closed = asyncio.Event(), asyncio.Event(), asyncio.Event()
+    query_entered, query_release, query_closed = (
+        asyncio.Event(), asyncio.Event(), asyncio.Event()
+    )
+    if deadline_query:
+        from kestrel_sovereign.a2a.question_supervisor import NativeQuestionSupervisor
 
-    async def subscribe(*args, **kwargs):
-        entered.set()
-        try:
-            await release.wait()
-            yield PeerSubscriptionEvent(event="status", data='{"status":"completed","message":"reply"}')
-        finally:
-            closed.set()
+        # Force the real deadline lane to cross its SQL admission before
+        # retirement, then finish that lane before releasing the peer read.
+        # PostgreSQL preserves denial inside its native QueryError carrier.
+        deadline_task = None
+        original_deadline = NativeQuestionSupervisor._deadline_loop
+        original_executor = p.backend._execution_query_executor
 
-    router = SimpleNamespace(subscribe_a2a_task=subscribe)
-    feature._resolve_retained_automatic_peer = AsyncMock(return_value=(router, object(), object()))
-    tasks = ()
-    outcomes = ()
+        async def deadline_loop(supervisor):
+            nonlocal deadline_task
+            deadline_task = asyncio.current_task()
+            try:
+                await original_deadline(supervisor)
+            finally:
+                query_closed.set()
+
+        @asynccontextmanager
+        async def held_executor(executor, commit_state=None):
+            if asyncio.current_task() is deadline_task and not query_entered.is_set():
+                query_entered.set()
+                await query_release.wait()
+            async with original_executor(executor, commit_state) as checked:
+                yield checked
+
+        monkeypatch.setattr(NativeQuestionSupervisor, "_deadline_loop", deadline_loop)
+        monkeypatch.setattr(p.backend, "_execution_query_executor", held_executor)
+    original_open = p.feature._open_native_dispatch
+    @asynccontextmanager
+    async def held_read(dispatch_id):
+        async with original_open(dispatch_id) as (session, dispatch):
+            async def get_task(retained):
+                entered.set()
+                try:
+                    await release.wait()
+                    require_execution_work(owner)
+                    return await session.get_task(retained)
+                finally:
+                    closed.set()
+            yield SimpleNamespace(get_task=get_task), dispatch
+    p.feature._open_native_dispatch = held_read
+    await p.feature.post_all_features_loaded(owner)
+    with bind_execution_custody(owner._execution_custody.fence) as request_claim:
+        result = await p.feature.send_a2a_question("Peer", "Native custody question")
+    assert result.data["sent"] is True
+    request_claim.revoke("request turn finished")
+    resident = p.feature._question_supervisor_task
     try:
-        with bind_execution_custody(Authority()):
-            await feature.send_a2a_question("peer", "question")
-        tasks = tuple(owner._background_tasks)
-        await asyncio.wait_for(entered.wait(), 1)
+        await asyncio.wait_for(entered.wait(), 3)
+        await p.manager.complete_task(result.data["remote_task_id"], "Native reply", recipient_agent_id=p.recipient.did)
         if retirement == "generation":
-            owner._execution_custody.revoke("original question runtime retired")
-        if retirement == "disable":
-            await feature._cancel_owned_background_tasks()
+            if deadline_query:
+                await asyncio.wait_for(query_entered.wait(), 3)
+            owner._execution_custody.revoke("original runtime retired")
+            if deadline_query:
+                query_release.set()
+                await asyncio.wait_for(query_closed.wait(), 3)
+        elif retirement == "disable":
+            await p.feature.shutdown()
         release.set()
-        outcomes = await asyncio.wait_for(asyncio.gather(*tasks, return_exceptions=True), 1)
-        assert closed.is_set()
         if retirement == "none":
-            assert outcomes == [None]
-            owner.pending_a2a_questions.mark_resolved.assert_awaited_once()
-            claimed = owner.pending_a2a_questions.mark_resolved.await_args
-            assert claimed.args == ("task",)
-            assert claimed.kwargs["state"] == "completed"
-            assert claimed.kwargs["reply_text"] == "reply"
-            assert claimed.kwargs["claim"]
-            owner.pending_a2a_questions.confirm_wake_delivered.assert_awaited_once_with(
-                "task", claim=claimed.kwargs["claim"],
-            )
-            owner.dispatcher.enqueue_signal.assert_awaited_once()
-            signal = owner.dispatcher.enqueue_signal.await_args.args[0]
-            assert signal.target_agent == owner.did
+            async with asyncio.timeout(3):
+                while not (await p.sender_manager.question_store.get(result.data["question_id"])).receiver_settled or await p.sender_manager.question_store.pending_wakes():
+                    await asyncio.sleep(0.01)
+            assert (await p.backend.fetch_one("SELECT COUNT(*) FROM durable_signal_events WHERE source = ?", ("a2a.question_answered",)))[0] == 1
+            assert not resident.done(), "request turn retired its resident recovery"
         else:
-            assert all(isinstance(error, (ExecutionAuthorityError, asyncio.CancelledError)) for error in outcomes)
-            owner.pending_a2a_questions.mark_resolved.assert_not_awaited()
-            owner.dispatcher.enqueue_signal.assert_not_awaited()
-        assert not feature._owned_background_tasks
+            outcome = await await_owned_task(resident)
+            if retirement == "generation":
+                _assert_original_runtime_retirement(outcome.error)
+            else:
+                assert isinstance(outcome.error, asyncio.CancelledError)
+            assert not (await p.sender_manager.question_store.get(result.data["question_id"])).receiver_settled
+            assert (await p.backend.fetch_one("SELECT COUNT(*) FROM durable_signal_events WHERE source = ?", ("a2a.question_answered",)))[0] == 0
+        assert closed.is_set()
     finally:
         release.set()
+        query_release.set()
         try:
-            await feature._cancel_owned_background_tasks()
-        except ExecutionAuthorityError as retained:
+            await p.feature.shutdown()
+        except BaseException as error:
             assert retirement == "generation"
-            assert any(retained is error for error in outcomes)
-        finally:
-            await asyncio.gather(*tasks, return_exceptions=True)
-            for task in tuple(owner._background_tasks):
-                task.cancel()
-            await asyncio.gather(*tuple(owner._background_tasks), return_exceptions=True)
+            _assert_original_runtime_retirement(error)
+            if deadline_query:
+                from kestrel_sdk.storage.database.interface import QueryError
+
+                assert any(
+                    isinstance(original, QueryError)
+                    for original in _explicit_control_chain(error)
+                )
+            assert not p.feature._owned_background_tasks
+            # This test has harvested the expected retained receipt. The
+            # shared fixture repeats shutdown and must not report it anew.
+            p.feature._owned_background_control = None

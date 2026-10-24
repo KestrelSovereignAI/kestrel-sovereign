@@ -3,6 +3,7 @@ from fastapi import APIRouter
 
 # Core routers (always present, not feature-gated)
 from .agent import router as agent_router
+from .task_inbox import router as task_inbox_router
 from .conversations import router as conversations_router
 from .memories import router as memories_router
 from .sovereignty import router as sovereignty_router
@@ -26,6 +27,7 @@ from .host_stop import router as host_stop_router
 
 __all__ = [
     "agent_router",
+    "task_inbox_router",
     "conversations_router",
     "memories_router",
     "sovereignty_router",

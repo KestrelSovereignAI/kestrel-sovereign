@@ -44,6 +44,7 @@ from kestrel_sovereign.signals import (
 )
 from kestrel_sovereign.storage.async_conversation_store import AsyncConversationStore
 from kestrel_sovereign.storage.db import SQLiteBackend
+import kestrel_sovereign.storage.db.sqlite as sqlite_backend_module
 from kestrel_sovereign.storage.session_id_column import new_session_id
 from kestrel_sovereign.storage.turn_provenance import (
     SIGNAL_WAKE_REPLY_KEY,
@@ -51,6 +52,7 @@ from kestrel_sovereign.storage.turn_provenance import (
     wake_reply_metadata,
 )
 from tests.shared.booted_agent import booted_agent
+from tests.utils.aiosqlite_workers import aiosqlite_worker, normal_close_schedule
 
 SOURCE = "test.wake_reply"
 LONG_REPLY = (
@@ -396,30 +398,71 @@ async def test_event_id_is_the_row_holding_that_wakes_reply(tmp_path, monkeypatc
     async with _waking_agent(
         tmp_path, monkeypatch, template, [LONG_REPLY, second_reply]
     ) as (agent, emitted):
-        chain = new_session_id()
-        first = _wake(session_id=chain, kind="first")
-        second = _wake(session_id=chain, kind="second")
-        assert (await agent.dispatcher.dispatch_signal(first)).status == Status.OK
-        assert (await agent.dispatcher.dispatch_signal(second)).status == Status.OK
-        await _settle(agent)
+        backend = agent._raw_storage.db.backend
+        assert isinstance(backend, SQLiteBackend)
+        original_open = backend._open_snapshot_read_connection
+        original_close = sqlite_backend_module._close_aiosqlite_connection
+        snapshots = set()
+        admitted = set()
+        loop = asyncio.get_running_loop()
+        original_clock = loop.time
+        # This functional test is about durable reply IDs, not native close
+        # speed. Only snapshots actually created by THIS backend are scheduled.
+        async with normal_close_schedule(prejoined=True) as finish:
+            async def opened_snapshot():
+                connection = await original_open()
+                snapshots.add(connection)
+                return connection
 
-        by_signal = {event["signal_id"]: event for event in emitted}
-        first_event, second_event = by_signal[first.id], by_signal[second.id]
+            async def close_snapshot(connection, **kwargs):
+                if connection not in snapshots:
+                    return await original_close(connection, **kwargs)
+                assert connection not in admitted
+                assert aiosqlite_worker(connection).is_alive()
+                assert "close_task" not in kwargs
+                assert kwargs.get("deadline") is None
+                assert kwargs["retained_closes"] is backend._retired_connection_closes
+                admitted.add(connection)
+                result = await finish(
+                    connection,
+                    lambda original_task: original_close(
+                        connection, close_task=original_task, **kwargs
+                    ),
+                    retained_closes=backend._retired_connection_closes,
+                )
+                assert not aiosqlite_worker(connection).is_alive()
+                assert loop.time == original_clock
+                return result
 
-        assert first_event["result_summary_complete"] is False
-        assert second_event["result_summary_complete"] is True
-        first_id = first_event["reply_message_id"]
-        second_id = second_event["reply_message_id"]
-        assert isinstance(first_id, int) and isinstance(second_id, int)
-        assert first_id < second_id
+            with monkeypatch.context() as snapshot_patch:
+                snapshot_patch.setattr(backend, "_open_snapshot_read_connection", opened_snapshot)
+                snapshot_patch.setattr(sqlite_backend_module, "_close_aiosqlite_connection", close_snapshot)
+                chain = new_session_id()
+                first = _wake(session_id=chain, kind="first")
+                second = _wake(session_id=chain, kind="second")
+                assert (await agent.dispatcher.dispatch_signal(first)).status == Status.OK
+                assert (await agent.dispatcher.dispatch_signal(second)).status == Status.OK
+                await _settle(agent)
 
-        role, metadata = await _row(agent, first_id)
-        assert role == "assistant"
-        assert metadata[SIGNAL_WAKE_REPLY_KEY] == first.id
-        assert metadata["session_id"] == chain
-        stored = await agent.storage.get_conversation_message(first_id)
-        assert stored["content"] == LONG_REPLY, "the stored row holds the whole reply"
-        assert (await agent.storage.get_conversation_message(second_id))["content"] == second_reply
+                by_signal = {event["signal_id"]: event for event in emitted}
+                first_event, second_event = by_signal[first.id], by_signal[second.id]
+
+                assert first_event["result_summary_complete"] is False
+                assert second_event["result_summary_complete"] is True
+                first_id = first_event["reply_message_id"]
+                second_id = second_event["reply_message_id"]
+                assert isinstance(first_id, int) and isinstance(second_id, int)
+                assert first_id < second_id
+
+                role, metadata = await _row(agent, first_id)
+                assert role == "assistant"
+                assert metadata[SIGNAL_WAKE_REPLY_KEY] == first.id
+                assert metadata["session_id"] == chain
+                stored = await agent.storage.get_conversation_message(first_id)
+                assert stored["content"] == LONG_REPLY, "the stored row holds the whole reply"
+                assert (await agent.storage.get_conversation_message(second_id))["content"] == second_reply
+                assert admitted == snapshots
+        assert loop.time == original_clock
 
 
 @asynccontextmanager

@@ -420,6 +420,56 @@ most once; hosts must synchronously latch denial and their fatal-loss policy.
 Callbacks are notification, not instantaneous distributed fencing: asyncpg can
 queue them after PostgreSQL has already released the lock.
 
+### Terminal physical barriers (#3739)
+
+`PostgresBackend.advisory_locks(TerminalAdvisoryBarrier(((namespace, key),)))`
+uses the **same** bounded advisory allocator, exact-session loss listener,
+original native closer and joined checkout/reset owner. The immutable request
+requires nonempty signed-32-bit integer pairs (not booleans) and exclusive mode.
+It requires the original already-connected backend and shared advisory owner;
+retirement or replacement while waiting cannot admit a body on a successor.
+It does not connect a replacement operational pool or expose a SQL executor,
+connection, arbitrary terminal callback, target claim or provider permission.
+
+The yielded `TerminalAdvisoryLease.require_physical()` proves only that exact
+physical exclusion is still live. Its `require_live()` **always denies** ordinary
+execution, including through `AdvisoryExecutionFence.require_work()` and
+`lock_and_validate()`. The immutable request is itself an always-denying fence,
+bound before allocator entry and retained through native retirement. Connection
+initializers, loss callbacks, reset owners, the body and copied children all
+retain that cleanup-only custody even when the caller had no original scope.
+The loss listener explicitly rebinds its original scope union: asyncpg dispatches
+from the transport's creation context, so a session first warmed for an ordinary
+lease must not lend that unrestricted context to later terminal callbacks.
+Native tests reuse that exact warmed session before externally terminating it.
+The scope and physical handle retire monotonically; escaping a copied context does
+not keep the permission alive. Ordinary advisory handles retain their previous
+`require_live()` behavior.
+
+This physical barrier can run behind retained denied or UNKNOWN ancestors; it
+neither clears them nor restores ordinary work. All original admissions are
+sampled again only after acquisition/body failure, exact-session retirement and
+native pool reset have joined. Original control, native failures and actual
+caller withdrawals are composed through the canonical finite error contract.
+If the original backend/shared owner retires during asynchronous pool creation,
+the exact newly owned pool closes through the same backend close owner before
+refusal returns. Failed or refused close admission retains its exact pool/Task
+debt; it is not a hidden replacement pool or successful retirement.
+Hosts must still join their own exact accepted provider/storage/receipt Tasks
+and validate original durable operation/target permission in a **fixed terminal
+API**. A fresh mutex is not that permission, a producer join, an erasure receipt,
+a reconciled COMMIT or a billing settlement.
+
+`test_terminal_advisory_barrier.py` exercises actual isolated PostgreSQL locks,
+denied/UNKNOWN ancestors, eager/ordinary children, ordinary-work refusals,
+copied scope retirement, actual init/loss/reset callback children, session loss,
+a one-slot operational pool, delegated backend retirement during checkout and
+pool creation, and repeated withdrawal during acquire/body/release tails.
+The existing original-advisory admission/physical-retirement tests also run the
+terminal request, retaining real native protocol tails and failed closer debt.
+These are native Core boundary proofs, not downstream Frinz adoption, deployed
+object erasure, provider/GPU acceptance or published-package evidence.
+
 `bind_execution_custody(fence)` owns one connection-free admission. Its host
 `ExecutionFence` supplies immutable generation binding, `require_work()`, and
 `lock_and_validate(connection)`. Copied children retain the same irrevocable

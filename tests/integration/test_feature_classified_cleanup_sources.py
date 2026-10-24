@@ -7,7 +7,7 @@ import pytest
 from kestrel_sovereign._async_ownership import await_owned_task, create_owned_task
 from kestrel_sovereign.execution_custody import (
     ExecutionCustody, _explicit_control_chain, bind_execution_custody_snapshot,
-    execution_commit_outcome,
+    execution_commit_outcome, is_execution_control_error,
 )
 from kestrel_sovereign.kestrel_agent import require_feature_lifecycle_integrity
 from kestrel_sovereign.storage.db import postgres as postgres_module
@@ -19,6 +19,143 @@ from tests.integration.test_maintenance_original_retirement import _original_con
 from tests.utils.original_failure import OriginalFailure
 
 cleanup_pg = _cleanup_pg
+from tests.unit.test_signals_dispatcher import dispatcher_components as _signal_components, db_path as _signal_db_path
+dispatcher_components = _signal_components
+db_path = _signal_db_path
+
+
+@pytest.mark.parametrize('entry', ['safe_mode', 'activation', 'ready'])
+async def test_finite_completed_refusal_reaches_original_feature_lifecycle_caller(dispatcher_components, onboarding_owner, entry):
+    from kestrel_sovereign.kestrel_agent import enter_feature_lifecycle_safe_mode
+    from kestrel_sovereign.execution_custody import execution_native_source_error
+    from tests.unit.test_signals_dispatcher import _action_reg, _signal
+    c = dispatcher_components
+    _, agent, _database = onboarding_owner
+    originals = []
+    class UnsupportedBody:
+        pass
+    body = {'actual completed value': UnsupportedBody()}
+    async def handler(payload):
+        return body
+    c.registry.register(_action_reg('finite.completed.refusal', handler=handler))
+    async def refuse():
+        try:
+            await c.dispatcher.dispatch_signal(_signal('finite.completed.refusal'))
+        except BaseException as error:
+            assert is_execution_control_error(error)
+            assert execution_native_source_error(error) is None
+            originals.append(OriginalFailure.capture(error))
+            raise
+    class Feature(SDKFixtureFeature):
+        contribution_prefix = 'finite-completed-refusal'
+        async def on_enable(self):
+            if entry == 'activation':
+                await refuse()
+        async def on_agent_ready(self, owner):
+            if entry == 'ready':
+                await refuse()
+    feature = Feature(agent)
+    if entry == 'safe_mode':
+        refused = await await_owned_task(create_owned_task(refuse(), retain_originals=True))
+        operation = enter_feature_lifecycle_safe_mode(agent, 'actual finite completed refusal', refused.error)
+    elif entry == 'ready':
+        await agent._activate_feature_runtime(feature, notify_ready=False)
+        operation = agent._notify_feature_runtime_ready(feature)
+    else:
+        operation = agent._activate_feature_runtime(feature)
+    result = await await_owned_task(create_owned_task(operation, retain_originals=True))
+    assert len(originals) == 1
+    originals[0].assert_retained(result.error)
+    assert any(getattr(error, 'signal_result', None) is not None
+               and error.signal_result.action_result is body for error in _explicit_control_chain(result.error))
+    assert not any(isinstance(error, asyncio.CancelledError) for error in _explicit_control_chain(result.error))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('entry,earlier', [('unregister', False), ('activation', False), ('unregister', True), ('safe_mode', False), ('ready', False)])
+async def test_finite_sql_rollback_withdrawal_finishes_independent_feature_cleanup(
+    native_pg, onboarding_owner, monkeypatch, entry, earlier,
+):
+    backend, observer, schema = native_pg
+    _, agent, database = onboarding_owner
+    await backend.execute("INSERT INTO effects VALUES (315, 'original seed')")
+    entered, release = asyncio.Event(), asyncio.Event()
+    rollbacks, withdrawals, cleanup = [], [], []
+    opening = OSError('actual original activation failure')
+    original_exit, original_join = asyncpg.transaction.Transaction.__aexit__, postgres_module.await_owned_task
+    async def rollback(transaction, *args):
+        result = await original_exit(transaction, *args)
+        if args[1] is not None and any(isinstance(error, asyncpg.UniqueViolationError)
+                                     for error in _explicit_control_chain(args[1])):
+            rollbacks.append((transaction, asyncio.current_task(), args[1]))
+            entered.set()
+            await release.wait()
+        return result
+    async def join(*args, **kwargs):
+        result = await original_join(*args, **kwargs)
+        if result.cancellation is not None:
+            withdrawals.append(result.cancellation)
+        return result
+    monkeypatch.setattr(asyncpg.transaction.Transaction, '__aexit__', rollback)
+    monkeypatch.setattr(postgres_module, 'await_owned_task', join)
+    class Feature(SDKFixtureFeature):
+        contribution_prefix = 'finite-rollback-cleanup'
+        async def on_enable(self):
+            if entry == 'activation':
+                raise opening
+        async def on_disable(self):
+            with bind_execution_custody_snapshot((ExecutionCustody(GenerationFence()),)):
+                await backend.execute("INSERT INTO effects VALUES (315, 'must roll back')")
+        async def on_agent_ready(self, agent):
+            if entry == 'ready':
+                await self.on_disable()
+        async def shutdown(self):
+            cleanup.append('actual feature shutdown')
+            await database.execute('INSERT INTO host_rollback_effects VALUES (315)')
+            return await super().shutdown()
+    feature = Feature(agent)
+    if entry == 'safe_mode':
+        async def persist_safe_mode(reason, *, cause):
+            await feature.on_disable()
+        monkeypatch.setattr(agent, 'enter_safe_mode', persist_safe_mode)
+    if entry in ('unregister', 'ready'):
+        await agent._activate_feature_runtime(feature, notify_ready=False)
+    early_error = OriginalFailure.capture(OSError('actual earlier contribution cleanup failure'))
+    if earlier:
+        runtime = agent._ensure_feature_contribution_runtime()
+        deactivate = runtime.deactivate
+        def fail_deactivate(value):
+            deactivate(value)
+            raise early_error.error
+        monkeypatch.setattr(runtime, 'deactivate', fail_deactivate)
+    from kestrel_sovereign.kestrel_agent import enter_feature_lifecycle_safe_mode
+    operation = (agent._unregister_feature_runtime(feature) if entry == 'unregister'
+                 else agent._notify_feature_runtime_ready(feature) if entry == 'ready'
+                 else enter_feature_lifecycle_safe_mode(agent, 'actual native persistence failure', features=(feature,))
+                 if entry == 'safe_mode' else agent._activate_feature_runtime(feature))
+    owner = create_owned_task(operation, retain_originals=True)
+    try:
+        await asyncio.wait_for(entered.wait(), 5)
+        owner.cancel('actual caller withdrew during healthy native rollback')
+        await asyncio.sleep(0)
+        release.set()
+        result = await await_owned_task(owner)
+        assert cleanup == ([] if entry in ('safe_mode', 'ready') else ['actual feature shutdown']), 'finite withdrawal group skipped independent feature cleanup'
+        assert await database.fetchval('SELECT count(*) FROM host_rollback_effects WHERE id=315') == int(entry not in ('safe_mode', 'ready'))
+        assert len(rollbacks) == 1 and rollbacks[0][1].done()
+        chain = tuple(_explicit_control_chain(result.error))
+        assert withdrawals and all(error in chain for error in withdrawals), 'activation cleanup dropped actual caller withdrawal'
+        if entry == 'activation':
+            assert opening in chain
+        elif entry == 'unregister':
+            assert rollbacks[0][2] in chain
+        if earlier:
+            early_error.assert_retained(result.error)
+        assert await observer.fetchval(f'SELECT value FROM "{schema}".effects WHERE id=315') == 'original seed'
+        assert feature.enabled is (entry == 'ready')
+    finally:
+        release.set()
+        await await_owned_task(owner)
 
 
 @pytest.mark.asyncio
@@ -49,8 +186,9 @@ async def test_unregister_shared_retention_does_not_mutate_two_native_sources(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize('withdraw', [False, True])
 async def test_classified_reset_failure_keeps_caller_out_of_both_shared_latches(
-    native_pg, onboarding_owner, monkeypatch,
+    native_pg, onboarding_owner, monkeypatch, withdraw,
 ):
     backend, observer, schema = native_pg
     _, agent, _database = onboarding_owner
@@ -82,12 +220,14 @@ async def test_classified_reset_failure_keeps_caller_out_of_both_shared_latches(
     owner = create_owned_task(agent._activate_feature_runtime(Feature(agent)), retain_originals=True)
     try:
         await asyncio.wait_for(entered.wait(), 5)
-        owner.cancel("actual classified native cleanup observer withdrew")
-        await asyncio.sleep(0)
+        if withdraw:
+            owner.cancel("actual classified native cleanup observer withdrew")
+            await asyncio.sleep(0)
         release.set()
         result = await await_owned_task(owner)
         physical.assert_retained(result.error)
-        assert withdrawals and all(error in tuple(_explicit_control_chain(result.error)) for error in withdrawals)
+        assert bool(withdrawals) is withdraw
+        assert all(error in tuple(_explicit_control_chain(result.error)) for error in withdrawals)
         for shared in (agent._feature_lifecycle_control, agent._shutdown_control):
             physical.assert_retained(shared)
             assert execution_commit_outcome(shared) == "committed"

@@ -1,0 +1,782 @@
+{
+  "schema_version": 1,
+  "scope": "Reviewed automated observations only; no complete conformance claim. NOT TESTED and MANUAL remain unverified.",
+  "patched_tree": "2a55d5eaccf357f249c6c23188366cd045a46a82",
+  "protocol_version": "1.0.1",
+  "protocol_bindings": [
+    "JSONRPC",
+    "HTTP+JSON"
+  ],
+  "must_compatibility": "81.8%",
+  "unverified_requirements": {
+    "AUTH-INTASK-001": "Agent MUST use a Task to track operation requiring authorization; no automated probe in the pinned TCK.",
+    "AUTH-INTASK-002": "Agent MUST transition to auth_required state; no automated probe in the pinned TCK.",
+    "AUTH-INTASK-003": "Agent MUST include status message explaining authorization; no automated probe in the pinned TCK.",
+    "AUTH-INTASK-004": "Agent MUST arrange to receive credentials out-of-band; no automated probe in the pinned TCK.",
+    "AUTH-SCOPE-001": "Authorization checks on every operation request; no automated probe in the pinned TCK.",
+    "AUTH-SCOPE-002": "Results scoped to caller's authorization boundaries; no automated probe in the pinned TCK.",
+    "AUTH-SCOPE-003": "Server must not reveal existence of unauthorized resources; no automated probe in the pinned TCK.",
+    "AUTH-SERVER-002": "Server must authenticate every incoming request; no automated probe in the pinned TCK.",
+    "BIND-EQUIV-001": "All supported protocols provide identical functionality; no automated probe in the pinned TCK.",
+    "BIND-EQUIV-002": "All bindings return semantically equivalent results; no automated probe in the pinned TCK.",
+    "BIND-EQUIV-003": "All bindings map errors consistently; no automated probe in the pinned TCK.",
+    "BIND-EQUIV-004": "All bindings support same authentication schemes; no automated probe in the pinned TCK.",
+    "GRPC-SVC-003": "gRPC over HTTP/2 with TLS; no automated probe in the pinned TCK.",
+    "VER-CLIENT-001": "Clients must send A2A-Version header with each request; no automated probe in the pinned TCK.",
+    "VER-CLIENT-002": "Patch version numbers must not affect negotiation; no automated probe in the pinned TCK.",
+    "VER-SERVER-001": "Agent processes requests using requested version semantics; no automated probe in the pinned TCK."
+  },
+  "must_requirements": {
+    "AUTH-INTASK-001": {
+      "status": "NOT TESTED",
+      "transports": {}
+    },
+    "AUTH-INTASK-002": {
+      "status": "NOT TESTED",
+      "transports": {}
+    },
+    "AUTH-INTASK-003": {
+      "status": "NOT TESTED",
+      "transports": {}
+    },
+    "AUTH-INTASK-004": {
+      "status": "NOT TESTED",
+      "transports": {}
+    },
+    "AUTH-SCOPE-001": {
+      "status": "NOT TESTED",
+      "transports": {}
+    },
+    "AUTH-SCOPE-002": {
+      "status": "NOT TESTED",
+      "transports": {}
+    },
+    "AUTH-SCOPE-003": {
+      "status": "NOT TESTED",
+      "transports": {}
+    },
+    "AUTH-SERVER-002": {
+      "status": "NOT TESTED",
+      "transports": {}
+    },
+    "AUTH-TLS-001": {
+      "status": "MANUAL",
+      "transports": {}
+    },
+    "BIND-CUSTOM-002": {
+      "status": "MANUAL",
+      "transports": {}
+    },
+    "BIND-EQUIV-001": {
+      "status": "NOT TESTED",
+      "transports": {}
+    },
+    "BIND-EQUIV-002": {
+      "status": "NOT TESTED",
+      "transports": {}
+    },
+    "BIND-EQUIV-003": {
+      "status": "NOT TESTED",
+      "transports": {}
+    },
+    "BIND-EQUIV-004": {
+      "status": "NOT TESTED",
+      "transports": {}
+    },
+    "BIND-FIELD-001": {
+      "status": "PASS",
+      "transports": {
+        "agent_card": "PASS"
+      }
+    },
+    "CARD-CLIENT-001": {
+      "status": "MANUAL",
+      "transports": {}
+    },
+    "CARD-DISC-001": {
+      "status": "PASS",
+      "transports": {
+        "agent_card": "PASS"
+      }
+    },
+    "CARD-EXT-001": {
+      "status": "SKIPPED",
+      "transports": {
+        "jsonrpc": "SKIPPED",
+        "http_json": "SKIPPED",
+        "grpc": "SKIPPED"
+      }
+    },
+    "CARD-EXT-002": {
+      "status": "SKIPPED",
+      "transports": {
+        "jsonrpc": "SKIPPED",
+        "http_json": "SKIPPED",
+        "grpc": "SKIPPED"
+      }
+    },
+    "CARD-PROTO-001": {
+      "status": "PASS",
+      "transports": {
+        "agent_card": "PASS"
+      }
+    },
+    "CARD-PROTO-002": {
+      "status": "PASS",
+      "transports": {
+        "agent_card": "PASS"
+      }
+    },
+    "CARD-SIGN-001": {
+      "status": "MANUAL",
+      "transports": {}
+    },
+    "CARD-SIGN-002": {
+      "status": "MANUAL",
+      "transports": {}
+    },
+    "CARD-SIGN-003": {
+      "status": "MANUAL",
+      "transports": {}
+    },
+    "CARD-SIGN-004": {
+      "status": "MANUAL",
+      "transports": {}
+    },
+    "CARD-STRUCT-001": {
+      "status": "PASS",
+      "transports": {
+        "agent_card": "PASS"
+      }
+    },
+    "CORE-CANCEL-001": {
+      "status": "PASS",
+      "transports": {
+        "grpc": "SKIPPED",
+        "jsonrpc": "PASS",
+        "http_json": "PASS"
+      }
+    },
+    "CORE-CANCEL-002": {
+      "status": "PASS",
+      "transports": {
+        "grpc": "SKIPPED",
+        "jsonrpc": "PASS",
+        "http_json": "PASS"
+      }
+    },
+    "CORE-CANCEL-003": {
+      "status": "PASS",
+      "transports": {
+        "grpc": "SKIPPED",
+        "jsonrpc": "PASS",
+        "http_json": "PASS"
+      }
+    },
+    "CORE-CAP-001": {
+      "status": "PASS",
+      "transports": {
+        "jsonrpc": "PASS",
+        "http_json": "PASS"
+      }
+    },
+    "CORE-CAP-002": {
+      "status": "SKIPPED",
+      "transports": {
+        "jsonrpc": "SKIPPED"
+      }
+    },
+    "CORE-CAP-003": {
+      "status": "PASS",
+      "transports": {
+        "jsonrpc": "PASS"
+      }
+    },
+    "CORE-CAP-004": {
+      "status": "SKIPPED",
+      "transports": {
+        "jsonrpc": "SKIPPED",
+        "http_json": "SKIPPED"
+      }
+    },
+    "CORE-ERR-001": {
+      "status": "PASS",
+      "transports": {
+        "jsonrpc": "PASS",
+        "http_json": "PASS"
+      }
+    },
+    "CORE-ERR-002": {
+      "status": "PASS",
+      "transports": {
+        "jsonrpc": "PASS",
+        "http_json": "PASS"
+      }
+    },
+    "CORE-EXECUTION-MODE-001": {
+      "status": "PASS",
+      "transports": {
+        "grpc": "SKIPPED",
+        "jsonrpc": "PASS",
+        "http_json": "PASS"
+      }
+    },
+    "CORE-EXECUTION-MODE-002": {
+      "status": "PASS",
+      "transports": {
+        "grpc": "SKIPPED",
+        "jsonrpc": "PASS",
+        "http_json": "PASS"
+      }
+    },
+    "CORE-GET-001": {
+      "status": "PASS",
+      "transports": {
+        "grpc": "SKIPPED",
+        "jsonrpc": "PASS",
+        "http_json": "PASS"
+      }
+    },
+    "CORE-GET-002": {
+      "status": "PASS",
+      "transports": {
+        "grpc": "SKIPPED",
+        "jsonrpc": "PASS",
+        "http_json": "PASS"
+      }
+    },
+    "CORE-HIST-002": {
+      "status": "PASS",
+      "transports": {
+        "grpc": "SKIPPED",
+        "jsonrpc": "PASS",
+        "http_json": "PASS"
+      }
+    },
+    "CORE-LIST-001": {
+      "status": "PASS",
+      "transports": {
+        "grpc": "SKIPPED",
+        "jsonrpc": "PASS",
+        "http_json": "PASS"
+      }
+    },
+    "CORE-LIST-002": {
+      "status": "PASS",
+      "transports": {
+        "grpc": "SKIPPED",
+        "jsonrpc": "PASS",
+        "http_json": "PASS"
+      }
+    },
+    "CORE-LIST-003": {
+      "status": "PASS",
+      "transports": {
+        "grpc": "SKIPPED",
+        "jsonrpc": "PASS",
+        "http_json": "PASS"
+      }
+    },
+    "CORE-LIST-004": {
+      "status": "PASS",
+      "transports": {
+        "grpc": "SKIPPED",
+        "jsonrpc": "PASS",
+        "http_json": "PASS"
+      }
+    },
+    "CORE-LIST-005": {
+      "status": "PASS",
+      "transports": {
+        "grpc": "SKIPPED",
+        "jsonrpc": "PASS",
+        "http_json": "PASS"
+      }
+    },
+    "CORE-MULTI-001a": {
+      "status": "PASS",
+      "transports": {
+        "grpc": "SKIPPED",
+        "jsonrpc": "PASS",
+        "http_json": "PASS"
+      }
+    },
+    "CORE-MULTI-002a": {
+      "status": "PASS",
+      "transports": {
+        "grpc": "SKIPPED",
+        "jsonrpc": "PASS",
+        "http_json": "PASS"
+      }
+    },
+    "CORE-MULTI-003": {
+      "status": "PASS",
+      "transports": {
+        "grpc": "SKIPPED",
+        "jsonrpc": "PASS",
+        "http_json": "PASS"
+      }
+    },
+    "CORE-MULTI-004": {
+      "status": "PASS",
+      "transports": {
+        "grpc": "SKIPPED",
+        "jsonrpc": "PASS",
+        "http_json": "PASS"
+      }
+    },
+    "CORE-MULTI-005": {
+      "status": "PASS",
+      "transports": {
+        "grpc": "SKIPPED",
+        "jsonrpc": "PASS",
+        "http_json": "PASS"
+      }
+    },
+    "CORE-MULTI-006": {
+      "status": "PASS",
+      "transports": {
+        "grpc": "SKIPPED",
+        "jsonrpc": "PASS",
+        "http_json": "PASS"
+      }
+    },
+    "CORE-SEND-001": {
+      "status": "PASS",
+      "transports": {
+        "grpc": "SKIPPED",
+        "jsonrpc": "PASS",
+        "http_json": "PASS"
+      }
+    },
+    "CORE-SEND-002": {
+      "status": "PASS",
+      "transports": {
+        "grpc": "SKIPPED",
+        "jsonrpc": "PASS",
+        "http_json": "PASS"
+      }
+    },
+    "CORE-SEND-003": {
+      "status": "PASS",
+      "transports": {
+        "grpc": "SKIPPED",
+        "jsonrpc": "PASS",
+        "http_json": "PASS"
+      }
+    },
+    "CORE-STREAM-001": {
+      "status": "PASS",
+      "transports": {
+        "grpc": "SKIPPED",
+        "jsonrpc": "PASS",
+        "http_json": "PASS"
+      }
+    },
+    "CORE-STREAM-002": {
+      "status": "PASS",
+      "transports": {
+        "grpc": "SKIPPED",
+        "jsonrpc": "PASS",
+        "http_json": "PASS"
+      }
+    },
+    "CORE-STREAM-003": {
+      "status": "PASS",
+      "transports": {
+        "grpc": "SKIPPED",
+        "jsonrpc": "PASS",
+        "http_json": "PASS"
+      }
+    },
+    "DM-ART-001": {
+      "status": "PASS",
+      "transports": {
+        "grpc": "SKIPPED",
+        "jsonrpc": "PASS",
+        "http_json": "PASS"
+      }
+    },
+    "DM-MSG-001": {
+      "status": "PASS",
+      "transports": {
+        "grpc": "SKIPPED",
+        "jsonrpc": "PASS",
+        "http_json": "PASS"
+      }
+    },
+    "DM-MSG-002": {
+      "status": "PASS",
+      "transports": {
+        "jsonrpc": "PASS",
+        "http_json": "PASS"
+      }
+    },
+    "DM-PART-001": {
+      "status": "PASS",
+      "transports": {
+        "jsonrpc": "PASS",
+        "http_json": "PASS"
+      }
+    },
+    "DM-SERIAL-001": {
+      "status": "PASS",
+      "transports": {
+        "jsonrpc": "PASS",
+        "http_json": "PASS"
+      }
+    },
+    "DM-SERIAL-002": {
+      "status": "PASS",
+      "transports": {
+        "jsonrpc": "PASS",
+        "http_json": "PASS"
+      }
+    },
+    "DM-SERIAL-003": {
+      "status": "PASS",
+      "transports": {
+        "jsonrpc": "PASS",
+        "http_json": "PASS"
+      }
+    },
+    "DM-SERIAL-004": {
+      "status": "PASS",
+      "transports": {
+        "jsonrpc": "PASS",
+        "http_json": "PASS"
+      }
+    },
+    "DM-STATUS-001": {
+      "status": "PASS",
+      "transports": {
+        "jsonrpc": "PASS",
+        "http_json": "PASS"
+      }
+    },
+    "DM-TASK-001": {
+      "status": "PASS",
+      "transports": {
+        "jsonrpc": "PASS",
+        "http_json": "PASS"
+      }
+    },
+    "DM-TASK-002": {
+      "status": "PASS",
+      "transports": {
+        "jsonrpc": "PASS",
+        "http_json": "PASS"
+      }
+    },
+    "GRPC-ERR-001": {
+      "status": "SKIPPED",
+      "transports": {
+        "grpc": "SKIPPED"
+      }
+    },
+    "GRPC-ERR-002": {
+      "status": "SKIPPED",
+      "transports": {
+        "grpc": "SKIPPED"
+      }
+    },
+    "GRPC-ERR-003": {
+      "status": "SKIPPED",
+      "transports": {
+        "grpc": "SKIPPED"
+      }
+    },
+    "GRPC-META-001": {
+      "status": "SKIPPED",
+      "transports": {
+        "grpc": "SKIPPED"
+      }
+    },
+    "GRPC-SVC-001": {
+      "status": "SKIPPED",
+      "transports": {
+        "grpc": "SKIPPED"
+      }
+    },
+    "GRPC-SVC-002": {
+      "status": "SKIPPED",
+      "transports": {
+        "grpc": "SKIPPED"
+      }
+    },
+    "GRPC-SVC-003": {
+      "status": "NOT TESTED",
+      "transports": {}
+    },
+    "HTTP_JSON-ERR-001": {
+      "status": "PASS",
+      "transports": {
+        "http_json": "PASS"
+      }
+    },
+    "HTTP_JSON-ERR-002": {
+      "status": "PASS",
+      "transports": {
+        "http_json": "PASS"
+      }
+    },
+    "HTTP_JSON-FMT-001": {
+      "status": "PASS",
+      "transports": {
+        "http_json": "PASS"
+      }
+    },
+    "HTTP_JSON-QP-001": {
+      "status": "PASS",
+      "transports": {
+        "http_json": "PASS"
+      }
+    },
+    "HTTP_JSON-SSE-001": {
+      "status": "PASS",
+      "transports": {
+        "http_json": "PASS"
+      }
+    },
+    "HTTP_JSON-STATUS-001": {
+      "status": "PASS",
+      "transports": {
+        "http_json": "PASS"
+      }
+    },
+    "HTTP_JSON-SVC-002": {
+      "status": "PASS",
+      "transports": {
+        "http_json": "PASS"
+      }
+    },
+    "HTTP_JSON-URL-001": {
+      "status": "PASS",
+      "transports": {
+        "http_json": "PASS"
+      }
+    },
+    "HTTP_JSON-URL-002": {
+      "status": "PASS",
+      "transports": {
+        "http_json": "PASS"
+      }
+    },
+    "JSONRPC-ERR-001": {
+      "status": "PASS",
+      "transports": {
+        "jsonrpc": "PASS"
+      }
+    },
+    "JSONRPC-ERR-002": {
+      "status": "PASS",
+      "transports": {
+        "jsonrpc": "PASS"
+      }
+    },
+    "JSONRPC-FMT-001": {
+      "status": "PASS",
+      "transports": {
+        "jsonrpc": "PASS"
+      }
+    },
+    "JSONRPC-FMT-002": {
+      "status": "PASS",
+      "transports": {
+        "jsonrpc": "PASS"
+      }
+    },
+    "JSONRPC-SSE-001": {
+      "status": "PASS",
+      "transports": {
+        "jsonrpc": "PASS"
+      }
+    },
+    "JSONRPC-SSE-002": {
+      "status": "PASS",
+      "transports": {
+        "jsonrpc": "PASS"
+      }
+    },
+    "JSONRPC-SVC-001": {
+      "status": "PASS",
+      "transports": {
+        "jsonrpc": "PASS"
+      }
+    },
+    "JSONRPC-SVC-002": {
+      "status": "PASS",
+      "transports": {
+        "jsonrpc": "PASS"
+      }
+    },
+    "PUSH-CREATE-001": {
+      "status": "SKIPPED",
+      "transports": {
+        "grpc": "SKIPPED",
+        "jsonrpc": "SKIPPED",
+        "http_json": "SKIPPED"
+      }
+    },
+    "PUSH-CREATE-002": {
+      "status": "SKIPPED",
+      "transports": {
+        "grpc": "SKIPPED",
+        "jsonrpc": "SKIPPED",
+        "http_json": "SKIPPED"
+      }
+    },
+    "PUSH-DEL-001": {
+      "status": "SKIPPED",
+      "transports": {
+        "grpc": "SKIPPED",
+        "jsonrpc": "SKIPPED",
+        "http_json": "SKIPPED"
+      }
+    },
+    "PUSH-DEL-002": {
+      "status": "SKIPPED",
+      "transports": {
+        "grpc": "SKIPPED",
+        "jsonrpc": "SKIPPED",
+        "http_json": "SKIPPED"
+      }
+    },
+    "PUSH-DELIVER-001": {
+      "status": "SKIPPED",
+      "transports": {
+        "grpc": "SKIPPED",
+        "jsonrpc": "SKIPPED",
+        "http_json": "SKIPPED"
+      }
+    },
+    "PUSH-DELIVER-002": {
+      "status": "SKIPPED",
+      "transports": {
+        "grpc": "SKIPPED",
+        "jsonrpc": "SKIPPED",
+        "http_json": "SKIPPED"
+      }
+    },
+    "PUSH-DELIVER-003": {
+      "status": "SKIPPED",
+      "transports": {
+        "grpc": "SKIPPED",
+        "jsonrpc": "SKIPPED",
+        "http_json": "SKIPPED"
+      }
+    },
+    "PUSH-GET-001": {
+      "status": "SKIPPED",
+      "transports": {
+        "grpc": "SKIPPED",
+        "jsonrpc": "SKIPPED",
+        "http_json": "SKIPPED"
+      }
+    },
+    "PUSH-GET-002": {
+      "status": "SKIPPED",
+      "transports": {
+        "grpc": "SKIPPED",
+        "jsonrpc": "SKIPPED",
+        "http_json": "SKIPPED"
+      }
+    },
+    "PUSH-LIST-001": {
+      "status": "SKIPPED",
+      "transports": {
+        "grpc": "SKIPPED",
+        "jsonrpc": "SKIPPED",
+        "http_json": "SKIPPED"
+      }
+    },
+    "STREAM-ORDER-001": {
+      "status": "PASS",
+      "transports": {
+        "grpc": "SKIPPED",
+        "jsonrpc": "PASS",
+        "http_json": "PASS"
+      }
+    },
+    "STREAM-ORDER-002": {
+      "status": "PASS",
+      "transports": {
+        "grpc": "SKIPPED",
+        "jsonrpc": "PASS",
+        "http_json": "PASS"
+      }
+    },
+    "STREAM-ORDER-003": {
+      "status": "PASS",
+      "transports": {
+        "grpc": "SKIPPED",
+        "jsonrpc": "PASS",
+        "http_json": "PASS"
+      }
+    },
+    "STREAM-ORDER-004": {
+      "status": "PASS",
+      "transports": {
+        "grpc": "SKIPPED",
+        "jsonrpc": "PASS",
+        "http_json": "PASS"
+      }
+    },
+    "STREAM-SUB-001": {
+      "status": "PASS",
+      "transports": {
+        "grpc": "SKIPPED",
+        "jsonrpc": "PASS"
+      }
+    },
+    "STREAM-SUB-002": {
+      "status": "PASS",
+      "transports": {
+        "grpc": "SKIPPED",
+        "jsonrpc": "PASS",
+        "http_json": "PASS"
+      }
+    },
+    "STREAM-SUB-003": {
+      "status": "PASS",
+      "transports": {
+        "grpc": "SKIPPED",
+        "jsonrpc": "PASS",
+        "http_json": "PASS"
+      }
+    },
+    "STREAM-SUB-004": {
+      "status": "PASS",
+      "transports": {
+        "grpc": "SKIPPED",
+        "jsonrpc": "PASS",
+        "http_json": "PASS"
+      }
+    },
+    "VER-CLIENT-001": {
+      "status": "NOT TESTED",
+      "transports": {}
+    },
+    "VER-CLIENT-002": {
+      "status": "NOT TESTED",
+      "transports": {}
+    },
+    "VER-SERVER-001": {
+      "status": "NOT TESTED",
+      "transports": {}
+    },
+    "VER-SERVER-002": {
+      "status": "PASS",
+      "transports": {
+        "jsonrpc": "PASS",
+        "http_json": "PASS"
+      }
+    },
+    "VER-SERVER-003": {
+      "status": "PASS",
+      "transports": {
+        "jsonrpc": "PASS"
+      }
+    }
+  }
+}

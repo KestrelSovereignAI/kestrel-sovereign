@@ -29,7 +29,6 @@ teardown, so the ``embedding_vec`` column a first write creates (#3411) is
 sized for that case alone and never pins the shared table's width.
 """
 
-import os
 import uuid
 
 import pytest
@@ -298,7 +297,7 @@ async def test_embedding_profile_rows_cross_from_a_sqlite_anchor(pg, tmp_path):
         )
 
 
-async def test_birth_record_replicates_into_postgres_with_vectors(pg, tmp_path):
+async def test_birth_record_replicates_into_postgres_with_vectors(pg, tmp_path, monkeypatch):
     """End to end on the real backend: a SQLite anchor's record — including
     chunk vectors — lands in PostgreSQL, and a second pass is a no-op."""
     from kestrel_sovereign.identity.birth_record import (
@@ -313,8 +312,8 @@ async def test_birth_record_replicates_into_postgres_with_vectors(pg, tmp_path):
     from kestrel_sovereign.storage.async_graph_store import AsyncGraphStore
     from kestrel_sovereign.storage.async_rag_store import AsyncRAGStore, IndexedChunk
 
-    os.environ.setdefault("KESTREL_DATA_KEY", "test-master-key-for-encryption-32chars!")
-    os.environ.setdefault(DID_WEB_DOMAIN_ENV, "agents.kestrel-sovereign.test")
+    monkeypatch.setenv("KESTREL_DATA_KEY", "test-master-key-for-encryption-32chars!")
+    monkeypatch.setenv(DID_WEB_DOMAIN_ENV, "agents.kestrel-sovereign.test")
 
     creds = await create_kestrel_identity_async(
         str(tmp_path), None, agent_name="Postgres Bird",

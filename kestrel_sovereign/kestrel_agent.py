@@ -11,6 +11,7 @@ import sys
 import time
 from dataclasses import dataclass
 from dataclasses import replace as _replace_dataclass
+from functools import partial
 from pathlib import Path, PurePath
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Mapping, Optional
 from uuid import uuid4
@@ -84,16 +85,9 @@ class _BackgroundShutdownControl(RuntimeError):
 
 from kestrel_sdk.hooks.base import HookEvent, HookInput
 
-from kestrel_sovereign.a2a.stores import (
-    SQLiteFeedbackStore,
-    SQLiteMemoryService,
-    SQLiteObservabilityStore,
-    SQLiteSessionService,
-    SQLiteTaskStore,
-)
+from kestrel_sovereign.a2a.scope import NativeRecipientScope
 from kestrel_sovereign.a2a.task_manager import TaskManager
 
-# PostgreSQL stores imported conditionally when pg_pool is available
 from kestrel_sovereign.agent import ContextBuilder, ContextManager
 from kestrel_sovereign.agent.backup import BackupMixin
 from kestrel_sovereign.agent.boot import (
@@ -153,6 +147,8 @@ from kestrel_sovereign.command_policy import (
 from kestrel_sovereign.execution_custody import (
     _explicit_control_chain,
     execution_native_source_error,
+    execution_observation_error,
+    execution_observer_cancellations,
     execution_terminal_error,
     execution_work_operation,
     is_execution_control_error,
@@ -187,7 +183,7 @@ from kestrel_sovereign.telemetry import (
 )
 
 if TYPE_CHECKING:
-    from kestrel_sovereign.a2a.agent_card import AgentCard
+    from kestrel_sdk.native_a2a.types import AgentCard
     from kestrel_sovereign.execution_custody import ExecutionCustody
     from kestrel_sovereign.features.peers.directory import (
         PeerDirectoryRouter,
@@ -538,9 +534,17 @@ async def enter_feature_lifecycle_safe_mode(agent: object, reason: str, *errors,
     """
     cause = SafeModeCause.FEATURE_LIFECYCLE_UNCERTAIN.value
     _retain_feature_lifecycle_safe_mode(agent, reason, *errors)
-    controls = [error for error in errors if is_execution_control_error(error)]
-    withdrawals = [error for error in errors if isinstance(error, asyncio.CancelledError)
-                   and not is_execution_control_error(error)]
+    controls, withdrawals = [], []
+    def retain_failure(error):
+        if is_execution_control_error(error):
+            controls.append(error)
+        elif isinstance(error, asyncio.CancelledError):
+            withdrawals.append(error)
+        elif isinstance(error, BaseExceptionGroup):
+            _raise_unexpected_lifecycle_exception_group(error)
+            withdrawals.extend(execution_observer_cancellations(error))
+    for error in errors:
+        retain_failure(error)
     quarantine = getattr(agent, "_quarantine_feature_contributions", None)
     for feature in features:
         feature.enabled = False
@@ -548,12 +552,7 @@ async def enter_feature_lifecycle_safe_mode(agent: object, reason: str, *errors,
             try:
                 quarantine(feature)
             except (Exception, asyncio.CancelledError, BaseExceptionGroup) as error:
-                if is_execution_control_error(error):
-                    controls.append(error)
-                elif isinstance(error, asyncio.CancelledError):
-                    withdrawals.append(error)
-                elif isinstance(error, BaseExceptionGroup):
-                    _raise_unexpected_lifecycle_exception_group(error)
+                retain_failure(error)
     try:
         enter = getattr(agent, "enter_safe_mode", None)
         if callable(enter):
@@ -561,12 +560,7 @@ async def enter_feature_lifecycle_safe_mode(agent: object, reason: str, *errors,
             if inspect.isawaitable(result):
                 await result
     except (Exception, asyncio.CancelledError, BaseExceptionGroup) as error:
-        if is_execution_control_error(error):
-            controls.append(error)
-        elif isinstance(error, asyncio.CancelledError):
-            withdrawals.append(error)
-        elif isinstance(error, BaseExceptionGroup):
-            _raise_unexpected_lifecycle_exception_group(error)
+        retain_failure(error)
     finally:
         _retain_feature_lifecycle_safe_mode(agent, reason, *controls)
     withdrawals.extend(
@@ -576,7 +570,7 @@ async def enter_feature_lifecycle_safe_mode(agent: object, reason: str, *errors,
         and all(error is not prior for prior in withdrawals)
     )
     terminal = execution_terminal_error(
-        agent._feature_lifecycle_control, *withdrawals, retain_originals=True,
+        agent._feature_lifecycle_control, *controls, *withdrawals, retain_originals=True,
         isolate_control_originals=True,
     )
     if terminal is not None:
@@ -2860,7 +2854,9 @@ class KestrelAgent(
         data_dir = self._serving_data_dir()
         if data_dir is None or self._serving_record is not None:
             return
-        self._serving_record = ServingRecord.acquire(data_dir)
+        self._serving_record = ServingRecord.acquire(
+            data_dir, storage_path=Path(self.storage_path)
+        )
 
     def _resource_custody(self) -> ResourceCustody:
         """The tracker of the resources this agent holds (#3522)."""
@@ -3214,41 +3210,13 @@ class KestrelAgent(
 
     async def _boot_phase_a2a_observability_signals(self, ctx: BootContext) -> None:
         """Phase 2 — A2A stores, observability, and the signal spine. TaskManager + its stores, the observability/feedback sinks, the enablement store, the SignalDispatcher/registries, and the core (always-on) signal sources."""
-        # Initialize TaskManager for A2A unified routing
-        # All stores use the abstract data layer (SQLite for sovereign, PostgreSQL for multi-tenant)
-        if self._db_backend.lower() == "postgres":
-            # Reuse storage's guarded native backend in both shared-pool and
-            # DSN-only modes; wrappers must not drop its retained generation.
-            pg_backend = self._raw_storage._backend
-            from kestrel_sovereign.a2a.stores.postgres import (
-                PostgresFeedbackStore,
-                PostgresMemoryService,
-                PostgresObservabilityStore,
-                PostgresSessionService,
-                PostgresTaskStore,
-            )
-            task_store = PostgresTaskStore(backend=pg_backend)
-            session_service = PostgresSessionService(backend=pg_backend)
-            observability_store = PostgresObservabilityStore(backend=pg_backend)
-            memory_service = PostgresMemoryService(backend=pg_backend)
-            feedback_store = PostgresFeedbackStore(backend=pg_backend)
-            logging.info(f"Using PostgreSQL A2A stores for agent {self.did}")
-        else:
-            # SQLite mode: use SQLite stores with file path
-            task_store_path = self.storage_path
-            task_store = SQLiteTaskStore(task_store_path)
-            session_service = SQLiteSessionService(task_store_path)
-            observability_store = SQLiteObservabilityStore(task_store_path)
-            memory_service = SQLiteMemoryService(task_store_path)
-            feedback_store = SQLiteFeedbackStore(task_store_path)
-            logging.info(f"Using SQLite A2A stores for agent {self.did}")
-
-        self.task_manager = TaskManager(
-            task_store=task_store,
-            session_service=session_service,
-            observability_store=observability_store,
-            memory_service=memory_service,
-            feedback_store=feedback_store,
+        # Native admission and context ownership share the primary connection.
+        # AsyncStorage owns this backend; every A2A store borrows it so partial
+        # boot rollback cannot retire storage still held by other services.
+        self.task_manager = TaskManager.from_backend(
+            self._raw_storage._backend,
+            scope=NativeRecipientScope(self.did),
+            owns_backend=False,
             hooks_manager=self.hooks_manager,  # Pass hooks manager for security
             on_task_complete=self._on_background_task_complete,  # For notifications
             # Inbound-task callback: when a peer creates a task
@@ -3267,11 +3235,10 @@ class KestrelAgent(
             # causation chain (serialized) so outbound A2A tasks
             # carry the lineage. The dispatcher sets the chain on
             # the agent before calling process_input for COGNITION
-            # signals; create_task reads it via this provider.
+            # signals; local execute_skill reads it via this provider.
             # See #905 review P1 — without this, A→B→A loops would
             # restart at depth 1 every iteration.
             causation_chain_provider=self._provide_causation_chain,
-            host_agent_id=self.did,
         )
         # Register teardown BEFORE initialize: ``TaskManager.initialize()`` opens
         # its A2A store connections (task/session/observability/memory/feedback)
@@ -3281,7 +3248,9 @@ class KestrelAgent(
         ctx.on_rollback("task_manager", self._boot_teardown_task_manager)
         await self.task_manager.initialize()
 
-        # Expose feedback store for features and commands
+        feedback_store = self.task_manager.feedback_store
+        observability_store = self.task_manager.observability_store
+        # Expose the canonical stores for features and commands.
         self.feedback_store = feedback_store
 
         # Expose observability store for orchestrator instrumentation
@@ -3467,7 +3436,12 @@ class KestrelAgent(
             DURABLE_COGNITION_CONSUMER_ID as A2A_SUBMITTED_COGNITION_CONSUMER_ID,
         )
 
+        from kestrel_sovereign.signals.sources.a2a_question_answered import (
+            DURABLE_COGNITION_CONSUMER_ID as A2A_QUESTION_COGNITION_CONSUMER_ID,
+        )
+
         for consumer_id, source in (
+            (A2A_QUESTION_COGNITION_CONSUMER_ID, "a2a.question_answered"),
             (A2A_COMPLETE_COGNITION_CONSUMER_ID, "a2a.task_complete"),
             (A2A_SUBMITTED_COGNITION_CONSUMER_ID, "a2a.task_submitted"),
         ):
@@ -3480,22 +3454,6 @@ class KestrelAgent(
                 )
             )
 
-        # Sender-side store for in-flight send_a2a_question
-        # correlation rows (#1444). PeersFeature.send_a2a_question
-        # inserts here on POST; the subscription supervisor marks
-        # RESOLVED on terminal SSE frame; the hourly expiry sweep
-        # walks ``list_waiting_past_deadline`` and marks EXPIRED.
-        from kestrel_sovereign.storage.async_pending_a2a_question_store import (
-            PendingA2AQuestionStore,
-        )
-        # ``agent_id`` is the agent's DID — scopes every query so a
-        # shared backend cannot leak rows across agents (codex
-        # round 1 P1 on PR #1453). DID is guaranteed non-None by
-        # the time we get here.
-        self.pending_a2a_questions = PendingA2AQuestionStore(
-            self._raw_storage.db,
-            agent_id=self.did or "",
-        )
 
 
     async def _boot_phase_providers_payer_sync(self, ctx: BootContext) -> None:
@@ -4661,7 +4619,12 @@ class KestrelAgent(
             DURABLE_COGNITION_CONSUMER_ID as A2A_SUBMITTED_COGNITION_CONSUMER_ID,
         )
 
+        from kestrel_sovereign.signals.sources.a2a_question_answered import (
+            DURABLE_COGNITION_CONSUMER_ID as A2A_QUESTION_COGNITION_CONSUMER_ID,
+        )
+
         for consumer_id in (
+            A2A_QUESTION_COGNITION_CONSUMER_ID,
             A2A_COMPLETE_COGNITION_CONSUMER_ID,
             A2A_SUBMITTED_COGNITION_CONSUMER_ID,
         ):
@@ -4824,6 +4787,12 @@ class KestrelAgent(
 
     async def _boot_teardown_storage(self) -> ReleaseOutcome:
         """Close the primary DB connection and drop the privacy layer."""
+        if self._resource_custody().is_held("task_manager"):
+            # Native stores and executions borrow this primary connection.
+            # A failed manager close must retain both handles until its retry
+            # has joined every execution and released every borrowed service.
+            logging.getLogger(__name__).error("boot rollback: retaining storage until native task-manager teardown completes")
+            return ReleaseOutcome.RETAINED
         # Dispatcher teardown owns a runtime-owner release against this very
         # backend.  If that release has not finished, retaining both handles
         # is the only safe rollback state: closing here would strand a live
@@ -4879,6 +4848,21 @@ class KestrelAgent(
                 return ReleaseOutcome.RETAINED
         return ReleaseOutcome.RELEASED
 
+    async def _close_native_task_manager(self, manager):
+        """Join standalone publication readers before releasing their primary store."""
+        authority = getattr(self, "_native_a2a_runtime_authority", None)
+        if authority is not None:
+            from kestrel_sovereign.a2a.native_standalone import (
+                SingleAgentNativeAuthority,
+            )
+
+            if not isinstance(authority, SingleAgentNativeAuthority):
+                raise TypeError("Native runtime publication requires its original authority owner")
+            if authority.recipient is not self or authority.manager is not manager:
+                raise ValueError("Native publication retirement belongs to another runtime or task manager")
+            await authority.close()
+        return await manager.close()
+
     async def _boot_teardown_task_manager(self) -> ReleaseOutcome:
         """Close the A2A TaskManager stores.
 
@@ -4890,7 +4874,7 @@ class KestrelAgent(
         if tm is None or not hasattr(tm, "close"):
             self.task_manager = None
             return ReleaseOutcome.RELEASED
-        outcome = reported_outcome(await tm.close())
+        outcome = reported_outcome(await self._close_native_task_manager(tm))
         if outcome is ReleaseOutcome.RELEASED and self.task_manager is tm:
             self.task_manager = None
         return outcome
@@ -6689,7 +6673,7 @@ class KestrelAgent(
         ``set_task_manager``). Any stage after the first can raise having left the
         EARLIER stages' registrations live: an ``on_enable`` failure strands the
         hooks already registered, and an ``_wire_feature_a2a`` failure past
-        ``register_agent`` strands both the hooks and the A2A agent. The old
+        ``register_provider`` strands both the hooks and the task provider. The old
         rollback popped the feature from ``self.features`` FIRST and then called
         only ``feature.shutdown()`` — which reverses the feature's OWN resources
         (signal sources / wait providers / owned tasks / sleep hooks) but NOT the
@@ -7125,15 +7109,12 @@ class KestrelAgent(
         await security.register_feature_tools(feature.name, feature)
 
     def _wire_feature_a2a(self, feature: "Feature") -> None:
-        """Register a feature as an A2A agent with the TaskManager.
+        """Register a feature's native skills with the host task manager.
 
-        Collects command prefixes, registers the feature's agent card + handler
-        for unified command routing, and wires the task_manager into features
-        that consume it. One source of truth shared by boot
-        (:meth:`_register_feature`) and runtime re-enable
-        (:meth:`_activate_feature_runtime`); the inverse is the
-        ``task_manager.unregister_agent`` call in
-        :meth:`_unregister_feature_runtime`.
+        A feature contributes skills and a handler; the serving agent owns the
+        single Agent Card and its transport interfaces. Boot and runtime
+        re-enable share this producer, and _unregister_feature_runtime removes
+        the same provider registration.
         """
         command_prefixes = {}
         for tool in feature.get_tools():
@@ -7144,15 +7125,16 @@ class KestrelAgent(
             )
 
         if self.task_manager:
-            agent_card = feature.get_agent_card()
-            self.task_manager.register_agent(
-                agent_card=agent_card,
+            skills = feature.get_agent_skills()
+            self.task_manager.register_provider(
+                provider_id=feature.name,
+                skills=skills,
                 handler=feature,
                 command_prefixes=command_prefixes,
             )
             logging.info(
-                f"Registered A2A agent '{agent_card.name}' with "
-                f"{len(agent_card.skills)} skills"
+                "Registered task provider '%s' with %d native skills",
+                feature.name, len(skills),
             )
 
             # Wire task_manager into features that need it
@@ -7318,6 +7300,11 @@ class KestrelAgent(
                 # Do not retain a third-party cleanup/quarantine exception as a
                 # printable cause; either may contain feature configuration.
                 raise quarantine_error from None
+            if withdrawals:
+                # A settled cleanup can report ordinary SQL failure together
+                # with this caller's withdrawal, without unresolved control.
+                # Retain withdrawal without exposing third-party cleanup text.
+                raise execution_observation_error(activation_error, *withdrawals) from None
             raise
 
         if notify_ready:
@@ -7355,7 +7342,8 @@ class KestrelAgent(
                 # let the enable endpoint report success after its caller left.
                 transition_task = asyncio.current_task()
                 if (
-                    isinstance(exc, asyncio.CancelledError)
+                    (isinstance(exc, asyncio.CancelledError)
+                     or execution_observer_cancellations(exc))
                     and transition_task is not None
                     and transition_task.cancelling()
                 ):
@@ -7382,7 +7370,7 @@ class KestrelAgent(
         * the feature's owned **signal sources** and **wait providers** (via
           ``feature.shutdown()`` — base :class:`Feature` unregisters both);
         * the hooks auto-registered from ``get_hooks()``;
-        * the A2A TaskManager agent registration;
+        * the native TaskManager provider registration;
         * the feature's dynamic tools + hidden-tool bookkeeping.
 
         ``unload`` controls the endpoint soft-toggle vs. full unload:
@@ -7427,7 +7415,9 @@ class KestrelAgent(
                 and not isinstance(error, Exception)
                 and not is_execution_control_error(error)
             ):
-                raise error
+                _raise_unexpected_lifecycle_exception_group(error)
+                if not execution_observer_cancellations(error):
+                    raise error
             errors.append(error)
             self._remember_shutdown_control(error)
 
@@ -7487,11 +7477,11 @@ class KestrelAgent(
 
         if self.task_manager:
             try:
-                self.task_manager.unregister_agent(feature.get_agent_card().name)
+                self.task_manager.unregister_provider(feature.name)
             except (Exception, asyncio.CancelledError, BaseExceptionGroup) as exc:
-                if isinstance(exc, BaseExceptionGroup) and not isinstance(exc, Exception) and not is_execution_control_error(exc):
-                    raise
-                if is_execution_control_error(exc):
+                if isinstance(exc, BaseExceptionGroup) and not isinstance(exc, Exception):
+                    retain_failure(exc)
+                elif is_execution_control_error(exc):
                     retain_failure(exc)
                 logging.warning(
                     "Failed to unregister feature '%s' from task manager: %s",
@@ -7550,9 +7540,7 @@ class KestrelAgent(
 
         # Surface the failure only AFTER every independent cleanup step ran.
         if errors:
-            raise execution_terminal_error(
-                *errors, retain_originals=True, isolate_control_originals=True,
-            )
+            raise execution_observation_error(*errors)
         return reported
 
     def _hold_feature(self, feature: "Feature") -> None:
@@ -9501,13 +9489,18 @@ Expected Duration: {expected_duration}
             context.run(_CURRENT_CUSTODY.set, (scope,))
         return context
 
-    def _track_runtime_task(self, coro, *, name: str) -> asyncio.Task:
+    def _track_runtime_task(self, coro, *, name: str, admission=None) -> asyncio.Task:
         """Publish an explicit first-party resident owner, never an effect child.
 
         Creation requires every current admission to be live; READY publication
         checks them again. Only then does this service run under the original
         runtime generation. Ordinary `_track_background_task` children retain
         all denying ancestors and never receive this handoff.
+        Resident ownership also identifies infrastructure to the idle restart
+        gate. Finite work admitted by a resident remains separately tracked.
+
+        An explicit admission receipt retains the exact accepted Task if later
+        publication raises; that caller must join it before releasing storage.
         """
         from kestrel_sovereign.execution_custody import require_execution_work
         try:
@@ -9530,14 +9523,26 @@ Expected Duration: {expected_duration}
         # it does not mint a replacement admission or refresh a generation.
         from kestrel_sovereign._async_ownership import create_owned_task
         try:
-            task = create_owned_task(resident(), name=name, context=context)
+            try:
+                task = create_owned_task(
+                    resident(), name=name, context=context, admission=admission,
+                )
+            finally:
+                if admission is not None and admission.task is not None:
+                    # The exact accepted owner survives even if create_owned
+                    # or a subsequent publication callback refuses to return.
+                    admission.task._kestrel_started_at = time.monotonic()
+                    admission.task._kestrel_runtime_service = True
+                    self._background_tasks.add(admission.task)
         except BaseException:
             # Canonical admission closes the refused resident wrapper. Its
             # submitted operation has not entered (READY remains separate),
             # so this original publisher must close that fresh coroutine too.
-            coro.close()
+            if admission is None or admission.task is None:
+                coro.close()
             raise
         task._kestrel_started_at = time.monotonic()
+        task._kestrel_runtime_service = True
         self._background_tasks.add(task)
 
         def completed(done):
@@ -9554,6 +9559,10 @@ Expected Duration: {expected_duration}
 
     async def _shutdown_background_tasks(self) -> None:
         tasks = set(self._background_tasks)
+        dispatcher = getattr(self, "dispatcher", None)
+        owners = getattr(type(dispatcher), "durable_owner_tasks", None)
+        if callable(owners):
+            tasks.difference_update(owners(dispatcher))
         if not tasks:
             self._raise_shutdown_control()
             return
@@ -9566,7 +9575,7 @@ Expected Duration: {expected_duration}
         from kestrel_sovereign._async_ownership import owned_task_error
         for task in tasks:
             self._remember_shutdown_control(owned_task_error(task))
-        self._background_tasks.clear()
+        self._background_tasks.difference_update(tasks)
         self._raise_shutdown_control()
 
     def _has_pending_llm_storage_dependents(self) -> bool:
@@ -10046,64 +10055,30 @@ Expected Duration: {expected_duration}
                 return name
         return default
 
+    async def get_public_profile(self) -> dict[str, str]:
+        """Public display fields shared by console discovery and signed cards."""
+        node = (
+            await self.storage.get_node(self.agent_id)
+            if self.storage is not None else None
+        )
+        description = "Constitutional AI Agent with sovereign memory"
+        if node is not None:
+            description = node.properties.get("description", description)
+        if not isinstance(description, str):
+            raise ValueError("Agent public description must be text")
+        return {
+            "name": self.resolve_effective_name(node, default="Kestrel Agent"),
+            "description": description,
+        }
+
     async def get_agent_card(self) -> "AgentCard":
-        """
-        Generate an AgentCard for this agent (for A2A discovery).
-        Returns agent identity, capabilities, and available skills.
-        """
-        from kestrel_sovereign.a2a.agent_card import (
-            AgentCapabilities,
-            AgentCard,
-            AgentProvider,
-        )
+        """Return this host's signed native card under its live publication lease."""
+        from kestrel_sovereign.a2a.native_publication import NativeA2APublication
 
-        # Get agent name from storage node if available
-        agent_name = "Kestrel Agent"
-        agent_description = "Constitutional AI Agent with sovereign memory"
-
-        agent_node = None
-        if self.storage:
-            try:
-                agent_node = await self.storage.get_node(self.agent_id)
-                if agent_node and agent_node.properties:
-                    agent_description = agent_node.properties.get("description", agent_description)
-            except Exception as e:
-                logging.warning(f"Could not load agent node for card generation: {e}")
-
-        # Prefer the live session name so a volatile-mode rename (which skips the
-        # durable node write) is reflected on the card instead of the stale stored
-        # name (#2672 review P2).
-        agent_name = self.resolve_effective_name(agent_node, default=agent_name)
-
-        # Build base URL - in production this would be the agent's public URL
-        # For now, use localhost
-        base_url = os.environ.get("KESTREL_BASE_URL", "http://localhost:8888")
-
-        # Collect skills from all features
-        skills = []
-        for feature in self.features.values():
-            if hasattr(feature, 'get_agent_card'):
-                feature_card = feature.get_agent_card()
-                skills.extend(feature_card.skills)
-
-        return AgentCard(
-            name=agent_name,
-            description=agent_description,
-            url=base_url,
-            version="0.1.0",
-            provider=AgentProvider(
-                organization="Kestrel Sovereign AI",
-                url="https://github.com/KestrelSovereignAI/kestrel-sovereign"
-            ),
-            capabilities=AgentCapabilities(
-                streaming=True,
-                pushNotifications=False,
-                stateTransitionHistory=True
-            ),
-            defaultInputModes=["text"],
-            defaultOutputModes=["text"],
-            skills=skills
-        )
+        publication = vars(self).get("_native_a2a_publication")
+        if not isinstance(publication, NativeA2APublication):
+            raise RuntimeError("Native Agent Card requires configured public hosting")
+        return await publication.get_card()
 
     async def _close_standalone_hold_context(
         self,
@@ -10185,11 +10160,12 @@ Expected Duration: {expected_duration}
         """
         finite_outcomes: list[BaseException] = []
 
-        def remember_finite(error):
+        def remember_finite(error, *, retain_ordinary=False):
             # Shared agent state owns source-only facts. This invocation still
             # owes its finite caller every actual delivered withdrawal.
             if error is not None and (
-                is_execution_control_error(error)
+                retain_ordinary
+                or is_execution_control_error(error)
                 or isinstance(error, asyncio.CancelledError)
             ) and all(error is not prior for prior in finite_outcomes):
                 finite_outcomes.append(error)
@@ -10214,6 +10190,14 @@ Expected Duration: {expected_duration}
         from kestrel_sovereign.execution_custody import (
             retire_process_runtime_custody,
         )
+        if dispatcher is not None:
+            try:
+                dispatcher.shutdown()
+            except BaseException as opening:  # noqa: BLE001 - re-raise the original after mandatory resource cleanup
+                # Admission may already be closed and its original completion
+                # accepted. Preserve the publication failure while the normal
+                # resource sweep and durable tail join that same close owner.
+                remember_finite(opening, retain_ordinary=True)
         # Borrowed tenant/shared host authority must never be retired by
         # shutting down one agent. Deny local children before any await.
         retire_process_runtime_custody(getattr(self, "_execution_custody", None))
@@ -10600,7 +10584,7 @@ Expected Duration: {expected_duration}
                 await _release_within(
                     "task_manager",
                     "TaskManager",
-                    self.task_manager.close,
+                    partial(self._close_native_task_manager, self.task_manager),
                     _step_budget(),
                 )
         except asyncio.CancelledError as cancellation:
@@ -11234,6 +11218,12 @@ Expected Duration: {expected_duration}
             # join. Neither SQLAlchemy nor primary storage may close early.
             return tail_result(True)
         await self._join_llm_storage_dependents()
+
+        if custody.is_held("task_manager"):
+            # The finite prefix could not join the native manager. Keep its
+            # primary backend and SQLAlchemy owners available for a retry.
+            logging.getLogger(__name__).warning("Retaining primary storage until native task-manager release completes")
+            return tail_result(True)
 
         # Dispose an optional cached SQLAlchemy engine as its own bounded
         # phase.  Otherwise a slow engine disposal can consume the guard that

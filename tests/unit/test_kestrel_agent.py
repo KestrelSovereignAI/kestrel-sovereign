@@ -63,6 +63,8 @@ def _durable_backend_double() -> MagicMock:
     """Provide the transactional backend contract used during signal boot."""
     backend = MagicMock()
     backend.backend_type = "sqlite"
+    backend.connect = AsyncMock()
+    backend.close = AsyncMock()
     backend.execute_script = AsyncMock()
     backend.execute = AsyncMock(return_value=1)
 
@@ -169,6 +171,17 @@ def _mandatory_feature_double(
     return feature_class(MagicMock())
 
 
+def _native_boot_task_manager_double(backend):
+    """Keep boot collaborators faithful to native sync/async service contracts."""
+    manager = AsyncMock()
+    manager.register_provider = MagicMock()
+    manager.unregister_provider = MagicMock()
+    manager.observability_store.backend = backend
+    manager.observability_store.set_privacy_config_provider = MagicMock()
+    manager.observability_store.purge_observability_since = AsyncMock(return_value={})
+    return manager
+
+
 async def _initialize_with_features(
     agent: KestrelAgent,
     features: list[Feature],
@@ -205,15 +218,8 @@ async def _initialize_with_features(
                     mock_memory_system.consolidator = MagicMock()
                     MockMemorySystem.return_value = mock_memory_system
 
-                    mock_task_manager = AsyncMock()
-                    mock_task_manager.initialize = AsyncMock()
-                    mock_task_manager.register_agent = MagicMock()
-                    # TaskManager's runtime unregister contract is
-                    # synchronous. Keep this double faithful so feature
-                    # rollback does not create an unawaited AsyncMock
-                    # coroutine during shutdown.
-                    mock_task_manager.unregister_agent = MagicMock()
-                    MockTaskManager.return_value = mock_task_manager
+                    mock_task_manager = _native_boot_task_manager_double(MockStorage.return_value._backend)
+                    MockTaskManager.from_backend.return_value = mock_task_manager
 
                     await agent.initialize()
 
@@ -3370,10 +3376,8 @@ class TestInitialize:
                         mock_memory_system.consolidator = MagicMock()
                         MockMemorySystem.return_value = mock_memory_system
 
-                        mock_task_manager = AsyncMock()
-                        mock_task_manager.initialize = AsyncMock()
-                        mock_task_manager.register_agent = MagicMock()
-                        MockTaskManager.return_value = mock_task_manager
+                        mock_task_manager = _native_boot_task_manager_double(MockStorage.return_value._backend)
+                        MockTaskManager.from_backend.return_value = mock_task_manager
 
                         await agent.initialize()
 
@@ -3415,10 +3419,8 @@ class TestInitialize:
                         mock_memory_system.consolidator = MagicMock()
                         MockMemorySystem.return_value = mock_memory_system
 
-                        mock_task_manager = AsyncMock()
-                        mock_task_manager.initialize = AsyncMock()
-                        mock_task_manager.register_agent = MagicMock()
-                        MockTaskManager.return_value = mock_task_manager
+                        mock_task_manager = _native_boot_task_manager_double(MockStorage.return_value._backend)
+                        MockTaskManager.from_backend.return_value = mock_task_manager
 
                         await agent.initialize()
 
@@ -3454,10 +3456,8 @@ class TestInitialize:
                         mock_memory_system.consolidator = MagicMock()
                         MockMemorySystem.return_value = mock_memory_system
 
-                        mock_task_manager = AsyncMock()
-                        mock_task_manager.initialize = AsyncMock()
-                        mock_task_manager.register_agent = MagicMock()
-                        MockTaskManager.return_value = mock_task_manager
+                        mock_task_manager = _native_boot_task_manager_double(MockStorage.return_value._backend)
+                        MockTaskManager.from_backend.return_value = mock_task_manager
 
                         await agent.initialize()
 
@@ -3494,10 +3494,8 @@ class TestInitialize:
                         mock_memory_system.consolidator = MagicMock()
                         MockMemorySystem.return_value = mock_memory_system
 
-                        mock_task_manager = AsyncMock()
-                        mock_task_manager.initialize = AsyncMock()
-                        mock_task_manager.register_agent = MagicMock()
-                        MockTaskManager.return_value = mock_task_manager
+                        mock_task_manager = _native_boot_task_manager_double(MockStorage.return_value._backend)
+                        MockTaskManager.from_backend.return_value = mock_task_manager
 
                         await agent.initialize()
 
@@ -3556,10 +3554,8 @@ class TestInitialize:
                         mock_memory_system.consolidator = MagicMock()
                         MockMemorySystem.return_value = mock_memory_system
 
-                        mock_task_manager = AsyncMock()
-                        mock_task_manager.initialize = AsyncMock()
-                        mock_task_manager.register_agent = MagicMock()
-                        MockTaskManager.return_value = mock_task_manager
+                        mock_task_manager = _native_boot_task_manager_double(MockStorage.return_value._backend)
+                        MockTaskManager.from_backend.return_value = mock_task_manager
 
                         await agent.initialize()
 

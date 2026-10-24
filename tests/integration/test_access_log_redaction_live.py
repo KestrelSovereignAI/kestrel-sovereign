@@ -37,12 +37,7 @@ def test_real_uvicorn_logs_redact_direct_and_multi_agent_sse_keys(monkeypatch):
     manager = SimpleNamespace(
         get_agent=lambda name: routed_agent if name.casefold() == "kite" else None,
     )
-    monkeypatch.setattr(
-        server_module.app.state,
-        "agent_manager",
-        manager,
-        raising=False,
-    )
+    app.state.agent_manager = manager
 
     # This is the real multi-agent ASGI router. It must sit inside auth and
     # query redaction, matching the main application's middleware order.

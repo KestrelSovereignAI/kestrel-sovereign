@@ -828,8 +828,20 @@ class TestCmdTerminateReportsOnlyVerifiedTermination:
         Treating EADDRNOTAVAIL as "taken" rejects a start uvicorn would have
         completed, and reports an incomplete shutdown on a usable port.
         """
-        # TEST-NET-1: valid, resolvable, and never assigned to this host.
-        assert ProcessManager.is_port_in_use(9998, "192.0.2.1") is False
+        import errno
+        import socket
+        import sys
+
+        # Darwin assigns only configured loopback aliases, unlike Linux's
+        # whole 127/8 route. Use an unassigned loopback alias there: this tests
+        # the real kernel error without requiring a nonlocal bind in offline
+        # test environments. Other platforms retain TEST-NET-1.
+        host = "127.254.253.252" if sys.platform == "darwin" else "192.0.2.1"
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+            with pytest.raises(OSError) as unassignable:
+                probe.bind((host, 0))
+        assert unassignable.value.errno == errno.EADDRNOTAVAIL
+        assert ProcessManager.is_port_in_use(9998, host) is False
 
     def test_an_unresolvable_bind_address_is_not_called_occupied(self, monkeypatch):
         """A typo is a configuration fault, not another process holding a port.
@@ -996,6 +1008,294 @@ class TestCmdTerminateReportsOnlyVerifiedTermination:
             "a dead host's PID file was kept because the port was still held; "
             "the number can be reused and signalled by the next command"
         )
+
+    @pytest.mark.parametrize("named", [True, False])
+    def test_an_agent_the_signal_never_reached_is_reported_as_such(
+        self, multi_agent_env, capsys, named
+    ):
+        """A standalone agent's refused signal is said, not called a SIGKILL.
+
+        ``terminate_agent`` used to wait out the stop deadline after a refused
+        signal and then report the agent "still running after SIGKILL", a
+        signal it never sent (#3781).
+        """
+        import subprocess as _subprocess
+        import sys as _sys
+
+        _repoint_ports(multi_agent_env, host=_free_port(), claw=_free_port(),
+                       testbot=_free_port())
+        agent = _subprocess.Popen(
+            [_sys.executable, "-c", "import time; time.sleep(300)"]
+        )
+        try:
+            ProcessManager.write_pid(
+                ProcessManager.agent_pid_file(
+                    (multi_agent_env / "agent_data" / "claw").resolve()
+                ),
+                agent.pid,
+            )
+            args = build_parser().parse_args(
+                ["terminate", "claw"] if named else ["terminate"]
+            )
+            with patch.object(ProcessManager, "kill_process",
+                              return_value=False) as kill, \
+                 patch.object(ProcessManager, "wait_for_exit") as wait, \
+                 patch("kestrel_sovereign.cli._get_project_dir",
+                       return_value=multi_agent_env):
+                rc = cmd_terminate(args)
+            assert agent.poll() is None
+        finally:
+            agent.kill()
+            agent.wait()
+
+        output = capsys.readouterr().out
+        assert rc == 1, output
+        kill.assert_called_once()
+        wait.assert_not_called()
+        assert (
+            f"claw: PID {agent.pid} could not be signalled and is still running"
+            in output
+        )
+        assert "SIGKILL" not in output
+
+
+@contextmanager
+def _running_host(env, *, ignore_sigterm=False):
+    """A real process recorded as the in-process host, stopped for real.
+
+    Nothing about its liveness is stubbed: the verified PID read, the signal
+    and the exit wait all act on this child, which this test owns.
+    """
+    import subprocess as _subprocess
+    import sys as _sys
+
+    from kestrel_sovereign.cli_lifecycle import _host_pid_file
+
+    script = (
+        "import signal, sys, time\n"
+        + ("signal.signal(signal.SIGTERM, signal.SIG_IGN)\n" if ignore_sigterm else "")
+        + "sys.stdout.write('ready\\n'); sys.stdout.flush()\n"
+        "time.sleep(300)\n"
+    )
+    host = _subprocess.Popen(
+        [_sys.executable, "-c", script], stdout=_subprocess.PIPE, text=True
+    )
+    try:
+        assert host.stdout.readline() == "ready\n"
+        ProcessManager.write_pid(_host_pid_file(env), host.pid)
+        assert ProcessManager.read_pid_record(_host_pid_file(env)).is_running
+        yield host
+    finally:
+        if host.poll() is None:
+            host.kill()
+        host.wait()
+        host.stdout.close()
+
+
+@pytest.mark.skipif(
+    __import__("sys").platform == "win32",
+    reason="exercises POSIX SIGTERM/SIGKILL against a real child",
+)
+class TestCmdTerminateInProcessHost:
+    """Stopping the in-process host (#3781)."""
+
+    def test_agent_ports_are_not_searched_while_the_host_serves_them(
+        self, multi_agent_env, capsys
+    ):
+        """In-process agents bind no port; listing every listener for each
+        one cost about half a second per agent on every restart."""
+        _repoint_ports(multi_agent_env, host=_free_port(), claw=_free_port(),
+                       testbot=_free_port())
+        args = build_parser().parse_args(["terminate"])
+
+        with _running_host(multi_agent_env) as host, \
+             patch.object(ProcessManager, "find_pids_on_port",
+                          return_value=[]) as search, \
+             patch("kestrel_sovereign.cli._get_project_dir",
+                   return_value=multi_agent_env):
+            rc = cmd_terminate(args)
+            assert host.poll() is not None, "the host was not stopped"
+
+        output = capsys.readouterr().out
+        assert rc == 0, output
+        assert "MultiAgent terminated" in output
+        search.assert_not_called()
+
+    def test_a_held_agent_port_beside_the_host_is_still_searched(
+        self, multi_agent_env, capsys
+    ):
+        """A standalone agent can run beside the host; its port gets the
+        orphan search exactly as before."""
+        import socket as _socket
+
+        held = _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM)
+        held.bind(("127.0.0.1", 0))
+        held.listen(1)
+        claw_port = held.getsockname()[1]
+        try:
+            _repoint_ports(multi_agent_env, host=_free_port(), claw=claw_port,
+                           testbot=_free_port())
+            args = build_parser().parse_args(["terminate"])
+            with _running_host(multi_agent_env), \
+                 patch.object(ProcessManager, "find_pids_on_port",
+                              return_value=[]) as search, \
+                 patch("kestrel_sovereign.cli._get_project_dir",
+                       return_value=multi_agent_env):
+                rc = cmd_terminate(args)
+        finally:
+            held.close()
+
+        output = capsys.readouterr().out
+        assert rc == 1, output
+        assert f"port :{claw_port} is still in use" in output
+        search.assert_called_once_with(claw_port)
+
+    def test_agent_ports_are_searched_when_no_host_runs(self, multi_agent_env):
+        """Without a host there is no in-process mode to rely on."""
+        claw_port, testbot_port = _free_port(), _free_port()
+        _repoint_ports(multi_agent_env, host=_free_port(), claw=claw_port,
+                       testbot=testbot_port)
+        args = build_parser().parse_args(["terminate"])
+
+        with patch.object(ProcessManager, "find_pids_on_port",
+                          return_value=[]) as search, \
+             patch("kestrel_sovereign.cli._get_project_dir",
+                   return_value=multi_agent_env):
+            cmd_terminate(args)
+
+        searched = {call.args[0] for call in search.call_args_list}
+        assert {claw_port, testbot_port} <= searched
+
+    def test_the_host_gets_the_full_stop_deadline(self, multi_agent_env, capsys):
+        """A SIGKILL inside the graceful window skips the app's shutdown."""
+        from kestrel_sovereign.multi_agent.process_manager import (
+            SERVER_TERMINATE_TIMEOUT_SECONDS,
+        )
+
+        _repoint_ports(multi_agent_env, host=_free_port(), claw=_free_port(),
+                       testbot=_free_port())
+        args = build_parser().parse_args(["terminate"])
+
+        with _running_host(multi_agent_env) as host, \
+             patch.object(ProcessManager, "wait_for_exit",
+                          wraps=ProcessManager.wait_for_exit) as wait, \
+             patch("kestrel_sovereign.cli._get_project_dir",
+                   return_value=multi_agent_env):
+            rc = cmd_terminate(args)
+
+        output = capsys.readouterr().out
+        assert rc == 0, output
+        wait.assert_called_once_with(host.pid, SERVER_TERMINATE_TIMEOUT_SECONDS)
+        assert "SIGKILL" not in output
+
+    def test_a_host_that_outlives_the_deadline_is_killed_and_says_so(
+        self, multi_agent_env, capsys, monkeypatch
+    ):
+        from kestrel_sovereign import cli_lifecycle
+
+        monkeypatch.setattr(cli_lifecycle, "SERVER_TERMINATE_TIMEOUT_SECONDS", 0.5)
+        _repoint_ports(multi_agent_env, host=_free_port(), claw=_free_port(),
+                       testbot=_free_port())
+        args = build_parser().parse_args(["terminate"])
+
+        with _running_host(multi_agent_env, ignore_sigterm=True) as host, \
+             patch("kestrel_sovereign.cli._get_project_dir",
+                   return_value=multi_agent_env):
+            rc = cmd_terminate(args)
+            host.wait(timeout=10)
+
+        output = capsys.readouterr().out
+        assert rc == 0, output
+        assert "sending SIGKILL; its shutdown did not complete" in output
+        assert "MultiAgent terminated" in output
+
+    def test_a_host_the_signal_never_reached_is_not_waited_for(
+        self, multi_agent_env, capsys
+    ):
+        """No signal, no shutdown to wait out: report at once (#3781).
+
+        ``os.kill`` refused (a host under another uid) used to cost the whole
+        stop deadline before the same failure was reported.
+        """
+        _repoint_ports(multi_agent_env, host=_free_port(), claw=_free_port(),
+                       testbot=_free_port())
+        args = build_parser().parse_args(["terminate"])
+
+        with _running_host(multi_agent_env) as host, \
+             patch.object(ProcessManager, "kill_process",
+                          return_value=False) as kill, \
+             patch.object(ProcessManager, "wait_for_exit") as wait, \
+             patch("kestrel_sovereign.cli._get_project_dir",
+                   return_value=multi_agent_env):
+            rc = cmd_terminate(args)
+            assert host.poll() is None
+
+        output = capsys.readouterr().out
+        assert rc == 1, output
+        kill.assert_called_once()
+        wait.assert_not_called()
+        assert f"PID {host.pid} could not be signalled and is still running" in output
+        assert "SIGKILL" not in output
+
+
+def _orphan_server(shutdown_seconds: float):
+    """A real untracked server that frees its port before it has finished.
+
+    Like uvicorn: on SIGTERM it closes its listening socket at once, then
+    spends ``shutdown_seconds`` shutting down before it exits.
+    """
+    import subprocess as _subprocess
+    import sys as _sys
+
+    script = (
+        "import signal, socket, sys, time\n"
+        "listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)\n"
+        "listener.bind(('127.0.0.1', 0))\n"
+        "listener.listen(1)\n"
+        "stop = []\n"
+        "signal.signal(signal.SIGTERM, lambda *_: stop.append(True))\n"
+        "sys.stdout.write(f'{listener.getsockname()[1]}\\n'); sys.stdout.flush()\n"
+        "while not stop:\n"
+        "    time.sleep(0.02)\n"
+        "listener.close()\n"
+        f"time.sleep({shutdown_seconds})\n"
+    )
+    return _subprocess.Popen(
+        [_sys.executable, "-c", script], stdout=_subprocess.PIPE, text=True
+    )
+
+
+@pytest.mark.skipif(
+    __import__("sys").platform == "win32",
+    reason="exercises a POSIX SIGTERM handler in a real child",
+)
+def test_reap_waits_for_the_server_not_just_its_port():
+    """A free port is not a stopped server (#3781).
+
+    With no PID record the host is stopped through its port. uvicorn closes
+    its listener first and runs the application's shutdown afterwards, so
+    returning as soon as the port frees let ``kestrel restart`` start a new
+    host beside the old one while the old one was still shutting down.
+    """
+    server = _orphan_server(shutdown_seconds=1.5)
+    try:
+        port = int(server.stdout.readline())
+        assert ProcessManager.is_port_in_use(port, "127.0.0.1")
+        with patch.object(
+            ProcessManager, "find_pids_on_port", return_value=[server.pid]
+        ):
+            result = _reap_orphans_on_port(
+                port, "host", force=False, bind="127.0.0.1"
+            )
+        exited = server.poll()
+    finally:
+        if server.poll() is None:
+            server.kill()
+        server.wait()
+        server.stdout.close()
+
+    assert result is PortReapResult.RELEASED
+    assert exited == 0, "the reap returned while the server was still shutting down"
 
 
 # -----------------------------------------------------------------------
@@ -1391,7 +1691,7 @@ class TestCmdLogs:
         assert str(log_file) in call_args
 
     def test_logs_follow_flag(self, multi_agent_env):
-        """Logs with -f flag should pass -f to tail."""
+        """Logs with -f follows the log by name, across a launch's rotation."""
         log_file = multi_agent_env / "logs" / "host.log"
         log_file.write_text("test log\n")
 
@@ -1403,7 +1703,8 @@ class TestCmdLogs:
             cmd_logs(args)
 
         call_args = mock_call.call_args[0][0]
-        assert "-f" in call_args
+        assert "-F" in call_args
+        assert "-f" not in call_args
 
 
 # -----------------------------------------------------------------------

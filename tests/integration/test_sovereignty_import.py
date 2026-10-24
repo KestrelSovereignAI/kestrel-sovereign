@@ -8,6 +8,8 @@ These tests verify the full round-trip:
 4. Verify data integrity
 """
 
+from tests.shared.native_shutdown_budget import shutdown_fixture_agent
+
 import pytest
 import pytest_asyncio
 import tempfile
@@ -371,7 +373,7 @@ async def test_agent_command_import(temp_db, llm_service, skip_bootstrap):
         print("✅ Agent command import/export cycle successful")
     finally:
         # Clean up resources
-        await agent.shutdown()
+        await shutdown_fixture_agent(agent)
 
 
 @pytest.mark.asyncio

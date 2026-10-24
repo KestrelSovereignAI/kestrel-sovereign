@@ -107,6 +107,12 @@ class FailingAdapter(StubAdapter):
 def _make_db(fetchall_data=None, fetchone_data=None):
     """Create a mock AsyncDatabase."""
     db = AsyncMock()
+    db.backend_type = "sqlite"
+    db.backend = db
+    @asynccontextmanager
+    async def transaction(**kwargs):
+        yield db
+    db.transaction = transaction
     db.fetchall = AsyncMock(return_value=fetchall_data or [])
     db.fetchone = AsyncMock(return_value=fetchone_data)
     db.execute = AsyncMock(return_value=0)
@@ -1691,6 +1697,7 @@ class TestChannelPrivacyGating:
             "2026-03-01T10:00:00", None,
         )])
         feat = await self._feature(privacy_preset="ephemeral", db=db)
+        db.fetchall.reset_mock()  # Schema-catalog reads are not history reads.
         envelope = await feat.channels_history()
         assert envelope.status is ToolResultStatus.OK
         assert envelope.data["count"] == 0
@@ -1706,6 +1713,7 @@ class TestChannelPrivacyGating:
             "isolated leak", "success", "2026-03-01T10:00:00", None,
         )])
         feat = await self._feature(privacy_preset="isolated", db=db)
+        db.fetchall.reset_mock()  # Measure only the privacy-gated history call.
         envelope = await feat.channels_history()
         assert envelope.status is ToolResultStatus.OK
         assert envelope.data["count"] == 0

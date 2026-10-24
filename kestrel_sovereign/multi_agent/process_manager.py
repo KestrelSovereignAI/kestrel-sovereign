@@ -73,6 +73,97 @@ logger = logging.getLogger(__name__)
 # shorter or longer operator-selected timeout explicitly.
 DEFAULT_STARTUP_HEALTH_TIMEOUT_SECONDS = 120.0
 
+#: How long uvicorn lets open connections finish after SIGTERM before it
+#: cancels them and runs the application's lifespan shutdown. Without a limit
+#: uvicorn waits on them for ever, and a loaded console holds an event stream
+#: open, so the stop always escalated to SIGKILL and no shutdown work ran:
+#: no agent shutdown, Stop receipts, scheduler, host-feature or Phoenix stop
+#: (#3781). An integer because that is the type uvicorn's option takes.
+SERVER_GRACEFUL_SHUTDOWN_SECONDS = 5
+
+#: How long a stop waits after SIGTERM before SIGKILL. It must cover the
+#: graceful window above and then the application's own lifespan shutdown,
+#: which stops each agent in turn under its own deadline before host features
+#: and Phoenix. The wait ends as soon as the process exits, so a clean
+#: shutdown costs only the time it takes.
+SERVER_TERMINATE_TIMEOUT_SECONDS = 60.0
+
+#: How long a stop that had to send SIGKILL waits before it judges whether the
+#: process is gone. A server's whole stop therefore lasts at most
+#: ``SERVER_TERMINATE_TIMEOUT_SECONDS`` plus this.
+SERVER_KILL_GRACE_SECONDS = 0.5
+
+#: A log a detached server writes to is rotated at launch once it reaches this
+#: size. The child holds the file for its whole life, so launch is the one
+#: point a rotation cannot lose its lines (#3781).
+LOG_ROTATION_MAX_BYTES = 64 * 1024 * 1024
+
+#: Rotated generations kept beside a log: ``host.log.1`` is the newest.
+LOG_ROTATION_BACKUPS = 5
+
+
+def server_command(host: str, port: int) -> list[str]:
+    """The argv that serves ``kestrel_sovereign.server:app`` on ``host:port``.
+
+    One builder for the fleet host and a standalone agent, so both stop the
+    same way: within :data:`SERVER_GRACEFUL_SHUTDOWN_SECONDS` uvicorn stops
+    waiting on open connections and runs the application's shutdown.
+    """
+    return [
+        sys.executable, "-m", "uvicorn", "kestrel_sovereign.server:app",
+        "--host", host, "--port", str(port),
+        "--timeout-graceful-shutdown", str(SERVER_GRACEFUL_SHUTDOWN_SECONDS),
+    ]
+
+
+def rotate_log_file(
+    log_file: Path,
+    *,
+    max_bytes: int = LOG_ROTATION_MAX_BYTES,
+    backups: int = LOG_ROTATION_BACKUPS,
+) -> bool:
+    """Rotate ``log_file`` when it has reached ``max_bytes``; True if it did.
+
+    ``log_file`` becomes ``<name>.1``, each existing ``<name>.N`` moves to
+    ``<name>.N+1``, and the generation past ``backups`` is deleted. Call it
+    only before a process opens the log: a writer that already holds the file
+    keeps writing to the renamed one.
+    """
+    if backups < 1:
+        raise ValueError("a rotated log keeps at least one backup")
+    try:
+        size = log_file.stat().st_size
+    except FileNotFoundError:
+        return False
+    if size < max_bytes:
+        return False
+
+    def generation(n: int) -> Path:
+        return log_file.with_name(f"{log_file.name}.{n}")
+
+    generation(backups).unlink(missing_ok=True)
+    for n in range(backups - 1, 0, -1):
+        if generation(n).exists():
+            os.replace(generation(n), generation(n + 1))
+    os.replace(log_file, generation(1))
+    return True
+
+
+def _rotate_launch_log(log_file: Path) -> None:
+    """Rotate ``log_file`` before a launch opens it; a refusal skips only that.
+
+    Rotation is housekeeping, not part of serving. A log that cannot be moved
+    aside (on Windows, a viewer holding it open without delete sharing) is
+    appended to as before, and says so, rather than failing the launch.
+    """
+    try:
+        rotate_log_file(log_file)
+    except OSError as exc:
+        logger.warning(
+            "Could not rotate %s before launch; appending to it: %s",
+            log_file, exc,
+        )
+
 
 def _open_detached_log(log_file: Path) -> int:
     """Return a child-inheritable append contract, not just a parent CRT flag."""
@@ -142,6 +233,18 @@ def recorded_pid(value: object) -> Optional[int]:
     if type(value) is int and 0 < value <= _MAX_PID:
         return value
     return None
+
+
+def recorded_birth_identity(value: object) -> str | None:
+    """One canonical kernel-provided unsigned 64-bit lifetime identity."""
+    if not isinstance(value, str) or ":" not in value:
+        return None
+    platform, number = value.split(":", 1)
+    if platform not in {"linux", "darwin"} or not number.isascii() or not number.isdecimal():
+        return None
+    if len(number) > 20 or not 0 <= int(number) < 2**64 or str(int(number)) != number:
+        return None
+    return value
 
 
 def recorded_start_time(value: object) -> Optional[float]:
@@ -240,6 +343,11 @@ class AgentProcess:
     #: the agent paths signalled whatever held the number, while the host path
     #: was already protected (#2995).
     started_at: Optional[float] = None
+    #: Why the last stop left ``pid`` running, phrased to follow the PID:
+    #: "is still running after SIGKILL", or "could not be signalled and is
+    #: still running" when the stop signal never reached it. None once a stop
+    #: succeeds.
+    stop_failure: Optional[str] = None
 
 
 class ProcessManager:
@@ -441,6 +549,58 @@ class ProcessManager:
                 return False
 
     @staticmethod
+    def process_birth_identity(pid: int) -> str:
+        """Read the original kernel birth identity without an epoch conversion.
+
+        Linux stat field 22 is raw boot-relative ticks; Darwin's unique process
+        identifier is allocated by the kernel for that process's lifetime.
+        Neither depends on wall-clock changes. Missing or opaque data raises;
+        callers must distinguish that from a kernel-confirmed absent PID.
+        """
+        if recorded_pid(pid) is None:
+            raise ValueError("Process birth identity requires a positive PID")
+        if sys.platform.startswith("linux"):
+            if os.readlink("/proc/self") != str(os.getpid()):
+                raise OSError(errno.EXDEV, "procfs does not expose this PID namespace")
+            raw = Path(f"/proc/{pid}/stat").read_bytes()
+            if not raw.startswith(str(pid).encode("ascii") + b" (") or b")" not in raw:
+                raise OSError(errno.EIO, "Kernel process stat has no original PID boundary")
+            fields = raw.rsplit(b")", 1)[1].split()
+            if len(fields) <= 19 or not fields[19].isdigit():
+                raise OSError(errno.EIO, "Kernel process stat has no birth identity")
+            value = f"linux:{int(fields[19])}"
+        elif sys.platform == "darwin":
+            import ctypes
+
+            class UniqueProcessInfo(ctypes.Structure):
+                # proc_uniqidentifierinfo, XNU proc_info_private.h (API size 56).
+                _fields_ = [
+                    ("executable_uuid", ctypes.c_ubyte * 16),
+                    ("unique_id", ctypes.c_uint64),
+                    ("parent_unique_id", ctypes.c_uint64),
+                    ("pid_version", ctypes.c_int32),
+                    ("parent_pid_version", ctypes.c_int32),
+                    ("reserved_a", ctypes.c_uint64),
+                    ("reserved_b", ctypes.c_uint64),
+                ]
+
+            read = ctypes.CDLL("/usr/lib/libproc.dylib", use_errno=True).proc_pidinfo
+            read.argtypes = (ctypes.c_int, ctypes.c_int, ctypes.c_uint64, ctypes.c_void_p, ctypes.c_int)
+            read.restype = ctypes.c_int
+            info = UniqueProcessInfo()
+            # PROC_PIDUNIQIDENTIFIERINFO. Executable UUID and PID version may
+            # change at exec; only the kernel's process lifetime ID is used.
+            if read(pid, 17, 0, ctypes.byref(info), ctypes.sizeof(info)) != ctypes.sizeof(info):
+                code = ctypes.get_errno() or errno.EIO
+                raise OSError(code, os.strerror(code))
+            value = f"darwin:{info.unique_id}"
+        else:
+            raise OSError(errno.ENOTSUP, "Kernel process birth identity is unavailable")
+        if recorded_birth_identity(value) is None:
+            raise OSError(errno.EIO, "Kernel process birth identity is invalid")
+        return value
+
+    @staticmethod
     def process_start_time(pid: int) -> Optional[float]:
         """When `pid` started, or None if that cannot be established.
 
@@ -566,7 +726,8 @@ class ProcessManager:
 
     @staticmethod
     def identify_recorded_process(
-        pid: int, recorded_start: Optional[float], source: str
+        pid: int, recorded_start: Optional[float], source: str, *,
+        recorded_birth: str | None = None, require_birth: bool = False,
     ) -> tuple[PidStatus, str]:
         """Whether the process running as ``pid`` here is the one a record names.
 
@@ -579,6 +740,22 @@ class ProcessManager:
         instant. UNDECIDABLE otherwise: something runs as ``pid`` and nothing
         proves whose it is, or the process table cannot be read from here.
         """
+        if require_birth:
+            if recorded_birth_identity(recorded_birth) is None:
+                return PidStatus.UNDECIDABLE, f"{source} has no original kernel birth identity"
+            try:
+                actual_birth = ProcessManager.process_birth_identity(pid)
+            except (OSError, ValueError):
+                try:
+                    os.kill(pid, 0)
+                except ProcessLookupError:
+                    return PidStatus.STALE, f"kernel confirms no process is running as PID {pid}"
+                except OSError:
+                    pass
+                return PidStatus.UNDECIDABLE, f"PID {pid} kernel birth identity cannot be established"
+            if actual_birth == recorded_birth:
+                return PidStatus.LIVE, f"PID {pid} retains its original kernel birth identity"
+            return PidStatus.STALE, f"PID {pid} belongs to another kernel process lifetime"
         exists, live_start = ProcessManager._probe_process(pid)
         if exists is False:
             # Nothing is running under that number. Whether it once was is not
@@ -790,6 +967,7 @@ class ProcessManager:
         block-buffering rationale).
         """
         log_file.parent.mkdir(parents=True, exist_ok=True)
+        _rotate_launch_log(log_file)
         child_env = dict(env)
         child_env.setdefault("PYTHONUNBUFFERED", "1")
 
@@ -846,6 +1024,7 @@ class ProcessManager:
         never block the host from shutting down.
         """
         log_file.parent.mkdir(parents=True, exist_ok=True)
+        _rotate_launch_log(log_file)
         # Force unbuffered stdout in the CHILD process so the pump sees
         # runtime log lines (single-line WARNINGs, exception tracebacks)
         # immediately. Without this, Python detects its stdout isn't a
@@ -1165,6 +1344,10 @@ class ProcessManager:
         env["PORT"] = str(config.port)
         env["KESTREL_SERVE_UI"] = "true" if standalone else "false"
         env["KESTREL_HOST_URL"] = f"http://localhost:{host_port}"
+        if env.get("KESTREL_BASE_URL") is not None:
+            # The configured public front door routes each child by the exact
+            # launcher name, rather than by display name or its signing DID.
+            env["KESTREL_A2A_DISCOVERY_AGENT"] = name
         # Unlike an in-process AgentManager, this process handoff cannot pass
         # constructor arguments. Carry the exact per-agent config rather than
         # asking the child to discover a project-global profile. Remove an
@@ -1226,10 +1409,7 @@ class ProcessManager:
             env["KESTREL_DATA_KEY"] = effective_key
             logger.info(f"Agent '{name}' using per-agent data key from {agent_key_var}")
 
-        cmd = [
-            sys.executable, "-m", "uvicorn", "kestrel_sovereign.server:app",
-            "--host", host_bind, "--port", str(config.port),
-        ]
+        cmd = server_command(host_bind, config.port)
 
         registry_env, registry_file = stage_process_a2a_did_registry(
             identity_documents,
@@ -1268,7 +1448,23 @@ class ProcessManager:
         self._agents[name] = ap
         return ap
 
-    def terminate_agent(self, name: str, timeout: float = 5.0) -> bool:
+    @staticmethod
+    def wait_for_exit(pid: int, timeout: float, *, interval: float = 0.25) -> bool:
+        """Poll until ``pid`` is no longer running; False if ``timeout`` ran out.
+
+        Returns as soon as the process is gone, so a generous ``timeout``
+        costs nothing when the process exits promptly.
+        """
+        deadline = time.monotonic() + timeout
+        while ProcessManager.is_process_running(pid):
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(interval)
+        return True
+
+    def terminate_agent(
+        self, name: str, timeout: float = SERVER_TERMINATE_TIMEOUT_SECONDS
+    ) -> bool:
         """Terminate a single agent process.
 
         Args:
@@ -1277,7 +1473,9 @@ class ProcessManager:
 
         Returns:
             True only once the agent is confirmed gone (or was never running).
-            False if it is still running after SIGKILL.
+            False if it is still running: after SIGKILL, or because the stop
+            signal could not reach it. ``AgentProcess.stop_failure`` says
+            which.
 
         Termination is reported on the strength of the postcondition, never on the
         strength of having sent a signal: ``kill_process`` cannot signal a
@@ -1308,25 +1506,23 @@ class ProcessManager:
             if ap.pid_file:
                 self.clear_pid(ap.pid_file)
             ap.pid = None
+            ap.stop_failure = None
             return True
 
         logger.info(f"Terminating agent '{name}' (PID {ap.pid})...")
-        self.kill_process(ap.pid, force=False, started_at=ap.started_at)
+        signalled = self.kill_process(ap.pid, force=False, started_at=ap.started_at)
 
-        # Wait for graceful shutdown
-        deadline = time.time() + timeout
-        while time.time() < deadline:
-            if not self.is_process_running(ap.pid):
-                break
-            time.sleep(0.25)
-
-        # Force kill if still running
-        if self.is_process_running(ap.pid):
+        # Force kill if graceful shutdown did not finish in time. A stop
+        # signal that never reached the agent (another uid, or a number the
+        # recorded process no longer holds) started no shutdown to wait for,
+        # and a SIGKILL would be refused the same way: waiting out the whole
+        # deadline would only delay saying so (#3781).
+        if signalled and not self.wait_for_exit(ap.pid, timeout):
             logger.warning(
                 f"Agent '{name}' did not terminate gracefully, sending SIGKILL"
             )
             self.kill_process(ap.pid, force=True, started_at=ap.started_at)
-            time.sleep(0.5)
+            time.sleep(SERVER_KILL_GRACE_SECONDS)
 
         # Reap before judging. ``start_agent`` spawns agents with
         # ``subprocess.Popen``, so this process is their parent, and a killed
@@ -1337,8 +1533,13 @@ class ProcessManager:
         self._reap_if_child(ap.pid)
 
         if self.is_process_running(ap.pid):
+            ap.stop_failure = (
+                "is still running after SIGKILL"
+                if signalled
+                else "could not be signalled and is still running"
+            )
             logger.error(
-                f"Agent '{name}' (PID {ap.pid}) is still running after SIGKILL; "
+                f"Agent '{name}' (PID {ap.pid}) {ap.stop_failure}; "
                 "leaving the PID file in place"
             )
             return False
@@ -1346,6 +1547,7 @@ class ProcessManager:
         if ap.pid_file:
             self.clear_pid(ap.pid_file)
         ap.pid = None
+        ap.stop_failure = None
         logger.info(f"Agent '{name}' terminated")
         return True
 
@@ -1393,15 +1595,17 @@ class ProcessManager:
         except (ChildProcessError, OSError):
             pass
 
-    def terminate_all(self, timeout: float = 5.0) -> list[str]:
+    def terminate_all(
+        self, timeout: float = SERVER_TERMINATE_TIMEOUT_SECONDS
+    ) -> list[str]:
         """Terminate all managed agent processes.
 
         Args:
             timeout: Seconds to wait per agent for graceful shutdown.
 
         Returns:
-            The names of agents still running after SIGKILL, in the order they
-            were attempted. Empty when every agent stopped. Returned rather
+            The names of agents still running after their stop, in the order
+            they were attempted. Empty when every agent stopped. Returned rather
             than discarded so a caller cannot report a clean shutdown over the
             top of an agent that outlived it.
         """

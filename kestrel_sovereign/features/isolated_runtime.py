@@ -37,7 +37,7 @@ import threading
 import time
 import weakref
 from concurrent.futures import Executor, Future
-from contextlib import asynccontextmanager
+from contextlib import ExitStack, asynccontextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -75,7 +75,6 @@ from kestrel_sovereign._async_ownership import (
     gather_owned,
     owned_task_error,
     owned_task_observation_control,
-    raise_owned_outcome,
 )
 from kestrel_sovereign._bounded_subprocess import run_bounded_subprocess
 from kestrel_sovereign.native_retirement import NativeExecutionObserver, bind_native_execution_observer
@@ -215,6 +214,8 @@ class HostedTelegramRouteAttestation:
 
     ownership_store: ChannelRouteOwnershipStore
     bot_id: str
+    outbound_authority: Any = field(default=None, repr=False)
+    outbound_timeout_seconds: float = 30.0
 
 
 def set_hosted_telegram_route_attestation_resolver(
@@ -656,8 +657,14 @@ _MAX_PENDING_NON_CURSOR_INGRESS_EVENTS = 1
 _cursor_owned_inbound_protocol: ContextVar[bool] = ContextVar(
     "isolated_cursor_owned_inbound_protocol", default=False
 )
+_telegram_admission_fence: ContextVar[Any] = ContextVar(
+    "isolated_telegram_admission_fence", default=None,
+)
 _telegram_terminal_inbound_disposition: ContextVar[str | None] = ContextVar(
     "isolated_telegram_terminal_inbound_disposition", default=None
+)
+_telegram_acknowledgement_session_id: ContextVar[str | None] = ContextVar(
+    "isolated_telegram_acknowledgement_session_id", default=None
 )
 @dataclass(slots=True)
 class _ConfigIngressFenceLease:
@@ -1990,6 +1997,15 @@ class _HostIngressAdmission:
     core_outcome: _HostIngressOutcome | None = field(default=None, repr=False)
     core_denied_scopes: tuple = field(default=(), repr=False)
     opening: BaseException | None = field(default=None, repr=False)
+    withdrawal_stops_work: bool = False
+    withdrawal_task: asyncio.Task | None = field(default=None, repr=False)
+    withdrawal_cancel_count: int = 0
+    dispatch_deadline: float | None = None
+    dispatch_expiry: Callable[[], _HostIngressOutcome] | None = field(default=None, repr=False)
+    dispatch_expired: bool = False
+    provider_rpc_started: bool = False
+    physical_client_retired: asyncio.Future | None = field(default=None, repr=False)
+    scheduled_tool: bool = False
 
     def require_work(self, agent):
         """Only THIS known Core validation seam can authenticate a denial."""
@@ -2006,9 +2022,32 @@ class _HostIngressAdmission:
                 commit = ("unknown" if any(scope._uncertain_commit == "unknown" for scope in self.scopes)
                           else "committed" if any(scope._uncertain_commit == "committed" or scope._acknowledged_commits for scope in self.scopes)
                           else None)
-                self.core_outcome = _HostIngressOutcome(_HOST_INGRESS_CONTROL, commit_outcome=commit)
+                self.core_outcome = _merge_host_ingress_control(
+                    self.core_outcome,
+                    _HostIngressOutcome(_HOST_INGRESS_CONTROL, commit_outcome=commit),
+                )
                 self.core_denied_scopes = tuple(scope for scope in self.scopes if scope._denial is not None)
             raise
+        # Irreversible native custody is authenticated BEFORE ordinary caller
+        # withdrawal can short-circuit it; cancellation never erases denial.
+        if self.withdrawal_stops_work and (
+            self.cancellation is not None or (
+                self.withdrawal_task is not None
+                and self.withdrawal_task.cancelling() > self.withdrawal_cancel_count
+            )
+        ):
+            raise asyncio.CancelledError()
+        if (self.dispatch_deadline is not None
+            and asyncio.get_running_loop().time() >= self.dispatch_deadline):
+            if self.dispatch_expiry is not None:
+                self.dispatch_expiry()
+            raise ExecutionAuthorityError("original hosted dispatch deadline expired")
+        if self.withdrawal_stops_work and (
+            self.native_error is not None
+            or self.proxy._terminal_lifecycle_latched
+            or self.proxy._terminal_lifecycle_generation != self.generation
+        ):
+            raise ExecutionAuthorityError("original hosted dispatch admission retired")
 
 
 def _detached_host_ingress_control(*, cleanup=False):
@@ -2076,12 +2115,19 @@ def _finish_host_ingress_admission(admission, outcome):
     return outcome
 
 
-def _retain_host_ingress_public_outcome(proxy, outcome):
-    """Monotonic detached classification, not a raw-error history."""
-    prior = proxy._host_ingress_public_control
+def _merge_host_ingress_control(prior, outcome):
+    """One monotonic order for authenticated admission and public facts."""
     ranks = {None: 0, "committed": 1, "unknown": 2}
     if prior is None or ranks[outcome.commit_outcome] > ranks[prior.commit_outcome]:
-        proxy._host_ingress_public_control = outcome
+        return outcome
+    return prior
+
+
+def _retain_host_ingress_public_outcome(proxy, outcome):
+    """Monotonic detached classification, not a raw-error history."""
+    proxy._host_ingress_public_control = _merge_host_ingress_control(
+        proxy._host_ingress_public_control, outcome,
+    )
     return proxy._host_ingress_public_control
 
 
@@ -2480,6 +2526,9 @@ async def _wait_for_host_ingress_operation(
     operation: asyncio.Task[Any],
     outcome_slot: _HostIngressOutcomeSlot,
     admission: _HostIngressAdmission | None = None,
+    *,
+    deadline_seconds: float | None = None,
+    on_deadline: Callable[[], _HostIngressOutcome] | None = None,
 ) -> tuple[_HostIngressOutcome, tuple[Any, ...] | None]:
     """Drain a shielded worker and remember only caller-originated cancel.
 
@@ -2492,24 +2541,54 @@ async def _wait_for_host_ingress_operation(
 
     caller = asyncio.current_task()
     caller_cancel_args: tuple[Any, ...] | None = None
-    while not operation.done():
-        try:
-            await asyncio.shield(operation)
-        except asyncio.CancelledError as error:
-            if caller is not None and caller.cancelling():
-                if admission is not None and admission.cancellation is None:
-                    admission.cancellation = error
-                if caller_cancel_args is None:
-                    caller_cancel_args = tuple(error.args)
-                continue
-            # The worker's child/RPC cancellation is a terminal worker result,
-            # not a cancellation request against this public caller.
-            break
-        except BaseException:  # noqa: BLE001 - discard worker traceback at boundary
-            # Always retrieve the terminal exception below rather than letting
-            # a task traceback become the public ingress traceback.
-            break
-    if _consume_host_ingress_operation(operation):
+    deadline, timer, early_outcome = None, None, None
+    try:
+        if deadline_seconds is not None:
+            if on_deadline is None:
+                raise ValueError("bounded ingress observation requires its original retirement owner")
+            try:
+                deadline = asyncio.get_running_loop().create_future()
+                timer = asyncio.get_running_loop().call_later(deadline_seconds, deadline.set_result, None)
+            except BaseException as error:  # noqa: BLE001 - accepted original survives deadline publication refusal
+                if admission is not None and admission.opening is None:
+                    admission.opening = error
+                early_outcome = on_deadline()
+        while early_outcome is None and not operation.done():
+            try:
+                if deadline is None:
+                    await asyncio.shield(operation)
+                else:
+                    done, _ = await asyncio.wait((operation, deadline), return_when=asyncio.FIRST_COMPLETED)
+                    if operation not in done:
+                        early_outcome = on_deadline()
+                        break
+            except asyncio.CancelledError as error:
+                if caller is not None and caller.cancelling():
+                    if admission is not None and admission.cancellation is None:
+                        admission.cancellation = error
+                    if caller_cancel_args is None:
+                        caller_cancel_args = tuple(error.args)
+                    continue
+                # The worker's child/RPC cancellation is a terminal worker
+                # result, not cancellation directed at this public caller.
+                break
+            except BaseException as error:  # noqa: BLE001 - retain failed observation of original owner
+                if deadline is not None and not operation.done():
+                    if admission is not None and admission.opening is None:
+                        admission.opening = error
+                    # A failed wait callback is not a terminal worker result.
+                    # Use the SAME bounded retirement path and retain the
+                    # accepted original; never project a result and abandon it.
+                    early_outcome = on_deadline()
+                break
+    finally:
+        if timer is not None:
+            timer.cancel()
+        if deadline is not None and not deadline.done():
+            deadline.cancel()
+    if early_outcome is not None:
+        outcome = early_outcome
+    elif _consume_host_ingress_operation(operation):
         outcome = outcome_slot.take()
     else:
         # A task which failed outside the worker must not leave a result in a
@@ -7281,6 +7360,8 @@ class ProxyFeature(Feature):
         self._venv_relocated_this_startup = False
         self._host_config: Dict[str, Any] = {}
         self._hosted_telegram_startup_attested = False
+        self._hosted_telegram_outbound_authority = None
+        self._hosted_telegram_outbound_timeout = 30.0
         self._hosted_telegram_route_identity: Optional[str] = None
         self._hosted_telegram_route_claim: Optional[ChannelRouteClaim] = None
         self._hosted_telegram_ownership_store: Optional[ChannelRouteOwnershipStore] = None
@@ -8047,6 +8128,7 @@ class ProxyFeature(Feature):
 
     def _clear_hosted_telegram_startup_attestation(self) -> None:
         self._hosted_telegram_startup_attested = False
+        self._hosted_telegram_outbound_authority = None
         self._hosted_telegram_route_identity = None
         self._hosted_telegram_route_claim = None
         self._hosted_telegram_ownership_store = None
@@ -8119,6 +8201,11 @@ class ProxyFeature(Feature):
                 "hosted Telegram route resolver must return "
                 "HostedTelegramRouteAttestation or None"
             )
+        from kestrel_sovereign.features.hosted_telegram_dispatch import validate_outbound_timeout
+
+        if resolved.outbound_authority is not None and not callable(resolved.outbound_authority):
+            raise TypeError("hosted Telegram outbound authority must be callable")
+        outbound_timeout = validate_outbound_timeout(resolved.outbound_timeout_seconds)
         claimed = await self.reconcile_hosted_telegram_route_claim(
             ownership_store=resolved.ownership_store,
             bot_id=resolved.bot_id,
@@ -8127,6 +8214,8 @@ class ProxyFeature(Feature):
             raise RuntimeError(
                 "Hosted Telegram route is already owned; refusing to start child"
             )
+        self._hosted_telegram_outbound_authority = resolved.outbound_authority
+        self._hosted_telegram_outbound_timeout = outbound_timeout
 
     @_detached_host_ingress_control()
     async def reconcile_hosted_telegram_route_claim(
@@ -8988,6 +9077,23 @@ class ProxyFeature(Feature):
             for candidate in self._terminal_retirement_clients
             if candidate is not client
         ]
+        self._notify_terminal_client_retired(client)
+
+    def _notify_terminal_client_retired(self, client: Any) -> None:
+        """Notify existing dispatch owners after the ORIGINAL stop completes.
+
+        These futures classify physical retirement; they neither close a
+        process nor grant work. Owners can retain host authority until this
+        phase without waiting on the gate drain which they themselves hold.
+        """
+        if client is None:
+            return
+        for admission in tuple(vars(self).get("_host_ingress_admissions", ())):
+            if type(admission) is not _HostIngressAdmission:
+                continue
+            notification = admission.physical_client_retired
+            if admission.client is client and notification is not None and not notification.done():
+                notification.set_result(None)
 
     def _new_terminal_stop_completion_marker(
         self, client: Any
@@ -9086,6 +9192,7 @@ class ProxyFeature(Feature):
                 self._discard_terminal_stop_completion(marker)
                 return
             marker.completed = True
+            self._notify_terminal_client_retired(client)
             return
 
         # Preserve the narrow direct helper used by focused identity tests.
@@ -9096,6 +9203,7 @@ class ProxyFeature(Feature):
         if marker is not None:
             marker.completed = True
             self._terminal_stop_completed_client_markers.append(marker)
+            self._notify_terminal_client_retired(client)
 
     def _forget_terminal_stop_completion(
         self,
@@ -12354,15 +12462,29 @@ class ProxyFeature(Feature):
             raise RuntimeError("isolated feature changed during external ingress lifecycle")
         if name not in {_EXTERNAL_INGRESS_QUIESCE, _EXTERNAL_INGRESS_RESUME}:
             raise RuntimeError("invalid external ingress lifecycle operation")
-        capabilities = self._host_ingress_capabilities(quiesce.client)
+        return await self._call_exact_client_host_ingress(
+            quiesce.client, name, {"transition_id": quiesce.transition_id},
+        )
+
+    async def _call_exact_client_host_ingress(
+        self, client: Any, name: str, payload: HostIngressPayload,
+    ) -> HostIngressPayload:
+        """Reuse the original ingress owner under an ALREADY owned boundary.
+
+        Callers retain either the existing lifecycle fence or normal traffic
+        admission. This private helper grants neither and never selects a new
+        child, re-enters the public gate, or interprets provider authority.
+        """
+        self._assert_child_start_allowed()
+        if self._client is not client:
+            raise HostIngressError("isolated feature child is no longer selected")
+        capabilities = self._host_ingress_capabilities(client)
         if capabilities is None or name not in capabilities.names:
             raise RuntimeError("isolated feature lacks external ingress lifecycle capability")
-        request = _prepare_host_ingress_request(
-            name, {"transition_id": quiesce.transition_id}
-        )
+        request = _prepare_host_ingress_request(name, payload)
         if request is None:
             raise RuntimeError("invalid external ingress lifecycle request")
-        call = getattr(quiesce.client, "call_host_ingress", None)
+        call = getattr(client, "call_host_ingress", None)
         if not callable(call):
             raise RuntimeError("isolated feature lacks external ingress lifecycle RPC")
         outcome_slot = _HostIngressOutcomeSlot()
@@ -12372,21 +12494,21 @@ class ProxyFeature(Feature):
         # metadata joins that same task, never a second RPC/closer.
         admission = _HostIngressAdmission(
             self._terminal_lifecycle_generation, current_execution_custody(self.agent),
-            proxy=self, client=quiesce.client, traffic_gate=self._traffic_gate,
+            proxy=self, client=client, traffic_gate=self._traffic_gate,
         )
         admission.admission.task = asyncio.current_task()
         self._host_ingress_admissions.add(admission)
-        await self._run_host_ingress(request, outcome_slot, admission, _rpc_call=call)
-        outcome = outcome_slot.outcome
-        if outcome is None:
-            raise HostIngressError("external ingress lifecycle RPC failed")
-        if outcome.status == _HOST_INGRESS_CANCELLED:
-            raise asyncio.CancelledError()
-        if outcome.status == _HOST_INGRESS_CONTROL:
-            _deliver_host_ingress_outcome(outcome, None)
-        if outcome.status != _HOST_INGRESS_SUCCESS:
-            raise HostIngressError("external ingress lifecycle RPC failed")
-        return outcome.payload
+        outcome = _HostIngressOutcome(_HOST_INGRESS_GENERIC_FAILURE)
+        try:
+            await self._run_host_ingress(request, outcome_slot, admission, _rpc_call=call)
+            outcome = outcome_slot.take()
+        except BaseException as error:  # noqa: BLE001 - original observer failure stays owned
+            admission.opening = error
+            outcome = _redacted_host_ingress_error(error)
+        finally:
+            outcome = _finish_host_ingress_admission(admission, outcome)
+        self = client = name = payload = request = call = admission = outcome_slot = capabilities = None
+        return _deliver_host_ingress_outcome(outcome, None)
 
     async def _quiesce_external_ingress(
         self, quiesce: _ExternalIngressQuiesce
@@ -12577,6 +12699,15 @@ class ProxyFeature(Feature):
             except BaseException as error:  # noqa: BLE001 - external RPC boundary redaction
                 # The SDK/custom-client boundary is untrusted. Do not retain its
                 # exception object or its potentially secret-bearing message.
+                if admission is not None:
+                    try:
+                        # A trusted Core check inside the tool operation may
+                        # have denied after traffic admission waited. Recheck
+                        # actual irreversible custody, not foreign exception
+                        # classes/attributes, to authenticate that native lane.
+                        admission.require_work(self.agent)
+                    except BaseException:  # noqa: BLE001 - the canonical validator records native provenance
+                        pass
                 outcome_slot.outcome = _redacted_host_ingress_error(error)
                 return
             try:
@@ -12627,6 +12758,27 @@ class ProxyFeature(Feature):
                 admission.cancellation if joined.error is not None or admission.native_error is not None else None,
                 retain_originals=True, isolate_control_originals=True,
             )
+            delivered = outcome_slot.outcome
+            if admission.provider_rpc_started and (
+                admission.native_error is not None
+                or delivered.status != _HOST_INGRESS_SUCCESS
+                or type(delivered.payload) is not dict
+                or delivered.payload.get("success") is not True
+            ):
+                # The effect belongs to this WHOLE original RPC, not only the
+                # authority factory body. Custody checks and envelope formation
+                # still run after that body exits. Losing the result anywhere
+                # after SDK dispatch cannot become rejection-before-send or a
+                # retryable tool-error envelope. This is Core's private effect
+                # receipt, never an attribute supplied by a foreign exception.
+                admission.native_error = execution_terminal_error(
+                    admission.native_error, ExecutionCommitOutcomeError("unknown"),
+                    retain_originals=True, isolate_control_originals=True,
+                )
+                admission.core_outcome = _merge_host_ingress_control(
+                    admission.core_outcome,
+                    _HostIngressOutcome(_HOST_INGRESS_CONTROL, commit_outcome="unknown"),
+                )
             if admission.native_error is not None:
                 # Native classification is BACKEND phase data, not error attrs
                 # on a foreign transaction body or a caught facade exception.
@@ -12646,9 +12798,9 @@ class ProxyFeature(Feature):
                         scope._uncertain_commit is None for scope in admission.scopes
                     )
                     scoped = bool(admission.core_denied_scopes) and stable_scopes
-                    localized = (not facts and scoped) or (
+                    localized = outcome.commit_outcome != "unknown" and ((not facts and scoped) or (
                         retired_ack and stable_scopes and (admission.core_outcome is None or scoped)
-                    )
+                    ))
                     if localized:
                         self._host_ingress_admissions.discard(admission)
                         outcome = self._host_ingress_public_control or outcome
@@ -12875,6 +13027,27 @@ class ProxyFeature(Feature):
     @_detached_host_ingress_control()
     async def call_isolated_tool(self, name: str, args: Dict[str, Any]) -> Dict[str, Any]:
         from kestrel_sovereign.execution_custody import bind_execution_runtime
+        from kestrel_sovereign.features.hosted_telegram_dispatch import (
+            is_hosted_send, start_dispatch, wait_dispatch,
+        )
+        if isinstance(name, str):
+            # Flatten accepted string subclasses with the base operation,
+            # not an overridable __str__/__eq__ that could hide the actual
+            # JSON tool name from the hosted dispatch authority boundary.
+            name = str.__str__(name)
+        if is_hosted_send(self, name):
+            with ExitStack() as runtime_stack:
+                owner = start_dispatch(self, name, args, runtime_stack=runtime_stack)
+                self = name = args = runtime_stack = None
+                outcome, cancellation = await wait_dispatch(owner)
+                scheduled = owner[1].scheduled_tool
+                owner = None
+                if outcome.status not in {_HOST_INGRESS_SUCCESS, _HOST_INGRESS_CANCELLED, _HOST_INGRESS_CONTROL}:
+                    if scheduled:
+                        raise SchedulerExecutionContextUnavailable("scheduled hosted Telegram dispatch is unavailable")
+                    return {"status": "error", "error": "hosted Telegram dispatch is unavailable",
+                            "tool": "telegram_send", "success": False}
+                return _deliver_host_ingress_outcome(outcome, cancellation)
         with bind_execution_runtime(self.agent):
             return await self._call_isolated_tool_owned(name, args)
 
@@ -13054,7 +13227,10 @@ class ProxyFeature(Feature):
                 get_current_scheduler_execution()
             if self._client is None:
                 raise RuntimeError("isolated feature client is unavailable")
-            if context is None:
+            from kestrel_sovereign.features.hosted_telegram_dispatch import is_hosted_send, dispatch_admitted
+            if is_hosted_send(self, name):
+                result = await dispatch_admitted(self, args, context)
+            elif context is None:
                 # Preserve the existing wire format for chat/API/legacy calls.
                 result = await _maybe_await(self._client.call_tool(name, args))
             else:
@@ -16692,6 +16868,8 @@ class ProxyFeature(Feature):
         *,
         cursor_owned_protocol: bool,
         telegram_terminal_disposition: str | None = None,
+        acknowledgement_session_id: str | None = None,
+        admission_fence: Any = None,
     ) -> Any:
         """Route with a host-only protocol classification.
 
@@ -16702,15 +16880,27 @@ class ProxyFeature(Feature):
         or widening every legacy ChannelFeature implementation.
         """
 
+        from kestrel_sovereign.signals.sources.channels import validate_channel_session_id
+
+        if acknowledgement_session_id is not None and telegram_terminal_disposition != "care_acknowledgement":
+            raise ProtocolError("session correlation is restricted to host care acknowledgements")
+        try:
+            acknowledgement_session_id = validate_channel_session_id(acknowledgement_session_id)
+        except ValueError as error:
+            raise ProtocolError("invalid hosted acknowledgement session identity") from error
         token = _cursor_owned_inbound_protocol.set(cursor_owned_protocol)
         terminal_token = _telegram_terminal_inbound_disposition.set(
             telegram_terminal_disposition
         )
+        session_token = _telegram_acknowledgement_session_id.set(acknowledgement_session_id)
+        admission_token = _telegram_admission_fence.set(admission_fence)
         try:
             return await self._route_inbound(payload)
         finally:
             _cursor_owned_inbound_protocol.reset(token)
             _telegram_terminal_inbound_disposition.reset(terminal_token)
+            _telegram_acknowledgement_session_id.reset(session_token)
+            _telegram_admission_fence.reset(admission_token)
 
     @_detached_host_ingress_control()
     async def admit_hosted_telegram_ingress(
@@ -16719,6 +16909,8 @@ class ProxyFeature(Feature):
         *,
         terminal_disposition: str | None = None,
         acknowledgement_only: bool = False,
+        acknowledgement_session_id: str | None = None,
+        admission_fence: Any = None,
     ) -> Any:
         """Durably admit one host-authenticated Telegram webhook result.
 
@@ -16730,6 +16922,12 @@ class ProxyFeature(Feature):
         success to Telegram.  This narrow host API preserves the proxy-owned
         agent/channel binding and refuses ordinary polling or un-attested
         children from manufacturing hosted admission.
+
+        ``acknowledgement_session_id`` is an optional trusted-host selection
+        of the original authorized workflow run. It is accepted only with
+        ``acknowledgement_only=True``; no provider/child DTO field selects it.
+        It preserves USER_VISIBLE/UNTRUSTED semantics, conveys no authority,
+        and must be repeated when verifying an exact terminal replay receipt.
         """
 
         if (
@@ -16747,16 +16945,28 @@ class ProxyFeature(Feature):
             acknowledgement_only and terminal_disposition is not None
         ):
             raise ProtocolError("invalid hosted acknowledgement admission")
+        from kestrel_sovereign.signals.sources.channels import validate_channel_session_id
+
+        if acknowledgement_session_id is not None and not acknowledgement_only:
+            raise ProtocolError("session correlation is restricted to host care acknowledgements")
+        try:
+            acknowledgement_session_id = validate_channel_session_id(acknowledgement_session_id)
+        except ValueError as error:
+            raise ProtocolError("invalid hosted acknowledgement session identity") from error
         # This classification is supplied only by the authenticated host API.
         # It is intentionally not a child-advertised terminal descriptor: a
         # transport may not downgrade arbitrary messages to care receipts.
         if acknowledgement_only:
             terminal_disposition = "care_acknowledgement"
-        return await self._route_validated_inbound(
-            payload,
-            cursor_owned_protocol=True,
-            telegram_terminal_disposition=terminal_disposition,
-        )
+        route_arguments = {
+            "cursor_owned_protocol": True,
+            "telegram_terminal_disposition": terminal_disposition,
+        }
+        if admission_fence is not None:
+            route_arguments["admission_fence"] = admission_fence
+        if acknowledgement_session_id is not None:
+            route_arguments["acknowledgement_session_id"] = acknowledgement_session_id
+        return await self._route_validated_inbound(payload, **route_arguments)
 
     async def _route_inbound(self, payload: Any) -> Any:
         self._require_event_ingress_work()
@@ -16818,9 +17028,17 @@ class ProxyFeature(Feature):
             _cursor_owned_inbound_protocol.get(),
         )
         if terminal_disposition is not None:
+            terminal_arguments = {"disposition": terminal_disposition}
+            if _telegram_admission_fence.get() is not None:
+                terminal_arguments["admission_fence"] = _telegram_admission_fence.get()
+            session_id = _telegram_acknowledgement_session_id.get()
+            if session_id is not None:
+                terminal_arguments["session_id"] = session_id
             return await channel.handle_terminal_inbound(
-                message, disposition=terminal_disposition
+                message, **terminal_arguments,
             )
+        if _telegram_admission_fence.get() is not None:
+            return await channel.handle_inbound(message, admission_fence=_telegram_admission_fence.get())
         return await channel.handle_inbound(message)
 
 
@@ -16945,7 +17163,11 @@ class ProxyChannelAdapter(ChannelAdapter):
         return None
 
     async def send_message(self, to: str, content: str, **kwargs):
-        result = await self._proxy.call_isolated_tool(
-            self._send_tool, {"to": to, "message": content}
-        )
-        return _delivery_receipt_from_result(self._channel_type, result)
+        try:
+            result = await self._proxy.call_isolated_tool(
+                self._send_tool, {"to": to, "message": content}
+            )
+            return _delivery_receipt_from_result(self._channel_type, result)
+        finally:
+            kwargs.clear()
+            self = to = content = result = None

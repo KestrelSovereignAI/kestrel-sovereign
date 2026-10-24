@@ -244,7 +244,11 @@ async def test_optional_enablement_ddl_original_receipt_reaches_boot(tmp_path, m
     from kestrel_sovereign.a2a.stores.unified.feature_enablement_store import FeatureEnablementStore
     from tests.unit.test_agent_boot_phases import _make_agent, _boot_mocks, _cleanup
 
+    from kestrel_sovereign.storage.db.sqlite import SQLiteBackend
+
     agent = _make_agent(tmp_path)
+    backend = SQLiteBackend(str(tmp_path / "boot.db"))
+    await backend.connect()
     error = receipt(kind)
     original = FeatureEnablementStore.initialize
 
@@ -254,7 +258,7 @@ async def test_optional_enablement_ddl_original_receipt_reaches_boot(tmp_path, m
 
     monkeypatch.setattr(FeatureEnablementStore, "initialize", actual_ddl_then_receipt)
     try:
-        with _boot_mocks():
+        with _boot_mocks(real_task_manager=True, primary_backend=backend):
             await agent._boot_phase_storage_privacy(BootContext(custody=agent._resource_custody()))
             outcome = await await_owned_task(asyncio.create_task(agent._boot_phase_a2a_observability_signals(BootContext(custody=agent._resource_custody()))))
             assert outcome.error is error, "optional boot initialization discarded its DDL receipt"
@@ -262,3 +266,4 @@ async def test_optional_enablement_ddl_original_receipt_reaches_boot(tmp_path, m
                 assert observer.execute("SELECT COUNT(*) FROM sqlite_master WHERE name='feature_enablement'").fetchone()[0] == 1
     finally:
         await _cleanup(agent)
+        await backend.close()

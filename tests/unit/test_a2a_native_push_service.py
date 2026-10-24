@@ -1,0 +1,408 @@
+"""Original resident acceptance, startup failure, and service shutdown custody."""
+
+import asyncio
+import inspect
+
+import pytest
+
+from kestrel_sovereign._async_ownership import create_owned_task
+from kestrel_sovereign.a2a.push_policy import NativePushPolicy
+from kestrel_sovereign.a2a.push_service import (
+    NativePushService,
+    PushServiceUnavailable,
+    start_native_push_service,
+)
+from kestrel_sovereign.storage.db.interface import TransactionError
+from tests.unit.test_a2a_native_push_outbox import (
+    outbox as outbox,  # noqa: PLC0414 - pytest fixture re-export
+)
+from tests.unit.test_a2a_native_push_outbox import (
+    push_store as push_store,  # noqa: PLC0414 - pytest fixture dependency
+)
+from tests.unit.test_a2a_native_push_outbox import callback, refuse_original_database_write
+from tests.unit.test_a2a_native_push_worker import register, worker
+from tests.unit.test_durable_callback_runtime_context import resident_dispatcher
+from tests.utils.native_push import fixture_push_authorizer, intercept_push_commit_ack
+from tests.utils.outbound_tls import (
+    outbound_close_barrier as outbound_close_barrier,  # noqa: PLC0414 - pytest fixture re-export
+)
+from tests.utils.outbound_tls import (
+    outbound_tls as outbound_tls,  # noqa: PLC0414 - pytest fixture re-export
+)
+
+
+async def test_service_publishes_only_its_original_ready_worker_and_joins_shutdown(
+    outbox,
+):
+    value, _ = outbox
+    service = NativePushService(worker(value), task_factory=create_owned_task)
+    with pytest.raises(RuntimeError, match="ready managed"):
+        service.require_ready()
+    await service.start()
+    assert service.require_ready() is service.worker
+    owner = service.task
+    assert owner is not None and not owner.done()
+    with pytest.raises(RuntimeError, match="fresh managed"):
+        await service.start()
+    await service.close()
+    assert service.task is owner and owner.done()
+    await service.close()
+    with pytest.raises(PushServiceUnavailable) as stopped:
+        service.require_ready()
+    assert isinstance(stopped.value.__cause__, asyncio.CancelledError)
+
+
+async def test_canonical_startup_uses_actual_runtime_ready_publisher(outbox):
+    value, _ = outbox
+    manager = value.configurations.task_store
+    from tests.utils.native_a2a import manager_for
+
+    manager = manager_for(value.backend, manager.scope, owns_backend=False)
+    await manager.initialize()
+    runtime, _ = resident_dispatcher()
+    runtime._execution_custody = (
+        None  # standalone owner; this test performs real database work
+    )
+    policy = NativePushPolicy(
+        timeout_seconds=7, batch_size=13, database_retry_attempts=7, retry_seconds=11,
+        retry_max_seconds=43, delivery_retry_attempts=4,
+    )
+    try:
+        service = await start_native_push_service(
+            manager,
+            value.signals,
+            policy=policy,
+            task_factory=runtime._track_runtime_task,
+            authorize_creator=fixture_push_authorizer(manager.task_store),
+        )
+        assert manager.push_service is service
+        assert service.task in runtime._background_tasks
+        assert service.require_ready() is service.worker
+        assert service.worker.outbox.signals is value.signals
+        assert service.worker.outbox.configurations.task_store is manager.task_store
+        assert service.worker.transport.timeout == 7 and service.worker.batch_size == 13
+        assert service.worker.database_retry_policy.max_attempts == 7
+        assert service.worker.transport.database_retry_policy is service.worker.database_retry_policy
+        assert service.worker.transport.retry_delay == service.worker.retry_delay
+        assert service.worker.transport.retry_delay.total_seconds() == 11
+        assert service.worker.retry_max_delay.total_seconds() == 43
+        assert service.worker.max_delivery_attempts == 4
+        with pytest.raises(RuntimeError, match="replace"):
+            await start_native_push_service(
+                manager,
+                value.signals,
+                policy=policy,
+                task_factory=runtime._track_runtime_task,
+                authorize_creator=fixture_push_authorizer(manager.task_store),
+            )
+        await manager.close()
+        assert service.task.done() and value.backend.is_connected
+    finally:
+        await manager.close()
+
+
+async def test_failed_binding_joins_actual_resident_before_startup_returns(
+    outbox, monkeypatch
+):
+    from tests.utils.native_a2a import manager_for
+
+    value, _ = outbox
+    manager = manager_for(value.backend, value.configurations.scope, owns_backend=False)
+    await manager.initialize()
+    accepted = []
+    original = RuntimeError("original task manager refused binding")
+
+    def publish(operation, *, name, admission):
+        task = create_owned_task(operation, name=name, admission=admission)
+        accepted.append(task)
+        return task
+
+    def refuse(_service):
+        raise original
+
+    monkeypatch.setattr(manager, "bind_push_service", refuse)
+    try:
+        with pytest.raises(RuntimeError) as caught:
+            await start_native_push_service(
+                manager, value.signals, policy=NativePushPolicy(), task_factory=publish,
+                authorize_creator=fixture_push_authorizer(manager.task_store),
+            )
+        assert caught.value is original
+        assert len(accepted) == 1 and accepted[0].done()
+        assert manager.push_service is None and value.backend.is_connected
+    finally:
+        for task in accepted:
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(*accepted, return_exceptions=True)
+        await manager.close()
+
+
+async def test_failed_publication_keeps_and_joins_the_original_accepted_resident(
+    outbox,
+):
+    value, _ = outbox
+    original = ValueError("original post-acceptance publication failure")
+    accepted = []
+
+    def publisher(operation, *, name, admission):
+        owner = create_owned_task(operation, name=name, admission=admission)
+        accepted.append(owner)
+        raise original
+
+    service = NativePushService(worker(value), task_factory=publisher)
+    with pytest.raises(ValueError) as caught:
+        await service.start()
+    assert caught.value is original
+    assert service.task is accepted[0] and service.task.done()
+    assert not service.worker.ready
+
+
+async def test_preacceptance_refusal_closes_the_fresh_operation_without_adopting_a_task(
+    outbox,
+):
+    value, _ = outbox
+    original = RuntimeError("original publisher refused before acceptance")
+    operations = []
+
+    def publisher(operation, *, name, admission):
+        operations.append(operation)
+        raise original
+
+    service = NativePushService(worker(value), task_factory=publisher)
+    with pytest.raises(RuntimeError) as caught:
+        await service.start()
+    assert caught.value is original
+    assert (
+        service.task is None
+        and inspect.getcoroutinestate(operations[0]) == inspect.CORO_CLOSED
+    )
+    await service.close()
+
+
+async def test_original_worker_storage_failure_wakes_startup_without_a_false_ready_ack(
+    outbox,
+):
+    value, task = outbox
+    await value.register(callback(task), creator_id="did:creator")
+    await refuse_original_database_write(
+        value.backend, table="durable_signal_events", event="INSERT"
+    )
+    service = NativePushService(worker(value), task_factory=create_owned_task)
+    try:
+        with pytest.raises(TransactionError) as caught:
+            await service.start()
+        assert service.task.done() and service.task.exception() is caught.value
+        assert not service.worker.ready
+        with pytest.raises(TransactionError) as repeated:
+            service.require_ready()
+        assert repeated.value is caught.value
+    finally:
+        await asyncio.gather(service.close(), return_exceptions=True)
+
+
+async def test_startup_cancellation_joins_the_original_resident_before_returning(
+    outbox, monkeypatch
+):
+    value, _ = outbox
+    entered, release = asyncio.Event(), asyncio.Event()
+    original_forward = value.forward_pending
+
+    async def waiting_forward(**kwargs):
+        entered.set()
+        await release.wait()
+        return await original_forward(**kwargs)
+
+    monkeypatch.setattr(value, "forward_pending", waiting_forward)
+    service = NativePushService(worker(value), task_factory=create_owned_task)
+    starting = asyncio.create_task(service.start())
+    try:
+        await entered.wait()
+        assert not service.worker.ready
+        with pytest.raises(RuntimeError, match="ready managed"):
+            service.require_ready()
+        starting.cancel("original startup observer cancellation")
+        release.set()
+        with pytest.raises(asyncio.CancelledError) as caught:
+            await starting
+        assert caught.value.args == ("original startup observer cancellation",)
+        assert service.task.done() and not service.worker.ready
+    finally:
+        release.set()
+        await asyncio.gather(starting, return_exceptions=True)
+        await service.close()
+
+
+async def test_startup_cancellation_joins_the_original_journal_commit(
+    outbox, monkeypatch
+):
+    from kestrel_sovereign.a2a import push_service
+
+    value, task = outbox
+    await value.register(callback(task), creator_id="did:creator")
+    entered, release, cancel_sent = asyncio.Event(), asyncio.Event(), asyncio.Event()
+    original_join = push_service.await_owned_task
+    service = NativePushService(worker(value), task_factory=create_owned_task)
+
+    async def held_ack():
+        entered.set()
+        await release.wait()
+
+    intercept_push_commit_ack(value, monkeypatch, held_ack)
+
+    async def observe_original_join(task, *args, **kwargs):
+        if task is service.task and task.cancelling():
+            # The actual cancel producer has scheduled the resident before
+            # waking this witness; no timer stands in for that handoff.
+            cancel_sent.set()
+        return await original_join(task, *args, **kwargs)
+
+    monkeypatch.setattr(push_service, "await_owned_task", observe_original_join)
+    starting = asyncio.create_task(service.start())
+    try:
+        await entered.wait()
+        starting.cancel("original journal observer withdrawal")
+        await cancel_sent.wait()
+        release.set()
+        with pytest.raises(asyncio.CancelledError) as caught:
+            await starting
+        assert caught.value.args == ("original journal observer withdrawal",)
+        assert await value.backend.fetch_one(
+            "SELECT COUNT(*) FROM durable_signal_events"
+        ) == (1,)
+        assert await value.changes.pending(limit=10) == []
+    finally:
+        release.set()
+        await asyncio.gather(starting, return_exceptions=True)
+        await asyncio.gather(service.close(), return_exceptions=True)
+
+
+async def test_genuine_journal_commit_ack_failure_keeps_its_original_control(
+    outbox, monkeypatch
+):
+    from kestrel_sovereign.execution_custody import (
+        ExecutionCommitOutcomeError,
+        _explicit_control_chain,
+        execution_commit_outcome,
+        is_execution_control_error,
+    )
+
+    value, task = outbox
+    await value.register(callback(task), creator_id="did:creator")
+    original = OSError("original native journal COMMIT acknowledgement failed")
+
+    async def failed_ack():
+        raise original
+
+    intercept_push_commit_ack(value, monkeypatch, failed_ack)
+    service = NativePushService(worker(value), task_factory=create_owned_task)
+    try:
+        with pytest.raises((ExecutionCommitOutcomeError, BaseExceptionGroup)) as caught:
+            await service.start()
+        assert is_execution_control_error(caught.value)
+        assert execution_commit_outcome(caught.value) == "unknown"
+        assert any(error is original for error in _explicit_control_chain(caught.value))
+        assert service.task.done() and not service.worker.ready
+        with pytest.raises((ExecutionCommitOutcomeError, BaseExceptionGroup)) as closing:
+            await service.close()
+        assert is_execution_control_error(closing.value)
+        assert execution_commit_outcome(closing.value) == "unknown"
+        assert any(error is original for error in _explicit_control_chain(closing.value))
+    finally:
+        await asyncio.gather(service.close(), return_exceptions=True)
+
+
+async def test_waiting_for_readiness_without_an_accepted_owner_is_refused(outbox):
+    value, _ = outbox
+    service = NativePushService(worker(value), task_factory=create_owned_task)
+    with pytest.raises(RuntimeError, match="not accepted"):
+        await service.wait_ready()
+
+
+async def test_invalid_publication_result_still_retires_the_original_accepted_owner(
+    outbox,
+):
+    value, _ = outbox
+
+    def publisher(operation, *, name, admission):
+        create_owned_task(operation, name=name, admission=admission)
+        # The publisher accepts the operation but fails to publish its handle.
+
+    service = NativePushService(worker(value), task_factory=publisher)
+    with pytest.raises(RuntimeError, match="original accepted owner"):
+        await service.start()
+    assert service.task.done() and not service.worker.ready
+
+
+@pytest.mark.parametrize("outbound_tls", [{"dns_validations": 2}], indirect=True)
+@pytest.mark.parametrize("cancel_observer", [False, True])
+async def test_service_shutdown_joins_the_original_http_close_before_storage_release(
+    outbox, outbound_tls, outbound_close_barrier, cancel_observer
+):
+    value, task = outbox
+    runner, _ = await register(value, task, outbound_tls.url + "/callback")
+    service = NativePushService(runner, task_factory=create_owned_task)
+    closing = None
+    try:
+        await service.start()
+        await outbound_close_barrier.entered.wait()
+        closing = asyncio.create_task(service.close())
+        await asyncio.sleep(0)
+        assert not closing.done() and not service.task.done()
+        assert await value.backend.fetch_all(
+            "SELECT retired FROM a2a_push_delivery_attempts"
+        ) == [(0,)]
+        if cancel_observer:
+            closing.cancel("original retirement observer cancellation")
+            await asyncio.sleep(0)
+            assert not closing.done() and not service.task.done()
+        outbound_close_barrier.release.set()
+        if cancel_observer:
+            with pytest.raises(asyncio.CancelledError) as caught:
+                await closing
+            assert caught.value.args == ("original retirement observer cancellation",)
+        else:
+            await closing
+        assert service.task.done() and not service.worker.ready
+        assert await value.backend.fetch_all(
+            "SELECT retired FROM a2a_push_delivery_attempts"
+        ) == [(1,)]
+    finally:
+        outbound_close_barrier.release.set()
+        if closing is not None:
+            await asyncio.gather(closing, return_exceptions=True)
+        await service.close()
+
+
+async def test_publisher_cannot_substitute_a_borrowed_owner_for_its_accepted_worker(
+    outbox,
+):
+    value, _ = outbox
+    borrowed = create_owned_task(asyncio.Event().wait())
+
+    def publisher(operation, *, name, admission):
+        create_owned_task(operation, name=name, admission=admission)
+        return borrowed
+
+    service = NativePushService(worker(value), task_factory=publisher)
+    try:
+        with pytest.raises(RuntimeError, match="original accepted owner"):
+            await service.start()
+        assert service.task is not borrowed and service.task.done()
+        assert not borrowed.done()
+    finally:
+        await service.close()
+        borrowed.cancel()
+        await asyncio.gather(borrowed, return_exceptions=True)
+
+
+@pytest.mark.parametrize("bad_worker,bad_factory", [(True, False), (False, True)])
+async def test_service_requires_the_canonical_worker_and_publisher(
+    outbox, bad_worker, bad_factory
+):
+    value, _ = outbox
+    with pytest.raises(TypeError):
+        NativePushService(
+            None if bad_worker else worker(value),
+            task_factory=None if bad_factory else create_owned_task,
+        )

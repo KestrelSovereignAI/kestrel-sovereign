@@ -265,26 +265,6 @@ def autowire_otel_project(env: Optional[dict] = None) -> Optional[str]:
     return DEFAULT_OTEL_PROJECT
 
 
-def supports_host_root_path() -> bool:
-    """Best-effort probe: does the installed Phoenix honour ``PHOENIX_HOST_ROOT_PATH``?
-
-    Newer Phoenix versions expose the config via
-    ``phoenix.config.get_env_host_root_path`` (and the
-    ``PHOENIX_HOST_ROOT_PATH`` env constant). If neither is present we fall back
-    to root-path serving and the proxy strips the ``/phoenix`` prefix instead
-    (see :meth:`PhoenixSupervisor.upstream_url`).
-    """
-    try:
-        import phoenix.config as pc  # type: ignore
-    except Exception:  # noqa: BLE001 - any import failure ⇒ assume unsupported
-        return False
-    return (
-        hasattr(pc, "get_env_host_root_path")
-        or hasattr(pc, "PHOENIX_HOST_ROOT_PATH")
-        or "PHOENIX_HOST_ROOT_PATH" in getattr(pc, "__dict__", {})
-    )
-
-
 # ---------------------------------------------------------------------------
 # Private storage custody
 # ---------------------------------------------------------------------------
@@ -426,9 +406,8 @@ class PhoenixSupervisor:
             else phoenix_working_dir()
         )
         self._storage_prepared = False
-        # ``None`` means "auto-detect from the installed Phoenix". Resolved on
-        # start() so tests can force a value.
-        self._root_path_override = root_path
+        # The required Phoenix release supports the host root path. Keep its
+        # imports and configuration side effects inside the supervised child.
         self.root_path = root_path if root_path is not None else PHOENIX_ROOT_PATH
         self.process: Optional[subprocess.Popen] = None
         # PID of an orphaned Phoenix this supervisor *adopted* rather than spawned
@@ -937,19 +916,6 @@ class PhoenixSupervisor:
             )
             return False
 
-        # Resolve the effective root-path against the installed Phoenix unless a
-        # value was pinned by the caller/tests.
-        if self._root_path_override is None:
-            if supports_host_root_path():
-                self.root_path = PHOENIX_ROOT_PATH
-            else:
-                logger.warning(
-                    "Installed Phoenix does not support PHOENIX_HOST_ROOT_PATH — "
-                    "falling back to root-path serving; the proxy will strip the "
-                    "/phoenix prefix. Some absolute UI links may not embed cleanly."
-                )
-                self.root_path = ""
-
         # Adopt-or-reap: never spawn a second child into a port an orphaned
         # Phoenix already holds (#2589 split-brain). Adopt a still-serving child,
         # or reap a non-serving leak so our fresh child can bind. Never blocks
@@ -1313,7 +1279,6 @@ __all__ = [
     "phoenix_otlp_endpoint",
     "autowire_otlp_endpoint",
     "autowire_otel_project",
-    "supports_host_root_path",
     "mint_embed_token",
     "issue_embed_cookie",
     "verify_embed_cookie",

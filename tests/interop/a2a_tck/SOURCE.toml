@@ -1,0 +1,9 @@
+schema_version = 1
+upstream_repository = "https://github.com/a2aproject/a2a-tck.git"
+upstream_commit = "d4d6fae7887f88ef607fb461c13e3b0e1802f19b"
+patched_commit = "298a5c483ea6919e1193d819ac237a2257c97c5c"
+patched_tree = "2a55d5eaccf357f249c6c23188366cd045a46a82"
+patch_sha256 = "a45411fb236754c85231368e0bd1595e2e1a4641417a85bb838cd32bd5ab8e21"
+license_sha256 = "c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4"
+protocol_version = "1.0.1"
+spec_commit = "3303592588e388e62e0f69f701af531d2f4e3991"

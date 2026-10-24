@@ -43,7 +43,8 @@ privacy: public
   - `/agent/notifications/sse`
   - `/agent/context-status`
   - `/agent/reflection/status`
-  - `/agent/tasks`
+  - `/api/agent/task-inbox`
+  - `/api/agent/task-inbox/{task_id}`
   - `/agent/heartbeat/status`
   - `/agent/heartbeat/trigger`
 - `conversations`

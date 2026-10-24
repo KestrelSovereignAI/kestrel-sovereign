@@ -47,6 +47,26 @@ working examples.
 
 ## Picking a mode
 
+### Hosted care-only channel acknowledgements
+
+`ProxyFeature.admit_hosted_telegram_ingress` accepts optional
+`acknowledgement_session_id` only with `acknowledgement_only=True`. The trusted
+host must obtain it from the original authorized workflow wait/run while
+holding its existing authority locks, not from provider or child metadata.
+Core carries this opaque, nonempty printable UTF-8 identity (at most256bytes)
+through task-local ingress context to the canonical channel signal's
+`session_id`. Ordinary and polling calls retain their existing unbound behavior.
+
+This does **not** promote USER_VISIBLE channel events to INTERNAL or change the
+UNTRUSTED source registration. A Workflows consumer must explicitly use run
+correlation with that original run ID; agent-wide internal-broadcast guards stay
+in force. Care-only terminal admission never creates a cognition delivery.
+The optional `expected_channel_signal` argument on the existing durable receipt
+lookup must be built with the same session ID. Missing or different session
+binding cannot borrow a prior terminal receipt, including payload-elided
+privacy modes. Existing immutable workflow definitions/waits are not rewritten
+by this Core API; consumers own their versioned definition migration.
+
 | Mode | When to use | Example |
 |---|---|---|
 | **ACTION** | Deterministic side effect; no LLM, no follow-up cognition. | `trash_retention` purges old rows; `backup_snapshot` writes a sync snapshot. |
@@ -404,13 +424,13 @@ terminates a process. It is deliberately not the operator/local HTTP Stop door
 (`POST /api/agent/stop`, `POST /api/host/stop`): those doors neither build nor
 impersonate this signal, and the A2A transport lane cannot reach them.
 
-Two doors feed it, and both call `dispatch_peer_stop`, which builds a `Signal`
-and awaits `SignalDispatcher.dispatch_signal`. Neither door cancels anything:
-
-- `POST /api/agent/peer/stop` carries the replay-protected hybrid A2A envelope
-  (`a2a_verb=peer_stop`). An unsigned envelope is refused.
-- `AgentManager.stop_host_attested_local_peer` carries the manager's
-  same-process route capability for co-hosted agents.
+Native A2A `SendMessage` carries the declared `peer-stop-v1` extension in
+message metadata over either advertised binding. The request handler verifies
+the complete-request hybrid sender proof, recipient authorization, and replay
+reservation before calling `dispatch_peer_stop`. That function builds a
+`Signal` and awaits `SignalDispatcher.dispatch_signal`; cancellation happens
+only inside the dispatcher-invoked handler. The response is a native A2A
+`Message` containing the Stop receipt.
 
 Identities are routing principals, never payload:
 

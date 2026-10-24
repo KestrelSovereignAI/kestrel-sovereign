@@ -13,6 +13,10 @@ import uvicorn
 
 import kestrel_sovereign.server as server
 from kestrel_sovereign.multi_agent.config import MultiAgentConfig
+from kestrel_sovereign.multi_agent.process_manager import (
+    SERVER_GRACEFUL_SHUTDOWN_SECONDS,
+)
+from tests.shared.environment_guard import unset_environment
 
 
 _SERVER_ENV_NAMES = ("KESTREL_SERVER_HOST", "PORT")
@@ -20,9 +24,12 @@ _SERVER_ENV_NAMES = ("KESTREL_SERVER_HOST", "PORT")
 
 @pytest.fixture(autouse=True)
 def _clear_server_environment(monkeypatch):
-    """Keep host-machine bind settings from influencing CLI contract tests."""
-    for name in _SERVER_ENV_NAMES:
-        monkeypatch.delenv(name, raising=False)
+    """Keep host-machine bind settings from influencing CLI contract tests.
+
+    ``main`` mirrors the address it resolves into the environment, so the
+    variables are recorded for ``monkeypatch`` to remove afterwards (#3671).
+    """
+    unset_environment(monkeypatch, *_SERVER_ENV_NAMES)
 
 
 @pytest.mark.parametrize(
@@ -64,7 +71,17 @@ def test_main_honors_cli_environment_and_default_precedence(
 
     server.main(arguments)
 
-    assert calls == [((server.app,), {"host": expected_host, "port": expected_port})]
+    assert calls == [
+        (
+            (server.app,),
+            {
+                "host": expected_host,
+                "port": expected_port,
+                "timeout_graceful_shutdown": SERVER_GRACEFUL_SHUTDOWN_SECONDS,
+                "log_config": None,
+            },
+        )
+    ]
     assert os.environ["KESTREL_SERVER_HOST"] == expected_host
     assert os.environ["PORT"] == str(expected_port)
 

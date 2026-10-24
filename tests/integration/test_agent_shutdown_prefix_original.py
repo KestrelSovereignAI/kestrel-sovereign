@@ -10,6 +10,17 @@ from tests.integration.test_host_onboarding_original_admission import onboarding
 from tests.integration.test_maintenance_original_retirement import _original_control
 from tests.unit.test_host_context_native_cleanup import _actual_operation
 from tests.utils.original_failure import OriginalFailure
+from tests.shared.native_shutdown_budget import reserve_native_shutdown_budget
+
+
+@pytest.fixture(autouse=True)
+def native_prefix_budget(onboarding_owner, monkeypatch):
+    _manager, agent, _database = onboarding_owner
+    # These tests must enter a real fallible prefix before the durable tail.
+    # CI reserves a larger SQLite checkpoint window than local defaults. Keep
+    # that complete native reservation AND five seconds for the prefix instead
+    # of letting a fixed five-second total silently allocate zero prefix time.
+    reserve_native_shutdown_budget(agent, monkeypatch)
 
 
 @pytest.mark.asyncio

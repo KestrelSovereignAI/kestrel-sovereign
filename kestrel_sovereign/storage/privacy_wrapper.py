@@ -812,6 +812,22 @@ class _SharedGateHold:
         self.live = True
 
 
+class _ExclusiveGateHold:
+    """One native exclusive acquisition, never a reusable task credential."""
+
+    __slots__ = ('gate', 'task', 'live', 'holds')
+
+    def __init__(self, gate):
+        self.gate = gate
+        self.task = asyncio.current_task()
+        self.live = True
+        self.holds = 1
+
+
+class _OriginalJournalGateBusy(RuntimeError):
+    """The original terminal row cannot immediately retain its privacy policy."""
+
+
 class DurablePersistenceGate:
     """Shared/exclusive gate between durable signal persistence and a privacy flip (#3316).
 
@@ -865,6 +881,7 @@ class DurablePersistenceGate:
     def __init__(self) -> None:
         self._lock = AsyncReaderWriterLock()
         self._owner: Optional["asyncio.Task"] = None
+        self._exclusive_hold: Optional[_ExclusiveGateHold] = None
         self._shared_lock = DurablePersistenceGateSharedLock(self)
 
     def locked(self) -> bool:
@@ -874,6 +891,33 @@ class DurablePersistenceGate:
     def _owned_by_current_task(self) -> bool:
         task = asyncio.current_task()
         return task is not None and self._owner is task
+
+    def _capture_original_exclusive_hold(self):
+        """Capture only the current task's actual lexical acquisition."""
+        return self._exclusive_hold if self._owned_by_current_task() else None
+
+    def _release_exclusive_hold(self, hold):
+        hold.holds -= 1
+        if hold.holds == 0:
+            self._exclusive_hold = None
+            self._lock.release()
+
+    @asynccontextmanager
+    async def _retain_original_exclusive_hold(self, hold):
+        """Pin the original lock for a fixed journal child joined by its owner.
+
+        This is not inherited shared or exclusive work authority. Even if the
+        original frame unwinds, its native lock cannot be released underneath
+        an admitted journal's SQL/COMMIT/reset cleanup.
+        """
+        if (type(hold) is not _ExclusiveGateHold or hold.gate is not self
+                or self._exclusive_hold is not hold or not hold.live):
+            raise RuntimeError('Original exclusive privacy hold retired')
+        hold.holds += 1
+        try:
+            yield
+        finally:
+            self._release_exclusive_hold(hold)
 
     def _live_shared_hold(self) -> Optional[_SharedGateHold]:
         """The innermost live shared hold on this gate in the current context."""
@@ -902,6 +946,33 @@ class DurablePersistenceGate:
             lease = _SharedGateLease()
         else:
             lease = inherited.lease
+        async with self._hold_shared_lease(lease):
+            yield
+
+    @asynccontextmanager
+    async def _original_journal(self, exclusive_hold=None):
+        """Protect one original journal without waiting on a transition owner.
+
+        Ingress still uses blocking shared admission. Routing runs outside
+        that leaf lock, so its later terminal row must not wait for a privacy
+        transition which may itself be awaiting the dispatch's completion.
+        """
+        if exclusive_hold is not None:
+            async with self._retain_original_exclusive_hold(exclusive_hold):
+                yield
+            return
+        inherited = self._live_shared_hold()
+        if inherited is None:
+            if not self._lock.try_acquire_read():
+                raise _OriginalJournalGateBusy('Original terminal journal privacy gate busy')
+            lease = _SharedGateLease()
+        else:
+            lease = inherited.lease
+        async with self._hold_shared_lease(lease):
+            yield
+
+    @asynccontextmanager
+    async def _hold_shared_lease(self, lease):
         lease.holds += 1
         hold = _SharedGateHold(self, lease)
         token = _DURABLE_GATE_SHARED_HOLDS.set(
@@ -937,11 +1008,13 @@ class DurablePersistenceGate:
             )
         await self._lock.acquire()
         self._owner = asyncio.current_task()
+        hold = self._exclusive_hold = _ExclusiveGateHold(self)
         try:
             yield
         finally:
+            hold.live = False
             self._owner = None
-            self._lock.release()
+            self._release_exclusive_hold(hold)
 
 
 class DurablePersistenceGateSharedLock:

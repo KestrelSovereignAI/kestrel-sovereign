@@ -7,6 +7,8 @@ and cannot be circumvented through various attack vectors.
 
 Run with: pytest -m adversarial tests/integration/test_constitution_adversarial.py
 """
+
+from tests.shared.native_shutdown_budget import shutdown_fixture_agent
 import pytest
 import pytest_asyncio
 import sqlite3
@@ -283,9 +285,9 @@ class TestCrossUserIsolation:
 
         finally:
             if agent_a is not None:
-                await agent_a.shutdown()
+                await shutdown_fixture_agent(agent_a)
             if agent_b is not None:
-                await agent_b.shutdown()
+                await shutdown_fixture_agent(agent_b)
             await llm_service_a.close()
             await llm_service_b.close()
 
@@ -346,7 +348,7 @@ class TestPrivacyModeEnforcement:
                         f"Privacy mode violation detected."
                     )
 
-            await agent.shutdown()
+            await shutdown_fixture_agent(agent)
 
         finally:
             await llm_service.close()

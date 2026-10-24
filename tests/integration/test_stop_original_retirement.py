@@ -1,5 +1,7 @@
 """A bounded server Stop close cannot erase a still-live native settlement."""
 
+from tests.shared.native_shutdown_budget import shutdown_fixture_agent
+
 import asyncio
 
 import asyncpg
@@ -119,6 +121,6 @@ async def test_bounded_original_stop_close_keeps_pending_native_settlement(
             if not is_execution_control_error(error):
                 raise
         backend._execution_custody = None
-        await agent.shutdown()
+        await shutdown_fixture_agent(agent)
         await agent_db.close()
         await db.close()

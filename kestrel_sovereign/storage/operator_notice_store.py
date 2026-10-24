@@ -33,7 +33,7 @@ routing metadata only. The rendered notice prose is not stored here, and no
 user content ever reaches this table.
 
 Schema note: the table is declared in ``async_database.CORE_SCHEMA`` alongside
-``wait_signal_state`` and ``pending_a2a_questions``, so it is created by the
+``wait_signal_state``, so it is created by the
 one idempotent ``CREATE TABLE IF NOT EXISTS`` path every backend already runs.
 There is no hand-rolled ``ALTER``/backfill here; any future additive column
 must go through :meth:`AsyncDatabase.migrate_columns_once` (#2791).
@@ -191,7 +191,7 @@ class OperatorNoticeAuditStore:
     Construct with the agent's :class:`AsyncDatabase` and the owning agent's
     id (its DID). Every query is filtered by ``agent_id`` so a shared Postgres
     backend cannot leak rows between agents — the same isolation rule
-    ``WaitSignalStore`` and ``PendingA2AQuestionStore`` follow.
+    ``WaitSignalStore`` follow.
     """
 
     def __init__(self, db: Any, agent_id: str):

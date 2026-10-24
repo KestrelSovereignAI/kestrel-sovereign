@@ -919,3 +919,23 @@ role = "technical_reviewer"
 # (target = "log", suppress_ok = true) logs a warning at startup and is
 # ignored, and the status API reports `target` under `deprecated_fields`.
 # Delete both keys.
+
+
+# ---------------------------------------------------------------------------
+# [event_loop_watchdog] — name the frame that blocks the host's event loop (#3806)
+# ---------------------------------------------------------------------------
+# Every agent turn and the Distributed Stop owner's lease renewal share the
+# server's one event loop, so a synchronous section that runs too long on it
+# can fence the Stop owner (#3745). The loop runs a heartbeat every
+# heartbeat_interval_seconds; a daemon thread watches it. When the heartbeat
+# is overdue by more than stall_threshold_seconds, the thread logs one WARNING
+# with the stall so far and the loop thread's Python stack, then one INFO line
+# with the total once the loop resumes. Host-wide: read once when the server
+# starts, from the same kestrel.toml as every other section. An unknown key, a
+# non-positive threshold or a heartbeat interval under 0.01 s refuses startup.
+# The values below are the defaults.
+#
+# [event_loop_watchdog]
+# enabled = true
+# stall_threshold_seconds = 1.0
+# heartbeat_interval_seconds = 0.25

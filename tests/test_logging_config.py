@@ -1,9 +1,11 @@
 """Tests for kestrel_sovereign.logging_config — structured JSON logging."""
 
+import asyncio
+import contextlib
 import json
 import logging
 import os
-import uuid
+import re
 from unittest import mock
 
 import pytest
@@ -283,3 +285,168 @@ class TestSetupLogging:
         captured = capsys.readouterr()
         parsed = json.loads(captured.err.strip())
         assert parsed["message"] == "Server starting up..."
+
+
+# ---------------------------------------------------------------------------
+# Timestamps and uvicorn's own loggers (#3781)
+# ---------------------------------------------------------------------------
+
+_TIMESTAMP = r"\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2},\d{3}"
+
+
+async def _asgi_app(scope, receive, send):  # pragma: no cover - never served
+    raise AssertionError("the app is never called")
+
+
+@contextlib.contextmanager
+def _uvicorn_configured(**config_kwargs):
+    """Configure logging exactly as uvicorn's CLI does before importing the app.
+
+    ``uvicorn.Config`` applies uvicorn's default logging config in its
+    constructor: handlers and formatters of its own on ``uvicorn`` and
+    ``uvicorn.access``, with ``propagate=False``. ``access_log=False``
+    (``--no-access-log``) then strips ``uvicorn.access`` of its handlers. The
+    loggers are restored afterwards so no other test sees them changed.
+    """
+    import uvicorn
+
+    from kestrel_sovereign.logging_config import UVICORN_LOGGERS
+
+    saved = {}
+    for name in UVICORN_LOGGERS:
+        lg = logging.getLogger(name)
+        saved[name] = (list(lg.handlers), lg.propagate, lg.level)
+    try:
+        config = uvicorn.Config(
+            _asgi_app, http="h11", ws="none", **config_kwargs
+        )
+        assert logging.getLogger("uvicorn").handlers, "uvicorn configured nothing"
+        assert logging.getLogger("uvicorn.access").propagate is False
+        yield config
+    finally:
+        for name, (handlers, propagate, level) in saved.items():
+            lg = logging.getLogger(name)
+            lg.handlers[:] = handlers
+            lg.propagate = propagate
+            lg.setLevel(level)
+
+
+def _logs_requests(config) -> bool:
+    """Whether uvicorn's HTTP protocol, built now, would log each request.
+
+    The protocol decides once per connection, from
+    ``uvicorn.access.hasHandlers()``, so this asks the real class rather than
+    restating its rule.
+    """
+    from uvicorn.protocols.http.h11_impl import H11Protocol
+    from uvicorn.server import ServerState
+
+    loop = asyncio.new_event_loop()
+    try:
+        protocol = H11Protocol(
+            config=config, server_state=ServerState(), app_state={}, _loop=loop
+        )
+        return protocol.access_log
+    finally:
+        loop.close()
+
+
+@pytest.fixture
+def uvicorn_logging_configured():
+    with _uvicorn_configured():
+        yield
+
+
+class TestHostLogLines:
+    """Every host log line carries a timestamp, uvicorn's included."""
+
+    def teardown_method(self):
+        root = logging.getLogger()
+        root.handlers.clear()
+        root.setLevel(logging.WARNING)
+
+    def test_text_format_starts_with_a_timestamp(self, capsys):
+        setup_logging(fmt="text", level="INFO")
+        logging.getLogger("test.timestamp").info("phase reached")
+
+        line = capsys.readouterr().err.strip()
+        assert re.match(rf"^{_TIMESTAMP} INFO:test\.timestamp:", line), line
+        assert line.endswith("phase reached")
+
+    def test_uvicorn_server_lines_use_the_host_format(
+        self, uvicorn_logging_configured, capsys
+    ):
+        setup_logging(fmt="text", level="INFO")
+        logging.getLogger("uvicorn.error").info(
+            "Waiting for connections to close. (CTRL+C to force quit)"
+        )
+
+        captured = capsys.readouterr()
+        lines = (captured.err + captured.out).strip().splitlines()
+        assert len(lines) == 1, lines
+        assert re.match(
+            rf"^{_TIMESTAMP} INFO:uvicorn\.error:\[correlation_id=-\]:"
+            r"Waiting for connections to close\.",
+            lines[0],
+        ), lines[0]
+
+    def test_uvicorn_access_lines_use_the_host_format(
+        self, uvicorn_logging_configured, capsys
+    ):
+        setup_logging(fmt="text", level="INFO")
+        # The shape uvicorn's HTTP protocols log each request with.
+        logging.getLogger("uvicorn.access").info(
+            '%s - "%s %s HTTP/%s" %d', "127.0.0.1:5000", "GET", "/health", "1.1", 200
+        )
+
+        captured = capsys.readouterr()
+        lines = (captured.err + captured.out).strip().splitlines()
+        assert len(lines) == 1, lines
+        assert re.match(rf"^{_TIMESTAMP} INFO:uvicorn\.access:", lines[0]), lines[0]
+        assert lines[0].endswith('127.0.0.1:5000 - "GET /health HTTP/1.1" 200')
+
+    def test_uvicorn_lines_follow_the_json_format_too(
+        self, uvicorn_logging_configured, capsys
+    ):
+        setup_logging(fmt="json", level="INFO")
+        logging.getLogger("uvicorn.error").info("Shutting down")
+
+        captured = capsys.readouterr()
+        lines = (captured.err + captured.out).strip().splitlines()
+        assert len(lines) == 1, lines
+        parsed = json.loads(lines[0])
+        assert parsed["logger"] == "uvicorn.error"
+        assert parsed["message"] == "Shutting down"
+        assert "T" in parsed["timestamp"]
+
+    def test_access_log_stays_on_when_uvicorn_logs_requests(self, capsys):
+        with _uvicorn_configured() as config:
+            assert _logs_requests(config) is True
+            setup_logging(fmt="text", level="INFO")
+            assert _logs_requests(config) is True
+
+    def test_no_access_log_stays_off_after_setup(self, capsys):
+        """``--no-access-log`` is not undone by the application's logging setup.
+
+        uvicorn applies it before importing the application, whose import then
+        calls ``setup_logging``; routing ``uvicorn.access`` to the root handler
+        would give it a handler again and turn request logging back on.
+        """
+        with _uvicorn_configured(access_log=False) as config:
+            assert _logs_requests(config) is False
+            setup_logging(fmt="text", level="INFO")
+            assert _logs_requests(config) is False
+
+            logging.getLogger("uvicorn.access").info(
+                '%s - "%s %s HTTP/%s" %d',
+                "127.0.0.1:5000", "GET", "/health", "1.1", 200,
+            )
+            logging.getLogger("uvicorn.error").info("Started server process")
+
+        captured = capsys.readouterr()
+        lines = (captured.err + captured.out).strip().splitlines()
+        # The server's own lines are still routed; the access line went nowhere.
+        assert len(lines) == 1, lines
+        assert re.match(
+            rf"^{_TIMESTAMP} INFO:uvicorn\.error:", lines[0]
+        ), lines[0]

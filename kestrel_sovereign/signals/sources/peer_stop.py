@@ -1,8 +1,7 @@
 """Authenticated peer cooperative Stop as a typed ACTION signal (#3169).
 
-Peer Stop deliberately has no direct cancellation door.  Both the signed wire
-path (``POST /api/agent/peer/stop``) and the host-attested same-process path
-(``AgentManager.stop_host_attested_local_peer``) call
+Peer Stop deliberately has no direct cancellation door. Native A2A SendMessage
+and SendStreamingMessage enter the signed recipient guard, then call
 :func:`dispatch_peer_stop`, which builds an ``a2a.peer_stop`` signal and awaits
 ``SignalDispatcher.dispatch_signal``.  Causation-cycle detection, depth TTL,
 durable source-event deduplication, and per-source rate limiting therefore
@@ -10,8 +9,8 @@ decide every peer Stop before the handler below can cancel anything.
 
 Identities are routing principals, never payload:
 
-* the **actor** is ``Signal.caller`` — the verified envelope sender (wire) or
-  the manager-attested sender (local);
+* the **actor** is ``Signal.caller`` — the durable principal selected by native signed-request
+  admission and recipient policy;
 * the **target** is ``Signal.target_agent`` — the recipient's own DID.
 
 The payload carries only the signed intent (scope, work target, reason,
@@ -88,7 +87,6 @@ from kestrel_sdk.signals import (
 )
 
 from kestrel_sovereign.agent.invocation import validate_invocation_id
-from kestrel_sovereign.a2a.envelope_signing import A2A_AUDIENCE_METADATA_KEY
 from kestrel_sovereign.signals.context import get_current_signal
 from kestrel_sovereign.signals.in_flight_control import (
     InFlightControlActionRegistration,
@@ -114,7 +112,6 @@ from kestrel_sovereign.stop.runtime_target import (
 )
 
 SOURCE_NAME = "a2a.peer_stop"
-PEER_STOP_A2A_VERB = "peer_stop"
 PEER_STOP_RATE_LIMIT_PER_MINUTE = 4
 PEER_STOP_RATE_LIMIT_PER_HOUR = 20
 PEER_STOP_RATE_LIMIT_BURST = 4
@@ -260,102 +257,12 @@ def _peer_stop_schema(payload: dict) -> dict:
     return intent
 
 
-def encode_peer_stop_intent(
-    *,
-    scope: StopScope,
-    target: str | None,
-    reason: str | None,
-    cascade: bool,
-    correlation_id: str,
-) -> str:
-    """Return the canonical signed message text for a peer Stop intent."""
-
-    intent = parse_peer_stop_intent(
-        {
-            "scope": scope.value if isinstance(scope, StopScope) else scope,
-            "target": target,
-            "reason": reason,
-            "cascade": cascade,
-            "correlation_id": correlation_id,
-        }
-    )
-    return json.dumps(intent, sort_keys=True, separators=(",", ":"))
 
 
-def decode_peer_stop_intent(message: object) -> dict[str, Any]:
-    """Parse one signed peer Stop message; only canonical encoding is valid."""
-
-    if not isinstance(message, str):
-        raise PeerStopIntentError("peer Stop message must be text")
-    try:
-        raw = json.loads(message)
-    except (TypeError, ValueError) as error:
-        raise PeerStopIntentError("peer Stop message is not valid JSON") from error
-    intent = parse_peer_stop_intent(raw)
-    if message != json.dumps(intent, sort_keys=True, separators=(",", ":")):
-        raise PeerStopIntentError("peer Stop message must use canonical encoding")
-    return intent
 
 
-def decode_peer_stop_action_envelope(
-    envelope: object,
-) -> tuple[dict[str, Any], str, str, dict]:
-    """Validate the task-shaped peer Stop action envelope.
-
-    The hybrid A2A signature binds ``id``, ``sessionId``, the exact message
-    text, the ``a2a_verb``, the audience, and the causation chain.  This parser
-    keeps peer Stop on that reviewed authentication format without treating it
-    as a persisted A2A task.
-    """
-
-    if not isinstance(envelope, Mapping):
-        raise PeerStopIntentError("peer Stop envelope must be an object")
-    if envelope.get("artifacts") not in (None, []):
-        raise PeerStopIntentError("peer Stop cannot carry artifacts")
-    correlation_id = envelope.get("id")
-    session_id = envelope.get("sessionId")
-    try:
-        validate_invocation_id(correlation_id)
-        validate_invocation_id(session_id)
-    except ValueError as error:
-        raise PeerStopIntentError(
-            "peer Stop envelope requires valid id and sessionId"
-        ) from error
-
-    message = envelope.get("message")
-    if not isinstance(message, Mapping):
-        raise PeerStopIntentError("peer Stop message must be an object")
-    parts = message.get("parts")
-    if (
-        not isinstance(parts, list)
-        or len(parts) != 1
-        or not isinstance(parts[0], Mapping)
-        or parts[0].get("type") != "text"
-        or not isinstance(parts[0].get("text"), str)
-    ):
-        raise PeerStopIntentError("peer Stop requires exactly one text message part")
-    intent = decode_peer_stop_intent(parts[0]["text"])
-    if intent["correlation_id"] != correlation_id:
-        raise PeerStopIntentError("peer Stop correlation does not match envelope id")
-
-    metadata = envelope.get("metadata")
-    if not isinstance(metadata, dict):
-        raise PeerStopIntentError("peer Stop metadata must be an object")
-    if metadata.get("a2a_verb") != PEER_STOP_A2A_VERB:
-        raise PeerStopIntentError(
-            f"peer Stop envelope must bind a2a_verb={PEER_STOP_A2A_VERB}"
-        )
-    peer_stop_audience(metadata)
-    return intent, correlation_id, session_id, metadata
 
 
-def peer_stop_audience(metadata: Mapping[str, Any]) -> str:
-    """Return the required signed audience; it is checked, never trusted."""
-
-    audience = metadata.get(A2A_AUDIENCE_METADATA_KEY)
-    if not isinstance(audience, str) or not audience.strip():
-        raise PeerStopIntentError("peer Stop envelope requires a signed audience")
-    return audience
 
 
 # ---------------------------------------------------------------------------
@@ -1060,7 +967,6 @@ def _peer_stop_redaction(payload: dict) -> str:
 
 __all__ = [
     "MAX_PEER_STOP_REASON_CHARS",
-    "PEER_STOP_A2A_VERB",
     "PEER_STOP_CIRCUIT_OPEN",
     "PEER_STOP_CIRCUIT_THRESHOLD",
     "PEER_STOP_CIRCUIT_THRESHOLD_ENV",
@@ -1076,12 +982,8 @@ __all__ = [
     "attach_stop_evidence",
     "build_peer_stop_registration",
     "build_peer_stop_signal",
-    "decode_peer_stop_action_envelope",
-    "decode_peer_stop_intent",
     "dispatch_peer_stop",
-    "encode_peer_stop_intent",
     "parse_peer_stop_intent",
-    "peer_stop_audience",
     "peer_stop_breaker_refusal",
     "peer_stop_delivery_id",
     "peer_stop_delivery_request",

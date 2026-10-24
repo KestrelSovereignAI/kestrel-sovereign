@@ -1556,6 +1556,17 @@ class MemoryConsolidator:
 
         return persistent_writes_allowed(self._persist_policy)
 
+    def _timestamp_parameter(self, value: datetime | str | None) -> Any:
+        """Bind this store's legacy TIMESTAMP columns without guessing SQL types.
+
+        PostgreSQL requires native naive UTC datetimes. SQLite's episode and
+        archival columns retain their existing ISO spelling; they are not the
+        separately canonicalized conversation ``created_at`` column.
+        """
+        if self._db.backend_type == "postgres":
+            return timestamp_query_param("postgres", value)
+        return value.isoformat() if isinstance(value, datetime) else value
+
     async def _save_episode(self, episode: MemoryEpisode) -> None:
         """Save episode to database and optionally to the Knowledge Graph."""
         if not self._durable_writes_allowed():
@@ -1581,11 +1592,11 @@ class MemoryConsolidator:
                 episode.agent_id,
                 episode.title,
                 episode.summary,
-                episode.timespan_start.isoformat() if episode.timespan_start else None,
-                episode.timespan_end.isoformat() if episode.timespan_end else None,
+                self._timestamp_parameter(episode.timespan_start),
+                self._timestamp_parameter(episode.timespan_end),
                 json.dumps(episode.key_message_ids),
                 episode.emotional_arc,
-                datetime.now(timezone.utc).isoformat(),
+                self._timestamp_parameter(datetime.now(timezone.utc)),
                 episode.importance,
             )
         )
@@ -2067,7 +2078,7 @@ class MemoryConsolidator:
                        SET metadata = ?, archived_at = ?
                        WHERE id = ? AND agent_id = ?
                          AND deleted_at IS NULL AND archived_at IS NULL""",
-                    (json.dumps(metadata), archived_at, msg_id, self.agent_id),
+                    (json.dumps(metadata), self._timestamp_parameter(archived_at), msg_id, self.agent_id),
                 )
                 archived_count += 1
                 continue
@@ -2108,7 +2119,7 @@ class MemoryConsolidator:
                        SET metadata = ?, archived_at = ?
                        WHERE id = ? AND agent_id = ?
                          AND deleted_at IS NULL AND archived_at IS NULL""",
-                    (json.dumps(metadata), archived_at, msg_id, self.agent_id)
+                    (json.dumps(metadata), self._timestamp_parameter(archived_at), msg_id, self.agent_id)
                 )
                 archived_count += 1
 
@@ -2366,53 +2377,4 @@ class MemoryConsolidator:
             (self.agent_id, limit, offset)
         )
 
-        episodes = []
-        for row in rows:
-            (ep_id, agent_id, title, summary, timespan_start, timespan_end,
-             key_message_ids, emotional_arc, created_at, importance,
-             access_count) = row
-
-            # Parse JSON fields
-            if isinstance(key_message_ids, str):
-                try:
-                    key_message_ids = json.loads(key_message_ids)
-                except (json.JSONDecodeError, TypeError):
-                    key_message_ids = []
-
-            # Parse timestamps
-            try:
-                timespan_start = datetime.fromisoformat(
-                    timespan_start.replace("Z", "+00:00")
-                ) if timespan_start else None
-            except (ValueError, TypeError):
-                timespan_start = None
-
-            try:
-                timespan_end = datetime.fromisoformat(
-                    timespan_end.replace("Z", "+00:00")
-                ) if timespan_end else None
-            except (ValueError, TypeError):
-                timespan_end = None
-
-            try:
-                created_at = datetime.fromisoformat(
-                    created_at.replace("Z", "+00:00")
-                ) if created_at else None
-            except (ValueError, TypeError):
-                created_at = None
-
-            episodes.append(MemoryEpisode(
-                id=ep_id,
-                agent_id=agent_id,
-                title=title,
-                summary=summary,
-                timespan_start=timespan_start,
-                timespan_end=timespan_end,
-                key_message_ids=key_message_ids,
-                emotional_arc=emotional_arc,
-                created_at=created_at,
-                importance=importance if importance is not None else 0.5,
-                access_count=access_count if access_count is not None else 0,
-            ))
-
-        return episodes
+        return [MemoryEpisode.from_row(row) for row in rows]

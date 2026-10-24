@@ -13,7 +13,6 @@ marker (and any provider/underlying text) never surfaces.
 
 import asyncio
 import json
-import os
 from contextlib import asynccontextmanager
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
@@ -30,7 +29,15 @@ from kestrel_sovereign.features.bridge.router import get_router
 
 
 API_KEY = "test-bridge-key"
-pytestmark = pytest.mark.usefixtures("isolated_process_rate_limiter")
+pytestmark = pytest.mark.usefixtures(
+    "isolated_process_rate_limiter", "_bridge_api_key"
+)
+
+
+@pytest.fixture
+def _bridge_api_key(monkeypatch):
+    """The sovereign key the requests below authenticate with."""
+    monkeypatch.setenv("KESTREL_API_KEY", API_KEY)
 
 
 def _boot(
@@ -96,7 +103,6 @@ def _post_stream(
     cancel_on_check=None,
     self_fenced=False,
 ):
-    os.environ["KESTREL_API_KEY"] = API_KEY
     app, restore = _boot(
         process_input_streaming,
         cancel_on_check=cancel_on_check,
@@ -120,7 +126,6 @@ def _post_stream_with_agent(
 ):
     """Drive the real bridge route and retain its test agent for assertions."""
 
-    os.environ["KESTREL_API_KEY"] = API_KEY
     app, restore = _boot(
         process_input_streaming,
         cancel_on_check=cancel_on_check,

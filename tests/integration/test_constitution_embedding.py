@@ -9,6 +9,8 @@ This module verifies that:
 5. Genesis self-audit prevents corrupted agents
 6. Constitutional governance is immutable
 """
+
+from tests.shared.native_shutdown_budget import shutdown_fixture_agent
 import pytest
 import asyncio
 from pathlib import Path
@@ -284,7 +286,7 @@ async def test_agent_can_access_constitution_via_kestrel_agent(tmp_path):
         assert len(constitution_text) > 1000, "Constitution must be substantive"
 
     finally:
-        await agent.shutdown()
+        await shutdown_fixture_agent(agent)
 
 
 @pytest.mark.anyio
@@ -547,7 +549,7 @@ async def test_fresh_inception_passes_verification_and_audit(tmp_path, monkeypat
         await agent._maybe_audit()
         assert agent._safe_mode is False, "Untampered periodic audit must not Safe-Mode"
     finally:
-        await agent.shutdown()
+        await shutdown_fixture_agent(agent)
 
 
 @pytest.mark.anyio
@@ -573,7 +575,7 @@ async def test_docs_frontmatter_does_not_cause_false_mismatch(tmp_path, monkeypa
         is_valid, message = await agent._verify_constitution_integrity()
         assert is_valid, f"Docs frontmatter must not fail audit, got: {message}"
     finally:
-        await agent.shutdown()
+        await shutdown_fixture_agent(agent)
 
 
 @pytest.mark.anyio
@@ -603,7 +605,7 @@ async def test_mutated_governing_source_enters_safe_mode(tmp_path, monkeypatch):
         await agent._maybe_audit()
         assert agent._safe_mode is True, "Governing mutation must enter Safe Mode"
     finally:
-        await agent.shutdown()
+        await shutdown_fixture_agent(agent)
 
 
 @pytest.mark.anyio
@@ -639,7 +641,7 @@ async def test_missing_governing_source_fails_closed_into_safe_mode(
         await agent._maybe_audit()
         assert agent._safe_mode is True, "Missing governing source must enter Safe Mode"
     finally:
-        await agent.shutdown()
+        await shutdown_fixture_agent(agent)
 
 
 @pytest.mark.anyio
@@ -671,7 +673,7 @@ async def test_unreadable_governing_source_fails_closed_into_safe_mode(
         assert agent._safe_mode is True
     finally:
         os.chmod(governing, 0o644)
-        await agent.shutdown()
+        await shutdown_fixture_agent(agent)
 
 
 @pytest.mark.anyio
@@ -720,7 +722,7 @@ async def test_installer_inception_and_audit_resolve_identical_bytes(
         is_valid, message = await agent._verify_constitution_integrity()
         assert is_valid, f"Audit must match inception bytes, got: {message}"
     finally:
-        await agent.shutdown()
+        await shutdown_fixture_agent(agent)
 
 
 @pytest.mark.anyio
@@ -771,7 +773,7 @@ async def test_active_amendment_viii_verifies_and_dormant_downgrade_fails(
         assert not is_valid, "Dormant downgrade of an active contract must fail"
         assert "INTEGRITY FAILURE" in message
     finally:
-        await agent.shutdown()
+        await shutdown_fixture_agent(agent)
 
 
 @pytest.mark.anyio
@@ -825,4 +827,4 @@ async def test_inception_accepts_monkeypatched_authoritative_path(
         is_valid, message = await agent._verify_constitution_integrity()
         assert is_valid, f"Authoritative-path inception must verify: {message}"
     finally:
-        await agent.shutdown()
+        await shutdown_fixture_agent(agent)

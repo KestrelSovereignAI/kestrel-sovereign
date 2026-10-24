@@ -5,12 +5,12 @@ Tests the explore-then-direct-call optimization where features explored
 via subagent dispatch expose their individual tools for direct calling.
 """
 
-import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
 
-from kestrel_sovereign.kestrel_agent import KestrelAgent
-from kestrel_sdk.tools.base import ToolSchema, ToolParameter, ToolCategory
+import pytest
+from kestrel_sdk.tools.base import ToolCategory, ToolParameter, ToolSchema
 
+from kestrel_sovereign.kestrel_agent import KestrelAgent
 
 # =============================================================================
 # Helpers
@@ -372,7 +372,6 @@ class TestBuildAllTools:
         feature.on_disable = AsyncMock()
         feature.shutdown = AsyncMock()
         feature.get_hooks.return_value = []
-        feature.get_agent_card.return_value.name = "ModelAgent"
         agent.features = {"ModelAgent": feature}
         agent.task_manager = MagicMock()
         agent._register_explored_feature_tools(feature)
@@ -389,7 +388,7 @@ class TestBuildAllTools:
         assert agent._tool_context_hidden_features == set()
         assert agent._tool_context_hidden_tools == set()
         feature.shutdown.assert_awaited_once()
-        agent.task_manager.unregister_agent.assert_called_once_with("ModelAgent")
+        agent.task_manager.unregister_provider.assert_called_once_with("ModelAgent")
 
 
 # =============================================================================
@@ -614,7 +613,8 @@ class TestAllToolsReachCodexHandler:
         tool name."""
         from kestrel_sovereign.llm.codex_adapter import CodexAdapter
         from tests.unit.test_codex_adapter import (
-            _FakeAppServer, _TEXT_TURN,
+            _TEXT_TURN,
+            _FakeAppServer,
         )
 
         adapter = CodexAdapter()
@@ -674,7 +674,8 @@ class TestAllToolsReachCodexHandler:
         registry)."""
         from kestrel_sovereign.llm.codex_adapter import CodexAdapter
         from tests.unit.test_codex_adapter import (
-            _FakeAppServer, _TEXT_TURN,
+            _TEXT_TURN,
+            _FakeAppServer,
         )
 
         adapter = CodexAdapter()

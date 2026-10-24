@@ -374,7 +374,7 @@ async def test_typed_command_marker_is_set_by_execute_command(monkeypatch):
         )
 
     manager = TaskManager.__new__(TaskManager)
-    manager._agents = {}
+    manager._providers = {}
     monkeypatch.setattr(
         TaskManager,
         "get_agent_for_command",
@@ -1639,7 +1639,9 @@ from kestrel_sdk.llm.decisions import (  # noqa: E402
     UnavailableReason,
 )
 
-from kestrel_sovereign.llm import decision_service as decision_service_module  # noqa: E402
+from kestrel_sovereign.llm import (
+    decision_service as decision_service_module,  # noqa: E402
+)
 from kestrel_sovereign.llm.decision_service import DecisionOverrideRefused  # noqa: E402
 from kestrel_sovereign.llm.decisions.config import DecisionRouteConfig  # noqa: E402
 from kestrel_sovereign.llm.decisions.resolve import RouteDecisionState  # noqa: E402
@@ -2268,10 +2270,10 @@ from kestrel_sdk.llm import (  # noqa: E402
 )
 from pydantic import SecretStr  # noqa: E402
 
-from kestrel_sovereign.llm.remote_backend import REMOTE_ROUTE_NAME  # noqa: E402
 from kestrel_sovereign.llm.provider_policy import (  # noqa: E402
     known_vendors,
 )
+from kestrel_sovereign.llm.remote_backend import REMOTE_ROUTE_NAME  # noqa: E402
 
 LEASE_MODEL = "llama-3"
 

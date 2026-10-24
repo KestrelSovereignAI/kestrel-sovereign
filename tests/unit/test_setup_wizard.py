@@ -14,6 +14,17 @@ from kestrel_sovereign.setup.prompts import StubPrompter
 from kestrel_sovereign.setup.toml_file import read_toml
 from kestrel_sovereign.setup.wizard import run_wizard
 from kestrel_sovereign.setup.steps import agent as agent_step
+from tests.shared.environment_guard import unset_environment
+
+
+@pytest.fixture(autouse=True)
+def _unset_sovereign_key(monkeypatch):
+    """Start without a sovereign API key, as a fresh machine does (#3671).
+
+    The keys step writes the key it adopts or generates into ``os.environ``;
+    recorded here, ``monkeypatch`` removes it after the test.
+    """
+    unset_environment(monkeypatch, "KESTREL_API_KEY")
 
 
 class _FakeCreds:

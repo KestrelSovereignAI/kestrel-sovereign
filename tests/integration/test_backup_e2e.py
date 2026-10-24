@@ -11,7 +11,7 @@ from dotenv import load_dotenv
 project_root = Path(__file__).parent.parent.parent
 load_dotenv(project_root / ".env")
 
-from server import app, get_api_key
+from server import app
 from kestrel_sovereign.inception_service import create_kestrel_identity_async
 import kestrel_sovereign.storage as storage_pkg
 import tempfile
@@ -19,14 +19,19 @@ import os
 from tests.shared.genesis_audit import deterministic_safe_genesis_auditor
 
 
+API_KEY = "test-key-for-backup-e2e-api"
+
+
 @pytest.fixture(scope="function")
-def api_key():
-    """Get the API key from environment."""
-    return get_api_key()
+def api_key(monkeypatch):
+    """The sovereign key the server checks; without one it mints its own
+    into the environment (#3671)."""
+    monkeypatch.setenv("KESTREL_API_KEY", API_KEY)
+    return API_KEY
 
 
 @pytest_asyncio.fixture(scope="function")
-async def async_client(monkeypatch):
+async def async_client(monkeypatch, api_key):
     """Create an async client for testing the server with proper lifespan management."""
     # Use mkdtemp instead of TemporaryDirectory context manager to control cleanup
     agent_dir = tempfile.mkdtemp()

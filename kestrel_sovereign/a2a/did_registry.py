@@ -45,6 +45,16 @@ _PROCESS_REGISTRY_DIRECTORY = ".kestrel-launch"
 _PROCESS_REGISTRY_PREFIX = "a2a-peer-identities-"
 
 
+def same_a2a_sender_identity_witness(before: tuple, after: tuple) -> bool:
+    """Compare exact host/identity owners without invoking object equality."""
+    return (
+        before[0] == after[0]
+        and before[1] is after[1]
+        and before[2] is after[2]
+        and before[3] == after[3]
+    )
+
+
 class ProcessA2ADidResolverConfigurationError(RuntimeError):
     """A process-managed peer verification registry is malformed."""
 
@@ -372,6 +382,16 @@ class ProcessA2ADidResolver:
         if self._federated_fallback and signing_did.startswith("did:web:"):
             return signing_did
         return None
+
+    def signing_did_for_agent_id(self, agent_id: str) -> str | None:
+        """Select a peer's signing identity from immutable launcher evidence."""
+        if not isinstance(agent_id, str) or not agent_id:
+            return None
+        return next(
+            (did for did, stable_id in self._stable_agent_ids.items()
+             if stable_id == agent_id),
+            None,
+        )
 
 
 def install_process_a2a_did_resolver(

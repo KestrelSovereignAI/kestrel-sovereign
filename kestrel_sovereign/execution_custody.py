@@ -227,17 +227,31 @@ def execution_commit_outcome(error: BaseException | None) -> str | None:
     return outcome
 
 
-def is_execution_control_error(error: BaseException | None) -> bool:
+def _is_execution_control_node(error: BaseException) -> bool:
+    return (isinstance(error, ExecutionAuthorityError)
+            or bool(_acknowledged_commits(error))
+            or bool(vars(error).get("_kestrel_native_retirement_debts")))
+
+
+def is_execution_control_error(
+    error: BaseException | None, *, recursive: bool = True,
+) -> bool:
     """Original authority, commit, or physical-retirement evidence is control.
 
     An ordinary native close exception still controls retirement when it
     carries the actual retained resource/closer. Availability/tool-error
     normalization must never erase that original ownership evidence.
+
+    By default, inspect the explicit cause/group graph, ignoring implicit
+    context and visiting cyclic graphs only once. With ``recursive=False``,
+    inspect only the supplied node using the SAME predicate: a group or
+    ordinary carrier cannot borrow control from its members or cause. Its own
+    acknowledged commit or native retirement evidence still counts. Neither
+    mode changes the original errors, graph, receipts or physical owners.
     """
-    return any(isinstance(current, ExecutionAuthorityError)
-               or bool(_acknowledged_commits(current))
-               or bool(vars(current).get("_kestrel_native_retirement_debts"))
-               for current in _explicit_control_chain(error))
+    nodes = (_explicit_control_chain(error) if recursive
+             else () if error is None else (error,))
+    return any(_is_execution_control_node(current) for current in nodes)
 
 
 def retained_execution_error(error: BaseException) -> BaseException:
@@ -423,6 +437,14 @@ def execution_observation_error(*errors: BaseException | None,
     present = _enclosing_original_errors(present)
     if len(present) < 2:
         return present[0] if present else None
+    if any(is_execution_control_error(error) for error in present):
+        # Native composition must first associate an ordinary physical error
+        # with its actual settled retirement owner. Premarking the whole group
+        # as an observation would hide that original from later source-only
+        # lifecycle latches. The canonical composer excludes observer C while
+        # retaining the physical original without changing its graph.
+        return execution_terminal_error(*present, retain_originals=True,
+                                        isolate_control_originals=True)
     terminal = BaseExceptionGroup(message, present)
     terminal._kestrel_finite_native_sources = (_FINITE_NATIVE_SOURCES, tuple(sources))
     return execution_terminal_error(terminal, retain_originals=True, isolate_control_originals=True)
@@ -601,7 +623,10 @@ class ExecutionFence(Protocol):
     checkout. Validators must not publish effects or start/commit transactions.
     """
 
-    backend_type: str
+    @property
+    def backend_type(self) -> str:
+        """Observe the bound backend without requiring a mutable host fence."""
+        ...
 
     def require_work(self) -> None: ...
 
@@ -964,6 +989,34 @@ def bind_native_execution_admission(validator: Callable[[], Awaitable[None]]) ->
         _NATIVE_ADMISSION_VALIDATORS.reset(token)
 
 
+@dataclass(frozen=True)
+class _NativeHTTPAdmission:
+    client: object = field(repr=False)
+    validator: Callable[[], Awaitable[None]] = field(repr=False)
+
+    async def __call__(self) -> None:
+        """Defer this client-specific gate until its original HTTP dispatch."""
+
+
+@contextmanager
+def bind_native_http_execution_admission(
+    client: object, validator: Callable[[], Awaitable[None]],
+) -> Iterator[None]:
+    """Reauthorize one selected native HTTP client after request observers.
+
+    An authorization lookup can use a different HTTP client. That lookup keeps
+    all ordinary execution gates, without recursively invoking the peer gate
+    whose decision it is computing. The immutable callback remains in copied
+    contexts and applies to every actual dispatch through the selected client.
+    """
+    if not isinstance(client, (_NativeHTTPXAsyncClient, _NativeHTTPX2AsyncClient)):
+        raise TypeError("Native HTTP admission requires an actual native client")
+    if not callable(validator):
+        raise TypeError("Native HTTP admission requires a trusted validator")
+    with bind_native_execution_admission(_NativeHTTPAdmission(client, validator)):
+        yield
+
+
 def capture_native_execution_admission() -> tuple[Callable[[], Awaitable[None]], ...]:
     """Retain the original trusted gate inventory for a deferred resource."""
     return _NATIVE_ADMISSION_VALIDATORS.get()
@@ -1231,7 +1284,11 @@ def retain_native_execution_http_client_close(client: Any) -> None:
         with bind_execution_custody_snapshot(captured):
             require_original_native_work()
             for validator in validators:
-                await validator()
+                if isinstance(validator, _NativeHTTPAdmission):
+                    if validator.client is client:
+                        await validator.validator()
+                else:
+                    await validator()
             require_original_native_work()
             return await native_dispatch(request)
 

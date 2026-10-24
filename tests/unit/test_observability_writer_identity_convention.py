@@ -32,21 +32,9 @@ CORE = Path(__file__).resolve().parents[2] / "kestrel_sovereign"
 STORE = CORE / "a2a" / "stores" / "unified" / "observability_store.py"
 TABLE = "INSERT INTO a2a_observability"
 
-# Modules that take `agent_name` as their OWN parameter and forward it,
-# so the value is chosen by their callers rather than here. An entry has
-# to EARN the exemption: `test_the_allowlist_is_tight` requires every
-# recorder call in the module to pass a bare name bound to a parameter
-# of the enclosing function.
-#
-# Checking only for staleness was not enough, and the difference matters.
-# A one-directional check rejects entries that stopped calling a
-# recorder — but a module that really does write a display name is
-# non-stale by construction, so the more it offends the better it
-# qualifies. Verified: replacing this set with "every module that calls
-# a recorder" left all three tests green. The gate could be silenced by
-# a one-line edit, which is the decay this comment used to claim was
-# impossible.
-_FORWARDS_A_PARAMETER = {"a2a/task_manager.py"}
+# Every recorder chooses its own DID through the same public owner contract.
+# TaskManager derives it from the server-owned NativeRecipientScope; there is
+# no exemption for a chosen display name or an unscoped forwarding wrapper.
 
 
 def _recorder_arg_positions() -> dict[str, int]:
@@ -133,75 +121,17 @@ def test_the_scan_covers_every_recorder_the_store_defines():
     assert any(expr == "self.did" for _, _, expr in calls), calls
 
 
-def test_the_allowlist_is_tight():
-    """An exemption must be earned, not merely declared.
-
-    Two ways it can rot, and both are checked. An entry that stopped
-    calling a recorder is stale and must go — the first version of this
-    file exempted `a2a/task_worker.py`, which has no production
-    constructor at all. And an entry whose calls pass a CHOSEN value
-    rather than a forwarded parameter is not a pass-through at all; it
-    is a writer that has been waved through.
-    """
-    scanned = {path for path, _, _ in _agent_name_expressions()}
-    stale = _FORWARDS_A_PARAMETER - scanned
-    assert stale == set(), (
-        f"these modules are exempted but no longer call a recorder: {stale}"
-    )
-
-    unearned = [
-        f"{path}:{line} passes {expr}"
-        for path, line, expr in _agent_name_expressions()
-        if path in _FORWARDS_A_PARAMETER and not _is_forwarded_parameter(path, line)
-    ]
-    assert unearned == [], (
-        "an exempted module must FORWARD its caller's identity, not choose "
-        "one: " + "; ".join(unearned)
-    )
-
-
-def _is_forwarded_parameter(rel_path: str, lineno: int) -> bool:
-    """Is the identity at *lineno* a bare name bound to an enclosing parameter?"""
-    tree = ast.parse((CORE / rel_path).read_text(errors="replace"))
-    recorders = _recorder_arg_positions()
-
-    for func in ast.walk(tree):
-        if not isinstance(func, (ast.AsyncFunctionDef, ast.FunctionDef)):
-            continue
-        parameters = {
-            a.arg
-            for a in (
-                func.args.args + func.args.kwonlyargs + func.args.posonlyargs
-            )
-        }
-        for node in ast.walk(func):
-            if not isinstance(node, ast.Call) or node.lineno != lineno:
-                continue
-            name = getattr(node.func, "attr", None) or getattr(node.func, "id", None)
-            if name not in recorders:
-                continue
-            keyword = {kw.arg: kw.value for kw in node.keywords}
-            value = keyword.get("agent_name")
-            if value is None:
-                index = recorders[name]
-                value = node.args[index] if len(node.args) > index else None
-            if isinstance(value, ast.Name) and value.id in parameters:
-                return True
-    return False
-
-
 def test_every_recorder_of_our_own_events_writes_the_did():
     """The convention the reads depend on.
 
     If this fails, either a writer started using the display name — in
-    which case `endpoints/observability.py` now under-reads — or a new
-    pass-through was added and belongs in `_FORWARDS_A_PARAMETER` with a
-    note on how its callers resolve the value.
+    which case `endpoints/observability.py` now under-reads. The owner DID
+    must come from the same contract the rest of that recorder uses.
     """
     offenders = [
         f"{path}:{line} passes {expr}"
         for path, line, expr in _agent_name_expressions()
-        if expr != "self.did" and path not in _FORWARDS_A_PARAMETER
+        if expr != "self.did"
     ]
 
     assert offenders == [], (

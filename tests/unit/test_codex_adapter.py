@@ -1411,6 +1411,9 @@ class TestThreadStartParams:
         (fake_temp / "kestrel-codex").symlink_to(outside_target)
 
         monkeypatch.setenv("TMPDIR", str(fake_temp))
+        # Restore tempfile's process-global cache as well as TMPDIR at teardown.
+        # Otherwise later Unix-socket tests inherit this deeply nested path.
+        monkeypatch.setattr(tempfile, "tempdir", None)
         # tempfile.gettempdir caches; force re-read for this test by
         # importing fresh.
         import importlib

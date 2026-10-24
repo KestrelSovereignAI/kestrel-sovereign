@@ -160,11 +160,44 @@ class CorrelationContextFilter(logging.Filter):
         return True
 
 
+TEXT_LOG_FORMAT = (
+    "%(asctime)s %(levelname)s:%(name)s:[correlation_id=%(correlation_id)s]:%(message)s"
+)
+
+#: uvicorn configures these loggers before it imports the application, with
+#: handlers and a formatter of its own and ``propagate=False`` on the first and
+#: last. Left that way, uvicorn's own lines (startup, shutdown, "Waiting for
+#: connections to close", every access line) reach the host log in its format
+#: and without a timestamp, so a restart cannot be timed from the log (#3781).
+UVICORN_LOGGERS = ("uvicorn", "uvicorn.error", "uvicorn.access")
+
+
+def _route_uvicorn_loggers_to_root() -> None:
+    """Send uvicorn's records through the root handler and its formatter.
+
+    A logger with no handlers that does not propagate writes nowhere, and is
+    left that way: it was silenced on purpose. ``--no-access-log`` silences
+    ``uvicorn.access`` exactly so, and uvicorn's HTTP protocols then log
+    requests only while ``hasHandlers()`` is true, so letting it propagate
+    would turn access logging back on.
+    """
+    for name in UVICORN_LOGGERS:
+        uvicorn_logger = logging.getLogger(name)
+        if not uvicorn_logger.handlers and not uvicorn_logger.propagate:
+            continue
+        for handler in list(uvicorn_logger.handlers):
+            uvicorn_logger.removeHandler(handler)
+        uvicorn_logger.propagate = True
+
+
 def setup_logging(
     fmt: Optional[str] = None,
     level: Optional[str] = None,
 ) -> None:
     """Configure the root logger with the chosen format and level.
+
+    uvicorn's loggers are routed through the same root handler, so every line
+    the host writes carries the same format and timestamp.
 
     Args:
         fmt: "text" or "json". Defaults to env KESTREL_LOG_FORMAT or "text".
@@ -184,9 +217,8 @@ def setup_logging(
     if log_format == "json":
         handler.setFormatter(JSONFormatter())
     else:
-        handler.setFormatter(logging.Formatter(
-            "%(levelname)s:%(name)s:[correlation_id=%(correlation_id)s]:%(message)s"
-        ))
+        handler.setFormatter(logging.Formatter(TEXT_LOG_FORMAT))
 
     root.addHandler(handler)
     root.setLevel(getattr(logging, log_level, logging.INFO))
+    _route_uvicorn_loggers_to_root()

@@ -21,6 +21,7 @@ returns its ``SignalHandle`` the moment the signal is queued.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
@@ -28,9 +29,17 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from kestrel_sdk.native_a2a.helpers.proto_helpers import new_text_message
+from kestrel_sdk.native_a2a.types import Role, SendMessageRequest, Task, TaskState, TaskStatus
+from google.protobuf.json_format import MessageToJson
 from kestrel_sdk.signals import SignalHandle, SignalMode, SignalResult, Status
 
-from kestrel_sovereign.a2a.types import TaskState
+from kestrel_sovereign.a2a.native_input import native_request_digest
+from kestrel_sovereign.a2a.stores.unified.context_store import ContextOwnership
+from kestrel_sovereign.a2a.stores.unified.task_store import (
+    NativeTaskSnapshot,
+    TaskCancellationSnapshot,
+)
 from kestrel_sovereign.agent.event_manager import EventManagerMixin
 from kestrel_sovereign.signals import DurableAdmissionDisposition
 from kestrel_sovereign.signals.dispatcher import (
@@ -81,14 +90,12 @@ class _Agent(EventManagerMixin):
             return_value=None
         )
         self.task_manager = MagicMock()
-        self.task_manager.get_task = AsyncMock(
-            side_effect=lambda task_id: _task(task_id, state=TaskState.SUBMITTED)
+        self.task_manager.get_task_snapshot = AsyncMock(
+            side_effect=lambda task_id: _task(task_id, state=TaskState.TASK_STATE_SUBMITTED)
         )
         self.task_manager.get_task_cancellation_snapshot = AsyncMock(
-            side_effect=lambda _task_id, *, recipient_agent_id: MagicMock(
-                state="submitted",
-                actor_agent_id=None,
-                recipient_agent_id=recipient_agent_id,
+            side_effect=lambda _task_id, *, recipient_agent_id: TaskCancellationSnapshot(
+                state="submitted", actor_agent_id=None, input_revision=0,
             )
         )
         self.tracked: list = []
@@ -99,13 +106,22 @@ class _Agent(EventManagerMixin):
         return task
 
 
-def _task(task_id: str = "task-1", *, state=TaskState.COMPLETED):
-    task = MagicMock()
-    task.id = task_id
-    task.status.state = state
-    task.status.message = None
-    task.metadata = {"agent_id": "Meridian", "skill": "research"}
-    return task
+def _task(task_id: str = "task-1", *, state=TaskState.TASK_STATE_COMPLETED):
+    context = "context-" + task_id
+    request = SendMessageRequest(message=new_text_message(
+        "Research request", role=Role.ROLE_USER, context_id=context,
+    ))
+    task = Task(id=task_id, context_id=context, status=TaskStatus(state=state),
+                history=[request.message], metadata={"skill": "research"})
+    return NativeTaskSnapshot(
+        task=task, lifecycle_revision=0,
+        ownership=ContextOwnership(context_id=context, tenant="",
+                                   recipient_agent_id="did:test:agent",
+                                   creator_agent_id="did:test:sender"),
+        input_request_json=MessageToJson(request),
+        input_request_digest=hashlib.sha256(request.SerializeToString(deterministic=True)).hexdigest(),
+        input_wire_request_digest=native_request_digest(request, "SendMessage"),
+    )
 
 
 async def _drain(agent) -> None:
@@ -133,14 +149,14 @@ async def test_boot_reconciliation_recreates_missing_a2a_outbox_rows():
     """TaskStore, not the one-shot callback, is the crash-safe wake authority."""
 
     agent = _Agent()
-    submitted = _task("submitted-gap", state=TaskState.SUBMITTED)
-    working = _task("working-gap", state=TaskState.WORKING)
-    completed = _task("completed-gap", state=TaskState.COMPLETED)
+    submitted = _task("submitted-gap", state=TaskState.TASK_STATE_SUBMITTED)
+    working = _task("working-gap", state=TaskState.TASK_STATE_WORKING)
+    completed = _task("completed-gap", state=TaskState.TASK_STATE_COMPLETED)
     agent.task_manager.list_cognition_wake_candidates = AsyncMock(
         return_value=[
-            SimpleNamespace(task=submitted, lifecycle_revision=0),
-            SimpleNamespace(task=working, lifecycle_revision=7),
-            SimpleNamespace(task=completed, lifecycle_revision=8),
+            replace(submitted, lifecycle_revision=0),
+            replace(working, lifecycle_revision=7),
+            replace(completed, lifecycle_revision=8),
         ]
     )
     agent.dispatcher.enqueue_durable_cognition = AsyncMock(
@@ -155,8 +171,8 @@ async def test_boot_reconciliation_recreates_missing_a2a_outbox_rows():
 
     calls = agent.dispatcher.enqueue_durable_cognition.await_args_list
     assert [call.kwargs["source_event_id"] for call in calls] == [
-        "submitted-gap",
-        "working-gap:working:7",
+        '["submitted-gap",0]',
+        '["working-gap",0,7]',
         "completed-gap",
     ]
     assert [call.kwargs["consumer_id"] for call in calls] == [
@@ -220,14 +236,8 @@ async def test_boot_reconciliation_fails_closed_when_wake_is_not_durable():
     agent = _Agent()
     agent.task_manager.list_cognition_wake_candidates = AsyncMock(
         return_value=[
-            SimpleNamespace(
-                task=_task("missing-outbox", state=TaskState.SUBMITTED),
-                lifecycle_revision=0,
-            ),
-            SimpleNamespace(
-                task=_task("behind-it", state=TaskState.COMPLETED),
-                lifecycle_revision=4,
-            ),
+            replace(_task('missing-outbox', state=TaskState.TASK_STATE_SUBMITTED), lifecycle_revision=0),
+            replace(_task('behind-it', state=TaskState.TASK_STATE_COMPLETED), lifecycle_revision=4),
         ]
     )
     dispositions = iter(
@@ -248,7 +258,7 @@ async def test_boot_reconciliation_fails_closed_when_wake_is_not_durable():
     assert [
         call.kwargs["source_event_id"]
         for call in agent.dispatcher.enqueue_durable_cognition.await_args_list
-    ] == ["missing-outbox", "behind-it"]
+    ] == ['["missing-outbox",0]', "behind-it"]
 
 
 @pytest.mark.asyncio
@@ -269,10 +279,7 @@ async def test_boot_reconciliation_mints_working_only_after_the_submission_ends(
     agent = _Agent()
     agent.task_manager.list_cognition_wake_candidates = AsyncMock(
         return_value=[
-            SimpleNamespace(
-                task=_task("mid-turn", state=TaskState.WORKING),
-                lifecycle_revision=1,
-            )
+            replace(_task('mid-turn', state=TaskState.TASK_STATE_WORKING), lifecycle_revision=1)
         ]
     )
     agent.dispatcher.get_durable_delivery_for_source_event = AsyncMock(
@@ -289,13 +296,13 @@ async def test_boot_reconciliation_mints_working_only_after_the_submission_ends(
     agent.dispatcher.get_durable_delivery_for_source_event.assert_awaited_once_with(
         consumer_id="core.a2a-task-submitted-cognition-v1",
         source="a2a.task_submitted",
-        source_event_id="mid-turn",
+        source_event_id='["mid-turn",0]',
     )
     minted = [
         call.kwargs["source_event_id"]
         for call in agent.dispatcher.enqueue_durable_cognition.await_args_list
     ]
-    assert minted == (["mid-turn:working:1"] if mints else [])
+    assert minted == (['["mid-turn",0,1]'] if mints else [])
 
 
 @pytest.mark.asyncio
@@ -317,7 +324,7 @@ async def test_a2a_wake_retries_a_failed_durable_consumer_read(monkeypatch, capl
     )
 
     with caplog.at_level(logging.WARNING):
-        agent._on_task_submitted(_task(state=TaskState.SUBMITTED))
+        agent._on_task_submitted(_task(state=TaskState.TASK_STATE_SUBMITTED))
         await _drain(agent)
 
     assert agent.dispatcher.has_durable_consumer.await_count == 2
@@ -332,14 +339,8 @@ async def test_boot_reconciliation_leaves_a_terminally_failed_wake_failed(caplog
     agent = _Agent()
     agent.task_manager.list_cognition_wake_candidates = AsyncMock(
         return_value=[
-            SimpleNamespace(
-                task=_task("exhausted", state=TaskState.SUBMITTED),
-                lifecycle_revision=0,
-            ),
-            SimpleNamespace(
-                task=_task("behind-it", state=TaskState.COMPLETED),
-                lifecycle_revision=4,
-            ),
+            replace(_task('exhausted', state=TaskState.TASK_STATE_SUBMITTED), lifecycle_revision=0),
+            replace(_task('behind-it', state=TaskState.TASK_STATE_COMPLETED), lifecycle_revision=4),
         ]
     )
     dispositions = iter(
@@ -361,7 +362,7 @@ async def test_boot_reconciliation_leaves_a_terminally_failed_wake_failed(caplog
     assert [
         call.kwargs["source_event_id"]
         for call in agent.dispatcher.enqueue_durable_cognition.await_args_list
-    ] == ["exhausted", "behind-it"]
+    ] == ['["exhausted",0]', "behind-it"]
     assert "exhausted already failed terminally" in caplog.text
 
 
@@ -386,35 +387,7 @@ async def test_completion_wake_does_not_clear_submission_self_decline():
     assert agent._a2a_self_declining_task_ids == {"shared-task"}
 
 
-@pytest.mark.asyncio
-async def test_privacy_elided_a2a_replay_rehydrates_from_task_store():
-    """A marker-only signal row regains content from the scoped task ledger."""
 
-    agent = _Agent()
-    task = _task("private-task", state=TaskState.WORKING)
-    task.sessionId = "private-session"
-    task.history = []
-    agent.task_manager.get_task_for_recipient = AsyncMock(return_value=task)
-    event = SimpleNamespace(
-        source="a2a.task_submitted",
-        source_event_id="private-task:working:7",
-        dedupe_key=task.id,
-        target_agent=agent.did,
-    )
-    dispatch_signal = SimpleNamespace(id="retry-signal", arrived_at=MagicMock())
-
-    recovered = await agent.rehydrate_durable_cognition_signal(
-        event,
-        dispatch_signal=dispatch_signal,
-    )
-
-    assert recovered.id == "retry-signal"
-    assert recovered.payload["task_id"] == task.id
-    assert recovered.payload["session_id"] == "private-session"
-    agent.task_manager.get_task_for_recipient.assert_awaited_once_with(
-        task.id,
-        agent.did,
-    )
 
 
 @pytest.mark.asyncio
@@ -423,11 +396,11 @@ async def test_working_a2a_task_remains_executable_after_crash():
 
     agent = _Agent()
     agent.task_manager.get_task_cancellation_snapshot = AsyncMock(
-        return_value=SimpleNamespace(state="working", actor_agent_id=None)
+        return_value=TaskCancellationSnapshot(state="working", actor_agent_id=None)
     )
     signal = SimpleNamespace(
         source="a2a.task_submitted",
-        payload={"task_id": "working-after-crash"},
+        payload={"task_id": "working-after-crash", "input_revision": 0},
     )
 
     assert await agent.validate_cognition_signal_execution(signal) is None
@@ -457,7 +430,7 @@ async def test_a2a_persistence_retry_rebuilds_a_fresh_signal(monkeypatch):
 
     agent.dispatcher.enqueue_durable_cognition = AsyncMock(side_effect=enqueue)
 
-    agent._on_task_submitted(_task(state=TaskState.SUBMITTED))
+    agent._on_task_submitted(_task(state=TaskState.TASK_STATE_SUBMITTED))
     await _drain(agent)
 
     assert len(seen) == 2
@@ -468,8 +441,8 @@ async def test_a2a_persistence_retry_rebuilds_a_fresh_signal(monkeypatch):
 @pytest.mark.parametrize(
     "fire,state",
     [
-        (lambda a, t: a._on_background_task_complete(t), TaskState.COMPLETED),
-        (lambda a, t: a._on_task_submitted(t), TaskState.SUBMITTED),
+        (lambda a, t: a._on_background_task_complete(t), TaskState.TASK_STATE_COMPLETED),
+        (lambda a, t: a._on_task_submitted(t), TaskState.TASK_STATE_SUBMITTED),
     ],
     ids=["task_complete", "task_submitted"],
 )
@@ -499,16 +472,16 @@ async def test_a2a_wake_does_not_retry_a_terminally_failed_delivery(
 
 
 @pytest.mark.parametrize(
-    "fire,prefix",
+    "fire,prefix,state",
     [
-        (lambda a, t: a._on_background_task_complete(t), "a2a_complete:"),
-        (lambda a, t: a._on_task_submitted(t), "a2a_submitted:"),
+        (lambda a, t: a._on_background_task_complete(t), "a2a_complete:", TaskState.TASK_STATE_COMPLETED),
+        (lambda a, t: a._on_task_submitted(t), "a2a_submitted:", TaskState.TASK_STATE_SUBMITTED),
     ],
     ids=["task_complete", "task_submitted"],
 )
 class TestDetachedDeliveryIsOwnedAndHarvested:
     @pytest.mark.asyncio
-    async def test_dispatch_runs_in_a_tracked_task(self, fire, prefix):
+    async def test_dispatch_runs_in_a_tracked_task(self, fire, prefix, state):
         """The enqueue must not be fire-and-forget: an untracked coroutine
         is invisible to shutdown, which is how #2660 lost rows."""
         agent = _Agent()
@@ -516,7 +489,7 @@ class TestDetachedDeliveryIsOwnedAndHarvested:
             side_effect=lambda *a, **k: _signal_handle(Status.OK)
         )
 
-        fire(agent, _task())
+        fire(agent, _task(state=state))
 
         assert [n for _t, n in agent.tracked if n.startswith(prefix)], (
             f"dispatch was not registered with the agent tracker ({prefix})"
@@ -524,14 +497,16 @@ class TestDetachedDeliveryIsOwnedAndHarvested:
         await _drain(agent)
         agent.dispatcher.enqueue_durable_cognition.assert_awaited_once()
         call = agent.dispatcher.enqueue_durable_cognition.await_args
-        assert call.kwargs["source_event_id"] == "task-1"
+        assert call.kwargs["source_event_id"] == (
+            '["task-1",0]' if state == TaskState.TASK_STATE_SUBMITTED else "task-1"
+        )
         assert call.kwargs["consumer_id"] in {
             "core.a2a-task-complete-cognition-v1",
             "core.a2a-task-submitted-cognition-v1",
         }
 
     @pytest.mark.asyncio
-    async def test_terminal_result_is_harvested(self, fire, prefix):
+    async def test_terminal_result_is_harvested(self, fire, prefix, state):
         """The handle must actually be awaited to a terminal state — not
         merely accepted.
 
@@ -556,7 +531,7 @@ class TestDetachedDeliveryIsOwnedAndHarvested:
             side_effect=lambda *a, **k: _RecordingHandle()
         )
 
-        fire(agent, _task())
+        fire(agent, _task(state=state))
         await _drain(agent)
 
         assert waited, (
@@ -572,7 +547,7 @@ class TestDetachedDeliveryIsOwnedAndHarvested:
         Status.DROPPED_VALIDATION,
     ])
     async def test_undelivered_wake_is_logged_not_silent(
-        self, fire, prefix, status, caplog
+        self, fire, prefix, state, status, caplog
     ):
         """A wake the dispatcher accepted and then failed/dropped must
         surface. Silence here is the exact defect #2532 was filed for."""
@@ -582,7 +557,7 @@ class TestDetachedDeliveryIsOwnedAndHarvested:
         )
 
         with caplog.at_level(logging.WARNING):
-            fire(agent, _task())
+            fire(agent, _task(state=state))
             await _drain(agent)
 
         assert any(
@@ -591,7 +566,7 @@ class TestDetachedDeliveryIsOwnedAndHarvested:
 
     @pytest.mark.asyncio
     async def test_coalesced_is_not_reported_as_failure(
-        self, fire, prefix, caplog
+        self, fire, prefix, state, caplog
     ):
         """COALESCED means an equivalent wake was already dispatched —
         the intended outcome for a detached callback, so it must not be
@@ -603,14 +578,14 @@ class TestDetachedDeliveryIsOwnedAndHarvested:
         )
 
         with caplog.at_level(logging.WARNING):
-            fire(agent, _task())
+            fire(agent, _task(state=state))
             await _drain(agent)
 
         assert not any("never delivered" in r.getMessage() for r in caplog.records)
 
     @pytest.mark.asyncio
     async def test_enqueue_failure_retries_without_escaping_the_callback(
-        self, fire, prefix, monkeypatch
+        self, fire, prefix, state, monkeypatch
     ):
         """These are sync callbacks on the task-persistence path; a
         dispatcher failure must never break task completion/creation or lose
@@ -627,7 +602,7 @@ class TestDetachedDeliveryIsOwnedAndHarvested:
             ]
         )
 
-        fire(agent, _task())
+        fire(agent, _task(state=state))
         await _drain(agent)  # harvest task must not raise
         assert agent.dispatcher.enqueue_durable_cognition.await_count == 2
 

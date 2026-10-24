@@ -10,13 +10,13 @@ from uuid import uuid4
 
 import asyncpg
 import pytest
+from kestrel_sdk.native_a2a.types import TaskState
 
 from kestrel_sovereign._async_ownership import (
     await_owned_task,
     create_owned_task,
     owned_task_error,
 )
-from kestrel_sovereign.a2a.types import TaskState
 from kestrel_sovereign.execution_custody import (
     ExecutionCustody,
     _explicit_control_chain,
@@ -109,7 +109,7 @@ async def test_actual_agent_completion_receipt_survives_wait_harvest(
 ):
     backend, manager, task, runtime, owner, dispatcher = real_dispatch
     await manager.update_status(
-        task.id, TaskState.WORKING, recipient_agent_id=runtime.did
+        task.id, TaskState.TASK_STATE_WORKING, recipient_agent_id=runtime.did
     )
     await manager.complete_task(
         task.id, "actual final row", recipient_agent_id=runtime.did
@@ -177,7 +177,7 @@ async def test_failed_wait_classification_cannot_become_restart_loss(
 ):
     backend, manager, task, runtime, owner, dispatcher = real_dispatch
     await manager.update_status(
-        task.id, TaskState.WORKING, recipient_agent_id=runtime.did
+        task.id, TaskState.TASK_STATE_WORKING, recipient_agent_id=runtime.did
     )
     await manager.complete_task(
         task.id, "actual final row", recipient_agent_id=runtime.did
@@ -342,11 +342,14 @@ async def test_durable_resume_rejects_original_borrowed_native_callback(
 
         native_owner.add_done_callback(completed)
     borrowed = native_owner if projected is None else projected
+    callback_entered = asyncio.Event()
 
     def sync_callback(*args):
+        callback_entered.set()
         return borrowed
 
     async def async_callback(*args):
+        callback_entered.set()
         return borrowed
 
     callback = sync_callback if callback_kind == "sync" else async_callback
@@ -366,6 +369,10 @@ async def test_durable_resume_rejects_original_borrowed_native_callback(
             ),
             retain_originals=True,
         )
+        # Native consumer registration precedes the callback. Its real SQL
+        # must finish before measuring rejection of the borrowed operation;
+        # host scheduling before callback entry is not that observation.
+        await asyncio.wait_for(callback_entered.wait(), 5)
         done, pending = await asyncio.wait({caller}, timeout=0.08)
         failure = owned_task_error(caller) if done else None
         if pending:
@@ -426,14 +433,14 @@ async def test_durable_resume_accepts_plain_results_from_actual_stores(
 
     backend, manager, task, runtime, owner, dispatcher = real_dispatch
     await manager.update_status(
-        task.id, TaskState.WORKING, recipient_agent_id=runtime.did
+        task.id, TaskState.TASK_STATE_WORKING, recipient_agent_id=runtime.did
     )
     await manager.complete_task(
         task.id, "actual terminal resume row", recipient_agent_id=runtime.did
     )
     backend._execution_custody = ExecutionCustody(GenerationFence())
     row = await manager.get_task_for_recipient(task.id, runtime.did)
-    assert row.status.state == TaskState.COMPLETED
+    assert row.status.state == TaskState.TASK_STATE_COMPLETED
     consumer_id = "native-plain-resume-" + uuid4().hex
     if plain_callback == "poll":
         monkeypatch.setattr(

@@ -4,6 +4,7 @@ No real Phoenix is needed: the subprocess is stubbed and the reverse proxy is
 driven through an ``httpx.MockTransport`` upstream.
 """
 
+import builtins
 import errno
 import os
 import sys
@@ -522,16 +523,23 @@ def test_start_reaps_child_when_private_pid_file_cannot_be_written(
 def test_start_and_stop_lifecycle(tmp_path, monkeypatch):
     _StubPopen.instances.clear()
     monkeypatch.setattr(ps, "phoenix_enabled", lambda: True)
-    monkeypatch.setattr(ps, "supports_host_root_path", lambda: True)
+    imported = []
+    original_import = builtins.__import__
+
+    def reject_parent_phoenix_import(name, *args, **kwargs):
+        if name == "phoenix" or name.startswith("phoenix."):
+            imported.append(name)
+            raise ImportError("Phoenix belongs in its supervised child")
+        return original_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", reject_parent_phoenix_import)
     monkeypatch.setattr(ps.subprocess, "Popen", _StubPopen)
     # No Phoenix already serving the port → adopt-or-reap falls through to spawn.
     monkeypatch.setattr(ps.PhoenixSupervisor, "is_healthy", lambda self, **k: False)
 
     sup = ps.PhoenixSupervisor(working_dir=tmp_path / "phx", port=6006)
-    # A pinned root_path was NOT given → resolved from supports_host_root_path.
-    sup._root_path_override = None
-
     assert sup.start(wait_for_health=False) is True
+    assert imported == [], "Starting supervision must not import Phoenix into the host"
     assert sup.running is True
     assert sup.root_path == "/phoenix"
     # Launched with the phoenix serve argv.
@@ -545,15 +553,13 @@ def test_start_and_stop_lifecycle(tmp_path, monkeypatch):
     assert not sup.pid_file.exists()
 
 
-def test_start_falls_back_when_root_path_unsupported(tmp_path, monkeypatch):
+def test_start_preserves_an_explicit_empty_root_path(tmp_path, monkeypatch):
     _StubPopen.instances.clear()
     monkeypatch.setattr(ps, "phoenix_enabled", lambda: True)
-    monkeypatch.setattr(ps, "supports_host_root_path", lambda: False)
     monkeypatch.setattr(ps.subprocess, "Popen", _StubPopen)
     monkeypatch.setattr(ps.PhoenixSupervisor, "is_healthy", lambda self, **k: False)
 
-    sup = ps.PhoenixSupervisor(working_dir=tmp_path / "phx")
-    sup._root_path_override = None
+    sup = ps.PhoenixSupervisor(working_dir=tmp_path / "phx", root_path="")
     assert sup.start(wait_for_health=False) is True
     assert sup.root_path == ""
 
@@ -584,7 +590,6 @@ def test_adopt_existing_healthy_phoenix(tmp_path, monkeypatch):
     child) instead of spawning a second child into the held port (#2589/#2690)."""
     _StubPopen.instances.clear()
     monkeypatch.setattr(ps, "phoenix_enabled", lambda: True)
-    monkeypatch.setattr(ps, "supports_host_root_path", lambda: True)
     monkeypatch.setattr(ps.subprocess, "Popen", _StubPopen)
     # A healthy Phoenix already holds the port, owned by PID 9999.
     monkeypatch.setattr(ps.PhoenixSupervisor, "is_healthy", lambda self, **k: True)
@@ -596,7 +601,6 @@ def test_adopt_existing_healthy_phoenix(tmp_path, monkeypatch):
     )
 
     sup = ps.PhoenixSupervisor(working_dir=tmp_path / "phx", port=6006)
-    sup._root_path_override = None
     sup.working_dir.mkdir(parents=True, exist_ok=True)
     sup.pid_file.write_text("9999")  # prior boot recorded this child as private
 
@@ -619,7 +623,6 @@ def test_adopt_reaps_listener_not_matching_private_pidfile(tmp_path, monkeypatch
     fresh private-store child — never adopt an unverifiable trace store."""
     _StubPopen.instances.clear()
     monkeypatch.setattr(ps, "phoenix_enabled", lambda: True)
-    monkeypatch.setattr(ps, "supports_host_root_path", lambda: True)
     monkeypatch.setattr(ps.subprocess, "Popen", _StubPopen)
     monkeypatch.setattr(ps.PhoenixSupervisor, "is_healthy", lambda self, **k: True)
     monkeypatch.setattr(
@@ -636,7 +639,6 @@ def test_adopt_reaps_listener_not_matching_private_pidfile(tmp_path, monkeypatch
     )
 
     sup = ps.PhoenixSupervisor(working_dir=tmp_path / "phx", port=6006)
-    sup._root_path_override = None
     sup.working_dir.mkdir(parents=True, exist_ok=True)
     sup.pid_file.write_text("200")  # pidfile names a different PID than the listener
 
@@ -653,7 +655,6 @@ def test_reap_stale_child_then_spawn(tmp_path, monkeypatch):
     Reap it so a fresh child can bind, then spawn (#2589)."""
     _StubPopen.instances.clear()
     monkeypatch.setattr(ps, "phoenix_enabled", lambda: True)
-    monkeypatch.setattr(ps, "supports_host_root_path", lambda: True)
     monkeypatch.setattr(ps.subprocess, "Popen", _StubPopen)
     monkeypatch.setattr(ps.PhoenixSupervisor, "is_healthy", lambda self, **k: False)
     monkeypatch.setattr(
@@ -667,7 +668,6 @@ def test_reap_stale_child_then_spawn(tmp_path, monkeypatch):
     )
 
     sup = ps.PhoenixSupervisor(working_dir=tmp_path / "phx", port=6006)
-    sup._root_path_override = None
     sup.working_dir.mkdir(parents=True, exist_ok=True)
     sup.pid_file.write_text("5150")  # leaked child from a hard-killed host
 
@@ -826,7 +826,6 @@ def test_start_reaps_live_legacy_then_migrates_then_spawns(tmp_path, monkeypatch
     _StubPopen.instances.clear()
     home, legacy = _legacy_home(tmp_path, monkeypatch, legacy_pid=31337)
     monkeypatch.setattr(ps, "phoenix_enabled", lambda: True)
-    monkeypatch.setattr(ps, "supports_host_root_path", lambda: True)
     monkeypatch.setattr(ps.subprocess, "Popen", _StubPopen)
 
     live = {31337}
@@ -846,7 +845,6 @@ def test_start_reaps_live_legacy_then_migrates_then_spawns(tmp_path, monkeypatch
     )
 
     sup = ps.PhoenixSupervisor()
-    sup._root_path_override = None
 
     assert sup.start(wait_for_health=False) is True
     # Legacy Phoenix reaped.
@@ -870,11 +868,9 @@ def test_repeat_boot_adopts_private_store_child(tmp_path, monkeypatch):
     monkeypatch.setenv("KESTREL_HOME", str(home))
     monkeypatch.delenv(ps.PHOENIX_WORKING_DIR_ENV, raising=False)
     monkeypatch.setattr(ps, "phoenix_enabled", lambda: True)
-    monkeypatch.setattr(ps, "supports_host_root_path", lambda: True)
     monkeypatch.setattr(ps.subprocess, "Popen", _StubPopen)
 
     sup = ps.PhoenixSupervisor()  # default resolver, no legacy store present
-    sup._root_path_override = None
     sup.working_dir.mkdir(parents=True, exist_ok=True)
     sup.pid_file.write_text("8080")  # private-store child from the prior boot
 

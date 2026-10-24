@@ -372,11 +372,11 @@ jobs:
           uv run --python 3.11 --no-sync python -m pytest
           -p pytest_asyncio.plugin -p pytest_timeout -p kestrel_sovereign.testing.fixtures
           tests/integration/test_wait_resident_custody_pg.py
-          tests/unit/test_a2a_question_expiry_settlement.py
+          tests/unit/test_a2a_native_question_supervisor.py
           tests/unit/test_agent_manager.py tests/unit/test_audit_read_back_own_writes.py
           tests/unit/test_execution_custody_production_routes.py
           tests/unit/test_execution_custody_review49_native.py tests/unit/test_spawn_feature.py
-          -k "wait_resident_outlives or crash_while_the_late_wake_is_in_flight or spawn_receipt_wait_cannot_outlive or deeply_nested_value_never_raises or public_stream_rename_retains_privacy or native_fanout_physically_joins_stronger_late_sibling or terminate_child_preserves_active_cancellation_group"
+          -k "wait_resident_outlives or crash_after_durable_admission_before_outbox_checkpoint_deduplicates or privacy_elided_question_wake_rehydrates_from_owned_outbox_after_restart or answer_after_clock_deadline_creates_ordered_deadline_and_late_waves or spawn_receipt_wait_cannot_outlive or deeply_nested_value_never_raises or public_stream_rename_retains_privacy or native_fanout_physically_joins_stronger_late_sibling or terminate_child_preserves_active_cancellation_group"
           -q --tb=short -o addopts='' --timeout=60 --session-timeout=600
         env:
           TEST_POSTGRES_URL: postgresql://kestrel_user:kestrel_password@localhost:5433/kestrel
@@ -817,6 +817,10 @@ jobs:
     env:
       DATABASE_URL: postgresql://kestrel_user:kestrel_password@localhost:5433/kestrel
       REDIS_URL: redis://localhost:6380
+      # A real 2.6MiB WAL checkpoint took 1.654s on a shared runner,
+      # exceeding the default 1.01s worker-retirement reservation. Keep this
+      # fixture budget finite without changing production or unit deadlines.
+      KESTREL_AIOSQLITE_WORKER_SHUTDOWN_TIMEOUT_S: "5.0"
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
@@ -924,9 +928,84 @@ jobs:
   # execution and no extension of the existing integration timeout. This is a
   # required reusable release-CI job as well as a PR job. The shared failed-unit
   # run cancellation above also reaches this lane.
+  a2a-go-interop:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    needs: [lint-and-imports, unit-tests]
+    if: >-
+      (github.event_name != 'push' || github.ref != 'refs/heads/main')
+      && needs.lint-and-imports.outputs.run_expensive != 'false'
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ inputs.ref }}
+      - uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7.6.0
+        with:
+          enable-cache: true
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version-file: tests/interop/a2a_go_peer/go.mod
+          cache-dependency-path: tests/interop/a2a_go_peer/go.sum
+      - name: Install the locked host
+        run: uv sync --python 3.14 --locked
+      - name: Verify native A2A interoperability and resident shutdown
+        run: >-
+          uv run --no-sync python -m pytest tests/interop/test_a2a_go.py
+          tests/interop/test_native_drainer_shutdown.py
+          -p pytest_asyncio.plugin -p pytest_timeout -o addopts=''
+          -v --tb=short -x --timeout=120 --junitxml=a2a-go-interop.xml
+        timeout-minutes: 5
+        env:
+          PYTEST_DISABLE_PLUGIN_AUTOLOAD: "1"
+          PYTHON_DOTENV_DISABLED: "1"
+          KESTREL_SKIP_DOTENV: "1"
+          KESTREL_PHOENIX_ENABLED: "0"
+          KESTREL_TRACING_ENABLED: "0"
+          EMAIL_DRY_RUN: "true"
+          OPENAI_API_KEY: ""
+          ANTHROPIC_API_KEY: ""
+          GOOGLE_API_KEY: ""
+          GEMINI_API_KEY: ""
+          XAI_API_KEY: ""
+      - name: Verify reviewed A2A 1.0.1 MUST and full conformance scenarios
+        run: >-
+          uv run --no-sync python -m pytest tests/interop/test_a2a_tck.py
+          -p pytest_asyncio.plugin -p pytest_timeout -o addopts=''
+          --basetemp=${{ runner.temp }}/kestrel-a2a-tck
+          -v --tb=short -x --timeout=300 --junitxml=a2a-tck.xml
+        timeout-minutes: 10
+        env:
+          PYTEST_DISABLE_PLUGIN_AUTOLOAD: "1"
+          PYTHON_DOTENV_DISABLED: "1"
+          KESTREL_SKIP_DOTENV: "1"
+          KESTREL_PHOENIX_ENABLED: "0"
+          KESTREL_TRACING_ENABLED: "0"
+          EMAIL_DRY_RUN: "true"
+          OPENAI_API_KEY: ""
+          ANTHROPIC_API_KEY: ""
+          GOOGLE_API_KEY: ""
+          GEMINI_API_KEY: ""
+          XAI_API_KEY: ""
+      - name: Retain interoperability and conformance results
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: a2a-go-interop
+          path: |
+            a2a-go-interop.xml
+            a2a-tck.xml
+            ${{ runner.temp }}/kestrel-a2a-tck/**/tck-*.log
+            ${{ runner.temp }}/kestrel-a2a-tck/**/tck-*-reports/
+          if-no-files-found: error
+          retention-days: 14
+
   native-postgres-tests:
     runs-on: ubuntu-latest
     timeout-minutes: 60
+    env:
+      KESTREL_AIOSQLITE_WORKER_SHUTDOWN_TIMEOUT_S: "5.0"
     permissions:
       contents: read
     needs: lint-and-imports
@@ -1084,7 +1163,9 @@ jobs:
   # squash-merge to main or a duplicate issue-* push run skips it like the
   # other expensive tiers. Pull requests always run it.
   console-smoke:
-    runs-on: ubuntu-latest
+    # Pin this browser/native-library environment; ubuntu-latest moved to
+    # 26.04 and repeatedly exhausted the bounded apt/browser install budget.
+    runs-on: ubuntu-24.04
     # Explicit `contents: read` so this job does NOT inherit the wider grant
     # publish.yml's `ci:` job holds. Jobs of a called workflow inherit the
     # caller's permissions when they declare none, which would hand this
@@ -1132,12 +1213,16 @@ jobs:
       - name: Install JavaScript dependencies
         run: npm ci --no-audit --no-fund
 
+      - name: Verify locked Playwright runner compatibility
+        run: node --test tests/js/test_playwright_platform_support.cjs
+        timeout-minutes: 2
+
       - name: Install the Chromium browser
         run: npx playwright install --with-deps chromium
-        timeout-minutes: 5
+        timeout-minutes: 10
 
       - name: Verify offline native voice transport custody
-        run: node --test tests/js/test_voice_native_custody.cjs
+        run: node --test tests/js/test_voice_native_custody.cjs tests/js/test_voice_startup_settlement.cjs
         timeout-minutes: 3
 
       - name: Run the Console smoke against a fresh isolated instance

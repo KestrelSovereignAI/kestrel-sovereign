@@ -56,30 +56,21 @@ SECURITY_FLOORS = {
 # contract v7, #3424) that ``LLMService.decide`` is built on. Version 0.39.1
 # adds the shared outbound policy and native pinned transports; 0.39.2 fixes
 # their canonical host identity before DNS and native requests (#3679).
-# Core's avatar and did:web fetchers require that correction. This is a Core-only
-# release gate: sibling packages are released from their own repositories, but
-# Core must never
-# silently lower its declared/locked line to accommodate an older Frinz or
-# observability constraint. Their compatible releases remain a documented
-# release-cascade prerequisite in README.md.
-SDK_RELEASE_CASCADE_SPECIFIERS = frozenset({(">=", "0.39.2"), ("<", "0.40")})
+# Version 0.40 replaces draft A2A types with native AgentSkill contracts.
+# The coordinated 0.41 floor includes the shared computer-use, artifact,
+# resource-scope and workspace-transfer contracts (#3679).
+# Version 0.42 adds the single vendored native A2A implementation shared with
+# Feature.get_agent_skills; Core must consume its a2a extra.
+# Version 0.42.1 enforces Major.Minor version negotiation and exposes the
+# canonical version parser used by Core's signed Agent Card validation.
+# Version 0.42.2 enforces all standard HTTP header and query carriers.
+# This is a Core-only release gate: sibling packages release independently.
+# Core must never lower its declared/locked line to accommodate an older
+# consumer. Host feature acceptance remains a release prerequisite in README.md.
+SDK_RELEASE_CASCADE_SPECIFIERS = frozenset({(">=", "0.42.2"), ("<", "1")})
 SDK_RELEASE_CASCADE_CONTRACTS = {
-    "base": frozenset({"httpx", "tracing"}),
+    "base": frozenset({"a2a", "httpx", "tracing"}),
     "observability": frozenset({"metrics"}),
-}
-SDK_RELEASE_CASCADE_DOWNSTREAM_REQUIREMENTS = {
-    # These are release prerequisites, not declarations about sibling repos'
-    # current branches. Each downstream must publish/test this line before a
-    # Core release can be cut.
-    "kestrel-feature-talon": ">=0.37.1,<0.40",
-    "kestrel-feature-story-archive": ">=0.17,<0.40",
-    "kestrel-feature-eye": ">=0.37.1,<0.40",
-    "kestrel-feature-flight": ">=0.37.1,<0.40",
-    "kestrel-claws": ">=0.37.1,<0.40",
-    "kestrel-feature-features": ">=0.36.0,<0.40",
-    "kestrel-channel-telegram": ">=0.36,<0.40",
-    "frinz": ">=0.39.0,<0.40",
-    "observability fleet": ">=0.39.0,<0.40",
 }
 
 def _pyproject() -> dict:
@@ -90,6 +81,19 @@ def _pyproject() -> dict:
 def _lock() -> dict:
     with open(REPO_ROOT / "uv.lock", "rb") as f:
         return tomllib.load(f)
+
+
+def _assert_requirement_floor(requirement: Requirement, floor: Version) -> None:
+    lower_bounds = [
+        Version(specifier.version)
+        for specifier in requirement.specifier
+        if specifier.operator in {">=", "==", "==="}
+        and "*" not in specifier.version
+    ]
+    assert lower_bounds and max(lower_bounds) >= floor, (
+        f"{requirement} permits a version below the required floor "
+        f"{requirement.name}>={floor}"
+    )
 
 
 def test_installed_remote_mcp_campaign_requires_the_public_feature_contract():
@@ -107,6 +111,23 @@ def test_installed_remote_mcp_campaign_requires_the_public_feature_contract():
         item for item in _lock()["package"] if item["name"] == "kestrel-feature-mcp"
     ]
     assert Version(package["version"]) >= Version("0.7.0")
+    assert package["source"] == {"registry": "https://pypi.org/simple"}
+
+
+def test_native_a2a_streams_require_server_scoped_shutdown():
+    """MUST then full TCK boots must not share a latched SSE shutdown flag."""
+    (requirement,) = [
+        Requirement(raw)
+        for raw in _pyproject()["project"]["dependencies"]
+        if canonicalize_name(Requirement(raw).name) == "sse-starlette"
+    ]
+    _assert_requirement_floor(requirement, Version("3.5.0"))
+    assert Version("3.5.0") in requirement.specifier
+    assert Version("3.6.0") in requirement.specifier
+    (package,) = [
+        item for item in _lock()["package"] if item["name"] == "sse-starlette"
+    ]
+    assert Version(package["version"]) >= Version("3.5.0")
     assert package["source"] == {"registry": "https://pypi.org/simple"}
 
 
@@ -176,16 +197,7 @@ def test_security_floors_are_declared():
         assert declarations, f"Missing security-floored dependency: {package}"
 
         for requirement in declarations:
-            lower_bounds = [
-                Version(specifier.version)
-                for specifier in requirement.specifier
-                if specifier.operator in {">=", "==", "==="}
-                and "*" not in specifier.version
-            ]
-            assert lower_bounds and max(lower_bounds) >= floor, (
-                f"{requirement} permits a version below the security floor "
-                f"{package}>={floor}"
-            )
+            _assert_requirement_floor(requirement, floor)
 
 
 def test_security_floors_are_locked():
@@ -238,15 +250,16 @@ def test_windows_tzdata_is_a_direct_base_dependency_and_is_locked():
 
 
 def test_asyncpg_runtime_probe_supports_current_minor_releases():
-    """Doctor uses asyncpg's public connection path, not a pinned parser shape."""
+    """Require native retirement fixes without capping future minor releases."""
     direct = [
         Requirement(raw)
         for raw in _pyproject()["project"]["dependencies"]
         if canonicalize_name(Requirement(raw).name) == "asyncpg"
     ]
     assert len(direct) == 1
-    assert Version("0.30") in direct[0].specifier
-    assert Version("0.31") in direct[0].specifier
+    assert Version("0.31") not in direct[0].specifier
+    assert Version("0.32") in direct[0].specifier
+    assert Version("0.33") in direct[0].specifier
 
     root = _locked_root_package(_lock())
     locked_metadata = [
@@ -254,7 +267,7 @@ def test_asyncpg_runtime_probe_supports_current_minor_releases():
         for requirement in root["metadata"]["requires-dist"]
         if requirement["name"] == "asyncpg"
     ]
-    assert locked_metadata == [{"name": "asyncpg", "specifier": ">=0.30.0"}]
+    assert locked_metadata == [{"name": "asyncpg", "specifier": ">=0.32.0"}]
 
 
 def _sdk_contract_requirement(
@@ -275,12 +288,12 @@ def _sdk_contract_requirement(
     return requirement
 
 
-def test_sdk_039_release_cascade_contract_is_declared():
+def test_sdk_native_release_cascade_contract_is_declared():
     """Core owns the transport floor; observability adds metrics to that floor.
 
-    This deliberately does not inspect sibling worktrees: their compatible
-    Frinz/observability releases are an external release prerequisite, while
-    this repository can reliably guard only its own published constraints.
+    This deliberately does not inspect sibling worktrees. Installed host
+    feature acceptance remains a separate release prerequisite; this
+    repository guards its own published constraints.
     """
 
     pyproject = _pyproject()
@@ -297,18 +310,17 @@ def test_sdk_039_release_cascade_contract_is_declared():
         assert Version("0.38.2") not in specifier
         assert Version("0.39.0") not in specifier
         assert Version("0.39.1") not in specifier
-        assert Version("0.39.2") in specifier
+        assert Version("0.39.2") not in specifier
         assert Version("0.40.0") not in specifier
+        assert Version("0.41.0") not in specifier
+        assert Version("0.42.0") not in specifier
+        assert Version("0.42.1") not in specifier
+        assert Version("0.42.2") in specifier
+        assert Version("0.43.0") in specifier
+        assert Version("1.0.0") not in specifier
 
-    # The human release contract identifies downstream gates without probing
-    # their (possibly dirty or unavailable) repositories from Core CI.
-    readme = (REPO_ROOT / "README.md").read_text(encoding="utf-8").casefold()
-    for downstream, specifier in SDK_RELEASE_CASCADE_DOWNSTREAM_REQUIREMENTS.items():
-        assert downstream in readme
-        assert f"kestrel-sovereign-sdk{specifier}" in readme
 
-
-def test_sdk_039_release_cascade_contract_is_locked():
+def test_sdk_native_release_cascade_contract_is_locked():
     """The lock must exercise the outbound contract and one canonical floor."""
 
     root = _locked_root_package(_lock())
@@ -340,5 +352,5 @@ def test_sdk_039_release_cascade_contract_is_locked():
     ]
     assert sdk_versions
     assert all(
-        Version("0.39.2") <= version < Version("0.40.0") for version in sdk_versions
+        Version("0.42.2") <= version < Version("1.0.0") for version in sdk_versions
     )

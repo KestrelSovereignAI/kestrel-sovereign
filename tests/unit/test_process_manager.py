@@ -614,6 +614,8 @@ class TestStartAgent:
     ):
         """Child storage and export roots both bind to this agent."""
         monkeypatch.delenv("KESTREL_A2A_TRANSPORT_KEY", raising=False)
+        monkeypatch.setenv("KESTREL_BASE_URL", "https://process-front-door.test/proxy")
+        monkeypatch.setenv("KESTREL_A2A_DISCOVERY_AGENT", "inherited-wrong-recipient")
         cfg = LocalAgentConfig(
             data_dir=Path("agent_data/claw"), port=8801,
         )
@@ -630,6 +632,8 @@ class TestStartAgent:
         assert env["KESTREL_IDENTITY_EXPORT_DIR"] == str(expected_root)
         assert "KESTREL_DATA_DIR" not in env
         assert env["PORT"] == "8801"
+        assert env["KESTREL_BASE_URL"] == "https://process-front-door.test/proxy"
+        assert env["KESTREL_A2A_DISCOVERY_AGENT"] == "claw"
         assert env["KESTREL_SERVE_UI"] == "false"
         assert env["KESTREL_A2A_TRANSPORT_KEY"]
         assert env["KESTREL_API_KEY"] == ""
@@ -1557,6 +1561,69 @@ class TestTerminateAgent:
         # clearing it would strand a live agent with nothing pointing at it.
         assert ap.pid_file.exists()
         assert ap.pid == 99999
+        assert ap.stop_failure == "is still running after SIGKILL"
+
+    @pytest.mark.skipif(
+        sys.platform == "win32",
+        reason="the start-time refusal is checked against a real POSIX child",
+    )
+    def test_a_refused_stop_signal_is_reported_without_waiting(self, pm, project_dir):
+        """A signal that never reached the agent started no shutdown (#3781).
+
+        Waiting out the stop deadline for it turned a refusal into a minute's
+        delay per agent before the same failure was reported. The refusal is
+        the real one: the recorded start time does not match the live process
+        holding the number, so ``kill_process`` withholds both signals.
+        """
+        child = subprocess.Popen(
+            [sys.executable, "-c", "import time; time.sleep(300)"]
+        )
+        try:
+            live_start = ProcessManager.process_start_time(child.pid)
+            assert live_start is not None
+            ap = pm.register_agent("claw", LocalAgentConfig(
+                data_dir=Path("agent_data/claw"), port=8801,
+            ))
+            ap.pid = child.pid
+            # Recorded long before the live process began: its number was reused.
+            ap.started_at = live_start - 3600
+            ProcessManager.write_pid(ap.pid_file, child.pid)
+
+            with patch.object(ProcessManager, "wait_for_exit") as wait:
+                result = pm.terminate_agent("claw")
+            still_alive = child.poll() is None
+        finally:
+            child.kill()
+            child.wait()
+
+        assert result is False
+        wait.assert_not_called()
+        assert still_alive, "a process the stop could not identify was signalled"
+        assert ap.stop_failure == "could not be signalled and is still running"
+        assert ap.pid_file.exists()
+        assert ap.pid == child.pid
+
+    def test_a_refused_signal_to_an_agent_that_already_exited_is_a_stop(
+        self, pm, project_dir
+    ):
+        """The agent exited between the liveness check and the signal."""
+        ap = pm.register_agent("claw", LocalAgentConfig(
+            data_dir=Path("agent_data/claw"), port=8801,
+        ))
+        ap.pid = 99999
+        ProcessManager.write_pid(ap.pid_file, 99999)
+
+        with patch.object(ProcessManager, "is_process_running",
+                          side_effect=[True, False]), \
+             patch.object(ProcessManager, "kill_process", return_value=False), \
+             patch.object(ProcessManager, "wait_for_exit") as wait:
+            result = pm.terminate_agent("claw")
+
+        assert result is True
+        wait.assert_not_called()
+        assert not ap.pid_file.exists()
+        assert ap.pid is None
+        assert ap.stop_failure is None
 
     def test_terminate_all_names_the_agents_that_survived(self, pm, project_dir):
         """terminate_all reports which agents outlived it rather than dropping it."""
@@ -2231,3 +2298,263 @@ class TestSpawnDetached:
             "Detached spawn must open with O_APPEND so prior content "
             "(another agent's pre-restart logs) is preserved."
         )
+
+
+# -----------------------------------------------------------------------
+# Server command and graceful stop (#3781)
+# -----------------------------------------------------------------------
+
+_STREAMING_APP = '''
+import asyncio
+import os
+import pathlib
+
+MARKER = pathlib.Path(os.environ["LIFESPAN_SHUTDOWN_MARKER"])
+
+
+async def app(scope, receive, send):
+    if scope["type"] == "lifespan":
+        while True:
+            message = await receive()
+            if message["type"] == "lifespan.startup":
+                await send({"type": "lifespan.startup.complete"})
+            elif message["type"] == "lifespan.shutdown":
+                MARKER.write_text("ran")
+                await send({"type": "lifespan.shutdown.complete"})
+                return
+    # A console event stream: it never ends on its own.
+    await send({
+        "type": "http.response.start",
+        "status": 200,
+        "headers": [(b"content-type", b"text/event-stream")],
+    })
+    while True:
+        await send({
+            "type": "http.response.body",
+            "body": b"data: tick\\n\\n",
+            "more_body": True,
+        })
+        await asyncio.sleep(0.2)
+'''
+
+
+class TestServerCommand:
+    """Every launcher serves the app through one command that can stop."""
+
+    def test_server_command_bounds_the_graceful_shutdown(self):
+        cmd = process_manager.server_command("127.0.0.1", 8801)
+
+        assert cmd == [
+            sys.executable, "-m", "uvicorn", "kestrel_sovereign.server:app",
+            "--host", "127.0.0.1", "--port", "8801",
+            "--timeout-graceful-shutdown",
+            str(process_manager.SERVER_GRACEFUL_SHUTDOWN_SECONDS),
+        ]
+
+    def test_a_stop_waits_past_the_graceful_window(self):
+        """SIGKILL inside the graceful window would skip the app's shutdown."""
+        assert (
+            process_manager.SERVER_TERMINATE_TIMEOUT_SECONDS
+            > process_manager.SERVER_GRACEFUL_SHUTDOWN_SECONDS
+        )
+        assert ProcessManager.terminate_agent.__defaults__ == (
+            process_manager.SERVER_TERMINATE_TIMEOUT_SECONDS,
+        )
+
+    def test_start_agent_launches_the_server_command(self, pm):
+        cfg = LocalAgentConfig(data_dir=Path("agent_data/claw"), port=8801)
+        mock_process = MagicMock()
+        mock_process.pid = 12345
+
+        with patch("subprocess.Popen", return_value=mock_process) as mock_popen:
+            pm.start_agent("claw", cfg, host_bind="127.0.0.1")
+
+        assert mock_popen.call_args[0][0] == process_manager.server_command(
+            "127.0.0.1", 8801
+        )
+
+    @pytest.mark.skipif(
+        sys.platform == "win32", reason="SIGTERM is a POSIX stop signal"
+    )
+    def test_sigterm_runs_lifespan_shutdown_despite_an_open_stream(
+        self, tmp_path, monkeypatch
+    ):
+        """The real uvicorn, launched with the real command's options.
+
+        Without ``--timeout-graceful-shutdown`` uvicorn waits on the open
+        stream for ever, so the stop escalated to SIGKILL and the
+        application's shutdown never ran (#3781).
+        """
+        import signal
+        import socket
+
+        monkeypatch.setattr(process_manager, "SERVER_GRACEFUL_SHUTDOWN_SECONDS", 1)
+        (tmp_path / "stream_app.py").write_text(_STREAMING_APP)
+        marker = tmp_path / "lifespan-shutdown.marker"
+        with socket.socket() as probe:
+            probe.bind(("127.0.0.1", 0))
+            port = probe.getsockname()[1]
+
+        cmd = process_manager.server_command("127.0.0.1", port)
+        cmd[cmd.index("kestrel_sovereign.server:app")] = "stream_app:app"
+        child_env = {k: v for k, v in os.environ.items() if k != "PYTHONPATH"}
+        child_env["LIFESPAN_SHUTDOWN_MARKER"] = str(marker)
+        server_log = tmp_path / "server.log"
+        with open(server_log, "wb") as log:
+            server = subprocess.Popen(
+                cmd, cwd=tmp_path, env=child_env, stdout=log, stderr=subprocess.STDOUT
+            )
+        stream = None
+        try:
+            deadline = time.monotonic() + 30
+            while True:
+                try:
+                    stream = socket.create_connection(("127.0.0.1", port), timeout=1)
+                    break
+                except OSError:
+                    if server.poll() is not None or time.monotonic() > deadline:
+                        pytest.fail(f"test server never listened: {server_log.read_text()}")
+                    time.sleep(0.1)
+            stream.settimeout(5)
+            stream.sendall(b"GET /events HTTP/1.1\r\nHost: test\r\n\r\n")
+            assert b"200" in stream.recv(4096), "the stream did not start"
+
+            server.send_signal(signal.SIGTERM)
+            try:
+                server.wait(timeout=15)
+            except subprocess.TimeoutExpired:
+                pytest.fail(
+                    "uvicorn kept waiting on the open stream after SIGTERM: "
+                    f"{server_log.read_text()}"
+                )
+            assert marker.read_text() == "ran", server_log.read_text()
+        finally:
+            if stream is not None:
+                stream.close()
+            if server.poll() is None:
+                server.kill()
+                server.wait()
+
+
+class TestWaitForExit:
+    def test_returns_true_once_the_process_is_gone(self):
+        exited = subprocess.Popen([sys.executable, "-c", "pass"])
+        exited.wait()
+
+        assert ProcessManager.wait_for_exit(exited.pid, timeout=5) is True
+
+    def test_returns_false_when_the_deadline_passes_first(self):
+        started = time.monotonic()
+
+        assert ProcessManager.wait_for_exit(os.getpid(), timeout=0.2) is False
+        assert time.monotonic() - started >= 0.2
+
+
+class TestLogRotation:
+    """A full log is set aside at launch, never while a server writes it."""
+
+    @staticmethod
+    def _sized(path: Path, size: int, text: str = "") -> Path:
+        path.write_text(text)
+        os.truncate(path, max(size, len(text)))
+        return path
+
+    def test_a_log_below_the_threshold_is_left_alone(self, tmp_path):
+        log = self._sized(tmp_path / "host.log", 99, "keep")
+
+        assert process_manager.rotate_log_file(log, max_bytes=100) is False
+        assert log.read_text().startswith("keep")
+        assert not (tmp_path / "host.log.1").exists()
+
+    def test_a_missing_log_is_not_an_error(self, tmp_path):
+        assert process_manager.rotate_log_file(tmp_path / "host.log") is False
+
+    def test_a_full_log_becomes_the_first_generation(self, tmp_path):
+        log = self._sized(tmp_path / "host.log", 100, "current")
+
+        assert process_manager.rotate_log_file(log, max_bytes=100) is True
+        assert not log.exists()
+        assert (tmp_path / "host.log.1").read_text().startswith("current")
+
+    def test_generations_shift_and_the_oldest_is_dropped(self, tmp_path):
+        log = self._sized(tmp_path / "host.log", 100, "current")
+        for n in (1, 2, 3):
+            (tmp_path / f"host.log.{n}").write_text(f"gen{n}")
+        unrelated = tmp_path / "host.log.before-1433"
+        unrelated.write_text("operator copy")
+
+        assert process_manager.rotate_log_file(log, max_bytes=100, backups=3)
+        assert (tmp_path / "host.log.1").read_text().startswith("current")
+        assert (tmp_path / "host.log.2").read_text() == "gen1"
+        assert (tmp_path / "host.log.3").read_text() == "gen2"
+        assert not (tmp_path / "host.log.4").exists()
+        assert unrelated.read_text() == "operator copy"
+
+    def test_at_least_one_backup_is_kept(self, tmp_path):
+        with pytest.raises(ValueError):
+            process_manager.rotate_log_file(tmp_path / "host.log", backups=0)
+
+    def test_detached_launch_rotates_a_full_log_before_the_child_writes(
+        self, pm, tmp_path
+    ):
+        log = self._sized(
+            tmp_path / "host.log",
+            process_manager.LOG_ROTATION_MAX_BYTES,
+            "previous lifetime\n",
+        )
+        pid = pm._spawn_detached(
+            cmd=[sys.executable, "-c", "print('new lifetime')"],
+            env={"PATH": os.environ.get("PATH", "")},
+            log_file=log,
+            pid_file=tmp_path / "host.pid",
+        )
+        deadline = time.monotonic() + 10
+        while "new lifetime" not in (log.read_text() if log.exists() else ""):
+            assert time.monotonic() < deadline, "the child never wrote"
+            time.sleep(0.05)
+        ProcessManager._reap_if_child(pid)
+
+        assert log.read_text() == "new lifetime\n"
+        assert (tmp_path / "host.log.1").read_text().startswith("previous lifetime")
+
+    def test_a_log_that_cannot_be_rotated_does_not_stop_the_launch(
+        self, pm, tmp_path, caplog
+    ):
+        """On Windows a viewer can hold the log open without delete sharing,
+        and the rename is refused. The launch appends to the log instead."""
+        log = self._sized(
+            tmp_path / "agent.log",
+            process_manager.LOG_ROTATION_MAX_BYTES,
+            "previous lifetime\n",
+        )
+        refused = PermissionError(13, "The process cannot access the file")
+        with patch.object(process_manager.os, "replace", side_effect=refused), \
+             patch.object(subprocess, "Popen", return_value=MagicMock(pid=1)) as popen, \
+             patch("threading.Thread"), \
+             caplog.at_level("WARNING", logger=process_manager.__name__):
+            pm._spawn(
+                cmd=["python", "-c", "pass"],
+                env={},
+                log_file=log,
+                pid_file=tmp_path / "agent.pid",
+            )
+
+        popen.assert_called_once()
+        assert log.read_text().startswith("previous lifetime")
+        assert f"Could not rotate {log}" in caplog.text
+
+    def test_piped_launch_rotates_a_full_log_too(self, pm, tmp_path):
+        log = self._sized(
+            tmp_path / "agent.log", process_manager.LOG_ROTATION_MAX_BYTES
+        )
+        with patch.object(subprocess, "Popen", return_value=MagicMock(pid=1)), \
+             patch("threading.Thread"):
+            pm._spawn(
+                cmd=["python", "-c", "pass"],
+                env={},
+                log_file=log,
+                pid_file=tmp_path / "agent.pid",
+            )
+
+        assert not log.exists()
+        assert (tmp_path / "agent.log.1").exists()

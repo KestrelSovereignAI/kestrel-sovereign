@@ -437,17 +437,22 @@
     },
     {
       "existing_code_refs": [
-        "kestrel_sovereign/a2a/agent_card.py",
         "kestrel_sovereign/a2a/transport_auth.py",
-        "kestrel_sovereign/a2a/types.py",
         "kestrel_sovereign/features/keys/feature.py",
         "kestrel_sovereign/multi_agent/route_name.py",
         "kestrel_sovereign/security/agent_encryption.py",
         "kestrel_sovereign/security/service_key_storage.py",
-        "kestrel_sovereign/storage/async_pending_a2a_question_store.py"
+        "tests/interop/a2a_tck/COVERAGE.json",
+        "tests/interop/test_a2a_go.py",
+        "tests/interop/test_a2a_tck.py"
       ],
-      "findings": [],
-      "missing_code_refs": [],
+      "findings": [
+        "missing_code_refs"
+      ],
+      "missing_code_refs": [
+        "kestrel_sovereign/a2a/agent_card.py",
+        "kestrel_sovereign/a2a/types.py"
+      ],
       "missing_links": [],
       "path": "docs/architecture/NATIVE_MCP_A2A.md",
       "privacy": "public",
@@ -805,6 +810,18 @@
       "status": "needs-revalidation",
       "title": "Workflows \u2014 Stage-to-Signal Mapping Spec (Phase 0)",
       "type": "Architecture Spec"
+    },
+    {
+      "existing_code_refs": [],
+      "findings": [],
+      "missing_code_refs": [],
+      "missing_links": [],
+      "path": "docs/architecture/a2a/OFFLINE_CUTOVER.md",
+      "privacy": "public",
+      "render": "public",
+      "status": "draft",
+      "title": "Offline native A2A cutover",
+      "type": "Migration Runbook"
     },
     {
       "existing_code_refs": [
@@ -1939,7 +1956,8 @@
         "tests/integration/test_orchestration_e2e.py",
         "tests/integration/test_sovereignty_e2e.py",
         "tests/integration/test_sovereignty_guarantees.py",
-        "tests/unit/test_a2a_task_manager.py",
+        "tests/unit/test_a2a_native_consumers.py",
+        "tests/unit/test_a2a_native_task_manager.py",
         "tests/unit/test_audit_anchor_feature.py",
         "tests/unit/test_bootstrap_feature.py",
         "tests/unit/test_bootstrap_service.py",
@@ -2148,7 +2166,7 @@
       "existing_code_refs": [
         "kestrel_sovereign/command_handler.py",
         "kestrel_sovereign/kestrel_agent.py",
-        "tests/unit/test_a2a_task_manager.py",
+        "tests/unit/test_a2a_native_task_manager.py",
         "tests/unit/test_agent_runtime_endpoint_contracts.py",
         "tests/unit/test_command_handler_async_boundary_contracts.py",
         "tests/unit/test_command_handler_constitution_contracts.py",
@@ -2193,8 +2211,7 @@
         "kestrel_sovereign/llm/codex_adapter.py",
         "kestrel_sovereign/multi_agent/config.py",
         "kestrel_sovereign/server.py",
-        "server.py",
-        "tests/unit/test_a2a_sign_on_send.py"
+        "server.py"
       ],
       "findings": [],
       "missing_code_refs": [],
@@ -3940,6 +3957,18 @@
       "status": "needs-revalidation",
       "title": "Kestrel Simple Launch Page: One-Screen Version",
       "type": "Design Note"
+    },
+    {
+      "existing_code_refs": [],
+      "findings": [],
+      "missing_code_refs": [],
+      "missing_links": [],
+      "path": "docs/development/ASYNC_OWNERSHIP_PUBLIC_API.md",
+      "privacy": "",
+      "render": "public",
+      "status": "",
+      "title": "Public asynchronous-tail ownership",
+      "type": "Developer Guide"
     },
     {
       "existing_code_refs": [],

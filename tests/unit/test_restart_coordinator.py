@@ -66,9 +66,11 @@ from kestrel_sovereign.features.restart_coordinator.update_profiles import (
     get_update_profile,
     is_valid_target_ref,
 )
+from kestrel_sovereign.security.sovereign_key import _EPHEMERAL_KEY_FINGERPRINT_ENV
 from kestrel_sovereign.storage.async_database import AsyncDatabase
 from kestrel_sovereign.storage.db import SQLiteBackend
 from kestrel_sovereign.storage.session_id_column import is_stampable_session_id
+from tests.shared.environment_guard import unset_environment
 
 
 # ---------------------------------------------------------------------------
@@ -739,7 +741,7 @@ async def test_request_restart_rejects_server_generated_temporary_key(
     from kestrel_sovereign.server import get_api_key
 
     feat, backend = await _make_feature(tmp_path)
-    monkeypatch.delenv("KESTREL_API_KEY", raising=False)
+    unset_environment(monkeypatch, "KESTREL_API_KEY", _EPHEMERAL_KEY_FINGERPRINT_ENV)
     with patch("kestrel_sovereign.server.secrets.token_urlsafe") as generate:
         generate.return_value = "process-only-bootstrap-key"
         assert get_api_key() == "process-only-bootstrap-key"
@@ -3469,6 +3471,9 @@ async def test_cron_does_not_complete_same_process_executing_row(tmp_path):
 
     feat, backend, agent = await _real_dispatch_feature(tmp_path)
     await feat.initialize()
+    # The mock child never exits, so the dispatch watchdog would follow it
+    # for its whole window before ``drain_background_tasks`` returns.
+    feat._restart_dispatch_grace = 0
     created = await feat.request_restart(reason="ship")
     req_id = created.data["request"]["id"]
 
@@ -5871,6 +5876,7 @@ def test_kinds_only_description_withholds_every_per_instance_tail():
         # Durable dispatcher owner-liveness tick, a fresh task every ~40s.
         "durable_signal_owner_heartbeat:did:pkh:eip155:1:0xabc",
         "workflows:lease-recovery",
+        "native_a2a_question_recovery",
     ],
 )
 def test_permanent_bookkeeping_daemons_are_infrastructure(name):
@@ -6160,6 +6166,148 @@ async def test_live_restart_child_leaves_the_row_executing(tmp_path):
     assert row.status == "executing"
     # Still tracked as in flight, so the reconciler leaves it alone too.
     assert req_id in feat._executing_since
+
+
+class _SlowFailingChild:
+    """A restart child that fails only as the host's whole stop ends.
+
+    The case it stands for: ``kestrel terminate`` signals the host, waits out
+    the stop deadline, sends a SIGKILL that does not take, waits the kill
+    grace, and exits 1 with the host still running. Each ``poll`` is one
+    watchdog interval later on ``clock``, so the child's lifetime is measured
+    in the watchdog's own time.
+    """
+
+    pid = 4244
+
+    def __init__(self, clock, *, lifetime, interval, stderr_path):
+        self._clock = clock
+        self._exits_at = clock.time() + lifetime
+        self._interval = interval
+        self._kestrel_stderr_path = str(stderr_path)
+        self.returncode = None
+        self.polls = 0
+
+    def poll(self):
+        self.polls += 1
+        self._clock.advance(self._interval)
+        if self._clock.time() >= self._exits_at:
+            self.returncode = 1
+        return self.returncode
+
+
+async def _watch_a_slow_child(tmp_path, monkeypatch, *, lifetime):
+    """Dispatch a restart whose child exits 1 after ``lifetime`` virtual seconds.
+
+    Runs the production watch window, on a virtual clock, so a minute of the
+    child's life costs nothing. Returns the child, the row once the watch has
+    ended, and the window the watch ran under.
+    """
+    from types import SimpleNamespace as _Namespace
+
+    from kestrel_sovereign.features.restart_coordinator import feature as feature_mod
+    from tests.utils.virtual_clock import VirtualClock
+
+    feat, backend, agent = await _real_dispatch_feature(tmp_path)
+    await feat.initialize()
+    created = await feat.request_restart(reason="ship")
+    req_id = created.data["request"]["id"]
+
+    clock = VirtualClock(time.monotonic())
+    interval = feature_mod._DISPATCH_POLL_SECONDS
+    virtual_time = _Namespace(
+        **{name: getattr(time, name) for name in dir(time) if not name.startswith("_")}
+    )
+    virtual_time.monotonic = clock.time
+    monkeypatch.setattr(feature_mod, "time", virtual_time)
+    monkeypatch.setattr(feature_mod, "_DISPATCH_POLL_SECONDS", 0)
+
+    err_path = tmp_path / "restart.err"
+    err_path.write_text("host: PID 4100 is still running after SIGKILL\n")
+    child = _SlowFailingChild(
+        clock, lifetime=lifetime, interval=interval, stderr_path=err_path,
+    )
+    with patch.object(
+        RestartCoordinatorFeature, "_spawn_restart_subprocess",
+        return_value=child,
+    ):
+        await feat.restart_coordinator()
+    await agent.drain_background_tasks()
+    return child, await get_request(backend, req_id), feat._restart_dispatch_grace
+
+
+@pytest.mark.asyncio
+async def test_child_that_fails_at_the_end_of_the_host_stop_is_caught(
+    tmp_path, monkeypatch,
+):
+    """The watch lasts as long as ``kestrel terminate``'s stop of the host.
+
+    A restart that cannot stop this host exits only after giving it
+    ``SERVER_TERMINATE_TIMEOUT_SECONDS``, a SIGKILL and
+    ``SERVER_KILL_GRACE_SECONDS``. A watch that ends sooner misses the failure,
+    and the row sits ``executing`` until the 600s stranded-row sweep (#3781).
+    """
+    from kestrel_sovereign.multi_agent.process_manager import (
+        SERVER_KILL_GRACE_SECONDS,
+        SERVER_TERMINATE_TIMEOUT_SECONDS,
+    )
+
+    child, row, _ = await _watch_a_slow_child(
+        tmp_path, monkeypatch,
+        lifetime=SERVER_TERMINATE_TIMEOUT_SECONDS + SERVER_KILL_GRACE_SECONDS,
+    )
+
+    assert child.returncode == 1, "the watch ended before the child exited"
+    assert row.status == "pending", "the late failure was not recovered"
+    assert "exited 1" in row.status_reason
+    assert "still running after SIGKILL" in row.status_reason
+
+
+@pytest.mark.asyncio
+async def test_a_child_running_past_the_host_stop_is_left_to_the_sweep(
+    tmp_path, monkeypatch,
+):
+    """The window is a bound, and the host's stop is all it covers.
+
+    A child still running once that stop is over is not following
+    ``kestrel terminate``'s timeline. The watch ends without acting and the
+    row falls to the stranded-row sweep, which owns it from then on.
+    """
+    from kestrel_sovereign.features.restart_coordinator import feature as feature_mod
+
+    child, row, window = await _watch_a_slow_child(
+        tmp_path, monkeypatch,
+        lifetime=feature_mod.RESTART_DISPATCH_GRACE_SECONDS
+        + 2 * feature_mod._DISPATCH_POLL_SECONDS,
+    )
+
+    assert window == feature_mod.RESTART_DISPATCH_GRACE_SECONDS
+    assert child.returncode is None, "the watch outlived its window"
+    assert row.status == "executing"
+
+
+def test_dispatch_watch_window_is_the_host_stop_budget():
+    """One source of truth: the watch window is the stop ``kestrel terminate``
+    gives the host, its deadline and then the kill grace, and it ends before
+    the stranded-row sweep begins.
+
+    A watch still running when the sweep returns the row to ``pending`` could
+    see its old child exit after the next tick re-dispatched the row, and
+    fail the new dispatch for it.
+    """
+    from kestrel_sovereign.features.restart_coordinator.feature import (
+        RESTART_DISPATCH_GRACE_SECONDS,
+        STALE_EXECUTING_SECONDS,
+    )
+    from kestrel_sovereign.multi_agent.process_manager import (
+        SERVER_KILL_GRACE_SECONDS,
+        SERVER_TERMINATE_TIMEOUT_SECONDS,
+    )
+
+    assert RESTART_DISPATCH_GRACE_SECONDS == (
+        SERVER_TERMINATE_TIMEOUT_SECONDS + SERVER_KILL_GRACE_SECONDS
+    )
+    assert RESTART_DISPATCH_GRACE_SECONDS < STALE_EXECUTING_SECONDS
 
 
 @pytest.mark.asyncio

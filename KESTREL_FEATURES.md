@@ -489,13 +489,13 @@ Runtime security policy can still deny a discovered tool at call time; static ge
 
 | Tool | Command | Category | Params | Token cost | State |
 |---|---|---|---|---:|---|
-| `ask_agent` | `!ask` | `communication` | `agent_name`, `message` | 105 | `enabled` |
-| `get_peer_task_result` | `!a2a result` | `communication` | `recipient`, `task_id` | 182 | `enabled` |
-| `list_outbound_a2a_tasks` | `!a2a outbound` | `communication` | `limit`, `recipient` | 175 | `enabled` |
+| `ask_agent` | `!ask` | `communication` | `agent_name`, `message` | 76 | `enabled` |
+| `get_peer_task_result` | `!a2a result` | `communication` | `dispatch_id` | 77 | `enabled` |
+| `list_outbound_a2a_tasks` | `!a2a outbound` | `communication` | `limit`, `recipient` | 109 | `enabled` |
 | `list_peers` | `!peers` | `communication` |  | 22 | `enabled` |
-| `send_a2a_message` | `!a2a tell` | `communication` | `recipient`, `message`, `session_id` | 161 | `enabled` |
-| `send_a2a_question` | `!a2a ask` | `communication` | `recipient`, `message`, `session_id`, `timeout_seconds`, `artifacts`, `references` | 498 | `enabled` |
-| `send_a2a_task` | `!a2a send` | `communication` | `recipient`, `message`, `skill_id`, `session_id`, `artifacts`, `references` | 488 | `enabled` |
+| `send_a2a_message` | `!a2a tell` | `communication` | `recipient`, `message`, `context_id` | 161 | `enabled` |
+| `send_a2a_question` | `!a2a ask` | `communication` | `recipient`, `message`, `context_id`, `timeout_seconds`, `parts` | 146 | `enabled` |
+| `send_a2a_task` | `!a2a send` | `communication` | `recipient`, `message`, `skill_id`, `context_id`, `parts`, `continue_dispatch_id` | 313 | `enabled` |
 | `stop_peer` | `!peer stop` | `communication` | `recipient`, `reason`, `scope`, `target` | 172 | `enabled` |
 
 ### `response_audit` (ResponseAuditFeature)
@@ -652,14 +652,14 @@ Runtime security policy can still deny a discovered tool at call time; static ge
 
 | Tool | Command | Category | Params | Token cost | State |
 |---|---|---|---|---:|---|
-| `attach_artifact_to_a2a_task` | `!a2a attach` | `communication` | `task_id`, `name`, `content`, `index`, `last_chunk` | 383 | `enabled` |
+| `attach_artifact_to_a2a_task` | `!a2a attach` | `communication` | `task_id`, `name`, `content`, `artifact_id`, `last_chunk` | 149 | `enabled` |
 | `cancel_task` | `!cancel-task` | `utility` | `task_id`, `reason` | 74 | `enabled` |
 | `check_task_status` | `!task-status` | `utility` | `task_id` | 85 | `enabled` |
 | `get_task_result` | `!task-result` | `utility` | `task_id` | 81 | `enabled` |
 | `list_available_skills` | `!list-skills` | `utility` |  | 65 | `enabled` |
-| `list_my_tasks` | `!tasks` | `utility` | `status`, `task_type`, `limit` | 197 | `enabled` |
-| `respond_to_a2a_task` | `!a2a respond` | `communication` | `task_id`, `content`, `state` | 259 | `enabled` |
-| `run_workflow` | `!run-workflow` | `utility` | `steps` | 271 | `enabled` |
+| `list_my_tasks` | `!tasks` | `utility` | `status`, `task_type`, `limit` | 149 | `enabled` |
+| `respond_to_a2a_task` | `!a2a respond` | `communication` | `task_id`, `content`, `state` | 205 | `enabled` |
+| `run_workflow` | `!run-workflow` | `utility` | `steps` | 263 | `enabled` |
 
 ### `todo` (TodoFeature)
 
@@ -744,7 +744,6 @@ Runtime security policy can still deny a discovered tool at call time; static ge
   - `POST /api/agent/invoke`
   - `GET /api/agent/notifications`
   - `GET /api/agent/notifications/sse`
-  - `POST /api/agent/peer/stop`
   - `GET /api/agent/privacy-mode`
   - `POST /api/agent/privacy-mode`
   - `POST /api/agent/privacy-mode/cancel`
@@ -753,13 +752,6 @@ Runtime security policy can still deny a discovered tool at call time; static ge
   - `POST /api/agent/stop`
   - `GET /api/agent/stop/capabilities`
   - `POST /api/agent/stream`
-  - `GET /api/agent/tasks`
-  - `POST /api/agent/tasks/send`
-  - `POST /api/agent/tasks/{task_id:path}/cancel`
-  - `POST /api/agent/tasks/{task_id:path}/read`
-  - `POST /api/agent/tasks/{task_id:path}/subscribe`
-  - `GET /api/agent/tasks/{task_id}`
-  - `GET /api/agent/tasks/{task_id}/subscribe`
 - [`kestrel_sovereign/endpoints/auth_oauth.py`](kestrel_sovereign/endpoints/auth_oauth.py)
   - `GET /auth/callback`
   - `GET /auth/login`
@@ -908,6 +900,9 @@ Runtime security policy can still deny a discovered tool at call time; static ge
   - `GET /api/storage/stats`
 - [`kestrel_sovereign/endpoints/spawn.py`](kestrel_sovereign/endpoints/spawn.py)
   - `GET /api/spawn/children`
+- [`kestrel_sovereign/endpoints/task_inbox.py`](kestrel_sovereign/endpoints/task_inbox.py)
+  - `GET /api/agent/task-inbox`
+  - `GET /api/agent/task-inbox/{task_id}`
 - [`kestrel_sovereign/endpoints/ui.py`](kestrel_sovereign/endpoints/ui.py)
   - `GET /api/ui/theme`
   - `GET /api/ui/themes`
@@ -1060,12 +1055,12 @@ Runtime security policy can still deny a discovered tool at call time; static ge
 | `!model-list` | `model` | `[use_cache]` | List all available AI models. |
 | `!model-pull` | `model` | `<model_name> [progress_callback]` | Download a new AI model (Ollama only). |
 | `!model-set` | `model` | `<vendor_or_model> [model]` | Set the active AI model for conversations. Accepts a vendor and model, e.g. set_model('openai', 'gpt-5-mini'), or the 'vendor:route/model' micro-syntax in a single arg, e.g. set_model('anthropic:plan/claude-opus-4-7'). The vendor, route, and model must be real — an unknown triple is rejected, not silently applied. Call list_models first to discover valid vendor/route/model values. |
-| `!a2a ask` | `peers` | `<recipient> <message> [session_id] [timeout_seconds] [artifacts] [references]` | Ask another agent a question. Fire-and-resume: this tool POSTs the question, spawns a background SSE subscription on the recipient's task, and returns IMMEDIATELY with ``awaiting_reply=True``. Your current turn ends here. When the recipient's task reaches a terminal state, the ``a2a.question_answered`` signal fires a fresh COGNITION turn on your dispatcher with the reply text inline — respond there. If ``timeout_seconds`` passes first, you are woken with ``state='expired'`` and the question is withdrawn (the recipient's task is canceled); the wake's ``withdrawn`` flag says whether that was confirmed. Do NOT block your turn waiting for the answer; the supervisor will wake you. For fire-and-forget use send_a2a_message; for tracked work you'll check on later use send_a2a_task.<br><br>SEND-SIDE ARTIFACTS: pass ``artifacts`` and/or ``references`` to attach durable payload (planning docs, evidence, saved-memory/recall references) to the question so the recipient can retrieve it from the task store while answering. This is the SEND side — distinct from the RESPONDER-side attach_artifact_to_a2a_task tool a recipient uses to attach output onto an incoming task before responding. |
-| `!a2a outbound` | `peers` | `[limit] [recipient]` | List the A2A tasks you SENT to peer agents — your local audit log of outbound dispatches (#1576). Each row carries task_id, recipient, verb (message/question/task), dispatch_tool, created_at, and terminal_state (populated after a get_peer_task_result fetch confirms the peer's final state). Use this when you need to enumerate 'what did I send and to whom?' without per-id round trips. |
-| `!a2a result` | `peers` | `<recipient> <task_id>` | Fetch the current state + full reply text of an A2A task you previously sent to a peer agent. Use this when an `a2a.question_answered` signal arrived with `truncated=true` (the inline reply was clipped at 8 KiB) — this tool fetches the FULL untruncated body from the peer's task store. Returns the same envelope shape a local `get_task_result` would, but routed through the host proxy to the peer (#1444 truncation recovery path). |
-| `!a2a send` | `peers` | `<recipient> <message> [skill_id] [session_id] [artifacts] [references]` | Submit a tracked A2A task to another agent. Persists in the recipient's TaskStore, fires the a2a.task_submitted signal so they wake and process it, returns the task_id for tracking. Caller can poll status via get_a2a_task (or receive the a2a.task_complete signal). Use this for delegated work you'll check on later. For an answer now use send_a2a_question; for a fire-and-forget notification use send_a2a_message.<br><br>SEND-SIDE ARTIFACTS: pass ``artifacts`` and/or ``references`` to hand off durable payload (planning docs, evidence bundles, saved-memory/recall references, logs, diffs) WITH the task — the recipient retrieves them from the task store via get_task_result/check_task_status. This is the SEND side; it is distinct from the RESPONDER-side attach_artifact_to_a2a_task tool, which a RECIPIENT uses to attach output onto an INCOMING task before responding. Each artifact is a dict like {'name': 'plan', 'text': '...'} (or 'data': {...} for structured metadata, optional 'index'/'last_chunk' for chunked bodies). Each reference is a dict descriptor like {'ref_type': 'memory', 'id': '...', 'label': '...'}. |
-| `!a2a tell` | `peers` | `<recipient> <message> [session_id]` | Send an async message to another agent — fire-and-forget, no reply expected. Persists in the recipient's TaskStore and fires the a2a.task_submitted signal so they wake and see it on their next cognition turn, but the caller does NOT track lifecycle. Use this for notifications, FYIs, status updates ('I just shipped PR 42'). For a tracked work assignment use send_a2a_task; for a synchronous Q&A use send_a2a_question. |
-| `!ask` | `peers` | `<agent_name> <message>` | Send a message to another agent in the multi_agent and get their response. Use this to collaborate, ask questions, or delegate tasks to peer agents. |
+| `!a2a ask` | `peers` | `<recipient> <message> [context_id] [timeout_seconds] [parts]` | Send a native A2A question and end this turn. Its durable local question correlation resumes you through a2a.question_answered. Use standard Message Parts for handoff data. Never resend an uncertain dispatch. |
+| `!a2a outbound` | `peers` | `[limit] [recipient]` | List your native outbound A2A dispatch audit. Each row has an immutable dispatch_id, stable recipient, selected tenant and interface, delivery state, and the nullable remote_task_id and last observed task state. Message bodies are not stored in this audit. |
+| `!a2a result` | `peers` | `<dispatch_id>` | Read the full standard Task for your immutable outbound dispatch_id. Reconciles uncertain original delivery by peer reads without resending. The retained ledger supplies the stable peer, tenant and remote task ID. |
+| `!a2a send` | `peers` | `<recipient> [message] [skill_id] [context_id] [parts] [continue_dispatch_id]` | Delegate tracked work to a peer using native A2A. The dispatch_id is your immutable local handle; remote_task_id is assigned by the peer and can be null. Use message for text or parts for complete standard input; message may be omitted. Match the peer's advertised input modes, including the selected skill's overrides. For a JSON-only skill, supply parts such as [{'data':{'request':'...'}}] without a text message. Artifacts are peer outputs. skill_id is an optional advisory hint from the peer's signed Agent Card; it grants no direct tool invocation. Use context_id for a conversation context. To send follow-up input to an existing task, set continue_dispatch_id to its latest acknowledged local dispatch. The retained task, context and verified peer binding must match. |
+| `!a2a tell` | `peers` | `<recipient> <message> [context_id]` | Send an async message to another agent — fire-and-forget, no reply expected. Persists in the recipient's TaskStore and fires the a2a.task_submitted signal so they wake and see it on their next cognition turn, but the caller does NOT track lifecycle. Use this for notifications, FYIs, status updates ('I just shipped PR 42'). For a tracked work assignment use send_a2a_task; for a synchronous Q&A use send_a2a_question. |
+| `!ask` | `peers` | `<agent_name> <message>` | Send a native A2A message to a peer and wait for its terminal or interrupted response. The durable dispatch remains available if delivery becomes uncertain. |
 | `!peer stop` | `peers` | `<recipient> [reason] [scope] [target]` | Cooperatively stop a peer agent's current in-flight work through the authenticated signal rail. Any authorized peer may pull this bounded, rate-limited andon cord; it does not Hold, terminate, cascade to the peer's descendants, or grant hierarchy. Use scope='agent' for the peer's current work, or scope='turn' with that exact observable turn id. |
 | `!peers` | `peers` |  | List all available peer agents in the multi_agent. |
 | `!audit` | `response_audit` |  | Show audit configuration and status |
@@ -1122,14 +1117,14 @@ Runtime security policy can still deny a discovered tool at call time; static ge
 | `!strategy` | `strategic_memory` | `[section]` | View the current strategic context: vision, milestones, stakeholders, decisions, blockers, and patterns. |
 | `!strategy-reconcile` | `strategic_memory` | `[apply]` | Check each active blocker against live GitHub issue state and report which reference already-closed issues. Pass apply='yes' to resolve the stale rows. |
 | `!strategy-search` | `strategic_memory` | `<query> [kind] [limit] [include_retired]` | Search the strategy ledger (learned patterns and blockers) by keyword. This is the query path that replaced dumping the whole log into the system prompt. |
-| `!a2a attach` | `tasks` | `<task_id> <name> <content> [index] [last_chunk]` | RESPONDER-SIDE artifact attach: the RECIPIENT of an incoming A2A task uses this to attach its own output. To attach payload as the SENDER of an outgoing task, pass ``artifacts``/``references`` to send_a2a_task / send_a2a_question instead. Attach one chunk of long-form output as an Artifact to an incoming A2A task BEFORE calling respond_to_a2a_task. Use this when your reply exceeds the per-tool argument cap (10K chars) — chunk the body into segments of <=9000 chars each, call this tool once per segment with monotonically-increasing index (0, 1, 2, ...) and last_chunk=False on every segment except the final one. The sender's get_peer_task_result returns the artifacts in order so the resumed turn can reassemble the full body. After all segments are attached, call respond_to_a2a_task with a SHORT content like 'See attached artifacts (N segments).' so the sender knows where to look. |
-| `!a2a respond` | `tasks` | `<task_id> <content> [state]` | Respond to an incoming A2A task in your inbox by transitioning it to a terminal state with your reply text. Use this when another agent sent you a task via send_a2a_question (fire-and-resume — sender's turn ended, they wake on the a2a.question_answered signal when you transition), send_a2a_message (FYI, brief receipt), or send_a2a_task (delegated work, full result). The sender's subscription supervisor on the SSE stream picks up your terminal frame and fires their resumption signal. Without this tool the sender's send_a2a_question lineage never resumes until the hourly expiry sweep fires a state='expired' signal. |
+| `!a2a attach` | `tasks` | `<task_id> <name> <content> [artifact_id] [last_chunk]` | Attach text output to an incoming task. The first call returns an artifact_id. For longer output, pass that same artifact_id with each later chunk; set last_chunk=False until the final chunk. Finish the task with respond_to_a2a_task. |
+| `!a2a respond` | `tasks` | `<task_id> <content> [state]` | Respond to an incoming A2A task in your inbox by transitioning it to a terminal state with your reply text. Use this when another agent sent you a task via send_a2a_question (fire-and-resume — sender's turn ended, they wake on the a2a.question_answered signal when you transition), send_a2a_message (FYI, brief receipt), or send_a2a_task (delegated work, full result). The sender's resident question recovery reads your native result and queues a durable resumption signal after your terminal reply. Unanswered questions use their recorded deadline; a later reply produces a late-answer wake. |
 | `!cancel-task` | `tasks` | `<task_id> [reason]` | Cancel a pending or running task. |
 | `!list-skills` | `tasks` |  | List all available features and their skills that can be used with run_workflow. Returns feature names, skill names, and descriptions. Call this first to discover what skills are available before building a workflow plan. |
-| `!run-workflow` | `tasks` | `<steps>` | Execute a multi-step plan across features. Each step runs a specific feature skill with arguments. All steps execute sequentially and results are returned together. Use this instead of making individual subagent calls when you need to gather information from multiple features. Steps format: [{"feature": "feature_name", "skill": "skill_name", "args": {}}]. Feature names match the tool names shown in your available tools (e.g., model_agent, memory_feature, wallet_feature). Skill names are the individual tool methods within each feature (e.g., list_models, memory_status, check_balance). Args can reference prior step outputs with {{steps.N.result}} or {{prev.result}}. Steps can optionally include max_retries (default 0) and retry_delay_ms (default 1000). |
+| `!run-workflow` | `tasks` | `<steps>` | Execute a multi-step plan across features. Each step runs a specific feature skill with arguments. All steps execute sequentially and results are returned together. Use this instead of making individual subagent calls when you need to gather information from multiple features. Steps format: [{"feature": "feature_name", "skill": "skill_name", "args": {}}]. Use the exact feature identifiers returned by list_available_skills. Skill names are the individual tool methods within each feature (e.g., list_models, memory_status, check_balance). Args can reference prior step outputs with {{steps.N.result}} or {{prev.result}}. Steps can optionally include max_retries (default 0) and retry_delay_ms (default 1000). |
 | `!task-result` | `tasks` | `<task_id>` | Get the result/artifacts from a completed task. The returned message field is the REPLY content, distinct from request_content (what was originally ASKED) surfaced by check_task_status. |
 | `!task-status` | `tasks` | `<task_id>` | Check the status of a background task by ID. Returns two distinct content fields: request_content (what was ASKED — the inbound sender's message) and message (the REPLY that has been written back, if any). |
-| `!tasks` | `tasks` | `[status] [task_type] [limit]` | List background tasks, optionally filtered by status or type. status must be one of the TaskState values: submitted, working, completed, failed, canceled (case-insensitive). With no status, returns the pending (submitted) inbox; a status filter queries tasks across ALL states. |
+| `!tasks` | `tasks` | `[status] [task_type] [limit]` | List background tasks, optionally filtered by status or type. status is a native lifecycle label such as submitted, working, input-required, auth-required, completed, failed, canceled, or rejected (case-insensitive). With no status, returns the pending (submitted) inbox; a status filter queries tasks across ALL states. |
 | `!todo add` | `todo` | `<title> [description] [scope] [status] [priority] [owner] [links] [terminal_condition] [next_check_at] [source_metadata]` | Create a durable active todo with terminal criteria and optional external links. |
 | `!todo complete` | `todo` | `<todo_id> [outcome] [evidence] [terminal_condition_satisfied] [superseded_by]` | Mark a todo done only when its terminal condition is explicitly satisfied, or cancel/supersede it with a reason. |
 | `!todo link` | `todo` | `<todo_id> <link_type> <target> [title] [status] [url] [metadata]` | Attach an external reference to a todo, such as a GitHub issue, coding workflow run, A2A task, scheduled job, restart request, action item, or evidence URL. |

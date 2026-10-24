@@ -294,11 +294,11 @@ class TestVolatileRenameLiveVsRestart:
         assert payload["name"] == "SessionName"
         assert agent._agent_name == "SessionName"
 
-        # LIVE (A2A card): the real card builder shares resolve_effective_name, so
-        # it advertises the same live session name — endpoint and card never
-        # disagree after a volatile rename.
-        card = await KestrelAgent.get_agent_card(agent)
-        assert card.name == "SessionName"
+        # LIVE profile: console discovery and native signed cards consume this
+        # same display profile. Native route/signature tests separately verify
+        # a volatile rename changes the public card without changing its route.
+        card = await KestrelAgent.get_public_profile(agent)
+        assert card["name"] == "SessionName"
 
         # DURABLE: the stored node was never renamed.
         node = await agent.storage.get_node(agent.agent_id)
@@ -312,13 +312,13 @@ class TestVolatileRenameLiveVsRestart:
             await restarted.storage.get_node(restarted.agent_id)
         ).properties["name"]
         assert restarted._agent_name == "TestAgent"
-        restarted_card = await KestrelAgent.get_agent_card(restarted)
-        assert restarted_card.name == "TestAgent"
+        restarted_card = await KestrelAgent.get_public_profile(restarted)
+        assert restarted_card["name"] == "TestAgent"
 
 
 class TestMultiAgentDiscoveryLiveName:
     """The multi-agent ``GET /api/agents`` discovery route advertises each agent's
-    LIVE display name (from ``get_agent_card`` → ``resolve_effective_name``) and
+    LIVE display name (from ``get_public_profile`` → ``resolve_effective_name``) and
     exposes the AgentManager routing key separately as ``routing_name``. It must
     NOT overwrite the live name with the immutable key — the prior bug hid every
     session rename behind the registration name in host discovery (#2672 review
@@ -329,17 +329,12 @@ class TestMultiAgentDiscoveryLiveName:
         from kestrel_sovereign.endpoints.models import get_agents
 
         # Registered under manager key "Emma" but renamed live to "RenamedLive"
-        # (a volatile session rename that skipped the durable node write). The card
+        # (a volatile session rename that skipped the durable node write). The profile
         # carries the live name; the manager key is the routing identity.
-        card = MagicMock()
-        card.model_dump.return_value = {
-            "name": "RenamedLive",
-            "description": "d",
-            "url": "http://localhost:8888",
-            "skills": [],
-        }
         agent = MagicMock(agent_id="did:emma", is_demo=False)
-        agent.get_agent_card = AsyncMock(return_value=card)
+        agent.get_public_profile = AsyncMock(return_value={
+            "name": "RenamedLive", "description": "d",
+        })
 
         manager = MagicMock()
         manager.list_agents.return_value = {"Emma": agent}
@@ -358,13 +353,13 @@ class TestMultiAgentDiscoveryLiveName:
 
     @pytest.mark.asyncio
     async def test_get_agents_error_fallback_carries_routing_name(self):
-        """When card generation fails the fallback entry still carries the routing
+        """When profile generation fails the error entry still carries the routing
         key under BOTH ``name`` (best available) and ``routing_name`` so path
         construction never loses the manager key (#2672 review P2)."""
         from kestrel_sovereign.endpoints.models import get_agents
 
         agent = MagicMock(agent_id="did:emma", is_demo=False)
-        agent.get_agent_card = AsyncMock(side_effect=RuntimeError("boom"))
+        agent.get_public_profile = AsyncMock(side_effect=RuntimeError("boom"))
 
         manager = MagicMock()
         manager.list_agents.return_value = {"Emma": agent}
