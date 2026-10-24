@@ -179,6 +179,8 @@ class AuthorizedArtifactService:
     async def _perform(self, context, action, operation, *, mutation=False, link=None):
         async with self.authority.operation(context, action, self.repository.storage_id,
                                             link=link) as check:
+            await self.repository.ensure_initialized()
+            check()
             result = await operation(self._scope(context), check)
             try:
                 # Native COMMIT can await after the repository's final check.

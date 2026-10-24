@@ -111,15 +111,29 @@ def test_real_uvicorn_logs_redact_direct_and_multi_agent_sse_keys(monkeypatch):
                 assert response.status_code == 200
                 assert response.json()["authenticated"] is True
 
+            # Actual Uvicorn must not log private metadata from artifact URLs,
+            # whether the request succeeds or authentication refuses it.
+            for artifact_path in (
+                "/api/artifacts/publications/private-publication-key",
+                "/api/agents/Kite/api/artifacts/private-artifact/revisions/private-revision/file",
+            ):
+                response = client.get(artifact_path, params={"path": "private-filename.md"},
+                                      headers={"X-API-Key": "direct-secret-2429"})
+                assert response.status_code == 200
+                assert "private-" in response.json()["path"]
+            assert client.get("/api/artifacts/publications/denied-private-key").status_code == 401
+
         logs = output.getvalue()
-        assert observed_keys == [key for _, key in paths_and_keys]
-        assert observed_agents == [None, routed_agent]
+        assert observed_keys[:2] == [key for _, key in paths_and_keys]
+        assert observed_agents[:2] == [None, routed_agent]
         for _, key in paths_and_keys:
             assert key not in logs
         assert logs.count("api_key=redacted") == 2
         # The real multi-agent router strips the prefix before Uvicorn emits
         # the log record, proving the proxy-routing layer actually ran.
         assert logs.count("/api/agent/notifications/sse?") == 2
+        assert "private-" not in logs
+        assert logs.count('GET /api/artifacts HTTP/') == 3
     finally:
         server.should_exit = True
         thread.join(timeout=5.0)

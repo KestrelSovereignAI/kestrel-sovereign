@@ -386,3 +386,98 @@ async def test_keyless_agent_boots_without_advertising_artifacts(temp_db, monkey
     finally:
         await shutdown_fixture_agent(agent)
         await llm.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("damage", ["wrong-key", "missing-envelope"])
+async def test_unavailable_store_is_local_to_artifacts_and_recoverable(host, monkeypatch, damage):
+    import os
+    from cryptography.fernet import Fernet
+    client, agents, _ = host
+    ref, _ = await publish(client, content=b"preserved-original")
+    agent = agents["kite"]
+    old = agent.features["ArtifactsFeature"]
+    db = old._service.repository.db
+    wrapped = (await db.fetchone("SELECT wrapped_key FROM artifact_keys WHERE key_id = 'v1'"))[0]
+    original_blob = (await db.fetchone("SELECT content FROM artifact_blobs"))[0]
+    key = os.environ["KESTREL_DATA_KEY"]
+    await old.shutdown()
+    if damage == "wrong-key":
+        monkeypatch.setenv("KESTREL_DATA_KEY", Fernet.generate_key().decode())
+    else:
+        await db.execute("DELETE FROM artifact_keys")
+    replacement = ArtifactsFeature(agent)
+    await replacement.initialize()  # Optional storage cannot abort activation.
+    agent.features[replacement.name] = replacement
+    await replacement.on_enable()
+    url = path() + f'/{ref["artifact_id"]}/head'
+    response = await client.get(url, headers=AUTH)
+    assert response.status_code == 503
+    assert response.json() == {"error": {"code": "artifact_integrity_failure"}}
+    assert (await db.fetchone("SELECT content FROM artifact_blobs"))[0] == original_blob
+    assert replacement._service.repository._index_key is None
+    if damage == "wrong-key":
+        assert (await db.fetchone("SELECT wrapped_key FROM artifact_keys WHERE key_id = 'v1'"))[0] == wrapped
+        monkeypatch.setenv("KESTREL_DATA_KEY", key)
+    else:
+        assert not await db.fetchone("SELECT 1 FROM artifact_keys")
+        await db.execute("INSERT INTO artifact_keys(key_id, wrapped_key) VALUES (?, ?)", ("v1", wrapped))
+    assert (await client.get(url, headers=AUTH)).json()["ref"] == ref
+    body = await client.get(path() + f'/{ref["artifact_id"]}/revisions/{ref["revision_id"]}/file',
+                            headers=AUTH, params={"path": "report.txt"})
+    assert body.content == b"preserved-original"
+
+
+@pytest.mark.asyncio
+async def test_keyed_real_boot_omits_subagent_claim_and_survives_wrong_artifact_key(temp_db, monkeypatch):
+    from cryptography.fernet import Fernet
+    from kestrel_sovereign.kestrel_agent import KestrelAgent
+    from kestrel_sovereign.llm.service import LLMService
+    from tests.shared.native_shutdown_budget import shutdown_fixture_agent
+    monkeypatch.delenv("KESTREL_DATA_KEY_FILE", raising=False)
+    wrapped = None
+    for restart in (False, True):
+        monkeypatch.setenv("KESTREL_DATA_KEY", Fernet.generate_key().decode())
+        llm = LLMService()
+        agent = KestrelAgent(did="did:test:keyed-artifact-boot", storage_path=str(temp_db),
+                             llm_service=llm, privacy_mode=PrivacyMode.NORMAL)
+        try:
+            await agent.initialize()
+            feature = agent.features["ArtifactsFeature"]
+            assert feature.get_router() is not None and feature._accepting
+            assert feature.tool_name not in {item["function"]["name"] for item in agent._build_all_tools()}
+            assert feature.name not in agent._build_features_prompt_section()
+            assert feature.tool_name not in agent._visible_features_by_tool_name()
+            assert feature.tool_name not in agent._registered_features_by_tool_name()
+            repo = feature._service.repository
+            assert repo._index_key is None
+            if not restart:
+                assert not await repo.db.table_exists("artifact_keys")
+                await repo.initialize()  # Simulate a store opened before the restart.
+                wrapped = (await repo.db.fetchone("SELECT wrapped_key FROM artifact_keys WHERE key_id = 'v1'"))[0]
+            else:
+                assert (await repo.db.fetchone("SELECT wrapped_key FROM artifact_keys WHERE key_id = 'v1'"))[0] == wrapped
+        finally:
+            await shutdown_fixture_agent(agent)
+            await llm.close()
+
+
+@pytest.mark.asyncio
+async def test_host_metrics_use_route_templates_without_private_identifiers(host, monkeypatch):
+    from kestrel_sdk import metrics
+    client, _, _ = host
+    labels = []
+    sink = SimpleNamespace(inc=lambda: None, observe=lambda _: None)
+    def labelled(**values):
+        labels.append(values)
+        return sink
+    monkeypatch.setattr(metrics, "PROMETHEUS_AVAILABLE", True)
+    monkeypatch.setattr(metrics, "REQUEST_COUNT", SimpleNamespace(labels=labelled))
+    monkeypatch.setattr(metrics, "REQUEST_DURATION", SimpleNamespace(labels=labelled))
+    ref, _ = await publish(client, key="private-publication-key")
+    await client.get(path() + "/publications/private-publication-key", headers=AUTH)
+    await client.get(path() + f'/{ref["artifact_id"]}/head', headers=AUTH)
+    paths = {values["path"] for values in labels}
+    assert "/api/artifacts/publications/{key}" in paths
+    assert "/api/artifacts/{artifact_id}/head" in paths
+    assert all("private-publication-key" not in item and ref["artifact_id"] not in item for item in paths)

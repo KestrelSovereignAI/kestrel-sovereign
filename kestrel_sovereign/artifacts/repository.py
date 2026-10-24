@@ -14,6 +14,7 @@ the host must account for this growth when admitting ongoing publication work.
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
+import asyncio
 import base64
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -121,6 +122,26 @@ class ArtifactRepository:
         self.limits = limits or ArtifactLimits()
         self.clock = clock
         self._index_key: bytes | None = None
+        self._initialization_lock = asyncio.Lock()
+
+    async def ensure_initialized(self) -> None:
+        """Open lazily inside an authorized service operation, once per runtime.
+
+        An unavailable optional store must not take down the rest of the host.
+        Failure leaves the original envelope intact and remains retryable after
+        the operator restores its key. No plaintext or replacement-key fallback.
+        """
+        if self._index_key is None:
+            async with self._initialization_lock:
+                if self._index_key is None:
+                    try:
+                        await self.initialize()
+                    except TransactionError as error:
+                        if execution_commit_outcome(error) is not None:
+                            raise ResourceOutcomeUnknown("artifact initialization requires reconciliation") from error
+                        if isinstance(error.__cause__, ArtifactIntegrityError):
+                            raise error.__cause__ from None
+                        raise
 
     async def initialize(self) -> None:
         self._require_outermost()
@@ -140,10 +161,15 @@ class ArtifactRepository:
                 await self.db.execute("INSERT INTO artifact_keys (key_id, wrapped_key) VALUES (?, ?)",
                                       ("v1", wrapping_cipher.encrypt(index_key)))
             else:
-                index_key = wrapping_cipher.decrypt(bytes(row[0]))
+                try:
+                    index_key = wrapping_cipher.decrypt(bytes(row[0]))
+                except DecryptionError:
+                    raise ArtifactIntegrityError(
+                        "artifact envelope cannot be opened; restore its original KESTREL_DATA_KEY "
+                        "or complete offline key rotation"
+                    ) from None
             if len(index_key) != 32:
                 raise ArtifactIntegrityError("invalid artifact envelope key")
-        self._index_key = index_key
         for name, table, columns in (
             ("idx_artifact_refs_blob", "artifact_blob_refs", "owner, blob_key"),
             ("idx_artifact_staging_expiry", "artifact_staging", "expires_at, owner"),
@@ -152,6 +178,7 @@ class ArtifactRepository:
             ("idx_artifact_publication_artifact", "artifact_publications", "owner, artifact_id"),
         ):
             await self.db.ensure_index(name, table, columns)
+        self._index_key = index_key
 
     def _require_outermost(self) -> None:
         if self.db.owns_open_transaction is not False:

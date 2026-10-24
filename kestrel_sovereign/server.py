@@ -4513,8 +4513,9 @@ async def request_metrics_middleware(request: Request, call_next):
     response = await call_next(request)
     duration = _time.monotonic() - start
 
-    # Normalize path to avoid unbounded cardinality from path params
-    path = request.url.path
+    # Use the matched template, never private IDs/publication keys from the
+    # request target. Unmatched paths also share one bounded, content-free label.
+    path = getattr(request.scope.get("route"), "path", None) or "/unmatched"
     method = request.method
     status = str(response.status_code)
 
@@ -4916,7 +4917,7 @@ async def deprecated_agent_prefix_compat(request: Request, call_next):
     return await call_next(request)
 
 
-# Registered after every other middleware so it is the outermost ASGI layer.
+# Outside all buffering middleware and inside the artifact delivery boundary.
 # Application/auth code sees the original query string; the scope is redacted
 # only as ``http.response.start`` crosses back to Uvicorn's access logger.
 from kestrel_sovereign.security.access_log import (

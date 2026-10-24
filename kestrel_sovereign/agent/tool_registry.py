@@ -574,7 +574,8 @@ class ToolRegistryMixin:
 
     def _feature_supports_subagent_dispatch(self, feature: Any) -> bool:
         return (
-            callable(getattr(feature, "to_orchestrator_tool", None))
+            getattr(feature, "supports_subagent_dispatch", True) is True
+            and callable(getattr(feature, "to_orchestrator_tool", None))
             and callable(getattr(feature, "execute_as_subagent", None))
         )
 
@@ -592,8 +593,10 @@ class ToolRegistryMixin:
           visible.
         * **not hidden by the active tool-context profile** — progressive
           disclosure can hide a feature for the current turn.
-        * **supports subagent dispatch** — only features exposing both
-          ``to_orchestrator_tool`` and ``execute_as_subagent`` are dispatchable.
+        * **supports subagent dispatch** — the feature has not opted out of
+          model-facing execution and exposes both ``to_orchestrator_tool`` and
+          ``execute_as_subagent``. HTTP-only services can remain enabled without
+          advertising an executable capability they do not implement.
 
         One source of truth shared by :meth:`_build_feature_tools`,
         :meth:`_visible_features_by_tool_name`, and

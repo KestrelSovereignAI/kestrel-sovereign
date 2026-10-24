@@ -81,6 +81,11 @@ dependency rather than publishing a plaintext or in-memory substitute. Keyless
 hosts omit this optional feature during discovery, retain a health diagnostic,
 and continue booting their other features. Routes
 follow the selected agent and current feature instance, including reloads.
+The repository opens lazily inside the first authorized operation. An unavailable
+or incorrectly keyed artifact store returns an explicit storage failure without
+preventing the agent's other capabilities from starting. Original ciphertext and
+envelope keys are preserved; there is no replacement-key fallback. This HTTP
+service opts out of model subagent dispatch until producer tools are implemented.
 
 The initial host policy admits only a current, configured sovereign API key in
 `X-API-Key` or `Authorization: Bearer`. Cookie, JWT, peer, unattended and delegated
@@ -108,7 +113,9 @@ stop its owned task; re-enable starts it again. Published revisions are retained
 
 Private responses remain authorized through body delivery, use no-store caching
 and serve source bytes as attachments with nosniff and a sandbox policy. The
-bounded upload body is parsed before taking privacy/grant gates, so an idle
+host redacts artifact request targets in access logs and uses route templates
+for metrics, so file paths and publication keys do not become telemetry labels.
+The bounded upload body is parsed before taking privacy/grant gates, so an idle
 uploader cannot prevent revocation. Authorization is rechecked after parsing.
 Any authority failure after durable acceptance requires reconciliation.
 The viewer chooses safe renderers after an authorized fetch. Raw artifact access is

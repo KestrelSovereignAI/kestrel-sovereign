@@ -48,6 +48,8 @@ from kestrel_sovereign.storage.privacy_wrapper import require_durable_persistenc
 class ArtifactsFeature(Feature):
     """Encrypted revisions served through the host's live feature router."""
 
+    supports_subagent_dispatch = False
+
     def __init__(self, agent):
         super().__init__(agent)
         # Optional bundled features are contained during discovery, whereas an
@@ -71,7 +73,7 @@ class ArtifactsFeature(Feature):
 
     @property
     def tool_description(self) -> str:
-        return "Store and retrieve immutable, encrypted artifact revisions"
+        return "HTTP service for encrypted artifact revisions; no model-facing producer tools"
 
     async def initialize(self):
         if self._service is not None:
@@ -87,7 +89,6 @@ class ArtifactsFeature(Feature):
         if db is None:
             raise RuntimeError("Artifacts require the agent's durable database")
         repository = ArtifactRepository(db, storage_id="agent-artifacts")
-        await repository.initialize()
         self._agent_id = agent_id
         self._service = AuthorizedArtifactService(repository, ArtifactAuthority())
         self._router = create_artifact_router(
@@ -117,7 +118,11 @@ class ArtifactsFeature(Feature):
                     # Host maintenance only: erase expired unreferenced bytes,
                     # including owners who never return. Erasure is allowed in
                     # volatile privacy modes; nothing is read or disclosed.
-                    await self._service.repository.collect_expired_staging(owner_limit=100)
+                    repository = self._service.repository
+                    # Do not open an unused store or unwrap a key merely to
+                    # boot a host. Existing staging can be erased without keys.
+                    if await repository.db.table_exists("artifact_staging"):
+                        await repository.collect_expired_staging(owner_limit=100)
             except Exception as error:
                 if is_execution_control_error(error):
                     raise
