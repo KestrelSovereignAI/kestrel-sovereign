@@ -19,7 +19,7 @@ Auto-generated file-tree + per-file purpose index. Always-loaded context for the
 GitHub App (issue #791). Do **not** edit by hand — regenerate via `python scripts/generate_repo_map.py`.
 
 **Generated:** 2026-10-23
-**Scope:** 3333 tracked files (2492 `.py`, 366 `.md`, 475 other). Excludes `__pycache__`, `node_modules`, `.venv`, `.claude`, build artifacts.
+**Scope:** 3336 tracked files (2494 `.py`, 367 `.md`, 475 other). Excludes `__pycache__`, `node_modules`, `.venv`, `.claude`, build artifacts.
 
 **Format per file:** `path — one-line purpose` plus the public top-level Python symbols on the next line
 (classes and functions; private `_name` skipped).
@@ -268,6 +268,7 @@ Repo entry points and standard project files.
   - `class AgentConfig`; `def find_agent_dir(hint)`; `def list_agents(base_dir)`
 - **kestrel_sovereign/api_errors.py** — Canonical HTTP API error envelopes and FastAPI exception handlers.
   - `class ApiHTTPException`; `def rate_limited_until(declined)`; `def generation_incomplete()`; `def api_error_response()`; `async def api_http_exception_handler(request, exc)`; `async def api_validation_exception_handler(request, exc)`; `async def api_unhandled_exception_handler(request, exc)`; `def register_api_error_handlers(app)`
+- **kestrel_sovereign/async_ownership.py** — Public, cancellation-safe ownership of already-owned asynchronous tails.
 - **kestrel_sovereign/audit_time.py** — Canonical audit timestamp handling.
   - `def utc_now_iso()`; `def normalize_audit_timestamp(value)`
 - **kestrel_sovereign/auth.py** — Caller context for threading authentication identity into agent operations.
@@ -2198,6 +2199,7 @@ Repo entry points and standard project files.
 - **docs/design/launch/mark/png/kestrel_mark_512_white.png** — —
 - **docs/design/launch/mark/png/kestrel_mark_64.png** — —
 - **docs/design/launch/mark/png/kestrel_mark_64_white.png** — —
+- **docs/development/ASYNC_OWNERSHIP_PUBLIC_API.md** — Public asynchronous-tail ownership — `kestrel_sovereign.async_ownership` exposes ten identity aliases of Core's canonical ownership implementation.
 - **docs/development/BIG_BRAIN.md** — Big Brain — Best Open-Weight LLMs for Agentic Chat (December 2025) Overview and Criteria
 - **docs/development/DETERMINISTIC_DEV_GATES.md** — Deterministic development gates — > Detection is `grep` and AST.
 - **docs/development/DEVCONTAINER_QUICKSTART.md** — Dev Container Quick Start — Get a complete Kestrel + Kestrel development environment running in Docker Desktop with one click.
@@ -3413,7 +3415,7 @@ Repo entry points and standard project files.
 - **tests/unit/storage/test_sovereign_import_destination.py** — #2525: ``target_db_path`` is refused before the bound database is touched.
   - `async def test_non_none_target_db_path_is_refused_before_any_io(target)`; `async def test_omitted_keyword_does_not_warn(recwarn, tmp_path)`; `def test_unsupported_destination_is_a_value_error()`
 - **tests/unit/storage/test_sqlite_close_diagnostics.py** — What an SQLite close reports when it overruns its budget (#3460).
-  - `def short_close_window(monkeypatch)`; `async def test_slow_close_reports_elapsed_budget_and_wal_size(tmp_path, short_close_window, caplog)`; `async def test_overrun_interrupts_before_it_logs(tmp_path, short_close_window, monkeypatch)`; `async def test_normal_close_logs_nothing_and_checkpoints(tmp_path, caplog)`; `async def test_failed_wal_read_reports_unknown_and_keeps_close_error(tmp_path, short_close_window, monkeypatch, caplog)`; `async def test_non_wal_database_reports_journal_mode_without_wal(short_close_window, caplog)`; `async def test_non_wal_database_closes_normally(caplog)`; `async def test_known_non_wal_journal_mode_never_reads_a_stray_wal(tmp_path)`; `…`
+  - `def short_close_window(monkeypatch)`; `async def test_snapshot_close_records_actual_native_and_ack_stages(tmp_path, monkeypatch, record_property, stage)`; `async def test_snapshot_validation_failure_still_retires_original_primary(tmp_path, monkeypatch, record_property, fault, …)`; `async def test_slow_close_reports_elapsed_budget_and_wal_size(tmp_path, short_close_window, caplog)`; `async def test_overrun_interrupts_before_it_logs(tmp_path, short_close_window, monkeypatch)`; `async def test_normal_close_logs_nothing_and_checkpoints(tmp_path, caplog)`; `async def test_failed_wal_read_reports_unknown_and_keeps_close_error(tmp_path, short_close_window, monkeypatch, caplog)`; `async def test_non_wal_database_reports_journal_mode_without_wal(short_close_window, caplog)`; `…`
 - **tests/unit/storage/test_sqlite_close_drain_cancellation.py** — Native rollback-drain cancellation is not cancellation of its close observer.
   - `async def test_close_distinguishes_native_drain_from_original_caller(tmp_path, monkeypatch, cancel_close, historical_cancel)`
 - **tests/unit/storage/test_sqlite_cold_read.py** — Cold-read semantics for the SQLite backend (#2920).
@@ -3625,7 +3627,7 @@ Repo entry points and standard project files.
 - **tests/unit/test_agent_soul_resources.py** — —
   - `def data_key(monkeypatch)`; `async def test_soul_resource_round_trip_is_encrypted(tmp_path)`; `async def test_legacy_sqlite_text_ciphertext_remains_readable(tmp_path)`; `async def test_soul_resource_versions_select_current_and_keep_provenance(tmp_path)`; `async def test_context_builder_loads_canonical_soul_over_seed(tmp_path)`
 - **tests/unit/test_aiosqlite_worker_utils.py** — Tests for aiosqlite worker-lifecycle synchronization helpers.
-  - `async def test_lifecycle_checkpoint_wins_without_waiting_for_owner()`; `async def test_lifecycle_checkpoint_rejects_premature_completion()`; `async def test_lifecycle_checkpoint_fails_closed_when_both_are_ready()`; `async def test_lifecycle_checkpoint_reports_owner_failure()`; `async def test_lifecycle_checkpoint_reports_owner_cancellation()`; `async def test_lifecycle_checkpoint_has_finite_deadlock_guard()`; `async def test_close_stages_record_both_waits_and_the_deadline(tmp_path)`; `async def test_close_stages_report_a_wait_while_it_is_armed(tmp_path)`; `…`
+  - `async def prejoined_snapshot_case(tmp_path)`; `async def test_prejoined_schedule_requires_original_close_task_done_before_ack(prejoined_snapshot_case, monkeypatch)`; `async def test_prejoined_schedule_preserves_original_native_or_ack_failure(prejoined_snapshot_case, monkeypatch, failure_kind, phase)`; `async def test_prejoined_schedule_retains_caller_and_late_close_errors(prejoined_snapshot_case, monkeypatch, late_failure, repeated)`; `async def test_prejoined_schedule_keeps_exact_admission_receipt(prejoined_snapshot_case, phase, accepted)`; `async def test_prejoined_schedule_rejects_wrong_original_ack_task(prejoined_snapshot_case)`; `async def test_lifecycle_checkpoint_wins_without_waiting_for_owner()`; `async def test_lifecycle_checkpoint_rejects_premature_completion()`; `…`
 - **tests/unit/test_anchored_bytes.py** — Reading the bytes an agent is anchored to (#2465).
   - `def test_corrupted_pointer_recovers_only_unambiguous_typed_evidence()`; `def test_corrupted_pointer_never_becomes_absence_or_hash_prose(pointer)`; `def test_governance_snapshot_preserves_absence_and_explicit_null_distinctly()`; `def test_missing_pointer_recovers_only_typed_receipt_evidence(key)`; `def test_missing_pointer_refuses_malformed_ambiguous_or_unbounded_evidence(properties, targets)`; `def test_history_is_evidence_not_an_unsigned_replacement_pointer()`; `async def test_a_missing_row_is_absent()`; `async def test_stored_plaintext_comes_back_as_text()`; `…`
 - **tests/unit/test_anthropic_cache_control.py** — Unit tests for Anthropic cache_control markers (issue #705).
@@ -5002,6 +5004,8 @@ Repo entry points and standard project files.
   - `class TestOAuthRouteDoesNotLeakApiKey`
 - **tests/unit/test_provider_thinking_channels.py** — —
   - `async def test_anthropic_streaming_emits_thinking_delta()`; `async def test_anthropic_streaming_splits_think_tags()`; `async def test_ollama_streaming_splits_think_tags(monkeypatch)`; `async def test_ollama_streaming_emits_native_thinking_field(monkeypatch)`; `async def test_ollama_streaming_emits_native_thinking_via_sdk_objects(monkeypatch)`; `async def test_ollama_with_tools_suppresses_thinking_under_structured_output(monkeypatch)`; `async def test_ollama_with_tools_emits_native_thinking_on_no_tool_fallthrough(monkeypatch)`; `async def test_ollama_with_tools_preserves_untagged_prose_as_visible(monkeypatch)`; `…`
+- **tests/unit/test_public_async_ownership.py** — Public aliases retain canonical task ownership, not execution authority.
+  - `def test_public_owned_tail_api_is_exact_canonical_identity_and_signature()`; `async def test_public_operation_retains_original_outcome_and_cleanup(control)`; `async def test_public_blocking_tail_joins_body_and_finalizer_before_withdrawal()`; `async def test_public_cleanup_joins_original_tail_after_work_revocation()`; `async def test_public_admission_keeps_exact_native_task_across_publication_failure(failure)`; `async def test_public_expired_deadline_retains_error_and_pending_original_debt(failure)`; `async def test_public_bounded_wait_retains_repeated_observer_cancellation_without_cancelling_owner()`
 - **tests/unit/test_publish_workflow_version_contract.py** — Release publishing must bind the package version to an explicit semver tag.
   - `def test_publish_version_check_accepts_matching_tag_for_push_and_dispatch()`; `def test_publish_version_check_rejects_non_release_refs(release_ref)`; `def test_publish_version_check_rejects_mismatched_tag()`; `def test_manual_publish_input_is_described_as_a_release_tag()`; `def test_version_check_runs_for_tag_pushes_and_manual_dispatches()`; `def test_build_checks_out_the_same_release_ref_that_is_verified()`
 - **tests/unit/test_pytest_asyncio_requirement.py** — A run without pytest-asyncio stops before its first test (#3522).
