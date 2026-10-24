@@ -912,8 +912,13 @@ setup callback.
 
 Core-created PostgreSQL pools use `NativeJournalPostgresConnection`, exported
 from `kestrel_sovereign.storage.db.postgres`. Hosts constructing external pools
-must pass this as `asyncpg.create_pool(connection_class=...)` before opting into
-scoped native journals. Unscoped legacy pools retain ordinary append; an
+must pass this as `asyncpg.create_pool(connection_class=...)` and set
+`min_size=0` before opting into scoped native journals. With asyncpg 0.32,
+use `init_size` for startup warmup; `min_size` instead maintains a background
+connection floor. Autonomous maintenance cannot inherit original execution
+authority, so a nonzero floor or an active maintenance task refuses admission.
+Core uses the configured warmup count as `init_size` and sets `min_size=0`.
+Unscoped legacy pools retain ordinary append; an
 unfenced external pool cannot claim the stronger scoped contract. No additional
 connection or database slot is allocated by this connection class.
 

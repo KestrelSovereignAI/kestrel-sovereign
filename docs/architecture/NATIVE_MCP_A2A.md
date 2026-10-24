@@ -1281,7 +1281,7 @@ they do not establish deployment or foreign-framework acceptance.
 3. Add remote connections/OAuth/registry, then Apps and Tasks. Remote write
    scopes remain gated on [#596](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/596).
 4. Complete the native-A2A callers and storage migration, then publish/test
-   the coordinated Core dependency cutover with **SDK >=0.42.1**. Re-survey
+   the coordinated Core dependency cutover with **SDK >=0.42.2**. Re-survey
    consumers and update their actual callers and constraints: the recorded
    survey found Core ceilings below 0.54 in Talon/Features and SDK ceilings
    below 0.40 in Telegram, Talon, Features and editable Claws/Eye/Flight.

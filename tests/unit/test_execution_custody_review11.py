@@ -9,7 +9,9 @@ from kestrel_sovereign.execution_custody import (
     ExecutionCommitOutcomeError,
     ExecutionCustody,
     ProcessRuntimeExecutionFence,
+    _explicit_control_chain,
     bind_execution_custody,
+    is_execution_control_error,
     require_execution_work,
 )
 from tests.unit.test_execution_custody import Authority
@@ -170,6 +172,15 @@ async def _use_original_runtime(p, tmp_path):
     return owner
 
 
+def _assert_original_runtime_retirement(error):
+    assert is_execution_control_error(error)
+    assert any(
+        isinstance(original, ExecutionAuthorityError)
+        and "original runtime retired" in str(original)
+        for original in _explicit_control_chain(error)
+    )
+
+
 async def test_native_question_resident_waits_for_ready_and_outlives_boot_claim(
     native_question_peer, monkeypatch, tmp_path,
 ):
@@ -197,9 +208,12 @@ async def test_native_question_resident_waits_for_ready_and_outlives_boot_claim(
     assert resident.done() and not p.feature._owned_background_tasks
 
 
-@pytest.mark.parametrize("retirement", ["none", "generation", "disable"])
+@pytest.mark.parametrize("retirement,deadline_query", [
+    ("none", False), ("generation", False), ("disable", False),
+    ("generation", True),
+])
 async def test_native_question_recovery_retains_original_runtime_after_request_turn(
-    native_question_peer, retirement, tmp_path,
+    native_question_peer, retirement, deadline_query, tmp_path, monkeypatch,
 ):
     p = native_question_peer
     if p.backend.backend_type != "postgres":
@@ -207,6 +221,37 @@ async def test_native_question_recovery_retains_original_runtime_after_request_t
     owner = await _use_original_runtime(p, tmp_path)
     owner._runtime_publication_ready.set()
     entered, release, closed = asyncio.Event(), asyncio.Event(), asyncio.Event()
+    query_entered, query_release, query_closed = (
+        asyncio.Event(), asyncio.Event(), asyncio.Event()
+    )
+    if deadline_query:
+        from kestrel_sovereign.a2a.question_supervisor import NativeQuestionSupervisor
+
+        # Force the real deadline lane to cross its SQL admission before
+        # retirement, then finish that lane before releasing the peer read.
+        # PostgreSQL preserves denial inside its native QueryError carrier.
+        deadline_task = None
+        original_deadline = NativeQuestionSupervisor._deadline_loop
+        original_executor = p.backend._execution_query_executor
+
+        async def deadline_loop(supervisor):
+            nonlocal deadline_task
+            deadline_task = asyncio.current_task()
+            try:
+                await original_deadline(supervisor)
+            finally:
+                query_closed.set()
+
+        @asynccontextmanager
+        async def held_executor(executor, commit_state=None):
+            if asyncio.current_task() is deadline_task and not query_entered.is_set():
+                query_entered.set()
+                await query_release.wait()
+            async with original_executor(executor, commit_state) as checked:
+                yield checked
+
+        monkeypatch.setattr(NativeQuestionSupervisor, "_deadline_loop", deadline_loop)
+        monkeypatch.setattr(p.backend, "_execution_query_executor", held_executor)
     original_open = p.feature._open_native_dispatch
     @asynccontextmanager
     async def held_read(dispatch_id):
@@ -231,7 +276,12 @@ async def test_native_question_recovery_retains_original_runtime_after_request_t
         await asyncio.wait_for(entered.wait(), 3)
         await p.manager.complete_task(result.data["remote_task_id"], "Native reply", recipient_agent_id=p.recipient.did)
         if retirement == "generation":
+            if deadline_query:
+                await asyncio.wait_for(query_entered.wait(), 3)
             owner._execution_custody.revoke("original runtime retired")
+            if deadline_query:
+                query_release.set()
+                await asyncio.wait_for(query_closed.wait(), 3)
         elif retirement == "disable":
             await p.feature.shutdown()
         release.set()
@@ -243,16 +293,28 @@ async def test_native_question_recovery_retains_original_runtime_after_request_t
             assert not resident.done(), "request turn retired its resident recovery"
         else:
             outcome = await await_owned_task(resident)
-            assert isinstance(outcome.error, (ExecutionAuthorityError, asyncio.CancelledError))
+            if retirement == "generation":
+                _assert_original_runtime_retirement(outcome.error)
+            else:
+                assert isinstance(outcome.error, asyncio.CancelledError)
             assert not (await p.sender_manager.question_store.get(result.data["question_id"])).receiver_settled
             assert (await p.backend.fetch_one("SELECT COUNT(*) FROM durable_signal_events WHERE source = ?", ("a2a.question_answered",)))[0] == 0
         assert closed.is_set()
     finally:
         release.set()
+        query_release.set()
         try:
             await p.feature.shutdown()
-        except ExecutionAuthorityError as error:
-            assert retirement == "generation" and "original runtime retired" in str(error)
+        except BaseException as error:
+            assert retirement == "generation"
+            _assert_original_runtime_retirement(error)
+            if deadline_query:
+                from kestrel_sdk.storage.database.interface import QueryError
+
+                assert any(
+                    isinstance(original, QueryError)
+                    for original in _explicit_control_chain(error)
+                )
             assert not p.feature._owned_background_tasks
             # This test has harvested the expected retained receipt. The
             # shared fixture repeats shutdown and must not report it anew.

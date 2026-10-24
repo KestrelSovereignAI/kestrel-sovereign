@@ -328,13 +328,15 @@ use the scheduler host's own storage pool, not the agents' advisory pool.
 
 #### Native SDK release requirements
 
-Core requires `kestrel-sovereign-sdk[a2a,httpx,tracing]>=0.42.0,<1`; the
+Core requires `kestrel-sovereign-sdk[a2a,httpx,tracing]>=0.42.2,<1`; the
 `observability` extra adds `metrics` under that same base constraint. The 0.40
 release replaces draft A2A contribution types with native `AgentSkill` and
 `get_agent_skills` contracts; the coordinated 0.41.0 floor also includes the
 shared computer-use, artifact, resource-scope and workspace-transfer contracts.
 The 0.42 floor supplies the reviewed vendored native A2A implementation used by
 both Core and feature skill producers through the SDK's `a2a` extra.
+SDK 0.42.2 also supplies the standard version query carrier and validation
+of repeated version headers required by Core's native bindings.
 SDK 0.39 lacks the native initialization contract and cannot boot this release.
 The lock records the tested version without excluding future SDK minor
 releases. The SDK
@@ -368,6 +370,13 @@ Core 0.54 additionally requires the published Features 0.3.4 and Talon 0.3.0
 lines in the host profile. Talon's discovery tool is `talon_scan_stale_work`;
 GitHub's separate issue/PR scanner keeps `scan_stale_work`. The Talon package
 and host-manifest bounds must advance together before the Core release.
+
+External PostgreSQL pools used for scoped native journals must pass
+`connection_class=NativeJournalPostgresConnection` and `min_size=0` to
+`asyncpg.create_pool`; use `init_size` for startup warmup. In asyncpg 0.32,
+`min_size` starts autonomous pool maintenance, which cannot inherit original
+execution authority. Such pools are refused before journal admission. See
+[the native journal pool contract](docs/architecture/SIGNAL_DISPATCHER.md).
 
 A Core release that raises the SDK floor without compatible feature releases makes
 `kestrel update` refuse every feature whose cap excludes the new line — or
