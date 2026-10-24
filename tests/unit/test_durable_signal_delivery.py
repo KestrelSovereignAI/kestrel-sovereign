@@ -194,6 +194,81 @@ async def _dispatcher(path, did: str):
     return backend, agent, dispatcher
 
 
+@pytest.mark.asyncio
+async def test_shutdown_preserves_pending_claim_until_attempt_neutral_recovery(tmp_path):
+    """A close before cognition begins must not consume the only attempt."""
+    path = tmp_path / "shutdown-before-cognition-begin.db"
+    did = "did:agent:shutdown-before-begin"
+    backend, agent, dispatcher = await _channel_dispatcher(path, did)
+    consumer = DurableConsumerRegistration(
+        consumer_id=DURABLE_COGNITION_CONSUMER_ID,
+        source="channel.message",
+        agent_id=did,
+        correlation_selector=(
+            f"payload.{DURABLE_COGNITION_MARKER}={DURABLE_COGNITION_MARKER_VALUE}"
+        ),
+        max_attempts=1,
+    )
+    signal = _channel_signal(did, "shutdown-before-begin")
+    try:
+        await dispatcher.register_durable_consumer(consumer)
+        await dispatcher.durable_store.persist_signal(
+            signal, agent_id=did, source_event_id="shutdown-before-begin",
+            retention_days=1,
+            caller_identity_factory=lambda: dispatcher._protect_durable_caller_identity(signal),
+        )
+        async with dispatcher._admit_durable_operation():
+            delivery = await dispatcher.claim_durable_delivery_for_event(
+                consumer_id=consumer.consumer_id, event_id=signal.id,
+                executor_id=dispatcher._durable_delivery_owner,
+            )
+            assert delivery is not None
+            dispatcher.shutdown()
+            result = await dispatcher._route_durable_cognition_delivery(
+                signal, dispatcher._registry.get(signal.source), time.monotonic(),
+                persisted_event_id=signal.id, consumer_id=consumer.consumer_id,
+                durable_admission=None, durable_created=False, use_live_signal=False,
+                claimed_delivery=delivery,
+            )
+            assert result.status is Status.FAILED
+            assert result.error == "Durable cognition admission closed for shutdown"
+        await dispatcher.shutdown_durable_delivery()
+        row = await backend.fetch_one(
+            "SELECT status, attempts, last_error FROM durable_signal_deliveries "
+            "WHERE consumer_id = ?", (consumer.consumer_id,),
+        )
+        assert row[0] == LEASED
+        assert row[1] == 1
+        assert row[2] == "cognition admission pending"
+    finally:
+        await dispatcher.shutdown_durable_delivery()
+        await _close(backend, agent)
+
+    backend, agent, dispatcher = await _channel_dispatcher(path, did)
+    calls = []
+
+    async def complete(prompt):
+        calls.append(prompt)
+        return "handled"
+
+    agent.process_input = complete
+    try:
+        [recovered] = await dispatcher.list_durable_deliveries()
+        assert recovered.status == RETRY
+        assert recovered.attempts == 0
+        await dispatcher.register_durable_consumer(consumer)
+        await dispatcher.start_durable_cognition_consumer(consumer.consumer_id)
+        drainer = dispatcher._durable_cognition_drainers[consumer.consumer_id]
+        await asyncio.wait_for(drainer, _HANG_GUARD_SECONDS)
+        [settled] = await dispatcher.list_durable_deliveries()
+        assert settled.status == ACKNOWLEDGED
+        assert settled.attempts == 1
+        assert len(calls) == 1
+    finally:
+        await dispatcher.shutdown_durable_delivery()
+        await _close(backend, agent)
+
+
 async def _close(backend, agent: _Agent) -> None:
     pending = [task for task in agent.tasks if not task.done()]
     if pending:

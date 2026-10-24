@@ -284,6 +284,7 @@ class _CognitionClaimSettlement:
 
     delivery: DurableDelivery
     receipt: object = None
+    shutdown_deferred: bool = False
 
     @property
     def retry_pending(self) -> bool:
@@ -5348,6 +5349,12 @@ class SignalDispatcher:
         Recovery refunds a claim that never crossed begin. Shutdown is not a
         Hold and must not spend an attempt or manufacture a Hold disposition.
         """
+        settlement = self._cognition_claim_settlement.get()
+        if settlement is not None and settlement.delivery is delivery:
+            # This is an intentional pending admission, not an abandoned
+            # routing task. Keep its native marker so recovery refunds the
+            # unstarted attempt; it is not an ACK/NACK receipt.
+            settlement.shutdown_deferred = True
         self._pending_cognition_admissions.pop(delivery.delivery_id, None)
         result = self._failure_result(
             signal, start, error="Durable cognition admission closed for shutdown",
@@ -5509,7 +5516,8 @@ class SignalDispatcher:
             routing_task = routing_admission.task
             if routing_task is not None and not routing_task.done():
                 self._retain_durable_cognition_task(routing_task, delivery=delivery)
-            elif routing_task is None and settlement.receipt is None:
+            elif (routing_task is None and settlement.receipt is None
+                  and not settlement.shutdown_deferred):
                 # Ordinary refusal paths can return a FAILED/HOLD result.
                 # Their original-token CAS is idempotent if that path already
                 # settled the delivery; no unowned live lease may escape just
