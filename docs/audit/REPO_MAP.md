@@ -19,7 +19,7 @@ Auto-generated file-tree + per-file purpose index. Always-loaded context for the
 GitHub App (issue #791). Do **not** edit by hand — regenerate via `python scripts/generate_repo_map.py`.
 
 **Generated:** 2026-10-24
-**Scope:** 3342 tracked files (2500 `.py`, 367 `.md`, 475 other). Excludes `__pycache__`, `node_modules`, `.venv`, `.claude`, build artifacts.
+**Scope:** 3343 tracked files (2501 `.py`, 367 `.md`, 475 other). Excludes `__pycache__`, `node_modules`, `.venv`, `.claude`, build artifacts.
 
 **Format per file:** `path — one-line purpose` plus the public top-level Python symbols on the next line
 (classes and functions; private `_name` skipped).
@@ -3886,6 +3886,8 @@ Repo entry points and standard project files.
   - `async def test_send_failure_after_first_chunk_closes_body(close_in_stream_task)`
 - **tests/unit/test_cloudrun_entrypoint_persistence.py** — Container bootstrap persistence drift guards (#2472).
   - `def test_single_agent_entrypoint_never_incepts_durable_identity()`; `def test_multi_agent_entrypoint_refuses_durable_cloudrun()`; `def test_multi_agent_entrypoint_never_bootstraps_host_control_directory()`; `def test_multi_agent_entrypoint_canonicalizes_relative_host_control_directory(tmp_path)`; `def test_multi_agent_entrypoint_marks_only_fallback_host_path_as_derived(tmp_path)`; `def test_multi_agent_entrypoint_refuses_existing_agent_at_host_control_root(tmp_path)`; `def test_multi_agent_entrypoint_refuses_requested_host_control_collision(tmp_path)`; `def test_multi_agent_entrypoint_refuses_symlink_alias_to_external_host_custody(tmp_path)`
+- **tests/unit/test_cloudrun_required_install.py** — Required image installation failures must reach Docker's RUN exit status.
+  - `def test_required_installation_failure_fails_the_image(tmp_path, failure, authenticated)`; `def test_successful_image_installs_both_packages_and_clears_build_auth(tmp_path, authenticated)`
 - **tests/unit/test_codex_abandoned_turn.py** — #3552: a Codex turn the caller abandons does not poison the session.
   - `class FakeCodexAppServer`; `async def test_an_abandoned_turn_sends_the_next_request_to_a_new_thread(abandon, script, monkeypatch, tmp_path)`; `async def test_a_queued_same_session_request_does_not_get_the_abandoned_thread(monkeypatch, tmp_path)`; `async def test_a_turn_the_app_server_ended_keeps_its_thread(consume, monkeypatch, tmp_path)`; `async def test_closing_a_turn_after_it_ended_keeps_its_thread(monkeypatch, tmp_path)`; `async def test_a_call_cancelled_before_its_turn_started_keeps_the_thread(monkeypatch, tmp_path)`; `async def test_a_stalled_plan_turn_times_out_and_the_next_starts_a_new_thread(turns, tmp_path, monkeypatch)`
 - **tests/unit/test_codex_adapter.py** — Tests for the OpenAI plan adapter (app-server backed) and registry.
