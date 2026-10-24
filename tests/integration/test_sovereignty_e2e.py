@@ -20,7 +20,7 @@ from datetime import datetime, UTC
 
 from kestrel_sovereign.storage import Storage, GraphNode
 from kestrel_sovereign.storage.sovereign_adapter import SovereignStorageAdapter, RootManifest, ShardMetadata
-from kestrel_sovereign.filecoin_adapter import FilecoinAdapter, StorageTier
+from kestrel_sovereign.filecoin_adapter import StorageTier
 from kestrel_sovereign.llm.service import LLMService
 from kestrel_sovereign.privacy import PrivacyMode
 from kestrel_sovereign.kestrel_agent import KestrelAgent
