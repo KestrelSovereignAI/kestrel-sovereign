@@ -104,14 +104,27 @@ async def test_native_subscription_timeout_keeps_original_control(peer_session, 
     else:
         monkeypatch.setattr(p.http, "_transport", httpx.MockTransport(lambda request: stream_response(request, p, Body())))
 
+    deadline = asyncio.timeout(None)
+
     async def read():
-        async with asyncio.timeout(0.05):
+        async with deadline:
             return [event async for event in p.session.subscribe(dispatch)]
 
-    result = await join(create_owned_task(read()))
-    assert entered.is_set() and effects == [True]
-    assert carries(result.error, original), "native deadline receipt became ordinary EOF"
-    assert await p.admission.backend.fetch_val("SELECT COUNT(*) FROM review54_effects") == 1
+    owner = create_owned_task(read())
+    try:
+        # Arm the real deadline only after the original operation has entered
+        # and committed its effect. A fixed 50ms budget also timed out database
+        # setup under the parallel suite, never reaching the boundary tested.
+        await asyncio.wait_for(entered.wait(), 2)
+        assert effects == [True]
+        deadline.reschedule(asyncio.get_running_loop().time())
+        result = await join(owner)
+        assert carries(result.error, original), "native deadline receipt became ordinary EOF"
+        assert await p.admission.backend.fetch_val("SELECT COUNT(*) FROM review54_effects") == 1
+    finally:
+        if not owner.done():
+            owner.cancel()
+            await join(owner)
 
 
 @pytest.mark.parametrize("kind", KINDS)

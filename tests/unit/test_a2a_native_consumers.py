@@ -61,8 +61,8 @@ async def test_status_commands_and_preturn_share_native_owner_and_text(inbox):
     assert result.data["request_content"] == "first request part\nsecond request part"
     assert result.data["message"] is None
     assert result.data["sender"] == "did:kestrel:verified-sender"
-    assert not task.status.HasField("timestamp")
-    assert result.data["status_timestamp"] is None
+    assert task.status.HasField("timestamp")
+    assert result.data["status_timestamp"] == task.status.timestamp.ToJsonString()
     assert "created_at" not in result.data
     listing = await feature.list_my_tasks(status="submitted", task_type="peer")
     assert listing.status is ToolResultStatus.OK
