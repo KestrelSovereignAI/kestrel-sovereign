@@ -1,7 +1,41 @@
 """Source identity and physical-retirement assertions shared by custody tests."""
+import asyncio
+from contextlib import contextmanager
 from dataclasses import dataclass
 
+import aiosqlite
+
 from kestrel_sovereign.execution_custody import _explicit_control_chain, _native_source_originals, execution_cleanup_debts
+
+
+@dataclass(frozen=True)
+class OriginalSQLiteCommitAck:
+    entered: asyncio.Event
+    release: asyncio.Event
+
+
+@contextmanager
+def hold_original_sqlite_commit_ack(monkeypatch, owns_commit):
+    """Hold a selected real worker's successful COMMIT reply, never its SQL."""
+    acknowledgement = OriginalSQLiteCommitAck(asyncio.Event(), asyncio.Event())
+    original = aiosqlite.Connection._execute
+
+    async def hold(connection, function, *args, **kwargs):
+        result = await original(connection, function, *args, **kwargs)
+        # Selection may observe the real INSERT before choosing its owner's
+        # COMMIT; earlier schema/initialization commits are not that receipt.
+        selected = owns_commit(connection, function, args)
+        if function.__name__ == "commit" and selected:
+            acknowledgement.entered.set()
+            await acknowledgement.release.wait()
+        return result
+
+    with monkeypatch.context() as patch:
+        patch.setattr(aiosqlite.Connection, "_execute", hold)
+        try:
+            yield acknowledgement
+        finally:
+            acknowledgement.release.set()
 
 
 @dataclass(frozen=True)
