@@ -5,12 +5,17 @@ import threading
 from contextlib import nullcontext
 
 import pytest
+import pytest_asyncio
 
 import kestrel_sovereign.storage.db.sqlite as sqlite_module
+from kestrel_sovereign._async_ownership import await_owned_operation, await_owned_task
 from kestrel_sovereign.execution_custody import (
     ExecutionCommitOutcomeError,
+    execution_cleanup_debts,
     execution_commit_outcome,
+    execution_observation_error,
 )
+from tests.unit.test_host_context_native_cleanup import _actual_operation
 from kestrel_sovereign.storage.db import SQLiteBackend
 from tests.utils.aiosqlite_workers import (
     CloseStage,
@@ -27,6 +32,360 @@ from tests.utils.virtual_clock import (
     await_within_hang_guard,
     wait_for_thread_event,
 )
+
+
+@pytest_asyncio.fixture
+async def prejoined_snapshot_case(tmp_path):
+    """Real private snapshot; explicit test-owner reconciliation on refusal.
+
+    This resource fixture never reports a failed close as successful. Its
+    final raw close is ONLY reconciliation after assertions for an original
+    unstarted/failed closer, as in test_sqlite_inner_close_admission. Normal
+    successful cases must already have retired the worker before teardown.
+    """
+    backend = SQLiteBackend(str(tmp_path / "prejoined-snapshot.db"))
+    await backend.connect()
+    snapshot = await backend._open_snapshot_read_connection()
+    worker = aiosqlite_worker(snapshot)
+    # This is the actual coordinating test owner's retained map; the wake
+    # adapter separately requires its exact backend-owned map, not this one.
+    retained_closes = {}
+    real_close = snapshot.close
+    failures = []
+    try:
+        yield snapshot, worker, retained_closes
+    except BaseException as error:  # noqa: BLE001 - retain the original test body alongside cleanup
+        failures.append(error)
+    finally:
+        try:
+            try:
+                if worker.is_alive():
+                    # Explicit TEST reconciliation only; never original ACK.
+                    outcome = await await_within_hang_guard(
+                        await_owned_operation(
+                            real_close(), retirement_resource=snapshot,
+                            retain_originals=True,
+                        ),
+                        step="test-owner reconciliation of the exact snapshot close",
+                    )
+                    failures.extend((outcome.error, outcome.cancellation))
+            except BaseException as error:  # noqa: BLE001 - independently join the original worker after close failure
+                failures.append(error)
+            try:
+                await await_within_hang_guard(
+                    asyncio.to_thread(worker.join, HANG_GUARD_SECONDS),
+                    step="test-owner reconciliation of the exact snapshot worker",
+                )
+            except BaseException as error:  # noqa: BLE001 - worker observation cannot skip retained owners
+                failures.append(error)
+            finally:
+                for record in tuple(retained_closes.values()):
+                    if record.retirement_task is not None:
+                        try:
+                            outcome = await await_within_hang_guard(
+                                await_owned_task(record.retirement_task),
+                                step="the canonical original snapshot reaper settling",
+                            )
+                            failures.extend((outcome.error, outcome.cancellation))
+                        except BaseException as error:  # noqa: BLE001 - retain each actual original reaper failure
+                            failures.append(error)
+            try:
+                assert not worker.is_alive()
+            except BaseException as error:  # noqa: BLE001 - validation follows mandatory retirement harvest
+                failures.append(error)
+        finally:
+            try:
+                outcome = await await_within_hang_guard(
+                    await_owned_operation(
+                        backend.close(), retirement_resource=backend,
+                        retain_originals=True,
+                    ),
+                    step="the actual primary backend closing after snapshot cleanup",
+                )
+                failures.extend((outcome.error, outcome.cancellation))
+            except BaseException as error:  # noqa: BLE001 - compose every actual cleanup original
+                failures.append(error)
+        terminal = execution_observation_error(*failures)
+        if terminal is not None:
+            raise terminal
+
+
+@pytest.mark.asyncio
+async def test_prejoined_schedule_requires_original_close_task_done_before_ack(
+    prejoined_snapshot_case, monkeypatch,
+):
+    connection, worker, retained = prejoined_snapshot_case
+    real_close = connection.close
+    close_epilogue = asyncio.Event()
+    release_epilogue = asyncio.Event()
+    originals, acknowledgements = [], []
+    loop = asyncio.get_running_loop()
+    original_clock = loop.time
+
+    async def close_with_epilogue():
+        originals.append(asyncio.current_task())
+        await real_close()
+        close_epilogue.set()
+        await release_epilogue.wait()
+
+    monkeypatch.setattr(connection, "close", close_with_epilogue)
+
+    def acknowledge(original_task):
+        assert original_task is originals[0]
+        assert original_task.done(), "worker exit was mistaken for Task completion"
+        assert not worker.is_alive()
+        acknowledgements.append(original_task)
+        return sqlite_module._close_aiosqlite_connection(
+            connection, close_task=original_task, retained_closes=retained,
+        )
+
+    owner = None
+    body_failure = None
+    try:
+        async with normal_close_schedule(prejoined=True) as finish:
+            owner = asyncio.create_task(finish(
+                connection, acknowledge, retained_closes=retained,
+            ))
+            await await_within_hang_guard(close_epilogue.wait(), step="real close epilogue")
+            await await_within_hang_guard(
+                asyncio.to_thread(worker.join, HANG_GUARD_SECONDS),
+                step="the real worker exiting before its close Task",
+            )
+            assert not worker.is_alive() and not originals[0].done()
+            assert not acknowledgements and not owner.done()
+            release_epilogue.set()
+            await await_within_hang_guard(owner, step="same close Task and ACK completing")
+        assert len(originals) == len(acknowledgements) == 1
+        assert not retained and loop.time == original_clock
+    except BaseException as error:  # noqa: BLE001 - keep assertion/control and actual owner failure
+        body_failure = error
+    finally:
+        release_epilogue.set()
+        failures = [body_failure]
+        if owner is not None:
+            outcome = await await_owned_task(owner)
+            failures.extend((outcome.error, outcome.cancellation))
+        terminal = execution_observation_error(*failures)
+        if terminal is not None:
+            raise terminal
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure_kind", ["ordinary", "control", "unknown"])
+@pytest.mark.parametrize("phase", ["native", "ack"])
+async def test_prejoined_schedule_preserves_original_native_or_ack_failure(
+    prejoined_snapshot_case, monkeypatch, failure_kind, phase,
+):
+    connection, worker, retained = prejoined_snapshot_case
+    failure = (
+        asyncio.CancelledError("original prejoined close control")
+        if failure_kind == "control" else
+        ExecutionCommitOutcomeError("unknown") if failure_kind == "unknown" else
+        OSError("original prejoined close failure")
+    )
+    source = OriginalFailure.capture(failure)
+    real_close = connection.close
+    originals, acknowledgements = [], []
+
+    async def fail_after_real_close():
+        originals.append(asyncio.current_task())
+        await real_close()
+        if phase == "native":
+            raise failure
+
+    monkeypatch.setattr(connection, "close", fail_after_real_close)
+
+    async def acknowledge(original_task):
+        acknowledgements.append(original_task)
+        await sqlite_module._close_aiosqlite_connection(
+            connection, close_task=original_task, retained_closes=retained,
+        )
+        if phase == "ack":
+            raise failure
+
+    with pytest.raises(BaseException) as caught:
+        async with normal_close_schedule(prejoined=True) as finish:
+            await finish(connection, acknowledge, retained_closes=retained)
+    source.assert_retained(caught.value)
+    assert len(originals) == 1 and originals[0].done()
+    assert not worker.is_alive()
+    assert len(acknowledgements) == (1 if phase == "ack" else 0)
+    assert execution_commit_outcome(caught.value) == (
+        "unknown" if failure_kind == "unknown" else None
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("late_failure", [None, "ordinary", "unknown"])
+@pytest.mark.parametrize("repeated", [False, True])
+async def test_prejoined_schedule_retains_caller_and_late_close_errors(
+    prejoined_snapshot_case, monkeypatch, late_failure, repeated,
+):
+    connection, worker, retained = prejoined_snapshot_case
+    entered, release = block_aiosqlite_native_close(connection)
+    failure = (
+        ExecutionCommitOutcomeError("unknown") if late_failure == "unknown" else
+        OSError("late actual prejoined close error") if late_failure == "ordinary" else None
+    )
+    source = OriginalFailure.capture(failure) if failure is not None else None
+    real_close = connection.close
+    originals, acknowledgements, callers = [], [], []
+    caller_observed = asyncio.Event()
+
+    async def close_with_late_error():
+        originals.append(asyncio.current_task())
+        await real_close()
+        if failure is not None:
+            raise failure
+
+    monkeypatch.setattr(connection, "close", close_with_late_error)
+
+    def acknowledge(original_task):
+        acknowledgements.append(original_task)
+        return sqlite_module._close_aiosqlite_connection(
+            connection, close_task=original_task, retained_closes=retained,
+        )
+
+    async def retire():
+        async with normal_close_schedule(prejoined=True) as finish:
+            try:
+                await finish(connection, acknowledge, retained_closes=retained)
+            except asyncio.CancelledError as error:
+                callers.append(OriginalFailure.capture(error))
+                caller_observed.set()
+                raise
+
+    owner = asyncio.create_task(retire())
+    body_failure = None
+    owner_outcome_asserted = False
+    try:
+        await wait_for_thread_event(entered, step="actual prejoined native close held")
+        owner.cancel("original prejoined caller")
+        await await_within_hang_guard(caller_observed.wait(), step="caller C observed")
+        if repeated:
+            owner.cancel("repeated prejoined caller")
+            for _ in range(3):
+                await asyncio.sleep(0)
+            assert not owner.done()
+        assert not acknowledgements
+        release.set()
+        with pytest.raises(BaseException) as caught:
+            await await_within_hang_guard(owner, step="same cancelled close owner retiring")
+        assert len(callers) == 1
+        callers[0].assert_retained(caught.value)
+        if source is not None:
+            source.assert_retained(caught.value)
+        assert len(originals) == 1 and originals[0].done()
+        assert not worker.is_alive() and not acknowledgements
+        assert execution_commit_outcome(caught.value) == (
+            "unknown" if late_failure == "unknown" else None
+        )
+        owner_outcome_asserted = True
+    except BaseException as error:  # noqa: BLE001 - a failed assertion cannot discard a late original
+        body_failure = error
+    finally:
+        release.set()
+        outcome = await await_owned_task(owner)
+        # On the ordinary expected-negative path the terminal was already
+        # asserted above. Any earlier assertion failure must compose ALL
+        # actual owner outcomes rather than discard a late UNKNOWN or C.
+        terminal = execution_observation_error(
+            body_failure,
+            outcome.error if not owner_outcome_asserted else None,
+            outcome.cancellation,
+        )
+        if terminal is not None:
+            raise terminal
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("phase", ["native", "ack"])
+@pytest.mark.parametrize("accepted", [False, True])
+async def test_prejoined_schedule_keeps_exact_admission_receipt(
+    prejoined_snapshot_case, phase, accepted,
+):
+    connection, worker, retained = prejoined_snapshot_case
+    loop, previous = asyncio.get_running_loop(), asyncio.get_running_loop().get_task_factory()
+    failure = OSError("exact prejoined admission publication failure")
+    source = OriginalFailure.capture(failure)
+    original_handle = connection._connection
+    accepted_tasks, attempted, acknowledgement_inputs = [], [], []
+    native_code = connection.close.__func__.__code__
+
+    async def acknowledge(original_task):
+        await sqlite_module._close_aiosqlite_connection(
+            connection, close_task=original_task, retained_closes=retained,
+        )
+
+    def acknowledgement_factory(original_task):
+        assert original_task.done() and not worker.is_alive()
+        acknowledgement_inputs.append(original_task)
+        return acknowledge(original_task)
+
+    class FailedPublicationTask(asyncio.Task):
+        def add_done_callback(self, callback, *args, **kwargs):
+            if getattr(callback, "__name__", "") == "close_unstarted" and not attempted:
+                attempted.append(True)
+                super().add_done_callback(callback, *args, **kwargs)
+                raise failure
+            return super().add_done_callback(callback, *args, **kwargs)
+
+    def factory(loop, coroutine, **kwargs):
+        operation = _actual_operation(coroutine)
+        target = native_code if phase == "native" else acknowledge.__code__
+        if getattr(operation, "cr_code", None) is target:
+            if not accepted:
+                attempted.append(True)
+                raise failure
+            task = FailedPublicationTask(coroutine, loop=loop, **kwargs)
+            accepted_tasks.append(task)
+            return task
+        return previous(loop, coroutine, **kwargs) if previous else asyncio.Task(coroutine, loop=loop, **kwargs)
+
+    try:
+        loop.set_task_factory(factory)
+        with pytest.raises(BaseException) as caught:
+            async with normal_close_schedule(prejoined=True) as finish:
+                await finish(connection, acknowledgement_factory, retained_closes=retained)
+        loop.set_task_factory(previous)
+        source.assert_retained(caught.value)
+        assert len(attempted) == 1
+        assert len(accepted_tasks) == int(accepted)
+        assert all(task.done() for task in accepted_tasks)
+        if phase == "native":
+            expected_task = accepted_tasks[0] if accepted else None
+            assert worker.is_alive() and not acknowledgement_inputs
+            assert retained[connection].close_task is expected_task
+            assert any(resource is connection and task is expected_task
+                       for resource, task in execution_cleanup_debts(caught.value))
+            assert connection._connection is original_handle
+        else:
+            assert len(acknowledgement_inputs) == 1
+            assert acknowledgement_inputs[0].done() and not worker.is_alive()
+            assert not retained
+    finally:
+        loop.set_task_factory(previous)
+
+
+@pytest.mark.asyncio
+async def test_prejoined_schedule_rejects_wrong_original_ack_task(prejoined_snapshot_case):
+    connection, worker, retained = prejoined_snapshot_case
+    foreign = asyncio.create_task(asyncio.sleep(0))
+    await foreign
+    originals = []
+
+    def wrong_acknowledgement(original_task):
+        assert original_task.done() and original_task is not foreign
+        originals.append(original_task)
+        return sqlite_module._close_aiosqlite_connection(
+            connection, close_task=foreign, retained_closes=retained,
+        )
+
+    with pytest.raises(AssertionError, match="prejoined ACK substituted the original close Task"):
+        async with normal_close_schedule(prejoined=True) as finish:
+            await finish(connection, wrong_acknowledgement, retained_closes=retained)
+    assert len(originals) == 1 and originals[0].done()
+    assert not worker.is_alive()
 
 
 @pytest.mark.asyncio

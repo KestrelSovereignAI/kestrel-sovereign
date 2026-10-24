@@ -1087,11 +1087,8 @@ async def await_owned_task(
                 publication_errors.append(error)
 
     if not defer_cancellation and pending_cancellation is not None:
-        from kestrel_sovereign.execution_custody import execution_terminal_error
-        raise execution_terminal_error(
-            pending_cancellation, *publication_errors, retain_originals=True,
-            isolate_control_originals=True,
-        )
+        from kestrel_sovereign.execution_custody import execution_observation_error
+        raise execution_observation_error(pending_cancellation, *publication_errors)
     if not task.done():
         # Only an explicitly borrowed observer may leave before settlement.
         assert not defer_cancellation and publication_errors
