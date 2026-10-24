@@ -3963,6 +3963,18 @@
       "findings": [],
       "missing_code_refs": [],
       "missing_links": [],
+      "path": "docs/development/ASYNC_OWNERSHIP_PUBLIC_API.md",
+      "privacy": "",
+      "render": "public",
+      "status": "",
+      "title": "Public asynchronous-tail ownership",
+      "type": "Developer Guide"
+    },
+    {
+      "existing_code_refs": [],
+      "findings": [],
+      "missing_code_refs": [],
+      "missing_links": [],
       "path": "docs/development/BIG_BRAIN.md",
       "privacy": "internal",
       "render": "internal",

@@ -1,6 +1,7 @@
 """Native rollback-drain cancellation is not cancellation of its close observer."""
 
 import asyncio
+import contextlib
 import sqlite3
 
 import pytest
@@ -78,7 +79,7 @@ async def test_close_distinguishes_native_drain_from_original_caller(
         assert drain.done()
         assert backend._connection is None
         assert not backend.connection_retirement_pending
-        with sqlite3.connect(path) as observer:
+        with contextlib.closing(sqlite3.connect(path)) as observer, observer:
             assert observer.execute("SELECT COUNT(*) FROM effects").fetchone()[0] == 0
     finally:
         release.set()

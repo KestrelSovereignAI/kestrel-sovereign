@@ -33,17 +33,20 @@ from kestrel_sdk.features import (
     PermissionLevel as SDKPermissionLevel,
 )
 from kestrel_sdk.hooks.base import Hook, HookEvent, HookOutput
+from kestrel_sdk.signals import ResourceLock
 from kestrel_sdk.tools import Outcome, WaitStatus
 from kestrel_sdk.tools.base import ToolCategory
 
 from kestrel_sovereign.auth import CallerContext
 from kestrel_sovereign.endpoints.features import router as features_router
+from kestrel_sovereign.execution_custody import execution_observation_error
 from kestrel_sovereign.features.base import Feature, tool
 from kestrel_sovereign.features.security.feature import SecurityFeature
 from kestrel_sovereign.features.security.permissions import PermissionLevel
 from kestrel_sovereign.kestrel_agent import KestrelAgent
 from kestrel_sovereign.signals.registry import SourceRegistry
 from kestrel_sovereign.waits import WaitRegistry
+from tests.utils.virtual_clock import await_within_hang_guard
 
 
 def _sovereign_feature_app(agent) -> FastAPI:
@@ -840,21 +843,87 @@ async def test_boot_ready_hook_waits_until_host_context_is_published(tmp_path):
     gate = asyncio.Event()
     agent._host_context_publication_gate = gate
     entered = asyncio.Event()
+    release = asyncio.Event()
+    completed = asyncio.Event()
 
     class CognitionReadyFeature(_FullFeature):
         async def on_agent_ready(self, ready_agent):
             async with ready_agent._turn_lifecycle():
                 entered.set()
+                await release.wait()
+            completed.set()
 
     feature = CognitionReadyFeature(agent)
     agent.features[feature.name] = feature
 
-    await asyncio.wait_for(agent._run_or_defer_agent_ready_hooks(), timeout=1)
+    await await_within_hang_guard(
+        agent._run_or_defer_agent_ready_hooks(),
+        step="deferring readiness behind the unpublished host context",
+    )
     assert not entered.is_set()
+    assert agent._agent_ready_hooks_deferred is True
+    assert agent._agent_ready_hooks_completed is False
+    manager = agent._get_lock_manager()
+    # An attempted completion cannot borrow publication that has not happened.
+    with pytest.raises(RuntimeError, match="before host context publication"):
+        await await_within_hang_guard(
+            agent.complete_deferred_agent_readiness(),
+            step="refusing readiness completion while publication is held",
+        )
+    assert not entered.is_set()
+    assert not completed.is_set()
+    assert not manager.is_held(ResourceLock.CONVERSATION)
 
-    gate.set()
-    await asyncio.wait_for(agent.complete_deferred_agent_readiness(), timeout=1)
-    assert entered.is_set()
+    before = asyncio.all_tasks()
+    readiness = None
+    failure = None
+    try:
+        gate.set()
+        readiness = asyncio.create_task(agent.complete_deferred_agent_readiness())
+        await await_within_hang_guard(
+            entered.wait(), step="the published readiness hook entering cognition"
+        )
+        assert not readiness.done()
+        assert not completed.is_set()
+        assert manager.is_held(ResourceLock.CONVERSATION)
+        # Capture the actual diagnostic Task born for this real hold, not a
+        # replacement watchdog or a task-count tolerance.
+        watchdogs = {
+            task
+            for task in asyncio.all_tasks() - before
+            if getattr(task.get_coro(), "cr_code", None)
+            is type(manager)._warn_while_holding.__code__
+        }
+        assert len(watchdogs) == 1
+        release.set()
+        await await_within_hang_guard(
+            readiness, step="readiness completing after its original turn exits"
+        )
+        assert completed.is_set()
+        assert agent._agent_ready_hooks_deferred is False
+        assert agent._agent_ready_hooks_completed is True
+        assert not manager.is_held(ResourceLock.CONVERSATION)
+        assert all(task.done() for task in watchdogs)
+        assert all(task.cancelled() for task in watchdogs)
+        async with manager.acquire({ResourceLock.CONVERSATION}, label="ready-reuse"):
+            assert manager.is_owned_by_current_task(ResourceLock.CONVERSATION)
+        assert not manager.is_held(ResourceLock.CONVERSATION)
+        assert asyncio.all_tasks() == before
+    except BaseException as error:
+        failure = error
+    finally:
+        release.set()
+        if readiness is not None:
+            if failure is not None and not readiness.done():
+                readiness.cancel("readiness regression cleanup after failure")
+            try:
+                await await_within_hang_guard(
+                    readiness, step="joining the original readiness task on exit"
+                )
+            except BaseException as error:
+                failure = execution_observation_error(failure, error)
+    if failure is not None:
+        raise failure
 
 
 @pytest.mark.asyncio

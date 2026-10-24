@@ -1,4 +1,5 @@
 """Real native connection program registration and transaction-lifetime fences."""
+import contextlib
 import sqlite3
 
 import pytest
@@ -325,7 +326,7 @@ def test_original_sqlite_float_literals_preserve_native_ieee_values():
     for exponent in (-1074, -1073, -1022, -1000, -1, 0, 1, 1022, 1023):
         value = math.ldexp(1.0, exponent)
         values.extend((value, -value, math.nextafter(value, 0), math.nextafter(value, math.inf)))
-    with sqlite3.connect(':memory:') as reference:
+    with contextlib.closing(sqlite3.connect(':memory:')) as reference, reference:
         for value in values:
             if not math.isfinite(value):
                 continue
