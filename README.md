@@ -364,6 +364,11 @@ checks establish resolver compatibility, not runtime acceptance. Editable
 Eye, Flight and Claws installations and the rest of each host's feature
 manifest need their own source and runtime verification before Core ships.
 
+Core 0.54 additionally requires the published Features 0.3.4 and Talon 0.3.0
+lines in the host profile. Talon's discovery tool is `talon_scan_stale_work`;
+GitHub's separate issue/PR scanner keeps `scan_stale_work`. The Talon package
+and host-manifest bounds must advance together before the Core release.
+
 A Core release that raises the SDK floor without compatible feature releases makes
 `kestrel update` refuse every feature whose cap excludes the new line — or
 worse, lets `kestrel feature sync` downgrade the SDK under Core while
