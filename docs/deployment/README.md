@@ -513,5 +513,20 @@ Check the webhook delivery page on GitHub. Response body includes diagnostic inf
 - `no_mention` in diag → comment missing `@kestrel` trigger
 - LLM error → check Cloud Run logs for the actual exception
 
+### Long gaps in the log, or `Distributed Stop owner FENCED`
+Something held the server's event loop, which every agent turn and the Stop
+owner's lease renewal share. The event-loop stall watchdog
+(`kestrel_sovereign.event_loop_watchdog`) logs one `WARNING` once the loop's
+heartbeat is more than `stall_threshold_seconds` overdue (default 1.0 s), with
+the loop thread's Python stack at that moment; the frame holding the loop is
+the last one. An `INFO` line follows when the loop resumes: the block lasted at
+least as long as the heartbeat ran late and at most the time since the previous
+heartbeat. If the `WARNING` says the watchdog thread itself woke late
+(something held the GIL), its stack was sampled after the fact and may show the
+frame just past the blocking call; with no stack at all, the loop resumed before
+the watchdog thread could look. The `[event_loop_watchdog]` section of
+`kestrel.toml` sets the threshold, the heartbeat interval and `enabled`; see
+`kestrel.toml.example`.
+
 ### Logs not appearing in Cloud Run
 Python `logging.info()` calls from request handlers don't always reach Cloud Run's structured log pipeline. Use `print(json.dumps({"severity": "WARNING", "message": "..."}), flush=True)` for debugging.
