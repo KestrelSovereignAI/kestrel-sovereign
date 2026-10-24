@@ -10,9 +10,12 @@ from __future__ import annotations
 import hashlib
 import json
 import uuid
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, Dict, Mapping, Optional
+from typing import Any, AsyncIterator, Dict, Mapping, Optional
+
+from kestrel_sdk.storage.database.interface import TransactionError
 
 from kestrel_sovereign.security.encryption import (
     decrypt_string_fernet,
@@ -67,6 +70,62 @@ def check_version_request(
 
 
 @dataclass(frozen=True)
+class ExpectedCurrentVersion:
+    """The current version a write was computed from (#3779).
+
+    A writer that read the current version and derived its new body from it
+    passes this, so the store refuses the write if another writer has since
+    made a different version current. Without it, the write would replace
+    that writer's version with one built from the older text. ``version`` is
+    ``None`` when no version was current.
+    """
+
+    version: Optional[int]
+
+
+class ResourceVersionConflictError(RuntimeError):
+    """The current version is no longer the one a write was computed from.
+
+    Nothing was written. Read the current version again and redo the write.
+    """
+
+    def __init__(
+        self, resource_type: str, *, expected: Optional[int], actual: Optional[int]
+    ):
+        self.resource_type = resource_type
+        self.expected = expected
+        self.actual = actual
+
+        def describe(version: Optional[int]) -> str:
+            return f"v{version}" if version is not None else "none"
+
+        super().__init__(
+            f"the current {resource_type} version is {describe(actual)}, not "
+            f"{describe(expected)} as when this write read it; nothing was written"
+        )
+
+
+@asynccontextmanager
+async def surfacing_version_conflicts() -> AsyncIterator[None]:
+    """Raise a version conflict as itself from a transaction that wrapped it.
+
+    An owning transaction reports whatever its block raised as a
+    :class:`TransactionError` caused by it. A refused write is a named
+    outcome its caller acts on (re-read and redo), not a storage fault, so
+    enter this outside the transaction that refuses it.
+    """
+    try:
+        yield
+    except TransactionError as error:
+        cause = error.__cause__
+        while isinstance(cause, TransactionError):
+            cause = cause.__cause__
+        if not isinstance(cause, ResourceVersionConflictError):
+            raise
+        raise cause from None
+
+
+@dataclass(frozen=True)
 class AgentResourceVersion:
     """A decrypted private resource version attached to an agent identity."""
 
@@ -108,6 +167,7 @@ class AgentResourceStore:
         anchoring_metadata: Optional[Dict[str, Any]] = None,
         public_metadata: Optional[Dict[str, Any]] = None,
         provenance: Optional[Mapping[str, Any]] = None,
+        expected_current: Optional[ExpectedCurrentVersion] = None,
     ) -> AgentResourceVersion:
         """Create a new encrypted resource version.
 
@@ -125,10 +185,16 @@ class AgentResourceStore:
                 store writes itself: ``created_by``, ``source``,
                 ``created_at``, ``signature``, ``previous_version`` or
                 ``previous_content_hash``.
+            expected_current: The current version this write was computed
+                from. If another version is current when the write runs, it
+                raises :class:`ResourceVersionConflictError` and writes
+                nothing. ``None`` writes whatever is current.
 
         A version made current records the version it replaced, if one was
         current, as ``previous_version`` and ``previous_content_hash``.
         """
+        # A copy, so what is recorded is what was checked.
+        provenance = dict(provenance or {})
         check_version_request(resource_type, content, provenance)
 
         content_hash = hashlib.sha256(content.encode("utf-8")).hexdigest()
@@ -144,16 +210,26 @@ class AgentResourceStore:
         # provenance. A caller's open transaction is joined, so a caller that
         # publishes more alongside the version (the SOUL's graph reference)
         # rolls back with it. Immediate: this unit reads before it writes.
-        async with self.db.transaction(immediate=True):
+        async with surfacing_version_conflicts(), self.db.transaction(immediate=True):
             await self._lock_versions(resource_type)
             existing = await self._current_or_latest(resource_type)
+            if expected_current is not None:
+                # Checked under the version lock, so no other writer can make
+                # a version current between this check and the insert.
+                actual = (
+                    existing["version"] if existing and existing["is_current"] else None
+                )
+                if actual != expected_current.version:
+                    raise ResourceVersionConflictError(
+                        resource_type, expected=expected_current.version, actual=actual
+                    )
             resource_id = existing["resource_id"] if existing else str(uuid.uuid4())
             latest_version = await self._latest_version(resource_type)
             version = latest_version + 1
 
             now = datetime.now(timezone.utc)
             recorded_provenance = {
-                **(provenance or {}),
+                **provenance,
                 "created_by": created_by,
                 "source": source,
                 "created_at": now.isoformat(),
@@ -290,8 +366,12 @@ class AgentResourceStore:
         created_by: Optional[str] = None,
         source: str = "agent_data/SOUL.md",
         provenance: Optional[Mapping[str, Any]] = None,
+        expected_current: Optional[ExpectedCurrentVersion] = None,
     ) -> AgentResourceVersion:
-        """Promote a local SOUL.md seed/cache body into the canonical store."""
+        """Promote a local SOUL.md seed/cache body into the canonical store.
+
+        ``expected_current`` is as for :meth:`create_version`.
+        """
         return await self.create_version(
             SOUL_MARKDOWN_RESOURCE_TYPE,
             content,
@@ -299,6 +379,7 @@ class AgentResourceStore:
             source=source,
             make_current=True,
             provenance=provenance,
+            expected_current=expected_current,
         )
 
     async def _lock_versions(self, resource_type: str) -> None:

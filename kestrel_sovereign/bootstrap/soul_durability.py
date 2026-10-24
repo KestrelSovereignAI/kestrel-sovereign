@@ -66,7 +66,7 @@ class SoulFileStatus:
             )
         if self.state is SoulFileState.FILE_MISSING:
             return (
-                "SOUL.md is not on disk; the next restart serves the canonical "
+                "SOUL.md is missing or empty; the next restart serves the canonical "
                 f"SOUL v{self.canonical_version}."
             )
         if self.state is SoulFileState.UNVERIFIED:
@@ -128,6 +128,23 @@ async def inspect_soul_file(
     soul_path = Path(agent_data_path) / SOUL_FILENAME if agent_data_path else None
     path_text = str(soul_path) if soul_path is not None else None
 
+    # The canonical SOUL is read before the file. A writer that publishes the
+    # file's text on the strength of this comparison names the canonical
+    # version read here as the one it expects, so that version must be no
+    # newer than the file text: a canonical write landing between the two
+    # reads is then caught as a conflict rather than overwritten with text
+    # read before it (#3779).
+    reader = getattr(storage, "get_current_agent_resource", None)
+    canonical = None
+    canonical_error: Optional[Exception] = None
+    if reader is not None:
+        try:
+            canonical = await reader()
+        except Exception as exc:
+            if is_execution_control_error(exc):
+                raise
+            canonical_error = exc
+
     file_content: Optional[str] = None
     if soul_path is not None:
         try:
@@ -142,23 +159,24 @@ async def inspect_soul_file(
         file_content = None
     file_sha = soul_sha256(file_content) if file_content is not None else None
 
-    reader = getattr(storage, "get_current_agent_resource", None)
-    canonical = None
-    if reader is not None:
-        try:
-            canonical = await reader()
-        except Exception as exc:
-            if is_execution_control_error(exc):
-                raise
-            return SoulFileStatus(
-                SoulFileState.UNVERIFIED,
-                path_text,
-                file_sha256=file_sha,
-                error=f"canonical SOUL read failed: {exc}",
-            )
+    if canonical_error is not None:
+        return SoulFileStatus(
+            SoulFileState.UNVERIFIED,
+            path_text,
+            file_sha256=file_sha,
+            error=f"canonical SOUL read failed: {canonical_error}",
+        )
     canonical_content = getattr(canonical, "content", None) if canonical else None
     if not canonical_content:
-        return SoulFileStatus(SoulFileState.NO_CANONICAL, path_text, file_sha256=file_sha)
+        # An empty current version is no canonical SOUL to boot, which then
+        # promotes the file, but it is still the current version: a write
+        # computed from this comparison must name it as the one it expects.
+        return SoulFileStatus(
+            SoulFileState.NO_CANONICAL,
+            path_text,
+            file_sha256=file_sha,
+            canonical_version=getattr(canonical, "version", None) if canonical else None,
+        )
     if not isinstance(canonical_content, str):
         return SoulFileStatus(
             SoulFileState.UNVERIFIED,

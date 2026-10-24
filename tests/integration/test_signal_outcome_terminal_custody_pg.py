@@ -471,6 +471,52 @@ async def test_postgres_database_clone_cannot_inherit_original_journal_identity(
                 await control.execute(f'DROP DATABASE IF EXISTS "{owned_name}"')
 
 
+async def _disposable_login_role(control, schema):
+    """A login role of the calling test's own, with the use of ``schema`` only.
+
+    A role-default change (``ALTER ROLE ... SET``) reaches every new session of
+    the role it names. Made to the fixture's login role, it would reach every
+    other test and user of that role while the test ran (xdist workers share
+    it across their own databases), and ``RESET`` afterwards would delete any
+    setting the role already had. Returns the role's name and password; the
+    caller drops it with :func:`_drop_disposable_login_role`.
+
+    The role may create tables the dispatcher makes on first use. They outlive
+    it, owned by the fixture's role, because the fixture's teardown still uses
+    them.
+    """
+    import asyncpg
+    import secrets
+    import uuid
+    role = 'journal_durability_' + uuid.uuid4().hex
+    secret = secrets.token_hex(16)
+    try:
+        await control.execute(f'CREATE ROLE "{role}" LOGIN PASSWORD \'{secret}\'')
+    except asyncpg.InsufficientPrivilegeError:
+        pytest.skip('TEST_POSTGRES_URL role cannot create a login role (needs CREATEROLE)')
+    try:
+        # Membership lets the fixture's role take over what this role owns
+        # (REASSIGN OWNED) even when it is not a superuser.
+        await control.execute(f'GRANT "{role}" TO CURRENT_USER')
+        await control.execute(f'GRANT USAGE, CREATE ON SCHEMA "{schema}" TO "{role}"')
+        await control.execute(f'GRANT ALL ON ALL TABLES IN SCHEMA "{schema}" TO "{role}"')
+        await control.execute(f'GRANT ALL ON ALL SEQUENCES IN SCHEMA "{schema}" TO "{role}"')
+    except BaseException:
+        await _drop_disposable_login_role(control, role)
+        raise
+    return role, secret
+
+
+async def _drop_disposable_login_role(control, role):
+    # What it created passes to the fixture's role; then its grants, then the
+    # role itself with its role-level settings.
+    try:
+        await control.execute(f'REASSIGN OWNED BY "{role}" TO CURRENT_USER')
+        await control.execute(f'DROP OWNED BY "{role}"')
+    finally:
+        await control.execute(f'DROP ROLE IF EXISTS "{role}"')
+
+
 async def test_postgres_original_journal_refuses_effective_durability_drift(dispatcher_components, native_pg, monkeypatch):
     from kestrel_sovereign._async_ownership import await_owned_task
     from kestrel_sovereign.execution_custody import ExecutionCustody, bind_execution_runtime, is_execution_control_error, execution_commit_outcome
@@ -479,40 +525,55 @@ async def test_postgres_original_journal_refuses_effective_durability_drift(disp
     from tests.unit.test_signals_dispatcher import _action_reg, _signal
     c = dispatcher_components
     _, control, schema = native_pg
-    role = await control.fetchval('SELECT SESSION_USER')
-    quoted_role = '"' + role.replace('"', '""') + '"'
-    pool = await _fresh_journal_pool(c.backend._pool, min_size=1, max_size=1, ssl='disable')
+    # The durability default is changed on a role this test owns, so no other
+    # session of the fixture's login role sees it.
+    fixture_role_settings = (
+        "SELECT array_agg(s.setdatabase::text || ':' || array_to_string(s.setconfig, ',') "
+        "ORDER BY s.setdatabase) FROM pg_catalog.pg_db_role_setting s "
+        "JOIN pg_catalog.pg_roles r ON r.oid = s.setrole WHERE r.rolname = SESSION_USER"
+    )
+    settings_before = await control.fetchval(fixture_role_settings)
+    role, secret = await _disposable_login_role(control, schema)
+    pool = None
     original_pool = c.backend._pool
-    c.backend._pool = pool
-    observed = []
-    principal = NativeJournalPostgresConnection._original_journal_principal
-    async def observe_principal(connection):
-        observed.append(await connection.fetchval('SHOW synchronous_commit'))
-        return await principal(connection)
-    monkeypatch.setattr(NativeJournalPostgresConnection, '_original_journal_principal', observe_principal)
-    scope = ExecutionCustody(_OriginalWork(backend_type='postgres'))
-    async def handler(payload):
-        await control.execute(f'ALTER ROLE {quoted_role} SET synchronous_commit=off')
-        async with pool.acquire() as connection:
-            await connection.close()
-        scope.revoke('actual work cutoff before changed role-default reconnect')
-        return {'genuine': True}
-    signal = _signal('native.durability.reconnect')
-    c.registry.register(_action_reg(signal.source, handler=handler))
     try:
+        pool = await _fresh_journal_pool(
+            c.backend._pool, min_size=1, max_size=1, ssl='disable', user=role, password=secret,
+        )
+        assert await pool.fetchval('SELECT SESSION_USER') == role
+        c.backend._pool = pool
+        observed = []
+        principal = NativeJournalPostgresConnection._original_journal_principal
+        async def observe_principal(connection):
+            observed.append(await connection.fetchval('SHOW synchronous_commit'))
+            return await principal(connection)
+        monkeypatch.setattr(NativeJournalPostgresConnection, '_original_journal_principal', observe_principal)
+        scope = ExecutionCustody(_OriginalWork(backend_type='postgres'))
+        async def handler(payload):
+            await control.execute(f'ALTER ROLE "{role}" SET synchronous_commit=off')
+            async with pool.acquire() as connection:
+                await connection.close()
+            scope.revoke('actual work cutoff before changed role-default reconnect')
+            return {'genuine': True}
+        signal = _signal('native.durability.reconnect')
+        c.registry.register(_action_reg(signal.source, handler=handler))
         with bind_execution_runtime(SimpleNamespace(_execution_custody=scope)):
             outcome = await await_owned_task(asyncio.create_task(c.dispatcher.dispatch_signal(signal)))
         assert observed == ['on', 'off'], 'actual new session did not inherit changed role durability'
         assert is_execution_control_error(outcome.error), 'journal acknowledged asynchronously committed replacement session'
         assert execution_commit_outcome(outcome.error) is None
         assert await control.fetchval(f'SELECT COUNT(*) FROM ONLY "{schema}".signal_log WHERE id=$1', signal.id) == 0
+        assert await control.fetchval(fixture_role_settings) == settings_before, (
+            "the fixture's login role defaults changed"
+        )
     finally:
         c.backend._pool = original_pool
         try:
-            await control.execute(f'ALTER ROLE {quoted_role} RESET synchronous_commit')
+            if pool is not None:
+                async with asyncio.timeout(10):
+                    await pool.close()
         finally:
-            async with asyncio.timeout(10):
-                await pool.close()
+            await _drop_disposable_login_role(control, role)
 
 
 @pytest.mark.parametrize('direct_tls', [False, True])

@@ -484,6 +484,12 @@ the version it replaced on that version, and loads it into the session. The agen
 itself: it is a sovereign command, not a tool. It is refused in the
 `ephemeral`, `isolated` and `deidentified` privacy modes, which store no SOUL.
 `!bootstrap-status` shows whether `SOUL.md` matches the stored version.
+If the stored version or `SOUL.md` changes while it runs (another revision,
+or a rename), it stores nothing and says so; check `SOUL.md` and run it again.
+Renaming the agent renames the stored version; an edit to `SOUL.md` that was
+never revised stays in the file and is not made the stored version by a rename.
+A rename never stores over a version made while it ran: it reads the stored
+version again and renames that.
 
 ### Running Multiple Agents
 

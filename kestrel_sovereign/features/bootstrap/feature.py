@@ -27,6 +27,10 @@ from kestrel_sdk.tools.base import ToolCategory
 from kestrel_sdk.tools.result import ToolResult
 from kestrel_sovereign.bootstrap import BootstrapState
 from kestrel_sovereign.bootstrap.soul_durability import inspect_soul_file
+from kestrel_sovereign.storage.agent_resource_store import (
+    ExpectedCurrentVersion,
+    ResourceVersionConflictError,
+)
 from kestrel_sovereign.storage.privacy_wrapper import (
     acquire_control_plane_capability,
     optional_transition_lock,
@@ -285,8 +289,44 @@ async def _rename_agent_core_locked(agent, old_name: str, new_name: str) -> Rena
     )
 
 
+def _renamed_soul(content: str, old_name: str, new_name: str) -> str:
+    """``content`` with the SOUL's references to ``old_name`` renamed."""
+    patterns = [
+        (rf"# SOUL\.md\s*[-—]\s*You Are {re.escape(old_name)}", f"# SOUL.md - You Are {new_name}"),
+        (rf"# SOUL\.md\s*[-—]\s*{re.escape(old_name)}", f"# SOUL.md - {new_name}"),
+        (rf"You're {re.escape(old_name)}", f"You're {new_name}"),
+        (rf"I'm {re.escape(old_name)}", f"I'm {new_name}"),
+    ]
+    for pattern, replacement in patterns:
+        content = re.sub(pattern, replacement, content, flags=re.IGNORECASE)
+    return content
+
+
+# How many times a rename re-reads the canonical SOUL after another writer
+# made a new version current while the rename ran. Each conflict means a real
+# concurrent SOUL write, so a rename that keeps losing reports the failure
+# rather than spin.
+_SOUL_RENAME_ATTEMPTS = 3
+
+
 async def _update_soul_name(agent, old_name: str, new_name: str) -> bool:
-    """Update the agent name in SOUL.md if it exists."""
+    """Update the agent name in the canonical SOUL and in SOUL.md.
+
+    The rename is applied to the canonical SOUL, the version every boot
+    serves, not to whatever SOUL.md holds. An edit made to the file alone and
+    never made canonical with ``!revise-soul`` stays in the file, renamed
+    too, and is not promoted by a rename (#3779).
+
+    The renamed canonical SOUL is written only if the version it was renamed
+    from is still current. Another writer (a Sovereign revision on another
+    replica) may make a new version current while the rename runs; writing
+    over it would publish the older text renamed and lose that revision. On
+    such a conflict the rename reads the SOUL again and renames that.
+
+    Raises:
+        ResourceVersionConflictError: every attempt lost to a concurrent
+            SOUL write; neither the canonical SOUL nor SOUL.md was changed.
+    """
     if not hasattr(agent, 'bootstrap_service') or not agent.bootstrap_service:
         return False
 
@@ -295,26 +335,32 @@ async def _update_soul_name(agent, old_name: str, new_name: str) -> bool:
         return False
 
     soul_path = Path(agent_data_path) / "SOUL.md"
-    if not soul_path.exists():
-        return False
+    storage = getattr(agent, "storage", None)
+    reader = getattr(storage, "get_current_agent_resource", None)
+    for attempt in range(1, _SOUL_RENAME_ATTEMPTS + 1):
+        file_content = (
+            soul_path.read_text(encoding="utf-8") if soul_path.exists() else None
+        )
+        canonical = await reader() if reader is not None else None
+        # An empty canonical SOUL is none, as at boot, which then promotes the
+        # file. Any other body is renamed, and one that is not text fails the
+        # rename rather than falling back to the file.
+        canonical_content = getattr(canonical, "content", None) or None
 
-    content = soul_path.read_text(encoding="utf-8")
+        base = canonical_content if canonical_content is not None else file_content
+        if base is None:
+            return False
+        content = _renamed_soul(base, old_name, new_name)
+        if file_content is None:
+            # Restore the cache only when the canonical SOUL changed.
+            file_renamed = content if content != base else None
+        elif file_content == base:
+            file_renamed = content
+        else:
+            file_renamed = _renamed_soul(file_content, old_name, new_name)
+        if content == base and file_renamed == file_content:
+            return False
 
-    patterns = [
-        (rf"# SOUL\.md\s*[-—]\s*You Are {re.escape(old_name)}", f"# SOUL.md - You Are {new_name}"),
-        (rf"# SOUL\.md\s*[-—]\s*{re.escape(old_name)}", f"# SOUL.md - {new_name}"),
-        (rf"You're {re.escape(old_name)}", f"You're {new_name}"),
-        (rf"I'm {re.escape(old_name)}", f"I'm {new_name}"),
-    ]
-
-    updated = False
-    for pattern, replacement in patterns:
-        new_content, count = re.subn(pattern, replacement, content, flags=re.IGNORECASE)
-        if count > 0:
-            content = new_content
-            updated = True
-
-    if updated:
         # Privacy boundary (#2672 review P1): the renamed SOUL body is user-derived
         # content. In a volatile privacy mode, do NOT rewrite it to disk or promote
         # it into the encrypted resource table / durable graph — leave no trace.
@@ -330,14 +376,29 @@ async def _update_soul_name(agent, old_name: str, new_name: str) -> bool:
             )
             return False
 
-        soul_path.write_text(content, encoding="utf-8")
-        storage = getattr(agent, "storage", None)
-        if storage and hasattr(storage, "promote_soul_seed"):
-            await storage.promote_soul_seed(
-                content,
-                created_by=getattr(agent, "agent_id", getattr(agent, "did", "")),
-                source=f"rename:{soul_path}",
-            )
+        # The canonical SOUL first: it is what boot serves, and a conflict
+        # then leaves the file untouched for the next attempt to read.
+        if content != base and storage and hasattr(storage, "promote_soul_seed"):
+            try:
+                await storage.promote_soul_seed(
+                    content,
+                    created_by=getattr(agent, "agent_id", getattr(agent, "did", "")),
+                    source=f"rename:{soul_path}",
+                    expected_current=ExpectedCurrentVersion(
+                        getattr(canonical, "version", None)
+                        if canonical is not None else None
+                    ),
+                )
+            except ResourceVersionConflictError as conflict:
+                if attempt == _SOUL_RENAME_ATTEMPTS:
+                    raise
+                logger.info(
+                    "SOUL rename re-reading the canonical SOUL (attempt %d of %d): %s",
+                    attempt, _SOUL_RENAME_ATTEMPTS, conflict,
+                )
+                continue
+        if file_renamed != file_content:
+            soul_path.write_text(file_renamed, encoding="utf-8")
         if hasattr(agent, 'context_builder'):
             loaded = False
             if hasattr(agent.context_builder, "load_canonical_soul_resource"):
