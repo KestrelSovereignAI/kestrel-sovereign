@@ -19,7 +19,7 @@ Auto-generated file-tree + per-file purpose index. Always-loaded context for the
 GitHub App (issue #791). Do **not** edit by hand — regenerate via `python scripts/generate_repo_map.py`.
 
 **Generated:** 2026-10-24
-**Scope:** 3340 tracked files (2498 `.py`, 367 `.md`, 475 other). Excludes `__pycache__`, `node_modules`, `.venv`, `.claude`, build artifacts.
+**Scope:** 3342 tracked files (2500 `.py`, 367 `.md`, 475 other). Excludes `__pycache__`, `node_modules`, `.venv`, `.claude`, build artifacts.
 
 **Format per file:** `path — one-line purpose` plus the public top-level Python symbols on the next line
 (classes and functions; private `_name` skipped).
@@ -457,6 +457,8 @@ Repo entry points and standard project files.
   - `def discover_entry_point_callables(group)`; `def discover_entry_point_classes(group, base_class)`
 - **kestrel_sovereign/ephemeral_session.py** — Ephemeral Session Handler for Kestrel Privacy System.
   - `class EphemeralSession`
+- **kestrel_sovereign/event_loop_watchdog.py** — Event-loop stall watchdog: name the frame that blocks the host's loop (#3806).
+  - `class EventLoopWatchdogConfig`; `def resolve_event_loop_watchdog_config()`; `class EventLoopStallWatchdog`; `def event_loop_stall_watchdog(config)`
 - **kestrel_sovereign/execution_custody.py** — Connection-free execution authority with irreversible task custody.
   - `class ExecutionAuthorityError`; `class ExecutionCommitOutcomeError`; `class ConfirmedLeaseDeadline`; `class NativeExecutionRetirement`; `class AcknowledgedExecutionCommit`; `def retain_acknowledged_execution_commit(error, receipt)`; `def execution_commit_outcome(error)`; `def is_execution_control_error(error)`; `…`
 - **kestrel_sovereign/extensions/__init__.py** — —
@@ -4254,6 +4256,8 @@ Repo entry points and standard project files.
   - `class TestMemoryMetadataEpistemicFields`; `class TestEpistemicDetection`; `class TestExtractEpistemicFields`; `async def router()`; `class TestSchemaRouterEpistemicProvenance`; `class TestMarkSuperseded`; `class TestRecallSupersededFilter`; `class TestRetrieverCertaintyWeighting`; `…`
 - **tests/unit/test_escalation_classifier.py** — Tests for the escalation classifier (#1540 / #1563).
   - `def test_audit_row_with_user_denied_decision_yields_user_denied()`; `def test_audit_row_with_web_ui_per_scope_user_choice_yields_user_denied(choice)`; `def test_audit_row_for_different_tool_does_not_attribute_denial()`; `def test_audit_row_for_different_feature_does_not_attribute_denial()`; `def test_codex_rejected_by_user_without_audit_is_sandbox_blocked()`; `def test_sandbox_seccomp_refusal_is_sandbox_blocked()`; `def test_approval_timeout_is_policy_blocked()`; `def test_auto_denied_is_policy_blocked()`; `…`
+- **tests/unit/test_event_loop_watchdog.py** — The event-loop stall watchdog names the frame that blocks the loop (#3806).
+  - `def watchdog_log(caplog)`; `async def test_a_blocked_loop_logs_one_warning_naming_the_sleeping_frame(watchdog_log)`; `async def test_a_healthy_loop_logs_no_stall(watchdog_log)`; `async def test_a_block_shorter_than_the_threshold_is_not_a_stall(watchdog_log)`; `async def test_a_long_stall_gets_one_stack(watchdog_log)`; `async def test_each_stall_gets_its_own_stack_and_resume_line(watchdog_log)`; `async def test_a_stall_holding_the_gil_is_reported_with_the_watchdogs_own_delay(watchdog_log)`; `async def test_stopping_during_a_reported_stall_still_logs_its_end(watchdog_log)`; `…`
 - **tests/unit/test_example_model_config_contracts.py** — Contracts for example model config files and catalog source-of-truth shape.
   - `def test_unified_example_llm_block_uses_vendor_route_schema()`; `def test_unified_example_priorities_match_declared_vendors()`; `def test_root_model_catalog_is_manual_overrides_only()`; `def test_package_local_model_catalog_duplicate_is_removed()`; `def test_example_documents_both_memory_retrieval_floors()`
 - **tests/unit/test_execute_named_tool.py** — Unit tests for ``OrchestratorEngineMixin.execute_named_tool``.

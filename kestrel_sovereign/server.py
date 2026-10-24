@@ -51,6 +51,7 @@ from kestrel_sovereign.api_errors import (
     register_api_error_handlers,
 )
 from kestrel_sovereign.auth import normalize_api_key
+from kestrel_sovereign.event_loop_watchdog import event_loop_stall_watchdog
 from kestrel_sovereign.execution_custody import (
     execution_finite_error,
     execution_observation_error,
@@ -4204,9 +4205,11 @@ async def lifespan(app: FastAPI):
     # Rejected entry must not install another teardown owner over resources
     # still owned by a previous lifecycle. Recovery drains them explicitly.
     _require_retired_server_resources(app)
-    async with _lifespan_teardown_owner(app):
-        async with _lifespan_startup(app):
-            yield
+    # Outermost, so a stall during startup or teardown is named too (#3806).
+    with event_loop_stall_watchdog():
+        async with _lifespan_teardown_owner(app):
+            async with _lifespan_startup(app):
+                yield
 
 
 app = FastAPI(lifespan=lifespan)
