@@ -232,8 +232,14 @@ class DeliveryQueue:
     # Lifecycle
     # ------------------------------------------------------------------
 
-    async def start(self):
-        """Create DB tables and launch the background worker."""
+    async def start(self, *, polling: bool = True):
+        """Prepare schema, optionally recover pending work and start polling.
+
+        A held maintenance boot needs the actual configured queue surface but
+        must not reclaim an old in-flight effect before its registry is proven.
+        """
+        if type(polling) is not bool:
+            raise TypeError("polling must be a boolean")
         if self._task is not None:
             terminal = execution_terminal_error(
                 getattr(self, "_worker_control", None),
@@ -248,6 +254,8 @@ class DeliveryQueue:
                     message="original delivery worker must settle before restart",
                 )
         await self._ensure_tables()
+        if not polling:
+            return
         await self._reclaim_in_flight()
         self._stop_requested.clear()
         self._loop_entered = False

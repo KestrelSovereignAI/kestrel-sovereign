@@ -523,7 +523,9 @@ class SchedulerFeature(Feature):
             # Record ownership so base shutdown()/boot rollback unregisters it.
             self._register_wait_provider(registry, CIWaitable(self), replace=True)
 
-        if not self._db:
+        from kestrel_sovereign.agent.runtime_start import maintenance_boot_active
+
+        if maintenance_boot_active(agent) or not self._db:
             return
 
         # Check what's already scheduled
