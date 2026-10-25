@@ -15,6 +15,7 @@ from kestrel_sovereign.hold.enforcement import initialize_with_bound_hold_contex
 from kestrel_sovereign.host_features.storage import resolve_host_database_launch_context
 from kestrel_sovereign.storage.db import SQLiteBackend
 from tests.unit.test_cleanup_task_admission import _partial_native_agent
+from tests.utils.aiosqlite_workers import wait_for_lifecycle_checkpoint
 
 
 @pytest.mark.asyncio
@@ -141,8 +142,9 @@ async def test_actual_standalone_startup_preserves_host_close_debt(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("startup_contention", [False, True], ids=["normal", "contended"])
 async def test_actual_bootstrap_failure_does_not_mask_cleanup_withdrawal(
-    tmp_path, monkeypatch
+    tmp_path, monkeypatch, startup_contention,
 ):
     import aiosqlite
 
@@ -174,11 +176,24 @@ async def test_actual_bootstrap_failure_does_not_mask_cleanup_withdrawal(
 
     monkeypatch.setattr(aiosqlite.Connection, "execute", native_schema_error)
     monkeypatch.setattr(aiosqlite.Connection, "close", held_actual_close)
-    bootstrap = asyncio.create_task(
-        build_host_context(db_path=str(tmp_path / "native-bootstrap.db"))
-    )
+    blocker = None
+    release_startup = None
+    bootstrap = None
     try:
-        await asyncio.wait_for(entered.wait(), 3)
+        if startup_contention:
+            # Real startup may wait on an existing native writer before reaching
+            # the cleanup behavior under test. It has no three-second SLO.
+            blocker = sqlite3.connect(tmp_path / "native-bootstrap.db")
+            blocker.execute("PRAGMA journal_mode=WAL")
+            blocker.execute("CREATE TABLE owned_startup_contention (id INTEGER)")
+            blocker.execute("BEGIN IMMEDIATE")
+            release_startup = asyncio.get_running_loop().call_later(3.5, blocker.rollback)
+        bootstrap = asyncio.create_task(
+            build_host_context(db_path=str(tmp_path / "native-bootstrap.db"))
+        )
+        await wait_for_lifecycle_checkpoint(
+            entered.wait(), bootstrap, description="actual failed-bootstrap native close",
+        )
         assert faulted and closed
         bootstrap.cancel("caller withdrew after actual failed schema")
         await asyncio.sleep(0)
@@ -189,7 +204,13 @@ async def test_actual_bootstrap_failure_does_not_mask_cleanup_withdrawal(
         assert all(not getattr(conn, "_thread", conn).is_alive() for conn in closed)
     finally:
         release.set()
-        await await_owned_task(bootstrap)
+        if release_startup is not None:
+            release_startup.cancel()
+        if blocker is not None:
+            blocker.rollback()
+            blocker.close()
+        if bootstrap is not None:
+            await await_owned_task(bootstrap)
 
 
 @pytest.mark.asyncio
@@ -232,7 +253,9 @@ async def test_original_unknown_stays_control_during_native_bootstrap_withdrawal
         retain_originals=True,
     )
     try:
-        await asyncio.wait_for(entered.wait(), 3)
+        await wait_for_lifecycle_checkpoint(
+            entered.wait(), bootstrap, description="original unknown-bootstrap native close",
+        )
         for message in (
             "first native bootstrap withdrawal",
             "second native bootstrap withdrawal",

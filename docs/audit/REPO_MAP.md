@@ -5400,7 +5400,7 @@ Repo entry points and standard project files.
 - **tests/unit/test_standalone_context_shutdown_admission.py** — Original Agent-owned Hold resources close without an extra collector Task.
   - `async def test_agent_shutdown_retains_original_standalone_context(tmp_path, monkeypatch, refusal)`; `async def test_agent_original_context_close_joins_actual_ack_through_withdrawal(tmp_path, monkeypatch)`
 - **tests/unit/test_standalone_original_cleanup.py** — Original standalone resources and caller withdrawal survive failed startup.
-  - `async def test_actual_standalone_startup_preserves_host_close_debt(tmp_path, monkeypatch, refusal)`; `async def test_actual_bootstrap_failure_does_not_mask_cleanup_withdrawal(tmp_path, monkeypatch)`; `async def test_original_unknown_stays_control_during_native_bootstrap_withdrawal(tmp_path, monkeypatch)`
+  - `async def test_actual_standalone_startup_preserves_host_close_debt(tmp_path, monkeypatch, refusal)`; `async def test_actual_bootstrap_failure_does_not_mask_cleanup_withdrawal(tmp_path, monkeypatch, startup_contention)`; `async def test_original_unknown_stays_control_during_native_bootstrap_withdrawal(tmp_path, monkeypatch)`
 - **tests/unit/test_state_of_mind_feature.py** — Direct contracts for the StateOfMind feature.
   - `async def test_state_of_mind_requires_llm_service()`; `async def test_state_of_mind_formats_via_profile_service()`
 - **tests/unit/test_sticky_events.py** — Sticky aux events (current-state replay) on EventManagerMixin (#1825).
