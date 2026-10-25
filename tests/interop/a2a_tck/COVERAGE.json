@@ -1,5 +1,5 @@
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "scope": "Reviewed automated observations only; no complete conformance claim. NOT TESTED and MANUAL remain unverified.",
   "patched_tree": "2a55d5eaccf357f249c6c23188366cd045a46a82",
   "protocol_version": "1.0.1",
@@ -777,6 +777,30 @@
       "transports": {
         "jsonrpc": "PASS"
       }
+    }
+  },
+  "required_advisory_requirements": {
+    "CARD-CACHE-001": {
+      "level": "SHOULD",
+      "status": "PASS",
+      "transports": {
+        "agent_card": "PASS"
+      },
+      "test_ids": [
+        "tests/compatibility/agent_card/test_agent_card_caching.py::TestAgentCardCacheControl::test_cache_control_has_max_age",
+        "tests/compatibility/agent_card/test_agent_card_caching.py::TestAgentCardCacheControl::test_cache_control_present"
+      ]
+    },
+    "HTTP_JSON-SVC-001": {
+      "level": "SHOULD",
+      "status": "PASS",
+      "transports": {
+        "http_json": "PASS"
+      },
+      "test_ids": [
+        "tests/compatibility/core_operations/test_transport_behavior.py::TestRestFormat::test_response_content_type",
+        "tests/compatibility/http_json/test_problem_details.py::TestHttpJsonErrorMediaType::test_error_content_type"
+      ]
     }
   }
 }
