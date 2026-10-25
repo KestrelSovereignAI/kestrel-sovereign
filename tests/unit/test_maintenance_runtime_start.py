@@ -16,6 +16,9 @@ from kestrel_sovereign.features.delivery.feature import DeliveryFeature
 from kestrel_sovereign.features.delivery.queue import DeliveryQueue
 from kestrel_sovereign.features.scheduler.feature import SchedulerFeature
 from kestrel_sovereign.features.scheduler.runner import SchedulerRunner
+from kestrel_sovereign.feature_registry import InstalledFeatureRuntime
+from kestrel_sovereign.features import isolated_runtime
+from kestrel_sovereign.features.isolated_runtime import ProxyFeature
 from kestrel_sovereign.storage.async_database import AsyncDatabase
 from tests.unit.test_agent_boot_phases import _make_agent
 
@@ -43,6 +46,72 @@ async def test_maintenance_retirement_joins_without_new_status_publication(tmp_p
         assert runner._runtime_status_publish_task is None
     finally:
         await db.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("distribution,version", [
+    ("kestrel-channel-telegram", "0.1.9"),
+    ("kestrel-channel-telegram", "unknown"),
+    ("unreviewed-isolated-service", "1.0.0"),
+])
+async def test_maintenance_refuses_unsupported_child_before_launch(tmp_path, monkeypatch, distribution, version):
+    agent = _make_agent(tmp_path)
+    agent.defer_agent_readiness_to_host(maintenance=True)
+    runtime = InstalledFeatureRuntime(
+        class_name="TelegramFeature", entry_point="telegram.feature:TelegramFeature",
+        distribution=distribution, runtime="isolated-venv", service="kestrel-telegram-service",
+    )
+    proxy = ProxyFeature(agent, runtime)
+    monkeypatch.setattr(isolated_runtime, "_feature_distribution_version", lambda *_args: version)
+    try:
+        with pytest.raises(MaintenanceBootError, match="maintenance"):
+            proxy._assert_child_start_allowed()
+    finally:
+        await close_agent(agent)
+
+
+@pytest.mark.asyncio
+async def test_maintenance_does_not_resolve_or_claim_a_hosted_route(tmp_path):
+    agent = _make_agent(tmp_path)
+    agent.defer_agent_readiness_to_host(maintenance=True)
+
+    async def serving_route_resolver(_proxy):
+        raise AssertionError("maintenance attempted serving route acquisition")
+
+    agent.hosted_telegram_route_attestation_resolver = serving_route_resolver
+    proxy = ProxyFeature(agent, InstalledFeatureRuntime(
+        class_name="TelegramFeature", entry_point="telegram.feature:TelegramFeature",
+        distribution="kestrel-channel-telegram", runtime="isolated-venv", service="kestrel-telegram-service",
+    ))
+    try:
+        await proxy._resolve_hosted_telegram_startup_attestation()
+        assert proxy._hosted_telegram_route_claim is None
+        assert proxy._hosted_telegram_startup_attested is False
+    finally:
+        await close_agent(agent)
+
+
+@pytest.mark.asyncio
+async def test_maintenance_child_uses_reserved_native_sdk_handshake_not_route_attestation(tmp_path, monkeypatch):
+    agent = _make_agent(tmp_path)
+    agent.defer_agent_readiness_to_host(maintenance=True)
+    runtime = InstalledFeatureRuntime(
+        class_name="TelegramFeature", entry_point="telegram.feature:TelegramFeature",
+        distribution="kestrel-channel-telegram", runtime="isolated-venv", service="kestrel-telegram-service",
+    )
+    proxy = ProxyFeature(agent, runtime)
+    monkeypatch.setattr(isolated_runtime, "_feature_distribution_version", lambda *_args: "0.1.10")
+    client = None
+    try:
+        client = proxy._build_client(config={"_kestrel_host_runtime_capabilities": ["forged-owner"]})
+        assert client.config["_kestrel_host_runtime_capabilities"] == [
+            "channel-inbound-acknowledgement-v1", "kestrel-maintenance-boot-v1",
+        ]
+        assert client.process is None
+    finally:
+        if client is not None:
+            await client.stop()
+        await close_agent(agent)
 
 
 @pytest.mark.asyncio
