@@ -883,11 +883,11 @@ wheels = [
 
 [[package]]
 name = "certifi"
-version = "2026.5.20"
+version = "2026.10.23"
 source = { registry = "https://pypi.org/simple" }
-sdist = { url = "https://files.pythonhosted.org/packages/f3/ce/ee2ecad540810a79593028e88299baeae54d346cc7a0d94b6199988b89b1/certifi-2026.5.20.tar.gz", hash = "sha256:69dea482ab64caa7b9f6aba1c6bf48bb6a5448d1c0f1b17ab42ad8c763a5344d", size = 135422, upload-time = "2026-05-20T11:46:50.073Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/fd/11/b524cbd9bbdaca58608e4cf4053fd463417549e1959fa8d3aa18319f9555/certifi-2026.10.23.tar.gz", hash = "sha256:a9895e6e2758b371e0545e321a3a8fd1fcfd9829ada8824a936dfb16aaaf36cd", size = 136225, upload-time = "2026-10-23T11:36:16.478Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/59/8c/57e832b7af6d7c5abe66eb3fbe3a3a32f4d11ea23a1aa7131371035be991/certifi-2026.5.20-py3-none-any.whl", hash = "sha256:3c52e209ba0a4ad7aebe60436a4ab349c39e1e602e8c134221e546902ad25897", size = 134134, upload-time = "2026-05-20T11:46:48.578Z" },
+    { url = "https://files.pythonhosted.org/packages/32/d1/a3652fe2c19134d0d15922177821d863cbd7e842d53a21bbe7e8e3a1b5ac/certifi-2026.10.23-py3-none-any.whl", hash = "sha256:e9b54de76e530bb6cf0ccd036787103acb58fd42ba930ea8bf948ddbaa2f61d1", size = 135082, upload-time = "2026-10-23T11:36:14.763Z" },
 ]
 
 [[package]]
@@ -3165,7 +3165,7 @@ all = [
 
 [[package]]
 name = "kestrel-sovereign"
-version = "0.54.3"
+version = "0.54.4"
 source = { editable = "." }
 dependencies = [
     { name = "aiohttp" },
@@ -3175,7 +3175,6 @@ dependencies = [
     { name = "authlib" },
     { name = "beautifulsoup4" },
     { name = "cbor2" },
-    { name = "certifi" },
     { name = "charset-normalizer" },
     { name = "cryptography" },
     { name = "email-validator" },
@@ -3384,7 +3383,6 @@ requires-dist = [
     { name = "azure-mgmt-appcontainers", marker = "extra == 'cloud'", specifier = ">=3.0.0" },
     { name = "beautifulsoup4", specifier = "==4.14.3" },
     { name = "cbor2", specifier = ">=5.9.0" },
-    { name = "certifi", specifier = "==2026.5.20" },
     { name = "charset-normalizer", specifier = "==3.4.7" },
     { name = "cryptography", specifier = ">=48.0.1" },
     { name = "diffusers", marker = "extra == 'ml'", specifier = ">=0.38.0" },
@@ -3414,7 +3412,7 @@ requires-dist = [
     { name = "kestrel-sovereign", extras = ["search"], marker = "extra == 'all-features'" },
     { name = "kestrel-sovereign", extras = ["test"], marker = "extra == 'full'" },
     { name = "kestrel-sovereign", extras = ["wallet"], marker = "extra == 'all-features'" },
-    { name = "kestrel-sovereign-sdk", extras = ["a2a", "httpx", "tracing"], specifier = ">=0.42.3,<1" },
+    { name = "kestrel-sovereign-sdk", extras = ["a2a", "httpx", "tracing"], specifier = ">=0.42.4,<1" },
     { name = "kestrel-sovereign-sdk", extras = ["metrics"], marker = "extra == 'observability'" },
     { name = "networkx", specifier = "==3.6.1" },
     { name = "numpy", specifier = ">=2.3.1" },
@@ -3502,19 +3500,20 @@ test = [
 
 [[package]]
 name = "kestrel-sovereign-sdk"
-version = "0.42.3"
+version = "0.42.4"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "idna" },
     { name = "pydantic" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/3e/50/5a6d2dcf128b0a5ec091a93a1d7e28ca2a14496caf2f7c2c82e1b2251ab7/kestrel_sovereign_sdk-0.42.3.tar.gz", hash = "sha256:0897b4ead7f11a608d8a2028d687d6d373061ac66633f8f24d96b289fe364b9f", size = 536057, upload-time = "2026-10-25T17:20:08.912Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/97/36/5fba3b220dfd819cfbfa3ea4110eb35cfe63e4a411dba63de94b2af7ffbf/kestrel_sovereign_sdk-0.42.4.tar.gz", hash = "sha256:55c2f39349838b86f3dca5bb8815d033e837388d14fa76a103d609732117c08b", size = 536798, upload-time = "2026-10-25T23:48:02.733Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/3b/38/19445e6a509a6f07ae1d5632680abeaaf80c6938d1d13c8c8b76b740e61c/kestrel_sovereign_sdk-0.42.3-py3-none-any.whl", hash = "sha256:2969d27ab3331a34063320a8cac874929a5e14d1e839c033ec0bb7b61382ad0e", size = 645066, upload-time = "2026-10-25T17:20:10.262Z" },
+    { url = "https://files.pythonhosted.org/packages/82/d4/6ea5deff036fb567781a21fa277d79c8a6e1edb8cb6bf8c1d561504c07bf/kestrel_sovereign_sdk-0.42.4-py3-none-any.whl", hash = "sha256:79c4956adb44f61633d93242ecff771140dab1ed8a0d39fc86f48d11f3779ee5", size = 645346, upload-time = "2026-10-25T23:48:04.004Z" },
 ]
 
 [package.optional-dependencies]
 a2a = [
+    { name = "certifi" },
     { name = "cryptography" },
     { name = "culsans", marker = "python_full_version < '3.13'" },
     { name = "google-api-core", version = "2.25.2", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.14'" },
@@ -3530,10 +3529,12 @@ a2a = [
     { name = "starlette" },
 ]
 httpx = [
+    { name = "certifi" },
     { name = "httpcore", extra = ["asyncio"] },
     { name = "httpx" },
 ]
 httpx2 = [
+    { name = "certifi" },
     { name = "httpcore2", extra = ["asyncio"] },
     { name = "httpx2" },
 ]
@@ -3541,6 +3542,7 @@ metrics = [
     { name = "prometheus-client" },
 ]
 tracing = [
+    { name = "certifi" },
     { name = "openinference-semantic-conventions" },
     { name = "opentelemetry-exporter-otlp-proto-http" },
     { name = "opentelemetry-sdk" },

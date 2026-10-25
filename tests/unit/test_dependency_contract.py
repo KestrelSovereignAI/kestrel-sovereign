@@ -65,10 +65,11 @@ SECURITY_FLOORS = {
 # canonical version parser used by Core's signed Agent Card validation.
 # Version 0.42.2 enforces all standard HTTP header and query carriers.
 # Version 0.42.3 corrects native HTTP+JSON protocol error media types.
+# Version 0.42.4 supplies one current trust-bundle floor for all HTTPS clients.
 # This is a Core-only release gate: sibling packages release independently.
 # Core must never lower its declared/locked line to accommodate an older
 # consumer. Host feature acceptance remains a release prerequisite in README.md.
-SDK_RELEASE_CASCADE_SPECIFIERS = frozenset({(">=", "0.42.3"), ("<", "1")})
+SDK_RELEASE_CASCADE_SPECIFIERS = frozenset({(">=", "0.42.4"), ("<", "1")})
 SDK_RELEASE_CASCADE_CONTRACTS = {
     "base": frozenset({"a2a", "httpx", "tracing"}),
     "observability": frozenset({"metrics"}),
@@ -130,6 +131,17 @@ def test_native_a2a_streams_require_server_scoped_shutdown():
     ]
     assert Version(package["version"]) >= Version("3.5.0")
     assert package["source"] == {"registry": "https://pypi.org/simple"}
+
+
+def test_shared_sdk_owns_the_current_https_trust_bundle_policy():
+    """Core must not pin an obsolete CA bundle against its shared HTTPS SDK."""
+    declared = [Requirement(raw) for raw in _pyproject()["project"]["dependencies"]]
+    assert not any(canonicalize_name(item.name) == "certifi" for item in declared)
+    packages = {item["name"]: item for item in _lock()["package"]}
+    sdk = packages["kestrel-sovereign-sdk"]
+    assert any(item["name"] == "certifi" for item in sdk["optional-dependencies"]["a2a"])
+    assert Version(packages["certifi"]["version"]) >= Version("2026.10.23")
+    assert packages["certifi"]["source"] == {"registry": "https://pypi.org/simple"}
 
 
 def _locked_root_package(lock: dict) -> dict:
@@ -317,7 +329,8 @@ def test_sdk_native_release_cascade_contract_is_declared():
         assert Version("0.42.0") not in specifier
         assert Version("0.42.1") not in specifier
         assert Version("0.42.2") not in specifier
-        assert Version("0.42.3") in specifier
+        assert Version("0.42.3") not in specifier
+        assert Version("0.42.4") in specifier
         assert Version("0.43.0") in specifier
         assert Version("1.0.0") not in specifier
 
@@ -354,5 +367,5 @@ def test_sdk_native_release_cascade_contract_is_locked():
     ]
     assert sdk_versions
     assert all(
-        Version("0.42.3") <= version < Version("1.0.0") for version in sdk_versions
+        Version("0.42.4") <= version < Version("1.0.0") for version in sdk_versions
     )
