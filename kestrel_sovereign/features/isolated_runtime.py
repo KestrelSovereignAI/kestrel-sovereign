@@ -12261,6 +12261,12 @@ class ProxyFeature(Feature):
         if maintenance_boot_active(self.agent):
             from packaging.version import InvalidVersion, Version
 
+            if (
+                self.runtime.runtime != "isolated-venv"
+                or self._bin_path is not None
+                or os.environ.get(_env_key(self.name, "BIN"))
+            ):
+                raise MaintenanceBootError("maintenance boot requires verified VENV distribution custody; BIN overrides are unsupported")
             if not self._is_telegram_runtime():
                 raise MaintenanceBootError("maintenance boot requires reviewed isolated-child startup support")
             installed = _feature_distribution_version(
