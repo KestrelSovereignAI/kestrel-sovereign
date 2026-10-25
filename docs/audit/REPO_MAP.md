@@ -18,8 +18,8 @@ generated: true
 Auto-generated file-tree + per-file purpose index. Always-loaded context for the kestrel-agent
 GitHub App (issue #791). Do **not** edit by hand — regenerate via `python scripts/generate_repo_map.py`.
 
-**Generated:** 2026-10-24
-**Scope:** 3346 tracked files (2504 `.py`, 367 `.md`, 475 other). Excludes `__pycache__`, `node_modules`, `.venv`, `.claude`, build artifacts.
+**Generated:** 2026-10-25
+**Scope:** 3356 tracked files (2514 `.py`, 367 `.md`, 475 other). Excludes `__pycache__`, `node_modules`, `.venv`, `.claude`, build artifacts.
 
 **Format per file:** `path — one-line purpose` plus the public top-level Python symbols on the next line
 (classes and functions; private `_name` skipped).
@@ -268,6 +268,13 @@ Repo entry points and standard project files.
   - `class AgentConfig`; `def find_agent_dir(hint)`; `def list_agents(base_dir)`
 - **kestrel_sovereign/api_errors.py** — Canonical HTTP API error envelopes and FastAPI exception handlers.
   - `class ApiHTTPException`; `def rate_limited_until(declined)`; `def generation_incomplete()`; `def api_error_response()`; `async def api_http_exception_handler(request, exc)`; `async def api_validation_exception_handler(request, exc)`; `async def api_unhandled_exception_handler(request, exc)`; `def register_api_error_handlers(app)`
+- **kestrel_sovereign/artifacts/__init__.py** — Producer-neutral saved outputs.
+- **kestrel_sovereign/artifacts/http.py** — Private revision routes constructed only with a host authentication resolver.
+  - `class ArtifactDeliveryMiddleware`; `def create_artifact_router(service)`
+- **kestrel_sovereign/artifacts/repository.py** — Transactional encrypted artifact persistence, independent of a producer.
+  - `class ArtifactIntegrityError`; `class ArtifactQuotaExceeded`; `class ArtifactLimits`; `class ArtifactRepository`
+- **kestrel_sovereign/artifacts/service.py** — Host-authorized artifact operations, independent of any computer session.
+  - `class ArtifactAccessDenied`; `class ArtifactAction`; `class ArtifactAuthority`; `class AuthorizedArtifactService`
 - **kestrel_sovereign/async_ownership.py** — Public, cancellation-safe ownership of already-owned asynchronous tails.
 - **kestrel_sovereign/audit_time.py** — Canonical audit timestamp handling.
   - `def utc_now_iso()`; `def normalize_audit_timestamp(value)`
@@ -475,6 +482,9 @@ Repo entry points and standard project files.
   - `class FeatureStatus`; `class PackageBoundary`; `class RegistryValidationError`; `class SkillInfo`; `class FeaturePackageInfo`; `class InstalledFeatureRuntime`; `def validate_registry(registry)`; `def load_registry(path)`; `…`
 - **kestrel_sovereign/features/__init__.py** — Feature Discovery for Kestrel Agent.
   - `class DuplicateFeatureEntryPointError`; `class FeatureDiscoveryAmbiguityError`; `class FeatureDiscoverySelection`; `class MandatoryFeatureReadinessError`; `def verify_mandatory_feature_set(features)`; `def get_disabled_features()`; `def discover_feature_modules()`; `def find_feature_class(module)`; `…`
+- **kestrel_sovereign/features/artifacts/__init__.py** — Durable artifact host capability.
+- **kestrel_sovereign/features/artifacts/feature.py** — Bind the artifact service to an original agent and current host authority.
+  - `class ArtifactsFeature`
 - **kestrel_sovereign/features/attachments/__init__.py** — Chat attachments feature (#1662): a lazy ``read_attachment`` tool so an agent can read a file the user attached (non-inline) on demand.
 - **kestrel_sovereign/features/attachments/component.yaml** — (configuration)
 - **kestrel_sovereign/features/attachments/feature.py** — Lazy attachment reading (#1662 PR C).
@@ -2504,6 +2514,14 @@ Repo entry points and standard project files.
   - `def clean_sse_connections()`; `def live_server()`; `async def test_real_http_sse_delivers_approval_and_decision_resolves_caller(live_server)`; `async def test_real_http_denying_posts_404_after_request_times_out(live_server)`
 - **tests/integration/test_approval_sse_e2e.py** — End-to-end test for the approval-request SSE path with real infrastructure.
   - `def clean_sse_connections()`; `async def test_approval_request_reaches_sse_and_decision_resolves_caller()`; `async def test_event_buffered_before_connect_is_replayed_on_sse_connect()`
+- **tests/integration/test_artifact_host.py** — Real host auth/routing and durable artifact service; no provider calls.
+  - `async def host(repository, monkeypatch)`; `def path(name)`; `async def publish(client, name, key, ref, …)`; `async def test_registered_host_publish_edit_scope_and_reload(host)`; `async def test_only_current_explicit_sovereign_credentials(host, monkeypatch)`; `async def test_query_key_exception_cannot_authorize_artifact_receipts(host)`; `async def test_privacy_transition_blocks_reads_and_writes_but_allows_erasure(host)`; `async def test_link_destinations_are_not_implicitly_granted(host)`; `…`
+- **tests/integration/test_artifact_http.py** — Real private ASGI publication/view/edit flow against both database engines.
+  - `async def api(access)`; `async def publish(client)`; `def revision_url(ref)`; `async def test_private_publish_edit_history_and_delete(api)`; `async def test_authentication_scope_input_and_private_response_headers(api)`; `async def test_untrusted_mime_cannot_execute_on_application_origin(api)`; `async def test_bounded_body_and_validation_do_not_echo_private_content(api, access)`; `async def test_authority_gate_retained_until_body_send(api, access)`; `…`
+- **tests/integration/test_artifact_repository.py** — Real SQLite publication, ownership and durability checks for saved outputs.
+  - `async def repository(tmp_path, monkeypatch, request)`; `async def publish(store)`; `async def test_publish_survives_restart_without_source_session(repository)`; `async def test_publication_failure_rolls_back_head_revision_and_receipt(repository)`; `async def test_uncommitted_caller_transaction_cannot_receive_saved_receipt(repository)`; `async def test_owner_scope_does_not_leak_hashes_or_revisions(repository)`; `async def test_updates_and_deletes_compare_current_head(repository)`; `async def test_simultaneous_edits_have_exactly_one_winner(repository)`; `…`
+- **tests/integration/test_artifact_service.py** — Authorized operations over real encrypted SQLite/PostgreSQL repositories.
+  - `class PolicyHolder`; `class Access`; `async def access(repository)`; `async def staged(access, context)`; `async def test_service_protocol_and_all_producer_neutral_operations(access)`; `async def test_equal_or_expired_lifetime_context_is_not_a_credential(access)`; `async def test_exact_grants_and_storage_boundary_required(access, field, value)`; `async def test_exact_authenticated_scope_never_inherits_other_namespace(access, field, value)`; `…`
 - **tests/integration/test_asset_restorer.py** — Integration tests for #1391 — :class:`AssetRestorer` protocol + ``SovereignStorageAdapter.import_agent(asset_restorers=...)``.
   - `def temp_db()`; `def temp_db_2()`; `async def test_no_restorers_preserves_pre_1391_behavior(temp_db)`; `async def test_inline_asset_decrypted_and_handed_to_restorer(temp_db)`; `async def test_pre_encrypted_asset_passes_raw_bytes_through(temp_db)`; `async def test_restorer_only_sees_its_declared_types(temp_db)`; `async def test_unhandled_asset_type_recorded_as_skipped(temp_db)`; `async def test_multiple_restorers_for_same_type_both_called(temp_db)`; `…`
 - **tests/integration/test_asset_restorer_external_ref.py** — Integration tests for #1438 — external-ref asset restoration via the filecoin adapter (Phase-2 follow-up to #1391).
@@ -3595,7 +3613,7 @@ Repo entry points and standard project files.
 - **tests/unit/test_access_grant.py** — Data-access grant schema + verification tests (#1273).
   - `def owner()`; `def source()`; `def host()`; `def signed_grant(owner, source, host)`; `def package_signed_ok(monkeypatch)`; `def package_signed_invalid(monkeypatch)`; `def test_signable_payload_is_deterministic(signed_grant)`; `def test_compute_grant_id_excludes_id_and_created_at(owner, source, host)`; `…`
 - **tests/unit/test_access_log_redaction.py** — Credential redaction at Uvicorn's ASGI access-log seam (#2429).
-  - `def test_sensitive_query_values_are_redacted_without_dropping_safe_fields()`; `def test_percent_encoded_sensitive_name_is_redacted()`; `def test_safe_query_is_returned_byte_for_byte()`; `async def test_multi_agent_request_is_redacted_only_during_response_start_send()`
+  - `def test_sensitive_query_values_are_redacted_without_dropping_safe_fields()`; `def test_percent_encoded_sensitive_name_is_redacted()`; `def test_safe_query_is_returned_byte_for_byte()`; `async def test_multi_agent_request_is_redacted_only_during_response_start_send()`; `async def test_artifact_identifiers_are_redacted_without_changing_handler_semantics(prefix, query)`; `async def test_escaped_error_keeps_scope_redacted_for_outer_error_handler(during_send, artifact)`
 - **tests/unit/test_acknowledged_execution_commit.py** — Receipt classification only; actual transaction proofs live in integration.
   - `async def test_settled_fact_cannot_hide_combined_unscoped_control()`; `async def test_selected_cancel_keeps_scoped_provenance_across_reaggregation()`; `async def test_settled_fact_never_localizes_legacy_unresolved_committed_carrier()`; `async def acknowledged_receipt()`; `def test_native_original_retention_keeps_enclosing_cancellation_without_cause_cycle()`; `async def test_observer_receipt_is_local_only_after_original_retirement()`; `async def test_settled_commit_does_not_localize_unknown_or_actual_failed_closer()`; `async def test_only_denied_scope_retains_acknowledged_commit_after_retirement()`
 - **tests/unit/test_adapter_cache_stability.py** — Per-adapter cache-stability tests.
