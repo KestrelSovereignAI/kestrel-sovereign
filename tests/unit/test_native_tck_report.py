@@ -33,8 +33,8 @@ def evidence(tmp_path):
             "transports": {}, "test_ids": [],
         },
         "CARD-CACHE-001": {
-            "level": "SHOULD", "status": "FAIL", "errors": ["no max-age"],
-            "transports": {"agent_card": "FAIL"},
+            "level": "SHOULD", "status": "PASS", "errors": [],
+            "transports": {"agent_card": "PASS"},
             "test_ids": ["tests/wire/test_card.py::test_cache"],
         },
     }
@@ -46,9 +46,13 @@ def evidence(tmp_path):
         ]},
     }
     profile = {
-        "schema_version": 1, "patched_tree": tree, "protocol_version": "1.0.1",
+        "schema_version": 2, "patched_tree": tree, "protocol_version": "1.0.1",
         "protocol_bindings": ["JSONRPC", "HTTP+JSON"], "must_compatibility": "50.0%",
         "unverified_requirements": {"VER-CLIENT-002": "Patch negotiation has no probe."},
+        "required_advisory_requirements": {
+            "CARD-CACHE-001": {key: requirements["CARD-CACHE-001"][key]
+                               for key in ("level", "status", "transports", "test_ids")},
+        },
         "must_requirements": {
             key: {"status": row["status"], "transports": row["transports"]}
             for key, row in requirements.items() if row["level"] == "MUST"
@@ -59,13 +63,13 @@ def evidence(tmp_path):
     (reports / "junitreport.xml").write_text(
         '<testsuites><testsuite>'
         '<testcase classname="tests.wire.test_message.TestMessage" name="test_reply[part::text]"/>'
-        '<testcase classname="tests.wire.test_card" name="test_cache"><failure>no max-age</failure></testcase>'
+        '<testcase classname="tests.wire.test_card" name="test_cache"/>'
         '</testsuite></testsuites>'
     )
     return reports, provenance
 
 
-def _validate(evidence, *, level="full", returncode=1):
+def _validate(evidence, *, level="full", returncode=0):
     reports, provenance = evidence
     return validate_tck_report(reports, level=level, returncode=returncode, provenance_dir=provenance)
 
@@ -76,12 +80,23 @@ def _rewrite(path, change):
     path.write_text(json.dumps(data))
 
 
-def test_full_advisory_failure_retains_unmodified_raw_gaps(evidence):
+def _fail_advisory(evidence):
+    reports, _ = evidence
+    _rewrite(reports / "compatibility.json", lambda data:
+             data["per_requirement"]["CARD-CACHE-001"].update(
+                 status="FAIL", transports={"agent_card": "FAIL"}, errors=["no max-age"]))
+    path = reports / "junitreport.xml"
+    tree = ElementTree.parse(path)
+    ElementTree.SubElement(tree.getroot().find("testsuite")[1], "failure").text = "no max-age"
+    tree.write(path)
+
+
+def test_full_pass_retains_unmodified_raw_gaps(evidence):
     reports, _ = evidence
     before = (reports / "compatibility.json").read_bytes()
     report = _validate(evidence)
     assert report["per_requirement"]["VER-CLIENT-002"]["status"] == "NOT TESTED"
-    assert report["per_requirement"]["CARD-CACHE-001"]["status"] == "FAIL"
+    assert report["per_requirement"]["CARD-CACHE-001"]["status"] == "PASS"
     assert report["summary"]["must_compatibility"] == "50.0%"
     assert (reports / "compatibility.json").read_bytes() == before
 
@@ -132,7 +147,7 @@ def test_coverage_profile_must_be_complete_and_bound_to_source(evidence, mutatio
         elif mutation == "protocol":
             data["protocol_version"] = "1.0.0"
         elif mutation == "schema":
-            data["schema_version"] = 2
+            data["schema_version"] = 3
         elif mutation == "empty":
             data["must_requirements"] = {}
         elif mutation == "no_positive":
@@ -172,7 +187,9 @@ def test_junit_errors_and_unaccounted_failures_are_fatal(evidence, mutation):
         suite.clear()
     elif mutation == "unknown_failure":
         suite[1].set("name", "test_unmapped")
+        ElementTree.SubElement(suite[1], "failure").text = "unmapped failure"
     elif mutation == "mixed_level":
+        ElementTree.SubElement(suite[1], "failure").text = "mixed-level failure"
         _rewrite(reports / "compatibility.json", lambda data:
                  data["per_requirement"]["DM-MSG-001"]["test_ids"].append("tests/wire/test_card.py::test_cache"))
     elif mutation == "duplicate":
@@ -180,26 +197,26 @@ def test_junit_errors_and_unaccounted_failures_are_fatal(evidence, mutation):
     else:
         ElementTree.SubElement(suite[0], "skipped")
     tree.write(path)
-    with pytest.raises(ValueError, match="JUnit|advisory requirement"):
-        _validate(evidence)
+    with pytest.raises(ValueError, match="JUnit|failed checks"):
+        _validate(evidence, returncode=1 if mutation in {"unknown_failure", "mixed_level"} else 0)
 
 
 def test_must_phase_never_accepts_failed_advisory_checks(evidence):
+    _fail_advisory(evidence)
     with pytest.raises(ValueError, match="MUST-only run"):
-        _validate(evidence, level="must")
+        _validate(evidence, level="must", returncode=1)
 
 
 def test_successful_must_phase(evidence):
-    reports, _ = evidence
-    path = reports / "junitreport.xml"
-    tree = ElementTree.parse(path)
-    case = tree.getroot().find("testsuite")[1]
-    case.remove(case.find("failure"))
-    tree.write(path)
     _validate(evidence, level="must", returncode=0)
 
 
 def test_exit_zero_cannot_hide_assertion_failures(evidence):
+    reports, _ = evidence
+    path = reports / "junitreport.xml"
+    tree = ElementTree.parse(path)
+    ElementTree.SubElement(tree.getroot().find("testsuite")[1], "failure").text = "hidden assertion"
+    tree.write(path)
     with pytest.raises(ValueError, match="exit status and JUnit"):
         _validate(evidence, returncode=0)
 
@@ -226,7 +243,108 @@ def test_checked_in_profile_preserves_all_known_obligations():
     assert len(profile["must_requirements"]) == 115
     assert len(profile["unverified_requirements"]) == 16
     assert profile["must_compatibility"] == "81.8%"
+    assert set(profile["required_advisory_requirements"]) == {"CARD-CACHE-001", "HTTP_JSON-SVC-001"}
+    for row in profile["required_advisory_requirements"].values():
+        assert row["level"] == "SHOULD" and row["status"] == "PASS"
+        assert set(row["transports"].values()) == {"PASS"}
+        assert len(row["test_ids"]) == 2
     for key in ("DM-MSG-001", "STREAM-SUB-002"):
         assert profile["must_requirements"][key]["status"] == "PASS"
         for binding in ("jsonrpc", "http_json"):
             assert profile["must_requirements"][key]["transports"][binding] == "PASS"
+
+
+@pytest.mark.parametrize("mutation", ["remove", "skip", "manual", "change_binding", "weaken_level", "lose_probe"])
+def test_resolved_advisory_coverage_cannot_disappear(evidence, mutation):
+    reports, _ = evidence
+    def change(data):
+        rows = data["per_requirement"]
+        if mutation == "remove":
+            del rows["CARD-CACHE-001"]
+        elif mutation == "skip":
+            rows["CARD-CACHE-001"]["status"] = "SKIPPED"
+        elif mutation == "manual":
+            rows["CARD-CACHE-001"]["status"] = "MANUAL"
+        elif mutation == "change_binding":
+            rows["CARD-CACHE-001"]["transports"] = {"http_json": "PASS"}
+        elif mutation == "weaken_level":
+            rows["CARD-CACHE-001"]["level"] = "MAY"
+        else:
+            rows["CARD-CACHE-001"]["test_ids"] = []
+    _rewrite(reports / "compatibility.json", change)
+    with pytest.raises(ValueError, match="advisory coverage"):
+        _validate(evidence)
+
+
+@pytest.mark.parametrize("mutation", ["missing", "empty", "failed", "no_probes"])
+def test_resolved_advisory_profile_cannot_be_waived(evidence, mutation):
+    _, provenance = evidence
+    def change(data):
+        if mutation == "missing":
+            del data["required_advisory_requirements"]
+        elif mutation == "empty":
+            data["required_advisory_requirements"] = {}
+        elif mutation == "failed":
+            data["required_advisory_requirements"]["CARD-CACHE-001"]["status"] = "FAIL"
+        else:
+            data["required_advisory_requirements"]["CARD-CACHE-001"]["test_ids"] = []
+    _rewrite(provenance / "COVERAGE.json", change)
+    with pytest.raises(ValueError, match="advisory coverage profile"):
+        _validate(evidence)
+
+
+@pytest.mark.parametrize("mutation", ["remove", "skip"])
+def test_every_resolved_advisory_probe_needs_a_passing_junit_case(evidence, mutation):
+    reports, _ = evidence
+    path = reports / "junitreport.xml"
+    tree = ElementTree.parse(path)
+    suite = tree.getroot().find("testsuite")
+    if mutation == "remove":
+        suite.remove(suite[1])
+    else:
+        ElementTree.SubElement(suite[1], "skipped")
+    tree.write(path)
+    with pytest.raises(ValueError, match="advisory.*JUnit"):
+        _validate(evidence)
+
+
+@pytest.mark.parametrize("level", ["SHOULD", "MAY"])
+def test_full_profile_rejects_other_failed_advisories(evidence, level):
+    reports, _ = evidence
+    _rewrite(reports / "compatibility.json", lambda data:
+             data["per_requirement"].update({"OPTIONAL-001": {
+                 "level": level, "status": "FAIL", "errors": ["another failure"],
+                 "transports": {"jsonrpc": "FAIL"},
+                 "test_ids": ["tests/wire/test_optional.py::test_optional"],
+             }}))
+    path = reports / "junitreport.xml"
+    tree = ElementTree.parse(path)
+    case = ElementTree.SubElement(tree.getroot().find("testsuite"), "testcase",
+                                  classname="tests.wire.test_optional", name="test_optional")
+    ElementTree.SubElement(case, "failure").text = "another failure"
+    tree.write(path)
+    with pytest.raises(ValueError, match="full profile has failed checks"):
+        _validate(evidence, returncode=1)
+
+
+@pytest.mark.parametrize("requirement_level", ["SHOULD", "MAY"])
+@pytest.mark.parametrize("failure_location", ["status", "transport"])
+def test_full_profile_rejects_raw_failures_despite_passing_junit(
+    evidence, requirement_level, failure_location
+):
+    reports, _ = evidence
+    _rewrite(reports / "compatibility.json", lambda data:
+             data["per_requirement"].update({"OPTIONAL-001": {
+                 "level": requirement_level,
+                 "status": "FAIL" if failure_location == "status" else "PASS",
+                 "errors": ["reported failure"],
+                 "transports": {"http_json": "FAIL" if failure_location == "transport" else "PASS"},
+                 "test_ids": ["tests/wire/test_optional.py::test_optional"],
+             }}))
+    path = reports / "junitreport.xml"
+    tree = ElementTree.parse(path)
+    ElementTree.SubElement(tree.getroot().find("testsuite"), "testcase",
+                           classname="tests.wire.test_optional", name="test_optional")
+    tree.write(path)
+    with pytest.raises(ValueError, match="full profile reports failed requirement: OPTIONAL-001"):
+        _validate(evidence)

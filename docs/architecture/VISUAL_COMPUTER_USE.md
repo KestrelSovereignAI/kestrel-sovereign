@@ -69,7 +69,7 @@ There are no known external consumers requiring compatibility with these new
 interfaces. Replace conflicting ownership semantics deliberately; do not add
 aliases or a parallel artifact service to avoid a coordinated cutover.
 
-Core's native A2A cutover (#3803, under #3679) uses published SDK 0.42.2,
+Core's native A2A cutover (#3803, under #3679) now consumes published SDK 0.42.3,
 which includes the computer/artifact contracts introduced in 0.41. SDK 0.40
 predates these contracts and is not an artifact runtime dependency.
 

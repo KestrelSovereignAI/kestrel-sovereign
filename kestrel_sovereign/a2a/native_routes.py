@@ -171,7 +171,7 @@ class NativeA2AHTTP:
                         handler.agent_card,
                         card_modifier=card_modifier,
                         card_url=path,
-                        cache_control="no-cache",
+                        cache_control="no-cache, max-age=0",
                     )
                 )
         self.routes = (self.route, *self.card_routes)

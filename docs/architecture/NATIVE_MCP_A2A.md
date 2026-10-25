@@ -59,7 +59,7 @@ caps are subject to migration, not reasons to downgrade the protocol target.
 | `kestrel-sovereign-sdk` | Remove draft wire models; shared host/feature credential and typed-part contracts; update all consumers |
 | Host manifest packages | Survey published constraints and editable sources; release incompatible consumers before the host floor moves |
 
-The coordinated Core cutover requires **SDK 0.42.2 or newer**. SDK
+The coordinated Core cutover requires **SDK 0.42.3 or newer**. SDK
 [PR #87](https://github.com/KestrelSovereignAI/kestrel-sovereign-sdk/pull/87)
 and [PR #88](https://github.com/KestrelSovereignAI/kestrel-sovereign-sdk/pull/88)
 add the shared computer-use, artifact, resource-scope and workspace-transfer
@@ -74,6 +74,10 @@ ignoring specification patch numbers. SDK 0.42.2
 adds the standard alternative HTTP version query carrier and validates repeated
 version headers, resolving SDK
 [#92](https://github.com/KestrelSovereignAI/kestrel-sovereign-sdk/issues/92).
+SDK 0.42.3 ([PR #95](https://github.com/KestrelSovereignAI/kestrel-sovereign-sdk/pull/95))
+is public and corrects native HTTP+JSON protocol error media types. Its wheel
+and source distribution match the release artifacts and reviewed source. Core's
+floor and lock consume that published repair through the normal package contract.
 The retained optional gRPC handler's version negotiation remains tracked in SDK
 [#91](https://github.com/KestrelSovereignAI/kestrel-sovereign-sdk/issues/91);
 Core does not serve gRPC.
@@ -444,7 +448,7 @@ the registration key served at the authority-root well-known path. Other
 recipients expose only their directly configured card URLs. Blank or invalid
 configuration refuses publication.
 
-The implementation uses published SDK 0.42.2, including the reviewed signing
+The implementation uses published SDK 0.42.3, including the reviewed signing
 and HTTP-authorization repairs. Push delivery and draft-route retirement are
 implemented. The pinned TCK observation matrix and independent Go peer below
 record the measured interoperability scope; public release and deployment
@@ -797,11 +801,17 @@ requirements, a new skip, any MUST failure, runner error, missing report or lost
 Message/terminal-stream pass on either binding fail the gate. A profile change
 requires review against the pinned runner source.
 
-Raw JSON, HTML and JUnit reports retain all manual obligations, optional-capability
-skips and SHOULD/MAY failures. The full run permits only failed checks that map
-solely to advisory requirements; fixture errors and unmapped failures remain
-fatal. This is a pinned, corrected runner, not an unmodified upstream TCK or a
-claim that automated checks establish every requirement. Run it locally with
+Raw JSON, HTML and JUnit reports retain all manual obligations and optional
+capability skips. The full run requires zero failed checks in both the raw
+requirement observations and JUnit. A failure in either report fails the gate. Profile schema 2
+also records the resolved Agent Card cache and HTTP+JSON error-media SHOULDs,
+including their native binding observations and all four passing JUnit probes.
+Losing or skipping one of those probes fails the gate. Both public and per-agent
+cards require revalidation with `Cache-Control: no-cache, max-age=0`; the live
+recipient gate runs before conditional ETag responses, including after policy,
+identity or registration withdrawal. Signed-card and authorization checks remain
+required. This is a pinned, corrected runner; its automated evidence leaves the
+listed manual and unprobed obligations unverified. Run it locally with
 `uv run pytest tests/interop/test_a2a_tck.py`; no external TCK-source override is
 accepted. Adoption of published dependencies and the full host feature manifest
 remain separate release requirements.
@@ -1338,7 +1348,7 @@ effect and its durable terminal record.
 3. Add remote connections/OAuth/registry, then Apps and Tasks. Remote write
    scopes remain gated on [#596](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/596).
 4. Complete the native-A2A callers and storage migration, then publish/test
-   the coordinated Core dependency cutover with **SDK >=0.42.2**. Re-survey
+   the coordinated Core dependency cutover with **SDK >=0.42.3**. Re-survey
    consumers and update their actual callers and constraints: the recorded
    survey found Core ceilings below 0.54 in Talon/Features and SDK ceilings
    below 0.40 in Telegram, Talon, Features and editable Claws/Eye/Flight.

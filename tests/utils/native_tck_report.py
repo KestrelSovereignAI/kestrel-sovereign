@@ -19,7 +19,7 @@ def validate_tck_report(
     reports: Path, *, level: str, returncode: int,
     provenance_dir: Path | None = None,
 ) -> dict:
-    """Reject MUST regressions and runner errors; retain advisory failures.
+    """Reject failed checks and runner errors; preserve explicit coverage gaps.
 
     COVERAGE.json is an exact reviewed observation matrix, including missing
     probes, conditional skips and manual checks. It is not a waiver or a claim
@@ -32,7 +32,7 @@ def validate_tck_report(
     provenance = provenance_dir or Path(__file__).resolve().parents[1] / "interop/a2a_tck"
     source = tomllib.loads((provenance / "SOURCE.toml").read_text())
     profile = json.loads((provenance / "COVERAGE.json").read_text())
-    if profile["schema_version"] != 1 or (
+    if profile["schema_version"] != 2 or (
         profile["patched_tree"], profile["protocol_version"]
     ) != (source["patched_tree"], source["protocol_version"]):
         raise ValueError("TCK coverage profile differs from the reviewed source")
@@ -44,6 +44,18 @@ def validate_tck_report(
         not reason.strip() for reason in profile["unverified_requirements"].values()
     ):
         raise ValueError("TCK coverage gaps need an explicit reviewed description")
+
+    advisories = profile.get("required_advisory_requirements")
+    if not isinstance(advisories, dict) or not advisories or any(
+        not isinstance(row, dict)
+        or row.get("level") not in {"SHOULD", "MAY"}
+        or row.get("status") != "PASS"
+        or not row.get("transports")
+        or set(row["transports"].values()) != {"PASS"}
+        or not row.get("test_ids")
+        for row in advisories.values()
+    ):
+        raise ValueError("TCK advisory coverage profile requires passing probes")
 
     report = json.loads((reports / "compatibility.json").read_text())
     requirements = report["per_requirement"]
@@ -59,6 +71,15 @@ def validate_tck_report(
         changed = sorted(key for key in actual.keys() | expected.keys()
                          if actual.get(key) != expected.get(key))
         raise ValueError(f"TCK MUST coverage changed; review the raw evidence: {changed}")
+    if level == "full":
+        for key, expected_row in advisories.items():
+            row = requirements.get(key)
+            if not isinstance(row, dict) or any(
+                row.get(field) != expected_row[field]
+                for field in ("level", "status", "transports")
+            ) or set(row.get("test_ids", ())) != set(expected_row["test_ids"]):
+                raise ValueError(f"TCK advisory coverage changed; review raw evidence: {key}")
+
     summary = report["summary"]
     if summary["score_scope"] != "automated" or (
         summary["must_compatibility"] != profile["must_compatibility"]
@@ -86,11 +107,15 @@ def validate_tck_report(
         raise ValueError("TCK exit status and JUnit failures disagree")
     if level == "must" and failures:
         raise ValueError("TCK MUST-only run has failed checks")
-    for identity in failures:
-        mapped = [row for row in requirements.values()
-                  if any(_junit_address(node) == identity for node in row["test_ids"])]
-        if not mapped or any(row["level"] == "MUST" or row["status"] != "FAIL" for row in mapped):
-            raise ValueError(f"TCK failure is not solely an advisory requirement: {identity}")
+    if level == "full" and failures:
+        raise ValueError("TCK full profile has failed checks")
+    if level == "full":
+        for key, row in requirements.items():
+            if row["status"] == "FAIL" or "FAIL" in row["transports"].values():
+                raise ValueError(f"TCK full profile reports failed requirement: {key}")
+        for key, row in advisories.items():
+            if any(outcomes.get(_junit_address(node)) != "PASS" for node in row["test_ids"]):
+                raise ValueError(f"TCK advisory pass lacks passing JUnit probes: {key}")
     for key, row in requirements.items():
         if row["level"] == "MUST" and row["status"] == "PASS" and not any(
             outcomes.get(_junit_address(node)) == "PASS" for node in row["test_ids"]
