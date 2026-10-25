@@ -1218,6 +1218,8 @@ class KestrelAgent(
         # Resident services belong to the immutable runtime, not the short
         # scheduler/request admission that happened to cause its cold boot.
         self._runtime_publication_ready = asyncio.Event()
+        self._maintenance_boot = False
+        self._maintenance_expected_features = None
         # Production launchers bind the fleet control store before initialize.
         # Direct construction remains supported for embedding/tests; only an
         # explicit binding activates the durable turn-start admission seam.
@@ -2632,7 +2634,7 @@ class KestrelAgent(
             self._boot_state = new_state
             ready = getattr(self, "_runtime_publication_ready", None)
             if isinstance(ready, asyncio.Event):
-                if new_state is BootPhaseState.READY:
+                if new_state is BootPhaseState.READY and not self.maintenance_boot:
                     ready.set()
                 else:
                     ready.clear()
@@ -3556,7 +3558,7 @@ class KestrelAgent(
         # Targets are ordered by trust: Sovereign → Federated → Delegated → Expedient.
         # Snapshots fire on shutdown, scheduled backup, or explicit !backup command.
         self._sync_service = None
-        if self._db_backend.lower() != "postgres" and self._sync_enabled:
+        if self._db_backend.lower() != "postgres" and self._sync_enabled and not self.maintenance_boot:
             try:
                 from kestrel_sovereign.storage.sync.targets import (
                     GCSTarget,
@@ -4130,7 +4132,7 @@ class KestrelAgent(
         logging.info("State initialized")
 
         # Fire SESSION_START hook
-        if self.hooks_manager:
+        if self.hooks_manager and not self.maintenance_boot:
             from kestrel_sdk.hooks.base import HookEvent, HookInput
             hook_input = HookInput(
                 session_id="agent_init",
@@ -4555,7 +4557,7 @@ class KestrelAgent(
         # summaries on every prune) and the periodic janitor have a
         # live worker to talk to. Without this hook the salvage rows
         # would stay in ``pointer-only`` forever — codex round 1 #3.
-        if hasattr(self, "context_manager") and self.context_manager:
+        if not self.maintenance_boot and hasattr(self, "context_manager") and self.context_manager:
             try:
                 await self.context_manager.start_salvage_worker()
                 ctx.on_rollback("salvage_worker", self._boot_teardown_salvage)
@@ -4608,24 +4610,30 @@ class KestrelAgent(
         # callbacks. Repair any commit->callback crash gap before starting the
         # consumers: privacy-elided durable rows need the live task envelope
         # presented once before a drainer may claim their marker-only replay.
+        if not self.maintenance_boot:
+            await self._start_a2a_cognition_runtime()
+
+        # Ready hooks are business startup too; a maintenance generation never
+        # completes them, including after its native SafeMode transition.
+        await self._run_or_defer_agent_ready_hooks()
+
+    async def _start_a2a_cognition_runtime(self) -> None:
+        from kestrel_sovereign.agent.runtime_start import require_runtime_start_allowed
+
+        require_runtime_start_allowed(self)
         await self.reconcile_a2a_cognition_wakes()
         from kestrel_sovereign.signals.sources import a2a_cognition_consumers
 
         for consumer_id, _source in a2a_cognition_consumers():
             await self.dispatcher.start_durable_cognition_consumer(consumer_id)
 
-        # All subsystems are now up (memory system, context manager, dispatcher,
-        # LLM). On direct-agent boots, notify features now. Server-owned agents
-        # defer while the host owns the publication boundary or its host policy
-        # gate is closed: an on_agent_ready hook is allowed to await cognition,
-        # and awaiting that turn here while the server awaits initialize() is a
-        # circular gate wait. The server binds host context, publishes/onboards
-        # the agent, opens the gate, then completes this same hook pass.
-        await self._run_or_defer_agent_ready_hooks()
-
     @execution_work_operation
     async def _notify_agent_ready_hooks(self) -> None:
         """Run the best-effort ready-phase hook once services are usable."""
+
+        from kestrel_sovereign.agent.runtime_start import require_runtime_start_allowed
+
+        require_runtime_start_allowed(self)
 
         for feature in list(self.features.values()):
             ready_hook = getattr(feature, "on_agent_ready", None)
@@ -4666,7 +4674,7 @@ class KestrelAgent(
             if self._agent_ready_hooks_completed:
                 return
             gate = getattr(self, "_host_context_publication_gate", None)
-            if self._agent_readiness_host_owned or (
+            if self.maintenance_boot or self._agent_readiness_host_owned or (
                 gate is not None and not gate.is_set()
             ):
                 self._agent_ready_hooks_deferred = True
@@ -4675,24 +4683,71 @@ class KestrelAgent(
             self._agent_ready_hooks_deferred = False
             self._agent_ready_hooks_completed = True
 
-    def defer_agent_readiness_to_host(self) -> None:
+    @property
+    def maintenance_boot(self) -> bool:
+        """One-way, process-local startup hold; never a durable safety waiver."""
+        return getattr(self, "_maintenance_boot", False) is True
+
+    def defer_agent_readiness_to_host(
+        self,
+        *,
+        maintenance: bool = False,
+        expected_features: Optional[set[str] | frozenset[str]] = None,
+    ) -> None:
         """Transfer the initial ready-hook pass to a publishing host.
 
         The host must claim this boundary before :meth:`initialize`.  Its
         post-onboarding path later calls
         :meth:`complete_deferred_agent_readiness`; an already-open context gate
         does not weaken that registration boundary.
+
+        ``maintenance=True`` additionally holds resident publication, Core
+        inline business startup and participating feature startup. Claim it
+        before initialize(). This generation cannot later serve: native
+        SafeMode exit does not release the hold, and there is no release API.
+        Shutdown it completely and construct a normal generation for serving.
+        Features still construct their real contributions; this is not a
+        reduced-feature boot or a sandbox for arbitrary third-party code.
+        To certify lifecycle repair, bind the COMPLETE expected feature-name
+        inventory here (mandatory features are included automatically). It is
+        copied/frozen before boot. An unspecified inventory permits diagnostic
+        maintenance boot, but can never certify feature-lifecycle repair.
         """
+
+        if type(maintenance) is not bool:
+            raise TypeError("maintenance must be a boolean")
+        if expected_features is not None and not maintenance:
+            raise ValueError("expected_features requires maintenance boot")
+        if maintenance and self._boot_state is not BootPhaseState.NOT_STARTED:
+            raise RuntimeError("maintenance must be claimed before initialize()")
+        expected = None
+        if expected_features is not None:
+            if not isinstance(expected_features, (set, frozenset)) or not expected_features:
+                raise ValueError("expected_features must be a nonempty set of feature names")
+            if any(type(name) is not str or not name.isidentifier() for name in expected_features):
+                raise ValueError("expected_features contains an invalid feature name")
+            from kestrel_sovereign.multi_agent.config import MANDATORY_FEATURES
+
+            expected = frozenset(expected_features) | frozenset(MANDATORY_FEATURES)
+        if maintenance and self.maintenance_boot and expected != self._maintenance_expected_features:
+            raise RuntimeError("maintenance feature inventory cannot be replaced")
 
         if self._agent_ready_hooks_completed:
             raise RuntimeError(
                 "cannot transfer agent readiness after ready hooks completed"
             )
         self._agent_readiness_host_owned = True
+        if maintenance:
+            self._maintenance_expected_features = expected
+            self._maintenance_boot = True
 
     @execution_work_operation
     async def complete_deferred_agent_readiness(self) -> None:
         """Complete the server-deferred ready hooks after host publication."""
+
+        from kestrel_sovereign.agent.runtime_start import require_runtime_start_allowed
+
+        require_runtime_start_allowed(self)
 
         async with self._agent_readiness_lock():
             if not bool(getattr(self, "_agent_ready_hooks_deferred", False)):
@@ -6460,9 +6515,21 @@ class KestrelAgent(
             return False
         if self._boot_state is not BootPhaseState.READY:
             return False
+        from kestrel_sovereign.agent.runtime_start import maintenance_boot_active
+
         runtime = getattr(self, "feature_contribution_runtime", None)
         if runtime is None:
             return False
+        if maintenance_boot_active(self):
+            expected = getattr(self, "_maintenance_expected_features", None)
+            if not expected or set(self.features) != expected:
+                return False
+            # Product/provider availability (e.g. VisualIdentity.enabled)
+            # is not native lifecycle activation. Check the original registry
+            # identity for EVERY loaded feature, including zero-contribution
+            # features; a valid remaining registry alone is insufficient.
+            if any(not runtime.is_active(feature) for feature in self.features.values()):
+                return False
         try:
             return runtime.validate_active_integrity() is True
         except Exception as exc:  # noqa: BLE001 - report type, remain restricted
@@ -7304,6 +7371,8 @@ class KestrelAgent(
         """
 
         require_feature_lifecycle_integrity(self)
+        if self.maintenance_boot:
+            return
         ready_hook = getattr(feature, "on_agent_ready", None)
         if ready_hook is not None:
             try:
