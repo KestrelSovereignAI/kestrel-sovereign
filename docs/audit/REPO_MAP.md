@@ -19,7 +19,7 @@ Auto-generated file-tree + per-file purpose index. Always-loaded context for the
 GitHub App (issue #791). Do **not** edit by hand — regenerate via `python scripts/generate_repo_map.py`.
 
 **Generated:** 2026-10-25
-**Scope:** 3357 tracked files (2515 `.py`, 367 `.md`, 475 other). Excludes `__pycache__`, `node_modules`, `.venv`, `.claude`, build artifacts.
+**Scope:** 3358 tracked files (2516 `.py`, 367 `.md`, 475 other). Excludes `__pycache__`, `node_modules`, `.venv`, `.claude`, build artifacts.
 
 **Format per file:** `path — one-line purpose` plus the public top-level Python symbols on the next line
 (classes and functions; private `_name` skipped).
@@ -3467,6 +3467,8 @@ Repo entry points and standard project files.
   - `async def test_a_foreign_revision_of_our_assertion_is_not_retracted(governed, ledger)`; `async def test_our_own_current_revision_is_still_ours(governed, ledger)`
 - **tests/unit/test_3051_r6_unpersisted_mutation_projection_repro.py** — Round-6 reproduction (#3306 / #3320): a failed save authorized a retraction.
   - `async def test_a_failed_supersede_does_not_retract_through_a_paused_projection(wired, tmp_path)`; `async def test_a_supersede_that_later_persists_still_retracts_on_the_next_pass(wired, tmp_path)`; `async def test_a_successful_supersede_during_a_paused_projection_retracts(wired, tmp_path)`; `async def test_an_older_snapshot_is_refused_after_a_newer_one_projected(governed, ledger)`; `def test_a_snapshot_cannot_see_a_later_mutation(ledger)`; `def test_a_failed_save_does_not_advance_the_confirmed_snapshot(ledger)`
+- **tests/unit/test_a2a_cognition_retry_recovery.py** — An original A2A retry fence must not prevent replacement-host boot.
+  - `def private(request)`; `def completed(request)`; `async def retry_pair(manager, native_a2a_backend_factory, private, completed)`; `async def test_boot_reconcile_preserves_original_a2a_retry_until_owner_retires(retry_pair, recovery)`; `async def refused_retry(pair, signal)`; `async def test_owned_retry_without_authoritative_rehydration_is_not_checkpointable(retry_pair, monkeypatch, missing)`; `async def test_owned_retry_does_not_bypass_original_private_integrity(retry_pair)`; `async def test_original_channel_retry_does_not_advance_provider_cursor(tmp_path, private)`
 - **tests/unit/test_a2a_did_registry.py** — A2A verification-document lookup and signed-envelope verification.
   - `def test_resolves_known_hybrid_agent_to_doc_with_vms()`; `def test_unknown_did_resolves_none()`; `def test_legacy_non_hybrid_agent_not_resolvable()`; `def test_install_injects_distinct_verification_resolver_per_agent()`; `def test_federated_fallback_off_by_default_returns_none()`; `def test_resolver_is_document_lookup_not_peer_authorization()`; `async def test_resolver_composes_with_native_proof_verifier(native_request_admission)`; `async def test_tampered_native_request_rejected_through_resolver(native_request_admission)`; `…`
 - **tests/unit/test_a2a_inbound_authorization.py** — Recipient-scoped authorization after successful A2A DID verification.

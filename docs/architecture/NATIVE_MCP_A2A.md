@@ -963,6 +963,16 @@ runtimes exclude the original live owner's retry. Candidate listing and native
 claims use the same configured stale-owner cutoff. A stopped or stale owner
 still permits the existing at-least-once crash recovery with a fresh token.
 
+A2A boot reconciliation can recognize a retained retry as a durable duplicate
+without claiming it, after the normal source-integrity checks. This requires
+the exact native A2A consumer/source contract, original managed owner/token,
+and the agent's authoritative rehydration hook and source declaration. It
+prevents an unexpired predecessor owner from refusing replacement-host boot;
+the drainer still waits for that owner to stop or become stale. Channel retry
+receipts remain non-checkpointable, so a provider cannot discard a private
+envelope that its source cannot rebuild. Real two-runtime task-store and
+privacy-mode recovery cases cover this in `test_a2a_cognition_retry_recovery.py`.
+
 Genuine native control loss terminalizes the exact original
 agent/consumer/delivery/owner/token as failed, non-ACKable work. Shutdown retains
 the owner's liveness while an original cognition body resists cancellation,

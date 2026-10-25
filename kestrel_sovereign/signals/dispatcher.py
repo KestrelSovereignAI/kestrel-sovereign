@@ -5146,11 +5146,24 @@ class SignalDispatcher:
                     ),
                     registration=registration,
                 )
-            if existing is not None and existing.status == LEASED:
-                # Another live runtime can already own this exact durable
-                # wake. That is checkpoint-safe duplicate admission: the row
-                # remains recoverable through its managed owner/lease even
-                # though this dispatcher must not steal or execute it.
+            from kestrel_sovereign.signals.sources import a2a_cognition_consumers
+
+            rebuildable_a2a_retry = (
+                existing is not None and existing.status == RETRY
+                and (existing.consumer_id, existing.event.source) in a2a_cognition_consumers()
+                and existing.event.source in self._durable_rebuildable_sources()
+                and isinstance(existing.lease_owner, str)
+                and existing.lease_owner.startswith("dispatcher:")
+                and bool(existing.lease_token)
+            )
+            if existing is not None and (existing.status == LEASED or rebuildable_a2a_retry):
+                # Another runtime can own this exact wake, including an A2A
+                # retry whose original release/cleanup still holds its token.
+                # The authoritative A2A store can rebuild it after owner death;
+                # boot reconciliation need not acquire it to prove admission.
+                # The normal integrity check above still precedes this result.
+                # Channel RETRY rows are deliberately excluded: advancing a
+                # provider cursor could lose an unrebuildable private envelope.
                 if durable_admission is not None and not durable_admission.done():
                     durable_admission.set_result(
                         DurableAdmissionResult(
@@ -5163,7 +5176,7 @@ class SignalDispatcher:
                     start,
                     Status.COALESCED,
                     error=(
-                        "Duplicate source event ID is already leased by its "
+                        "Duplicate source event ID is already owned by its "
                         f"durable consumer {consumer_id}"
                     ),
                     registration=registration,
