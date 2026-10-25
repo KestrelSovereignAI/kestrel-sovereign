@@ -115,10 +115,10 @@ class _FakeAgent:
     def __init__(self):
         self.background_tasks: list = []
 
-    def _track_background_task(self, coro, *, name):
-        import asyncio
+    def _track_background_task(self, coro, *, name, admission=None):
+        from kestrel_sovereign._async_ownership import create_owned_task
 
-        task = asyncio.create_task(coro, name=name)
+        task = create_owned_task(coro, name=name, admission=admission)
         self.background_tasks.append(task)
         return task
 

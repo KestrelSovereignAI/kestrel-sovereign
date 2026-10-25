@@ -1,3 +1,19 @@
+---
+type: Architecture Spec
+title: Hosted feature recovery without business startup
+description: Permanent attended maintenance boot policy with exact feature inventory and native lifecycle verification.
+resource: /docs/architecture/MAINTENANCE_FEATURE_RECOVERY.md
+status: proposed
+privacy: public
+owner: architecture
+canonical: false
+generated: false
+tags:
+- lifecycle
+- recovery
+- features
+---
+
 # Hosted feature recovery without business startup
 
 An attended host may need to reconstruct an existing agent's full feature

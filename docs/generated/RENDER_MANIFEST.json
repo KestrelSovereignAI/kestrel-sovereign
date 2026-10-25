@@ -376,6 +376,18 @@
       "findings": [],
       "missing_code_refs": [],
       "missing_links": [],
+      "path": "docs/architecture/MAINTENANCE_FEATURE_RECOVERY.md",
+      "privacy": "public",
+      "render": "public",
+      "status": "proposed",
+      "title": "Hosted feature recovery without business startup",
+      "type": "Architecture Spec"
+    },
+    {
+      "existing_code_refs": [],
+      "findings": [],
+      "missing_code_refs": [],
+      "missing_links": [],
       "path": "docs/architecture/MEMORY_OWNERSHIP.md",
       "privacy": "public",
       "render": "public",
@@ -4665,6 +4677,18 @@
       "render": "public",
       "status": "proposed",
       "title": "Core 0.53.35",
+      "type": "Release Note"
+    },
+    {
+      "existing_code_refs": [],
+      "findings": [],
+      "missing_code_refs": [],
+      "missing_links": [],
+      "path": "docs/releases/v0.53.44.md",
+      "privacy": "public",
+      "render": "public",
+      "status": "proposed",
+      "title": "Core 0.53.44",
       "type": "Release Note"
     },
     {

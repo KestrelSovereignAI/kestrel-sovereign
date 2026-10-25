@@ -15,7 +15,14 @@ from kestrel_sovereign.inception_service import create_kestrel_identity_async
 from kestrel_sovereign.kestrel_agent import KestrelAgent
 from kestrel_sovereign.llm.service import LLMService
 from kestrel_sovereign.multi_agent.config import MANDATORY_FEATURES
-from tests.shared.native_shutdown_budget import shutdown_fixture_agent
+
+
+async def shutdown_fixture_agent(agent):
+    """Use the stable line's public original shutdown/completion boundaries."""
+    try:
+        await agent.shutdown()
+    finally:
+        await agent.wait_for_shutdown_completion()
 
 
 def no_provider_policy():

@@ -6547,8 +6547,10 @@ class KestrelAgent(
             return False
         if self._boot_state is not BootPhaseState.READY:
             return False
-        if self.maintenance_boot:
-            expected = self._maintenance_expected_features
+        from kestrel_sovereign.agent.runtime_start import maintenance_boot_active
+
+        if maintenance_boot_active(self):
+            expected = getattr(self, "_maintenance_expected_features", None)
             if not expected or set(self.features) != expected:
                 return False
             # Native boot registration treats a missing optional enabled flag
