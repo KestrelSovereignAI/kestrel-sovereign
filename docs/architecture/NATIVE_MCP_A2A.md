@@ -948,6 +948,43 @@ API key as peer authority. Drain or explicitly stop old in-flight work during th
 upgrade; mixed draft/new workers are unsupported. Rollback requires the saved
 pre-migration database and a coherent old host/SDK set, not a parallel handler.
 
+### Durable cognition cleanup
+
+Core's channel, A2A task-submitted, task-complete and question-answer consumers
+share the `core_cognition_consumers()` inventory. A2A startup registers and
+starts the same `a2a_cognition_consumers()` contracts consumed by both stores.
+An unrelated durable subscription does not gain fixed native cleanup authority
+from a dispatcher-like executor name.
+
+A retry release retains its original managed owner/token until a trusted
+re-claim or terminal write replaces or clears it. NACK, Hold deferral and
+retained-task release share that rule. The resident store excludes its pending
+or failed native release receipt; only that local fence ends when the native
+acknowledgement settles. Separate runtimes exclude the original live owner's
+retry. Candidate listing and native
+claims use the same configured stale-owner cutoff. A stopped or stale owner
+still permits the existing at-least-once crash recovery with a fresh token.
+
+A2A boot reconciliation can recognize a retained retry as a durable duplicate
+without claiming it, after the normal source-integrity checks. This requires
+the exact native A2A consumer/source contract, original managed owner/token,
+and the agent's authoritative rehydration hook and source declaration. It
+prevents an unexpired predecessor owner from refusing replacement-host boot;
+the drainer still waits for that owner to stop or become stale. Channel retry
+receipts remain non-checkpointable, so a provider cannot discard a private
+envelope that its source cannot rebuild. Real two-runtime task-store and
+privacy-mode recovery cases cover this in `test_a2a_cognition_retry_recovery.py`.
+
+Genuine native control loss terminalizes the exact original
+agent/consumer/delivery/owner/token as failed, non-ACKable work. Shutdown retains
+the owner's liveness while an original cognition body resists cancellation,
+and releases that owner only after the body and terminal receipt settle.
+Cleanup cannot acquire work, acknowledge a provider cursor, replace a successor
+or reopen ordinary execution. The source-specific SQLite and PostgreSQL
+contracts are exercised in `test_sqlite_cognition_shutdown_terminal.py` and
+`test_a2a_cognition_cleanup.py`; initialized-agent startup is checked in
+`test_native_drainer_shutdown.py`.
+
 ### Retired surface coverage
 
 The cutover deletes the private task worker, local-submission and envelope

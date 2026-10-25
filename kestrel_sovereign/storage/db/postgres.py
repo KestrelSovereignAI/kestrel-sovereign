@@ -2551,9 +2551,7 @@ class PostgresBackend(DatabaseBackend):
         It serializes with canonical owner recovery using its exact key.
         """
         from kestrel_sovereign.signals.durable import DurableSignalStore
-        from kestrel_sovereign.signals.sources.channels import (
-            DURABLE_COGNITION_CONSUMER_ID,
-        )
+        from kestrel_sovereign.signals.sources import core_cognition_consumers
 
         if any(type(value) is not str or not value.strip() for value in (agent_id, owner_id)):
             raise ValueError("cognition cleanup requires exact owner identities")
@@ -2577,10 +2575,10 @@ class PostgresBackend(DatabaseBackend):
                         "AND owner.stopped_at IS NULL AND EXISTS ("
                         f"SELECT 1 FROM {DurableSignalStore.DELIVERIES} delivery "
                         "WHERE delivery.agent_id = $1 AND delivery.lease_owner = $2 "
-                        "AND delivery.consumer_id = $3 "
+                        "AND delivery.consumer_id = ANY($3::text[]) "
                         "AND delivery.status IN ('leased', 'retry') "
                         "AND delivery.lease_token IS NOT NULL)",
-                        agent_id, owner_id, DURABLE_COGNITION_CONSUMER_ID,
+                        agent_id, owner_id, list(dict(core_cognition_consumers())),
                     )
                     return result == "UPDATE 1"
 
@@ -2595,14 +2593,12 @@ class PostgresBackend(DatabaseBackend):
         new lease, acknowledge a provider cursor, or overwrite a successor.
         """
         from kestrel_sovereign.signals.durable import DurableSignalStore
-        from kestrel_sovereign.signals.sources.channels import (
-            DURABLE_COGNITION_CONSUMER_ID,
-        )
+        from kestrel_sovereign.signals.sources import core_cognition_consumers
 
         identities = (agent_id, consumer_id, delivery_id, owner_id, lease_token, error)
         if any(type(value) is not str or not value.strip() for value in identities):
             raise ValueError("cognition terminal custody requires exact identities")
-        if consumer_id != DURABLE_COGNITION_CONSUMER_ID or not owner_id.startswith("dispatcher:"):
+        if consumer_id not in dict(core_cognition_consumers()) or not owner_id.startswith("dispatcher:"):
             raise ValueError("cognition terminal custody requires its managed consumer")
         pool = self._pool
         if pool is None:
