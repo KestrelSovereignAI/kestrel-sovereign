@@ -2868,6 +2868,16 @@ class SignalDispatcher:
             await self._release_expired_initial_handoffs()
             return len(purged)
 
+    async def purge_expired_signal_log(self, *, max_rows: int) -> int:
+        """Run this agent's ``signal_log`` retention sweep (#3785).
+
+        Deletes at most *max_rows* of this agent's outcome rows whose
+        per-source ``retention_until`` has passed, and returns the count.
+        """
+        return await self._store.purge_expired(
+            target_agent=self._agent.did, max_rows=max_rows
+        )
+
     async def shutdown_durable_delivery(self) -> bool:
         """Close admission, drain committed work, then release this owner.
 

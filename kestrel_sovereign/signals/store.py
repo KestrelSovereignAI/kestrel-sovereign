@@ -8,8 +8,8 @@ Privacy is first-class here, not bolted on later (per SIGNAL_DISPATCHER.md
 - Caller identifier is redacted by default to role/scope.
 - Causation chain is stored as digest; full chain is reconstructible from
   individual entries via signal_id joins.
-- Retention is per-source via `registration.retention_days`; a sweep ACTION
-  signal handles deletion.
+- Retention is per-source via `registration.retention_days`; the
+  `trash_retention` maintenance rail deletes expired rows.
 
 The redaction policy runs BEFORE the row hits the database. There is no
 encrypted-at-rest fallback; if a redaction policy is too permissive, raw
@@ -35,6 +35,10 @@ from kestrel_sdk.signals import (
 )
 from kestrel_sovereign.a2a.stores.unified.base import UnifiedStoreBase
 from kestrel_sovereign.storage.db.interface import DatabaseBackend
+from kestrel_sovereign.storage.retention import (
+    DEFAULT_TELEMETRY_MAX_ROWS_PER_SWEEP,
+    delete_rows_in_batches,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -515,11 +519,29 @@ class SignalLogStore(UnifiedStoreBase):
     # Retention sweep
     # ------------------------------------------------------------------
 
-    async def purge_expired(self, *, now: Optional[datetime] = None) -> int:
-        """Delete rows past their `retention_until`. Called by the
-        retention-sweep ACTION signal (registered separately)."""
+    async def purge_expired(
+        self,
+        *,
+        target_agent: str,
+        now: Optional[datetime] = None,
+        max_rows: int = DEFAULT_TELEMETRY_MAX_ROWS_PER_SWEEP,
+    ) -> int:
+        """Delete one agent's rows past their `retention_until`.
+
+        Called by the ``trash_retention`` maintenance rail through
+        ``SignalDispatcher.purge_expired_signal_log`` (#3785); before that
+        nothing called it, and every row outlived its source's window.
+        ``target_agent`` is mandatory because agents sharing a PostgreSQL
+        database share this table. Deletes at most ``max_rows`` rows, in
+        batches; returns how many it deleted.
+        """
+        if not isinstance(target_agent, str) or not target_agent.strip():
+            raise ValueError("target_agent must be a non-empty string")
         cutoff = now if now is not None else datetime.now(timezone.utc)
-        return await self._backend.execute(
-            f"DELETE FROM {self.TABLE} WHERE retention_until < ?",
-            (self.to_timestamp_param(cutoff),),
+        return await delete_rows_in_batches(
+            self._backend,
+            table=self.TABLE,
+            predicate="candidate.target_agent = ? AND candidate.retention_until < ?",
+            params=(target_agent, self.to_timestamp_param(cutoff)),
+            max_rows=max_rows,
         )

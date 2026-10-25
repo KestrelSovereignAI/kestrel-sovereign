@@ -243,6 +243,13 @@ PROJECT_ROOT_ENV = "KESTREL_PROJECT_ROOT"
 #: a variable's shape, not its prefix.
 TRAINING_WORKING_DIR_ENV = "LOCAL_MPS_WORKING_DIR"
 
+#: The root database copies are written under before a destructive write,
+#: such as a forced constitution reanchor (see :func:`backup_dir`).
+BACKUP_DIR_ENV = "KESTREL_BACKUP_DIR"
+
+#: The backup root's default name, below the project directory.
+DEFAULT_BACKUP_DIRNAME = "backups"
+
 #: The ``multi_agent.toml`` a host loads (see ``server.resolve_multi_agent_path``).
 #: A file, not a root, but it names every hosted agent's data and
 #: identity-export directory, so choosing it chooses where agent state lives.
@@ -271,6 +278,7 @@ RUNTIME_PATH_ENV_NAMES: tuple[str, ...] = (
     PROJECT_ROOT_ENV,
     MULTI_AGENT_CONFIG_ENV,
     TRAINING_WORKING_DIR_ENV,
+    BACKUP_DIR_ENV,
 )
 
 #: Test-harness seam (#3286): ``os.pathsep``-separated roots that every
@@ -373,6 +381,32 @@ def host_data_dir() -> Path:
     return guard_storage_path(
         Path(os.path.abspath(base / "host-data")), source="host data root"
     )
+
+
+def backup_dir(project: Path, *, environ: Mapping[str, str] | None = None) -> Path:
+    """Resolve the root database copies are written under (#3785).
+
+    ``KESTREL_BACKUP_DIR`` from *environ* (``os.environ`` when None), resolved
+    against *project* when relative; unset, ``<project>/backups``. Resolution
+    has no filesystem side effects: the writer creates and validates the
+    directory. A variable set to an empty value raises ``ValueError`` rather
+    than being read as unset, because a path the operator blanked out is not
+    the default they did not ask for.
+    """
+    value = runtime_path_env(BACKUP_DIR_ENV, environ=environ, base=Path(project))
+    if value is None:
+        root = Path(project) / DEFAULT_BACKUP_DIRNAME
+    elif not value.strip():
+        raise ValueError(
+            f"{BACKUP_DIR_ENV} is set but empty; name the directory database "
+            f"copies go under, or unset it to use "
+            f"{Path(project) / DEFAULT_BACKUP_DIRNAME}"
+        )
+    else:
+        root = Path(value).expanduser()
+        if not root.is_absolute():
+            root = Path(project) / root
+    return guard_storage_path(Path(os.path.abspath(root)), source="backup root")
 
 
 @lru_cache(maxsize=64)

@@ -1322,3 +1322,70 @@ def test_reanchor_defaults_to_the_agents_configured_descriptor(reanchor_env):
     assert captured["source_descriptor_path"] == Path(
         "/secure/test-source.signed.json"
     )
+
+
+# ---------------------------------------------------------------------------
+# Where the backup goes (#3785)
+# ---------------------------------------------------------------------------
+
+def test_reanchor_backs_up_under_the_projects_backup_root(reanchor_env, capsys):
+    """Copies no longer pile up beside the agent database: the CLI hands the
+    helper the project's backup root, and names it before any write."""
+    args = _parse(["constitution", "reanchor", "--agent-name", "Test"])
+    result = ReanchorResult(
+        agent_name="Test",
+        db_path=reanchor_env / "agent_data" / "Test" / "kestrel_prime.db",
+        canonical_path=Path("/fake/canonical.md"),
+        old_hash="a" * 64,
+        new_hash="b" * 64,
+        backup_path=None,
+        drift_unforced=True,
+    )
+    seen: dict = {}
+
+    async def _capture(**kwargs):
+        seen.update(kwargs)
+        return result
+
+    with patch("kestrel_sovereign.cli._get_project_dir", return_value=reanchor_env), \
+         patch("kestrel_sovereign.cli._agent_appears_running", return_value=False), \
+         patch(
+             "kestrel_sovereign.setup.constitution_reanchor.reanchor_constitution",
+             side_effect=_capture,
+         ):
+        assert cmd_constitution(args) == 1
+
+    assert seen["backup_root"] == reanchor_env / "backups"
+    out = capsys.readouterr().out
+    assert f"backed up under {reanchor_env / 'backups'}" in out
+    assert "-reanchor/Test/kestrel_prime.db.backup-<timestamp>" in out
+
+
+def test_reanchor_reads_the_backup_root_from_the_agent_homes_env(
+    reanchor_env, restore_environ,
+):
+    (reanchor_env / ".env").write_text("KESTREL_BACKUP_DIR=offsite/kestrel\n")
+
+    captured = _capture_reanchor_kwargs(
+        reanchor_env, ["constitution", "reanchor", "--agent-name", "Test"]
+    )
+
+    assert captured["backup_root"] == reanchor_env / "offsite" / "kestrel"
+
+
+def test_reanchor_refuses_a_blank_backup_root(reanchor_env, restore_environ, capsys):
+    (reanchor_env / ".env").write_text("KESTREL_BACKUP_DIR=\n")
+    args = _parse(["constitution", "reanchor", "--agent-name", "Test", "--force"])
+
+    async def _must_not_run(**_kwargs):
+        raise AssertionError("nothing is read or written with a blank backup root")
+
+    with patch("kestrel_sovereign.cli._get_project_dir", return_value=reanchor_env), \
+         patch("kestrel_sovereign.cli._agent_appears_running", return_value=False), \
+         patch(
+             "kestrel_sovereign.setup.constitution_reanchor.reanchor_constitution",
+             side_effect=_must_not_run,
+         ):
+        assert cmd_constitution(args) == 2
+
+    assert "KESTREL_BACKUP_DIR is set but empty" in capsys.readouterr().err

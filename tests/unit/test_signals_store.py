@@ -327,12 +327,62 @@ async def test_purge_expired_deletes_only_old_rows(store):
     # Sweep with a clock 7 days in the future — short-retention row expired,
     # long-retention row not yet.
     future = datetime.now(timezone.utc) + timedelta(days=7)
-    deleted = await store.purge_expired(now=future)
+    deleted = await store.purge_expired(target_agent="agent-1", now=future)
     assert deleted == 1
 
     rows = await store.backend.fetch_all("SELECT source FROM signal_log")
     assert [r[0] for r in rows] == ["new"]
 
+
+
+def _signal_for(target_agent: str, source: str = "test") -> Signal:
+    return Signal(
+        source=source,
+        kind="tick",
+        mode=SignalMode.ACTION,
+        payload={"a": 1},
+        target_agent=target_agent,
+    )
+
+
+@pytest.mark.asyncio
+async def test_purge_expired_sweeps_only_its_own_agent(store):
+    """#3785: agents sharing a PostgreSQL database share ``signal_log``; one
+    agent's sweep must leave another agent's expired rows to that agent."""
+    for target in ("agent-1", "agent-2"):
+        sig = _signal_for(target)
+        await store.append(sig, _registration(retention_days=1), _ok_result(sig))
+
+    future = datetime.now(timezone.utc) + timedelta(days=7)
+    assert await store.purge_expired(target_agent="agent-1", now=future) == 1
+
+    rows = await store.backend.fetch_all("SELECT target_agent FROM signal_log")
+    assert [r[0] for r in rows] == ["agent-2"]
+
+
+@pytest.mark.asyncio
+async def test_purge_expired_stops_at_max_rows(store):
+    for _ in range(5):
+        sig = _signal_for("agent-1")
+        await store.append(sig, _registration(retention_days=1), _ok_result(sig))
+
+    future = datetime.now(timezone.utc) + timedelta(days=7)
+    assert await store.purge_expired(
+        target_agent="agent-1", now=future, max_rows=3
+    ) == 3
+    assert await store.backend.fetch_val("SELECT COUNT(*) FROM signal_log") == 2
+    assert await store.purge_expired(target_agent="agent-1", now=future) == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("target_agent", ["", "   ", None])
+async def test_purge_expired_refuses_an_empty_scope(store, target_agent):
+    sig = _signal_for("agent-1")
+    await store.append(sig, _registration(retention_days=1), _ok_result(sig))
+    future = datetime.now(timezone.utc) + timedelta(days=7)
+    with pytest.raises(ValueError):
+        await store.purge_expired(target_agent=target_agent, now=future)
+    assert await store.backend.fetch_val("SELECT COUNT(*) FROM signal_log") == 1
 
 @pytest.mark.asyncio
 async def test_ordinary_alternate_table_append_and_retention(tmp_path):
@@ -347,7 +397,9 @@ async def test_ordinary_alternate_table_append_and_retention(tmp_path):
         await store.append(signal, _registration(retention_days=1), _ok_result(signal))
         assert await backend.fetch_val('SELECT COUNT(*) FROM alternate_signal_log') == 1
         assert not await backend.table_exists('signal_log')
-        assert await store.purge_expired(now=datetime.now(timezone.utc) + timedelta(days=2)) == 1
+        assert await store.purge_expired(
+            target_agent="agent-1", now=datetime.now(timezone.utc) + timedelta(days=2)
+        ) == 1
         assert await backend.fetch_val('SELECT COUNT(*) FROM alternate_signal_log') == 0
     finally:
         await backend.close()

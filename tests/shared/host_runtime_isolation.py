@@ -103,6 +103,8 @@ ISOLATED_LAYOUT: dict[str, Optional[str]] = {
     paths.MULTI_AGENT_CONFIG_ENV: "multi_agent.toml",
     # Unset, local MPS training defaults below the operator's real ``HOME``.
     paths.TRAINING_WORKING_DIR_ENV: "training",
+    # Unset, the backup root follows the pinned ``KESTREL_HOME``.
+    paths.BACKUP_DIR_ENV: None,
 }
 
 #: Below the session root: where the variables a test removes are pinned for

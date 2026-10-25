@@ -415,6 +415,55 @@ dependency-contract test checks the Core base/observability declarations and
 lockfile only, so downstream release verification remains an explicit release
 gate.
 
+### Agent database size, retention and backups
+
+Most of a large agent database is operational telemetry, not memory. Before
+#3785 four tables had no effective retention: `health_log` (one liveness
+result a minute, ~860 MB per agent), `task_execution_log` (every scheduled
+run, including the every-minute no-op ticks), `signal_log` (rows carried a
+per-source expiry, but nothing removed them) and `restart_status_events`.
+The `trash_retention` maintenance cron, every 6 hours, now removes their
+expired rows: up to `max_rows_per_sweep` per table per run, in small batches.
+The windows are `[telemetry_retention]` in `kestrel.toml`; see
+`kestrel.toml.example`. The cron's result in `!schedule history` reports each
+table's `rows_purged`, and `capped: true` while a backlog remains.
+
+`!health` includes a `database_size` check, so an agent can see its own
+database grow: the file size, the free pages only `VACUUM` returns to the
+filesystem, and the write-ahead log. It reports and never fails the probe.
+
+Removing rows does not shrink a SQLite file: freed pages are reused by later
+writes, so the file stops growing. To return the space once the cron reports
+no table `capped`, stop the host and vacuum each agent database. `VACUUM`
+needs about as much free disk as the database it rewrites.
+
+```bash
+kestrel terminate
+sqlite3 agent_data/<agent>/kestrel_prime.db "PRAGMA wal_checkpoint(TRUNCATE); VACUUM;"
+kestrel start
+```
+
+On PostgreSQL, autovacuum makes the freed rows reusable; `VACUUM FULL`
+returns the space but locks each table it rewrites.
+
+`kestrel constitution reanchor --force` copies a SQLite agent database before
+it writes. The copy goes under the backup root, `KESTREL_BACKUP_DIR` (read from
+the project `.env` or the environment; relative to the project directory), or
+`<project>/backups` when that is unset:
+
+```text
+<backup root>/<YYYY-MM-DD>-reanchor/<agent data dir>/kestrel_prime.db.backup-<YYYYmmdd-HHMMSS>
+```
+
+Before #3785 the copies were written beside the database, and nothing moved
+them. The copy is written as `kestrel_prime.db.partial-backup-<random>` in its
+final directory, flushed to disk, and only then given its final name, which is
+never overwritten; a copy that fails part-way leaves nothing under that name,
+and the reanchor refuses before writing anything. The backup root is created
+when missing, but never its parent, so a root on an unmounted volume is refused
+rather than recreated on the boot disk. Kestrel never deletes a copy: which
+ones to keep is the Sovereign's decision.
+
 ## Typical dev deploy flow
 
 ```bash

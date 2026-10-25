@@ -14,7 +14,10 @@ silently failing every tick with "Unknown task".
 Built-in cron sources (see ``signals/sources/scheduler.py`` CRON_TASKS):
     backup_snapshot       -- snapshot the agent's data via the sync service
     trash_retention       -- hard-purge soft-deleted conversation rows
-                             past their per-agent retention window (#764)
+                             past their per-agent retention window (#764),
+                             and age out operational telemetry (health_log,
+                             task_execution_log, signal_log,
+                             restart_status_events) (#3785)
     training_cycle        -- run a LoRA training cycle (ReflectionFeature)
     morning_signal        -- produce the daily briefing artifact
     strategy_reconcile_blockers -- resolve strategy-ledger blockers whose
@@ -2038,9 +2041,15 @@ class SchedulerFeature(Feature):
         user might still be reaching for. Operators can disable the
         rail entirely with ``!schedule pause <task_id>``.
 
+        Before the conversation sweep, and whatever it decides, the rail
+        also expires terminal durable-signal history, operator-notice
+        audit rows, and operational telemetry
+        (:meth:`_purge_operational_telemetry`), each isolated from the others.
+
         Args:
             args: Optional overrides — supports ``max_rows`` (int) for
-                the per-sweep cap. Empty dict is the common case.
+                the per-sweep cap of the conversation sweep. Empty dict is
+                the common case.
         """
         from datetime import datetime, timedelta, timezone
         from kestrel_sovereign.storage.retention import (
@@ -2072,7 +2081,7 @@ class SchedulerFeature(Feature):
                         exc,
                     )
 
-        durable_summary = (
+        maintenance_summary = (
             {"durable_signal_events_purged": durable_purged}
             if durable_purged is not None
             else {}
@@ -2083,9 +2092,18 @@ class SchedulerFeature(Feature):
         # conversation sweep below.
         notices_purged = await self._purge_operator_notice_audit()
         if notices_purged is not None:
-            durable_summary = {
-                **durable_summary,
+            maintenance_summary = {
+                **maintenance_summary,
                 "operator_notices_purged": notices_purged,
+            }
+
+        # Operational telemetry (#3785): the rows the agent writes about
+        # itself on a cadence. Same rail, same isolation rule.
+        telemetry = await self._purge_operational_telemetry()
+        if telemetry is not None:
+            maintenance_summary = {
+                **maintenance_summary,
+                "telemetry_retention": telemetry,
             }
 
         storage = getattr(self.agent, "storage", None)
@@ -2093,7 +2111,7 @@ class SchedulerFeature(Feature):
             return json.dumps({
                 "skipped": True,
                 "reason": "storage facade missing purge_trash_older_than",
-                **durable_summary,
+                **maintenance_summary,
             })
 
         config = load_trash_config()
@@ -2111,7 +2129,7 @@ class SchedulerFeature(Feature):
                 "skipped": True,
                 "reason": "non-positive retention window",
                 "privacy_mode": privacy_mode,
-                **durable_summary,
+                **maintenance_summary,
             })
 
         max_rows = int(args.get("max_rows") or DEFAULT_MAX_ROWS_PER_SWEEP)
@@ -2128,7 +2146,7 @@ class SchedulerFeature(Feature):
             logger.warning(
                 "[retention] agent=%s sweep failed: %s", self._agent_id, e,
             )
-            return json.dumps({"error": str(e), **durable_summary})
+            return json.dumps({"error": str(e), **maintenance_summary})
 
         if purged:
             logger.info(
@@ -2142,8 +2160,117 @@ class SchedulerFeature(Feature):
             "retention_days": retention_days,
             "cutoff": cutoff_iso,
             "max_rows": max_rows,
-            **durable_summary,
+            **maintenance_summary,
         })
+
+    async def _purge_operational_telemetry(self) -> Optional[Dict[str, Any]]:
+        """Age out this agent's operational telemetry (#3785).
+
+        ``health_log``, ``task_execution_log`` and ``restart_status_events``
+        are swept by the ``[telemetry_retention]`` windows; ``signal_log`` by
+        the per-source ``retention_until`` stamped on each row. Each table is
+        reported on its own: ``rows_purged`` (and ``capped`` when the sweep
+        stopped at the per-table cap, so more may remain for the next run),
+        ``kept`` when the operator keeps
+        that table forever, ``absent`` when this agent never created it, or
+        the ``error`` that table's sweep raised. One table's failure never
+        stops the others.
+
+        Returns ``None`` when there is no database or no agent identity to
+        scope the sweep by.
+        """
+        db = getattr(self, "_db", None)
+        if db is None:
+            return None
+        from kestrel_sovereign.features.health.feature import purge_health_log
+        from kestrel_sovereign.features.restart_coordinator.event_store import (
+            purge_events_before,
+        )
+        from kestrel_sovereign.features.scheduler.execution_log_retention import (
+            purge_execution_log,
+        )
+        from kestrel_sovereign.features.storage_access import (
+            AgentIdentityUnavailable,
+            resolve_scoped_agent_did,
+        )
+        from kestrel_sovereign.storage.retention import load_telemetry_retention
+
+        # Resolved outside the per-table catch-all, as the notice sweep does:
+        # a missing identity is a named refusal, not an empty scope (#3251).
+        try:
+            agent_did = resolve_scoped_agent_did(self.agent)
+        except AgentIdentityUnavailable:
+            logger.warning(
+                "[retention] operational telemetry cleanup skipped: "
+                "agent identity unavailable"
+            )
+            return None
+
+        policy = load_telemetry_retention()
+        max_rows = policy.max_rows_per_sweep
+        now = datetime.now(timezone.utc)
+        report: Dict[str, Any] = {}
+        sweeps = (
+            ("health_log", purge_health_log),
+            ("task_execution_log", purge_execution_log),
+            ("restart_status_events", purge_events_before),
+        )
+        for table, purge in sweeps:
+            cutoff = policy.cutoff(table, now)
+            if cutoff is None:
+                report[table] = {"kept": True}
+                continue
+            entry: Dict[str, Any] = {"retention_days": policy.days[table]}
+            try:
+                if not await db.table_exists(table):
+                    report[table] = {"absent": True}
+                    continue
+                purged = await purge(
+                    db, agent_id=agent_did, older_than=cutoff, max_rows=max_rows,
+                )
+            except Exception as exc:
+                if is_execution_control_error(exc):
+                    raise
+                logger.warning(
+                    "[retention] %s cleanup failed for agent=%s: %s",
+                    table, self._agent_id, exc,
+                )
+                entry["error"] = str(exc)
+            else:
+                entry["rows_purged"] = purged
+                if purged >= max_rows:
+                    entry["capped"] = True
+            report[table] = entry
+
+        dispatcher = getattr(self.agent, "dispatcher", None)
+        purge_signal_log = getattr(dispatcher, "purge_expired_signal_log", None)
+        if callable(purge_signal_log):
+            entry = {}
+            try:
+                purged = await purge_signal_log(max_rows=max_rows)
+            except Exception as exc:
+                if is_execution_control_error(exc):
+                    raise
+                logger.warning(
+                    "[retention] signal_log cleanup failed for agent=%s: %s",
+                    self._agent_id, exc,
+                )
+                entry["error"] = str(exc)
+            else:
+                entry["rows_purged"] = purged
+                if purged >= max_rows:
+                    entry["capped"] = True
+            report["signal_log"] = entry
+
+        purged_total = sum(
+            entry.get("rows_purged", 0) for entry in report.values()
+        )
+        if purged_total:
+            logger.info(
+                "[retention.telemetry] agent=%s rows_purged=%d %s",
+                self._agent_id, purged_total, report,
+            )
+        return report
 
     async def _purge_operator_notice_audit(self) -> Optional[int]:
         """Drop this agent's expired ``operator_notice_audit`` rows (#2530).
@@ -4679,11 +4806,25 @@ class SchedulerFeature(Feature):
             }
             for row in rows
         ]
+        # Rated runs survive execution-log retention (#3785); unrated ones do
+        # not, so a window longer than the retention undercounts executions.
+        from kestrel_sovereign.storage.retention import load_telemetry_retention
+
+        retained_days = load_telemetry_retention().days.get("task_execution_log")
+        confirmation = f"Engagement over last {days} day(s): {len(tasks)} task(s)"
+        if retained_days is not None and days > retained_days:
+            confirmation += (
+                f"; unrated runs older than {retained_days} days are pruned, "
+                f"so execution counts cover the last {retained_days} days"
+            )
         return ToolResult.ok(
-            confirmation=(
-                f"Engagement over last {days} day(s): {len(tasks)} task(s)"
-            ),
-            data={"window_days": days, "tasks": tasks, "count": len(tasks)},
+            confirmation=confirmation,
+            data={
+                "window_days": days,
+                "tasks": tasks,
+                "count": len(tasks),
+                "execution_log_retention_days": retained_days,
+            },
         )
 
     @tool(

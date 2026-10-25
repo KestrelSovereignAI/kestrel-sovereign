@@ -61,8 +61,6 @@ from __future__ import annotations
 import hashlib
 import logging
 import os
-import shutil
-import time
 from collections.abc import Mapping
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
@@ -105,6 +103,7 @@ from kestrel_sovereign.constitution.trust_root import (
     SovereignTrustRootError,
     load_sovereign_trust_root,
 )
+from kestrel_sovereign.paths import backup_dir, project_dir
 from kestrel_sovereign.storage import AsyncStorage, GraphNode
 from kestrel_sovereign.execution_custody import (
     execution_commit_outcome,
@@ -435,6 +434,7 @@ async def reanchor_constitution(
     runtime_backend: str | None = None,
     runtime_dsn: str | None = None,
     hosted_agent_did: str | None = None,
+    backup_root: Path | None = None,
 ) -> ReanchorResult:
     """Reanchor one agent to the current canonical constitution.
 
@@ -461,7 +461,7 @@ async def reanchor_constitution(
          contract.
 
     Args:
-        agent_name: Display name (used for messages and backup naming).
+        agent_name: Display name (used for messages).
         agent_dir: Managed agent's data directory (contains
             ``kestrel_prime.db``); None for a hosted PostgreSQL agent.
         canonical_path: Optional on-disk constitution the operator expects to
@@ -496,6 +496,10 @@ async def reanchor_constitution(
             tenant registry. It must be paired with an explicit PostgreSQL
             DSN and no local agent directory. The host must independently
             verify the DID-to-tenant binding before calling this API.
+        backup_root: Where a forced write to a local SQLite file copies the
+            database first (#3785). None resolves the project's configured
+            backup root (:func:`kestrel_sovereign.paths.backup_dir`) from
+            ``environ``. The copy is never written beside the database.
     """
     db_path = agent_dir / "kestrel_prime.db" if agent_dir is not None else None
     # The path the operator asked for, kept apart from the one reported: the
@@ -959,7 +963,19 @@ async def reanchor_constitution(
     backup_unavailable_reason: str | None = None
     if target.writes_to_anchor:
         assert db_path is not None
-        backup_path = _backup_db(db_path)
+        try:
+            if backup_root is None:
+                backup_root = backup_dir(project_dir(), environ=environ)
+            backup_path = _backup_db(db_path, backup_root)
+        except (OSError, ValueError) as exc:
+            return _result(
+                old_hash=old_hash,
+                new_hash=new_hash,
+                error=(
+                    f"The agent DB could not be backed up, so nothing was "
+                    f"written: {exc}"
+                ),
+            )
         logger.info("Backed up agent DB to %s before reanchor", backup_path)
     else:
         backup_unavailable_reason = (
@@ -1678,15 +1694,15 @@ async def _reindex_constitution_rag(
     )
 
 
-def _backup_db(db_path: Path) -> Path:
-    """Copy the agent DB to a timestamped sibling. ``shutil.copy2``
-    preserves mtime + permissions so the backup is restorable by
-    ``cp`` / ``mv`` without surprises.
+def _backup_db(db_path: Path, backup_root: Path) -> Path:
+    """Copy the agent DB to a timestamped file under ``backup_root``. The
+    copy keeps the DB's mtime + permissions so it is restorable by ``cp`` /
+    ``mv`` without surprises, and appears under its final name only once it
+    is complete (see :mod:`kestrel_sovereign.storage.db_backups`).
     """
-    ts = time.strftime("%Y%m%d-%H%M%S")
-    backup = db_path.with_name(f"{db_path.name}.backup-{ts}")
-    shutil.copy2(db_path, backup)
-    return backup
+    from kestrel_sovereign.storage.db_backups import write_reanchor_backup
+
+    return write_reanchor_backup(db_path, backup_root)
 
 
 def _now_iso() -> str:

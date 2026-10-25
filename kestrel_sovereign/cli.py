@@ -1683,6 +1683,17 @@ def cmd_constitution_reanchor(args) -> int:
         print(f"error: {source_refusal}", file=sys.stderr)
         return 2
 
+    # A forced write to a SQLite file copies it under the backup root first,
+    # never beside the database (#3785). Resolved from the launch environment,
+    # like everything else this command reads.
+    from kestrel_sovereign.paths import backup_dir
+
+    try:
+        backup_root = backup_dir(project_dir, environ=launch_env)
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+
     # Pre-flight check: agent must not be running. SQLite WAL locking
     # would corrupt mid-write. We check the launcher's PID files and the
     # serving record the agent's own process writes rather than probing the
@@ -1710,6 +1721,7 @@ def cmd_constitution_reanchor(args) -> int:
             environ=launch_env,
             runtime_backend=runtime_backend,
             runtime_dsn=runtime_dsn,
+            backup_root=backup_root,
         )
     )
 
@@ -1722,8 +1734,9 @@ def cmd_constitution_reanchor(args) -> int:
         backup_line = f"  Backup:  {result.backup_unavailable_reason or '(none)'}"
     if result.target_backend == "sqlite":
         planned_backup = (
-            f"The DB will be backed up to "
-            f"{result.db_path.name}.backup-<timestamp> before any write."
+            f"The DB will be backed up under {backup_root} "
+            f"(<date>-reanchor/{result.db_path.parent.name}/"
+            f"{result.db_path.name}.backup-<timestamp>) before any write."
         )
     else:
         planned_backup = (
