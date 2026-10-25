@@ -19,7 +19,7 @@ Auto-generated file-tree + per-file purpose index. Always-loaded context for the
 GitHub App (issue #791). Do **not** edit by hand — regenerate via `python scripts/generate_repo_map.py`.
 
 **Generated:** 2026-10-25
-**Scope:** 3358 tracked files (2516 `.py`, 367 `.md`, 475 other). Excludes `__pycache__`, `node_modules`, `.venv`, `.claude`, build artifacts.
+**Scope:** 3368 tracked files (2524 `.py`, 369 `.md`, 475 other). Excludes `__pycache__`, `node_modules`, `.venv`, `.claude`, build artifacts.
 
 **Format per file:** `path — one-line purpose` plus the public top-level Python symbols on the next line
 (classes and functions; private `_name` skipped).
@@ -238,6 +238,8 @@ Repo entry points and standard project files.
   - `class PrivacyStateUnreadableError`; `class SavedModelPreference`; `class PrivacyState`; `async def load_privacy_state(db, agent_id)`; `async def write_privacy_state(db, agent_id, state)`; `class RestoredPrivacyState`; `async def resolve_recorded_privacy_state(db, agent_id)`; `async def restore_privacy_state(db, agent_id)`; `…`
 - **kestrel_sovereign/agent/request_lifecycle.py** — Request lifecycle mixin for KestrelAgent.
   - `class RequestCompletionDisposition`; `def bind_request_operation_if_supported(agent, request_id, operation)`; `class RequestLifecycleMixin`
+- **kestrel_sovereign/agent/runtime_start.py** — Host-owned maintenance boot policy, separate from durable SafeMode/Hold.
+  - `class MaintenanceBootError`; `def maintenance_boot_active(agent)`; `def require_runtime_start_allowed(agent)`
 - **kestrel_sovereign/agent/salvage.py** — Durable salvage primitive for the context system (epic #1307 / C).
   - `class SalvageReason`; `class SalvageState`; `class SalvageResult`; `class SalvageWriteError`; `async def salvage_messages()`; `class SalvageWorker`; `async def get_salvage_state_counts(conv_store, session_id)`; `async def get_pending_count(conv_store, session_id)`; `…`
 - **kestrel_sovereign/agent/semantic_recall.py** — Deterministic, provenance-aware selection for canonical assertion recall.
@@ -631,9 +633,9 @@ Repo entry points and standard project files.
   - `def normalize_choice(value, aliases)`; `def coerce_enum(value, valid)`
 - **kestrel_sovereign/features/health/__init__.py** — Health Feature - periodic liveness probes for the agent.
 - **kestrel_sovereign/features/health/checks.py** — Individual health check functions for the Heartbeat Feature.
-  - `def derive_overall_status(checks)`; `def worst_status()`; `async def check_database(db)`; `async def check_llm_service(agent)`; `async def check_memory_system(agent)`; `async def check_disk_space(threshold_mb)`; `async def check_context_budget(agent)`; `async def check_scheduler_liveness(agent, db)`; `…`
+  - `def derive_overall_status(checks)`; `def worst_status()`; `async def check_database(db)`; `async def check_llm_service(agent)`; `async def check_memory_system(agent)`; `async def check_disk_space(threshold_mb)`; `async def check_database_size(db)`; `async def check_context_budget(agent)`; `…`
 - **kestrel_sovereign/features/health/feature.py** — Health Feature - periodic liveness probes.
-  - `class HealthFeature`
+  - `async def purge_health_log(db)`; `class HealthFeature`
 - **kestrel_sovereign/features/hosted_telegram_dispatch.py** — Host-authorized Telegram activation and send on one admitted child.
   - `class HostedTelegramBinding`; `class HostedTelegramOutbound`; `def is_hosted_send(proxy, name)`; `def start_dispatch(proxy, name, arguments)`; `async def wait_dispatch(owner)`; `async def dispatch_admitted(proxy, arguments, context)`; `def validate_outbound_timeout(value)`
 - **kestrel_sovereign/features/identity/__init__.py** — Identity Feature: Agent tools for identity export, import, and verification.
@@ -690,7 +692,7 @@ Repo entry points and standard project files.
 - **kestrel_sovereign/features/restart_coordinator/authority.py** — Durable authority for whole-host restarts.
   - `class RestartDelegation`; `class RestartAuthorityError`; `def require_restart_request_authority()`; `def agent_request_bounds_violation()`; `def is_agent_request_seal(request)`; `def agent_update_boundary_violation(request)`; `def agent_request_refusal(bound, detail)`; `def issue_restart_delegation()`; `…`
 - **kestrel_sovereign/features/restart_coordinator/event_store.py** — Durable typed-event store for restart_status events (#1562).
-  - `def dedupe_signature(request_id, state)`; `class RestartStatusEvent`; `async def ensure_restart_status_events_table(db)`; `async def record_event(db)`; `async def list_events_for_request(db, request_id)`; `async def list_recent_events_for_history(db)`; `async def list_recent_events_for_agent_context(db)`; `async def latest_event_for_signature(db, dedupe_sig)`
+  - `def dedupe_signature(request_id, state)`; `class RestartStatusEvent`; `async def ensure_restart_status_events_table(db)`; `async def record_event(db)`; `async def list_events_for_request(db, request_id)`; `async def list_recent_events_for_history(db)`; `async def list_recent_events_for_agent_context(db)`; `async def latest_event_for_signature(db, dedupe_sig)`; `…`
 - **kestrel_sovereign/features/restart_coordinator/events.py** — Chat-visible restart-status events (#1551).
   - `def build_restart_status_event(request)`
 - **kestrel_sovereign/features/restart_coordinator/feature.py** — RestartCoordinatorFeature — durable, host-mediated restart requests.
@@ -708,6 +710,8 @@ Repo entry points and standard project files.
 - **kestrel_sovereign/features/scheduler/constants.py** — Shared scheduler state constants without runner/status import cycles.
 - **kestrel_sovereign/features/scheduler/cron.py** — Lightweight cron expression parser -- pure Python, no dependencies.
   - `class CronParseError`; `def get_timezone(timezone_name)`; `def parse(expression)`; `def matches(expression, dt)`; `def next_run(expression, after, timezone_name)`
+- **kestrel_sovereign/features/scheduler/execution_log_retention.py** — Age out old ``task_execution_log`` rows (#3785).
+  - `async def purge_execution_log(db)`
 - **kestrel_sovereign/features/scheduler/failure_streak.py** — Consecutive-failure tracking for scheduled tasks (#3280).
   - `class FailureStreak`; `class FailureStreakTransition`; `def next_failure_streak(prior)`; `def failure_streak_view(values)`; `async def load_failure_markers(db, agent_id)`
 - **kestrel_sovereign/features/scheduler/feature.py** — Scheduler Feature -- cron-based scheduled task execution for agents.
@@ -1549,6 +1553,8 @@ Repo entry points and standard project files.
   - `def sqlite_statements(script)`; `def reject_transaction_control(sql)`
 - **kestrel_sovereign/storage/db/write_audit.py** — Task-local database write audit hooks.
   - `def capture_write_queries(callback)`; `def suppress_write_audit()`; `def request_handler_write_audit(callback)`; `def requested_handler_write_audit_callback()`; `def record_write_query(query)`; `def record_write_script(script)`
+- **kestrel_sovereign/storage/db_backups.py** — Where a reanchor's copy of an agent database goes, and how (#3785).
+  - `def reanchor_backup_path(db_path, backup_root)`; `def write_reanchor_backup(db_path, backup_root)`
 - **kestrel_sovereign/storage/destructive_audit.py** — Append-only audit trail for destructive storage operations (#750).
   - `def destructive_audit_caller(identity)`; `def audit_db_path_for(main_db_path)`; `def default_caller_identity()`; `def hash_rows(rows)`; `class DestructiveAuditEvent`; `class DestructiveAuditLog`
 - **kestrel_sovereign/storage/embedding_column.py** — Where a raw-SQL reader takes a stored embedding from, and how to decode it.
@@ -1563,6 +1569,8 @@ Repo entry points and standard project files.
   - `def encrypt_string(content, fernet, agent_did, purpose)`; `def decrypt_string(content, metadata, fernet, agent_did, …)`
 - **kestrel_sovereign/storage/feed_sequence.py** — Commit-ordered sequence numbers for append-only receipt feeds (#3159 R6).
   - `def feed_sequence_index_name(table)`; `def feed_sequence_trigger_name(table)`; `async def ensure_feed_sequence(db)`
+- **kestrel_sovereign/storage/footprint.py** — How much space an agent database takes (#3785).
+  - `def format_bytes(count)`; `class DatabaseSize`; `async def measure_database_size(db)`
 - **kestrel_sovereign/storage/identity_metadata.py** — Field-only identity updates under native graph custody.
   - `async def merge_identity_metadata_in_database(db, agent_id, updates)`; `async def merge_identity_metadata(storage, agent_id, updates)`
 - **kestrel_sovereign/storage/legacy_fact_migration.py** — Bounded, restart-safe import of the one verified legacy fact shape.
@@ -1598,7 +1606,7 @@ Repo entry points and standard project files.
 - **kestrel_sovereign/storage/providers/lighthouse_rest.py** — Async REST client for Lighthouse storage API.
   - `class LighthouseDownloadLimitError`; `def deal_records(status)`; `async def list_all_uploads(client)`; `class UploadBody`; `def describe_upload_failure(exc)`; `class LighthouseGateway`; `class LighthouseRestClient`
 - **kestrel_sovereign/storage/retention.py** — Retention helpers for the soft-delete migration (#764).
-  - `def load_trash_config()`; `def resolve_retention_days()`; `def load_forgetting_config()`; `def agent_privacy_mode(agent)`
+  - `def load_trash_config()`; `def resolve_retention_days()`; `def load_forgetting_config()`; `def agent_privacy_mode(agent)`; `class TelemetryRetention`; `def load_telemetry_retention()`; `def resolve_telemetry_retention(section)`; `async def delete_rows_in_batches(db)`
 - **kestrel_sovereign/storage/saved_items_store.py** — Saved Items Store for Kestrel.
   - `class SavedItemType`; `class SourceType`; `def get_schema(schema_id)`; `def list_schemas()`; `def validate_structured_content(content, schema_id)`; `class SavedItem`; `class SavedItemsStore`
 - **kestrel_sovereign/storage/schema_router.py** — Schema-aware routing: promote extracted structure to typed storage.
@@ -1962,6 +1970,7 @@ Repo entry points and standard project files.
 - **docs/architecture/INCREMENTAL_BACKUP.md** — Incremental Backup — Page-Aligned Content-Addressed Deltas for Active Agents — **Status (2026-06-27): Design spike for [#1842](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/1842).** No implementation yet.
 - **docs/architecture/LLM_PROVIDER_CAPABILITIES.md** — LLM Provider Capabilities — Kestrel tracks adapter-level capabilities separately from per-model `ModelInfo`.
 - **docs/architecture/LLM_SERVICE_ARCHITECTURE.md** — Kestrel LLM Service Architecture — > **Canonical spec for every change touching the LLM service, provider registry, discovery, or routing.** If this doc contradicts code, the code wins — and this doc is a bug.
+- **docs/architecture/MAINTENANCE_FEATURE_RECOVERY.md** — Hosted feature recovery without business startup — An attended host may need to reconstruct an existing agent's full feature registry before Core can verify and exit a durable `feature_lifecycle_uncertain` restriction.
 - **docs/architecture/MEMORY_OWNERSHIP.md** — Memory System Ownership Map — > Created for Issue #501.
 - **docs/architecture/MEMORY_SYSTEM.md** — Kestrel Memory System — > The difference between a search engine and a friend is that a friend *actually remembers*.
 - **docs/architecture/MULTI_AGENT_VOICE.md** — Multi-Agent Voice — The Mixing Board — **Status:** Draft v1 — design proposal.
@@ -2274,6 +2283,7 @@ Repo entry points and standard project files.
 - **docs/releases/v0.53.33.md** — Core 0.53.33 — Wait-worker resident custody — Status: candidate; review, CI, publication and artifact verification are required.
 - **docs/releases/v0.53.34.md** — Core 0.53.34 — Sovereignty retrieval and portable conversations — Status: candidate; release review, CI, publication and artifact verification are required.
 - **docs/releases/v0.53.35.md** — Core 0.53.35 — Original Future and Task custody — Status: candidate; product merge, release review, CI, publication and artifact verification are required.
+- **docs/releases/v0.54.2.md** — 0.54.2 — attended feature-recovery startup boundary — Candidate release notes; publication and downstream acceptance are separate gates, not established by this file.
 - **docs/research/DEVELOPMENT_THROUGHPUT.md** — Development Throughput: Scion, CI, and Parallel Lanes — **Started:** 2026-10-16.
 - **docs/research/FLUX2_TRAINING_CONFIG.md** — FLUX.2 LoRA Training Configuration — **Source**: [SimpleTuner FLUX2.md Quickstart](https://github.com/bghira/SimpleTuner/blob/main/documentation/quickstart/FLUX2.md)
 - **docs/research/GPU-Enabled Container Hosting Options for AI Workloads.md** — **GPU-Enabled Container Hosting Options for AI** **Workloads** — Large AI models (like LLMs) demand powerful GPUs with substantial VRAM.
@@ -2923,6 +2933,8 @@ Repo entry points and standard project files.
   - `async def test_basic_generate()`; `async def test_generate_with_tools_returns_llm_response()`; `async def test_generate_with_messages()`; `async def test_generate_returns_coherent_response()`; `async def test_generate_handles_empty_system_prompt()`
 - **tests/integration/test_llm_space_mgmt_e2e.py** — Integration tests for LLM space management - REAL TESTS, NO MOCKS
   - `def sovereign_turn(monkeypatch)`; `async def llm_service()`; `def test_model_name()`; `class TestSpaceManagement`; `class TestDatabaseIntegration`
+- **tests/integration/test_maintenance_feature_recovery.py** — Real incepted identity -> full Core boot -> persisted latch -> restart/exit.
+  - `def no_provider_policy()`; `async def test_real_full_boot_can_prove_and_exit_persisted_feature_restriction(tmp_path, with_workflows)`
 - **tests/integration/test_maintenance_original_retirement.py** — Actual maintenance/storage/sleep cannot normalize native original control.
   - `async def test_maintenance_keeps_original_body_and_lease_retirement_control(native_pg, assertion_store, monkeypatch, door, …)`; `async def test_maintenance_domain_handlers_preserve_original_control_graph(native_pg, assertion_store, monkeypatch, target)`; `async def test_maintenance_postgres_report_source_preserves_original_graph(native_pg, native_pg_maintenance, tmp_path, monkeypatch)`; `async def test_maintenance_close_receipt_publication_retains_original_unstarted_lease(native_pg, assertion_store, monkeypatch, after, …)`; `async def test_handled_worker_with_successful_diagnostics_survives_retirement_control(native_pg, assertion_store, monkeypatch, body_kind, …)`
 - **tests/integration/test_manager_complete_exit_policy.py** — Reader/drain/fence terminal exits keep original control and observations.
@@ -4739,6 +4751,8 @@ Repo entry points and standard project files.
   - `class TestLumpyAnchorStability`; `class TestLumpyPruneSafetyNet`; `class TestEnvParsing`; `def test_safety_net_target_respected_across_fractions(frac)`; `class TestSentFormBytePreservation`; `class TestEmitByteCounting`; `class TestStableCeiling`
 - **tests/unit/test_main_identity_discovery.py** — Which database names the agent at server startup (#2472, #2894).
   - `def runtime_db(monkeypatch)`; `async def test_a_freshly_incepted_agent_boots_before_its_record_reaches_postgres(tmp_path, runtime_db)`; `async def test_the_anchor_and_the_runtime_database_agreeing_is_the_steady_state(tmp_path, runtime_db)`; `async def test_an_anchor_naming_a_different_agent_than_the_database_refuses(tmp_path, runtime_db)`; `async def test_a_container_with_no_anchor_still_reads_the_durable_database(tmp_path, runtime_db)`; `async def test_no_anchor_and_an_empty_database_is_an_unincepted_host(tmp_path, runtime_db)`; `async def test_two_agents_in_one_database_refuse_with_no_anchor(tmp_path, runtime_db)`; `async def test_two_agents_in_one_database_refuse_even_when_the_anchor_names_one(tmp_path, runtime_db)`; `…`
+- **tests/unit/test_maintenance_runtime_start.py** — Real boot/publication and SQLite queue components, not fleet acceptance.
+  - `async def close_agent(agent)`; `async def test_maintenance_retirement_joins_without_new_status_publication(tmp_path)`; `async def test_maintenance_refuses_unsupported_child_before_launch(tmp_path, monkeypatch, distribution, version)`; `async def test_maintenance_does_not_resolve_or_claim_a_hosted_route(tmp_path)`; `async def test_maintenance_refuses_bin_override_without_child_distribution_proof(tmp_path, monkeypatch)`; `async def test_maintenance_child_uses_reserved_native_sdk_handshake_not_route_attestation(tmp_path, monkeypatch)`; `async def test_original_ready_publication_respects_permanent_maintenance_hold(tmp_path, maintenance)`; `async def test_maintenance_requires_preboot_claim_and_cannot_be_downgraded(tmp_path)`; `…`
 - **tests/unit/test_mandate_constitution_block.py** — Spawn-mandate behavioral_rules surface in the child's governing constitution (#2225).
   - `def test_render_block_contains_rules_and_no_base()`; `def test_render_block_survives_mixed_type_values()`; `def test_render_block_drops_freetext_injection()`; `def test_render_block_surfaces_documented_boolean_flags()`; `def test_render_block_drops_forbidden_weakening_keys()`; `def test_render_block_sanitizes_typed_fields()`; `def test_render_block_keeps_valid_typed_fields()`; `def test_render_block_surfaces_allowed_tools_positive_ceiling()`; `…`
 - **tests/unit/test_mandate_constraint_enforcement.py** — Runtime enforcement of SpawnMandate additional_constraints (#2137).
@@ -5065,6 +5079,8 @@ Repo entry points and standard project files.
   - `async def test_read_attachment_rejects_hash_not_in_this_conversation()`; `async def test_read_attachment_scopes_to_agents_active_session()`; `async def test_read_attachment_rejects_malformed_id()`; `async def test_read_attachment_returns_text_document()`; `async def test_read_attachment_paginates_long_text()`; `async def test_read_attachment_parses_pdf()`; `async def test_read_attachment_image_directs_to_paste()`; `def test_lazy_attachment_hint_lists_only_lazy()`; `…`
 - **tests/unit/test_read_attachment_pagination.py** — Pagination for read_attachment (#2134, F086).
   - `async def test_every_chunk_fits_under_cap_regardless_of_escaping(unit)`; `async def test_first_chunk_reports_range_and_total()`; `async def test_next_offset_returns_following_chunk()`; `async def test_small_length_is_honored()`; `async def test_oversized_length_shrinks_to_fit_the_cap()`; `async def test_small_document_reads_fully_with_no_next()`; `async def test_offset_beyond_end_returns_empty_and_no_next()`
+- **tests/unit/test_reanchor_backup.py** — Where a reanchor's database copy goes, and how it is written (#3785).
+  - `def agent_dir(tmp_path)`; `def backup_root(tmp_path)`; `def test_a_copy_lands_under_the_backup_root_not_beside_the_database(agent_dir, backup_root)`; `def test_the_directories_it_creates_are_private(agent_dir, backup_root)`; `def test_an_existing_backup_root_behind_a_symlink_is_used(agent_dir, tmp_path)`; `def test_a_failed_copy_leaves_nothing_under_any_name(agent_dir, backup_root, monkeypatch)`; `def test_a_copy_in_the_same_second_never_overwrites_the_first(agent_dir, backup_root, monkeypatch)`; `def test_a_copy_gives_up_rather_than_overwrite(agent_dir, backup_root, monkeypatch)`; `…`
 - **tests/unit/test_reanchor_constitution.py** — Unit tests for !reanchor-constitution command.
   - `def test_both_reanchor_writers_prelock_the_complete_shared_node_set()`; `def test_governance_helper_prelocks_complete_write_set_before_writing()`; `async def test_reanchor_rejects_missing_signed_artifact()`; `async def test_reanchor_rejects_short_hash(tmp_path)`; `async def test_reanchor_rejects_wrong_hash(tmp_path)`; `async def test_reanchor_rejects_oversized_artifact_before_storage(tmp_path)`; `async def test_reanchor_commit_outcome_never_claims_rollback_or_invites_retry(tmp_path, outcome)`; `async def test_reanchor_succeeds_with_sovereign_signed_artifact(tmp_path)`; `…`
 - **tests/unit/test_reanchor_rag_embedding.py** — The constitution reanchor embeds RAG chunks the way the live agent does (#3418).
@@ -5515,6 +5531,8 @@ Repo entry points and standard project files.
   - `class TestIsTracingEnabled`; `class TestCurrentTraceIdentity`; `class TestTurnSpanAddress`; `class TestOptionalSpan`; `class TestSetupTracing`; `class TestStartEndSpan`; `class TestGetTracer`; `class TestGracefulDegradation`
 - **tests/unit/test_telemetry_layer_span_attribution.py** — Telemetry-layer spans carry ``kestrel.agent_name`` + OpenInference kind (#2699).
   - `def otel_exporter()`; `class TestSpanAttributeConstants`; `class TestHelpersStampKindAndAgentName`; `async def test_signal_dispatch_cognition_span_carries_kind_and_agent_name(otel_exporter, tmp_path)`
+- **tests/unit/test_telemetry_retention.py** — Operational telemetry retention and database size reporting (#3785).
+  - `async def db(request, tmp_path)`; `def test_policy_defaults_bound_every_table()`; `def test_policy_honours_overrides_and_keeps_a_zero_window_forever()`; `def test_policy_falls_back_on_malformed_values(bad)`; `def test_policy_refuses_a_non_positive_cap(cap)`; `async def test_batched_delete_commits_in_batches_up_to_the_cap(db)`; `async def test_health_log_purge_keeps_the_window_and_other_agents(db)`; `async def test_health_log_purge_refuses_an_empty_scope(db, agent_id)`; `…`
 - **tests/unit/test_terminal_advisory_barrier.py** — Pure request/authority contracts for terminal physical exclusion (#3739).
   - `def test_terminal_keys_require_nonempty_immutable_tuple(keys)`; `def test_terminal_keys_require_exact_immutable_pairs(keys)`; `def test_terminal_keys_reject_noninteger_and_boolean_values(value)`; `def test_terminal_keys_reject_outside_signed_int32(value)`; `def test_terminal_keys_keep_exact_signed_boundary_values()`; `async def test_terminal_rejects_opaque_operational_pool_before_advisory_allocation()`
 - **tests/unit/test_terminal_original_isolation.py** — Pure terminal-composition contracts; native I/O is tested separately.
