@@ -956,10 +956,12 @@ starts the same `a2a_cognition_consumers()` contracts consumed by both stores.
 An unrelated durable subscription does not gain fixed native cleanup authority
 from a dispatcher-like executor name.
 
-A retry release retains only its original managed owner/token until its native
-acknowledgement settles. NACK, Hold deferral and retained-task release share
-that rule. The resident store excludes its pending/failed receipt, and separate
-runtimes exclude the original live owner's retry. Candidate listing and native
+A retry release retains its original managed owner/token until a trusted
+re-claim or terminal write replaces or clears it. NACK, Hold deferral and
+retained-task release share that rule. The resident store excludes its pending
+or failed native release receipt; only that local fence ends when the native
+acknowledgement settles. Separate runtimes exclude the original live owner's
+retry. Candidate listing and native
 claims use the same configured stale-owner cutoff. A stopped or stale owner
 still permits the existing at-least-once crash recovery with a fresh token.
 
