@@ -3439,22 +3439,9 @@ class KestrelAgent(
         # Hold and restart; their drainers observe Release and resume the
         # unclaimed ledger rows without requiring a peer retry.
         from kestrel_sovereign.signals import DurableConsumerRegistration
-        from kestrel_sovereign.signals.sources.a2a import (
-            DURABLE_COGNITION_CONSUMER_ID as A2A_COMPLETE_COGNITION_CONSUMER_ID,
-        )
-        from kestrel_sovereign.signals.sources.a2a_task_submitted import (
-            DURABLE_COGNITION_CONSUMER_ID as A2A_SUBMITTED_COGNITION_CONSUMER_ID,
-        )
+        from kestrel_sovereign.signals.sources import a2a_cognition_consumers
 
-        from kestrel_sovereign.signals.sources.a2a_question_answered import (
-            DURABLE_COGNITION_CONSUMER_ID as A2A_QUESTION_COGNITION_CONSUMER_ID,
-        )
-
-        for consumer_id, source in (
-            (A2A_QUESTION_COGNITION_CONSUMER_ID, "a2a.question_answered"),
-            (A2A_COMPLETE_COGNITION_CONSUMER_ID, "a2a.task_complete"),
-            (A2A_SUBMITTED_COGNITION_CONSUMER_ID, "a2a.task_submitted"),
-        ):
+        for consumer_id, source in a2a_cognition_consumers():
             await self.dispatcher.register_durable_consumer(
                 DurableConsumerRegistration(
                     consumer_id=consumer_id,
@@ -4622,22 +4609,9 @@ class KestrelAgent(
         # consumers: privacy-elided durable rows need the live task envelope
         # presented once before a drainer may claim their marker-only replay.
         await self.reconcile_a2a_cognition_wakes()
-        from kestrel_sovereign.signals.sources.a2a import (
-            DURABLE_COGNITION_CONSUMER_ID as A2A_COMPLETE_COGNITION_CONSUMER_ID,
-        )
-        from kestrel_sovereign.signals.sources.a2a_task_submitted import (
-            DURABLE_COGNITION_CONSUMER_ID as A2A_SUBMITTED_COGNITION_CONSUMER_ID,
-        )
+        from kestrel_sovereign.signals.sources import a2a_cognition_consumers
 
-        from kestrel_sovereign.signals.sources.a2a_question_answered import (
-            DURABLE_COGNITION_CONSUMER_ID as A2A_QUESTION_COGNITION_CONSUMER_ID,
-        )
-
-        for consumer_id in (
-            A2A_QUESTION_COGNITION_CONSUMER_ID,
-            A2A_COMPLETE_COGNITION_CONSUMER_ID,
-            A2A_SUBMITTED_COGNITION_CONSUMER_ID,
-        ):
+        for consumer_id, _source in a2a_cognition_consumers():
             await self.dispatcher.start_durable_cognition_consumer(consumer_id)
 
         # All subsystems are now up (memory system, context manager, dispatcher,

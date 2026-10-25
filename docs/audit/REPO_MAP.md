@@ -19,7 +19,7 @@ Auto-generated file-tree + per-file purpose index. Always-loaded context for the
 GitHub App (issue #791). Do **not** edit by hand — regenerate via `python scripts/generate_repo_map.py`.
 
 **Generated:** 2026-10-25
-**Scope:** 3356 tracked files (2514 `.py`, 367 `.md`, 475 other). Excludes `__pycache__`, `node_modules`, `.venv`, `.claude`, build artifacts.
+**Scope:** 3357 tracked files (2515 `.py`, 367 `.md`, 475 other). Excludes `__pycache__`, `node_modules`, `.venv`, `.claude`, build artifacts.
 
 **Format per file:** `path — one-line purpose` plus the public top-level Python symbols on the next line
 (classes and functions; private `_name` skipped).
@@ -1343,6 +1343,7 @@ Repo entry points and standard project files.
 - **kestrel_sovereign/signals/rehydration.py** — Explicit source-store proof that privacy-elided cognition was withdrawn.
   - `class DurableCognitionWithdrawal`
 - **kestrel_sovereign/signals/sources/__init__.py** — Built-in signal source registrations.
+  - `def a2a_cognition_consumers()`; `def core_cognition_consumers()`
 - **kestrel_sovereign/signals/sources/a2a.py** — Native A2A completion wakes from committed task ownership.
   - `def build_a2a_task_complete_registration()`; `def build_signal_for_completed_task(candidate, target_agent)`
 - **kestrel_sovereign/signals/sources/a2a_question_answered.py** — Sender-owned wake from an authorized native question receipt or local deadline.
@@ -2482,6 +2483,8 @@ Repo entry points and standard project files.
   - `class NativeMemoryOwners`; `async def native_memory_owners(native_pg, tmp_path, monkeypatch)`; `def native_vector_consumers(native_memory_owners)`; `def actual_native_loss(lease, observed)`
 - **tests/integration/test_a2a_cancel_original_control.py** — Actual native cancellation CAS/readback must retain its FIRST receipt.
   - `async def test_public_cancel_native_unknown_survives_real_reconciliation_and_later_control(native_pg, monkeypatch, later)`
+- **tests/integration/test_a2a_cognition_cleanup.py** — Core cognition cleanup and original receipts on owned PostgreSQL.
+  - `async def cognition_lease(native_pg, cognition_source, cognition_registration)`; `async def test_core_cognition_native_cleanup_supports_original_registered_source(cognition_lease)`; `async def test_core_cognition_native_cleanup_refuses_other_capabilities(cognition_lease, mismatch)`; `async def release(ledger, delivery, kind)`; `async def test_original_retry_commit_lost_ack_excludes_fresh_runtime_and_settles(cognition_lease, monkeypatch, kind)`; `async def test_retained_core_cognition_keeps_owner_until_original_body_and_terminal_receipt(cognition_lease, monkeypatch)`
 - **tests/integration/test_a2a_identity_original_control.py** — A2A identity/policy consumers preserve original PostgreSQL control.
   - `async def test_a2a_policy_identity_does_not_turn_original_control_into_refusal(native_memory_owners, tmp_path, door, kind)`
 - **tests/integration/test_a2a_native_single_lifespan.py** — The real standalone server publishes after real agent boot and retires routes.
@@ -5383,7 +5386,7 @@ Repo entry points and standard project files.
 - **tests/unit/test_sql_utils.py** — Tests for kestrel_sovereign.sql_utils — SQL identifier validation.
   - `class TestSafeTableName`; `class TestSafeColumnName`
 - **tests/unit/test_sqlite_cognition_shutdown_terminal.py** — Real SQLite control receipts must settle their exact lease after close.
-  - `async def owned_delivery(tmp_path)`; `async def original_commit_uncertainty(backend, dispatcher, delivery, monkeypatch, …)`; `async def test_closed_sqlite_cognition_persists_original_control_before_owner_release(tmp_path, monkeypatch, phase)`; `async def test_closed_sqlite_cognition_retains_control_on_exact_identity_mismatch(tmp_path, monkeypatch, mismatch)`; `async def test_original_retry_capability_does_not_admit_release_or_cursor_ack(tmp_path, terminal_ackable)`
+  - `def cognition_source(request)`; `def cognition_registration(cognition_source)`; `def cognition_signal(source, agent_id)`; `async def owned_delivery(tmp_path, cognition_source)`; `async def original_commit_uncertainty(backend, dispatcher, delivery, monkeypatch, …)`; `async def test_closed_sqlite_cognition_persists_original_control_before_owner_release(tmp_path, monkeypatch, phase, cognition_source)`; `async def test_closed_sqlite_cognition_retains_control_on_exact_identity_mismatch(tmp_path, monkeypatch, mismatch, cognition_source)`; `async def test_original_retry_capability_does_not_admit_release_or_cursor_ack(tmp_path, terminal_ackable, cognition_source)`; `…`
 - **tests/unit/test_sqlite_journal_admission_fence.py** — Admission metadata must never invoke a concurrently installed factory.
   - `async def test_admission_snapshot_atomically_fences_actual_text_factory(dispatcher_components, monkeypatch, tmp_path)`
 - **tests/unit/test_sse_approval_events.py** — Tests that the /agent/notifications/sse endpoint forwards events from the agent's event bus (e.g.

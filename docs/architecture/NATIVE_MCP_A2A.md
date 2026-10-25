@@ -948,6 +948,31 @@ API key as peer authority. Drain or explicitly stop old in-flight work during th
 upgrade; mixed draft/new workers are unsupported. Rollback requires the saved
 pre-migration database and a coherent old host/SDK set, not a parallel handler.
 
+### Durable cognition cleanup
+
+Core's channel, A2A task-submitted, task-complete and question-answer consumers
+share the `core_cognition_consumers()` inventory. A2A startup registers and
+starts the same `a2a_cognition_consumers()` contracts consumed by both stores.
+An unrelated durable subscription does not gain fixed native cleanup authority
+from a dispatcher-like executor name.
+
+A retry release retains only its original managed owner/token until its native
+acknowledgement settles. NACK, Hold deferral and retained-task release share
+that rule. The resident store excludes its pending/failed receipt, and separate
+runtimes exclude the original live owner's retry. Candidate listing and native
+claims use the same configured stale-owner cutoff. A stopped or stale owner
+still permits the existing at-least-once crash recovery with a fresh token.
+
+Genuine native control loss terminalizes the exact original
+agent/consumer/delivery/owner/token as failed, non-ACKable work. Shutdown retains
+the owner's liveness while an original cognition body resists cancellation,
+and releases that owner only after the body and terminal receipt settle.
+Cleanup cannot acquire work, acknowledge a provider cursor, replace a successor
+or reopen ordinary execution. The source-specific SQLite and PostgreSQL
+contracts are exercised in `test_sqlite_cognition_shutdown_terminal.py` and
+`test_a2a_cognition_cleanup.py`; initialized-agent startup is checked in
+`test_native_drainer_shutdown.py`.
+
 ### Retired surface coverage
 
 The cutover deletes the private task worker, local-submission and envelope

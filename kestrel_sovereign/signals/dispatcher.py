@@ -2853,6 +2853,10 @@ class SignalDispatcher:
                 limit=limit,
                 rebuildable_sources=rebuildable_sources,
                 claim_executor_id=claim_executor_id,
+                runtime_owner_stale_before=(
+                    datetime.now(timezone.utc) - self._runtime_owner_stale_after
+                    if claim_executor_id is not None else None
+                ),
             )
 
     async def purge_expired_durable_deliveries(self) -> int:
