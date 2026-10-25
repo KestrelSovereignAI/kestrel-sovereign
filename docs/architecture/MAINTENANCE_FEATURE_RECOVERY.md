@@ -30,7 +30,12 @@ release/downgrade API. Normal callers retain the existing no-argument behavior.
 For repair, also pass `expected_features={...}` in that same preboot call.
 Core freezes this complete inventory (plus mandatory features) and refuses
 native lifecycle verification if any feature is missing, unexpected or
-disabled. A maintenance boot without this explicit inventory can inspect state
+natively inactive. This uses the original contribution registry's object
+identity, not a feature's product-facing `enabled` flag: a provider-free
+VisualIdentity feature may have no image provider while remaining genuinely
+activated. An object left loaded after native deactivation cannot certify
+repair, even if the remaining registry is internally consistent.
+A maintenance boot without this explicit inventory can inspect state
 but cannot certify repair. Caller mutation of the supplied set cannot change
 the bound inventory, and a second claim cannot replace it.
 
@@ -46,7 +51,8 @@ from publishing runtime workers or declaring application health. Maintenance:
 - Prepares the real Delivery queue without reclaiming old in-flight rows or
   starting its worker.
 - Registers Scheduler contributions without seeding/removing durable schedules
-  or arming polling.
+  or arming polling. Retirement joins original owners/publications without
+  creating a new optional stopped-status write.
 - Refuses public streaming/nonstreaming turn admission independently of the
   durable SafeMode and Hold latches.
 

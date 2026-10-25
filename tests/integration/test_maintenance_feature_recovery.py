@@ -99,6 +99,15 @@ async def test_real_full_boot_can_prove_and_exit_persisted_feature_restriction(t
         assert expected <= set(restarted.features)
         assert restarted.verify_feature_lifecycle_integrity() is True
         assert not restarted._runtime_publication_ready.is_set()
+        # Loaded-object presence alone cannot certify its actual native
+        # activation. Real deactivation leaves the remaining registry valid.
+        delivery = restarted.features["DeliveryFeature"]
+        registry = restarted.feature_contribution_runtime
+        assert registry.deactivate(delivery) is True
+        assert registry.validate_active_integrity() is True
+        assert restarted.verify_feature_lifecycle_integrity() is False
+        registry.activate(restarted._prepare_feature_contribution_transition((delivery,)).only())
+        assert restarted.verify_feature_lifecycle_integrity() is True
         missing = restarted.features.pop("DeliveryFeature")
         try:
             assert restarted.verify_feature_lifecycle_integrity() is False

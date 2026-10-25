@@ -1588,7 +1588,7 @@ class SchedulerRunner:
             self._poll_interval,
         )
 
-    async def stop(self):
+    async def stop(self, *, publish_stopped: bool = True):
         self._arm_requested = False
         self._arm_requested_monotonic = None
         self._arm_requested_at = None
@@ -1638,7 +1638,7 @@ class SchedulerRunner:
         self._runtime_worker_state = "stopped"
         try:
             await self._finish_runtime_status_publication(
-                publish_stopped=pending_cancellation is None,
+                publish_stopped=publish_stopped and pending_cancellation is None,
                 timeout=(
                     RUNTIME_STATUS_PUBLISH_TIMEOUT_SECONDS
                     if pending_cancellation is None

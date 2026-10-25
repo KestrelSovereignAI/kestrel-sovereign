@@ -15,6 +15,7 @@ from kestrel_sovereign.agent.runtime_start import MaintenanceBootError
 from kestrel_sovereign.features.delivery.feature import DeliveryFeature
 from kestrel_sovereign.features.delivery.queue import DeliveryQueue
 from kestrel_sovereign.features.scheduler.feature import SchedulerFeature
+from kestrel_sovereign.features.scheduler.runner import SchedulerRunner
 from kestrel_sovereign.storage.async_database import AsyncDatabase
 from tests.unit.test_agent_boot_phases import _make_agent
 
@@ -23,6 +24,25 @@ async def close_agent(agent):
     await agent._shutdown_background_tasks()
     await agent.llm_service.close()
     await agent.llm_service.wait_for_close_completion()
+
+
+@pytest.mark.asyncio
+async def test_maintenance_retirement_joins_without_new_status_publication(tmp_path):
+    db = await AsyncDatabase.sqlite(str(tmp_path / "held-scheduler.db"))
+
+    async def effect(*_args):
+        raise AssertionError("held scheduler dispatched business work")
+
+    runner = SchedulerRunner(db, "did:test:held-scheduler", effect)
+    await runner._ensure_tables()
+    try:
+        before = await db.fetchval("SELECT total_changes()")
+        await runner.stop(publish_stopped=False)
+        assert await db.fetchval("SELECT total_changes()") == before
+        assert runner._task is None and runner._worker_task is None
+        assert runner._runtime_status_publish_task is None
+    finally:
+        await db.close()
 
 
 @pytest.mark.asyncio

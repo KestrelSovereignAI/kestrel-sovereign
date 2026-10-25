@@ -6549,18 +6549,19 @@ class KestrelAgent(
             return False
         from kestrel_sovereign.agent.runtime_start import maintenance_boot_active
 
+        runtime = getattr(self, "feature_contribution_runtime", None)
+        if runtime is None:
+            return False
         if maintenance_boot_active(self):
             expected = getattr(self, "_maintenance_expected_features", None)
             if not expected or set(self.features) != expected:
                 return False
-            # Native boot registration treats a missing optional enabled flag
-            # as active; explicit runtime disable/quarantine writes False.
-            # The contribution runtime below separately proves real activation.
-            if any(getattr(feature, "enabled", True) is not True for feature in self.features.values()):
+            # Product/provider availability (e.g. VisualIdentity.enabled)
+            # is not native lifecycle activation. Check the original registry
+            # identity for EVERY loaded feature, including zero-contribution
+            # features; a valid remaining registry alone is insufficient.
+            if any(not runtime.is_active(feature) for feature in self.features.values()):
                 return False
-        runtime = getattr(self, "feature_contribution_runtime", None)
-        if runtime is None:
-            return False
         try:
             return runtime.validate_active_integrity() is True
         except Exception as exc:  # noqa: BLE001 - report type, remain restricted
