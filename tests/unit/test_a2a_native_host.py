@@ -1476,6 +1476,33 @@ async def test_native_message_tool_audit_lists_immutable_dispatch_and_remote_id(
     assert "Native audit visibility" not in str(row)
 
 
+async def test_native_outbound_audit_tool_pages_by_before_cursor(local_native_peer):
+    """#3838: a reader walks the whole audit through the tool, not one page."""
+    from kestrel_sdk.tools.result import ToolResultStatus
+
+    from kestrel_sovereign.features.peers.feature import PeersFeature
+
+    p = local_native_peer
+    feature = PeersFeature(p.sender)
+    feature._peer_router = p.directory
+    feature._peer_requester = p.requester
+    feature._own_name = "Sender"
+    sent = [
+        (await feature.send_a2a_message("Peer", f"audit page {n}")).data["dispatch_id"]
+        for n in range(3)
+    ]
+    first = await feature.list_outbound_a2a_tasks(limit=2, recipient="Peer")
+    rest = await feature.list_outbound_a2a_tasks(
+        limit=2, recipient="Peer", before=first.data["rows"][-1]["dispatch_id"]
+    )
+    walked = [row["dispatch_id"] for row in first.data["rows"] + rest.data["rows"]]
+    assert first.data["count"] == 2 and rest.data["count"] == 1
+    assert sorted(walked) == sorted(sent) and len(set(walked)) == 3
+    refused = await feature.list_outbound_a2a_tasks(before="no-such-dispatch")
+    assert refused.status is ToolResultStatus.ERROR
+    assert "cursor names no dispatch" in refused.error
+
+
 async def test_native_message_audit_refuses_another_local_tenant_store(
     local_native_peer,
 ):

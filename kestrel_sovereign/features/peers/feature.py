@@ -1349,14 +1349,15 @@ class PeersFeature(Feature):
             "List your native outbound A2A dispatch audit. Each row has an immutable "
             "dispatch_id, stable recipient, selected tenant and interface, delivery state, "
             "and the nullable remote_task_id and last observed task state. "
-            "Message bodies are not stored in this audit."
+            "Message bodies are not stored in this audit. Newest first; pass "
+            "before=<the last row's dispatch_id> to read the next, older page."
         ),
         category=ToolCategory.COMMUNICATION,
         command_prefix="!a2a outbound",
     )
     @execution_work_operation
     async def list_outbound_a2a_tasks(
-        self, limit: int = 50, recipient: str = ""
+        self, limit: int = 50, recipient: str = "", before: str = ""
     ) -> ToolResult:
         """List this sender's native dispatch audit without fetching peer data."""
         from dataclasses import asdict
@@ -1367,7 +1368,11 @@ class PeersFeature(Feature):
             if recipient:
                 _, _, peer = await self._resolve_automatic_peer(recipient)
                 recipient_id = peer.agent_id
-            rows = await store.list_recent(limit=limit, recipient_id=recipient_id)
+            rows = await store.list_recent(
+                limit=limit,
+                recipient_id=recipient_id,
+                before_dispatch_id=before or None,
+            )
         except (PeerDirectoryError, ValueError) as error:
             if is_execution_control_error(error):
                 raise

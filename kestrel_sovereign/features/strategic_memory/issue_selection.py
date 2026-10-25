@@ -34,6 +34,7 @@ from kestrel_sovereign.features.strategic_memory.github_integration import (
     github_api_post,
 )
 from kestrel_sovereign.features.strategic_memory.run_history import (
+    ORDER_REFUSED,
     RunHistory,
     TalonRun,
 )
@@ -137,8 +138,9 @@ EXCLUDED_PR_LINKAGE_UNREADABLE = "pr_linkage_unreadable"
 
 #: Exclusion reasons reported in ``diagnostics["run_exclusions"]`` by the
 #: run-history gate (#3398), which only eligible candidates reach: the last
-#: Talon run asked a question nothing since has answered, or GitHub could not
-#: say whether anything has.
+#: Talon run asked a question nothing since has answered (or, read from an
+#: executor's work reports, the executor refused the last order, #3838), or
+#: GitHub could not say whether anything has.
 EXCLUDED_RUN_HISTORY = "run_history"
 EXCLUDED_RUN_HISTORY_UNCONFIRMED = "run_history_unconfirmed"
 
@@ -239,7 +241,10 @@ async def pick_top_issue(
     ``diagnostics["run_exclusions"]`` does the same for candidates whose most
     recent Talon run in ``run_history`` stopped to ask a question, with
     nothing on the issue since that authorizes a retry (#3398). ``None``
-    means the caller has no Talon registry, so no issue has a last run.
+    means the caller has no Talon registry, so no issue has a last run. When
+    another agent executes the caller's dispatches, ``run_history`` is read
+    from that executor's work reports, and an order the executor refused
+    waits for new input the same way (#3838).
 
     ``diagnostics["workspace_exclusions"]`` lists every candidate that passed
     those gates but whose repository Talon reports no usable workspace for,
@@ -247,7 +252,8 @@ async def pick_top_issue(
     whose readiness ``talon_workspaces`` could not read (#3548). Its run
     would only fail at ``talon_run``. ``talon_workspaces`` is read once per
     repository; ``None`` means the caller has no Talon, so no workspace is
-    asked about.
+    asked about, or that another agent executes its dispatches, whose
+    refusals in ``run_history`` stand in for its workspace answer (#3838).
 
     ``candidates_checked`` and ``candidates_unreadable`` do the same for the
     milestone and backlog passes: how many distinct candidates had their PR
@@ -347,7 +353,7 @@ async def pick_top_issue(
             if run_history is not None
             else None
         )
-        if run is None or not run.ended_with_question:
+        if run is None or not run.awaits_new_input:
             return None
         key = (repo, issue_number)
         if key not in awaiting:
@@ -935,7 +941,7 @@ def _comment_speaks_for_repository(comment: Dict[str, Any]) -> bool:
 def _run_exclusion(
     repo: str, issue_number: int, run: TalonRun, reason: str
 ) -> Dict[str, Any]:
-    return {
+    exclusion = {
         "repo": repo,
         "issue_number": issue_number,
         "reason": reason,
@@ -943,6 +949,12 @@ def _run_exclusion(
         "disposition": run.disposition,
         "completed_at": run.completed_at.isoformat(),
     }
+    if run.executor is not None:
+        # Read from the executor's answer to a work order (#3838).
+        exclusion["executor"] = run.executor
+        exclusion["order_id"] = run.order_id
+        exclusion["dispatch_id"] = run.dispatch_id
+    return exclusion
 
 
 def _workspace_exclusion(
@@ -1087,6 +1099,18 @@ def describe_exclusion(exclusion: Dict[str, Any]) -> str:
             f"Talon job {str(exclusion.get('job_id'))[:8]} ended "
             f"{exclusion.get('disposition')} at {when} without a PR"
         )
+        executor = exclusion.get("executor")
+        if executor is not None:
+            dispatch_id = str(exclusion.get("dispatch_id"))
+            order = exclusion.get("order_id") or f"dispatch {dispatch_id[:8]}"
+            job = str(exclusion.get("job_id"))
+            run = (
+                f"{executor} refused work order {order} at {when}"
+                if exclusion.get("disposition") == ORDER_REFUSED
+                else f"{executor} reported work order {order} "
+                f"{exclusion.get('disposition')} at {when} without a PR"
+                + (f" (Talon job {job[:8]})" if job != dispatch_id else "")
+            )
         if reason == EXCLUDED_RUN_HISTORY_UNCONFIRMED:
             return (
                 f"skipped {target} -- {run}, and GitHub could not say whether "

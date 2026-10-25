@@ -574,6 +574,51 @@ async def test_native_outbound_listing_has_actor_scope_filter_and_deterministic_
     assert outbound.sender_scope == NativeRecipientScope("did:sender")
 
 
+async def test_native_outbound_listing_pages_the_whole_audit_by_cursor(outbound):
+    """#3838: a reader that must see every dispatch to one peer walks the
+    audit page by page; no row is skipped or repeated, ties on ``created_at``
+    included, and a dispatch recorded meanwhile never shifts a later page."""
+    from datetime import UTC, datetime, timedelta
+
+    moments = iter(
+        [datetime(2026, 10, 20, tzinfo=UTC)] * 4
+        + [datetime(2026, 10, 20, tzinfo=UTC) + timedelta(seconds=n) for n in range(1, 4)]
+    )
+    outbound._clock = lambda: next(moments)
+    mine = [
+        await reserve(outbound, request(), dispatch_id=f"d{n}", recipient="did:peer-a")
+        for n in range(7)
+    ]
+    outbound._clock = lambda: datetime(2026, 10, 20, 0, 0, 2, tzinfo=UTC)
+    await reserve(outbound, request(), dispatch_id="other", recipient="did:peer-b")
+    newest_first = await outbound.list_recent(recipient_id="did:peer-a")
+    assert sorted(newest_first, key=lambda row: row.dispatch_id) == mine
+
+    walked, before = [], None
+    while True:
+        page = await outbound.list_recent(
+            limit=3, recipient_id="did:peer-a", before_dispatch_id=before
+        )
+        walked += page
+        if before is None:
+            outbound._clock = lambda: datetime(2026, 10, 21, tzinfo=UTC)
+            await reserve(outbound, request(), dispatch_id="late", recipient="did:peer-a")
+        if len(page) < 3:
+            break
+        before = page[-1].dispatch_id
+    assert walked == newest_first
+
+
+async def test_native_outbound_list_cursor_must_name_this_senders_dispatch(outbound):
+    other = OutboundStore(outbound.backend, sender_scope=NativeRecipientScope("did:other"))
+    await reserve(other, request(), dispatch_id="foreign")
+    for cursor in ("absent", "foreign"):
+        with pytest.raises(ValueError, match="cursor names no dispatch"):
+            await outbound.list_recent(before_dispatch_id=cursor)
+    with pytest.raises(ValueError, match="before_dispatch_id"):
+        await outbound.list_recent(before_dispatch_id=" ")
+
+
 @pytest.mark.parametrize("limit", [True, 0, -1, 1001, 1.5, "1"])
 async def test_native_outbound_listing_refuses_invalid_limits(outbound, limit):
     with pytest.raises(ValueError, match="list limit"):
