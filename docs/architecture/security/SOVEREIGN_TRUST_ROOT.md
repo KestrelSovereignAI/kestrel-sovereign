@@ -93,6 +93,12 @@ write. With `--force`, a signed artifact and external root are mandatory. A
 successful write stores the signed artifact and signer/verification details in
 the audit record. Reanchor never exits Safe Mode automatically.
 
+Before a forced write to a SQLite agent database, the CLI copies it under the
+backup root: `KESTREL_BACKUP_DIR`, else `<project>/backups`. The copy is
+`<date>-reanchor/<agent data dir>/kestrel_prime.db.backup-<timestamp>`, never
+a file beside the database. A copy that cannot be written refuses the reanchor
+before anything is written.
+
 ### Native publication and recovery custody
 
 The native runtime and offline signed writers reserve their complete graph

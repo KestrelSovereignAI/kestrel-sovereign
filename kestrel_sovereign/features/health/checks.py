@@ -522,7 +522,6 @@ async def check_database_size(db) -> Dict[str, Any]:
     measured every tick so the agent, and anyone reading its health history,
     can watch the file grow; Meridian's reached 1.89 GB before anyone looked.
     ``free pages`` is space only ``VACUUM`` returns to the filesystem.
-    ``memory_status`` names the largest tables.
 
     Args:
         db: AsyncDatabase instance (may be None)

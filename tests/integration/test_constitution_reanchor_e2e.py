@@ -36,6 +36,7 @@ import pytest
 
 from kestrel_sovereign.agent.constitution import ConstitutionMixin
 from kestrel_sovereign.inception_service import create_kestrel_identity_async
+from kestrel_sovereign.paths import backup_dir, project_dir
 from kestrel_sovereign.constitution.amendment_artifact import (
     build_legacy_signed_reanchor_artifact,
     did_document_from_legacy_public_key,
@@ -221,10 +222,15 @@ async def test_reanchor_updates_all_five_locations(tmp_path, monkeypatch):
     # ---- 5. Verify backup exists with the original DB content ----
     assert result.backup_path is not None
     assert result.backup_path.exists(), "backup file must be present"
-    assert result.backup_path.parent == db_path.parent, (
-        "backup must live alongside the DB it backs up"
+    # Under the project's backup root, never beside the DB (#3785).
+    backup_root = backup_dir(project_dir())
+    assert result.backup_path.parent == (
+        backup_root / result.backup_path.parent.parent.name / agent_dir.name
     )
+    assert result.backup_path.parent.parent.parent == backup_root
+    assert result.backup_path.parent.parent.name.endswith("-reanchor")
     assert ".backup-" in result.backup_path.name
+    assert not list(agent_dir.glob("*.backup-*"))
     # The backup's stored constitution_hash must still be v1.
     pre_via_backup = await _snapshot(result.backup_path, agent_did)
     assert pre_via_backup["agent_constitution_hash"] == v1_hash, (
@@ -760,6 +766,54 @@ async def test_reanchor_rolls_back_on_mid_write_failure(tmp_path, monkeypatch):
         "Mid-write failure must roll back the entire reanchor "
         f"transaction. Diff: pre={pre} vs post={post}"
     )
+
+
+@pytest.mark.asyncio
+async def test_reanchor_refuses_when_the_backup_cannot_be_written(
+    tmp_path, monkeypatch,
+):
+    """The file-level backup is taken before the write; when it cannot be
+    written (here, a backup root on a volume that is not mounted) the reanchor
+    refuses and the live DB is untouched (#3785)."""
+    constitution_path = tmp_path / "KESTREL_CONSTITUTION.md"
+    constitution_path.write_bytes(CONSTITUTION_V1)
+    import kestrel_sovereign.config as ks_config
+
+    monkeypatch.setattr(ks_config, "CONSTITUTION_PATH", str(constitution_path))
+    agent_dir = tmp_path / "agent_data" / "TestAgent"
+    creds = await create_kestrel_identity_async(
+        output_dir=str(agent_dir),
+        constitution_path=str(constitution_path),
+        agent_name="TestAgent",
+    )
+    db_path = agent_dir / "kestrel_prime.db"
+
+    constitution_path.write_bytes(CONSTITUTION_V2)
+    pre = await _snapshot(db_path, creds.agent_did)
+    artifact_path, trust_root_path = _write_authority_files(
+        tmp_path,
+        CONSTITUTION_V2,
+        did_document=_ROOT_DID_DOCUMENT,
+    )
+    unmounted = tmp_path / "Volumes" / "data2" / "backups" / "kestrel"
+
+    result = await reanchor_constitution(
+        agent_name="TestAgent",
+        agent_dir=agent_dir,
+        canonical_path=constitution_path,
+        force=True,
+        amendment_artifact_path=artifact_path,
+        sovereign_trust_root_path=trust_root_path,
+        backup_root=unmounted,
+    )
+
+    assert not result.reanchored
+    assert result.backup_path is None
+    assert "could not be backed up, so nothing was written" in result.error
+    assert "KESTREL_BACKUP_DIR" in result.error
+    assert not (tmp_path / "Volumes").exists()
+    assert not list(agent_dir.glob("*.backup-*"))
+    assert await _snapshot(db_path, creds.agent_did) == pre
 
 
 @pytest.mark.asyncio

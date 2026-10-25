@@ -523,7 +523,7 @@ class MemoryFeature(Feature):
 
     @tool(
         name="memory_status",
-        description="Check memory system health and statistics, including how large my database is and which tables take the space. Use this to understand my memory capabilities and current state.",
+        description="Check memory system health and statistics. Use this to understand my memory capabilities and current state.",
         category=ToolCategory.SYSTEM,
         command_prefix="!memory status"
     )
@@ -614,17 +614,13 @@ class MemoryFeature(Feature):
             f"{lexical_index['coverage']:.1%}"
             if lexical_index.get("available") else "unavailable"
         )
-        # Outside the catch-all above: execution control must reach the owner.
-        database = await self._database_footprint()
-        database_summary = database.get("size", {}).get("summary", "unmeasured")
         return ToolResult.ok(
             confirmation=(
                 f"Memory status: {total_messages} message(s), "
                 f"{episode_count} episode(s), "
                 f"{file_count} file(s), "
                 f"encryption={'on' if encryption_enabled else 'off'}, "
-                f"lexical-index={lexical_summary}, "
-                f"database={database_summary}"
+                f"lexical-index={lexical_summary}"
             ),
             data={
                 "total_messages": total_messages,
@@ -638,40 +634,8 @@ class MemoryFeature(Feature):
                 "rag": rag_stats,
                 "lexical_index": lexical_index,
                 "embedding_profiles": embedding_profiles,
-                "database": database,
             },
         )
-
-    async def _database_footprint(self) -> Dict[str, Any]:
-        """The agent database's size and its largest tables (#3785).
-
-        Most of a large agent database is usually operational telemetry, not
-        memory; this is how the agent can see which. Degrades to an
-        ``error`` entry rather than failing ``memory_status``.
-        """
-        from kestrel_sovereign.storage.footprint import (
-            measure_database_size,
-            measure_largest_tables,
-        )
-
-        footprint: Dict[str, Any] = {}
-        try:
-            size = await measure_database_size(self._db)
-            if size is None:
-                footprint["size"] = {
-                    "unavailable": "unsupported database adapter",
-                }
-            else:
-                footprint["size"] = size.to_dict()
-            footprint["largest_tables"] = (
-                await measure_largest_tables(self._db)
-            ).to_dict()
-        except Exception as exc:  # noqa: BLE001 - status must degrade
-            if is_execution_control_error(exc):
-                raise
-            logger.warning("Database footprint unavailable: %s", exc)
-            footprint["error"] = str(exc)
-        return footprint
 
     async def shutdown(self) -> None:
         """Cancel the backfill task, then run the base feature teardown.

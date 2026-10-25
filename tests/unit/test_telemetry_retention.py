@@ -1,17 +1,19 @@
-"""Operational telemetry retention and database footprint (#3785).
+"""Operational telemetry retention and database size reporting (#3785).
 
 Meridian's database reached 1.89 GB for 708 messages. Almost all of it was
 rows the agent writes about itself on a cadence and never removed:
 ``health_log`` (~860 MB), ``task_execution_log``, ``signal_log`` and
 ``restart_status_events``. These tests pin the retention policy, each owner's
 purge predicate (on SQLite and PostgreSQL), the ``trash_retention`` rail that
-runs them, and the size reporting that lets an agent see where its bytes are.
+runs them, and the size the liveness probe reports so an agent can see its
+database grow.
 """
 
 from __future__ import annotations
 
 import json
 import sqlite3
+from contextlib import closing
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
@@ -387,75 +389,63 @@ async def test_database_size_reports_the_whole_database(db):
     assert "free pages" in after.describe()
 
 
-async def test_largest_tables_names_the_biggest_with_its_indexes(db):
-    await _create_health_log(db)
-    await db.execute("CREATE INDEX idx_health_log_agent ON health_log(agent_id, created_at)")
-    await db.execute("CREATE TABLE small (id TEXT PRIMARY KEY)")
-    for index in range(300):
-        await _health_row(db, f"h{index}", AGENT, f"{index:04d}" + "y" * 600)
-
-    report = await footprint.measure_largest_tables(db, limit=5)
-
-    assert report.unavailable is None
-    names = [table.name for table in report.tables]
-    assert names[0] == "health_log"
-    assert "idx_health_log_agent" not in names, "indexes count toward their table"
-    if db.backend_type == "sqlite":
-        connection = sqlite3.connect(db.backend.db_path)
-        try:
-            own = connection.execute(
-                "SELECT SUM(pgsize) FROM dbstat WHERE name = 'health_log'"
-            ).fetchone()[0]
-        finally:
-            connection.close()
-        assert report.tables[0].bytes > own
-    assert report.to_dict()["tables"][0]["name"] == "health_log"
-
-
-async def test_largest_tables_reports_a_scan_that_ran_out_of_time(tmp_path, monkeypatch):
-    database = await AsyncDatabase.sqlite(
-        str(tmp_path / "slow.db"), schema_initializer=_no_schema
+async def test_database_size_refuses_a_replaced_database_file(tmp_path):
+    from kestrel_sovereign.storage.db.interface import (
+        ConnectionError as DatabaseConnectionError,
     )
-    try:
-        await _create_health_log(database)
-        monkeypatch.setattr(footprint, "TABLE_SCAN_BUDGET_S", -1.0)
-        monkeypatch.setattr(footprint, "_PROGRESS_INTERVAL", 1)
-        report = await footprint.measure_largest_tables(database)
-    finally:
-        await database.close()
-    assert report.tables == ()
-    assert "gave up" in report.unavailable
 
-
-async def test_largest_tables_refuses_a_replaced_database_file(tmp_path):
     path = tmp_path / "replaced.db"
     database = await AsyncDatabase.sqlite(str(path), schema_initializer=_no_schema)
     try:
         path.rename(tmp_path / "moved.db")
         sqlite3.connect(path).close()
-        report = await footprint.measure_largest_tables(database)
+        with pytest.raises(DatabaseConnectionError):
+            await footprint.measure_database_size(database)
     finally:
         await database.close()
-    assert report.tables == ()
-    assert "changed" in report.unavailable
+
+
+async def test_database_size_never_pairs_one_file_with_anothers_log(tmp_path):
+    """The page counts come through the agent's connection, the log by its
+    pathname. A file replaced between the two must not be reported as one
+    database: that pairing is what the read-by-pathname table scan got wrong.
+    """
+    from kestrel_sovereign.storage.db.interface import (
+        ConnectionError as DatabaseConnectionError,
+    )
+
+    path = tmp_path / "raced.db"
+    database = await AsyncDatabase.sqlite(str(path), schema_initializer=_no_schema)
+    query_size = database.fetchone
+
+    async def size_then_replace(sql, *args, **kwargs):
+        row = await query_size(sql, *args, **kwargs)
+        path.rename(tmp_path / "moved.db")
+        with closing(sqlite3.connect(path)) as replacement:
+            replacement.execute("CREATE TABLE unrelated_replacement_table (v)")
+        return row
+
+    try:
+        database.fetchone = size_then_replace
+        with pytest.raises(DatabaseConnectionError):
+            await footprint.measure_database_size(database)
+    finally:
+        del database.fetchone
+        await database.close()
 
 
 async def test_footprint_does_not_guess_for_an_unknown_adapter():
     unknown = SimpleNamespace(backend_type="duckdb")
     assert await footprint.measure_database_size(unknown) is None
-    report = await footprint.measure_largest_tables(unknown)
-    assert report.unavailable == "unsupported database adapter"
 
 
 async def test_footprint_of_an_in_memory_database():
     database = await AsyncDatabase.sqlite(":memory:", schema_initializer=_no_schema)
     try:
         size = await footprint.measure_database_size(database)
-        report = await footprint.measure_largest_tables(database)
     finally:
         await database.close()
     assert size.wal_bytes is None
-    assert report.unavailable == "in-memory database"
 
 
 # --- the trash_retention rail ------------------------------------------------
@@ -668,85 +658,6 @@ async def test_health_probe_propagates_execution_control():
     )
     with pytest.raises(ExecutionAuthorityError):
         await check_database_size(revoked)
-
-
-# --- memory_status -----------------------------------------------------------
-
-
-def _memory_feature(db):
-    from unittest.mock import MagicMock
-
-    from kestrel_sovereign.features.memory.feature import MemoryFeature
-
-    feature = MemoryFeature(agent=MagicMock())
-    feature._db = db
-    return feature
-
-
-async def test_memory_status_footprint_names_the_largest_tables(tmp_path):
-    database = await AsyncDatabase.sqlite(
-        str(tmp_path / "memory.db"), schema_initializer=_no_schema
-    )
-    try:
-        await _create_health_log(database)
-        for index in range(100):
-            await _health_row(database, f"h{index}", AGENT, "z" * 800 + str(index))
-        footprint_data = await _memory_feature(database)._database_footprint()
-    finally:
-        await database.close()
-    assert footprint_data["size"]["backend"] == "sqlite"
-    assert footprint_data["largest_tables"]["tables"][0]["name"] == "health_log"
-
-
-async def test_memory_status_reports_the_database(monkeypatch):
-    from unittest.mock import MagicMock
-
-    from kestrel_sdk.tools.result import ToolResultStatus
-
-    store = MagicMock()
-    store.agent_id = AGENT
-    store.encryption_enabled = False
-    store.get_lexical_index_health = AsyncMock(return_value={"coverage": 1.0})
-    store.get_embedding_profile_health = AsyncMock(return_value={})
-    db = MagicMock()
-    db.fetchone = AsyncMock(side_effect=[(5,), (2,)])
-    feature = _memory_feature(db)
-    feature.agent_id = AGENT
-    feature.storage = object()
-    feature._memory_system = None
-    feature.agent.memory_system = None
-    monkeypatch.setattr(feature, "_get_conversation_store", lambda: store)
-    monkeypatch.setattr(feature, "_database_footprint", AsyncMock(return_value={
-        "size": {"summary": "1.89 GB (0 B free pages, WAL 33.0 MB)"},
-        "largest_tables": {"tables": [{"name": "health_log", "bytes": 1}]},
-    }))
-
-    result = await feature.memory_status()
-
-    assert result.status is ToolResultStatus.OK
-    assert "database=1.89 GB" in result.confirmation
-    assert result.data["database"]["largest_tables"]["tables"][0]["name"] == "health_log"
-
-
-async def test_memory_status_footprint_degrades_on_failure():
-    broken = SimpleNamespace(
-        backend_type="sqlite",
-        fetchone=AsyncMock(side_effect=RuntimeError("database is locked")),
-    )
-    assert await _memory_feature(broken)._database_footprint() == {
-        "error": "database is locked",
-    }
-
-
-async def test_memory_status_footprint_propagates_execution_control():
-    from kestrel_sovereign.execution_custody import ExecutionAuthorityError
-
-    revoked = SimpleNamespace(
-        backend_type="sqlite",
-        fetchone=AsyncMock(side_effect=ExecutionAuthorityError("lease lost")),
-    )
-    with pytest.raises(ExecutionAuthorityError):
-        await _memory_feature(revoked)._database_footprint()
 
 
 # --- signal_log --------------------------------------------------------------
