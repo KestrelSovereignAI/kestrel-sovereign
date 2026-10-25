@@ -92,6 +92,23 @@ async def test_maintenance_does_not_resolve_or_claim_a_hosted_route(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_maintenance_refuses_bin_override_without_child_distribution_proof(tmp_path, monkeypatch):
+    agent = _make_agent(tmp_path)
+    agent.defer_agent_readiness_to_host(maintenance=True)
+    monkeypatch.setenv("KESTREL_FEATURE_TELEGRAMFEATURE_BIN", "/bin/true")
+    monkeypatch.setattr(isolated_runtime, "_feature_distribution_version", lambda *_args: "0.1.10")
+    proxy = ProxyFeature(agent, InstalledFeatureRuntime(
+        class_name="TelegramFeature", entry_point="telegram.feature:TelegramFeature",
+        distribution="kestrel-channel-telegram", runtime="isolated-venv", service="kestrel-telegram-service",
+    ))
+    try:
+        with pytest.raises(MaintenanceBootError, match="maintenance"):
+            proxy._assert_child_start_allowed()
+    finally:
+        await close_agent(agent)
+
+
+@pytest.mark.asyncio
 async def test_maintenance_child_uses_reserved_native_sdk_handshake_not_route_attestation(tmp_path, monkeypatch):
     agent = _make_agent(tmp_path)
     agent.defer_agent_readiness_to_host(maintenance=True)

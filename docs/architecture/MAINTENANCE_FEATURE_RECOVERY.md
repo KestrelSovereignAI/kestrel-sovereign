@@ -66,6 +66,9 @@ provider/poller even with configured credentials; it does not pretend to own
 a hosted route, and maintenance does not invoke the serving-route resolver or
 acquire a channel claim. An older or unreviewed isolated runtime fails before
 starting, rather than discovering an unsafe child after it has polled.
+Maintenance does not admit a BIN override: an immutable executable alone does
+not prove that it implements this distribution's maintenance handshake. Normal
+serving BIN support and its existing custody checks remain unchanged.
 
 In particular Workflows must construct its store/runner/wait contribution but
 not recover runs, restore waits, reconcile triggers or start recovery from
