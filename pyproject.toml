@@ -105,7 +105,7 @@ dependencies = [
     # feature skill producers. The lock records the tested release; future minor versions remain
     # admissible. Verify installed host features against the resolved SDK
     # before release rather than preserving an obsolete minor ceiling.
-    "kestrel-sovereign-sdk[a2a,httpx,tracing]>=0.42.2,<1",
+    "kestrel-sovereign-sdk[a2a,httpx,tracing]>=0.42.3,<1",
     # Native A2A implementation is owned by the shared SDK [a2a] extra.
     # Core and feature skill producers use the same reviewed vendored types.
     "protobuf>=5.29.5",
