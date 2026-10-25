@@ -1,6 +1,7 @@
 """Native manager construction and the real host's signal boot phase."""
 
 import asyncio
+from contextlib import AsyncExitStack
 from dataclasses import replace
 from types import SimpleNamespace
 
@@ -2274,9 +2275,18 @@ async def native_question_peer(local_native_peer):
         await feature.post_all_features_loaded(p.sender)
         yield SimpleNamespace(**vars(p), feature=feature, dispatcher=dispatcher)
     finally:
-        await feature.shutdown()
-        await dispatcher.shutdown_durable_delivery()
-        await asyncio.gather(*signal_agent.tasks, return_exceptions=True)
+        async def join_signal_tasks():
+            await asyncio.gather(*signal_agent.tasks, return_exceptions=True)
+
+        try:
+            async with AsyncExitStack() as cleanup:
+                cleanup.push_async_callback(join_signal_tasks)
+                cleanup.push_async_callback(dispatcher.shutdown_durable_delivery)
+                cleanup.push_async_callback(feature.shutdown)
+        except asyncio.CancelledError as error:
+            # Report the original cancellation/receipt as a fixture failure,
+            # so pytest still runs unrelated fixture finalizers in this worker.
+            raise AssertionError("Native question fixture retained shutdown cancellation") from error
 
 
 async def test_public_question_sender_retains_live_submission_ownership_until_receipt(
