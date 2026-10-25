@@ -453,6 +453,12 @@ async def require_turn_start_allowed(agent: Any) -> EffectiveHoldState | None:
     fail closed through :func:`require_context_hold_store`.
     """
 
+    from kestrel_sovereign.agent.runtime_start import require_runtime_start_allowed
+
+    # Even an earlier durable Hold snapshot cannot release a process-local
+    # maintenance generation. This precedes credentials/genesis/turn work in
+    # both public streaming and nonstreaming paths.
+    require_runtime_start_allowed(agent)
     reused = _turn_admission_snapshot.get()
     if (
         reused is not None

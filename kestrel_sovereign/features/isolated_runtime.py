@@ -641,6 +641,7 @@ _EVENT_INGRESS_ACK_BACKOFF = 0.1
 # guessing Core versions from an arbitrary client name.
 _HOST_RUNTIME_CAPABILITIES_FIELD = "_kestrel_host_runtime_capabilities"
 _ACKNOWLEDGED_CHANNEL_INBOUND_CAPABILITY = "channel-inbound-acknowledgement-v1"
+_MAINTENANCE_BOOT_CAPABILITY = "kestrel-maintenance-boot-v1"
 # A host-only startup fence for an externally provisioned Telegram webhook.
 # It is deliberately injected at process launch rather than stored in feature
 # config: a user config row must never be able to claim a host route is live.
@@ -8146,6 +8147,15 @@ class ProxyFeature(Feature):
         """
 
         self._require_telegram_runtime()
+        from kestrel_sovereign.agent.runtime_start import MaintenanceBootError, maintenance_boot_active
+
+        if maintenance_boot_active(self.agent):
+            if self._hosted_telegram_route_claim is not None:
+                raise MaintenanceBootError("maintenance boot cannot inherit a serving Telegram route claim")
+            # Maintenance is NOT a hosted-route attestation. The child hold
+            # has its own native handshake and may not claim/release a route.
+            self._clear_hosted_telegram_startup_attestation()
+            return
         # Do not use bare ``getattr`` here: dynamic integration proxies (and
         # unittest mocks) manufacture callable-looking attributes that were
         # never a host injection. Only an explicitly stored instance value or
@@ -12246,6 +12256,30 @@ class ProxyFeature(Feature):
                 f"Cannot continue isolated feature {self.name}: terminal lifecycle "
                 "is latched; explicit initialize is required"
             )
+        from kestrel_sovereign.agent.runtime_start import MaintenanceBootError, maintenance_boot_active
+
+        if maintenance_boot_active(self.agent):
+            from packaging.version import InvalidVersion, Version
+
+            if (
+                self.runtime.runtime != "isolated-venv"
+                or self._bin_path is not None
+                or os.environ.get(_env_key(self.name, "BIN"))
+            ):
+                raise MaintenanceBootError("maintenance boot requires verified VENV distribution custody; BIN overrides are unsupported")
+            if not self._is_telegram_runtime():
+                raise MaintenanceBootError("maintenance boot requires reviewed isolated-child startup support")
+            installed = _feature_distribution_version(
+                self.runtime.distribution, self.runtime.project or self.runtime.distribution,
+            )
+            try:
+                supported = Version(installed) >= Version("0.1.10")
+            except InvalidVersion:
+                supported = False
+            if not supported:
+                # Refuse BEFORE process launch. An old child may poll during
+                # initialize, so a post-start capability check would be late.
+                raise MaintenanceBootError("maintenance boot requires Telegram >=0.1.10 before child launch")
 
     def _raise_storage_write_error(self, error: BaseException) -> None:
         """Surface storage failure without leaking feature config or secrets."""
@@ -14660,7 +14694,11 @@ class ProxyFeature(Feature):
         )
         if runtime_distribution == "kestrel-channel-telegram":
             capabilities = [_ACKNOWLEDGED_CHANNEL_INBOUND_CAPABILITY]
-            if self._hosted_telegram_startup_attested:
+            from kestrel_sovereign.agent.runtime_start import maintenance_boot_active
+
+            if maintenance_boot_active(self.agent):
+                capabilities.append(_MAINTENANCE_BOOT_CAPABILITY)
+            elif self._hosted_telegram_startup_attested:
                 capabilities.append(_HOSTED_TELEGRAM_INGRESS_OWNER_CAPABILITY)
             child_config[_HOST_RUNTIME_CAPABILITIES_FIELD] = capabilities
         kwargs = {

@@ -76,7 +76,9 @@ class DeliveryFeature(Feature):
                 else None
             ),
         )
-        await self._queue.start()
+        from kestrel_sovereign.agent.runtime_start import maintenance_boot_active
+
+        await self._queue.start(polling=not maintenance_boot_active(self.agent))
         logger.info("DeliveryFeature initialized")
 
     async def shutdown(self):
