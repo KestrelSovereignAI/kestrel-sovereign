@@ -478,3 +478,21 @@ async def test_shutdown_terminalizes_an_original_cognition_commit_with_lost_ack(
             if closing is not None:
                 await asyncio.gather(closing, return_exceptions=True)
                 await dispatcher.wait_for_durable_shutdown_release()
+
+
+@pytest.mark.timeout(120)
+async def test_initialized_a2a_consumers_share_the_native_cleanup_inventory(native_go_environment):
+    from kestrel_sovereign.signals.sources import a2a, a2a_question_answered, a2a_task_submitted, core_cognition_consumers
+
+    agent = native_go_environment.recipient
+    dispatcher = agent.dispatcher
+    contracts = dict(core_cognition_consumers())
+    rows = await dispatcher.durable_store.backend.fetch_all(
+        "SELECT consumer_id, source FROM durable_signal_consumers WHERE agent_id=?", (agent.did,),
+    )
+    registered = dict(rows)
+    for source in (a2a, a2a_question_answered, a2a_task_submitted):
+        consumer = source.DURABLE_COGNITION_CONSUMER_ID
+        assert consumer in dispatcher._started_durable_cognition_consumers
+        assert registered[consumer] == contracts[consumer] == source.SOURCE_NAME
+        assert dispatcher._registry.get(source.SOURCE_NAME).default_mode is SignalMode.COGNITION
