@@ -803,7 +803,7 @@ requires review against the pinned runner source.
 
 Raw JSON, HTML and JUnit reports retain all manual obligations and optional
 capability skips. The full run requires zero failed checks in both the raw
-requirement observations and JUnit. Conflicting evidence fails the gate. Profile schema 2
+requirement observations and JUnit. A failure in either report fails the gate. Profile schema 2
 also records the resolved Agent Card cache and HTTP+JSON error-media SHOULDs,
 including their native binding observations and all four passing JUnit probes.
 Losing or skipping one of those probes fails the gate. Both public and per-agent
