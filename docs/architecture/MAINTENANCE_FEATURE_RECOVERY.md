@@ -57,6 +57,16 @@ from publishing runtime workers or declaring application health. Maintenance:
   durable SafeMode and Hold latches.
 
 Participating external features must also hold their **inline** startup work.
+Core refuses maintenance isolated-child launch unless its startup contract is
+explicitly supported. Telegram requires host/child release **0.1.10 or newer**
+before launch (the existing immutable artifact checks also match the child to
+the host release). Core injects the reserved, non-persisted
+`kestrel-maintenance-boot-v1` initialize capability. That child starts no
+provider/poller even with configured credentials; it does not pretend to own
+a hosted route, and maintenance does not invoke the serving-route resolver or
+acquire a channel claim. An older or unreviewed isolated runtime fails before
+starting, rather than discovering an unsafe child after it has polled.
+
 In particular Workflows must construct its store/runner/wait contribution but
 not recover runs, restore waits, reconcile triggers or start recovery from
 `post_all_features_loaded` or `on_agent_ready`. A resident task barrier by
