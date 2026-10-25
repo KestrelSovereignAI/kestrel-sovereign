@@ -80,7 +80,6 @@ def _rewrite(path, change):
     path.write_text(json.dumps(data))
 
 
-
 def _fail_advisory(evidence):
     reports, _ = evidence
     _rewrite(reports / "compatibility.json", lambda data:
@@ -90,6 +89,7 @@ def _fail_advisory(evidence):
     tree = ElementTree.parse(path)
     ElementTree.SubElement(tree.getroot().find("testsuite")[1], "failure").text = "no max-age"
     tree.write(path)
+
 
 def test_full_pass_retains_unmodified_raw_gaps(evidence):
     reports, _ = evidence
@@ -178,8 +178,6 @@ def test_runner_abort_is_never_advisory(evidence, returncode):
 @pytest.mark.parametrize("mutation", ["error", "empty", "unknown_failure", "mixed_level", "duplicate", "no_pass"])
 def test_junit_errors_and_unaccounted_failures_are_fatal(evidence, mutation):
     reports, _ = evidence
-    if mutation in {"unknown_failure", "mixed_level"}:
-        _fail_advisory(evidence)
     path = reports / "junitreport.xml"
     tree = ElementTree.parse(path)
     suite = tree.getroot().find("testsuite")
@@ -189,7 +187,9 @@ def test_junit_errors_and_unaccounted_failures_are_fatal(evidence, mutation):
         suite.clear()
     elif mutation == "unknown_failure":
         suite[1].set("name", "test_unmapped")
+        ElementTree.SubElement(suite[1], "failure").text = "unmapped failure"
     elif mutation == "mixed_level":
+        ElementTree.SubElement(suite[1], "failure").text = "mixed-level failure"
         _rewrite(reports / "compatibility.json", lambda data:
                  data["per_requirement"]["DM-MSG-001"]["test_ids"].append("tests/wire/test_card.py::test_cache"))
     elif mutation == "duplicate":
@@ -197,7 +197,7 @@ def test_junit_errors_and_unaccounted_failures_are_fatal(evidence, mutation):
     else:
         ElementTree.SubElement(suite[0], "skipped")
     tree.write(path)
-    with pytest.raises(ValueError, match="JUnit|advisory coverage|failed checks"):
+    with pytest.raises(ValueError, match="JUnit|failed checks"):
         _validate(evidence, returncode=1 if mutation in {"unknown_failure", "mixed_level"} else 0)
 
 
@@ -325,3 +325,26 @@ def test_full_profile_rejects_other_failed_advisories(evidence, level):
     tree.write(path)
     with pytest.raises(ValueError, match="full profile has failed checks"):
         _validate(evidence, returncode=1)
+
+
+@pytest.mark.parametrize("requirement_level", ["SHOULD", "MAY"])
+@pytest.mark.parametrize("failure_location", ["status", "transport"])
+def test_full_profile_rejects_raw_failures_despite_passing_junit(
+    evidence, requirement_level, failure_location
+):
+    reports, _ = evidence
+    _rewrite(reports / "compatibility.json", lambda data:
+             data["per_requirement"].update({"OPTIONAL-001": {
+                 "level": requirement_level,
+                 "status": "FAIL" if failure_location == "status" else "PASS",
+                 "errors": ["reported failure"],
+                 "transports": {"http_json": "FAIL" if failure_location == "transport" else "PASS"},
+                 "test_ids": ["tests/wire/test_optional.py::test_optional"],
+             }}))
+    path = reports / "junitreport.xml"
+    tree = ElementTree.parse(path)
+    ElementTree.SubElement(tree.getroot().find("testsuite"), "testcase",
+                           classname="tests.wire.test_optional", name="test_optional")
+    tree.write(path)
+    with pytest.raises(ValueError, match="full profile reports failed requirement: OPTIONAL-001"):
+        _validate(evidence)

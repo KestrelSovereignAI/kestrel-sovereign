@@ -110,6 +110,9 @@ def validate_tck_report(
     if level == "full" and failures:
         raise ValueError("TCK full profile has failed checks")
     if level == "full":
+        for key, row in requirements.items():
+            if row["status"] == "FAIL" or "FAIL" in row["transports"].values():
+                raise ValueError(f"TCK full profile reports failed requirement: {key}")
         for key, row in advisories.items():
             if any(outcomes.get(_junit_address(node)) != "PASS" for node in row["test_ids"]):
                 raise ValueError(f"TCK advisory pass lacks passing JUnit probes: {key}")
