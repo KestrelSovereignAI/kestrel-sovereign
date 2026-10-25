@@ -98,6 +98,8 @@ async def test_manager_commits_native_routes_and_card_as_one_publication(publica
         direct = await http.get(native_card_path("registered-agent"))
         root = await http.get("/.well-known/agent-card.json")
         assert direct.status_code == root.status_code == 200
+        for response in (direct, root):
+            assert set(response.headers["cache-control"].split(", ")) == {"no-cache", "max-age=0"}
         assert direct.json() == root.json()
         verify_native_agent_card(
             ParseDict(root.json(), AgentCard()),
@@ -108,11 +110,11 @@ async def test_manager_commits_native_routes_and_card_as_one_publication(publica
             },
         )
         etag = direct.headers["etag"]
-        assert (
-            await http.get(
-                native_card_path("registered-agent"), headers={"If-None-Match": etag}
-            )
-        ).status_code == 304
+        for path in (native_card_path("registered-agent"), "/.well-known/agent-card.json"):
+            unchanged = await http.get(path, headers={"If-None-Match": etag})
+            assert unchanged.status_code == 304
+            assert unchanged.headers["etag"] == etag
+            assert set(unchanged.headers["cache-control"].split(", ")) == {"no-cache", "max-age=0"}
         p.recipient._agent_name = "Session Rename"
         renamed = await http.get(
             native_card_path("registered-agent"), headers={"If-None-Match": etag}
@@ -126,7 +128,8 @@ async def test_manager_commits_native_routes_and_card_as_one_publication(publica
         async with p.host.a2a_lifecycle_lease():
             p.host._withdraw_initialized_agent("registered-agent", p.recipient)
         assert p.app.routes == []
-        assert (await http.get(native_card_path("registered-agent"))).status_code == 404
+        for path in (native_card_path("registered-agent"), "/.well-known/agent-card.json"):
+            assert (await http.get(path, headers={"If-None-Match": etag})).status_code == 404
         with pytest.raises(HTTPException) as denied:
             await p.publication.get_card()
         assert denied.value.status_code == 404
@@ -136,28 +139,44 @@ async def test_manager_commits_native_routes_and_card_as_one_publication(publica
 async def test_public_card_revalidates_the_exact_recipient_generation(
     publication, fault
 ):
+    import httpx
     from starlette.exceptions import HTTPException
+
+    from kestrel_sovereign.a2a.native_routes import native_card_path
 
     p = publication
     async with p.host.a2a_lifecycle_lease():
         p.host._register_agent("registered-agent", p.recipient)
-        if fault == "policy":
-            p.host.install_a2a_hosted_policy(
-                p.recipient,
-                resolver=p.policy.resolver,
-                authorizer=p.policy.authorizer,
-                router=p.policy.router,
-                requester=p.policy.requester,
-            )
-        elif fault == "identity":
-            p.recipient.identity = replace(
-                p.recipient.identity, new_verification_methods=[]
-            )
-        else:
-            p.host._agents["registered-agent"] = SimpleNamespace(**vars(p.recipient))
-    with pytest.raises(HTTPException) as denied:
-        await p.publication.get_card()
-    assert denied.value.status_code == 403
+    paths = (native_card_path("registered-agent"), "/.well-known/agent-card.json")
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(p.app), base_url="https://native.test"
+    ) as http:
+        original = [await http.get(path) for path in paths]
+        assert all(response.status_code == 200 for response in original)
+        async with p.host.a2a_lifecycle_lease():
+            if fault == "policy":
+                p.host.install_a2a_hosted_policy(
+                    p.recipient,
+                    resolver=p.policy.resolver,
+                    authorizer=p.policy.authorizer,
+                    router=p.policy.router,
+                    requester=p.policy.requester,
+                )
+            elif fault == "identity":
+                p.recipient.identity = replace(
+                    p.recipient.identity, new_verification_methods=[]
+                )
+            else:
+                p.host._agents["registered-agent"] = SimpleNamespace(**vars(p.recipient))
+        for path, response in zip(paths, original, strict=True):
+            # The live recipient gate precedes conditional caching. Neither
+            # the old validator nor a wildcard can revalidate withdrawn policy.
+            for validator in (response.headers["etag"], "*"):
+                denied = await http.get(path, headers={"If-None-Match": validator})
+                assert denied.status_code == 403
+        with pytest.raises(HTTPException) as denied:
+            await p.publication.get_card()
+        assert denied.value.status_code == 403
 
 
 async def test_native_publication_failure_withdraws_manager_registration(publication):
