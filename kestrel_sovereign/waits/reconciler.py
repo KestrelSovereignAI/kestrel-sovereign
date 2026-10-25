@@ -56,7 +56,7 @@ import time
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
 
 from kestrel_sdk.signals import Signal, SignalMode, Visibility
 from kestrel_sdk.tools import MonitorableWaitable, Outcome, ToolResult, WaitStatus
@@ -1638,14 +1638,46 @@ async def register_wait_watch(
             ``kind`` with no registered provider, or a handle the named
             provider affirmatively does not own.
     """
+    await _write_watch(
+        agent,
+        ref,
+        lambda store, kind, handle: store.start_watch(
+            kind, handle, origin_session_id=origin_session_id
+        ),
+    )
+
+
+async def arm_wait_watch_if_absent(
+    agent: Any, ref: str, *, origin_session_id: Optional[str] = None
+) -> bool:
+    """Arm a watch on ``ref`` unless the handle was ever registered (#3758).
+
+    For a caller that started work and may have stopped before its
+    :func:`register_wait_watch` ran: it repairs the missing watch without
+    touching one that exists. A handle that has any wait state keeps it as it
+    is, its origin session and its delivered or in-flight wake included, so
+    this never replays a wake or re-arms a watch that was stopped or retired.
+    ``origin_session_id`` is recorded only on a watch this arms. Validated
+    exactly like :func:`register_wait_watch`, and raises the same
+    ``ValueError``s. Returns whether it armed a watch.
+    """
+    return await _write_watch(
+        agent,
+        ref,
+        lambda store, kind, handle: store.start_watch_if_absent(
+            kind, handle, origin_session_id=origin_session_id
+        ),
+    )
+
+
+async def _write_watch(agent: Any, ref: str, write: Callable[..., Awaitable[Any]]) -> Any:
+    """Validate ``ref`` and run ``write(store, kind, handle)`` in the lifetime."""
     reconciler, resolved = await _registration_lifetime(agent, ref)
     async with reconciler._live_operation():
         kind, handle, _provider = (
             resolved if resolved is not None else await _resolve_owned_provider(agent, ref)
         )
-        await reconciler._store.start_watch(
-            kind, handle, origin_session_id=origin_session_id
-        )
+        return await write(reconciler._store, kind, handle)
 
 
 class DurableResumeUnsupportedError(ValueError):

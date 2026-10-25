@@ -820,6 +820,40 @@ class WaitSignalStore:
                 (self._agent_id, kind, handle, origin_session_id),
             )
 
+    async def start_watch_if_absent(
+        self,
+        kind: str,
+        handle: str,
+        *,
+        origin_session_id: Optional[str] = None,
+    ) -> bool:
+        """Arm a watch on ``(kind, handle)`` only if the handle has no row (#3758).
+
+        For recovering a registration that never ran. A row of any kind is
+        left exactly as it is: an armed watch, its origin session, a delivered
+        or in-flight wake, a watch stopped or retired. So this never replays
+        a wake and never moves a watch, unlike :meth:`start_watch`, whose
+        re-arm is the point of calling it. Same ``INSERT OR IGNORE`` as
+        :meth:`seed_signaled`. Returns True if it armed a watch.
+        """
+        if origin_session_id is not None:
+            if not isinstance(origin_session_id, str):
+                raise TypeError(
+                    "start_watch_if_absent origin_session_id must be a string "
+                    f"or None, got {type(origin_session_id).__name__}"
+                )
+            origin_session_id = origin_session_id.strip() or None
+        rowcount = await self._db.execute(
+            """
+            INSERT OR IGNORE INTO wait_signal_state
+                (agent_id, kind, handle, watching,
+                 watch_origin_session_id, updated_at)
+            VALUES (?, ?, ?, 1, ?, CURRENT_TIMESTAMP)
+            """,
+            (self._agent_id, kind, handle, origin_session_id),
+        )
+        return rowcount > 0
+
     async def stop_watch(self, kind: str, handle: str) -> None:
         """Clear the explicit watch on ``(kind, handle)`` (set watching=0)."""
         await self._db.execute(

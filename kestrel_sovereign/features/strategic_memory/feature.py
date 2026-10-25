@@ -17,21 +17,32 @@ Two canonical files, split by how the content is meant to be read:
 
 This feature also provides !strategy commands for querying and updating
 strategic context at runtime.
+
+``signal_dispatch`` picks the top issue and starts it. When the host's Talon
+policy names another agent as its only dispatcher, this agent keeps selection
+and sends that executor a work order instead of launching anything itself
+(#3758).
 """
 
 import asyncio
 import copy
 import logging
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
+from uuid import uuid4
 
 from kestrel_sdk.tools.base import ToolCategory
 from kestrel_sdk.tools.result import ToolResult
 from kestrel_sovereign.agent.orchestrator_engine import ToolNotRegisteredError
+from kestrel_sovereign.execution_custody import is_execution_control_error
 from kestrel_sovereign.features.base import Feature, tool
 from kestrel_sovereign.features.enum_coerce import normalize_choice as _normalize_choice
+from kestrel_sovereign.waits.reconciler import (
+    arm_wait_watch_if_absent,
+    register_wait_watch,
+)
 
 from .atomic_file import (
     file_digest as _strategy_digest,
@@ -86,7 +97,20 @@ from .ledger_index import (
     search_rows,
 )
 from .morning_signal import generate_morning_signal
-from .run_history import RunHistoryUnreadable, read_run_history
+from .run_history import (
+    DELIVERY_UNCERTAIN,
+    TALON_WAIT_KIND,
+    WORK_ORDER_SCHEMA,
+    NamedToolCall,
+    OutstandingOrder,
+    RunHistory,
+    RunHistoryUnreadable,
+    SettledDispatch,
+    read_executor_run_history,
+    read_run_history,
+    tool_payload,
+    tool_succeeded,
+)
 from .session_log import collect_session_log
 from .workflow_runs import assess_workflow_runs
 from .workspace_readiness import TalonWorkspaceProviderOutdated, talon_workspaces
@@ -119,6 +143,21 @@ _DISPATCH_MODE_ALIASES = {
 # ``workflow_run``.  Both must be live before execute mode is admitted.
 _DEFAULT_DISPATCH_WORKFLOW = "fleet_coding_pipeline"
 _WORKFLOW_RUN_TOOL = "workflow_run"
+#: The ``source`` every tool ``signal_dispatch`` calls by name is audited as.
+_DISPATCH_SOURCE = "strategic_memory.signal_dispatch"
+
+#: kestrel-feature-talon names the one agent on a host that may start Talon
+#: runs in its operator policy (``[talon.policy] dispatcher``,
+#: kestrel-feature-talon#57) and refuses a launch on any other agent with
+#: ``TALON_NOT_DISPATCHER``. Core cannot import that package, so it asks this
+#: agent's Talon for the policy its launches load, through the tool Talon
+#: publishes for reading it, and reads this field of the answer.
+_TALON_CONFIG_TOOL = "talon_get_config"
+_TALON_DISPATCHER = "dispatcher"
+#: The Peers tool a delegated dispatch sends its work order with (#3758).
+_SEND_TASK_TOOL = "send_a2a_task"
+#: The fleet's work-order contract bounds an order's ``context`` in words.
+_WORK_ORDER_CONTEXT_WORDS = 300
 #: Every ``reason_code`` a failed ``signal_dispatch`` result can carry. The
 #: scheduler admits a code into the dispatch failure (and so into
 #: ``signal_log.error``) only by membership here — see
@@ -146,6 +185,24 @@ SIGNAL_DISPATCH_REASON_CODES = frozenset(
         # its dispatch would run in (or its provider has no read that says),
         # and no other candidate was selected; not "nothing to do" (#3548).
         "TALON_WORKSPACE_UNCONFIRMED",
+        # ``[talon.policy] dispatcher`` is set but names no agent. Talon then
+        # refuses every launch, so where the work would run is unknown (#3758).
+        "DISPATCHER_POLICY_INVALID",
+        # This agent's Talon could not say which agent may start its runs,
+        # so whether this agent or another one executes is unknown (#3758).
+        "DISPATCHER_POLICY_UNCONFIRMED",
+        # Another agent executes this agent's dispatches, and no enabled tool
+        # here can read its reports or send it a work order (#3758).
+        "WORK_ORDER_UNAVAILABLE",
+        # The work order was refused before anything left this agent (#3758).
+        "WORK_ORDER_REJECTED",
+        # The work order may have reached the executor, but its delivery was
+        # not confirmed; sending it again could give it the issue twice.
+        "WORK_ORDER_UNCONFIRMED",
+        # The wait that wakes this agent when the executor reports was not
+        # armed, for the order just sent or for one sent before whose watch
+        # was never registered (#3758, #3755).
+        "WORK_ORDER_WAKE_UNARMED",
     }
 )
 #: The ``reason_code`` a failed ``strategy_reconcile_blockers`` result can
@@ -211,6 +268,18 @@ class _SaveOutcome:
     #: The file had changed on disk, so it was re-read and only this call's
     #: change was applied to what it now holds.
     reloaded: bool = False
+
+
+class _DispatcherPolicyInvalid(ValueError):
+    """``[talon.policy] dispatcher`` is set to something that names no agent."""
+
+
+class _DispatcherPolicyUnconfirmed(RuntimeError):
+    """This agent's Talon did not say which agent may start its runs."""
+
+
+class _TalonUnaskable(_DispatcherPolicyUnconfirmed):
+    """Talon is loaded, but this runtime cannot call a tool by name to ask it."""
 
 
 class _StrategyFileConflict(Exception):
@@ -324,6 +393,13 @@ class StrategicMemoryFeature(Feature):
         # in-memory change that never reached disk (#3320). Projection runs
         # AFTER release: it reads only the snapshot, never the live ledger.
         self._ledger_mutation_lock = asyncio.Lock()
+        # Held from reading the executor's work orders to sending it the next
+        # one, so a scheduled dispatch and a turn's cannot both find it idle
+        # and each send an order (#3758).
+        self._work_order_lock = asyncio.Lock()
+        # What each finished dispatch to the executor said, by dispatch id:
+        # it cannot change, so it is read from the executor once (#3758).
+        self._settled_work_orders: Dict[str, SettledDispatch] = {}
 
     @property
     def tool_description(self) -> str:
@@ -2155,13 +2231,335 @@ class StrategicMemoryFeature(Feature):
                 return session_id.strip()
         return "strategic-memory"
 
+    async def _dispatch_executor(self, call: Optional[NamedToolCall]) -> Optional[str]:
+        """The agent that runs this agent's dispatches, or ``None`` for this one.
+
+        kestrel-feature-talon lets a host name one agent as its only Talon
+        dispatcher and refuses a launch on any other (#57). A queue owner that
+        is not that agent keeps selection and delegates execution to it
+        (#3758). Which agent that is comes from this agent's own Talon: the
+        policy ``talon_get_config`` reports is the one its launches load, from
+        whatever file Talon was configured with, so this cannot name an
+        executor that Talon's launch gate does not. An agent with no ``talon``
+        wait provider has no Talon and runs its own dispatches. A Talon whose
+        policy has no ``dispatcher`` field predates #57 and lets every agent
+        launch. The agent is matched by its public ``agent_name``, as Talon
+        matches it.
+
+        Raises :class:`_TalonUnaskable` when this runtime cannot ask Talon,
+        :class:`_DispatcherPolicyUnconfirmed` when Talon does not answer, and
+        :class:`_DispatcherPolicyInvalid`
+        when it reports a dispatcher that names no agent: Talon refuses every
+        launch then, and reading either as "anyone may dispatch" would launch
+        here anyway.
+        """
+        registry = getattr(self.agent, "wait_registry", None)
+        if registry is None or registry.get(TALON_WAIT_KIND) is None:
+            return None
+        if call is None:
+            raise _TalonUnaskable(
+                "Talon is loaded on this agent, but governed named-tool "
+                "dispatch is unavailable on this agent runtime, so Talon "
+                "cannot be asked which agent may start its runs"
+            )
+        try:
+            answer = await call(_TALON_CONFIG_TOOL, {})
+        except ToolNotRegisteredError as exc:
+            raise _DispatcherPolicyUnconfirmed(
+                f"Talon is loaded on this agent, but no enabled feature exposes "
+                f"'{_TALON_CONFIG_TOOL}' to report its policy"
+            ) from exc
+        except Exception as exc:  # noqa: BLE001 - sanitize the tool boundary
+            if is_execution_control_error(exc):
+                raise
+            raise _DispatcherPolicyUnconfirmed(
+                f"'{_TALON_CONFIG_TOOL}' raised {type(exc).__name__}: {exc}"
+            ) from exc
+        payload = tool_payload(answer)
+        if not tool_succeeded(payload):
+            raise _DispatcherPolicyUnconfirmed(
+                f"'{_TALON_CONFIG_TOOL}' did not report Talon's policy: "
+                f"{payload.get('error') or 'no reason given'}"
+            )
+        data = payload.get("data")
+        policy = data.get("policy") if isinstance(data, dict) else None
+        if not isinstance(policy, dict):
+            raise _DispatcherPolicyUnconfirmed(
+                f"'{_TALON_CONFIG_TOOL}' reported no policy"
+            )
+        dispatcher = policy.get(_TALON_DISPATCHER)
+        if dispatcher is None:
+            return None
+        if not isinstance(dispatcher, str) or not dispatcher.strip():
+            raise _DispatcherPolicyInvalid(
+                f"talon.policy.{_TALON_DISPATCHER} is {dispatcher!r}, which names "
+                "no agent"
+            )
+        dispatcher = dispatcher.strip()
+        own = getattr(self.agent, "agent_name", None)
+        if isinstance(own, str) and own.strip() == dispatcher:
+            return None
+        return dispatcher
+
+    def _named_tool_call(self, execute_named_tool: Callable) -> NamedToolCall:
+        """Call tools by name through governed dispatch, audited as this tool."""
+        session_id = self._dispatch_session_id()
+
+        async def call(name: str, args: Dict[str, Any]) -> Any:
+            return await execute_named_tool(
+                name, args, session_id=session_id, source=_DISPATCH_SOURCE
+            )
+
+        return call
+
     @staticmethod
-    def _dispatch_runner_payload(result: Any) -> Dict[str, Any]:
-        if isinstance(result, ToolResult):
-            return result.to_dict()
-        if isinstance(result, dict):
-            return dict(result)
-        return {"result": str(result)}
+    def _describe_outstanding(order: OutstandingOrder) -> str:
+        """One line naming a work order the executor has not answered."""
+        if order.state == DELIVERY_UNCERTAIN:
+            return (
+                f"dispatch {order.dispatch_id}, whose delivery is uncertain "
+                f"(get_peer_task_result('{order.dispatch_id}') reconciles it)"
+            )
+        target = (
+            f"{order.repo}#{order.issue_number}"
+            if order.repo and order.issue_number
+            else "an issue its order does not identify"
+        )
+        return (
+            f"work order {order.order_id or 'without an order_id'} on {target} "
+            f"(dispatch {order.dispatch_id}, task {order.state or 'state unknown'})"
+        )
+
+    @staticmethod
+    def _work_order_context(issue: Dict[str, Any]) -> str:
+        """The order's ``context``: why this issue, within the contract's bound."""
+        words = (
+            f"{issue['issue_title']} ({issue['priority']} priority), selected by "
+            f"signal_dispatch. {issue.get('context') or ''}"
+        ).split()
+        return " ".join(words[:_WORK_ORDER_CONTEXT_WORDS])
+
+    async def _send_work_order(
+        self,
+        issue: Dict[str, Any],
+        executor: str,
+        call: NamedToolCall,
+        skipped: List[Dict[str, Any]],
+        skipped_text: str,
+    ) -> ToolResult:
+        """Send ``executor`` the work order for ``issue`` and arm its wake (#3758).
+
+        The outcome is the executor's report on the order, not anything
+        launched here. Until #3755, the sender of an A2A task gets no wake
+        when the recipient answers it, so the ``a2a:<dispatch_id>`` wait is
+        what wakes this agent then.
+        """
+        repo, number = issue["repo"], issue["issue_number"]
+        order_id = f"wo-{number}-{uuid4().hex[:8]}"
+        order = {
+            "schema": WORK_ORDER_SCHEMA,
+            "order_id": order_id,
+            "repo": repo,
+            "issue": number,
+            "action": "claim",
+            "talon": {},
+            "verify": [],
+            "context": self._work_order_context(issue),
+        }
+        base = {
+            "mode": "execute",
+            "issue": issue,
+            "executor": executor,
+            "order_id": order_id,
+            "work_order": order,
+            "skipped": skipped,
+        }
+        try:
+            sent = await call(
+                _SEND_TASK_TOOL,
+                {
+                    "recipient": executor,
+                    "message": (
+                        f"Work order {order_id}: claim {repo}#{number} "
+                        f"({issue['issue_title']}). The order is the "
+                        f"{WORK_ORDER_SCHEMA} data part."
+                    ),
+                    "parts": [{"data": order}],
+                },
+            )
+        except ToolNotRegisteredError:
+            return ToolResult.failed(
+                f"{executor} runs this agent's dispatches, but no enabled "
+                f"feature here exposes '{_SEND_TASK_TOOL}'. Enable the Peers "
+                "feature and retry; no work order was sent.",
+                data={**base, "dispatched": False, "reason_code": "WORK_ORDER_UNAVAILABLE"},
+            )
+        except Exception as exc:  # noqa: BLE001 - sanitize the tool boundary
+            if is_execution_control_error(exc):
+                raise
+            logger.exception(
+                "Strategic Memory could not send work order %s to %s", order_id, executor
+            )
+            return ToolResult.failed(
+                f"Sending work order {order_id} for {repo}#{number} to "
+                f"{executor} failed before its delivery was confirmed, so it may "
+                f"have arrived. Inspect list_outbound_a2a_tasks(recipient="
+                f"'{executor}') before sending it again; the next signal_dispatch "
+                "waits on any dispatch whose delivery is uncertain.",
+                data={**base, "dispatched": None, "reason_code": "WORK_ORDER_UNCONFIRMED"},
+            )
+        payload = tool_payload(sent)
+        result = payload.get("data") if isinstance(payload.get("data"), dict) else {}
+        dispatch_id = result.get("dispatch_id")
+        dispatch_id = (
+            dispatch_id.strip()
+            if isinstance(dispatch_id, str) and dispatch_id.strip()
+            else None
+        )
+        delivered = tool_succeeded(payload)
+        if not delivered and (dispatch_id is None or result.get("sent") is False):
+            return ToolResult.failed(
+                f"Work order {order_id} for {repo}#{number} was not sent to "
+                f"{executor}: {payload.get('error') or 'the send was refused'}",
+                data={
+                    **base,
+                    "dispatched": False,
+                    "dispatch_id": dispatch_id,
+                    "reason_code": "WORK_ORDER_REJECTED",
+                    "send_result": payload,
+                },
+            )
+        if dispatch_id is None:
+            return ToolResult.failed(
+                f"'{_SEND_TASK_TOOL}' reported work order {order_id} for "
+                f"{repo}#{number} sent to {executor} without naming its "
+                f"dispatch, so its delivery cannot be followed. Inspect "
+                f"list_outbound_a2a_tasks(recipient='{executor}') before sending "
+                "it again.",
+                data={
+                    **base,
+                    "dispatched": None,
+                    "reason_code": "WORK_ORDER_UNCONFIRMED",
+                    "send_result": payload,
+                },
+            )
+        # Armed for an uncertain delivery too: its read reconciles the
+        # dispatch, so whatever the executor makes of the order still wakes
+        # this agent.
+        wake = f"a2a:{dispatch_id}"
+        wake_error = await self._arm_work_order_wake(wake)
+        sent_data = {
+            **base,
+            "dispatch_id": dispatch_id,
+            "remote_task_id": result.get("remote_task_id"),
+            "wake": None if wake_error else wake,
+            "send_result": payload,
+        }
+        unarmed = (
+            ""
+            if wake_error is None
+            else f" The wait that wakes this agent when {executor} reports was "
+            f"not armed ({wake_error}); arm wait(target='{wake}', "
+            "mode='signal') yourself, because nothing else wakes the sender of "
+            "an A2A task when it is answered (#3755)."
+        )
+        if not delivered:
+            # ``sent`` is True when the executor acknowledged the order and a
+            # later step here failed, None when delivery itself is uncertain.
+            acknowledged = result.get("sent") is True
+            return ToolResult.failed(
+                f"Work order {order_id} for {repo}#{number} "
+                f"{'reached' if acknowledged else 'may have reached'} {executor}, "
+                f"but the send did not complete: "
+                f"{payload.get('error') or 'no reason given'}. Do not send it "
+                f"again; get_peer_task_result('{dispatch_id}') reads it, and "
+                "the next signal_dispatch waits on it." + unarmed,
+                data={
+                    **sent_data,
+                    "dispatched": True if acknowledged else None,
+                    "reason_code": "WORK_ORDER_UNCONFIRMED",
+                },
+            )
+        logger.info(
+            "signal_dispatch sent work order %s for %s#%s to %s as dispatch %s",
+            order_id, repo, number, executor, dispatch_id,
+        )
+        body = (
+            f"Sent {executor} work order {order_id} for {repo}#{number} as "
+            f"dispatch {dispatch_id}."
+            + (
+                f" {executor}'s report on it wakes this agent ({wake})."
+                if wake_error is None
+                else unarmed
+            )
+            + skipped_text
+        )
+        if wake_error is not None:
+            return ToolResult.partial(
+                confirmation=body,
+                error=f"The wake for work order {order_id} was not armed: {wake_error}",
+                data={**sent_data, "dispatched": True, "reason_code": "WORK_ORDER_WAKE_UNARMED"},
+            )
+        return ToolResult.ok(confirmation=body, data={**sent_data, "dispatched": True})
+
+    async def _arm_work_order_wake(self, wake: str) -> Optional[str]:
+        """Arm ``wake`` as ``wait(wake, mode='signal')`` does; why it failed, or ``None``.
+
+        The same wait lifecycle call the ``wait`` tool makes, with this turn's
+        session, so the executor's report wakes the session that sent the
+        order (#3663).
+        """
+        try:
+            await register_wait_watch(
+                self.agent, wake, origin_session_id=self._turn_session_id()
+            )
+        except ValueError as exc:
+            if is_execution_control_error(exc):
+                raise
+            return str(exc)
+        except Exception as exc:  # noqa: BLE001 - sanitize the wait boundary
+            if is_execution_control_error(exc):
+                raise
+            logger.exception("Strategic Memory could not arm %s", wake)
+            return f"arming it raised {type(exc).__name__}"
+        return None
+
+    async def _recover_work_order_wakes(self, run_history: RunHistory) -> List[str]:
+        """Arm the wake of every order to the executor that never had one (#3758).
+
+        A dispatch can stop after the executor accepted an order and before
+        its wake was armed, and nothing else wakes the sender of an A2A task
+        when it is answered (#3755). The order is then usually answered long
+        before the next dispatch reads it, so every order is checked, answered
+        or not. An order whose wait was ever registered keeps that wait as it
+        is (:func:`arm_wait_watch_if_absent`): its session, and a wake already
+        delivered, are never touched. Returns one line per wake that could
+        not be armed.
+        """
+        session = self._turn_session_id()
+        unarmed: List[str] = []
+        dispatch_ids = [order.dispatch_id for order in run_history.outstanding]
+        dispatch_ids += [d for d in run_history.answered if d not in dispatch_ids]
+        for dispatch_id in dispatch_ids:
+            wake = f"a2a:{dispatch_id}"
+            try:
+                armed = await arm_wait_watch_if_absent(
+                    self.agent, wake, origin_session_id=session
+                )
+            except Exception as exc:  # noqa: BLE001 - sanitize the wait boundary
+                if is_execution_control_error(exc):
+                    raise
+                logger.exception("Strategic Memory could not recover %s", wake)
+                unarmed.append(f"{wake}: {exc}")
+                continue
+            if armed:
+                logger.warning(
+                    "signal_dispatch armed %s, the wake of a work order sent "
+                    "to %s that never had one: the dispatch that sent it "
+                    "stopped before arming it",
+                    wake, run_history.executor,
+                )
+        return unarmed
 
     @tool(
         name="signal_dispatch",
@@ -2169,13 +2567,17 @@ class StrategicMemoryFeature(Feature):
             "Pick the highest-priority issue from strategic memory and start "
             "it through a live feature-contributed dispatch workflow. Preview "
             "with mode='suggest'; execute fails closed when no compatible "
-            "workflow capability and governed runner are enabled."
+            "workflow capability and governed runner are enabled. When Talon "
+            "policy names another agent as the host's dispatcher, execute "
+            "instead sends that agent a work order (send_a2a_task) and arms "
+            "wait('a2a:<dispatch_id>', mode='signal') for its report, one "
+            "order at a time."
         ),
         category=ToolCategory.SYSTEM,
         command_prefix="!dispatch",
     )
     async def signal_dispatch(self, mode: str = "execute") -> ToolResult:
-        """Preview or execute the top issue through generic workflow contracts."""
+        """Preview or execute the top issue, here or through its executor."""
 
         mode = _normalize_choice(mode or "", _DISPATCH_MODE_ALIASES)
         if mode not in ("execute", "suggest"):
@@ -2189,26 +2591,130 @@ class StrategicMemoryFeature(Feature):
             )
 
         workflow_name = self._dispatch_workflow_name()
+        execute_named_tool = getattr(self.agent, "execute_named_tool", None)
+        call = (
+            self._named_tool_call(execute_named_tool)
+            if callable(execute_named_tool)
+            else None
+        )
         try:
-            run_history = await read_run_history(self.agent)
-        except RunHistoryUnreadable as exc:
-            # The registry is how selection knows an issue's last run asked a
-            # question nobody has answered (#3398). Selecting without all of
-            # it could dispatch that same run again.
-            return ToolResult.partial(
-                confirmation=(
-                    "## Signal Dispatch"
-                    + (" (suggest)" if mode == "suggest" else "")
-                    + f"\nCould not confirm Talon's run history: {exc}. Nothing "
-                    "was dispatched -- without it, re-dispatching an issue "
-                    "whose last run is still waiting on an answer cannot be "
-                    "ruled out. This is not the same as having nothing to do."
-                ),
-                error=f"Talon's run history is unconfirmed: {exc}",
+            executor = await self._dispatch_executor(call)
+        except _TalonUnaskable as exc:
+            return ToolResult.failed(
+                f"{exc}. Upgrade the host; nothing was dispatched.",
                 data={
                     "mode": mode,
                     "issue": None,
                     "workflow": workflow_name,
+                    "dispatched": False,
+                    "skipped": [],
+                    "reason_code": "GOVERNED_DISPATCH_UNAVAILABLE",
+                },
+            )
+        except _DispatcherPolicyUnconfirmed as exc:
+            # Launching here could be refused as TALON_NOT_DISPATCHER every
+            # day, and delegating could hand the work to an agent Talon does
+            # not name (#3758).
+            return ToolResult.partial(
+                confirmation=(
+                    "## Signal Dispatch"
+                    + (" (suggest)" if mode == "suggest" else "")
+                    + f"\nCould not confirm which agent runs this agent's "
+                    f"dispatches: {exc}. Nothing was dispatched. This is not "
+                    "the same as having nothing to do."
+                ),
+                error=f"Talon's dispatcher policy is unconfirmed: {exc}",
+                data={
+                    "mode": mode,
+                    "issue": None,
+                    "workflow": workflow_name,
+                    "dispatched": False,
+                    "skipped": [],
+                    "reason_code": "DISPATCHER_POLICY_UNCONFIRMED",
+                },
+            )
+        except _DispatcherPolicyInvalid as exc:
+            return ToolResult.failed(
+                f"{exc}. Talon refuses every launch while it does, so where the "
+                "work would run is unknown; nothing was dispatched. Set it to "
+                "the agent_name of the one agent that may start Talon runs, or "
+                "remove it.",
+                data={
+                    "mode": mode,
+                    "issue": None,
+                    "workflow": workflow_name,
+                    "dispatched": False,
+                    "skipped": [],
+                    "reason_code": "DISPATCHER_POLICY_INVALID",
+                },
+            )
+        if executor is None or mode != "execute":
+            return await self._select_and_dispatch(mode, workflow_name, executor, call)
+        async with self._work_order_lock:
+            return await self._select_and_dispatch(mode, workflow_name, executor, call)
+
+    async def _select_and_dispatch(
+        self,
+        mode: str,
+        workflow_name: str,
+        executor: Optional[str],
+        call: Optional[NamedToolCall],
+    ) -> ToolResult:
+        """Select the top issue, then preview it, start it, or send it on.
+
+        ``executor`` is ``None`` when this agent runs its own dispatches.
+        Otherwise selection reads that executor's work reports instead of this
+        agent's Talon (#3758), through ``call``, and execute sends it a work
+        order, one at a time: while it has not answered the last, nothing is
+        sent. An executor is only ever named through ``call``, so it is set
+        whenever ``executor`` is.
+        """
+        history_name = (
+            "Talon's run history" if executor is None else f"{executor}'s work reports"
+        )
+        try:
+            run_history = (
+                await read_run_history(self.agent)
+                if executor is None
+                else await read_executor_run_history(
+                    executor, call, self._settled_work_orders
+                )
+            )
+        except ToolNotRegisteredError as exc:
+            return ToolResult.failed(
+                f"{executor} runs this agent's dispatches, but its work reports "
+                f"cannot be read: {exc}. Enable the Peers feature and retry; "
+                "nothing was dispatched.",
+                data={
+                    "mode": mode,
+                    "issue": None,
+                    "workflow": workflow_name,
+                    "executor": executor,
+                    "dispatched": False,
+                    "skipped": [],
+                    "reason_code": "WORK_ORDER_UNAVAILABLE",
+                },
+            )
+        except RunHistoryUnreadable as exc:
+            # The registry is how selection knows an issue's last run asked a
+            # question nobody has answered (#3398). Selecting without all of
+            # it could dispatch that same run again. An executor's reports
+            # stand in for it when another agent runs the work (#3758).
+            return ToolResult.partial(
+                confirmation=(
+                    "## Signal Dispatch"
+                    + (" (suggest)" if mode == "suggest" else "")
+                    + f"\nCould not confirm {history_name}: {exc}. Nothing "
+                    "was dispatched -- without it, re-dispatching an issue "
+                    "whose last run is still waiting on an answer cannot be "
+                    "ruled out. This is not the same as having nothing to do."
+                ),
+                error=f"Could not confirm {history_name}: {exc}",
+                data={
+                    "mode": mode,
+                    "issue": None,
+                    "workflow": workflow_name,
+                    "executor": executor,
                     "dispatched": False,
                     "skipped": [],
                     "reason_code": "RUN_HISTORY_UNCONFIRMED",
@@ -2217,8 +2723,58 @@ class StrategicMemoryFeature(Feature):
                     "requirement": exc.requirement,
                 },
             )
+        if executor is not None and mode == "execute":
+            unarmed = await self._recover_work_order_wakes(run_history)
+            if unarmed:
+                # The wait engine that could not arm these would not arm the
+                # next order's wake either, and nothing else wakes this agent
+                # when the executor answers (#3755).
+                return ToolResult.partial(
+                    confirmation=(
+                        "## Signal Dispatch\nThe wake for "
+                        f"{len(unarmed)} work order(s) sent to {executor} that "
+                        "never had one could not be armed: "
+                        + "; ".join(unarmed)
+                        + ". Nothing was dispatched: a new order's report "
+                        "would not wake this agent either."
+                    ),
+                    error=f"{len(unarmed)} work order wake(s) could not be armed",
+                    data={
+                        "mode": mode,
+                        "issue": None,
+                        "workflow": workflow_name,
+                        "executor": executor,
+                        "dispatched": False,
+                        "skipped": [],
+                        "unarmed_wakes": unarmed,
+                        "reason_code": "WORK_ORDER_WAKE_UNARMED",
+                    },
+                )
+        outstanding = list(run_history.outstanding)
+        if outstanding and mode == "execute":
+            more = len(outstanding) - 1
+            return ToolResult.ok(
+                confirmation=(
+                    f"## Signal Dispatch\n{executor} has not answered "
+                    f"{self._describe_outstanding(outstanding[0])}"
+                    + (f", and {more} more order(s)" if more else "")
+                    + ". Nothing was dispatched: signal_dispatch sends one work "
+                    "order at a time, and the next waits for that answer."
+                ),
+                data={
+                    "mode": mode,
+                    "issue": None,
+                    "workflow": workflow_name,
+                    "executor": executor,
+                    "dispatched": False,
+                    "skipped": [],
+                    "outstanding": [asdict(order) for order in outstanding],
+                },
+            )
+        # Another agent's Talon is not asked: that executor's refusal of an
+        # order is its answer for the workspace (#3758).
         try:
-            workspaces = talon_workspaces(self.agent)
+            workspaces = talon_workspaces(self.agent) if executor is None else None
         except TalonWorkspaceProviderOutdated as exc:
             # Without the read, a candidate in a repository nobody has
             # provisioned a Talon workspace for is started and then fails at
@@ -2366,26 +2922,47 @@ class StrategicMemoryFeature(Feature):
             )
 
         if mode == "suggest":
+            if executor is None:
+                plan = (
+                    f"Execute mode will request the contributed `{workflow_name}` "
+                    "workflow"
+                )
+            else:
+                plan = (
+                    f"Execute mode will send {executor} a `{WORK_ORDER_SCHEMA}` "
+                    "work order"
+                    + (
+                        " once it has answered "
+                        + self._describe_outstanding(outstanding[0])
+                        if outstanding
+                        else ""
+                    )
+                )
             body = (
                 "## Signal Dispatch (suggest)\n"
                 f"**Top issue:** {issue['repo']}#{issue['issue_number']}: "
                 f"{issue['issue_title']}\n"
                 f"**Priority:** {issue['priority']}\n"
                 f"**Context:** {issue.get('context', 'N/A')}\n\n"
-                f"Execute mode will request the contributed `{workflow_name}` "
-                "workflow; no work was started by this preview."
+                f"{plan}; no work was started by this preview."
                 + skipped_text
             )
-            return ToolResult.ok(
-                confirmation=body,
-                data={
-                    "mode": "suggest",
-                    "issue": issue,
-                    "workflow": workflow_name,
-                    "dispatched": False,
-                    "skipped": skipped,
-                    "body": body,
-                },
+            data = {
+                "mode": "suggest",
+                "issue": issue,
+                "workflow": workflow_name,
+                "dispatched": False,
+                "skipped": skipped,
+                "body": body,
+            }
+            if executor is not None:
+                data["executor"] = executor
+                data["outstanding"] = [asdict(order) for order in outstanding]
+            return ToolResult.ok(confirmation=body, data=data)
+
+        if executor is not None:
+            return await self._send_work_order(
+                issue, executor, call, skipped, skipped_text
             )
 
         registration = self._resolve_dispatch_workflow(workflow_name)
@@ -2433,7 +3010,7 @@ class StrategicMemoryFeature(Feature):
                 _WORKFLOW_RUN_TOOL,
                 {"name": workflow_name, "params": params},
                 session_id=self._dispatch_session_id(),
-                source="strategic_memory.signal_dispatch",
+                source=_DISPATCH_SOURCE,
             )
         except ToolNotRegisteredError:
             logger.info(
@@ -2473,18 +3050,8 @@ class StrategicMemoryFeature(Feature):
                 },
             )
 
-        runner_payload = self._dispatch_runner_payload(runner_result)
-        accepted = (
-            isinstance(runner_result, ToolResult)
-            and runner_result.status.value == "ok"
-        ) or (
-            isinstance(runner_result, dict)
-            and (
-                runner_result.get("status") == "ok"
-                or runner_result.get("success") is True
-            )
-        )
-        if not accepted:
+        runner_payload = tool_payload(runner_result)
+        if not tool_succeeded(runner_payload):
             runner_error = (
                 runner_payload.get("error")
                 or "the workflow runner did not confirm acceptance"

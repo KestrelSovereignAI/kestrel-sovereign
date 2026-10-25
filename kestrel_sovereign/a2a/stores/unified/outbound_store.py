@@ -252,8 +252,15 @@ class OutboundStore(UnifiedStoreBase):
         *,
         limit: int = 50,
         recipient_id: str | None = None,
+        before_dispatch_id: str | None = None,
     ) -> list[OutboundDispatch]:
-        """Read only this local actor's audit, with an optional stable peer filter."""
+        """Read only this local actor's audit, with an optional stable peer filter.
+
+        Newest first. ``before_dispatch_id`` names the last row of a previous
+        page and returns the rows after it in that order, so a reader can walk
+        the whole audit; a dispatch recorded meanwhile sorts first and never
+        shifts a later page.
+        """
         if (
             isinstance(limit, bool)
             or not isinstance(limit, int)
@@ -271,6 +278,17 @@ class OutboundStore(UnifiedStoreBase):
             _text(recipient_id, "recipient_id")
             predicates.append("recipient_id = ?")
             values.append(recipient_id)
+        if before_dispatch_id is not None:
+            _text(before_dispatch_id, "before_dispatch_id")
+            cursor = await self.get(before_dispatch_id)
+            if cursor is None:
+                raise ValueError(
+                    "Outbound list cursor names no dispatch of this sender"
+                )
+            predicates.append(
+                "(created_at < ? OR (created_at = ? AND dispatch_id < ?))"
+            )
+            values.extend([cursor.created_at, cursor.created_at, cursor.dispatch_id])
         values.append(limit)
         rows = await self.backend.fetch_all(
             f"SELECT {_COLUMNS} FROM a2a_outbound_dispatches WHERE {' AND '.join(predicates)} "
