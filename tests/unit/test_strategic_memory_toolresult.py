@@ -15,7 +15,7 @@ Pins the honesty edges introduced by the migration:
 from __future__ import annotations
 
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, call, patch
 
 import pytest
 
@@ -219,25 +219,66 @@ def _agent_ready_issue(number, title, repo="o/r"):
     }
 
 
+def _talon_policy(dispatcher=None):
+    """``talon_get_config``'s ``policy``: ``asdict(TalonPolicy)`` in Talon >=0.2.14."""
+    return {
+        "allowed_backends": ["claude", "codex", "opencode"],
+        "allow_api_billing": False,
+        "require_worktree": True,
+        "require_sandboxed_workspace": True,
+        "allow_background_jobs": True,
+        "dispatcher": dispatcher,
+    }
+
+
+#: The policy query a dispatch makes first whenever Talon is loaded (#3838):
+#: which agent may start this agent's Talon runs.
+_POLICY_QUERY = call(
+    "talon_get_config",
+    {},
+    session_id="chat-7",
+    source="strategic_memory.signal_dispatch",
+)
+
+
 def _dispatch_agent(*, registration=None, runner_result=None):
     operator_registry = SimpleNamespace(
         get_workflow_registration=lambda name: registration
     )
-    execute_named_tool = AsyncMock(
-        return_value=(
-            runner_result
-            if runner_result is not None
-            else ToolResult.ok(
-                "started",
-                data={"run_id": "run-42", "status": "pending"},
-            )
+    runner_answer = (
+        runner_result
+        if runner_result is not None
+        else ToolResult.ok(
+            "started",
+            data={"run_id": "run-42", "status": "pending"},
         )
     )
+
+    async def answer(name, args, *, session_id, source):
+        if name == "talon_get_config":
+            # Talon names no dispatcher, so this agent runs its own work.
+            return ToolResult.ok(
+                "Talon config loaded",
+                data={"success": True, "policy": _talon_policy(), "preference": {}},
+            )
+        return runner_answer
+
     return SimpleNamespace(
         operator_registry=operator_registry,
-        execute_named_tool=execute_named_tool,
+        execute_named_tool=AsyncMock(side_effect=answer),
         get_turn_bound_session_id=lambda: "chat-7",
     )
+
+
+def _dispatched(agent):
+    """The tools a Talon-backed dispatch called by name after the policy query.
+
+    It asks Talon its dispatcher policy before anything else, exactly once
+    (#3838).
+    """
+    calls = agent.execute_named_tool.await_args_list
+    assert calls[:1] == [_POLICY_QUERY]
+    return calls[1:]
 
 
 @pytest.mark.asyncio
@@ -904,7 +945,7 @@ async def test_signal_dispatch_does_not_select_without_talons_run_history(mode):
     assert "kestrel-feature-talon>=" not in result.confirmation
     assert "No actionable issue found" not in result.confirmation
     pick.assert_not_awaited()
-    agent.execute_named_tool.assert_not_awaited()
+    assert _dispatched(agent) == []
 
 
 @pytest.mark.asyncio
@@ -934,7 +975,7 @@ async def test_signal_dispatch_names_the_talon_release_it_needs(mode):
     assert "kestrel-feature-talon>=0.2.10" in result.error
     assert provider.effects == []
     pick.assert_not_awaited()
-    agent.execute_named_tool.assert_not_awaited()
+    assert _dispatched(agent) == []
 
 
 @pytest.mark.asyncio
@@ -963,7 +1004,7 @@ async def test_signal_dispatch_does_not_dispatch_over_a_silently_unreadable_regi
     assert "finished_runs()" in result.confirmation
     assert "No actionable issue found" not in result.confirmation
     assert provider.effects == []
-    agent.execute_named_tool.assert_not_awaited()
+    assert _dispatched(agent) == []
 
 
 @pytest.mark.asyncio
@@ -986,7 +1027,7 @@ async def test_signal_dispatch_does_not_dispatch_over_an_incomplete_read(monkeyp
     assert result.data["reason_code"] == "RUN_HISTORY_UNCONFIRMED"
     assert result.data["dispatched"] is False
     assert "jobs.json: JSONDecodeError" in result.confirmation
-    agent.execute_named_tool.assert_not_awaited()
+    assert _dispatched(agent) == []
 
 
 @pytest.mark.asyncio
@@ -1032,7 +1073,7 @@ async def test_signal_dispatch_does_not_redispatch_an_unanswered_run(mode, monke
     ) in result.confirmation
     assert provider.reads == 1
     assert provider.effects == []
-    agent.execute_named_tool.assert_not_awaited()
+    assert _dispatched(agent) == []
 
 
 @pytest.mark.asyncio
@@ -1171,7 +1212,7 @@ async def test_signal_dispatch_suggest_names_every_gate_that_refused_a_candidate
         "skipped o/r#3400 -- Talon job job3400a ended blocked",
     ):
         assert line in result.confirmation, line
-    agent.execute_named_tool.assert_not_awaited()
+    assert _dispatched(agent) == []
 
 
 @pytest.mark.asyncio
@@ -1315,7 +1356,7 @@ async def test_signal_dispatch_skips_an_issue_in_an_unprovisioned_repository(mon
     assert (result.data["issue"]["repo"], result.data["issue"]["issue_number"]) == (
         "o/r", 2,
     )
-    agent.execute_named_tool.assert_awaited_once()
+    assert len(_dispatched(agent)) == 1
     [name, request] = agent.execute_named_tool.await_args.args
     assert name == "workflow_run"
     assert (request["params"]["repo"], request["params"]["issue"]) == ("o/r", 2)
@@ -1352,7 +1393,7 @@ async def test_signal_dispatch_suggest_names_the_repository_to_provision(monkeyp
     assert result.data["issue"]["repo"] == "o/r"
     assert [skip["reason"] for skip in result.data["skipped"]] == ["no_talon_workspace"]
     assert "talon_setup_workspace(repo='o/w')" in result.confirmation
-    agent.execute_named_tool.assert_not_awaited()
+    assert _dispatched(agent) == []
 
 
 @pytest.mark.asyncio
@@ -1375,7 +1416,7 @@ async def test_signal_dispatch_with_only_an_unprovisioned_repository_starts_noth
     assert result.data["issue"] is None
     assert "No actionable issue found." in result.confirmation
     assert "talon_setup_workspace(repo='o/w')" in result.confirmation
-    agent.execute_named_tool.assert_not_awaited()
+    assert _dispatched(agent) == []
 
 
 @pytest.mark.asyncio
@@ -1392,21 +1433,23 @@ async def test_signal_dispatch_dispatches_a_provisioned_repository_as_before(mon
     assert result.status is ToolResultStatus.OK
     assert result.data["dispatched"] is True
     assert result.data["skipped"] == []
-    agent.execute_named_tool.assert_awaited_once_with(
-        "workflow_run",
-        {
-            "name": "fleet_coding_pipeline",
-            "params": {
-                "repo": "o/r",
-                "issue": 2,
-                "issue_title": "provisioned",
-                "priority": "high",
-                "context": "Blocker (severity: high): next.",
+    assert _dispatched(agent) == [
+        call(
+            "workflow_run",
+            {
+                "name": "fleet_coding_pipeline",
+                "params": {
+                    "repo": "o/r",
+                    "issue": 2,
+                    "issue_title": "provisioned",
+                    "priority": "high",
+                    "context": "Blocker (severity: high): next.",
+                },
             },
-        },
-        session_id="chat-7",
-        source="strategic_memory.signal_dispatch",
-    )
+            session_id="chat-7",
+            source="strategic_memory.signal_dispatch",
+        )
+    ]
     assert provider.workspace_reads == ["o/r"]
 
 
@@ -1438,7 +1481,7 @@ async def test_signal_dispatch_names_the_talon_release_workspace_readiness_needs
     assert "No actionable issue found" not in result.confirmation
     assert provider.effects == []
     pick.assert_not_awaited()
-    agent.execute_named_tool.assert_not_awaited()
+    assert _dispatched(agent) == []
 
 
 @pytest.mark.asyncio
@@ -1470,7 +1513,7 @@ async def test_signal_dispatch_does_not_start_a_run_talon_cannot_confirm(
     assert "skipped o/r#2 -- Talon could not say whether o/r has a workspace" in (
         result.confirmation
     )
-    agent.execute_named_tool.assert_not_awaited()
+    assert _dispatched(agent) == []
 
 
 @pytest.mark.asyncio
@@ -1495,7 +1538,7 @@ async def test_signal_dispatch_still_dispatches_past_a_repository_talon_cannot_c
         (skip["repo"], skip["issue_number"], skip["reason"])
         for skip in result.data["skipped"]
     ] == [("o/w", 30, "talon_workspace_unconfirmed")]
-    agent.execute_named_tool.assert_awaited_once()
+    assert len(_dispatched(agent)) == 1
 
 
 @pytest.mark.asyncio
