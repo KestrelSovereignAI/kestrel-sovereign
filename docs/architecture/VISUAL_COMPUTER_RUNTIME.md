@@ -25,8 +25,9 @@ The host loads environment factories from
 `kestrel_sovereign.environment_providers` and computer factories from
 `kestrel_sovereign.computer_drivers`. Entry points construct their own SDK
 protocol with trusted private settings. No shell/local-host fallback exists.
-The built-in `local-docker-browser` adapter is delivered separately; registering
-its factory is not evidence that its worker or Docker boundary is ready.
+The built-in `local-docker-browser` adapter ships in Core; its pinned worker
+image must be built and verified separately. Registering its factory is not
+evidence that its worker or Docker boundary is ready.
 
 Enable only after installing the concrete driver and building its pinned
 worker image. The local Docker image reference identifies the inspected local

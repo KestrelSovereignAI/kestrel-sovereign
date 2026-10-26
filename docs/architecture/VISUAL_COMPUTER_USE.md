@@ -300,17 +300,28 @@ data authority, and cleanup status is separate from saved ownership. HTML
 source can be edited as inert text in the shared panel; it never executes or
 renders as a browser document there.
 
-First-party producers consume `ArtifactsFeature.artifact_bridge_api_version`
-1: `async with feature.artifact_operation(request=None) as (service, context)`
-retains the original caller's artifact/privacy lease; service methods still
-check each action. `feature.artifact_response(request, build)` calls the async
-`build(service, context)` callback and retains artifact custody through actual
-final ASGI delivery. A workflow wrapper must separately retain its original
-independent run resolver through the Response ASGI call using its existing
-outer delivery primitive. A resolver closed inside the callback cannot grant
-later delivery, and no run lease is converted into artifact authority. Candidate
-Core bridge availability is an explicit installation gate; consumers never
-fall back to private feature fields or another content store.
+First-party producers require `ArtifactsFeature.artifact_bridge_api_version`
+3. `async with feature.artifact_operation(request=None) as operation` yields
+one typed retained `ArtifactOperation`: `service`, `context`, fixed `expires_at`
+and synchronous `check_current`. Service methods still check each action.
+The checker is valid only inside that original lexical frame and can restrict
+an independently owned consumer transaction immediately before COMMIT.
+`feature.artifact_response(request, build, check_current=original_consumer_check)`
+calls `await build(operation)` and retains original artifact custody plus the
+consumer restriction through the actual final ASGI send. A workflow wrapper
+must separately retain its original independent run resolver through that
+Response's ASGI call. A closed resolver or copied context cannot grant later
+delivery; a run lease never becomes artifact authority. Consumer restrictions
+must synchronously return None or raise. Candidate Core availability is an
+explicit installation gate; consumers never fall back to private feature
+fields or another content store.
+
+Artifact and visual tool payloads also stay out of canonical plaintext
+`a2a_tool_dispatches`, tool-call observability metadata/errors and security
+decision summaries, including NORMAL and PUBLIC privacy modes. Those rows keep
+operational names, decisions, error classes, timing and sizes. This diagnostic
+rule does not replace conversation retention policy, authorize a tool, or
+change the canonical encrypted source and its erasure semantics.
 
 The computer view exposes session state, active controller, Stop and takeover.
 It links outputs by artifact reference, without embedding lifecycle ownership.
