@@ -27,6 +27,17 @@ last therefore also offers a batch, when the cap leaves room for one (see
 the text, at its end) and fits the cap, so all of them can be made in one
 response, and their chunks, joined in order, continue the text from
 ``next_offset`` without a gap.
+
+The cap is not the only way a chunk can be lost. Before each model call the
+orchestrator prunes the turn to the model's context window, replacing tool
+results with a stub oldest first, and every call's arguments and every pruned
+result's stub stay in the turn: eighty calls leave about 20,000 characters of
+them. Inside the orchestrator's tool loop a read therefore also sizes to the
+room the turn has left (:func:`~kestrel_sovereign.features.base.orchestrator_result_room`):
+a chunk to its share of its own batch's room, and the batch it offers so that
+its calls' arguments and results, beside the text of the response making
+them, fit what a later response has. As the turn fills, batches get fewer and
+smaller rather than being pruned before the model reads them.
 """
 
 from __future__ import annotations
@@ -44,21 +55,24 @@ from kestrel_sdk.tools.result import ToolResult
 from kestrel_sovereign.features.base import (
     largest_fitting_result,
     orchestrator_result_cap,
+    orchestrator_result_room,
     serialized_result_len,
 )
 
 _INTEGER_TEXT = re.compile(r"\s*[+-]?\d+\s*")
 
 #: The most characters a batch's results add to the turn in one model
-#: response: three results at the default 8,000-character cap. The
-#: orchestrator prunes a turn's oldest tool results once its messages near the
-#: model's context window, which it takes as 32,768 tokens (about 92,000
-#: characters) when it cannot resolve the model's own; a larger batch, with
-#: the system prompt, could lose its own first chunks to that pruning before
-#: the model reads them. Three to a response, 50,000 characters outside the
-#: BMP (600,000 once serialized) take under thirty responses, inside the tool
-#: loop's default budget.
+#: response: three results at the default 8,000-character cap. Three to a
+#: response, 50,000 characters outside the BMP (600,000 once serialized) take
+#: about thirty responses, inside the tool loop's default budget. Inside the
+#: orchestrator's loop a batch is smaller still when the turn has less room
+#: left than this.
 MAX_BATCH_CHARS = 24_000
+
+#: Characters a batch sized to the turn's room leaves for the text of the
+#: response that makes its calls: the orchestrator counts that text beside
+#: the calls' arguments and results.
+RESPONSE_TEXT_RESERVE = 1_000
 
 
 class PageRequestError(ValueError):
@@ -133,8 +147,9 @@ def paged_text_result(
     tool_name: str,
     subject: str,
     data: Mapping[str, Any],
+    call_arguments: Mapping[str, Any],
 ) -> ToolResult:
-    """One chunk of ``text``, as a result that fits the tool-result cap.
+    """One chunk of ``text``, as a result that reaches the model whole.
 
     Args:
         text: The whole text being read.
@@ -146,11 +161,15 @@ def paged_text_result(
             carries ahead of the position fields and the chunk. They must be
             the same on every call for the same text: a batch is sized
             against them.
+        call_arguments: The calling tool's arguments other than ``offset``
+            and ``limit``, which a call reading on repeats. The orchestrator
+            keeps every call's arguments in the turn, so a batch is sized
+            against them too.
 
     An ``offset`` equal to the text's length returns an empty final chunk; an
     ``offset`` past it fails and reports ``total_chars``. While characters
-    remain, a chunk holds at least one, so following ``next_offset`` always
-    reaches the end.
+    remain and the turn has room for one, a chunk holds at least one, so
+    following ``next_offset`` always reaches the end.
     """
     total = len(text)
     digest = hashlib.sha256(text.encode("utf-8", "surrogatepass")).hexdigest()
@@ -180,6 +199,13 @@ def paged_text_result(
             "next_offset": end if has_more else None,
             "truncated": has_more,
         }
+        if page.limit is not None and end < requested_end:
+            # Fewer than the limit asked for: a model reading a batch must not
+            # go on from the batch's next offset, past what this one missed.
+            confirmation += (
+                f" That is fewer than limit={page.limit}: the next chunk "
+                f"starts at offset={end}, not at a later batch offset."
+            )
         if not has_more:
             confirmation += " End of file."
         elif batch is None:
@@ -189,9 +215,9 @@ def paged_text_result(
             )
         else:
             confirmation += (
-                f" More remains; call {tool_name} again with offset={end}, or "
-                f"read on faster: call it once for each offset in batch_offsets "
-                f"with limit={batch.limit}, all in one response."
+                f" More remains: call {tool_name} once for each offset in "
+                f"batch_offsets with limit={batch.limit}, all in one response "
+                f"(or with offset={end} for the next chunk alone)."
             )
             fields["batch_limit"] = batch.limit
             fields["batch_offsets"] = list(batch.offsets)
@@ -200,6 +226,10 @@ def paged_text_result(
         return ToolResult.ok(confirmation=confirmation, data=fields)
 
     cap = orchestrator_result_cap()
+    room = orchestrator_result_room()
+    # This result reaches the model whole when it fits the cap and, inside the
+    # orchestrator's tool loop, its share of the room its batch has.
+    own_cap = cap if room is None else min(cap, room.share())
     # Each of a batch's results is at most the cap; a batch of one chunk is
     # only the next call, so a cap too large for two offers none.
     batch_chunks = MAX_BATCH_CHARS // cap
@@ -220,7 +250,22 @@ def paged_text_result(
             tool_name=tool_name,
         ),
     )
-    room = cap - envelope
+    # A call reading on, as the orchestrator counts its arguments: every
+    # position it names is at most ``total``.
+    call_chars = len(json.dumps({**call_arguments, "offset": total, "limit": total}))
+    later = None if room is None else room.later_chars - RESPONSE_TEXT_RESERVE
+
+    def chunk_room(calls: int) -> int:
+        """Escaped characters each of a batch of ``calls`` chunks may hold.
+
+        Each result fits the cap, and in the orchestrator's loop the batch's
+        calls and results fit what a later response has: equal shares, so
+        each result fits its own share when the batch runs.
+        """
+        per_result = cap
+        if later is not None:
+            per_result = min(cap, (later - calls * call_chars) // calls)
+        return per_result - envelope
 
     # Serialized, every character takes at least one character, so neither a
     # chunk nor a batched one is longer than the cap: the escaped widths of
@@ -232,15 +277,17 @@ def paged_text_result(
     def escaped_len(first: int, end: int) -> int:
         return widths[end - start] - widths[first - start]
 
-    def batch_after(end: int) -> Optional[_Batch]:
-        """The batch from ``end`` with the largest chunks that all fit."""
+    def batch_of(end: int, calls: int) -> Optional[_Batch]:
+        """The batch of at most ``calls`` chunks from ``end`` with the
+        largest chunks that all fit."""
+        fits = chunk_room(calls)
         best: Optional[_Batch] = None
-        lo, hi = 1, min(total - end, room)
+        lo, hi = 1, min(total - end, fits)
         while lo <= hi:
             size = (lo + hi) // 2
-            offsets = tuple(range(end, min(total, end + batch_chunks * size), size))
+            offsets = tuple(range(end, min(total, end + calls * size), size))
             if all(
-                escaped_len(offset, min(offset + size, total)) <= room
+                escaped_len(offset, min(offset + size, total)) <= fits
                 for offset in offsets
             ):
                 best = _Batch(limit=size, offsets=offsets)
@@ -248,6 +295,22 @@ def paged_text_result(
             else:
                 hi = size - 1
         return best
+
+    def covered(batch: _Batch) -> int:
+        return min(total, batch.offsets[-1] + batch.limit) - batch.offsets[0]
+
+    def batch_after(end: int) -> Optional[_Batch]:
+        """The batch from ``end`` that reads furthest; of two that read as
+        far, the one with fewer calls. None when the next call alone reads as
+        far, as it does when the rest of the text fits one chunk or the turn
+        has room for little more than one: a batch of one chunk is only the
+        next call."""
+        best: Optional[_Batch] = None
+        for calls in range(batch_chunks, 0, -1):
+            batch = batch_of(end, calls)
+            if batch is not None and (best is None or covered(batch) >= covered(best)):
+                best = batch
+        return best if best is not None and len(best.offsets) > 1 else None
 
     def build(end: int) -> ToolResult:
         has_more = end < total
@@ -259,19 +322,35 @@ def paged_text_result(
             has_more=has_more,
         )
 
+    def fits(candidate: ToolResult) -> bool:
+        return serialized_result_len(candidate, tool_name=tool_name) <= own_cap
+
+    # A batched call asks for a window whose escaped characters fit its share
+    # under an envelope no larger than ``envelope``, so the whole window fits
+    # and the call returns exactly ``batch_limit``. Tried first, because only
+    # a shorter chunk carries the "fewer than limit" note, so a search could
+    # miss the whole window by probing one character short of it.
+    if requested_end - start <= own_cap:
+        whole = build(requested_end)
+        if fits(whole):
+            return whole
     shortest = start + 1 if start < requested_end else start
-    longest = min(requested_end, start + cap)
-    # A batched call asks for a window whose escaped characters fit in
-    # ``room``. Every chunk it could return is a prefix of that window under
-    # an envelope no larger than ``envelope``, so every candidate fits and
-    # the search returns the whole ``batch_limit``.
+    longest = min(requested_end - 1, start + own_cap)
     fit = largest_fitting_result(
-        build, shortest, longest, cap=cap, tool_name=tool_name
+        build, shortest, longest, cap=own_cap, tool_name=tool_name
     )
-    if fit is None:
+    if fit is not None:
+        return fit[1]
+    if own_cap < cap:
+        # Without the identifying fields: the orchestrator never prunes a
+        # result this short, so the model sees where to read on even in a
+        # turn with no room for anything longer.
         return ToolResult.failed(
-            f"{tool_name} cannot fit the next character of {subject} under the "
-            f"{cap:,}-character tool-result cap",
-            data={**data, "offset": start, "total_chars": total},
+            f"no room left in this turn for more of the text; read on in a "
+            f"later turn from offset={start}"
         )
-    return fit[1]
+    return ToolResult.failed(
+        f"{tool_name} cannot fit the next character of {subject} under the "
+        f"{cap:,}-character tool-result cap",
+        data={**data, "offset": start, "total_chars": total},
+    )

@@ -270,14 +270,38 @@ stops after 45 responses by default. The cap measures the escaped JSON, where
 a non-ASCII character takes six characters and one outside the BMP twelve, so
 50,000 such characters can need eighty chunks. A chunk that is not the last
 therefore also carries `batch_offsets` (starting at `next_offset`) and
-`batch_limit`: a call at each of those offsets with `limit=batch_limit`
-returns exactly that many characters and fits the cap, so a model can make
-them all in one response and read on without a gap. A batch's results total
-at most `MAX_BATCH_CHARS` (24,000 characters, three results at the default
-cap), so one response's reads stay small beside the orchestrator's 32,768-token
-fallback context window, which it prunes old tool results against. With a
-cap over 12,000 characters no batch is offered. Batched, 50,000 characters
-outside the BMP are read in 28 responses at the default cap.
+`batch_limit`, and its confirmation tells the model to read on with them: a
+call at each of those offsets with `limit=batch_limit` returns exactly that
+many characters and fits the cap, so a model can make them all in one response
+and read on without a gap. With a cap over 12,000 characters no batch is
+offered. Batched, 50,000 characters outside the BMP are read in about thirty
+responses at the default cap.
+
+A batch's results total at most `MAX_BATCH_CHARS` (24,000 characters, three
+results at the default cap). The cap is not the only way a chunk can be lost:
+before each model call the orchestrator prunes the turn to the model's context
+window, replacing tool results with a stub oldest first, and every call's
+arguments and every pruned result's stub stay in the turn. A read of eighty
+chunks leaves about 20,000 characters of them, and inside the 32,768-token
+fallback window the orchestrator uses for a model it cannot identify, a batch
+sized to the cap alone lost its first chunk to the prune before the model read
+it.
+
+So the orchestrator publishes, for every tool batch it runs, the room that
+batch's results have before the prune would reclaim one of them
+(`OrchestratorResultRoom`, read with `orchestrator_result_room()` in
+`kestrel_sovereign.features.base`): the window less everything the prune keeps,
+counted the way the prune counts it. A chunk fits its equal share of its own
+batch's room as well as the cap. The batch it offers is sized so that its
+calls' arguments, their results and 1,000 characters of the response's own
+text fit the room a later response has; a batch is offered only when it reads
+further than the next call alone would. As the turn fills, batches get fewer
+and smaller rather than being pruned unread. A call that gets less room than
+its batch was sized for (a response whose text outran that reserve) returns
+fewer characters than `limit` and says that the next chunk starts at its own
+end. A turn with no room left for any chunk gets a short failure, one the prune
+always keeps, naming the offset to read on from in a later turn. A subagent's
+tools run outside the turn's prune and size to the cap alone.
 
 ## Future Work
 

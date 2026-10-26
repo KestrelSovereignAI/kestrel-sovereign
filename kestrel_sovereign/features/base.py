@@ -1,17 +1,20 @@
 import asyncio
 import contextlib
+import contextvars
 import inspect
 import json
 import logging
 import os
 import re
 import time
+from dataclasses import dataclass
 from typing import (
     TYPE_CHECKING,
     Any,
     Callable,
     ClassVar,
     Dict,
+    Iterator,
     List,
     Mapping,
     Optional,
@@ -146,6 +149,66 @@ def orchestrator_result_cap() -> int:
     except Exception:  # pragma: no cover - defensive import fallback
         MAX_TOOL_RESULT_CHARS = 8000
     return max(1000, int(MAX_TOOL_RESULT_CHARS))
+
+
+@dataclass(frozen=True)
+class OrchestratorResultRoom:
+    """What one tool batch's results have of the turn's context window (#3740).
+
+    Before each model call the orchestrator prunes the turn to the model's
+    context window: it sheds replayed history, then replaces the turn's tool
+    results, oldest first, with a short stub. When a batch's results do not fit
+    beside everything else the turn keeps, the first of them is replaced before
+    the model has read it. The orchestrator publishes this for every batch it
+    runs (:func:`orchestrator_result_room`), so a tool can size what it returns,
+    and what it tells the model to call next, to reach the model whole.
+
+    All three are characters as the prune counts them: each message's content
+    plus the JSON of each call's arguments.
+
+    ``chars`` is the room this batch's results have together: the window less
+    everything the prune keeps, which is the system prompt, the request, each
+    assistant message with its calls' arguments (this batch's included) and
+    each earlier result at its pruned size. ``calls`` is how many calls the
+    batch makes. ``later_chars`` is what a later response has once this batch's
+    results are pruned in turn: its own text, its calls' arguments and their
+    results together.
+    """
+
+    chars: int
+    calls: int
+    later_chars: int
+
+    def share(self) -> int:
+        """One call's equal share of :attr:`chars`."""
+        return self.chars // max(1, self.calls)
+
+
+_ORCHESTRATOR_RESULT_ROOM: contextvars.ContextVar[Optional[OrchestratorResultRoom]] = (
+    contextvars.ContextVar("kestrel_orchestrator_result_room", default=None)
+)
+
+
+def orchestrator_result_room() -> Optional[OrchestratorResultRoom]:
+    """The room the running tool batch's results have in the turn.
+
+    ``None`` outside the orchestrator's own tool loop: a subagent's tools, a
+    ``!command``, or a transport that keeps its own context (the codex
+    app-server) are not pruned against this turn's window.
+    """
+    return _ORCHESTRATOR_RESULT_ROOM.get()
+
+
+@contextlib.contextmanager
+def bind_orchestrator_result_room(
+    room: Optional[OrchestratorResultRoom],
+) -> Iterator[Optional[OrchestratorResultRoom]]:
+    """Publish ``room`` to the tools that run inside this block."""
+    token = _ORCHESTRATOR_RESULT_ROOM.set(room)
+    try:
+        yield room
+    finally:
+        _ORCHESTRATOR_RESULT_ROOM.reset(token)
 
 
 def serialized_result_len(result: Any, *, tool_name: str = "") -> int:
@@ -1890,7 +1953,9 @@ class Feature(_SdkFeature):
             sink_scope = bind_part_collector(parts_sink)
 
         hook_session_id = session_id or ""
-        with sink_scope:
+        # The dispatching turn's batch room (#3740) is not this tool's: its
+        # result goes to the subagent's own loop, never the turn's prune.
+        with sink_scope, bind_orchestrator_result_room(None):
             hooks_manager = getattr(self.agent, "hooks_manager", None)
             effective_args = args
             if hooks_manager is not None:

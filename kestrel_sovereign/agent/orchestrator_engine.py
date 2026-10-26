@@ -153,6 +153,54 @@ MAX_TOOL_CONCURRENCY = int(os.environ.get("KESTREL_MAX_TOOL_CONCURRENCY", "10"))
 # warning naming the model that failed to resolve — never as a silent default.
 _DEFAULT_ORCHESTRATOR_CONTEXT_LIMIT = 131072
 
+# The prune's estimate of the characters in a token.
+_PRUNE_CHARS_PER_TOKEN = 3.5
+
+# A tool result no longer than this survives the prune whole; a longer one is
+# replaced by a stub (``_pruned_message``) once the turn is over its window.
+_PRUNE_MIN_RESULT_CHARS = 200
+
+
+def _message_budget_chars(context_limit: int) -> int:
+    """Characters the prune lets a turn's messages and tool schemas take."""
+    return int(
+        context_limit * _PRUNE_CHARS_PER_TOKEN * (1 - CONTEXT_RESERVE_FRACTION)
+    )
+
+
+def _tools_chars(tools: Optional[list]) -> int:
+    """Characters of the tool schemas offered with a turn's messages."""
+    return sum(len(json.dumps(t)) for t in tools) if tools else 0
+
+
+def _messages_chars(messages: list) -> int:
+    """Characters of ``messages`` as the prune counts them: each message's
+    content plus the JSON of each call's arguments."""
+    total = 0
+    for m in messages:
+        total += len(m.get("content", "") or "")
+        for tc in m.get("tool_calls", []):
+            total += len(json.dumps(tc.get("function", {}).get("arguments", {})))
+    return total
+
+
+def _pruned_message(message: dict) -> dict:
+    """``message`` as the prune keeps it once it reclaims the turn's tool output."""
+    if (
+        message.get("role") != "tool"
+        or len(message.get("content", "")) <= _PRUNE_MIN_RESULT_CHARS
+    ):
+        return message
+    return {
+        "role": "tool",
+        "tool_call_id": message.get("tool_call_id", ""),
+        "content": (
+            f"[Result truncated: was {len(message['content'])} chars. "
+            "Tool completed successfully.]"
+        ),
+    }
+
+
 # Inactivity watchdog for every streamed orchestrator LLM call: the turn's
 # first ``stream_with_tool_detection`` (#3552) and each tool-loop follow-up, so
 # a hung upstream (anthropic 429 backoff, network blip, frozen provider queue,
@@ -3432,6 +3480,8 @@ class OrchestratorEngineMixin:
         # Add initial assistant response with tool calls
         messages.append(self._build_assistant_tool_history_msg(response))
 
+        from kestrel_sovereign.features.base import bind_orchestrator_result_room
+
         tracker = IterationTracker(
             threshold=KESTREL_DIMINISHING_THRESHOLD,
             max_low_delta=KESTREL_MAX_LOW_DELTA,
@@ -3443,14 +3493,20 @@ class OrchestratorEngineMixin:
 
             features_by_tool_name = self._visible_features_by_tool_name()
             known_tools = self._known_tool_names()
-            batch_result = await self._execute_tool_batch_at_stop_boundary(
-                response.tool_calls, features_by_tool_name, known_tools,
-                messages, iteration, user_message,
-                tool_results=tool_results,
-                session_id=session_id,
-                effective_model=effective_model,
-                defer_cancellation_to_persistence=True,
+            result_room = self._tool_batch_result_room(
+                messages, self._build_all_tools(), history_ids=history_ids,
+                has_user_message=bool(continuation_user_content or user_message),
+                model=effective_model, calls=len(response.tool_calls),
             )
+            with bind_orchestrator_result_room(result_room):
+                batch_result = await self._execute_tool_batch_at_stop_boundary(
+                    response.tool_calls, features_by_tool_name, known_tools,
+                    messages, iteration, user_message,
+                    tool_results=tool_results,
+                    session_id=session_id,
+                    effective_model=effective_model,
+                    defer_cancellation_to_persistence=True,
+                )
             if isinstance(batch_result, _DeferredToolBatchCancellation):
                 batch_result.raise_outcome()
 
@@ -3551,6 +3607,44 @@ class OrchestratorEngineMixin:
         return self._prune_orchestrator_messages(
             messages, tools, protected_prefix=protected_prefix,
             history_len=history_len, model=model,
+        )
+
+    def _tool_batch_result_room(
+        self, messages: list, tools: list, *, history_ids: frozenset,
+        has_user_message: bool, model: Optional[str], calls: int,
+    ):
+        """What the batch about to run has of the turn's window (#3740).
+
+        ``messages`` ends with the assistant message making the batch's calls.
+        Once the batch has run, the prune before the next model call sheds
+        replayed history and then stubs tool results oldest first, so this
+        batch's results, the newest, are the last it reclaims: they reach the
+        model whole exactly when they fit beside what it keeps once everything
+        older is reclaimed. Published to the batch's tools as an
+        :class:`~kestrel_sovereign.features.base.OrchestratorResultRoom`.
+        """
+        from kestrel_sovereign.features.base import OrchestratorResultRoom
+
+        _init_constants()
+        context_limit = OrchestratorEngineMixin._resolve_orchestrator_context_limit(
+            self.llm_service, model
+        )
+        budget = _message_budget_chars(context_limit) - _tools_chars(tools)
+        protected_prefix, history_len = OrchestratorEngineMixin._prefix_bounds(
+            messages, history_ids, has_user_message
+        )
+        kept = (
+            messages[:1]
+            + messages[1 + history_len:protected_prefix]
+            + [_pruned_message(m) for m in messages[protected_prefix:]]
+        )
+        chars = budget - _messages_chars(kept)
+        # Pruned, a result keeps at most _PRUNE_MIN_RESULT_CHARS: a shorter
+        # one stays whole and a longer one becomes a shorter stub.
+        return OrchestratorResultRoom(
+            chars=chars,
+            calls=calls,
+            later_chars=chars - calls * _PRUNE_MIN_RESULT_CHARS,
         )
 
     @staticmethod
@@ -3683,7 +3777,7 @@ class OrchestratorEngineMixin:
         session's history can exceed the ceiling on its own with no oversized
         tool result to reclaim.
 
-        Uses char-based estimation: ~4 chars per token.
+        Uses char-based estimation: ~3.5 chars per token.
         """
         _init_constants()
         if context_limit is None:
@@ -3691,21 +3785,11 @@ class OrchestratorEngineMixin:
                 self.llm_service, model
             )
 
-        chars_per_token = 3.5
-        max_chars = int(context_limit * chars_per_token * (1 - CONTEXT_RESERVE_FRACTION))
+        chars_per_token = _PRUNE_CHARS_PER_TOKEN
+        tool_chars = _tools_chars(tools)
+        max_message_chars = _message_budget_chars(context_limit) - tool_chars
 
-        tool_chars = sum(len(json.dumps(t)) for t in tools) if tools else 0
-        max_message_chars = max_chars - tool_chars
-
-        def _total_chars(msgs):
-            total = 0
-            for m in msgs:
-                total += len(m.get("content", "") or "")
-                for tc in m.get("tool_calls", []):
-                    total += len(json.dumps(tc.get("function", {}).get("arguments", {})))
-            return total
-
-        current = _total_chars(messages)
+        current = _messages_chars(messages)
 
         if current <= max_message_chars:
             return messages
@@ -3728,13 +3812,13 @@ class OrchestratorEngineMixin:
         # and would have freed the same bytes (codex review r4).
         # ``system`` (index 0) and the current user turn (the tail of
         # ``protected``) are structural and never dropped.
-        if history_len and _total_chars(protected + middle) > max_message_chars:
+        if history_len and _messages_chars(protected + middle) > max_message_chars:
             head = protected[:1]
             history = list(protected[1:1 + history_len])
             tail = list(protected[1 + history_len:])
             shed = 0
             while history and (
-                _total_chars(head + history + tail + middle) > max_message_chars
+                _messages_chars(head + history + tail + middle) > max_message_chars
             ):
                 history.pop(0)
                 shed += 1
@@ -3759,18 +3843,12 @@ class OrchestratorEngineMixin:
         # Step 2 — only if shedding every replayed turn still left the payload
         # over: start reclaiming this turn's own tool output.
         for i, msg in enumerate(middle):
-            if _total_chars(protected + middle) <= max_message_chars:
+            if _messages_chars(protected + middle) <= max_message_chars:
                 break
-            if msg.get("role") == "tool" and len(msg.get("content", "")) > 200:
-                original_len = len(msg["content"])
-                middle[i] = {
-                    "role": "tool",
-                    "tool_call_id": msg.get("tool_call_id", ""),
-                    "content": f"[Result truncated: was {original_len} chars. Tool completed successfully.]"
-                }
+            middle[i] = _pruned_message(msg)
 
         result = protected + middle
-        new_total = _total_chars(result)
+        new_total = _messages_chars(result)
         logging.info(
             f"[ORCHESTRATOR] After pruning: ~{int(new_total / chars_per_token)}tok "
             f"(removed ~{int((current - new_total) / chars_per_token)}tok)"
@@ -3889,6 +3967,8 @@ class OrchestratorEngineMixin:
 
         messages.append(self._build_assistant_tool_history_msg(response))
 
+        from kestrel_sovereign.features.base import bind_orchestrator_result_room
+
         tracker = IterationTracker(
             threshold=KESTREL_DIMINISHING_THRESHOLD,
             max_low_delta=KESTREL_MAX_LOW_DELTA,
@@ -3930,14 +4010,22 @@ class OrchestratorEngineMixin:
             # as (terminal_event_index, [parts]). Lets us yield each component
             # bubble right after its producing tool's card in a multi-tool batch.
             part_emit_buffer: list = []
-            batch_result = await self._execute_tool_batch_at_stop_boundary(
-                response.tool_calls, features_by_tool_name, known_tools,
-                messages, iteration, user_message,
-                tool_events=tool_events, tool_results=tool_results, streaming=True,
-                session_id=session_id, part_emit_buffer=part_emit_buffer,
-                effective_model=effective_model,
-                defer_cancellation_to_persistence=True,
+            result_room = self._tool_batch_result_room(
+                messages, self._build_all_tools(), history_ids=history_ids,
+                has_user_message=bool(continuation_user_content or user_message),
+                model=effective_model, calls=len(response.tool_calls),
             )
+            # No yield inside: the room is bound and released on this step.
+            with bind_orchestrator_result_room(result_room):
+                batch_result = await self._execute_tool_batch_at_stop_boundary(
+                    response.tool_calls, features_by_tool_name, known_tools,
+                    messages, iteration, user_message,
+                    tool_events=tool_events, tool_results=tool_results,
+                    streaming=True, session_id=session_id,
+                    part_emit_buffer=part_emit_buffer,
+                    effective_model=effective_model,
+                    defer_cancellation_to_persistence=True,
+                )
             if isinstance(batch_result, _DeferredToolBatchCancellation):
                 # The side effect and its result are complete, but Stop cancelled
                 # the invocation owner while this batch was in flight. Hand the

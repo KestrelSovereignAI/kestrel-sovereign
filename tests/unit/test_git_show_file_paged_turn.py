@@ -8,6 +8,12 @@ a real git repository; only the model is scripted, and it does what the tool
 result tells it to: call again with ``offset=next_offset`` until that is null,
 or, batching, call once for each of ``batch_offsets`` with
 ``limit=batch_limit`` in one response.
+
+The scripted model is one the orchestrator cannot identify, so unless a test
+says otherwise it prunes the turn against its 32,768-token fallback window,
+the smallest it uses. Every call's arguments and every pruned result's stub
+stay in the turn, so a long read fills that window: these turns also show a
+read sizing itself to the room left rather than losing a chunk to the prune.
 """
 
 from __future__ import annotations
@@ -39,6 +45,7 @@ DEFAULT_LOOP_SETTINGS = {
 
 DOC_CHARS = 50_000
 DONE = "I have read the whole file."
+STOPPED = "I stopped reading:"
 
 
 def _document() -> str:
@@ -109,13 +116,18 @@ class _PagingModel:
     Every call sees the turn's real message list: the tool results it parses
     are the exact text the orchestrator put in front of the model. Sequential,
     it follows ``next_offset``; batched, it makes one call per entry of
-    ``batch_offsets`` with ``limit=batch_limit``, all in one response.
+    ``batch_offsets`` with ``limit=batch_limit``, all in one response, and
+    follows ``next_offset`` when a chunk offers no batch. ``say`` is the text
+    it writes beside its calls.
     """
 
-    def __init__(self, repo_path: str, path: str, *, batched: bool) -> None:
+    def __init__(
+        self, repo_path: str, path: str, *, batched: bool, say: str = ""
+    ) -> None:
         self.repo_path = repo_path
         self.path = path
         self.batched = batched
+        self.say = say
         self.tool_messages: List[str] = []
         self.requests: List[dict] = []
         self.offered: List[set] = []
@@ -140,7 +152,7 @@ class _PagingModel:
                 )
             )
         self._pending = len(tool_calls)
-        return LLMResponse(content="", tool_calls=tool_calls)
+        return LLMResponse(content=self.say, tool_calls=tool_calls)
 
     def _respond(self, kwargs: dict) -> LLMResponse | str:
         self.calls += 1
@@ -163,11 +175,17 @@ class _PagingModel:
             assert not content.startswith("[Large tool output"), (
                 "the orchestrator replaced the tool result with its preview"
             )
+            assert not content.startswith("[Result truncated"), (
+                "the orchestrator pruned a result before the model read it"
+            )
         self.tool_messages.extend(results)
-        data = json.loads(results[-1])["data"]
+        last = json.loads(results[-1])
+        if last["status"] != "ok":
+            return f"{STOPPED} {last['error']}"
+        data = last["data"]
         if data["next_offset"] is None:
             return DONE
-        if self.batched:
+        if self.batched and "batch_offsets" in data:
             return self._read(
                 [
                     {"offset": offset, "limit": data["batch_limit"]}
@@ -199,7 +217,7 @@ async def _streaming_turn(agent, text: str) -> str:
     )
 
 
-async def _read_in_a_turn(
+async def _run_read_turn(
     tmp_path,
     monkeypatch,
     turn: Callable,
@@ -207,6 +225,7 @@ async def _read_in_a_turn(
     *,
     batched: bool,
     context_tokens: Optional[int] = None,
+    say: str = "",
 ):
     """Run one real turn whose model reads the committed ``document``.
 
@@ -214,7 +233,8 @@ async def _read_in_a_turn(
     prunes old tool results against; left unset, the scripted model is one it
     cannot identify and it takes its 32,768-token fallback.
 
-    Returns the turn's reply, the model, and the tool results it saw in order.
+    Returns the turn's reply, the model, and the repository. The model has
+    already checked that every result it saw was whole.
     """
     repo = _commit_document(tmp_path, document)
     monkeypatch.setenv("KESTREL_CLI_ALLOWED_REPO_ROOTS", str(repo))
@@ -232,7 +252,9 @@ async def _read_in_a_turn(
             if type(feature).__name__ == "CliFeature"
         )
         agent._register_explored_feature_tools(cli)
-        model = _PagingModel(str(repo), "docs/TWO_BRAIN.md", batched=batched)
+        model = _PagingModel(
+            str(repo), "docs/TWO_BRAIN.md", batched=batched, say=say
+        )
         if context_tokens is not None:
             # The window the orchestrator honours ahead of any lookup.
             monkeypatch.setattr(
@@ -251,22 +273,27 @@ async def _read_in_a_turn(
 
     # The loop ran to the model's own answer, not to a budget stop. (A
     # streamed reply puts a separator between tool rounds and its answer.)
-    assert reply.strip().endswith(DONE), reply
     assert "diminishing returns" not in reply
     assert "Maximum tool call iterations" not in reply
     assert model.offered and all(
         "git_show_file" in offered for offered in model.offered
     ), model.offered
     assert len(model.tool_messages) == len(model.requests)
+    return reply, model, repo
 
+
+def _chunks_read(model: _PagingModel) -> List[str]:
+    """The chunks the model read, in order, checked as one contiguous read
+    from the start: each call returned what it asked for, where it asked."""
     chunks = []
     expected_offset = 0
     for request, message in zip(model.requests, model.tool_messages):
         # The model saw each result whole: under the cap, and JSON rather
-        # than the orchestrator's head-and-tail preview.
+        # than the orchestrator's head-and-tail preview or pruning stub.
         assert len(message) <= DEFAULT_RESULT_CAP
         result = json.loads(message)
-        assert result["status"] == "ok", result
+        if result["status"] != "ok":
+            break
         data = result["data"]
         assert data["offset"] == request.get("offset", 0) == expected_offset
         assert data["total_chars"] == DOC_CHARS
@@ -281,7 +308,21 @@ async def _read_in_a_turn(
             expected_offset if expected_offset < DOC_CHARS else None
         )
         chunks.append(data["content"])
+    return chunks
 
+
+async def _read_in_a_turn(tmp_path, monkeypatch, turn: Callable, document: str, **kwargs):
+    """Run one real turn whose model reads the whole committed ``document``.
+
+    Returns the turn's reply, the model, and the tool results it saw in order.
+    """
+    reply, model, repo = await _run_read_turn(
+        tmp_path, monkeypatch, turn, document, **kwargs
+    )
+
+    assert reply.strip().endswith(DONE), reply
+    chunks = _chunks_read(model)
+    assert len(chunks) == len(model.tool_messages)
     assert "".join(chunks) == document
     assert "".join(chunks).encode("utf-8") == (
         repo / "docs" / "TWO_BRAIN.md"
@@ -321,24 +362,31 @@ async def test_a_turn_reads_a_50k_file_in_full_through_batched_chunks(
     assert len(messages) >= 10
 
 
+#: The fallback window the orchestrator prunes against for a model it cannot
+#: identify, and the 200,000-token window of the models the fleet runs.
+WINDOWS = {"fallback_window": None, "200k_window": 200_000}
+
+
 @pytest.mark.asyncio
+@pytest.mark.parametrize("window", sorted(WINDOWS))
 @pytest.mark.parametrize("turn", [_non_streaming_turn, _streaming_turn])
 async def test_a_turn_reads_50k_characters_outside_the_bmp_through_batched_chunks(
-    tmp_path, monkeypatch, default_loop_settings, turn,
+    tmp_path, monkeypatch, default_loop_settings, turn, window,
 ):
     """#3740: batching keeps a heavily escaped file inside the turn's budget.
 
     Serialized, these 50,000 characters are 600,000: about eighty chunks, more
     than the loop's 45 responses allow one chunk at a time (a turn following
     only ``next_offset`` stops with "diminishing returns" before the end).
-    Three to a response they take 27 batches.
+    Three to a response they take about 28 batches.
 
-    The model's window is 200,000 tokens, as for the models the fleet runs.
     Eighty calls' own arguments and pruned-result stubs, about 20,000
-    characters, stay in the turn. In the 32,768-token fallback, beside this
-    agent's 39,000 characters of system prompt and request, they leave room
-    for only two chunks by the end of the file, and the orchestrator prunes
-    the first of a batch of three before the model reads it.
+    characters, stay in the turn. In the fallback window, beside this agent's
+    39,000 characters of system prompt and request, that leaves room for only
+    two chunks by the end of the file. A batch sized to the cap alone lost its
+    first chunk to the prune there, unread (the model's results check that
+    every chunk it saw was a whole result); sized to the room the turn has
+    left, the batches get fewer and smaller instead.
     """
     _, model, messages = await _read_in_a_turn(
         tmp_path,
@@ -346,9 +394,38 @@ async def test_a_turn_reads_50k_characters_outside_the_bmp_through_batched_chunk
         turn,
         _astral_document(),
         batched=True,
-        context_tokens=200_000,
+        context_tokens=WINDOWS[window],
     )
 
     assert len(messages) > 45
-    # The reads plus the model's answer, well inside the loop's 45.
-    assert model.calls <= 30, model.calls
+    # The reads plus the model's answer, inside the loop's 45. (The count
+    # moves with the system prompt and the length of repo_path, which every
+    # call and chunk carries.)
+    assert model.calls < 40, model.calls
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("turn", [_non_streaming_turn, _streaming_turn])
+async def test_a_read_that_outgrows_the_turn_stops_where_the_model_can_see_it(
+    tmp_path, monkeypatch, default_loop_settings, turn,
+):
+    """The orchestrator counts the text a response writes beside its calls.
+    Each batch leaves room for one response's note, but a model that writes
+    900 characters with every response fills the fallback window before the
+    end of this file. The read shrinks with the room and then stops, with a
+    result short enough that the prune keeps it, naming where to read on:
+    the model never receives a chunk the prune cut before it read it."""
+    say = ("Reading the next part of the file. " * 30)[:900]
+
+    reply, model, _ = await _run_read_turn(
+        tmp_path, monkeypatch, turn, _astral_document(), batched=True, say=say,
+    )
+
+    chunks = _chunks_read(model)
+    read = "".join(chunks)
+    assert 0 < len(read) < DOC_CHARS
+    assert read == _astral_document()[: len(read)]
+    stop = json.loads(model.tool_messages[len(chunks)])
+    assert stop["status"] == "error"
+    assert f"from offset={len(read)}" in stop["error"]
+    assert reply.strip().endswith(f"{STOPPED} {stop['error']}"), reply

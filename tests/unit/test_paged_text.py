@@ -9,14 +9,22 @@ whole rather than a head-and-tail preview.
 from __future__ import annotations
 
 import hashlib
+import json
 
 import pytest
 from kestrel_sdk.tools.result import ToolResultStatus
 
 from kestrel_sovereign import kestrel_agent
-from kestrel_sovereign.features.base import orchestrator_result_cap, serialized_result_len
+from kestrel_sovereign.agent.orchestrator_engine import _PRUNE_MIN_RESULT_CHARS
+from kestrel_sovereign.features.base import (
+    OrchestratorResultRoom,
+    bind_orchestrator_result_room,
+    orchestrator_result_cap,
+    serialized_result_len,
+)
 from kestrel_sovereign.features.paged_text import (
     MAX_BATCH_CHARS,
+    RESPONSE_TEXT_RESERVE,
     PageRequest,
     PageRequestError,
     page_request,
@@ -25,6 +33,7 @@ from kestrel_sovereign.features.paged_text import (
 
 TOOL = "read_test_file"
 DATA = {"repo": "owner/repo", "path": "docs/big.md", "ref": "main"}
+CALL = {"repo": "owner/repo", "path": "docs/big.md", "ref": "main"}
 
 
 @pytest.fixture(autouse=True)
@@ -39,6 +48,7 @@ def _read(text: str, offset=0, limit=None):
         tool_name=TOOL,
         subject="docs/big.md at main",
         data=DATA,
+        call_arguments=CALL,
     )
 
 
@@ -114,6 +124,10 @@ def _read_batched(text: str):
     rounds = [[_read(text)]]
     while rounds[-1][-1].data["next_offset"] is not None:
         last = rounds[-1][-1].data
+        if "batch_offsets" not in last:
+            # No batch reads further than the next call alone.
+            rounds.append([_read(text, last["next_offset"])])
+            continue
         limit, offsets = last["batch_limit"], last["batch_offsets"]
         batch = [_read(text, offset, limit) for offset in offsets]
         for offset, result in zip(offsets, batch):
@@ -171,8 +185,13 @@ def test_a_batch_is_bounded_and_starts_at_next_offset(name):
                 assert "batch_offsets" not in data and "batch_limit" not in data
                 assert "End of file" in result.confirmation
                 continue
+            if "batch_offsets" not in data:
+                # Only when the next call alone reads the rest.
+                remaining = len(text) - data["next_offset"]
+                assert _read(text, data["next_offset"]).data["returned_chars"] == remaining
+                continue
             offsets, limit = data["batch_offsets"], data["batch_limit"]
-            assert 1 <= len(offsets) <= most
+            assert 2 <= len(offsets) <= most
             assert offsets[0] == data["next_offset"]
             assert offsets == list(range(offsets[0], offsets[-1] + 1, limit))
             assert offsets[-1] < len(text)
@@ -207,6 +226,138 @@ def test_a_cap_too_large_for_two_chunks_in_a_batch_offers_none(monkeypatch):
     assert "batch_offsets" not in result.data and "batch_limit" not in result.data
     assert "for the next chunk" in result.confirmation
     assert _fits(result)
+
+
+# ---------------------------------------------------------------------------
+# Inside the orchestrator's tool loop: the room the turn has left
+# ---------------------------------------------------------------------------
+
+
+def _call_chars(offset: int, limit: int) -> int:
+    """A continuation call's arguments, as the orchestrator counts them."""
+    return len(json.dumps({**CALL, "offset": offset, "limit": limit}))
+
+
+def test_a_chunk_fits_its_share_of_its_batchs_room():
+    """Two calls share 6,000 characters of room: the orchestrator would prune
+    a result over 3,000 before the model read it, so the chunk is as large as
+    fits 3,000 rather than the cap."""
+    room = OrchestratorResultRoom(chars=6_000, calls=2, later_chars=0)
+
+    with bind_orchestrator_result_room(room):
+        result = _read(BATCH_TEXTS["astral"])
+
+    size = serialized_result_len(result, tool_name=TOOL)
+    # One more character is twelve more, and a digit in each offset.
+    assert 3_000 - 20 < size <= 3_000
+    # A later response has no room for two chunks: no batch is offered.
+    assert "batch_offsets" not in result.data
+    assert f"offset={result.data['next_offset']}" in result.confirmation
+
+
+@pytest.mark.parametrize("later", [60_000, 24_000, 15_000, 11_000])
+@pytest.mark.parametrize("name", ["astral", "mixed", "ascii"])
+def test_a_batch_fits_the_room_a_later_response_has(name, later):
+    """#3740: a batch's calls, their results and the response's text fit what
+    a later response has, so the orchestrator prunes none of its results
+    before the model reads them; each still returns exactly ``batch_limit``."""
+    text = BATCH_TEXTS[name]
+    with bind_orchestrator_result_room(
+        OrchestratorResultRoom(chars=60_000, calls=1, later_chars=later)
+    ):
+        first = _read(text)
+    offsets, limit = first.data["batch_offsets"], first.data["batch_limit"]
+    arguments = sum(_call_chars(offset, limit) for offset in offsets)
+
+    # The batch's own room when it runs, at its smallest: the response's text
+    # used its whole reserve, and this batch's results kept 200 characters
+    # each once pruned (``later_chars`` already allowed for that).
+    room = OrchestratorResultRoom(
+        chars=later - RESPONSE_TEXT_RESERVE - arguments,
+        calls=len(offsets),
+        later_chars=0,
+    )
+    with bind_orchestrator_result_room(room):
+        batch = [_read(text, offset, limit) for offset in offsets]
+
+    for offset, result in zip(offsets, batch):
+        assert result.status is ToolResultStatus.OK, result.error
+        assert result.data["returned_chars"] == min(limit, len(text) - offset)
+        assert "fewer than limit" not in result.confirmation
+    assert sum(
+        serialized_result_len(result, tool_name=TOOL) for result in batch
+    ) <= room.chars
+
+
+def test_batches_get_fewer_and_smaller_as_the_turn_fills():
+    text = BATCH_TEXTS["astral"]
+
+    def covered(later: int):
+        with bind_orchestrator_result_room(
+            OrchestratorResultRoom(chars=60_000, calls=1, later_chars=later)
+        ):
+            data = _read(text).data
+        if "batch_offsets" not in data:
+            return 0, 0
+        return len(data["batch_offsets"]), len(data["batch_offsets"]) * data["batch_limit"]
+
+    roomy, tighter, tight, full = (
+        covered(later) for later in (60_000, 18_000, 12_000, 9_000)
+    )
+
+    assert roomy[0] == 3
+    assert roomy[1] > tighter[1] > tight[1] > 0
+    assert tight[0] == 2
+    # With room for little more than one full chunk, two smaller ones read
+    # less than the next call alone would: following next_offset is the way.
+    assert full == (0, 0)
+
+
+def test_a_batched_call_given_less_room_than_its_batch_expected_says_so():
+    """A response whose own text outran the reserve leaves its batch less room
+    than it was sized for. Each call returns what fits its share, and says
+    that the next chunk starts at its own end, not at the next batch offset,
+    rather than return a chunk the orchestrator would prune unread."""
+    text = BATCH_TEXTS["astral"]
+    with bind_orchestrator_result_room(
+        OrchestratorResultRoom(chars=60_000, calls=1, later_chars=60_000)
+    ):
+        first = _read(text)
+    offsets, limit = first.data["batch_offsets"], first.data["batch_limit"]
+
+    with bind_orchestrator_result_room(
+        OrchestratorResultRoom(chars=12_000, calls=3, later_chars=0)
+    ):
+        short = _read(text, offsets[0], limit)
+
+    assert short.status is ToolResultStatus.OK
+    returned = short.data["returned_chars"]
+    assert 0 < returned < limit
+    assert serialized_result_len(short, tool_name=TOOL) <= 4_000
+    assert short.data["content"] == text[offsets[0]: offsets[0] + returned]
+    assert short.data["next_offset"] == offsets[0] + returned
+    assert f"fewer than limit={limit}" in short.confirmation
+    assert f"starts at offset={offsets[0] + returned}" in short.confirmation
+
+
+def test_a_turn_with_no_room_left_fails_short_enough_to_be_kept():
+    """With no room for a chunk, the read says where to read on, in a result
+    the orchestrator never prunes: it keeps any result of
+    ``_PRUNE_MIN_RESULT_CHARS`` or fewer whole."""
+    text = "a" * 10_000_000
+    with bind_orchestrator_result_room(
+        OrchestratorResultRoom(chars=300, calls=1, later_chars=0)
+    ):
+        result = _read(text, offset=9_999_999)
+
+    assert result.status is ToolResultStatus.ERROR
+    assert "no room left" in result.error
+    assert result.error.endswith("from offset=9999999")
+    assert not result.data
+    assert (
+        serialized_result_len(result, tool_name="git_show_file")
+        <= _PRUNE_MIN_RESULT_CHARS
+    )
 
 
 def test_offset_zero_is_the_default_and_names_the_next_offset():
@@ -305,6 +456,7 @@ def test_identifying_fields_too_large_to_leave_room_fail_rather_than_overflow(mo
         tool_name=TOOL,
         subject="x",
         data={"path": "p" * 2000},
+        call_arguments={"path": "p" * 2000},
     )
 
     assert result.status is ToolResultStatus.ERROR
