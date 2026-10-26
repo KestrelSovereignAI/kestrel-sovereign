@@ -178,7 +178,13 @@ class VisualComputerFeature(Feature):
             raise VisualAccessDenied("visual access requires original sovereign authority")
         generation = self._generation
         self._require_live(generation, request)
-        with caller_context_scope(caller):
+        # Tools borrow the endpoint's original revocable turn scope. Only an
+        # HTTP response owns a new caller lifetime; a copied CallerContext
+        # must never extend the endpoint's authority.
+        scope = capture_turn_scope(self.agent)
+        if request is None and current_caller_context() is not caller:
+            raise VisualAccessDenied("visual tool caller is no longer current")
+        with (scope.bind() if request is None else caller_context_scope(caller)):
             try:
                 require_sovereign_caller("visual computer")
                 if request is not None:

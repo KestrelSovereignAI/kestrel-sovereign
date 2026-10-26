@@ -88,7 +88,15 @@ def test_startup_promotion_stays_under_budget():
         SaveFeature, StrategicMemoryFeature, SpawnFeature,
         TaskFeature, PeersFeature, TodoFeature, WaitFeature,
     } <= set(promoted_classes)
-    total = sum(_tool_count(cls, agent) for cls in promoted_classes)
+    from kestrel_sovereign.features.visual_computer import VisualComputerFeature
+
+    # Include configured visual tools, even though discovery correctly hides
+    # them until the visual runtime has initialized. The default-only census
+    # missed this production budget and let it evict already explored tools.
+    visual = VisualComputerFeature(agent)
+    visual.runtime = object()
+    total = sum(_tool_count(cls, agent) for cls in promoted_classes
+                if cls is not VisualComputerFeature) + len(visual.get_tools())
 
     common_exploration = _tool_count(ModelAgent, agent) + _tool_count(MemoryFeature, agent)
 

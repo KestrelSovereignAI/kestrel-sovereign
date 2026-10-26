@@ -529,6 +529,7 @@ def test_inbound_authorizer_has_no_recipient_without_a_did(agent):
 # register: the modules that call the guard, asserted exactly.
 ROUTED_MODULES = {
     "features/artifacts/feature.py",
+    "features/visual_computer/feature.py",  # retained visual custody owner
     "agent/preturn_state.py",
     "a2a/inbound_authorization.py",
     "a2a/native_standalone.py",  # standalone native publication owner

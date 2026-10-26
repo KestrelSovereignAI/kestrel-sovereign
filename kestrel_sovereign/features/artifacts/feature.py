@@ -34,7 +34,6 @@ from kestrel_sovereign.artifacts.service import (
 )
 from kestrel_sovereign.auth import (
     AuthMethod, CallerContext, caller_context_scope, current_caller_context,
-    caller_context_binding_scope, capture_caller_context_binding,
 )
 from kestrel_sovereign.endpoints.agent_helpers import get_caller
 from kestrel_sovereign.features.base import Feature
@@ -306,12 +305,12 @@ class ArtifactsFeature(ArtifactProducerTools, ArtifactWorkspaceTools, Feature):
             raise ArtifactAccessDenied("artifact access requires sovereign authority")
         generation = self._generation
         self._require_live(request, generation)
-        binding = capture_caller_context_binding() if request is None else None
-        if request is None and (binding is None or binding.caller is not caller):
+        scope = capture_turn_scope(self.agent)
+        if request is None and current_caller_context() is not caller:
             raise ArtifactAccessDenied("artifact tool caller is no longer current")
         # HTTP owns this response lifetime. Tools MUST reuse the endpoint's
         # existing binding; minting a scope here would outlive its revocation.
-        with (caller_context_binding_scope(binding) if request is None else caller_context_scope(caller)):
+        with (scope.bind() if request is None else caller_context_scope(caller)):
             try:
                 require_sovereign_caller("artifact access")
             except HostAuthorityError:

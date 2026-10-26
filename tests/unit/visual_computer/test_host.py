@@ -175,20 +175,23 @@ async def test_bound_context_retains_configured_fixed_deadline_and_current_grant
     now = datetime.now(UTC)
     clock = [now]
     monkeypatch.setattr(feature.runtime.authority, "clock", lambda: clock[0])
-    async with feature._bind_context(CallerContext.sovereign(credential=KEY)) as context:
-        original_expiry = now + timedelta(seconds=budget)
-        assert context.expires_at == original_expiry
-        # Changing configuration cannot renew an already bound caller.
-        feature.runtime.policy = replace(feature.runtime.policy, operation_seconds=2*budget)
-        clock[0] = original_expiry - timedelta(seconds=1)
-        assert (await feature.runtime.status(context, sid))["session"]["session_id"] == sid
-        feature._cfg["granted_actions"].remove(VisualAction.STATUS.value)
-        with pytest.raises(OperatorAuthorizationError):
-            await feature.runtime.status(context, sid)
-        feature._cfg["granted_actions"].append(VisualAction.STATUS.value)
-        clock[0] = original_expiry + timedelta(microseconds=1)
-        with pytest.raises(OperatorAuthorizationError):
-            await feature.runtime.status(context, sid)
+    from kestrel_sovereign.auth import caller_context_scope
+    caller = CallerContext.sovereign(credential=KEY)
+    with caller_context_scope(caller):
+        async with feature._bind_context(caller) as context:
+            original_expiry = now + timedelta(seconds=budget)
+            assert context.expires_at == original_expiry
+            # Changing configuration cannot renew an already bound caller.
+            feature.runtime.policy = replace(feature.runtime.policy, operation_seconds=2*budget)
+            clock[0] = original_expiry - timedelta(seconds=1)
+            assert (await feature.runtime.status(context, sid))["session"]["session_id"] == sid
+            feature._cfg["granted_actions"].remove(VisualAction.STATUS.value)
+            with pytest.raises(OperatorAuthorizationError):
+                await feature.runtime.status(context, sid)
+            feature._cfg["granted_actions"].append(VisualAction.STATUS.value)
+            clock[0] = original_expiry + timedelta(microseconds=1)
+            with pytest.raises(OperatorAuthorizationError):
+                await feature.runtime.status(context, sid)
 
 
 @pytest.mark.asyncio
@@ -295,3 +298,57 @@ async def test_visual_plan_uses_original_caller_configured_model_and_host_router
     assert (await client.post(path()+f"/sessions/{sid}/plan",headers=AUTH,
         json={"prompt":"Read","model_override":"model-selected"})).status_code == 400
     assert len(calls)==2
+
+
+@pytest.mark.asyncio
+async def test_visual_tool_cannot_mint_authority_from_copied_caller(visual_host):
+    from kestrel_sovereign.auth import CallerContext
+    from kestrel_sdk.operator import OperatorAuthorizationError
+
+    _, agents, _ = visual_host
+    feature = agents["kite"].features["VisualComputerFeature"]
+    with pytest.raises(OperatorAuthorizationError):
+        async with feature._bind_context(CallerContext.sovereign(credential=KEY)):
+            pytest.fail("a copied caller minted visual authority")
+
+
+@pytest.mark.asyncio
+async def test_visual_tool_delivery_observes_original_endpoint_revocation(visual_host, harness, monkeypatch):
+    from kestrel_sovereign.auth import CallerContext, caller_context_scope, current_caller_context
+    from kestrel_sdk.operator import OperatorAuthorizationError
+
+    client, agents, _ = visual_host
+    admitted = await client.post(path()+"/requests", headers=AUTH, json=intent())
+    assert admitted.status_code == 200
+    sid = admitted.json()["session_id"]
+    feature = agents["kite"].features["VisualComputerFeature"]
+    entered, release = asyncio.Event(), asyncio.Event()
+    observe = harness.adapter.observe
+
+    async def delayed(session):
+        entered.set()
+        await release.wait()
+        return await observe(session)
+
+    monkeypatch.setattr(harness.adapter, "observe", delayed)
+
+    async def borrowed_tool():
+        async with feature._bind_context(current_caller_context()) as context:
+            return await feature.runtime.observe(context, sid)
+
+    pending = None
+    try:
+        with caller_context_scope(CallerContext.sovereign(credential=KEY)):
+            pending = asyncio.create_task(borrowed_tool())
+            await asyncio.wait_for(entered.wait(), 2)
+        # Only the endpoint owns that lifetime. The copied task must refuse
+        # private pixels even though its independent operation TTL is current.
+        release.set()
+        with pytest.raises(OperatorAuthorizationError):
+            await pending
+    finally:
+        release.set()
+        if pending is not None and not pending.done():
+            pending.cancel()
+        if pending is not None:
+            await asyncio.gather(pending, return_exceptions=True)
