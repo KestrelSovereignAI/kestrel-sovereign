@@ -274,6 +274,8 @@ SCHEDULER_READ_TOOLS = frozenset(
 MEMORY_READ_TOOLS = frozenset(
     {
         "search_memory",
+        # #3784 — search_memory returns snippets; this reads a hit in full.
+        "read_message_by_id",
         "search_documents",
         "search_case_law",
         "recall_recent",

@@ -24,7 +24,12 @@ from typing import Any, Dict, List, Optional
 
 from kestrel_sovereign.agent.context_builder import extract_raw_user_content
 from kestrel_sovereign.execution_custody import is_execution_control_error
-from kestrel_sovereign.features.base import Feature, tool
+from kestrel_sovereign.features.base import (
+    Feature,
+    largest_fitting_result,
+    orchestrator_result_cap,
+    tool,
+)
 from kestrel_sovereign.features.enum_coerce import (
     STATUS_DONE_CANCELLED_ALIASES,
     normalize_choice,
@@ -34,6 +39,15 @@ from kestrel_sovereign.features.storage_access import (
     resolve_feature_database,
 )
 from kestrel_sovereign.features.memory.reflection_hook import ReflectionSleepHook
+from kestrel_sovereign.features.memory.search_results import (
+    bounded_echo,
+    fit_search_result,
+    message_text,
+    omission_notice,
+    search_hits,
+    stored_session_id,
+    timestamp_text,
+)
 from kestrel_sovereign.storage.memory_system import (
     MemoryConsolidationTimeoutError,
     _consolidation_timeout_seconds,
@@ -43,6 +57,9 @@ from kestrel_sdk.tools.base import ToolCategory
 from kestrel_sdk.tools.result import ToolResult
 
 logger = logging.getLogger(__name__)
+
+#: Upper bound for a message id or character offset argument: a 64-bit row id.
+_MAX_ROW_ID = 2**63 - 1
 
 
 def _strip_sent_form_for_recall(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -179,6 +196,36 @@ class MemoryFeature(Feature):
     # doesn't have to unpack a ToolResult envelope.
     # ------------------------------------------------------------------
 
+    async def _active_question_id(self, conv_store: Any) -> Optional[int]:
+        """The persisted row of the question the live turn is answering.
+
+        A turn persists its user row before any tool runs, in the TURN's
+        session, so that row is the newest user row there. It is not the
+        newest user row of the session being searched: a search scoped to an
+        older conversation would otherwise take that conversation's last
+        question for the active one and hide it (#3784). Operator-signal rows
+        are injected as user rows during a turn, so they are passed over; a
+        signal wake's own user row is the active one when a wake asks.
+
+        None outside a live turn — a command, a cron tick, a detached task —
+        where there is no active question to hide.
+        """
+        if not self._owns_live_turn():
+            return None
+        get_recent = getattr(conv_store, "get_conversation_history", None)
+        if not inspect.iscoroutinefunction(get_recent):
+            return None
+        # A session-less turn's row is the newest user row agent-wide: turns
+        # hold CONVERSATION, so no other turn writes one while this one runs.
+        recent = await get_recent(limit=20, session_id=self._turn_session_id())
+        user_ids = [
+            row.get("id") for row in recent
+            if row.get("id") is not None
+            and row.get("role") == "user"
+            and not (row.get("metadata") or {}).get("operator_signal")
+        ]
+        return max(user_ids, default=None)
+
     async def _search_memory_impl(
         self,
         query: str,
@@ -187,8 +234,9 @@ class MemoryFeature(Feature):
     ) -> Dict[str, Any]:
         """Run the conversation-history search and return a dict.
 
-        Returns ``{"ok": True, "results": [...], "count": N, ...}`` or
-        ``{"ok": False, "error": str}``.
+        Returns ``{"ok": True, "hits": [SearchHit, ...], "count": N, ...}`` or
+        ``{"ok": False, "error": str}``. A hit holds its message text; callers
+        return it to the model only through :func:`fit_search_result` (#3784).
         """
         try:
             conv_store = self._get_conversation_store()
@@ -200,30 +248,14 @@ class MemoryFeature(Feature):
                 limit=limit,
                 session_id=session_id,
             )
-            # The current user turn is persisted before an agent may call this
-            # tool. Identify the newest ordinary user row so we suppress only
-            # the active question, not a genuinely historical question that a
-            # later search is expected to find. Operator/signal user rows can
-            # be appended after the active turn, so ignore them here.
-            get_recent = getattr(conv_store, "get_conversation_history", None)
-            recent = (
-                await get_recent(limit=20, session_id=session_id)
-                if inspect.iscoroutinefunction(get_recent)
-                else []
-            )
-            ordinary_user_ids = [
-                row.get("id") for row in recent
-                if row.get("id") is not None
-                and row.get("role") == "user"
-                and not (row.get("metadata") or {}).get("operator_signal")
-                and not (row.get("metadata") or {}).get("signal_wake")
-            ]
-            newest_user_id = max(ordinary_user_ids, default=None)
+            # Suppress only the question the live turn is answering, never a
+            # genuinely historical question a later search is expected to find.
+            active_question_id = await self._active_question_id(conv_store)
             results = [
                 row for row in results
                 if not (
-                    newest_user_id is not None
-                    and row.get("id") == newest_user_id
+                    active_question_id is not None
+                    and row.get("id") == active_question_id
                     and row.get("role") == "user"
                     and _is_user_query_echo(
                         extract_raw_user_content(str(row.get("content", ""))),
@@ -232,10 +264,13 @@ class MemoryFeature(Feature):
                 )
             ]
             cleaned = _strip_sent_form_for_recall(results)
+            hits = search_hits(
+                cleaned, query, agent_id=getattr(self, "agent_id", None)
+            )
             return {
                 "ok": True,
-                "results": cleaned,
-                "count": len(cleaned),
+                "hits": hits,
+                "count": len(hits),
                 "query": query,
                 "session_id": session_id,
             }
@@ -243,12 +278,14 @@ class MemoryFeature(Feature):
             logger.error(f"_search_memory_impl failed: {e}")
             return {"ok": False, "error": str(e)}
         except Exception as e:
+            if is_execution_control_error(e):
+                raise
             logger.error(f"_search_memory_impl failed: {e}", exc_info=True)
             return {"ok": False, "error": str(e)}
 
     @tool(
         name="search_memory",
-        description="PRIMARY TOOL for recalling past conversations. Use this when asked 'do you remember', 'what did we discuss', or any question about past conversations. Decrypts and searches conversation history client-side for reliable results. Pass session_id to scope to a single conversation thread.",
+        description="PRIMARY TOOL for recalling past conversations. Use this when asked 'do you remember', 'what did we discuss', or any question about past conversations. Decrypts and searches conversation history client-side for reliable results. Pass session_id to scope to a single conversation thread. Each hit is a short snippet around the match with its message_id; read the message itself with read_message_by_id(message_id, offset=snippet_start).",
         category=ToolCategory.MEMORY,
         command_prefix="!memory search"
     )
@@ -264,6 +301,14 @@ class MemoryFeature(Feature):
         Uses the conversation store's encryption-aware search_history,
         which decrypts client-side before matching. Optionally scope to
         a single session.
+
+        Each hit is compact (#3784): ``message_id``, ``session_id``,
+        ``role``, ``timestamp``, ``score``, ``match`` and a ``snippet`` cut
+        from ``[snippet_start, snippet_end)`` of the message's
+        ``content_chars`` characters, plus bare ``concepts``. The whole
+        result fits the orchestrator's tool-result cap: snippets shrink
+        first, then the lowest-ranked hits are dropped, and the result is
+        PARTIAL, naming how many were ``omitted``.
 
         Args:
             query: Search term or phrase to find in past conversations
@@ -284,19 +329,179 @@ class MemoryFeature(Feature):
         if not data["ok"]:
             return ToolResult.failed(data["error"])
 
-        scope = f" in session {session_id}" if session_id else ""
-        return ToolResult.ok(
-            confirmation=(
-                f"Found {data['count']} match(es) for {query!r}{scope} "
+        matched = data["count"]
+        query_echo = bounded_echo(query)
+        session_echo = bounded_echo(session_id)
+        scope = f" in session {session_echo}" if session_id else ""
+        cap = orchestrator_result_cap()
+
+        def render(entries: List[Dict[str, Any]], omitted: int) -> ToolResult:
+            confirmation = (
+                f"Found {matched} match(es) for {query_echo!r}{scope} "
                 f"(limit requested: {limit_val})"
-            ),
-            data={
-                "results": data["results"],
-                "count": data["count"],
-                "query": data["query"],
-                "session_id": data["session_id"],
+            )
+            if entries:
+                confirmation += (
+                    ". Each result is a snippet; read a whole message with "
+                    "read_message_by_id(message_id, offset=snippet_start)"
+                )
+            payload = {
+                "results": entries,
+                "count": len(entries),
+                "matched": matched,
+                "omitted": omitted,
+                "truncated": omitted > 0,
+                "query": query_echo,
+                "session_id": session_echo,
                 "limit_requested": limit_val,
-            },
+            }
+            if omitted:
+                return ToolResult.partial(
+                    confirmation=confirmation,
+                    error=omission_notice(omitted, matched, cap),
+                    data=payload,
+                )
+            return ToolResult.ok(confirmation=confirmation, data=payload)
+
+        return fit_search_result(
+            data["hits"], render, cap=cap, tool_name="search_memory"
+        )
+
+    @tool(
+        name="read_message_by_id",
+        description="Read ONE stored conversation message by its message_id, in ranged chunks. search_memory returns only a snippet of each hit; use this to read the message itself. Pass offset (for example a hit's snippet_start) to start mid-message and length to bound the chunk. Each chunk reports total_chars and next_offset: call again with offset=next_offset to read on. Pass session_id to refuse a stale id from another conversation.",
+        category=ToolCategory.MEMORY,
+        command_prefix="!memory read-message"
+    )
+    async def read_message_by_id(
+        self,
+        message_id: int,
+        offset: int = 0,
+        length: Optional[int] = None,
+        session_id: Optional[str] = None,
+    ) -> ToolResult:
+        """Read one live message by id, a chunk at a time (#3784).
+
+        Reads the same store ``search_memory`` searches, and returns the text
+        a hit's snippet was cut from, so a hit's ``snippet_start`` is a valid
+        ``offset``. Each chunk is sized so the whole result fits the
+        orchestrator's tool-result cap; where the row's stored labels
+        (session, role, timestamp) would leave no room for a single
+        character, they are left out and named in ``labels_omitted``.
+
+        Args:
+            message_id: The message to read (a search hit's ``message_id``).
+            offset: Character offset to start from (default 0).
+            length: Most characters to return; the chunk shrinks further to
+                fit the cap. Defaults to as much as fits.
+            session_id: Optional guard — refuse if the message isn't in this
+                conversation.
+        """
+        row_id, error = _coerce_int(message_id, "message_id", lo=1, hi=_MAX_ROW_ID)
+        if error:
+            return ToolResult.failed(error)
+        start, error = _coerce_int(offset, "offset", lo=0, hi=_MAX_ROW_ID)
+        if error:
+            return ToolResult.failed(error)
+        wanted: Optional[int] = None
+        if length is not None:
+            wanted, error = _coerce_int(length, "length", lo=1, hi=_MAX_ROW_ID)
+            if error:
+                return ToolResult.failed(error)
+
+        conv_store = self._get_conversation_store()
+        if not conv_store:
+            return ToolResult.failed("Conversation store unavailable")
+        guard = await self._guard_message_session(conv_store, row_id, session_id)
+        if guard is not None:
+            return guard
+        try:
+            rows = await conv_store.get_messages_by_ids([row_id])
+        except Exception as e:
+            if is_execution_control_error(e):
+                raise
+            logger.error(f"read_message_by_id failed: {e}", exc_info=True)
+            return ToolResult.failed(str(e))
+        if not rows:
+            return ToolResult.failed(
+                f"No live message found with id {row_id} (deleted, archived, "
+                f"or absent)",
+                data={"message_id": row_id},
+            )
+
+        row = _strip_sent_form_for_recall(rows)[0]
+        meta = row.get("metadata") or {}
+        row_session = meta.get("session_id") if isinstance(meta, dict) else None
+        text = message_text(row)
+        total = len(text)
+        if start > total:
+            return ToolResult.failed(
+                f"offset {start} is past the end of message {row_id} "
+                f"({total} characters)",
+                data={"message_id": row_id, "total_chars": total},
+            )
+        requested_end = total if wanted is None else min(start + wanted, total)
+        # Labels the chunk carries when they fit beside it. They are stored
+        # values, not bounded by construction, so they can be left out —
+        # visibly — rather than crowd out the content they label.
+        labels = {
+            "session_id": stored_session_id(row_session),
+            "role": row.get("role"),
+            "timestamp": timestamp_text(row.get("created_at")),
+        }
+
+        def build(end: int, *, with_labels: bool) -> ToolResult:
+            has_more = end < total
+            confirmation = f"Read message {row_id} — characters {start}–{end} of {total}."
+            if has_more:
+                confirmation += (
+                    f" More remains; call read_message_by_id again with "
+                    f"offset={end} for the next chunk."
+                )
+            else:
+                confirmation += " End of message."
+            chunk = text[start:end]
+            data: Dict[str, Any] = {"message_id": row_id}
+            if with_labels:
+                data.update(labels)
+            else:
+                confirmation += (
+                    " Its session_id, role and timestamp were left out to fit "
+                    "the tool-result cap."
+                )
+                data["labels_omitted"] = list(labels)
+            data.update({
+                "offset": start,
+                "length": len(chunk),
+                "total_chars": total,
+                "next_offset": end if has_more else None,
+                "truncated": has_more,
+                "content": chunk,
+            })
+            return ToolResult.ok(confirmation=confirmation, data=data)
+
+        # Every returned result is measured against the cap. A chunk carries
+        # at least one character while any remain — an empty chunk would page
+        # forever — so where even that does not fit beside the labels, the
+        # labels go; where it does not fit at all, the read fails.
+        cap = orchestrator_result_cap()
+        shortest = start + 1 if start < requested_end else start
+        for with_labels in (True, False):
+            fit = largest_fitting_result(
+                lambda end, with_labels=with_labels: build(
+                    end, with_labels=with_labels
+                ),
+                shortest,
+                requested_end,
+                cap=cap,
+                tool_name="read_message_by_id",
+            )
+            if fit is not None:
+                return fit[1]
+        return ToolResult.failed(
+            f"read_message_by_id cannot fit the next character of message "
+            f"{row_id} under the {cap:,}-character tool-result cap",
+            data={"message_id": row_id, "offset": start, "total_chars": total},
         )
 
     @tool(
@@ -769,21 +974,35 @@ class MemoryFeature(Feature):
                     f"{fallback['error']}",
                     data={"limit_requested": limit_val},
                 )
-            return ToolResult.partial(
-                confirmation=(
-                    f"Memory retriever unavailable; fell back to keyword "
-                    f"search and found {fallback['count']} match(es)"
-                ),
-                error=(
+            matched = fallback["count"]
+            cap = orchestrator_result_cap()
+
+            def render(entries: List[Dict[str, Any]], omitted: int) -> ToolResult:
+                error = (
                     "emotional weighting (mood/importance/recency) was NOT "
                     "applied — results are basic keyword matches"
-                ),
-                data={
-                    "fallback_results": fallback["results"],
-                    "count": fallback["count"],
-                    "query": query,
-                    "limit_requested": limit_val,
-                },
+                )
+                if omitted:
+                    error += "; " + omission_notice(omitted, matched, cap)
+                return ToolResult.partial(
+                    confirmation=(
+                        f"Memory retriever unavailable; fell back to keyword "
+                        f"search and found {matched} match(es)"
+                    ),
+                    error=error,
+                    data={
+                        "fallback_results": entries,
+                        "count": len(entries),
+                        "matched": matched,
+                        "omitted": omitted,
+                        "truncated": omitted > 0,
+                        "query": bounded_echo(query),
+                        "limit_requested": limit_val,
+                    },
+                )
+
+            return fit_search_result(
+                fallback["hits"], render, cap=cap, tool_name="recall_emotional"
             )
 
         # Mood is mapped to a valence weighting. An unknown, non-empty mood
@@ -1232,6 +1451,8 @@ class MemoryFeature(Feature):
         try:
             belongs = await storage.message_belongs_to_session(message_id, session_id)
         except Exception as e:
+            if is_execution_control_error(e):
+                raise
             logger.error(f"message-session guard failed: {e}", exc_info=True)
             return ToolResult.failed(str(e))
         if not belongs:

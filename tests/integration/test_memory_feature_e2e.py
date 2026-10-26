@@ -69,6 +69,7 @@ class TestMemoryFeatureDiscovery:
 
         expected = {
             "search_memory",
+            "read_message_by_id",
             "recall_recent",
             "search_documents",
             "search_case_law",

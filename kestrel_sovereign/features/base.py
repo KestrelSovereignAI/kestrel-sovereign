@@ -172,6 +172,39 @@ def serialized_result_len(result: Any, *, tool_name: str = "") -> int:
     return len(_json.dumps(payload))
 
 
+def largest_fitting_result(
+    build: Callable[[int], Any],
+    lo: int,
+    hi: int,
+    *,
+    cap: int,
+    tool_name: str,
+) -> Optional[tuple[int, Any]]:
+    """The largest ``n`` in ``[lo, hi]`` whose ``build(n)`` fits ``cap``.
+
+    ``build(n)`` returns a tool result that grows with ``n`` — a chunk's end,
+    a snippet's width, a count of hits — and each candidate is measured with
+    :func:`serialized_result_len`, the orchestrator's own measure. Returns
+    ``(n, result)`` for the best one, or ``None`` when not even ``build(lo)``
+    fits.
+
+    Growth need not be strictly monotone (a dropped ellipsis can make a wider
+    snippet a few characters shorter): only measured results are returned, so
+    the worst a non-monotone step costs is a slightly smaller ``n``, never a
+    result over the cap.
+    """
+    best: Optional[tuple[int, Any]] = None
+    while lo <= hi:
+        mid = (lo + hi) // 2
+        result = build(mid)
+        if serialized_result_len(result, tool_name=tool_name) <= cap:
+            best = (mid, result)
+            lo = mid + 1
+        else:
+            hi = mid - 1
+    return best
+
+
 def _invoke_subagent_prompt(
     prompt_builder: Callable[..., str],
     runtime_tools: list[Any],
