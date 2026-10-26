@@ -85,6 +85,19 @@ def is_tracing_enabled() -> bool:
     return bool(os.environ.get("OTEL_EXPORTER_OTLP_ENDPOINT"))
 
 
+def _instrument_fastapi(app) -> None:
+    from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
+    from kestrel_sovereign.security.access_log import PRIVATE_CAPABILITY_URL_PATTERN
+
+    # Preserve OTel's instrumentation-specific-over-generic environment rule.
+    # Exclude before span construction; a request hook runs after raw URL and
+    # header capture and cannot reliably erase those values on every error.
+    configured = os.environ.get("OTEL_PYTHON_FASTAPI_EXCLUDED_URLS",
+                                os.environ.get("OTEL_PYTHON_EXCLUDED_URLS", ""))
+    excluded = ",".join(value for value in (configured, PRIVATE_CAPABILITY_URL_PATTERN) if value)
+    FastAPIInstrumentor.instrument_app(app, excluded_urls=excluded)
+
+
 def setup_tracing(app=None) -> bool:
     """Initialize OpenTelemetry tracing.
 
@@ -125,8 +138,7 @@ def setup_tracing(app=None) -> bool:
         # Auto-instrument FastAPI if app is provided
         if app is not None:
             try:
-                from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
-                FastAPIInstrumentor.instrument_app(app)
+                _instrument_fastapi(app)
                 logger.info("FastAPI auto-instrumentation enabled")
             except ImportError:
                 logger.debug("opentelemetry-instrumentation-fastapi not installed, skipping")

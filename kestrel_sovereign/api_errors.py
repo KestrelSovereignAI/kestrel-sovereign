@@ -214,11 +214,17 @@ async def api_unhandled_exception_handler(
     )
     token = correlation_id_var.set(correlation_id)
     try:
+        from kestrel_sovereign.security.access_log import private_capability_path
+        path = request.scope.get("path", request.url.path)
+        private_path = private_capability_path(path)
         logger.error(
             "Unhandled API error for %s %s",
             request.method,
-            request.url.path,
-            exc_info=(type(exc), exc, exc.__traceback__),
+            private_path or path,
+            # Private exceptions can embed IDs, source paths or submitted data.
+            # Keep their class, never their message/traceback or cached URL.
+            exc_info=None if private_path else (type(exc), exc, exc.__traceback__),
+            extra={"error_type": type(exc).__name__},
         )
         return api_error_response(
             status_code=500,

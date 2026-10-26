@@ -17,7 +17,9 @@ from urllib.parse import parse_qsl, urlencode
 
 
 _REDACTED_VALUE = "redacted"
-_ARTIFACT_TARGET = re.compile(r"/api/artifacts(?:/|$)")
+# Also used before optional auto-instrumentation creates a URL-bearing span.
+PRIVATE_CAPABILITY_URL_PATTERN = r"/api/(?:artifacts|visual-computer)(?:[/?#]|$)"
+_PRIVATE_TARGET = re.compile(r"/api/(artifacts|visual-computer)(?:/|$)")
 _SENSITIVE_QUERY_NAMES = frozenset(
     {
         "apikey",
@@ -32,6 +34,12 @@ _SENSITIVE_QUERY_NAMES = frozenset(
 def _is_sensitive_query_name(name: str) -> bool:
     normalized = name.casefold().replace("-", "").replace("_", "")
     return normalized in _SENSITIVE_QUERY_NAMES or normalized.endswith("token")
+
+
+def private_capability_path(path: str) -> str | None:
+    """Return a content-free service path, including on unrouted failures."""
+    match = _PRIVATE_TARGET.search(path)
+    return f"/api/{match[1]}" if match else None
 
 
 def redact_sensitive_query_string(query_string: bytes) -> bytes:
@@ -77,19 +85,19 @@ class SensitiveQueryStringRedactionMiddleware:
         if scope.get("type") != "http":
             return await self.app(scope, receive, send)
 
-        # Artifact IDs, publication keys and file paths are private metadata,
+        # Artifact and computer IDs, keys and file paths are private metadata,
         # including on failed/unauthenticated requests and agent-prefixed URLs.
-        artifact = bool(_ARTIFACT_TARGET.search(scope.get("path", "")))
+        private_path = private_capability_path(scope.get("path", ""))
         query = scope.get("query_string", b"")
-        redacted_query = b"" if artifact else redact_sensitive_query_string(query)
-        if not artifact and redacted_query == query:
+        redacted_query = b"" if private_path else redact_sensitive_query_string(query)
+        if not private_path and redacted_query == query:
             return await self.app(scope, receive, send)
 
         def redact_scope() -> None:
             scope["query_string"] = redacted_query
-            if artifact:
-                scope["path"] = "/api/artifacts"
-                scope["raw_path"] = b"/api/artifacts"
+            if private_path:
+                scope["path"] = private_path
+                scope["raw_path"] = private_path.encode("ascii")
 
         async def send_with_redacted_scope(message: dict) -> None:
             if message.get("type") == "http.response.start":
@@ -106,7 +114,7 @@ class SensitiveQueryStringRedactionMiddleware:
                     # code after response-start. Keep its request semantics
                     # unchanged after the synchronous access-log seam.
                     scope["query_string"] = original_query
-                    if artifact:
+                    if private_path:
                         scope["path"] = original_path
                         if original_raw_path is None:
                             scope.pop("raw_path", None)

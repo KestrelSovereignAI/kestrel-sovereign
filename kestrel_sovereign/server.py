@@ -4917,7 +4917,7 @@ async def deprecated_agent_prefix_compat(request: Request, call_next):
     return await call_next(request)
 
 
-# Outside all buffering middleware and inside the artifact delivery boundary.
+# Outside all buffering middleware and inside the private delivery boundary.
 # Application/auth code sees the original query string; the scope is redacted
 # only as ``http.response.start`` crosses back to Uvicorn's access logger.
 from kestrel_sovereign.security.access_log import (
@@ -4926,7 +4926,7 @@ from kestrel_sovereign.security.access_log import (
 
 app.add_middleware(SensitiveQueryStringRedactionMiddleware)
 
-# Keep private artifact authority through the real send, outside all of the
+# Keep private capability authority through the real send, outside all of the
 # BaseHTTPMiddleware queues above. Feature routers alone cannot own delivery.
 from kestrel_sovereign.security.private_delivery import PrivateDeliveryMiddleware
 

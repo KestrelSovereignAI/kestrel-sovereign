@@ -86,10 +86,11 @@ async def test_multi_agent_request_is_redacted_only_during_response_start_send()
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("capability", ["artifacts", "visual-computer"])
 @pytest.mark.parametrize("prefix", ["", "/agent", "/api/agents/Kite", "/api/agent-routes/a2l0ZQ"])
 @pytest.mark.parametrize("query", [b"", b"path=private%2Ffile.md&cursor=private-cursor"])
-async def test_artifact_identifiers_are_redacted_without_changing_handler_semantics(prefix, query):
-    path = prefix + "/api/artifacts/publications/private-publication-key"
+async def test_artifact_identifiers_are_redacted_without_changing_handler_semantics(capability, prefix, query):
+    path = prefix + f"/api/{capability}/publications/private-publication-key"
     scope = {"type": "http", "path": path, "raw_path": path.encode(), "query_string": query}
     observed = []
     async def inner(inner_scope, receive, send):
@@ -101,16 +102,16 @@ async def test_artifact_identifiers_are_redacted_without_changing_handler_semant
     async def send(message):
         observed.append(get_path_with_query_string(scope))
     await SensitiveQueryStringRedactionMiddleware(inner)(scope, receive, send)
-    assert observed == ["/api/artifacts"]
+    assert observed == [f"/api/{capability}"]
     assert scope["path"] == path and scope["raw_path"] == path.encode() and scope["query_string"] == query
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("during_send", [False, True])
-@pytest.mark.parametrize("artifact", [False, True])
-async def test_escaped_error_keeps_scope_redacted_for_outer_error_handler(during_send, artifact):
-    path = "/api/artifacts/private-id/file" if artifact else "/events"
-    query = b"path=private-file" if artifact else b"api_key=private-key"
+@pytest.mark.parametrize("capability", [None, "artifacts", "visual-computer"])
+async def test_escaped_error_keeps_scope_redacted_for_outer_error_handler(during_send, capability):
+    path = f"/api/{capability}/private-id/file" if capability else "/events"
+    query = b"path=private-file" if capability else b"api_key=private-key"
     scope = {"type": "http", "path": path, "raw_path": path.encode(), "query_string": query}
     failure = RuntimeError("refused before response start")
     async def inner(scope, receive, send):
@@ -122,4 +123,4 @@ async def test_escaped_error_keeps_scope_redacted_for_outer_error_handler(during
     with pytest.raises(RuntimeError) as error:
         await SensitiveQueryStringRedactionMiddleware(inner)(scope, None, send)
     assert error.value is failure
-    assert get_path_with_query_string(scope) == ("/api/artifacts" if artifact else "/events?api_key=redacted")
+    assert get_path_with_query_string(scope) == (f"/api/{capability}" if capability else "/events?api_key=redacted")
