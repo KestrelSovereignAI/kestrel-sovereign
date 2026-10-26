@@ -109,7 +109,7 @@ async def harness(tmp_path, monkeypatch):
     # authentication is tested separately through the actual host resolver.
     from kestrel_sovereign.security.capability_authority import HostCapabilityAuthority
     from kestrel_sovereign.visual_computer.runtime import VisualAccessDenied
-    authority = HostCapabilityAuthority(capability="visual-computer", label="visual computer", non_disclosing_actions=frozenset({VisualAction.STOP.value, VisualAction.RELEASE.value}), access_denied=VisualAccessDenied)
+    authority = HostCapabilityAuthority(capability="visual-computer", label="visual computer", non_disclosing_actions=frozenset({VisualAction.STOP.value, VisualAction.RELEASE.value}), priority_actions=frozenset({VisualAction.STOP.value, VisualAction.RELEASE.value}), access_denied=VisualAccessDenied)
     repo = VisualCustodyRepository(db)
     adapter = Adapter()
     runtime = VisualComputerRuntime(repo, authority, providers={"test-provider":adapter}, drivers={"test-driver":adapter})

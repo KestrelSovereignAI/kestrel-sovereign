@@ -91,3 +91,30 @@ transfer or full epic readiness. Concrete driver and product composition must
 supply those measurements. Offline browsing stays explicitly gated from network
 access until active-call egress holds the exact originating authorization lease;
 autonomous browser authority is not inferred from attribution.
+
+## Active-call egress and priority safety
+
+A concrete network adapter may accept the trusted `EgressGuard` callback in
+`visual_computer.egress`. The runtime activates it only while one original
+`driver.act` RPC is running. Each borrowed gateway task presents the exact
+session/owner/lease/epoch/action ID, holds the callback context through socket
+and reply cleanup, and calls its synchronous check before each network effect.
+The callback does not mint an OperatorContext, consult causation, acquire a
+replacement privacy lease, or survive the originating RPC. The runtime revokes,
+cancels and physically joins accepted gateway tasks before that original lease
+exits. Job counts and grant/action deadlines are bounded. These host hooks are
+not proof that the concrete gateway's DNS, redirect, transport or destination
+policy has passed its separate production tests.
+
+Priority Stop and release retain exact binding, freshness, current grant,
+capability and boundary checks, while bypassing fresh privacy/authority read
+admission. Otherwise a queued privacy writer could wait for a blocked action
+while Stop waited behind that same writer. This exception returns no raw data
+and is never registered as a raw-operation lease: nested observations still
+acquire the ordinary gates and satisfy the complete privacy policy. Artifact
+erasure keeps its existing admission behavior.
+
+Workspace transfer uses the same original host operation boundary but requires
+a verified paused session with no controller and the exact current control
+epoch. A new control intent invalidates that transfer's synchronous check.
+Observation/model operations continue to require a ready agent controller.

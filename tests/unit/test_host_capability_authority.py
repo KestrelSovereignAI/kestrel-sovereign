@@ -201,3 +201,8 @@ async def test_cancellation_releases_current_operation_and_transition_gates():
         a.gate.release()
         async with a.operation():
             pass
+
+
+def test_priority_requires_non_disclosing_actions():
+    with pytest.raises(ValueError):
+        HostCapabilityAuthority(capability="visual-computer",label="visual",priority_actions=frozenset({Action.STOP.value}))

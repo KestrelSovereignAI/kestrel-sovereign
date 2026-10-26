@@ -315,3 +315,158 @@ async def test_unknown_input_blocks_different_action_until_original_status(harne
         with pytest.raises(ResourceOutcomeUnknown):
             await h.runtime.act(ctx,second)
         assert h.adapter.effects == 1
+
+
+@pytest.mark.asyncio
+async def test_transfer_requires_verified_paused_none_and_current_control_epoch(harness):
+    h = harness
+    ctx = h.context()
+    with h.bind(ctx):
+        session, _ = await opened(h,ctx)
+        with pytest.raises(ResourceConflict):
+            async with h.runtime.session_operation(ctx,session.session_id):
+                pass
+        stop = ControlRequest(request_id="stop",session_id=session.session_id,expected_control_epoch=0,operation="pause")
+        paused = await h.runtime.control(ctx,session.session_id,stop,action=VisualAction.STOP)
+        async with h.runtime.session_operation(ctx,session.session_id) as (admitted,driver,current):
+            assert admitted == paused and driver is h.adapter
+            current()
+        take = ControlRequest(request_id="take",session_id=session.session_id,expected_control_epoch=1,operation="takeover")
+        with pytest.raises(ResourceConflict):
+            async with h.runtime.session_operation(ctx,session.session_id) as (_,_,current):
+                await h.runtime.control(ctx,session.session_id,take,action=VisualAction.TAKEOVER)
+                current()
+        with pytest.raises(ResourceConflict):
+            async with h.runtime.session_operation(ctx,session.session_id):
+                pass
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("writer_gate", ["privacy", "authority"])
+async def test_stop_priority_bypasses_writer_waiting_for_the_action(harness, writer_gate):
+    h = harness
+    ctx = h.context()
+    entered = asyncio.Event()
+    async def blocked():
+        entered.set()
+        await asyncio.Event().wait()
+    with h.bind(ctx):
+        session, action = await opened(h,ctx)
+        h.adapter.before_effect=blocked
+        active=asyncio.create_task(h.runtime.act(ctx,action))
+        await entered.wait()
+        async def transition():
+            manager = h.privacy_gate.exclusive() if writer_gate == "privacy" else h.gate
+            async with manager:
+                pass
+        writer=asyncio.create_task(transition())
+        await asyncio.sleep(0)
+        try:
+            stop=ControlRequest(request_id="stop",session_id=session.session_id,expected_control_epoch=0,operation="pause")
+            stopped=await asyncio.wait_for(h.runtime.control(ctx,session.session_id,stop,action=VisualAction.STOP),0.5)
+            assert stopped.controller == "none"
+            assert not writer.done()  # The original effect still owns privacy.
+        finally:
+            active.cancel()
+            writer.cancel()
+            await asyncio.gather(active,writer,return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_priority_safety_does_not_grant_nested_raw_privacy_lease(harness):
+    h = harness
+    ctx=h.context()
+    with h.bind(ctx):
+        session,_=await opened(h,ctx)
+        held,release=asyncio.Event(),asyncio.Event()
+        async def writer():
+            async with h.privacy_gate.exclusive():
+                held.set()
+                await release.wait()
+        transition=asyncio.create_task(writer())
+        await held.wait()
+        try:
+            async with h.runtime.authority.operation(ctx,VisualAction.STOP,h.repository.storage_id):
+                assert asyncio.current_task() not in h.runtime.authority._operations
+                with pytest.raises(TimeoutError):
+                    async with asyncio.timeout(0.03):
+                        async with h.runtime.authority.operation(ctx,VisualAction.OBSERVE,h.repository.storage_id):
+                            pytest.fail("priority Stop conferred a raw privacy lease")
+        finally:
+            release.set()
+            await transition
+        h.revoked.add(id(ctx))
+        with pytest.raises(OperatorAuthorizationError):
+            async with h.runtime.authority.operation(ctx,VisualAction.STOP,h.repository.storage_id):
+                pass
+
+
+@pytest.mark.asyncio
+async def test_priority_still_rejects_cross_binding_and_expired_stop(harness):
+    h=harness
+    first,other=h.context(),h.context(principal="other")
+    authority=h.runtime.authority
+    with h.bind(first):
+        async with authority.operation(first,VisualAction.STOP,h.repository.storage_id):
+            with h.bind(other),pytest.raises(OperatorAuthorizationError):
+                async with authority.operation(other,VisualAction.STOP,h.repository.storage_id):
+                    pass
+        clock=authority.clock
+        authority.clock=lambda:first.expires_at
+        try:
+            with pytest.raises(OperatorAuthorizationError):
+                async with authority.operation(first,VisualAction.STOP,h.repository.storage_id):
+                    pass
+        finally:
+            authority.clock=clock
+
+
+@pytest.mark.asyncio
+async def test_retained_observation_snapshot_loses_authority_after_takeover_and_handback(harness):
+    h=harness
+    ctx=h.context()
+    entered,release=asyncio.Event(),asyncio.Event()
+    with h.bind(ctx):
+        session,_=await opened(h,ctx)
+        async def inference():
+            async with h.runtime.session_operation(ctx,session.session_id,VisualAction.OBSERVE) as (_,_,current):
+                entered.set()
+                await release.wait()
+                current()
+        pending=asyncio.create_task(inference())
+        await entered.wait()
+        take=ControlRequest(request_id="take",session_id=session.session_id,expected_control_epoch=0,operation="takeover")
+        await asyncio.wait_for(h.runtime.control(ctx,session.session_id,take,action=VisualAction.TAKEOVER),0.5)
+        back=ControlRequest(request_id="back",session_id=session.session_id,expected_control_epoch=1,operation="resume")
+        await h.runtime.control(ctx,session.session_id,back,action=VisualAction.HANDBACK)
+        release.set()
+        with pytest.raises(ResourceConflict):
+            await pending
+
+
+@pytest.mark.asyncio
+async def test_slow_observation_cannot_overwrite_newer_frame(harness):
+    h=harness
+    ctx=h.context()
+    entered,release=asyncio.Event(),asyncio.Event()
+    with h.bind(ctx):
+        session,_=await opened(h,ctx)
+        original=h.adapter.observe
+        async def slow(session):
+            value=await original(session)
+            entered.set()
+            await release.wait()
+            return value
+        h.adapter.observe=slow
+        pending=asyncio.create_task(h.runtime.observe(ctx,session.session_id))
+        await entered.wait()
+        # A newer completed observation stores a distinct frame while the old
+        # transport is still in flight; its revision must remain authoritative.
+        h.adapter.observe=original
+        h.adapter.effects=1
+        newest=await h.runtime.observe(ctx,session.session_id)
+        release.set()
+        with pytest.raises(ResourceConflict):
+            await pending
+        record=await h.repository.get(h.runtime.scope(ctx),session_id=session.session_id)
+        assert record.frame == newest.frame

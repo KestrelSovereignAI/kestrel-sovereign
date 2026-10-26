@@ -46,6 +46,7 @@ class HostCapabilityAuthority:
     def __init__(
         self, *, capability: str, label: str,
         non_disclosing_actions: frozenset[str] = frozenset(),
+        priority_actions: frozenset[str] = frozenset(),
         access_denied: type[Exception] = HostCapabilityAccessDenied,
         clock: Callable[[], datetime] | None = None,
     ):
@@ -54,10 +55,14 @@ class HostCapabilityAuthority:
         self.capability = capability
         self.label = label
         self.non_disclosing_actions = frozenset(non_disclosing_actions)
+        self.priority_actions = frozenset(priority_actions)
+        if not self.priority_actions <= self.non_disclosing_actions:
+            raise ValueError("priority actions must be non-disclosing safety operations")
         self.access_denied = access_denied
         self.clock = clock or (lambda: datetime.now(UTC))
         self._bindings: dict[int, _Binding] = {}
         self._operations: dict[asyncio.Task, _Binding] = {}
+        self._priority_operations: dict[asyncio.Task, _Binding] = {}
 
     @contextmanager
     def bind_authenticated(
@@ -118,6 +123,22 @@ class HostCapabilityAuthority:
         check()
         task = asyncio.current_task()
         existing = self._operations.get(task)
+        priority = self._priority_operations.get(task)
+        if any(value is not None and value is not binding for value in (existing, priority)):
+            raise self.access_denied(f"nested {self.label} owner does not match")
+        if action.value in self.priority_actions:
+            # Fencing/erasure cannot queue behind a writer which is waiting
+            # for the very action Stop must drain. This is NOT a raw-data
+            # lease: nested observation still acquires both normal gates.
+            if priority is None:
+                self._priority_operations[task] = binding
+            try:
+                check()
+                yield check
+            finally:
+                if priority is None:
+                    self._priority_operations.pop(task, None)
+            return
         if existing is not None:
             if existing is not binding:
                 raise self.access_denied(f"nested {self.label} owner does not match")

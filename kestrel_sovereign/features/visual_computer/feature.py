@@ -29,6 +29,7 @@ from kestrel_sovereign.security.host_authority import HostAuthorityError, requir
 from kestrel_sovereign.storage.privacy_wrapper import require_durable_persistence_gate
 from kestrel_sovereign.turn_scope import capture_turn_scope
 from kestrel_sovereign.visual_computer.discovery import construct_adapters
+from kestrel_sovereign.visual_computer.egress import ActiveCallEgress
 from kestrel_sovereign.visual_computer.repository import VisualCustodyRepository
 from kestrel_sovereign.visual_computer.runtime import VisualAccessDenied, VisualAction, VisualComputerRuntime, VisualPolicy
 
@@ -71,7 +72,11 @@ class VisualComputerFeature(Feature):
         if not isinstance(grants, list) or not grants or not set(grants) <= {a.value for a in VisualAction}:
             raise ValueError("explicit visual granted_actions are required")
         providers = {name: dict(settings) for name, settings in self._cfg.get("providers", {}).items()}
-        drivers = self._cfg.get("drivers", {})
+        drivers = {name:dict(settings) for name,settings in self._cfg.get("drivers", {}).items()}
+        egress = ActiveCallEgress()
+        for name,settings in drivers.items():
+            if name == "local-docker-browser":
+                settings["egress_guard"] = egress.operation
         if not providers or not drivers:
             raise ValueError("visual provider and driver factories must be explicitly configured")
         for name, settings in providers.items():
@@ -85,10 +90,11 @@ class VisualComputerFeature(Feature):
             operation_seconds=self._cfg.get("operation_seconds", 30))
         authority = HostCapabilityAuthority(capability="visual-computer", label="visual computer",
             non_disclosing_actions=frozenset({VisualAction.STOP.value, VisualAction.RELEASE.value}),
+            priority_actions=frozenset({VisualAction.STOP.value, VisualAction.RELEASE.value}),
             access_denied=VisualAccessDenied)
         self._agent_id = agent_id
         self.runtime = VisualComputerRuntime(VisualCustodyRepository(db), authority,
-            providers=providers, drivers=drivers, policy=policy, check_destination=self._check_destination)
+            providers=providers, drivers=drivers, policy=policy, check_destination=self._check_destination, egress=egress)
         from kestrel_sovereign.visual_computer.http import create_visual_computer_router
         self._router = create_visual_computer_router(self.runtime, resolve_context=self._resolve_context)
 

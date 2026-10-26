@@ -165,3 +165,59 @@ async def test_disabled_visual_config_exposes_no_tools_or_router(harness, monkey
     feature = VisualComputerFeature(SimpleNamespace())
     await feature.initialize()
     assert feature.get_tools() == [] and feature.get_router() is None and feature.get_ui_contributions() is None
+
+
+@pytest.mark.asyncio
+async def test_canonical_factory_receives_only_trusted_host_egress_guard(harness, monkeypatch):
+    h = harness
+    cfg={"enabled":True, "granted_actions":[VisualAction.ADMIT.value],
+         "providers":{"local-docker-browser":{"image":"private-image"}},
+         "drivers":{"local-docker-browser":{}}}
+    monkeypatch.setattr(feature_module,"load_section",lambda section:{"visual_computer":cfg})
+    captured={}
+    def factory(**settings):
+        captured.update(settings)
+        return {"local-docker-browser":h.adapter},{"local-docker-browser":h.adapter}
+    monkeypatch.setattr(feature_module,"construct_adapters",factory)
+    agent=PolicyHolder()
+    agent.did="did:test:kite"
+    agent._raw_storage=SimpleNamespace(db=h.db)
+    agent.features={}
+    feature=VisualComputerFeature(agent)
+    await feature.initialize()
+    guard=captured["drivers"]["local-docker-browser"]["egress_guard"]
+    assert callable(guard) and guard.__self__ is feature.runtime.egress
+    assert len(captured["providers"]["local-docker-browser"]["credential_key"]) == 32
+    assert "egress_guard" not in cfg["drivers"]["local-docker-browser"]
+
+
+@pytest.mark.asyncio
+async def test_actual_stop_route_does_not_wait_behind_privacy_writer(visual_host,harness):
+    client,agents,_=visual_host
+    admitted=await client.post(path()+"/requests",headers=AUTH,json=intent())
+    sid=admitted.json()["session_id"]
+    observation=await client.get(path()+f"/sessions/{sid}/observation",headers=AUTH)
+    frame=observation.json()["frame"]
+    entered=asyncio.Event()
+    async def blocked():
+        entered.set()
+        await asyncio.Event().wait()
+    harness.adapter.before_effect=blocked
+    payload={"action_id":"blocked-action","session_id":sid,"observation_id":frame["observation_id"],"control_epoch":0,
+        "not_after":(datetime.now(UTC)+timedelta(seconds=20)).isoformat(),"action":{"kind":"click","x":1,"y":1}}
+    active=asyncio.create_task(client.post(path()+f"/sessions/{sid}/actions",headers=AUTH,json=payload))
+    await entered.wait()
+    async def transition():
+        async with agents["kite"].gate.exclusive():
+            pass
+    writer=asyncio.create_task(transition())
+    await asyncio.sleep(0)
+    try:
+        stop={"request_id":"priority-stop","session_id":sid,"expected_control_epoch":0,"operation":"pause"}
+        response=await asyncio.wait_for(client.post(path()+f"/sessions/{sid}/stop",headers=AUTH,json=stop),0.5)
+        assert response.status_code == 200 and response.json()["stopped"] is True
+        assert not writer.done()
+    finally:
+        active.cancel()
+        writer.cancel()
+        await asyncio.gather(active,writer,return_exceptions=True)

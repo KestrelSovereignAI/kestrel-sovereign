@@ -25,6 +25,7 @@ from kestrel_sdk.resources import ResourceConflict, ResourceError, ResourceNotFo
 from kestrel_sdk.operator import OperatorAuthorizationError
 
 from .repository import CustodyRecord, VisualCustodyRepository
+from .egress import ActiveCallEgress
 
 
 class VisualAccessDenied(ResourceError, OperatorAuthorizationError):
@@ -66,13 +67,15 @@ class VisualPolicy:
 
 class VisualComputerRuntime:
     def __init__(self, repository: VisualCustodyRepository, authority, *, providers, drivers,
-                 policy: VisualPolicy | None = None, check_destination=None):
+                 policy: VisualPolicy | None = None, check_destination=None, egress=None):
         self.repository, self.authority = repository, authority
         self.providers, self.drivers = dict(providers), dict(drivers)
         self.policy = policy or VisualPolicy()
         self.check_destination = check_destination
+        self.egress = egress or ActiveCallEgress(clock=authority.clock)
         self._locks = {}
         self._fences = set()
+        self._control_serials = {}
         self._verified_sessions = set()
         self._inflight = 0
 
@@ -84,6 +87,11 @@ class VisualComputerRuntime:
     @staticmethod
     def _key(scope, session_id):
         return (scope.tenant_id, scope.principal_id, scope.agent_id, session_id)
+
+    def _fence(self, scope, session_id):
+        key = self._key(scope, session_id)
+        self._fences.add(key)
+        self._control_serials[key] = self._control_serials.get(key, 0)+1
 
     def _lock(self, session_id):
         return self._locks.setdefault(session_id, asyncio.Lock())
@@ -262,6 +270,16 @@ class VisualComputerRuntime:
                 or session.expires_at <= self._now() or record.lease.expires_at <= self._now()):
             raise ResourceConflict("visual session is fenced or requires reconciliation")
 
+    def _transfer_ready(self, record):
+        self._destination(record.request.location)
+        key = self._key(record.request.scope, record.session_id)
+        session = record.session
+        if (session is None or session.state != "paused" or session.controller != "none"
+                or record.pending_control is not None or record.phase != "fenced"
+                or key not in self._verified_sessions
+                or session.expires_at <= self._now() or record.lease.expires_at <= self._now()):
+            raise ResourceConflict("workspace transfer requires exact verified paused control epoch")
+
     @asynccontextmanager
     async def session_operation(self, context, session_id, action=VisualAction.TRANSFER):
         """Broker/inference boundary; retains original privacy/lease custody."""
@@ -269,12 +287,18 @@ class VisualComputerRuntime:
         async with self.operation(context, action) as check:
             async with self._lock(session_id):
                 record = await self.repository.get(self.scope(context), session_id=session_id, guard=check)
-                self._ready(record)
-                def current():
-                    check()
+                serial = self._control_serials.get(self._key(record.request.scope, record.session_id), 0)
+            def current():
+                check()
+                if self._control_serials.get(self._key(record.request.scope, record.session_id), 0) != serial:
+                    raise ResourceConflict("retained visual session control epoch changed")
+                if action == VisualAction.TRANSFER:
+                    self._transfer_ready(record)
+                else:
                     self._ready(record)
-                yield record.session, self._driver(record), current
-                current()
+            current()
+            yield record.session, self._driver(record), current
+            current()
 
     async def status(self, context, session_id):
         async with self.operation(context, VisualAction.STATUS) as check:
@@ -289,11 +313,11 @@ class VisualComputerRuntime:
 
     async def observe(self, context, session_id):
         async with self.session_operation(context, session_id, VisualAction.OBSERVE) as (session, driver, check):
+            record = await self.repository.get(self.scope(context), session_id=session_id, guard=check)
             observation = await self._call(context, check, driver.observe, session)
             if (observation.frame.session_id != session_id or observation.frame.control_epoch != session.control_epoch
                     or observation.frame.observed_at > self._now() or observation.frame.observed_at >= session.expires_at):
                 raise ResourceConflict("observation does not match current session")
-            record = await self.repository.get(self.scope(context), session_id=session_id, guard=check)
             record.frame, record.last_activity_at = observation.frame, self._now()
             # Pixels remain response-only; durable raw recording is disabled.
             await self.repository.save(self.scope(context), record, check)
@@ -345,7 +369,9 @@ class VisualComputerRuntime:
                     if request.not_after <= self._now():
                         raise ResourceConflict("action deadline expired before effect")
                 effect_check()
-                receipt = await self._call(context, check, self._driver(record).act, record.session, request)
+                async with self.egress.activate(record.session, request.action_id, effect_check,
+                        deadline=min(request.not_after, context.expires_at)):
+                    receipt = await self._call(context, check, self._driver(record).act, record.session, request)
                 self._receipt(request, receipt)
                 # Preserve accepted outcome even if Stop raced its response;
                 # no session save can overwrite a newer control epoch.
@@ -386,7 +412,8 @@ class VisualComputerRuntime:
                 session = await self._call(context, check, self._driver(record).status, scope, session_id)
                 self._session(record, session)
                 if session != record.session or session.expires_at <= self._now():
-                    self._fences.add(self._key(scope, session_id))
+                    self._fence(scope, session_id)
+                    await self.egress.revoke_session(scope, session_id)
                     raise ResourceOutcomeUnknown("worker incarnation or accepted session state changed")
                 if await self.repository.has_pending_actions(scope, session_id, guard=check):
                     raise ResourceOutcomeUnknown("reconcile original accepted actions before resuming the session")
@@ -405,11 +432,13 @@ class VisualComputerRuntime:
             # Fence synchronously, before any queued database work. Safety
             # never reserves a normal action/history slot.
             fence = self._key(scope, session_id)
-            self._fences.add(fence)
+            self._fence(scope, session_id)
+            await self.egress.revoke_session(scope, session_id)
             try:
                 record = await self.repository.get(scope, session_id=session_id, guard=check)
             except ResourceNotFound:
                 self._fences.discard(fence)
+                self._control_serials.pop(fence, None)
                 raise
             if record.last_control is not None and record.last_control.request_id == request.request_id:
                 if record.last_control != request:
@@ -449,11 +478,13 @@ class VisualComputerRuntime:
         async with self.operation(context, VisualAction.RELEASE) as check:
             scope = self.scope(context)
             fence = self._key(scope, session_id)
-            self._fences.add(fence)
+            self._fence(scope, session_id)
+            await self.egress.revoke_session(scope, session_id)
             try:
                 record = await self.repository.get(scope, session_id=session_id, guard=check)
             except ResourceNotFound:
                 self._fences.discard(fence)
+                self._control_serials.pop(fence, None)
                 raise
             if record.lease is None:
                 raise ResourceOutcomeUnknown("unknown acquisition retains request cleanup custody")
@@ -484,7 +515,8 @@ class VisualComputerRuntime:
             await self.repository.ensure_initialized()
         uncertain = []
         for record in await self.repository.records(scope):
-            self._fences.add(self._key(scope, record.session_id))
+            self._fence(scope, record.session_id)
+            await self.egress.revoke_session(scope, record.session_id)
             if record.session is None or record.phase == "released":
                 continue
             request = record.pending_control
@@ -527,7 +559,8 @@ class VisualComputerRuntime:
             if (self._now() < record.lease.expires_at
                     and (self._now()-last).total_seconds() < record.request.idle_ttl_seconds):
                 continue
-            self._fences.add(self._key(scope, record.session_id))
+            self._fence(scope, record.session_id)
+            await self.egress.revoke_session(scope, record.session_id)
             record.frame, record.phase = None, "fenced"
             try:
                 await self.repository.save(scope, record)
