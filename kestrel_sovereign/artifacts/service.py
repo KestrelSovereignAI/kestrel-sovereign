@@ -18,11 +18,9 @@ this is not a Python sandbox. No service entry point accepts an owner selector.
 
 from __future__ import annotations
 
-import asyncio
-from collections.abc import Callable, Iterator
-from contextlib import asynccontextmanager, contextmanager
-from dataclasses import dataclass
-from datetime import UTC, datetime
+from collections.abc import Callable
+from contextlib import asynccontextmanager
+from datetime import datetime
 from enum import StrEnum
 
 from kestrel_sdk.artifacts import (
@@ -37,9 +35,7 @@ from kestrel_sdk.artifacts import (
 from kestrel_sdk.operator import OperatorAuthorizationError, OperatorContext
 from kestrel_sdk.resources import ResourceError, ResourceOutcomeUnknown, ResourceScope
 
-from kestrel_sovereign._async_rwlock import AsyncReaderWriterLock
-from kestrel_sovereign.privacy import PrivacyConfig, PrivacyMode
-from kestrel_sovereign.storage.privacy_wrapper import require_durable_persistence_gate
+from kestrel_sovereign.security.capability_authority import HostCapabilityAuthority
 
 from .repository import ArtifactRepository
 
@@ -58,110 +54,19 @@ class ArtifactAction(StrEnum):
 CurrentAuthority = Callable[[OperatorContext, ArtifactAction, ArtifactLink | None], None]
 
 
-@dataclass
-class _Binding:
-    context: OperatorContext
-    privacy_holder: object
-    check_current: CurrentAuthority
-    authority_gate: AsyncReaderWriterLock
-    active: bool = True
-
-
-class ArtifactAuthority:
-    """Request-lifetime provenance for contexts resolved by trusted host code.
-
-Use one instance per host service. Bindings are removed on request exit and
-invalidate copied task contexts immediately. No external registration API may
-expose ``bind_authenticated``. The checker is required even for a sovereign
-caller: role alone does not prove a still-current credential or live grant.
-"""
+class ArtifactAuthority(HostCapabilityAuthority):
+    """Artifact policy over the canonical original-context host binding."""
 
     def __init__(self, *, clock: Callable[[], datetime] | None = None):
-        self.clock = clock or (lambda: datetime.now(UTC))
-        self._bindings: dict[int, _Binding] = {}
-        self._operations: dict[asyncio.Task, _Binding] = {}
-
-    @contextmanager
-    def bind_authenticated(
-        self, context: OperatorContext, *, privacy_holder: object,
-        check_current: CurrentAuthority, authority_gate: AsyncReaderWriterLock,
-    ) -> Iterator[OperatorContext]:
-        if not isinstance(context, OperatorContext) or not callable(check_current):
-            raise TypeError("host-resolved context and current authority checker required")
-        if not isinstance(authority_gate, AsyncReaderWriterLock):
-            raise TypeError("host authority transition gate required")
-        context.require_fresh(self.clock())
-        require_durable_persistence_gate(privacy_holder)
-        if id(context) in self._bindings:
-            raise ValueError("artifact context already has an active lifetime")
-        binding = _Binding(context, privacy_holder, check_current, authority_gate)
-        self._bindings[id(context)] = binding
-        try:
-            yield context
-        finally:
-            binding.active = False
-            self._bindings.pop(id(context), None)
-
-    def _check(self, binding: _Binding, context: OperatorContext,
-               action: ArtifactAction, storage_id: str,
-               link: ArtifactLink | None) -> None:
-        if (not binding.active or binding.context is not context
-                or self._bindings.get(id(context)) is not binding):
-            raise ArtifactAccessDenied("artifact context is not active")
-        try:
-            context.require_fresh(self.clock())
-            context.require_action(action.value)
-            context.require_capability("artifacts")
-            context.require_boundary(storage_id)
-            if binding.check_current(context, action, link) is not None:
-                raise TypeError("artifact authority checker must return None or raise")
-        except Exception:
-            # A failed current-grant lookup is a denial, including plain
-            # PermissionError or infrastructure failures. Never turn a checker
-            # failure after durable acceptance into an ordinary save failure.
-            raise ArtifactAccessDenied("artifact authority is unavailable") from None
-        # Generic binary/source artifacts have no PII/deidentification transform.
-        # Refuse those modes instead of treating persistent storage as consent
-        # to retain or reveal arbitrary originals. Explicit erasure stays usable.
-        if action is not ArtifactAction.DELETE:
-            holder = binding.privacy_holder
-            config = getattr(holder, "privacy_config", None)
-            if (getattr(holder, "privacy_mode", None) not in (PrivacyMode.NORMAL, PrivacyMode.PUBLIC)
-                    or not isinstance(config, PrivacyConfig)
-                    or config.storage != "full" or config.assurance != "none"
-                    or config.audit != "optional"):
-                raise ArtifactAccessDenied("privacy policy does not permit raw artifacts")
+        super().__init__(capability="artifacts", label="artifact",
+                         non_disclosing_actions=frozenset({ArtifactAction.DELETE.value}),
+                         access_denied=ArtifactAccessDenied, clock=clock)
 
     @asynccontextmanager
     async def operation(self, context: OperatorContext, action: ArtifactAction,
                         storage_id: str, *, link: ArtifactLink | None = None):
-        binding = self._bindings.get(id(context))
-        if binding is None or binding.context is not context:
-            raise ArtifactAccessDenied("artifact context was not resolved by this host")
-
-        def check() -> None:
-            self._check(binding, context, action, storage_id, link)
-
-        check()
-        task = asyncio.current_task()
-        existing = self._operations.get(task)
-        if existing is not None:
-            # A response retains the gates across service calls and ASGI send.
-            # Re-enter only on the SAME task and exact binding; copied task
-            # context does not grant a lease. Still check each nested action.
-            if existing is not binding:
-                raise ArtifactAccessDenied("nested artifact owner does not match")
+        async with super().operation(context, action, storage_id, target=link) as check:
             yield check
-            return
-        gate = require_durable_persistence_gate(binding.privacy_holder)
-        async with gate.shared():
-            async with binding.authority_gate.read():
-                check()
-                self._operations[task] = binding
-                try:
-                    yield check
-                finally:
-                    self._operations.pop(task, None)
 
 
 class AuthorizedArtifactService:
