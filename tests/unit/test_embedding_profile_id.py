@@ -30,7 +30,6 @@ from kestrel_sovereign.llm.embedding_service import (
     derive_embedding_profile,
 )
 from kestrel_sovereign.storage.sqla.embedding_profile import (
-    _clear_profile_upsert_cache_for_tests,
     upsert_embedding_profile,
 )
 
@@ -427,31 +426,7 @@ def test_cosine_similarity_normal_case():
 
 
 @pytest.mark.asyncio
-async def test_upsert_caches_per_process():
-    """Idempotency: second call for the same id is a no-op via cache."""
-    _clear_profile_upsert_cache_for_tests()
-
-    db = MagicMock()
-    db.backend_type = "sqlite"
-    db.execute = AsyncMock()
-
-    profile = derive_embedding_profile(
-        provider="openai", model="text-embedding-3-small", dim=1536
-    )
-    svc = MagicMock()
-    svc.describe = MagicMock(return_value=profile)
-
-    await upsert_embedding_profile(db, svc, profile.profile_id)
-    await upsert_embedding_profile(db, svc, profile.profile_id)
-
-    assert db.execute.await_count == 1, (
-        "Second call must hit the per-process cache and skip the UPSERT."
-    )
-
-
-@pytest.mark.asyncio
 async def test_upsert_handles_postgres_dialect():
-    _clear_profile_upsert_cache_for_tests()
 
     db = MagicMock()
     db.backend_type = "postgres"
@@ -469,7 +444,6 @@ async def test_upsert_handles_postgres_dialect():
 @pytest.mark.asyncio
 async def test_upsert_swallows_failure():
     """A failed upsert must NEVER bubble — registry is operator-visibility-only."""
-    _clear_profile_upsert_cache_for_tests()
 
     db = MagicMock()
     db.backend_type = "sqlite"
@@ -486,7 +460,6 @@ async def test_upsert_swallows_failure():
 @pytest.mark.asyncio
 async def test_upsert_skips_when_service_describes_to_none():
     """A service that can't describe itself yields a no-op."""
-    _clear_profile_upsert_cache_for_tests()
 
     db = MagicMock()
     db.backend_type = "sqlite"

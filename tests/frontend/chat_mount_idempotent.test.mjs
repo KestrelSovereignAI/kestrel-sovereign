@@ -57,6 +57,7 @@ dom.window.EventTarget.prototype.addEventListener = function (type, ...rest) {
 
 const chat = await import('../../kestrel_sovereign/static/js/chat.js');
 const { state } = await import('../../kestrel_sovereign/static/js/ui.js');
+const renderers = await import('../../kestrel_sovereign/static/js/ui-ext/renderers.js');
 
 function chatDeps(hostAgent) {
     return { api: { hasCapability: () => true, getHostAgent: () => hostAgent } };
@@ -215,6 +216,23 @@ test('remounting an existing surface after another one rebinds cached DOM withou
         + '<button id="composer-mode-toggle"></button>');
     chat.mount(first, { deps: chatDeps('remount-a') });
     const firstViewport = first.querySelector('#chat-container');
+    const witness = { mounts: 0, disposals: 0 };
+    const renderer = {
+        id: 'embedded-pane-view', match: { contentType: 'embedded-pane-view' },
+        render: () => '<button>View action</button>',
+        mount() {
+            witness.mounts += 1;
+            return () => { witness.disposals += 1; };
+        },
+    };
+    renderers.registerRenderer(renderer);
+    const appendPart = () => {
+        const part = document.createElement('div');
+        part.innerHTML = renderers.renderToSafeHtml(renderer, {}, {}, String, String);
+        state.chatPanes.get('remount-a').element.appendChild(part);
+        renderers.mountRenderers(part);
+    };
+    appendPart();
     first.remove();
     const second = freshChatHost('remount-second', 'second surface');
     second.insertAdjacentHTML('beforeend', '<div id="thinking-indicator"></div>'
@@ -250,4 +268,14 @@ test('remounting an existing surface after another one rebinds cached DOM withou
     assert.equal(firstViewport.children[0], state.chatPanes.get('remount-target').element,
         'the reactivated surface, not the detached previous one, owns the new pane');
     assert.equal(secondViewport.children[0], secondPane, 'inactive surface stays untouched');
+    assert.deepEqual(witness, { mounts: 1, disposals: 0 },
+        'a cached pane keeps its existing resources when its surface is reactivated');
+    appendPart();
+    assert.deepEqual(witness, { mounts: 2, disposals: 0 },
+        'detached background panes remain usable after the surface switch');
+    chat.mountChatPane('remount-a');
+    appendPart();
+    assert.deepEqual(witness, { mounts: 3, disposals: 0 },
+        'the same canonical pane accepts new renderers after switching back');
+    renderers._reset();
 });

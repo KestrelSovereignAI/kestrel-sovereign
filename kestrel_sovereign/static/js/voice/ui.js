@@ -32,6 +32,7 @@ import API from '../api.js';
 import { addMessage, addMessageStreaming, finalizeStreamingMessage, renderToolCardsHtml, mountToolRenderers } from '../chat.js';
 import { getOrCreateChatPane } from '../ui.js';
 import UI from '../ui-ext/registry.js';
+import { unmountRenderers } from '../ui-ext/renderers.js';
 import bus from '../ui-ext/bus.js';
 import { Events } from './events.js';
 import { createRealtimeClient, normalizeToolBatchResults, readToolBatchResponse } from './realtime.js';
@@ -1488,9 +1489,10 @@ function renderVoiceToolCard(session, card) {
 }
 
 
-function updateVoiceToolCard(div, card) {
+export function updateVoiceToolCard(div, card) {
   const content = div?.querySelector?.('.message-content');
   if (content) {
+    unmountRenderers(content, { retire: 'children' });
     content.innerHTML = renderToolCardsHtml([card]);
     mountToolRenderers(content);
   }

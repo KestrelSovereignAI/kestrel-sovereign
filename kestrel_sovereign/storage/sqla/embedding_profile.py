@@ -25,7 +25,7 @@ from __future__ import annotations
 
 import logging
 from datetime import datetime
-from typing import Any, Optional, Set
+from typing import Any, Optional
 
 from sqlalchemy import Boolean, Float, Integer, Text
 from sqlalchemy.orm import Mapped, mapped_column
@@ -37,18 +37,6 @@ from .base import SovereignBase
 logger = logging.getLogger(__name__)
 
 
-# Per-process cache of profile ids we've already upserted, so the
-# storage hot path doesn't do an upsert + roundtrip on every write.
-# Tiny by design — there are typically 1-2 distinct profiles per
-# deployment, rarely more than ~5 across mid-life provider switches.
-_PROFILE_UPSERT_CACHE: Set[str] = set()
-
-
-def _clear_profile_upsert_cache_for_tests() -> None:
-    """Reset the process-local upsert cache. Test-only."""
-    _PROFILE_UPSERT_CACHE.clear()
-
-
 async def upsert_embedding_profile(
     db: "Any",
     embedding_service: "Any",
@@ -57,15 +45,16 @@ async def upsert_embedding_profile(
     """Upsert a row into ``embedding_profiles`` for the given profile id.
 
     Pulls human-readable fields from the service's ``describe()``
-    method. Idempotent — second call for the same id is a no-op via
-    the in-process cache, so the storage hot path stays cheap.
+    method. The database's unique key makes repeated calls idempotent.
+    Process-local sightings cannot prove a row exists in this database or
+    survived the caller's transaction, so every call reaches that database.
 
     Ordinary availability failure is logged at DEBUG. Original execution
     control propagates before availability handling. The registry
     table is operator-visibility only; storage and kNN don't read it.
     A failed upsert never blocks message persistence.
     """
-    if not profile_id or profile_id in _PROFILE_UPSERT_CACHE:
+    if not profile_id:
         return
     if not hasattr(embedding_service, "describe"):
         return
@@ -111,7 +100,6 @@ async def upsert_embedding_profile(
                     1 if profile.normalized else 0,
                 ),
             )
-        _PROFILE_UPSERT_CACHE.add(profile.profile_id)
     except Exception as exc:
         if is_execution_control_error(exc):
             raise

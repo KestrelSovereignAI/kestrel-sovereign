@@ -205,13 +205,27 @@ def validate_tool_arguments(
     # Walk the full JSON container graph, including mixed dictionaries and
     # lists. An iterative traversal avoids Python recursion limits; repeated
     # in-process references are inspected once rather than expanded forever.
-    pending = list(arguments.items())
-    visited = set()
+    # Retain iterators rather than materializing every child and its path.
+    # Each frame carries the segment that led into its container; path strings
+    # are constructed only when reporting a refusal.
+    pending = [(iter(arguments.items()), False, None)]
+    visited = {id(arguments)}
     while pending:
-        key, value = pending.pop()
+        values, indexed, _ = pending[-1]
+        try:
+            key, value = next(values)
+        except StopIteration:
+            pending.pop()
+            continue
         if isinstance(value, str) and len(value) > MAX_TOOL_ARG_LENGTH:
+            segments = [segment for _, _, segment in pending if segment is not None]
+            segments.append((key, indexed))
+            path = "".join(
+                f"[{part}]" if is_index else ("" if index == 0 else ".") + str(part)
+                for index, (part, is_index) in enumerate(segments)
+            )
             error = (
-                f"Tool '{tool_name}' argument '{key}' exceeds maximum length "
+                f"Tool '{tool_name}' argument '{path}' exceeds maximum length "
                 f"({len(value)} > {MAX_TOOL_ARG_LENGTH})"
             )
             logger.warning(f"Tool validation failed: {error}")
@@ -220,12 +234,10 @@ def validate_tool_arguments(
             if id(value) in visited:
                 continue
             visited.add(id(value))
-            if isinstance(value, dict):
-                pending.extend((f"{key}.{nested_key}", nested_value)
-                               for nested_key, nested_value in value.items())
-            else:
-                pending.extend((f"{key}[{index}]", item)
-                               for index, item in enumerate(value))
+            pending.append((
+                iter(value.items()) if isinstance(value, dict) else enumerate(value),
+                isinstance(value, list), (key, indexed),
+            ))
 
     return True, None
 

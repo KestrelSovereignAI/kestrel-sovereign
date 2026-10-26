@@ -2454,7 +2454,7 @@ class OrchestratorEngineMixin:
 
         # Record into context stats accumulator (if available on the agent)
         context_stats = getattr(self, "context_stats", None)
-        if context_stats is not None:
+        if context_stats is not None and bound_tool is None:
             context_stats.record(tool_name, args, len(result_json))
 
         await OrchestratorEngineMixin._log_tool_dispatch(
