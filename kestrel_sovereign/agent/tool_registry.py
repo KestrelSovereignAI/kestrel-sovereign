@@ -16,7 +16,7 @@ from uuid import uuid4
 
 from kestrel_sdk.resources import ResourceConflict, ResourceOutcomeUnknown
 
-from kestrel_sdk.tools.base import GovernedToolBinding
+from kestrel_sdk.tools import GovernedToolBinding
 
 from kestrel_sovereign.agent.tool_allowlist import (
     KnownToolNames,

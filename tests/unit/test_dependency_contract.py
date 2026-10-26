@@ -66,10 +66,11 @@ SECURITY_FLOORS = {
 # Version 0.42.2 enforces all standard HTTP header and query carriers.
 # Version 0.42.3 corrects native HTTP+JSON protocol error media types.
 # Version 0.42.4 owns the certifi floor for HTTPX/requests; OS roots are unaffected.
+# Version 0.43 adds model exposure and governed registration bindings.
 # This is a Core-only release gate: sibling packages release independently.
 # Core must never lower its declared/locked line to accommodate an older
 # consumer. Host feature acceptance remains a release prerequisite in README.md.
-SDK_RELEASE_CASCADE_SPECIFIERS = frozenset({(">=", "0.42.4"), ("<", "1")})
+SDK_RELEASE_CASCADE_SPECIFIERS = frozenset({(">=", "0.43.0"), ("<", "1")})
 SDK_RELEASE_CASCADE_CONTRACTS = {
     "base": frozenset({"a2a", "httpx", "tracing"}),
     "observability": frozenset({"metrics"}),
@@ -330,7 +331,7 @@ def test_sdk_native_release_cascade_contract_is_declared():
         assert Version("0.42.1") not in specifier
         assert Version("0.42.2") not in specifier
         assert Version("0.42.3") not in specifier
-        assert Version("0.42.4") in specifier
+        assert Version("0.42.4") not in specifier
         assert Version("0.43.0") in specifier
         assert Version("1.0.0") not in specifier
 
@@ -367,5 +368,5 @@ def test_sdk_native_release_cascade_contract_is_locked():
     ]
     assert sdk_versions
     assert all(
-        Version("0.42.4") <= version < Version("1.0.0") for version in sdk_versions
+        Version("0.43.0") <= version < Version("1.0.0") for version in sdk_versions
     )
