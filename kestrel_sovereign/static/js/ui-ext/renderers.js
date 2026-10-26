@@ -35,9 +35,9 @@
 // changes to `rootEl` and its descendants and may return a teardown fn. The
 // supplied owner/pane context is routing information, not an authorization grant.
 //
-// This module is generic — no feature-name strings. It holds NO DOM and does NOT
-// import the markdown module; core supplies the `sanitize` function so the
-// registry stays pure and unit-testable.
+// This module is generic — no feature-name strings. It retains mounted roots
+// only for their active resource lifetime and does not import markdown; core
+// supplies the sanitizer and ends each mount before discarding its DOM.
 // ============================================================================
 
 /**
@@ -60,6 +60,13 @@
 
 /** @type {FeatureRenderer[]} */
 const _renderers = [];
+const _mounts = new Map();
+
+function retireRendererMounts(renderer) {
+    for (const mounted of [..._mounts.values()]) {
+        if (mounted.renderer === renderer) mounted.dispose();
+    }
+}
 
 // Monotonic counter for internal renderer ids. Every registered renderer gets a
 // stable `_uid` (emitted into the wrapper and used by `mountRenderers` to find
@@ -126,8 +133,10 @@ export function registerRenderer(def) {
         if (i >= 0) {
             // Preserve the existing internal uid so a re-register doesn't orphan
             // already-mounted markup that points at the old uid.
-            def._uid = _renderers[i]._uid || `ui-ext-r-${_uidSeq++}`;
+            const previous = _renderers[i];
+            def._uid = previous._uid || `ui-ext-r-${_uidSeq++}`;
             _renderers[i] = def;
+            retireRendererMounts(previous);
             return;
         }
     }
@@ -143,7 +152,10 @@ export function registerRenderer(def) {
  */
 export function unregisterRenderer(id) {
     const i = _renderers.findIndex((r) => r.id === id);
-    if (i >= 0) _renderers.splice(i, 1);
+    if (i >= 0) {
+        const [renderer] = _renderers.splice(i, 1);
+        retireRendererMounts(renderer);
+    }
 }
 
 /** First renderer whose `match.tool` matches `name` and whose gate passes. */
@@ -205,8 +217,8 @@ export function renderToSafeHtml(renderer, payload, ctx, sanitize, escapeAttr) {
  * After core has built live DOM from sanitized markup, find every
  * renderer-owned root inside `containerEl` and invoke its `mount(rootEl, ctx)`
  * hook. Returns a single teardown fn that calls every collected teardown (or a
- * no-op). Idempotent per element via a `data-ui-ext-mounted` marker so a
- * re-render of the same container does not double-mount.
+ * no-op). The registry owns mount identity; the DOM marker is diagnostic.
+ * Disposing a mount permits the same DOM to mount again.
  *
  * @param {HTMLElement} containerEl
  * @param {object} ctx
@@ -217,27 +229,53 @@ export function mountRenderers(containerEl, ctx = {}) {
     const teardowns = [];
     const roots = containerEl.querySelectorAll('[data-ui-ext-renderer]');
     for (const root of roots) {
-        if (root.dataset && root.dataset.uiExtMounted === '1') continue;
+        if (_mounts.has(root)) continue;
         const id = root.dataset ? root.dataset.uiExtRendererId : undefined;
         const renderer = id ? _renderers.find((r) => r._uid === id) : null;
-        if (root.dataset) root.dataset.uiExtMounted = '1';
         if (!renderer || typeof renderer.mount !== 'function') continue;
-        try {
-            const ret = renderer.mount(root, ctx);
-            if (typeof ret === 'function') teardowns.push(ret);
-        } catch (err) {
-            console.error('[ui-ext renderers] mount threw:', err);
-        }
-    }
-    return () => {
-        for (const t of teardowns) {
+        let active = true;
+        let teardown;
+        const release = () => {
+            const callback = teardown;
+            teardown = null;
+            if (typeof callback !== 'function') return;
             try {
-                t();
+                callback();
             } catch (err) {
                 console.error('[ui-ext renderers] teardown threw:', err);
             }
+        };
+        const dispose = () => {
+            if (!active) return;
+            active = false;
+            _mounts.delete(root);
+            if (root.dataset) delete root.dataset.uiExtMounted;
+            release();
+        };
+        // Claim before invoking feature code, including a reentrant mount or
+        // synchronous unregister. A teardown returned after retirement still
+        // runs once, without disturbing a newer mount of the same root.
+        _mounts.set(root, { renderer, dispose });
+        if (root.dataset) root.dataset.uiExtMounted = '1';
+        try {
+            teardown = renderer.mount(root, ctx);
+            if (!active) release();
+        } catch (err) {
+            dispose();
+            console.error('[ui-ext renderers] mount threw:', err);
         }
+        teardowns.push(dispose);
+    }
+    return () => {
+        for (const dispose of teardowns) dispose();
     };
+}
+
+/** End mounts before their containing DOM is cleared or replaced. */
+export function unmountRenderers(containerEl) {
+    if (!containerEl || typeof containerEl.querySelectorAll !== 'function') return;
+    const roots = [containerEl, ...containerEl.querySelectorAll('[data-ui-ext-renderer]')];
+    for (const root of roots) _mounts.get(root)?.dispose();
 }
 
 /** The registered renderers, in registration order (read-only snapshot; tests). */
@@ -247,6 +285,7 @@ export function renderers() {
 
 /** Test/teardown affordance: forget all renderers. */
 export function _reset() {
+    for (const mounted of [..._mounts.values()]) mounted.dispose();
     _renderers.length = 0;
 }
 
@@ -257,6 +296,7 @@ export const Renderers = {
     findContentTypeRenderer,
     renderToSafeHtml,
     mountRenderers,
+    unmountRenderers,
     renderers,
     _reset,
 };

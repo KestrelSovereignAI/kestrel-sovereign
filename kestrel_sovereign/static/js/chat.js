@@ -14,6 +14,7 @@ import {
     findContentTypeRenderer,
     renderToSafeHtml,
     mountRenderers,
+    unmountRenderers,
 } from './ui-ext/renderers.js';
 import { buildMessageKebab } from './message_kebab.js';
 import { validateHostStopEnvelope } from './stop_evidence.js';
@@ -934,6 +935,7 @@ export function renderAgentContentHtml(content, { streaming = false, toolEvents 
 
 async function finalizeAgentContent(contentDiv, content, toolEvents = null) {
     const markdown = deps().markdown;
+    unmountRenderers(contentDiv);
     // No tool activity → the plain finalize path (markdown + highlight +
     // mermaid in one shot). Keeps the common turn on the simplest route.
     if (!normalizeToolEvents(toolEvents).length) {
@@ -1452,6 +1454,7 @@ export function mountChatPane(agentName) {
     // Empty the container of any leftover non-pane children (defensive
     // against pre-migration HTML that mounted welcome content directly
     // into #chat-container without going through a pane).
+    unmountRenderers(container);
     container.innerHTML = '';
     container.appendChild(target.element);
     deps().state.mountedChatAgent = agentName;
@@ -1548,6 +1551,7 @@ export function wipeAgentChatPane(agentName, html = '') {
     // goes with the innerHTML reset below; null the field too.
     pane.queuedMessage = null;
     pane.queuedHostStopGeneration = null;
+    unmountRenderers(pane.element);
     pane.element.innerHTML = html;
     pane.scrollPos = 0;
     // #2909: a cleared pane is a fresh conversation — follow its tail,
@@ -4583,6 +4587,7 @@ export function updateStreamingMessage(msgDiv, content, paneElement = null, thin
         const thinkingHtml = renderThinkingBubbles(thinkingItems);
         // renderAgentContentHtml handles both cases: tool runs become
         // grouped cards in document order, no tools → a single markdown pass.
+        unmountRenderers(contentDiv);
         contentDiv.innerHTML = `${thinkingHtml}${renderAgentContentHtml(content, { streaming: true, toolEvents })}`;
         deps().markdown.highlightCodeBlocks(contentDiv, true);
         // Tool cards may carry feature-renderer wrappers; mount their imperative
@@ -4657,7 +4662,9 @@ export async function finalizeStreamingMessage(msgDiv, content, paneOrElement = 
         : includePaneArtifacts;
     const thinkingItems = (pane && includeThinking && pane.thinkingItems) ? pane.thinkingItems : [];
     if (thinkingItems.length) {
+        unmountRenderers(contentDiv);
         contentDiv.innerHTML = `${renderThinkingBubbles(thinkingItems)}${contentDiv.innerHTML}`;
+        mountToolRenderers(contentDiv);
         deps().markdown.highlightCodeBlocks(contentDiv, true);
     }
     if (opts.model || opts.provider) {
