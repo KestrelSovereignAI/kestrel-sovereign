@@ -100,14 +100,15 @@ for (const placement of ['mounted', 'background', 'nested-background']) {
         const callbacks = [];
         let clickedOwner;
         const verifyContext = (stage, ctx) => {
-            callbacks.push(stage);
-            assert.equal(ctx.type, type);
-            assert.equal(ctx.ownerAgent, ownerAgent);
-            assert.equal(ctx.paneElement, target);
+            callbacks.push({ stage, ctx });
         };
         registerRenderer({
             id: type,
-            match: { contentType: type },
+            match: { contentType(value, ctx) {
+                if (value !== type) return false;
+                verifyContext('match', ctx);
+                return true;
+            } },
             gate(ctx) {
                 verifyContext('gate', ctx);
                 return true;
@@ -129,7 +130,13 @@ for (const placement of ['mounted', 'background', 'nested-background']) {
         try {
             const part = chat.appendMessagePart(type, { label: 'Open' }, target);
             assert.equal(part.parentElement, target);
-            assert.deepEqual(callbacks, ['gate', 'render', 'mount']);
+            assert.deepEqual(callbacks.map(({ stage }) => stage),
+                ['match', 'gate', 'render', 'mount']);
+            for (const { stage, ctx } of callbacks) {
+                assert.equal(ctx.type, type, `${stage}: part type`);
+                assert.equal(ctx.ownerAgent, ownerAgent, `${stage}: owner agent`);
+                assert.equal(ctx.paneElement, target, `${stage}: target pane`);
+            }
             assert.equal(part.querySelector('img').getAttribute('onerror'), null,
                 'owner context does not bypass core sanitization');
             const button = part.querySelector('button');
