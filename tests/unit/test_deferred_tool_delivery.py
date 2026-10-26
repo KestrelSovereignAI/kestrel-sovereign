@@ -38,11 +38,15 @@ class PostPolicy(Hook):
         self.replace = False
         self.replace_with_none = False
         self.redact_message = False
+        self.clear_parts = False
+        self.observe_result = None
         self.failure = None
         self.output = HookOutput.allow()
 
     async def execute(self, value):
         self.started.set()
+        if self.observe_result is not None:
+            self.observe_result(value.tool_response)
         if self.failure == "raise":
             raise RuntimeError("private-policy-sentinel")
         if self.failure == "timeout":
@@ -58,6 +62,8 @@ class PostPolicy(Hook):
             value.tool_response = None
         if self.redact_message:
             value.tool_response["confirmation"] = "Reviewed replacement text"
+        if self.clear_parts:
+            value.tool_response["parts"] = None
         emit_part("post_policy", {})
         return self.output
 
@@ -73,6 +79,8 @@ class DeferredTool:
         self.publication_error = None
         self.publication_parts = None
         self.mutate_before_error = False
+        self.part_form = "original"
+        self.active_result = None
 
     async def execute(self, **arguments):
         self.executions.append(arguments)
@@ -81,14 +89,20 @@ class DeferredTool:
             self.publications.append("published-once")
             if self.publication_error is not None:
                 if self.mutate_before_error:
-                    self.last_result["data"]["value"] = "private-mutated-factory-sentinel"
+                    self.active_result["data"]["value"] = "private-mutated-factory-sentinel"
                 raise self.publication_error
             if self.publication_parts is not None:
                 return self.publication_parts
             return [{"type": "private_view", "data": {"reference": "opaque-reference"}}]
 
-        self.last_result = DeferredToolResult(ToolResult.ok("Complete", data={"value": "original"},
-            parts=[{"type": "original_part", "data": {}}]).to_dict(), publish=publish)
+        envelope = ToolResult.ok("Complete", data={"value": "original"}).to_dict()
+        if self.part_form == "original":
+            envelope["parts"] = [{"type": "original_part", "data": {}}]
+        elif self.part_form == "null":
+            envelope["parts"] = None
+        elif self.part_form == "empty":
+            envelope["parts"] = []
+        self.last_result = DeferredToolResult(envelope, publish=publish)
         return self.last_result
 
 
@@ -120,6 +134,7 @@ async def boundary(tmp_path, request):
     await store.initialize()
     host = CompletionHost(store)
     tool, bindings, policy = DeferredTool(), [], PostPolicy()
+    policy.observe_result = lambda result: setattr(tool, "active_result", result)
     offered = tool
     if request.param != "handle":
         base = SDKFeature if request.param == "sdk-decorator" else CoreFeature
@@ -329,7 +344,7 @@ async def test_non_dictionary_policy_replacement_never_restores_prior_data(bound
         assert peer.tool.executions == [{}] and not peer.tool.publications
         assert [part["type"] for part in drain_parts()] == ["original_part", "post_policy"]
         with pytest.raises(RuntimeError, match="already finalized or transferred"):
-            peer.tool.last_result.finalize(peer.tool.last_result, allowed=True)
+            peer.tool.active_result.finalize(peer.tool.active_result, allowed=True)
 
 
 @pytest.mark.parametrize("path", ["chat", "named", "bound"])
@@ -341,4 +356,44 @@ async def test_top_level_post_policy_redaction_withholds_private_delivery(bounda
         result = await peer.invoke(path)
         assert result["confirmation"] == "Reviewed replacement text"
         assert peer.tool.executions == [{}] and not peer.tool.publications
+        assert [part["type"] for part in drain_parts()] == ["original_part", "post_policy"]
+
+
+@pytest.mark.parametrize("path", ["chat", "named", "bound"])
+@pytest.mark.parametrize("part_form", ["missing", "null", "empty"])
+@pytest.mark.parametrize("completion", ["deny", "empty", "failure"])
+async def test_optional_parts_do_not_relabel_completed_execution(boundary, path, part_form, completion):
+    peer = boundary
+    peer.tool.part_form = part_form
+    peer.policy.release.set()
+    if completion == "deny":
+        peer.policy.output = HookOutput.deny("Private delivery denied")
+    elif completion == "empty":
+        peer.tool.publication_parts = []
+    else:
+        peer.tool.publication_error = RuntimeError("private-factory-sentinel")
+    with part_collector():
+        result = await peer.invoke(path)
+        assert result["status"] == "ok" and result["data"] == {"value": "original"}
+        assert peer.tool.executions == [{}]
+        assert peer.tool.publications == ([] if completion == "deny" else ["published-once"])
+        parts = drain_parts()
+        assert [part["type"] for part in parts] == (
+            ["post_policy", "notice"] if completion == "failure" else ["post_policy"])
+        if completion == "failure":
+            assert result["parts"] == [parts[-1]]
+        else:
+            assert not result.get("parts")
+
+
+@pytest.mark.parametrize("path", ["chat", "named", "bound"])
+async def test_policy_can_remove_original_parts_with_null(boundary, path):
+    peer = boundary
+    peer.policy.clear_parts = True
+    peer.policy.release.set()
+    with part_collector():
+        result = await peer.invoke(path)
+        assert result["status"] == "ok" and result["data"] == {"value": "original"}
+        assert peer.tool.executions == [{}] and not peer.tool.publications
+        assert "parts" not in result
         assert [part["type"] for part in drain_parts()] == ["original_part", "post_policy"]

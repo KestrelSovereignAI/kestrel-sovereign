@@ -901,12 +901,13 @@ async def _complete_post_tool_result(host, result, post_input):
             "level": "error", "title": "Tool UI delivery failed",
             "body": "The tool completed, but its UI could not be delivered. Do not run it again to recover the UI.",
         }}]
-        payload.setdefault("parts", []).extend(added)
+        appended_parts = added
     else:
         payload, added = completed.result, completed.parts
-    if "parts" in payload:
-        payload["parts"] = [clean for part in payload["parts"]
-                            if (clean := sanitize_part(part)) is not None]
+        appended_parts = None
+    from kestrel_sovereign.features.base import _attach_envelope_parts
+    _attach_envelope_parts(payload, payload.pop("parts", None), None,
+                           appended_parts=appended_parts)
     host._reemit_envelope_parts({"parts": added})
     return payload
 
