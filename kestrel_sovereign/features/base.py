@@ -52,6 +52,7 @@ from kestrel_sdk.tools.base import AgentTool, ToolSchema
 from kestrel_sdk.tools.base import ToolCategory as ToolCategory
 from kestrel_sdk.tools.base import ToolParameter as ToolParameter
 from kestrel_sdk.tools.result import ToolResult, ToolResultStatus
+from kestrel_sdk.tools.deferred import DeferredToolResult
 
 from kestrel_sovereign.execution_custody import (
     ExecutionAuthorityError,
@@ -2523,6 +2524,8 @@ ABSOLUTE PROHIBITION - NEVER FABRICATE:
                         #     full picture)
                         #   - ERROR → success=False, error copied
                         #     into the wrapper's top-level error
+                        if isinstance(result, DeferredToolResult):
+                            return result.for_tool(self.name, pending_parts, include_success=True)
                         if isinstance(result, ToolResult):
                             # Unified wire shape (#F025): spread the ToolResult
                             # envelope at the TOP level — matching the SDK

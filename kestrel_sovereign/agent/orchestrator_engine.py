@@ -39,6 +39,7 @@ from typing import (
 from kestrel_sdk.hooks.base import HookEvent, HookInput
 from kestrel_sdk.llm import ToolCallStarted
 from kestrel_sdk.resources import ResourceConflict, ResourceOutcomeUnknown, ResourceUnsupported
+from kestrel_sdk.tools import DeferredToolResult
 
 from kestrel_sovereign._async_ownership import (
     OwnedTaskOutcome,
@@ -868,8 +869,20 @@ def _extract_inline_error_fields(result: Any) -> tuple[Optional[str], Optional[s
     return None, None
 
 
+def _complete_deferred_tool_result(host, result, post_outputs):
+    """Deliver only newly deferred parts after the owning post-tool policy."""
+    if not isinstance(result, DeferredToolResult):
+        return result
+    allowed = all(evaluate_blocking_decision(output) is None for output in post_outputs)
+    completed = result.finalize(result, allowed=allowed)
+    host._reemit_envelope_parts({"parts": completed.parts})
+    return completed.result
+
+
 class OrchestratorEngineMixin:
     """Mixin providing orchestrator loop methods for KestrelAgent."""
+
+    supports_deferred_tool_results: bool = True
 
     @staticmethod
     def _signals_unfinished_tool_work(content: Optional[str]) -> bool:
@@ -1125,12 +1138,12 @@ class OrchestratorEngineMixin:
             tool_response=result if isinstance(result, dict) else {"result": str(result)},
             execution_time_ms=exec_duration_ms,
         )
-        await self.hooks_manager.execute_hooks_parallel(
+        post_outputs = await self.hooks_manager.execute_hooks_parallel(
             HookEvent.POST_TOOL_USE,
             post_hook_input,
         )
         require_execution_work(self)
-        return result
+        return _complete_deferred_tool_result(self, result, post_outputs)
 
     async def _generate_with_messages_bounded(
         self,
@@ -1754,11 +1767,11 @@ class OrchestratorEngineMixin:
             tool_response=result if isinstance(result, dict) else {"result": str(result)},
             execution_time_ms=exec_duration_ms,
         )
-        await self.hooks_manager.execute_hooks_parallel(
+        post_outputs = await self.hooks_manager.execute_hooks_parallel(
             HookEvent.POST_TOOL_USE, post_input,
         )
         require_execution_work(self)
-        return result
+        return _complete_deferred_tool_result(self, result, post_outputs)
 
     def _resolve_named_tool(self, tool_name: str) -> tuple[Any, Any]:
         """Find an ``(AgentTool, Feature)`` pair by tool name.
