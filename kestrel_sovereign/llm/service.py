@@ -108,7 +108,7 @@ from kestrel_sovereign.kestrel_config.constants import (
 )
 from kestrel_sovereign.config import load_config, load_section
 from kestrel_sovereign import telemetry
-from kestrel_sovereign.execution_custody import ExecutionAuthorityError, ExecutionCustody, bind_execution_runtime, require_execution_work, execution_work_operation, is_execution_control_error, execution_terminal_error
+from kestrel_sovereign.execution_custody import ExecutionAuthorityError, ExecutionCustody, bind_execution_runtime, require_execution_work, execution_work_operation, is_execution_control_error, execution_terminal_error, require_native_execution_admission
 from kestrel_sovereign._async_ownership import owned_task_error
 
 logger = logging.getLogger(__name__)
@@ -943,6 +943,7 @@ class LLMService(DecisionServiceMixin, ModalityRecordingMixin, ModelDiscoveryMix
             # see test_discovery_hang_regression), so the attribute may not exist.
             agent_name=getattr(self, "_agent_display_name", None),
             attributes=span_attributes,
+            redact_errors=redact,
         ) as span:
             yield span
 
@@ -1969,7 +1970,7 @@ class LLMService(DecisionServiceMixin, ModalityRecordingMixin, ModelDiscoveryMix
         )
         return any(p in msg for p in auth_patterns)
 
-    def _maybe_disable_route(self, provider: Dict[str, Any], exc: Exception) -> None:
+    def _maybe_disable_route(self, provider: Dict[str, Any], exc: Exception, *, redact_content: bool = False) -> None:
         """Record a route as permanently disabled if *exc* looks like a
         401/403. No-op for transient or caller-side errors. Logs once per
         route so repeated failures don't flood the log.
@@ -1979,7 +1980,7 @@ class LLMService(DecisionServiceMixin, ModalityRecordingMixin, ModelDiscoveryMix
             return
         if not self._is_permanent_auth_error(exc):
             return
-        reason = str(exc)[:200]
+        reason = type(exc).__name__ if redact_content else str(exc)[:200]
         self._disabled_routes[name] = reason
         logger.warning(
             "Route %s disabled for the rest of this session after permanent "
@@ -4779,7 +4780,7 @@ class LLMService(DecisionServiceMixin, ModalityRecordingMixin, ModelDiscoveryMix
             force_local_only=force_local_only,
             metadata=metadata,
             tools_used=tools_used,
-            error_message=str(error),
+            error_message=type(error).__name__ if invocation_context.redact_content else str(error),
             publish_identity=False,
             usage_available=usage_available,
             track_model_usage=track_model_usage,
@@ -4833,7 +4834,7 @@ class LLMService(DecisionServiceMixin, ModalityRecordingMixin, ModelDiscoveryMix
             return error
 
         try:
-            require_execution_work(self)
+            await require_native_execution_admission(self)
             self._guard_dispatch(
                 provider_name, model, path=path, force_local_only=force_local_only
             )
@@ -4847,7 +4848,7 @@ class LLMService(DecisionServiceMixin, ModalityRecordingMixin, ModelDiscoveryMix
             started = time.monotonic()
             try:
                 response = await bound_attempt_call(route, provider_name, model, attempt)
-                require_execution_work(self)
+                await require_native_execution_admission(self)
             except ExecutionAuthorityError:
                 raise
             except asyncio.CancelledError:
@@ -4857,7 +4858,7 @@ class LLMService(DecisionServiceMixin, ModalityRecordingMixin, ModelDiscoveryMix
             except Exception as exc:
                 if is_execution_control_error(exc):
                     raise
-                require_execution_work(self)
+                await require_native_execution_admission(self)
                 reported = reported_usage(exc)
                 usage_available = response_usage_available(reported)
                 await self._finalize_failed_invocation(
@@ -4930,7 +4931,7 @@ class LLMService(DecisionServiceMixin, ModalityRecordingMixin, ModelDiscoveryMix
                 tools_used=tools_used,
                 publish_identity=publish_identity,
             )
-            require_execution_work(self)
+            await require_native_execution_admission(self)
             return response
 
     @execution_work_operation
@@ -6645,10 +6646,29 @@ No other text or formatting.
             )
             return self._annotate_and_return(span, result, redact=_redact)
 
+    def _required_image_messages(self, adapter, messages, images, provider_name, model, capabilities=None):
+        """Use existing vision transport with a strict per-attempt image gate.
+
+        A visual computer observation cannot become a blind text attempt.
+        Route capabilities can narrow the adapter family and concrete model
+        metadata still wins. Ordinary text calls retain their existing path.
+        """
+        if not images:
+            return messages
+        adapter_mode = getattr(adapter.provider_capabilities(), "vision_input_mode", "unknown")
+        image_mode = (capabilities or {}).get("vision_input_mode", adapter_mode)
+        if (capabilities is not None and capabilities.get("supports_vision") is not True
+                or image_mode not in {"openai_image_url", "anthropic_content_block", "gemini_inline_data", "ollama_images"}
+                or self._discovered_model_supports_vision(provider_name, model) is not True
+                or not callable(getattr(adapter, "attach_images_to_last_user_message", None))):
+            raise LLMServiceError("selected route cannot transport this visual observation")
+        return self._apply_eager_vision(adapter, messages, images, provider_name, model)
+
     async def generate_with_messages(
         self,
         *,
         messages: List[Dict[str, Any]],
+        images: Optional[List[bytes]] = None,
         tools: Optional[List[Dict[str, Any]]] = None,
         response_format: Optional[Type[BaseModel]] = None,
         force_local_only: bool = False,
@@ -6663,6 +6683,8 @@ No other text or formatting.
 
         Args:
             messages: Pre-built message list
+            images: Bounded image bytes that every attempted route must see;
+                unknown concrete-model vision or image transport is refused.
             tools: Optional tools for function calling
             response_format: Optional Pydantic model for structured output
             force_local_only: Only use local providers
@@ -6685,6 +6707,10 @@ No other text or formatting.
             String content or LLMResponse
         """
         self._check_policy()
+        if images is not None and (not images or len(images) > 4 or any(
+            not isinstance(image, bytes) or not 0 < len(image) <= 8 * 1024 * 1024 for image in images
+        )):
+            raise ValueError("image input requires one to four bounded byte payloads")
         force_local_only = self._effective_force_local_only(force_local_only)
         invocation_context = self._resolve_invocation_context(
             invocation_context,
@@ -6700,6 +6726,7 @@ No other text or formatting.
             return await self._generate_with_messages_inner(
                 span,
                 messages=messages,
+                images=images,
                 tools=tools,
                 response_format=response_format,
                 force_local_only=force_local_only,
@@ -6716,6 +6743,7 @@ No other text or formatting.
         span,
         *,
         messages: List[Dict[str, Any]],
+        images: Optional[List[bytes]] = None,
         tools: Optional[List[Dict[str, Any]]] = None,
         response_format: Optional[Type[BaseModel]] = None,
         force_local_only: bool = False,
@@ -6743,6 +6771,7 @@ No other text or formatting.
             model_override=model_override,
             required_capabilities=(
                 "chat",
+                *(("vision",) if images else ()),
                 *(("tools",) if tools else ()),
                 *(("structured_output",) if response_format else ()),
             ),
@@ -6756,7 +6785,8 @@ No other text or formatting.
                         remote_route.adapter.get_response(
                             client=remote_route.client,
                             model=model,
-                            messages=messages,
+                            messages=self._required_image_messages(remote_route.adapter, messages, images, REMOTE_ROUTE_NAME, model,
+                                {"supports_vision": "vision" in remote_route.capabilities}),
                             tools=tools,
                             response_format=response_format,
                             cancel_token=cancel_token,
@@ -6941,7 +6971,8 @@ No other text or formatting.
                     provider["adapter"].get_response(
                         client=provider["client"],
                         model=model,
-                        messages=messages,
+                        messages=self._required_image_messages(provider["adapter"], messages, images, provider["name"], model,
+                            provider.get("capabilities")),
                         tools=tools,
                         response_format=response_format,
                         extra_body=provider_cache_body(provider),
@@ -6970,28 +7001,30 @@ No other text or formatting.
                     raise
                 # 400 = request problem (context too big, bad format, etc.)
                 # Don't fall back — the request itself is broken, not the provider.
-                logger.error(f"Provider {provider['name']} rejected request (400): {e}")
-                raise LLMServiceError(f"Request rejected by {provider['name']}: {e}") from e
+                diagnostic = type(e).__name__ if _redact else str(e)
+                logger.error(f"Provider {provider['name']} rejected request (400): {diagnostic}")
+                raise LLMServiceError(f"Request rejected by {provider['name']}: {diagnostic}") from e
             except ExecutionAuthorityError:
                 raise
             except Exception as e:
                 if is_execution_control_error(e):
                     raise
-                logger.error(f"Provider {provider['name']} failed: {e}")
+                diagnostic = type(e).__name__ if _redact else str(e)
+                logger.error(f"Provider {provider['name']} failed: {diagnostic}")
                 if is_harness_owned_stall(provider, e):
                     # See get_response: a harness-owned route's stall,
                     # abandoned on its bound (#1968), never rotates.
                     raise LLMServiceError(
-                        f"Harness-owned route {provider['name']} failed: {e}"
+                        f"Harness-owned route {provider['name']} failed: {diagnostic}"
                     ) from e
-                self._maybe_disable_route(provider, e)
+                self._maybe_disable_route(provider, e, redact_content=_redact)
                 if isinstance(e, UnfinishedAfterInlineToolsError):
                     raise
                 last_error = e
                 route_errors.append(e)
                 if explicit_selection:
                     raise LLMServiceError(
-                        f"Selected route {provider['name']} failed: {e}"
+                        f"Selected route {provider['name']} failed: {diagnostic}"
                     ) from e
                 if self._configured_routes_exhausted(
                     providers, provider_index, configured_vendors
@@ -7005,13 +7038,13 @@ No other text or formatting.
                         "Configured routes exhausted in generate_with_messages: "
                         "preferred vendor %s route %s failed and every remaining "
                         "route is an unconfigured vendor. Error: %s",
-                        providers[0].get("vendor"), provider["name"], e,
+                        providers[0].get("vendor"), provider["name"], diagnostic,
                     )
                     exhausted = LLMServiceError(
                         f"Preferred route {provider['name']} failed and the "
                         f"only remaining routes are unconfigured vendors; "
                         f"refusing to silently swap vendors. "
-                        f"Underlying error: {e}"
+                        f"Underlying error: {diagnostic}"
                     )
                     # This too is an aggregate of every attempted route: its
                     # verdicts describe them all, not this route's error.
@@ -7019,13 +7052,13 @@ No other text or formatting.
                     raise exhausted from e
                 logger.warning(
                     "Falling through from %s in generate_with_messages: %s",
-                    provider["name"], e,
+                    provider["name"], diagnostic,
                 )
                 continue
 
         aggregate = LLMServiceError(
             f"All providers failed for generate_with_messages "
-            f"(last: {last_provider_name}): {last_error}"
+            f"(last: {last_provider_name}): {type(last_error).__name__ if _redact else last_error}"
         )
         state_aggregate_verdicts(aggregate, route_errors)
         raise aggregate from last_error

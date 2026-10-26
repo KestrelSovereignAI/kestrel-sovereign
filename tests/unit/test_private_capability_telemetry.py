@@ -63,3 +63,32 @@ async def test_actual_otel_excludes_private_targets_before_span_creation(monkeyp
     finally:
         FastAPIInstrumentor.uninstrument_app(app)
         provider.shutdown()
+
+
+def test_redacted_llm_span_preserves_original_failure_without_exporting_chain():
+    from opentelemetry.sdk.trace import TracerProvider
+    from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+    from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
+    from kestrel_sdk.tracing import KestrelTracer
+    from kestrel_sovereign import telemetry
+    exporter = InMemorySpanExporter()
+    provider = TracerProvider()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    previous = telemetry.get_kestrel_tracer()
+    telemetry.set_kestrel_tracer(KestrelTracer(tracer=provider.get_tracer("private-test")))
+    original = RuntimeError("private-model-response")
+    original.__cause__ = ValueError("private-screenshot")
+    from kestrel_sovereign.llm.service import LLMService
+    service = LLMService.__new__(LLMService)
+    try:
+        with pytest.raises(RuntimeError) as caught:
+            with service._llm_request_span("private", redact=True):
+                raise original
+        assert caught.value is original
+        [span] = exporter.get_finished_spans()
+        assert span.status.status_code.name == "ERROR"
+        assert span.status.description == "RuntimeError"
+        assert "private-" not in repr([dict(event.attributes) for event in span.events])
+    finally:
+        telemetry.set_kestrel_tracer(previous)
+        provider.shutdown()

@@ -244,6 +244,13 @@ class AnswerPath:
 
 
 ANSWER_PATHS: Tuple[AnswerPath, ...] = (
+    # A computer proposal can become an accepted input checkpoint only after
+    # the existing non-streaming route has proved its generation finished.
+    AnswerPath(
+        "visual_proposal",
+        "kestrel_sovereign.visual_computer.inference:VisualInference.plan",
+        ("generate_with_messages",),
+    ),
     # A route attempt: what one route's adapter returned, or the terminal
     # response that ended its stream.
     AnswerPath(

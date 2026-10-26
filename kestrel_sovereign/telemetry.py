@@ -666,7 +666,8 @@ def serialize_llm_input(
 
 @contextmanager
 def llm_span(
-    name, *, input_value=None, model_name=None, agent_name=None, attributes=None
+    name, *, input_value=None, model_name=None, agent_name=None, attributes=None,
+    redact_errors=False,
 ):
     """Open an OpenInference LLM span via the process ``KestrelTracer``.
 
@@ -681,6 +682,7 @@ def llm_span(
     tracer = get_kestrel_tracer()
     effective_attributes = dict(attributes or {})
     effective_attributes.update(current_turn_span_attributes())
+    original_error = None
     with tracer.llm_span(
         name,
         input_value=truncate_for_span(input_value),
@@ -688,7 +690,21 @@ def llm_span(
         agent_name=agent_name,
         attributes=effective_attributes,
     ) as span:
-        yield span
+        try:
+            yield span
+        except BaseException as error:
+            if not redact_errors:
+                raise
+            # SDK/OTel otherwise records the entire explicit exception chain,
+            # which can include a provider's echoed screenshot or prompt.
+            # End this span without handing it that content, then propagate
+            # the exact original error to its control/lifecycle owner.
+            original_error = error
+            if _OTEL_AVAILABLE and callable(getattr(span, "set_status", None)):
+                span.set_status(StatusCode.ERROR, type(error).__name__)
+            span.add_event("exception", {"exception.type": type(error).__name__})
+    if original_error is not None:
+        raise original_error
 
 
 def annotate_llm_response_span(

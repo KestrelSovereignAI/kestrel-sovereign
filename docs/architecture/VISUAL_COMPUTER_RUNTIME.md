@@ -126,3 +126,28 @@ that selection. Current processing privacy forces the existing router's local
 policy when required. The result contains one host-generated, observation-bound
 ActionRequest or a finished answer. It does not automatically submit input;
 execution and original-ID status reconciliation use the existing action tools.
+
+Each proposal starts with a fresh driver screenshot and retains the original
+session/grant/privacy operation through model delivery. PNG identity, dimensions,
+byte count, epoch and freshness are checked before image transport. Every model
+attempt uses the existing router, configured fallback policy, image folding and
+finished-generation gate. Concrete model discovery must positively advertise
+vision, and the adapter must identify a supported byte-image transport. Cold or
+unknown vision metadata is an explicit refusal; refresh the existing model
+catalog before using that route. Text readiness alone is insufficient, including
+on a private inference lease. No browser/model location pairing is implicitly
+authorized by choosing the other location.
+
+The existing native execution admission carries the retained visual check to
+each actual HTTP dispatch, including SDK retries after request observers. It is
+also checked before and after non-HTTP provider attempts. A takeover, grant
+withdrawal or expired operation stops fallback and withholds the proposal. A
+retired callback cannot regain authority in a copied task. The model may propose
+only an SDK action or completion: IDs, deadlines, owner and epoch are host-owned.
+Generated clicks are checked against the original frame before being offered;
+execution revalidates them through the runtime's accepted-action ledger.
+
+Visual prompts, images, answers and provider exception chains are withheld from
+LLM telemetry. Content-free model/usage/failure classification remains available.
+Private artifact/computer HTTP URLs are excluded before optional OTel span
+construction; access and inner error paths redact private identifiers as well.
