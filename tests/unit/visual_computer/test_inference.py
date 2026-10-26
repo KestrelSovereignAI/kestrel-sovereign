@@ -24,6 +24,7 @@ from kestrel_sovereign.llm import service as service_module
 from kestrel_sovereign.llm.model_cache import get_shared_model_cache
 from kestrel_sovereign.llm.model_metadata import ModelInfo
 from kestrel_sovereign.llm.openai_adapter import OpenAIAdapter
+from kestrel_sdk.llm import RequestOptions
 from kestrel_sovereign.visual_computer.inference import VisualInference
 from kestrel_sovereign.visual_computer.runtime import VisualAction
 
@@ -50,12 +51,14 @@ async def inference(harness, monkeypatch, tmp_path):
     # Scripted discovery evidence, separate from the actual image wire proof.
     cache.set([ModelInfo(id="gpt-4o", display_name="Synthetic vision", provider="openai", supports_vision=True)])
     posts = []
-    state = SimpleNamespace(answer={"action":{"kind":"click", "x":0, "y":0}, "answer":""}, before_request=None, during_response=None)
+    state = SimpleNamespace(answer={"action":{"kind":"click", "x":0, "y":0}, "answer":""}, before_request=None, during_response=None, error=None)
     async def server(request):
         if request.url.path.endswith("/models"):
             return httpx.Response(200, json={"object":"list", "data":[{"id":"gpt-4o", "object":"model", "created":1, "owned_by":"synthetic"}]})
         body = json.loads(request.content)
         posts.append((request.url.host, body))
+        if state.error is not None:
+            return httpx.Response(400, json={"error":{"message":state.error,"type":"invalid_request_error","code":"invalid_request"}})
         if state.during_response:
             await state.during_response()
         return httpx.Response(200, json={"id":"synthetic-completion", "object":"chat.completion", "created":1, "model":"gpt-4o",
@@ -114,6 +117,17 @@ async def test_all_blind_routes_explicitly_refuse_without_model_submission(infer
     with x.h.bind(x.ctx), pytest.raises(ResourceUnsupported):
         await x.planner.plan(x.ctx,x.session.session_id,"inspect")
     assert not x.posts and not x.h.adapter.effects
+
+
+@pytest.mark.asyncio
+async def test_private_native_model_error_never_enters_adapter_or_host_logs(inference,caplog):
+    x=inference
+    private="private-observed-value-f046"
+    x.state.error=private
+    with x.h.bind(x.ctx),pytest.raises(ResourceUnsupported):
+        await x.planner.plan(x.ctx,x.session.session_id,"inspect")
+    assert len(x.posts)==1 and not x.h.adapter.effects
+    assert private not in caplog.text
 
 
 @pytest.mark.asyncio
@@ -242,3 +256,11 @@ async def test_private_driver_cannot_forge_bounded_image_metadata(inference):
     with x.h.bind(x.ctx),pytest.raises(ResourceUnsupported):
         await x.planner.plan(x.ctx,x.session.session_id,"inspect")
     assert not x.posts
+
+
+@pytest.mark.asyncio
+async def test_existing_request_options_reach_selected_image_transport(inference):
+    x=inference
+    planner=VisualInference(x.h.runtime,x.service,request_options=RequestOptions(raw={"temperature":0}))
+    with x.h.bind(x.ctx):await planner.plan(x.ctx,x.session.session_id,"inspect")
+    assert len(x.posts)==1 and x.posts[0][1]["temperature"]==0

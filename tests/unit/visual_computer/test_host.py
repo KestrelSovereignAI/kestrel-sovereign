@@ -160,6 +160,38 @@ async def test_bound_context_rechecks_live_grant_and_exact_feature_generation(vi
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("budget", [30, 120])
+async def test_bound_context_retains_configured_fixed_deadline_and_current_grant(visual_host, monkeypatch, budget):
+    from dataclasses import replace
+    from kestrel_sdk.operator import OperatorAuthorizationError
+    from kestrel_sovereign.auth import CallerContext
+
+    client, agents, _ = visual_host
+    admitted = await client.post(path()+"/requests", headers=AUTH, json=intent())
+    assert admitted.status_code == 200
+    sid = admitted.json()["session_id"]
+    feature = agents["kite"].features["VisualComputerFeature"]
+    feature.runtime.policy = replace(feature.runtime.policy, operation_seconds=budget)
+    now = datetime.now(UTC)
+    clock = [now]
+    monkeypatch.setattr(feature.runtime.authority, "clock", lambda: clock[0])
+    async with feature._bind_context(CallerContext.sovereign(credential=KEY)) as context:
+        original_expiry = now + timedelta(seconds=budget)
+        assert context.expires_at == original_expiry
+        # Changing configuration cannot renew an already bound caller.
+        feature.runtime.policy = replace(feature.runtime.policy, operation_seconds=2*budget)
+        clock[0] = original_expiry - timedelta(seconds=1)
+        assert (await feature.runtime.status(context, sid))["session"]["session_id"] == sid
+        feature._cfg["granted_actions"].remove(VisualAction.STATUS.value)
+        with pytest.raises(OperatorAuthorizationError):
+            await feature.runtime.status(context, sid)
+        feature._cfg["granted_actions"].append(VisualAction.STATUS.value)
+        clock[0] = original_expiry + timedelta(microseconds=1)
+        with pytest.raises(OperatorAuthorizationError):
+            await feature.runtime.status(context, sid)
+
+
+@pytest.mark.asyncio
 async def test_disabled_visual_config_exposes_no_tools_or_router(harness, monkeypatch):
     monkeypatch.setattr(feature_module,"load_section",lambda section:{})
     feature = VisualComputerFeature(SimpleNamespace())
@@ -253,3 +285,10 @@ async def test_visual_plan_uses_original_caller_configured_model_and_host_router
     with caller_context_scope(CallerContext.authenticated("peer")),pytest.raises(OperatorAuthorizationError):
         await feature.visual_plan(sid,"Read")
     assert len(calls)==1
+    response=await client.post(path()+f"/sessions/{sid}/plan",headers=AUTH,json={"prompt":"Read the screen"})
+    assert response.status_code == 200 and response.json() == answer
+    assert len(calls)==2 and calls[-1][0].acting_agent_id == "did:test:kite"
+    assert (await client.post(path()+f"/sessions/{sid}/plan",json={"prompt":"Read"})).status_code == 401
+    assert (await client.post(path()+f"/sessions/{sid}/plan",headers=AUTH,
+        json={"prompt":"Read","model_override":"model-selected"})).status_code == 400
+    assert len(calls)==2

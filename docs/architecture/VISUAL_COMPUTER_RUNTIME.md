@@ -122,7 +122,12 @@ Observation/model operations continue to require a ready agent controller.
 `visual_plan(session_id, prompt)` invokes `VisualInference` using the original
 bound caller and the agent's existing LLM service. An optional trusted
 `visual_model` setting selects an explicit model; model input cannot override
-that selection. Current processing privacy forces the existing router's local
+that selection. The authenticated `POST /sessions/{id}/plan` accepts only
+`{"prompt":"task text"}` and uses the same operation. An optional trusted
+`visual_request_options` mapping carries SDK reasoning or native `raw` options
+through the existing adapter, and requires an explicit configured visual model.
+It is not accepted from a tool task, page, model output or HTTP caller.
+Current processing privacy forces the existing router's local
 policy when required. The result contains one host-generated, observation-bound
 ActionRequest or a finished answer. It does not automatically submit input;
 execution and original-ID status reconciliation use the existing action tools.
@@ -137,6 +142,14 @@ unknown vision metadata is an explicit refusal; refresh the existing model
 catalog before using that route. Text readiness alone is insufficient, including
 on a private inference lease. No browser/model location pairing is implicitly
 authorized by choosing the other location.
+
+The original host caller deadline uses the configured `operation_seconds`,
+bounded by `max_lifetime_seconds`; the default remains 30 seconds. Increasing
+that trusted budget never extends an existing context, resource lease, accepted
+action or the independent 60-second frame freshness check. Grant and control
+revocation remain immediate, including during a longer local model call. Local
+Ollama model vision evidence comes from `/api/show` capabilities, not model-name
+heuristics. Rejected model output is never repaired into an accepted action.
 
 The existing native execution admission carries the retained visual check to
 each actual HTTP dispatch, including SDK retries after request observers. It is

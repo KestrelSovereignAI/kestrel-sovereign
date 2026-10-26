@@ -641,18 +641,18 @@ class OpenAIAdapter(LLMAdapter):
             ), finish_reason)
 
         except openai.RateLimitError as e:
-            logger.error(f"OpenAI rate limit exceeded: {e}")
+            logger.error("OpenAI rate limit exceeded: %s", type(e).__name__)
             raise
         except openai.APIConnectionError as e:
-            logger.error(f"OpenAI connection error: {e}")
+            logger.error("OpenAI connection error: %s", type(e).__name__)
             raise
         except openai.APIError as e:
-            logger.error(f"OpenAI API error: {e}")
+            logger.error("OpenAI API error: %s", type(e).__name__)
             raise
         except Exception as e:
             if is_execution_control_error(e):
                 raise
-            logger.error(f"OpenAI adapter failed: {e}", exc_info=True)
+            logger.error("OpenAI adapter failed: %s", type(e).__name__)
             raise
 
     async def get_streaming_response(
@@ -784,16 +784,16 @@ class OpenAIAdapter(LLMAdapter):
             logger.info(f"Stream completed. Total chunks: {chunk_count}")
 
         except openai.RateLimitError as e:
-            logger.error(f"OpenAI rate limit exceeded during streaming: {e}")
+            logger.error("OpenAI rate limit exceeded during streaming: %s", type(e).__name__)
             raise
         except openai.APIConnectionError as e:
-            logger.error(f"OpenAI connection error during streaming: {e}")
+            logger.error("OpenAI connection error during streaming: %s", type(e).__name__)
             raise
         except openai.APIError as e:
-            logger.error(f"OpenAI API error during streaming: {e}")
+            logger.error("OpenAI API error during streaming: %s", type(e).__name__)
             raise
         except Exception as e:
-            logger.error(f"OpenAI streaming failed: {e}", exc_info=True)
+            logger.error("OpenAI streaming failed: %s", type(e).__name__)
             raise
 
     async def get_streaming_response_with_tools(
@@ -1080,16 +1080,16 @@ class OpenAIAdapter(LLMAdapter):
             ), finish_reason)
 
         except openai.RateLimitError as e:
-            logger.error(f"OpenAI rate limit exceeded during streaming with tools: {e}")
+            logger.error("OpenAI rate limit exceeded during streaming with tools: %s", type(e).__name__)
             raise
         except openai.APIConnectionError as e:
-            logger.error(f"OpenAI connection error during streaming with tools: {e}")
+            logger.error("OpenAI connection error during streaming with tools: %s", type(e).__name__)
             raise
         except openai.APIError as e:
-            logger.error(f"OpenAI API error during streaming with tools: {e}")
+            logger.error("OpenAI API error during streaming with tools: %s", type(e).__name__)
             raise
         except Exception as e:
-            logger.error(f"OpenAI streaming with tools failed: {e}", exc_info=True)
+            logger.error("OpenAI streaming with tools failed: %s", type(e).__name__)
             raise
 
     async def continue_with_tool_results(

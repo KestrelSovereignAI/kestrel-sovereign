@@ -38,6 +38,7 @@ class VisualComputerFeature(Feature):
     """Authenticated visual sessions with independent explicit visual grants."""
 
     supports_subagent_dispatch = False
+    promote_tools_on_startup = True
 
     def __init__(self, agent):
         super().__init__(agent)
@@ -96,7 +97,8 @@ class VisualComputerFeature(Feature):
         self.runtime = VisualComputerRuntime(VisualCustodyRepository(db), authority,
             providers=providers, drivers=drivers, policy=policy, check_destination=self._check_destination, egress=egress)
         from kestrel_sovereign.visual_computer.http import create_visual_computer_router
-        self._router = create_visual_computer_router(self.runtime, resolve_context=self._resolve_context)
+        self._router = create_visual_computer_router(self.runtime, resolve_context=self._resolve_context,
+                                                    plan_operation=self._plan)
 
     def _check_destination(self, location):
         config = getattr(self.agent, "privacy_config", None)
@@ -191,7 +193,12 @@ class VisualComputerFeature(Feature):
             context = OperatorContext(tenant_id=self._agent_id, principal_id="host-sovereign", acting_agent_id=self._agent_id,
                 granted_actions=frozenset(self._cfg["granted_actions"]), granted_capabilities={"visual-computer"},
                 permitted_boundary_ids={self.runtime.repository.storage_id}, correlation_id=uuid4().hex,
-                issued_at=now, expires_at=now+timedelta(seconds=min(30, self.runtime.policy.operation_seconds)))
+                # Retain one fixed original deadline for the configured call.
+                # A hard 30-second cap silently cut off otherwise admitted
+                # local vision calls; frame and resource expiry remain tighter
+                # independent checks and never renew with a model retry.
+                issued_at=now, expires_at=now+timedelta(seconds=min(
+                    self.runtime.policy.operation_seconds, self.runtime.policy.max_lifetime_seconds)))
             def current(context, action, target):
                 self._require_live(generation, request)
                 if (target is not None or action.value not in self._cfg["granted_actions"]
@@ -268,7 +275,11 @@ class VisualComputerFeature(Feature):
     @tool(name="visual_plan", description="Plan one observation-bound visual action through the host inference router")
     async def visual_plan(self, session_id: str, prompt: str) -> dict:
         """Observe and plan once; submitting an action remains a separate authorized call."""
-        if not isinstance(prompt, str) or not prompt.strip() or len(prompt.encode()) > 32*1024:
+        async with self._bind_context(current_caller_context()) as context:
+            return await self._plan(context, session_id, prompt)
+
+    async def _plan(self, context, session_id, prompt):
+        if not isinstance(prompt, str) or not prompt.strip() or len(prompt.encode()) > 16*1024:
             raise ValueError("visual planning requires a bounded nonempty prompt")
         service = getattr(self.agent, "llm_service", None)
         if service is None:
@@ -277,10 +288,17 @@ class VisualComputerFeature(Feature):
         if model is not None and (not isinstance(model,str) or not model.strip() or len(model)>512):
             raise ValueError("configured visual model is invalid")
         from kestrel_sovereign.visual_computer.inference import VisualInference
+        configured_options = self._cfg.get("visual_request_options")
+        options = {}
+        if configured_options is not None:
+            if (not isinstance(configured_options,dict) or not model
+                    or set(configured_options)-{"reasoning_effort","thinking_budget_tokens","raw"}):
+                raise ValueError("visual inference options require a configured model and reasoning options")
+            from kestrel_sdk.llm import RequestOptions
+            options["request_options"] = RequestOptions(**configured_options)
         force_local = getattr(getattr(self.agent,"privacy_config",None),"processing",None) != "cloud"
-        async with self._bind_context(current_caller_context()) as context:
-            async with self.runtime.operation(context,VisualAction.OBSERVE):
-                result = await VisualInference(self.runtime,service).plan(context,session_id,prompt,
-                    model_override=model,force_local_only=force_local)
-                return {key:value.model_dump(mode="json") if hasattr(value,"model_dump") else value
-                        for key,value in result.items()}
+        async with self.runtime.operation(context,VisualAction.OBSERVE):
+            result = await VisualInference(self.runtime,service,**options).plan(context,session_id,prompt,
+                model_override=model,force_local_only=force_local)
+            return {key:value.model_dump(mode="json") if hasattr(value,"model_dump") else value
+                    for key,value in result.items()}

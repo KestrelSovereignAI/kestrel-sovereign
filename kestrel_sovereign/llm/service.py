@@ -24,7 +24,7 @@ from typing import AsyncIterator, Awaitable, Callable, List, Dict, Any, Mapping,
 
 import openai
 import httpx
-from kestrel_sdk.llm import ProviderCapabilities
+from kestrel_sdk.llm import ProviderCapabilities, RequestOptions
 
 if TYPE_CHECKING:
     from kestrel_sovereign.storage.async_database import AsyncDatabase
@@ -6669,6 +6669,7 @@ No other text or formatting.
         *,
         messages: List[Dict[str, Any]],
         images: Optional[List[bytes]] = None,
+        request_options: Optional[RequestOptions] = None,
         tools: Optional[List[Dict[str, Any]]] = None,
         response_format: Optional[Type[BaseModel]] = None,
         force_local_only: bool = False,
@@ -6727,6 +6728,7 @@ No other text or formatting.
                 span,
                 messages=messages,
                 images=images,
+                **({"request_options": request_options} if request_options is not None else {}),
                 tools=tools,
                 response_format=response_format,
                 force_local_only=force_local_only,
@@ -6744,6 +6746,7 @@ No other text or formatting.
         *,
         messages: List[Dict[str, Any]],
         images: Optional[List[bytes]] = None,
+        request_options: Optional[RequestOptions] = None,
         tools: Optional[List[Dict[str, Any]]] = None,
         response_format: Optional[Type[BaseModel]] = None,
         force_local_only: bool = False,
@@ -6790,6 +6793,7 @@ No other text or formatting.
                             tools=tools,
                             response_format=response_format,
                             cancel_token=cancel_token,
+                            **({"request_options": request_options} if request_options is not None else {}),
                         ),
                         REMOTE_ROUTE_NAME,
                         model,
@@ -6980,6 +6984,7 @@ No other text or formatting.
                         keep_trailing_system=keep_trailing_system,
                         tool_executor=tool_executor,
                         cancel_token=cancel_token,
+                        **({"request_options": request_options} if request_options is not None else {}),
                     ),
                     provider["name"],
                     model,

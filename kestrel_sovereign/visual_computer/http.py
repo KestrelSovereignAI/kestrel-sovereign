@@ -10,7 +10,7 @@ from pydantic import ValidationError
 from starlette.responses import JSONResponse, Response
 from kestrel_sdk.computer_use import ActionRequest, ControlRequest, EnvironmentRequest
 from kestrel_sdk.operator import OperatorAuthorizationError
-from kestrel_sdk.resources import ResourceConflict, ResourceNotFound, ResourceOutcomeUnknown
+from kestrel_sdk.resources import ResourceConflict, ResourceNotFound, ResourceOutcomeUnknown, ResourceUnsupported
 
 from kestrel_sovereign.security.private_delivery import AuthorizedCapabilityResponse
 from .repository import CustodyIntegrityError
@@ -49,6 +49,8 @@ def _error(error, prepared):
         status, code = 404, "visual_not_found"
     elif isinstance(error, ResourceConflict):
         status, code = 409, "visual_conflict"
+    elif isinstance(error, ResourceUnsupported):
+        status, code = 422, "visual_unsupported"
     elif isinstance(error, (ResourceOutcomeUnknown, TimeoutError)):
         status, code = 503, "visual_outcome_unknown"
     elif isinstance(error, CustodyIntegrityError):
@@ -60,7 +62,7 @@ def _error(error, prepared):
     return _json({"error":{"code":code}}, status)
 
 
-def create_visual_computer_router(runtime, *, resolve_context):
+def create_visual_computer_router(runtime, *, resolve_context, plan_operation=None):
     router = APIRouter(prefix="/api/visual-computer", tags=["visual-computer"])
 
     def respond(request, action, build, prepare=None):
@@ -118,6 +120,16 @@ def create_visual_computer_router(runtime, *, resolve_context):
                 raise ResourceConflict("action session does not match route")
             return _json(await runtime.act(context, action))
         return respond(request, VisualAction.ACT, build, lambda:_body(request))
+
+    @router.post("/sessions/{session_id}/plan")
+    async def plan(session_id: str, request: Request):
+        async def build(context, value):
+            if set(value) != {"prompt"}:
+                raise ValueError("planning accepts only task text")
+            if plan_operation is None:
+                raise ResourceUnsupported("host visual inference unavailable")
+            return _json(await plan_operation(context, session_id, value["prompt"]))
+        return respond(request, VisualAction.OBSERVE, build, lambda:_body(request))
 
     @router.get("/sessions/{session_id}/actions/{action_id}")
     async def action_status(session_id: str, action_id: str, request: Request):

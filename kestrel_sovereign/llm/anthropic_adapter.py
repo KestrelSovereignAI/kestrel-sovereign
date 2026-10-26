@@ -1546,8 +1546,8 @@ class AnthropicAdapter(LLMAdapter):
 
         except Exception as e:
             logger.error(
-                f"Anthropic API error [credential={self._credential_identity()}]: {e}",
-                exc_info=True,
+                "Anthropic API error [credential=%s]: %s",
+                self._credential_identity(), type(e).__name__,
             )
             raise
 
@@ -1672,8 +1672,8 @@ class AnthropicAdapter(LLMAdapter):
 
         except Exception as e:
             logger.error(
-                f"Anthropic streaming error [credential={self._credential_identity()}]: {e}",
-                exc_info=True,
+                "Anthropic streaming error [credential=%s]: %s",
+                self._credential_identity(), type(e).__name__,
             )
             raise
 
@@ -2022,9 +2022,8 @@ class AnthropicAdapter(LLMAdapter):
 
         except Exception as e:
             logger.error(
-                f"Anthropic streaming with tools failed "
-                f"[credential={self._credential_identity()}]: {e}",
-                exc_info=True,
+                "Anthropic streaming with tools failed [credential=%s]: %s",
+                self._credential_identity(), type(e).__name__,
             )
             raise
 

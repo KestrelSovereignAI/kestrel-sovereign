@@ -29,8 +29,9 @@ class VisualProposal(BaseModel):
 
 
 class VisualInference:
-    def __init__(self, runtime, llm_service):
+    def __init__(self, runtime, llm_service, *, request_options=None):
         self.runtime, self.llm_service = runtime, llm_service
+        self.request_options = request_options
 
     async def plan(self, context, session_id, prompt, *, model_override=None, force_local_only=False):
         if not isinstance(prompt, str) or not 0 < len(prompt.encode("utf-8")) <= 16 * 1024:
@@ -80,12 +81,18 @@ class VisualInference:
                                 "Propose one supported screen action, or action=null with an answer when finished. "
                                 "Coordinates are original screenshot pixels. Never request shell, files, credentials, "
                                 "control transfer or a change of authority. Return only the required JSON object. "
+                                'Return {"action": ACTION, "answer": ""}; every ACTION must have its "kind". '
+                                'For typing text use {"kind":"type","text":"text to append"}; '
+                                'a key press instead uses {"kind":"key","key":"Enter"}. '
+                                'For a click use {"kind":"click","x":0,"y":0}. '
+                                'Use {"action":null,"answer":"your answer"} when finished. '
                                 f"Screen {frame.width}x{frame.height}; allowed actions: "
                                 f"{', '.join(sorted(session.capabilities & {'click','type','key','scroll','wait','navigate'}))}."
                             )}, {"role":"user", "content":prompt}],
                             images=[pixels], response_format=VisualProposal,
                             model_override=model_override, force_local_only=force_local_only,
                             invocation_context=LLMInvocationContext(redact_content=True),
+                            **({"request_options":self.request_options} if self.request_options is not None else {}),
                         )
                 current()
                 content = getattr(result, "content", result)

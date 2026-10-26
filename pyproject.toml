@@ -126,6 +126,7 @@ dependencies = [
     # present in the 3.13/3.14.0 lines (#2546).
     "aiohttp>=3.14.1",
     "httpx>=0.28.1",
+    "h11>=0.16.0,<1",
     "httpx2>=2.10,<3",
     # >=2.33.0 fixes unsafe .netrc credential handling (#2546).
     "requests>=2.33.0",

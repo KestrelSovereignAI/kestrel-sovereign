@@ -474,7 +474,7 @@ class GoogleAdapter(LLMAdapter):
             ), finish_reason)
 
         except Exception as e:
-            logger.error(f"Google Gemini API error: {e}", exc_info=True)
+            logger.error("Google Gemini API error: %s", type(e).__name__)
             raise
 
     @genai_stream
@@ -551,7 +551,7 @@ class GoogleAdapter(LLMAdapter):
             ), finish_reason)
 
         except Exception as e:
-            logger.error(f"Google Gemini streaming error: {e}", exc_info=True)
+            logger.error("Google Gemini streaming error: %s", type(e).__name__)
             raise
 
     async def get_streaming_response(
