@@ -69,8 +69,9 @@ There are no known external consumers requiring compatibility with these new
 interfaces. Replace conflicting ownership semantics deliberately; do not add
 aliases or a parallel artifact service to avoid a coordinated cutover.
 
-Core's native A2A cutover (#3803, under #3679) now consumes published SDK 0.42.3,
-which includes the computer/artifact contracts introduced in 0.41. SDK 0.40
+Core's native A2A cutover (#3803, under #3679) consumes the published SDK under
+the constraint declared in [pyproject.toml](../../pyproject.toml), including the
+computer/artifact contracts introduced in 0.41. SDK 0.40
 predates these contracts and is not an artifact runtime dependency.
 
 `ArtifactsFeature` registers the private `/api/artifacts` router through the

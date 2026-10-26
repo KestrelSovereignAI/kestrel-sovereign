@@ -59,7 +59,8 @@ caps are subject to migration, not reasons to downgrade the protocol target.
 | `kestrel-sovereign-sdk` | Remove draft wire models; shared host/feature credential and typed-part contracts; update all consumers |
 | Host manifest packages | Survey published constraints and editable sources; release incompatible consumers before the host floor moves |
 
-The coordinated Core cutover requires **SDK 0.42.3 or newer**. SDK
+The coordinated Core cutover uses the published SDK under the constraint in
+[Core's dependency manifest](../../pyproject.toml). SDK
 [PR #87](https://github.com/KestrelSovereignAI/kestrel-sovereign-sdk/pull/87)
 and [PR #88](https://github.com/KestrelSovereignAI/kestrel-sovereign-sdk/pull/88)
 add the shared computer-use, artifact, resource-scope and workspace-transfer
@@ -76,8 +77,11 @@ version headers, resolving SDK
 [#92](https://github.com/KestrelSovereignAI/kestrel-sovereign-sdk/issues/92).
 SDK 0.42.3 ([PR #95](https://github.com/KestrelSovereignAI/kestrel-sovereign-sdk/pull/95))
 is public and corrects native HTTP+JSON protocol error media types. Its wheel
-and source distribution match the release artifacts and reviewed source. Core's
-floor and lock consume that published repair through the normal package contract.
+and source distribution match the release artifacts and reviewed source.
+SDK 0.42.4 ([PR #96](https://github.com/KestrelSovereignAI/kestrel-sovereign-sdk/pull/96))
+adds a shared certifi dependency policy for certificate-bundle consumers;
+operating-system trust stores are unaffected. Core's floor and lock consume
+the published SDK through the canonical dependency declaration above.
 The retained optional gRPC handler's version negotiation remains tracked in SDK
 [#91](https://github.com/KestrelSovereignAI/kestrel-sovereign-sdk/issues/91);
 Core does not serve gRPC.
@@ -448,8 +452,9 @@ the registration key served at the authority-root well-known path. Other
 recipients expose only their directly configured card URLs. Blank or invalid
 configuration refuses publication.
 
-The implementation uses published SDK 0.42.3, including the reviewed signing
-and HTTP-authorization repairs. Push delivery and draft-route retirement are
+The implementation uses the published SDK selected by Core's dependency
+manifest, including the reviewed signing and HTTP-authorization repairs.
+Push delivery and draft-route retirement are
 implemented. The pinned TCK observation matrix and independent Go peer below
 record the measured interoperability scope; public release and deployment
 evidence remain in epic #3679.
@@ -1348,7 +1353,8 @@ effect and its durable terminal record.
 3. Add remote connections/OAuth/registry, then Apps and Tasks. Remote write
    scopes remain gated on [#596](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/596).
 4. Complete the native-A2A callers and storage migration, then publish/test
-   the coordinated Core dependency cutover with **SDK >=0.42.3**. Re-survey
+   the coordinated Core dependency cutover under the canonical SDK constraint
+   in Core's dependency manifest. Re-survey
    consumers and update their actual callers and constraints: the recorded
    survey found Core ceilings below 0.54 in Talon/Features and SDK ceilings
    below 0.40 in Telegram, Talon, Features and editable Claws/Eye/Flight.
