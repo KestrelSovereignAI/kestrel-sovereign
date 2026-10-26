@@ -4,11 +4,11 @@ from __future__ import annotations
 
 import ast
 import json
-from pathlib import Path
 import subprocess
 import sys
 import tempfile
 import unittest
+from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[2]
 LEGACY_PATHS = (

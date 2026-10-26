@@ -1,8 +1,7 @@
-#!/usr/bin/env python3
 """Retired ownerless Runpod helper; see Core issue #3828."""
 
-from pathlib import Path
 import sys
+from pathlib import Path
 
 
 def main() -> None:
