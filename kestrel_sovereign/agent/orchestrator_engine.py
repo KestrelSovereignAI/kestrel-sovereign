@@ -39,6 +39,7 @@ from typing import (
 from kestrel_sdk.hooks.base import HookEvent, HookInput
 from kestrel_sdk.llm import ToolCallStarted
 from kestrel_sdk.resources import ResourceConflict, ResourceOutcomeUnknown, ResourceUnsupported
+from kestrel_sdk.tools import DeferredToolResult
 
 from kestrel_sovereign._async_ownership import (
     OwnedTaskOutcome,
@@ -868,8 +869,53 @@ def _extract_inline_error_fields(result: Any) -> tuple[Optional[str], Optional[s
     return None, None
 
 
+async def _complete_post_tool_result(host, result, post_input):
+    """Complete policy before private UI delivery; execution is already done."""
+    deferred = isinstance(result, DeferredToolResult)
+    post_outputs = await host.hooks_manager.execute_hooks_parallel(
+        HookEvent.POST_TOOL_USE, post_input,
+        **({"require_complete": True} if deferred else {}),
+    )
+    require_execution_work(host)
+    if not isinstance(result, DeferredToolResult):
+        return result
+    allowed = all(evaluate_blocking_decision(output) is None for output in post_outputs)
+    post_result = post_input.tool_response
+    if not isinstance(post_result, dict):
+        # Consume the private factory, then fail the invalid policy contract.
+        # This must not be mistaken for a UI callback failure or restore data
+        # removed by the policy's replacement.
+        result.finalize(post_result, allowed=False)
+    reviewed = deepcopy(dict(post_result))
+    try:
+        completed = result.finalize(post_result, allowed=allowed)
+    except Exception as error:
+        if is_execution_control_error(error):
+            raise
+        # This is a separate UI operation after confirmed tool execution.
+        # Report its failure through the existing notice channel; do not turn
+        # the completed tool into a retryable error or expose callback text.
+        logging.getLogger(__name__).error("Deferred UI publication failed (%s)", type(error).__name__)
+        payload = reviewed
+        added = [{"type": "notice", "data": {
+            "level": "error", "title": "Tool UI delivery failed",
+            "body": "The tool completed, but its UI could not be delivered. Do not run it again to recover the UI.",
+        }}]
+        appended_parts = added
+    else:
+        payload, added = completed.result, completed.parts
+        appended_parts = None
+    from kestrel_sovereign.features.base import _attach_envelope_parts
+    _attach_envelope_parts(payload, payload.pop("parts", None), None,
+                           appended_parts=appended_parts)
+    host._reemit_envelope_parts({"parts": added})
+    return payload
+
+
 class OrchestratorEngineMixin:
     """Mixin providing orchestrator loop methods for KestrelAgent."""
+
+    supports_deferred_tool_results: bool = True
 
     @staticmethod
     def _signals_unfinished_tool_work(content: Optional[str]) -> bool:
@@ -1125,12 +1171,7 @@ class OrchestratorEngineMixin:
             tool_response=result if isinstance(result, dict) else {"result": str(result)},
             execution_time_ms=exec_duration_ms,
         )
-        await self.hooks_manager.execute_hooks_parallel(
-            HookEvent.POST_TOOL_USE,
-            post_hook_input,
-        )
-        require_execution_work(self)
-        return result
+        return await _complete_post_tool_result(self, result, post_hook_input)
 
     async def _generate_with_messages_bounded(
         self,
@@ -1754,11 +1795,7 @@ class OrchestratorEngineMixin:
             tool_response=result if isinstance(result, dict) else {"result": str(result)},
             execution_time_ms=exec_duration_ms,
         )
-        await self.hooks_manager.execute_hooks_parallel(
-            HookEvent.POST_TOOL_USE, post_input,
-        )
-        require_execution_work(self)
-        return result
+        return await _complete_post_tool_result(self, result, post_input)
 
     def _resolve_named_tool(self, tool_name: str) -> tuple[Any, Any]:
         """Find an ``(AgentTool, Feature)`` pair by tool name.

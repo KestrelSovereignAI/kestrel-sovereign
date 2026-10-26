@@ -106,7 +106,8 @@ dependencies = [
     # admissible. Verify installed host features against the resolved SDK
     # before release rather than preserving an obsolete minor ceiling.
     # 0.43 adds model exposure and governed registration bindings for external callers.
-    "kestrel-sovereign-sdk[a2a,httpx,tracing]>=0.43.0,<1",
+    # 0.44.1 adds private result delivery after completed post-tool policy.
+    "kestrel-sovereign-sdk[a2a,httpx,tracing]>=0.44.1,<1",
     # Native A2A implementation is owned by the shared SDK [a2a] extra.
     # Core and feature skill producers use the same reviewed vendored types.
     "protobuf>=5.29.5",
