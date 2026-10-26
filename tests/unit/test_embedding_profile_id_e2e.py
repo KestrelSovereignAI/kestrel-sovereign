@@ -207,3 +207,45 @@ async def test_e2e_registry_upsert_round_trip():
     finally:
         await db.close()
         os.unlink(path)
+
+
+async def test_same_profile_is_registered_in_each_actual_database(tmp_path):
+    from types import SimpleNamespace
+    from kestrel_sovereign.llm.embedding_service import derive_embedding_profile
+    from kestrel_sovereign.storage.sqla.embedding_profile import upsert_embedding_profile
+
+    profile = derive_embedding_profile(provider="fixture", model="multi-database", dim=3)
+    service = SimpleNamespace(describe=lambda: profile)
+    databases = []
+    try:
+        for name in ["first", "second"]:
+            db = await AsyncDatabase.sqlite(str(tmp_path / (name + ".db")))
+            databases.append(db)
+            await upsert_embedding_profile(db, service, profile.profile_id)
+            await upsert_embedding_profile(db, service, profile.profile_id)
+        assert [await db.fetchval("SELECT COUNT(*) FROM embedding_profiles")
+                for db in databases] == [1, 1]
+    finally:
+        for db in databases:
+            await db.close()
+
+
+async def test_rolled_back_profile_write_does_not_suppress_the_next_actual_upsert(tmp_path):
+    from types import SimpleNamespace
+    from kestrel_sovereign.llm.embedding_service import derive_embedding_profile
+    from kestrel_sovereign.storage.sqla.embedding_profile import upsert_embedding_profile
+
+    profile = derive_embedding_profile(provider="fixture", model="rollback-registry", dim=3)
+    service = SimpleNamespace(describe=lambda: profile)
+    db = await AsyncDatabase.sqlite(str(tmp_path / "rolled-back.db"))
+    try:
+        with pytest.raises(RuntimeError, match="intentional rollback"):
+            async with db.transaction():
+                await upsert_embedding_profile(db, service, profile.profile_id)
+                assert await db.fetchval("SELECT COUNT(*) FROM embedding_profiles") == 1
+                raise RuntimeError("intentional rollback")
+        assert await db.fetchval("SELECT COUNT(*) FROM embedding_profiles") == 0
+        await upsert_embedding_profile(db, service, profile.profile_id)
+        assert await db.fetchval("SELECT COUNT(*) FROM embedding_profiles") == 1
+    finally:
+        await db.close()
