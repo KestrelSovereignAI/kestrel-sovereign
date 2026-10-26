@@ -4652,7 +4652,10 @@ export async function finalizeStreamingMessage(msgDiv, content, paneOrElement = 
     // sliced to the same stream-baseline as ``content`` (#1560) and skipping
     // any already shown in a pre-restart bubble.
     const toolEvents = (pane && includePaneArtifacts) ? paneStreamToolEvents(pane) : null;
+    const generation = pane?.generation;
+    const originalParent = msgDiv.parentNode;
     await finalizeAgentContent(contentDiv, content, toolEvents);
+    if ((pane && pane.generation !== generation) || msgDiv.parentNode !== originalParent) return;
     // #1914: thinking bubbles belong to ONE bubble of a multi-bubble (parts)
     // turn, not every sealed segment. ``includeThinking`` (defaults to
     // ``includePaneArtifacts`` so existing callers are unchanged) lets the

@@ -15,6 +15,7 @@
 
 import API from './api.js';
 import { state, Toast } from './ui.js';
+import { unmountRenderers } from './ui-ext/renderers.js';
 import {
     updateContextStatus,
     wipeAgentChatPane,
@@ -141,6 +142,7 @@ export function fadeRemoveMessageNodes(messageId, fallbackDiv) {
     }
     if (!nodes.length && fallbackDiv) nodes = [fallbackDiv];
     for (const node of nodes) {
+        unmountRenderers(node);
         node.style.transition = 'opacity 0.2s, transform 0.2s';
         node.style.opacity = '0';
         node.style.transform = 'scale(0.95)';
