@@ -7,7 +7,7 @@ tags:
 - docs
 - architecture
 - architecture-spec
-timestamp: '2026-10-19T00:00:00Z'
+timestamp: '2026-10-26T00:00:00Z'
 status: design-of-record
 owner: architecture
 canonical: false
@@ -112,6 +112,24 @@ offline: stop the host, rotate the same agent database, and restart. Native comm
 expiry or lost delivery requires publication reconciliation, not a failed-save
 claim. Host registration does not by itself complete workspace transfers, producer
 tools, delegated grants or the end-to-end computer-use epic.
+
+### Embedding host migration for Core 0.56
+
+Embedding hosts upgrading from Core 0.54.2–0.55.1 must replace the public
+`ArtifactDeliveryMiddleware` import from `kestrel_sovereign.artifacts.http`
+with `PrivateDeliveryMiddleware` from
+`kestrel_sovereign.security.private_delivery`. The shared middleware now serves
+both artifacts and visual computer responses. Core's standard server installs
+it already; custom ASGI hosts must install it outside response-buffering
+middleware so its final-send acknowledgement reaches the actual transport.
+Keep the authenticated context and original operation lease alive until that
+send completes.
+
+The middleware's internal scope entry changed from `kestrel.artifact_delivery`
+to `kestrel.private_delivery`. Hosts must let the middleware create and manage
+this entry; manually populating either scope key does not establish delivery
+custody. Routers without the current middleware fail closed. There is no legacy
+scope-key fallback.
 
 While enabled, the feature sweeps up to 100 owners' expired staging every minute,
 including owners who never return. Disable/shutdown join the current sweep and
