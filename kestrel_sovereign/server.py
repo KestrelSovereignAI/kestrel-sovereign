@@ -4928,9 +4928,9 @@ app.add_middleware(SensitiveQueryStringRedactionMiddleware)
 
 # Keep private artifact authority through the real send, outside all of the
 # BaseHTTPMiddleware queues above. Feature routers alone cannot own delivery.
-from kestrel_sovereign.artifacts.http import ArtifactDeliveryMiddleware
+from kestrel_sovereign.security.private_delivery import PrivateDeliveryMiddleware
 
-app.add_middleware(ArtifactDeliveryMiddleware)
+app.add_middleware(PrivateDeliveryMiddleware)
 
 
 if SERVE_UI:
