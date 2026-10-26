@@ -1,3 +1,20 @@
+---
+type: Architecture Spec
+title: Retained host service discovery
+description: Original host service registration discovery bound to agent lifecycle and publication, independent of resource authority.
+resource: /docs/architecture/HOST_SERVICE_DISCOVERY.md
+tags:
+- docs
+- architecture
+- architecture-spec
+timestamp: '2026-10-26T00:00:00Z'
+status: implementation-candidate
+owner: architecture
+canonical: false
+generated: false
+privacy: public
+---
+
 # Retained host service discovery
 
 `OperatorRuntimeRegistry` remains the sole service registration authority.
