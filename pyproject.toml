@@ -389,6 +389,12 @@ kestrel = "kestrel_sovereign.testing.fixtures"
 [project.entry-points."kestrel_sovereign.conversation_providers"]
 [project.entry-points."kestrel_sovereign.storage_providers"]
 
+[project.entry-points."kestrel_sovereign.environment_providers"]
+local-docker-browser = "kestrel_sovereign.visual_computer.docker:environment_provider_factory"
+
+[project.entry-points."kestrel_sovereign.computer_drivers"]
+local-docker-browser = "kestrel_sovereign.visual_computer.docker:computer_driver_factory"
+
 [dependency-groups]
 dev = [
     {include-group = "test"},
