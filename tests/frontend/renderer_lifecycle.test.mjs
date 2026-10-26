@@ -314,8 +314,9 @@ test('mounting a pane retires leftover non-pane content', () => {
     }
 });
 
-test('a cleared pane cannot acquire new mounts after asynchronous finalization', async () => {
-    const id = 'late-finalization';
+for (const retirement of ['cleared', 'deleted', 'cleared-and-reattached']) {
+test(`a ${retirement} message cannot acquire new mounts after asynchronous finalization`, async () => {
+    const id = 'late-finalization-' + retirement;
     const witness = { mounts: 0, clicks: 0, disposals: 0 };
     const renderer = interactiveRenderer(id, witness);
     renderer.match = { tool: id };
@@ -338,11 +339,23 @@ test('a cleared pane cannot acquire new mounts after asynchronous finalization',
     try {
         const finalizing = chat.finalizeStreamingMessage(message, '', pane);
         await started;
-        chat.wipeAgentChatPane(id);
+        if (retirement === 'deleted') {
+            const removed = new Promise(resolve => {
+                const observer = new dom.window.MutationObserver(() => {
+                    if (!message.parentNode) { observer.disconnect(); resolve(); }
+                });
+                observer.observe(pane.element, { childList: true });
+            });
+            history.fadeRemoveMessageNodes(null, message);
+            await removed;
+        } else {
+            chat.wipeAgentChatPane(id);
+            if (retirement === 'cleared-and-reattached') pane.element.append(message);
+        }
         pane.thinkingItems = ['']; // a new turn started while the old finalizer was held
         release();
         await finalizing;
-        assert.equal(message.parentNode, null);
+        assert.equal(message.parentNode, retirement === 'cleared-and-reattached' ? pane.element : null);
         assert.deepEqual(witness, { mounts: 1, clicks: 0, disposals: 1 });
     } finally {
         release();
@@ -351,5 +364,6 @@ test('a cleared pane cannot acquire new mounts after asynchronous finalization',
         pane.element.remove();
     }
 });
+}
 
 test.after(() => { dom.window.close(); });
