@@ -16,6 +16,7 @@ import os
 import re
 import struct
 import uuid
+from bisect import bisect_right
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from time import monotonic, perf_counter
@@ -327,6 +328,11 @@ _SEARCH_STOPWORDS = frozenset({
     "about", "some", "any", "all", "each", "every", "so", "if", "then",
 })
 
+# How ``search_history`` admitted a hit (#3784): the whole query appears as
+# one phrase, or enough of its terms do (the tokenized fallback below).
+SEARCH_MATCH_EXACT = "exact"
+SEARCH_MATCH_TERMS = "terms"
+
 # Minimum fraction of query terms that must appear in content for a
 # tokenized fallback hit.  0.6 = at least 60 % of non-stopword query
 # tokens must be present — conservative enough to avoid noise while
@@ -390,6 +396,8 @@ _SEARCH_WRAPPER_LINE_RES = (
     ),
     re.compile(r"-+\s*END MEMORIES\s*-*", re.IGNORECASE),
 )
+# The sent-form tags removed last, after every pattern above has run.
+_SEARCH_WRAPPER_TAGS = ("<user_input>", "</user_input>")
 
 
 def _strip_search_wrappers(text: str) -> str:
@@ -416,7 +424,119 @@ def _strip_search_wrappers(text: str) -> str:
         s = pattern.sub(" ", s)
     for pattern in _SEARCH_WRAPPER_LINE_RES:
         s = pattern.sub(" ", s)
-    return s.replace("<user_input>", " ").replace("</user_input>", " ")
+    for tag in _SEARCH_WRAPPER_TAGS:
+        s = s.replace(tag, " ")
+    return s
+
+
+#: Every stage of :func:`_strip_search_wrappers`, in its order, as patterns.
+_SEARCH_PROJECTION_STAGES = (
+    *_SEARCH_WRAPPER_BLOCK_RES,
+    *_SEARCH_WRAPPER_LINE_RES,
+    *(re.compile(re.escape(tag)) for tag in _SEARCH_WRAPPER_TAGS),
+)
+
+
+@dataclass(frozen=True)
+class SearchProjection:
+    """A text's search-matching projection, with a way back to its offsets.
+
+    ``text`` is exactly :func:`_strip_search_wrappers` of the source. The
+    projection is built from segments: a *kept* run of source characters, or
+    the single space that replaced a removed wrapper span. ``starts[i]`` is
+    where segment ``i`` begins in ``text``; ``segments[i]`` is ``(source
+    start, source end, kept)``.
+    """
+
+    text: str
+    starts: Tuple[int, ...]
+    segments: Tuple[Tuple[int, int, bool], ...]
+
+    def _segment_at(self, position: int) -> Tuple[int, Tuple[int, int, bool]]:
+        index = bisect_right(self.starts, position) - 1
+        return self.starts[index], self.segments[index]
+
+    def source_span(self, start: int, end: int) -> Tuple[int, int]:
+        """The source ``[start, end)`` that ``text[start:end]`` came from.
+
+        A replacement space maps to the whole wrapper span it replaced, so a
+        span is never narrower in the source than in the projection.
+        """
+        if not self.segments:
+            return 0, 0
+        first, (source_start, source_end, kept) = self._segment_at(start)
+        begin = source_start + (start - first) if kept else source_start
+        if end <= start:
+            return begin, begin
+        last, (source_start, source_end, kept) = self._segment_at(end - 1)
+        return begin, (source_start + (end - last) if kept else source_end)
+
+
+def search_match_projection(text: str) -> SearchProjection:
+    """:func:`_strip_search_wrappers`, keeping each character's source offset.
+
+    Search admits a hit on the wrapper-free projection (#1537), so a caller
+    pointing at *where* a hit matched has to look in that projection too: in
+    the source text, a recalled ``[Memory N]`` line inside a bare RELEVANT
+    MEMORIES block can carry the same words and be found first (#3784). This
+    applies the same patterns in the same order, and maps the projection's
+    positions back to ``text`` with :meth:`SearchProjection.source_span`.
+    """
+    current = text or ""
+    projection = SearchProjection(
+        current,
+        (0,) if current else (),
+        ((0, len(current), True),) if current else (),
+    )
+    for pattern in _SEARCH_PROJECTION_STAGES:
+        spans = [m.span() for m in pattern.finditer(current) if m.end() > m.start()]
+        if spans:
+            projection = _replace_spans(projection, spans)
+            current = projection.text
+    return projection
+
+
+def _replace_spans(
+    projection: SearchProjection, spans: Sequence[Tuple[int, int]]
+) -> SearchProjection:
+    """``projection`` with each of its ordered, disjoint ``spans`` made one space."""
+    current, starts, segments = projection.text, projection.starts, projection.segments
+    parts: List[str] = []
+    new_starts: List[int] = []
+    new_segments: List[Tuple[int, int, bool]] = []
+    length = 0
+
+    def keep(lo: int, hi: int) -> None:
+        # Copy current[lo:hi] with the segments under it, split at lo and hi.
+        nonlocal length
+        if lo >= hi:
+            return
+        index = bisect_right(starts, lo) - 1
+        while index < len(starts) and starts[index] < hi:
+            seg_start = starts[index]
+            source_start, source_end, kept = segments[index]
+            seg_end = seg_start + (source_end - source_start if kept else 1)
+            a, b = max(lo, seg_start), min(hi, seg_end)
+            new_starts.append(length + (a - lo))
+            new_segments.append(
+                (source_start + (a - seg_start), source_start + (b - seg_start), True)
+                if kept else (source_start, source_end, False)
+            )
+            index += 1
+        parts.append(current[lo:hi])
+        length += hi - lo
+
+    previous = 0
+    for match_start, match_end in spans:
+        keep(previous, match_start)
+        source_start, source_end = projection.source_span(match_start, match_end)
+        new_starts.append(length)
+        new_segments.append((source_start, source_end, False))
+        parts.append(" ")
+        length += 1
+        previous = match_end
+    keep(previous, len(current))
+    return SearchProjection("".join(parts), tuple(new_starts), tuple(new_segments))
 
 
 # Negation tokens form a semantic-equivalence class for the fallback
@@ -3227,6 +3347,13 @@ class AsyncConversationStore:
             session_id: If provided, restrict search to messages tagged
                 with this session_id in metadata. Useful for "what did
                 we discuss in this session" queries.
+
+        Returns:
+            One dict per hit, best first: ``id``, ``role``, canonical
+            ``content``, cleaned ``metadata``, ``created_at``, and how it
+            matched — ``match`` is :data:`SEARCH_MATCH_EXACT` (``score``
+            1.0) or :data:`SEARCH_MATCH_TERMS` (``score`` is the share of
+            query terms found).
         """
         # SQL pre-filter when session_id is provided. We can match against
         # the metadata JSON because session_id is plaintext (not encrypted).
@@ -3244,7 +3371,7 @@ class AsyncConversationStore:
             # unchanged.
             esc = _escape_like_session_value(session_id)
             rows = await self.db.fetchall(
-                "SELECT id, role, content, metadata, rendered_content "
+                "SELECT id, role, content, metadata, created_at, rendered_content "
                 "FROM conversation_history "
                 "WHERE agent_id = ? AND deleted_at IS NULL AND archived_at IS NULL "
                 "AND (metadata LIKE ? ESCAPE '\\' OR metadata LIKE ? ESCAPE '\\') "
@@ -3259,7 +3386,7 @@ class AsyncConversationStore:
             # Fetch all live messages (up to 5000) and search client-side after decryption
             # SQL LIKE doesn't work on encrypted content, so we must decrypt first
             rows = await self.db.fetchall(
-                "SELECT id, role, content, metadata, rendered_content "
+                "SELECT id, role, content, metadata, created_at, rendered_content "
                 "FROM conversation_history "
                 "WHERE agent_id = ? AND deleted_at IS NULL AND archived_at IS NULL "
                 "ORDER BY id DESC LIMIT 5000",
@@ -3313,7 +3440,7 @@ class AsyncConversationStore:
             # search for what the user said should not false-match against
             # stamped <retrieved_context> from memories/RAG.
             content, _ = await self._resolve_canonical(
-                row_id, row[1], meta, content, row[4] if len(row) > 4 else None
+                row_id, row[1], meta, content, row[5] if len(row) > 5 else None
             )
 
             # Match against a wrapper-stripped projection (#1537): even
@@ -3330,21 +3457,30 @@ class AsyncConversationStore:
 
             cleaned_meta = None  # lazily computed
 
-            def _make_entry():
+            def _make_entry(match: str, score: float):
+                # ``id``/``created_at`` let a caller address the row again
+                # (#3784: a hit is a pointer plus an excerpt, and the full
+                # message is read by id); ``match``/``score`` say which test
+                # admitted it — the whole query as one phrase, or the share
+                # of its terms the tokenized fallback found.
                 nonlocal cleaned_meta
                 if cleaned_meta is None:
                     cleaned_meta = remove_enc_flag(meta)
                     if cleaned_meta:
                         cleaned_meta.pop('key_version', None)
                 return {
+                    'id': row_id,
                     'role': row[1],
                     'content': content,
                     'metadata': cleaned_meta if cleaned_meta else None,
+                    'created_at': row[4] if len(row) > 4 else None,
+                    'match': match,
+                    'score': score,
                 }
 
             # Exact substring match (original behaviour)
             if query_lower in content_lower:
-                exact_results.append(_make_entry())
+                exact_results.append(_make_entry(SEARCH_MATCH_EXACT, 1.0))
                 if len(exact_results) >= limit:
                     break
                 continue
@@ -3356,7 +3492,9 @@ class AsyncConversationStore:
             if use_token_fallback and len(exact_results) < limit:
                 score = _token_match_score(stripped_query_tokens, content_lower)
                 if score >= _TOKEN_MATCH_THRESHOLD:
-                    token_candidates.append((score, _make_entry()))
+                    token_candidates.append(
+                        (score, _make_entry(SEARCH_MATCH_TERMS, score))
+                    )
 
         # If exact matches filled the limit, return them directly.
         if len(exact_results) >= limit:

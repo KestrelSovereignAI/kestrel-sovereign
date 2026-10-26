@@ -517,8 +517,38 @@ layer can advertise `embedding_answerability_gate = false`.
 Only silent weighted retrieval/context injection is gated. The explicit
 `search_memory` history tool remains a literal operator/agent search surface;
 it suppresses the active question echo but does not ask the evidence judge.
+The active question is the user row the live turn persisted, the newest user
+row of the turn's own session other than an operator notice. It is not the
+newest question of the session being searched, so a search scoped to an older
+conversation still finds that conversation's last question. Outside a live
+turn (a command, a cron tick) nothing is suppressed.
 Candidates beyond the eight-item semantic shortlist are deliberately omitted
 from a gated result, even when a caller requests a larger limit.
+
+A `search_memory` hit is a pointer plus an excerpt, not the message (#3784).
+Each hit carries `message_id`, `session_id`, `role`, `timestamp`, `score`,
+`match` (`exact` phrase or `terms` fallback), a `snippet` of at most 400
+characters around the match, the `snippet_start`/`snippet_end` range it was
+cut from, the message's `content_chars`, and up to five bare concept names.
+No other metadata is returned. The whole result is sized to the orchestrator's
+tool-result cap (`KESTREL_MAX_TOOL_RESULT_CHARS`, measured as the orchestrator
+measures it), so it reaches the model whole, including in a subagent's prompt.
+Snippets shrink to 80 characters first; then the lowest-ranked hits are
+dropped, and the result is PARTIAL with `omitted`, `truncated: true` and an
+error naming how many. `read_message_by_id(message_id, offset, length)` reads
+a message in chunks under the same cap, reporting `total_chars` and
+`next_offset`. A hit's `snippet_start` is a valid `offset`: both index the same
+text, with sent-form wrappers stripped from user rows. The snippet is centred
+on where the hit matched in the same wrapper-free projection search admits hits
+on, mapped back to that text: a legacy row that quotes an older message inside
+a bare `RELEVANT MEMORIES` block is excerpted at what was said, not at the
+quote. A stored session id longer than a session id can be (512 characters) is
+clipped with a visible `[N chars omitted]` marker in hits and reads. Every
+chunk a read returns is measured against the cap; when the row's `session_id`,
+`role` and `timestamp` would leave no room for a single character, they are
+left out and named in `labels_omitted`, and a read that cannot fit one
+character at all fails rather than return an oversized result. The keyword
+fallback of `recall_emotional` returns the same compact, bounded hits.
 
 ### Emotional Score (20%)
 
