@@ -1,8 +1,9 @@
 """
 Global resource registry for test cleanup.
 
-This module provides crash-safe tracking of:
-- RunPod GPU instances
+Historical Runpod IDs are retained for canonical original-lease reconciliation;
+they never authorize automatic cloud cleanup. Other resource types retain the
+existing best-effort legacy behavior, not a verified physical cleanup guarantee:
 - Docker containers
 - Server subprocesses
 - Temporary files/directories
@@ -26,6 +27,8 @@ from datetime import datetime, timezone
 from typing import Optional, Callable, Dict, Any
 from pathlib import Path
 import logging
+
+from kestrel_sovereign.legacy_runpod import LegacyRunpodPathError
 
 logger = logging.getLogger(__name__)
 
@@ -66,7 +69,7 @@ class ResourceRegistry:
     """
     Singleton registry for tracked resources.
 
-    Ensures resources are cleaned up even on crashes via:
+    Records legacy test resources and installs best-effort cleanup hooks:
     - atexit handler (normal exit)
     - signal handlers (Ctrl+C, kill)
     - Persistent file for crash recovery
@@ -110,24 +113,44 @@ class ResourceRegistry:
         self._handlers_installed = True
 
     def _signal_handler(self, signum, frame):
-        """Handle signals by cleaning up then re-raising.
+        """Attempt cleanup, then restore and re-send the original signal.
 
-        Note: We use raise SystemExit instead of sys.exit() to allow pytest
-        to handle the exit properly and complete its hooks.
+        An unresolved Runpod record or failed diagnostic must not consume
+        shutdown or imply successful cleanup.
         """
-        print(f"\n[CLEANUP] Received signal {signum}, cleaning up resources...")
-        self.cleanup_all()
-        # Re-raise the original signal to let the default handler run
-        signal.signal(signum, signal.SIG_DFL)
-        os.kill(os.getpid(), signum)
+        try:
+            print(f"\n[CLEANUP] Received signal {signum}, cleaning up resources...")
+            self.cleanup_all()
+        except LegacyRunpodPathError as error:
+            logger.error("Unresolved cloud resource during signal cleanup: %s", error)
+        finally:
+            # A refusal/logging failure must never convert SIGINT/SIGTERM into
+            # an ordinary caught error. Original unresolved records remain.
+            signal.signal(signum, signal.SIG_DFL)
+            os.kill(os.getpid(), signum)
 
     def _recover_from_crash(self):
         """Check for resources from a crashed previous run."""
         if not REGISTRY_FILE.exists():
             return
 
+        data = json.loads(REGISTRY_FILE.read_text())
+        if not isinstance(data, dict):
+            raise ValueError("Resource registry is invalid; original records retained")
+        # Historical IDs are reconciliation evidence, not provider authority.
+        # Refuse BEFORE the old generic recovery handler can erase this file
+        # or perform any unrelated cleanup under an unverified registry.
+        for resource_id, record in data.items():
+            if not isinstance(record, dict):
+                raise ValueError("Resource registry is invalid; original records retained")
+            self._cleanup_resource_by_type(
+                record.get("resource_type"), resource_id,
+                record.get("metadata", {}), validate_only=True,
+            )
+            if record.get("resource_type") == "runpod":
+                self._cleanup_runpod(resource_id)
+
         try:
-            data = json.loads(REGISTRY_FILE.read_text())
             if data:
                 print(f"\n[RECOVERY] Found {len(data)} orphaned resources from previous crash")
                 for resource_id, resource_data in data.items():
@@ -198,6 +221,15 @@ class ResourceRegistry:
 
         if self._cleanup_in_progress:
             return
+        # No provider operation, memory deletion or file unlink is permitted
+        # for legacy cloud records without the original canonical lease.
+        for resource in self._resources.values():
+            self._cleanup_resource_by_type(
+                resource.resource_type, resource.resource_id,
+                resource.metadata, validate_only=True,
+            )
+            if resource.resource_type == "runpod":
+                self._cleanup_runpod(resource.resource_id)
         self._cleanup_in_progress = True
 
         if self._resources:
@@ -227,38 +259,30 @@ class ResourceRegistry:
 
         self._cleanup_in_progress = False
 
-    def _cleanup_resource_by_type(self, resource_type: str, resource_id: str, metadata: Dict[str, Any]):
-        """Clean up a resource based on its type."""
-        if resource_type == "runpod":
-            self._cleanup_runpod(resource_id)
-        elif resource_type == "docker":
-            self._cleanup_docker(resource_id)
-        elif resource_type == "subprocess":
-            self._cleanup_subprocess(resource_id, metadata)
-        elif resource_type == "tempdir":
-            self._cleanup_tempdir(resource_id)
+    def _cleanup_resource_by_type(
+        self, resource_type: object, resource_id: str, metadata: Dict[str, Any],
+        *, validate_only: bool = False,
+    ):
+        """Validate against the same finite dispatch before any cleanup."""
+        cleaners = {
+            "runpod": self._cleanup_runpod,
+            "docker": self._cleanup_docker,
+            "subprocess": self._cleanup_subprocess,
+            "tempdir": self._cleanup_tempdir,
+        }
+        if not isinstance(resource_type, str) or resource_type not in cleaners:
+            raise ValueError("Resource registry type is invalid; original records retained")
+        if validate_only:
+            return
+        cleaner = cleaners[resource_type]
+        if resource_type == "subprocess":
+            cleaner(resource_id, metadata)
         else:
-            logger.warning(f"Unknown resource type: {resource_type}")
+            cleaner(resource_id)
 
     def _cleanup_runpod(self, pod_id: str):
-        """Terminate a RunPod instance."""
-        try:
-            import runpod
-            api_key = os.environ.get("RUNPOD_API_KEY")
-            if api_key:
-                runpod.api_key = api_key
-                try:
-                    runpod.stop_pod(pod_id)
-                except Exception:
-                    pass
-                runpod.terminate_pod(pod_id)
-                print(f"[CLEANUP] Terminated RunPod {pod_id}")
-            else:
-                print(f"[CLEANUP] Cannot cleanup RunPod {pod_id}: No API key")
-        except ImportError:
-            print(f"[CLEANUP] Cannot cleanup RunPod {pod_id}: runpod module not installed")
-        except Exception as e:
-            print(f"[CLEANUP] Error terminating RunPod {pod_id}: {e}")
+        """Retain an unresolved historical ID; never infer cleanup authority."""
+        raise LegacyRunpodPathError("test resource cleanup", resource_id=pod_id)
 
     def _cleanup_docker(self, container_id: str):
         """Stop and remove a Docker container."""
@@ -337,7 +361,7 @@ registry = ResourceRegistry()
 
 # Convenience functions for common resource types
 def track_runpod(pod_id: str, name: str = "", cost_per_hr: float = 0.0) -> str:
-    """Track a RunPod instance for cleanup."""
+    """Retain a historical ID for reconciliation, never cleanup authority."""
     resource = TrackedResource(
         resource_type="runpod",
         resource_id=pod_id,
