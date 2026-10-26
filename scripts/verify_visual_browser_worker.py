@@ -24,7 +24,7 @@ def exercise(checked, cid, output, *, monotonic=time.monotonic):
     incarnation = checked(["exec", cid, "python", "-c",
         "from pathlib import Path; print(Path('/tmp/kestrel-browser/incarnation').read_text())"]).decode().strip()
     initial = {"schema_version": 1, "request": request, "secret": secret, "document_html": html,
-               "incarnation": incarnation}
+               "incarnation": incarnation, "network_profile": None}
     checked([*program, "initialize"], input=json.dumps(initial).encode())
     checked(["exec", cid, "python", "-c",
              ("import pathlib,time; p=pathlib.Path('/tmp/kestrel-browser/worker.sock'); "

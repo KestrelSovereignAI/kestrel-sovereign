@@ -147,7 +147,7 @@ async def test_priority_control_and_reconciliation_use_dedicated_transport(monke
     async def bound(value, **options):
         return {"container_id": CID}
     calls = []
-    async def rpc(cid, value, *, mode=None):
+    async def rpc(cid, value, *, mode=None, **options):
         calls.append((mode, value["operation"]))
         return {"id": value["id"], "result": {}}
     monkeypatch.setattr(driver, "_bound", bound)

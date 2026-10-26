@@ -20,7 +20,7 @@ from kestrel_sovereign.visual_computer.docker import (
 from scripts.verify_visual_browser_sandbox import CONTEXT, source_identity
 
 
-async def run(output, socket):
+async def run(output, socket, *, scenario=None):
     output.mkdir(parents=True, mode=0o700, exist_ok=False)
     identity = uuid4().hex
     tag = "kestrel-visual-adapter-proof:" + identity
@@ -45,6 +45,13 @@ async def run(output, socket):
         if image["Config"].get("Labels", {}).get(LABEL + ".proof") != identity:
             raise RuntimeError("image ownership mismatch")
         record()
+        if scenario is not None:
+            custody["result"] = await scenario(boundary, image, identity, output)
+            if source_identity() != custody["source"]:
+                raise RuntimeError("source changed during real Docker acceptance")
+            custody["source_unchanged"] = True
+            record()
+            return custody
         provider = DockerEnvironmentProvider(docker_socket=socket, image="local-worker@" + image["Id"],
                                                credential_key=secrets.token_bytes(32))
         scope = ResourceScope(tenant_id="synthetic", principal_id="adapter-proof")

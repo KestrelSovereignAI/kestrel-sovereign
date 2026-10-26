@@ -2,9 +2,10 @@
 
 This is the pinned browser image and sandbox verification for Core #3709,
 part of #3703. It contains Chromium, a synthetic offline probe and a private persistent
-browser worker. Host SDK-driver registration, current-grant authorization,
-provider custody, artifact transfer, human takeover and governed network access
-remain separate work. It is not a completed visual-computer capability.
+browser worker, concrete SDK adapters, contained workspace transport and a
+bounded active-call HTTP relay. Host authorization, durable custody and artifact
+publication remain the canonical host's responsibility. The local proofs below
+do not establish a completed visual-computer product or remote-provider support.
 
 Build and verify on an available local Docker daemon:
 
@@ -105,14 +106,16 @@ the trusted host must avoid holding idle slots and retain physical cleanup
 authority if control transport is unavailable. Priority human control remains
 part of host integration. Pause fences
 queued input before draining accepted work, suspends observations and advances
-the control epoch; resume advances it again. This is not human takeover. A frame
+the control epoch; resume advances it again. Logical takeover fences the agent
+with a paused human controller; a human input transport is not installed. A frame
 is an observation identity, not a promise that autonomous page content is static.
 
 Only screenshot, click, text, a restricted key set, scroll and wait are supported.
 Waits send no browser input: a wait that cannot fit its deadline is refused,
 and an interrupted wait has a known denial without retiring a healthy page.
 The maximum 10-second wait has a separate bounded scheduling allowance.
-Navigation, clipboard, files, exec and takeover are refused. Sessions last at most
+Navigation requires the explicit HTTP profile below; file bytes use the distinct
+negotiated workspace extension. Clipboard and unrestricted exec are refused. Sessions last at most
 one hour, with wall and monotonic expiry, bounded receipts and IPC, an async
 retirement loop and an OS process deadline (up to ten seconds of teardown grace).
 With the reviewed no-restart Docker configuration, process termination retires
@@ -178,7 +181,7 @@ fixtures. This local proof is not a completed product or a remote-provider claim
 ## Negotiated workspace transport
 
 The current image pins SDK 0.43.0 and carries the required
-`io.kestrel.visual-computer.worker-contract=sdk-0.43-workspace-v1` label.
+`io.kestrel.visual-computer.worker-contract=sdk-0.43-http-v1` label.
 Older images are refused rather than claiming their file-transfer capability.
 The driver implements the SDK's `WorkspaceTransferProvider` extension;
 `workspace_transfer()` returns a distinct transport with all standard prepare,
@@ -209,3 +212,71 @@ Limits are 32 selected files, 128 KiB per file, 2 MiB per transfer, path depth
 per worker. Completed workspaces retain their quota until lease retirement.
 The outer tmpfs/resource limits still apply. This transport does not mount or
 address ambient host files and does not publish an artifact itself.
+
+## Bounded active-call HTTP profile
+
+The offline profile remains the default. An explicit private `network_policy`
+setting on both factories selects up to eight exact HTTP(S) origins and GET/HEAD
+methods; the provider's computed `profile_id` binds that policy digest. Normal
+settings contain `origins`, `methods` and an `address_pins` mapping from each
+hostname origin to one explicit trusted public IPv4 address. For example,
+`{"origins":["https://example.com"],"methods":["GET","HEAD"],"address_pins":{"https://example.com":"93.184.216.34"}}`
+describes an operator-maintained pin, not a verified current service address.
+Literal IPv4 origins pin themselves. Missing, extra or nonpublic pins and
+unmeasured IPv6 egress are refused. Runtime libc DNS is never scheduled: its
+accepted OS resolver work could outlive task cancellation. The gateway connects
+only the admitted literal address, retaining the original HTTP Host, TLS SNI
+and normal certificate validation. DNS changes require a newly admitted policy.
+No ambient proxy,
+cookie jar, authentication header, operator profile or retry is used.
+
+The browser still has `network=none`. A private authenticated relay carries
+bounded HTTP jobs through the exact session, control epoch and action ID to the
+host gateway. The trusted host injects its `egress_guard(session, action_id)`
+lexical callback. An owned child task holds the original operation's authority
+and privacy lease across each job; synchronous current checks run before
+connect, request send and response delivery. Another owned child retains this
+same guard for every input, including offline input, through asynchronous
+container inspection and the final stdin write. A guard rejection before that
+write sends no input; transport loss or revocation afterward remains unknown.
+The bare SDK adapter does not replace its caller's authorization responsibility.
+
+Only the original active `act` RPC can admit jobs. Its closure cancels and joins
+all gateway work and seals worker response handlers. Idle pages, waits, observe,
+status and background requests acquire no HTTP authority. Stop and takeover
+close accepted sockets and drain Chromium fulfillment handlers before a
+successful fence. Cancelled CDP input or uncertain response fulfillment still
+retires the worker; cancelling a waiter cannot unsend a browser effect.
+
+This deliberately narrow profile refuses redirects: Playwright's routing API
+does not intercept every redirect hop. It also refuses credentialed browser
+requests, Set-Cookie, compressed responses, attachments, protocol upgrades and
+informational responses. Service workers and downloads are disabled;
+WebSocket routes close, WebRTC constructors refuse, and unsupported non-HTTP
+channels have no gateway. Chromium's independent network namespace denies
+direct TCP/UDP and DNS. No unauthenticated CDP or browser socket is published.
+Per action limits are 16 HTTP requests, 4096 URL characters, 16 KiB response
+headers, 128 KiB per response body and eight seconds per job, within the action
+and fixed lease deadlines. Request URLs, query values, headers, bodies and
+remote exception messages never enter normal gateway logs or audit output.
+
+Run the explicit controlled test with a new private evidence directory:
+
+```sh
+python -m scripts.verify_visual_docker_egress \
+  --docker-socket /absolute/path/to/local/docker.sock \
+  --output /absolute/path/to/new/private-http-evidence
+```
+
+It creates two labelled, bounded synthetic Docker servers and verifies each
+exact container ID and local port. A test-only Python object admits only the
+one owned endpoint through the same literal-pin connection path; ordinary
+configuration cannot enable this exception. A host resolver sentinel fails the
+real proof if runtime libc DNS is called.
+Actual Chromium navigates, fetches a subresource, edits pixels, exports its DOM,
+refuses forbidden/background channels and redirects, and closes accepted slow
+HTTP sockets before both pause and takeover acknowledgements. Original unknown
+action IDs remain reconcilable; stale epochs fail. All owned containers and the
+image are removed by exact identity. This proves local controlled HTTP; it does
+not establish a public HTTPS interoperability, remote platform, cookie login,
+redirect, manual human-input or general browsing capability.

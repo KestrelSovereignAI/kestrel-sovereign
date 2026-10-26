@@ -8,3 +8,4 @@
 !wire.py
 !rpc_client.py
 !workspace.py
+!network.py

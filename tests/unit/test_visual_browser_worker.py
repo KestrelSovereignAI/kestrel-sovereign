@@ -188,7 +188,7 @@ def test_bootstrap_is_one_shot_and_secret_file_is_private(ipc_dir, monkeypatch):
     _driver, _page, session = controller()
     request = {key: session[key] for key in ("schema_version", "session_id", "scope", "lease_id", "surface", "expires_at")}
     request["required_capabilities"] = ["screenshot"]
-    raw = wire.encode({"schema_version": 1, "secret": SECRET, "request": request, "document_html": "<input>", "incarnation": "c" * 64})
+    raw = wire.encode({"schema_version": 1, "secret": SECRET, "request": request, "document_html": "<input>", "incarnation": "c" * 64, "network_profile": None})
     monkeypatch.setattr(rpc, "DIRECTORY", ipc_dir)
     (ipc_dir / "incarnation").write_text("c" * 64)
     assert wire.decode(rpc.initialize(raw))["submitted"]
@@ -198,7 +198,7 @@ def test_bootstrap_is_one_shot_and_secret_file_is_private(ipc_dir, monkeypatch):
     path.unlink()  # Worker consumes it; a second init still cannot replace custody.
     with pytest.raises(FileExistsError):
         rpc.initialize(raw)
-    for invalid in (b"{}", wire.encode({"schema_version": True, "secret": SECRET, "request": request, "document_html": "", "incarnation": "c" * 64})):
+    for invalid in (b"{}", wire.encode({"schema_version": True, "secret": SECRET, "request": request, "document_html": "", "incarnation": "c" * 64, "network_profile": None})):
         with pytest.raises(worker.Refused):
             worker.bootstrap(wire.decode(invalid))
 
@@ -207,7 +207,7 @@ def test_ipc_byte_budget_includes_worst_case_json_escaping():
     _driver, _page, session = controller()
     request = {key: session[key] for key in ("schema_version", "session_id", "scope", "lease_id", "surface", "expires_at")}
     request["required_capabilities"] = ["screenshot"]
-    initial = {"schema_version": 1, "secret": SECRET, "request": request, "document_html": "\x00" * 65536, "incarnation": "c" * 64}
+    initial = {"schema_version": 1, "secret": SECRET, "request": request, "document_html": "\x00" * 65536, "incarnation": "c" * 64, "network_profile": None}
     assert len(wire.encode(worker.bootstrap(initial))) <= wire.MAX_REQUEST
     typed = message("act", {"session": session, "request": {"action": {"kind": "type", "text": "😀" * 16384}}})
     assert len(wire.encode(typed)) <= wire.MAX_REQUEST
@@ -297,7 +297,7 @@ def test_bootstrap_cannot_cross_a_worker_process_replacement(ipc_dir, monkeypatc
     request = {key: session[key] for key in ("schema_version", "session_id", "scope", "lease_id", "surface", "expires_at")}
     request["required_capabilities"] = ["screenshot"]
     raw = wire.encode({"schema_version": 1, "secret": SECRET, "request": request,
-                       "document_html": "", "incarnation": "c" * 64})
+                       "document_html": "", "incarnation": "c" * 64, "network_profile": None})
     monkeypatch.setattr(rpc, "DIRECTORY", ipc_dir)
     (ipc_dir / "incarnation").write_text("d" * 64)
     with pytest.raises(ValueError, match="incarnation"):

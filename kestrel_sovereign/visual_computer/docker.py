@@ -32,6 +32,7 @@ from kestrel_sdk.resources import (
     ResourceUnsupported,
 )
 from .docker_policy import container_arguments, verify_container
+from .docker_egress import DockerEgressPolicy, HTTPGateway, EgressDenied, EgressUnknown
 
 PROVIDER = "local-docker-browser"
 PROFILE = "offline-v1"
@@ -39,7 +40,7 @@ OPERATIONS = frozenset({"screenshot", "click", "type", "key", "scroll", "wait", 
 # Takeover transfers custody and fences automation; human input transport is a
 # separate capability. It never exposes CDP or unrestricted browser execution.
 LABEL = "io.kestrel.visual-computer"
-WORKER_CONTRACT = "sdk-0.43-workspace-v1"
+WORKER_CONTRACT = "sdk-0.43-http-v1"
 MAX_OUTPUT = 24 * 1024 * 1024
 ID = re.compile(r"^[a-f0-9]{64}$")
 READ_INCARNATION = (
@@ -97,18 +98,31 @@ class DockerBoundary:
             raise ResourceUnsupported("docker_cli_unavailable")
         self.executable = executable
 
-    async def invoke(self, arguments, *, data=None, timeout=25):
+    async def invoke(self, arguments, *, data=None, timeout=25, current=None):
         # A new empty Docker config disables user contexts and proxy injection.
         # HOME remains the real home, but no operator configuration is consumed.
         environment = {"HOME": os.environ.get("HOME", ""), "PATH": os.defpath,
                        "PYTHON_DOTENV_DISABLED": "1"}
         with tempfile.TemporaryDirectory(prefix="kestrel-private-docker-") as config:
-            process = await asyncio.create_subprocess_exec(
+            launch = asyncio.create_task(asyncio.create_subprocess_exec(
                 self.executable, "--config", config, "--host", f"unix://{self.socket}",
                 *arguments, stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
                 env=environment, cwd=Path(__file__).parent,
-            )
+            ))
+            try:
+                process = await asyncio.shield(launch)
+            except BaseException:
+                # Cancellation can race OS process creation. Retain the launch
+                # until its exact process is known, then reap without stdin.
+                process = await launch
+                if process.returncode is None:
+                    try:
+                        process.kill()
+                    except ProcessLookupError:
+                        pass
+                await process.wait()
+                raise
             async def read(stream):
                 chunks, size = [], 0
                 while chunk := await stream.read(min(65536, MAX_OUTPUT + 1 - size)):
@@ -117,21 +131,49 @@ class DockerBoundary:
                         raise DockerCommandError("docker_response_limit")
                     chunks.append(chunk)
                 return b"".join(chunks)
+            dispatched = False
             async def write():
-                if data:
-                    process.stdin.write(data)
-                    await process.stdin.drain()
-                process.stdin.close()
+                nonlocal dispatched
+                try:
+                    if current is not None:
+                        current()
+                    if data:
+                        dispatched = True
+                        process.stdin.write(data)
+                        await process.stdin.drain()
+                finally:
+                    process.stdin.close()
+            async def retire():
+                if process.returncode is None:
+                    try:
+                        process.kill()
+                    except ProcessLookupError:
+                        pass
+                await process.wait()
+            streams = [asyncio.create_task(write()), asyncio.create_task(read(process.stdout)),
+                       asyncio.create_task(read(process.stderr))]
             try:
                 async with asyncio.timeout(timeout):
-                    _, output, error = await asyncio.gather(write(), read(process.stdout), read(process.stderr))
+                    _, output, error = await asyncio.gather(*streams)
                     await process.wait()
+                    if current is not None:
+                        current()
             except (TimeoutError, asyncio.CancelledError, OSError, DockerCommandError):
-                if process.returncode is None:
-                    process.kill()
-                await process.wait()
+                await retire()
                 # Killing the CLI cannot unsend an accepted Docker/browser call.
                 raise ResourceOutcomeUnknown("docker_transport_outcome_unknown") from None
+            except BaseException:
+                # Authority can revoke during process launch or output delivery.
+                # Join this owned process even when its check rejects the call.
+                await retire()
+                if dispatched:
+                    raise ResourceOutcomeUnknown("driver_effect_outcome_unknown") from None
+                raise
+            finally:
+                for task in streams:
+                    if not task.done():
+                        task.cancel()
+                await asyncio.gather(*streams, return_exceptions=True)
             if process.returncode:
                 # Only this exact daemon response establishes current absence.
                 target = arguments[-1]
@@ -160,12 +202,12 @@ class DockerBoundary:
                 or info.get("Architecture") != "aarch64" or info.get("DefaultRuntime") != "runc"):
             raise ResourceUnsupported("unsupported_docker_platform_requires_real_conformance")
 
-    async def rpc(self, cid, value, *, mode=None):
+    async def rpc(self, cid, value, *, mode=None, current=None):
         command = ["exec", "-i", cid, "python", "/opt/kestrel-browser/rpc_client.py"]
         if mode:
             command.append(mode)
         try:
-            return json.loads(await self.invoke(command, data=_json(value) + b"\n"))
+            return json.loads(await self.invoke(command, data=_json(value) + b"\n", current=current))
         except (ValueError, TypeError):
             raise ResourceOutcomeUnknown("invalid_private_worker_response") from None
 
@@ -198,8 +240,11 @@ def _admit(record, image, identity):
 class DockerEnvironmentProvider:
     """Idempotent acquisition with the canonical host as sole durable owner."""
 
-    def __init__(self, *, docker_socket, image, credential_key, profile_id=PROFILE):
-        if not isinstance(image, str) or not IMAGE.fullmatch(image) or profile_id != PROFILE:
+    def __init__(self, *, docker_socket, image, credential_key, profile_id=None, network_policy=None):
+        self.policy = DockerEgressPolicy.from_settings(network_policy)
+        self.profile_id = self.policy.profile_id if self.policy is not None else PROFILE
+        self.operations = OPERATIONS | ({"navigate"} if self.policy is not None else set())
+        if not isinstance(image, str) or not IMAGE.fullmatch(image) or profile_id not in {None, self.profile_id}:
             raise ResourceUnsupported("unsupported_docker_image_or_profile")
         if isinstance(credential_key, SecretBytes):
             credential_key = credential_key.get_secret_value()
@@ -213,12 +258,12 @@ class DockerEnvironmentProvider:
 
     async def capabilities(self):
         return EnvironmentCapabilities(provider_id=PROVIDER, location="local", surfaces=frozenset({"browser"}),
-                                       operations=OPERATIONS)
+                                       operations=frozenset(self.operations))
 
     def _request(self, request):
-        if (request.provider_id != PROVIDER or request.profile_id != PROFILE or request.image != self.image
+        if (request.provider_id != PROVIDER or request.profile_id != self.profile_id or request.image != self.image
                 or request.location != "local" or request.region is not None or request.surface != "browser"
-                or not request.required_capabilities <= OPERATIONS
+                or not request.required_capabilities <= self.operations
                 or not 0 < (request.expires_at - _now()).total_seconds() <= 3600):
             raise ResourceUnsupported("unsupported_offline_browser_request")
 
@@ -291,7 +336,7 @@ class DockerEnvironmentProvider:
         state = "pending" if live and _now() < lease.expires_at else "failed"
         if live:
             connection = await self.connect(scope, lease)
-            driver = DockerComputerDriver(docker_socket=self.boundary.socket)
+            driver = DockerComputerDriver(docker_socket=self.boundary.socket, network_policy=self.policy)
             try:
                 admission = await driver._admission(connection)
                 if admission:
@@ -309,7 +354,7 @@ class DockerEnvironmentProvider:
         incarnation = (await self.boundary.invoke(["exec", record["Id"], "python", "-c", READ_INCARNATION])).decode().strip()
         if not ID.fullmatch(incarnation):
             raise ResourceOutcomeUnknown("worker_incarnation_unknown")
-        endpoint = {"incarnation": incarnation, "container_id": record["Id"], "image_id": image["Id"], "identity": identity,
+        endpoint = {"profile_id": self.profile_id, "incarnation": incarnation, "container_id": record["Id"], "image_id": image["Id"], "identity": identity,
                     "scope": scope.model_dump(mode="json"), "lease_id": lease.lease_id,
                     "expires_at": lease.expires_at.isoformat(), "pid": record["State"]["Pid"],
                     "started_at": record["State"]["StartedAt"]}
@@ -334,11 +379,16 @@ class DockerEnvironmentProvider:
 class DockerComputerDriver:
     driver_id = PROVIDER
 
-    def __init__(self, *, docker_socket, egress_guard=None):
+    def __init__(self, *, docker_socket, egress_guard=None, network_policy=None):
         if egress_guard is not None and not callable(egress_guard):
             raise ResourceUnsupported("invalid_private_egress_guard")
         self.boundary = DockerBoundary(docker_socket)
         self.egress_guard = egress_guard
+        self.policy = DockerEgressPolicy.from_settings(network_policy)
+        self.profile_id = self.policy.profile_id if self.policy is not None else PROFILE
+        self.operations = OPERATIONS | ({"navigate"} if self.policy is not None else set())
+        self._pumps = {}
+        self._borrowers = {}
         self._connections = {}
 
     def workspace_transfer(self):
@@ -347,9 +397,9 @@ class DockerComputerDriver:
     async def _bound(self, connection, *, cleanup=False):
         try:
             endpoint = json.loads(connection.endpoint.get_secret_value())
-            if (set(endpoint) != {"container_id", "image_id", "identity", "scope", "lease_id", "expires_at", "pid", "started_at", "incarnation"}
+            if (set(endpoint) != {"container_id", "image_id", "identity", "scope", "lease_id", "expires_at", "pid", "started_at", "incarnation", "profile_id"}
                     or not ID.fullmatch(endpoint["container_id"]) or not ID.fullmatch(endpoint["incarnation"]) or not ID.fullmatch(endpoint["identity"])
-                    or connection.driver_id != PROVIDER or endpoint["lease_id"] != connection.lease_id
+                    or endpoint["profile_id"] != self.profile_id or connection.driver_id != PROVIDER or endpoint["lease_id"] != connection.lease_id
                     or datetime.fromisoformat(endpoint["expires_at"]) != connection.expires_at
                     or (_now() >= connection.expires_at and not cleanup)):
                 raise ValueError
@@ -386,7 +436,8 @@ class DockerComputerDriver:
         # All public identity/bounds checks happen before any credential is sent.
         if (connection.driver_id != self.driver_id or connection.lease_id != request.lease_id
                 or request.expires_at > connection.expires_at or _now() >= request.expires_at
-                or request.surface != "browser" or not request.required_capabilities <= OPERATIONS):
+                or request.surface != "browser" or not request.required_capabilities <= self.operations
+                or (self.policy is not None and self.egress_guard is None)):
             raise ResourceUnsupported("invalid_browser_connection_or_capabilities")
         endpoint = await self._bound(connection)
         if endpoint["scope"] != request.scope.model_dump(mode="json"):
@@ -409,6 +460,7 @@ class DockerComputerDriver:
             # cookie profile, file access or operator content.
             await self.boundary.rpc(endpoint["container_id"], {"schema_version": 1,
                 "secret": connection.credential.get_secret_value(), "request": payload, "incarnation": endpoint["incarnation"],
+                "network_profile": self.policy.profile_id if self.policy is not None else None,
                 "document_html": "<!doctype html><title>Private workspace</title><body contenteditable=true style='min-height:500px;font:24px sans-serif'></body>"}, mode="initialize")
         elif marker.strip() != b"1":
             raise ResourceOutcomeUnknown("worker_bootstrap_state_unknown")
@@ -422,15 +474,19 @@ class DockerComputerDriver:
             raise ResourceConflict("session_request_conflict")
         return session
 
-    async def _rpc(self, session_id, operation, arguments, *, priority=False, cleanup=False):
+    async def _rpc(self, session_id, operation, arguments, *, priority=False, cleanup=False, current=None):
         connection = self._connections.get(session_id)
         if connection is None:
             raise ResourceNotFound("session_connection_unavailable")
         endpoint = await self._bound(connection, cleanup=cleanup)
+        if current is not None:
+            current()
         identifier = uuid4().hex
         response = await self.boundary.rpc(endpoint["container_id"], {"schema_version": 1,
             "secret": connection.credential.get_secret_value(), "id": identifier,
-            "operation": operation, "arguments": arguments}, mode="priority" if priority else None)
+            "operation": operation, "arguments": arguments}, mode="priority" if priority else None, current=current)
+        if current is not None:
+            current()
         if response.get("id") != identifier:
             raise ResourceOutcomeUnknown("worker_response_identity_unknown")
         if "error" in response:
@@ -458,15 +514,96 @@ class DockerComputerDriver:
         except (ValueError, KeyError, TypeError, ValidationError):
             raise ResourceOutcomeUnknown("invalid_worker_observation") from None
 
+    async def _pump(self, session, action_id):
+        gateway = HTTPGateway(self.policy)
+        while True:
+            jobs = await self._rpc(session.session_id, "network_poll", {
+                "session": session.model_dump(mode="json"), "action_id": action_id})
+            if not isinstance(jobs, list) or len(jobs) > 16:
+                raise ResourceOutcomeUnknown("invalid_network_job_batch")
+            for job in jobs:
+                if (job.get("action_id") != action_id or job.get("session_id") != session.session_id
+                        or job.get("control_epoch") != session.control_epoch):
+                    raise ResourceOutcomeUnknown("network_job_identity_mismatch")
+                # The callback binds the original RPC's authority. It runs on
+                # this owned task and remains held through reply and cleanup.
+                async with self.egress_guard(session, action_id) as current:
+                    current()
+                    try:
+                        result = await gateway.fetch(job, current)
+                        reply = {"outcome": "completed", "status": result["status"], "headers": result["headers"],
+                                 "body_base64": base64.b64encode(result["body"]).decode()}
+                    except EgressDenied:
+                        reply = {"outcome": "denied"}
+                    except EgressUnknown:
+                        reply = {"outcome": "unknown"}
+                    current()
+                    await self._rpc(session.session_id, "network_reply", {
+                        "session": session.model_dump(mode="json"), "action_id": action_id,
+                        "job_id": job["job_id"], "reply": reply}, current=current)
+                    current()
+            await asyncio.sleep(.03)
+
+    async def _stop_pump(self, session_id):
+        entry = self._pumps.pop(session_id, None)
+        if entry is not None:
+            entry[1].cancel()
+            await asyncio.gather(entry[1], return_exceptions=True)
+        return entry
+
     async def act(self, session, request):
-        return _record(ActionReceipt, await self._rpc(session.session_id, "act", {
-            "session": session.model_dump(mode="json"), "request": request.model_dump(mode="json")}))
+        if self.egress_guard is None:
+            return await self._perform_act(session, request)
+        async def borrow():
+            async with self.egress_guard(session, request.action_id) as current:
+                current()
+                return await self._perform_act(session, request, current=current)
+        if session.session_id in self._borrowers:
+            raise ResourceConflict("action_borrower_already_active")
+        borrower = asyncio.create_task(borrow())
+        self._borrowers[session.session_id] = borrower
+        try:
+            return await borrower
+        finally:
+            self._borrowers.pop(session.session_id, None)
+            if not borrower.done():
+                borrower.cancel()
+            await asyncio.gather(borrower, return_exceptions=True)
+
+    async def _perform_act(self, session, request, *, current=None):
+        if session.session_id in self._pumps:
+            raise ResourceConflict("network_action_already_active")
+        if self.policy is not None and request.action.kind != "wait":
+            if self.egress_guard is None:
+                raise ResourceUnsupported("active_host_egress_guard_required")
+            self._pumps[session.session_id] = (request.action_id, asyncio.create_task(self._pump(session, request.action_id)))
+        try:
+            return _record(ActionReceipt, await self._rpc(session.session_id, "act", {
+                "session": session.model_dump(mode="json"), "request": request.model_dump(mode="json")}, current=current))
+        finally:
+            entry = await self._stop_pump(session.session_id)
+            if entry is not None:
+                try:
+                    await self._rpc(session.session_id, "network_cancel", {
+                        "session": session.model_dump(mode="json"), "action_id": entry[0]}, priority=True)
+                except (ResourceNotFound, ResourceConflict, ResourceOutcomeUnknown):
+                    # The original action result remains completed/unknown as
+                    # recorded. Cleanup uncertainty cannot authorize another input.
+                    pass
 
     async def action_status(self, session, action_id):
         return _record(ActionReceipt, await self._rpc(session.session_id, "action_status", {
             "session": session.model_dump(mode="json"), "action_id": action_id}, priority=True))
 
     async def control(self, session, request):
+        borrower = self._borrowers.get(session.session_id)
+        if borrower is not None and borrower is not asyncio.current_task():
+            borrower.cancel()
+            await asyncio.gather(borrower, return_exceptions=True)
+        entry = await self._stop_pump(session.session_id)
+        if entry is not None:
+            await self._rpc(session.session_id, "network_cancel", {
+                "session": session.model_dump(mode="json"), "action_id": entry[0]}, priority=True)
         return _record(ComputerSession, await self._rpc(session.session_id, "control", {
             "session": session.model_dump(mode="json"), "request": request.model_dump(mode="json")}, priority=True))
 
@@ -534,7 +671,7 @@ class DockerWorkspaceTransfer:
 
 
 def environment_provider_factory(*, settings: Mapping[str, object]):
-    if set(settings) - {"docker_socket", "image", "credential_key", "profile_id"}:
+    if set(settings) - {"docker_socket", "image", "credential_key", "profile_id", "network_policy"}:
         raise ResourceUnsupported("unknown_private_docker_settings")
     try:
         return DockerEnvironmentProvider(**settings)
@@ -543,6 +680,6 @@ def environment_provider_factory(*, settings: Mapping[str, object]):
 
 
 def computer_driver_factory(*, settings: Mapping[str, object]):
-    if "docker_socket" not in settings or set(settings) - {"docker_socket", "egress_guard"}:
+    if "docker_socket" not in settings or set(settings) - {"docker_socket", "egress_guard", "network_policy"}:
         raise ResourceUnsupported("invalid_private_docker_settings")
     return DockerComputerDriver(**settings)

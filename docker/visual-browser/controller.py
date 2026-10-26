@@ -73,8 +73,8 @@ class BrowserController:
 
     def __init__(self, page, request: dict, *, driver_id="local-docker-browser",
                  clock=lambda: datetime.now(UTC), monotonic=time.monotonic,
-                 action_limit=4096, frame_ttl_seconds=30, workspace_enabled=False):
-        self.operations = OPERATIONS | ({"files"} if workspace_enabled else set())
+                 action_limit=4096, frame_ttl_seconds=30, workspace_enabled=False, network_enabled=False):
+        self.operations = OPERATIONS | ({"files"} if workspace_enabled else set()) | ({"navigate"} if network_enabled else set())
         required = {"schema_version", "session_id", "scope", "lease_id", "surface",
                     "required_capabilities", "expires_at"}
         if not version_one(request) or set(request) != required:
@@ -198,6 +198,15 @@ class BrowserController:
         if (kind == "scroll" and set(action) == {"schema_version", "kind", "delta_x", "delta_y"}
                 and all(integer(action[name], -10000, 10000) for name in ("delta_x", "delta_y"))):
             return lambda: self.page.mouse.wheel(action["delta_x"], action["delta_y"])
+        if (kind == "navigate" and "navigate" in self.operations
+                and set(action) == {"schema_version", "kind", "url"}):
+            from kestrel_sdk.computer_use import Navigate
+            from pydantic import ValidationError
+            try:
+                navigation = Navigate.model_validate_json(json.dumps(action))
+            except (ValidationError, ValueError, TypeError):
+                raise Refused("unsupported_action") from None
+            return lambda: self.page.goto(navigation.url, wait_until="domcontentloaded")
         if (kind == "wait" and set(action) == {"schema_version", "kind", "milliseconds"}
                 and integer(action["milliseconds"], 0, 10000)):
             return lambda: asyncio.sleep(action["milliseconds"] / 1000)
@@ -237,12 +246,17 @@ class BrowserController:
                        "outcome": "unknown", "recorded_at": self.clock().isoformat(), "reason_code": "outcome_unknown"}
             self._actions[action_id] = (request_hash, receipt)
             self._frame = None
+            relay = getattr(self, "network", None)
+            if relay is not None:
+                relay.begin(session, request)
             try:
                 # No await separates final input fencing from effect dispatch.
                 self._bound(session, agent=True)
                 async with asyncio.timeout(remaining):
                     await effect()
-                receipt.update(outcome="completed", reason_code=None, recorded_at=self.clock().isoformat())
+                    network_known = await relay.drain(action_id) if relay is not None else True
+                receipt.update(outcome="completed" if network_known else "unknown",
+                               reason_code=None if network_known else "network_outcome_unknown", recorded_at=self.clock().isoformat())
             except asyncio.CancelledError:
                 # Cancelling the Python waiter does not unsend a Chromium input.
                 # Fence synchronously; the worker must physically retire it.
@@ -261,6 +275,13 @@ class BrowserController:
                 else:
                     self._fence_retirement()
                     await self.retire()
+            finally:
+                if relay is not None:
+                    try:
+                        await relay.end(action_id)
+                    except (TimeoutError, ConnectionError, OSError):
+                        self._fence_retirement()
+                        receipt.update(outcome="unknown", reason_code="network_outcome_unknown")
             return copy.deepcopy(receipt)
 
     def action_status(self, session, action_id):

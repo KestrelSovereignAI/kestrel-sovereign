@@ -19,9 +19,11 @@ from wire import DIRECTORY, MAX_REQUEST, MAX_RESPONSE, SECRET, decode, encode
 
 
 def bootstrap(value):
-    if (not version_one(value) or set(value) != {"schema_version", "secret", "request", "document_html", "incarnation"}
+    if (not version_one(value) or set(value) != {"schema_version", "secret", "request", "document_html", "incarnation", "network_profile"}
             or not isinstance(value["secret"], str) or not SECRET.fullmatch(value["secret"])
             or not isinstance(value["incarnation"], str) or not SECRET.fullmatch(value["incarnation"])
+            or (value["network_profile"] is not None and (not isinstance(value["network_profile"], str)
+                or not value["network_profile"].startswith("http-get-pinned-v1-")))
             or not isinstance(value["document_html"], str)
             or len(value["document_html"].encode()) > 65536):
         raise Refused("invalid_bootstrap")
@@ -46,7 +48,7 @@ class Endpoint:
         if not isinstance(arguments, dict):
             raise Refused("invalid_request")
         controller = self.controller
-        if self.priority and operation not in {"status", "action_status", "control"}:
+        if self.priority and operation not in {"status", "action_status", "control", "network_cancel"}:
             raise Refused("priority_operation_required")
         if operation == "status" and set(arguments) == {"scope", "session_id"}:
             return controller.status(**arguments)
@@ -59,6 +61,12 @@ class Endpoint:
             return controller.action_status(**arguments)
         if operation == "control" and set(arguments) == {"session", "request"}:
             return await controller.control(**arguments)
+        if operation == "network_poll" and set(arguments) == {"session", "action_id"} and hasattr(controller, "network"):
+            return controller.network.poll(**arguments)
+        if operation == "network_reply" and set(arguments) == {"session", "action_id", "job_id", "reply"} and hasattr(controller, "network"):
+            return controller.network.reply(**arguments)
+        if operation == "network_cancel" and set(arguments) == {"session", "action_id"} and hasattr(controller, "network"):
+            return await controller.network.cancel(**arguments)
         if operation == "workspace" and set(arguments) == {"session", "operation", "arguments"} and hasattr(controller, "workspace"):
             return await controller.workspace.dispatch(**arguments)
         raise Refused("unsupported_request")
@@ -166,8 +174,23 @@ async def main():
                                                 accept_downloads=False, service_workers="block")
             page = await context.new_page()
             from workspace import WorkspaceTransport
-            controller = BrowserController(page, settings["request"], workspace_enabled=True)
+            controller = BrowserController(page, settings["request"], workspace_enabled=True,
+                                           network_enabled=settings["network_profile"] is not None)
             controller.workspace = WorkspaceTransport(controller, DIRECTORY / "workspace-transfer")
+            async def deny_socket(connection):
+                await connection.close(code=1008, reason="unsupported_channel")
+            await context.route_web_socket("**/*", deny_socket)
+            await context.add_init_script("""for (const name of ['RTCPeerConnection','webkitRTCPeerConnection']) {
+                Object.defineProperty(globalThis,name,{value:class {constructor(){throw new DOMException('unsupported_channel','SecurityError')}},writable:false,configurable:false});
+            }""")
+            if settings["network_profile"] is not None:
+                from network import NetworkRelay
+                controller.network = NetworkRelay(controller)
+                await context.route("**/*", controller.network.route)
+            else:
+                async def deny_request(route):
+                    await route.abort("blockedbyclient")
+                await context.route("**/*", deny_request)
             await page.set_content(settings["document_html"], timeout=5000)
         signal.alarm(max(1, math.ceil(controller.deadline - controller.monotonic())) + 10)
         try:

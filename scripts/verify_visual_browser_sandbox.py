@@ -51,7 +51,7 @@ def source_identity() -> dict:
     adapter_root = ROOT / "kestrel_sovereign" / "visual_computer"
     files.update({"host-adapter/" + path.name: hashlib.sha256(path.read_bytes()).hexdigest()
                   for path in sorted(adapter_root.glob("docker*.py"))})
-    for name in ("verify_visual_browser_sandbox.py", "verify_visual_browser_worker.py", "verify_visual_docker_adapters.py"):
+    for name in ("verify_visual_browser_sandbox.py", "verify_visual_browser_worker.py", "verify_visual_docker_adapters.py", "verify_visual_docker_egress.py"):
         path = ROOT / "scripts" / name
         if path.is_file():
             files["verification/" + name] = hashlib.sha256(path.read_bytes()).hexdigest()
