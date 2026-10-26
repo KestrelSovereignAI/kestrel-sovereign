@@ -454,6 +454,7 @@
         "kestrel_sovereign/multi_agent/route_name.py",
         "kestrel_sovereign/security/agent_encryption.py",
         "kestrel_sovereign/security/service_key_storage.py",
+        "pyproject.toml",
         "tests/interop/a2a_tck/COVERAGE.json",
         "tests/interop/test_a2a_go.py",
         "tests/interop/test_a2a_tck.py"
@@ -733,7 +734,8 @@
     },
     {
       "existing_code_refs": [
-        "AGENTS.md"
+        "AGENTS.md",
+        "pyproject.toml"
       ],
       "findings": [],
       "missing_code_refs": [],
