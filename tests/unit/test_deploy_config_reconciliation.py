@@ -222,6 +222,7 @@ def test_prod_profile_declares_explicit_native_a2a_authority(live_config):
     assert env["KESTREL_BASE_URL"] == "https://kestrel-prod-7jpbsywhdq-uc.a.run.app"
     assert env["KESTREL_A2A_DISCOVERY_AGENT"] == env["KESTREL_EXPECTED_DID"]
     assert env["KESTREL_A2A_DISCOVERY_AGENT"] == "${KESTREL_PROD_EXPECTED_DID}"
+    assert env["KESTREL_A2A_PUSH_ENABLED"] == "false"
 
 
 def test_prod_publication_resolves_the_existing_pinned_identity(live_config, monkeypatch):
@@ -235,6 +236,7 @@ def test_prod_publication_resolves_the_existing_pinned_identity(live_config, mon
     assert configuration is not None
     assert configuration.discovery_routing_key == env["KESTREL_EXPECTED_DID"] == expected_did
     assert configuration.public_base_url == env["KESTREL_BASE_URL"]
+    assert configuration.push is None
 
 
 def test_prod_profile_uses_single_agent_image(live_config):
