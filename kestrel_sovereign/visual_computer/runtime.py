@@ -11,15 +11,14 @@ from __future__ import annotations
 import asyncio
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
-from datetime import UTC, datetime
 from decimal import Decimal
 from enum import StrEnum
 import math
 from uuid import uuid4
 
 from kestrel_sdk.computer_use import (
-    ActionReceipt, ActionRequest, ComputerSession, ControlRequest,
-    EnvironmentRequest, ScreenObservation, SessionRequest,
+    ActionReceipt, ActionRequest, ControlRequest,
+    EnvironmentRequest, SessionRequest,
 )
 from kestrel_sdk.resources import ResourceConflict, ResourceError, ResourceNotFound, ResourceOutcomeUnknown, ResourceScope
 from kestrel_sdk.operator import OperatorAuthorizationError
@@ -328,58 +327,93 @@ class VisualComputerRuntime:
         request = ActionRequest.model_validate(request)
         async with self.operation(context, VisualAction.ACT) as check:
             scope = self.scope(context)
-            async with self._lock(request.session_id):
-                record = await self.repository.get(scope, session_id=request.session_id, guard=check)
-                # Deduplication precedes stale-frame checks: an acknowledged
-                # duplicate returns the same receipt without another effect.
-                try:
-                    previous = await self.repository.action(scope, request.session_id, request.action_id, guard=check)
-                except ResourceNotFound:
-                    previous = None
-                if previous is not None:
-                    if previous.request != request:
-                        raise ResourceConflict("action ID already identifies different input")
-                    if previous.receipt is None or previous.receipt.outcome == "unknown":
-                        raise ResourceOutcomeUnknown("action requires original-ID status reconciliation")
-                    check()
-                    return previous.receipt
-                self._ready(record)
-                if await self.repository.has_pending_actions(scope, request.session_id, guard=check):
-                    raise ResourceOutcomeUnknown("reconcile accepted session input before new actions")
-                frame = record.frame
-                if (frame is None or request.observation_id != frame.observation_id
-                        or request.control_epoch != record.session.control_epoch
-                        or request.not_after <= self._now()
-                        or request.not_after > min(record.session.expires_at, context.expires_at)
-                        or (request.not_after-self._now()).total_seconds() > self.policy.operation_seconds
-                        or request.action.kind not in record.session.capabilities):
-                    raise ResourceConflict("action does not match current observation and authority")
-                if request.action.kind == "click" and (request.action.x >= frame.width or request.action.y >= frame.height):
-                    raise ResourceConflict("click is outside current screen")
-                if self._inflight >= self.policy.max_inflight_actions:
-                    raise ResourceConflict("normal visual input capacity exhausted")
-                await self.repository.action(scope, request.session_id, request.action_id, accept=request, guard=check)
-                record.frame, record.last_activity_at = None, self._now()
-                await self.repository.save(scope, record, check)
-                self._inflight += 1
+            prepared = dispatched = inflight = driver_entered = False
             try:
+                async with self._lock(request.session_id):
+                    record = await self.repository.get(scope, session_id=request.session_id, guard=check)
+                    # Deduplication precedes stale-frame checks: an acknowledged
+                    # duplicate returns the same receipt without another effect.
+                    try:
+                        previous = await self.repository.action(scope, request.session_id, request.action_id, guard=check)
+                    except ResourceNotFound:
+                        previous = None
+                    if previous is not None:
+                        if previous.request != request:
+                            raise ResourceConflict("action ID already identifies different input")
+                        if not previous.dispatch_started and previous.receipt is None:
+                            previous = await self.repository.action(scope, request.session_id, request.action_id,
+                                abandon_prepared=True, guard=check)
+                        if previous.receipt is None or previous.receipt.outcome == "unknown":
+                            raise ResourceOutcomeUnknown("action requires original-ID status reconciliation")
+                        check()
+                        return previous.receipt
+                    self._ready(record)
+                    if await self.repository.has_pending_actions(scope, request.session_id, guard=check):
+                        raise ResourceOutcomeUnknown("reconcile accepted session input before new actions")
+                    frame = record.frame
+                    if (frame is None or request.observation_id != frame.observation_id
+                            or request.control_epoch != record.session.control_epoch
+                            or request.not_after <= self._now()
+                            or request.not_after > min(record.session.expires_at, context.expires_at)
+                            or (request.not_after-self._now()).total_seconds() > self.policy.operation_seconds
+                            or request.action.kind not in record.session.capabilities):
+                        raise ResourceConflict("action does not match current observation and authority")
+                    if request.action.kind == "click" and (request.action.x >= frame.width or request.action.y >= frame.height):
+                        raise ResourceConflict("click is outside current screen")
+                    if self._inflight >= self.policy.max_inflight_actions:
+                        raise ResourceConflict("normal visual input capacity exhausted")
+                    self._inflight += 1
+                    inflight = True
+                    serial = self._control_serials.get(self._key(scope, request.session_id), 0)
+                    await self.repository.action(scope, request.session_id, request.action_id, accept=request, prepare=True, guard=check)
+                    prepared = True
+                    record.frame, record.last_activity_at = None, self._now()
+                    await self.repository.save(scope, record, check)
+                    await self.repository.action(scope, request.session_id, request.action_id,
+                        dispatch_revision=record.revision, guard=check)
+                    dispatched = True
                 def effect_check():
                     check()
                     self._ready(record)
+                    if self._control_serials.get(self._key(scope, request.session_id), 0) != serial:
+                        raise ResourceConflict("original action control epoch changed")
                     if request.not_after <= self._now():
                         raise ResourceConflict("action deadline expired before effect")
                 effect_check()
                 async with self.egress.activate(record.session, request.action_id, effect_check,
                         deadline=min(request.not_after, context.expires_at)):
-                    receipt = await self._call(context, check, self._driver(record).act, record.session, request)
+                    async def dispatch():
+                        nonlocal driver_entered
+                        current = await self.repository.get(scope, session_id=request.session_id, guard=effect_check)
+                        if current.revision != record.revision or current.session != record.session or current.lease != record.lease:
+                            raise ResourceConflict("accepted visual frame/session changed before driver dispatch")
+                        effect_check()
+                        driver_entered = True
+                        return await self._driver(record).act(record.session, request)
+                    receipt = await self._call(context, check, dispatch)
                 self._receipt(request, receipt)
                 # Preserve accepted outcome even if Stop raced its response;
                 # no session save can overwrite a newer control epoch.
                 await self.repository.action(scope, request.session_id, request.action_id, receipt=receipt, guard=check)
                 check()
                 return receipt
+            except BaseException:
+                if dispatched and not driver_entered:
+                    # This origin owns the acknowledged one-shot dispatch CAS,
+                    # and never entered a driver. Preserve that exact fact even
+                    # if its authority retired. This grants no further I/O.
+                    receipt = ActionReceipt(action_id=request.action_id, session_id=request.session_id,
+                        observation_id=request.observation_id, control_epoch=request.control_epoch,
+                        outcome="denied", recorded_at=self._now(), reason_code="host_not_dispatched")
+                    await self.repository.action(scope, request.session_id, request.action_id, receipt=receipt)
+                elif prepared and not dispatched:
+                    # A lost dispatch-CAS acknowledgement stays ambiguous.
+                    await self.repository.action(scope, request.session_id, request.action_id,
+                        abandon_prepared=True)
+                raise
             finally:
-                self._inflight -= 1
+                if inflight:
+                    self._inflight -= 1
 
     @staticmethod
     def _receipt(request, receipt):
@@ -392,6 +426,9 @@ class VisualComputerRuntime:
             scope = self.scope(context)
             record = await self.repository.get(scope, session_id=session_id, guard=check)
             accepted = await self.repository.action(scope, session_id, action_id, guard=check)
+            if not accepted.dispatch_started and accepted.receipt is None:
+                accepted = await self.repository.action(scope, session_id, action_id,
+                    abandon_prepared=True, guard=check)
             if accepted.receipt is not None and accepted.receipt.outcome != "unknown":
                 return accepted.receipt
             try:
@@ -407,6 +444,8 @@ class VisualComputerRuntime:
             scope = self.scope(context)
             async with self._lock(session_id):
                 record = await self.repository.get(scope, session_id=session_id, guard=check)
+                if record.phase == "released":
+                    raise ResourceConflict("released visual session cannot be resumed")
                 if record.session is None or record.pending_control is not None:
                     raise ResourceOutcomeUnknown("session/control acceptance requires explicit safety reconciliation")
                 session = await self._call(context, check, self._driver(record).status, scope, session_id)
@@ -446,6 +485,8 @@ class VisualComputerRuntime:
                 if record.phase == "active" and record.session == record.control_receipt:
                     self._fences.discard(self._key(scope, session_id))
                 return record.control_receipt
+            if record.phase == "released":
+                raise ResourceConflict("released visual session cannot accept control")
             if record.session is None:
                 raise ResourceConflict("visual session has not opened")
             if record.pending_control is not None and record.pending_control != request:

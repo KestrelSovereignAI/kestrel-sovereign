@@ -55,6 +55,8 @@ class ActionRecord(BaseModel):
     model_config = ConfigDict(extra="forbid")
     request: ActionRequest
     receipt: ActionReceipt | None = None
+    # Legacy receipt-less rows may already have dispatched; never replay them.
+    dispatch_started: bool = True
 
 
 class VisualCustodyRepository:
@@ -96,6 +98,29 @@ class VisualCustodyRepository:
                             key = cipher.decrypt(bytes(row[0]))
                         except DecryptionError:
                             raise CustodyIntegrityError("original visual custody key is unavailable") from None
+                    # These indexed flags are projections of authenticated
+                    # payloads, never an independent authority/ownership store.
+                    for table, column in (("visual_computer_requests", "released"),
+                                          ("visual_computer_actions", "pending")):
+                        if not await self.db.column_exists(table, column):
+                            default = 0 if column == "released" else 1
+                            await self.db.execute(f"ALTER TABLE {table} ADD COLUMN {column} BIGINT NOT NULL DEFAULT {default}")
+                            rows = await self.db.fetchall(f"SELECT * FROM {table}")
+                            for item in rows:
+                                if column == "released":
+                                    owner, identity, _, payload = item[:4]
+                                    record = self._open(owner, identity, payload, CustodyRecord, key=key)
+                                    value = int(record.phase == "released" and record.lease is not None
+                                                and record.lease.state == "released")
+                                    await self.db.execute(f"UPDATE {table} SET released = ? WHERE owner = ? AND request_id = ?", (value, owner, identity))
+                                else:
+                                    owner, session_key, action_id, payload = item[:4]
+                                    record = self._open(owner, f"{session_key}:{action_id}", payload, ActionRecord, key=key)
+                                    value = int(record.receipt is None or record.receipt.outcome == "unknown")
+                                    await self.db.execute(f"UPDATE {table} SET pending = ? WHERE owner = ? AND session_key = ? AND action_id = ?", (value, owner, session_key, action_id))
+                    await self.db.execute("CREATE INDEX IF NOT EXISTS visual_computer_live_requests ON visual_computer_requests (owner, released)")
+                    await self.db.execute("CREATE INDEX IF NOT EXISTS visual_computer_pending_actions ON visual_computer_actions (owner, session_key, pending)")
+                    await self.db.execute("DELETE FROM visual_computer_actions WHERE pending = 0 AND EXISTS (SELECT 1 FROM visual_computer_requests r WHERE r.owner = visual_computer_actions.owner AND r.session_key = visual_computer_actions.session_key AND r.released = 1)")
             except TransactionError as error:
                 if execution_commit_outcome(error) is not None:
                     raise ResourceOutcomeUnknown("visual custody initialization requires reconciliation") from error
@@ -122,9 +147,9 @@ class VisualCustodyRepository:
                                          credential=value.connection.credential.get_secret_value())
         return AEADCipher(self._key).encrypt(json.dumps(payload).encode(), aad=f"{owner}:{identity}".encode())
 
-    def _open(self, owner, identity, payload, model):
+    def _open(self, owner, identity, payload, model, *, key=None):
         try:
-            plain = AEADCipher(self._key).decrypt(bytes(payload), aad=f"{owner}:{identity}".encode())
+            plain = AEADCipher(key or self._key).decrypt(bytes(payload), aad=f"{owner}:{identity}".encode())
             return model.model_validate_json(plain)
         except (DecryptionError, ValueError):
             raise CustodyIntegrityError("visual custody verification failed") from None
@@ -158,7 +183,7 @@ class VisualCustodyRepository:
                 if stored.request.digest() != record.request.digest():
                     raise ResourceConflict("request ID already identifies different constraints")
                 return stored
-            count = await self.db.fetchone("SELECT COUNT(*) FROM visual_computer_requests WHERE owner = ?", (owner,))
+            count = await self.db.fetchone("SELECT COUNT(*) FROM visual_computer_requests r WHERE owner = ? AND (released = 0 OR EXISTS (SELECT 1 FROM visual_computer_actions a WHERE a.owner = r.owner AND a.session_key = r.session_key AND a.pending = 1))", (owner,))
             if count[0] >= self.max_requests:
                 raise ResourceConflict("visual custody request capacity exhausted")
             await self.db.execute("INSERT INTO visual_computer_requests (owner, request_id, session_key, payload, revision) VALUES (?, ?, ?, ?, 0)",
@@ -179,36 +204,76 @@ class VisualCustodyRepository:
     async def save(self, scope, record, guard=None):
         async with self._transaction(guard):
             owner = self._owner(scope)
+            await self._lock_owner(owner)
+            original = await self.db.fetchone("SELECT payload FROM visual_computer_requests WHERE owner = ? AND request_id = ?", (owner, record.request.request_id))
+            if original is None:
+                raise ResourceNotFound("visual custody not found")
+            previous = self._open(owner, record.request.request_id, original[0], CustodyRecord)
+            if previous.request != record.request or previous.session_id != record.session_id:
+                raise ResourceConflict("original visual custody identity changed")
+            released = record.phase == "released" and record.lease is not None and record.lease.state == "released"
+            if record.phase == "released" and not released:
+                raise ResourceConflict("release requires verified physical lease retirement")
+            if previous.phase == "released" and record != previous:
+                raise ResourceConflict("released visual custody is immutable")
+            if released:
+                # Retain exact constraints, original lease and session identity;
+                # remove obsolete private connection/frame/control derivatives.
+                record.connection = record.frame = record.pending_control = None
+                record.last_control = record.control_receipt = None
             updated = record.model_copy(update={"revision": record.revision + 1})
-            count = await self.db.execute("UPDATE visual_computer_requests SET payload = ?, revision = revision + 1 WHERE owner = ? AND request_id = ? AND revision = ?", (self._seal(owner, record.request.request_id, updated), owner, record.request.request_id, record.revision))
+            count = await self.db.execute("UPDATE visual_computer_requests SET payload = ?, revision = revision + 1, released = ? WHERE owner = ? AND request_id = ? AND revision = ?", (self._seal(owner, record.request.request_id, updated), int(released), owner, record.request.request_id, record.revision))
             if count != 1:
                 raise ResourceConflict("visual custody changed concurrently; reconcile")
+            if released:
+                await self.db.execute("DELETE FROM visual_computer_actions WHERE owner = ? AND session_key = ? AND pending = 0", (owner, self._address("session", record.session_id)))
         record.revision += 1
 
-    async def action(self, scope, session_id, action_id, *, accept=None, receipt=None, guard=None):
-        async with self._transaction(guard, write=accept is not None or receipt is not None):
+    async def action(self, scope, session_id, action_id, *, accept=None, receipt=None, guard=None,
+                     prepare=False, dispatch_revision=None, abandon_prepared=False):
+        async with self._transaction(guard, write=accept is not None or receipt is not None or dispatch_revision is not None or abandon_prepared):
             owner, session_key = self._owner(scope), self._address("session", session_id)
-            if accept is not None or receipt is not None:
+            if accept is not None or receipt is not None or dispatch_revision is not None or abandon_prepared:
                 await self._lock_owner(owner)
             identity = f"{session_key}:{action_id}"
             row = await self.db.fetchone("SELECT payload FROM visual_computer_actions WHERE owner = ? AND session_key = ? AND action_id = ?", (owner, session_key, action_id))
+            parent = await self.db.fetchone("SELECT released FROM visual_computer_requests WHERE owner = ? AND session_key = ?", (owner, session_key))
+            if (accept is not None or dispatch_revision is not None) and (parent is None or parent[0]):
+                raise ResourceConflict("original action session is absent or physically released")
             if row is None:
                 if accept is None:
                     raise ResourceNotFound("visual action not found")
                 count = await self.db.fetchone("SELECT COUNT(*) FROM visual_computer_actions WHERE owner = ?", (owner,))
                 if count[0] >= self.max_actions:
                     raise ResourceConflict("visual custody action capacity exhausted")
-                stored = ActionRecord(request=accept)
+                stored = ActionRecord(request=accept, dispatch_started=not prepare)
                 await self.db.execute("INSERT INTO visual_computer_actions (owner, session_key, action_id, payload) VALUES (?, ?, ?, ?)", (owner, session_key, action_id, self._seal(owner, identity, stored)))
             else:
                 stored = self._open(owner, identity, row[0], ActionRecord)
                 if accept is not None and stored.request != accept:
                     raise ResourceConflict("action ID already identifies different input")
+            changed = False
+            if dispatch_revision is not None:
+                if stored.dispatch_started or stored.receipt is not None:
+                    raise ResourceConflict("original action dispatch is no longer available")
+                current = await self.db.fetchone("SELECT revision FROM visual_computer_requests WHERE owner = ? AND session_key = ?", (owner, session_key))
+                if current is None or current[0] != dispatch_revision:
+                    raise ResourceConflict("visual session changed before original dispatch")
+                stored.dispatch_started, changed = True, True
+            if abandon_prepared and not stored.dispatch_started and stored.receipt is None:
+                request = stored.request
+                stored.receipt = ActionReceipt(action_id=request.action_id, session_id=request.session_id,
+                    observation_id=request.observation_id, control_epoch=request.control_epoch,
+                    outcome="denied", recorded_at=datetime.now(request.not_after.tzinfo), reason_code="host_not_dispatched")
+                changed = True
             if receipt is not None:
                 if stored.receipt is not None and stored.receipt.outcome != "unknown" and stored.receipt != receipt:
                     raise ResourceConflict("accepted action receipt changed")
-                stored.receipt = receipt
-                await self.db.execute("UPDATE visual_computer_actions SET payload = ? WHERE owner = ? AND session_key = ? AND action_id = ?", (self._seal(owner, identity, stored), owner, session_key, action_id))
+                stored.receipt, changed = receipt, True
+            if changed:
+                await self.db.execute("UPDATE visual_computer_actions SET payload = ?, pending = ? WHERE owner = ? AND session_key = ? AND action_id = ?", (self._seal(owner, identity, stored), int(stored.receipt is None or stored.receipt.outcome == "unknown"), owner, session_key, action_id))
+            if changed and parent is not None and parent[0] and stored.receipt is not None and stored.receipt.outcome != "unknown":
+                await self.db.execute("DELETE FROM visual_computer_actions WHERE owner = ? AND session_key = ? AND action_id = ? AND pending = 0", (owner, session_key, action_id))
             return stored
 
     async def _lock_owner(self, owner):
@@ -229,5 +294,5 @@ class VisualCustodyRepository:
         """Internal host lifecycle only; exact original owner, no public list API."""
         async with self._transaction(write=False):
             owner = self._owner(scope)
-            rows = await self.db.fetchall("SELECT request_id, payload FROM visual_computer_requests WHERE owner = ?", (owner,))
+            rows = await self.db.fetchall("SELECT request_id, payload FROM visual_computer_requests r WHERE owner = ? AND (released = 0 OR EXISTS (SELECT 1 FROM visual_computer_actions a WHERE a.owner = r.owner AND a.session_key = r.session_key AND a.pending = 1))", (owner,))
             return [self._open(owner, row[0], row[1], CustodyRecord) for row in rows]

@@ -158,17 +158,22 @@ async def test_stale_expired_or_unsupported_input_has_no_effect(change, reason):
     with pytest.raises(Refused, match=reason):
         await driver.act(session, {**request, **change})
     assert page.effects == []
+    if "session_id" not in change:
+        receipt = driver.action_status(session, "input")
+        assert receipt["outcome"] == "denied" and receipt["reason_code"] == reason
+        assert receipt["control_epoch"] == change.get("control_epoch", request["control_epoch"])
+        assert receipt["observation_id"] == change.get("observation_id", request["observation_id"])
 
 
 @pytest.mark.asyncio
 async def test_owner_epoch_frame_age_and_receipt_budget_are_enforced():
     elapsed = [0]
-    driver, page, session = controller(monotonic=lambda: elapsed[0], action_limit=1)
+    driver, page, session = controller(monotonic=lambda: elapsed[0], action_limit=2)
     request = await action(driver, session)
     elapsed[0] = 31
     with pytest.raises(Refused, match="stale_observation"):
         await driver.act(session, request)
-    request = await action(driver, session)
+    request = await action(driver, session, action_id="after-negative-receipt")
     await driver.act(session, request)
     next_request = await action(driver, session, action_id="next")
     with pytest.raises(Refused, match="action_budget_exhausted"):
@@ -196,6 +201,7 @@ async def test_boolean_versions_and_clock_rollback_cannot_extend_input_authority
         await driver.act(session, {**request, "schema_version": True})
     with pytest.raises(Refused, match="invalid_action"):
         await driver.act(session, {**request, "action": {**request["action"], "schema_version": True}})
+    request = {**request, "action_id": "clock-expired"}
     elapsed[0] = 6
     now[0] -= timedelta(hours=1)
     with pytest.raises(Refused, match="action_expired"):

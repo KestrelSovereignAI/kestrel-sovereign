@@ -92,6 +92,34 @@ normal input until `POST /sessions/{session_id}/reconcile` verifies the exact
 accepted session and all unknown actions have been resolved. A replacement
 worker cannot be adopted through a reused resource name.
 
+New host action acceptance records a preparation before the one-shot durable
+dispatch CAS. Original authorization, session/lease/epoch and the accepted frame
+revision are checked again after that CAS and before the driver is entered.
+Preparation alone permits no input: an interrupted preparation can become an
+exact `denied` receipt during original-ID status reconciliation. A known local
+failure after acknowledged dispatch CAS but before driver entry also records
+that no input was dispatched. Legacy receipt-less records and a lost dispatch
+checkpoint acknowledgement remain dispatch-possible; they are never replayed.
+A generic driver conflict, timeout, cancellation or invalid receipt is not
+proof of no effect. The browser worker journals exact negative receipts for
+its authenticated synchronous pre-effect refusals, including stale frames and
+epochs. Status reconciles those receipts using the original action ID; input
+resumes only after unresolved actions have terminal receipts.
+
+The default limits are 256 active or unresolved requests and 4096 retained
+actions across an owner's live sessions and unresolved released sessions.
+Terminal action payloads are reclaimed only after verified physical release;
+unknown actions and uncertain leases keep both custody and their capacity
+charge. Released requests retain immutable encrypted constraints, original
+session/owner/lease bindings and their IDs in the same canonical request row.
+Obsolete connection, frame and control derivatives are removed. A released
+session cannot accept input, control, reconciliation or new action IDs, even
+when its terminal action payloads were reclaimed. Exact-ID request lookup
+retains its tombstone; ordinary lifecycle/operator listings scan only active
+or unresolved custody. Minimal anti-resurrection request history necessarily
+grows with distinct released IDs; these live-capacity bounds do not claim a
+bounded lifetime tombstone store. Raw pixels remain response-only.
+
 The operator view shows custody phase, controller, epoch, resource state and
 reconciliation requirements. Stop fences input cooperatively. Takeover drains
 or reconciles accepted work through the driver's priority control path and

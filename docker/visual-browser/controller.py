@@ -214,33 +214,57 @@ class BrowserController:
 
     async def act(self, session, request):
         async with self._lock:
-            self._bound(session, agent=True)
             fields = {"schema_version", "action_id", "session_id", "observation_id", "control_epoch", "not_after", "action"}
             if not version_one(request) or set(request) != fields:
                 raise Refused("invalid_action")
+            # Authenticate the fixed owner/lease before journaling any input
+            # identity. A stale epoch can then receive an exact negative receipt.
+            if not version_one(session) or not version_one(session.get("scope")):
+                raise Refused("session_unavailable")
+            self._owner(session.get("scope"), session.get("session_id"))
+            if (session.get("lease_id") != self._session["lease_id"]
+                    or session.get("driver_id") != self._session["driver_id"]):
+                raise Refused("session_unavailable")
             action_id = identifier(request["action_id"])
-            if (request["session_id"] != self._session["session_id"] or type(request["control_epoch"]) is not int
-                    or request["control_epoch"] != self._session["control_epoch"]):
+            identifier(request["observation_id"])
+            if (request["session_id"] != self._session["session_id"]
+                    or not integer(request["control_epoch"], 0, 2**63-1)):
                 raise Refused("stale_control")
             request_hash = digest(request)
             previous = self._actions.get(action_id)
             if previous:
+                self._bound(session, agent=True)
+                if request["control_epoch"] != self._session["control_epoch"]:
+                    raise Refused("stale_control")
                 if previous[0] != request_hash:
                     raise Refused("action_conflict")
                 return copy.deepcopy(previous[1])
             if len(self._actions) >= self.action_limit:
                 raise Refused("action_budget_exhausted")
-            if (self._frame is None or request["observation_id"] != self._frame[0]["observation_id"]
-                    or self.monotonic() - self._frame[1] > self.frame_ttl):
-                raise Refused("stale_observation")
-            not_after = instant(request["not_after"])
-            effect = self._effect(request["action"], self._frame[0])
-            is_wait = request["action"]["kind"] == "wait"
-            frame_deadline = self._frame[1] + (not_after - instant(self._frame[0]["observed_at"])).total_seconds()
-            remaining = min((not_after - self.clock()).total_seconds(), frame_deadline - self.monotonic(),
-                            self.deadline - self.monotonic(), 11 if is_wait else 10)
-            if remaining <= 0 or (is_wait and request["action"]["milliseconds"] / 1000 >= remaining):
-                raise Refused("action_expired")
+            try:
+                self._bound(session, agent=True)
+                if request["control_epoch"] != self._session["control_epoch"]:
+                    raise Refused("stale_control")
+                if (self._frame is None or request["observation_id"] != self._frame[0]["observation_id"]
+                        or self.monotonic() - self._frame[1] > self.frame_ttl):
+                    raise Refused("stale_observation")
+                not_after = instant(request["not_after"])
+                effect = self._effect(request["action"], self._frame[0])
+                is_wait = request["action"]["kind"] == "wait"
+                frame_deadline = self._frame[1] + (not_after - instant(self._frame[0]["observed_at"])).total_seconds()
+                remaining = min((not_after - self.clock()).total_seconds(), frame_deadline - self.monotonic(),
+                                self.deadline - self.monotonic(), 11 if is_wait else 10)
+                if remaining <= 0 or (is_wait and request["action"]["milliseconds"] / 1000 >= remaining):
+                    raise Refused("action_expired")
+            except Refused as refusal:
+                # These are THIS controller's synchronous pre-effect checks,
+                # not an inference from generic host/transport exceptions.
+                receipt = {"schema_version": 1, "action_id": action_id,
+                    "session_id": request["session_id"], "observation_id": request["observation_id"],
+                    "control_epoch": request["control_epoch"], "outcome": "denied",
+                    "recorded_at": self.clock().isoformat(), "reason_code": refusal.code}
+                self._actions[action_id] = (request_hash, receipt)
+                raise
             receipt = {"schema_version": 1, "action_id": action_id, "session_id": self._session["session_id"],
                        "observation_id": request["observation_id"], "control_epoch": request["control_epoch"],
                        "outcome": "unknown", "recorded_at": self.clock().isoformat(), "reason_code": "outcome_unknown"}

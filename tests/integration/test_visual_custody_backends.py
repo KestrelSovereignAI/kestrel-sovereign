@@ -122,3 +122,70 @@ async def test_native_current_guard_rolls_back_admission_after_sql_before_commit
     with pytest.raises(ResourceConflict):
         await store.admit(SCOPE, record(), current)
     assert (await store.db.fetchone("SELECT COUNT(*) FROM visual_computer_requests"))[0] == 0
+
+
+@pytest.mark.asyncio
+async def test_native_preparation_dispatch_cas_and_restart_never_replay(custody):
+    store,reopen=custody
+    original=await store.admit(SCOPE,record(),lambda:None)
+    request=ActionRequest(action_id="prepared",session_id=original.session_id,observation_id="frame",
+        control_epoch=0,not_after=datetime.now(UTC)+timedelta(seconds=10),action={"kind":"click","x":1,"y":1})
+    await store.action(SCOPE,original.session_id,request.action_id,accept=request,prepare=True)
+    db=await reopen()
+    try:
+        restarted=VisualCustodyRepository(db)
+        denied=await restarted.action(SCOPE,original.session_id,request.action_id,abandon_prepared=True)
+        assert denied.receipt.outcome=="denied" and not denied.dispatch_started
+        with pytest.raises(ResourceConflict):
+            await restarted.action(SCOPE,original.session_id,request.action_id,dispatch_revision=original.revision)
+        other=request.model_copy(update={"action_id":"dispatch-possible"})
+        await restarted.action(SCOPE,original.session_id,other.action_id,accept=other,prepare=True)
+        await restarted.action(SCOPE,original.session_id,other.action_id,dispatch_revision=original.revision)
+        with pytest.raises(ResourceConflict):
+            await store.action(SCOPE,original.session_id,other.action_id,dispatch_revision=original.revision)
+        pending=await restarted.action(SCOPE,original.session_id,other.action_id,abandon_prepared=True)
+        assert pending.dispatch_started and pending.receipt is None
+    finally: await db.close()
+
+
+@pytest.mark.asyncio
+async def test_native_verified_release_capacity_and_unknown_action_retention(custody):
+    from kestrel_sdk.computer_use import EnvironmentLease
+    store,reopen=custody;store.max_requests=store.max_actions=1
+    original=await store.admit(SCOPE,record(),lambda:None)
+    request=ActionRequest(action_id="terminal",session_id=original.session_id,observation_id="frame",
+        control_epoch=0,not_after=datetime.now(UTC)+timedelta(seconds=10),action={"kind":"type","text":"private-terminal-text"})
+    await store.action(SCOPE,original.session_id,request.action_id,accept=request)
+    receipt=ActionReceipt(action_id=request.action_id,session_id=request.session_id,
+        observation_id=request.observation_id,control_epoch=0,outcome="completed",recorded_at=datetime.now(UTC))
+    await store.action(SCOPE,original.session_id,request.action_id,receipt=receipt)
+    original.lease=EnvironmentLease(lease_id="lease",request_id=original.request.request_id,quote_id="q",scope=SCOPE,
+        provider_id=original.request.provider_id,location="local",expires_at=original.request.expires_at,
+        state="released",released_at=datetime.now(UTC),provider_resource_id="original-worker")
+    original.phase="released"
+    await store.save(SCOPE,original)
+    assert (await store.db.fetchone("SELECT COUNT(*) FROM visual_computer_actions"))[0]==0
+    other=record();other.session_id="new-session";other.request=other.request.model_copy(update={"request_id":"new-request"})
+    await store.admit(SCOPE,other,lambda:None)
+    with pytest.raises(ResourceConflict):
+        await store.action(SCOPE,original.session_id,request.action_id,accept=request)
+    pending=request.model_copy(update={"session_id":other.session_id,"action_id":"unknown"})
+    await store.action(SCOPE,other.session_id,pending.action_id,accept=pending)
+    # Upgrade populated original tables on each actual native backend.
+    await store.db.execute("DROP INDEX visual_computer_live_requests")
+    await store.db.execute("DROP INDEX visual_computer_pending_actions")
+    await store.db.execute("ALTER TABLE visual_computer_requests DROP COLUMN released")
+    await store.db.execute("ALTER TABLE visual_computer_actions DROP COLUMN pending")
+    db=await reopen()
+    try:
+        restarted=VisualCustodyRepository(db,max_requests=1,max_actions=1)
+        tombstone=await restarted.get(SCOPE,session_id=original.session_id)
+        assert tombstone.phase=="released" and tombstone.request==original.request
+        assert (await restarted.admit(SCOPE,original,lambda:None)).phase=="released"
+        recovered=await restarted.action(SCOPE,other.session_id,pending.action_id)
+        assert recovered.request==pending and recovered.dispatch_started and recovered.receipt is None
+        other.lease=original.lease.model_copy(update={"request_id":other.request.request_id})
+        other.phase="released";await restarted.save(SCOPE,other)
+        assert (await restarted.action(SCOPE,other.session_id,pending.action_id)).receipt is None
+        assert [r.session_id for r in await restarted.records(SCOPE)]==[other.session_id]
+    finally: await db.close()
