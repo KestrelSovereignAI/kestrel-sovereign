@@ -12,6 +12,7 @@ Extracted from kestrel_agent.py — handles the core orchestrator loop:
 
 import asyncio
 import contextvars
+import itertools
 import json
 import logging
 import os
@@ -54,6 +55,7 @@ from kestrel_sovereign.agent.direct_tool_arguments import (
 )
 from kestrel_sovereign.agent.tool_output_store import (
     Retention,
+    ToolOutputPaging,
     agent_tool_output_store,
     tool_output_scope,
 )
@@ -3405,12 +3407,19 @@ class OrchestratorEngineMixin:
             max_low_delta=KESTREL_MAX_LOW_DELTA,
             budget_stop_pct=KESTREL_BUDGET_STOP_PCT,
         )
-        for iteration in range(max_iterations):
-            if iteration >= max_iterations * 0.8:
-                logging.warning(f"[ORCHESTRATOR] Approaching max iterations: {iteration + 1}/{max_iterations}")
+        # #3740: passes that only page a clipped result forward are not
+        # counted, so reading a long output whole does not end the turn.
+        paging = ToolOutputPaging()
+        for iteration in itertools.count():
+            budget_iteration = paging.budget_iteration(iteration)
+            if budget_iteration >= max_iterations:
+                break
+            if budget_iteration >= max_iterations * 0.8:
+                logging.warning(f"[ORCHESTRATOR] Approaching max iterations: {budget_iteration + 1}/{max_iterations}")
 
             features_by_tool_name = self._visible_features_by_tool_name()
             known_tools = self._known_tool_names()
+            batch_start = len(messages)
             batch_result = await self._execute_tool_batch_at_stop_boundary(
                 response.tool_calls, features_by_tool_name, known_tools,
                 messages, iteration, user_message,
@@ -3421,6 +3430,7 @@ class OrchestratorEngineMixin:
             )
             if isinstance(batch_result, _DeferredToolBatchCancellation):
                 batch_result.raise_outcome()
+            paging.settle(response.tool_calls, messages[batch_start:])
 
             # Continue conversation with tool results
             all_tools = self._build_all_tools()
@@ -3485,9 +3495,10 @@ class OrchestratorEngineMixin:
 
             # Track diminishing returns on this response before continuing
             tracker.record(response)
-            if tracker.should_stop(iteration, max_iterations):
+            budget_iteration = paging.budget_iteration(iteration)
+            if tracker.should_stop(budget_iteration, max_iterations):
                 logging.warning(
-                    f"[ORCHESTRATOR] Diminishing returns detected at iteration {iteration + 1}/{max_iterations} "
+                    f"[ORCHESTRATOR] Diminishing returns detected at iteration {budget_iteration + 1}/{max_iterations} "
                     f"(consecutive_low_delta={tracker.consecutive_low_delta}). Stopping."
                 )
                 return response.content or "Stopped: diminishing returns detected"
@@ -3879,7 +3890,11 @@ class OrchestratorEngineMixin:
         # multi-iteration turns: emit once per turn, not per iteration.
         followup_separator_emitted = False
 
-        for iteration in range(max_iterations):
+        # #3740: see the non-streaming loop.
+        paging = ToolOutputPaging()
+        for iteration in itertools.count():
+            if paging.budget_iteration(iteration) >= max_iterations:
+                break
             if _cancelled():
                 return
 
@@ -3898,6 +3913,7 @@ class OrchestratorEngineMixin:
             # as (terminal_event_index, [parts]). Lets us yield each component
             # bubble right after its producing tool's card in a multi-tool batch.
             part_emit_buffer: list = []
+            batch_start = len(messages)
             batch_result = await self._execute_tool_batch_at_stop_boundary(
                 response.tool_calls, features_by_tool_name, known_tools,
                 messages, iteration, user_message,
@@ -3915,6 +3931,7 @@ class OrchestratorEngineMixin:
                 with batch_result.handoff():
                     yield batch_result
                 return
+            paging.settle(response.tool_calls, messages[batch_start:])
             _parts_by_event_index: dict = {}
             for _evt_idx, _evt_parts in part_emit_buffer:
                 _parts_by_event_index.setdefault(_evt_idx, []).extend(_evt_parts)
@@ -4200,9 +4217,10 @@ class OrchestratorEngineMixin:
 
             # Track diminishing returns on this response before continuing
             tracker.record(response)
-            if tracker.should_stop(iteration, max_iterations):
+            budget_iteration = paging.budget_iteration(iteration)
+            if tracker.should_stop(budget_iteration, max_iterations):
                 logging.warning(
-                    f"[ORCHESTRATOR-STREAM] Diminishing returns detected at iteration {iteration + 1}/{max_iterations} "
+                    f"[ORCHESTRATOR-STREAM] Diminishing returns detected at iteration {budget_iteration + 1}/{max_iterations} "
                     f"(consecutive_low_delta={tracker.consecutive_low_delta}). Stopping."
                 )
                 yield response.content or "Stopped: diminishing returns detected"

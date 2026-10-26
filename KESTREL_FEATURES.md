@@ -689,7 +689,7 @@ Runtime security policy can still deny a discovered tool at call time; static ge
 
 | Tool | Command | Category | Params | Token cost | State |
 |---|---|---|---|---:|---|
-| `read_tool_output` |  | `system` | `handle`, `offset`, `length` | 250 | `enabled` |
+| `read_tool_output` |  | `system` | `handle`, `offset`, `length` | 260 | `enabled` |
 
 ### `wait` (WaitFeature)
 

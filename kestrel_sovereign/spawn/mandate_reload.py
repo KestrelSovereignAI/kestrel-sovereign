@@ -17,7 +17,10 @@ from kestrel_sovereign.spawn.mandate import (
     SpawnMandate,
     validate_spawn_max_child_depth,
 )
-from kestrel_sovereign.spawn.mandate_hook import MandateRestrictionHook
+from kestrel_sovereign.spawn.mandate_hook import (
+    ContinuedToolResolver,
+    MandateRestrictionHook,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -177,8 +180,17 @@ async def read_spawn_features_allowed(storage: Any, agent_did: str) -> Optional[
     return names or None
 
 
-def register_restriction_hook(hooks_manager: Any, mandate: Any) -> int:
+def register_restriction_hook(
+    hooks_manager: Any,
+    mandate: Any,
+    *,
+    continued_tool: Optional[ContinuedToolResolver] = None,
+) -> int:
     """Register the runtime tool-constraint hook for a mandate.
+
+    ``continued_tool`` lets a call that only continues a permitted call take
+    its authority (see :class:`MandateRestrictionHook`); the mandate itself is
+    unchanged.
 
     Returns the number of distinct restricted tools enforced (0 = no-op, e.g. a
     mandate with no tool constraints or a missing hooks manager).
@@ -194,6 +206,7 @@ def register_restriction_hook(hooks_manager: Any, mandate: Any) -> int:
             restricted,
             allowed_tools=allowed,
             restricted_tool_args=restricted_args,
+            continued_tool=continued_tool,
         )
     )
     count = len(set(restricted)) + len(restricted_args) + int(allowed is not None)

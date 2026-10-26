@@ -14,13 +14,22 @@ workflow. ``restricted_tool_args`` expresses that: a per-tool allowlist of
 argument values. Enforcement is a positive allowlist (deny unless the observed
 argument value is explicitly permitted), so it fails closed on a missing or
 unexpected value (#2321).
+
+A call that only continues another call takes that call's authority. Reading
+a tool result the orchestrator clipped to a preview (``read_tool_output``)
+returns characters the producing call already returned, so it is permitted
+wherever the producing tool is, and a signed ceiling that predates the reader
+needs no re-signing to read a permitted file whole (#3740).
 """
 
 from __future__ import annotations
 
-from typing import Any, Iterable, Mapping
+from typing import Any, Callable, Iterable, Mapping, Optional
 
 from kestrel_sdk.hooks.base import Hook, HookEvent, HookInput, HookOutput
+
+#: Names the tool a call continues (see :class:`MandateRestrictionHook`).
+ContinuedToolResolver = Callable[[str, Mapping[str, Any]], Optional[str]]
 
 
 class MandateRestrictionHook(Hook):
@@ -31,6 +40,13 @@ class MandateRestrictionHook(Hook):
     ``restricted_tool_args`` map. Tool names are matched exactly against the
     dispatched ``tool_name``; argument allowlists are matched against
     ``tool_input``.
+
+    ``continued_tool`` names, for a ``(tool_name, tool_input)`` call, the tool
+    whose call it continues, or ``None``. A call outside the ``allowed_tools``
+    ceiling is permitted when the tool it continues is inside it and not
+    restricted. Listing the call's own tool in ``restricted_tools`` still
+    denies it, and its argument allowlist still applies. Without a resolver no
+    call is a continuation.
     """
 
     def __init__(
@@ -39,6 +55,7 @@ class MandateRestrictionHook(Hook):
         *,
         allowed_tools: Iterable[str] | None = None,
         restricted_tool_args: Mapping[str, Mapping[str, Iterable[Any]]] | None = None,
+        continued_tool: ContinuedToolResolver | None = None,
         priority: int = 10,
     ):
         # Low priority number = runs early, so the denial lands before slower
@@ -70,6 +87,7 @@ class MandateRestrictionHook(Hook):
                 norm[str(arg_name)] = values
             if norm:
                 self._arg_allow[str(tool_name)] = norm
+        self._continued_tool = continued_tool
 
     @property
     def restricted_tools(self) -> frozenset[str]:
@@ -92,7 +110,11 @@ class MandateRestrictionHook(Hook):
                 f"Tool '{input.tool_name}' is restricted by this agent's spawn "
                 f"mandate and may not be used."
             )
-        if self._allowed is not None and input.tool_name not in self._allowed:
+        if (
+            self._allowed is not None
+            and input.tool_name not in self._allowed
+            and not self._continues_permitted_tool(input)
+        ):
             return HookOutput.deny(
                 f"Tool '{input.tool_name}' is outside this agent's allowed-tools "
                 "ceiling and may not be used."
@@ -111,3 +133,15 @@ class MandateRestrictionHook(Hook):
                         f"spawn mandate (got {tool_input.get(arg_name)!r})."
                     )
         return HookOutput.allow()
+
+    def _continues_permitted_tool(self, input: HookInput) -> bool:
+        """True when the call only continues a call of a tool this ceiling permits."""
+        if self._continued_tool is None or self._allowed is None:
+            return False
+        source = self._continued_tool(input.tool_name, input.tool_input or {})
+        return (
+            isinstance(source, str)
+            and source != input.tool_name
+            and source in self._allowed
+            and source not in self._restricted
+        )

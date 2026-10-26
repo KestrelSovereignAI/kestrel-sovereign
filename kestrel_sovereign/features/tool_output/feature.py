@@ -24,6 +24,7 @@ from kestrel_sdk.tools.base import ToolCategory
 from kestrel_sdk.tools.result import ToolResult
 
 from kestrel_sovereign.agent.tool_output_store import (
+    READ_TOOL_OUTPUT,
     ToolOutputUnavailable,
     agent_tool_output_store,
     tool_output_scope,
@@ -57,17 +58,17 @@ class ToolOutputFeature(Feature):
         """Nothing to prepare: the store belongs to the agent."""
 
     @tool(
-        name="read_tool_output",
+        name=READ_TOOL_OUTPUT,
         description=(
             "Read a tool result that was too long to show whole. When a tool "
             "result is replaced by a '[Large tool output …]' preview, the "
             "preview names a handle like tool_output:<id> and the offset where "
-            "the omitted characters start. Pass that handle and offset; each "
-            "chunk reports its range, total_chars and next_offset — call again "
-            "with offset=next_offset until next_offset is null to read every "
-            "character. Offsets index the result's JSON text, the same text "
-            "the preview shows. A handle can be read only in the conversation "
-            "that produced it."
+            "the omitted characters start. Pass that handle and offset, and "
+            "omit length to get as much as fits; each chunk reports its range, "
+            "total_chars and next_offset — call again with offset=next_offset "
+            "until next_offset is null to read every character. Offsets index "
+            "the result's JSON text, the same text the preview shows. A "
+            "handle can be read only in the conversation that produced it."
         ),
         category=ToolCategory.SYSTEM,
     )
@@ -156,7 +157,7 @@ class ToolOutputFeature(Feature):
             shortest,
             requested_end,
             cap=cap,
-            tool_name="read_tool_output",
+            tool_name=READ_TOOL_OUTPUT,
         )
         if fit is not None:
             return fit[1]

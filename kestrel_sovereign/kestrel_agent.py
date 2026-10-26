@@ -136,6 +136,7 @@ from kestrel_sovereign.agent.streaming import (
 from kestrel_sovereign.agent.tool_output_store import (
     ToolOutputStore,
     agent_tool_output_store,
+    continued_tool_resolver,
 )
 from kestrel_sovereign.agent.tool_registry import ToolRegistryMixin
 from kestrel_sovereign.agent.tool_allowlist import bump_registry_generation
@@ -4597,7 +4598,14 @@ class KestrelAgent(
                     _spawn_mandate,
                     features_allowed=[],
                 )
-                register_restriction_hook(self.hooks_manager, _spawn_mandate)
+                # A ceiling signed before read_tool_output existed still lets
+                # the child read the whole of an output it was allowed to
+                # produce (#3740).
+                register_restriction_hook(
+                    self.hooks_manager,
+                    _spawn_mandate,
+                    continued_tool=continued_tool_resolver(self),
+                )
 
         # Lifecycle hardening (#377): refuse to declare initialization
         # successful when no LLM provider came up. Lives here rather than in

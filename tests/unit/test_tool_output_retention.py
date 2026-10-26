@@ -8,9 +8,14 @@ subagent's answer the same way. The orchestrator now keeps the whole result in
 the agent's ``ToolOutputStore``, the preview names it by a handle, and
 ``read_tool_output`` pages it in chunks that each fit under the cap.
 
-The acceptance case is driven through the real ``KestrelAgent`` dispatch path:
-a 50,000-character repository file comes back clipped, and the agent reads
-every character of it, chunk by chunk, each chunk saying where it sits.
+The acceptance case is driven through the real ``KestrelAgent`` dispatch path
+and through the whole tool loop of both orchestrator transports: a
+50,000-character repository file comes back clipped, and the agent reads every
+character of it, chunk by chunk, each chunk saying where it sits, within one
+turn. Paging passes do not spend the turn's iteration budget, which ended the
+read partway under the default and the ``.env.example`` settings. A spawned
+child whose signed tool ceiling predates the reader may read the whole of an
+output it was allowed to produce.
 """
 
 from __future__ import annotations
@@ -22,7 +27,7 @@ from typing import Any, Optional
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-from kestrel_sdk.hooks.base import HookEvent, HookInput, HookOutput
+from kestrel_sdk.hooks.base import HookEvent, HookInput, HookOutput, PermissionDecision
 from kestrel_sdk.tools.base import ToolCategory, ToolParameter, ToolSchema
 from kestrel_sdk.tools.result import ToolResult
 
@@ -34,21 +39,28 @@ from kestrel_sovereign.agent.orchestrator_engine import (
 from kestrel_sovereign.agent.tool_output_store import (
     DEFAULT_RETAIN_CHARS,
     DEFAULT_RETAIN_ENTRIES,
+    READ_TOOL_OUTPUT,
     RETAIN_CHARS_ENV,
     RETAIN_ENTRIES_ENV,
     TOOL_OUTPUT_HANDLE_PREFIX,
     Retention,
+    ToolOutputPaging,
     ToolOutputScope,
     ToolOutputStore,
     ToolOutputUnavailable,
+    continued_tool_resolver,
     tool_output_scope,
 )
 from kestrel_sovereign.features.security.feature import default_permission_for_feature
 from kestrel_sovereign.features.security.permissions import PermissionLevel
 from kestrel_sovereign.features.tool_output.feature import ToolOutputFeature
+from kestrel_sovereign.hooks import HooksManager
 from kestrel_sovereign.kestrel_agent import KestrelAgent
+from kestrel_sovereign.llm.adapter import LLMResponse, ToolCall
 from kestrel_sovereign.multi_agent.config import MANDATORY_FEATURE_MODULES
 from kestrel_sovereign.privacy import PrivacyMode
+from kestrel_sovereign.spawn.mandate_hook import MandateRestrictionHook
+from kestrel_sovereign.spawn.mandate_reload import register_restriction_hook
 from tests.shared.booted_agent import booted_agent
 
 #: The default orchestrator cap, pinned so the bound does not move with the
@@ -317,18 +329,21 @@ class _RepoFileTool:
         ).to_dict()
 
 
-@pytest.fixture
-def result_cap(monkeypatch):
+def _pin_cap(monkeypatch, cap: int) -> int:
     """Pin the cap the orchestrator applies and the one chunks are sized to."""
     import kestrel_sovereign.kestrel_agent as kestrel_agent
 
-    monkeypatch.setattr(kestrel_agent, "MAX_TOOL_RESULT_CHARS", RESULT_CAP)
-    monkeypatch.setattr(orchestrator_engine, "MAX_TOOL_RESULT_CHARS", RESULT_CAP)
-    return RESULT_CAP
+    monkeypatch.setattr(kestrel_agent, "MAX_TOOL_RESULT_CHARS", cap)
+    monkeypatch.setattr(orchestrator_engine, "MAX_TOOL_RESULT_CHARS", cap)
+    return cap
 
 
 @pytest.fixture
-def agent(result_cap):
+def result_cap(monkeypatch):
+    return _pin_cap(monkeypatch, RESULT_CAP)
+
+
+def _real_agent() -> KestrelAgent:
     """A real ``KestrelAgent`` whose dispatch path and reader are both real."""
     with patch("kestrel_sovereign.kestrel_agent.LLMService"):
         agent = KestrelAgent(did="did:test:3740")
@@ -339,12 +354,18 @@ def agent(result_cap):
     agent.observability_store.log_tool_dispatch = AsyncMock(return_value="d-1")
     agent.hooks_manager = _AllowAllHooks()
     agent.features = {
-        "SecurityFeature": SimpleNamespace(permission_store=_AuditStore()),
+        # The audit trail only; disabled, so the tool loop offers no tool for it.
+        "SecurityFeature": SimpleNamespace(permission_store=_AuditStore(), enabled=False),
     }
     reader = ToolOutputFeature(agent)
     agent.features[reader.name] = reader
     agent._register_explored_feature_tools(reader)
     return agent
+
+
+@pytest.fixture
+def agent(result_cap):
+    return _real_agent()
 
 
 async def _dispatch(agent, tool_name: str, arguments: dict, features=None) -> str:
@@ -626,3 +647,484 @@ def test_a_constructed_agent_keeps_a_store():
         agent = KestrelAgent(did="did:test:3740-store")
 
     assert isinstance(agent.tool_output_store, ToolOutputStore)
+
+
+# --- the turn budget -------------------------------------------------------------
+
+
+def _read_call(call_id: str, handle: str, offset: int, **extra: Any) -> ToolCall:
+    return ToolCall(
+        id=call_id,
+        name=READ_TOOL_OUTPUT,
+        arguments={"handle": handle, "offset": offset, **extra},
+    )
+
+
+def _chunk_message(call_id: str, handle: str, start: int, length: int, total: int,
+                   *, success: bool = True) -> dict:
+    data = {"handle": handle, "offset": start, "length": length, "total_chars": total}
+    payload = {"success": success, "status": "ok" if success else "error", "data": data}
+    return {"role": "tool", "tool_call_id": call_id, "content": json.dumps(payload)}
+
+
+HANDLE_A = TOOL_OUTPUT_HANDLE_PREFIX + "a" * 24
+HANDLE_B = TOOL_OUTPUT_HANDLE_PREFIX + "b" * 24
+
+
+def test_consecutive_whole_chunks_are_credited():
+    paging = ToolOutputPaging()
+
+    assert paging.settle(
+        [_read_call("1", HANDLE_A, 2000)], [_chunk_message("1", HANDLE_A, 2000, 500, 3000)]
+    )
+    assert paging.settle(
+        [_read_call("2", HANDLE_A, 2500)], [_chunk_message("2", HANDLE_A, 2500, 500, 3000)]
+    )
+
+    assert paging.credited == 2
+    assert paging.budget_iteration(5) == 3
+
+
+def test_parallel_reads_of_two_handles_are_one_credited_pass():
+    paging = ToolOutputPaging()
+
+    assert paging.settle(
+        [_read_call("1", HANDLE_A, 0), _read_call("2", HANDLE_B, 2000)],
+        [
+            _chunk_message("1", HANDLE_A, 0, 400, 900),
+            _chunk_message("2", HANDLE_B, 2000, 400, 9000),
+        ],
+    )
+    assert paging.credited == 1
+
+
+@pytest.mark.parametrize(
+    "calls, messages",
+    [
+        # nothing was called
+        ([], []),
+        # another tool shares the batch, even one whose result looks like a chunk
+        (
+            [_read_call("1", HANDLE_A, 0),
+             ToolCall(id="2", name="read_repo_file", arguments={})],
+            [_chunk_message("1", HANDLE_A, 0, 100, 900),
+             _chunk_message("2", HANDLE_B, 0, 100, 900)],
+        ),
+        # the read failed
+        ([_read_call("1", HANDLE_A, 0)],
+         [_chunk_message("1", HANDLE_A, 0, 100, 900, success=False)]),
+        # the read was clipped, or its result is missing
+        ([_read_call("1", HANDLE_A, 0)],
+         [{"role": "tool", "tool_call_id": "1",
+           "content": "[Large tool output — 9 chars]"}]),
+        ([_read_call("1", HANDLE_A, 0)], []),
+        # an empty chunk at the end
+        ([_read_call("1", HANDLE_A, 900)], [_chunk_message("1", HANDLE_A, 900, 0, 900)]),
+        # the caller's length cut the chunk short
+        ([_read_call("1", HANDLE_A, 0, length=10)],
+         [_chunk_message("1", HANDLE_A, 0, 10, 900)]),
+        ([_read_call("1", HANDLE_A, 0, length="many")],
+         [_chunk_message("1", HANDLE_A, 0, 10, 900)]),
+    ],
+)
+def test_a_pass_that_does_not_page_forward_is_counted(calls, messages):
+    paging = ToolOutputPaging()
+
+    assert paging.settle(calls, messages) is False
+    assert paging.credited == 0
+
+
+def test_a_length_the_cap_cut_short_is_still_a_whole_chunk():
+    paging = ToolOutputPaging()
+
+    assert paging.settle(
+        [_read_call("1", HANDLE_A, 0, length=10_000)],
+        [_chunk_message("1", HANDLE_A, 0, 6000, 6100)],
+    )
+    assert paging.settle(
+        [_read_call("2", HANDLE_A, 6000, length=100)],
+        [_chunk_message("2", HANDLE_A, 6000, 100, 6100)],
+    ), "a chunk that reaches the end is whole"
+
+
+@pytest.mark.parametrize("offset", [0, 400, 600])
+def test_rereading_or_skipping_ahead_is_counted(offset):
+    paging = ToolOutputPaging()
+    assert paging.settle(
+        [_read_call("1", HANDLE_A, 0)], [_chunk_message("1", HANDLE_A, 0, 500, 9000)]
+    )
+
+    assert not paging.settle(
+        [_read_call("2", HANDLE_A, offset)],
+        [_chunk_message("2", HANDLE_A, offset, 500, 9000)],
+    )
+    assert paging.credited == 1
+    assert paging.settle(
+        [_read_call("3", HANDLE_A, 500)], [_chunk_message("3", HANDLE_A, 500, 500, 9000)]
+    ), "a counted pass does not move where reading resumes"
+
+
+def _unicode_file(chars: int) -> str:
+    """Text every character of which JSON-escapes six-fold: no ASCII at all."""
+    unit = "ÜÑÏÇÖÐÉ—東京の夜✓ñú\u3000"
+    return (unit * (chars // len(unit) + 1))[:chars]
+
+
+class _PreviewReader:
+    """A model that reads a clipped result whole the way the preview says.
+
+    It starts at the offset the preview names and calls ``read_tool_output``
+    at each chunk's ``next_offset`` until it is null, one chunk per model
+    call, then answers. ``stall`` makes it re-read its first chunk instead.
+    """
+
+    def __init__(self, *, stall: bool = False):
+        self.stall = stall
+        self.calls = 0
+        self.head: Optional[str] = None
+        self.chunks: list[dict] = []
+        self.confirmations: list[str] = []
+
+    def next_response(self, messages: list) -> LLMResponse:
+        self.calls += 1
+        assert self.calls <= 500, "the tool loop never stopped"
+        content = messages[-1]["content"]
+        if content.startswith("[Large tool output"):
+            ((handle, offset),) = set(READ_CALL_RE.findall(content))
+            marker = f"Preview (first {PREVIEW_HEAD_CHARS} chars):\n"
+            self.head = content.split(marker, 1)[1][: int(offset)]
+            return self._read(handle, int(offset))
+        result = json.loads(content)
+        assert result["success"] is True, result
+        chunk = result["data"]
+        self.chunks.append(chunk)
+        self.confirmations.append(result["confirmation"])
+        if self.stall:
+            return self._read(chunk["handle"], self.chunks[0]["offset"])
+        if chunk["next_offset"] is None:
+            return LLMResponse(content="Finished.", tool_calls=None)
+        return self._read(chunk["handle"], chunk["next_offset"])
+
+    def _read(self, handle: str, offset: int) -> LLMResponse:
+        return LLMResponse(
+            content=None,
+            tool_calls=[_read_call(f"read-{self.calls}", handle, offset)],
+        )
+
+    def text(self) -> str:
+        return self.head + "".join(chunk["content"] for chunk in self.chunks)
+
+
+async def _run_turn(agent, reader: _PreviewReader, *, streaming: bool,
+                    max_iterations: int, path: str) -> str:
+    """One whole tool turn: the model reads ``path``, then pages its output."""
+    # The patched service is a MagicMock; give the loop's prune a real window.
+    agent.llm_service._context_limit = 200_000
+    first = LLMResponse(
+        content=None,
+        tool_calls=[
+            ToolCall(id="source", name="read_repo_file", arguments={"path": path})
+        ],
+    )
+    arguments = dict(
+        response=first,
+        feature_tools=agent._build_all_tools(),
+        system_prompt="sys",
+        force_local_only=False,
+        effective_model="claude-opus-5",
+        max_iterations=max_iterations,
+        user_message=f"Read {path} whole.",
+    )
+    if not streaming:
+        async def generate_with_messages(*, messages, **_kw):
+            return reader.next_response(messages)
+
+        agent.llm_service.generate_with_messages = generate_with_messages
+        return await agent._handle_orchestrator_response(**arguments)
+
+    async def stream_with_tool_detection(*, messages, **_kw):
+        response = reader.next_response(messages)
+        if response.content:
+            yield response.content
+        yield response
+
+    agent.llm_service.stream_with_tool_detection = stream_with_tool_detection
+    pieces = [
+        piece
+        async for piece in agent._handle_orchestrator_response_streaming(
+            tool_events=[], tool_results=[], **arguments
+        )
+        if isinstance(piece, str)
+    ]
+    return "".join(pieces)
+
+
+#: The settings the read stopped partway under before the paging credit: the
+#: defaults, and the ``.env.example`` values (KESTREL_MAX_TOOL_RESULT_CHARS=4000,
+#: KESTREL_MAX_TOOL_ITERATIONS=15).
+SETTINGS = {
+    "defaults": dict(cap=8000, max_iterations=50, document=_unicode_file),
+    "env-example": dict(cap=4000, max_iterations=15, document=_repo_file),
+}
+
+
+@pytest.fixture
+def budget(monkeypatch):
+    """Pin the loop's diminishing-returns knobs to their defaults."""
+    orchestrator_engine._init_constants()
+    monkeypatch.setattr(orchestrator_engine, "KESTREL_BUDGET_STOP_PCT", 90)
+    monkeypatch.setattr(orchestrator_engine, "KESTREL_MAX_LOW_DELTA", 5)
+    monkeypatch.setattr(orchestrator_engine, "KESTREL_DIMINISHING_THRESHOLD", 500)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("streaming", [False, True], ids=["invoke", "stream"])
+@pytest.mark.parametrize("setting", sorted(SETTINGS))
+async def test_a_50k_file_is_read_whole_within_one_turn(
+    monkeypatch, budget, setting, streaming
+):
+    """The acceptance case, through the whole tool loop of each transport.
+
+    The read takes more passes than the turn's iteration budget allows, so
+    before the paging credit the loop stopped it partway ("Stopped:
+    diminishing returns detected") and the model never saw the rest.
+    """
+    config = SETTINGS[setting]
+    _pin_cap(monkeypatch, config["cap"])
+    agent = _real_agent()
+    document = config["document"](50_000)
+    agent.register_dynamic_tools("github", [_RepoFileTool({"docs/BIG.md": document})])
+    reader = _PreviewReader()
+
+    answer = await _run_turn(
+        agent, reader, streaming=streaming,
+        max_iterations=config["max_iterations"], path="docs/BIG.md",
+    )
+
+    assert answer.endswith("Finished."), answer[-300:]
+    whole = reader.text()
+    total = reader.chunks[0]["total_chars"]
+    assert len(whole) == total
+    assert json.loads(whole)["data"]["content"] == document
+    for chunk, confirmation in zip(reader.chunks, reader.confirmations):
+        assert chunk["total_chars"] == total
+        assert len(chunk["content"]) == chunk["length"] > 0
+        end = chunk["offset"] + chunk["length"]
+        assert f"characters {chunk['offset']}–{end} of {total}." in confirmation
+    assert [c["offset"] + c["length"] for c in reader.chunks[:-1]] == [
+        c["next_offset"] for c in reader.chunks[:-1]
+    ] == [c["offset"] for c in reader.chunks[1:]]
+    assert reader.chunks[-1]["next_offset"] is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("setting", sorted(SETTINGS))
+async def test_without_the_paging_credit_the_same_read_stops_partway(
+    monkeypatch, budget, setting
+):
+    """The control: these reads take more passes than the budget allows."""
+    config = SETTINGS[setting]
+    _pin_cap(monkeypatch, config["cap"])
+    monkeypatch.setattr(ToolOutputPaging, "settle", lambda self, *_: False)
+    agent = _real_agent()
+    agent.register_dynamic_tools(
+        "github", [_RepoFileTool({"docs/BIG.md": config["document"](50_000)})]
+    )
+    reader = _PreviewReader()
+
+    answer = await _run_turn(
+        agent, reader, streaming=False,
+        max_iterations=config["max_iterations"], path="docs/BIG.md",
+    )
+
+    assert "Finished." not in answer
+    assert reader.chunks[-1]["next_offset"] is not None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("streaming", [False, True], ids=["invoke", "stream"])
+async def test_rereading_one_chunk_is_still_stopped_by_the_budget(
+    monkeypatch, budget, streaming
+):
+    _pin_cap(monkeypatch, 4000)
+    agent = _real_agent()
+    agent.register_dynamic_tools("github", [_RepoFileTool({"a.md": _repo_file(50_000)})])
+    reader = _PreviewReader(stall=True)
+
+    answer = await _run_turn(agent, reader, streaming=streaming,
+                             max_iterations=15, path="a.md")
+
+    assert "Finished." not in answer
+    # Its first chunk was new text, so that one pass is not counted; every
+    # re-read after it is.
+    assert reader.calls <= 15 + 1
+    assert reader.chunks[-1]["next_offset"] is not None
+
+
+# --- spawn mandates --------------------------------------------------------------
+
+
+def _pre_tool_use(tool_name: str, tool_input: dict) -> HookInput:
+    return HookInput(
+        session_id="t",
+        hook_event_name=HookEvent.PRE_TOOL_USE.value,
+        tool_name=tool_name,
+        tool_input=tool_input,
+    )
+
+
+def _producers(**handles: str):
+    """A resolver naming each handle's producer, as the agent's store does."""
+    def continued_tool(tool_name, tool_input):
+        if tool_name != READ_TOOL_OUTPUT:
+            return None
+        return handles.get(tool_input.get("handle"))
+    return continued_tool
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "ceiling, restricted, producer, allowed",
+    [
+        # the ceiling predates the reader and permits the producer
+        (["read_repo_file"], [], "read_repo_file", True),
+        # the producer is outside the ceiling
+        (["read_repo_file"], [], "fs_read", False),
+        # the producer is inside it but restricted
+        (["fs_read"], ["fs_read"], "fs_read", False),
+        # the reader itself is restricted
+        (["read_repo_file"], [READ_TOOL_OUTPUT], "read_repo_file", False),
+        # nothing is retained under the handle
+        (["read_repo_file"], [], None, False),
+    ],
+)
+async def test_a_read_takes_the_authority_of_the_call_it_continues(
+    ceiling, restricted, producer, allowed
+):
+    handle = TOOL_OUTPUT_HANDLE_PREFIX + "c" * 24
+    hook = MandateRestrictionHook(
+        restricted,
+        allowed_tools=ceiling,
+        continued_tool=_producers(**({handle: producer} if producer else {})),
+    )
+
+    out = await hook.execute(_pre_tool_use(READ_TOOL_OUTPUT, {"handle": handle}))
+
+    assert (out.permission_decision != PermissionDecision.DENY) is allowed
+
+
+@pytest.mark.asyncio
+async def test_without_a_resolver_the_ceiling_is_unchanged():
+    hook = MandateRestrictionHook([], allowed_tools=["read_repo_file"])
+
+    out = await hook.execute(
+        _pre_tool_use(READ_TOOL_OUTPUT, {"handle": TOOL_OUTPUT_HANDLE_PREFIX + "c" * 24})
+    )
+
+    assert out.permission_decision == PermissionDecision.DENY
+
+
+def test_only_a_read_is_a_continuation():
+    """A tool cannot borrow authority by naming a handle in its own arguments."""
+    store = _store(max_chars=100)
+    handle = _retain(store, "x" * 10)
+    continued_tool = continued_tool_resolver(SimpleNamespace(tool_output_store=store))
+
+    assert continued_tool(READ_TOOL_OUTPUT, {"handle": handle}) == "read_github_file"
+    assert continued_tool("fs_write", {"handle": handle}) is None
+    assert continued_tool(READ_TOOL_OUTPUT, {"handle": "tool_output:unknown"}) is None
+    assert continued_tool(READ_TOOL_OUTPUT, {}) is None
+    no_store = continued_tool_resolver(SimpleNamespace())
+    assert no_store(READ_TOOL_OUTPUT, {"handle": handle}) is None
+
+
+@pytest.mark.asyncio
+async def test_a_child_whose_ceiling_predates_the_reader_reads_a_file_whole(agent):
+    """Through the real hooks manager and dispatch path, as a reloaded child runs.
+
+    The persisted ``allowed_tools`` lists the source tool but not
+    ``read_tool_output``. Without the continuation rule the source read came
+    back clipped and every read of it was refused as outside the ceiling.
+    """
+    agent.hooks_manager = HooksManager()
+    register_restriction_hook(
+        agent.hooks_manager,
+        SimpleNamespace(additional_constraints={"allowed_tools": ["read_repo_file"]}),
+        continued_tool=continued_tool_resolver(agent),
+    )
+    document = _repo_file(50_000)
+    agent.register_dynamic_tools("github", [_RepoFileTool({"docs/BIG.md": document})])
+
+    preview = await _dispatch(agent, "read_repo_file", {"path": "docs/BIG.md"})
+    ((handle, _),) = set(READ_CALL_RE.findall(preview))
+    whole, _ = await _read_all(agent, handle, 0)
+    assert json.loads(whole)["data"]["content"] == document
+
+    foreign = agent.tool_output_store.retain(
+        "y" * 9000, tool_name="fs_read", scope=tool_output_scope(agent)
+    ).handle
+    refused = json.loads(await _dispatch(agent, "read_tool_output", {"handle": foreign}))
+    assert refused["success"] is False
+    assert "allowed-tools ceiling" in refused["error"]
+
+
+@pytest.mark.asyncio
+async def test_boot_wires_the_continuation_into_a_childs_mandate_hook(tmp_path):
+    """``initialize()`` registers the hook with the child's own store behind it."""
+    import os
+
+    from kestrel_sovereign.inception_service import (
+        create_kestrel_identity_async,
+        generate_secp256k1_keypair,
+    )
+    from kestrel_sovereign.llm.service import LLMService
+    from kestrel_sovereign.spawn.mandate import SpawnMandate, sign_mandate
+    from tests.shared.native_shutdown_budget import shutdown_fixture_agent
+
+    parent_key, _ = generate_secp256k1_keypair()
+    parent_did = "did:pkh:eip155:1:0xParent3740"
+    mandate = sign_mandate(
+        SpawnMandate(
+            parent_did=parent_did,
+            purpose="scoped reader",
+            ttl_seconds=999,
+            additional_constraints={"allowed_tools": ["read_repo_file"]},
+        ),
+        parent_key,
+    )
+    credentials = await create_kestrel_identity_async(
+        output_dir=str(tmp_path),
+        is_test_instance=True,
+        agent_name="ReaderChild",
+        parent_did=parent_did,
+        spawn_mandate=mandate,
+    )
+    llm_service = LLMService()
+    child = KestrelAgent(
+        did=credentials.agent_did,
+        storage_path=os.path.join(str(tmp_path), "kestrel_prime.db"),
+        llm_service=llm_service,
+        allowed_features=set(),
+    )
+    try:
+        await child.initialize()
+        (hook,) = [
+            h for h in child.hooks_manager.get_hooks(HookEvent.PRE_TOOL_USE)
+            if isinstance(h, MandateRestrictionHook)
+        ]
+        scope = tool_output_scope(child)
+        permitted = child.tool_output_store.retain(
+            "x" * 9000, tool_name="read_repo_file", scope=scope
+        ).handle
+        foreign = child.tool_output_store.retain(
+            "y" * 9000, tool_name="fs_read", scope=scope
+        ).handle
+
+        allowed = await hook.execute(_pre_tool_use(READ_TOOL_OUTPUT, {"handle": permitted}))
+        denied = await hook.execute(_pre_tool_use(READ_TOOL_OUTPUT, {"handle": foreign}))
+
+        assert allowed.permission_decision != PermissionDecision.DENY
+        assert denied.permission_decision == PermissionDecision.DENY
+    finally:
+        await shutdown_fixture_agent(child)
+        await llm_service.close()

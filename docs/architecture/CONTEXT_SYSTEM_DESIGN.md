@@ -408,6 +408,23 @@ the store, so a round trip such as EPHEMERAL → NORMAL → EPHEMERAL does not b
 back output from the EPHEMERAL session that leaving it closed. An output
 produced outside any chat session is readable only where no session is bound.
 
+A long output takes many chunks: a 50,000-character file of non-ASCII text
+serializes to about 300,000 characters, some 45 chunks under the default cap.
+Each chunk is a pass of the turn's tool loop, so counted against
+`KESTREL_MAX_TOOL_ITERATIONS` they ended the turn partway through the file. A
+pass is therefore not counted when every call in it was a successful
+`read_tool_output` returning a whole chunk (cut by the cap or the end of the
+output, not by a `length` the caller passed) from where the turn last stopped
+reading that handle (`ToolOutputPaging`). Credited passes never revisit a
+character, so their number is bounded by the output's size; re-reading,
+skipping ahead, short reads and every other tool call still count.
+
+A spawned child's signed `allowed_tools` ceiling may predate the reader.
+`MandateRestrictionHook` treats a `read_tool_output` call as a continuation of
+the call that produced its handle, and permits it wherever that tool is in the
+ceiling and not restricted. Listing `read_tool_output` in `restricted_tools`
+still denies it, and the mandate itself is not rewritten.
+
 ## Durable salvage status
 
 Three distinct behaviors coexist:
