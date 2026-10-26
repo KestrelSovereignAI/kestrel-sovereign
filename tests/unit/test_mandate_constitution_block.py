@@ -237,14 +237,18 @@ async def test_governing_constitution_includes_mandate_rules(tmp_path):
         storage_path=os.path.join(str(tmp_path), "kestrel_prime.db"),
         llm_service=LLMService(),
     )
-    await agent.initialize()
+    try:
+        await agent.initialize()
 
-    constitution = await agent._get_governing_constitution()
-    assert "Error:" not in constitution
-    assert "SPAWN MANDATE CONSTRAINTS" in constitution
-    assert BEHAVIOR_RULE in constitution
-    # Base constitution still present (append, not replace).
-    assert len(constitution) > len(render_mandate_constitution_block(agent.spawn_mandate))
+        constitution = await agent._get_governing_constitution()
+        assert "Error:" not in constitution
+        assert "SPAWN MANDATE CONSTRAINTS" in constitution
+        assert BEHAVIOR_RULE in constitution
+        # Base constitution still present (append, not replace).
+        assert len(constitution) > len(render_mandate_constitution_block(agent.spawn_mandate))
+
+    finally:
+        await agent.shutdown()
 
 
 @pytest.mark.asyncio
@@ -263,8 +267,11 @@ async def test_root_agent_governing_constitution_has_no_mandate_block(tmp_path):
         storage_path=os.path.join(str(tmp_path), "kestrel_prime.db"),
         llm_service=LLMService(),
     )
-    await agent.initialize()
+    try:
+        await agent.initialize()
 
-    constitution = await agent._get_governing_constitution()
-    assert "Error:" not in constitution
-    assert "SPAWN MANDATE CONSTRAINTS" not in constitution
+        constitution = await agent._get_governing_constitution()
+        assert "Error:" not in constitution
+        assert "SPAWN MANDATE CONSTRAINTS" not in constitution
+    finally:
+        await agent.shutdown()
