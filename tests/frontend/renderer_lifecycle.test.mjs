@@ -60,6 +60,16 @@ function mountedFixture(id) {
     return { witness, container, dispose, button: container.querySelector('button') };
 }
 
+function whenRemoved(node) {
+    if (!node.parentNode) return Promise.resolve();
+    return new Promise(resolve => {
+        const observer = new dom.window.MutationObserver(() => {
+            if (!node.parentNode) { observer.disconnect(); resolve(); }
+        });
+        observer.observe(node.parentNode, { childList: true });
+    });
+}
+
 test('disposing a mount permits a fresh mount of the same actual DOM', () => {
     const { witness, container, dispose, button } = mountedFixture('remount-view');
     try {
@@ -179,6 +189,75 @@ test('a failed mount releases its claim so the actual root can recover', () => {
     }
 });
 
+test('retiring a DOM container prevents fresh renderer markup from reviving it', () => {
+    const fixture = mountedFixture('retired-dom');
+    try {
+        registry.unmountRenderers(fixture.container, { retire: 'self' });
+        const renderer = registry.findContentTypeRenderer('retired-dom');
+        fixture.container.innerHTML = registry.renderToSafeHtml(renderer, {}, {}, purify.sanitize, String);
+        registry.mountRenderers(fixture.container);
+        fixture.container.querySelector('button').click();
+        assert.deepEqual(fixture.witness, { mounts: 1, clicks: 0, disposals: 1 });
+    } finally {
+        registry._reset(); fixture.container.remove();
+    }
+});
+
+test('retiring children permits new content but never revives an old subtree', () => {
+    const fixture = mountedFixture('retired-child');
+    const previous = fixture.container.firstElementChild;
+    try {
+        registry.unmountRenderers(fixture.container, { retire: 'children' });
+        const renderer = registry.findContentTypeRenderer('retired-child');
+        fixture.container.innerHTML = registry.renderToSafeHtml(renderer, {}, {}, purify.sanitize, String);
+        fixture.container.append(previous);
+        registry.mountRenderers(fixture.container);
+        previous.querySelector('button').click();
+        fixture.container.firstElementChild.querySelector('button').click();
+        assert.deepEqual(fixture.witness, { mounts: 2, clicks: 1, disposals: 1 });
+    } finally {
+        registry._reset(); fixture.container.remove();
+    }
+});
+
+test('teardown cannot mount replacement children during physical retirement', () => {
+    const fixture = mountedFixture('retiring-reentrant');
+    const renderer = registry.findContentTypeRenderer('retiring-reentrant');
+    const mount = renderer.mount;
+    registry.unmountRenderers(fixture.container);
+    fixture.witness.mounts = 0; fixture.witness.disposals = 0;
+    renderer.mount = root => {
+        const dispose = mount(root);
+        return () => {
+            dispose();
+            fixture.container.insertAdjacentHTML('beforeend', registry.renderToSafeHtml(renderer, {}, {}, purify.sanitize, String));
+            registry.mountRenderers(fixture.container);
+        };
+    };
+    try {
+        registry.mountRenderers(fixture.container);
+        registry.unmountRenderers(fixture.container, { retire: 'children' });
+        registry.mountRenderers(fixture.container);
+        assert.deepEqual(fixture.witness, { mounts: 1, clicks: 0, disposals: 1 });
+    } finally {
+        renderer.mount = mount;
+        registry._reset(); fixture.container.remove();
+    }
+});
+
+test('unsupported retirement modes fail before altering a live mount', () => {
+    const fixture = mountedFixture('invalid-retirement');
+    try {
+        for (const retire of [true, 'all', 1]) {
+            assert.throws(() => registry.unmountRenderers(fixture.container, { retire }), TypeError);
+        }
+        fixture.button.click();
+        assert.deepEqual(fixture.witness, { mounts: 1, clicks: 1, disposals: 0 });
+    } finally {
+        registry._reset(); fixture.container.remove();
+    }
+});
+
 test('wiping one real chat pane releases its parts and preserves a background pane', () => {
     const first = { mounts: 0, clicks: 0, disposals: 0 };
     const second = { mounts: 0, clicks: 0, disposals: 0 };
@@ -277,15 +356,7 @@ test('deleting all bubbles of one message retires their renderer mounts', async 
         fixture.container.dataset.messageId = 'shared-message';
     }
     try {
-        const removed = new Promise(resolve => {
-            const observer = new dom.window.MutationObserver(() => {
-                if (!a.container.parentNode && !b.container.parentNode) {
-                    observer.disconnect();
-                    resolve();
-                }
-            });
-            observer.observe(document.body, { childList: true });
-        });
+        const removed = Promise.all([whenRemoved(a.container), whenRemoved(b.container)]);
         history.fadeRemoveMessageNodes('shared-message', a.container);
         await removed;
         a.button.click(); b.button.click();
@@ -296,6 +367,34 @@ test('deleting all bubbles of one message retires their renderer mounts', async 
         a.container.remove(); b.container.remove();
     }
 });
+
+for (const retirement of ['pane-wipe', 'message-fade']) {
+test(`late voice updates cannot revive resources after ${retirement}`, async () => {
+    const id = 'late-voice-' + retirement;
+    const witness = { mounts: 0, clicks: 0, disposals: 0 };
+    const renderer = interactiveRenderer(id, witness);
+    renderer.match = { tool: id };
+    registry.registerRenderer(renderer);
+    const pane = getOrCreateChatPane(id);
+    const message = document.createElement('div');
+    message.innerHTML = '<div class="message-content"></div>';
+    pane.element.append(message);
+    const card = { name: id, status: 'running', events: [{ phase: 'start', name: id }] };
+    try {
+        voice.updateVoiceToolCard(message, card);
+        if (retirement === 'pane-wipe') chat.wipeAgentChatPane(id);
+        else history.fadeRemoveMessageNodes(null, message);
+        // A fade still has a parent; physical retirement must already prevent
+        // late resource creation before the DOM is removed by its real timer.
+        voice.updateVoiceToolCard(message, { ...card, status: 'done' });
+        message.querySelector('button').click();
+        assert.deepEqual(witness, { mounts: 1, clicks: 0, disposals: 1 });
+        if (retirement === 'message-fade') await whenRemoved(message);
+    } finally {
+        registry._reset(); pane.element.remove();
+    }
+});
+}
 
 test('mounting a pane retires leftover non-pane content', () => {
     const leftover = mountedFixture('leftover-content');
@@ -340,12 +439,7 @@ test(`a ${retirement} message cannot acquire new mounts after asynchronous final
         const finalizing = chat.finalizeStreamingMessage(message, '', pane);
         await started;
         if (retirement === 'deleted') {
-            const removed = new Promise(resolve => {
-                const observer = new dom.window.MutationObserver(() => {
-                    if (!message.parentNode) { observer.disconnect(); resolve(); }
-                });
-                observer.observe(pane.element, { childList: true });
-            });
+            const removed = whenRemoved(message);
             history.fadeRemoveMessageNodes(null, message);
             await removed;
         } else {
