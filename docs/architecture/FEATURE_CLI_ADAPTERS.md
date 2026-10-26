@@ -261,7 +261,10 @@ replaced by the head-and-tail preview. Each chunk reports `offset`,
 `content_sha256` of the whole file. Following `next_offset` from 0 reads every
 character, and the chunks joined in order are the file; a changed digest means
 the file changed at that ref between calls. An `offset` past the end fails and
-reports `total_chars`. The envelope is `kestrel_sovereign.features.paged_text`,
+reports `total_chars`. The cap is the configured value however small, as the
+orchestrator applies it; when not even one character fits beside the envelope,
+the read fails and names the cap rather than return a chunk the model would
+only see as a preview. The envelope is `kestrel_sovereign.features.paged_text`,
 for any tool that reads a text in ranges. Each call still reads the whole file
 from git, so the terminal's 1 MiB capture limit bounds what can be paged.
 
@@ -282,26 +285,15 @@ results at the default cap). The cap is not the only way a chunk can be lost:
 before each model call the orchestrator prunes the turn to the model's context
 window, replacing tool results with a stub oldest first, and every call's
 arguments and every pruned result's stub stay in the turn. A read of eighty
-chunks leaves about 20,000 characters of them, and inside the 32,768-token
-fallback window the orchestrator uses for a model it cannot identify, a batch
-sized to the cap alone lost its first chunk to the prune before the model read
-it.
-
-So the orchestrator publishes, for every tool batch it runs, the room that
-batch's results have before the prune would reclaim one of them
-(`OrchestratorResultRoom`, read with `orchestrator_result_room()` in
-`kestrel_sovereign.features.base`): the window less everything the prune keeps,
-counted the way the prune counts it. A chunk fits its equal share of its own
-batch's room as well as the cap. The batch it offers is sized so that its
-calls' arguments, their results and 1,000 characters of the response's own
-text fit the room a later response has; a batch is offered only when it reads
-further than the next call alone would. As the turn fills, batches get fewer
-and smaller rather than being pruned unread. A call that gets less room than
-its batch was sized for (a response whose text outran that reserve) returns
-fewer characters than `limit` and says that the next chunk starts at its own
-end. A turn with no room left for any chunk gets a short failure, one the prune
-always keeps, naming the offset to read on from in a later turn. A subagent's
-tools run outside the turn's prune and size to the cap alone.
+chunks leaves about 20,000 characters of them. A read does not see how much of
+the window its turn has left, so a long read in a small window can have a
+batch's first chunk pruned before the model reads it: inside the 32,768-token
+fallback window the orchestrator uses for a model it cannot identify, 50,000
+characters outside the BMP lose a chunk that way before the end. Sizing a read
+to the room its turn has left is
+[#3851](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/3851).
+`read_github_file` belongs to `kestrel-feature-github`; paging it is
+[kestrel-feature-github#11](https://github.com/KestrelSovereignAI/kestrel-feature-github/issues/11).
 
 ## Future Work
 

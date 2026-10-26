@@ -227,6 +227,18 @@ class TestValidateToolArguments:
             value = [value]
         assert validate_tool_arguments("test_tool", {"payload": value}) == (True, None)
 
+    def test_flat_scalar_array_does_not_allocate_a_path_for_every_item(self):
+        import tracemalloc
+
+        arguments = {"payload": [0] * 100_000}
+        tracemalloc.start()
+        try:
+            assert validate_tool_arguments("test_tool", arguments) == (True, None)
+            _, peak = tracemalloc.get_traced_memory()
+        finally:
+            tracemalloc.stop()
+        assert peak < 1024 * 1024, f"Guardrail allocated {peak} bytes for a flat scalar array"
+
     def test_list_item_string_length(self):
         long_string = "x" * (MAX_TOOL_ARG_LENGTH + 1)
         is_valid, error = validate_tool_arguments(

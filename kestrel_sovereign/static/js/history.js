@@ -15,6 +15,7 @@
 
 import API from './api.js';
 import { state, Toast } from './ui.js';
+import { unmountRenderers } from './ui-ext/renderers.js';
 import {
     updateContextStatus,
     wipeAgentChatPane,
@@ -130,7 +131,7 @@ window.startNewConversation = async function() {
 // just the clicked one) so a delete doesn't orphan the part/extra-prose
 // bubbles. Falls back to the passed node when none are tagged (single-bubble
 // messages predating this path / non-id bubbles).
-function fadeRemoveMessageNodes(messageId, fallbackDiv) {
+export function fadeRemoveMessageNodes(messageId, fallbackDiv) {
     let nodes = [];
     if (messageId && typeof document.querySelectorAll === 'function') {
         // Escape the id for an attribute selector (quotes/backslashes).
@@ -141,6 +142,7 @@ function fadeRemoveMessageNodes(messageId, fallbackDiv) {
     }
     if (!nodes.length && fallbackDiv) nodes = [fallbackDiv];
     for (const node of nodes) {
+        unmountRenderers(node, { retire: 'self' });
         node.style.transition = 'opacity 0.2s, transform 0.2s';
         node.style.opacity = '0';
         node.style.transform = 'scale(0.95)';

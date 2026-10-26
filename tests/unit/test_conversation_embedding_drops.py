@@ -1152,10 +1152,6 @@ async def test_postgres_best_effort_writes_after_a_dropped_vector_keep_the_trans
     The cleanup is confined to a savepoint; the registry write is skipped,
     because the row it would describe carries no profile id.
     """
-    from kestrel_sovereign.storage.sqla import embedding_profile
-
-    # The registry write is cached per process; start with it unwritten.
-    monkeypatch.setattr(embedding_profile, "_PROFILE_UPSERT_CACHE", set())
     async with _own_postgres_schema(postgres_url) as case:
         store = _store(case.db, _FixedWidthEmbeddings(6))
         await _drop_every_postgres_vector(

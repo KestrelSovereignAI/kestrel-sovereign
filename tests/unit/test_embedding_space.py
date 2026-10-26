@@ -22,7 +22,6 @@ import pytest
 
 from kestrel_sovereign.storage.async_database import AsyncDatabase
 from kestrel_sovereign.storage.sqla.embedding_profile import (
-    _clear_profile_upsert_cache_for_tests,
     record_space_parity,
 )
 
@@ -307,7 +306,6 @@ async def test_local_only_session_refuses_cloud_embedding_route():
 
 @pytest.fixture
 async def profiles_db():
-    _clear_profile_upsert_cache_for_tests()
     with tempfile.TemporaryDirectory() as tmp:
         database = await AsyncDatabase.sqlite(str(Path(tmp) / "profiles.db"))
         yield database

@@ -42,7 +42,6 @@ from kestrel_sovereign.storage.active_embedding_profile import (
 )
 from kestrel_sovereign.storage.async_database import AsyncDatabase
 from kestrel_sovereign.storage.sqla.embedding_profile import (
-    _clear_profile_upsert_cache_for_tests,
     record_space_parity,
 )
 from tests.utils.process_local_llm_service import process_local_service
@@ -83,7 +82,6 @@ def _vector(seed: float) -> bytes:
 
 @pytest.fixture
 async def db(tmp_path):
-    _clear_profile_upsert_cache_for_tests()
     database = await AsyncDatabase.sqlite(str(tmp_path / "kestrel_prime.db"))
     try:
         yield database

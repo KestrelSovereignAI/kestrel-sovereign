@@ -196,7 +196,7 @@ class CliFeature(Feature):
 
     @tool(
         name="git_show_file",
-        description="Read a local repository file from a git ref via `git show`, in ranged chunks. ref: single git ref, no ranges/`..`; path: repo-relative pathspec (no leading `/` or `..`); repo_path: within allowed repo roots (default cwd). Each call returns as much as fits the tool-result cap and the turn's remaining context, starting at offset (characters, default 0); limit caps the chunk. Each chunk reports total_chars and next_offset (null at the end). To read on, call once for each batch_offsets entry with limit=batch_limit, all in one response, or call again with offset=next_offset.",
+        description="Read a local repository file from a git ref via `git show`, in ranged chunks. ref: single git ref, no ranges/`..`; path: repo-relative pathspec (no leading `/` or `..`); repo_path: within allowed repo roots (default cwd). Each call returns as much as fits the tool-result cap, starting at offset (characters, default 0); limit caps the chunk. Each chunk reports offset, returned_chars, total_chars and next_offset (null at the end). To read on, call once for each batch_offsets entry with limit=batch_limit, all in one response, or call again with offset=next_offset.",
         category=ToolCategory.DATA_ACCESS,
         command_prefix="!git-show-file",
     )
@@ -227,7 +227,6 @@ class CliFeature(Feature):
             tool_name="git_show_file",
             subject=f"{payload['path']} at {payload['ref']}",
             data=payload,
-            call_arguments={"ref": ref, "path": path, "repo_path": repo_path},
         )
 
     @tool(
