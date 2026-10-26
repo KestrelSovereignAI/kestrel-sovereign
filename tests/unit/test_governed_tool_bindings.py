@@ -395,6 +395,23 @@ async def test_registering_owner_again_expires_prior_batch(host):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("changed", ["target", "owner"])
+async def test_binding_checks_canonical_registry_not_just_batch_presence(host, changed):
+    agent, _ = host
+    original, replacement = _Tool(), _Tool()
+    binding = _mount(agent, original)
+    # A retained owner batch cannot authorize a handle the host has reassigned.
+    if changed == "target":
+        agent._direct_tools[binding.name] = replacement
+    else:
+        agent._tool_to_feature[binding.name] = "mcp:another-owner"
+    assert not binding.is_current
+    with pytest.raises(ResourceConflict):
+        await binding.invoke({"count": 3}, session_id="mcp-app:view-1")
+    assert original.calls == replacement.calls == []
+
+
+@pytest.mark.asyncio
 async def test_bound_arguments_are_an_independent_snapshot_while_approval_waits(host):
     agent, _ = host
     tool = _Tool()
