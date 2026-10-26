@@ -18,8 +18,8 @@ generated: true
 Auto-generated file-tree + per-file purpose index. Always-loaded context for the kestrel-agent
 GitHub App (issue #791). Do **not** edit by hand — regenerate via `python scripts/generate_repo_map.py`.
 
-**Generated:** 2026-10-25
-**Scope:** 3368 tracked files (2524 `.py`, 369 `.md`, 475 other). Excludes `__pycache__`, `node_modules`, `.venv`, `.claude`, build artifacts.
+**Generated:** 2026-10-26
+**Scope:** 3373 tracked files (2529 `.py`, 369 `.md`, 475 other). Excludes `__pycache__`, `node_modules`, `.venv`, `.claude`, build artifacts.
 
 **Format per file:** `path — one-line purpose` plus the public top-level Python symbols on the next line
 (classes and functions; private `_name` skipped).
@@ -497,7 +497,7 @@ Repo entry points and standard project files.
 - **kestrel_sovereign/features/audit_anchor/hasher.py** — Deterministic hashing of audit log entries.
   - `class AuditHasher`
 - **kestrel_sovereign/features/base.py** — —
-  - `class SubagentContextBudgetExceeded`; `def is_flat_toolresult_envelope(value)`; `def orchestrator_result_cap()`; `def serialized_result_len(result)`; `class Feature`
+  - `class SubagentContextBudgetExceeded`; `def is_flat_toolresult_envelope(value)`; `def orchestrator_result_cap()`; `def serialized_result_len(result)`; `def largest_fitting_result(build, lo, hi)`; `class Feature`
 - **kestrel_sovereign/features/bootstrap/__init__.py** — Bootstrap feature for agent wake-up, discovery commands, and file convention.
 - **kestrel_sovereign/features/bootstrap/feature.py** — Bootstrap Feature - Commands for agent wake-up and discovery management.
   - `class RenameOutcome`; `async def rename_agent_core(agent, new_name)`; `class BootstrapFeature`
@@ -659,6 +659,8 @@ Repo entry points and standard project files.
   - `class MemoryFeature`
 - **kestrel_sovereign/features/memory/reflection_hook.py** — Pre-sleep memory application attestation.
   - `class AttestationWritesForbidden`; `def attestation_decision_request(session_context, content)`; `class RetrievedMemoryCandidate`; `class RetrievalMarks`; `def retrieving_turn(earlier, later, retrieved_second)`; `def render_turn(turn)`; `class ReflectionSleepHook`; `def attestation_eval_sample(raw, source)`; `…`
+- **kestrel_sovereign/features/memory/search_results.py** — Compact, size-bounded conversation-search results (#3784).
+  - `class SearchHit`; `def snippet_bounds(total, match_start, match_end, width)`; `def locate_match(text, query, tokens)`; `def bare_concept_name(value, agent_id)`; `def bare_concepts(metadata, agent_id)`; `def timestamp_text(value)`; `def message_text(row)`; `def search_hits(rows, query)`; `…`
 - **kestrel_sovereign/features/memory_agency/__init__.py** — Memory agency -- agent-controlled memory pinning and release.
 - **kestrel_sovereign/features/memory_agency/feature.py** — Memory Agency -- agent-controlled memory pinning, release, and fact storage.
   - `class MemoryAgencyFeature`
@@ -777,7 +779,7 @@ Repo entry points and standard project files.
 - **kestrel_sovereign/features/strategic_memory/morning_signal.py** — Morning Signal briefing generator for Strategic Memory.
   - `async def generate_morning_signal(data, workflow_runs)`
 - **kestrel_sovereign/features/strategic_memory/run_history.py** — What Talon's job registry says about each issue's most recent run (#3398).
-  - `class RunHistoryUnreadable`; `class TalonProviderOutdated`; `class TalonRun`; `class RunHistory`; `async def read_run_history(agent)`
+  - `class RunHistoryUnreadable`; `class TalonProviderOutdated`; `class TalonRun`; `class OutstandingOrder`; `class RunHistory`; `async def read_run_history(agent)`; `def tool_payload(result)`; `def tool_succeeded(payload)`; `…`
 - **kestrel_sovereign/features/strategic_memory/session_log.py** — Session Log collector for Strategic Memory.
   - `async def collect_session_log(data, session_id, focus)`
 - **kestrel_sovereign/features/strategic_memory/timestamps.py** — The graph ``created_at`` contract, applied at the projection seam (#3255).
@@ -1020,6 +1022,8 @@ Repo entry points and standard project files.
   - `def pytest_catalog_workloads()`
 - **kestrel_sovereign/knowledge/shacl_validation.py** — Governed, offline SHACL validation for canonical semantic datasets.
   - `class ShaclValidationError`; `class ShaclCapabilityUnavailable`; `class ShaclSnapshotMismatch`; `class ValidationState`; `class ValidationSeverity`; `class ValidationSource`; `class ValidationWriteAction`; `class ShaclValidationLimits`; `…`
+- **kestrel_sovereign/legacy_runpod.py** — Permanent refusals for ownerless historical Runpod control paths.
+  - `class LegacyRunpodPathError`
 - **kestrel_sovereign/lifecycle_checks.py** — Startup lifecycle hardening checks.
   - `class NoLLMProvidersError`; `class NoReachableProvidersError`; `class IdentityIsolationError`; `def is_isolated_nonproduction_kite_environment(env)`; `def verify_llm_providers_initialized(llm_service)`; `async def verify_llm_providers_reachable(llm_service)`; `def verify_identity_isolation(db_did, expected_did)`; `async def warn_stale_bootstrap_pending(agent)`
 - **kestrel_sovereign/llm/LLM_SERVICE_HARDENING.md** — LLM Service Hardening Implementation — ## Overview
@@ -1504,7 +1508,7 @@ Repo entry points and standard project files.
 - **kestrel_sovereign/storage/async_assertion_store.py** — Tenant-bound persistence for canonical semantic assertions.
   - `class AssertionStoreError`; `class SemanticRecallUnavailableError`; `class MaintenanceLeaseLostError`; `class TenantIsolationError`; `class AssertionConflictError`; `class AssertionOperationErasedError`; `class AssertionWriteResult`; `class SupersessionResult`; `…`
 - **kestrel_sovereign/storage/async_conversation_store.py** — Async Conversation Store for Kestrel Storage.
-  - `class ProjectionNotReady`; `class ConversationLexicalSchemaError`; `class ConversationSessionTimestampError`; `class DroppedConversationEmbedding`; `class EmbeddingColumnMismatch`; `class PreparedConversationFields`; `class SearchTerms`; `def session_match_decoration(messages, name, terms)`; `…`
+  - `class ProjectionNotReady`; `class ConversationLexicalSchemaError`; `class ConversationSessionTimestampError`; `class DroppedConversationEmbedding`; `class EmbeddingColumnMismatch`; `class PreparedConversationFields`; `class SearchProjection`; `def search_match_projection(text)`; `…`
 - **kestrel_sovereign/storage/async_database.py** — Async Database for Kestrel Storage.
   - `class DatabaseRetirementError`; `class DatabaseInitializationCleanupError`; `def graph_created_at_index_columns(backend_type)`; `def core_schema_sql(backend_type)`; `def validate_sqlite_core_schema_readiness(db_path)`; `class AsyncDatabase`
 - **kestrel_sovereign/storage/async_file_store.py** — Async File Store for Kestrel Storage.
@@ -1800,8 +1804,8 @@ Repo entry points and standard project files.
   - `def find_pem_files(directory)`; `def main()`
 - **scripts/move_root_docs.py** — Move markdown documents from repo root into the docs/ hierarchy.
   - `def move_files()`
-- **scripts/poll_runpod_start.py** — Poll RunPod every 5 minutes to try starting a pod.
-  - `def load_env()`; `def main()`
+- **scripts/poll_runpod_start.py** — Retired ownerless Runpod helper; see Core issue #3828.
+  - `def main()`
 - **scripts/provision_agent_openrouter.py** — Provision an OpenRouter API key for an agent and persist it.
   - `async def provision_agent_key(db_path, agent_label, limit_usd, limit_reset)`; `def parse_args()`
 - **scripts/public_repo_files/.gitignore** — —
@@ -2465,22 +2469,22 @@ Repo entry points and standard project files.
 - **tests/frontend/voice_default_pane.test.mjs** — (mjs asset)
 - **tests/frontend/voice_provider_attribution.test.mjs** — (mjs asset)
 - **tests/frontend/widget_claims.test.mjs** — (mjs asset)
-- **tests/infrastructure/check_pods.py** — Check RunPod pods status.
+- **tests/infrastructure/check_pods.py** — Retired ownerless Runpod helper; see Core issue #3828.
   - `def main()`
-- **tests/infrastructure/manual_debug_pod.py** — Manual debug helper for RunPod pods.
+- **tests/infrastructure/manual_debug_pod.py** — Retired ownerless Runpod helper; see Core issue #3828.
   - `def main()`
-- **tests/infrastructure/stop_all_pods.py** — Stop all running RunPod pods.
+- **tests/infrastructure/stop_all_pods.py** — Retired ownerless Runpod helper; see Core issue #3828.
   - `def main()`
-- **tests/infrastructure/test_basic_container.py** — Basic container test for RunPod infrastructure.
-  - `def runpod_client()`; `def cleanup_pod(runpod_client)`; `def test_basic_ubuntu_container(runpod_client, cleanup_pod)`
-- **tests/infrastructure/test_gpu_basic.py** — GPU basic test for RunPod infrastructure.
-  - `def runpod_client()`; `def cleanup_pod(runpod_client)`; `def test_gpu_nvidia_smi(runpod_client, cleanup_pod)`
-- **tests/infrastructure/test_runpod_gpu.py** — RunPod GPU Testing Script for Kestrel Agent
-  - `def create_pod()`; `def wait_for_pod_ready(pod_id, timeout)`; `def test_kestrel_agent(pod)`; `def cleanup_pod(pod_id)`; `def main()`
-- **tests/infrastructure/test_simple_pod.py** — Simple pod test for RunPod infrastructure.
-  - `def runpod_client()`; `def cleanup_pod(runpod_client)`; `def test_simple_pod_creation(runpod_client, cleanup_pod)`
-- **tests/infrastructure/test_ssh_pod.py** — SSH-enabled pod test for RunPod infrastructure.
-  - `def runpod_client()`; `def cleanup_pod(runpod_client)`; `def test_ssh_enabled_pod(runpod_client, cleanup_pod)`
+- **tests/infrastructure/test_basic_container.py** — Retired ownerless Runpod helper; see Core issue #3828.
+  - `def main()`
+- **tests/infrastructure/test_gpu_basic.py** — Retired ownerless Runpod helper; see Core issue #3828.
+  - `def main()`
+- **tests/infrastructure/test_runpod_gpu.py** — Retired ownerless Runpod helper; see Core issue #3828.
+  - `def main()`
+- **tests/infrastructure/test_simple_pod.py** — Retired ownerless Runpod helper; see Core issue #3828.
+  - `def main()`
+- **tests/infrastructure/test_ssh_pod.py** — Retired ownerless Runpod helper; see Core issue #3828.
+  - `def main()`
 - **tests/integration/conftest.py** — Pytest configuration for integration tests.
   - `def pytest_collection_modifyitems(config, items)`; `def pytest_timeout_set_timer(item, settings)`; `def live_call_budget(request)`; `async def complete_bootstrap(agent)`; `async def grant_permissions(agent)`; `def skip_bootstrap()`
 - **tests/integration/live_routes.py** — Deadlines and usable-route probes for tests that call live LLM routes (#3269).
@@ -4144,7 +4148,7 @@ Repo entry points and standard project files.
 - **tests/unit/test_denied_tools_dispatch.py** — Tests for security DENY enforcement at orchestrator dispatch level.
   - `class TestDeniedToolsStripping`; `class TestSubagentDeniedToolsExclusion`
 - **tests/unit/test_dependency_contract.py** — Security contracts for declared dependencies and the resolved lock.
-  - `def test_installed_remote_mcp_campaign_requires_the_public_feature_contract()`; `def test_native_a2a_streams_require_server_scoped_shutdown()`; `def test_banned_packages_not_declared()`; `def test_banned_packages_not_locked()`; `def test_security_floors_are_declared()`; `def test_security_floors_are_locked()`; `def test_windows_tzdata_is_a_direct_base_dependency_and_is_locked()`; `def test_asyncpg_runtime_probe_supports_current_minor_releases()`; `…`
+  - `def test_installed_remote_mcp_campaign_requires_the_public_feature_contract()`; `def test_native_a2a_streams_require_server_scoped_shutdown()`; `def test_shared_sdk_owns_the_current_https_trust_bundle_policy()`; `def test_banned_packages_not_declared()`; `def test_banned_packages_not_locked()`; `def test_security_floors_are_declared()`; `def test_security_floors_are_locked()`; `def test_windows_tzdata_is_a_direct_base_dependency_and_is_locked()`; `…`
 - **tests/unit/test_deploy_azure.py** — Unit tests for Azure Container Apps deployment provider.
   - `def deployment_profile()`; `def provider_and_client()`; `async def test_deploy_logs_create_only_for_resource_not_found(deployment_profile, provider_and_client, caplog)`; `async def test_deploy_logs_update_when_resource_exists(deployment_profile, provider_and_client, caplog)`; `async def test_deploy_does_not_misclassify_lookup_failure_as_absent(deployment_profile, provider_and_client)`; `async def test_deploy_lookup_preserves_caller_cancellation(deployment_profile, provider_and_client)`
 - **tests/unit/test_deploy_bugs.py** — Unit tests for deploy feature bug fixes (#101).
@@ -4697,6 +4701,8 @@ Repo entry points and standard project files.
   - `def test_lookup_has_exact_version_and_digest_round_trip()`; `def test_new_codec_vocabulary_release_preserves_the_existing_immutable_pin()`; `def test_loading_and_resolution_are_offline(monkeypatch)`; `def test_iri_profile_closure_pins_the_normative_rfc3986_source()`; `def test_import_cycle_is_rejected_with_the_cycle_path()`; `def test_missing_import_is_rejected_without_a_fallback()`; `def test_duplicate_namespace_is_rejected()`; `def test_digest_mismatch_is_rejected()`; `…`
 - **tests/unit/test_legacy_decrypt_fallback.py** — Regression tests for ``decrypt_with_legacy_fallback`` (#1458).
   - `class TestCurrentV2Passthrough`; `class TestPreV2RawAESGCMRecovery`; `class TestRejectionShape`
+- **tests/unit/test_legacy_runpod_paths.py** — Real subprocess refusal controls: no cloud fixture or successful mock.
+  - `class LegacyRunpodPathsTests`
 - **tests/unit/test_lifecycle_checks.py** — Tests for the startup lifecycle hardening rails (#377, #381, #406).
   - `def test_provider_check_passes_when_at_least_one_provider_initialized()`; `def test_provider_check_passes_with_multiple_providers()`; `def test_provider_check_raises_when_zero_providers()`; `def test_provider_check_raises_when_providers_attr_missing()`; `def test_provider_check_raises_when_providers_is_none()`; `def test_provider_check_skipped_when_llm_service_disabled()`; `def test_provider_check_still_raises_when_disabled_false_and_no_providers()`; `def test_provider_check_message_mentions_payer_policy_escape_hatch()`; `…`
 - **tests/unit/test_lifecycle_coordinator_admission_inventory.py** — All canonical lifecycle admissions use receipts, including coordinators.
@@ -4795,6 +4801,8 @@ Repo entry points and standard project files.
   - `def test_summarize_separates_retrieval_from_abstention_quality()`; `def test_rank_query_uses_production_salience_components_but_relevance_gate()`; `def test_fixture_ids_and_labels_are_well_formed()`; `def test_partial_lexical_overlap_below_canonical_threshold_is_not_relevance()`; `async def test_general_recall_excludes_explicitly_superseded_memory()`; `async def test_salience_only_reranks_semantically_competitive_candidates()`; `def test_interrogative_echo_is_dropped_without_hiding_user_fact()`
 - **tests/unit/test_memory_retriever_cosine.py** — Tests for the vector-cosine semantic-score path on :class:`MemoryRetriever`.
   - `def test_cosine_unit_identical_vectors_is_one()`; `def test_cosine_unit_opposite_vectors_is_zero()`; `def test_cosine_unit_orthogonal_vectors_is_zero()`; `def test_cosine_unit_returns_none_on_length_mismatch()`; `def test_cosine_unit_returns_none_on_zero_norm()`; `async def test_embed_query_returns_none_without_service()`; `async def test_embed_query_returns_none_for_empty_query()`; `async def test_embed_query_returns_none_on_aembed_failure()`; `…`
+- **tests/unit/test_memory_search_compact_results.py** — search_memory returns compact, size-bounded hits (#3784).
+  - `def result_cap(monkeypatch)`; `async def store(tmp_path)`; `async def test_a_million_character_message_cannot_make_a_large_search_result(store, result_cap)`; `async def test_twenty_huge_hits_shrink_and_drop_but_stay_under_the_cap(store, result_cap)`; `async def test_snippets_shrink_before_any_hit_is_dropped(store, result_cap)`; `async def test_the_smallest_cap_still_fits_with_a_huge_query(store, result_cap)`; `async def test_hits_carry_no_metadata_envelope_and_bare_concepts(store, result_cap)`; `async def test_term_fallback_hits_report_their_score(store, result_cap)`; `…`
 - **tests/unit/test_memory_system.py** — Unit tests for Human-Like Memory System.
   - `class TestEmotionalTagger`; `class TestTemporalAnalyzer`; `class TestAssociativeLinker`; `class TestMemoryRetriever`; `class TestDecayCalculation`; `class TestMemoryMetadata`; `class TestTemporalPattern`; `class TestMemoryEpisode`; `…`
 - **tests/unit/test_memory_wiring.py** — Integration-style tests that verify the memory pipeline is actually WIRED, not just that individual components work in isolation.
@@ -5447,6 +5455,8 @@ Repo entry points and standard project files.
   - `async def test_non_status_label_is_reported_missing_status()`; `async def test_status_label_is_not_reported()`; `async def test_unlabelled_issue_is_reported_missing_status()`; `async def test_fix_applies_the_same_label_to_non_status_and_unlabelled()`; `async def test_report_only_run_performs_no_write()`; `async def test_fix_does_not_claim_to_add_a_label_already_present()`
 - **tests/unit/test_strategic_memory_created_at_contract.py** — Strategic-memory projections stamp ``created_at`` under the graph contract (#3255).
   - `def test_contract_created_at(value, expected, new_york_clock)`; `def test_parse_instant(value, expected, new_york_clock)`; `def test_stamp_leaves_the_key_absent_when_nothing_is_known()`; `def test_every_writer_stamps_the_contract_shape()`; `def test_every_writer_leaves_the_key_absent_for_a_dateless_row()`; `async def test_reindex_rewrites_bare_date_and_empty_stamps(tmp_path)`
+- **tests/unit/test_strategic_memory_delegated_dispatch.py** — signal_dispatch delegates execution to the host's Talon dispatcher (#3838).
+  - `async def test_execute_sends_the_dispatcher_a_work_order_and_arms_its_wake(monkeypatch)`; `async def test_the_dispatcher_itself_still_launches_locally(monkeypatch)`; `async def test_a_policy_without_a_dispatcher_launches_locally(monkeypatch)`; `async def test_an_unconfirmed_dispatcher_policy_dispatches_nothing(mode, broken, monkeypatch)`; `async def test_suggest_names_the_executor_and_sends_nothing(monkeypatch)`; `async def test_a_refused_send_is_rejected_and_arms_nothing(monkeypatch)`; `async def test_an_uncertain_send_is_unconfirmed_and_still_arms_its_wake(monkeypatch)`; `async def test_a_send_without_a_dispatch_is_classified_by_what_peers_reported(send_result, dispatched, code, monkeypatch)`; `…`
 - **tests/unit/test_strategic_memory_external_edits.py** — STRATEGY.yaml edits made while the agent runs must survive its writes (#2273).
   - `class TestExternalEditsSurviveWrites`; `class TestUnchangedDiskWritesAsBefore`; `class TestRefusedWritesLeaveTheFileUntouched`; `class TestFailedWritesLeaveTheOriginalIntact`; `class TestReplacementKeepsTheFilesShape`
 - **tests/unit/test_strategic_memory_issue_selection.py** — Tests for provider-neutral strategic-memory issue selection.
