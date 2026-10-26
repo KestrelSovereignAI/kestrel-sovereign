@@ -5,6 +5,10 @@ binds its exact identity for one lifetime and supplies a synchronous checker
 of current authority. Privacy, authority and database leases retain their
 existing order. Each capability explicitly identifies non-disclosing safety
 or erasure actions; that exemption never bypasses owner/grant checks.
+
+``AsyncReaderWriterLock`` is the public host authority transition gate type.
+It reexports the existing lock so external host integrations share the same
+identity and locking semantics rather than creating a parallel gate.
 """
 
 from __future__ import annotations
@@ -19,9 +23,17 @@ from enum import StrEnum
 from kestrel_sdk.operator import OperatorAuthorizationError, OperatorContext
 from kestrel_sdk.resources import ResourceError
 
-from kestrel_sovereign._async_rwlock import AsyncReaderWriterLock
+from kestrel_sovereign._async_rwlock import AsyncReaderWriterLock as AsyncReaderWriterLock
 from kestrel_sovereign.privacy import PrivacyConfig, PrivacyMode
 from kestrel_sovereign.storage.privacy_wrapper import require_durable_persistence_gate
+
+
+__all__ = [
+    "AsyncReaderWriterLock",
+    "CurrentHostAuthority",
+    "HostCapabilityAccessDenied",
+    "HostCapabilityAuthority",
+]
 
 
 class HostCapabilityAccessDenied(ResourceError, OperatorAuthorizationError):
