@@ -258,6 +258,8 @@ def _attach_envelope_parts(
     response: Dict[str, Any],
     explicit_parts: Any,
     buffered_parts: Optional[List[dict]],
+    *,
+    appended_parts: Any = None,
 ) -> None:
     """Attach first-class typed parts to a tool-result envelope (#2641).
 
@@ -269,12 +271,16 @@ def _attach_envelope_parts(
     subagent dispatch passes through to the parent turn's collector. The key is
     only present when at least one valid part exists, so envelopes without
     parts are byte-identical to the pre-#2641 shape.
+    ``appended_parts`` follows the existing parts, including a deferred UI
+    publication or its delivery-error notice after post-tool policy.
     """
     entries: List[Any] = []
     if buffered_parts:
         entries.extend(buffered_parts)
     if isinstance(explicit_parts, (list, tuple)):
         entries.extend(explicit_parts)
+    if isinstance(appended_parts, (list, tuple)):
+        entries.extend(appended_parts)
     if not entries:
         return
     # Lazy import: features.base is imported very early and importing
