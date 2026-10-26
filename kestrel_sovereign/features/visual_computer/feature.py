@@ -78,6 +78,7 @@ class VisualComputerFeature(Feature):
         for name,settings in drivers.items():
             if name == "local-docker-browser":
                 settings["egress_guard"] = egress.operation
+                settings["workspace_guard"] = egress.transfer_operation
         if not providers or not drivers:
             raise ValueError("visual provider and driver factories must be explicitly configured")
         for name, settings in providers.items():

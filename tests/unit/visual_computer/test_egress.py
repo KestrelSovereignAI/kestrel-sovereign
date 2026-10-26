@@ -8,6 +8,59 @@ from tests.unit.visual_computer.test_runtime import opened
 
 
 @pytest.mark.asyncio
+async def test_workspace_borrow_is_paused_original_and_cannot_use_action_lane(harness):
+    h=harness
+    ctx=h.context()
+    with h.bind(ctx):
+        session, action=await opened(h,ctx)
+    egress=ActiveCallEgress()
+    paused=session.model_copy(update={"state":"paused","controller":"none"})
+    async def job(callback, candidate=paused):
+        async with callback(candidate,action.action_id) as current:
+            current()
+    with pytest.raises(OperatorAuthorizationError):
+        async with egress.activate_transfer(session,action.action_id,lambda:None,deadline=action.not_after):
+            pass
+    async with egress.activate_transfer(paused,action.action_id,lambda:None,deadline=action.not_after):
+        with pytest.raises(OperatorAuthorizationError):
+            await job(egress.transfer_operation)
+        await asyncio.create_task(job(egress.transfer_operation))
+        with pytest.raises(OperatorAuthorizationError):
+            await asyncio.create_task(job(egress.operation))
+        with pytest.raises(OperatorAuthorizationError):
+            await asyncio.create_task(job(egress.transfer_operation,session))
+    with pytest.raises(OperatorAuthorizationError):
+        await asyncio.create_task(job(egress.transfer_operation))
+    async with egress.activate(session,action.action_id,lambda:None,deadline=action.not_after):
+        with pytest.raises(OperatorAuthorizationError):
+            await asyncio.create_task(job(egress.transfer_operation))
+
+
+@pytest.mark.asyncio
+async def test_priority_stop_joins_original_workspace_borrow_before_ack(harness):
+    h=harness
+    ctx=h.context()
+    with h.bind(ctx):
+        session, action=await opened(h,ctx)
+    paused=session.model_copy(update={"state":"paused","controller":"none"})
+    egress=ActiveCallEgress()
+    entered,closed=asyncio.Event(),asyncio.Event()
+    async def transfer():
+        async with egress.transfer_operation(paused,action.action_id):
+            entered.set()
+            try:
+                await asyncio.Event().wait()
+            finally:
+                closed.set()
+    async with egress.activate_transfer(paused,action.action_id,lambda:None,deadline=action.not_after):
+        task=asyncio.create_task(transfer())
+        await entered.wait()
+        await egress.revoke_session(paused.scope,paused.session_id)
+        assert closed.is_set() and task.done()
+    assert not egress._calls
+
+
+@pytest.mark.asyncio
 async def test_egress_borrows_only_exact_original_active_rpc(harness):
     h = harness
     ctx = h.context()

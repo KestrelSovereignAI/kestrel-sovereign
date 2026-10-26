@@ -80,17 +80,30 @@ class ActiveCallEgress:
         self._calls = {}
 
     @staticmethod
-    def _key(session, action_id):
+    def _key(session, action_id, purpose="action"):
         scope = session.scope
         return (scope.tenant_id, scope.principal_id, scope.agent_id, session.session_id,
-                session.lease_id, session.driver_id, session.control_epoch, action_id)
+                session.lease_id, session.driver_id, session.control_epoch, action_id, purpose)
 
     @asynccontextmanager
     async def activate(self, session, action_id, check, *, deadline):
-        if (not callable(check) or session.state != "ready" or session.controller != "agent"
+        async with self._activate(session, action_id, check, deadline=deadline, purpose="action"):
+            yield
+
+    @asynccontextmanager
+    async def activate_transfer(self, session, transfer_id, check, *, deadline):
+        """Borrow the exact original paused workspace operation; grant nothing."""
+        async with self._activate(session, transfer_id, check, deadline=deadline, purpose="workspace"):
+            yield
+
+    @asynccontextmanager
+    async def _activate(self, session, action_id, check, *, deadline, purpose):
+        valid_session = ((purpose == "action" and session.state == "ready" and session.controller == "agent")
+            or (purpose == "workspace" and session.state == "paused" and session.controller == "none"))
+        if (not callable(check) or not valid_session
                 or deadline.tzinfo is None or deadline <= self.clock() or deadline > session.expires_at):
             raise OperatorAuthorizationError("no originating visual action egress authority")
-        key = self._key(session, action_id)
+        key = self._key(session, action_id, purpose)
         if key in self._calls:
             raise OperatorAuthorizationError("originating visual action is already active")
         call = _ActiveCall(session, action_id, check, deadline, self.clock, asyncio.current_task())
@@ -107,7 +120,18 @@ class ActiveCallEgress:
     @asynccontextmanager
     async def operation(self, session: ComputerSession, action_id: str):
         """Trusted driver factory callback; untrusted HTTP cannot call it."""
-        call = self._calls.get(self._key(session, action_id))
+        async with self._operation(session, action_id, purpose="action") as check:
+            yield check
+
+    @asynccontextmanager
+    async def transfer_operation(self, session: ComputerSession, transfer_id: str):
+        """Purpose-separated borrow by an owned workspace transport task."""
+        async with self._operation(session, transfer_id, purpose="workspace") as check:
+            yield check
+
+    @asynccontextmanager
+    async def _operation(self, session, action_id, *, purpose):
+        call = self._calls.get(self._key(session, action_id, purpose))
         task = asyncio.current_task()
         if (call is None or session != call.session or task is None or task is call.origin
                 or (task not in call.accepted_jobs and len(call.accepted_jobs) >= self.max_jobs)):

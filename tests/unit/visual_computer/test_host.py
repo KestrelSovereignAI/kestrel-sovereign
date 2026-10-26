@@ -219,6 +219,9 @@ async def test_canonical_factory_receives_only_trusted_host_egress_guard(harness
     await feature.initialize()
     guard=captured["drivers"]["local-docker-browser"]["egress_guard"]
     assert callable(guard) and guard.__self__ is feature.runtime.egress
+    workspace_guard=captured["drivers"]["local-docker-browser"]["workspace_guard"]
+    assert callable(workspace_guard) and workspace_guard.__self__ is feature.runtime.egress
+    assert workspace_guard.__name__ == "transfer_operation"
     assert len(captured["providers"]["local-docker-browser"]["credential_key"]) == 32
     assert "egress_guard" not in cfg["drivers"]["local-docker-browser"]
 
