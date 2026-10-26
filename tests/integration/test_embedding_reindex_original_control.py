@@ -69,7 +69,6 @@ async def test_actual_embedding_corpus_and_reindex_preserve_original_control(
     ordinary = OSError("ordinary callback unavailable after acknowledged native work")
     reached, sources, fired = [], [], []
     armed = False
-    embedding_profile._clear_profile_upsert_cache_for_tests()
 
     @asynccontextmanager
     async def lose_ack(native):
@@ -341,6 +340,5 @@ async def test_actual_embedding_corpus_and_reindex_preserve_original_control(
     finally:
         backend._pool = pool
         backend._execution_custody = None
-        embedding_profile._clear_profile_upsert_cache_for_tests()
         await db.close()
         await pool.close()

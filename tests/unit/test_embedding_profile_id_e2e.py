@@ -183,10 +183,8 @@ async def test_e2e_registry_upsert_round_trip():
     from kestrel_sovereign.llm.embedding_service import derive_embedding_profile
     from kestrel_sovereign.storage.sqla.embedding_profile import (
         upsert_embedding_profile,
-        _clear_profile_upsert_cache_for_tests,
     )
 
-    _clear_profile_upsert_cache_for_tests()
     db, path = await _make_db()
     try:
         profile = derive_embedding_profile(
