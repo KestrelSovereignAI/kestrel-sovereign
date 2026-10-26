@@ -4,7 +4,7 @@ const { chromium } = require('playwright');
 const { expect } = require('@playwright/test');
 (async () => {
     assert.match(process.env.ARTIFACT_TEST_URL, /^http:\/\/127\.0\.0\.1:\d+$/);
-    const browser = await chromium.launch({ headless: true });
+    const browser = await chromium.launch({ headless: true, channel: 'chromium' });
     try {
         const page = await browser.newPage({ viewport: { width: 1440, height: 1000 } });
         const errors = [];

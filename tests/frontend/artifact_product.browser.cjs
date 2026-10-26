@@ -5,7 +5,7 @@ const { expect } = require('@playwright/test');
 (async () => {
     const base = process.env.ARTIFACT_TEST_URL;
     assert.match(base, /^http:\/\/127\.0\.0\.1:\d+$/);
-    const browser = await chromium.launch({ headless: true });
+    const browser = await chromium.launch({ headless: true, channel: 'chromium' });
     const page = await browser.newPage({ viewport: { width: 1440, height: 1000 } });
     const errors = [];
     page.on('pageerror', error => errors.push(error.message));
