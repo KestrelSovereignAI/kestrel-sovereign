@@ -140,8 +140,9 @@ test('explicit container teardown is idempotent and scoped to its own DOM', () =
     try {
         assert.equal(typeof registry.unmountRenderers, 'function');
         registry.unmountRenderers(first.container.firstElementChild);
-        registry.unmountRenderers(first.container);
         first.button.click();
+        assert.deepEqual(first.witness, { mounts: 1, clicks: 0, disposals: 1 });
+        registry.unmountRenderers(first.container);
         second.button.click();
         assert.deepEqual(first.witness, { mounts: 1, clicks: 0, disposals: 1 });
         assert.deepEqual(second.witness, { mounts: 1, clicks: 1, disposals: 0 });
