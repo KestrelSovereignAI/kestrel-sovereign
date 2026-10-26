@@ -10350,6 +10350,7 @@ Expected Duration: {expected_duration}
             label: str,
             operation: Callable[[], Any],
             budget: float,
+            request: Optional[Callable[[], None]] = None,
         ) -> Optional[ReleaseOutcome]:
             """Release one resource within its fair share of the budget.
 
@@ -10358,6 +10359,16 @@ Expected Duration: {expected_duration}
             it returns; custody decides whether that confirms the release
             (#3522). A timeout or an error is logged and the sweep goes on,
             leaving the resource held. Cancellation propagates.
+
+            ``request``, when given, is the owner's synchronous stop request.
+            It runs before ``operation`` is started and its deadline armed,
+            so the work it queues runs before ``operation``'s first turn, and
+            an ``operation`` left with nothing else to wait for finishes in
+            that turn. An event loop that stalls past the deadline resumes
+            with the deadline's callback overdue, and asyncio runs that
+            callback ahead of work queued after the stall: without the
+            request, it interrupted a stop whose loop had already ended
+            (#3840).
 
             Returns:
                 What the step reported, before custody judged it, or ``None``
@@ -10391,6 +10402,8 @@ Expected Duration: {expected_duration}
                     request_interrupt(task, expired=True)
 
                 try:
+                    if request is not None:
+                        request()
                     task = create_owned_task(
                         operation(), retain_originals=True, admission=admission,
                     )
@@ -10535,6 +10548,13 @@ Expected Duration: {expected_duration}
                 )
             )
 
+        def _stop_request(worker) -> Optional[Callable[[], None]]:
+            # A worker's synchronous stop request, made before its step's
+            # deadline is armed (#3840). Looked up on the class, for the same
+            # reason as shutdown_with_agent_deadline above.
+            request = getattr(type(worker), "request_stop", None)
+            return worker.request_stop if callable(request) else None
+
         shutdown_cancelled = False
         try:
             # EPHEMERAL hard-purge defense-in-depth (#767 / #2673). If the agent
@@ -10552,6 +10572,7 @@ Expected Duration: {expected_duration}
                     "Heartbeat",
                     self.heartbeat_runner.stop,
                     _step_budget(),
+                    request=_stop_request(self.heartbeat_runner),
                 )
 
             # Stop resume monitor (#1545)
@@ -10561,6 +10582,7 @@ Expected Duration: {expected_duration}
                     "Resume monitor",
                     self.resume_monitor.stop,
                     _step_budget(),
+                    request=_stop_request(self.resume_monitor),
                 )
 
             # Stop C / #1311 durable salvage worker. Drains in-flight

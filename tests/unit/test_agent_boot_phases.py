@@ -863,6 +863,89 @@ async def test_stopping_releases_the_record_once_every_owner_is_truthful(
         await _cleanup(agent)
 
 
+#: The cap on any one shutdown step's slice while a stall is injected; the
+#: injected stall is longer, so it always carries the clock past the step's
+#: deadline.
+_STEP_SLICE_CAP_SECONDS = 1.0
+_STALL_SECONDS = 1.5 * _STEP_SLICE_CAP_SECONDS
+
+
+#: Whether each worker's loop has run since boot published READY.
+_WORKER_LOOP_ENTERED = {
+    "heartbeat_runner": lambda runner: runner._pre_sleep_wall is not None,
+    "resume_monitor": lambda monitor: monitor._prev_wall is not None,
+}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("loop", ["not-started", "sleeping"])
+@pytest.mark.parametrize("stall", ["before-the-stop-runs", "while-the-stop-runs"])
+@pytest.mark.parametrize("worker", sorted(_WORKER_LOOP_ENTERED))
+async def test_a_loop_stall_past_a_stop_deadline_does_not_keep_a_stopped_worker(
+    tmp_path, monkeypatch, worker, stall, loop
+):
+    """A stall that carries the loop past a stop's deadline keeps nothing (#3840).
+
+    CI froze a worker's event loop for about a second inside the heartbeat's
+    0.66s shutdown slice. The loop resumed with the slice's deadline overdue,
+    and asyncio ran it ahead of the stop's remaining turns: it interrupted a
+    stop whose loop task had ended, and the heartbeat was kept. The stall is
+    injected on the loop clock, on the first turn after the step arms its
+    deadline or inside the stop's own first turn. In CI the worker's loop had
+    not run since READY; a worker that has been up a while is sleeping in it.
+    """
+    from kestrel_sovereign import kestrel_agent
+    from tests.utils.virtual_clock import advanceable_loop_clock
+
+    _trust(monkeypatch, _BOOT_OWNERS)
+    monkeypatch.setattr(
+        kestrel_agent, "KESTREL_FEATURE_SHUTDOWN_TIMEOUT_S", _STEP_SLICE_CAP_SECONDS
+    )
+    agent = _make_agent(tmp_path)
+    stalled = []
+    try:
+        with _boot_holding_every_resource():
+            await agent.initialize()
+            if loop == "sleeping":
+                # One turn: each runnable worker loop reaches its sleep.
+                await asyncio.sleep(0)
+            loop_entered = _WORKER_LOOP_ENTERED[worker](getattr(agent, worker))
+            assert loop_entered is (loop == "sleeping")
+            with advanceable_loop_clock() as clock:
+
+                def stall_the_loop():
+                    stalled.append(worker)
+                    clock.advance(_STALL_SECONDS)
+
+                if stall == "before-the-stop-runs":
+                    custody = agent._resource_custody()
+                    release = custody.release
+
+                    async def release_after_a_stall(name, step):
+                        if name == worker:
+                            asyncio.get_running_loop().call_soon(stall_the_loop)
+                        return await release(name, step)
+
+                    monkeypatch.setattr(custody, "release", release_after_a_stall)
+                else:
+                    worker_class = type(getattr(agent, worker))
+                    stop = worker_class.stop
+
+                    async def stop_after_a_stall(self):
+                        stall_the_loop()
+                        return await stop(self)
+
+                    monkeypatch.setattr(worker_class, "stop", stop_after_a_stall)
+
+                await _stop(agent)
+
+        assert stalled == [worker]
+        assert agent._resource_custody().held == ()
+        assert _guard_holder(tmp_path) is None
+    finally:
+        await _cleanup(agent)
+
+
 @pytest.mark.asyncio
 async def test_a_rollback_releases_the_record_once_every_owner_is_truthful(
     tmp_path, monkeypatch
