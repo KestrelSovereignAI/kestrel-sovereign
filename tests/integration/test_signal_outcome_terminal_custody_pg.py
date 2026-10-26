@@ -496,7 +496,27 @@ async def test_postgres_database_clone_cannot_inherit_original_journal_identity(
                 await control.execute(f'DROP DATABASE IF EXISTS "{owned_name}"')
 
 
+_SHARED_SESSION_DEFAULTS = (
+    'SELECT setdatabase, setrole, setconfig FROM pg_catalog.pg_db_role_setting '
+    'WHERE setrole IN (0, (SELECT oid FROM pg_catalog.pg_roles WHERE rolname=SESSION_USER)) '
+    'AND setdatabase IN (0, (SELECT oid FROM pg_catalog.pg_database WHERE datname=current_database())) '
+    'ORDER BY setdatabase, setrole'
+)
+
+
+async def _fresh_session_synchronous_commit(original):
+    """What a new session of the shared login role in the worker database starts with."""
+    import asyncpg
+    connection = await asyncpg.connect(*original._connect_args, **original._connect_kwargs)
+    try:
+        return (await connection.fetchval('SHOW synchronous_commit'),
+                await connection.fetchval("SELECT source FROM pg_catalog.pg_settings WHERE name='synchronous_commit'"))
+    finally:
+        await connection.close()
+
+
 async def test_postgres_original_journal_refuses_effective_durability_drift(dispatcher_components, native_pg, monkeypatch):
+    import uuid
     from kestrel_sovereign._async_ownership import await_owned_task
     from kestrel_sovereign.execution_custody import ExecutionCustody, bind_execution_runtime, is_execution_control_error, execution_commit_outcome
     from kestrel_sovereign.storage.db.native_journal_programs import NativeJournalPostgresConnection
@@ -504,57 +524,61 @@ async def test_postgres_original_journal_refuses_effective_durability_drift(disp
     from tests.unit.test_signals_dispatcher import _action_reg, _signal
     c = dispatcher_components
     _, control, schema = native_pg
-    role = await control.fetchval('SELECT SESSION_USER')
-    quoted_role = '"' + role.replace('"', '""') + '"'
-    global_settings = await control.fetchval(
-        'SELECT setconfig FROM pg_db_role_setting '
-        'WHERE setrole=(SELECT oid FROM pg_roles WHERE rolname=SESSION_USER) '
-        'AND setdatabase=0'
-    )
-    database = await control.fetchval('SELECT current_database()')
-    quoted_database = '"' + database.replace('"', '""') + '"'
-    pool = await _fresh_journal_pool(c.backend._pool, initial_size=1, max_size=1, ssl='disable')
-    original_pool = c.backend._pool
-    c.backend._pool = pool
-    observed = []
-    principal = NativeJournalPostgresConnection._original_journal_principal
-    async def observe_principal(connection):
-        observed.append(await connection.fetchval('SHOW synchronous_commit'))
-        return await principal(connection)
-    monkeypatch.setattr(NativeJournalPostgresConnection, '_original_journal_principal', observe_principal)
-    scope = ExecutionCustody(_OriginalWork(backend_type='postgres'))
-    async def handler(payload):
-        await control.execute(f'ALTER ROLE {quoted_role} IN DATABASE {quoted_database} SET synchronous_commit=off')
-        assert await control.fetchval(
-            'SELECT setconfig FROM pg_db_role_setting '
-            'WHERE setrole=(SELECT oid FROM pg_roles WHERE rolname=SESSION_USER) '
-            'AND setdatabase=0'
-        ) == global_settings, 'durability drift must not change another worker database'
-        async with pool.acquire() as connection:
-            await connection.close()
-        scope.revoke('actual work cutoff before changed role-default reconnect')
-        return {'genuine': True}
-    signal = _signal('native.durability.reconnect')
-    c.registry.register(_action_reg(signal.source, handler=handler))
+    # The replacement session must start with changed durability from the same
+    # recipe, so the change is a server-side default: SET or SET LOCAL on one
+    # connection never reaches a new session. The login role and the worker
+    # database are shared with concurrent tests, so the default is set on a
+    # database only this test connects to (#3853).
+    name = 'durability_db_' + uuid.uuid4().hex
+    original_pool, pool = c.backend._pool, None
+    shared_default = await _fresh_session_synchronous_commit(original_pool)
+    shared_settings = await control.fetch(_SHARED_SESSION_DEFAULTS)
+    await control.execute(f'CREATE DATABASE "{name}" TEMPLATE template0')
     try:
+        pool = await _fresh_journal_pool(original_pool, database=name, initial_size=1, max_size=1, ssl='disable')
+        c.backend._pool = pool
+        async with pool.acquire() as connection:
+            await connection.execute(f'CREATE SCHEMA "{schema}"')
+        await c.store.initialize()
+        observed = []
+        principal = NativeJournalPostgresConnection._original_journal_principal
+        async def observe_principal(connection):
+            observed.append(await connection.fetchval('SHOW synchronous_commit'))
+            return await principal(connection)
+        monkeypatch.setattr(NativeJournalPostgresConnection, '_original_journal_principal', observe_principal)
+        scope = ExecutionCustody(_OriginalWork(backend_type='postgres'))
+        drifted_shared_settings = []
+        async def handler(payload):
+            await control.execute(f'ALTER DATABASE "{name}" SET synchronous_commit=off')
+            drifted_shared_settings.append(await control.fetch(_SHARED_SESSION_DEFAULTS))
+            async with pool.acquire() as connection:
+                await connection.close()
+            scope.revoke('actual work cutoff before changed database-default reconnect')
+            return {'genuine': True}
+        signal = _signal('native.durability.reconnect')
+        c.registry.register(_action_reg(signal.source, handler=handler))
         with bind_execution_runtime(SimpleNamespace(_execution_custody=scope)):
             outcome = await await_owned_task(asyncio.create_task(c.dispatcher.dispatch_signal(signal)))
-        assert observed == ['on', 'off'], 'actual new session did not inherit changed role durability'
+        assert drifted_shared_settings == [shared_settings], 'durability drift changed a default of the shared login role or worker database'
+        assert observed == ['on', 'off'], 'actual new session did not inherit changed database durability'
         assert is_execution_control_error(outcome.error), 'journal acknowledged asynchronously committed replacement session'
         assert execution_commit_outcome(outcome.error) is None
-        assert await control.fetchval(f'SELECT COUNT(*) FROM ONLY "{schema}".signal_log WHERE id=$1', signal.id) == 0
+        async with pool.acquire() as connection:
+            assert await connection.fetchval(f'SELECT COUNT(*) FROM ONLY "{schema}".signal_log WHERE id=$1', signal.id) == 0
     finally:
-        c.backend._pool = original_pool
         try:
-            await control.execute(f'ALTER ROLE {quoted_role} IN DATABASE {quoted_database} RESET synchronous_commit')
-            assert await control.fetchval(
-                'SELECT setconfig FROM pg_db_role_setting '
-                'WHERE setrole=(SELECT oid FROM pg_roles WHERE rolname=SESSION_USER) '
-                'AND setdatabase=(SELECT oid FROM pg_database WHERE datname=current_database())'
-            ) is None, 'durability drift left a changed worker database default'
+            if pool is not None:
+                await c.dispatcher.shutdown_durable_delivery()
         finally:
-            async with asyncio.timeout(10):
-                await pool.close()
+            c.backend._pool = original_pool
+            if pool is not None:
+                async with asyncio.timeout(10):
+                    await pool.close()
+            await control.execute(f'DROP DATABASE IF EXISTS "{name}"')
+    value, source = await _fresh_session_synchronous_commit(original_pool)
+    assert (value, source) == shared_default and source not in ('user', 'database', 'database user'), (
+        f'a new session of the shared login role starts with synchronous_commit={value!r} from {source!r}, '
+        f'not the server default {shared_default!r}')
 
 
 @pytest.mark.parametrize('direct_tls', [False, True])
