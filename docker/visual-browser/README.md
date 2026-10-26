@@ -188,6 +188,17 @@ The driver implements the SDK's `WorkspaceTransferProvider` extension;
 read/write, status, release/abort and commit methods. The host artifact service
 must hold its exact current owner/privacy/session guard across every call.
 
+The trusted host also injects `workspace_guard(session, original_transfer_id)`
+from the same original-call borrower machinery, with a separate workspace
+purpose. Every prepare/read/write/commit/status RPC borrows that retained checker
+on an owned child task through async inspection, process launch, final stdin
+write and private reply. Priority control cancels and joins workspace borrowers
+before fencing the worker. A pre-dispatch revocation sends no new file command;
+post-dispatch uncertainty retains the original transfer ID for reconciliation.
+Release/abort can retire retained original IDs without fresh data authority;
+that cleanup path cannot read or install new bytes. SDK signatures are unchanged.
+Bare SDK callers still supply their own authorization responsibility.
+
 Data requires a paused session with controller `none`, current epoch and live
 transfer/session expiry. Takeover fences data; authenticated cleanup remains
 available for retained partial state. The explicit `browser` workspace exports

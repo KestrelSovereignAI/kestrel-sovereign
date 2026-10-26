@@ -379,16 +379,20 @@ class DockerEnvironmentProvider:
 class DockerComputerDriver:
     driver_id = PROVIDER
 
-    def __init__(self, *, docker_socket, egress_guard=None, network_policy=None):
+    def __init__(self, *, docker_socket, egress_guard=None, workspace_guard=None, network_policy=None):
         if egress_guard is not None and not callable(egress_guard):
             raise ResourceUnsupported("invalid_private_egress_guard")
+        if workspace_guard is not None and not callable(workspace_guard):
+            raise ResourceUnsupported("invalid_private_workspace_guard")
         self.boundary = DockerBoundary(docker_socket)
         self.egress_guard = egress_guard
+        self.workspace_guard = workspace_guard
         self.policy = DockerEgressPolicy.from_settings(network_policy)
         self.profile_id = self.policy.profile_id if self.policy is not None else PROFILE
         self.operations = OPERATIONS | ({"navigate"} if self.policy is not None else set())
         self._pumps = {}
         self._borrowers = {}
+        self._workspace_borrowers = {}
         self._connections = {}
 
     def workspace_transfer(self):
@@ -486,7 +490,12 @@ class DockerComputerDriver:
             "secret": connection.credential.get_secret_value(), "id": identifier,
             "operation": operation, "arguments": arguments}, mode="priority" if priority else None, current=current)
         if current is not None:
-            current()
+            try:
+                current()
+            except Exception:
+                # The accepted native RPC may already have installed bytes or
+                # delivered input. Revoked private delivery is never no-effect.
+                raise ResourceOutcomeUnknown("driver_effect_outcome_unknown") from None
         if response.get("id") != identifier:
             raise ResourceOutcomeUnknown("worker_response_identity_unknown")
         if "error" in response:
@@ -554,18 +563,32 @@ class DockerComputerDriver:
     async def act(self, session, request):
         if self.egress_guard is None:
             return await self._perform_act(session, request)
-        async def borrow():
-            async with self.egress_guard(session, request.action_id) as current:
-                current()
-                return await self._perform_act(session, request, current=current)
-        if session.session_id in self._borrowers:
+        return await self._guarded_call(session, request.action_id, self.egress_guard,
+            lambda current: self._perform_act(session, request, current=current))
+
+    async def _guarded_call(self, session, identifier, guard, operation, *, workspace=False):
+        """Owned dispatch borrower; authority remains the original host call's."""
+        if not workspace and session.session_id in self._borrowers:
             raise ResourceConflict("action_borrower_already_active")
+        async def borrow():
+            async with guard(session, identifier) as current:
+                current()
+                return await operation(current)
         borrower = asyncio.create_task(borrow())
-        self._borrowers[session.session_id] = borrower
+        if workspace:
+            self._workspace_borrowers.setdefault(session.session_id,set()).add(borrower)
+        else:
+            self._borrowers[session.session_id] = borrower
         try:
             return await borrower
         finally:
-            self._borrowers.pop(session.session_id, None)
+            if workspace:
+                retained = self._workspace_borrowers.get(session.session_id,set())
+                retained.discard(borrower)
+                if not retained:
+                    self._workspace_borrowers.pop(session.session_id,None)
+            else:
+                self._borrowers.pop(session.session_id, None)
             if not borrower.done():
                 borrower.cancel()
             await asyncio.gather(borrower, return_exceptions=True)
@@ -597,9 +620,14 @@ class DockerComputerDriver:
 
     async def control(self, session, request):
         borrower = self._borrowers.get(session.session_id)
-        if borrower is not None and borrower is not asyncio.current_task():
+        borrowers = set(self._workspace_borrowers.get(session.session_id,()))
+        if borrower is not None:
+            borrowers.add(borrower)
+        borrowers.discard(asyncio.current_task())
+        for borrower in borrowers:
             borrower.cancel()
-            await asyncio.gather(borrower, return_exceptions=True)
+        if borrowers:
+            await asyncio.gather(*borrowers, return_exceptions=True)
         entry = await self._stop_pump(session.session_id)
         if entry is not None:
             await self._rpc(session.session_id, "network_cancel", {
@@ -615,9 +643,20 @@ class DockerWorkspaceTransfer:
         self.driver = driver
 
     async def _call(self, session, operation, arguments):
-        return await self.driver._rpc(session.session_id, "workspace", {
-            "session": session.model_dump(mode="json"), "operation": operation, "arguments": arguments},
-            cleanup=operation in {"release_export", "abort_import"})
+        cleanup = operation in {"release_export", "abort_import"}
+        async def dispatch(current=None):
+            return await self.driver._rpc(session.session_id, "workspace", {
+                "session": session.model_dump(mode="json"), "operation": operation, "arguments": arguments},
+                cleanup=cleanup,current=current)
+        if cleanup or self.driver.workspace_guard is None:
+            # Cleanup retains original accepted IDs; it grants no file bytes or
+            # installation. Bare SDK callers retain authorization responsibility.
+            return await dispatch()
+        transfer_id = (arguments["request"]["transfer_id"] if "request" in arguments
+                       else arguments.get("snapshot_id",arguments.get("transfer_id")))
+        if not isinstance(transfer_id,str) or not transfer_id:
+            raise ResourceUnsupported("workspace_original_transfer_id_required")
+        return await self.driver._guarded_call(session,transfer_id,self.driver.workspace_guard,dispatch,workspace=True)
 
     async def prepare_export(self, session, request):
         from kestrel_sdk.workspaces import WorkspaceSnapshot
@@ -680,6 +719,6 @@ def environment_provider_factory(*, settings: Mapping[str, object]):
 
 
 def computer_driver_factory(*, settings: Mapping[str, object]):
-    if "docker_socket" not in settings or set(settings) - {"docker_socket", "egress_guard", "network_policy"}:
+    if "docker_socket" not in settings or set(settings) - {"docker_socket", "egress_guard", "workspace_guard", "network_policy"}:
         raise ResourceUnsupported("invalid_private_docker_settings")
     return DockerComputerDriver(**settings)
