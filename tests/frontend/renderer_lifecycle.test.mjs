@@ -139,7 +139,7 @@ test('explicit container teardown is idempotent and scoped to its own DOM', () =
     const second = mountedFixture('second-view');
     try {
         assert.equal(typeof registry.unmountRenderers, 'function');
-        registry.unmountRenderers(first.container);
+        registry.unmountRenderers(first.container.firstElementChild);
         registry.unmountRenderers(first.container);
         first.button.click();
         second.button.click();
@@ -149,6 +149,33 @@ test('explicit container teardown is idempotent and scoped to its own DOM', () =
         registry._reset();
         first.container.remove();
         second.container.remove();
+    }
+});
+
+test('a failed mount releases its claim so the actual root can recover', () => {
+    const witness = { mounts: 0, clicks: 0, disposals: 0 };
+    const renderer = interactiveRenderer('recovering-view', witness);
+    const mount = renderer.mount;
+    let attempts = 0;
+    renderer.mount = (root) => {
+        attempts += 1;
+        if (attempts === 1) throw new Error('Controlled renderer startup failure');
+        return mount(root);
+    };
+    registry.registerRenderer(renderer);
+    const container = document.createElement('div');
+    container.innerHTML = registry.renderToSafeHtml(renderer, {}, {}, purify.sanitize, String);
+    try {
+        registry.mountRenderers(container);
+        const dispose = registry.mountRenderers(container);
+        container.querySelector('button').click();
+        assert.equal(attempts, 2);
+        assert.deepEqual(witness, { mounts: 1, clicks: 1, disposals: 0 });
+        dispose();
+        assert.equal(witness.disposals, 1);
+    } finally {
+        registry._reset();
+        container.remove();
     }
 });
 
