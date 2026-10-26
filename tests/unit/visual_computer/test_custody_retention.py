@@ -129,6 +129,7 @@ async def test_first_upgrade_backfills_authenticated_legacy_rows_without_replay(
                 "INSERT INTO visual_computer_actions (owner,session_key,action_id,payload) VALUES (?,?,?,?)",
                 (owner, session_key, name, blob),
             )
+        await h.db.execute("DROP INDEX visual_computer_retired_requests")
         await h.db.execute("DROP INDEX visual_computer_live_requests")
         await h.db.execute("DROP INDEX visual_computer_pending_actions")
         await h.db.execute("ALTER TABLE visual_computer_requests DROP COLUMN released")

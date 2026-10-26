@@ -223,6 +223,28 @@ transfer rather than substituting unrestricted shell/file access.
 
 ## Interaction and resource custody
 
+A host dispatch CAS is not proof that a native worker received input. Core's
+concrete Docker driver can report a private, invocation-bound non-dispatch fact
+only after all its preflight/RPC children physically settle and no application
+stdin write was attempted. The possible-write marker is set before the native
+write, so partial writes, lost replies and cancellation after possible input
+remain unknown. The original live host invocation validates the full normalized
+ActionRequest/session and journals its exact terminal denial; generic driver
+exceptions and copied/retired facts never establish non-dispatch. Original
+cancellation and private-delivery policy still propagate after factual storage.
+
+A request refused or cancelled before the acquiring CAS may retire without ever
+acquiring an environment. The same encrypted request row retains immutable
+original request/session IDs, pre-acquisition phase and retirement time. It is
+not a verified physical release and has no fabricated lease. Atomic owner and
+revision checks prevent retirement racing into acquisition, or a stale task
+saving over the tombstone. Only authenticated admitted/quoted phases with no
+lease, connection, session, control or action facts qualify. Acquiring, unknown
+or any legacy possible-effect custody remains live and charged. Release,
+request reconciliation and expired-request maintenance expose these separate
+retirement semantics; exact-ID reopen cannot restore quota or acquire again.
+
+
 Persist the admitted request and accepted quote before acquisition. Quotes bind
 exact constraints, owner, region, pinned image, lifetime and cost ceiling. A
 lease identifies its accepted quote. Unknown acquire outcomes retain the same

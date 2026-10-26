@@ -172,6 +172,7 @@ async def test_native_verified_release_capacity_and_unknown_action_retention(cus
     pending=request.model_copy(update={"session_id":other.session_id,"action_id":"unknown"})
     await store.action(SCOPE,other.session_id,pending.action_id,accept=pending)
     # Upgrade populated original tables on each actual native backend.
+    await store.db.execute("DROP INDEX visual_computer_retired_requests")
     await store.db.execute("DROP INDEX visual_computer_live_requests")
     await store.db.execute("DROP INDEX visual_computer_pending_actions")
     await store.db.execute("ALTER TABLE visual_computer_requests DROP COLUMN released")

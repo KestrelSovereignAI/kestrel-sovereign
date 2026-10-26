@@ -23,6 +23,7 @@ from kestrel_sdk.computer_use import (
 from kestrel_sdk.resources import ResourceConflict, ResourceError, ResourceNotFound, ResourceOutcomeUnknown, ResourceScope
 from kestrel_sdk.operator import OperatorAuthorizationError
 
+from .dispatch import original_dispatch, NativeActionNotDispatched
 from .repository import CustodyRecord, VisualCustodyRepository
 from .egress import ActiveCallEgress
 
@@ -197,23 +198,34 @@ class VisualComputerRuntime:
                 if record.phase == "active":
                     check()
                     return record.session
+                if record.phase == "retired":
+                    raise ResourceConflict("original request retired without acquisition; use a new request ID")
                 if record.phase not in {"admitted", "quoted"}:
                     raise ResourceOutcomeUnknown("existing request requires original-ID reconciliation")
-                provider = self._provider(record)
-                if record.quote is None:
-                    capabilities = await self._call(context, check, provider.capabilities)
-                    if (capabilities.provider_id != request.provider_id or capabilities.location != request.location
-                            or request.surface not in capabilities.surfaces
-                            or not request.required_capabilities <= capabilities.operations):
-                        raise ResourceConflict("provider capabilities do not satisfy visual request")
-                    quote = await self._call(context, check, provider.quote, request)
-                    self._quote(record, quote)
-                    record.quote, record.phase = quote, "quoted"
+                try:
+                    provider = self._provider(record)
+                    if record.quote is None:
+                        capabilities = await self._call(context, check, provider.capabilities)
+                        if (capabilities.provider_id != request.provider_id or capabilities.location != request.location
+                                or request.surface not in capabilities.surfaces
+                                or not request.required_capabilities <= capabilities.operations):
+                            raise ResourceConflict("provider capabilities do not satisfy visual request")
+                        quote = await self._call(context, check, provider.quote, request)
+                        self._quote(record, quote)
+                        record.quote, record.phase = quote, "quoted"
+                        await self.repository.save(self.scope(context), record, check)
+                    self._quote(record, record.quote)
+                    record.phase = "acquiring"
                     await self.repository.save(self.scope(context), record, check)
-                self._quote(record, record.quote)
-                record.phase = "acquiring"
-                await self.repository.save(self.scope(context), record, check)
-                return await self._acquire_open(context, record, check)
+                    return await self._acquire_open(context, record, check)
+                except BaseException as original:
+                    try:
+                        await self.repository.retire_unacquired(self.scope(context), record, at=self._now())
+                    except ResourceConflict:
+                        pass  # Acquiring/unknown or a newer owner remains charged.
+                    except BaseException as retirement_error:
+                        original.add_note("original request retirement remains unconfirmed: "+type(retirement_error).__name__)
+                    raise
 
     async def _acquire_open(self, context, record, check):
         scope, provider = self.scope(context), self._provider(record)
@@ -254,6 +266,9 @@ class VisualComputerRuntime:
             scope = self.scope(context)
             async with self._lock((scope.model_dump_json(), request_id)):
                 record = await self.repository.get(scope, request_id=request_id, guard=check)
+                if record.phase in {"admitted", "quoted", "retired"}:
+                    record = await self.repository.retire_unacquired(scope, record, at=self._now(), guard=check)
+                    return self._retirement(record)
                 self._request(context, record.request)
                 if record.phase not in {"acquiring", "leased", "opening"}:
                     raise ResourceConflict("request has no pending acquisition/open reconciliation")
@@ -308,7 +323,7 @@ class VisualComputerRuntime:
                     "phase": record.phase, "session": record.session.model_dump(mode="json") if record.session else None,
                     "pending_control": record.pending_control.model_dump(mode="json") if record.pending_control else None,
                     "lease": record.lease.model_dump(mode="json") if record.lease else None,
-                    "requires_reconciliation": self._key(record.request.scope, record.session_id) not in self._verified_sessions or record.pending_control is not None}
+                    "requires_reconciliation": record.phase not in {"retired", "released"} and (self._key(record.request.scope, record.session_id) not in self._verified_sessions or record.pending_control is not None)}
 
     async def observe(self, context, session_id):
         async with self.session_operation(context, session_id, VisualAction.OBSERVE) as (session, driver, check):
@@ -389,7 +404,16 @@ class VisualComputerRuntime:
                             raise ResourceConflict("accepted visual frame/session changed before driver dispatch")
                         effect_check()
                         driver_entered = True
-                        return await self._driver(record).act(record.session, request)
+                        with original_dispatch(record.session, request) as original:
+                            try:
+                                return await self._driver(record).act(record.session, request)
+                            except NativeActionNotDispatched as fact:
+                                original.require(fact)
+                                denied = ActionReceipt(action_id=request.action_id, session_id=request.session_id,
+                                    observation_id=request.observation_id, control_epoch=request.control_epoch,
+                                    outcome="denied", recorded_at=self._now(), reason_code="host_not_dispatched")
+                                await self.repository.action(scope, request.session_id, request.action_id, receipt=denied)
+                                raise fact.original from None
                     receipt = await self._call(context, check, dispatch)
                 self._receipt(request, receipt)
                 # Preserve accepted outcome even if Stop raced its response;
@@ -515,6 +539,11 @@ class VisualComputerRuntime:
                 self._fences.discard(self._key(scope, session_id))
             return session
 
+    @staticmethod
+    def _retirement(record):
+        return {"session_id":record.session_id, "request_id":record.request.request_id,
+                "retired":True, "acquired":False, "released":False}
+
     async def release(self, context, session_id):
         async with self.operation(context, VisualAction.RELEASE) as check:
             scope = self.scope(context)
@@ -527,6 +556,11 @@ class VisualComputerRuntime:
                 self._fences.discard(fence)
                 self._control_serials.pop(fence, None)
                 raise
+            if record.phase in {"admitted", "quoted", "retired"}:
+                record = await self.repository.retire_unacquired(scope, record, at=self._now(), guard=check)
+                self._fences.discard(fence)
+                self._control_serials.pop(fence, None)
+                return self._retirement(record)
             if record.lease is None:
                 raise ResourceOutcomeUnknown("unknown acquisition retains request cleanup custody")
             if record.phase == "released":
@@ -594,7 +628,16 @@ class VisualComputerRuntime:
             await self.repository.ensure_initialized()
         uncertain = []
         for record in await self.repository.records(scope):
-            if record.phase == "released" or record.lease is None:
+            if record.phase in {"released", "retired"}:
+                continue
+            if record.lease is None:
+                if record.phase in {"admitted", "quoted"} and record.request.expires_at <= self._now():
+                    try:
+                        await self.repository.retire_unacquired(scope, record, at=self._now())
+                    except ResourceError:
+                        uncertain.append(record.session_id)
+                elif record.phase not in {"admitted", "quoted"}:
+                    uncertain.append(record.session_id)
                 continue
             last = record.last_activity_at or record.request.requested_at
             if (self._now() < record.lease.expires_at

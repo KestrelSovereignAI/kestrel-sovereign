@@ -31,6 +31,8 @@ from kestrel_sdk.resources import (
     ResourceConflict, ResourceNotFound, ResourceOutcomeUnknown,
     ResourceUnsupported,
 )
+from .dispatch import native_dispatch, native_trace
+from kestrel_sovereign._async_ownership import create_owned_task, await_owned_task, raise_owned_outcome
 from .docker_policy import container_arguments, verify_container
 from .docker_egress import DockerEgressPolicy, HTTPGateway, EgressDenied, EgressUnknown
 
@@ -98,91 +100,125 @@ class DockerBoundary:
             raise ResourceUnsupported("docker_cli_unavailable")
         self.executable = executable
 
-    async def invoke(self, arguments, *, data=None, timeout=25, current=None):
-        # A new empty Docker config disables user contexts and proxy injection.
-        # HOME remains the real home, but no operator configuration is consumed.
-        environment = {"HOME": os.environ.get("HOME", ""), "PATH": os.defpath,
-                       "PYTHON_DOTENV_DISABLED": "1"}
-        with tempfile.TemporaryDirectory(prefix="kestrel-private-docker-") as config:
-            launch = asyncio.create_task(asyncio.create_subprocess_exec(
-                self.executable, "--config", config, "--host", f"unix://{self.socket}",
-                *arguments, stdin=asyncio.subprocess.PIPE,
-                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
-                env=environment, cwd=Path(__file__).parent,
-            ))
-            try:
-                process = await asyncio.shield(launch)
-            except BaseException:
-                # Cancellation can race OS process creation. Retain the launch
-                # until its exact process is known, then reap without stdin.
-                process = await launch
-                if process.returncode is None:
-                    try:
-                        process.kill()
-                    except ProcessLookupError:
-                        pass
-                await process.wait()
-                raise
-            async def read(stream):
-                chunks, size = [], 0
-                while chunk := await stream.read(min(65536, MAX_OUTPUT + 1 - size)):
-                    size += len(chunk)
-                    if size > MAX_OUTPUT:
-                        raise DockerCommandError("docker_response_limit")
-                    chunks.append(chunk)
-                return b"".join(chunks)
-            dispatched = False
-            async def write():
-                nonlocal dispatched
+    async def invoke(self, arguments, *, data=None, timeout=25, current=None, _input_trace=None):
+        trace = native_trace()
+        if trace is None:
+            return await self._invoke(arguments, data=data, timeout=timeout, current=current)
+        # Every accepted native preflight/RPC child remains physically owned.
+        # Repeated caller cancellation cannot interrupt its process cleanup.
+        trace.commands += 1
+        command = None
+        owner = {"entered":False, "settled":False}
+        try:
+            command = create_owned_task(self._invoke(arguments, data=data, timeout=timeout,
+                current=current, _input_trace=_input_trace, _native_owner=owner), name="visual-native-command")
+            outcome = await await_owned_task(command, cancel_on_caller_cancellation=True)
+            return raise_owned_outcome(outcome, operation="visual native command")
+        finally:
+            if (command is None or command.done()) and (not owner["entered"] or owner["settled"]):
+                trace.commands -= 1
+                if _input_trace is trace:
+                    trace.rpc_settled = True
+
+    async def _invoke(self, arguments, *, data=None, timeout=25, current=None, _input_trace=None, _native_owner=None):
+        launch = process = None
+        streams = []
+        if _native_owner is not None:
+            _native_owner["entered"] = True
+        try:
+            # A new empty Docker config disables user contexts and proxy injection.
+            # HOME remains the real home, but no operator configuration is consumed.
+            environment = {"HOME": os.environ.get("HOME", ""), "PATH": os.defpath,
+                           "PYTHON_DOTENV_DISABLED": "1"}
+            with tempfile.TemporaryDirectory(prefix="kestrel-private-docker-") as config:
+                launch = asyncio.create_task(asyncio.create_subprocess_exec(
+                    self.executable, "--config", config, "--host", f"unix://{self.socket}",
+                    *arguments, stdin=asyncio.subprocess.PIPE,
+                    stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+                    env=environment, cwd=Path(__file__).parent,
+                ))
                 try:
-                    if current is not None:
-                        current()
-                    if data:
-                        dispatched = True
-                        process.stdin.write(data)
-                        await process.stdin.drain()
-                finally:
-                    process.stdin.close()
-            async def retire():
-                if process.returncode is None:
-                    try:
-                        process.kill()
-                    except ProcessLookupError:
-                        pass
-                await process.wait()
-            streams = [asyncio.create_task(write()), asyncio.create_task(read(process.stdout)),
-                       asyncio.create_task(read(process.stderr))]
-            try:
-                async with asyncio.timeout(timeout):
-                    _, output, error = await asyncio.gather(*streams)
+                    process = await asyncio.shield(launch)
+                except BaseException:
+                    # Cancellation can race OS process creation. Retain the launch
+                    # until its exact process is known, then reap without stdin.
+                    process = await launch
+                    if process.returncode is None:
+                        try:
+                            process.kill()
+                        except ProcessLookupError:
+                            pass
                     await process.wait()
-                    if current is not None:
-                        current()
-            except (TimeoutError, asyncio.CancelledError, OSError, DockerCommandError):
-                await retire()
-                # Killing the CLI cannot unsend an accepted Docker/browser call.
-                raise ResourceOutcomeUnknown("docker_transport_outcome_unknown") from None
-            except BaseException:
-                # Authority can revoke during process launch or output delivery.
-                # Join this owned process even when its check rejects the call.
-                await retire()
-                if dispatched:
-                    raise ResourceOutcomeUnknown("driver_effect_outcome_unknown") from None
-                raise
-            finally:
-                for task in streams:
-                    if not task.done():
-                        task.cancel()
-                await asyncio.gather(*streams, return_exceptions=True)
-            if process.returncode:
-                # Only this exact daemon response establishes current absence.
-                target = arguments[-1]
-                absent = re.compile(rb"(?:Error: |Error response from daemon: )No such (?:object|image|container): "
-                                    + re.escape(target.encode()) + rb"\s*")
-                if arguments[:2] in (["container", "inspect"], ["image", "inspect"]) and absent.fullmatch(error):
-                    raise ResourceNotFound("docker_resource_absent")
-                raise DockerCommandError("docker_operation_outcome_unknown", diagnostics=output + error)
-            return output
+                    raise
+                async def read(stream):
+                    chunks, size = [], 0
+                    while chunk := await stream.read(min(65536, MAX_OUTPUT + 1 - size)):
+                        size += len(chunk)
+                        if size > MAX_OUTPUT:
+                            raise DockerCommandError("docker_response_limit")
+                        chunks.append(chunk)
+                    return b"".join(chunks)
+                dispatched = False
+                async def write():
+                    nonlocal dispatched
+                    try:
+                        if current is not None:
+                            current()
+                        if data:
+                            dispatched = True
+                            if _input_trace is not None:
+                                # Set BEFORE any possible partial native write.
+                                _input_trace.input_started = True
+                            process.stdin.write(data)
+                            await process.stdin.drain()
+                    finally:
+                        process.stdin.close()
+                async def retire():
+                    if process.returncode is None:
+                        try:
+                            process.kill()
+                        except ProcessLookupError:
+                            pass
+                    await process.wait()
+                streams = [asyncio.create_task(write()), asyncio.create_task(read(process.stdout)),
+                           asyncio.create_task(read(process.stderr))]
+                try:
+                    async with asyncio.timeout(timeout):
+                        _, output, error = await asyncio.gather(*streams)
+                        await process.wait()
+                        if current is not None:
+                            current()
+                except (TimeoutError, asyncio.CancelledError, OSError, DockerCommandError):
+                    await retire()
+                    # Killing the CLI cannot unsend an accepted Docker/browser call.
+                    raise ResourceOutcomeUnknown("docker_transport_outcome_unknown") from None
+                except BaseException:
+                    # Authority can revoke during process launch or output delivery.
+                    # Join this owned process even when its check rejects the call.
+                    await retire()
+                    if dispatched:
+                        raise ResourceOutcomeUnknown("driver_effect_outcome_unknown") from None
+                    raise
+                finally:
+                    for task in streams:
+                        if not task.done():
+                            task.cancel()
+                    await asyncio.gather(*streams, return_exceptions=True)
+                if process.returncode:
+                    # Only this exact daemon response establishes current absence.
+                    target = arguments[-1]
+                    absent = re.compile(rb"(?:Error: |Error response from daemon: )No such (?:object|image|container): "
+                                        + re.escape(target.encode()) + rb"\s*")
+                    if arguments[:2] in (["container", "inspect"], ["image", "inspect"]) and absent.fullmatch(error):
+                        raise ResourceNotFound("docker_resource_absent")
+                    raise DockerCommandError("docker_operation_outcome_unknown", diagnostics=output + error)
+                return output
+        finally:
+            if _native_owner is not None:
+                # Task completion alone is not proof of physical settlement.
+                _native_owner["settled"] = (launch is None or (
+                    process is not None and process.returncode is not None
+                    and launch.done() and all(task.done() for task in streams)))
 
     async def inspect(self, target):
         try:
@@ -206,8 +242,10 @@ class DockerBoundary:
         command = ["exec", "-i", cid, "python", "/opt/kestrel-browser/rpc_client.py"]
         if mode:
             command.append(mode)
+        trace = native_trace() if value.get("operation") == "act" else None
+        options = {"_input_trace":trace} if trace is not None else {}
         try:
-            return json.loads(await self.invoke(command, data=_json(value) + b"\n", current=current))
+            return json.loads(await self.invoke(command, data=_json(value) + b"\n", current=current, **options))
         except (ValueError, TypeError):
             raise ResourceOutcomeUnknown("invalid_private_worker_response") from None
 
@@ -486,6 +524,9 @@ class DockerComputerDriver:
         if current is not None:
             current()
         identifier = uuid4().hex
+        trace = native_trace()
+        if operation == "act" and trace is not None:
+            trace.rpc_started = True
         response = await self.boundary.rpc(endpoint["container_id"], {"schema_version": 1,
             "secret": connection.credential.get_secret_value(), "id": identifier,
             "operation": operation, "arguments": arguments}, mode="priority" if priority else None, current=current)
@@ -561,10 +602,17 @@ class DockerComputerDriver:
         return entry
 
     async def act(self, session, request):
-        if self.egress_guard is None:
-            return await self._perform_act(session, request)
-        return await self._guarded_call(session, request.action_id, self.egress_guard,
-            lambda current: self._perform_act(session, request, current=current))
+        with native_dispatch(session, request, self.driver_id) as trace:
+            try:
+                if self.egress_guard is None:
+                    return await self._perform_act(session, request)
+                return await self._guarded_call(session, request.action_id, self.egress_guard,
+                    lambda current: self._perform_act(session, request, current=current))
+            except BaseException as error:
+                fact = trace.refusal(error) if trace is not None else None
+                if fact is not None:
+                    raise fact from error
+                raise
 
     async def _guarded_call(self, session, identifier, guard, operation, *, workspace=False):
         """Owned dispatch borrower; authority remains the original host call's."""

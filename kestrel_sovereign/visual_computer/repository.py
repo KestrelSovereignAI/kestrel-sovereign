@@ -48,7 +48,9 @@ class CustodyRecord(BaseModel):
     pending_control: ControlRequest | None = None
     last_control: ControlRequest | None = None
     control_receipt: ComputerSession | None = None
-    phase: Literal["admitted", "quoted", "acquiring", "leased", "opening", "active", "fenced", "unknown", "released"] = "admitted"
+    retired_at: datetime | None = None
+    retired_from: Literal["admitted", "quoted"] | None = None
+    phase: Literal["retired", "admitted", "quoted", "acquiring", "leased", "opening", "active", "fenced", "unknown", "released"] = "admitted"
 
 
 class ActionRecord(BaseModel):
@@ -118,7 +120,16 @@ class VisualCustodyRepository:
                                     record = self._open(owner, f"{session_key}:{action_id}", payload, ActionRecord, key=key)
                                     value = int(record.receipt is None or record.receipt.outcome == "unknown")
                                     await self.db.execute(f"UPDATE {table} SET pending = ? WHERE owner = ? AND session_key = ? AND action_id = ?", (value, owner, session_key, action_id))
+                    if not await self.db.column_exists("visual_computer_requests", "retired"):
+                        await self.db.execute("ALTER TABLE visual_computer_requests ADD COLUMN retired BIGINT NOT NULL DEFAULT 0")
+                        for owner, identity, payload in await self.db.fetchall("SELECT owner, request_id, payload FROM visual_computer_requests"):
+                            original = self._open(owner, identity, payload, CustodyRecord, key=key)
+                            if original.phase == "retired":
+                                if not self._retired(original):
+                                    raise CustodyIntegrityError("invalid original acquisition retirement")
+                                await self.db.execute("UPDATE visual_computer_requests SET retired = 1 WHERE owner = ? AND request_id = ?", (owner, identity))
                     await self.db.execute("CREATE INDEX IF NOT EXISTS visual_computer_live_requests ON visual_computer_requests (owner, released)")
+                    await self.db.execute("CREATE INDEX IF NOT EXISTS visual_computer_retired_requests ON visual_computer_requests (owner, retired, released)")
                     await self.db.execute("CREATE INDEX IF NOT EXISTS visual_computer_pending_actions ON visual_computer_actions (owner, session_key, pending)")
                     await self.db.execute("DELETE FROM visual_computer_actions WHERE pending = 0 AND EXISTS (SELECT 1 FROM visual_computer_requests r WHERE r.owner = visual_computer_actions.owner AND r.session_key = visual_computer_actions.session_key AND r.released = 1)")
             except TransactionError as error:
@@ -183,7 +194,7 @@ class VisualCustodyRepository:
                 if stored.request.digest() != record.request.digest():
                     raise ResourceConflict("request ID already identifies different constraints")
                 return stored
-            count = await self.db.fetchone("SELECT COUNT(*) FROM visual_computer_requests r WHERE owner = ? AND (released = 0 OR EXISTS (SELECT 1 FROM visual_computer_actions a WHERE a.owner = r.owner AND a.session_key = r.session_key AND a.pending = 1))", (owner,))
+            count = await self.db.fetchone("SELECT COUNT(*) FROM visual_computer_requests r WHERE owner = ? AND ((released = 0 AND retired = 0) OR EXISTS (SELECT 1 FROM visual_computer_actions a WHERE a.owner = r.owner AND a.session_key = r.session_key AND a.pending = 1))", (owner,))
             if count[0] >= self.max_requests:
                 raise ResourceConflict("visual custody request capacity exhausted")
             await self.db.execute("INSERT INTO visual_computer_requests (owner, request_id, session_key, payload, revision) VALUES (?, ?, ?, ?, 0)",
@@ -211,6 +222,14 @@ class VisualCustodyRepository:
             previous = self._open(owner, record.request.request_id, original[0], CustodyRecord)
             if previous.request != record.request or previous.session_id != record.session_id:
                 raise ResourceConflict("original visual custody identity changed")
+            if previous.phase == "retired":
+                if record != previous:
+                    raise ResourceConflict("retired visual custody is immutable")
+                return
+            if record.phase == "retired":
+                raise ResourceConflict("retirement requires original never-acquired CAS")
+            if previous.phase not in {"admitted", "quoted"} and record.phase in {"admitted", "quoted"}:
+                raise ResourceConflict("possible acquisition cannot become unacquired")
             released = record.phase == "released" and record.lease is not None and record.lease.state == "released"
             if record.phase == "released" and not released:
                 raise ResourceConflict("release requires verified physical lease retirement")
@@ -229,6 +248,48 @@ class VisualCustodyRepository:
                 await self.db.execute("DELETE FROM visual_computer_actions WHERE owner = ? AND session_key = ? AND pending = 0", (owner, self._address("session", record.session_id)))
         record.revision += 1
 
+    @staticmethod
+    def _unacquired(record):
+        return (record.phase in {"admitted", "quoted"} and all(value is None for value in (
+            record.lease, record.connection, record.session, record.frame, record.pending_control,
+            record.last_control, record.control_receipt, record.retired_at, record.retired_from)))
+
+    @staticmethod
+    def _retired(record):
+        return (record.phase == "retired" and record.retired_at is not None
+            and record.retired_at.tzinfo is not None and record.retired_from in {"admitted", "quoted"}
+            and all(value is None for value in (record.lease, record.connection, record.session,
+                record.frame, record.pending_control, record.last_control, record.control_receipt)))
+
+    async def retire_unacquired(self, scope, record, *, at, guard=None):
+        """CAS exact original pre-acquisition facts; never claim physical release.
+
+        Authenticated admitted/quoted phases precede the canonical acquiring CAS.
+        Legacy rows with any possible-effect facts/actions remain charged.
+        """
+        if at.tzinfo is None or at.utcoffset() is None:
+            raise ValueError("retirement time must be aware")
+        async with self._transaction(guard):
+            owner = self._owner(scope)
+            await self._lock_owner(owner)
+            row = await self.db.fetchone("SELECT payload FROM visual_computer_requests WHERE owner = ? AND request_id = ?", (owner, record.request.request_id))
+            if row is None:
+                raise ResourceNotFound("original visual custody not found")
+            original = self._open(owner, record.request.request_id, row[0], CustodyRecord)
+            if original.request != record.request or original.session_id != record.session_id:
+                raise ResourceConflict("retirement differs from original custody")
+            if self._retired(original):
+                return original
+            actions = await self.db.fetchone("SELECT 1 FROM visual_computer_actions WHERE owner = ? AND session_key = ? LIMIT 1", (owner, self._address("session", record.session_id)))
+            if original.revision != record.revision or not self._unacquired(original) or actions:
+                raise ResourceConflict("possible acquisition retains original custody")
+            retired = original.model_copy(update={"phase":"retired", "retired_at":at,
+                "retired_from":original.phase, "revision":original.revision+1})
+            count = await self.db.execute("UPDATE visual_computer_requests SET payload = ?, revision = revision + 1, retired = 1 WHERE owner = ? AND request_id = ? AND revision = ? AND released = 0 AND retired = 0", (self._seal(owner, record.request.request_id, retired), owner, record.request.request_id, original.revision))
+            if count != 1:
+                raise ResourceConflict("original retirement changed concurrently")
+            return retired
+
     async def action(self, scope, session_id, action_id, *, accept=None, receipt=None, guard=None,
                      prepare=False, dispatch_revision=None, abandon_prepared=False):
         async with self._transaction(guard, write=accept is not None or receipt is not None or dispatch_revision is not None or abandon_prepared):
@@ -237,8 +298,8 @@ class VisualCustodyRepository:
                 await self._lock_owner(owner)
             identity = f"{session_key}:{action_id}"
             row = await self.db.fetchone("SELECT payload FROM visual_computer_actions WHERE owner = ? AND session_key = ? AND action_id = ?", (owner, session_key, action_id))
-            parent = await self.db.fetchone("SELECT released FROM visual_computer_requests WHERE owner = ? AND session_key = ?", (owner, session_key))
-            if (accept is not None or dispatch_revision is not None) and (parent is None or parent[0]):
+            parent = await self.db.fetchone("SELECT released, retired FROM visual_computer_requests WHERE owner = ? AND session_key = ?", (owner, session_key))
+            if (accept is not None or dispatch_revision is not None) and (parent is None or parent[0] or parent[1]):
                 raise ResourceConflict("original action session is absent or physically released")
             if row is None:
                 if accept is None:
@@ -294,5 +355,5 @@ class VisualCustodyRepository:
         """Internal host lifecycle only; exact original owner, no public list API."""
         async with self._transaction(write=False):
             owner = self._owner(scope)
-            rows = await self.db.fetchall("SELECT request_id, payload FROM visual_computer_requests r WHERE owner = ? AND (released = 0 OR EXISTS (SELECT 1 FROM visual_computer_actions a WHERE a.owner = r.owner AND a.session_key = r.session_key AND a.pending = 1))", (owner,))
+            rows = await self.db.fetchall("SELECT request_id, payload FROM visual_computer_requests r WHERE owner = ? AND ((released = 0 AND retired = 0) OR EXISTS (SELECT 1 FROM visual_computer_actions a WHERE a.owner = r.owner AND a.session_key = r.session_key AND a.pending = 1))", (owner,))
             return [self._open(owner, row[0], row[1], CustodyRecord) for row in rows]
