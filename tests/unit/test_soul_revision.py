@@ -5,6 +5,8 @@ The canonical SOUL is the current encrypted ``agent.soul.markdown`` version;
 it. These tests pin that a Sovereign revision survives a restart, that a
 file-only edit loaded by ``bootstrap_reload`` is reported as not durable (and
 does revert, loudly), and that the volatile-privacy refusal (#2672) holds.
+A rename renames the canonical SOUL and never publishes over a revision that
+landed while it ran (#3813).
 """
 
 from __future__ import annotations
@@ -36,11 +38,19 @@ from kestrel_sovereign.bootstrap.soul_durability import (
     soul_sha256,
 )
 from kestrel_sovereign.command_handler import CommandHandler
-from kestrel_sovereign.features.bootstrap.feature import BootstrapFeature
+from kestrel_sovereign.features.bootstrap import feature as feature_module
+from kestrel_sovereign.features.bootstrap.feature import (
+    BootstrapFeature,
+    _update_soul_name,
+)
 from kestrel_sovereign.kestrel_agent import KestrelAgent
 from kestrel_sovereign.privacy import PrivacyMode
 from kestrel_sovereign.storage import AsyncStorage, SOUL_MARKDOWN_RESOURCE_TYPE
 from kestrel_sovereign.storage import async_graph_store as graph_store_module
+from kestrel_sovereign.storage.agent_resource_store import (
+    ExpectedCurrentVersion,
+    ResourceVersionConflictError,
+)
 from kestrel_sovereign.storage.async_graph_store import GraphNode
 from kestrel_sovereign.storage.privacy_wrapper import PrivacyEnforcingStorage
 
@@ -284,6 +294,9 @@ async def engine(request, tmp_path):
         await raw.delete_node(handle.did)
         await raw.db.execute(
             "DELETE FROM agent_identity_resources WHERE agent_id = ?", (handle.did,)
+        )
+        await raw.db.execute(
+            "DELETE FROM agent_metadata WHERE agent_id = ?", (handle.did,)
         )
     finally:
         await raw.close()
@@ -1134,3 +1147,620 @@ def test_soul_revision_is_not_an_agent_tool():
     for agent_tool in feature.get_tools():
         assert "revise" not in agent_tool.name
         assert agent_tool.schema.command_prefix != "!revise-soul"
+
+
+# ---------------------------------------------------------------------------
+# A rename does not publish over a concurrent revision (#3813)
+# ---------------------------------------------------------------------------
+
+
+def _renaming_agent(agent_id, storage, agent_dir) -> SimpleNamespace:
+    """The agent shape ``_update_soul_name`` uses, on one storage connection."""
+    return SimpleNamespace(
+        agent_id=agent_id,
+        storage=storage,
+        context_builder=ContextBuilder(storage, agent_data_path=str(agent_dir)),
+        bootstrap_service=SimpleNamespace(agent_data_path=str(agent_dir)),
+    )
+
+
+def _renamed(content: str) -> str:
+    return content.replace("You Are Claw", "You Are Talon")
+
+
+@pytest.mark.asyncio
+async def test_a_rename_does_not_publish_over_a_revision_that_lands_while_it_runs(
+    engine, agent_dir, monkeypatch
+):
+    """The lost update of #3813, on two connections to one database.
+
+    The rename reads v1. The Sovereign then edits SOUL.md and revises it on the
+    other connection, publishing the approved role change as v2. Published as
+    read, the rename would make "v1 renamed" v3 and drop the role change from
+    the canonical SOUL. The store refuses a write computed from v1 once v2 is
+    current, and the rename reads v2 again and renames that.
+    """
+    raw, storage = await _engine_open(engine)
+    other_raw, other_storage = await _engine_open(engine)
+    try:
+        assert await _engine_service(engine, raw, storage, agent_dir).save_soul_md(
+            ORIGINAL
+        ) is True
+        real_publish = storage.promote_soul_seed
+        revisions: list[SoulRevisionOutcome] = []
+
+        async def a_revision_lands_before_the_rename_publishes(*args, **kwargs):
+            if not revisions:
+                (agent_dir / "SOUL.md").write_text(REVISED, encoding="utf-8")
+                revisions.append(
+                    await _engine_service(
+                        engine, other_raw, other_storage, agent_dir
+                    ).revise_soul(
+                        reason="Sovereign-approved role change",
+                        revised_by=CallerContext.sovereign(),
+                    )
+                )
+            return await real_publish(*args, **kwargs)
+
+        monkeypatch.setattr(
+            storage, "promote_soul_seed", a_revision_lands_before_the_rename_publishes
+        )
+        agent = _renaming_agent(engine.did, storage, agent_dir)
+
+        assert await _update_soul_name(agent, "Claw", "Talon") is True
+
+        (revision,) = revisions
+        assert revision.revised is True, revision.message
+        assert (revision.previous_version, revision.version) == (1, 2)
+        assert await _soul_rows(raw, engine.did) == [(1, False), (2, False), (3, True)]
+        v2 = await raw.agent_resources.get_version(version=2)
+        assert (v2.content, v2.provenance["reason"]) == (
+            REVISED, "Sovereign-approved role change"
+        )
+        v3 = await raw.get_current_agent_resource()
+        assert v3.content == _renamed(REVISED)
+        assert v3.provenance["source"].startswith("rename:")
+        assert v3.provenance["previous_version"] == 2
+        assert v3.provenance["previous_content_hash"] == soul_sha256(REVISED)
+        assert (agent_dir / "SOUL.md").read_text(encoding="utf-8") == _renamed(REVISED)
+        assert agent.context_builder._soul_content == _renamed(REVISED)
+    finally:
+        await raw.close()
+        await other_raw.close()
+
+    raw, storage = await _engine_open(engine)
+    try:
+        builder = ContextBuilder(storage, agent_data_path=str(agent_dir))
+        runtime = SimpleNamespace(
+            agent_id=engine.did, storage=storage, context_builder=builder
+        )
+        await KestrelAgent._load_or_promote_soul_resource(runtime, str(agent_dir))
+        assert builder._soul_content == _renamed(REVISED)
+        assert (await inspect_soul_file(raw, agent_dir)).state is SoulFileState.IN_SYNC
+    finally:
+        await raw.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("landing", ["before_canonical_read", "after_canonical_read"])
+async def test_a_rename_renames_a_revision_that_lands_around_its_canonical_read(
+    engine, agent_dir, monkeypatch, landing
+):
+    """The canonical SOUL is read before SOUL.md, so either landing ends in step.
+
+    Landing after the canonical read, the revision falls between the rename's
+    two reads: its write from v1 is refused, and the next attempt finds the
+    file and v2 in step. Landing just before it, the rename reads v2 and the
+    revised file. Read file first, that landing gave the rename the older
+    file text and v2: it renamed v2 but left SOUL.md differing from it.
+    """
+    raw, storage = await _engine_open(engine)
+    other_raw, other_storage = await _engine_open(engine)
+    try:
+        assert await _engine_service(engine, raw, storage, agent_dir).save_soul_md(
+            ORIGINAL
+        ) is True
+        real_read = storage.get_current_agent_resource
+        revisions: list[SoulRevisionOutcome] = []
+
+        async def a_revision_lands_once():
+            if not revisions:
+                (agent_dir / "SOUL.md").write_text(REVISED, encoding="utf-8")
+                revisions.append(
+                    await _engine_service(
+                        engine, other_raw, other_storage, agent_dir
+                    ).revise_soul(
+                        reason="Sovereign-approved role change",
+                        revised_by=CallerContext.sovereign(),
+                    )
+                )
+
+        async def a_revision_lands_around_the_read(*args, **kwargs):
+            if landing == "before_canonical_read":
+                await a_revision_lands_once()
+            current = await real_read(*args, **kwargs)
+            if landing == "after_canonical_read":
+                await a_revision_lands_once()
+            return current
+
+        monkeypatch.setattr(
+            storage, "get_current_agent_resource", a_revision_lands_around_the_read
+        )
+        agent = _renaming_agent(engine.did, storage, agent_dir)
+
+        assert await _update_soul_name(agent, "Claw", "Talon") is True
+
+        (revision,) = revisions
+        assert revision.version == 2, revision.message
+        assert await _soul_rows(raw, engine.did) == [(1, False), (2, False), (3, True)]
+        current = await raw.get_current_agent_resource()
+        assert current.content == _renamed(REVISED)
+        assert current.provenance["previous_version"] == 2
+        assert (agent_dir / "SOUL.md").read_text(encoding="utf-8") == _renamed(REVISED)
+        assert (await inspect_soul_file(raw, agent_dir)).state is SoulFileState.IN_SYNC
+    finally:
+        await raw.close()
+        await other_raw.close()
+
+
+@pytest.mark.asyncio
+async def test_a_rename_that_keeps_losing_to_concurrent_writes_changes_nothing(
+    engine, agent_dir, monkeypatch
+):
+    """Bounded: after the last refused attempt the conflict is raised.
+
+    Another connection makes a new version current before each attempt
+    publishes. The rename writes no version and leaves SOUL.md and the
+    session as they were: the canonical SOUL is written before the file.
+    """
+    raw, storage = await _engine_open(engine)
+    other_raw, _ = await _engine_open(engine)
+    try:
+        assert await _engine_service(engine, raw, storage, agent_dir).save_soul_md(
+            ORIGINAL
+        ) is True
+        real_publish = storage.promote_soul_seed
+        refused: list[dict] = []
+
+        async def another_write_lands_first(*args, **kwargs):
+            refused.append(kwargs)
+            await other_raw.promote_soul_seed(
+                THIRD + f"\nWrite {len(refused)}.\n", created_by=engine.did
+            )
+            return await real_publish(*args, **kwargs)
+
+        monkeypatch.setattr(storage, "promote_soul_seed", another_write_lands_first)
+        agent = _renaming_agent(engine.did, storage, agent_dir)
+        agent.context_builder = MagicMock()
+
+        with pytest.raises(ResourceVersionConflictError) as conflict:
+            await _update_soul_name(agent, "Claw", "Talon")
+
+        attempts = feature_module._SOUL_RENAME_ATTEMPTS
+        assert len(refused) == attempts
+        assert [call["expected_current"] for call in refused] == [
+            ExpectedCurrentVersion(version) for version in range(1, attempts + 1)
+        ]
+        assert (conflict.value.expected, conflict.value.actual) == (attempts, attempts + 1)
+        assert "nothing was written" in str(conflict.value)
+        rows = await _soul_rows(raw, engine.did)
+        assert rows == [(v, v == attempts + 1) for v in range(1, attempts + 2)]
+        current = await raw.get_current_agent_resource()
+        assert current.provenance["source"] != f"rename:{agent_dir / 'SOUL.md'}"
+        assert (agent_dir / "SOUL.md").read_text(encoding="utf-8") == ORIGINAL
+        agent.context_builder.load_canonical_soul_resource.assert_not_called()
+    finally:
+        await raw.close()
+        await other_raw.close()
+
+
+async def _metadata_name(raw, did):
+    row = await raw.db.fetchone(
+        "SELECT value FROM agent_metadata WHERE agent_id = ? AND key = 'name'", (did,)
+    )
+    return row[0] if row else None
+
+
+async def _agent_node_name(raw, did) -> tuple[str, str]:
+    node = await raw.get_node(did)
+    return node.label, node.properties["name"]
+
+
+@pytest.mark.asyncio
+async def test_a_rename_that_loses_every_soul_attempt_changes_no_name_and_its_retry_renames(
+    engine, agent_dir, monkeypatch
+):
+    """Through ``!rename``: a refused SOUL rename leaves the name unchanged.
+
+    The SOUL rename finds the old name in the SOUL's text, and a retry takes
+    the old name from the live one. The name used to be written to the
+    metadata, the graph and the live agent first, and the SOUL last. Losing
+    every SOUL attempt then left Talon live, so running ``!rename Talon``
+    again renamed Talon to Talon and reported success over a canonical SOUL,
+    SOUL.md and session still saying "You Are Claw". The SOUL is renamed
+    first now: losing it fails the rename with the name unchanged everywhere,
+    and the retry renames Claw.
+    """
+    raw, storage = await _engine_open(engine)
+    other_raw, _ = await _engine_open(engine)
+    try:
+        await raw.add_node(
+            GraphNode(
+                node_id=engine.did,
+                node_type="agent",
+                label="Claw",
+                properties={"name": "Claw"},
+            )
+        )
+        assert await _engine_service(engine, raw, storage, agent_dir).save_soul_md(
+            ORIGINAL
+        ) is True
+        real_publish = storage.promote_soul_seed
+        concurrent: list[str] = []
+
+        async def a_revision_lands_first(*args, **kwargs):
+            # As a revision writes: SOUL.md, then the canonical version.
+            text = THIRD + f"\nWrite {len(concurrent) + 1}.\n"
+            concurrent.append(text)
+            (agent_dir / "SOUL.md").write_text(text, encoding="utf-8")
+            await other_raw.promote_soul_seed(text, created_by=engine.did)
+            return await real_publish(*args, **kwargs)
+
+        monkeypatch.setattr(storage, "promote_soul_seed", a_revision_lands_first)
+        agent = _renaming_agent(engine.did, storage, agent_dir)
+        agent._agent_name = "Claw"
+        agent.bootstrap_service.agent_name = "Claw"
+        agent._raw_storage = raw
+        feature = BootstrapFeature(agent)
+
+        refused = await feature.rename_agent("Talon")
+
+        attempts = feature_module._SOUL_RENAME_ATTEMPTS
+        assert len(concurrent) == attempts
+        assert refused.status is ToolResultStatus.ERROR
+        assert refused.error.startswith("Failed to rename: SOUL.md update failed: ")
+        assert "nothing was written" in refused.error
+        assert not refused.data["rename_outcome"]["db_row_written"]
+        assert not refused.data["rename_outcome"]["graph_updated"]
+        assert not refused.data["rename_outcome"]["memory_updated"]
+        assert not refused.data["rename_outcome"]["soul_md_updated"]
+        assert (agent._agent_name, agent.bootstrap_service.agent_name) == ("Claw", "Claw")
+        assert await _agent_node_name(raw, engine.did) == ("Claw", "Claw")
+        assert await _metadata_name(raw, engine.did) is None
+        last = concurrent[-1]
+        assert (await raw.get_current_agent_resource()).content == last
+        assert (agent_dir / "SOUL.md").read_text(encoding="utf-8") == last
+
+        # The concurrent SOUL writes stop, and the same rename is run again.
+        monkeypatch.setattr(storage, "promote_soul_seed", real_publish)
+        renamed = await feature.rename_agent("Talon")
+
+        assert renamed.status is ToolResultStatus.OK, renamed.error
+        assert "SOUL.md updated." in renamed.confirmation
+        assert (agent._agent_name, agent.bootstrap_service.agent_name) == (
+            "Talon", "Talon"
+        )
+        assert await _agent_node_name(raw, engine.did) == ("Talon", "Talon")
+        assert await _metadata_name(raw, engine.did) == "Talon"
+        current = await raw.get_current_agent_resource()
+        assert current.content == _renamed(last)
+        assert current.provenance["previous_version"] == attempts + 1
+        assert (agent_dir / "SOUL.md").read_text(encoding="utf-8") == _renamed(last)
+        assert agent.context_builder._soul_content == _renamed(last)
+    finally:
+        await raw.close()
+        await other_raw.close()
+
+    raw, storage = await _engine_open(engine)
+    try:
+        builder = ContextBuilder(storage, agent_data_path=str(agent_dir))
+        runtime = SimpleNamespace(
+            agent_id=engine.did, storage=storage, context_builder=builder
+        )
+        await KestrelAgent._load_or_promote_soul_resource(runtime, str(agent_dir))
+        assert builder._soul_content == _renamed(last)
+        assert (await inspect_soul_file(raw, agent_dir)).state is SoulFileState.IN_SYNC
+        assert await _agent_node_name(raw, engine.did) == ("Talon", "Talon")
+    finally:
+        await raw.close()
+
+
+@pytest.mark.asyncio
+async def test_a_rename_that_fails_after_the_soul_leaves_a_retry_that_completes_it(
+    tmp_path, agent_dir, monkeypatch
+):
+    """A store failing after the SOUL was renamed: the retry renames the rest.
+
+    The SOUL already names Talon and the live name is still Claw, so the
+    retry finds nothing left to rename in the SOUL and writes the name.
+    """
+    await _seed_canonical(tmp_path, agent_dir)
+    raw, storage = await _open(tmp_path)
+    try:
+        await raw.add_node(
+            GraphNode(
+                node_id=AGENT_ID,
+                node_type="agent",
+                label="Claw",
+                properties={"name": "Claw"},
+            )
+        )
+        agent = _renaming_agent(AGENT_ID, storage, agent_dir)
+        agent._agent_name = "Claw"
+        agent.bootstrap_service.agent_name = "Claw"
+        agent._raw_storage = raw
+        real_execute = raw.db.execute
+        metadata_writes: list[tuple] = []
+
+        async def the_metadata_store_fails_once(query, params=None, *args, **kwargs):
+            if "agent_metadata" in query and not metadata_writes:
+                metadata_writes.append(params)
+                raise QueryError("metadata store unavailable")
+            return await real_execute(query, params, *args, **kwargs)
+
+        monkeypatch.setattr(raw.db, "execute", the_metadata_store_fails_once)
+        feature = BootstrapFeature(agent)
+
+        partial = await feature.rename_agent("Talon")
+
+        assert partial.status is ToolResultStatus.PARTIAL
+        assert partial.data["rename_outcome"]["soul_md_updated"] is True
+        assert not partial.data["rename_outcome"]["db_row_written"]
+        assert "SOUL.md has the new name" in partial.error
+        assert "metadata DB still has the old name" in partial.error
+        assert agent._agent_name == "Claw"
+        assert (await raw.get_current_agent_resource()).content == _renamed(ORIGINAL)
+
+        renamed = await feature.rename_agent("Talon")
+
+        assert renamed.status is ToolResultStatus.OK, renamed.error
+        assert renamed.data["rename_outcome"]["soul_md_updated"] is False
+        assert agent._agent_name == "Talon"
+        assert await _agent_node_name(raw, AGENT_ID) == ("Talon", "Talon")
+        assert await _metadata_name(raw, AGENT_ID) == "Talon"
+        assert await _version_count(raw) == 2
+        assert (await raw.get_current_agent_resource()).content == _renamed(ORIGINAL)
+        assert (agent_dir / "SOUL.md").read_text(encoding="utf-8") == _renamed(ORIGINAL)
+    finally:
+        await raw.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("door", ["storage", "resource_store"])
+async def test_the_store_refuses_a_version_derived_from_one_no_longer_current(
+    engine, door
+):
+    """Checked under the version lock; a refusal writes no version and no graph link."""
+    raw, _ = await _engine_open(engine)
+    try:
+        writer = raw if door == "storage" else raw.agent_resources
+        with pytest.raises(ResourceVersionConflictError) as refused:
+            await writer.promote_soul_seed(
+                ORIGINAL, expected_current=ExpectedCurrentVersion(1)
+            )
+        assert (refused.value.expected, refused.value.actual) == (1, None)
+        assert await _soul_rows(raw, engine.did) == []
+
+        first = await writer.promote_soul_seed(
+            ORIGINAL, expected_current=ExpectedCurrentVersion(None)
+        )
+        assert first.version == 1
+        node_before = await raw.get_node(f"{engine.did}#soul")
+        # Only the storage door publishes the graph link with the version.
+        assert (node_before is not None) == (door == "storage")
+
+        for expected in (None, 2):
+            with pytest.raises(ResourceVersionConflictError) as refused:
+                await writer.promote_soul_seed(
+                    REVISED, expected_current=ExpectedCurrentVersion(expected)
+                )
+            assert (refused.value.expected, refused.value.actual) == (expected, 1)
+        assert await _soul_rows(raw, engine.did) == [(1, True)]
+        node_after = await raw.get_node(f"{engine.did}#soul")
+        assert getattr(node_after, "properties", None) == getattr(
+            node_before, "properties", None
+        )
+
+        # A version that is not current neither satisfies nor defeats the check.
+        await raw.agent_resources.create_version(
+            SOUL_MARKDOWN_RESOURCE_TYPE,
+            THIRD,
+            created_by=engine.did,
+            source="draft",
+            make_current=False,
+        )
+        with pytest.raises(ResourceVersionConflictError):
+            await writer.promote_soul_seed(
+                REVISED, expected_current=ExpectedCurrentVersion(2)
+            )
+        second = await writer.promote_soul_seed(
+            REVISED, expected_current=ExpectedCurrentVersion(1)
+        )
+        assert (second.version, second.provenance["previous_version"]) == (3, 1)
+        assert await _soul_rows(raw, engine.did) == [(1, False), (2, False), (3, True)]
+    finally:
+        await raw.close()
+
+
+@pytest.mark.asyncio
+async def test_a_rename_does_not_make_an_unrevised_file_edit_canonical(
+    tmp_path, agent_dir
+):
+    """A rename renames the canonical SOUL, not whatever SOUL.md holds.
+
+    Before #3813 the rename published the file, so an edit no Sovereign
+    revised became canonical, attributed to the rename. The edit stays in
+    the file, renamed too, and is still reported as differing.
+    """
+    await _seed_canonical(tmp_path, agent_dir)
+    (agent_dir / "SOUL.md").write_text(REVISED, encoding="utf-8")
+    raw, builder = await _boot(tmp_path, agent_dir)
+    try:
+        agent = _renaming_agent(AGENT_ID, builder.storage, agent_dir)
+        agent.context_builder = builder
+
+        assert await _update_soul_name(agent, "Claw", "Talon") is True
+
+        current = await raw.get_current_agent_resource()
+        assert (current.version, current.content) == (2, _renamed(ORIGINAL))
+        assert current.provenance["previous_version"] == 1
+        assert (agent_dir / "SOUL.md").read_text(encoding="utf-8") == _renamed(REVISED)
+        assert builder._soul_content == _renamed(ORIGINAL)
+        status = await inspect_soul_file(raw, agent_dir)
+        assert (status.state, status.canonical_version) == (SoulFileState.FILE_DIFFERS, 2)
+    finally:
+        await raw.close()
+
+
+@pytest.mark.asyncio
+async def test_a_rename_without_soul_md_renames_the_canonical_soul(tmp_path, agent_dir):
+    """The canonical SOUL is renamed; the missing cache is not recreated."""
+    await _seed_canonical(tmp_path, agent_dir)
+    (agent_dir / "SOUL.md").unlink()
+    raw, builder = await _boot(tmp_path, agent_dir)
+    try:
+        agent = _renaming_agent(AGENT_ID, builder.storage, agent_dir)
+        agent.context_builder = builder
+
+        assert await _update_soul_name(agent, "Nobody", "Talon") is False
+        assert await _version_count(raw) == 1
+
+        assert await _update_soul_name(agent, "Claw", "Talon") is True
+        current = await raw.get_current_agent_resource()
+        assert (current.version, current.content) == (2, _renamed(ORIGINAL))
+        assert not (agent_dir / "SOUL.md").exists()
+        assert builder._soul_content == _renamed(ORIGINAL)
+    finally:
+        await raw.close()
+
+
+@pytest.mark.asyncio
+async def test_a_rename_without_a_canonical_soul_publishes_the_renamed_file(
+    tmp_path, agent_dir
+):
+    """As boot would: the renamed SOUL.md becomes the first canonical version."""
+    (agent_dir / "SOUL.md").write_text(ORIGINAL, encoding="utf-8")
+    raw, storage = await _open(tmp_path)
+    try:
+        agent = _renaming_agent(AGENT_ID, storage, agent_dir)
+
+        assert await _update_soul_name(agent, "Claw", "Talon") is True
+
+        current = await raw.get_current_agent_resource()
+        assert (current.version, current.content) == (1, _renamed(ORIGINAL))
+        assert current.provenance["source"].startswith("rename:")
+        assert (agent_dir / "SOUL.md").read_text(encoding="utf-8") == _renamed(ORIGINAL)
+    finally:
+        await raw.close()
+
+
+@pytest.mark.asyncio
+async def test_a_rename_does_not_overwrite_a_file_edit_written_while_it_ran(
+    tmp_path, agent_dir, monkeypatch
+):
+    """SOUL.md is replaced only if it still holds the text the rename read."""
+    await _seed_canonical(tmp_path, agent_dir)
+    raw, storage = await _open(tmp_path)
+    try:
+        real_publish = storage.promote_soul_seed
+
+        async def publish_then_the_file_is_edited(*args, **kwargs):
+            published = await real_publish(*args, **kwargs)
+            (agent_dir / "SOUL.md").write_text(THIRD, encoding="utf-8")
+            return published
+
+        monkeypatch.setattr(storage, "promote_soul_seed", publish_then_the_file_is_edited)
+        agent = _renaming_agent(AGENT_ID, storage, agent_dir)
+
+        assert await _update_soul_name(agent, "Claw", "Talon") is True
+
+        assert (await raw.get_current_agent_resource()).content == _renamed(ORIGINAL)
+        assert (agent_dir / "SOUL.md").read_text(encoding="utf-8") == THIRD
+    finally:
+        await raw.close()
+
+
+@pytest.mark.asyncio
+async def test_a_rename_of_only_an_unrevised_file_edit_stores_no_version(
+    tmp_path, agent_dir
+):
+    """The canonical SOUL names nobody; only the file's pending edit is renamed."""
+    unnamed = "# SOUL.md\n\n## Role\nAccept work orders from did:pkh only.\n"
+    raw, storage = await _open(tmp_path)
+    try:
+        assert await _service(raw, storage, agent_dir).save_soul_md(unnamed) is True
+        (agent_dir / "SOUL.md").write_text(REVISED, encoding="utf-8")
+        agent = _renaming_agent(AGENT_ID, storage, agent_dir)
+
+        assert await _update_soul_name(agent, "Claw", "Talon") is True
+
+        assert await _version_count(raw) == 1
+        assert (await raw.get_current_agent_resource()).content == unnamed
+        assert (agent_dir / "SOUL.md").read_text(encoding="utf-8") == _renamed(REVISED)
+        assert await _update_soul_name(agent, "Claw", "Talon") is False
+    finally:
+        await raw.close()
+
+
+@pytest.mark.asyncio
+async def test_a_rename_that_could_write_nothing_reports_no_soul_update(agent_dir):
+    """A storage that can read but not publish the canonical SOUL, and no file."""
+    storage = SimpleNamespace(
+        get_current_agent_resource=AsyncMock(
+            return_value=SimpleNamespace(content=ORIGINAL, version=1)
+        )
+    )
+    builder = MagicMock()
+    agent = SimpleNamespace(
+        agent_id=AGENT_ID,
+        storage=storage,
+        context_builder=builder,
+        bootstrap_service=SimpleNamespace(agent_data_path=str(agent_dir)),
+    )
+
+    assert await _update_soul_name(agent, "Claw", "Talon") is False
+    assert not (agent_dir / "SOUL.md").exists()
+    builder.load_canonical_soul_resource.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("canonical_names_the_agent", [True, False])
+async def test_a_failed_soul_md_write_after_the_canonical_rename_still_reloads(
+    tmp_path, agent_dir, monkeypatch, caplog, canonical_names_the_agent
+):
+    """The canonical SOUL is renamed first; SOUL.md is only its cache.
+
+    A cache write that fails after the canonical SOUL was renamed is logged
+    and the session still loads the renamed SOUL. With nothing renamed but
+    the file, the failure is the rename's own and is raised.
+    """
+    canonical = ORIGINAL if canonical_names_the_agent else (
+        "# SOUL.md\n\n## Role\nAccept work orders from did:pkh only.\n"
+    )
+    raw, storage = await _open(tmp_path)
+    try:
+        assert await _service(raw, storage, agent_dir).save_soul_md(canonical) is True
+        (agent_dir / "SOUL.md").write_text(REVISED, encoding="utf-8")
+        real_write_text = type(agent_dir).write_text
+
+        def full_disk(path, *args, **kwargs):
+            if path.name == "SOUL.md":
+                raise OSError(28, "No space left on device")
+            return real_write_text(path, *args, **kwargs)
+
+        monkeypatch.setattr(type(agent_dir), "write_text", full_disk)
+        agent = _renaming_agent(AGENT_ID, storage, agent_dir)
+
+        if canonical_names_the_agent:
+            with caplog.at_level(logging.WARNING):
+                assert await _update_soul_name(agent, "Claw", "Talon") is True
+            assert "could not be updated after the canonical SOUL" in caplog.text
+            assert (await raw.get_current_agent_resource()).content == _renamed(ORIGINAL)
+            assert agent.context_builder._soul_content == _renamed(ORIGINAL)
+        else:
+            with pytest.raises(OSError):
+                await _update_soul_name(agent, "Claw", "Talon")
+            assert await _version_count(raw) == 1
+        assert (agent_dir / "SOUL.md").read_text(encoding="utf-8") == REVISED
+    finally:
+        await raw.close()
