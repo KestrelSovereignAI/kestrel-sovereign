@@ -143,6 +143,10 @@ class ResourceRegistry:
         for resource_id, record in data.items():
             if not isinstance(record, dict):
                 raise ValueError("Resource registry is invalid; original records retained")
+            self._cleanup_resource_by_type(
+                record.get("resource_type"), resource_id,
+                record.get("metadata", {}), validate_only=True,
+            )
             if record.get("resource_type") == "runpod":
                 self._cleanup_runpod(resource_id)
 
@@ -220,6 +224,10 @@ class ResourceRegistry:
         # No provider operation, memory deletion or file unlink is permitted
         # for legacy cloud records without the original canonical lease.
         for resource in self._resources.values():
+            self._cleanup_resource_by_type(
+                resource.resource_type, resource.resource_id,
+                resource.metadata, validate_only=True,
+            )
             if resource.resource_type == "runpod":
                 self._cleanup_runpod(resource.resource_id)
         self._cleanup_in_progress = True
@@ -251,18 +259,26 @@ class ResourceRegistry:
 
         self._cleanup_in_progress = False
 
-    def _cleanup_resource_by_type(self, resource_type: str, resource_id: str, metadata: Dict[str, Any]):
-        """Clean up a resource based on its type."""
-        if resource_type == "runpod":
-            self._cleanup_runpod(resource_id)
-        elif resource_type == "docker":
-            self._cleanup_docker(resource_id)
-        elif resource_type == "subprocess":
-            self._cleanup_subprocess(resource_id, metadata)
-        elif resource_type == "tempdir":
-            self._cleanup_tempdir(resource_id)
+    def _cleanup_resource_by_type(
+        self, resource_type: object, resource_id: str, metadata: Dict[str, Any],
+        *, validate_only: bool = False,
+    ):
+        """Validate against the same finite dispatch before any cleanup."""
+        cleaners = {
+            "runpod": self._cleanup_runpod,
+            "docker": self._cleanup_docker,
+            "subprocess": self._cleanup_subprocess,
+            "tempdir": self._cleanup_tempdir,
+        }
+        if not isinstance(resource_type, str) or resource_type not in cleaners:
+            raise ValueError("Resource registry type is invalid; original records retained")
+        if validate_only:
+            return
+        cleaner = cleaners[resource_type]
+        if resource_type == "subprocess":
+            cleaner(resource_id, metadata)
         else:
-            logger.warning(f"Unknown resource type: {resource_type}")
+            cleaner(resource_id)
 
     def _cleanup_runpod(self, pod_id: str):
         """Retain an unresolved historical ID; never infer cleanup authority."""
