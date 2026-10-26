@@ -65,7 +65,7 @@ SECURITY_FLOORS = {
 # canonical version parser used by Core's signed Agent Card validation.
 # Version 0.42.2 enforces all standard HTTP header and query carriers.
 # Version 0.42.3 corrects native HTTP+JSON protocol error media types.
-# Version 0.42.4 supplies one current trust-bundle floor for all HTTPS clients.
+# Version 0.42.4 owns the certifi floor for HTTPX/requests; OS roots are unaffected.
 # This is a Core-only release gate: sibling packages release independently.
 # Core must never lower its declared/locked line to accommodate an older
 # consumer. Host feature acceptance remains a release prerequisite in README.md.

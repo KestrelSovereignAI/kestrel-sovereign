@@ -328,8 +328,9 @@ use the scheduler host's own storage pool, not the agents' advisory pool.
 
 #### Native SDK release requirements
 
-Core requires `kestrel-sovereign-sdk[a2a,httpx,tracing]>=0.42.3,<1`; the
-`observability` extra adds `metrics` under that same base constraint. The 0.40
+Core declares its SDK version constraint in [pyproject.toml](https://github.com/KestrelSovereignAI/kestrel-sovereign/blob/main/pyproject.toml).
+The base install selects `[a2a,httpx,tracing]`; the `observability` extra adds
+`metrics` under that same base constraint. The 0.40
 release replaces draft A2A contribution types with native `AgentSkill` and
 `get_agent_skills` contracts; the coordinated 0.41.0 floor also includes the
 shared computer-use, artifact, resource-scope and workspace-transfer contracts.
@@ -338,6 +339,8 @@ both Core and feature skill producers through the SDK's `a2a` extra.
 SDK 0.42.2 also supplies the standard version query carrier and validation
 of repeated version headers required by Core's native bindings. SDK 0.42.3
 corrects native HTTP+JSON protocol error media types.
+SDK 0.42.4 owns the shared certifi dependency policy for HTTPX and requests;
+operating-system trust stores are unaffected.
 Core requires `sse-starlette>=3.5.0` so stopping one server does not cancel
 streams served by a later server in the same process; automatic stream
 draining remains enabled.
