@@ -239,7 +239,8 @@ async def test_rolled_back_profile_write_does_not_suppress_the_next_actual_upser
     service = SimpleNamespace(describe=lambda: profile)
     db = await AsyncDatabase.sqlite(str(tmp_path / "rolled-back.db"))
     try:
-        with pytest.raises(RuntimeError, match="intentional rollback"):
+        from kestrel_sdk.storage.database import TransactionError
+        with pytest.raises(TransactionError, match="intentional rollback"):
             async with db.transaction():
                 await upsert_embedding_profile(db, service, profile.profile_id)
                 assert await db.fetchval("SELECT COUNT(*) FROM embedding_profiles") == 1
