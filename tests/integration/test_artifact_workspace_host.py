@@ -384,3 +384,72 @@ async def test_broker_native_borrow_uses_original_transfer_and_both_current_gran
         if method not in {'prepare_export','prepare_import','status'}:
             assert h.transfer.cleanups[-1][1].session_id==current['session_id']
             assert h.transfer.cleanups[-1][2]==transfer_id
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["refused", "unknown", "cancelled"])
+async def test_every_attempted_export_prepare_retires_only_its_original_owner(workspace_host, monkeypatch, failure):
+    from kestrel_sdk.resources import ResourceUnsupported
+    h = workspace_host; current = await session(h)
+    retained = []
+    async def prepare(admitted, request):
+        # Prepare may reserve private native bytes before any kind of failure.
+        h.transfer.records[request.transfer_id] = WorkspaceTransferStatus(transfer_id=request.transfer_id, session_id=admitted.session_id, request_sha256=request.digest(), direction="export", state="preparing")
+        retained.append((admitted, request.transfer_id))
+        if failure == "cancelled":raise asyncio.CancelledError()
+        if failure == "unknown":raise ResourceOutcomeUnknown("accepted prepare lost ACK")
+        raise ResourceUnsupported("source cannot be exported")
+    monkeypatch.setattr(h.transfer, "prepare_export", prepare)
+    if failure == "cancelled":
+        from kestrel_sovereign.auth import CallerContext, caller_context_scope
+        tool = {item.name:item for item in h.agents['kite'].features['ArtifactsFeature'].get_tools()}['artifact_publish_workspace']
+        with caller_context_scope(CallerContext.sovereign(credential=KEY)):
+            with pytest.raises(asyncio.CancelledError):
+                await tool.execute(request_json=json.dumps(export_request(current)), publication_json=json.dumps({'title':'Workspace output','publication_key':'workspace-publication'}))
+    else:
+        response = await post(h, "publish", publication(current))
+        assert response.status_code in {500, 503}, response.text
+    assert len(retained) == 1
+    assert h.transfer.cleanups == [("release", retained[0][0], retained[0][1])], "prepare failure abandoned its reserved export"
+    assert h.transfer.records[retained[0][1]].state == "released"
+    assert h.transfer.reads == 0 and not h.transfer.files
+
+
+@pytest.mark.asyncio
+async def test_failed_export_does_not_read_status_or_retire_after_original_grant_loss(workspace_host, monkeypatch):
+    from kestrel_sdk.resources import ResourceUnsupported
+    h=workspace_host;current=await session(h);calls=[]
+    async def refused(admitted, request):
+        h.transfer.records[request.transfer_id]=WorkspaceTransferStatus(transfer_id=request.transfer_id,session_id=admitted.session_id,request_sha256=request.digest(),direction="export",state="preparing")
+        h.cfg['granted_actions'].remove('visual.transfer')
+        raise ResourceUnsupported('source refused after grant loss')
+    status=h.transfer.status
+    async def observed(*args):
+        calls.append(True)
+        return await status(*args)
+    monkeypatch.setattr(h.transfer,'prepare_export',refused);monkeypatch.setattr(h.transfer,'status',observed)
+    response=await post(h,'publish',publication(current))
+    # Preserve the existing generic unsupported-source error mapping.
+    assert response.status_code==500,response.text
+    assert not calls and not h.transfer.cleanups, 'failed prepare acquired data/cleanup after original grant loss'
+    assert h.transfer.records['export'].state=='preparing'
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("damage", ["session", "direction", "digest", "absent", "unknown"])
+async def test_failed_export_cannot_retire_unproven_original_request(workspace_host, monkeypatch, damage):
+    from kestrel_sdk.resources import ResourceUnsupported
+    h=workspace_host;current=await session(h)
+    async def refused(admitted, request):
+        h.transfer.records[request.transfer_id]=WorkspaceTransferStatus(transfer_id=request.transfer_id,session_id=admitted.session_id,request_sha256=request.digest(),direction="export",state="preparing")
+        raise ResourceUnsupported('source refused')
+    async def status(admitted, transfer_id):
+        value=h.transfer.records[transfer_id]
+        if damage=="absent":return None
+        if damage=="unknown":raise ResourceOutcomeUnknown('status unavailable')
+        return value.model_copy(update={"session_id":"another-session"} if damage=="session" else {"direction":"import"} if damage=="direction" else {"request_sha256":"0"*64})
+    monkeypatch.setattr(h.transfer,'prepare_export',refused);monkeypatch.setattr(h.transfer,'status',status)
+    response=await post(h,'publish',publication(current))
+    assert response.status_code==500,response.text
+    assert not h.transfer.cleanups, 'unproven failed-prepare ownership was retired'
+    assert h.transfer.records['export'].state=='preparing'

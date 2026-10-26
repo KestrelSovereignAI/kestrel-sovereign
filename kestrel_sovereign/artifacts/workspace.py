@@ -174,6 +174,20 @@ class ArtifactWorkspaceBroker:
                 except (ResourceOutcomeUnknown, asyncio.CancelledError):
                     retiring = True  # The original prepare can be accepted.
                     raise
+                except ResourceError:
+                    # A refusal can follow native reservation. But a conflicting
+                    # transfer ID may belong to a different immutable request.
+                    # Inspect only through the still-live ORIGINAL data lease;
+                    # failure/revocation cannot acquire a replacement grant.
+                    try:
+                        status = await self._call(lease, lease.transfer.status,
+                            lease.session, request.transfer_id, request=request)
+                        if status is not None:
+                            self._status(request, status, 'export')
+                            retiring = True
+                    except (ResourceError, OSError, ValueError, TimeoutError):
+                        pass  # Unknown/mismatched ownership must remain retained.
+                    raise
                 retiring = True
                 if (snapshot.request != request or snapshot.manifest.entrypoint != request.entrypoint
                         or {file.path for file in snapshot.manifest.files} != set(request.paths)):

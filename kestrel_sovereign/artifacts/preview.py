@@ -36,6 +36,10 @@ class ArtifactPreviewUnavailable(ResourceError):
     """No admitted local renderer, resource slot or verified cleanup exists."""
 
 
+class _CreateRejected(ArtifactPreviewUnavailable):
+    """Completed, known pre-creation daemon validation refusal."""
+
+
 class ArtifactPreviewRefused(ResourceError):
     """Source or derivative exceeds the approved preview contract."""
 
@@ -80,6 +84,7 @@ class _Job:
     finished: bool = False
     creation_started: bool = False
     create_acknowledged: bool = False
+    create_rejected: bool = False
     cleanup_confirmed: bool = False
 
 
@@ -144,7 +149,7 @@ class DockerArtifactRenderer:
         return {**{name: os.environ[name] for name in ('PATH', 'HOME', 'DOCKER_CONFIG') if name in os.environ},
                 'LC_ALL': 'C'}
 
-    async def _command(self, arguments, *, stdin=None, check=lambda: None, output_limit=65536, timeout=4):
+    async def _command(self, arguments, *, stdin=None, check=lambda: None, output_limit=65536, timeout=4, classify_create=False):
         process = await start_async_process(['docker', *arguments], env=self._env(),
             stdin=asyncio.subprocess.PIPE if stdin is not None else asyncio.subprocess.DEVNULL,
             stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
@@ -165,9 +170,9 @@ class DockerArtifactRenderer:
             async with asyncio.TaskGroup() as group:
                 group.create_task(write())
                 output = group.create_task(_bounded_read(process.stdout, output_limit))
-                group.create_task(_bounded_read(process.stderr, 8192))
+                error_output = group.create_task(_bounded_read(process.stderr, 8192))
                 group.create_task(wait_native())
-            return process.returncode, output.result()
+            return process.returncode, output.result(), error_output.result()
         completion = create_owned_task(collect(), name='preview-cli-io')
         cancellation = None
         try:
@@ -182,7 +187,15 @@ class DockerArtifactRenderer:
         result = raise_owned_outcome(outcome, operation='preview CLI cleanup')
         if not done:
             raise TimeoutError('preview CLI deadline exceeded')
-        return result
+        status, output, error_output = result
+        if classify_create and status != 0:
+            # Only known daemon-side validation refusals prove no creation can
+            # still complete. Generic daemon500/EOF/transport errors do not.
+            message = error_output.strip()
+            if (message == b'Error response from daemon: no command specified'
+                    or re.fullmatch(rb'Error response from daemon: unknown or invalid runtime name: [A-Za-z0-9][A-Za-z0-9_.-]*', message)):
+                raise _CreateRejected('renderer creation was refused')
+        return status, output
 
     async def _endpoint(self):
         explicit = os.environ.get('DOCKER_HOST')
@@ -251,7 +264,7 @@ class DockerArtifactRenderer:
                     '--memory=512m', '--memory-swap=512m', '--cpus=0.5', '--pids-limit=16',
                     '--user=65532:65532', '--ipc=none', '--cgroupns=private', '--runtime=runc', '--log-driver=none',
                     '--ulimit=nofile=32:32', '--tmpfs=/tmp:rw,nosuid,nodev,noexec,size=64m,mode=1777',
-                    job.image_id], output_limit=1024)
+                    job.image_id], output_limit=1024, classify_create=True)
                 if status != 0 or not re.fullmatch(rb'[a-f0-9]{64}\s*', identity):
                     raise ArtifactPreviewUnavailable('renderer creation outcome requires cleanup')
                 job.create_acknowledged = True; job.identity = identity.decode().strip()
@@ -269,6 +282,9 @@ class DockerArtifactRenderer:
                 if status != 0:
                     raise ArtifactPreviewRefused('renderer refused this source')
                 result = encode_preview(raw)
+        except _CreateRejected as error:
+            job.create_rejected = True
+            failure = error
         except ExceptionGroup as error:
             denied = error.subgroup(OperatorAuthorizationError)
             if denied is not None:
@@ -311,6 +327,14 @@ class DockerArtifactRenderer:
                             and value.get('Config', {}).get('Labels', {}).get('io.kestrel.artifact-preview.job') == job.name
                             and re.fullmatch(r'[a-f0-9]{64}', value.get('Id', ''))):
                         job.identity = value['Id']; job.create_acknowledged = True
+                elif job.create_rejected:
+                    # inspect failure alone cannot prove absence (the daemon
+                    # may be unavailable). Require a successful exact-name list
+                    # after the completed known validation refusal.
+                    status, present = await self._command(['--host', job.endpoint,
+                        'container', 'ls', '--all', '--filter', 'name=^/' + job.name + '$',
+                        '--format', '{{.ID}}'])
+                    job.cleanup_confirmed = status == 0 and not present.strip()
             except (OSError, ValueError, TimeoutError, ExceptionGroup):
                 pass
         if job.create_acknowledged:

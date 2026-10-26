@@ -57,3 +57,70 @@ async def test_missing_or_mutable_image_fails_before_docker_or_slot_admission(im
     with pytest.raises(ArtifactPreviewUnavailable):
         await DockerArtifactRenderer(image).render(pool, b'x', 'image/png', lambda: None)
     assert pool.active_count == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("message,rejected", [
+    ("Error response from daemon: no command specified\n", True),
+    ("Error response from daemon: unknown or invalid runtime name: owned-test-123\n", True),
+    ("Error response from daemon: internal server error\n", False),
+    ("Error response from daemon: EOF\n", False),
+    ("Error response from daemon: unknown or invalid runtime name: \n", False),
+    ("Error response from daemon: unknown or invalid runtime name: valid\nEOF\n", False),
+    ("connection reset by peer\n", False),
+])
+async def test_only_known_precreation_daemon_refusals_are_definitive_in_owned_native_process(monkeypatch, message, rejected):
+    import sys
+    from kestrel_sovereign.artifacts import preview
+    original = preview.start_async_process
+    children = []
+    async def launch(arguments, **kwargs):
+        child = await original([sys.executable, "-c", "import sys;sys.stderr.write("+repr(message)+");sys.exit(1)"], **kwargs)
+        children.append(child)
+        return child
+    monkeypatch.setattr(preview, "start_async_process", launch)
+    renderer = DockerArtifactRenderer("sha256:"+"1"*64)
+    if rejected:
+        with pytest.raises(preview._CreateRejected, match="renderer creation was refused") as error:
+            await renderer._command(["create"], classify_create=True)
+        assert message.strip() not in str(error.value)
+    else:
+        status, output = await renderer._command(["create"], classify_create=True)
+        assert status == 1 and not output
+    assert len(children) == 1 and children[0].returncode == 1
+
+
+@pytest.mark.asyncio
+async def test_known_rejection_still_retains_slot_without_successful_absence_oracle(monkeypatch):
+    renderer = DockerArtifactRenderer("sha256:"+"1"*64);pool = ArtifactPreviewPool();job = pool.reserve()
+    job.creation_started = True;job.create_rejected = True;job.finished = True
+    job.endpoint = "unix:///owned-test.sock";job.image_id = renderer.image
+    calls = []
+    async def unavailable(arguments, **kwargs):
+        calls.append(arguments)
+        return 1, b""
+    monkeypatch.setattr(renderer, "_command", unavailable)
+    await renderer._cleanup_native(pool, job)
+    assert pool.active_count == 1 and not job.cleanup_confirmed, "failed absence oracle released capacity"
+    assert any("ls" in call for call in calls)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("damage", ["label", "image", "name", "id"])
+async def test_recovery_never_removes_a_foreign_or_malformed_container(monkeypatch, damage):
+    renderer=DockerArtifactRenderer("sha256:"+"1"*64);pool=ArtifactPreviewPool();job=pool.reserve()
+    job.creation_started=True;job.finished=True;job.endpoint="unix:///owned-test.sock";job.image_id=renderer.image
+    value={"Id":"2"*64,"Name":"/"+job.name,"Config":{"Image":job.image_id,"Labels":{"io.kestrel.artifact-preview.job":job.name}}}
+    if damage=="label":value["Config"]["Labels"]={}
+    if damage=="image":value["Config"]["Image"]="sha256:"+"3"*64
+    if damage=="name":value["Name"]="/foreign"
+    if damage=="id":value["Id"]="not-a-container-id"
+    calls=[]
+    async def inspect_only(arguments, **kwargs):
+        import json
+        calls.append(arguments)
+        return 0,json.dumps([value]).encode()
+    monkeypatch.setattr(renderer,"_command",inspect_only)
+    await renderer._cleanup_native(pool,job)
+    assert pool.active_count==1 and not job.cleanup_confirmed, "foreign container reclaimed preview slot"
+    assert not any("rm" in args for args in calls), "foreign cleanup was dispatched"

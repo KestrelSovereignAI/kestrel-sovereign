@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import hmac
+import inspect
 import logging
 import os
 from contextlib import asynccontextmanager
@@ -160,7 +161,8 @@ class ArtifactsFeature(ArtifactProducerTools, ArtifactWorkspaceTools, Feature):
         returns a Response. A
         workflow wrapper must separately retain its original run resolver
         through the Response's ASGI call. Its synchronous ``check_current``
-        restricts canonical service work and the outer buffered ASGI delivery;
+        must return None or raise; returned booleans/awaitables are refused.
+        It restricts canonical service work and the outer buffered ASGI delivery;
         it grants nothing. A run scope/lease never substitutes for artifact
         authority. A resolver closed inside build cannot be resurrected here.
         """
@@ -185,7 +187,15 @@ class ArtifactsFeature(ArtifactProducerTools, ArtifactWorkspaceTools, Feature):
             return await build(admission)
         def restriction_check():
             try:
-                check_current()
+                result = check_current()
+                if result is not None:
+                    # A checker is synchronous None-or-raise. Never execute a
+                    # returned awaitable; close only an unstarted coroutine
+                    # created by this call, without abandoning a warning.
+                    if (inspect.iscoroutine(result)
+                            and inspect.getcoroutinestate(result) == inspect.CORO_CREATED):
+                        result.close()
+                    raise ArtifactAccessDenied('additional artifact policy is unavailable')
             except OperatorAuthorizationError:
                 # Keep a consumer's denial recognizable through canonical
                 # database rollback, without disclosing its policy details.

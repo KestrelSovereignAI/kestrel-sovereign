@@ -179,7 +179,7 @@ async def restricted_bridge_host(host):
     from kestrel_sovereign import server
     client,agents,app=host;feature=agents['kite'].features['ArtifactsFeature']
     policy=SimpleNamespace(generation=0,active=False,denied=False,built=0,checks=[],last_check=None,
-        close_before_response=False,inner_body_checked=asyncio.Event())
+        close_before_response=False,inner_body_checked=asyncio.Event(),result_factory=lambda:None)
     @asynccontextmanager
     async def independent_operation():
         generation=policy.generation;policy.active=True
@@ -187,6 +187,7 @@ async def restricted_bridge_host(host):
             policy.checks.append(True)
             if not policy.active or policy.denied or generation!=policy.generation:
                 raise OperatorAuthorizationError('original independent policy ended')
+            return policy.result_factory()
         policy.last_check=current
         try:yield current
         finally:policy.active=False
@@ -235,12 +236,14 @@ async def test_public_response_restriction_never_promotes_or_resurrects_an_indep
 
 
 @pytest.mark.asyncio
-async def test_public_restriction_fences_canonical_database_read_in_owned_child(restricted_bridge_host,monkeypatch):
+@pytest.mark.parametrize("violation", ["revocation", "invalid-return"])
+async def test_public_restriction_fences_canonical_database_read_in_owned_child(restricted_bridge_host,monkeypatch,violation):
     client,agents,_,policy=restricted_bridge_host
     service=agents['kite'].features['ArtifactsFeature']._service
     original=service.repository.page;returned=[]
     async def revoke_at_database(*args,**kwargs):
-        policy.generation+=1
+        if violation == "invalid-return":policy.result_factory=lambda:False
+        else:policy.generation+=1
         value=await asyncio.create_task(original(*args,**kwargs))
         returned.append(value)
         return value
@@ -252,7 +255,7 @@ async def test_public_restriction_fences_canonical_database_read_in_owned_child(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize('revoke',[False,True])
+@pytest.mark.parametrize('revoke',[False,True,'invalid-return'])
 async def test_public_restriction_reaches_actual_outer_buffered_transport(restricted_bridge_host,revoke):
     _,agents,app,policy=restricted_bridge_host
     entered,release=asyncio.Event(),asyncio.Event();messages=[]
@@ -272,7 +275,8 @@ async def test_public_restriction_reaches_actual_outer_buffered_transport(restri
         assert policy.active and agents['kite'].gate.locked()
         # Inner response checks may already have acknowledged middleware's
         # queue. Only the outer registered checker can stop the actual body.
-        if revoke:policy.generation+=1
+        if revoke == 'invalid-return':policy.result_factory=lambda:False
+        elif revoke:policy.generation+=1
         release.set()
         if revoke:
             denied=False
@@ -289,3 +293,29 @@ async def test_public_restriction_reaches_actual_outer_buffered_transport(restri
         release.set()
         if not serving.done():serving.cancel()
         await asyncio.gather(serving,return_exceptions=True)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("value", [False, True, 0, "allowed", "coroutine", "future"])
+async def test_public_restriction_must_synchronously_return_none_or_raise(restricted_bridge_host, value):
+    import inspect
+    client, _, _, policy = restricted_bridge_host
+    results = []
+    executed = []
+    async def asynchronous_check():
+        executed.append(True)
+    def result():
+        if value == "coroutine":
+            returned = asynchronous_check()
+        elif value == "future":
+            returned = asyncio.get_running_loop().create_future()
+            returned.set_result(None)
+        else:
+            returned = value
+        results.append(returned)
+        return returned
+    policy.result_factory = result
+    response = await client.get(path()+"/restricted-public-bridge-proof", headers=AUTH)
+    assert response.status_code == 403 and policy.built == 0, response.text
+    assert not executed, "restriction awaitable was executed"
+    assert all(not inspect.iscoroutine(item) or inspect.getcoroutinestate(item) == inspect.CORO_CLOSED for item in results), "rejected coroutine was abandoned"

@@ -260,3 +260,100 @@ async def test_lost_cleanup_ack_retains_capacity_until_exact_absence_is_reconcil
     await absent(renderer, renderer.names)
     assert not await renderer.reconcile_cleanup(pool)
     assert pool.active_count == 0
+
+
+@pytest.mark.asyncio
+async def test_definitive_daemon_create_refusal_frees_slot_after_exact_absence(renderer_image):
+    class RejectedCreate(ObservedRenderer):
+        async def _command(self, arguments, **kwargs):
+            if 'create' in arguments:
+                arguments = list(arguments)
+                arguments[arguments.index('--runtime=runc')] = '--runtime=kestrel-proof-missing-' + uuid4().hex
+            return await super()._command(arguments, **kwargs)
+    renderer = RejectedCreate(renderer_image)
+    pool = ArtifactPreviewPool()
+    try:
+        for _ in range(pool.capacity + 1):
+            with pytest.raises(ArtifactPreviewUnavailable):
+                await renderer.render(pool, png(), 'image/png', lambda: None)
+            await absent(renderer, renderer.names)
+            assert pool.active_count == 0, 'definitive daemon create refusal leaked preview capacity'
+        assert len(renderer.names) == pool.capacity + 1
+    finally:
+        await renderer.reconcile_cleanup(pool)
+        await absent(renderer, renderer.names)
+
+
+@pytest.mark.asyncio
+async def test_unknown_create_absence_retains_slot_until_late_native_owner_reconciles(renderer_image):
+    release = asyncio.Event()
+    class LateCreate(ObservedRenderer):
+        pending = None
+        async def _command(self, arguments, **kwargs):
+            if 'create' in arguments:
+                # This fixture owns a real delayed daemon call. Its lost ACK
+                # must not turn an early absence observation into free capacity.
+                self.names.append(arguments[arguments.index('--name') + 1])
+                async def native():
+                    await release.wait()
+                    return await DockerArtifactRenderer._command(self, arguments, **kwargs)
+                self.pending = asyncio.create_task(native())
+                raise OSError('create outcome is unacknowledged')
+            return await super()._command(arguments, **kwargs)
+    renderer = LateCreate(renderer_image); pool = ArtifactPreviewPool(); job = pool.reserve()
+    try:
+        with pytest.raises(ArtifactPreviewUnavailable):
+            await renderer.render(pool, png(), 'image/png', lambda: None, job=job)
+        await absent(renderer, renderer.names)
+        assert pool.active_count == 1, 'unacknowledged create was prematurely reclaimed'
+        assert await renderer.reconcile_cleanup(pool)
+        assert pool.active_count == 1
+        release.set()
+        status, _ = await renderer.pending
+        assert status == 0
+        assert not await renderer.reconcile_cleanup(pool)
+        assert pool.active_count == 0
+        await absent(renderer, renderer.names)
+    finally:
+        release.set()
+        if renderer.pending is not None:
+            await asyncio.gather(renderer.pending, return_exceptions=True)
+        await renderer._cleanup(pool, job)
+        await absent(renderer, renderer.names)
+
+
+@pytest_asyncio.fixture
+async def no_command_image(renderer_image, tmp_path):
+    renderer = DockerArtifactRenderer(renderer_image)
+    endpoint = await renderer._endpoint()
+    identity = uuid4().hex;tag = 'kestrel-artifact-no-command:' + identity
+    context = tmp_path / 'empty-image';context.mkdir()
+    (context/'Dockerfile').write_text('FROM scratch\nLABEL io.kestrel.proof="'+identity+'"\n')
+    status, _ = await renderer._command(['--host',endpoint,'build','--pull=false','--network=none','--tag',tag,str(context)],timeout=20)
+    assert status == 0
+    status, value = await renderer._command(['--host',endpoint,'image','inspect',tag])
+    assert status == 0
+    image=json.loads(value)[0];image_id=image['Id']
+    assert image['Config']['Labels']['io.kestrel.proof']==identity
+    try:
+        yield image_id
+    finally:
+        status, value = await renderer._command(['--host',endpoint,'image','inspect',image_id])
+        assert status == 0 and json.loads(value)[0]['Config']['Labels']['io.kestrel.proof']==identity
+        status, _ = await renderer._command(['--host',endpoint,'image','rm',image_id])
+        assert status == 0
+
+
+@pytest.mark.asyncio
+async def test_actual_daemon_no_command_refusal_does_not_consume_capacity(no_command_image):
+    renderer=ObservedRenderer(no_command_image);pool=ArtifactPreviewPool()
+    try:
+        for _ in range(pool.capacity+1):
+            with pytest.raises(ArtifactPreviewUnavailable):
+                await renderer.render(pool,png(),'image/png',lambda:None)
+            await absent(renderer,renderer.names)
+            assert pool.active_count==0,'definitive no-command refusal leaked preview capacity'
+        assert len(renderer.names)==pool.capacity+1
+    finally:
+        await renderer.reconcile_cleanup(pool)
+        await absent(renderer,renderer.names)

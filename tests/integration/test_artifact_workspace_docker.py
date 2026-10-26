@@ -157,6 +157,22 @@ async def test_real_host_docker_source_destruction_panel_edit_and_pinned_materia
             try:
                 first=await start();await action(first,Click(x=20,y=20));await action(first,TypeText(text='Broker durable source'))
                 first=await pause(first)
+                # Each refusal occurs AFTER the real worker reserves 2MiB.
+                # More than eight failed IDs must not exhaust its16MiB quota.
+                failed_exports=[]
+                for index in range(9):
+                    transfer_id='refused-export-'+str(index)
+                    rejected={**request(first,transfer_id),'paths':['not-browser-document'],'entrypoint':'not-browser-document'}
+                    rejected['limits']['max_total_bytes']=2*1024*1024
+                    refusal=await client.post('/api/artifacts/workspaces/publish',json={'request':rejected,'title':'Refused source','publication_key':'refused-key-'+str(index)})
+                    assert refusal.status_code!=200,refusal.text
+                    status=await client.get('/api/artifacts/workspaces/sessions/'+first['session_id']+'/transfers/'+transfer_id)
+                    assert status.status_code==200 and status.json()['state']=='released',status.text
+                    failed_exports.append(transfer_id)
+                physical=json.loads(await boundary.invoke(['exec',containers[0],'python','-c',
+                    "import json;from pathlib import Path;p=Path('/tmp/kestrel-browser/workspace-transfer');r=[json.loads(f.read_text()) for f in (p/'records').iterdir()];print(json.dumps({'reserved':sum(v['reserved'] for v in r),'export_trees':len(list((p/'exports').iterdir()))}))"]))
+                assert physical=={'reserved':0,'export_trees':0},physical
+                print(json.dumps({'failed_exports_released':failed_exports,'physical_after_refusals':physical}))
                 selected={**request(first,'export-original'),'paths':['document.html'],'entrypoint':'document.html'}
                 exported=await client.post('/api/artifacts/workspaces/publish',json={'request':selected,
                     'title':'Broker durable output','publication_key':'broker-original'})
