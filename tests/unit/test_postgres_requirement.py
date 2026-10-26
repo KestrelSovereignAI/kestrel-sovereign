@@ -11,9 +11,9 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 import os
+import shlex
 import subprocess
 import sys
-import shlex
 
 import pytest
 import yaml
