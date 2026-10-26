@@ -1451,6 +1451,14 @@ export function mountChatPane(agentName) {
         }
     }
 
+    // An embedder can reactivate a surface while another surface owns
+    // mountedChatAgent. Preserve every cached pane physically in this
+    // viewport before retiring the leftover DOM: pane lifetime belongs to
+    // the agent, including while it is detached for background work.
+    for (const pane of deps().state.chatPanes.values()) {
+        if (pane?.element?.parentNode === container) pane.element.remove();
+    }
+
     // Empty the container of any leftover non-pane children (defensive
     // against pre-migration HTML that mounted welcome content directly
     // into #chat-container without going through a pane).
