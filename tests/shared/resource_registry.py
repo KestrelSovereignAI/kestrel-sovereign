@@ -27,6 +27,8 @@ from typing import Optional, Callable, Dict, Any
 from pathlib import Path
 import logging
 
+from kestrel_sovereign.legacy_runpod import LegacyRunpodPathError
+
 logger = logging.getLogger(__name__)
 
 # Registry file for crash recovery
@@ -126,8 +128,19 @@ class ResourceRegistry:
         if not REGISTRY_FILE.exists():
             return
 
+        data = json.loads(REGISTRY_FILE.read_text())
+        if not isinstance(data, dict):
+            raise ValueError("Resource registry is invalid; original records retained")
+        # Historical IDs are reconciliation evidence, not provider authority.
+        # Refuse BEFORE the old generic recovery handler can erase this file
+        # or perform any unrelated cleanup under an unverified registry.
+        for resource_id, record in data.items():
+            if not isinstance(record, dict):
+                raise ValueError("Resource registry is invalid; original records retained")
+            if record.get("resource_type") == "runpod":
+                self._cleanup_runpod(resource_id)
+
         try:
-            data = json.loads(REGISTRY_FILE.read_text())
             if data:
                 print(f"\n[RECOVERY] Found {len(data)} orphaned resources from previous crash")
                 for resource_id, resource_data in data.items():
@@ -198,6 +211,11 @@ class ResourceRegistry:
 
         if self._cleanup_in_progress:
             return
+        # No provider operation, memory deletion or file unlink is permitted
+        # for legacy cloud records without the original canonical lease.
+        for resource in self._resources.values():
+            if resource.resource_type == "runpod":
+                self._cleanup_runpod(resource.resource_id)
         self._cleanup_in_progress = True
 
         if self._resources:
@@ -241,24 +259,8 @@ class ResourceRegistry:
             logger.warning(f"Unknown resource type: {resource_type}")
 
     def _cleanup_runpod(self, pod_id: str):
-        """Terminate a RunPod instance."""
-        try:
-            import runpod
-            api_key = os.environ.get("RUNPOD_API_KEY")
-            if api_key:
-                runpod.api_key = api_key
-                try:
-                    runpod.stop_pod(pod_id)
-                except Exception:
-                    pass
-                runpod.terminate_pod(pod_id)
-                print(f"[CLEANUP] Terminated RunPod {pod_id}")
-            else:
-                print(f"[CLEANUP] Cannot cleanup RunPod {pod_id}: No API key")
-        except ImportError:
-            print(f"[CLEANUP] Cannot cleanup RunPod {pod_id}: runpod module not installed")
-        except Exception as e:
-            print(f"[CLEANUP] Error terminating RunPod {pod_id}: {e}")
+        """Retain an unresolved historical ID; never infer cleanup authority."""
+        raise LegacyRunpodPathError("test resource cleanup", resource_id=pod_id)
 
     def _cleanup_docker(self, container_id: str):
         """Stop and remove a Docker container."""
