@@ -13,6 +13,7 @@ from types import SimpleNamespace
 import os
 import subprocess
 import sys
+import shlex
 
 import pytest
 import yaml
@@ -261,6 +262,18 @@ def test_native_ci_requires_the_test_url_and_selects_exactly_one_lane():
     assert "--timeout=120" in step["run"]
     assert step["timeout-minutes"] >= 49
     assert job["timeout-minutes"] > step["timeout-minutes"]
+
+
+def test_native_ci_uses_isolated_parallel_workers_with_module_affinity():
+    job = yaml.safe_load(CI_WORKFLOW.read_text())["jobs"]["native-postgres-tests"]
+    step, = [step for step in job["steps"] if "pytest tests/integration/" in step.get("run", "")]
+    arguments = shlex.split(step["run"])
+    plugins = [arguments[index + 1] for index, value in enumerate(arguments) if value == "-p"]
+    assert "xdist.plugin" in plugins, "native lane is serial while plugin autoload is disabled"
+    assert int(arguments[arguments.index("-n") + 1]) >= 2
+    assert "--dist=loadfile" in arguments, "each test module must stay in one worker"
+    assert str(step["env"][guard.REQUIRE_ENV]) == "1"
+    assert str(step["env"]["PYTEST_DISABLE_PLUGIN_AUTOLOAD"]) == "1"
 
 
 # ---------------------------------------------------------------------------
