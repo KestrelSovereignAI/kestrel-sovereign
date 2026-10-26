@@ -216,6 +216,27 @@ def test_prod_profile_has_bash_parity_env_vars(live_config):
     assert prod.env_vars["KESTREL_DB_BACKEND"] == "postgres"
 
 
+def test_prod_profile_declares_explicit_native_a2a_authority(live_config):
+    """Public peer authority comes from the profile, never request/listen data."""
+    env = live_config["profiles"]["prod"]["env_vars"]
+    assert env["KESTREL_BASE_URL"] == "https://kestrel-prod-7jpbsywhdq-uc.a.run.app"
+    assert env["KESTREL_A2A_DISCOVERY_AGENT"] == env["KESTREL_EXPECTED_DID"]
+    assert env["KESTREL_A2A_DISCOVERY_AGENT"] == "${KESTREL_PROD_EXPECTED_DID}"
+
+
+def test_prod_publication_resolves_the_existing_pinned_identity(live_config, monkeypatch):
+    """Deployment expansion supplies one identical custody/discovery identity."""
+    from kestrel_sovereign.a2a.native_publication import NativeHostingConfiguration
+
+    expected_did = "did:web:identity.example:production"
+    monkeypatch.setenv("KESTREL_PROD_EXPECTED_DID", expected_did)
+    env = DeployManager._expand_env_vars(live_config["profiles"]["prod"]["env_vars"])
+    configuration = NativeHostingConfiguration.from_environment(env)
+    assert configuration is not None
+    assert configuration.discovery_routing_key == env["KESTREL_EXPECTED_DID"] == expected_did
+    assert configuration.public_base_url == env["KESTREL_BASE_URL"]
+
+
 def test_prod_profile_uses_single_agent_image(live_config):
     """Durable prod uses the single-agent ``kestrel`` image."""
     manager = DeployManager(config=live_config)
