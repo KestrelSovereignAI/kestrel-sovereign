@@ -6,9 +6,11 @@ orchestrator LLM, including feature dispatcher tools and directly-promoted
 individual tools with LRU eviction.
 """
 
+import asyncio
 import hashlib
 import logging
 import re
+import time
 from copy import deepcopy
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List
@@ -25,6 +27,17 @@ from kestrel_sovereign.agent.tool_allowlist import (
     registry_generation,
 )
 from kestrel_sovereign.tools.result_contract import enforce_tool_result_contract
+
+
+@dataclass
+class _BoundToolExecution:
+    """Caller-local execution facts, independent of a tool's business result."""
+
+    started: bool = False
+    returned: bool = False
+    admitted: bool = False
+    audit_recorded: bool = False
+    arguments: dict | None = None
 
 
 @dataclass(frozen=True)
@@ -66,17 +79,61 @@ class _GovernedToolBinding:
             raise ValueError("A tool invocation requires a session_id")
         if not isinstance(source, str) or not source.strip():
             raise ValueError("A tool invocation requires a source")
-        try:
-            return await self.agent._dispatch_tool_call(
-                ToolCall(id=str(uuid4()), name=self.name, arguments=deepcopy(arguments)),
+        call = ToolCall(id=str(uuid4()), name=self.name, arguments=deepcopy(arguments))
+        execution = _BoundToolExecution()
+        dispatch_start = time.time()
+        from kestrel_sovereign._async_ownership import OwnedTaskOutcome, raise_owned_outcome
+        from kestrel_sovereign.execution_custody import is_execution_control_error
+
+        async def finalize(outcome):
+            if execution.audit_recorded or not execution.admitted:
+                return
+            unknown = execution.started
+            error_class = (
+                "ResourceOutcomeUnknown" if unknown else
+                type(outcome.error).__name__ if outcome.error is not None else
+                "CancelledError"
+            )
+            await self.agent._log_tool_dispatch(
+                tool_name=self.name, adapter=f"{self.owner}.{self.name}",
+                args=execution.arguments if execution.arguments is not None else call.arguments,
+                result={"success": False, "error": "Tool invocation did not complete"},
+                session_id=session_id, dispatch_start=dispatch_start,
+                status_hint="error", error_class=error_class,
+                error_message=(
+                    "Tool outcome is unconfirmed; reconcile before retrying"
+                    if unknown else "Invocation stopped before tool execution"
+                ),
+                required=True,
+            )
+            execution.audit_recorded = True
+
+        outcome = await self.agent._execute_tool_operation_at_stop_boundary(
+            lambda: self.agent._dispatch_tool_call(
+                call,
                 features_by_tool_name={}, known_tools=self.agent._known_tool_names(),
                 messages=[], iteration=0, user_message=None, session_id=session_id,
-                bound_tool=self, source=source,
-            )
-        except DatabaseError as exc:
-            raise ResourceOutcomeUnknown(
+                bound_tool=self, bound_execution=execution, source=source,
+            ),
+            name="bound-tool-invocation", cancel_on_caller_cancellation=True,
+            finalize=finalize,
+        )
+        error = outcome.error
+        if isinstance(error, Exception) and not is_execution_control_error(error) and (
+            isinstance(error, DatabaseError)
+            or (execution.started and not isinstance(
+                error, (ResourceConflict, ResourceOutcomeUnknown, asyncio.CancelledError),
+            ))
+        ):
+            message = (
                 "Tool audit could not be confirmed; reconcile before retrying"
-            ) from exc
+                if isinstance(error, DatabaseError)
+                else "Tool outcome is unconfirmed; reconcile before retrying"
+            )
+            unknown = ResourceOutcomeUnknown(message)
+            unknown.__cause__ = error
+            outcome = OwnedTaskOutcome(outcome.result, unknown, outcome.cancellation)
+        return raise_owned_outcome(outcome, operation="governed bound tool invocation", retain_originals=True)
 
 
 @dataclass(frozen=True)

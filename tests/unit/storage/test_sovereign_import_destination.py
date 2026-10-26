@@ -1,4 +1,4 @@
-"""#2525: ``target_db_path`` is refused before the bound database is touched.
+"""#2525: Core 0.55 removes the ignored ``target_db_path`` keyword.
 
 Backend-independent half of the regression (the SQLite two-database proof
 lives in ``tests/integration/test_sovereign_import_destination.py``). The
@@ -10,15 +10,14 @@ a SQLite path or a PostgreSQL DSN, whatever store the adapter is bound to.
 
 from __future__ import annotations
 
+import inspect
 from typing import List
 
 import pytest
 
 from kestrel_sovereign.storage.async_database import AsyncDatabase
 from kestrel_sovereign.storage.sovereign_adapter import (
-    TARGET_DB_PATH_REMOVAL_RELEASE,
     SovereignStorageAdapter,
-    UnsupportedImportDestinationError,
 )
 
 
@@ -50,20 +49,18 @@ class _NoFetch:
         "/tmp/other-agent/kestrel_prime.db",
         "postgresql://kestrel:s3cret@db.internal:5432/other",
         "",
+        None,
     ],
 )
-async def test_non_none_target_db_path_is_refused_before_any_io(target):
+async def test_removed_target_db_path_is_refused_before_any_io(target):
     db = _UntouchableDatabase()
     transport = _NoFetch()
     adapter = SovereignStorageAdapter(
         db, user_secret="secret", filecoin_adapter=transport, agent_id="a",
     )
 
-    with pytest.warns(DeprecationWarning, match=TARGET_DB_PATH_REMOVAL_RELEASE):
-        with pytest.raises(UnsupportedImportDestinationError) as excinfo:
-            await adapter.import_agent(
-                "bafy-not-fetched", target_db_path=target,
-            )
+    with pytest.raises(TypeError, match="target_db_path") as excinfo:
+        await adapter.import_agent("bafy-not-fetched", target_db_path=target)
 
     assert db.accessed == []
     assert transport.calls == []
@@ -92,5 +89,5 @@ async def test_omitted_keyword_does_not_warn(recwarn, tmp_path):
     assert not [w for w in recwarn if "target_db_path" in str(w.message)]
 
 
-def test_unsupported_destination_is_a_value_error():
-    assert issubclass(UnsupportedImportDestinationError, ValueError)
+def test_import_signature_has_no_ignored_destination():
+    assert "target_db_path" not in inspect.signature(SovereignStorageAdapter.import_agent).parameters

@@ -134,17 +134,12 @@ is. To import into a different database, construct an adapter bound to it.
 
 The `target_db_path` keyword never selected a destination — it was accepted
 and ignored, so a caller naming database B received a result while the bound
-database A was rewritten. It is deprecated and will be removed in
-kestrel-sovereign 0.55.0 (`TARGET_DB_PATH_REMOVAL_RELEASE`):
+database A was rewritten. Core 0.55 removes the keyword.
 
-* Passing it at all emits a `DeprecationWarning`.
-* Any value other than `None` raises `UnsupportedImportDestinationError`
-  (a `ValueError`) before the package is fetched and before any continuity
-  audit, import-log write, conversation mutation, or asset-restorer call.
-  The refused call is an invalid invocation, not an import attempt, so it
-  appends no `agent_import_log` row. The value is never interpreted as a
-  SQLite path or a PostgreSQL DSN, and never echoed in the error.
-* Migration: omit the keyword and bind the adapter to the intended database.
+Passing it at all, including `target_db_path=None`, raises `TypeError` during
+argument binding. No package is fetched and neither the bound database nor a
+named alternative is read or mutated. Omit the keyword and construct the
+adapter over the intended destination database.
 
 ### Keyring Encryption Detail
 The keyring uses a **deterministic key** derived from a known constant:

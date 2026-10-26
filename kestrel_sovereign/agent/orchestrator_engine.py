@@ -19,6 +19,7 @@ import re
 import sys
 import time
 from contextlib import aclosing, contextmanager, nullcontext
+from copy import deepcopy
 from dataclasses import dataclass
 from typing import (
     Any,
@@ -37,9 +38,10 @@ from typing import (
 
 from kestrel_sdk.hooks.base import HookEvent, HookInput
 from kestrel_sdk.llm import ToolCallStarted
-from kestrel_sdk.resources import ResourceConflict, ResourceUnsupported
+from kestrel_sdk.resources import ResourceConflict, ResourceOutcomeUnknown, ResourceUnsupported
 
 from kestrel_sovereign._async_ownership import (
+    OwnedTaskOutcome,
     await_owned_task,
     create_owned_task,
     gather_owned,
@@ -1038,6 +1040,7 @@ class OrchestratorEngineMixin:
         args: dict,
         session_id: str,
         execute_fn,
+        prepare_args=None,
     ) -> dict:
         """
         Execute a tool with PRE_TOOL_USE and POST_TOOL_USE hook enforcement.
@@ -1090,6 +1093,8 @@ class OrchestratorEngineMixin:
             if hook_output.updated_input is not None
             else hook_input.tool_input
         )
+        if prepare_args is not None:
+            args = prepare_args(args)
 
         # --- Execute the tool ---
         # Deliberately no span here (#2639): the observability hook's
@@ -1098,7 +1103,7 @@ class OrchestratorEngineMixin:
         # double-instrument the call and root as the ``unknown`` agent.
         exec_start = time.time()
         require_execution_work(self)
-        result = await execute_fn(args)
+        result = await execute_fn(deepcopy(args) if prepare_args is not None else args)
         mark_current_invocation_effect_completed(session_id)
         require_execution_work(self)
         exec_duration_ms = int((time.time() - exec_start) * 1000)
@@ -2175,6 +2180,7 @@ class OrchestratorEngineMixin:
         session_id: str = "orchestrator",
         effective_model: Optional[str] = None,
         bound_tool=None,
+        bound_execution=None,
         source: str = "model",
     ):
         """
@@ -2189,6 +2195,7 @@ class OrchestratorEngineMixin:
         log_prefix = "[ORCHESTRATOR-STREAM]" if streaming else "[ORCHESTRATOR]"
         dispatch_start = time.time()
         dispatch_meta: Dict[str, Any] = {}
+        bound_adapter = f"{bound_tool.owner}.{tool_name}" if bound_tool is not None else None
 
         from kestrel_sovereign.signals.constitution_canary import (
             PHANTOM_RECEIPT_TOOL_NAME,
@@ -2284,7 +2291,7 @@ class OrchestratorEngineMixin:
             await OrchestratorEngineMixin._log_tool_dispatch(
                 self,
                 tool_name=tool_name,
-                adapter=OrchestratorEngineMixin._tool_call_adapter(
+                adapter=bound_adapter or OrchestratorEngineMixin._tool_call_adapter(
                     self, tool_name, features_by_tool_name
                 ),
                 args=args,
@@ -2296,7 +2303,9 @@ class OrchestratorEngineMixin:
                 error_message=f"Tool validation failed: {validation_error}",
                 **({"required": True} if bound_tool is not None else {}),
             )
-            return
+            if bound_execution is not None:
+                bound_execution.audit_recorded = True
+            return result
 
         # Stream tool start indicator
         if streaming and tool_events is not None:
@@ -2308,6 +2317,9 @@ class OrchestratorEngineMixin:
             metadata={"arguments": args, "iteration": iteration, "source": source},
             **({"session_id": session_id} if bound_tool is not None else {}),
         )
+
+        if bound_execution is not None:
+            bound_execution.admitted = True
 
         feature = features_by_tool_name.get(tool_name)
         result = None
@@ -2335,6 +2347,7 @@ class OrchestratorEngineMixin:
                     session_id=session_id, dispatch_meta=dispatch_meta,
                     call_context=call_context, tool=bound_tool.tool,
                     bound_tool=bound_tool, feature_name=bound_tool.security_feature,
+                    bound_execution=bound_execution,
                 )
             elif feature:
                 # The guardrails are done with a subagent dispatch; anything that
@@ -2447,9 +2460,9 @@ class OrchestratorEngineMixin:
         await OrchestratorEngineMixin._log_tool_dispatch(
             self,
             tool_name=tool_name,
-            adapter=OrchestratorEngineMixin._tool_call_adapter(
+            adapter=bound_adapter or OrchestratorEngineMixin._tool_call_adapter(
                 self, tool_name, features_by_tool_name
-            ) if bound_tool is None else f"{bound_tool.owner}.{tool_name}",
+            ),
             args=dispatch_meta.get("arguments", args),
             result=result,
             session_id=session_id,
@@ -2460,8 +2473,13 @@ class OrchestratorEngineMixin:
             **({"required": True} if bound_tool is not None else {}),
         )
 
+        if bound_execution is not None:
+            bound_execution.audit_recorded = True
+
         if bound_tool is not None and dispatch_meta.get("binding_expired"):
             raise ResourceConflict("Tool registration expired; reopen the originating view")
+        if bound_tool is not None and dispatch_meta.get("outcome_unknown"):
+            raise ResourceOutcomeUnknown(dispatch_meta["error_message"]) from dispatch_meta["outcome_error"]
 
         return result
 
@@ -2803,6 +2821,7 @@ class OrchestratorEngineMixin:
         dispatch_meta=None, tool=None, feature_name=None,
         call_context: Optional[ToolCallContext] = None,
         bound_tool=None,
+        bound_execution=None,
     ):
         """Dispatch a direct tool call (no subagent LLM hop).
 
@@ -2855,16 +2874,27 @@ class OrchestratorEngineMixin:
             return await _failed(argument_error, error_class="ToolArgumentError")
         record_tool_acceptance(self, call_context, tool_name)
 
+        def _prepare_bound_arguments(effective_args):
+            effective_args, error = normalize_direct_tool_arguments(tool_name, tool, effective_args)
+            snapshot = deepcopy(effective_args)
+            bound_execution.arguments = snapshot
+            dispatch_meta["arguments"] = snapshot
+            if error is not None:
+                raise ValueError(error)
+            valid, error = validate_tool_arguments(tool_name, snapshot)
+            if not valid:
+                raise ValueError(error)
+            return snapshot
+
         async def _exec_direct(effective_args, t=tool):
             if bound_tool is not None:
                 dispatch_meta["binding_expired"] = not bound_tool.is_current
                 bound_tool.require_current()
-                dispatch_meta["arguments"] = effective_args
-                effective_args, error = normalize_direct_tool_arguments(tool_name, t, effective_args)
-                if error is not None:
-                    raise ValueError(error)
-                dispatch_meta["arguments"] = effective_args
-            return await t.execute(**effective_args)
+                bound_execution.started = True
+            result = await t.execute(**effective_args)
+            if bound_execution is not None:
+                bound_execution.returned = True
+            return result
 
         try:
             result = await self._execute_tool_with_hooks(
@@ -2873,6 +2903,7 @@ class OrchestratorEngineMixin:
                 args=args,
                 session_id=session_id,
                 execute_fn=_exec_direct,
+                **({"prepare_args": _prepare_bound_arguments} if bound_tool is not None else {}),
             )
             # #2641: direct tools carry the same envelope contract as
             # subagent dispatch (matters after progressive disclosure: an
@@ -2896,6 +2927,16 @@ class OrchestratorEngineMixin:
             if is_execution_control_error(e):
                 raise
             logging.error(f"[DIRECT-TOOL] {tool_name} failed: {e}")
+            if bound_execution is not None and (
+                bound_execution.returned
+                or (bound_execution.started and not isinstance(e, ResourceConflict))
+            ):
+                dispatch_meta["outcome_unknown"] = True
+                dispatch_meta["outcome_error"] = e
+                return await _failed(
+                    "Tool outcome is unconfirmed; reconcile before retrying",
+                    error_class="ResourceOutcomeUnknown", status="error",
+                )
             return await _failed(
                 str(e),
                 error_class=type(e).__name__,
@@ -3073,6 +3114,52 @@ class OrchestratorEngineMixin:
                 # parts once after the gather and attach to the last event.
                 _collect_parts()
 
+    async def _execute_tool_operation_at_stop_boundary(
+        self, operation, *, name, cancel_on_caller_cancellation=False, finalize=None,
+    ):
+        """Join a tool operation and its audit under the original turn scope.
+
+        Factories allocate coroutines only after native Task admission.
+        Model batches finish their admitted work. External callers may forward
+        cancellation once so an approval or transport can unwind; both paths
+        still join the original owner and any required audit before returning.
+        """
+        turn_scope = capture_turn_scope(self)
+        task_context = contextvars.copy_context()
+        lock_manager = None
+        get_lock_manager = getattr(type(self), "_get_lock_manager", None)
+        if callable(get_lock_manager):
+            lock_manager = get_lock_manager(self)
+        delegate = getattr(lock_manager, "delegate_current_task_ownership", None)
+        if callable(delegate):
+            delegate(task_context)
+
+        async def run_scoped(factory):
+            with turn_scope.bind():
+                return await factory()
+
+        owner = create_owned_task(
+            run_scoped(operation), name=name, context=task_context, retain_originals=True,
+        )
+        outcome = await await_owned_task(
+            owner, cancel_on_caller_cancellation=cancel_on_caller_cancellation,
+        )
+        if finalize is not None:
+            audit_owner = create_owned_task(
+                run_scoped(lambda: finalize(outcome)), name=name + "-audit",
+                context=task_context, retain_originals=True,
+            )
+            audit = await await_owned_task(audit_owner, pending_cancellation=outcome.cancellation)
+            outcome = OwnedTaskOutcome(
+                outcome.result,
+                execution_terminal_error(
+                    outcome.error, audit.error, retain_originals=True,
+                    isolate_control_originals=True,
+                ),
+                audit.cancellation,
+            )
+        return outcome
+
     async def _execute_tool_batch_at_stop_boundary(
         self,
         *args,
@@ -3090,48 +3177,12 @@ class OrchestratorEngineMixin:
         prevents another tool or provider round-trip.
         """
 
-        # The batch context below is a copy of this one, so ContextVars carry
-        # over by inheritance; what does not is authority defined relative to
-        # this task — the held transition span's reentry token and the
-        # explicit turn/session pairing. Re-present the whole turn scope, as
-        # every closure that runs turn work on another task does.
-        turn_scope = capture_turn_scope(self)
-
-        async def run_owned_batch():
-            with turn_scope.bind():
-                return await self._execute_tool_batch(*args, **kwargs)
-
-        # This moves the SAME logical turn into a cancellable task, which is
-        # exactly the case delegate_current_task_ownership documents: ordinary
-        # child tasks deliberately do not inherit a non-reentrant lock, so
-        # without this the batch runs with the turn's CONVERSATION hold
-        # invisible. is_owned_by_current_task and _caller_belongs_to_live_turn
-        # both go False inside every tool, which turns an in-turn isolated tool
-        # into a wait on a config-transition gate the turn itself is holding
-        # the lock against, and makes privacy_transition() re-acquire a lock
-        # its own turn owns. The invocation boundary and the dispatcher both
-        # delegate at their task boundaries; this one has to as well. Tokens
-        # are per-acquisition, so the delegation stops authorizing the moment
-        # this turn releases.
-        batch_context = contextvars.copy_context()
-        lock_manager = None
-        get_lock_manager = getattr(type(self), "_get_lock_manager", None)
-        if callable(get_lock_manager):
-            lock_manager = get_lock_manager(self)
-        delegate_lock_ownership = getattr(
-            lock_manager, "delegate_current_task_ownership", None
-        )
-        if callable(delegate_lock_ownership):
-            delegate_lock_ownership(batch_context)
-        owner = create_owned_task(
-            run_owned_batch(),
-            name="orchestrator-tool-batch",
-            context=batch_context,
-            retain_originals=True,
-        )
         tool_results = kwargs.get("tool_results")
         result_count = len(tool_results) if isinstance(tool_results, list) else None
-        outcome = await await_owned_task(owner)
+        outcome = await OrchestratorEngineMixin._execute_tool_operation_at_stop_boundary(
+            self, lambda: self._execute_tool_batch(*args, **kwargs),
+            name="orchestrator-tool-batch",
+        )
         if (
             result_count is not None
             and len(tool_results) > result_count
