@@ -13,6 +13,7 @@ from kestrel_sdk.operator import OperatorAuthorizationError
 
 from kestrel_sovereign.auth import CallerContext, caller_context_scope
 from kestrel_sovereign.privacy import PrivacyMode
+from kestrel_sovereign.features.artifacts import ArtifactOperation
 from tests.integration.test_artifact_host import host as host, repository as repository, KEY, AUTH, path, publish
 
 
@@ -20,9 +21,12 @@ from tests.integration.test_artifact_host import host as host, repository as rep
 async def test_public_operation_publishes_through_original_caller_and_context_retires(host):
     client, agents, _ = host
     feature=agents['kite'].features['ArtifactsFeature']
-    assert feature.artifact_bridge_api_version==2
+    assert feature.artifact_bridge_api_version==3
     with caller_context_scope(CallerContext.sovereign(credential=KEY)):
-        async with feature.artifact_operation() as (service, context):
+        async with feature.artifact_operation() as operation:
+            service,context=operation.service,operation.context
+            operation.check_current()
+            assert isinstance(operation,ArtifactOperation) and operation.expires_at==context.expires_at
             assert agents['kite'].gate.locked()
             assert context.acting_agent_id==agents['kite'].did
             assert context.granted_capabilities=={'artifacts'}
@@ -33,10 +37,55 @@ async def test_public_operation_publishes_through_original_caller_and_context_re
                 manifest=ArtifactManifest(files=(staged,),entrypoint=staged.path)))
             assert receipt.scope.agent_id==agents['kite'].did
         with pytest.raises(OperatorAuthorizationError):await service.get(context,receipt.ref)
+        with pytest.raises(OperatorAuthorizationError):operation.check_current()
     assert not agents['kite'].gate.locked()
     response=await client.get(path()+f'/{receipt.ref.artifact_id}/revisions/{receipt.ref.revision_id}/file',
         headers=AUTH,params={'path':'workflow.md'})
     assert response.content==content
+
+
+@pytest.mark.asyncio
+async def test_typed_operation_checker_ends_before_original_resolver_cleanup_finishes(host,monkeypatch):
+    _,agents,_=host;feature=agents['kite'].features['ArtifactsFeature']
+    original=feature._resolve_tool_context;retiring,finish=asyncio.Event(),asyncio.Event();retained=[]
+    @asynccontextmanager
+    async def delayed_cleanup():
+        async with original() as context:
+            try:yield context
+            finally:
+                retiring.set();await finish.wait()
+    monkeypatch.setattr(feature,'_resolve_tool_context',delayed_cleanup)
+    async def owner():
+        async with feature.artifact_operation() as operation:
+            retained.append(operation);operation.check_current()
+    with caller_context_scope(CallerContext.sovereign(credential=KEY)):
+        pending=asyncio.create_task(owner())
+        try:
+            await asyncio.wait_for(retiring.wait(),5)
+            with pytest.raises(OperatorAuthorizationError):retained[0].check_current()
+        finally:
+            finish.set();await pending
+    assert not agents['kite'].gate.locked()
+
+
+@pytest.mark.asyncio
+async def test_typed_original_checker_rolls_back_consumer_relation_before_native_commit(host):
+    from kestrel_sdk.storage.database import TransactionError
+    _,agents,_=host;feature=agents['kite'].features['ArtifactsFeature']
+    db=agents['kite']._raw_storage.db
+    await db.execute('CREATE TABLE consumer_reference_guard (id INTEGER PRIMARY KEY)')
+    with caller_context_scope(CallerContext.sovereign(credential=KEY)):
+        with pytest.raises((OperatorAuthorizationError,TransactionError)) as denied:
+            async with feature.artifact_operation() as operation:
+                async with db.transaction():
+                    operation.check_current()
+                    await db.execute('INSERT INTO consumer_reference_guard VALUES (1)')
+                    feature._generation+=1
+                    operation.check_current()  # Original pre-COMMIT boundary.
+        error=denied.value
+        while not isinstance(error,OperatorAuthorizationError) and error.__cause__ is not None:error=error.__cause__
+        assert isinstance(error,OperatorAuthorizationError)
+    assert (await db.fetchone('SELECT COUNT(*) FROM consumer_reference_guard'))[0]==0
 
 
 @pytest.mark.asyncio
@@ -50,11 +99,15 @@ async def test_public_operation_never_mints_caller_privacy_generation_or_rotated
             async with feature.artifact_operation():pytest.fail('privacy forbids persistence')
         agent.set_mode(PrivacyMode.NORMAL)
         with pytest.raises(OperatorAuthorizationError):
-            async with feature.artifact_operation() as (service, context):
+            async with feature.artifact_operation() as operation:
+                service,context=operation.service,operation.context
+                operation.check_current()
                 feature._generation+=1
                 await service.list(context)
         with pytest.raises(OperatorAuthorizationError):
-            async with feature.artifact_operation() as (service, context):
+            async with feature.artifact_operation() as operation:
+                service,context=operation.service,operation.context
+                operation.check_current()
                 monkeypatch.setenv('KESTREL_API_KEY','changed-current-bridge-key')
                 await service.list(context)
 
@@ -63,7 +116,9 @@ async def test_public_operation_never_mints_caller_privacy_generation_or_rotated
 async def bridge_host(host):
     from kestrel_sovereign import server
     client, agents, app=host;feature=agents['kite'].features['ArtifactsFeature']
-    async def build(service,context):
+    async def build(operation):
+        service,context=operation.service,operation.context
+        operation.check_current()
         return JSONResponse((await service.list(context)).model_dump(mode='json'))
     @feature.get_router().get('/public-bridge-proof')
     async def read(request:Request):return feature.artifact_response(request,build)
@@ -140,7 +195,9 @@ async def restricted_bridge_host(host):
             async with independent_operation() as current:
                 # This frame must enclose the artifact response's ASGI call;
                 # resolving a run lease inside build then exiting is invalid.
-                async def build(service,context):
+                async def build(operation):
+                    service,context=operation.service,operation.context
+                    operation.check_current()
                     policy.built+=1
                     class InnerCheckedResponse(JSONResponse):
                         async def __call__(self,s,r,output):

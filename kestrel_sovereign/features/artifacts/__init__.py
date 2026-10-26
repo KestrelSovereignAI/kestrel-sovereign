@@ -1,5 +1,5 @@
 """Durable artifact host capability."""
 
-from .feature import ArtifactsFeature
+from .feature import ArtifactOperation, ArtifactsFeature
 
-__all__ = ["ArtifactsFeature"]
+__all__ = ["ArtifactOperation", "ArtifactsFeature"]

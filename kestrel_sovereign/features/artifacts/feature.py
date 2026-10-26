@@ -13,7 +13,9 @@ import asyncio
 import hmac
 import logging
 import os
-from contextlib import asynccontextmanager, nullcontext
+from contextlib import asynccontextmanager
+from dataclasses import dataclass
+from collections.abc import Callable
 from datetime import timedelta
 from uuid import uuid4
 
@@ -51,12 +53,30 @@ from .producers import ArtifactProducerTools
 from .workspace import ArtifactWorkspaceTools, create_workspace_router
 
 
+@dataclass(frozen=True)
+class ArtifactOperation:
+    """One retained original operation, never a portable grant or credential.
+
+    ``check_current`` is synchronous and usable only while the original
+    operation frame remains active, including original owned database work.
+    Consumers retain their independent policy and combine its restriction.
+    """
+
+    service: AuthorizedArtifactService
+    context: OperatorContext
+    check_current: Callable[[], None]
+
+    @property
+    def expires_at(self):
+        return self.context.expires_at
+
+
 class ArtifactsFeature(ArtifactProducerTools, ArtifactWorkspaceTools, Feature):
     """Encrypted revisions served through the host's live feature router."""
 
     supports_subagent_dispatch = False
     promote_tools_on_startup = True
-    artifact_bridge_api_version = 2
+    artifact_bridge_api_version = 3
 
     def __init__(self, agent):
         super().__init__(agent)
@@ -112,7 +132,7 @@ class ArtifactsFeature(ArtifactProducerTools, ArtifactWorkspaceTools, Feature):
     async def artifact_operation(self, request=None):
         """Original-caller service bridge; no run/delegated grant.
 
-        Yield ``(service, artifact_context)`` while retaining the original
+        Yield an ``ArtifactOperation`` while retaining the original
         privacy and current feature/caller READ lease. Service operations still
         check their own actions. A context cannot be reused after this frame.
         HTTP producers must retain this frame through actual private delivery,
@@ -122,14 +142,23 @@ class ArtifactsFeature(ArtifactProducerTools, ArtifactWorkspaceTools, Feature):
         async with resolver as context:
             service = self._service
             async with service.authority.operation(context, ArtifactAction.READ, service.repository.storage_id) as check:
-                check()
-                yield service, context
-                check()
+                active = True
+                def current():
+                    if not active:
+                        raise ArtifactAccessDenied('artifact operation has ended')
+                    check()
+                try:
+                    current()
+                    yield ArtifactOperation(service, context, current)
+                    current()
+                finally:
+                    active = False
 
     def artifact_response(self, request, build, *, check_current=None):
         """Retain original artifact authority and restrictions through delivery.
 
-        ``await build(service, artifact_context)`` returns a Response. A
+        ``await build(operation)`` receives the typed retained operation and
+        returns a Response. A
         workflow wrapper must separately retain its original run resolver
         through the Response's ASGI call. Its synchronous ``check_current``
         restricts canonical service work and the outer buffered ASGI delivery;
@@ -145,12 +174,16 @@ class ArtifactsFeature(ArtifactProducerTools, ArtifactWorkspaceTools, Feature):
             raise ArtifactAccessDenied('artifact runtime is unavailable')
         @asynccontextmanager
         async def resolve(current_request):
-            async with self.artifact_operation(current_request) as (original, context):
-                if original is not service:
+            async with self.artifact_operation(current_request) as original:
+                if original.service is not service:
                     raise ArtifactAccessDenied('artifact runtime changed')
-                yield context
-        async def body(context):
-            return await build(service, context)
+                def combined_check():
+                    original.check_current()
+                    if check_current is not None:
+                        restriction_check()
+                yield ArtifactOperation(service, original.context, combined_check)
+        async def body(admission):
+            return await build(admission)
         def restriction_check():
             try:
                 check_current()
@@ -159,17 +192,11 @@ class ArtifactsFeature(ArtifactProducerTools, ArtifactWorkspaceTools, Feature):
                 # database rollback, without disclosing its policy details.
                 raise ArtifactAccessDenied('additional artifact policy is unavailable') from None
         @asynccontextmanager
-        async def operation(context, value):
-            async with service.authority.operation(context, ArtifactAction.READ, service.repository.storage_id) as artifact_check:
-                def check():
-                    artifact_check()
-                    if check_current is not None:
-                        restriction_check()
-                restriction = service.restrict_current(context, restriction_check) if check_current is not None else nullcontext()
-                async with restriction:
-                    check()
-                    yield check
-                    check()
+        async def operation(admission, value):
+            async with service.restrict_current(admission.context, admission.check_current):
+                admission.check_current()
+                yield admission.check_current
+                admission.check_current()
         return AuthorizedCapabilityResponse(request, authority=service.authority,
             resolve_context=resolve,
             operation=operation,
