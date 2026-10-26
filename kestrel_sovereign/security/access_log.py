@@ -28,7 +28,10 @@ def _url_path_literal(value: str) -> str:
 
 _LEGACY_WORKFLOW_ARTIFACT_MARKER = "/api/workflows/artifact-metadata"
 _LEGACY_WORKFLOW_ARTIFACT_TARGET = (
-    "(?i:" + _url_path_literal("/api/workflows/runs/")
+    # Commit to the first run prefix. Restarting a suffix scan at every run
+    # prefix makes malformed repeated-prefix paths quadratic before auth.
+    # Any later artifact suffix is already covered by that first prefix.
+    "(?i:" + r"\A(?>[\s\S]*?" + _url_path_literal("/api/workflows/runs/") + ")"
     + r"[\s\S]*" + _url_path_literal("/artifacts") + r"(?:/|%(?:2f|3f|23)|[?#]|$)|"
     # Escaped errors reach the outer error handler with this marker already
     # installed. It must still classify as private to suppress exception text.

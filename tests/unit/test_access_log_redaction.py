@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import inspect
 import re
+import subprocess
+import sys
 from urllib.parse import parse_qs, unquote
 
 import pytest
@@ -55,6 +58,39 @@ def test_legacy_artifact_family_is_private_in_raw_and_decoded_paths(path, prefix
 def test_legacy_classifier_does_not_claim_all_workflow_urls(path):
     assert private_capability_path(path) is None
     assert re.search(PRIVATE_CAPABILITY_URL_PATTERN, "http://localhost" + path) is None
+
+
+def test_repeated_run_prefixes_remain_bounded_before_authentication():
+    """A malformed target cannot monopolize the ASGI loop while classifying.
+
+    The amplification makes a quadratic scan reliably exceed the generous
+    child deadline. The owned process also bounds a regressed regex itself,
+    which cannot be interrupted by an event-loop or thread timeout.
+    """
+    probe = r'''
+import importlib.util
+import re
+import sys
+
+spec = importlib.util.spec_from_file_location("private_path_probe", sys.argv[1])
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+path = "/api/workflows/runs/x" * 65536
+for suffix, private in [("", False), ("/artifacts-extra", False),
+                        ("/artifacts/private-id", True)]:
+    target = path + suffix
+    assert bool(module.private_capability_path(target)) is private, "path classification"
+    assert bool(re.search(module.PRIVATE_CAPABILITY_URL_PATTERN,
+                          "http://localhost" + target)) is private, "pre-span exclusion"
+'''
+    completed = subprocess.run(
+        [sys.executable, "-B", "-c", probe, inspect.getfile(private_capability_path)],
+        capture_output=True,
+        text=True,
+        timeout=5,
+        check=False,
+    )
+    assert completed.returncode == 0, completed.stderr
 
 
 @pytest.mark.asyncio
