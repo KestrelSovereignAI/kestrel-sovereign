@@ -1,24 +1,26 @@
 """Public first-party bridge uses original policy and actual private transport."""
 import asyncio
+from contextlib import asynccontextmanager
 from hashlib import sha256
+from types import SimpleNamespace
 
 from fastapi import Request
 import pytest
 import pytest_asyncio
-from starlette.responses import JSONResponse
+from starlette.responses import JSONResponse, Response
 from kestrel_sdk.artifacts import ArtifactCommit, ArtifactManifest
 from kestrel_sdk.operator import OperatorAuthorizationError
 
 from kestrel_sovereign.auth import CallerContext, caller_context_scope
 from kestrel_sovereign.privacy import PrivacyMode
-from tests.integration.test_artifact_host import host, repository, KEY, AUTH, path, publish
+from tests.integration.test_artifact_host import host as host, repository as repository, KEY, AUTH, path, publish
 
 
 @pytest.mark.asyncio
 async def test_public_operation_publishes_through_original_caller_and_context_retires(host):
     client, agents, _ = host
     feature=agents['kite'].features['ArtifactsFeature']
-    assert feature.artifact_bridge_api_version==1
+    assert feature.artifact_bridge_api_version==2
     with caller_context_scope(CallerContext.sovereign(credential=KEY)):
         async with feature.artifact_operation() as (service, context):
             assert agents['kite'].gate.locked()
@@ -114,3 +116,119 @@ async def test_public_response_retains_privacy_and_current_generation_through_ac
         for task in (serving,transition):
             if task is not None and not task.done():task.cancel()
         await asyncio.gather(*(task for task in (serving,transition) if task is not None),return_exceptions=True)
+
+
+@pytest_asyncio.fixture
+async def restricted_bridge_host(host):
+    """Consumer-owned independent lease; it never supplies artifact grants."""
+    from kestrel_sovereign import server
+    client,agents,app=host;feature=agents['kite'].features['ArtifactsFeature']
+    policy=SimpleNamespace(generation=0,active=False,denied=False,built=0,checks=[],last_check=None,
+        close_before_response=False,inner_body_checked=asyncio.Event())
+    @asynccontextmanager
+    async def independent_operation():
+        generation=policy.generation;policy.active=True
+        def current():
+            policy.checks.append(True)
+            if not policy.active or policy.denied or generation!=policy.generation:
+                raise OperatorAuthorizationError('original independent policy ended')
+        policy.last_check=current
+        try:yield current
+        finally:policy.active=False
+    class IndependentResponse(Response):
+        async def __call__(self,scope,receive,send):
+            async with independent_operation() as current:
+                # This frame must enclose the artifact response's ASGI call;
+                # resolving a run lease inside build then exiting is invalid.
+                async def build(service,context):
+                    policy.built+=1
+                    class InnerCheckedResponse(JSONResponse):
+                        async def __call__(self,s,r,output):
+                            async def inner_send(message):
+                                current()
+                                if message['type']=='http.response.body':policy.inner_body_checked.set()
+                                await output(message)
+                            await super().__call__(s,r,inner_send)
+                    return InnerCheckedResponse((await service.list(context)).model_dump(mode='json'))
+                response=feature.artifact_response(Request(scope,receive),build,check_current=current)
+                if not policy.close_before_response:
+                    await response(scope,receive,send)
+                    return
+            await response(scope,receive,send)  # Deliberately retired consumer lease.
+    @feature.get_router().get('/restricted-public-bridge-proof')
+    async def read():return IndependentResponse()
+    server._unmount_feature_routers(app);server._mount_feature_routers(app)
+    yield client,agents,app,policy
+
+
+@pytest.mark.asyncio
+async def test_public_response_restriction_never_promotes_or_resurrects_an_independent_policy(restricted_bridge_host):
+    client,agents,_,policy=restricted_bridge_host
+    target=path()+'/restricted-public-bridge-proof'
+    assert (await client.get(target)).status_code==401 and policy.built==0
+    policy.denied=True
+    assert (await client.get(target,headers=AUTH)).status_code==403 and policy.built==0
+    policy.denied=False
+    policy.close_before_response=True
+    assert (await client.get(target,headers=AUTH)).status_code==403 and policy.built==0
+    policy.close_before_response=False
+    assert (await client.get(target,headers=AUTH)).status_code==200 and policy.built==1
+    with pytest.raises(OperatorAuthorizationError):policy.last_check()
+    assert not policy.active and not agents['kite'].gate.locked()
+
+
+@pytest.mark.asyncio
+async def test_public_restriction_fences_canonical_database_read_in_owned_child(restricted_bridge_host,monkeypatch):
+    client,agents,_,policy=restricted_bridge_host
+    service=agents['kite'].features['ArtifactsFeature']._service
+    original=service.repository.page;returned=[]
+    async def revoke_at_database(*args,**kwargs):
+        policy.generation+=1
+        value=await asyncio.create_task(original(*args,**kwargs))
+        returned.append(value)
+        return value
+    monkeypatch.setattr(service.repository,'page',revoke_at_database)
+    response=await client.get(path()+'/restricted-public-bridge-proof',headers=AUTH)
+    assert response.status_code==403,response.text
+    assert not returned,'independent revocation failed to fence the original database read'
+    assert not policy.active and not service._current_constraints
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('revoke',[False,True])
+async def test_public_restriction_reaches_actual_outer_buffered_transport(restricted_bridge_host,revoke):
+    _,agents,app,policy=restricted_bridge_host
+    entered,release=asyncio.Event(),asyncio.Event();messages=[]
+    async def receive():return {'type':'http.request','body':b'','more_body':False}
+    async def send(message):
+        if message['type']=='http.response.start' and message['status']==200:
+            entered.set();await release.wait()
+        messages.append(message)
+    target=path()+'/restricted-public-bridge-proof'
+    scope={'type':'http','asgi':{'version':'3.0','spec_version':'2.4'},'http_version':'1.1',
+        'method':'GET','scheme':'http','path':target,'raw_path':target.encode(),'query_string':b'',
+        'root_path':'','server':('test',80),'client':('test',1),'headers':[(b'x-api-key',KEY.encode())]}
+    serving=asyncio.create_task(app(scope,receive,send))
+    try:
+        await asyncio.wait_for(entered.wait(),5)
+        await asyncio.wait_for(policy.inner_body_checked.wait(),5)
+        assert policy.active and agents['kite'].gate.locked()
+        # Inner response checks may already have acknowledged middleware's
+        # queue. Only the outer registered checker can stop the actual body.
+        if revoke:policy.generation+=1
+        release.set()
+        if revoke:
+            denied=False
+            try:await serving
+            except OperatorAuthorizationError:denied=True
+            assert not any(m['type']=='http.response.body' and m.get('body') for m in messages), 'independent revocation failed to fence actual private body'
+            assert denied
+        else:
+            await serving
+            assert any(m['type']=='http.response.body' and m.get('body') for m in messages)
+        assert not policy.active and not agents['kite'].gate.locked()
+        with pytest.raises(OperatorAuthorizationError):policy.last_check()
+    finally:
+        release.set()
+        if not serving.done():serving.cancel()
+        await asyncio.gather(serving,return_exceptions=True)

@@ -16,7 +16,7 @@ from kestrel_sdk.artifacts import ArtifactFile, ArtifactManifest
 from kestrel_sdk.resources import ResourceConflict, ResourceNotFound, ResourceOutcomeUnknown
 from kestrel_sdk.workspaces import WorkspaceSnapshot, WorkspaceTransferStatus, WorkspaceMaterialization, WorkspaceExportRequest
 
-from tests.integration.test_artifact_host import host, repository, AUTH, KEY, path, publish
+from tests.integration.test_artifact_host import host as host, repository as repository, AUTH, KEY, path, publish
 from tests.unit.visual_computer.conftest import Adapter
 from tests.unit.visual_computer.test_host import intent, path as visual_path
 from kestrel_sovereign.features.visual_computer import feature as visual_module

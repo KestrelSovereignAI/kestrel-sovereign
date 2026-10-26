@@ -7,7 +7,7 @@ import pytest
 from kestrel_sdk.resources import ResourceOutcomeUnknown
 from kestrel_sovereign.auth import AuthMethod, CallerContext, caller_context_scope
 from kestrel_sovereign.privacy import PrivacyMode
-from tests.integration.test_artifact_host import host, repository, KEY, AUTH, path
+from tests.integration.test_artifact_host import host as host, repository as repository, KEY, AUTH, path
 
 
 def caller():

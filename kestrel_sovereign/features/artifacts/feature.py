@@ -13,11 +13,11 @@ import asyncio
 import hmac
 import logging
 import os
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, nullcontext
 from datetime import timedelta
 from uuid import uuid4
 
-from kestrel_sdk.operator import OperatorContext
+from kestrel_sdk.operator import OperatorAuthorizationError, OperatorContext
 from kestrel_sdk.security.encryption import get_fernet
 
 from kestrel_sovereign._async_rwlock import AsyncReaderWriterLock
@@ -56,7 +56,7 @@ class ArtifactsFeature(ArtifactProducerTools, ArtifactWorkspaceTools, Feature):
 
     supports_subagent_dispatch = False
     promote_tools_on_startup = True
-    artifact_bridge_api_version = 1
+    artifact_bridge_api_version = 2
 
     def __init__(self, agent):
         super().__init__(agent)
@@ -110,7 +110,7 @@ class ArtifactsFeature(ArtifactProducerTools, ArtifactWorkspaceTools, Feature):
 
     @asynccontextmanager
     async def artifact_operation(self, request=None):
-        """Version 1 original-caller service bridge; no run/delegated grant.
+        """Original-caller service bridge; no run/delegated grant.
 
         Yield ``(service, artifact_context)`` while retaining the original
         privacy and current feature/caller READ lease. Service operations still
@@ -126,17 +126,20 @@ class ArtifactsFeature(ArtifactProducerTools, ArtifactWorkspaceTools, Feature):
                 yield service, context
                 check()
 
-    def artifact_response(self, request, build):
-        """Retain only original artifact authority through final ASGI delivery.
+    def artifact_response(self, request, build, *, check_current=None):
+        """Retain original artifact authority and restrictions through delivery.
 
         ``await build(service, artifact_context)`` returns a Response. A
         workflow wrapper must separately retain its original run resolver
-        through the Response's ASGI call and use its existing final-delivery
-        primitive. A run scope/lease never substitutes for artifact authority;
-        an independent resolver closed inside build cannot be resurrected here.
+        through the Response's ASGI call. Its synchronous ``check_current``
+        restricts canonical service work and the outer buffered ASGI delivery;
+        it grants nothing. A run scope/lease never substitutes for artifact
+        authority. A resolver closed inside build cannot be resurrected here.
         """
         if not callable(build):
             raise TypeError('artifact response builder required')
+        if check_current is not None and not callable(check_current):
+            raise TypeError('artifact response restriction must be callable')
         service = self._service
         if service is None:
             raise ArtifactAccessDenied('artifact runtime is unavailable')
@@ -148,9 +151,28 @@ class ArtifactsFeature(ArtifactProducerTools, ArtifactWorkspaceTools, Feature):
                 yield context
         async def body(context):
             return await build(service, context)
+        def restriction_check():
+            try:
+                check_current()
+            except OperatorAuthorizationError:
+                # Keep a consumer's denial recognizable through canonical
+                # database rollback, without disclosing its policy details.
+                raise ArtifactAccessDenied('additional artifact policy is unavailable') from None
+        @asynccontextmanager
+        async def operation(context, value):
+            async with service.authority.operation(context, ArtifactAction.READ, service.repository.storage_id) as artifact_check:
+                def check():
+                    artifact_check()
+                    if check_current is not None:
+                        restriction_check()
+                restriction = service.restrict_current(context, restriction_check) if check_current is not None else nullcontext()
+                async with restriction:
+                    check()
+                    yield check
+                    check()
         return AuthorizedCapabilityResponse(request, authority=service.authority,
             resolve_context=resolve,
-            operation=lambda context,value:service.authority.operation(context, ArtifactAction.READ, service.repository.storage_id),
+            operation=operation,
             build=body, access_denied=ArtifactAccessDenied,
             error_response=lambda error,prepared:_delivery_error(error, prepared, request))
 

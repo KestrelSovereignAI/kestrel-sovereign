@@ -6,8 +6,8 @@ from kestrel_sdk.artifacts import ArtifactRef
 from kestrel_sovereign.artifacts.preview import DockerArtifactRenderer, host_preview_pool
 import pytest
 
-from tests.integration.test_artifact_host import host, repository, KEY, AUTH, path
-from tests.integration.test_artifact_preview_docker import renderer_image, png, pdf, ObservedRenderer, absent
+from tests.integration.test_artifact_host import host as host, repository as repository, KEY, AUTH, path
+from tests.integration.test_artifact_preview_docker import renderer_image as renderer_image, png, pdf, ObservedRenderer, absent
 
 
 async def publish_source(client, source, media_type, key='preview-source'):
