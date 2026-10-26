@@ -11,6 +11,7 @@ providers that are never used.
 
 import json
 import logging
+from contextlib import AsyncExitStack
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 
@@ -121,6 +122,21 @@ def _service(routes, *, config):
     service.providers = [route.as_provider() for route in routes]
     service._agent_display_name = "Emma"
     return service
+
+
+@pytest.fixture(autouse=True)
+async def _owned_service_lifetimes(monkeypatch):
+    """Close every real lineup service, including when a test fails."""
+    async with AsyncExitStack() as services:
+        factory = _service
+
+        def owned_service(routes, *, config):
+            service = factory(routes, config=config)
+            services.push_async_callback(service.close)
+            return service
+
+        monkeypatch.setattr(f"{__name__}._service", owned_service)
+        yield
 
 
 @pytest.fixture(autouse=True)
