@@ -106,6 +106,10 @@ MANDATORY_FEATURE_MODULES = {
     # is always present — independent of optional features like Tasks/Talon
     # that register waitable providers (#1860 clean cutover).
     "WaitFeature": "kestrel_sovereign.features.wait.feature",
+    # The orchestrator clips every agent's long tool results to a preview, so
+    # the one tool that reads the clipped characters back must be present
+    # wherever that cap applies (#3740).
+    "ToolOutputFeature": "kestrel_sovereign.features.tool_output.feature",
 }
 MANDATORY_FEATURES = frozenset(MANDATORY_FEATURE_MODULES)
 

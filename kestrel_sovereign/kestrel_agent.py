@@ -133,6 +133,10 @@ from kestrel_sovereign.agent.streaming import (
     _snapshot_post_response_hooks,
     resolve_turn_invocation_context,
 )
+from kestrel_sovereign.agent.tool_output_store import (
+    ToolOutputStore,
+    agent_tool_output_store,
+)
 from kestrel_sovereign.agent.tool_registry import ToolRegistryMixin
 from kestrel_sovereign.agent.tool_allowlist import bump_registry_generation
 from kestrel_sovereign.agent.turn_lifecycle import TurnLifecycleMixin
@@ -2115,6 +2119,9 @@ class KestrelAgent(
         # explores many features could silently evict operationally
         # critical tools (get_peer_task_result, save_item, etc.).
         self._pinned_features: set = set()
+        # #3740: the whole text of every tool result the orchestrator clips to
+        # a preview, readable back in chunks with read_tool_output.
+        self.tool_output_store = ToolOutputStore.from_environment()
 
         # Initialize constitution audit tracking
         self._init_constitution_audit_tracking()
@@ -5473,6 +5480,13 @@ class KestrelAgent(
             # Under the persistence gate held exclusive: a later durable signal
             # receipt names this installation, not the one it replaced (#3484).
             self._privacy_policy_epoch = getattr(self, "_privacy_policy_epoch", 0) + 1
+            # Retained tool output is readable only under the policy it was
+            # produced under (#3740), so none of it can be read after this.
+            # Release it with the flip, not at eviction: an EPHEMERAL session's
+            # output must not outlive the session leaving EPHEMERAL closes.
+            tool_outputs = agent_tool_output_store(self)
+            if tool_outputs is not None:
+                tool_outputs.clear()
             status_message = self.privacy_agent.set_mode(mode)
             self._install_privacy_mandate(plan)
         if plan.warning:

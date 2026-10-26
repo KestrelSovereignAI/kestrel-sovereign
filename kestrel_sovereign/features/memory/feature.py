@@ -26,6 +26,7 @@ from kestrel_sovereign.agent.context_builder import extract_raw_user_content
 from kestrel_sovereign.execution_custody import is_execution_control_error
 from kestrel_sovereign.features.base import (
     Feature,
+    coerce_int_arg as _coerce_int,
     largest_fitting_result,
     orchestrator_result_cap,
     tool,
@@ -93,23 +94,6 @@ def _strip_sent_form_for_recall(messages: List[Dict[str, Any]]) -> List[Dict[str
         else:
             out.append(msg)
     return out
-
-
-def _coerce_int(value: Any, name: str, *, lo: int, hi: int) -> tuple[Optional[int], Optional[str]]:
-    """Coerce a tool arg to an int in [lo, hi].
-
-    Returns ``(value, None)`` on success or ``(None, error_string)`` so
-    callers can return a ToolResult.failed without re-formatting. Used
-    for the schema-aware recall tools where malformed JSON args from
-    the LLM (string ``"25"``, float ``25.0``) are common.
-    """
-    try:
-        coerced = int(value)
-    except (TypeError, ValueError):
-        return None, f"{name} must be an integer, got {value!r}"
-    if coerced < lo or coerced > hi:
-        return None, f"{name} must be in [{lo}, {hi}], got {coerced}"
-    return coerced, None
 
 
 class MemoryFeature(Feature):

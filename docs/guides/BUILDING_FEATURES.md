@@ -618,9 +618,9 @@ KESTREL_DISABLED_FEATURES=GreeterFeature,SomeOtherFeature
 
 Or by passing `allowed_features` to the discovery function to whitelist specific features.
 
-The five sovereignty-foundation classes (`ConstitutionFeature`,
-`IdentityFeature`, `PeersFeature`, `SecurityFeature`, and `WaitFeature`) are an
-exception: they cannot be disabled or excluded by any host, agent, or spawn
+The six mandatory classes (`ConstitutionFeature`, `IdentityFeature`,
+`PeersFeature`, `SecurityFeature`, `WaitFeature`, and `ToolOutputFeature`) are
+an exception: they cannot be disabled or excluded by any host, agent, or spawn
 configuration. A disable attempt or lifecycle failure makes readiness fail with
 a sanitized `MandatoryFeatureReadinessError`; public `/health` reports only
 aggregate unhealthiness. Authenticated `/health/detailed` reports the class and

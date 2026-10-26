@@ -146,11 +146,14 @@ This architecture allows for:
 
 ### 6.4 Mandatory sovereignty readiness
 
-Five bundled features are part of the agent's readiness contract, not optional
+Six bundled features are part of the agent's readiness contract, not optional
 capabilities: `ConstitutionFeature`, `IdentityFeature`, `PeersFeature`,
-`SecurityFeature`, and `WaitFeature`. Their canonical class-to-module mapping
-lives in `multi_agent/config.py`; `MANDATORY_FEATURES` is derived from that map
-so discovery and configuration cannot drift into separate definitions.
+`SecurityFeature`, `WaitFeature`, and `ToolOutputFeature`. The last carries
+`read_tool_output`, the only way back to the characters the orchestrator clips
+from a long tool result, so it is present wherever that cap applies. Their
+canonical class-to-module mapping lives in `multi_agent/config.py`;
+`MANDATORY_FEATURES` is derived from that map so discovery and configuration
+cannot drift into separate definitions.
 
 The runtime enforces this contract at two boundaries:
 

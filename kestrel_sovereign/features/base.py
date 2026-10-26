@@ -172,6 +172,25 @@ def serialized_result_len(result: Any, *, tool_name: str = "") -> int:
     return len(_json.dumps(payload))
 
 
+def coerce_int_arg(
+    value: Any, name: str, *, lo: int, hi: int
+) -> tuple[Optional[int], Optional[str]]:
+    """Coerce a tool arg to an int in [lo, hi].
+
+    Returns ``(value, None)`` on success or ``(None, error_string)`` so
+    callers can return a ToolResult.failed without re-formatting. Used
+    by the paging and recall tools, where malformed JSON args from the
+    LLM (string ``"25"``, float ``25.0``) are common.
+    """
+    try:
+        coerced = int(value)
+    except (TypeError, ValueError):
+        return None, f"{name} must be an integer, got {value!r}"
+    if coerced < lo or coerced > hi:
+        return None, f"{name} must be in [{lo}, {hi}], got {coerced}"
+    return coerced, None
+
+
 def largest_fitting_result(
     build: Callable[[int], Any],
     lo: int,
@@ -2159,9 +2178,10 @@ ABSOLUTE PROHIBITION - NEVER FABRICATE:
         history that machinery exists. For TOOL RESULTS it does not: they are
         never written to ``conversation_history``, so they have no row id to
         salvage; ``_log_tool_dispatch`` records only ``result_status`` and
-        ``result_size_bytes``; and the orchestrator's own cap calls
-        ``_build_persisted_preview``, which despite its name persists nothing
-        -- it keeps a head and a tail and discards the middle irrecoverably.
+        ``result_size_bytes``; and the orchestrator's own cap keeps a clipped
+        result only in the agent's ``ToolOutputStore`` (#3740) -- process
+        memory, bounded, evictable and readable only from the producing
+        session, so not a durable artifact a pointer could rely on.
 
         So there is nowhere to put what trimming would drop. Refusing loudly
         is the only behaviour that neither loses data nor sends a request the

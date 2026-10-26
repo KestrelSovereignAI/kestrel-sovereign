@@ -305,6 +305,16 @@ tags = ["core", "wait", "coordination"]
 icon = "hourglass"
 core = true
 
+[tool_output]
+boundary = "bundled"
+package = "kestrel-sovereign"
+git = "https://github.com/KestrelSovereignAI/kestrel-sovereign.git"
+features = ["ToolOutputFeature"]
+description = "Mandatory ranged reads of tool results clipped to a preview"
+tags = ["core", "tools", "context"]
+icon = "scroll-text"
+core = true
+
 # =============================================================================
 # OPTIONAL CAPABILITY CATALOG
 # Some entries here are installable feature packages. Others are core capability

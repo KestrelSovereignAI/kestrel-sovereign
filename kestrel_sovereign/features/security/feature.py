@@ -145,6 +145,9 @@ _DEFAULT_PERMISSION_BY_FEATURE: Dict[str, PermissionLevel] = {
     "ConsentFeature": PermissionLevel.ALLOW,
     "SkillsFeature": PermissionLevel.ALLOW,
     "CliFeature": PermissionLevel.ALLOW,
+    # Reads back only output the agent's own tools already returned to it
+    # (#3740); an approval per chunk would make a long result unreadable.
+    "ToolOutputFeature": PermissionLevel.ALLOW,
 
     # --- Externally-visible / irreversible / risky: ASK explicitly ---
     "ComputeFeature": PermissionLevel.ASK,

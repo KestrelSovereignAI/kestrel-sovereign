@@ -147,10 +147,11 @@ def mandatory_feature_tool_names() -> frozenset[str]:
 # ---------------------------------------------------------------------------
 # The feature classes the orchestrator may load. Mandatory features
 # (IdentityFeature, SecurityFeature, PeersFeature, ConstitutionFeature,
-# WaitFeature) always load regardless and are intentionally omitted. NOTE the
-# absence of any code-editing / filesystem / shell feature (ComputeFeature,
-# ComputerUseFeature): those never load, so their write/edit/file tools
-# (fs_edit, fs_write, shell, write_script, …) are unavailable by construction.
+# WaitFeature, ToolOutputFeature) always load regardless and are intentionally
+# omitted. NOTE the absence of any code-editing / filesystem / shell feature
+# (ComputeFeature, ComputerUseFeature): those never load, so their
+# write/edit/file tools (fs_edit, fs_write, shell, write_script, …) are
+# unavailable by construction.
 FEATURE_ALLOWLIST = frozenset(
     {
         "WorkflowsFeature",       # workflow_run + read tools (the dispatch surface)

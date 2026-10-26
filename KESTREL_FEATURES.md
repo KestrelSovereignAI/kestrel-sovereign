@@ -189,7 +189,7 @@ The generated inventory below lists bundled Feature lifecycle modules only: the 
 Installed entry point feature classes are included in JSON output when present in the active environment.
 Runtime security policy can still deny a discovered tool at call time; static generation marks source-discovered tools as enabled unless their feature is disabled.
 
-- Current audited snapshot: `38` discoverable modules and `38` exported `Feature` subclasses.
+- Current audited snapshot: `39` discoverable modules and `39` exported `Feature` subclasses.
 
 ### `artifacts` (ArtifactsFeature)
 
@@ -681,6 +681,15 @@ Runtime security policy can still deny a discovered tool at call time; static ge
 | `todo_list` | `!todo list` | `system` | `scope`, `status`, `owner`, `include_done`, `include_superseded`, `limit` | 150 | `enabled` |
 | `todo_rollup` | `!todo rollup` | `system` | `include_done`, `limit` | 67 | `enabled` |
 | `todo_update` | `!todo update` | `system` | `todo_id`, `title`, `description`, `scope`, `status`, `priority`, `owner`, `links`, `terminal_condition`, `next_check_at`, `superseded_by`, `source_metadata` | 289 | `enabled` |
+
+### `tool_output` (ToolOutputFeature)
+
+- Source: [`kestrel_sovereign/features/tool_output/feature.py`](kestrel_sovereign/features/tool_output/feature.py)
+- Enablement state: `enabled`
+
+| Tool | Command | Category | Params | Token cost | State |
+|---|---|---|---|---:|---|
+| `read_tool_output` |  | `system` | `handle`, `offset`, `length` | 250 | `enabled` |
 
 ### `wait` (WaitFeature)
 

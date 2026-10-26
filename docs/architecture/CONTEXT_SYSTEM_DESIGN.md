@@ -383,6 +383,31 @@ that automatic Context C salvage runs on every production prune.
 The generated tool and command inventory remains
 [`KESTREL_FEATURES.md`](../../KESTREL_FEATURES.md).
 
+### Clipped tool results
+
+A tool result whose serialized JSON is longer than
+`KESTREL_MAX_TOOL_RESULT_CHARS` (default 8,000) reaches the model as a preview:
+its first 2,000 and last 500 characters and a count of those omitted. The
+orchestrator keeps the whole JSON in the agent's in-memory `ToolOutputStore`
+(`kestrel_sovereign.agent.tool_output_store`), and the preview names it by a
+`tool_output:<id>` handle and the offset where the omitted characters start
+(#3740). The mandatory `ToolOutputFeature`'s
+`read_tool_output(handle, offset, length)` reads that text in chunks that each
+fit under the same cap, reporting `offset`, `total_chars` and `next_offset`.
+Offsets index the JSON text the preview was cut from.
+
+The store is never written to storage, so a restart loses it. It holds at most
+`KESTREL_TOOL_OUTPUT_RETAIN_ENTRIES` outputs (default 64) and
+`KESTREL_TOOL_OUTPUT_RETAIN_CHARS` characters (default 4,000,000) per agent,
+evicting the least recently used first. An output larger than the whole budget
+is not kept, and its preview says the omitted characters cannot be read back.
+A handle is readable only from the session that produced it and only under the
+privacy policy it was produced under: the agent's privacy-policy epoch, which
+every applied privacy transition advances. An applied transition also clears
+the store, so a round trip such as EPHEMERAL → NORMAL → EPHEMERAL does not bring
+back output from the EPHEMERAL session that leaving it closed. An output
+produced outside any chat session is readable only where no session is bound.
+
 ## Durable salvage status
 
 Three distinct behaviors coexist:

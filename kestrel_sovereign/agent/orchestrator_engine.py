@@ -52,6 +52,11 @@ from kestrel_sovereign.a2a.stores.unified.observability_store import (
 from kestrel_sovereign.agent.direct_tool_arguments import (
     normalize_direct_tool_arguments,
 )
+from kestrel_sovereign.agent.tool_output_store import (
+    Retention,
+    agent_tool_output_store,
+    tool_output_scope,
+)
 from kestrel_sovereign.llm.adapter import (
     LLMResponse,
     ThinkingDelta,
@@ -633,7 +638,12 @@ PREVIEW_HEAD_CHARS = 2000
 PREVIEW_TAIL_CHARS = 500
 
 
-def _build_persisted_preview(result_json: str, tool_name: str, original_len: int) -> str:
+def _build_persisted_preview(
+    result_json: str,
+    tool_name: str,
+    original_len: int,
+    retention: Optional[Retention] = None,
+) -> str:
     """
     Build a preview for a large tool result.
 
@@ -644,29 +654,65 @@ def _build_persisted_preview(result_json: str, tool_name: str, original_len: int
         result_json: The full serialized tool result
         tool_name: Name of the tool that produced the result
         original_len: Original length in characters
+        retention: Whether the whole result was kept for ``read_tool_output``
+            (#3740): its handle, or why there is none. The preview names
+            either, so the agent knows whether the omitted characters can be
+            read back.
 
     Returns:
         Preview string with head, tail, and size metadata
     """
     head = result_json[:PREVIEW_HEAD_CHARS]
     tail = result_json[-PREVIEW_TAIL_CHARS:] if original_len > PREVIEW_HEAD_CHARS + PREVIEW_TAIL_CHARS else ""
+    resume_at = min(PREVIEW_HEAD_CHARS, original_len)
+    read_call = None
+    if retention is not None and retention.handle:
+        read_call = (
+            f'read_tool_output(handle="{retention.handle}", offset={resume_at})'
+        )
 
-    parts = [
-        f"[Large tool output — {original_len:,} chars from {tool_name}]",
+    parts = [f"[Large tool output — {original_len:,} chars from {tool_name}]"]
+    if read_call:
+        parts.append(
+            f"The whole output is retained as {retention.handle}. Read the "
+            f"characters this preview omits with {read_call}, and keep "
+            f"reading at each chunk's next_offset."
+        )
+    elif retention is not None:
+        parts.append(
+            f"The omitted characters were not retained ({retention.reason}) "
+            f"and cannot be read back."
+        )
+    parts.extend([
         "",
         f"Preview (first {PREVIEW_HEAD_CHARS} chars):",
         head,
-    ]
+    ])
     if tail:
+        omitted = (
+            f"{original_len - PREVIEW_HEAD_CHARS - PREVIEW_TAIL_CHARS:,} chars omitted"
+        )
+        if read_call:
+            omitted += f"; read them with {read_call}"
         parts.extend([
             "",
-            f"... [{original_len - PREVIEW_HEAD_CHARS - PREVIEW_TAIL_CHARS:,} chars omitted] ...",
+            f"... [{omitted}] ...",
             "",
             f"Tail (last {PREVIEW_TAIL_CHARS} chars):",
             tail,
         ])
 
     return "\n".join(parts)
+
+
+def _retain_clipped_tool_output(agent, result_json: str, tool_name: str) -> Retention:
+    """Keep a result the preview clips, so ``read_tool_output`` can page it (#3740)."""
+    store = agent_tool_output_store(agent)
+    if store is None:
+        return Retention(None, "this agent keeps no tool-output store")
+    return store.retain(
+        result_json, tool_name=tool_name, scope=tool_output_scope(agent)
+    )
 
 
 class ContextStats:
@@ -2392,8 +2438,18 @@ class OrchestratorEngineMixin:
 
         if len(result_json) > MAX_TOOL_RESULT_CHARS:
             original_len = len(result_json)
-            result_json = _build_persisted_preview(result_json, tool_name, original_len)
-            logging.info(f"{log_prefix} Large tool result ({original_len} chars) replaced with preview")
+            retention = _retain_clipped_tool_output(self, result_json, tool_name)
+            result_json = _build_persisted_preview(
+                result_json, tool_name, original_len, retention
+            )
+            logging.info(
+                "%s Large tool result (%d chars) replaced with preview; %s",
+                log_prefix,
+                original_len,
+                "retained for read_tool_output"
+                if retention.handle
+                else f"not retained: {retention.reason}",
+            )
         else:
             logging.debug(
                 "%s Tool result: chars=%d",
