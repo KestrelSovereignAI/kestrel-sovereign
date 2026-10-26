@@ -21,7 +21,10 @@ def exercise(checked, cid, output, *, monotonic=time.monotonic):
              ("import pathlib,time; p=pathlib.Path('/tmp/kestrel-browser'); "
              "\nfor _ in range(100):\n if p.is_dir(): break\n time.sleep(.05)\nelse: raise SystemExit(1)")])
     html = '<!doctype html><style>body{font:24px sans-serif}input{position:absolute;left:20px;top:20px;width:500px;height:40px;font-size:24px}</style><input aria-label="Persistent draft">'
-    initial = {"schema_version": 1, "request": request, "secret": secret, "document_html": html}
+    incarnation = checked(["exec", cid, "python", "-c",
+        "from pathlib import Path; print(Path('/tmp/kestrel-browser/incarnation').read_text())"]).decode().strip()
+    initial = {"schema_version": 1, "request": request, "secret": secret, "document_html": html,
+               "incarnation": incarnation}
     checked([*program, "initialize"], input=json.dumps(initial).encode())
     checked(["exec", cid, "python", "-c",
              ("import pathlib,time; p=pathlib.Path('/tmp/kestrel-browser/worker.sock'); "

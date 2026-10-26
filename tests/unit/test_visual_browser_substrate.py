@@ -7,11 +7,12 @@ import subprocess
 import pytest
 
 from scripts import verify_visual_browser_sandbox as probe
+from kestrel_sovereign.visual_computer import docker_policy
 
 
 def container():
     host = probe.verified_host_configuration()
-    host["SecurityOpt"] = ["no-new-privileges", "seccomp=" + (probe.CONTEXT / "seccomp.json").read_text()]
+    host["SecurityOpt"] = ["no-new-privileges", "seccomp=" + (probe.POLICY_ROOT / "seccomp.json").read_text()]
     return {"Id": "c" * 64, "Image": "sha256:test", "Mounts": [],
             "Config": {"Labels": {probe.LABEL: "test"}, "User": "pwuser"}, "HostConfig": host}
 
@@ -29,7 +30,7 @@ def test_container_admission_and_command_agree_on_isolation():
     assert arguments[arguments.index("--ulimit") + 1] == "rtprio=0:0"
     assert arguments[arguments.index("--log-driver") + 1] == "none"
     assert [arguments[i + 1] for i, value in enumerate(arguments) if value == "--security-opt"] == [
-        "no-new-privileges", f"seccomp={probe.CONTEXT / 'seccomp.json'}"]
+        "no-new-privileges", f"seccomp={probe.POLICY_ROOT / 'seccomp.json'}"]
     assert "--read-only" in arguments and "--init" in arguments
     assert "--privileged" not in arguments and "--volume" not in arguments and "--publish" not in arguments
 
@@ -171,11 +172,11 @@ def test_cleanup_refuses_a_replaced_container_owner(tmp_path, monkeypatch):
 
 def test_modified_seccomp_policy_is_rejected_before_docker_build(tmp_path, monkeypatch):
     context = tmp_path / 'context'; context.mkdir()
-    profile = json.loads((probe.CONTEXT / 'seccomp.json').read_text())
+    profile = json.loads((probe.POLICY_ROOT / 'seccomp.json').read_text())
     profile['syscalls'].append({'names': ['bpf', 'mount', 'pivot_root', 'umount2', 'keyctl', 'add_key', 'perf_event_open'],
                                 'action': 'SCMP_ACT_ALLOW'})
     (context / 'seccomp.json').write_text(json.dumps(profile))
-    monkeypatch.setattr(probe, 'CONTEXT', context)
+    monkeypatch.setattr(docker_policy, 'POLICY_ROOT', context)
     calls = []
     def engine(command, **kwargs):
         calls.append(command)
@@ -202,10 +203,10 @@ def test_refuses_unknown_actual_host_configuration_fields():
 
 def test_host_configuration_profile_is_pinned_before_docker(tmp_path, monkeypatch):
     context = tmp_path / 'context'; context.mkdir()
-    (context / 'seccomp.json').write_bytes((probe.CONTEXT / 'seccomp.json').read_bytes())
+    (context / 'seccomp.json').write_bytes((probe.POLICY_ROOT / 'seccomp.json').read_bytes())
     profile = probe.verified_host_configuration(); profile['GroupAdd'] = ['0']
     (context / 'host-config.json').write_text(json.dumps(profile))
-    monkeypatch.setattr(probe, 'CONTEXT', context)
+    monkeypatch.setattr(docker_policy, 'POLICY_ROOT', context)
     with pytest.raises(RuntimeError, match='host configuration digest'):
         probe.run(tmp_path / 'evidence', docker='must-not-be-called')
 
@@ -228,3 +229,22 @@ def test_source_identity_binds_actual_nested_context_bytes_and_dirty_head(tmp_pa
     assert before["build_context_files"]["nested/worker.py"] == hashlib.sha256(b"original").hexdigest()
     source.write_text("changed")
     assert probe.source_identity()["build_context_sha256"] != before["build_context_sha256"]
+
+
+@pytest.mark.parametrize("status", ["running", "exited"])
+def test_measured_docker29_post_start_null_oom_default_is_explicitly_supported(status):
+    value = container()
+    value["State"] = {"Status": status}
+    value["HostConfig"]["OomKillDisable"] = None
+    probe.verify_container(value, "sha256:test", "test")
+    value["HostConfig"]["OomKillDisable"] = True
+    with pytest.raises(RuntimeError):
+        probe.verify_container(value, "sha256:test", "test")
+
+
+def test_created_container_cannot_normalize_away_unreviewed_oom_setting():
+    value = container()
+    value["State"] = {"Status": "created"}
+    value["HostConfig"]["OomKillDisable"] = None
+    with pytest.raises(RuntimeError):
+        probe.verify_container(value, "sha256:test", "test")

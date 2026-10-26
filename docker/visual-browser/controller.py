@@ -101,7 +101,7 @@ class BrowserController:
         self._session = {"schema_version": 1, "session_id": identifier(request["session_id"]),
                          "scope": copy.deepcopy(scope), "lease_id": identifier(request["lease_id"]),
                          "driver_id": identifier(driver_id), "surface": "browser",
-                         "capabilities": sorted(OPERATIONS), "state": "ready", "controller": "agent",
+                         "capabilities": sorted(OPERATIONS | {"takeover"}), "state": "ready", "controller": "agent",
                          "control_epoch": 0, "expires_at": request["expires_at"]}
         self._lock = asyncio.Lock()
         self._frame = None
@@ -278,7 +278,7 @@ class BrowserController:
         if (request["session_id"] != self._session["session_id"] or type(request["expected_control_epoch"]) is not int
                 or request["expected_control_epoch"] != self._session["control_epoch"]):
             raise Refused("stale_control")
-        if not isinstance(request["operation"], str) or request["operation"] not in {"pause", "resume", "close"}:
+        if not isinstance(request["operation"], str) or request["operation"] not in {"pause", "takeover", "resume", "close"}:
             raise Refused("unsupported_control")
         if self._control_pending:
             raise Refused("control_pending")
@@ -294,11 +294,12 @@ class BrowserController:
                     raise Refused("session_closed")
                 operation = request["operation"]
                 if ((operation == "resume" and self._session["state"] != "paused")
-                        or (operation == "pause" and self._session["state"] != "ready")):
+                        or (operation == "pause" and self._session["state"] != "ready")
+                        or (operation == "takeover" and self._session["state"] not in {"ready", "paused"})):
                     raise Refused("invalid_control_transition")
                 self._session.update(control_epoch=self._session["control_epoch"] + 1,
-                                     state="ready" if operation == "resume" else "paused" if operation == "pause" else "closing",
-                                     controller="agent" if operation == "resume" else "none")
+                                     state="ready" if operation == "resume" else "paused" if operation in {"pause", "takeover"} else "closing",
+                                     controller="agent" if operation == "resume" else "human" if operation == "takeover" else "none")
                 self._frame = None
                 if len(self._controls) < 1024:
                     self._controls[request_id] = digest(request)

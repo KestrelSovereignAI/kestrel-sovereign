@@ -97,14 +97,15 @@ async def test_cancelled_accepted_effect_remains_unknown_without_replay():
 
 
 @pytest.mark.asyncio
-async def test_pending_pause_fences_queued_input_and_drains_accepted_effect():
+@pytest.mark.parametrize("operation", ["pause", "takeover"])
+async def test_pending_pause_fences_queued_input_and_drains_accepted_effect(operation):
     driver, page, session = controller()
     request = await action(driver, session)
     page.gate = asyncio.Event()
     active = asyncio.create_task(driver.act(session, request))
     await page.entered.wait()
     queued = asyncio.create_task(driver.act(session, {**request, "action_id": "queued"}))
-    pause = asyncio.create_task(driver.control(session, control(session, "pause")))
+    pause = asyncio.create_task(driver.control(session, control(session, operation)))
     await asyncio.sleep(0)
     page.gate.set()
     assert (await active)["outcome"] == "completed"
@@ -112,6 +113,7 @@ async def test_pending_pause_fences_queued_input_and_drains_accepted_effect():
         await queued
     paused = await pause
     assert paused["state"] == "paused" and paused["control_epoch"] == 1
+    assert paused["controller"] == ("human" if operation == "takeover" else "none")
     assert len(page.effects) == 1
     with pytest.raises(Refused, match="stale_control"):
         await driver.observe(session)

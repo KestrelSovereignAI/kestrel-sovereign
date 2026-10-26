@@ -120,3 +120,57 @@ its child processes. Lost worker state is not recoverable accepted-action state;
 a replacement is a new session. The host must retain custody until physical
 container retirement is confirmed. None of this is the host's authorization,
 privacy policy, egress gateway, inference adapter or SDK provider/driver factory.
+
+## Local SDK adapters
+
+`kestrel_sovereign.visual_computer.docker` supplies separate
+`environment_provider_factory` and `computer_driver_factory` SDK factories.
+The host supplies an explicit local Unix Docker socket; inherited Docker
+contexts, proxy configuration and operator credentials are excluded. Provider
+settings require a private 32-byte `credential_key`, a `profile_id` of
+`offline-v1`, and an `image` such as `local-worker@sha256:<configuration digest>`.
+For this local profile the digest is the exact locally built Docker image ID,
+not a registry manifest or multi-platform index digest. Build the reviewed
+worker first; the adapter never pulls an implicit replacement.
+
+The canonical reviewed profiles now live in
+[`docker_profile`](../../kestrel_sovereign/visual_computer/docker_profile/).
+The substrate verifier and installed adapters share those exact files. The
+measured Docker 29.8.2 cgroup-v2 API changes `OomKillDisable: false` to `null`
+after start; the policy explicitly recognizes that serialization only in
+running/exited states. Other changes to the complete HostConfig are refused.
+
+A connection binds the full immutable container ID, image ID, PID, start time,
+worker-generated startup nonce, owner and fixed expiry. One-shot bootstrap
+checks the nonce before accepting the secret, closing the inspect/start race.
+The private `control.sock` reserves two connections for status/action status
+and control, independently of the four normal IPC slots. Takeover fences queued
+input, drains accepted work, suspends agent observations and advances the epoch
+to a paused human controller. It does not enable a public human-input or CDP
+transport. An uncertain Chromium input still retires the browser and cannot
+report successful takeover or resume.
+
+The canonical host remains the only durable custody owner: encrypt
+`DriverConnection`, retain unknown acquisition and action outcomes, enforce
+released-request tombstones, and hold current authority/privacy guards through
+all adapter calls and deliveries. Docker labels reconcile a retained request;
+they do not authorize a caller or replace the host's released-request history.
+Idle policy belongs to that host; this worker independently enforces its fixed
+wall and monotonic expiry. No remote, x86_64, navigation, allowed egress,
+clipboard, unrestricted exec or workspace-file capability is advertised by
+`offline-v1`.
+
+Run the opt-in SDK acceptance with a new private evidence directory:
+
+```sh
+python -m scripts.verify_visual_docker_adapters \
+  --docker-socket /absolute/path/to/local/docker.sock \
+  --output /absolute/path/to/new/private-evidence
+```
+
+It drives the production adapters against the real daemon and Chromium,
+reconnects to the same page, verifies actual pixels and deduplicated receipts,
+occupies all normal transport slots before priority takeover, rejects stale
+control, checks IPv4/IPv6 network denial, waits for physical autonomous expiry,
+and verifies exact resource cleanup. Its screenshots are synthetic private
+fixtures. This local proof is not a completed product or a remote-provider claim.
