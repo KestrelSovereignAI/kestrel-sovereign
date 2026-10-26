@@ -13,6 +13,8 @@ Object.assign(globalThis, {
 });
 const purify = createDOMPurify(dom.window);
 const registry = await import('../../kestrel_sovereign/static/js/ui-ext/renderers.js');
+await import('../../kestrel_sovereign/static/js/icons.js');
+globalThis.kicon = window.kicon;
 const chat = await import('../../kestrel_sovereign/static/js/chat.js');
 const { getOrCreateChatPane } = await import('../../kestrel_sovereign/static/js/ui.js');
 chat.setChatDeps({ markdown: { sanitizeHtml: purify.sanitize } });
