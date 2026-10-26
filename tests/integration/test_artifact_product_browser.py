@@ -1,6 +1,9 @@
 """Actual shipped console and real initialized host; no substituted auth/router."""
 
 import asyncio
+import base64
+import json
+from io import BytesIO
 import os
 from pathlib import Path
 import shutil
@@ -36,6 +39,8 @@ async def test_production_console_artifact_upload_edit_recovery_discovery_and_co
         monkeypatch.setenv(name, value)
     key = 'artifact-browser-disposable-test-key'
     monkeypatch.setenv('KESTREL_API_KEY', key)
+    if os.environ.get('ARTIFACT_TEST_RENDERER_IMAGE'):
+        monkeypatch.setenv('KESTREL_ARTIFACT_RENDERER_IMAGE', os.environ['ARTIFACT_TEST_RENDERER_IMAGE'])
     monkeypatch.setenv('KESTREL_DATA_KEY', Fernet.generate_key().decode())
     monkeypatch.setenv('PYTHON_DOTENV_DISABLED', '1')
     monkeypatch.setenv('KESTREL_SKIP_DOTENV', '1')
@@ -65,10 +70,25 @@ async def test_production_console_artifact_upload_edit_recovery_discovery_and_co
         async with asyncio.timeout(15):
             while not runner.started:
                 await asyncio.sleep(.01)
+        preview_fixtures = []
+        if os.environ.get('ARTIFACT_TEST_RENDERER_IMAGE'):
+            from kestrel_sovereign.artifacts.preview import encode_preview
+            from pypdf import PdfWriter
+            import struct
+            raster = encode_preview(b'KAP1' + struct.pack('!II', 64, 32) + b'\xff\0\0' * (64 * 32)).png
+            pdf = BytesIO()
+            writer = PdfWriter()
+            writer.add_blank_page(width=720, height=576)
+            writer.write(pdf)
+            preview_fixtures = [
+                {'name': 'bounded.png', 'mimeType': 'image/png', 'base64': base64.b64encode(raster).decode()},
+                {'name': 'bounded.pdf', 'mimeType': 'application/pdf', 'base64': base64.b64encode(pdf.getvalue()).decode()},
+            ]
         child = await asyncio.create_subprocess_exec(
             'node', 'tests/frontend/artifact_product.browser.cjs',
             cwd=project_root,
-            env={**os.environ, 'ARTIFACT_TEST_URL': f'http://127.0.0.1:{port}', 'ARTIFACT_TEST_KEY': key},
+            env={**os.environ, 'ARTIFACT_TEST_URL': f'http://127.0.0.1:{port}', 'ARTIFACT_TEST_KEY': key,
+                 'ARTIFACT_TEST_PREVIEW_FIXTURES': json.dumps(preview_fixtures)},
             stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
         )
         try:

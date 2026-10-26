@@ -303,3 +303,25 @@ test('raster sources never enter the browser image decoder without a bounded ren
         assert.equal(button(item.panel, 'Download source file').disabled, false); item.close();
     }
 });
+
+test('only bounded generated PNG previews enter the browser and the document admits at most two decoders',async()=>{
+    const item=await fixture({type:'image/png'}),{revision}=item.panel.draft;
+    item.panel.dispose();item.panel.element.remove();
+    const content_base64='iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC';
+    const bytes=Uint8Array.from(atob(content_base64), c=>c.charCodeAt(0));
+    item.client.preview=async()=>({source:ref,media_type:'image/png',width:1,height:1,content_base64,sha256:await sha256(bytes)});
+    const panels=[];
+    try {
+        for(let i=0;i<3;i++) {
+            const panel=createArtifactPanel({client:item.client,ref,document:item.dom.window.document});
+            panels.push(panel);item.dom.window.document.body.append(panel.element);await panel.ready;
+        }
+        assert.equal(item.dom.window.document.querySelectorAll('img').length,2);
+        assert.equal(panels[2].element.querySelector('img'),null);
+        assert.match(panels[2].element.textContent,/Close another preview/);
+        panels[0].dispose();button(panels[2],'Show preview').click();await tick();
+        assert.equal(item.dom.window.document.querySelectorAll('img').length,2);
+        assert.equal(panels[2].element.querySelector('img').width,1);
+        assert.equal(panels[2].element.querySelector('img').height,1);
+    } finally {for(const panel of panels)panel.dispose();item.close();}
+});

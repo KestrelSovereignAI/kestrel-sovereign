@@ -260,12 +260,20 @@ Uploads and new text drafts use the same immutable publication/receipt state
 machine as edits, and remain unsaved until a verified receipt arrives.
 Artifact cards open the same reusable panel from chat, uploads, tools and
 workflow outputs. Text/Markdown/code editing commits a new immutable revision;
-image/PDF source downloads use authenticated revision-bound routes. Inline
-image/PDF viewing stays disabled until an isolated renderer proves aggregate
-OS memory/CPU/deadline limits and cleanup; original compressed raster images
-must not enter a browser decoder as a substitute for that boundary. Render
-untrusted content safely; HTML previews need isolation and cannot share host
-credentials/origin. No untrusted artifact script executes in the app origin.
+image/PDF source downloads use authenticated revision-bound routes. Configured
+local previews render the first page/frame inside a pinned Linux Poppler/Pillow
+container. Each process tree shares 512 MiB memory with no swap, half a CPU,
+16 processes and an eight-second independent supervisor deadline. An app-wide
+two-job pool admits source reads before decoding, retains uncertain cleanup
+slots and refuses excess work without queuing. The host receives bounded raw
+RGB and encodes a fresh PNG with stdlib code; the panel admits at most two
+1024-edge/one-megapixel derivatives per document. Original compressed sources
+never enter a browser decoder. The same current READ/privacy lease and
+per-artifact erasure fence cover rendering through the actual final response
+send. Missing or unsupported local sandboxes retain source-download behavior.
+See [renderer installation and bounds](../../kestrel_sovereign/artifacts/preview_worker/README.md).
+HTML previews need isolation and cannot share host credentials/origin.
+No untrusted artifact script executes in the app origin.
 The panel shows dirty, saving, saved, conflict, unknown and failed truthfully.
 A publication receipt is required for saved state.
 

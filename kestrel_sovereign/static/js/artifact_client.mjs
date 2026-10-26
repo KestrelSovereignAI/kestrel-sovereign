@@ -2,6 +2,8 @@
 
 const TOKEN = /^[A-Za-z0-9](?:[A-Za-z0-9._:@-]{0,254}[A-Za-z0-9])?$/;
 const MAX_VIEW_BYTES = 16 * 1024 * 1024;
+export const MAX_PREVIEW_PIXELS = 1024 * 1024;
+const PREVIEW_TYPES = new Set(['application/pdf', 'image/png', 'image/jpeg', 'image/webp', 'image/gif']);
 export const MAX_EDIT_BYTES = 1024 * 1024;
 const EDIT_TYPES = new Set(['text/plain', 'text/markdown', 'text/x-python', 'text/javascript',
     'text/css', 'application/json', 'application/javascript', 'application/xml', 'text/xml']);
@@ -66,6 +68,7 @@ export async function createArtifactClient(api, ownerAgent = api.getHostAgent())
         get: (ref, signal) => bound.request(revisionPath(ref), { signal, cache: 'no-store' }),
         head: (id, signal) => bound.request(`/api/artifacts/${encodeURIComponent(token(id))}/head`, { signal, cache: 'no-store' }),
         read: (ref, path, signal) => bound.readBytes(`${revisionPath(ref)}/file?path=${encodeURIComponent(path)}`, { signal, cache: 'no-store' }),
+        preview: (ref, signal) => bound.request(`${revisionPath(ref)}/preview`, { signal, cache: 'no-store' }),
         history: (id, cursor = null, signal) => bound.request(`/api/artifacts/${encodeURIComponent(token(id))}/history?limit=50${cursor ? `&cursor=${encodeURIComponent(cursor)}` : ''}`, { signal, cache: 'no-store' }),
         stage: (key, file, bytes, signal) => json('/api/artifacts/staging', {
             publication_key: key, path: file.path, media_type: file.media_type, content_base64: base64(bytes),
@@ -78,7 +81,7 @@ export async function createArtifactClient(api, ownerAgent = api.getHostAgent())
 export class ArtifactDraft {
     #client; #changed; #pending = null; #closed = false; #abort = new AbortController();
     #revision = null; #file = null; #bytes = null; #text = ''; #state = 'loading';
-    #editable = false; #comparison = null; #opened = false; #lineEnding = '\n'; #newTitle = null;
+    #editable = false; #comparison = null; #opened = false; #lineEnding = '\n'; #newTitle = null; #preview = null; #previewState = 'unavailable';
     constructor(client, changed = () => {}) { this.#client = client; this.#changed = changed; }
     get state() { return this.#state; }
     get revision() { return this.#revision; }
@@ -86,13 +89,15 @@ export class ArtifactDraft {
     get file() { return this.#file; }
     get bytes() { return this.#bytes; }
     get text() { return this.#text; }
+    get preview() { return this.#preview; }
+    get previewState() { return this.#previewState; }
     get editable() { return this.#editable; }
     get pendingKey() { return this.#pending?.request.idempotency_key ?? null; }
     get comparison() { return this.#comparison; }
     get hasUnsavedChanges() { return (!!this.#revision || this.#newTitle !== null) && ['dirty', 'saving', 'unknown', 'conflict', 'compare_failed', 'denied', 'failed', 'rejected', 'erased'].includes(this.#state); }
     #set(state) {
         if (!this.#closed) {
-            if (['erased', 'denied', 'unavailable'].includes(state)) this.#comparison = null;
+            if (['erased', 'denied', 'unavailable'].includes(state)) { this.#comparison = null; this.#preview = null; }
             this.#state = state; this.#changed(this);
         }
     }
@@ -155,6 +160,7 @@ export class ArtifactDraft {
             this.#editable = loaded.text !== null && loaded.lineEnding !== null && loaded.revision.manifest.files.length === 1;
             this.#lineEnding = loaded.lineEnding || '\n';
             this.#set('saved');
+            await this.#fetchPreview();
         } catch (error) { this.#set([401, 403].includes(error.status) || error.code === 'artifact_auth_changed' ? 'denied' : 'unavailable'); }
     }
     edit(text) {
@@ -200,6 +206,38 @@ export class ArtifactDraft {
             manifest: pending.request.manifest, provenance: pending.request.provenance, committed_at: receipt.committed_at };
         this.#bytes = pending.bytes; this.#file = pending.file; this.#newTitle = null; this.#pending = null; this.#comparison = null;
         this.#set('saved');
+        await this.#fetchPreview();
+    }
+    async #fetchPreview() {
+        if (!PREVIEW_TYPES.has(this.#file?.media_type) || !this.#client.preview || this.#closed) return;
+        const ref = this.#revision.ref;
+        this.#previewState = 'loading'; this.#changed(this);
+        try {
+            const result = await this.#client.preview(ref, this.#abort.signal);
+            if (this.#closed) return;
+            if (canonical(artifactRef(result.source)) !== canonical(ref) || result.media_type !== 'image/png'
+                || !Number.isInteger(result.width) || !Number.isInteger(result.height)
+                || result.width < 1 || result.width > 1024 || result.height < 1 || result.height > 1024
+                || result.width * result.height > MAX_PREVIEW_PIXELS
+                || typeof result.content_base64 !== 'string' || result.content_base64.length > 6 * 1024 * 1024) throw new Error('Invalid preview');
+            const bytes = Uint8Array.from(atob(result.content_base64), char => char.charCodeAt(0));
+            const view = new DataView(bytes.buffer);
+            if (bytes.length < 33 || bytes.length > 4 * 1024 * 1024
+                || [...bytes.subarray(0, 8)].join(',') !== '137,80,78,71,13,10,26,10'
+                || view.getUint32(8) !== 13 || view.getUint32(12) !== 0x49484452
+                || view.getUint32(16) !== result.width || view.getUint32(20) !== result.height
+                || bytes[24] !== 8 || bytes[25] !== 2 || bytes[26] !== 0 || bytes[27] !== 0 || bytes[28] !== 0
+                || await sha256(bytes) !== result.sha256) throw new Error('Invalid preview');
+            if (this.#closed) return;
+            this.#preview = { bytes, width: result.width, height: result.height };
+            this.#previewState = 'ready'; this.#changed(this);
+        } catch (error) {
+            if (this.#closed) return;
+            this.#preview = null; this.#previewState = 'unavailable';
+            if ([401, 403].includes(error.status) || error.code === 'artifact_auth_changed') this.#set('denied');
+            else if (error.code === 'artifact_not_found') this.#set('erased');
+            else this.#changed(this); // Refusal preserves authorized source download.
+        }
     }
     async #attempt() {
         const pending = this.#pending;
@@ -296,6 +334,6 @@ export class ArtifactDraft {
     }
     close() {
         this.#closed = true; this.#abort.abort(); this.#pending = null; this.#bytes = null;
-        this.#text = ''; this.#newTitle = null; this.#comparison = null; this.#revision = null; this.#file = null;
+        this.#text = ''; this.#newTitle = null; this.#preview = null; this.#comparison = null; this.#revision = null; this.#file = null;
     }
 }

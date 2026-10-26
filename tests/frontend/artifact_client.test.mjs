@@ -561,3 +561,19 @@ test('creation cannot claim saved after receiving an unrelated or malformed rece
         assert.equal(draft.state,'unknown');assert.ok(draft.pendingKey);assert.equal(draft.text,'# Original');draft.close();
     }
 });
+
+const previewBase64='iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC';
+async function previewFixture(change={}) {
+    const item=await fixture();item.draft.close();item.revision.manifest.files[0].media_type='image/png';
+    const bytes=Uint8Array.from(atob(previewBase64), c=>c.charCodeAt(0));
+    item.client.preview=async()=>({source:ref,media_type:'image/png',width:1,height:1,content_base64:previewBase64,sha256:await sha256(bytes),...change});
+    const draft=new ArtifactDraft(item.client);await draft.open(ref);return {draft,item};
+}
+test('only a verified bounded revision-bound generated RGB PNG becomes a preview',async()=>{
+    const {draft}=await previewFixture();assert.equal(draft.state,'saved');assert.equal(draft.previewState,'ready');
+    assert.deepEqual([draft.preview.width,draft.preview.height],[1,1]);draft.close();
+    for(const change of [{source:{...ref,revision_id:'other'}},{media_type:'image/svg+xml'},{width:100000},{height:0},
+        {sha256:'0'.repeat(64)},{content_base64:btoa('<script>')},{width:2},{content_base64:'A'.repeat(6*1024*1024+1)}]) {
+        const {draft}=await previewFixture(change);assert.equal(draft.state,'saved');assert.equal(draft.preview,null);assert.ok(draft.bytes);draft.close();
+    }
+});

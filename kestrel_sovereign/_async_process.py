@@ -258,6 +258,7 @@ async def start_async_process(
     *,
     cwd: Path | None = None,
     env: Mapping[str, str] | None = None,
+    stdin: Any = None,
     stdout: Any = None,
     stderr: Any = None,
 ) -> asyncio.subprocess.Process:
@@ -272,6 +273,7 @@ async def start_async_process(
             *argv,
             cwd=str(cwd) if cwd else None,
             env=dict(env) if env is not None else None,
+            stdin=stdin,
             stdout=stdout,
             stderr=stderr,
             **new_process_group_kwargs(),

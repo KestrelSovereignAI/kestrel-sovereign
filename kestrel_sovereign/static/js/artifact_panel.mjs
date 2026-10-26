@@ -1,5 +1,5 @@
 /** Shared artifact card/viewer. All producer-controlled values use DOM text. */
-import { ArtifactDraft, artifactRef, createArtifactClient } from './artifact_client.mjs';
+import { ArtifactDraft, artifactRef, createArtifactClient, MAX_PREVIEW_PIXELS } from './artifact_client.mjs';
 
 const STATUS = {
     loading: 'Opening saved revision…', saved: 'Saved revision', dirty: 'Unsaved changes',
@@ -15,6 +15,7 @@ const STATUS = {
 };
 const IMAGES = new Set(['image/png', 'image/jpeg', 'image/gif', 'image/webp']);
 const workspaces = new WeakMap();
+const previewBudgets = new WeakMap();
 
 function element(doc, tag, text, className) {
     const node = doc.createElement(tag);
@@ -37,10 +38,14 @@ export function createArtifactPanel({ client, ref, source, document: doc = globa
     const history = element(doc, 'div');
     const note = element(doc, 'p', 'Drafts stay in this panel until saved. Download a draft before closing if its save is unresolved.', 'text-muted');
     root.append(title, identity, status, toolbar, viewer, comparison, history, note);
-    let disposed = false, shownFile = null, editor = null, comparisonRef = null;
+    let disposed = false, shownFile = null, editor = null, comparisonRef = null, shownPreview = null, previewURL = null, releaseBudget = null;
     const urls = new Set();
     const objectURL = (bytes, type) => {
         const url = URL.createObjectURL(new Blob([bytes], { type })); urls.add(url); return url;
+    };
+    const releasePreview = () => {
+        if (previewURL) { URL.revokeObjectURL(previewURL); urls.delete(previewURL); previewURL = null; }
+        releaseBudget?.(); releaseBudget = null; shownPreview = null;
     };
     const download = (bytes, name) => {
         if (!bytes || disposed) return;
@@ -106,14 +111,14 @@ export function createArtifactPanel({ client, ref, source, document: doc = globa
         exportDraft.hidden = !draft.editable || !draft.hasUnsavedChanges;
         historyButton.disabled = !draft.revision || draft.state === 'saving';
         if (draft.file && draft.file !== shownFile) {
-            viewer.replaceChildren(); editor = null; shownFile = draft.file;
+            releasePreview(); viewer.replaceChildren(); editor = null; shownFile = draft.file;
             if (draft.editable) {
                 editor = element(doc, 'textarea'); editor.value = draft.text;
                 editor.setAttribute('aria-label', 'Artifact source'); editor.spellcheck = false;
                 editor.style.cssText = 'width:100%;min-height:18rem;box-sizing:border-box;font-family:monospace;';
                 editor.addEventListener('input', () => draft.edit(editor.value)); viewer.append(editor);
             } else if (IMAGES.has(draft.file.media_type)) {
-                viewer.append(element(doc, 'p', 'Download this image to view it. A bounded preview renderer is required for inline viewing.'));
+                viewer.append(element(doc, 'p', 'Download this image to view it. Inline preview is unavailable.'));
             } else if (draft.file.media_type === 'application/pdf') {
                 viewer.append(element(doc, 'p', 'Download this PDF to view it.'));
             } else if (draft.text) {
@@ -122,6 +127,27 @@ export function createArtifactPanel({ client, ref, source, document: doc = globa
             } else {
                 viewer.append(element(doc, 'p', 'Preview is unavailable for this file or bundle. Download the saved source to open it.'));
             }
+        }
+        if ((IMAGES.has(draft.file?.media_type) || draft.file?.media_type === 'application/pdf') && draft.preview !== shownPreview) {
+            releasePreview();
+            if (draft.preview) {
+                const preview = draft.preview;
+                const budget = previewBudgets.get(doc) || { count: 0, pixels: 0 }; previewBudgets.set(doc, budget);
+                const pixels = preview.width * preview.height;
+                if (budget.count < 2 && budget.pixels + pixels <= 2 * MAX_PREVIEW_PIXELS) {
+                    budget.count++; budget.pixels += pixels;
+                    releaseBudget = () => { budget.count--; budget.pixels -= pixels; };
+                    previewURL = objectURL(preview.bytes, 'image/png');
+                    const image = element(doc, 'img'); image.alt = draft.title; image.src = previewURL;
+                    image.className = 'artifact-preview'; image.width = preview.width; image.height = preview.height;
+                    image.style.cssText = 'max-width:100%;height:auto;'; viewer.replaceChildren(image);
+                } else {
+                    const retryPreview = element(doc, 'button', 'Show preview', 'btn btn-secondary'); retryPreview.type = 'button';
+                    retryPreview.addEventListener('click', () => { shownPreview = null; render(); });
+                    viewer.replaceChildren(element(doc, 'p', 'Close another preview, then select Show preview. Source download remains available.'), retryPreview);
+                }
+                shownPreview = preview;
+            } else if (['denied', 'erased'].includes(draft.state)) viewer.replaceChildren();
         }
         if (editor) editor.readOnly = !['saved', 'dirty', 'failed', 'rejected'].includes(draft.state) || !!draft.pendingKey;
         if (draft.comparison?.revision.ref.revision_id !== comparisonRef) {
@@ -138,7 +164,7 @@ export function createArtifactPanel({ client, ref, source, document: doc = globa
     doc.defaultView?.addEventListener('beforeunload', beforeUnload);
     function dispose() {
         if (disposed) return;
-        disposed = true; draft.close();
+        disposed = true; draft.close(); releasePreview();
         doc.defaultView?.removeEventListener('beforeunload', beforeUnload);
         for (const url of urls) URL.revokeObjectURL(url);
         urls.clear(); viewer.replaceChildren(); comparison.replaceChildren(); history.replaceChildren();

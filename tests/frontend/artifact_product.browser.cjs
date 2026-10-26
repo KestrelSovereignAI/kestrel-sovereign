@@ -70,8 +70,26 @@ const { expect } = require('@playwright/test');
         await stale.getByRole('button', { name: 'Save revision', exact: true }).click();
         await expect(stale.getByRole('status')).toHaveText('Saved revision');
         await expect(stale.getByLabel('Artifact source')).toHaveValue('Retained conflicting draft');
+        const previewFixtures = JSON.parse(process.env.ARTIFACT_TEST_PREVIEW_FIXTURES || '[]');
+        for (const fixture of previewFixtures) {
+            await library.getByLabel('Upload artifact').setInputFiles({ name: fixture.name, mimeType: fixture.mimeType, buffer: Buffer.from(fixture.base64, 'base64') });
+            const previewPanel = page.getByRole('region', { name: 'Saved artifact' }).last();
+            await expect(previewPanel.getByRole('status')).toHaveText('Unsaved changes');
+            await previewPanel.getByRole('button', { name: 'Save revision', exact: true }).click();
+            await expect(previewPanel.getByRole('status')).toHaveText('Saved revision');
+            const image = previewPanel.locator('img.artifact-preview');
+            await expect(image).toBeVisible({ timeout: 20000 });
+            const dimensions = await image.evaluate(node => [node.naturalWidth, node.naturalHeight]);
+            assert.ok(dimensions.every(value => value > 0 && value <= 1024));
+            assert.match(await image.getAttribute('src'), /^blob:/);
+            await expect(previewPanel.getByRole('button', { name: 'Download source file' })).toBeEnabled();
+            if (process.env.ARTIFACT_BROWSER_SCREENSHOT) {
+                await image.scrollIntoViewIfNeeded();
+                await page.screenshot({ path: process.env.ARTIFACT_BROWSER_SCREENSHOT.replace(/\.png$/, `-${fixture.name.replace('.', '-')}.png`) });
+            }
+        }
         assert.deepEqual(errors, []);
         if (process.env.ARTIFACT_BROWSER_SCREENSHOT) await page.screenshot({ path: process.env.ARTIFACT_BROWSER_SCREENSHOT });
-        console.log(JSON.stringify({ verdict: 'PASS', path: 'production console header → library → upload → durable receipt → lost ACK reconciliation → reload → encrypted head discovery → CAS conflict → explicit rebase', revision1, revision2, cleanup: 'browser closed by finally' }));
+        console.log(JSON.stringify({ verdict: 'PASS', path: 'production console header → library → upload → durable receipt → lost ACK reconciliation → reload → encrypted head discovery → CAS conflict → explicit rebase', revision1, revision2, previewKinds: previewFixtures.map(item => item.mimeType), cleanup: 'browser closed by finally' }));
     } finally { await browser.close(); }
 })().catch(error => { console.error(error); process.exitCode = 1; });

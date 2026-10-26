@@ -30,6 +30,7 @@ from kestrel_sovereign.security.private_delivery import (
     AuthorizedCapabilityResponse, PRIVATE_RESPONSE_HEADERS,
 )
 
+from .preview import ArtifactPreviewRefused, ArtifactPreviewUnavailable
 from .repository import ArtifactIntegrityError, ArtifactQuotaExceeded
 from .service import ArtifactAccessDenied, ArtifactAction, AuthorizedArtifactService
 
@@ -78,6 +79,10 @@ def _error(error: Exception) -> Response:
         status, code = 409, "artifact_conflict"
     elif isinstance(error, ResourceOutcomeUnknown):
         status, code = 503, "artifact_outcome_unknown"
+    elif isinstance(error, ArtifactPreviewUnavailable):
+        status, code = 503, "artifact_preview_unavailable"
+    elif isinstance(error, ArtifactPreviewRefused):
+        status, code = 422, "artifact_preview_refused"
     elif isinstance(error, ArtifactQuotaExceeded):
         status, code = 413, "artifact_quota_exceeded"
     elif isinstance(error, ArtifactIntegrityError):
@@ -108,8 +113,10 @@ def create_artifact_router(service: AuthorizedArtifactService, *, resolve_contex
         raise ValueError("artifact HTTP timeout must be positive and finite")
     router = APIRouter(prefix="/api/artifacts", tags=["artifacts"])
 
-    def respond(request, action, build, prepare=None):
+    def respond(request, action, build, prepare=None, preview_ref=None):
         def operation(context, value):
+            if preview_ref is not None:
+                return service.preview_delivery(context, preview_ref())
             return service.authority.operation(
                 context, action, service.repository.storage_id,
                 link=value if isinstance(value, ArtifactLink) else None,
@@ -200,6 +207,16 @@ def create_artifact_router(service: AuthorizedArtifactService, *, resolve_contex
                 **PRIVATE_RESPONSE_HEADERS, "Content-Disposition": 'attachment; filename="artifact.bin"',
             })
         return respond(request, ArtifactAction.READ, build)
+
+    @router.get("/{artifact_id}/revisions/{revision_id}/preview")
+    async def preview(artifact_id: str, revision_id: str, request: Request) -> Response:
+        def reference():
+            return ArtifactRef(artifact_id=artifact_id, revision_id=revision_id)
+        async def build(context):
+            ref = reference()
+            result = await service.preview(context, ref)
+            return _json(result.payload(ref))
+        return respond(request, ArtifactAction.READ, build, preview_ref=reference)
 
     @router.post("/links")
     async def link(request: Request) -> Response:

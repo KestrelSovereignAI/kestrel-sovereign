@@ -18,6 +18,7 @@ this is not a Python sandbox. No service entry point accepts an owner selector.
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Callable
 from contextlib import asynccontextmanager
 from datetime import datetime
@@ -38,6 +39,8 @@ from kestrel_sdk.resources import ResourceError, ResourceOutcomeUnknown, Resourc
 from kestrel_sovereign.security.capability_authority import HostCapabilityAuthority
 
 from .repository import ArtifactRepository
+from .preview import ArtifactPreviewUnavailable, ArtifactPreviewRefused, MAX_SOURCE_BYTES
+from kestrel_sovereign._async_rwlock import AsyncReaderWriterLock
 
 
 class ArtifactAccessDenied(ResourceError, OperatorAuthorizationError):
@@ -75,6 +78,10 @@ class AuthorizedArtifactService:
     def __init__(self, repository: ArtifactRepository, authority: ArtifactAuthority):
         self.repository = repository
         self.authority = authority
+        self.preview_pool = None
+        self.preview_renderer = None
+        self._erasure_fences = {}
+        self._preview_deliveries = {}
 
     @staticmethod
     def _scope(context: OperatorContext) -> ResourceScope:
@@ -147,6 +154,65 @@ class AuthorizedArtifactService:
             lambda scope, check: self.repository.link(scope, link, remove=True, guard=check),
             mutation=True, link=link)
 
+    @asynccontextmanager
+    async def _erasure_fence(self, context, artifact_id, *, write=False):
+        scope = self._scope(context)
+        key = (scope.tenant_id, scope.principal_id, scope.agent_id, artifact_id)
+        record = self._erasure_fences.setdefault(key, [AsyncReaderWriterLock(), 0])
+        record[1] += 1
+        try:
+            async with (record[0] if write else record[0].read()):
+                yield
+        finally:
+            record[1] -= 1
+            if not record[1]:
+                self._erasure_fences.pop(key, None)
+
+    @asynccontextmanager
+    async def preview_delivery(self, context: OperatorContext, ref: ArtifactRef):
+        """Fence canonical erasure through derivative generation AND final send."""
+        ref = ArtifactRef.model_validate(ref)
+        task = asyncio.current_task()
+        if task in self._preview_deliveries:
+            raise ArtifactAccessDenied('preview delivery already bound')
+        async with self.authority.operation(context, ArtifactAction.READ, self.repository.storage_id) as check:
+            async with self._erasure_fence(context, ref.artifact_id):
+                self._preview_deliveries[task] = (context, ref, check)
+                try:
+                    check()
+                    yield check
+                finally:
+                    self._preview_deliveries.pop(task, None)
+
+    async def preview(self, context: OperatorContext, ref: ArtifactRef):
+        binding = self._preview_deliveries.get(asyncio.current_task())
+        if binding is None or binding[0] is not context or binding[1] != ref:
+            raise ArtifactAccessDenied('preview delivery is not host-bound')
+        check = binding[2]
+        revision = await self.get(context, ref)
+        if self.preview_pool is None or self.preview_renderer is None:
+            raise ArtifactPreviewUnavailable('host preview renderer is unavailable')
+        file = next(file for file in revision.manifest.files if file.path == revision.manifest.entrypoint)
+        if not 0 < file.size_bytes <= MAX_SOURCE_BYTES:
+            raise ArtifactPreviewRefused('source exceeds the preview bound')
+        await self.preview_renderer.reconcile_cleanup(self.preview_pool)
+        check()
+        # Admission precedes source bytes as well as the native decoder. A
+        # saturated renderer cannot accumulate an unbounded input-read queue.
+        job = self.preview_pool.reserve()
+        try:
+            content = await self.read(context, ref, file.path)
+            check()
+            result = await self.preview_renderer.render(self.preview_pool, content, file.media_type, check, job=job)
+            check()
+            return result
+        finally:
+            if not job.creation_started:
+                self.preview_pool.complete(job)
+
     async def delete(self, context: OperatorContext, expected_head: ArtifactRef) -> None:
-        await self._perform(context, ArtifactAction.DELETE,
-            lambda scope, check: self.repository.delete(scope, expected_head, guard=check), mutation=True)
+        expected_head = ArtifactRef.model_validate(expected_head)
+        async with self.authority.operation(context, ArtifactAction.DELETE, self.repository.storage_id):
+            async with self._erasure_fence(context, expected_head.artifact_id, write=True):
+                await self._perform(context, ArtifactAction.DELETE,
+                    lambda scope, check: self.repository.delete(scope, expected_head, guard=check), mutation=True)

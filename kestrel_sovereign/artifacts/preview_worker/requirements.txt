@@ -1,0 +1,4 @@
+# Exact CPython 3.13 Linux wheels from Core's current uv.lock (amd64 + arm64).
+pillow==12.3.0 \
+    --hash=sha256:f7401aebd7f581d7f83a439d87d474999317ee099218e5ad25d125290990ba65 \
+    --hash=sha256:0847a763afefb695bc912d7c131e7e0632d4edc1d8698f58ddabec8e46b8b6d3

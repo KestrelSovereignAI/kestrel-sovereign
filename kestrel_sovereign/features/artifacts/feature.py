@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import hmac
 import logging
+import os
 from contextlib import asynccontextmanager
 from datetime import timedelta
 from uuid import uuid4
@@ -21,6 +22,7 @@ from kestrel_sdk.security.encryption import get_fernet
 
 from kestrel_sovereign._async_rwlock import AsyncReaderWriterLock
 from kestrel_sovereign.artifacts.http import create_artifact_router
+from kestrel_sovereign.artifacts.preview import DockerArtifactRenderer, host_preview_pool
 from kestrel_sovereign.artifacts.repository import ArtifactIntegrityError, ArtifactRepository
 from kestrel_sovereign.artifacts.service import (
     ArtifactAccessDenied,
@@ -94,6 +96,7 @@ class ArtifactsFeature(ArtifactProducerTools, Feature):
         repository = ArtifactRepository(db, storage_id="agent-artifacts")
         self._agent_id = agent_id
         self._service = AuthorizedArtifactService(repository, ArtifactAuthority())
+        self._service.preview_renderer = DockerArtifactRenderer(os.environ.get("KESTREL_ARTIFACT_RENDERER_IMAGE"))
         self._router = create_artifact_router(
             self._service, resolve_context=self._resolve_context,
         )
@@ -185,6 +188,7 @@ class ArtifactsFeature(ArtifactProducerTools, Feature):
         except HostAuthorityError:
             raise ArtifactAccessDenied("artifact authority is unavailable") from None
         async with self._bind_caller(caller, request=request) as context:
+            self._service.preview_pool = host_preview_pool(request.app)
             yield context
 
     @asynccontextmanager
