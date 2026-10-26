@@ -16,6 +16,7 @@ from kestrel_sovereign.agent.parts import drain_parts, emit_part, part_collector
 from kestrel_sovereign.agent.tool_registry import ToolRegistryMixin
 from kestrel_sovereign.hooks.manager import HooksManager
 from kestrel_sovereign.features.base import Feature as CoreFeature
+from kestrel_sovereign.execution_custody import ExecutionAuthorityError
 from kestrel_sovereign.storage.db.sqlite import SQLiteBackend
 
 
@@ -34,13 +35,29 @@ class PostPolicy(Hook):
         super().__init__("deferred-post-policy", [HookEvent.POST_TOOL_USE])
         self.started, self.release = asyncio.Event(), asyncio.Event()
         self.redact = False
+        self.replace = False
+        self.replace_with_none = False
+        self.redact_message = False
+        self.failure = None
         self.output = HookOutput.allow()
 
     async def execute(self, value):
         self.started.set()
+        if self.failure == "raise":
+            raise RuntimeError("private-policy-sentinel")
+        if self.failure == "timeout":
+            await asyncio.Event().wait()
+        if self.failure == "invalid":
+            return None
         await self.release.wait()
         if self.redact:
             value.tool_response["data"]["value"] = "redacted"
+        if self.replace:
+            value.tool_response = ToolResult.ok("Replacement").to_dict()
+        if self.replace_with_none:
+            value.tool_response = None
+        if self.redact_message:
+            value.tool_response["confirmation"] = "Reviewed replacement text"
         emit_part("post_policy", {})
         return self.output
 
@@ -53,16 +70,26 @@ class DeferredTool:
     def __init__(self):
         self.executions = []
         self.publications = []
+        self.publication_error = None
+        self.publication_parts = None
+        self.mutate_before_error = False
 
     async def execute(self, **arguments):
         self.executions.append(arguments)
 
         def publish():
             self.publications.append("published-once")
+            if self.publication_error is not None:
+                if self.mutate_before_error:
+                    self.last_result["data"]["value"] = "private-mutated-factory-sentinel"
+                raise self.publication_error
+            if self.publication_parts is not None:
+                return self.publication_parts
             return [{"type": "private_view", "data": {"reference": "opaque-reference"}}]
 
-        return DeferredToolResult(ToolResult.ok("Complete", data={"value": "original"},
+        self.last_result = DeferredToolResult(ToolResult.ok("Complete", data={"value": "original"},
             parts=[{"type": "original_part", "data": {}}]).to_dict(), publish=publish)
+        return self.last_result
 
 
 @dataclass
@@ -107,7 +134,8 @@ async def boundary(tmp_path, request):
             async def deferred_result(self):
                 return await tool.execute()
 
-        source = Source(None)
+        source = Source(host)
+        assert source.agent.supports_deferred_tool_results is True
         offered = next(item for item in source.get_tools() if item.name == tool.name)
     host.hooks_manager.register(policy)
     host.register_dynamic_tools("mcp:deferred-test", [offered],
@@ -196,3 +224,121 @@ async def test_cancellation_while_post_policy_is_pending_never_publishes(boundar
         finally:
             peer.policy.release.set()
             await asyncio.gather(call, return_exceptions=True)
+
+
+@pytest.mark.parametrize("path", ["chat", "named", "bound"])
+@pytest.mark.parametrize("failure", ["raise", "timeout", "invalid"])
+@pytest.mark.parametrize("enforcing", [False, True])
+async def test_incomplete_post_policy_never_publishes_private_parts(boundary, path, failure, enforcing):
+    peer = boundary
+    peer.policy.failure = failure
+    peer.policy.fail_closed = enforcing
+    peer.policy.timeout = 0.01
+    peer.policy.release.set()
+    with part_collector():
+        result = await peer.invoke(path)
+        assert peer.tool.executions == [{}]
+        assert not peer.tool.publications, "Incomplete policy was treated as permission for private delivery"
+        assert result["data"] == {"value": "original"}
+        assert [part["type"] for part in result["parts"]] == ["original_part"]
+        assert [part["type"] for part in drain_parts()] == ["original_part"]
+
+
+@pytest.mark.parametrize("path", ["chat", "named", "bound"])
+async def test_replaced_post_hook_response_withholds_private_parts(boundary, path):
+    peer = boundary
+    peer.policy.replace = True
+    peer.policy.release.set()
+    with part_collector():
+        result = await peer.invoke(path)
+        assert peer.tool.executions == [{}] and not peer.tool.publications
+        assert result == ToolResult.ok("Replacement").to_dict()
+        assert [part["type"] for part in drain_parts()] == ["original_part", "post_policy"]
+
+
+@pytest.mark.parametrize("path", ["chat", "named", "bound"])
+@pytest.mark.parametrize("error", [RuntimeError, KeyError, ValueError])
+async def test_publication_failure_reports_ui_error_without_failing_or_replaying_completed_tool(boundary, path, error, caplog):
+    peer = boundary
+    peer.tool.publication_error = error("private-factory-sentinel")
+    peer.policy.release.set()
+    with part_collector():
+        result = await peer.invoke(path)
+        assert result["status"] == "ok" and result["data"] == {"value": "original"}
+        assert peer.tool.executions == [{}] and peer.tool.publications == ["published-once"]
+        parts = drain_parts()
+        assert [part["type"] for part in parts] == ["original_part", "post_policy", "notice"]
+        notice = parts[-1]["data"]
+        assert notice["level"] == "error" and "Do not run it again" in notice["body"]
+        assert result["parts"][-1] == parts[-1]
+        assert "private-factory-sentinel" not in str(result) + str(parts) + caplog.text
+
+
+@pytest.mark.parametrize("path", ["chat", "named", "bound"])
+async def test_deferred_parts_use_the_canonical_envelope_sanitizer(boundary, path):
+    peer = boundary
+    peer.policy.release.set()
+    peer.tool.publication_parts = [{"type": "private_view", "data": {},
+        "id": "a" * 256, "untrusted_extra": "private-extra-sentinel"}]
+    with part_collector():
+        result = await peer.invoke(path)
+        published = drain_parts()[-1]
+        assert result["parts"][-1] == published
+        assert len(published["id"]) == 128
+        assert "private-extra-sentinel" not in str(result)
+
+
+@pytest.mark.parametrize("path", ["chat", "named", "bound"])
+@pytest.mark.parametrize("error", [asyncio.CancelledError, ExecutionAuthorityError])
+async def test_publication_preserves_execution_control_errors(boundary, path, error):
+    peer = boundary
+    peer.tool.publication_error = error("Original execution was withdrawn")
+    peer.policy.release.set()
+    with part_collector():
+        with pytest.raises(error):
+            await peer.invoke(path)
+        assert peer.tool.executions == [{}] and peer.tool.publications == ["published-once"]
+        assert [part["type"] for part in drain_parts()] == ["original_part", "post_policy"]
+
+
+@pytest.mark.parametrize("path", ["chat", "named", "bound"])
+async def test_failed_publication_cannot_rewrite_the_reviewed_tool_envelope(boundary, path):
+    peer = boundary
+    peer.tool.publication_error = RuntimeError("private-factory-sentinel")
+    peer.tool.mutate_before_error = True
+    peer.policy.release.set()
+    with part_collector():
+        result = await peer.invoke(path)
+        assert result["data"] == {"value": "original"}
+        assert "private-mutated-factory-sentinel" not in str(result) + str(drain_parts())
+
+
+@pytest.mark.parametrize("path", ["chat", "named", "bound"])
+async def test_non_dictionary_policy_replacement_never_restores_prior_data(boundary, path):
+    from kestrel_sdk.resources import ResourceOutcomeUnknown
+    peer = boundary
+    peer.policy.replace_with_none = True
+    peer.policy.release.set()
+    with part_collector():
+        if path == "chat":
+            result = await peer.invoke(path)
+            assert "data" not in result and result["success"] is False
+        else:
+            with pytest.raises((TypeError, ResourceOutcomeUnknown)):
+                await peer.invoke(path)
+        assert peer.tool.executions == [{}] and not peer.tool.publications
+        assert [part["type"] for part in drain_parts()] == ["original_part", "post_policy"]
+        with pytest.raises(RuntimeError, match="already finalized or transferred"):
+            peer.tool.last_result.finalize(peer.tool.last_result, allowed=True)
+
+
+@pytest.mark.parametrize("path", ["chat", "named", "bound"])
+async def test_top_level_post_policy_redaction_withholds_private_delivery(boundary, path):
+    peer = boundary
+    peer.policy.redact_message = True
+    peer.policy.release.set()
+    with part_collector():
+        result = await peer.invoke(path)
+        assert result["confirmation"] == "Reviewed replacement text"
+        assert peer.tool.executions == [{}] and not peer.tool.publications
+        assert [part["type"] for part in drain_parts()] == ["original_part", "post_policy"]

@@ -577,6 +577,33 @@ class TestHooksManager:
         assert hook2.call_count == 1
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["raise", "timeout"])
+@pytest.mark.parametrize("enforcing", [False, True])
+@pytest.mark.parametrize("require_complete", [False, True])
+async def test_parallel_hook_failures_retain_required_denials(failure, enforcing, require_complete):
+    class FailedPostHook(Hook):
+        def __init__(self):
+            super().__init__("owned-required-post", [HookEvent.POST_TOOL_USE])
+            self.fail_closed = enforcing
+            self.timeout = 0.01
+
+        async def execute(self, value):
+            if failure == "raise":
+                raise RuntimeError("owned hook failure")
+            await asyncio.Event().wait()
+
+    manager = HooksManager()
+    manager.register(FailedPostHook())
+    outputs = await manager.execute_hooks_parallel(HookEvent.POST_TOOL_USE,
+        HookInput(session_id="owned-post", hook_event_name=HookEvent.POST_TOOL_USE.value),
+        require_complete=require_complete)
+    if enforcing or require_complete:
+        assert len(outputs) == 1 and outputs[0].permission_decision == PermissionDecision.DENY
+    else:
+        assert outputs == []
+
+
 # === USER_PROMPT_SUBMIT Hook Tests ===
 
 
