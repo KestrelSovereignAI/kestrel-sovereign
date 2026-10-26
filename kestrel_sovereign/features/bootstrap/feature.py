@@ -15,6 +15,7 @@ Provides commands to control the bootstrap/discovery process:
 kestrel-sovereign #1042 narration-honesty contract (#1061).
 """
 
+import asyncio
 import logging
 import re
 from dataclasses import dataclass
@@ -27,6 +28,10 @@ from kestrel_sdk.tools.base import ToolCategory
 from kestrel_sdk.tools.result import ToolResult
 from kestrel_sovereign.bootstrap import BootstrapState
 from kestrel_sovereign.bootstrap.soul_durability import inspect_soul_file
+from kestrel_sovereign.storage.agent_resource_store import (
+    ExpectedCurrentVersion,
+    ResourceVersionConflictError,
+)
 from kestrel_sovereign.storage.privacy_wrapper import (
     acquire_control_plane_capability,
     optional_transition_lock,
@@ -193,6 +198,40 @@ async def _rename_agent_core_locked(agent, old_name: str, new_name: str) -> Rena
     memory_updated = False
     soul_md_updated = False
 
+    # The SOUL first, before the name is written anywhere (#3813). The rename
+    # is refused unless the SOUL version it read is still current, whether or
+    # not that SOUL names the agent, and a refusal fails the rename here,
+    # before the metadata, the graph or the live agent has the new name. A rename run again then takes the old
+    # name from the live agent and finds it in the SOUL. Renamed last, a
+    # refused SOUL left the new name live, so running the rename again renamed
+    # the new name to itself and reported success over a SOUL still naming
+    # the old one. A store failing after the SOUL was renamed leaves a SOUL
+    # that already has the new name, which the next rename leaves as it is.
+    try:
+        soul_md_updated = await _update_soul_name(agent, old_name, new_name)
+    except Exception as e:
+        if is_execution_control_error(e):
+            raise
+        _raise_carried_cancellation(e)
+        if isinstance(e, ResourceVersionConflictError):
+            logger.warning("Agent rename refused: %s", e)
+            error = (
+                "the SOUL changed while the rename ran, so the rename was "
+                f"refused and the name was changed nowhere ({e}). Rename again "
+                "to rename the current SOUL."
+            )
+        else:
+            logger.error(f"Agent rename failed during SOUL.md update: {e}", exc_info=True)
+            error = f"SOUL.md update failed: {e}"
+        return RenameOutcome(
+            success=False,
+            db_row_written=False,
+            graph_updated=False,
+            memory_updated=False,
+            soul_md_updated=False,
+            error=error,
+        )
+
     try:
         await agent._raw_storage.db.execute(
             """
@@ -205,13 +244,14 @@ async def _rename_agent_core_locked(agent, old_name: str, new_name: str) -> Rena
     except Exception as e:
         if is_execution_control_error(e):
             raise
-        logger.error(f"Agent rename failed before metadata write: {e}", exc_info=True)
+        _raise_carried_cancellation(e)
+        logger.error(f"Agent rename failed at the metadata write: {e}", exc_info=True)
         return RenameOutcome(
             success=False,
             db_row_written=False,
             graph_updated=False,
             memory_updated=False,
-            soul_md_updated=False,
+            soul_md_updated=soul_md_updated,
             error=f"metadata DB write failed: {e}",
         )
 
@@ -227,13 +267,14 @@ async def _rename_agent_core_locked(agent, old_name: str, new_name: str) -> Rena
     except Exception as e:
         if is_execution_control_error(e):
             raise
+        _raise_carried_cancellation(e)
         logger.error(f"Agent rename failed after metadata write: {e}", exc_info=True)
         return RenameOutcome(
             success=False,
             db_row_written=db_row_written,
             graph_updated=False,
             memory_updated=False,
-            soul_md_updated=False,
+            soul_md_updated=soul_md_updated,
             error=f"graph update failed: {e}",
         )
 
@@ -254,24 +295,8 @@ async def _rename_agent_core_locked(agent, old_name: str, new_name: str) -> Rena
             db_row_written=db_row_written,
             graph_updated=graph_updated,
             memory_updated=False,
-            soul_md_updated=False,
+            soul_md_updated=soul_md_updated,
             error=f"in-memory update failed: {e}",
-        )
-
-    # Update SOUL.md if it exists
-    try:
-        soul_md_updated = await _update_soul_name(agent, old_name, new_name)
-    except Exception as e:
-        if is_execution_control_error(e):
-            raise
-        logger.error(f"Agent rename failed during SOUL.md update: {e}", exc_info=True)
-        return RenameOutcome(
-            success=False,
-            db_row_written=db_row_written,
-            graph_updated=graph_updated,
-            memory_updated=memory_updated,
-            soul_md_updated=False,
-            error=f"SOUL.md update failed: {e}",
         )
 
     logger.info(f"Agent renamed: {old_name} -> {new_name}")
@@ -285,8 +310,74 @@ async def _rename_agent_core_locked(agent, old_name: str, new_name: str) -> Rena
     )
 
 
+def _raise_carried_cancellation(error: BaseException) -> None:
+    """Raise the cancellation ``error`` carries, if this task is being cancelled.
+
+    A storage write that fails while its task is cancelled can report its own
+    error with the cancellation as its explicit cause: SQLite does when the
+    cancellation arrives while it rolls back a refused SOUL write. The rename
+    was cancelled then, and reporting it as a failed rename would hide that
+    (#3813). A task not being cancelled was not: an expired
+    ``asyncio.timeout`` raises ``TimeoutError`` from the cancellation it used
+    to stop the work, and that failure is the rename's to report.
+    """
+    task = asyncio.current_task()
+    if task is None or not task.cancelling():
+        return
+    seen: set[int] = set()
+    pending: list[BaseException] = [error]
+    while pending:
+        current = pending.pop()
+        if id(current) in seen:
+            continue
+        seen.add(id(current))
+        if isinstance(current, asyncio.CancelledError):
+            raise current
+        if current.__cause__ is not None:
+            pending.append(current.__cause__)
+        if isinstance(current, BaseExceptionGroup):
+            pending.extend(current.exceptions)
+
+
+def _renamed_soul(content: str, old_name: str, new_name: str) -> str:
+    """``content`` with the SOUL's references to ``old_name`` renamed."""
+    patterns = [
+        (rf"# SOUL\.md\s*[-—]\s*You Are {re.escape(old_name)}", f"# SOUL.md - You Are {new_name}"),
+        (rf"# SOUL\.md\s*[-—]\s*{re.escape(old_name)}", f"# SOUL.md - {new_name}"),
+        (rf"You're {re.escape(old_name)}", f"You're {new_name}"),
+        (rf"I'm {re.escape(old_name)}", f"I'm {new_name}"),
+    ]
+    for pattern, replacement in patterns:
+        content = re.sub(pattern, replacement, content, flags=re.IGNORECASE)
+    return content
+
+
 async def _update_soul_name(agent, old_name: str, new_name: str) -> bool:
-    """Update the agent name in SOUL.md if it exists."""
+    """Update the agent name in its canonical SOUL and in SOUL.md.
+
+    The canonical SOUL, the version every boot serves, is what is renamed,
+    not whatever SOUL.md holds. The file is only its seed and cache, and
+    text read from it may predate a revision another connection has since
+    made canonical (#3813). Before anything is written, the store checks,
+    under the version lock a revision publishes under, that the version read
+    is still current; it checks a SOUL with nothing to rename too, because
+    the caller then renames the agent everywhere else. If another writer
+    made a new version current first, the rename is refused: it is not
+    retried, and nothing is written.
+
+    A SOUL.md holding the canonical text gets the renamed text. A SOUL.md
+    holding an edit that was never made canonical is renamed in place and
+    stays an uncommitted edit: a rename does not make it canonical. With no
+    canonical SOUL, the renamed file is published as boot would publish it.
+
+    Returns:
+        Whether the canonical SOUL or SOUL.md changed.
+
+    Raises:
+        ResourceVersionConflictError: another writer made a new SOUL version
+            current after the rename read the SOUL. Neither the canonical SOUL
+            nor SOUL.md was changed.
+    """
     if not hasattr(agent, 'bootstrap_service') or not agent.bootstrap_service:
         return False
 
@@ -295,58 +386,96 @@ async def _update_soul_name(agent, old_name: str, new_name: str) -> bool:
         return False
 
     soul_path = Path(agent_data_path) / "SOUL.md"
-    if not soul_path.exists():
-        return False
+    storage = getattr(agent, "storage", None)
+    read_canonical = getattr(storage, "get_current_agent_resource", None)
+    publish = getattr(storage, "promote_soul_seed", None)
+    require_current = getattr(storage, "require_current_agent_resource_version", None)
 
-    content = soul_path.read_text(encoding="utf-8")
+    # The canonical SOUL before the file: a revision landing between the two
+    # reads is then a newer current version, and the store refuses the rename.
+    canonical = await read_canonical() if read_canonical is not None else None
+    file_content = soul_path.read_text(encoding="utf-8") if soul_path.exists() else None
+    # An empty current version is no canonical SOUL, as at boot, which then
+    # serves the file.
+    canonical_content = canonical.content if canonical is not None else None
+    base = canonical_content or file_content
+    renamed = _renamed_soul(base, old_name, new_name) if base is not None else None
+    if file_content is None:
+        file_renamed = None
+    elif file_content == base:
+        file_renamed = renamed
+    else:
+        file_renamed = _renamed_soul(file_content, old_name, new_name)
+    publishes = renamed != base and publish is not None
 
-    patterns = [
-        (rf"# SOUL\.md\s*[-—]\s*You Are {re.escape(old_name)}", f"# SOUL.md - You Are {new_name}"),
-        (rf"# SOUL\.md\s*[-—]\s*{re.escape(old_name)}", f"# SOUL.md - {new_name}"),
-        (rf"You're {re.escape(old_name)}", f"You're {new_name}"),
-        (rf"I'm {re.escape(old_name)}", f"I'm {new_name}"),
-    ]
-
-    updated = False
-    for pattern, replacement in patterns:
-        new_content, count = re.subn(pattern, replacement, content, flags=re.IGNORECASE)
-        if count > 0:
-            content = new_content
-            updated = True
-
-    if updated:
-        # Privacy boundary (#2672 review P1): the renamed SOUL body is user-derived
-        # content. In a volatile privacy mode, do NOT rewrite it to disk or promote
-        # it into the encrypted resource table / durable graph — leave no trace.
-        # The in-memory agent name was already updated by the caller; the on-disk /
-        # canonical SOUL simply isn't persisted while volatile.
-        from kestrel_sovereign.features.storage_access import (
-            hides_persisted_user_content,
-        )
-        if hides_persisted_user_content(agent):
+    # Privacy boundary (#2672 review P1): the renamed SOUL body is user-derived
+    # content. In a volatile privacy mode, do NOT rewrite it to disk or promote
+    # it into the encrypted resource table / durable graph — leave no trace.
+    # The on-disk / canonical SOUL simply isn't persisted while volatile.
+    from kestrel_sovereign.features.storage_access import (
+        hides_persisted_user_content,
+    )
+    if hides_persisted_user_content(agent):
+        if publishes or file_renamed != file_content:
             logger.info(
                 "SOUL.md name not persisted on rename — durable SOUL writes are "
                 "disabled in the current privacy mode (#2672)"
             )
-            return False
+        return False
 
-        soul_path.write_text(content, encoding="utf-8")
-        storage = getattr(agent, "storage", None)
-        if storage and hasattr(storage, "promote_soul_seed"):
-            await storage.promote_soul_seed(
-                content,
-                created_by=getattr(agent, "agent_id", getattr(agent, "did", "")),
-                source=f"rename:{soul_path}",
+    # Checked even with nothing to publish: a revision naming the agent could
+    # have landed since the read, and renamed everywhere else, the agent would
+    # keep the old name in that SOUL with nothing left for a rename run again
+    # to rename (#3813).
+    expected_current = ExpectedCurrentVersion(
+        canonical.version if canonical is not None else None
+    )
+    changed = False
+    # The canonical SOUL before the file, so a refused rename leaves the file
+    # as it was.
+    if publishes:
+        await publish(
+            renamed,
+            created_by=getattr(agent, "agent_id", getattr(agent, "did", "")),
+            source=f"rename:{soul_path}",
+            expected_current=expected_current,
+        )
+        changed = True
+    elif read_canonical is not None and require_current is not None:
+        await require_current(expected_current)
+    if file_renamed != file_content:
+        try:
+            # Only over the text renamed above: an edit written to the file
+            # since it was read is not replaced with older text.
+            current_file = (
+                soul_path.read_text(encoding="utf-8") if soul_path.exists() else None
             )
-        if hasattr(agent, 'context_builder'):
-            loaded = False
-            if hasattr(agent.context_builder, "load_canonical_soul_resource"):
-                loaded = await agent.context_builder.load_canonical_soul_resource()
-            if not loaded:
-                agent.context_builder._load_soul_md()
-        return True
-
-    return False
+            if current_file == file_content:
+                soul_path.write_text(file_renamed, encoding="utf-8")
+                changed = True
+            else:
+                logger.warning(
+                    "SOUL.md changed while the rename ran; left as it is, without "
+                    "the new name"
+                )
+        except (OSError, UnicodeDecodeError) as exc:
+            if not changed:
+                raise
+            # The canonical SOUL, the one every boot serves, has the new name;
+            # SOUL.md is only its cache, and boot and !bootstrap-status report
+            # that it differs.
+            logger.warning(
+                "SOUL.md could not be updated after the canonical SOUL was "
+                "renamed: %s",
+                exc,
+            )
+    if changed and hasattr(agent, 'context_builder'):
+        loaded = False
+        if hasattr(agent.context_builder, "load_canonical_soul_resource"):
+            loaded = await agent.context_builder.load_canonical_soul_resource()
+        if not loaded:
+            agent.context_builder._load_soul_md()
+    return changed
 
 
 class BootstrapFeature(Feature):
@@ -1234,8 +1363,9 @@ class BootstrapFeature(Feature):
             new_name: The new name for the agent (1-64 characters)
 
         This will:
+        - Update the name in the canonical SOUL and in SOUL.md, first: if
+          that fails, the name is changed nowhere
         - Update the agent's name in metadata
-        - Update the SOUL.md header if it exists
         - The change takes effect immediately
         """
         if not isinstance(new_name, str):
