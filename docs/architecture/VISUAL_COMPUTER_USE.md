@@ -401,3 +401,51 @@ are exhausted. That session-specific model choice does not replace the general
 repository policy. Record the complete verdict for the exact candidate, fix
 findings, and prove regression guards with failing mutations. Unit tests do
 not claim real provider support or a completed live-agent journey.
+
+### Original native result after turn retirement
+
+The host captures `repository.original_action_result(scope, session, request,
+guard=original_effect_check)` before its one-shot dispatch CAS. It seals one
+existing prepared action row, original full session/request, initialized
+repository/data key, native backing generation, and actual plain relation.
+The CAS binds its exact new encrypted attempt payload before any driver input.
+No SQL transaction, row lock or pool checkout remains held through driver IO.
+
+The result owner exposes only `not_dispatched(original_dispatch_owner,
+exact_native_fact)`. Core constructs the matched denied receipt from its
+admitted immutable snapshot; no caller supplies SQL, a table, a callback,
+replacement IDs or receipt content. The native writer uses the same sealed
+SQLite/PostgreSQL terminal-journal engine as signal outcomes, with a separate
+closed action-table profile. It can update only that existing owner/session/
+action and exact old ciphertext, set its terminal pending projection, verify
+the complete new ciphertext, and commit. It cannot create or resurrect a row,
+change a frame/lease/control epoch, repeat input, or grant reads or delivery.
+Native catalog/postmatch reads are bounded proofs of that one write.
+
+Both host non-entry and concrete native no-stdin refusal require the same
+original dispatch owner. Accepted subprocesses and terminal SQL/COMMIT/reset
+owners are physically joined. The database retains a resource hold until the
+lexical result owner closes; database close joins that hold before retiring
+its original connection/key. Closing from the owner itself or while holding
+its needed transaction refuses. A copied, unissued, closed, foreign-task or
+rebound result owner cannot submit. Partial input, ambiguous transport and
+lost application acknowledgements remain UNKNOWN and retain quota. A lost
+SQL acknowledgement still escapes as its original UNKNOWN even if the host's
+independent proven non-entry can settle the exact denied row.
+
+Global turn retirement remains visible to all ordinary SQL, tools, network and
+private delivery. The existing final-input checker also requires canonical
+execution work on the exact original repository backend. Retirement itself
+therefore fences Docker stdin even before task cancellation arrives. The fixed
+terminal write obtains no new work admission.
+Native schema/program/key/backing changes or a CAS conflict refuse and retain
+original evidence; they never trigger a reload, replacement row, or retry.
+SQLite also retains its conservative external data-generation rule: after a
+foreign native commit, a retired result cannot borrow fresh ordinary work to
+readmit the destination. Native COMMIT uncertainty keeps its original outcome
+and cleanup owners. This first result profile covers agent actions on SDK0.43;
+human input and environment acquisition need separately reviewed profiles.
+
+A never-acquired request whose global turn was cancelled before its retirement
+write remains charged until a fresh genuinely admitted original-owner reconcile
+performs the normal safe-phase CAS. Rebinding the retired turn cannot retire it.

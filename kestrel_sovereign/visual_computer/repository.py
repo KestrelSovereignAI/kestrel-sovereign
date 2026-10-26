@@ -66,6 +66,7 @@ class VisualCustodyRepository:
         self.db, self.storage_id = db, storage_id
         self.max_requests, self.max_actions = max_requests, max_actions
         self._key = None
+        self._original_results = {}
         self._initialization_lock = asyncio.Lock()
 
     async def ensure_initialized(self):
@@ -290,8 +291,56 @@ class VisualCustodyRepository:
                 raise ResourceConflict("original retirement changed concurrently")
             return retired
 
+    @asynccontextmanager
+    async def original_action_result(self, scope, session, request, *, guard):
+        """Capture one existing prepared row before dispatch, never across IO."""
+        from kestrel_sovereign.storage.original_action_result import _OriginalActionResult, _AcceptedActionResult
+        from .dispatch import _ORIGIN
+        from kestrel_sovereign.storage.db.sqlite import SQLiteBackend
+        result = acceptance = None
+        try:
+            async with self._transaction(guard, write=False):
+                owner, session_key = self._owner(scope), self._address("session", session.session_id)
+                if session.scope != scope or request.session_id != session.session_id:
+                    raise ResourceConflict("original action result session differs")
+                row = await self.db.fetchone("SELECT payload FROM visual_computer_actions WHERE owner = ? AND session_key = ? AND action_id = ?", (owner, session_key, request.action_id))
+                if row is None:
+                    raise ResourceNotFound("original prepared action absent")
+                stored = self._open(owner, f"{session_key}:{request.action_id}", row[0], ActionRecord)
+                parent = await self.db.fetchone("SELECT request_id, payload FROM visual_computer_requests WHERE owner = ? AND session_key = ?", (owner, session_key))
+                original_session = self._open(owner, parent[0], parent[1], CustodyRecord) if parent else None
+                if original_session is None or original_session.session != session or request.control_epoch != session.control_epoch:
+                    raise ResourceConflict("original action result custody session differs")
+                origin = _ORIGIN.get()
+                if (stored.request != request or stored.receipt is not None or stored.dispatch_started
+                        or origin is None or origin.session != session):
+                    raise ResourceConflict("original prepared action result differs")
+                acceptance = _AcceptedActionResult(asyncio.current_task(), origin,
+                    (owner,session_key,request.action_id), bytes(row[0]), stored.model_dump_json())
+                self._original_results[acceptance] = None
+                result = _OriginalActionResult(self, origin, owner, session_key, row[0], stored, admission=acceptance)
+            backend = self.db.backend
+            if type(backend) is SQLiteBackend:
+                result._sqlite_relation = await backend._read_original_signal_outcome_relation(result, capture=True)
+                if result._sqlite_relation is None:
+                    raise CustodyIntegrityError("original action result requires its plain native relation")
+                table = 'main.visual_computer_actions'
+            else:
+                result._postgres_relation = await backend._capture_original_signal_outcome_relation(result)
+                table = result._postgres_relation.qualified_name
+            result._query = f"UPDATE {table} SET payload = ?, pending = 0 WHERE owner = ? AND session_key = ? AND action_id = ? AND payload = ? AND pending = 1"
+            cast = "?" if type(backend) is SQLiteBackend else "CAST(? AS BYTEA)"
+            result._match_query = f"SELECT 1 FROM {table} WHERE payload = ? AND owner = ? AND session_key = ? AND action_id = ? AND {cast} IS NOT NULL AND pending = 0"
+            guard()
+            yield result
+        finally:
+            if result is not None:
+                result.close()
+            elif acceptance is not None:
+                self._original_results.pop(acceptance, None)
+
     async def action(self, scope, session_id, action_id, *, accept=None, receipt=None, guard=None,
-                     prepare=False, dispatch_revision=None, abandon_prepared=False):
+                     prepare=False, dispatch_revision=None, abandon_prepared=False, _result_owner=None):
         async with self._transaction(guard, write=accept is not None or receipt is not None or dispatch_revision is not None or abandon_prepared):
             owner, session_key = self._owner(scope), self._address("session", session_id)
             if accept is not None or receipt is not None or dispatch_revision is not None or abandon_prepared:
@@ -332,7 +381,12 @@ class VisualCustodyRepository:
                     raise ResourceConflict("accepted action receipt changed")
                 stored.receipt, changed = receipt, True
             if changed:
-                await self.db.execute("UPDATE visual_computer_actions SET payload = ?, pending = ? WHERE owner = ? AND session_key = ? AND action_id = ?", (self._seal(owner, identity, stored), int(stored.receipt is None or stored.receipt.outcome == "unknown"), owner, session_key, action_id))
+                payload = self._seal(owner, identity, stored)
+                if _result_owner is not None:
+                    if dispatch_revision is None or _result_owner._identity != (owner, session_key, action_id):
+                        raise ResourceConflict("original result owner differs from dispatch row")
+                    _result_owner.dispatch_payload(bytes(row[0]), payload, stored)
+                await self.db.execute("UPDATE visual_computer_actions SET payload = ?, pending = ? WHERE owner = ? AND session_key = ? AND action_id = ?", (payload, int(stored.receipt is None or stored.receipt.outcome == "unknown"), owner, session_key, action_id))
             if changed and parent is not None and parent[0] and stored.receipt is not None and stored.receipt.outcome != "unknown":
                 await self.db.execute("DELETE FROM visual_computer_actions WHERE owner = ? AND session_key = ? AND action_id = ? AND pending = 0", (owner, session_key, action_id))
             return stored

@@ -224,12 +224,14 @@ async def test_lost_dispatch_ack_never_authorizes_a_second_dispatch(harness, mon
             await h.runtime.act(ctx, request)
         monkeypatch.setattr(h.repository, "action", original)
         stored = await original(h.runtime.scope(ctx), session.session_id, request.action_id)
-        assert stored.dispatch_started and stored.receipt is None and h.adapter.effects == 0
-        with pytest.raises(ResourceOutcomeUnknown):
-            await h.runtime.act(ctx, request)
+        assert stored.dispatch_started and stored.receipt.outcome == "denied" and h.adapter.effects == 0
+        assert stored.receipt.reason_code == "host_not_dispatched"
+        # The original host never entered its driver even though the SQL ACK
+        # was lost. Its fixed result owner can settle that no-effect fact;
+        # the original ResourceOutcomeUnknown above still escapes unchanged.
+        assert await h.runtime.act(ctx, request) == stored.receipt
         h.adapter.action_status = lambda *a: unavailable()
-        with pytest.raises(ResourceOutcomeUnknown):
-            await h.runtime.action_status(ctx, session.session_id, request.action_id)
+        assert await h.runtime.action_status(ctx, session.session_id, request.action_id) == stored.receipt
 
 
 @pytest.mark.asyncio

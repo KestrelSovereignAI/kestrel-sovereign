@@ -482,6 +482,8 @@ class PostgresBackend(DatabaseBackend):
         self._advisory_backend: Optional["PostgresBackend"] = None
         
         self._pool: Optional[asyncpg.Pool] = None
+        self._original_result_holds = {}
+        self._original_results_closing = False
         # PER-TASK transaction connection (#1726). Previously a single shared
         # instance attribute, which meant a concurrent task's execute()/fetch()
         # routed onto WHOEVER's transaction was open — cross-contaminating
@@ -611,6 +613,8 @@ class PostgresBackend(DatabaseBackend):
         instance._advisory_pool_lock = asyncio.Lock()
         instance._advisory_backend = advisory_backend
         instance._pool = pool
+        instance._original_result_holds = {}
+        instance._original_results_closing = False
         instance._txn_conn_var = contextvars.ContextVar("pg_txn_conn", default=None)
         instance._operational_conn_var = contextvars.ContextVar(
             "pg_operational_conn", default=None
@@ -867,6 +871,7 @@ class PostgresBackend(DatabaseBackend):
                     **pool_options,
                 )
             
+            self._original_results_closing = False
             logger.debug("Connected to PostgreSQL pool (initial: %s, maximum: %s)",
                          self._min_pool_size, self._max_pool_size)
             
@@ -881,6 +886,8 @@ class PostgresBackend(DatabaseBackend):
         an ordinary close failure or permission to skip the independent pool.
         Borrowed primary pools are only detached; their caller retains custody.
         """
+        from .original_result_custody import _drain_original_results
+        await _drain_original_results(self)
         errors: list[BaseException] = []
         for attribute in ("_advisory_pool", "_pool"):
             pool = getattr(self, attribute)
@@ -1356,7 +1363,7 @@ class PostgresBackend(DatabaseBackend):
         self, connection: Any, scopes: tuple[ExecutionCustody, ...],
         commit_state: _ExecutionCommitState | None = None,
         *, requires_commit_proof: bool | Callable[[], bool] = True,
-        admit_work: bool = False,
+        admit_work: bool = False, original_result=None,
     ) -> AsyncIterator[None]:
         """Classify native commit acknowledgement without granting work.
 
@@ -1401,6 +1408,9 @@ class PostgresBackend(DatabaseBackend):
             # Retirement may happen while it awaits; validate ordinary work
             # again without another await before creating the native exit.
             # Fixed native cleanup deliberately keeps its separate contract.
+            if original_result is not None:
+                from .original_result_custody import _require_original_result
+                _require_original_result(original_result, self)
             if admit_work:
                 require_execution_backend("postgres", scopes)
                 self._require_transaction_custody()
@@ -2257,9 +2267,12 @@ class PostgresBackend(DatabaseBackend):
                     )
                     return result == "UPDATE 1"
 
-    async def _read_original_signal_outcome_relation(self, connection, name):
+    async def _read_original_signal_outcome_relation(self, connection, name, *, journal=None):
         from kestrel_sovereign.signals.outcome_custody import _OriginalPostgresJournalRelation
         from kestrel_sovereign.signals.store import _OUTCOME_COLUMNS
+        from .original_result_custody import _original_result_profile
+        table, profile_columns = (_original_result_profile(journal) if journal is not None
+                                  else ('signal_log', None))
         row = await connection.fetchrow('''
             SELECT pg_catalog.current_database() AS database_name,
                    (SELECT d.oid::bigint FROM pg_catalog.pg_database AS d
@@ -2293,8 +2306,9 @@ class PostgresBackend(DatabaseBackend):
               AND NOT EXISTS (
                   SELECT 1 FROM pg_catalog.pg_index AS i WHERE i.indrelid OPERATOR(pg_catalog.=) c.oid
                     AND (i.indexprs IS NOT NULL OR
-                         (i.indpred IS NOT NULL AND pg_catalog.pg_get_expr(i.indpred, i.indrelid)  OPERATOR(pg_catalog.<>)  '(constitution_hash IS NOT NULL)'
-                          AND pg_catalog.pg_get_expr(i.indpred, i.indrelid)  OPERATOR(pg_catalog.<>)  'constitution_hash IS NOT NULL') OR
+                         (i.indpred IS NOT NULL AND ($3::pg_catalog.bool IS FALSE OR
+                         (pg_catalog.pg_get_expr(i.indpred, i.indrelid)  OPERATOR(pg_catalog.<>)  '(constitution_hash IS NOT NULL)'
+                          AND pg_catalog.pg_get_expr(i.indpred, i.indrelid)  OPERATOR(pg_catalog.<>)  'constitution_hash IS NOT NULL'))) OR
                          EXISTS (SELECT 1 FROM pg_catalog.pg_opclass AS op
                                  JOIN pg_catalog.pg_namespace AS onsp ON onsp.oid OPERATOR(pg_catalog.=) op.opcnamespace
                                  WHERE op.oid OPERATOR(pg_catalog.=) ANY(i.indclass)
@@ -2329,27 +2343,29 @@ class PostgresBackend(DatabaseBackend):
                   JOIN pg_catalog.pg_namespace AS tn ON tn.oid OPERATOR(pg_catalog.=) t.typnamespace
                   WHERE a.attrelid OPERATOR(pg_catalog.=) c.oid AND a.attnum OPERATOR(pg_catalog.>) 0 AND NOT a.attisdropped
                     AND (tn.nspname OPERATOR(pg_catalog.<>) 'pg_catalog' OR a.attgenerated OPERATOR(pg_catalog.<>) '' OR a.attidentity OPERATOR(pg_catalog.<>) ''))
-        ''', name, _POSTGRES_FIRST_NORMAL_OBJECT_ID)
-        if row is None or row['relation_name'] != 'signal_log':
+        ''', name, _POSTGRES_FIRST_NORMAL_OBJECT_ID, table == 'signal_log')
+        if row is None or row['relation_name'] != table:
             return None
         fields = dict(row)
         columns = fields.pop('column_names')
         types = fields.pop('column_type_oids')
         modifiers = fields.pop('column_type_modifiers')
-        if set(columns) != set(_OUTCOME_COLUMNS) or any(modifier != -1 for modifier in modifiers):
+        if set(columns) != set(profile_columns or _OUTCOME_COLUMNS) or any(modifier != -1 for modifier in modifiers):
             return None
         builtin = asyncpg.protocol.protocol.BUILTIN_TYPE_NAME_MAP
         expected = {name: builtin['text'] for name in _OUTCOME_COLUMNS}
         expected.update(duration_ms=builtin['int4'], payload_raw=builtin['jsonb'],
                         dispatched_at=builtin['timestamptz'], completed_at=builtin['timestamptz'],
                         retention_until=builtin['timestamptz'])
+        if table == 'visual_computer_actions':
+            expected = {name: builtin[{'TEXT':'text','BLOB':'bytea','BIGINT':'int8'}[kind]] for name, kind in profile_columns.items()}
         if len(types) != len(columns) or any(oid != expected[name] for name, oid in zip(columns, types)):
             return None
         return _OriginalPostgresJournalRelation(**fields)
 
     async def _capture_original_signal_outcome_relation(self, journal):
-        from kestrel_sovereign.signals.outcome_custody import _require_original_signal_outcome
-        _require_original_signal_outcome(journal, self, admission=True)
+        from kestrel_sovereign.storage.db.original_result_custody import _require_original_result
+        _require_original_result(journal, self, admission=True)
         if self.owns_open_transaction:
             raise ExecutionAuthorityError('Original signal destination refuses an enclosing transaction')
         journal._require_backing()
@@ -2378,7 +2394,9 @@ class PostgresBackend(DatabaseBackend):
                 journal._require_backing()
                 require_execution_work(self)
                 journal._postgres_pool = journal._postgres_pool.with_actual_connection(native, principal)
-                relation = await self._read_original_signal_outcome_relation(connection, 'signal_log')
+                from .original_result_custody import _original_result_profile
+                table = _original_result_profile(journal)[0]
+                relation = await self._read_original_signal_outcome_relation(connection, table, journal=journal)
                 if relation is None:
                     raise ExecutionAuthorityError('Original native signal journal requires its plain permanent audit table')
                 journal._require_backing()
@@ -2424,6 +2442,11 @@ class PostgresBackend(DatabaseBackend):
     async def _append_original_signal_outcome(self, journal):
         from kestrel_sovereign.signals.outcome_custody import _require_original_signal_outcome
         _require_original_signal_outcome(journal, self)
+        return await self._write_original_result(journal)
+
+    async def _write_original_result(self, journal):
+        from kestrel_sovereign.storage.db.original_result_custody import _require_original_result
+        _require_original_result(journal, self)
         if self.owns_open_transaction:
             raise ExecutionAuthorityError('Original signal journal refuses an enclosing transaction')
         entry = journal.begin(self)
@@ -2457,7 +2480,7 @@ class PostgresBackend(DatabaseBackend):
                 if await native._original_journal_principal() != journal._postgres_pool.principal:
                     raise journal.write_refusal('native_principal_changed')
                 journal.require_original(self)
-                async with self._tracked_native_transaction(connection, state.scopes, state):
+                async with self._tracked_native_transaction(connection, state.scopes, state, original_result=journal):
                     journal.require_original(self)
                     # Privileged catalog/proof operators must not resolve via
                     # an application's setup-controlled search_path.
@@ -2467,20 +2490,20 @@ class PostgresBackend(DatabaseBackend):
                     # lock is too late to exclude a racing trigger/rule DDL.
                     await connection.execute(f'LOCK TABLE ONLY {relation.qualified_name} IN SHARE UPDATE EXCLUSIVE MODE')
                     journal.require_original(self)
-                    if await self._read_original_signal_outcome_relation(connection, relation.qualified_name) != relation:
+                    if await self._read_original_signal_outcome_relation(connection, relation.qualified_name, journal=journal) != relation:
                         raise journal.write_refusal('destination_changed')
                     journal.require_original(self)
                     values = self._strip_tz(entry.values)
                     status = await connection.execute(query, *values)
                     journal.require_original(self)
-                    if status != 'INSERT 0 1':
+                    if status != ('UPDATE 1' if relation.relation_name == 'visual_computer_actions' else 'INSERT 0 1'):
                         raise journal.write_refusal('row_count')
                     matches = await connection.fetch(match_query, *values)
                     journal.require_original(self)
                     if len(matches) != 1 or tuple(matches[0]) != (1,):
                         raise journal.write_refusal('row_missing_or_changed')
                     journal.require_original(self)
-                    if await self._read_original_signal_outcome_relation(connection, relation.qualified_name) != relation:
+                    if await self._read_original_signal_outcome_relation(connection, relation.qualified_name, journal=journal) != relation:
                         raise journal.write_refusal('destination_changed')
                     journal.require_original(self)
             journal._acknowledgments = tuple(state.acknowledgments)
@@ -2500,6 +2523,12 @@ class PostgresBackend(DatabaseBackend):
                 journal._postgres_session = None
                 _ORIGINAL_POSTGRES_CONNECT.reset(connect_token)
         return entry.result_summary
+
+    async def _settle_original_action_result(self, journal):
+        from .original_result_custody import _original_result_profile
+        if _original_result_profile(journal)[0] != 'visual_computer_actions':
+            raise ExecutionAuthorityError('Original action result profile required')
+        return await self._write_original_result(journal)
 
     async def purge_retired_ephemeral_session(self, wrapper, *, reason: str):
         """Run only the original standalone runtime's mandatory privacy purge.

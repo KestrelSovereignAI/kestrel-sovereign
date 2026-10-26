@@ -9,7 +9,7 @@ of normal action capacity and precedes the driver's priority control call.
 from __future__ import annotations
 
 import asyncio
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, AsyncExitStack
 from dataclasses import dataclass
 from decimal import Decimal
 from enum import StrEnum
@@ -343,6 +343,8 @@ class VisualComputerRuntime:
         async with self.operation(context, VisualAction.ACT) as check:
             scope = self.scope(context)
             prepared = dispatched = inflight = driver_entered = False
+            result_stack = AsyncExitStack()
+            result_owner = original = None
             try:
                 async with self._lock(request.session_id):
                     record = await self.repository.get(scope, session_id=request.session_id, guard=check)
@@ -384,10 +386,15 @@ class VisualComputerRuntime:
                     prepared = True
                     record.frame, record.last_activity_at = None, self._now()
                     await self.repository.save(scope, record, check)
+                    original = result_stack.enter_context(original_dispatch(record.session, request))
+                    result_owner = await result_stack.enter_async_context(self.repository.original_action_result(
+                        scope, record.session, request, guard=check))
                     await self.repository.action(scope, request.session_id, request.action_id,
-                        dispatch_revision=record.revision, guard=check)
+                        dispatch_revision=record.revision, guard=check, _result_owner=result_owner)
                     dispatched = True
                 def effect_check():
+                    from kestrel_sovereign.execution_custody import require_execution_work
+                    require_execution_work(self.repository.db.backend)
                     check()
                     self._ready(record)
                     if self._control_serials.get(self._key(scope, request.session_id), 0) != serial:
@@ -404,16 +411,17 @@ class VisualComputerRuntime:
                             raise ResourceConflict("accepted visual frame/session changed before driver dispatch")
                         effect_check()
                         driver_entered = True
-                        with original_dispatch(record.session, request) as original:
+                        original.enter_driver()
+                        try:
+                            return await self._driver(record).act(record.session, request)
+                        except NativeActionNotDispatched as fact:
+                            original.require(fact)
                             try:
-                                return await self._driver(record).act(record.session, request)
-                            except NativeActionNotDispatched as fact:
-                                original.require(fact)
-                                denied = ActionReceipt(action_id=request.action_id, session_id=request.session_id,
-                                    observation_id=request.observation_id, control_epoch=request.control_epoch,
-                                    outcome="denied", recorded_at=self._now(), reason_code="host_not_dispatched")
-                                await self.repository.action(scope, request.session_id, request.action_id, receipt=denied)
-                                raise fact.original from None
+                                await result_owner.not_dispatched(original, fact)
+                            except BaseException as settlement:
+                                from kestrel_sovereign.execution_custody import execution_observation_error
+                                raise execution_observation_error(fact.original, settlement) from None
+                            raise fact.original from None
                     receipt = await self._call(context, check, dispatch)
                 self._receipt(request, receipt)
                 # Preserve accepted outcome even if Stop raced its response;
@@ -421,15 +429,13 @@ class VisualComputerRuntime:
                 await self.repository.action(scope, request.session_id, request.action_id, receipt=receipt, guard=check)
                 check()
                 return receipt
-            except BaseException:
-                if dispatched and not driver_entered:
-                    # This origin owns the acknowledged one-shot dispatch CAS,
-                    # and never entered a driver. Preserve that exact fact even
-                    # if its authority retired. This grants no further I/O.
-                    receipt = ActionReceipt(action_id=request.action_id, session_id=request.session_id,
-                        observation_id=request.observation_id, control_epoch=request.control_epoch,
-                        outcome="denied", recorded_at=self._now(), reason_code="host_not_dispatched")
-                    await self.repository.action(scope, request.session_id, request.action_id, receipt=receipt)
+            except BaseException as failure:
+                if result_owner is not None and not driver_entered:
+                    try:
+                        await result_owner.not_dispatched(original, original.refuse_unentered(failure))
+                    except BaseException as settlement:
+                        from kestrel_sovereign.execution_custody import execution_observation_error
+                        raise execution_observation_error(failure, settlement) from None
                 elif prepared and not dispatched:
                     # A lost dispatch-CAS acknowledgement stays ambiguous.
                     await self.repository.action(scope, request.session_id, request.action_id,
@@ -438,6 +444,7 @@ class VisualComputerRuntime:
             finally:
                 if inflight:
                     self._inflight -= 1
+                await result_stack.aclose()
 
     @staticmethod
     def _receipt(request, receipt):

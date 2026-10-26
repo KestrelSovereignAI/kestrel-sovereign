@@ -25,6 +25,19 @@ class _OriginalDispatch:
         self.session = ComputerSession.model_validate_json(session.model_dump_json())
         self.request = ActionRequest.model_validate_json(request.model_dump_json())
         self.active, self.trace = True, None
+        self.driver_entered = False
+
+    def enter_driver(self):
+        if not self.active or _ORIGIN.get() is not self or self.driver_entered or self.trace is not None:
+            raise ResourceOutcomeUnknown('original_driver_entry_differs')
+        self.driver_entered = True
+
+    def refuse_unentered(self, error):
+        if not self.active or _ORIGIN.get() is not self or self.driver_entered or self.trace is not None:
+            raise ResourceOutcomeUnknown('original_host_dispatch_may_have_entered')
+        trace = self.trace = _NativeDispatch(self)
+        trace.finished = True
+        return trace.refusal(error)
 
     def require(self, fact):
         trace = getattr(fact, '_trace', None)
