@@ -94,15 +94,23 @@ class ArtifactWorkspaceBroker:
                 or request.limits.max_total_bytes > 2*1024*1024):
             raise ValueError('workspace request exceeds the host transfer policy')
 
-    async def _call(self, lease, function, *args, request=None, mutation=False):
+    async def _call(self, lease, function, *args, request=None, transfer_id=None, mutation=False):
         lease.check()
+        transfer_id = request.transfer_id if request is not None else transfer_id
+        if transfer_id is None:
+            raise ValueError('workspace call requires its original transfer ID')
         deadline = min(lease.contexts.expires_at, lease.session.expires_at,
                        request.expires_at if request is not None else lease.session.expires_at)
         remaining = (deadline - self.runtime.authority.clock()).total_seconds()
         if remaining <= 0:
             raise ArtifactAccessDenied('workspace operation expired')
         try:
-            async with asyncio.timeout(remaining):
+            # The trusted transport borrows this exact original operation in
+            # its owned native task. It checks again after awaited inspection
+            # and process launch, immediately before writing private stdin.
+            # A pre/post SDK check alone cannot fence a physical installation.
+            async with asyncio.timeout(remaining), self.runtime.egress.activate_transfer(
+                    lease.session, transfer_id, lease.check, deadline=deadline):
                 if mutation:
                     lease.effect = True
                 result = await function(*args)
@@ -247,7 +255,7 @@ class ArtifactWorkspaceBroker:
     async def status(self, lease, transfer_id):
         if lease.task is not asyncio.current_task():
             raise ArtifactAccessDenied('workspace operation is not owned by this task')
-        value = await self._call(lease, lease.transfer.status, lease.session, transfer_id)
+        value = await self._call(lease, lease.transfer.status, lease.session, transfer_id, transfer_id=transfer_id)
         if value is None:
             return {'state':'unknown', 'transfer_id':transfer_id}
         if value.transfer_id != transfer_id or value.session_id != lease.session.session_id:

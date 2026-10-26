@@ -4,7 +4,9 @@ Set ARTIFACT_TEST_BROWSER_IMAGE to a locally built immutable browser image ID.
 The test creates only its own local sessions and releases their exact leases.
 """
 import asyncio
+from contextvars import ContextVar
 from datetime import UTC, datetime, timedelta
+from hashlib import sha256
 import json
 import os
 from pathlib import Path
@@ -19,6 +21,63 @@ import toml
 from kestrel_sdk.computer_use import ActionRequest, Click, TypeText
 from kestrel_sdk.payer_policy import PayerKind, PayerPolicy, PayerSpec
 from tests.shared.native_shutdown_budget import shutdown_fixture_agent
+
+
+async def _deny_native_materialization(client, agent, boundary, current, request, container_id, monkeypatch, phase, owner):
+    """Revoke the original host policy after real inspect/native launch awaits."""
+    visual=agent.features['VisualComputerFeature']
+    driver=visual.runtime.drivers['local-docker-browser']
+    target=ContextVar('artifact-test-original-materialization',default=False)
+    rpc,bound,launch=driver._rpc,driver._bound,asyncio.create_subprocess_exec
+    entered,proceed=asyncio.Event(),asyncio.Event();children=[];stdin_writes=[]
+    async def selected_rpc(session_id, operation, arguments, **kwargs):
+        token=target.set(operation=='workspace' and arguments.get('operation')=='commit_import')
+        try:return await rpc(session_id,operation,arguments,**kwargs)
+        finally:target.reset(token)
+    async def delayed_bound(*args, **kwargs):
+        value=await bound(*args,**kwargs)
+        if target.get() and not kwargs.get('cleanup'):
+            entered.set();await proceed.wait()
+        return value
+    async def delayed_launch(*args, **kwargs):
+        process=await launch(*args,**kwargs)
+        if target.get() and '/opt/kestrel-browser/rpc_client.py' in args:
+            children.append(process)
+            write=process.stdin.write
+            def observed_write(data):
+                stdin_writes.append(len(data));return write(data)
+            process.stdin.write=observed_write
+            entered.set();await proceed.wait()
+        return process
+    pending=None
+    with monkeypatch.context() as patch:
+        patch.setattr(driver,'_rpc',selected_rpc)
+        if phase=='inspect':patch.setattr(driver,'_bound',delayed_bound)
+        else:patch.setattr(asyncio,'create_subprocess_exec',delayed_launch)
+        try:
+            pending=asyncio.create_task(client.post('/api/artifacts/workspaces/materialize',json=request))
+            async with asyncio.timeout(10):await entered.wait()
+            # A new request can bind the new generation. This original one
+            # must never be resurrected by transport inspection or launch.
+            agent.features[owner]._generation+=1
+            proceed.set();response=await pending
+            assert response.status_code in {403,503},response.text
+        finally:
+            proceed.set()
+            if pending is not None and not pending.done():
+                pending.cancel();await asyncio.gather(pending,return_exceptions=True)
+    assert not stdin_writes,'revoked private commit reached native stdin'
+    assert all(child.returncode is not None for child in children),'native dispatch child was not physically reaped'
+    key=sha256(request['workspace_id'].encode()).hexdigest()
+    physical=json.loads(await boundary.invoke(['exec',container_id,'python','-c',
+        "import json;from pathlib import Path;p=Path('/tmp/kestrel-browser/workspace-transfer/workspaces/"+key+"');print(json.dumps({'target_exists':p.exists()}))"]))
+    assert not physical['target_exists'],'revoked host transfer physically installed a fresh workspace'
+    status=await client.get('/api/artifacts/workspaces/sessions/'+current['session_id']+'/transfers/'+request['transfer_id'])
+    assert status.status_code==200 and status.json()['state']=='aborted',status.text
+    assert not visual.runtime.egress._calls
+    return {'phase':phase,'retired_policy':owner,'transfer_id':request['transfer_id'],
+        'http_status':response.status_code,'native_stdin_writes':stdin_writes,'physical_target':physical,
+        'native_children_reaped':all(child.returncode is not None for child in children),'retained_cleanup':status.json()['state']}
 
 
 @pytest.mark.asyncio
@@ -121,6 +180,13 @@ async def test_real_host_docker_source_destruction_panel_edit_and_pinned_materia
                 second_ref={**first_ref,'revision_id':browser['revision_id']}
                 second=(await client.get(f"/api/artifacts/{second_ref['artifact_id']}/revisions/{second_ref['revision_id']}")).json()
                 destination=await pause(await start())
+                dispatch=[]
+                for phase in ('inspect','launch'):
+                    for owner in ('ArtifactsFeature','VisualComputerFeature'):
+                        name='denied-'+phase+'-'+owner.lower()
+                        denied={**request(destination,name,name),'source':second_ref,'manifest':second['manifest']}
+                        dispatch.append(await _deny_native_materialization(client,agent,boundary,destination,denied,
+                            containers[-1],monkeypatch,phase,owner))
                 incoming={**request(destination,'import-edited','fresh-edited'),'source':second_ref,'manifest':second['manifest']}
                 installed=await client.post('/api/artifacts/workspaces/materialize',json=incoming)
                 assert installed.status_code==200,installed.text
@@ -133,7 +199,8 @@ async def test_real_host_docker_source_destruction_panel_edit_and_pinned_materia
                 result=await client.get(f"/api/artifacts/{third_ref['artifact_id']}/revisions/{third_ref['revision_id']}/file",params={'path':'document.html'})
                 assert result.content.decode()==browser['source_text'] and third_ref['artifact_id']==first_ref['artifact_id']
                 print(json.dumps({'verdict':'PASS','path':'real host+Docker export → physical source destruction → shipped panel edit revision2 → exact fresh workspace materialization → export CAS revision3',
-                    'image':image,'containers':containers,'revisions':[first_ref,second_ref,third_ref],'browser':{k:v for k,v in browser.items() if k!='source_text'}}))
+                    'image':image,'containers':containers,'revisions':[first_ref,second_ref,third_ref],'dispatch_revocation':dispatch,
+                    'browser':{k:v for k,v in browser.items() if k!='source_text'}}))
             finally:
                 for sid in created:
                     if sid not in released:

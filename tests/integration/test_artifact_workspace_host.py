@@ -333,3 +333,54 @@ async def test_visual_grant_is_retained_and_rechecked_through_actual_transport_d
         release.set()
         if not pending.done():pending.cancel()
         await asyncio.gather(pending,return_exceptions=True)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('method', ['prepare_export', 'read_export', 'prepare_import', 'write_import_file', 'commit_import', 'status'])
+@pytest.mark.parametrize('revocation', [None, 'visual', 'artifacts'])
+async def test_broker_native_borrow_uses_original_transfer_and_both_current_grants(workspace_host, monkeypatch, method, revocation):
+    """Model a trusted transport's final dispatch after an awaited launch.
+
+    Real native-process/worker dispatch is exercised in the Docker host test.
+    This route test proves every broker data call opens the right lexical lane,
+    and either original feature's withdrawal reaches the borrowed final check.
+    """
+    h=workspace_host;current=await session(h)
+    runtime=h.agents['kite'].features['VisualComputerFeature'].runtime
+    artifacts=h.agents['kite'].features['ArtifactsFeature']
+    original=getattr(h.transfer, method);effects=[];checks=[]
+    transfer_id='native-dispatch'
+    async def guarded(admitted, *args):
+        # The production driver owns this child. The broker origin itself is
+        # deliberately ineligible to borrow transport authority.
+        async def native():
+            async with runtime.egress.transfer_operation(admitted, transfer_id) as check:
+                check();checks.append(check)
+                await asyncio.sleep(0)  # inspection/process launch boundary
+                if revocation=='visual':h.cfg['granted_actions'].remove('visual.transfer')
+                if revocation=='artifacts':artifacts._generation+=1
+                check()
+                effects.append(method)
+                return await original(admitted, *args)
+        return await asyncio.create_task(native())
+    monkeypatch.setattr(h.transfer, method, guarded)
+    if method in {'prepare_export','read_export'}:
+        body=publication(current);body['request']['transfer_id']=transfer_id
+        response=await post(h, 'publish', body)
+    elif method=='status':
+        response=await h.client.get(path()+f"/workspaces/sessions/{current['session_id']}/transfers/{transfer_id}",headers=AUTH)
+    else:
+        ref,_=await publish(h.client)
+        revision=(await h.client.get(path()+f"/{ref['artifact_id']}/revisions/{ref['revision_id']}",headers=AUTH)).json()
+        body={key:value for key,value in export_request(current,transfer_id).items() if key not in {'paths','entrypoint'}}
+        body.update(source=ref,manifest=revision['manifest'],workspace_id='native-target')
+        response=await post(h, 'materialize', body)
+    assert checks, response.text
+    assert response.status_code==(200 if revocation is None else 403), response.text
+    assert effects==([method] if revocation is None else [])
+    assert not runtime.egress._calls
+    if revocation is not None:
+        assert h.transfer.installs==0
+        if method not in {'prepare_export','prepare_import','status'}:
+            assert h.transfer.cleanups[-1][1].session_id==current['session_id']
+            assert h.transfer.cleanups[-1][2]==transfer_id
