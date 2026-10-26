@@ -2,8 +2,11 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { JSDOM } from 'jsdom';
 import createDOMPurify from 'dompurify';
+import { readFileSync } from 'node:fs';
 
-const dom = new JSDOM('<!doctype html><body></body>', { url: 'https://console.example/' });
+const dom = new JSDOM('<!doctype html><body></body>', {
+    url: 'https://console.example/', runScripts: 'outside-only',
+});
 Object.assign(globalThis, {
     window: dom.window,
     document: dom.window.document,
@@ -12,12 +15,21 @@ Object.assign(globalThis, {
     localStorage: dom.window.localStorage,
 });
 const purify = createDOMPurify(dom.window);
+for (const file of ['highlight.js', 'mermaid.js']) {
+    dom.window.eval(readFileSync(new URL(
+        '../../kestrel_sovereign/static/shared/markdown/' + file, import.meta.url,
+    ), 'utf8'));
+}
 const registry = await import('../../kestrel_sovereign/static/js/ui-ext/renderers.js');
 await import('../../kestrel_sovereign/static/js/icons.js');
 globalThis.kicon = window.kicon;
 const chat = await import('../../kestrel_sovereign/static/js/chat.js');
 const { getOrCreateChatPane } = await import('../../kestrel_sovereign/static/js/ui.js');
-chat.setChatDeps({ markdown: { sanitizeHtml: purify.sanitize } });
+chat.setChatDeps({ markdown: {
+    sanitizeHtml: purify.sanitize,
+    highlightCodeBlocks: dom.window.highlightCodeBlocks,
+    renderMermaidDiagrams: dom.window.renderMermaidDiagrams,
+} });
 
 function interactiveRenderer(id, witness) {
     return {
@@ -58,6 +70,8 @@ test('disposing a mount permits a fresh mount of the same actual DOM', () => {
         button.click();
         assert.equal(witness.disposals, 1);
         const remounted = registry.mountRenderers(container);
+        dispose();
+        registry.mountRenderers(container);
         button.click();
         assert.deepEqual(witness, { mounts: 2, clicks: 2, disposals: 1 });
         remounted();
@@ -74,6 +88,29 @@ test('unregistering a renderer disposes its existing native event listeners', ()
     try {
         registry.unregisterRenderer('retired-view');
         button.click();
+        assert.deepEqual(witness, { mounts: 1, clicks: 0, disposals: 1 });
+    } finally {
+        registry._reset();
+        container.remove();
+    }
+});
+
+test('synchronous retirement inside mount releases the eventual teardown once', () => {
+    const witness = { mounts: 0, clicks: 0, disposals: 0 };
+    const renderer = interactiveRenderer('self-retiring-view', witness);
+    const mount = renderer.mount;
+    renderer.mount = (root) => {
+        const dispose = mount(root);
+        registry.unregisterRenderer(renderer.id);
+        return dispose;
+    };
+    registry.registerRenderer(renderer);
+    const container = document.createElement('div');
+    container.innerHTML = registry.renderToSafeHtml(renderer, {}, {}, purify.sanitize, String);
+    try {
+        const dispose = registry.mountRenderers(container);
+        container.querySelector('button').click();
+        dispose();
         assert.deepEqual(witness, { mounts: 1, clicks: 0, disposals: 1 });
     } finally {
         registry._reset();
@@ -143,5 +180,41 @@ test('wiping one real chat pane releases its parts and preserves a background pa
         b.element.remove();
     }
 });
+
+for (const phase of ['streaming', 'finalization']) {
+    test(`${phase} replaces tool-card mounts without retaining old listeners`, async () => {
+        const id = 'lifecycle-tool-' + phase;
+        const witness = { mounts: 0, clicks: 0, disposals: 0 };
+        const renderer = interactiveRenderer(id, witness);
+        renderer.match = { tool: id };
+        registry.registerRenderer(renderer);
+        const pane = getOrCreateChatPane(id);
+        const message = document.createElement('div');
+        message.innerHTML = '<div class="message-content streaming"></div>';
+        pane.element.append(message);
+        const events = [{ phase: 'start', name: id, pos: 0 }];
+        try {
+            chat.updateStreamingMessage(message, '', pane.element, [], events);
+            const oldButton = message.querySelector('button');
+            assert.ok(oldButton);
+            if (phase === 'streaming') {
+                chat.updateStreamingMessage(message, '', pane.element, [], events);
+            } else {
+                pane.toolEvents = events;
+                await chat.finalizeStreamingMessage(message, '', pane);
+            }
+            oldButton.click();
+            const currentButton = message.querySelector('button');
+            assert.notEqual(currentButton, oldButton);
+            currentButton.click();
+            assert.deepEqual(witness, { mounts: 2, clicks: 1, disposals: 1 });
+            chat.wipeAgentChatPane(id);
+            assert.equal(witness.disposals, 2);
+        } finally {
+            registry._reset();
+            pane.element.remove();
+        }
+    });
+}
 
 test.after(() => { dom.window.close(); });
