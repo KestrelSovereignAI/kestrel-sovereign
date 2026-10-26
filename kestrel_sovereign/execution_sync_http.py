@@ -175,6 +175,9 @@ class _Request:
                 raise ExecutionAuthorityError("synchronous HTTP requires an original restriction")
             for restriction in self.restrictions:
                 restriction.check()
+            # Restriction callbacks can synchronously retire the original turn.
+            # They never supply or replace Core's native execution admission.
+            _require_sync_work(self.validators)
 
 
 def _request(client):
@@ -210,6 +213,9 @@ class _Stream(httpcore.NetworkStream):
                 request.check()
                 for restriction in request.restrictions:
                     restriction.check_request_write()
+                # The extra predicate may itself retire an original grant.
+                # Recheck the original owner and Core fence before any bytes.
+                request.check()
                 request.sent = True
                 if request.thread is not None:
                     request.thread.sent = True

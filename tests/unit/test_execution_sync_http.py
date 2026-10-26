@@ -83,6 +83,51 @@ def client(peer, **options):
     return httpx.Client(verify=peer.context, trust_env=False, timeout=2, **options)
 
 
+@pytest.mark.parametrize("retirement", ["host-grant", "global-turn", "original-checker"])
+async def test_write_predicates_cannot_retire_authority_then_send_native_body(
+    peer, monkeypatch, retirement,
+):
+    writes = []
+    state = {"checks": 0, "retired": False, "arm_original": False}
+    native_send = ssl.SSLSocket.send
+
+    def observe(self, data, flags=0):
+        size = native_send(self, data, flags)
+        if self.getpeername()[1] == peer.port:
+            writes.append((state["retired"], size))
+        return size
+
+    monkeypatch.setattr(ssl.SSLSocket, "send", observe)
+    with bind_execution_custody(ProcessRuntimeExecutionFence("owned-write-callback-stop")) as scope:
+        def original_check():
+            peer.check()
+            if state["arm_original"]:
+                scope.revoke("original checker retired the turn")
+                state["retired"] = True
+
+        def before_write():
+            state["checks"] += 1
+            if state["checks"] == 2:
+                if retirement == "original-checker":
+                    state["arm_original"] = True
+                else:
+                    state["retired"] = True
+                    if retirement == "host-grant":
+                        peer.current = False
+                    else:
+                        scope.revoke("extra predicate retired the turn")
+
+        with client(peer) as native, bind_native_sync_http_execution_admission(
+            native, original_check, check_before_request_write=before_write,
+        ):
+            with pytest.raises(NativeSyncHTTPOutcomeUnknown):
+                await await_native_sync_http(
+                    native, lambda c: c.post(peer.url, content=b"original").text,
+                )
+    assert state["retired"] and any(not retired for retired, _ in writes)
+    assert not [size for retired, size in writes if retired], writes
+
+
 async def test_real_native_https_keeps_original_checker_and_existing_pool(peer):
     with client(peer) as native:
         pool = native._transport._pool

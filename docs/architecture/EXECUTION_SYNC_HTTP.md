@@ -50,8 +50,11 @@ the exported constant is now 2, so consumers that require the extra boundary
 must explicitly negotiate 2. It does not claim an API1-only installed package
 has this feature. No package floor proves the feature before actual publication.
 
-The extra predicate runs after the original checks and immediately before EACH
-actual original `SSLSocket.send`, including every partial send. It must return
+The extra predicate runs for EACH actual original `SSLSocket.send`, including
+every partial send. Original checks run again after the extra predicate, and
+Core rechecks execution admission after all restriction callbacks, before any
+native bytes. A predicate cannot revoke an original grant or turn and then
+permit a send. It must return
 None or raise; coroutine functions and non-None/awaitable results are refused.
 Its lexical lifetime and copied-context refusal match the original restriction.
 It cannot replace the original checker, execution custody or any IO/delivery
