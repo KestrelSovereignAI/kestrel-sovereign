@@ -734,3 +734,28 @@ async def test_pre_execution_authority_failure_records_its_actual_class(host):
     assert tool.calls == []
     row = await backend.fetch_one("SELECT result_status, error_class FROM a2a_tool_dispatches")
     assert tuple(row) == ("error", "ExecutionAuthorityError")
+
+
+@pytest.mark.asyncio
+async def test_external_results_do_not_change_model_context_accounting(host):
+    from kestrel_sovereign.agent.orchestrator_engine import ContextStats
+    from kestrel_sovereign.llm.adapter import ToolCall
+
+    agent, _ = host
+    agent.context_stats = ContextStats()
+    agent.context_stats.record("already_in_context", {"count": 1}, 12)
+    before = agent.context_stats.get_analysis()
+    tool = _Tool(visible=True)
+    binding = _mount(agent, tool)
+    for _ in range(2):
+        await binding.invoke({"count": 3}, session_id="mcp-app:view-1")
+    assert agent.context_stats.get_analysis() == before
+    await agent._dispatch_tool_call(
+        ToolCall(id="model-call", name=binding.name, arguments={"count": 3}),
+        features_by_tool_name={}, known_tools=agent._known_tool_names(),
+        messages=[], iteration=0, user_message=None, session_id="model-session",
+    )
+    analysis = agent.context_stats.get_analysis()
+    assert analysis["total_tool_calls"] == before["total_tool_calls"] + 1
+    assert analysis["duplicate_tool_calls"] == 0
+    assert tool.calls == [{"count": 3}] * 3
