@@ -9,8 +9,15 @@ individual tools with LRU eviction.
 import hashlib
 import logging
 import re
+from copy import deepcopy
 from dataclasses import dataclass
-from typing import Any, Dict, List
+from typing import Any, Callable, Dict, List, TYPE_CHECKING
+from uuid import uuid4
+
+from kestrel_sdk.resources import ResourceConflict, ResourceOutcomeUnknown
+
+if TYPE_CHECKING:
+    from kestrel_sdk.tools.base import GovernedToolBinding
 
 from kestrel_sovereign.agent.tool_allowlist import (
     KnownToolNames,
@@ -19,6 +26,58 @@ from kestrel_sovereign.agent.tool_allowlist import (
     registry_generation,
 )
 from kestrel_sovereign.tools.result_contract import enforce_tool_result_contract
+
+
+@dataclass(frozen=True)
+class _GovernedToolBinding:
+    """An in-process reference to one owner's mounted registration batch.
+
+    The existing owner registry carries the batch identity. No second tool
+    registry or serialized bearer credential is involved.
+    """
+
+    agent: Any
+    name: str
+    owner: str
+    registration: object
+    tool: Any
+    security_feature: str
+
+    @property
+    def is_current(self) -> bool:
+        return (
+            self.agent._explored_features.get(self.owner) is self.registration
+            and self.agent._direct_tools.get(self.name) is self.tool
+            and self.agent._tool_to_feature.get(self.name) == self.owner
+        )
+
+    def require_current(self) -> None:
+        if not self.is_current:
+            raise ResourceConflict("Tool registration expired; reopen the originating view")
+
+    async def invoke(self, arguments: Dict[str, Any], *, session_id: str,
+                     source: str = "external") -> Any:
+        from kestrel_sovereign.llm.adapter import ToolCall
+        from kestrel_sovereign.storage.db.interface import DatabaseError
+
+        self.require_current()
+        if not isinstance(arguments, dict):
+            raise TypeError("Tool arguments must be a dictionary")
+        if not isinstance(session_id, str) or not session_id.strip():
+            raise ValueError("A tool invocation requires a session_id")
+        if not isinstance(source, str) or not source.strip():
+            raise ValueError("A tool invocation requires a source")
+        try:
+            return await self.agent._dispatch_tool_call(
+                ToolCall(id=str(uuid4()), name=self.name, arguments=deepcopy(arguments)),
+                features_by_tool_name={}, known_tools=self.agent._known_tool_names(),
+                messages=[], iteration=0, user_message=None, session_id=session_id,
+                bound_tool=self, source=source,
+            )
+        except DatabaseError as exc:
+            raise ResourceOutcomeUnknown(
+                "Tool audit could not be confirmed; reconcile before retrying"
+            ) from exc
 
 
 @dataclass(frozen=True)
@@ -308,7 +367,10 @@ class ToolRegistryMixin:
             self._visible_known_tool_names()
         )
 
-    def register_dynamic_tools(self, owner: str, tools, *, pin: bool = False) -> int:
+    def register_dynamic_tools(
+        self, owner: str, tools, *, pin: bool = False,
+        on_registered: "Callable[[Any, GovernedToolBinding], None] | None" = None,
+    ) -> int:
         """Mount runtime tools owned by ``owner`` into the direct-tool registry.
 
         This is the single primitive for adding first-class, LLM-callable tools
@@ -334,6 +396,13 @@ class ToolRegistryMixin:
         :meth:`unregister_dynamic_tools` treat feature- and non-feature owners
         uniformly. ``pin=True`` exempts the owner from LRU eviction.
 
+        ``schema.model_visible=False`` keeps a tool mounted and governed but
+        omits it from model schemas. Exposure is not authorization. A synchronous
+        ``on_registered(tool, binding)`` callback receives only tools retained
+        after eviction, with their actual disambiguated names. Bindings expire
+        when this owner is registered again, unmounted, or evicted, even when
+        the same tool object is reused. Callbacks must not mutate the registry.
+
         Permissions: a tool not present in the security permission store
         resolves to ``PermissionLevel.ASK`` (the safe default — never a silent
         ALLOW), so dynamically-mounted tools are always gated. Letting an
@@ -341,8 +410,11 @@ class ToolRegistryMixin:
         feature only enumerates ``self.agent.features`` today) is handled in
         #1979 PR5; it is a convenience, not a safety gap.
         """
+        if on_registered is not None and not callable(on_registered):
+            raise TypeError("on_registered must be callable")
         safe_owner = re.sub(r"\W+", "_", str(owner))
-        self._explored_features[owner] = True
+        registration = object()
+        self._explored_features[owner] = registration
         if pin:
             self._pinned_features.add(owner)
         mounted = []
@@ -357,16 +429,25 @@ class ToolRegistryMixin:
             self._direct_tools[name] = tool
             tool_def = tool.schema.to_openai_format()
             tool_def["function"]["name"] = name
-            self._direct_tool_defs.append(tool_def)
+            if getattr(tool.schema, "model_visible", True) is not False:
+                self._direct_tool_defs.append(tool_def)
             self._tool_to_feature[name] = owner
-            mounted.append(name)
+            mounted.append((name, tool))
         bump_registry_generation(self)
         self._maybe_evict_direct_tools()
-        registered = sum(1 for name in mounted if name in self._direct_tools)
+        retained = [(name, tool) for name, tool in mounted
+                    if self._direct_tools.get(name) is tool]
+        registered = len(retained)
         logging.info(
             f"[DYNAMIC-TOOLS] Registered {registered} of {len(mounted)} direct "
             f"tools for '{owner}'. Total: {len(self._direct_tools)}"
         )
+        if on_registered is not None:
+            for name, tool in retained:
+                on_registered(tool, _GovernedToolBinding(
+                    self, name, owner, registration, tool,
+                    self._security_feature_name_for_tool(name),
+                ))
         return registered
 
     def unregister_dynamic_tools(self, owner: str) -> int:

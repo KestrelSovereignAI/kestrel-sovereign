@@ -37,6 +37,7 @@ from typing import (
 
 from kestrel_sdk.hooks.base import HookEvent, HookInput
 from kestrel_sdk.llm import ToolCallStarted
+from kestrel_sdk.resources import ResourceConflict, ResourceUnsupported
 
 from kestrel_sovereign._async_ownership import (
     await_owned_task,
@@ -2173,6 +2174,8 @@ class OrchestratorEngineMixin:
         streaming: bool = False,
         session_id: str = "orchestrator",
         effective_model: Optional[str] = None,
+        bound_tool=None,
+        source: str = "model",
     ):
         """
         Dispatch a single tool call — used by both streaming and non-streaming loops.
@@ -2185,7 +2188,7 @@ class OrchestratorEngineMixin:
         args = tool_call.arguments if isinstance(tool_call.arguments, dict) else {}
         log_prefix = "[ORCHESTRATOR-STREAM]" if streaming else "[ORCHESTRATOR]"
         dispatch_start = time.time()
-        dispatch_meta: Dict[str, Optional[str]] = {}
+        dispatch_meta: Dict[str, Any] = {}
 
         from kestrel_sovereign.signals.constitution_canary import (
             PHANTOM_RECEIPT_TOOL_NAME,
@@ -2196,7 +2199,12 @@ class OrchestratorEngineMixin:
         # constitution receipt call is a call of the turn too.
         call_context = begin_tool_call(self, known_tools)
 
-        if tool_name == PHANTOM_RECEIPT_TOOL_NAME:
+        if bound_tool is not None:
+            bound_tool.require_current()
+            if not callable(getattr(getattr(self, "observability_store", None), "log_tool_dispatch", None)):
+                raise ResourceUnsupported("Required tool dispatch audit store is unavailable")
+
+        if tool_name == PHANTOM_RECEIPT_TOOL_NAME and bound_tool is None:
             handler = getattr(self, "_handle_constitution_receipt_tool", None)
             if not callable(handler):
                 result = {
@@ -2286,6 +2294,7 @@ class OrchestratorEngineMixin:
                 status_hint="error",
                 error_class="ToolValidationError",
                 error_message=f"Tool validation failed: {validation_error}",
+                **({"required": True} if bound_tool is not None else {}),
             )
             return
 
@@ -2296,7 +2305,8 @@ class OrchestratorEngineMixin:
         dispatch_event_id = await self.observability_store.log_tool_call(
             agent_name=self.did,
             tool_name=f"feature_dispatch:{tool_name}",
-            metadata={"arguments": args, "iteration": iteration}
+            metadata={"arguments": args, "iteration": iteration, "source": source},
+            **({"session_id": session_id} if bound_tool is not None else {}),
         )
 
         feature = features_by_tool_name.get(tool_name)
@@ -2318,7 +2328,15 @@ class OrchestratorEngineMixin:
         # A tool that dispatches another by name from here makes a nested
         # call, positioned at this one rather than counted again (#2935).
         with tool_call_scope(self, call_context):
-            if feature:
+            if bound_tool is not None:
+                result = await self._dispatch_direct_tool(
+                    tool_call, tool_name, args, dispatch_start, dispatch_event_id,
+                    tool_events=tool_events, streaming=streaming,
+                    session_id=session_id, dispatch_meta=dispatch_meta,
+                    call_context=call_context, tool=bound_tool.tool,
+                    bound_tool=bound_tool, feature_name=bound_tool.security_feature,
+                )
+            elif feature:
                 # The guardrails are done with a subagent dispatch; anything that
                 # refuses it from here on is the permission layer's decision.
                 record_tool_acceptance(self, call_context, tool_name)
@@ -2431,15 +2449,19 @@ class OrchestratorEngineMixin:
             tool_name=tool_name,
             adapter=OrchestratorEngineMixin._tool_call_adapter(
                 self, tool_name, features_by_tool_name
-            ),
-            args=args,
+            ) if bound_tool is None else f"{bound_tool.owner}.{tool_name}",
+            args=dispatch_meta.get("arguments", args),
             result=result,
             session_id=session_id,
             dispatch_start=dispatch_start,
             status_hint=dispatch_meta.get("status"),
             error_class=dispatch_meta.get("error_class"),
             error_message=dispatch_meta.get("error_message"),
+            **({"required": True} if bound_tool is not None else {}),
         )
+
+        if bound_tool is not None and dispatch_meta.get("binding_expired"):
+            raise ResourceConflict("Tool registration expired; reopen the originating view")
 
         return result
 
@@ -2465,15 +2487,20 @@ class OrchestratorEngineMixin:
         status_hint: Optional[str] = None,
         error_class: Optional[str] = None,
         error_message: Optional[str] = None,
+        required: bool = False,
     ) -> None:
-        """Best-effort structured dispatch log. Never affects tool behavior."""
+        """Build the canonical dispatch entry, optionally requiring persistence."""
         observability_store = getattr(self, "observability_store", None)
         if observability_store is None:
+            if required:
+                raise ResourceUnsupported("Required tool dispatch audit store is unavailable")
             return
         log_dispatch = getattr(observability_store, "log_tool_dispatch", None)
-        if log_dispatch is None:
+        if log_dispatch is None and not required:
             log_dispatch = getattr(observability_store, "log_structured_tool_call", None)
         if log_dispatch is None:
+            if required:
+                raise ResourceUnsupported("Required tool dispatch audit writer is unavailable")
             return
         try:
             normalized_session_id = real_session_id(session_id)
@@ -2494,10 +2521,11 @@ class OrchestratorEngineMixin:
                     error_message=error_message,
                     latency_ms=int((time.time() - dispatch_start) * 1000),
                     result_size_bytes=tool_result_size_bytes(result),
-                )
+                ),
+                **({"required": True} if required else {}),
             )
         except Exception as exc:
-            if is_execution_control_error(exc):
+            if required or is_execution_control_error(exc):
                 raise
             print(f"a2a_tool_dispatches dispatch wrapper failed: {exc}", file=sys.stderr)
 
@@ -2774,6 +2802,7 @@ class OrchestratorEngineMixin:
         *, tool_events=None, streaming=False, session_id="orchestrator",
         dispatch_meta=None, tool=None, feature_name=None,
         call_context: Optional[ToolCallContext] = None,
+        bound_tool=None,
     ):
         """Dispatch a direct tool call (no subagent LLM hop).
 
@@ -2827,6 +2856,14 @@ class OrchestratorEngineMixin:
         record_tool_acceptance(self, call_context, tool_name)
 
         async def _exec_direct(effective_args, t=tool):
+            if bound_tool is not None:
+                dispatch_meta["binding_expired"] = not bound_tool.is_current
+                bound_tool.require_current()
+                dispatch_meta["arguments"] = effective_args
+                effective_args, error = normalize_direct_tool_arguments(tool_name, t, effective_args)
+                if error is not None:
+                    raise ValueError(error)
+                dispatch_meta["arguments"] = effective_args
             return await t.execute(**effective_args)
 
         try:

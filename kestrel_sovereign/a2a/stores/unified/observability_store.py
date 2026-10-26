@@ -381,8 +381,10 @@ class ObservabilityStore(UnifiedStoreBase):
 
         logger.info(f"ObservabilityStore initialized ({self._backend.backend_type})")
 
-    async def log_tool_dispatch(self, entry: ToolDispatchEntry) -> None:
-        """Best-effort structured insert. Never break dispatch on log failure."""
+    async def log_tool_dispatch(
+        self, entry: ToolDispatchEntry, *, required: bool = False,
+    ) -> None:
+        """Write the canonical dispatch row; required callers observe failures."""
         try:
             await self._backend.execute(
                 """
@@ -412,6 +414,8 @@ class ObservabilityStore(UnifiedStoreBase):
                 ),
             )
         except Exception as exc:
+            if required:
+                raise
             print(f"a2a_tool_dispatches write failed: {exc}", file=sys.stderr)
 
     async def log_structured_tool_call(self, entry: ToolDispatchEntry) -> None:

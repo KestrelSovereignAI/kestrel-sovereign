@@ -6,13 +6,16 @@ import json
 import pytest
 import pytest_asyncio
 from kestrel_sdk.hooks.base import Hook, HookEvent, HookOutput
-from kestrel_sdk.resources import ResourceConflict, ResourceOutcomeUnknown
+from kestrel_sdk.resources import ResourceConflict, ResourceOutcomeUnknown, ResourceUnsupported
 from kestrel_sdk.tools.base import ToolCategory, ToolParameter, ToolSchema
 
 from kestrel_sovereign.a2a.stores.unified.observability_store import ObservabilityStore
 from kestrel_sovereign.agent.orchestrator_engine import OrchestratorEngineMixin
 from kestrel_sovereign.agent.tool_registry import ToolRegistryMixin
 from kestrel_sovereign.hooks.manager import HooksManager
+from kestrel_sovereign.features.security.approval_queue import ApprovalQueue, ApprovalStatus
+from kestrel_sovereign.features.security.hooks import SecurityHook
+from kestrel_sovereign.features.security.permissions import PermissionLevel, PermissionStore
 from kestrel_sovereign.storage.db.sqlite import SQLiteBackend
 
 
@@ -52,11 +55,23 @@ class _Agent(OrchestratorEngineMixin, ToolRegistryMixin):
         self.hooks_manager, self.observability_store = HooksManager(), store
 
 
+class _Store(ObservabilityStore):
+    """Real store with a scheduling point after the admission write."""
+
+    on_admitted = None
+
+    async def log_tool_call(self, *args, **kwargs):
+        result = await super().log_tool_call(*args, **kwargs)
+        if self.on_admitted is not None:
+            await self.on_admitted()
+        return result
+
+
 @pytest_asyncio.fixture
 async def host(tmp_path):
     backend = SQLiteBackend(str(tmp_path / "app-dispatches.db"))
     await backend.connect()
-    store = ObservabilityStore(backend)
+    store = _Store(backend)
     await store.initialize()
     try:
         yield _Agent(store), backend
@@ -170,3 +185,237 @@ async def test_failed_structured_audit_is_unknown_and_never_reexecutes(host):
     with pytest.raises(ResourceOutcomeUnknown, match="audit"):
         await binding.invoke({"count": 3}, session_id="mcp-app:view-1")
     assert tool.calls == [{"count": 3}]
+
+
+@pytest.mark.asyncio
+async def test_replacement_while_admission_is_awaited_cannot_redirect_the_call(host):
+    agent, backend = host
+    original, replacement = _Tool(), _Tool()
+    binding = _mount(agent, original)
+
+    async def replace():
+        agent.unregister_dynamic_tools("mcp:views")
+        _mount(agent, replacement, owner="mcp:replacement")
+
+    agent.observability_store.on_admitted = replace
+    policy = _Policy(HookOutput.allow())
+    agent.hooks_manager.register(policy)
+    with pytest.raises(ResourceConflict):
+        await binding.invoke({"count": 3}, session_id="mcp-app:view-1")
+    assert original.calls == replacement.calls == []
+    assert policy.inputs[0].feature_name == "mcp:views"
+    row = await backend.fetch_one("SELECT adapter, error_class FROM a2a_tool_dispatches")
+    assert tuple(row) == ("mcp:views.view_update", "ResourceConflict")
+
+
+@pytest.mark.asyncio
+async def test_hook_modified_arguments_are_validated_before_execution(host):
+    agent, backend = host
+    tool = _Tool()
+    binding = _mount(agent, tool)
+    agent.hooks_manager.register(_Policy(HookOutput.modify({"misspelled": 7})))
+    result = await binding.invoke({"count": 3}, session_id="mcp-app:view-1")
+    assert result["success"] is False
+    assert "misspelled" in result["error"]
+    assert tool.calls == []
+    row = await backend.fetch_one("SELECT args_redacted FROM a2a_tool_dispatches")
+    assert json.loads(row[0]) == {"misspelled": 7}
+
+
+@pytest.mark.asyncio
+async def test_business_resource_conflict_is_not_misreported_as_stale_binding(host):
+    class ConflictingTool(_Tool):
+        async def execute(self, **args):
+            raise ResourceConflict("Domain revision changed")
+
+    agent, _ = host
+    binding = _mount(agent, ConflictingTool())
+    result = await binding.invoke({"count": 3}, session_id="mcp-app:view-1")
+    assert result == {"success": False, "error": "Domain revision changed"}
+    assert binding.is_current
+
+
+@pytest.mark.asyncio
+async def test_collision_uses_actual_name_and_original_permission_owner(host):
+    agent, _ = host
+    first, second = _Tool(), _Tool()
+    _mount(agent, first)
+    binding = _mount(agent, second, owner="mcp:second")
+    policy = _Policy(HookOutput.allow())
+    agent.hooks_manager.register(policy)
+    await binding.invoke({"count": 4}, session_id="mcp-app:view-1")
+    assert binding.name == "view_update_2"
+    assert first.calls == []
+    assert second.calls == [{"count": 4}]
+    assert policy.inputs[0].feature_name == "mcp:second"
+    assert policy.inputs[0].tool_name == binding.name
+
+
+@pytest.mark.asyncio
+async def test_evicted_mount_is_not_offered_to_callback(host):
+    agent, _ = host
+    agent.MAX_DIRECT_TOOLS = 1
+    agent.register_dynamic_tools("pinned", [_Tool("pinned")], pin=True)
+    offered = []
+    assert agent.register_dynamic_tools(
+        "overflow", [_Tool()], on_registered=lambda *pair: offered.append(pair),
+    ) == 0
+    assert offered == []
+
+
+@pytest.mark.asyncio
+async def test_lru_eviction_expires_binding(host):
+    agent, _ = host
+    agent.MAX_DIRECT_TOOLS = 1
+    old = _mount(agent, _Tool())
+    current = _mount(agent, _Tool("new"), owner="mcp:new")
+    assert not old.is_current
+    assert current.is_current
+    with pytest.raises(ResourceConflict):
+        await old.invoke({"count": 3}, session_id="mcp-app:view-1")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("missing_store", [False, True])
+async def test_missing_audit_writer_refuses_before_any_effect(host, monkeypatch, missing_store):
+    agent, _ = host
+    tool = _Tool()
+    binding = _mount(agent, tool)
+    if missing_store:
+        monkeypatch.setattr(agent, "observability_store", None)
+    else:
+        monkeypatch.setattr(agent.observability_store, "log_tool_dispatch", None)
+    with pytest.raises(ResourceUnsupported, match="audit"):
+        await binding.invoke({"count": 3}, session_id="mcp-app:view-1")
+    assert tool.calls == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("arguments,session_id,source,error", [
+    ([], "mcp-app:view-1", "external", TypeError),
+    ({"count": 3}, "", "external", ValueError),
+    ({"count": 3}, None, "external", ValueError),
+    ({"count": 3}, "mcp-app:view-1", "", ValueError),
+    ({"count": 3}, "mcp-app:view-1", None, ValueError),
+])
+async def test_binding_requires_valid_invocation_context(host, arguments, session_id, source, error):
+    agent, _ = host
+    tool = _Tool()
+    binding = _mount(agent, tool)
+    with pytest.raises(error):
+        await binding.invoke(arguments, session_id=session_id, source=source)
+    assert tool.calls == []
+
+
+@pytest.mark.asyncio
+async def test_invalid_callback_does_not_mutate_registry(host):
+    agent, _ = host
+    with pytest.raises(TypeError, match="on_registered"):
+        agent.register_dynamic_tools("mcp:views", [_Tool()], on_registered=7)
+    assert agent._direct_tools == agent._explored_features == {}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("decision", ["allow", "deny", "approve", "reject", "replace", "cancel"])
+async def test_binding_uses_native_permission_store_and_approval_queue(host, tmp_path, decision):
+    agent, backend = host
+    tool = _Tool()
+    binding = _mount(agent, tool)
+    permissions = PermissionStore(str(tmp_path / "permissions.db"))
+    await permissions.initialize()
+    requests = asyncio.Queue()
+
+    async def added(request):
+        await requests.put(request)
+
+    approvals = ApprovalQueue(on_request_added=added, permission_store=permissions, agent=agent)
+    agent.hooks_manager.register(SecurityHook(permissions, approvals))
+    if decision in {"allow", "deny"}:
+        await permissions.set_permission(
+            "mcp:views", binding.name,
+            PermissionLevel.ALLOW if decision == "allow" else PermissionLevel.DENY,
+        )
+    call = asyncio.create_task(binding.invoke({"count": 3}, session_id="mcp-app:view-1"))
+    try:
+        if decision not in {"allow", "deny"}:
+            request = await requests.get()
+            assert request.feature_name == "mcp:views"
+            assert request.tool_name == binding.name
+            assert not call.done()
+            assert tool.calls == []
+            if decision == "replace":
+                agent.unregister_dynamic_tools("mcp:views")
+                _mount(agent, tool)
+            if decision == "cancel":
+                call.cancel()
+            else:
+                await approvals.submit_decision(request.id, decision != "reject", "once")
+        if decision == "replace":
+            with pytest.raises(ResourceConflict):
+                await call
+        elif decision == "cancel":
+            with pytest.raises(asyncio.CancelledError):
+                await call
+            assert request.status == ApprovalStatus.AWAITER_GONE
+            late = await approvals.submit_decision(request.id, True, "once")
+            assert late.awaiter_gone and late.persisted
+            assert approvals.pending_count == 0
+        else:
+            result = await call
+            assert result["success"] is (decision in {"allow", "approve"})
+        expected = [{"count": 3}] if decision in {"allow", "approve"} else []
+        assert tool.calls == expected
+        assert await permissions.get_audit_log()
+        if decision != "cancel":
+            rows = await backend.fetch_all("SELECT result_status FROM a2a_tool_dispatches")
+            assert len(rows) == 1
+        if decision == "approve":
+            # A once-only approval cannot authorize a second app request.
+            call = asyncio.create_task(binding.invoke({"count": 4}, session_id="mcp-app:view-1"))
+            request = await requests.get()
+            assert not call.done()
+            assert tool.calls == expected
+            await approvals.submit_decision(request.id, False, "once")
+            assert (await call)["success"] is False
+            assert tool.calls == expected
+    finally:
+        approvals.cancel_all()
+        if not call.done():
+            call.cancel()
+        await asyncio.gather(call, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_registering_owner_again_expires_prior_batch(host):
+    agent, _ = host
+    old = _mount(agent, _Tool())
+    new = _mount(agent, _Tool("new"))
+    assert not old.is_current
+    assert new.is_current
+
+
+@pytest.mark.asyncio
+async def test_bound_arguments_are_an_independent_snapshot_while_approval_waits(host):
+    agent, _ = host
+    tool = _Tool()
+    binding = _mount(agent, tool)
+    entered, resume = asyncio.Event(), asyncio.Event()
+
+    async def pending():
+        entered.set()
+        await resume.wait()
+
+    agent.hooks_manager.register(_Policy(HookOutput.allow(), before=pending))
+    arguments = {"count": {"nested": [3]}}
+    call = asyncio.create_task(binding.invoke(arguments, session_id="mcp-app:view-1"))
+    try:
+        await entered.wait()
+        arguments["count"]["nested"][0] = 9
+        resume.set()
+        await call
+        assert tool.calls == [{"count": {"nested": [3]}}]
+    finally:
+        resume.set()
+        if not call.done():
+            call.cancel()
+        await asyncio.gather(call, return_exceptions=True)
