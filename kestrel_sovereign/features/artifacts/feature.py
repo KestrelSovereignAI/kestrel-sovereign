@@ -21,7 +21,7 @@ from kestrel_sdk.operator import OperatorContext
 from kestrel_sdk.security.encryption import get_fernet
 
 from kestrel_sovereign._async_rwlock import AsyncReaderWriterLock
-from kestrel_sovereign.artifacts.http import create_artifact_router
+from kestrel_sovereign.artifacts.http import create_artifact_router, _delivery_error
 from kestrel_sovereign.artifacts.preview import DockerArtifactRenderer, host_preview_pool
 from kestrel_sovereign.artifacts.repository import ArtifactIntegrityError, ArtifactRepository
 from kestrel_sovereign.artifacts.service import (
@@ -43,6 +43,7 @@ from kestrel_sovereign.features.storage_access import (
 from kestrel_sovereign.security.host_authority import (
     HostAuthorityError, require_sovereign_caller, stable_sovereign_secret,
 )
+from kestrel_sovereign.security.private_delivery import AuthorizedCapabilityResponse
 from kestrel_sovereign.execution_custody import is_execution_control_error
 from kestrel_sovereign.storage.privacy_wrapper import require_durable_persistence_gate
 from kestrel_sovereign.turn_scope import capture_turn_scope
@@ -55,6 +56,7 @@ class ArtifactsFeature(ArtifactProducerTools, ArtifactWorkspaceTools, Feature):
 
     supports_subagent_dispatch = False
     promote_tools_on_startup = True
+    artifact_bridge_api_version = 1
 
     def __init__(self, agent):
         super().__init__(agent)
@@ -105,6 +107,52 @@ class ArtifactsFeature(ArtifactProducerTools, ArtifactWorkspaceTools, Feature):
 
     def get_router(self):
         return self._router
+
+    @asynccontextmanager
+    async def artifact_operation(self, request=None):
+        """Version 1 original-caller service bridge; no run/delegated grant.
+
+        Yield ``(service, artifact_context)`` while retaining the original
+        privacy and current feature/caller READ lease. Service operations still
+        check their own actions. A context cannot be reused after this frame.
+        HTTP producers must retain this frame through actual private delivery,
+        or use artifact_response. Independent policies retain their own lease.
+        """
+        resolver = self._resolve_context(request) if request is not None else self._resolve_tool_context()
+        async with resolver as context:
+            service = self._service
+            async with service.authority.operation(context, ArtifactAction.READ, service.repository.storage_id) as check:
+                check()
+                yield service, context
+                check()
+
+    def artifact_response(self, request, build):
+        """Retain only original artifact authority through final ASGI delivery.
+
+        ``await build(service, artifact_context)`` returns a Response. A
+        workflow wrapper must separately retain its original run resolver
+        through the Response's ASGI call and use its existing final-delivery
+        primitive. A run scope/lease never substitutes for artifact authority;
+        an independent resolver closed inside build cannot be resurrected here.
+        """
+        if not callable(build):
+            raise TypeError('artifact response builder required')
+        service = self._service
+        if service is None:
+            raise ArtifactAccessDenied('artifact runtime is unavailable')
+        @asynccontextmanager
+        async def resolve(current_request):
+            async with self.artifact_operation(current_request) as (original, context):
+                if original is not service:
+                    raise ArtifactAccessDenied('artifact runtime changed')
+                yield context
+        async def body(context):
+            return await build(service, context)
+        return AuthorizedCapabilityResponse(request, authority=service.authority,
+            resolve_context=resolve,
+            operation=lambda context,value:service.authority.operation(context, ArtifactAction.READ, service.repository.storage_id),
+            build=body, access_denied=ArtifactAccessDenied,
+            error_response=lambda error,prepared:_delivery_error(error, prepared, request))
 
     async def on_enable(self):
         if self._service is None:

@@ -300,6 +300,18 @@ data authority, and cleanup status is separate from saved ownership. HTML
 source can be edited as inert text in the shared panel; it never executes or
 renders as a browser document there.
 
+First-party producers consume `ArtifactsFeature.artifact_bridge_api_version`
+1: `async with feature.artifact_operation(request=None) as (service, context)`
+retains the original caller's artifact/privacy lease; service methods still
+check each action. `feature.artifact_response(request, build)` calls the async
+`build(service, context)` callback and retains artifact custody through actual
+final ASGI delivery. A workflow wrapper must separately retain its original
+independent run resolver through the Response ASGI call using its existing
+outer delivery primitive. A resolver closed inside the callback cannot grant
+later delivery, and no run lease is converted into artifact authority. Candidate
+Core bridge availability is an explicit installation gate; consumers never
+fall back to private feature fields or another content store.
+
 The computer view exposes session state, active controller, Stop and takeover.
 It links outputs by artifact reference, without embedding lifecycle ownership.
 Closing the view or losing its transport does not silently release or resume
