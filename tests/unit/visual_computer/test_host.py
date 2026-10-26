@@ -221,3 +221,35 @@ async def test_actual_stop_route_does_not_wait_behind_privacy_writer(visual_host
         active.cancel()
         writer.cancel()
         await asyncio.gather(active,writer,return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_visual_plan_uses_original_caller_configured_model_and_host_router(visual_host,monkeypatch):
+    import sys
+    from kestrel_sovereign.auth import CallerContext,caller_context_scope
+    from kestrel_sdk.operator import OperatorAuthorizationError
+    client,agents,_=visual_host
+    admitted=await client.post(path()+"/requests",headers=AUTH,json=intent())
+    sid=admitted.json()["session_id"]
+    feature=agents["kite"].features["VisualComputerFeature"]
+    service=object()
+    agents["kite"].llm_service=service
+    feature._cfg["visual_model"]="explicit-visual-model"
+    agents["kite"].privacy_config.processing="local"
+    calls=[]
+    class Planner:
+        def __init__(self,runtime,llm_service):
+            assert runtime is feature.runtime and llm_service is service
+        async def plan(self,context,session_id,prompt,**kwargs):
+            calls.append((context,session_id,prompt,kwargs))
+            return {"frame":None,"action_request":None,"answer":"Finished"}
+    monkeypatch.setitem(sys.modules,"kestrel_sovereign.visual_computer.inference",SimpleNamespace(VisualInference=Planner))
+    with caller_context_scope(CallerContext.sovereign(credential=KEY)):
+        answer=await feature.visual_plan(sid,"Summarize this screen")
+    assert answer == {"frame":None,"action_request":None,"answer":"Finished"}
+    context,session,prompt,kwargs=calls[0]
+    assert context.tenant_id == "did:test:kite" and context.acting_agent_id == "did:test:kite"
+    assert session == sid and kwargs == {"model_override":"explicit-visual-model","force_local_only":True}
+    with caller_context_scope(CallerContext.authenticated("peer")),pytest.raises(OperatorAuthorizationError):
+        await feature.visual_plan(sid,"Read")
+    assert len(calls)==1

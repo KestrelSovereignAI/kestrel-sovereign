@@ -118,3 +118,11 @@ Workspace transfer uses the same original host operation boundary but requires
 a verified paused session with no controller and the exact current control
 epoch. A new control intent invalidates that transfer's synchronous check.
 Observation/model operations continue to require a ready agent controller.
+
+`visual_plan(session_id, prompt)` invokes `VisualInference` using the original
+bound caller and the agent's existing LLM service. An optional trusted
+`visual_model` setting selects an explicit model; model input cannot override
+that selection. Current processing privacy forces the existing router's local
+policy when required. The result contains one host-generated, observation-bound
+ActionRequest or a finished answer. It does not automatically submit input;
+execution and original-ID status reconciliation use the existing action tools.

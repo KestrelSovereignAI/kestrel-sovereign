@@ -264,3 +264,23 @@ class VisualComputerFeature(Feature):
             return None
         return UIContributions(static_dir=str(Path(__file__).parent / "static"),
             modules=["visual-computer.js"], capability="visual-computer")
+
+    @tool(name="visual_plan", description="Plan one observation-bound visual action through the host inference router")
+    async def visual_plan(self, session_id: str, prompt: str) -> dict:
+        """Observe and plan once; submitting an action remains a separate authorized call."""
+        if not isinstance(prompt, str) or not prompt.strip() or len(prompt.encode()) > 32*1024:
+            raise ValueError("visual planning requires a bounded nonempty prompt")
+        service = getattr(self.agent, "llm_service", None)
+        if service is None:
+            raise RuntimeError("the host inference service is unavailable")
+        model = self._cfg.get("visual_model")
+        if model is not None and (not isinstance(model,str) or not model.strip() or len(model)>512):
+            raise ValueError("configured visual model is invalid")
+        from kestrel_sovereign.visual_computer.inference import VisualInference
+        force_local = getattr(getattr(self.agent,"privacy_config",None),"processing",None) != "cloud"
+        async with self._bind_context(current_caller_context()) as context:
+            async with self.runtime.operation(context,VisualAction.OBSERVE):
+                result = await VisualInference(self.runtime,service).plan(context,session_id,prompt,
+                    model_override=model,force_local_only=force_local)
+                return {key:value.model_dump(mode="json") if hasattr(value,"model_dump") else value
+                        for key,value in result.items()}
