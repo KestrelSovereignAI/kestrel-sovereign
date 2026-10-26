@@ -11,13 +11,12 @@ import logging
 import re
 from copy import deepcopy
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, List, TYPE_CHECKING
+from typing import Any, Callable, Dict, List
 from uuid import uuid4
 
 from kestrel_sdk.resources import ResourceConflict, ResourceOutcomeUnknown
 
-if TYPE_CHECKING:
-    from kestrel_sdk.tools.base import GovernedToolBinding
+from kestrel_sdk.tools.base import GovernedToolBinding
 
 from kestrel_sovereign.agent.tool_allowlist import (
     KnownToolNames,
@@ -369,7 +368,7 @@ class ToolRegistryMixin:
 
     def register_dynamic_tools(
         self, owner: str, tools, *, pin: bool = False,
-        on_registered: "Callable[[Any, GovernedToolBinding], None] | None" = None,
+        on_registered: Callable[[Any, GovernedToolBinding], None] | None = None,
     ) -> int:
         """Mount runtime tools owned by ``owner`` into the direct-tool registry.
 
