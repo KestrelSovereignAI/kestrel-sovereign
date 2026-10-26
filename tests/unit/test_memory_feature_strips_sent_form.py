@@ -165,15 +165,23 @@ async def test_search_memory_returns_raw_user_text_to_llm():
     assert out.status is ToolResultStatus.OK
     results = out.data["results"]
     user_rows = [r for r in results if r["role"] == "user"]
-    assert user_rows[0]["content"] == RAW_USER
+    assert user_rows[0]["snippet"] == RAW_USER
     # Assistant unchanged — guards against over-stripping.
     assistant_rows = [r for r in results if r["role"] == "assistant"]
-    assert assistant_rows[0]["content"] == "I remember."
+    assert assistant_rows[0]["snippet"] == "I remember."
+
+
+def _in_live_turn(feature, session_id=None):
+    """Run ``feature``'s calls as if inside the agent's live turn."""
+    feature.agent = MagicMock()
+    feature.agent.owns_live_turn = MagicMock(return_value=True)
+    feature.agent.get_turn_bound_session_id = MagicMock(return_value=session_id)
+    return feature
 
 
 @pytest.mark.asyncio
 async def test_search_memory_drops_only_the_active_question_echo():
-    feature = MemoryFeature.__new__(MemoryFeature)
+    feature = _in_live_turn(MemoryFeature.__new__(MemoryFeature))
     current = {
         "id": 12,
         "role": "user",
@@ -194,7 +202,7 @@ async def test_search_memory_drops_only_the_active_question_echo():
     out = await feature.search_memory(query="favorite planet", limit=10)
 
     assert out.status is ToolResultStatus.OK
-    assert [row["id"] for row in out.data["results"]] == [4]
+    assert [row["message_id"] for row in out.data["results"]] == [4]
     assert out.data["count"] == 1
     fake_store.get_conversation_history.assert_awaited_once_with(
         limit=20, session_id=None
@@ -297,7 +305,7 @@ async def test_search_memory_preserves_broad_token_fallback():
     )
     assert out.status is ToolResultStatus.OK
     assert out.data["count"] >= 1
-    returned = out.data["results"][0]["content"]
+    returned = out.data["results"][0]["snippet"]
     assert "meridian" in returned.lower()
     assert "<user_input>" not in returned
 
@@ -408,7 +416,7 @@ async def test_search_memory_recovers_canonical_row_alongside_bare_block_rows():
         query="Meridian and our discussion of the first Kestrel agent", limit=10
     )
     assert out.status is ToolResultStatus.OK
-    contents = [r["content"] for r in out.data["results"]]
+    contents = [r["snippet"] for r in out.data["results"]]
     assert any(
         "meridian and our discussion of the first kestrel agent" in c.lower()
         and "--- end memories ---" not in c.lower()

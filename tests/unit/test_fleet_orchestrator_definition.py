@@ -268,7 +268,10 @@ def test_memory_destructive_tools_are_denied():
     ):
         assert fo.is_tool_denied(tool), f"{tool} must be denied"
     # Reads stay available.
-    for tool in ("search_memory", "recall_recent", "memory_status", "get_episodes"):
+    for tool in (
+        "search_memory", "read_message_by_id", "recall_recent", "memory_status",
+        "get_episodes",
+    ):
         assert fo.is_tool_allowed(tool)
         assert not fo.is_tool_denied(tool)
 

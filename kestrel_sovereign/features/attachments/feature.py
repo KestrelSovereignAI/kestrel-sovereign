@@ -25,14 +25,13 @@ upload-receipt — store metadata is NOT reliable (ISOLATED mode doesn't persist
 it; content-dedup keeps stale metadata), so it's deferred rather than faked.
 """
 import io
-import json
 import logging
 import re
 from typing import Any, Dict, List, Optional
 
 from kestrel_sdk.tools.base import ToolCategory
 from kestrel_sdk.tools.result import ToolResult
-from kestrel_sovereign.features.base import Feature, _serialize_tool_result, tool
+from kestrel_sovereign.features.base import Feature, tool
 
 logger = logging.getLogger(__name__)
 
@@ -42,8 +41,8 @@ _HASH_RE = re.compile(r"^[a-f0-9]{64}$")
 # Both now live beside the serializer they measure, so a second feature
 # needing the same bound reuses it instead of writing a third copy.
 from kestrel_sovereign.features.base import (  # noqa: E402
+    largest_fitting_result as _largest_fitting_result,
     orchestrator_result_cap as _orchestrator_result_cap,
-    serialized_result_len as _serialized_len,
 )
 
 
@@ -266,16 +265,14 @@ class AttachmentsFeature(Feature):
         # against len(text) alone is wrong: JSON-escaping expands quotes,
         # backslashes, and non-ASCII/emoji far past the raw count, so a chunk
         # that "fits" by character count still gets replaced with the preview.
-        cap = _orchestrator_result_cap()
-        lo, hi = offset, requested_end
-        best_end = offset
-        while lo <= hi:
-            mid = (lo + hi) // 2
-            if _serialized_len(_build(mid)) <= cap:
-                best_end = mid
-                lo = mid + 1
-            else:
-                hi = mid - 1
+        fit = _largest_fitting_result(
+            _build,
+            offset,
+            requested_end,
+            cap=_orchestrator_result_cap(),
+            tool_name="read_attachment",
+        )
+        best_end = fit[0] if fit is not None else offset
         # Guarantee forward progress even in the pathological case where a
         # single character's escaped form plus the envelope exceeds the cap —
         # otherwise pagination would loop forever returning an empty chunk.
