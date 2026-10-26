@@ -1488,7 +1488,7 @@ function renderVoiceToolCard(session, card) {
 }
 
 
-function updateVoiceToolCard(div, card) {
+export function updateVoiceToolCard(div, card) {
   const content = div?.querySelector?.('.message-content');
   if (content) {
     content.innerHTML = renderToolCardsHtml([card]);

@@ -15,7 +15,8 @@ Object.assign(globalThis, {
     localStorage: dom.window.localStorage,
 });
 const purify = createDOMPurify(dom.window);
-for (const file of ['highlight.js', 'mermaid.js']) {
+dom.window.DOMPurify = purify;
+for (const file of ['parse.js', 'highlight.js', 'mermaid.js', 'katex.js', 'index.js']) {
     dom.window.eval(readFileSync(new URL(
         '../../kestrel_sovereign/static/shared/markdown/' + file, import.meta.url,
     ), 'utf8'));
@@ -25,11 +26,9 @@ await import('../../kestrel_sovereign/static/js/icons.js');
 globalThis.kicon = window.kicon;
 const chat = await import('../../kestrel_sovereign/static/js/chat.js');
 const { getOrCreateChatPane } = await import('../../kestrel_sovereign/static/js/ui.js');
-chat.setChatDeps({ markdown: {
-    sanitizeHtml: purify.sanitize,
-    highlightCodeBlocks: dom.window.highlightCodeBlocks,
-    renderMermaidDiagrams: dom.window.renderMermaidDiagrams,
-} });
+const voice = await import('../../kestrel_sovereign/static/js/voice/ui.js');
+const history = await import('../../kestrel_sovereign/static/js/history.js');
+chat.setChatDeps({ markdown: dom.window.SharedMarkdown });
 
 function interactiveRenderer(id, witness) {
     return {
@@ -209,7 +208,7 @@ test('wiping one real chat pane releases its parts and preserves a background pa
     }
 });
 
-for (const phase of ['streaming', 'finalization']) {
+for (const phase of ['streaming', 'finalization', 'thinking-finalization']) {
     test(`${phase} replaces tool-card mounts without retaining old listeners`, async () => {
         const id = 'lifecycle-tool-' + phase;
         const witness = { mounts: 0, clicks: 0, disposals: 0 };
@@ -229,20 +228,128 @@ for (const phase of ['streaming', 'finalization']) {
                 chat.updateStreamingMessage(message, '', pane.element, [], events);
             } else {
                 pane.toolEvents = events;
+                if (phase === 'thinking-finalization') pane.thinkingItems = [''];
                 await chat.finalizeStreamingMessage(message, '', pane);
             }
             oldButton.click();
             const currentButton = message.querySelector('button');
             assert.notEqual(currentButton, oldButton);
             currentButton.click();
-            assert.deepEqual(witness, { mounts: 2, clicks: 1, disposals: 1 });
+            const mounts = phase === 'thinking-finalization' ? 3 : 2;
+            assert.deepEqual(witness, { mounts, clicks: 1, disposals: mounts - 1 });
             chat.wipeAgentChatPane(id);
-            assert.equal(witness.disposals, 2);
+            assert.equal(witness.disposals, mounts);
         } finally {
             registry._reset();
             pane.element.remove();
         }
     });
 }
+
+test('voice tool-card replacement retires its old renderer', () => {
+    const id = 'voice-card-lifecycle';
+    const witness = { mounts: 0, clicks: 0, disposals: 0 };
+    const renderer = interactiveRenderer(id, witness);
+    renderer.match = { tool: id };
+    registry.registerRenderer(renderer);
+    const message = document.createElement('div');
+    message.innerHTML = '<div class="message-content"></div>';
+    const card = { name: id, status: 'running', events: [{ phase: 'start', name: id }] };
+    try {
+        voice.updateVoiceToolCard(message, card);
+        const previous = message.querySelector('button');
+        assert.ok(previous);
+        voice.updateVoiceToolCard(message, { ...card, status: 'done' });
+        previous.click();
+        message.querySelector('button').click();
+        assert.deepEqual(witness, { mounts: 2, clicks: 1, disposals: 1 });
+    } finally {
+        registry._reset();
+        message.remove();
+    }
+});
+
+test('deleting all bubbles of one message retires their renderer mounts', async () => {
+    const a = mountedFixture('deleted-message-first');
+    const b = mountedFixture('deleted-message-second');
+    for (const fixture of [a, b]) {
+        fixture.container.classList.add('message');
+        fixture.container.dataset.messageId = 'shared-message';
+    }
+    try {
+        const removed = new Promise(resolve => {
+            const observer = new dom.window.MutationObserver(() => {
+                if (!a.container.parentNode && !b.container.parentNode) {
+                    observer.disconnect();
+                    resolve();
+                }
+            });
+            observer.observe(document.body, { childList: true });
+        });
+        history.fadeRemoveMessageNodes('shared-message', a.container);
+        await removed;
+        a.button.click(); b.button.click();
+        assert.deepEqual(a.witness, { mounts: 1, clicks: 0, disposals: 1 });
+        assert.deepEqual(b.witness, { mounts: 1, clicks: 0, disposals: 1 });
+    } finally {
+        registry._reset();
+        a.container.remove(); b.container.remove();
+    }
+});
+
+test('mounting a pane retires leftover non-pane content', () => {
+    const leftover = mountedFixture('leftover-content');
+    const container = document.createElement('div');
+    container.id = 'chat-container';
+    container.append(leftover.container);
+    document.body.append(container);
+    try {
+        chat.mountChatPane('new-leftover-owner');
+        leftover.button.click();
+        assert.deepEqual(leftover.witness, { mounts: 1, clicks: 0, disposals: 1 });
+    } finally {
+        chat.wipeAgentChatPane('new-leftover-owner');
+        registry._reset();
+        container.remove();
+    }
+});
+
+test('a cleared pane cannot acquire new mounts after asynchronous finalization', async () => {
+    const id = 'late-finalization';
+    const witness = { mounts: 0, clicks: 0, disposals: 0 };
+    const renderer = interactiveRenderer(id, witness);
+    renderer.match = { tool: id };
+    registry.registerRenderer(renderer);
+    const pane = getOrCreateChatPane(id);
+    const message = document.createElement('div');
+    message.innerHTML = '<div class="message-content streaming"></div>';
+    pane.element.append(message);
+    pane.toolEvents = [{ phase: 'start', name: id, pos: 0 }];
+    let received, release;
+    const started = new Promise(resolve => { received = resolve; });
+    const resumed = new Promise(resolve => { release = resolve; });
+    chat.setChatDeps({ markdown: { ...dom.window.SharedMarkdown,
+        renderMermaidDiagrams: async element => {
+            await dom.window.SharedMarkdown.renderMermaidDiagrams(element);
+            received();
+            await resumed;
+        },
+    } });
+    try {
+        const finalizing = chat.finalizeStreamingMessage(message, '', pane);
+        await started;
+        chat.wipeAgentChatPane(id);
+        pane.thinkingItems = ['']; // a new turn started while the old finalizer was held
+        release();
+        await finalizing;
+        assert.equal(message.parentNode, null);
+        assert.deepEqual(witness, { mounts: 1, clicks: 0, disposals: 1 });
+    } finally {
+        release();
+        chat.setChatDeps({ markdown: dom.window.SharedMarkdown });
+        registry._reset();
+        pane.element.remove();
+    }
+});
 
 test.after(() => { dom.window.close(); });

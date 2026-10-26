@@ -130,7 +130,7 @@ window.startNewConversation = async function() {
 // just the clicked one) so a delete doesn't orphan the part/extra-prose
 // bubbles. Falls back to the passed node when none are tagged (single-bubble
 // messages predating this path / non-id bubbles).
-function fadeRemoveMessageNodes(messageId, fallbackDiv) {
+export function fadeRemoveMessageNodes(messageId, fallbackDiv) {
     let nodes = [];
     if (messageId && typeof document.querySelectorAll === 'function') {
         // Escape the id for an attribute selector (quotes/backslashes).
