@@ -10,6 +10,24 @@ from scripts import verify_visual_browser_sandbox as probe
 from kestrel_sovereign.visual_computer import docker_policy
 
 
+def network_fixture():
+    return {"proof_id":"a"*32, "server_id":"b"*64, "network_id":"d"*64,
+        "targets":[{"family":"ipv4", "host":"172.30.0.2", "port":18080},
+                   {"family":"ipv6", "host":"fd00:1234::2", "port":18080}]}
+
+
+@pytest.fixture(autouse=True)
+def peer_double_for_substrate_lifecycle_tests(monkeypatch):
+    # These tests isolate the substrate's admission/cleanup, not peer sockets.
+    # Peer identity/refusal guards have their own tests and real-daemon proof.
+    class Peers:
+        def __init__(self, *args, **kwargs):self.state={"fixture":network_fixture()};self.started=False
+        async def start(self):self.started=True
+        async def verify_live(self):assert self.started, "owned positive-control fixture was not started"
+        async def close(self):pass
+    monkeypatch.setattr(probe, "OwnedNetworkPeers", Peers)
+
+
 def container():
     host = probe.verified_host_configuration()
     host["SecurityOpt"] = ["no-new-privileges", "seccomp=" + (probe.POLICY_ROOT / "seccomp.json").read_text()]
@@ -71,16 +89,17 @@ def evidence():
     png = b"\x89PNG\r\n\x1a\nsynthetic"
     return {"uid": 1001, "capabilities": {name: 0 for name in ("CapEff", "CapBnd", "CapPrm", "CapInh", "CapAmb")},
             "rtprio_limit": [0, 0], "groups": [100, 1001], "no_new_privileges": True,
-            "fixture_result": "Persistent local browser draft", "refused_destinations": ["1.1.1.1", "169.254.169.254"],
+            "fixture_result": "Persistent local browser draft", "network_fixture":network_fixture(),
+            "refused_peers":[{**target, "refused":True} for target in network_fixture()["targets"]],
             "sandbox": "PID namespaces\tYes\nNetwork namespaces\tYes\nSeccomp-BPF sandbox\tYes",
             "png_base64": base64.b64encode(png).decode(), "png_sha256": hashlib.sha256(png).hexdigest()}
 
 
 @pytest.mark.parametrize("change", [{"uid": 0}, {"capabilities": 1}, {"no_new_privileges": False},
-                                  {"sandbox": "not sandboxed"}, {"refused_destinations": []},
+                                  {"sandbox": "not sandboxed"}, {"refused_peers": []},
                                   {"fixture_result": ""}, {"png_sha256": "0" * 64}])
 def test_refuses_incomplete_or_unverified_browser_evidence(change):
-    with pytest.raises(RuntimeError): probe.verify_result({**evidence(), **change})
+    with pytest.raises(RuntimeError): probe.verify_result({**evidence(), **change}, network_fixture=network_fixture())
 
 
 def test_seccomp_keeps_upstream_default_deny_and_enables_only_sandbox_namespaces():
@@ -192,7 +211,7 @@ def test_modified_seccomp_policy_is_rejected_before_docker_build(tmp_path, monke
     {'capabilities': {'CapEff': 0, 'CapBnd': 0x2000, 'CapPrm': 0, 'CapInh': 0, 'CapAmb': 0}},
 ])
 def test_refuses_unsafe_measured_process_limits(change):
-    with pytest.raises(RuntimeError): probe.verify_result({**evidence(), **change})
+    with pytest.raises(RuntimeError): probe.verify_result({**evidence(), **change}, network_fixture=network_fixture())
 
 
 def test_refuses_unknown_actual_host_configuration_fields():

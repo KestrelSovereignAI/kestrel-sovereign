@@ -18,6 +18,7 @@ from kestrel_sovereign.visual_computer.docker import (
     DockerCommandError, DockerComputerDriver, DockerEnvironmentProvider, LABEL, PROFILE, PROVIDER,
 )
 from scripts.verify_visual_browser_sandbox import CONTEXT, source_identity
+from scripts.visual_owned_peers import OwnedNetworkPeers
 
 
 async def run(output, socket, *, scenario=None):
@@ -214,17 +215,11 @@ async def run(output, socket, *, scenario=None):
             pass
         else:
             raise AssertionError("stale control accepted")
-        # Independently measure network=none across families and destinations.
-        refused = json.loads(await boundary.invoke(["exec", cid, "python", "-c",
-            "import json,socket; result={}; "
-            "\nfor family,host in [(socket.AF_INET,'1.1.1.1'),(socket.AF_INET,'169.254.169.254'),"
-            "(socket.AF_INET,'192.168.1.1'),(socket.AF_INET,'172.17.0.1'),(socket.AF_INET6,'2606:4700:4700::1111')]:"
-            "\n s=socket.socket(family); s.settimeout(.2)"
-            "\n try: s.connect((host,80)); result[host]=False"
-            "\n except OSError: result[host]=True"
-            "\n finally: s.close()"
-            "\nprint(json.dumps(result))"]))
-        assert all(refused.values())
+        # Both destinations are inspected listeners owned by this proof. A
+        # separate contained peer proves actual IPv4/IPv6 reachability first.
+        async with OwnedNetworkPeers(boundary.invoke, image["Id"], identity,
+                output/"owned-network", image_label=LABEL+".proof") as peers:
+            refused = await peers.refuse_from(cid)
         # Exercise Linux-only atomic rename and lost receipt reconciliation
         # directly against the same image's production filesystem transport.
         linux_filesystem = json.loads(await boundary.invoke(["exec", cid, "python", "-c", r'''

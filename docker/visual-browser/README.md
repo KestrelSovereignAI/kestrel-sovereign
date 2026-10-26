@@ -177,6 +177,15 @@ control, checks IPv4/IPv6 network denial, waits for physical autonomous expiry,
 and verifies exact resource cleanup. Its screenshots are synthetic private
 fixtures. This local proof is not a completed product or a remote-provider claim.
 
+Network refusal checks use only a uniquely labelled server on an owned internal
+dual-stack Docker network. A separate bounded peer proves both inspected IPv4
+and IPv6 listeners are reachable before the unchanged `network=none` browser
+attempts those exact addresses. The standalone sandbox verifier uses the same
+fixture. No public, metadata-service or operator-LAN destination is probed.
+Missing IPv6 fixture support fails the check; it does not silently reduce the
+claim to IPv4. Peer containers have fixed process deadlines and resource bounds,
+and cleanup verifies the original native container/network IDs and labels.
+
 
 ## Negotiated workspace transport
 

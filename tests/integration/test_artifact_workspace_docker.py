@@ -21,6 +21,7 @@ import toml
 from kestrel_sdk.computer_use import ActionRequest, Click, TypeText
 from kestrel_sdk.payer_policy import PayerKind, PayerPolicy, PayerSpec
 from tests.shared.native_shutdown_budget import shutdown_fixture_agent
+from tests.shared.local_docker import LocalDockerUnavailable, local_docker_socket
 
 
 async def _deny_native_materialization(client, agent, boundary, current, request, container_id, monkeypatch, phase, owner):
@@ -86,7 +87,10 @@ async def test_real_host_docker_source_destruction_panel_edit_and_pinned_materia
     if not image:
         pytest.skip('Real workspace journey requires ARTIFACT_TEST_BROWSER_IMAGE immutable local image ID')
     assert image.startswith('sha256:') and len(image)==71
-    docker_socket=os.environ.get('ARTIFACT_TEST_DOCKER_SOCKET','/Users/jason/.docker/run/docker.sock')
+    try:
+        docker_socket=local_docker_socket()
+    except LocalDockerUnavailable as error:
+        pytest.skip(str(error))
     for name in tuple(os.environ):
         if name.startswith(('KESTREL_','OTEL_')) or name.endswith(('_API_KEY','_TOKEN','_SECRET')):
             monkeypatch.delenv(name,raising=False)
