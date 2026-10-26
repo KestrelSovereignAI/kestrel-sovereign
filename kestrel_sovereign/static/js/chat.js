@@ -4790,7 +4790,9 @@ export function appendMessagePart(type, data, paneElement = null) {
         ? target.closest('.chat-container-pane')
         : null;
     const ownerAgent = paneRoot && paneRoot.dataset ? paneRoot.dataset.agent : undefined;
-    const partContext = { ownerAgent, paneElement: target };
+    // Feature matching, rendering and mounting need this same owner context.
+    // Mount runs before attachment, so its root cannot discover the pane yet.
+    const partContext = { type, ownerAgent, paneElement: target };
 
     const renderer = _partRenderers[type];
     // Two distinct trust levels (#2038 ticket 06), kept distinct:
@@ -4801,7 +4803,7 @@ export function appendMessagePart(type, data, paneElement = null) {
     //      renders non-author-trusted payload, MUST go through core
     //      sanitization via the inert-string contract. Consulted only when no
     //      host renderer claims the type, so the host contract is unchanged.
-    const featureRenderer = renderer ? null : findContentTypeRenderer(type, { type });
+    const featureRenderer = renderer ? null : findContentTypeRenderer(type, partContext);
     if (renderer) {
         try {
             const out = renderer(data, partContext);
@@ -4822,11 +4824,11 @@ export function appendMessagePart(type, data, paneElement = null) {
     } else if (featureRenderer) {
         const sanitize = (deps().markdown && deps().markdown.sanitizeHtml) || null;
         const safe = typeof sanitize === 'function'
-            ? renderToSafeHtml(featureRenderer, data, { type }, sanitize, _rendererAttrEscape)
+            ? renderToSafeHtml(featureRenderer, data, partContext, sanitize, _rendererAttrEscape)
             : null;
         if (safe != null) {
             contentDiv.innerHTML = safe;
-            mountToolRenderers(contentDiv, { type });
+            mountToolRenderers(contentDiv, partContext);
         } else {
             // Bad renderer output (non-string) or missing sanitizer — fail
             // closed to escaped text rather than risk unsanitized markup.

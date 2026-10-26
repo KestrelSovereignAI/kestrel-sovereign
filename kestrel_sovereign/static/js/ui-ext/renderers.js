@@ -23,15 +23,17 @@
 //
 // `render` returns a plain HTML STRING and nothing else. Core (chat.js) parses
 // and sanitizes that string through the SAME DOMPurify path as core markdown,
-// then builds the live DOM. The renderer is never handed the live target
-// element in `render`, so there is no code path by which it can write
-// unsanitized markup. A renderer that returns a `Node`/`DocumentFragment` (which
+// then builds the live DOM. This contract sanitizes the returned markup; it
+// does not sandbox installed same-origin feature JavaScript. Context can carry
+// the owning pane for routing, and feature code can already access the DOM.
+// A renderer that returns a `Node`/`DocumentFragment` (which
 // could carry `addEventListener` listeners DOMPurify cannot strip) is REJECTED.
 //
 // Imperative behavior (canvas, chart, click handlers) happens exclusively in the
 // optional `mount(rootEl, ctx)` hook, which core invokes AFTER it has
-// parsed+sanitized the markup and created `rootEl`. `mount` operates only on
-// `rootEl` and its descendants and may return a teardown fn.
+// parsed+sanitized the markup and created `rootEl`. `mount` should confine its
+// changes to `rootEl` and its descendants and may return a teardown fn. The
+// supplied owner/pane context is routing information, not an authorization grant.
 //
 // This module is generic — no feature-name strings. It holds NO DOM and does NOT
 // import the markdown module; core supplies the `sanitize` function so the
