@@ -733,8 +733,21 @@
       "type": "Architecture Spec"
     },
     {
+      "existing_code_refs": [],
+      "findings": [],
+      "missing_code_refs": [],
+      "missing_links": [],
+      "path": "docs/architecture/VISUAL_COMPUTER_RUNTIME.md",
+      "privacy": "public",
+      "render": "public",
+      "status": "implementation-candidate",
+      "title": "Governed visual computer runtime",
+      "type": "Architecture Spec"
+    },
+    {
       "existing_code_refs": [
         "AGENTS.md",
+        "kestrel_sovereign/artifacts/preview_worker/README.md",
         "pyproject.toml"
       ],
       "findings": [],

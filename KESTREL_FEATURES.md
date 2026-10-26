@@ -189,13 +189,22 @@ The generated inventory below lists bundled Feature lifecycle modules only: the 
 Installed entry point feature classes are included in JSON output when present in the active environment.
 Runtime security policy can still deny a discovered tool at call time; static generation marks source-discovered tools as enabled unless their feature is disabled.
 
-- Current audited snapshot: `38` discoverable modules and `38` exported `Feature` subclasses.
+- Current audited snapshot: `39` discoverable modules and `39` exported `Feature` subclasses.
 
 ### `artifacts` (ArtifactsFeature)
 
 - Source: [`kestrel_sovereign/features/artifacts/feature.py`](kestrel_sovereign/features/artifacts/feature.py)
 - Enablement state: `enabled`
-- Tools: none discovered
+
+| Tool | Command | Category | Params | Token cost | State |
+|---|---|---|---|---:|---|
+| `artifact_get` |  | `utility` | `artifact_id`, `revision_id`, `include_text` | 105 | `enabled` |
+| `artifact_list` |  | `utility` | `query`, `cursor`, `limit` | 97 | `enabled` |
+| `artifact_materialize_workspace` |  | `utility` | `request_json` | 80 | `enabled` |
+| `artifact_publication_status` |  | `utility` | `publication_key` | 55 | `enabled` |
+| `artifact_publish_text` |  | `utility` | `title`, `text`, `path`, `publication_key`, `media_type`, `artifact_id`, `expected_revision_id` | 283 | `enabled` |
+| `artifact_publish_workspace` |  | `utility` | `request_json`, `publication_json` | 108 | `enabled` |
+| `artifact_workspace_status` |  | `utility` | `session_id`, `transfer_id` | 67 | `enabled` |
 
 ### `attachments` (AttachmentsFeature)
 
@@ -681,6 +690,21 @@ Runtime security policy can still deny a discovered tool at call time; static ge
 | `todo_list` | `!todo list` | `system` | `scope`, `status`, `owner`, `include_done`, `include_superseded`, `limit` | 150 | `enabled` |
 | `todo_rollup` | `!todo rollup` | `system` | `include_done`, `limit` | 67 | `enabled` |
 | `todo_update` | `!todo update` | `system` | `todo_id`, `title`, `description`, `scope`, `status`, `priority`, `owner`, `links`, `terminal_condition`, `next_check_at`, `superseded_by`, `source_metadata` | 289 | `enabled` |
+
+### `visual_computer` (VisualComputerFeature)
+
+- Source: [`kestrel_sovereign/features/visual_computer/feature.py`](kestrel_sovereign/features/visual_computer/feature.py)
+- Enablement state: `enabled`
+
+| Tool | Command | Category | Params | Token cost | State |
+|---|---|---|---|---:|---|
+| `visual_computer_action` |  | `unknown` | `request_json` | 34 | `enabled` |
+| `visual_computer_action_status` |  | `unknown` | `session_id`, `action_id` | 51 | `enabled` |
+| `visual_computer_admit` |  | `unknown` | `request_json` | 38 | `enabled` |
+| `visual_computer_release` |  | `unknown` | `session_id` | 32 | `enabled` |
+| `visual_computer_status` |  | `unknown` | `session_id` | 35 | `enabled` |
+| `visual_computer_stop` |  | `unknown` | `session_id`, `expected_control_epoch`, `request_id` | 63 | `enabled` |
+| `visual_plan` |  | `unknown` | `session_id`, `prompt` | 55 | `enabled` |
 
 ### `wait` (WaitFeature)
 

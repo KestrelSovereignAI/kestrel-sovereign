@@ -1,3 +1,20 @@
+---
+type: Architecture Spec
+title: Governed visual computer runtime
+description: Governed provider-neutral visual runtime source, local browser delivery boundaries, and remaining remote and product acceptance gates.
+resource: /docs/architecture/VISUAL_COMPUTER_RUNTIME.md
+tags:
+- docs
+- architecture
+- architecture-spec
+timestamp: '2026-10-26T00:00:00Z'
+status: implementation-candidate
+owner: architecture
+canonical: false
+generated: false
+privacy: public
+---
+
 # Governed visual computer runtime
 
 `VisualComputerFeature` owns `/api/visual-computer` and its console Computer
