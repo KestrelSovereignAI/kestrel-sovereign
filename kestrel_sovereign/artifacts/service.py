@@ -52,6 +52,7 @@ class ArtifactAction(StrEnum):
     WRITE = "artifacts.write"
     LINK = "artifacts.link"
     DELETE = "artifacts.delete"
+    TRANSFER = "artifacts.transfer"
 
 
 CurrentAuthority = Callable[[OperatorContext, ArtifactAction, ArtifactLink | None], None]
@@ -82,6 +83,7 @@ class AuthorizedArtifactService:
         self.preview_renderer = None
         self._erasure_fences = {}
         self._preview_deliveries = {}
+        self._current_constraints = {}
 
     @staticmethod
     def _scope(context: OperatorContext) -> ResourceScope:
@@ -90,7 +92,15 @@ class AuthorizedArtifactService:
 
     async def _perform(self, context, action, operation, *, mutation=False, link=None):
         async with self.authority.operation(context, action, self.repository.storage_id,
-                                            link=link) as check:
+                                            link=link) as authority_check:
+            # Capture the original lexical restrictions for owned DB journal
+            # children too; a child does not inherit permission to admit work.
+            constraints = tuple(self._current_constraints.get(asyncio.current_task(), ()))
+            def check():
+                authority_check()
+                for bound, constraint in constraints:
+                    if bound is context:
+                        constraint()
             await self.repository.ensure_initialized()
             check()
             result = await operation(self._scope(context), check)
@@ -105,6 +115,26 @@ class AuthorizedArtifactService:
                     ) from None
                 raise ArtifactAccessDenied("artifact result authority is unavailable") from None
             return result
+
+    @asynccontextmanager
+    async def restrict_current(self, context, check):
+        """Add a lexical restriction, never a grant, to canonical DB guards.
+
+        A cross-capability broker retains its original visual/session check
+        here, so a revocation during an awaited DB step also fences COMMIT.
+        Exact task and context identity prevent inherited/background reuse.
+        """
+        task = asyncio.current_task()
+        constraints = self._current_constraints.setdefault(task, [])
+        entry = (context, check)
+        constraints.append(entry)
+        try:
+            check()
+            yield
+        finally:
+            constraints.remove(entry)
+            if not constraints:
+                self._current_constraints.pop(task, None)
 
     async def stage(self, context: OperatorContext, content: bytes, *, publication_key: str,
                     path: str, media_type: str) -> ArtifactFile:

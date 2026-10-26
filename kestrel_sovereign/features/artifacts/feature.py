@@ -47,9 +47,10 @@ from kestrel_sovereign.execution_custody import is_execution_control_error
 from kestrel_sovereign.storage.privacy_wrapper import require_durable_persistence_gate
 from kestrel_sovereign.turn_scope import capture_turn_scope
 from .producers import ArtifactProducerTools
+from .workspace import ArtifactWorkspaceTools, create_workspace_router
 
 
-class ArtifactsFeature(ArtifactProducerTools, Feature):
+class ArtifactsFeature(ArtifactProducerTools, ArtifactWorkspaceTools, Feature):
     """Encrypted revisions served through the host's live feature router."""
 
     supports_subagent_dispatch = False
@@ -100,6 +101,7 @@ class ArtifactsFeature(ArtifactProducerTools, Feature):
         self._router = create_artifact_router(
             self._service, resolve_context=self._resolve_context,
         )
+        self._router.include_router(create_workspace_router(self))
 
     def get_router(self):
         return self._router
@@ -226,6 +228,7 @@ class ArtifactsFeature(ArtifactProducerTools, Feature):
                 granted_actions=frozenset({
                     ArtifactAction.READ.value, ArtifactAction.WRITE.value,
                     ArtifactAction.DELETE.value,
+                    ArtifactAction.TRANSFER.value,
                 }),
                 granted_capabilities=frozenset({"artifacts"}),
                 permitted_boundary_ids=frozenset({self._service.repository.storage_id}),

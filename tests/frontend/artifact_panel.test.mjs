@@ -85,6 +85,7 @@ test('SVG, HTML and PDF remain downloadable without decoding active documents in
         const item = await fixture({ type });
         assert.equal(item.panel.element.querySelectorAll('script,object,embed,img,iframe,canvas').length, 0);
         assert.equal(button(item.panel, 'Download source file').disabled, false);
+        if (type === 'text/html') assert.equal(item.panel.element.querySelector('textarea').value, '<script>alert(1)</script>');
         if (type === 'application/pdf') assert.match(item.panel.element.textContent, /Download this PDF to view it/);
         item.close();
     }

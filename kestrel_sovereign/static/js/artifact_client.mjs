@@ -5,7 +5,7 @@ const MAX_VIEW_BYTES = 16 * 1024 * 1024;
 export const MAX_PREVIEW_PIXELS = 1024 * 1024;
 const PREVIEW_TYPES = new Set(['application/pdf', 'image/png', 'image/jpeg', 'image/webp', 'image/gif']);
 export const MAX_EDIT_BYTES = 1024 * 1024;
-const EDIT_TYPES = new Set(['text/plain', 'text/markdown', 'text/x-python', 'text/javascript',
+const EDIT_TYPES = new Set(['text/plain', 'text/markdown', 'text/html', 'text/x-python', 'text/javascript',
     'text/css', 'application/json', 'application/javascript', 'application/xml', 'text/xml']);
 
 function token(value) {

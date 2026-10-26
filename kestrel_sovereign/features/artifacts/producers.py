@@ -19,7 +19,7 @@ from kestrel_sovereign.artifacts.repository import ArtifactIntegrityError, Artif
 from kestrel_sovereign.artifacts.service import ArtifactAccessDenied, ArtifactAction
 from kestrel_sovereign.security.host_authority import HostAuthorityError
 
-_TEXT_TYPES = frozenset({"text/plain", "text/markdown", "text/x-python", "text/javascript",
+_TEXT_TYPES = frozenset({"text/plain", "text/markdown", "text/html", "text/x-python", "text/javascript",
                          "text/css", "application/json", "application/javascript", "application/xml", "text/xml"})
 _MAX_TEXT_BYTES = 1024 * 1024
 

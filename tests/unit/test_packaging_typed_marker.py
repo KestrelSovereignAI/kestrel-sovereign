@@ -34,6 +34,7 @@ import kestrel_sovereign
 REPOSITORY = Path(__file__).resolve().parents[2]
 TYPED_CLASSIFIER = "Typing :: Typed"
 MARKER_ARCNAME = "kestrel_sovereign/py.typed"
+PREVIEW_CONTEXT = "kestrel_sovereign/artifacts/preview_worker/"
 
 
 def _declared_classifiers() -> list[str]:
@@ -122,6 +123,16 @@ def test_distributions_ship_only_canonical_package_files(built_distributions, tm
 
 def test_pyproject_declares_typed_classifier():
     assert TYPED_CLASSIFIER in _declared_classifiers()
+
+
+def test_isolated_preview_build_context_survives_both_distribution_formats(built_distributions):
+    required = {PREVIEW_CONTEXT + name for name in ('Dockerfile', 'requirements.txt', 'worker.py', 'README.md')}
+    assert required <= built_distributions['package_files']
+    with zipfile.ZipFile(built_distributions['wheel']) as wheel, tarfile.open(built_distributions['sdist']) as sdist:
+        members = {member.name.split('/', 1)[1]:member for member in sdist.getmembers() if member.isfile()}
+        for name in required:
+            expected = (built_distributions['source'] / name).read_bytes()
+            assert wheel.read(name) == sdist.extractfile(members[name]).read() == expected
 
 
 def test_source_tree_carries_full_package_marker():

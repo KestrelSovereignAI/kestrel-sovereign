@@ -27,7 +27,8 @@ async def publish(agent, **changes):
 @pytest.mark.asyncio
 async def test_registered_producer_tool_creates_shared_card_and_reopens_via_real_host(host):
     client, agents, _ = host
-    assert set(tools(agents['kite'])) == {'artifact_publish_text', 'artifact_list', 'artifact_get', 'artifact_publication_status'}
+    assert set(tools(agents['kite'])) == {'artifact_publish_text', 'artifact_list', 'artifact_get', 'artifact_publication_status',
+        'artifact_publish_workspace', 'artifact_materialize_workspace', 'artifact_workspace_status'}
     with caller_context_scope(caller()):
         result = await publish(agents['kite'])
         assert result['status'] == 'ok' and result['data']['state'] == 'saved'

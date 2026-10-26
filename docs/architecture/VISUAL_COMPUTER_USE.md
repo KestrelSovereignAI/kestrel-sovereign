@@ -277,6 +277,29 @@ No untrusted artifact script executes in the app origin.
 The panel shows dirty, saving, saved, conflict, unknown and failed truthfully.
 A publication receipt is required for saved state.
 
+The artifact workspace broker negotiates only the SDK WorkspaceTransfer
+extension on the exact governed paused session. Host tools and authenticated
+`/api/artifacts/workspaces` routes independently bind `artifacts.transfer`
+plus READ/WRITE and the explicit `visual.transfer` grant from the same original
+caller. Both contexts retain matching tenant/principal/agent and overlapping
+deadlines; neither context promotes the other's grants. The lock order is
+original shared privacy, artifact authority, visual authority/session snapshot,
+then database. The retained visual checker also restricts canonical repository
+guards through COMMIT. No public host path or shell fallback is accepted.
+
+Exports select explicit regular files under at most 32 files, 128 KiB per file
+and 2 MiB total. They stage and publish into the existing ArtifactService,
+with a canonical publication key and a transfer-request digest in provenance.
+Imports verify an exact pinned source revision/manifest and its byte hashes
+before fresh atomic installation. Transfer IDs, workspace IDs and request
+deadlines are explicit before the first attempt; unknown outcomes reconcile
+the same IDs rather than silently replaying or changing targets. A durable
+publication receipt remains recoverable after source computer destruction.
+Retirement uses the already retained session/transport without minting fresh
+data authority, and cleanup status is separate from saved ownership. HTML
+source can be edited as inert text in the shared panel; it never executes or
+renders as a browser document there.
+
 The computer view exposes session state, active controller, Stop and takeover.
 It links outputs by artifact reference, without embedding lifecycle ownership.
 Closing the view or losing its transport does not silently release or resume
