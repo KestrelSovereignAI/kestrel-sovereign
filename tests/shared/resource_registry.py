@@ -113,10 +113,10 @@ class ResourceRegistry:
         self._handlers_installed = True
 
     def _signal_handler(self, signum, frame):
-        """Handle signals by cleaning up then re-raising.
+        """Attempt cleanup, then restore and re-send the original signal.
 
-        Note: We use raise SystemExit instead of sys.exit() to allow pytest
-        to handle the exit properly and complete its hooks.
+        An unresolved Runpod record or failed diagnostic must not consume
+        shutdown or imply successful cleanup.
         """
         print(f"\n[CLEANUP] Received signal {signum}, cleaning up resources...")
         try:
