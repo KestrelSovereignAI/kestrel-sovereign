@@ -696,6 +696,14 @@ class TurnLifecycleMixin:
         registry = getattr(state, "registry", None)
         validate_registry(registry)
         bind_registry(registry)
+        services = getattr(state, "service_resolver", None)
+        validate_services = getattr(self, "validate_host_service_resolver", None)
+        bind_services = getattr(self, "bind_host_service_resolver", None)
+        if services is not None and (not callable(validate_services) or not callable(bind_services)):
+            raise RuntimeError("agent cannot synchronize original host services")
+        if callable(validate_services) and callable(bind_services):
+            validate_services(services)
+            bind_services(services)
         self._host_context_publication_generation = generation
 
     @asynccontextmanager

@@ -2439,6 +2439,22 @@ async def _shutdown_phoenix(app: FastAPI, *, withdrawals=None, finite_errors=Non
     return cancelled
 
 
+def _bind_host_services(app: FastAPI, resolver, *, retiring=False) -> None:
+    """Publish/retire exact host discovery through public agent lifecycle seams."""
+    manager = getattr(app.state, "agent_manager", None)
+    target = manager if manager is not None else getattr(app.state, "agent", None)
+    if target is None:
+        return
+    if retiring:
+        clear = getattr(target, "clear_host_service_resolver", None)
+        if callable(clear):
+            clear(resolver)
+    else:
+        bind = getattr(target, "bind_host_service_resolver", None)
+        if callable(bind):
+            bind(resolver)
+
+
 async def _shutdown_host_features(app: FastAPI) -> None:
     """Release host-scoped resources without leaving later resources behind."""
     from kestrel_sovereign import host_features as _hf
@@ -2446,6 +2462,10 @@ async def _shutdown_host_features(app: FastAPI) -> None:
     host_features = getattr(app.state, "host_features", []) or []
     host_context = getattr(app.state, "host_context", None)
     failures = []
+    try:
+        _bind_host_services(app, getattr(host_context, "operator_registry", None), retiring=True)
+    except BaseException as error:
+        failures.append(error)
     try:
         if host_features and host_context is not None:
             await _hf.stop_host_features(host_features, host_context)
@@ -4097,6 +4117,7 @@ async def _lifespan_startup(app: FastAPI):
                     default_agent.bind_host_context_clause_registry(
                         host_context_registry
                     )
+                _bind_host_services(app, runtime.operator_registry)
             logger.info("Host features initialized: %d", len(started_features))
         else:
             # The fleet control store is host infrastructure, not an optional
@@ -4119,6 +4140,10 @@ async def _lifespan_startup(app: FastAPI):
             else _retained_host_cleanup_error(candidate_ctx)
         )
         failures = [exc] if retained_cleanup is None else [exc, retained_cleanup]
+        try:
+            _bind_host_services(app, getattr(candidate_ctx, "operator_registry", None), retiring=True)
+        except BaseException as binding_error:
+            failures.append(binding_error)
         fatal = retained_cleanup is not None or isinstance(
             exc,
             (ContributionContractError, FeatureContributionRuntimeError),

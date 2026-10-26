@@ -13,6 +13,7 @@ from .runtime import (
     OperatorRegistrationIdentityError,
     OperatorRegistrationSet,
     OperatorRuntimeRegistry,
+    ServiceOperation,
     service_registration_satisfies,
 )
 
@@ -24,5 +25,6 @@ __all__ = [
     "OperatorRegistrationIdentityError",
     "OperatorRegistrationSet",
     "OperatorRuntimeRegistry",
+    "ServiceOperation",
     "service_registration_satisfies",
 ]

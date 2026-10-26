@@ -1052,6 +1052,7 @@ class KestrelAgent(
     #: before boot has run and get "none refused" rather than an attribute
     #: error — an absent answer must not read as a clean one (#2951).
     rejected_feature_contributions: tuple = ()
+    host_service_operation_api_version = 1
 
     def __init__(
         self,
@@ -1070,6 +1071,7 @@ class KestrelAgent(
         payer_policy=None,
         host_db=None,
         host_context_clause_registry=None,
+        host_service_resolver=None,
         hosted_telegram_route_attestation_resolver: Any = None,
         peer_directory_router: Optional["PeerDirectoryRouter"] = None,
         peer_requester: Optional["PeerRequester"] = None,
@@ -1940,6 +1942,8 @@ class KestrelAgent(
         self.permission_defaults_registry = None
         self.setup_step_registry = None
         self.context_clause_registry = None
+        from kestrel_sovereign.operator.host_services import HostServiceBinding
+        self._host_services = HostServiceBinding(self, host_service_resolver)
         self._host_context_clause_registry = host_context_clause_registry
         # Bootstrap service is constructed in initialize(); default it here so
         # any code path that runs before/without full initialization (e.g. a
@@ -6459,6 +6463,22 @@ class KestrelAgent(
             )
         return runtime
 
+    def validate_host_service_resolver(self, resolver) -> None:
+        """Preflight explicit host discovery, preserving the agent registry."""
+        self._host_services.validate_binding(resolver)
+
+    def bind_host_service_resolver(self, resolver) -> None:
+        """Bind the host's current registration authority; grants stay separate."""
+        self._host_services.bind(resolver)
+
+    def clear_host_service_resolver(self, expected) -> bool:
+        """Retire only the exact original binding, preserving replacements."""
+        return self._host_services.clear(expected)
+
+    def host_service_operation(self, requirement):
+        """Retain exact HOST discovery plus a synchronous restriction checker."""
+        return self._host_services.operation(requirement)
+
     def validate_host_context_clause_registry(self, registry) -> None:
         """Preflight a host registry against this agent's active audit names."""
 
@@ -10253,6 +10273,7 @@ Expected Duration: {expected_duration}
                 remember_finite(opening, retain_ordinary=True)
         # Borrowed tenant/shared host authority must never be retired by
         # shutting down one agent. Deny local children before any await.
+        self._host_services.retire()
         retire_process_runtime_custody(getattr(self, "_execution_custody", None))
         storage_close_timeout = _minimum_storage_close_timeout(self.storage)
         # A feature may lazily create a file-backed SQLAlchemy factory during

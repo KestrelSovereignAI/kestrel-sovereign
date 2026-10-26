@@ -168,11 +168,9 @@ async function init() {
     // Host-scoped UI surface (#2293): the multi-agent host serves host-feature
     // panels at /api/host/ui/contributions, a surface distinct from the
     // per-agent one above. It is NOT agent-bound, so it loads at host-console
-    // boot regardless of agent selection. Only meaningful in host mode — in
-    // standalone mode there is no host root and the endpoint 404s (swallowed).
-    if (bootConfig.multiAgentHost) {
-        await loadHostFeatureUIContributions();
-    }
+    // boot regardless of agent selection. Single-agent hosts also mount host
+    // features; an absent contribution returns an empty authenticated manifest.
+    await loadHostFeatureUIContributions();
 
     // Initialize tasks component
     initTasks();

@@ -997,6 +997,7 @@ class _HostContextPublicationState:
 
     registry: object | None = None
     generation: int = 0
+    service_resolver: object | None = None
 
 
 class AgentManager:
@@ -1060,6 +1061,7 @@ class AgentManager:
             else None
         )
         self._host_context_clause_registry = None
+        self._host_service_resolver = None
         self._host_context_publication_gate: asyncio.Event | None = None
         self._host_context_publication_state = _HostContextPublicationState()
         # A multi-agent host owns one mutable isolated-feature root.  The
@@ -2641,6 +2643,7 @@ class AgentManager:
                     ),
                     allowed_features=allowed_features,
                     host_context_clause_registry=self._host_context_clause_registry,
+                    host_service_resolver=self._host_service_resolver,
                     hosted_telegram_route_attestation_resolver=hosted_telegram_resolver,
                     identity_export_dir=identity_export_dir,
                     constitution_source_descriptor_path=(
@@ -2683,6 +2686,7 @@ class AgentManager:
                     llm_service=llm_service,
                     allowed_features=allowed_features,
                     host_context_clause_registry=self._host_context_clause_registry,
+                    host_service_resolver=self._host_service_resolver,
                     hosted_telegram_route_attestation_resolver=hosted_telegram_resolver,
                     identity_export_dir=identity_export_dir,
                     constitution_source_descriptor_path=(
@@ -5734,6 +5738,17 @@ class AgentManager:
             validate_registry(registry)
             bind_registry(registry)
 
+        # Cold initialization may straddle host replacement. Rebind the
+        # original live service registry before this exact agent is routable.
+        services = self._host_service_resolver
+        validate_services = getattr(agent, "validate_host_service_resolver", None)
+        bind_services = getattr(agent, "bind_host_service_resolver", None)
+        if services is not None and (not callable(validate_services) or not callable(bind_services)):
+            raise RuntimeError("agent cannot bind the original host services")
+        if callable(validate_services) and callable(bind_services):
+            validate_services(services)
+            bind_services(services)
+
         # Refresh every shared publication pointer before the agent becomes
         # routable.  This also records that the direct rebind above consumed the
         # current generation, avoiding redundant work on its first normal turn.
@@ -7846,6 +7861,46 @@ class AgentManager:
         for agent in agents:
             agent._host_context_publication_state = state
             agent._host_context_publication_generation = state.generation
+
+    def validate_host_service_resolver(self, resolver) -> None:
+        from kestrel_sovereign.operator.host_services import HostServiceBinding
+        HostServiceBinding.validate(resolver)
+        for agent in self._agents.values():
+            agent.validate_host_service_resolver(resolver)
+
+    def bind_host_service_resolver(self, resolver) -> None:
+        """Publish one registry to current, cold and future exact agents."""
+        self.validate_host_service_resolver(resolver)
+        agents = tuple(self._agents.values())
+        for agent in agents:
+            agent.bind_host_service_resolver(resolver)
+        self._host_service_resolver = resolver
+        state = self._host_context_publication_state
+        state.service_resolver = resolver
+        state.generation += 1
+        for agent in agents:
+            agent._host_context_publication_state = state
+            agent._host_context_publication_generation = state.generation
+
+    def clear_host_service_resolver(self, expected) -> bool:
+        """Withdraw only this exact host generation, including cold agents."""
+        if self._host_service_resolver is not expected:
+            return False
+        # Revoke the shared pointer before independent per-agent cleanup, so
+        # one failing adapter cannot keep cold or retained discoveries current.
+        self._host_service_resolver = None
+        state = self._host_context_publication_state
+        state.service_resolver = None
+        state.generation += 1
+        failures = []
+        for agent in tuple(self._agents.values()):
+            try:
+                agent.clear_host_service_resolver(expected)
+            except BaseException as error:
+                failures.append(error)
+        if failures:
+            raise execution_finite_error(*failures, retain_originals=True)
+        return True
 
     def set_host_context_publication_gate(self, gate: asyncio.Event) -> None:
         """Gate current and future agent turns until host policy is published."""
@@ -14913,13 +14968,25 @@ class AgentManager:
         # takes a fresh snapshot after the first has finished every live agent.
         withdrawals: list[BaseException] = []
         acquired = False
+        discovery_error = None
         try:
             cancelled = await self._acquire_quarantined_shutdown_drain(withdrawals=withdrawals)
             acquired = True
             self._seal_agent_registration_for_shutdown_all()
+            resolver = self._host_service_resolver
+            if resolver is not None:
+                try:
+                    self.clear_host_service_resolver(resolver)
+                except BaseException as error:
+                    discovery_error = error
             await self._shutdown_all_while_drain_locked(cancelled=cancelled, withdrawals=withdrawals)
+            if discovery_error is not None:
+                raise discovery_error
         except BaseException as error:
             control = vars(self).get("_quarantined_shutdown_control")
+            if discovery_error is not None and error is not discovery_error:
+                raise execution_finite_error(control, error, discovery_error, *withdrawals,
+                    retain_originals=True, isolate_control_originals=True)
             if control is not None or is_execution_control_error(error):
                 raise execution_finite_error(
                     control, error, *withdrawals, retain_originals=True,

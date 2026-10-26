@@ -339,10 +339,10 @@ test('app.js skips the boot fetches when the render seeded multiAgentHost (#2048
     );
 });
 
-test('app.js loads the host-scoped UI surface at boot in multi-agent host mode (#2293)', () => {
+test('app.js discovers host UI on both single-agent and multi-agent boots', () => {
     // The host serves host-feature panels at /api/host/ui/contributions — a
     // surface distinct from the per-agent loader. app.js must load it during
-    // host-console boot (gated on multiAgentHost), or host panels never render.
+    // every host-console boot, or single-agent host panels never render.
     assert.match(
         appSrc,
         /import \{[^}]*\bloadHostFeatureUIContributions\b[^}]*\} from '\.\/ui-ext\/feature-loader\.js'/,
@@ -350,9 +350,10 @@ test('app.js loads the host-scoped UI surface at boot in multi-agent host mode (
     );
     assert.match(
         appSrc,
-        /if \(bootConfig\.multiAgentHost\) \{\s*await loadHostFeatureUIContributions\(\);/,
-        'the host-scoped surface must load at boot in host mode',
+        /await loadHostFeatureUIContributions\(\);/,
+        'host discovery must load independently of agent selection',
     );
+    assert.doesNotMatch(appSrc, /if \(bootConfig\.multiAgentHost\) \{\s*await loadHostFeatureUIContributions\(\);/);
 });
 
 test('app.js imports the shared loader rather than defining it inline', () => {

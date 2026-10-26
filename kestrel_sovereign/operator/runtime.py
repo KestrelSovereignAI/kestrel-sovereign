@@ -9,6 +9,7 @@ artifacts, HTTP projection, and feature-specific behavior belong elsewhere.
 from __future__ import annotations
 
 from collections.abc import Callable, Iterable
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from threading import RLock
@@ -25,7 +26,19 @@ from kestrel_sdk.operator import (
     ServiceReference,
     ServiceRegistration,
     ServiceRequirement,
+    ServiceScope,
 )
+
+
+@dataclass(frozen=True, slots=True)
+class ServiceOperation:
+    """Exact retained registration discovery, never a capability grant.
+
+    Consumers must retain their independent original run/content policies.
+    The checker is synchronous and valid only inside the original frame.
+    """
+    service: object
+    check_current: Callable[[], None]
 
 
 class OperatorRegistrationError(RuntimeError):
@@ -319,6 +332,40 @@ class OperatorRuntimeRegistry:
                 key=lambda item: self._stable_version_key(item.descriptor.version),
             )
             return selected.service
+
+    @asynccontextmanager
+    async def host_service_operation(self, requirement: ServiceRequirement):
+        """Retain one exact HOST registration epoch, including ABA removal.
+
+        Lookup IDs are discovery only. No OperatorContext is created here.
+        """
+        if not isinstance(requirement, ServiceRequirement) or requirement.scope is not ServiceScope.HOST:
+            raise OperatorAuthorizationError("explicit host service scope required")
+        with self._lock:
+            candidates = [registration for registration in self._services.values()
+                          if service_registration_satisfies(registration, requirement)]
+            if not candidates:
+                raise OperatorAuthorizationError("host service unavailable")
+            registration = max(candidates, key=lambda item: self._stable_version_key(item.descriptor.version))
+            original = next((value for value in self._active_sets.values()
+                             if any(item is registration for item in value.services)), None)
+            seal = None if original is None else original._registry_seal
+            if original is None or seal is None:
+                raise OperatorAuthorizationError("host registration unavailable")
+        active = True
+        def check():
+            with self._lock:
+                if (not active or self._services.get(registration.reference) is not registration
+                        or self._active_sets.get(id(original)) is not original
+                        or original._registry_seal is not seal
+                        or self._issued_set_seals.get(id(original)) != (original, seal)):
+                    raise OperatorAuthorizationError("original host registration ended")
+        try:
+            check()
+            yield ServiceOperation(registration.service, check)
+            check()
+        finally:
+            active = False
 
     def resolve_workflow_actor(self, name: str) -> Callable[..., object] | None:
         """Return the active actor for an exact workflow name, if present."""
