@@ -510,13 +510,6 @@ itself: it is a sovereign command, not a tool. It is refused in the
 `ephemeral`, `isolated` and `deidentified` privacy modes, which store no SOUL.
 `!bootstrap-status` shows whether `SOUL.md` matches the stored version.
 
-`!rename` renames the stored version, not the file, and stores the renamed
-text only if that version is still current. If a revision lands first, the
-rename renames the revision instead of replacing it. A rename that keeps losing
-to concurrent SOUL writes fails without changing the name anywhere, so running
-it again starts from the old name. An edit in `SOUL.md` that was never revised
-is renamed in the file and still needs `!revise-soul`.
-
 ### Running Multiple Agents
 
 Each agent runs on its own port. Create configs for each:

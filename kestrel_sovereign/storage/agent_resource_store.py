@@ -15,6 +15,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, AsyncIterator, Dict, Mapping, Optional
 
+from kestrel_sovereign.execution_custody import is_execution_control_error
 from kestrel_sovereign.security.encryption import (
     decrypt_string_fernet,
     encrypt_string_fernet,
@@ -107,14 +108,32 @@ def _describe_version(version: Optional[int]) -> str:
     return f"v{version}" if version is not None else "none"
 
 
+def _check_expected_current(
+    resource_type: str,
+    existing: Optional[Mapping[str, Any]],
+    expected_current: ExpectedCurrentVersion,
+) -> None:
+    """Raise unless ``existing`` is the current version ``expected_current`` names.
+
+    ``existing`` is the row :meth:`AgentResourceStore._current_or_latest`
+    read under the version lock.
+    """
+    actual = existing["version"] if existing and existing["is_current"] else None
+    if actual != expected_current.version:
+        raise ResourceVersionConflictError(
+            resource_type, expected=expected_current.version, actual=actual
+        )
+
+
 @asynccontextmanager
 async def surfacing_version_conflicts() -> AsyncIterator[None]:
     """Raise a version conflict as itself from a transaction that wrapped it.
 
     An owning transaction reports whatever its block raised as a
     :class:`TransactionError` caused by it. A refused write is an outcome its
-    caller acts on (read again and redo), not a storage fault, so enter this
-    outside the transaction the refusal is raised in.
+    caller acts on, not a storage fault, so enter this outside the
+    transaction the refusal is raised in. A wrapper carrying execution-control
+    evidence is raised as it is.
     """
     try:
         yield
@@ -122,9 +141,14 @@ async def surfacing_version_conflicts() -> AsyncIterator[None]:
         cause = error.__cause__
         while isinstance(cause, TransactionError):
             cause = cause.__cause__
-        if not isinstance(cause, ResourceVersionConflictError):
+        if (
+            not isinstance(cause, ResourceVersionConflictError)
+            or is_execution_control_error(error)
+        ):
             raise
-        raise cause from None
+        # With its own cause: a cancellation that arrived while the refused
+        # write rolled back is carried there, for the caller to propagate.
+        raise cause from cause.__cause__
 
 
 @dataclass(frozen=True)
@@ -216,13 +240,7 @@ class AgentResourceStore:
             if expected_current is not None:
                 # Under the version lock: no other writer can make a version
                 # current between this check and the insert (#3813).
-                actual = (
-                    existing["version"] if existing and existing["is_current"] else None
-                )
-                if actual != expected_current.version:
-                    raise ResourceVersionConflictError(
-                        resource_type, expected=expected_current.version, actual=actual
-                    )
+                _check_expected_current(resource_type, existing, expected_current)
             resource_id = existing["resource_id"] if existing else str(uuid.uuid4())
             latest_version = await self._latest_version(resource_type)
             version = latest_version + 1
@@ -294,6 +312,31 @@ class AgentResourceStore:
             if resource is None:
                 raise RuntimeError("created resource version could not be loaded")
         return resource
+
+    async def require_current_version(
+        self,
+        expected_current: ExpectedCurrentVersion,
+        resource_type: str = SOUL_MARKDOWN_RESOURCE_TYPE,
+    ) -> None:
+        """Refuse as :meth:`create_version` would, and write nothing.
+
+        For a writer that read the current version and found nothing to
+        derive from it, but must not act on that read once another version is
+        current: a rename whose SOUL names nobody still renames the agent
+        everywhere else (#3813). Checked under the version lock and in the
+        immediate transaction :meth:`create_version` writes under.
+
+        Raises:
+            ResourceVersionConflictError: ``expected_current`` is not the
+                current version.
+        """
+        async with surfacing_version_conflicts(), self.db.transaction(immediate=True):
+            await self._lock_versions(resource_type)
+            _check_expected_current(
+                resource_type,
+                await self._current_or_latest(resource_type),
+                expected_current,
+            )
 
     async def get_current(
         self, resource_type: str = SOUL_MARKDOWN_RESOURCE_TYPE

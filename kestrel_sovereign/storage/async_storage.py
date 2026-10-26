@@ -2635,6 +2635,26 @@ class AsyncStorage:
             resource_type
         )
 
+    async def require_current_agent_resource_version(
+        self,
+        expected_current: ExpectedCurrentVersion,
+        resource_type: str = SOUL_MARKDOWN_RESOURCE_TYPE,
+    ) -> None:
+        """Raise unless ``expected_current`` is the current version; write nothing.
+
+        The check :meth:`promote_soul_seed` makes before it writes, for a
+        writer that found nothing to write in the version it read (#3813).
+
+        Raises:
+            ~.agent_resource_store.ResourceVersionConflictError: a different
+                version is current.
+        """
+        if not self._initialized:
+            await self.initialize()
+        await self._require_agent_resource_store().require_current_version(
+            expected_current, resource_type
+        )
+
     async def promote_soul_seed(
         self,
         content: str,
