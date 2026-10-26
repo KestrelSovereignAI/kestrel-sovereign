@@ -131,6 +131,8 @@ class ResumeMonitor:
         self._name = name
         self._task_factory = task_factory or asyncio.create_task
         self._task: Optional[asyncio.Task] = None
+        # The loop task request_stop() has cancelled, so it is cancelled once.
+        self._stop_requested_task: Optional[asyncio.Task] = None
         self._running = False
         self._prev_wall: Optional[float] = None
         self._prev_mono: Optional[float] = None
@@ -201,12 +203,29 @@ class ResumeMonitor:
             self._threshold_seconds,
         )
 
-    async def stop(self) -> None:
+    def request_stop(self) -> None:
+        """Ask the loop to end, without waiting for it to.
+
+        :meth:`stop` makes this request, then joins the loop task. A caller
+        that bounds ``stop()`` by a deadline makes the request first, before
+        it arms that deadline, so a stalled event loop that carries its clock
+        past the deadline cannot preempt a stop that had only the loop's
+        unwind left to run (#3840). The loop task is cancelled once, however
+        many requests reach it.
+        """
         self._running = False
+        task = self._task
+        if task is None or task.done() or task is self._stop_requested_task:
+            return
+        self._stop_requested_task = task
+        task.cancel()
+
+    async def stop(self) -> None:
+        self.request_stop()
         if self._task and not self._task.done():
-            self._task.cancel()
             try:
                 await self._task
             except asyncio.CancelledError:
                 pass
         self._task = None
+        self._stop_requested_task = None

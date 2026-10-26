@@ -5,6 +5,7 @@ Verifies HeartbeatConfig loading, HeartbeatRunner scheduling,
 response normalization, dispatcher translation, and API integration.
 """
 
+import asyncio
 import logging
 from pathlib import Path
 from unittest.mock import AsyncMock, Mock, patch
@@ -324,6 +325,44 @@ class TestHeartbeatRunner:
 
         await runner.stop()
         assert not runner.is_running
+
+    @pytest.mark.asyncio
+    async def test_a_stop_after_a_stop_request_cancels_the_loop_once(
+        self, mock_agent, default_config
+    ):
+        """The shutdown sweep requests the stop before it bounds ``stop()`` (#3840).
+
+        ``stop()`` then joins the loop that request cancelled. A second
+        cancellation would interrupt the loop's unwind.
+        """
+        entered = asyncio.Event()
+        finish_unwind = asyncio.Event()
+        cancellations = []
+
+        async def loop_with_a_slow_unwind():
+            entered.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                cancellations.append("loop")
+                try:
+                    await finish_unwind.wait()
+                except asyncio.CancelledError:
+                    cancellations.append("unwind")
+                raise
+
+        runner = HeartbeatRunner(mock_agent, default_config)
+        runner._loop = loop_with_a_slow_unwind
+        await runner.start()
+        await entered.wait()
+
+        runner.request_stop()
+        assert not runner.is_running
+        stopping = asyncio.create_task(runner.stop())
+        asyncio.get_running_loop().call_soon(finish_unwind.set)
+        await stopping
+
+        assert cancellations == ["loop"]
 
     @pytest.mark.asyncio
     async def test_start_disabled(self, mock_agent):

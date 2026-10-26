@@ -157,6 +157,8 @@ class HeartbeatRunner:
         self.agent = agent
         self.config = config
         self._task: Optional[asyncio.Task] = None
+        # The loop task request_stop() has cancelled, so it is cancelled once.
+        self._stop_requested_task: Optional[asyncio.Task] = None
         self._history: List[Dict[str, Any]] = []
         self._running = False
         # Wall-clock captured immediately BEFORE each inter-tick sleep, for
@@ -198,13 +200,29 @@ class HeartbeatRunner:
             f"target={self.config.target}"
         )
 
+    def request_stop(self) -> None:
+        """Ask the loop to end, without waiting for it to.
+
+        :meth:`stop` makes this request, then joins the loop task. A caller
+        that bounds ``stop()`` by a deadline makes the request first, before
+        it arms that deadline: the loop's unwind is then queued ahead of the
+        deadline's callback, and ``stop()`` finds the loop already ended,
+        even when a stalled event loop carries its clock past the deadline
+        (#3840). The loop task is cancelled once, however many requests
+        reach it.
+        """
+        self._running = False
+        task = self._task
+        if task is None or task.done() or task is self._stop_requested_task:
+            return
+        self._stop_requested_task = task
+        task.cancel()
+
     async def stop(self) -> None:
         """Stop the heartbeat loop."""
-        self._running = False
+        self.request_stop()
         terminal = getattr(self, "_worker_control", None)
         if self._task:
-            if not self._task.done():
-                self._task.cancel()
             outcome = await await_owned_task(self._task)
             terminal = execution_terminal_error(
                 terminal,
@@ -212,6 +230,7 @@ class HeartbeatRunner:
                 outcome.cancellation,
             )
         self._task = None
+        self._stop_requested_task = None
         if terminal is not None:
             if is_execution_control_error(terminal):
                 self._worker_control = terminal

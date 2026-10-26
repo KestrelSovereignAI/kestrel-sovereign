@@ -142,6 +142,41 @@ class TestResumeMonitor:
         gap = await mon.poll_once()
         assert gap == pytest.approx(3600.0)
 
+    async def test_a_stop_after_a_stop_request_cancels_the_loop_once(self):
+        """The shutdown sweep requests the stop before it bounds ``stop()`` (#3840).
+
+        ``stop()`` then joins the loop that request cancelled. A second
+        cancellation would interrupt the loop's unwind.
+        """
+        entered = asyncio.Event()
+        finish_unwind = asyncio.Event()
+        cancellations = []
+
+        async def loop_with_a_slow_unwind():
+            entered.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                cancellations.append("loop")
+                try:
+                    await finish_unwind.wait()
+                except asyncio.CancelledError:
+                    cancellations.append("unwind")
+                raise
+
+        mon = ResumeMonitor(on_resume=AsyncMock())
+        mon._loop = loop_with_a_slow_unwind
+        await mon.start()
+        await entered.wait()
+
+        mon.request_stop()
+        assert not mon.is_running
+        stopping = asyncio.create_task(mon.stop())
+        asyncio.get_running_loop().call_soon(finish_unwind.set)
+        await stopping
+
+        assert cancellations == ["loop"]
+
 
 class TestResumeMonitorConfig:
     def test_defaults(self):
