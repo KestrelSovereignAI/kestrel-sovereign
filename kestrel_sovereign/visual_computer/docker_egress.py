@@ -75,6 +75,15 @@ one synthetic server endpoint, not a loopback/LAN/private-network category.
     container_id: str
     ownership: str
     port: int
+    tls: bool = False
+
+    @property
+    def origin(self):
+        # The TLS fixture name is derived from the exact ownership label, never
+        # an arbitrary hostname supplied through production settings.
+        if type(self.tls) is not bool or not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,61}[a-z0-9]",self.ownership):
+            raise EgressDenied("invalid_owned_test_server")
+        return (f"https://{self.ownership}.invalid" if self.tls else "http://127.0.0.1") + f":{self.port}"
 
     async def verify(self):
         record = await self.boundary.inspect(self.container_id)
@@ -129,7 +138,7 @@ class DockerEgressPolicy:
                 except (EgressDenied,ValueError,TypeError):
                     raise ResourceUnsupported("public_ipv4_origin_pin_required") from None
             else:
-                if canonical != f"http://127.0.0.1:{self.test_server.port}" or pins[canonical] != "127.0.0.1":
+                if canonical != self.test_server.origin or pins[canonical] != "127.0.0.1":
                     raise ResourceUnsupported("test_policy_requires_exact_owned_server")
             normalized.append(canonical)
         if set(pins) != set(normalized):

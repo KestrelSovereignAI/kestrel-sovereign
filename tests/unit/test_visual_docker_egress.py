@@ -120,6 +120,17 @@ def test_profile_digest_binds_original_hostname_and_exact_pin():
     assert policy("93.184.216.34").profile_id != policy("1.1.1.1").profile_id
 
 
+def test_tls_test_exception_is_only_exact_owned_derived_hostname_and_port():
+    owned = OwnedTestServer(object(),"c"*64,"synthetic-fixture",12345,tls=True)
+    policy = DockerEgressPolicy((owned.origin,),test_server=owned,address_pins=((owned.origin,"127.0.0.1"),))
+    assert policy.origins == ("https://synthetic-fixture.invalid:12345",)
+    for destination in ("https://other.invalid:12345","https://synthetic-fixture.invalid:443","http://synthetic-fixture.invalid:12345"):
+        with pytest.raises(ResourceUnsupported):
+            DockerEgressPolicy((destination,),test_server=owned,address_pins=((destination,"127.0.0.1"),))
+    with pytest.raises(ResourceUnsupported):
+        DockerEgressPolicy.from_settings({"origins":[owned.origin],"methods":["GET"],"address_pins":{owned.origin:"127.0.0.1"}})
+
+
 @pytest.mark.asyncio
 async def test_normal_pinned_transport_uses_literal_target_and_original_host_sni_with_no_dns(monkeypatch):
     async with controlled_server(b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\nBODY") as (local,requests,_):

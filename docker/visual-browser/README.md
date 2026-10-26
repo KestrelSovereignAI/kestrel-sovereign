@@ -280,3 +280,23 @@ action IDs remain reconcilable; stale epochs fail. All owned containers and the
 image are removed by exact identity. This proves local controlled HTTP; it does
 not establish a public HTTPS interoperability, remote platform, cookie login,
 redirect, manual human-input or general browsing capability.
+
+The separate owned TLS proof runs with:
+
+```sh
+python -m scripts.verify_visual_docker_tls \
+  --docker-socket /absolute/path/to/local/docker.sock \
+  --output /absolute/path/to/new/private-tls-evidence
+```
+
+It creates a temporary CA and two owned certificate/server fixtures. Normal
+platform trust must refuse that CA; a verifier-only SSLContext trusts it while
+retaining normal verification flags, hostname checks and required certificate
+validation. A leaf with the wrong SAN must still fail. The matching leaf enables
+the actual browser edit/export journey over TLS, retaining original Host and
+SNI while connecting to the exact fixture pin. Stop must close its accepted TLS
+socket and join owned child borrowers before acknowledgement. The test-only TLS
+origin derives from its unique Docker ownership label and cannot be configured
+through normal settings. Production code has no TLS bypass, custom trust or
+certificate option. This measures owned HTTPS behavior, not public HTTPS
+interoperability.

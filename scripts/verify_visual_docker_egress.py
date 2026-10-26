@@ -116,6 +116,15 @@ class OriginalCall:
             assert not self.tasks
 
 
+def owned_server_arguments(image_id, label, program, *arguments):
+    """One bounded resource profile for both controlled HTTP/TLS proofs."""
+    return ["run", "--detach", "--label", OWNED_SERVER_LABEL+"="+label,
+        "--name", "kestrel-http-proof-"+label, "--network", "bridge", "--publish", "127.0.0.1::8080",
+        "--read-only", "--tmpfs", "/tmp:rw,noexec,nosuid,nodev,size=4m", "--cap-drop", "ALL",
+        "--security-opt", "no-new-privileges:true", "--memory", "128m", "--cpus", ".5", "--pids-limit", "32",
+        "--log-driver", "none", "--entrypoint", "python", image_id, "-u", "-c", program, *arguments]
+
+
 async def scenario(boundary, image, identity, output):
     servers, leases = [], []
     manifest = {"server_ids": [], "leases": [], "cleanup_confirmed": False}
@@ -129,11 +138,7 @@ async def scenario(boundary, image, identity, output):
     loop.getaddrinfo = no_runtime_dns
     async def server(other):
         label = identity + "-" + str(len(servers))
-        cid = (await boundary.invoke(["run", "--detach", "--label", OWNED_SERVER_LABEL+"="+label,
-            "--name", "kestrel-http-proof-"+label, "--network", "bridge", "--publish", "127.0.0.1::8080",
-            "--read-only", "--tmpfs", "/tmp:rw,noexec,nosuid,nodev,size=4m", "--cap-drop", "ALL",
-            "--security-opt", "no-new-privileges:true", "--memory", "128m", "--cpus", ".5", "--pids-limit", "32",
-            "--log-driver", "none", "--entrypoint", "python", image["Id"], "-u", "-c", SERVER, other])).decode().strip()
+        cid = (await boundary.invoke(owned_server_arguments(image["Id"],label,SERVER,other))).decode().strip()
         servers.append((cid, label)); manifest["server_ids"].append(cid); record()
         inspected = await boundary.inspect(cid)
         port = int(inspected["NetworkSettings"]["Ports"]["8080/tcp"][0]["HostPort"])
