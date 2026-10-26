@@ -118,8 +118,8 @@ class ResourceRegistry:
         An unresolved Runpod record or failed diagnostic must not consume
         shutdown or imply successful cleanup.
         """
-        print(f"\n[CLEANUP] Received signal {signum}, cleaning up resources...")
         try:
+            print(f"\n[CLEANUP] Received signal {signum}, cleaning up resources...")
             self.cleanup_all()
         except LegacyRunpodPathError as error:
             logger.error("Unresolved cloud resource during signal cleanup: %s", error)

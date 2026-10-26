@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ast
+import errno
 import hashlib
 import json
 import os
@@ -90,7 +91,7 @@ print(json.dumps({"error": error, "same_original_bytes": before == after,
 
 
 SIGNAL_PROBE = """
-import atexit, hashlib, importlib.util, json, logging, os, pathlib, signal, sys
+import atexit, errno, hashlib, importlib.util, json, logging, os, pathlib, signal, sys
 from datetime import datetime, timezone
 repo, path, number, log_failure = sys.argv[1:]
 sys.path.insert(0, repo)
@@ -114,6 +115,27 @@ registry = module.registry
 record = module.TrackedResource("runpod", "synthetic-original-signal-id", datetime.now(timezone.utc))
 registry.register(record)
 print(json.dumps({"before_sha256": hashlib.sha256(module.REGISTRY_FILE.read_bytes()).hexdigest()}), flush=True)
+if log_failure in {"closed-stdout", "broken-stdout"}:
+    descriptor = sys.stdout.fileno()
+    if log_failure == "closed-stdout":
+        os.close(descriptor)
+        expected_errno = errno.EBADF
+    else:
+        read_descriptor, write_descriptor = os.pipe()
+        os.close(read_descriptor)
+        try:
+            os.dup2(write_descriptor, descriptor)
+        finally:
+            os.close(write_descriptor)
+        expected_errno = errno.EPIPE
+    try:
+        os.write(descriptor, b"actual signal diagnostic failure control")
+    except OSError as error:
+        if error.errno != expected_errno:
+            raise
+        print(json.dumps({"failed_stdout_errno": error.errno}), file=sys.stderr, flush=True)
+    else:
+        raise AssertionError("original stdout failure was not established")
 try:
     try:
         os.kill(os.getpid(), int(number))
@@ -168,15 +190,16 @@ class LegacyRunpodPathsTests(unittest.TestCase):
             for number, log_failure in (
                 (signal.SIGINT, "normal"), (signal.SIGTERM, "normal"),
                 (signal.SIGINT, "fail-log"), (signal.SIGTERM, "fail-log"),
+                (signal.SIGINT, "closed-stdout"), (signal.SIGTERM, "closed-stdout"),
+                (signal.SIGINT, "broken-stdout"), (signal.SIGTERM, "broken-stdout"),
             ):
                 with self.subTest(signal=number.name, log_failure=log_failure):
                     path = Path(directory, number.name + log_failure + ".json")
                     child = subprocess.run(
-                        [sys.executable, "-I", "-S", "-B", "-c", SIGNAL_PROBE, str(REPO), str(path), str(int(number)), log_failure],
+                        [sys.executable, "-I", "-S", "-B", "-u", "-c", SIGNAL_PROBE, str(REPO), str(path), str(int(number)), log_failure],
                         cwd=directory, env={}, stdin=subprocess.DEVNULL,
                         capture_output=True, text=True, timeout=10, check=False,
                     )
-                    self.assertEqual(child.returncode, -int(number), (child.stdout, child.stderr))
                     observed = [json.loads(line) for line in child.stdout.splitlines() if line.startswith("{")]
                     self.assertEqual(len(observed), 1, observed)
                     self.assertTrue(path.exists())
@@ -184,6 +207,10 @@ class LegacyRunpodPathsTests(unittest.TestCase):
                         self.assertIn("remains unresolved", child.stderr)
                     self.assertEqual(hashlib.sha256(path.read_bytes()).hexdigest(), observed[0]["before_sha256"])
                     self.assertIn("synthetic-original-signal-id", json.loads(path.read_text()))
+                    if log_failure in {"closed-stdout", "broken-stdout"}:
+                        failures = [json.loads(line) for line in child.stderr.splitlines() if line.startswith("{")]
+                        self.assertEqual(failures, [{"failed_stdout_errno": errno.EBADF if log_failure == "closed-stdout" else errno.EPIPE}])
+                    self.assertEqual(child.returncode, -int(number), (child.stdout, child.stderr))
 
     def assert_refused(self, result: subprocess.CompletedProcess[str], path: str) -> None:
         self.assertEqual(result.returncode, 1, (path, result.stdout, result.stderr))
