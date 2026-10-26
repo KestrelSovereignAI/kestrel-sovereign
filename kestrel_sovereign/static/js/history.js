@@ -142,7 +142,7 @@ export function fadeRemoveMessageNodes(messageId, fallbackDiv) {
     }
     if (!nodes.length && fallbackDiv) nodes = [fallbackDiv];
     for (const node of nodes) {
-        unmountRenderers(node);
+        unmountRenderers(node, { retire: 'self' });
         node.style.transition = 'opacity 0.2s, transform 0.2s';
         node.style.opacity = '0';
         node.style.transform = 'scale(0.95)';

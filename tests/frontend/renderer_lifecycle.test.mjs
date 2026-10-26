@@ -245,6 +245,29 @@ test('teardown cannot mount replacement children during physical retirement', ()
     }
 });
 
+test('outgoing DOM remains retired when its cleanup moves it elsewhere', () => {
+    const fixture = mountedFixture('moved-retired-child');
+    const renderer = registry.findContentTypeRenderer('moved-retired-child');
+    const mount = renderer.mount;
+    const destination = document.createElement('div');
+    registry.unmountRenderers(fixture.container);
+    fixture.witness.mounts = 0; fixture.witness.disposals = 0;
+    renderer.mount = root => {
+        const dispose = mount(root);
+        return () => { dispose(); destination.append(root); };
+    };
+    try {
+        registry.mountRenderers(fixture.container);
+        registry.unmountRenderers(fixture.container, { retire: 'children' });
+        registry.mountRenderers(destination);
+        destination.querySelector('button').click();
+        assert.deepEqual(fixture.witness, { mounts: 1, clicks: 0, disposals: 1 });
+    } finally {
+        renderer.mount = mount;
+        registry._reset(); fixture.container.remove(); destination.remove();
+    }
+});
+
 test('unsupported retirement modes fail before altering a live mount', () => {
     const fixture = mountedFixture('invalid-retirement');
     try {

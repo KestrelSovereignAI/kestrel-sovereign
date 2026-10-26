@@ -1490,10 +1490,10 @@ function renderVoiceToolCard(session, card) {
 
 
 export function updateVoiceToolCard(div, card) {
-    const content = div?.querySelector?.('.message-content');
-    if (content) {
-        unmountRenderers(content);
-        content.innerHTML = renderToolCardsHtml([card]);
+  const content = div?.querySelector?.('.message-content');
+  if (content) {
+    unmountRenderers(content, { retire: 'children' });
+    content.innerHTML = renderToolCardsHtml([card]);
     mountToolRenderers(content);
   }
 }

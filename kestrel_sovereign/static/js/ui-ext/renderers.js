@@ -61,6 +61,26 @@
 /** @type {FeatureRenderer[]} */
 const _renderers = [];
 const _mounts = new Map();
+// Physical DOM lifetime is separate from a reusable mount's lifetime. Weak
+// keys let discarded subtrees stay retired without retaining their DOM.
+const _domLifetimes = new WeakMap();
+
+function domLifetime(node) {
+    let lifetime = _domLifetimes.get(node);
+    if (!lifetime) {
+        lifetime = { retired: false, retiring: 0 };
+        _domLifetimes.set(node, lifetime);
+    }
+    return lifetime;
+}
+
+function mountIsRetired(root) {
+    for (let node = root; node; node = node.parentNode) {
+        const lifetime = _domLifetimes.get(node);
+        if (lifetime?.retired || lifetime?.retiring) return true;
+    }
+    return false;
+}
 
 function retireRendererMounts(renderer) {
     for (const mounted of [..._mounts.values()]) {
@@ -229,6 +249,7 @@ export function mountRenderers(containerEl, ctx = {}) {
     const teardowns = [];
     const roots = containerEl.querySelectorAll('[data-ui-ext-renderer]');
     for (const root of roots) {
+        if (mountIsRetired(root)) continue;
         if (_mounts.has(root)) continue;
         const id = root.dataset ? root.dataset.uiExtRendererId : undefined;
         const renderer = id ? _renderers.find((r) => r._uid === id) : null;
@@ -271,11 +292,35 @@ export function mountRenderers(containerEl, ctx = {}) {
     };
 }
 
-/** End mounts before their containing DOM is cleared or replaced. */
-export function unmountRenderers(containerEl) {
+/**
+ * End mounts; an ordinary unmount permits explicit remounting later.
+ * `retire: 'self'` permanently retires discarded DOM, while `'children'`
+ * retires a container's outgoing children and keeps the container reusable.
+ * Reentrant cleanup cannot mount resources inside an operation in progress.
+ */
+export function unmountRenderers(containerEl, { retire = false } = {}) {
+    if (![false, 'self', 'children'].includes(retire)) {
+        throw new TypeError('Renderer retirement must be self, children, or false');
+    }
     if (!containerEl || typeof containerEl.querySelectorAll !== 'function') return;
-    const roots = [containerEl, ...containerEl.querySelectorAll('[data-ui-ext-renderer]')];
-    for (const root of roots) _mounts.get(root)?.dispose();
+    const lifetime = domLifetime(containerEl);
+    const retireChildren = () => {
+        for (const child of containerEl.querySelectorAll(':scope > *')) {
+            domLifetime(child).retired = true;
+        }
+    };
+    lifetime.retiring += 1;
+    if (retire === 'self') lifetime.retired = true;
+    if (retire === 'children') retireChildren();
+    try {
+        const roots = [containerEl, ...containerEl.querySelectorAll('[data-ui-ext-renderer]')];
+        for (const root of roots) _mounts.get(root)?.dispose();
+    } finally {
+        // Cleanup may append DOM. It cannot mount while `retiring` is set,
+        // and any replacement children it created are outgoing DOM too.
+        if (retire === 'children') retireChildren();
+        lifetime.retiring -= 1;
+    }
 }
 
 /** The registered renderers, in registration order (read-only snapshot; tests). */
