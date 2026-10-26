@@ -10,12 +10,12 @@ database B, and prove:
 
 * the supported call (no keyword) restores into A and never touches B —
   which is exactly why a ``target_db_path=B`` call used to mutate A;
-* any non-``None`` ``target_db_path`` fails closed before the package is
+* every explicit ``target_db_path`` fails closed before the package is
   fetched and before any continuity audit, ``agent_import_log`` write,
   conversation mutation, or asset-restorer call, on every path the import
   could otherwise take (accepted, errored, continuity-rejected,
   consent-rejected) — neither A nor B changes by a single row;
-* an explicit ``target_db_path=None`` is deprecated but still imports.
+* an explicit ``target_db_path=None`` is also refused before I/O.
 
 The PostgreSQL leg proves the value is never reinterpreted against a
 non-SQLite backend. Run it with::
@@ -47,7 +47,6 @@ from kestrel_sovereign.storage.sovereign_adapter import (
     AssetMetadata,
     AssetRestorer,
     SovereignStorageAdapter,
-    UnsupportedImportDestinationError,
 )
 
 pytestmark = pytest.mark.integration
@@ -233,14 +232,11 @@ async def test_target_db_path_fails_closed_without_mutating_either_database(
     b_before = _dump(databases.b_path)
     restorer = _CapturingRestorer()
 
-    with pytest.warns(DeprecationWarning, match="target_db_path"):
-        with pytest.raises(UnsupportedImportDestinationError) as excinfo:
-            await adapter.import_agent(
-                package,
-                target_db_path=str(target_path),
-                asset_restorers=[restorer],
-                **kwargs,
-            )
+    with pytest.raises(TypeError, match="target_db_path") as excinfo:
+        await adapter.import_agent(
+            package, target_db_path=str(target_path),
+            asset_restorers=[restorer], **kwargs,
+        )
 
     assert str(target_path) not in str(excinfo.value)
     assert restorer.calls == []
@@ -250,7 +246,7 @@ async def test_target_db_path_fails_closed_without_mutating_either_database(
     assert await _contents(databases.b) == ["B_RESIDENT_MARKER"]
 
 
-async def test_explicit_none_is_deprecated_but_imports_into_bound_database(
+async def test_removed_explicit_none_cannot_modify_the_bound_database(
     databases,
 ):
     b_before = _dump(databases.b_path)
@@ -258,13 +254,12 @@ async def test_explicit_none_is_deprecated_but_imports_into_bound_database(
         databases.a.db, user_secret=SECRET, agent_id=AGENT_ID,
     )
 
-    with pytest.warns(DeprecationWarning, match="target_db_path"):
-        result = await adapter.import_agent(
-            databases.car_bytes, target_db_path=None,
-        )
+    a_before = _dump(databases.a_path)
+    with pytest.raises(TypeError, match="target_db_path"):
+        await adapter.import_agent(databases.car_bytes, target_db_path=None)
 
-    assert result.status == "imported"
-    assert await _contents(databases.a) == ["A_EXPORTED_MARKER"]
+    assert _dump(databases.a_path) == a_before
+    assert await _contents(databases.a) == []
     assert _dump(databases.b_path) == b_before
 
 
@@ -293,13 +288,11 @@ async def test_postgres_bound_adapter_never_reinterprets_target_db_path(
         restorer = _CapturingRestorer()
 
         for target in (str(databases.b_path), POSTGRES_URL):
-            with pytest.warns(DeprecationWarning, match="target_db_path"):
-                with pytest.raises(UnsupportedImportDestinationError) as excinfo:
-                    await adapter.import_agent(
-                        databases.car_bytes,
-                        target_db_path=target,
-                        asset_restorers=[restorer],
-                    )
+            with pytest.raises(TypeError, match="target_db_path") as excinfo:
+                await adapter.import_agent(
+                    databases.car_bytes, target_db_path=target,
+                    asset_restorers=[restorer],
+                )
             assert target not in str(excinfo.value)
 
         after = await db.fetchall(

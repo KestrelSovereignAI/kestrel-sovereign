@@ -211,6 +211,22 @@ class TestValidateToolArguments:
         assert is_valid is False
         assert "exceeds maximum length" in error
 
+    @pytest.mark.parametrize("value", [
+        {"nested": ["x" * (MAX_TOOL_ARG_LENGTH + 1)]},
+        [{"nested": "x" * (MAX_TOOL_ARG_LENGTH + 1)}],
+        [["x" * (MAX_TOOL_ARG_LENGTH + 1)]],
+    ])
+    def test_mixed_nested_containers_cannot_hide_an_oversize_string(self, value):
+        valid, error = validate_tool_arguments("test_tool", {"payload": value})
+        assert not valid
+        assert "payload" in error and "maximum length" in error
+
+    def test_deep_small_values_do_not_require_python_recursion(self):
+        value = "within limit"
+        for _ in range(1500):
+            value = [value]
+        assert validate_tool_arguments("test_tool", {"payload": value}) == (True, None)
+
     def test_list_item_string_length(self):
         long_string = "x" * (MAX_TOOL_ARG_LENGTH + 1)
         is_valid, error = validate_tool_arguments(

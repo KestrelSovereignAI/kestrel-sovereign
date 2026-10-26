@@ -6,11 +6,19 @@ orchestrator LLM, including feature dispatcher tools and directly-promoted
 individual tools with LRU eviction.
 """
 
+import asyncio
 import hashlib
 import logging
 import re
+import time
+from copy import deepcopy
 from dataclasses import dataclass
-from typing import Any, Dict, List
+from typing import Any, Callable, Dict, List
+from uuid import uuid4
+
+from kestrel_sdk.resources import ResourceConflict, ResourceOutcomeUnknown
+
+from kestrel_sdk.tools import GovernedToolBinding
 
 from kestrel_sovereign.agent.tool_allowlist import (
     KnownToolNames,
@@ -19,6 +27,113 @@ from kestrel_sovereign.agent.tool_allowlist import (
     registry_generation,
 )
 from kestrel_sovereign.tools.result_contract import enforce_tool_result_contract
+
+
+@dataclass
+class _BoundToolExecution:
+    """Caller-local execution facts, independent of a tool's business result."""
+
+    started: bool = False
+    returned: bool = False
+    admitted: bool = False
+    audit_recorded: bool = False
+    arguments: dict | None = None
+
+
+@dataclass(frozen=True)
+class _GovernedToolBinding:
+    """An in-process reference to one owner's mounted registration batch.
+
+    The existing owner registry carries the batch identity. No second tool
+    registry or serialized bearer credential is involved.
+    """
+
+    agent: Any
+    name: str
+    owner: str
+    registration: object
+    tool: Any
+    security_feature: str
+
+    @property
+    def is_current(self) -> bool:
+        return (
+            self.agent._explored_features.get(self.owner) is self.registration
+            and self.agent._direct_tools.get(self.name) is self.tool
+            and self.agent._tool_to_feature.get(self.name) == self.owner
+        )
+
+    def require_current(self) -> None:
+        if not self.is_current:
+            raise ResourceConflict("Tool registration expired; reopen the originating view")
+
+    async def invoke(self, arguments: Dict[str, Any], *, session_id: str,
+                     source: str = "external") -> Any:
+        from kestrel_sovereign.llm.adapter import ToolCall
+        from kestrel_sovereign.storage.db.interface import DatabaseError
+
+        self.require_current()
+        if not isinstance(arguments, dict):
+            raise TypeError("Tool arguments must be a dictionary")
+        if not isinstance(session_id, str) or not session_id.strip():
+            raise ValueError("A tool invocation requires a session_id")
+        if not isinstance(source, str) or not source.strip():
+            raise ValueError("A tool invocation requires a source")
+        call = ToolCall(id=str(uuid4()), name=self.name, arguments=deepcopy(arguments))
+        execution = _BoundToolExecution()
+        dispatch_start = time.time()
+        from kestrel_sovereign._async_ownership import OwnedTaskOutcome, raise_owned_outcome
+        from kestrel_sovereign.execution_custody import is_execution_control_error
+
+        async def finalize(outcome):
+            if execution.audit_recorded or not execution.admitted:
+                return
+            unknown = execution.started
+            error_class = (
+                "ResourceOutcomeUnknown" if unknown else
+                type(outcome.error).__name__ if outcome.error is not None else
+                "CancelledError"
+            )
+            await self.agent._log_tool_dispatch(
+                tool_name=self.name, adapter=f"{self.owner}.{self.name}",
+                args=execution.arguments if execution.arguments is not None else call.arguments,
+                result={"success": False, "error": "Tool invocation did not complete"},
+                session_id=session_id, dispatch_start=dispatch_start,
+                status_hint="error", error_class=error_class,
+                error_message=(
+                    "Tool outcome is unconfirmed; reconcile before retrying"
+                    if unknown else "Invocation stopped before tool execution"
+                ),
+                required=True,
+            )
+            execution.audit_recorded = True
+
+        outcome = await self.agent._execute_tool_operation_at_stop_boundary(
+            lambda: self.agent._dispatch_tool_call(
+                call,
+                features_by_tool_name={}, known_tools=self.agent._known_tool_names(),
+                messages=[], iteration=0, user_message=None, session_id=session_id,
+                bound_tool=self, bound_execution=execution, source=source,
+            ),
+            name="bound-tool-invocation", cancel_on_caller_cancellation=True,
+            finalize=finalize,
+        )
+        error = outcome.error
+        if isinstance(error, Exception) and not is_execution_control_error(error) and (
+            isinstance(error, DatabaseError)
+            or (execution.started and not isinstance(
+                error, (ResourceConflict, ResourceOutcomeUnknown, asyncio.CancelledError),
+            ))
+        ):
+            message = (
+                "Tool audit could not be confirmed; reconcile before retrying"
+                if isinstance(error, DatabaseError)
+                else "Tool outcome is unconfirmed; reconcile before retrying"
+            )
+            unknown = ResourceOutcomeUnknown(message)
+            unknown.__cause__ = error
+            outcome = OwnedTaskOutcome(outcome.result, unknown, outcome.cancellation)
+        return raise_owned_outcome(outcome, operation="governed bound tool invocation", retain_originals=True)
 
 
 @dataclass(frozen=True)
@@ -308,7 +423,10 @@ class ToolRegistryMixin:
             self._visible_known_tool_names()
         )
 
-    def register_dynamic_tools(self, owner: str, tools, *, pin: bool = False) -> int:
+    def register_dynamic_tools(
+        self, owner: str, tools, *, pin: bool = False,
+        on_registered: Callable[[Any, GovernedToolBinding], None] | None = None,
+    ) -> int:
         """Mount runtime tools owned by ``owner`` into the direct-tool registry.
 
         This is the single primitive for adding first-class, LLM-callable tools
@@ -334,6 +452,13 @@ class ToolRegistryMixin:
         :meth:`unregister_dynamic_tools` treat feature- and non-feature owners
         uniformly. ``pin=True`` exempts the owner from LRU eviction.
 
+        ``schema.model_visible=False`` keeps a tool mounted and governed but
+        omits it from model schemas. Exposure is not authorization. A synchronous
+        ``on_registered(tool, binding)`` callback receives only tools retained
+        after eviction, with their actual disambiguated names. Bindings expire
+        when this owner is registered again, unmounted, or evicted, even when
+        the same tool object is reused. Callbacks must not mutate the registry.
+
         Permissions: a tool not present in the security permission store
         resolves to ``PermissionLevel.ASK`` (the safe default — never a silent
         ALLOW), so dynamically-mounted tools are always gated. Letting an
@@ -341,8 +466,11 @@ class ToolRegistryMixin:
         feature only enumerates ``self.agent.features`` today) is handled in
         #1979 PR5; it is a convenience, not a safety gap.
         """
+        if on_registered is not None and not callable(on_registered):
+            raise TypeError("on_registered must be callable")
         safe_owner = re.sub(r"\W+", "_", str(owner))
-        self._explored_features[owner] = True
+        registration = object()
+        self._explored_features[owner] = registration
         if pin:
             self._pinned_features.add(owner)
         mounted = []
@@ -357,16 +485,25 @@ class ToolRegistryMixin:
             self._direct_tools[name] = tool
             tool_def = tool.schema.to_openai_format()
             tool_def["function"]["name"] = name
-            self._direct_tool_defs.append(tool_def)
+            if getattr(tool.schema, "model_visible", True) is not False:
+                self._direct_tool_defs.append(tool_def)
             self._tool_to_feature[name] = owner
-            mounted.append(name)
+            mounted.append((name, tool))
         bump_registry_generation(self)
         self._maybe_evict_direct_tools()
-        registered = sum(1 for name in mounted if name in self._direct_tools)
+        retained = [(name, tool) for name, tool in mounted
+                    if self._direct_tools.get(name) is tool]
+        registered = len(retained)
         logging.info(
             f"[DYNAMIC-TOOLS] Registered {registered} of {len(mounted)} direct "
             f"tools for '{owner}'. Total: {len(self._direct_tools)}"
         )
+        if on_registered is not None:
+            for name, tool in retained:
+                on_registered(tool, _GovernedToolBinding(
+                    self, name, owner, registration, tool,
+                    self._security_feature_name_for_tool(name),
+                ))
         return registered
 
     def unregister_dynamic_tools(self, owner: str) -> int:

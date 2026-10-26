@@ -341,6 +341,7 @@ of repeated version headers required by Core's native bindings. SDK 0.42.3
 corrects native HTTP+JSON protocol error media types.
 SDK 0.42.4 owns the shared certifi dependency policy for HTTPX and requests;
 operating-system trust stores are unaffected.
+SDK 0.43 adds governed dynamic-tool binding and model-exposure contracts.
 Core requires `sse-starlette>=3.5.0` so stopping one server does not cancel
 streams served by a later server in the same process; automatic stream
 draining remains enabled.

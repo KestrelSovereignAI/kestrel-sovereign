@@ -168,7 +168,7 @@ def validate_tool_arguments(
     1. Tool name is in the known allowlist (if provided).
     2. Arguments are a dict (not some other type).
     3. Each argument value is a valid JSON type.
-    4. No string argument exceeds MAX_TOOL_ARG_LENGTH.
+    4. No string at any nesting depth exceeds MAX_TOOL_ARG_LENGTH.
 
     Args:
         tool_name: Name of the tool being called.
@@ -202,7 +202,13 @@ def validate_tool_arguments(
             logger.warning(f"Tool validation failed: {error}")
             return False, error
 
-        # Check string length
+    # Walk the full JSON container graph, including mixed dictionaries and
+    # lists. An iterative traversal avoids Python recursion limits; repeated
+    # in-process references are inspected once rather than expanded forever.
+    pending = list(arguments.items())
+    visited = set()
+    while pending:
+        key, value = pending.pop()
         if isinstance(value, str) and len(value) > MAX_TOOL_ARG_LENGTH:
             error = (
                 f"Tool '{tool_name}' argument '{key}' exceeds maximum length "
@@ -210,28 +216,16 @@ def validate_tool_arguments(
             )
             logger.warning(f"Tool validation failed: {error}")
             return False, error
-
-        # Recursively check nested dicts
-        if isinstance(value, dict):
-            for nested_key, nested_value in value.items():
-                if isinstance(nested_value, str) and len(nested_value) > MAX_TOOL_ARG_LENGTH:
-                    error = (
-                        f"Tool '{tool_name}' argument '{key}.{nested_key}' exceeds "
-                        f"maximum length ({len(nested_value)} > {MAX_TOOL_ARG_LENGTH})"
-                    )
-                    logger.warning(f"Tool validation failed: {error}")
-                    return False, error
-
-        # Check string items in lists
-        if isinstance(value, list):
-            for i, item in enumerate(value):
-                if isinstance(item, str) and len(item) > MAX_TOOL_ARG_LENGTH:
-                    error = (
-                        f"Tool '{tool_name}' argument '{key}[{i}]' exceeds "
-                        f"maximum length ({len(item)} > {MAX_TOOL_ARG_LENGTH})"
-                    )
-                    logger.warning(f"Tool validation failed: {error}")
-                    return False, error
+        if isinstance(value, (dict, list)):
+            if id(value) in visited:
+                continue
+            visited.add(id(value))
+            if isinstance(value, dict):
+                pending.extend((f"{key}.{nested_key}", nested_value)
+                               for nested_key, nested_value in value.items())
+            else:
+                pending.extend((f"{key}[{index}]", item)
+                               for index, item in enumerate(value))
 
     return True, None
 

@@ -6,6 +6,7 @@ Uses only TEST_POSTGRES_URL and owns a unique schema; no shared rows are reset.
 import asyncio
 import os
 import uuid
+from urllib.parse import unquote, urlsplit
 
 import asyncpg
 import pytest
@@ -58,6 +59,16 @@ async def native_pg():
                     await control.execute(f'DROP SCHEMA "{schema}" CASCADE')
             finally:
                 await control.close()
+
+
+async def test_native_postgres_worker_uses_own_database(native_pg):
+    """Exercise the native lane's real connection after worker configuration."""
+    _, control, _ = native_pg
+    database = await control.fetchval("SELECT current_database()")
+    assert database == unquote(urlsplit(os.environ["TEST_POSTGRES_URL"]).path.lstrip("/"))
+    worker = os.environ.get("PYTEST_XDIST_WORKER")
+    if worker:
+        assert database.startswith(f"pytest_{worker}_"), "native worker reached the shared database"
 
 
 class GenerationFence:

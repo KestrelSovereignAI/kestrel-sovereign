@@ -1046,13 +1046,12 @@ jobs:
         run: uv sync
 
       - name: Run required native PostgreSQL tests
-        # Initial bounded lane, not a fabricated runner-speed measurement.
-        # Reuses integration's 45-minute pytest deadline and 50-minute step
-        # backstop (180s maximum marked case + epilogue). Exact-head CI must
-        # establish the new lane's actual timing; no historical skip counts
-        # are represented as passes. Collection uses the canonical native_pg
-        # dependency marker before pytest's -m deselection.
-        run: uv run pytest tests/integration/ -p pytest_asyncio.plugin -p pytest_timeout -o addopts='' -v --tb=short -x --timeout=120 --session-timeout=2700 -m "native_postgres and not docker_mcp and not mcp_integration and not cloud_resource and not bench"
+        # Run 40273423637 reached 3569/3672 cases before the serial 2700s
+        # session deadline. Reuse the unit tier's per-worker database isolation
+        # with two workers; keep each module together. Required cases, skip
+        # refusal and all existing deadlines stay unchanged. Exact-head CI
+        # must establish the parallel lane's complete result and timing.
+        run: uv run pytest tests/integration/ -p pytest_asyncio.plugin -p pytest_timeout -p xdist.plugin -n 2 --dist=loadfile -o addopts='' -v --tb=short -x --timeout=120 --session-timeout=2700 -m "native_postgres and not docker_mcp and not mcp_integration and not cloud_resource and not bench"
         timeout-minutes: 50
         env:
           TEST_POSTGRES_URL: postgresql://kestrel_user:kestrel_password@localhost:5433/kestrel

@@ -719,7 +719,7 @@ class TestRegisterDynamicToolsPublicAPI:
         assert "fetch" in agent._direct_tools
         assert "fetch_raw" in agent._direct_tools
         assert agent._tool_to_feature["fetch"] == "mcp:fetch"
-        assert agent._explored_features.get("mcp:fetch") is True
+        assert "mcp:fetch" in agent._explored_features
         names = {d["function"]["name"] for d in agent._direct_tool_defs}
         assert {"fetch", "fetch_raw"} <= names
 

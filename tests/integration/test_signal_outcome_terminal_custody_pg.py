@@ -506,6 +506,13 @@ async def test_postgres_original_journal_refuses_effective_durability_drift(disp
     _, control, schema = native_pg
     role = await control.fetchval('SELECT SESSION_USER')
     quoted_role = '"' + role.replace('"', '""') + '"'
+    global_settings = await control.fetchval(
+        'SELECT setconfig FROM pg_db_role_setting '
+        'WHERE setrole=(SELECT oid FROM pg_roles WHERE rolname=SESSION_USER) '
+        'AND setdatabase=0'
+    )
+    database = await control.fetchval('SELECT current_database()')
+    quoted_database = '"' + database.replace('"', '""') + '"'
     pool = await _fresh_journal_pool(c.backend._pool, initial_size=1, max_size=1, ssl='disable')
     original_pool = c.backend._pool
     c.backend._pool = pool
@@ -517,7 +524,12 @@ async def test_postgres_original_journal_refuses_effective_durability_drift(disp
     monkeypatch.setattr(NativeJournalPostgresConnection, '_original_journal_principal', observe_principal)
     scope = ExecutionCustody(_OriginalWork(backend_type='postgres'))
     async def handler(payload):
-        await control.execute(f'ALTER ROLE {quoted_role} SET synchronous_commit=off')
+        await control.execute(f'ALTER ROLE {quoted_role} IN DATABASE {quoted_database} SET synchronous_commit=off')
+        assert await control.fetchval(
+            'SELECT setconfig FROM pg_db_role_setting '
+            'WHERE setrole=(SELECT oid FROM pg_roles WHERE rolname=SESSION_USER) '
+            'AND setdatabase=0'
+        ) == global_settings, 'durability drift must not change another worker database'
         async with pool.acquire() as connection:
             await connection.close()
         scope.revoke('actual work cutoff before changed role-default reconnect')
@@ -534,7 +546,12 @@ async def test_postgres_original_journal_refuses_effective_durability_drift(disp
     finally:
         c.backend._pool = original_pool
         try:
-            await control.execute(f'ALTER ROLE {quoted_role} RESET synchronous_commit')
+            await control.execute(f'ALTER ROLE {quoted_role} IN DATABASE {quoted_database} RESET synchronous_commit')
+            assert await control.fetchval(
+                'SELECT setconfig FROM pg_db_role_setting '
+                'WHERE setrole=(SELECT oid FROM pg_roles WHERE rolname=SESSION_USER) '
+                'AND setdatabase=(SELECT oid FROM pg_database WHERE datname=current_database())'
+            ) is None, 'durability drift left a changed worker database default'
         finally:
             async with asyncio.timeout(10):
                 await pool.close()

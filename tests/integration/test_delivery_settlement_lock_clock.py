@@ -83,6 +83,7 @@ async def test_public_delivery_settlement_samples_after_original_row_lock(
                 await observer.execute("SELECT pg_stat_clear_snapshot()")
                 if await observer.fetchval(
                     "SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE pid<>pg_backend_pid() "
+                    "AND datname=current_database() "
                     "AND wait_event_type='Lock' AND query LIKE '%durable_signal_deliveries%')"
                 ):
                     break
