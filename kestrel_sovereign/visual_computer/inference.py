@@ -28,6 +28,19 @@ class VisualProposal(BaseModel):
     answer: str = Field(default="", max_length=2000)
 
 
+def _bounded_observation(observation):
+    frame, pixels = observation.frame, observation.image.get_secret_value()
+    # Validate the admitted driver's bounded PNG before any adapter decoding.
+    if (frame.media_type != "image/png" or not 33 <= len(pixels) <= 8 * 1024 * 1024
+            or pixels[:8] != b"\x89PNG\r\n\x1a\n" or pixels[8:16] != b"\x00\x00\x00\rIHDR"
+            or not 0 < frame.width <= 4096 or not 0 < frame.height <= 4096
+            or frame.width * frame.height > 8 * 1024 * 1024
+            or struct.unpack(">II", pixels[16:24]) != (frame.width, frame.height)
+            or sha256(pixels).hexdigest() != frame.image_sha256):
+        raise ResourceUnsupported("visual observation is not a bounded verified PNG")
+    return frame, pixels
+
+
 class VisualInference:
     def __init__(self, runtime, llm_service, *, request_options=None):
         self.runtime, self.llm_service = runtime, llm_service
@@ -37,16 +50,7 @@ class VisualInference:
         if not isinstance(prompt, str) or not 0 < len(prompt.encode("utf-8")) <= 16 * 1024:
             raise ValueError("visual task requires bounded text")
         observation = await self.runtime.observe(context, session_id)
-        frame, pixels = observation.frame, observation.image.get_secret_value()
-        # A screenshot from the admitted driver is PNG with exact small bounds.
-        # Validate before existing adapter image processing, without a host decode.
-        if (frame.media_type != "image/png" or not 33 <= len(pixels) <= 8 * 1024 * 1024
-                or pixels[:8] != b"\x89PNG\r\n\x1a\n" or pixels[8:16] != b"\x00\x00\x00\rIHDR"
-                or not 0 < frame.width <= 4096 or not 0 < frame.height <= 4096
-                or frame.width * frame.height > 8 * 1024 * 1024
-                or struct.unpack(">II", pixels[16:24]) != (frame.width, frame.height)
-                or sha256(pixels).hexdigest() != frame.image_sha256):
-            raise ResourceUnsupported("visual observation is not a bounded verified PNG")
+        frame, pixels = _bounded_observation(observation)
         async with self.runtime.session_operation(context, session_id, VisualAction.OBSERVE) as (session, _, check):
             active = True
             def current():
@@ -100,20 +104,35 @@ class VisualInference:
                     raise ValueError("invalid visual proposal size")
                 proposal = VisualProposal.model_validate_json(content)
                 request = None
+                action_frame = frame
                 if proposal.action is not None:
                     action = proposal.action
                     if action.kind not in session.capabilities:
                         raise ResourceUnsupported("model proposed an unavailable action")
                     if action.kind == "click" and (action.x >= frame.width or action.y >= frame.height):
                         raise ResourceUnsupported("model proposed a click outside the screen")
+                    # A local model can take longer than the driver's input
+                    # frame window. Obtain a NEW observation, without renewing
+                    # the original caller/epoch/model-frame authority, and bind
+                    # input only when its independently verified pixels match.
+                    current()
+                    action_frame, _ = _bounded_observation(await self.runtime.observe(context, session_id))
+                    current()
+                    if (action_frame.session_id != frame.session_id
+                            or action_frame.control_epoch != frame.control_epoch
+                            or action_frame.image_sha256 != frame.image_sha256
+                            or (action_frame.width, action_frame.height) != (frame.width, frame.height)
+                            or not 0 <= (self.runtime._now()-action_frame.observed_at).total_seconds() <= 15):
+                        raise ResourceConflict("screen changed while the model was planning")
                     request = ActionRequest(action_id=uuid4().hex, session_id=session_id,
-                        observation_id=frame.observation_id, control_epoch=session.control_epoch,
+                        observation_id=action_frame.observation_id, control_epoch=session.control_epoch,
                         not_after=min(context.expires_at, session.expires_at,
-                            frame.observed_at+timedelta(seconds=60),
+                            action_frame.observed_at+timedelta(seconds=30),
                             self.runtime._now()+timedelta(seconds=min(15,self.runtime.policy.operation_seconds))),
                         action=action)
                 current()
-                return {"frame":frame.model_dump(mode="json"),
+                return {"frame":action_frame.model_dump(mode="json"),
+                        "model_frame":frame.model_dump(mode="json"),
                         "action_request":request.model_dump(mode="json") if request is not None else None,
                         "answer":proposal.answer}
             except BaseException as error:

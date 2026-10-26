@@ -98,7 +98,27 @@ async def test_actual_router_transports_image_and_proposal_uses_canonical_receip
     url = next(item["image_url"]["url"] for item in content if item["type"] == "image_url")
     assert base64.b64decode(url.split(",",1)[1]) == PNG
     assert result["frame"]["observation_id"] == request.observation_id
+    assert result["model_frame"]["observation_id"] != request.observation_id
+    assert result["model_frame"]["image_sha256"] == result["frame"]["image_sha256"]
     assert "image_base64" not in json.dumps(result)
+
+
+@pytest.mark.asyncio
+async def test_changed_screen_after_model_never_rebinds_the_proposed_action(inference):
+    x=inference
+    original=x.h.adapter.observe
+    async def changed(session):
+        value=await original(session)
+        from pydantic import SecretBytes
+        pixels=PNG+b"changed"
+        return value.model_copy(update={"image":SecretBytes(pixels),
+            "frame":value.frame.model_copy(update={"image_sha256":sha256(pixels).hexdigest()})})
+    async def replace_screen():
+        x.h.adapter.observe=changed
+    x.state.during_response=replace_screen
+    with x.h.bind(x.ctx),pytest.raises(ResourceUnsupported):
+        await x.planner.plan(x.ctx,x.session.session_id,"inspect")
+    assert len(x.posts)==1 and not x.h.adapter.effects
 
 
 @pytest.mark.asyncio

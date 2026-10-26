@@ -160,6 +160,15 @@ only an SDK action or completion: IDs, deadlines, owner and epoch are host-owned
 Generated clicks are checked against the original frame before being offered;
 execution revalidates them through the runtime's accepted-action ledger.
 
+Before offering input, the host observes again under the retained original
+caller/control operation. Its verified pixels, dimensions and epoch must match
+the model's original frame exactly; any change refuses the proposal. The action
+uses that fresh observation ID and a short deadline. The response preserves both
+`model_frame` and the action's `frame` as distinct correlation facts. This does
+not renew the original model-frame freshness, caller deadline or control epoch,
+and does not relax a driver's shorter input-frame window. No new model call or
+input is submitted automatically when the screen changes.
+
 Visual prompts, images, answers and provider exception chains are withheld from
 LLM telemetry. Content-free model/usage/failure classification remains available.
 Private artifact/computer HTTP URLs are excluded before optional OTel span

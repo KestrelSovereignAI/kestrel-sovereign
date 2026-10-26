@@ -77,7 +77,8 @@ async def test_real_local_visual_product(tmp_path, monkeypatch):
         from kestrel_sovereign.visual_computer.runtime import VisualAction
         config={"enabled":True,"granted_actions":[a.value for a in VisualAction],"operation_seconds":120,
             "visual_model":f"ollama:local/{model}",
-            "visual_request_options":{"raw":{"think":False,"keep_alive":0,"options":{"num_ctx":8192,"temperature":0}}},
+            "visual_request_options":{"raw":{"format":"json","think":False,"keep_alive":0,
+                                              "options":{"num_ctx":8192,"temperature":0}}},
             "providers":{PROVIDER:{"docker_socket":docker_socket,"image":"local-worker@"+image["Id"],"profile_id":"offline-v1"}},
             "drivers":{PROVIDER:{"docker_socket":docker_socket}}}
         monkeypatch.setattr(visual_feature,"load_section",lambda section:{"visual_computer":config})
