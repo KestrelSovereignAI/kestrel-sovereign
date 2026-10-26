@@ -277,3 +277,29 @@ test('failed comparison removes stale rebase controls and offers a visible retry
     item.client.head=async()=>latest;button(item.panel,'Compare latest').click();await until(()=>item.panel.draft.comparison);
     assert.equal(button(item.panel,'Use latest as save base').hidden,false);assert.equal(item.panel.draft.text,'Keep draft');item.close();
 });
+
+test('deleted publication clears an already displayed comparison', async () => {
+    const item = await fixture();
+    const latest = structuredClone(item.panel.draft.revision); latest.ref.revision_id = 'latest';
+    item.client.get = async () => latest; item.client.head = async () => latest;
+    item.client.commit = async () => { throw { status: 409 }; };
+    edit(item.panel, item.dom.window, 'Keep draft'); button(item.panel, 'Save revision').click();
+    await until(() => item.panel.draft.state === 'conflict');
+    button(item.panel, 'Compare latest').click(); await until(() => item.panel.draft.comparison);
+    assert.ok(item.panel.element.querySelector('h4'));
+    item.client.status = async () => { throw { status: 404, code: 'artifact_not_found' }; };
+    button(item.panel, 'Check save').click(); await until(() => item.panel.draft.state === 'erased');
+    assert.equal(item.panel.element.querySelector('h4'), null);
+    assert.equal(item.panel.draft.comparison, null);
+    assert.equal(button(item.panel, 'Download source file').disabled, true);
+    assert.equal(item.panel.draft.text, 'Keep draft'); item.close();
+});
+
+test('raster sources never enter the browser image decoder without a bounded renderer', async () => {
+    for (const type of ['image/png', 'image/jpeg', 'image/gif', 'image/webp']) {
+        const item = await fixture({ type });
+        assert.equal(item.panel.element.querySelectorAll('img,canvas,iframe,object,embed').length, 0);
+        assert.match(item.panel.element.textContent, /Download this image to view it/);
+        assert.equal(button(item.panel, 'Download source file').disabled, false); item.close();
+    }
+});

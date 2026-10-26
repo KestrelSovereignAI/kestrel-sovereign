@@ -131,7 +131,7 @@ def create_artifact_router(service: AuthorizedArtifactService, *, resolve_contex
     @router.get("")
     async def list_artifacts(request: Request) -> Response:
         async def build(context):
-            return _json(await service.list(context, **page_query(request)))
+            return _json(await service.list(context, query=request.query_params.get("q", ""), **page_query(request)))
         return respond(request, ArtifactAction.READ, build)
 
     @router.post("/staging")

@@ -85,8 +85,13 @@ follow the selected agent and current feature instance, including reloads.
 The repository opens lazily inside the first authorized operation. An unavailable
 or incorrectly keyed artifact store returns an explicit storage failure without
 preventing the agent's other capabilities from starting. Original ciphertext and
-envelope keys are preserved; there is no replacement-key fallback. This HTTP
-service opts out of model subagent dispatch until producer tools are implemented.
+envelope keys are preserved; there is no replacement-key fallback. This feature opts out of model subagent dispatch. Its startup-promoted direct
+`artifact_publish_text`, `artifact_list`, `artifact_get` and
+`artifact_publication_status` tools use the original endpoint caller's revocable
+sovereign-key binding and the same service; a peer, unattended wake or delegated
+subagent gains no artifact grant. Publication takes a caller-selected original
+idempotency key. Successful output parts carry a pinned `ArtifactRef` for the
+shared panel, never a second content URL.
 
 The initial host policy admits only a current, configured sovereign API key in
 `X-API-Key` or `Authorization: Bearer`. Cookie, JWT, peer, unattended and delegated
@@ -246,9 +251,19 @@ Credential-profile persistence (#3716) is a separate opt-in follow-up.
 
 ## Shared product surface
 
+The console's Artifacts chat-header action opens the shared expandable panel
+on the right. Its library reads current heads from the authenticated service;
+search matches decrypted title, file name and media type in bounded pages with
+query-bound continuation. It creates no plaintext metadata index. Empty search
+pages can have a continuation when more encrypted metadata remains to inspect.
+Uploads and new text drafts use the same immutable publication/receipt state
+machine as edits, and remain unsaved until a verified receipt arrives.
 Artifact cards open the same reusable panel from chat, uploads, tools and
 workflow outputs. Text/Markdown/code editing commits a new immutable revision;
-image/PDF viewing and download use authenticated revision-bound routes. Render
+image/PDF source downloads use authenticated revision-bound routes. Inline
+image/PDF viewing stays disabled until an isolated renderer proves aggregate
+OS memory/CPU/deadline limits and cleanup; original compressed raster images
+must not enter a browser decoder as a substitute for that boundary. Render
 untrusted content safely; HTML previews need isolation and cannot share host
 credentials/origin. No untrusted artifact script executes in the app origin.
 The panel shows dirty, saving, saved, conflict, unknown and failed truthfully.

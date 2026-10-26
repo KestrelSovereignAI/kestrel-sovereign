@@ -475,18 +475,27 @@ Cleanup rechecks expiry and references while holding each owner's writer lock.
             raise ResourceNotFound("artifact file is unavailable")
 
     async def page(self, scope: ResourceScope, *, artifact_id: str | None = None,
-                   cursor: str | None = None, limit: int = 50,
+                   cursor: str | None = None, limit: int = 50, query: str = "",
                    guard: Callable[[], None] | None = None) -> ArtifactPage:
         from kestrel_sdk._validation import stable_token
         if type(limit) is not int or not 1 <= limit <= 100:
             raise ValueError("artifact page limit must be between 1 and 100")
+        if not isinstance(query, str) or len(query) > 200:
+            raise ValueError("artifact search must contain at most 200 characters")
+        query = query.strip().casefold()
+        if artifact_id is not None and query:
+            raise ValueError("artifact history does not accept a search query")
+        # Search only authorized decrypted metadata, never plaintext indexes.
+        # Cursors bind the normalized query so continuation cannot skip results
+        # from a different search. Each call decodes at most `limit` revisions.
+        selector = [artifact_id, hashlib.sha256(query.encode()).hexdigest()] if query else artifact_id
         anchor = None
         if cursor is not None:
             try:
                 if not isinstance(cursor, str) or not 1 <= len(cursor) <= 2048:
                     raise ValueError
                 anchor = json.loads(base64.b64decode(cursor, altchars=b"-_", validate=True))
-                if (not isinstance(anchor, list) or len(anchor) != 3 or anchor[2] != artifact_id
+                if (not isinstance(anchor, list) or len(anchor) != 3 or anchor[2] != selector
                         or not isinstance(anchor[0], str) or not isinstance(anchor[1], str)):
                     raise ValueError
                 if _stamp(datetime.fromisoformat(anchor[0])) != anchor[0]:
@@ -515,10 +524,14 @@ Cleanup rechecks expiry and references while holding each owner's writer lock.
             # after selection cannot turn a valid listing into a not-found error.
             items = tuple(self._decode_revision(owner, ArtifactRef(artifact_id=row[0], revision_id=row[1]), row[3])
                           for row in rows[:limit])
+            if query:
+                items = tuple(item for item in items if query in "\n".join(
+                    [item.title, *(file.path for file in item.manifest.files),
+                     *(file.media_type for file in item.manifest.files)]).casefold())
             next_cursor = None
             if len(rows) > limit:
                 last = rows[limit - 1]
-                next_cursor = base64.urlsafe_b64encode(json.dumps([last[2], last[1], artifact_id], separators=(",", ":")).encode()).decode()
+                next_cursor = base64.urlsafe_b64encode(json.dumps([last[2], last[1], selector], separators=(",", ":")).encode()).decode()
             return ArtifactPage(items=items, next_cursor=next_cursor)
 
     async def link(self, scope: ResourceScope, link: ArtifactLink, *, remove: bool = False,

@@ -23,10 +23,11 @@ function element(doc, tag, text, className) {
     return node;
 }
 
-export function createArtifactPanel({ client, ref, document: doc = globalThis.document,
+export function createArtifactPanel({ client, ref, source, document: doc = globalThis.document,
     onOpenRevision = () => {}, onClose = () => {}, confirmDiscard = () => globalThis.confirm('Discard the local draft and any unresolved save state?') }) {
     const root = element(doc, 'section', undefined, 'artifact-panel');
     root.setAttribute('aria-label', 'Saved artifact');
+    root.style.cssText = 'padding:1rem 0;border-top:1px solid var(--border-color);';
     const title = element(doc, 'h3', 'Artifact');
     const identity = element(doc, 'p', '', 'artifact-revision text-muted');
     const status = element(doc, 'p', STATUS.loading); status.setAttribute('role', 'status');
@@ -36,13 +37,10 @@ export function createArtifactPanel({ client, ref, document: doc = globalThis.do
     const history = element(doc, 'div');
     const note = element(doc, 'p', 'Drafts stay in this panel until saved. Download a draft before closing if its save is unresolved.', 'text-muted');
     root.append(title, identity, status, toolbar, viewer, comparison, history, note);
-    let disposed = false, previewURL = null, shownFile = null, editor = null, comparisonRef = null;
+    let disposed = false, shownFile = null, editor = null, comparisonRef = null;
     const urls = new Set();
     const objectURL = (bytes, type) => {
         const url = URL.createObjectURL(new Blob([bytes], { type })); urls.add(url); return url;
-    };
-    const releasePreview = () => {
-        if (previewURL) { URL.revokeObjectURL(previewURL); urls.delete(previewURL); previewURL = null; }
     };
     const download = (bytes, name) => {
         if (!bytes || disposed) return;
@@ -98,26 +96,24 @@ export function createArtifactPanel({ client, ref, document: doc = globalThis.do
     function render() {
         if (disposed) return;
         status.textContent = STATUS[draft.state] || 'Artifact unavailable';
-        title.textContent = draft.revision?.title || 'Artifact';
+        title.textContent = draft.title || 'Artifact';
         identity.textContent = draft.revision ? `Revision ${draft.revision.ref.revision_id}` : '';
         save.disabled = draft.state !== 'dirty';
         check.hidden = !['unknown', 'conflict', 'compare_failed'].includes(draft.state);
         retry.hidden = draft.state !== 'unknown'; compare.hidden = !['conflict', 'compare_failed'].includes(draft.state);
         rebase.hidden = !draft.comparison || draft.state !== 'conflict';
-        exportSaved.disabled = !draft.bytes;
+        exportSaved.disabled = !draft.bytes || ['denied', 'erased'].includes(draft.state);
         exportDraft.hidden = !draft.editable || !draft.hasUnsavedChanges;
         historyButton.disabled = !draft.revision || draft.state === 'saving';
         if (draft.file && draft.file !== shownFile) {
-            releasePreview(); viewer.replaceChildren(); editor = null; shownFile = draft.file;
+            viewer.replaceChildren(); editor = null; shownFile = draft.file;
             if (draft.editable) {
                 editor = element(doc, 'textarea'); editor.value = draft.text;
                 editor.setAttribute('aria-label', 'Artifact source'); editor.spellcheck = false;
                 editor.style.cssText = 'width:100%;min-height:18rem;box-sizing:border-box;font-family:monospace;';
                 editor.addEventListener('input', () => draft.edit(editor.value)); viewer.append(editor);
             } else if (IMAGES.has(draft.file.media_type)) {
-                previewURL = objectURL(draft.bytes, draft.file.media_type);
-                const image = element(doc, 'img'); image.alt = draft.revision.title; image.src = previewURL;
-                image.style.maxWidth = '100%'; viewer.append(image);
+                viewer.append(element(doc, 'p', 'Download this image to view it. A bounded preview renderer is required for inline viewing.'));
             } else if (draft.file.media_type === 'application/pdf') {
                 viewer.append(element(doc, 'p', 'Download this PDF to view it.'));
             } else if (draft.text) {
@@ -143,32 +139,51 @@ export function createArtifactPanel({ client, ref, document: doc = globalThis.do
     function dispose() {
         if (disposed) return;
         disposed = true; draft.close();
-        releasePreview();
         doc.defaultView?.removeEventListener('beforeunload', beforeUnload);
         for (const url of urls) URL.revokeObjectURL(url);
         urls.clear(); viewer.replaceChildren(); comparison.replaceChildren(); history.replaceChildren();
     }
     render();
-    const ready = draft.open(ref);
+    const ready = source ? draft.prepare(source) : draft.open(ref);
     return { element: root, draft, ready, dispose };
 }
 
-/** Open working copies belong to the app workspace, independently of chat cards. */
-export function openArtifactPanel({ client, ref, owner, root = globalThis.document.body }) {
+/** Open working copies belong to the right app panel, independently of producers. */
+function workspaceFor(root) {
     const doc = root.ownerDocument;
     let workspace = workspaces.get(root);
     if (!workspace || !workspace.element.isConnected) {
         const container = element(doc, 'aside', undefined, 'artifact-workspace');
-        container.setAttribute('aria-label', 'Open artifacts');
-        container.style.cssText = 'position:fixed;right:1rem;top:4rem;width:min(44rem,calc(100vw - 2rem));max-height:calc(100vh - 5rem);overflow:auto;z-index:1500;padding:1rem;background:var(--bg-secondary);color:var(--text-primary);border:1px solid var(--border-color);border-radius:12px;';
-        const heading = element(doc, 'h2', 'Open artifacts'), list = element(doc, 'div');
+        container.setAttribute('aria-label', 'Artifacts');
+        container.style.cssText = 'position:fixed;right:0;top:0;height:100dvh;width:min(36rem,100vw);box-sizing:border-box;overflow:auto;z-index:1500;padding:1rem;background:var(--bg-secondary);color:var(--text-primary);border-left:1px solid var(--border-color);box-shadow:-4px 0 20px #0003;';
+        const header = element(doc, 'div', undefined, 'row-flex');
+        header.style.cssText = 'display:flex;align-items:center;gap:.5rem;flex-wrap:wrap;position:sticky;top:-1rem;margin:-1rem -1rem 1rem;padding:1rem;background:var(--bg-secondary);border-bottom:1px solid var(--border-color);z-index:1;';
+        const heading = element(doc, 'h2', 'Artifacts'), list = element(doc, 'div');
+        heading.style.cssText = 'margin:0;flex:1;font-size:1.15rem;';
         const toggle = element(doc, 'button', 'Collapse artifacts', 'btn btn-secondary'); toggle.type = 'button';
-        toggle.addEventListener('click', () => { list.hidden = !list.hidden; toggle.textContent = list.hidden ? 'Show artifacts' : 'Collapse artifacts'; });
-        container.append(heading, toggle, list); root.append(container);
-        workspace = { element: container, list, toggle }; workspaces.set(root, workspace);
+        toggle.setAttribute('aria-expanded', 'true');
+        const resize = element(doc, 'button', 'Expand artifacts', 'btn btn-secondary'); resize.type = 'button';
+        resize.setAttribute('aria-pressed', 'false');
+        const setCollapsed = collapsed => {
+            list.hidden = collapsed; toggle.textContent = collapsed ? 'Show artifacts' : 'Collapse artifacts';
+            toggle.setAttribute('aria-expanded', String(!collapsed));
+            container.style.height = collapsed ? 'auto' : '100dvh';
+        };
+        toggle.addEventListener('click', () => setCollapsed(!list.hidden));
+        resize.addEventListener('click', () => {
+            const expanded = resize.getAttribute('aria-pressed') !== 'true';
+            resize.setAttribute('aria-pressed', String(expanded)); resize.textContent = expanded ? 'Restore panel width' : 'Expand artifacts';
+            container.style.width = expanded ? 'min(70rem,100vw)' : 'min(36rem,100vw)';
+        });
+        header.append(heading, toggle, resize); container.append(header, list); root.append(container);
+        workspace = { element: container, list, libraries: new Map(), show: () => setCollapsed(false) }; workspaces.set(root, workspace);
     }
-    workspace.list.hidden = false; workspace.toggle.textContent = 'Collapse artifacts';
-    const panel = createArtifactPanel({ client, ref, document: doc,
+    workspace.show(); return workspace;
+}
+
+export function openArtifactPanel({ client, ref, source, owner, root = globalThis.document.body }) {
+    const workspace = workspaceFor(root), doc = root.ownerDocument;
+    const panel = createArtifactPanel({ client, ref, source, document: doc,
         onOpenRevision: next => openArtifactPanel({ client, ref: next, owner, root }),
         onClose: () => {
             if (!workspace.list.childElementCount) { workspace.element.remove(); workspaces.delete(root); }
@@ -176,6 +191,81 @@ export function openArtifactPanel({ client, ref, owner, root = globalThis.docume
     if (owner) panel.element.prepend(element(doc, 'p', `Agent: ${owner}`, 'text-muted'));
     workspace.list.append(panel.element); panel.element.scrollIntoView?.({ block: 'nearest' });
     return panel;
+}
+
+/** A discovery page is a projection of the same encrypted service, never a store. */
+export async function openArtifactLibrary({ api, owner = api.getHostAgent(), root = globalThis.document.body }) {
+    const workspace = workspaceFor(root), doc = root.ownerDocument;
+    workspace.libraries.get(owner)?.dispose(true);
+    const section = element(doc, 'section', undefined, 'artifact-library');
+    section.setAttribute('aria-label', 'Artifact library');
+    const title = element(doc, 'h3', owner ? `Saved artifacts · ${owner}` : 'Saved artifacts');
+    const status = element(doc, 'p', 'Opening artifact library…'); status.setAttribute('role', 'status');
+    const form = element(doc, 'form'), search = element(doc, 'input');
+    search.type = 'search'; search.maxLength = 200; search.placeholder = 'Title, file name or media type'; search.setAttribute('aria-label', 'Search artifacts');
+    form.style.cssText = 'display:flex;gap:.5rem;margin-bottom:.75rem;'; search.style.cssText = 'min-width:0;flex:1;padding:.5rem;border:1px solid var(--border-color);border-radius:6px;background:var(--bg-primary);color:var(--text-primary);';
+    const submit = element(doc, 'button', 'Search', 'btn btn-secondary'); submit.type = 'submit';
+    const upload = element(doc, 'input'); upload.type = 'file'; upload.setAttribute('aria-label', 'Upload artifact');
+    const create = element(doc, 'button', 'New text artifact', 'btn btn-secondary'); create.type = 'button';
+    const newTitle = element(doc, 'input'); newTitle.value = 'Untitled document'; newTitle.maxLength = 200; newTitle.setAttribute('aria-label', 'New artifact title');
+    const newDocument = element(doc, 'label', 'New document title '); newDocument.append(newTitle, create);
+    newDocument.style.cssText = 'display:flex;gap:.5rem;align-items:center;flex-wrap:wrap;margin-bottom:.75rem;';
+    const uploadLabel = element(doc, 'label', 'Upload source file '); uploadLabel.append(upload); uploadLabel.style.display = 'block';
+    const close = element(doc, 'button', 'Close library', 'btn btn-secondary'); close.type = 'button';
+    const results = element(doc, 'div'), more = element(doc, 'button', 'Continue discovery', 'btn btn-secondary'); more.type = 'button'; more.hidden = true;
+    form.append(search, submit); section.append(title, status, form, newDocument, uploadLabel, close, results, more); workspace.list.prepend(section);
+    let client, cursor = null, query = '', generation = 0, closed = false, controller = null;
+    function dispose(keepWorkspace = false) {
+        closed = true; generation++; controller?.abort(); section.remove(); workspace.libraries.delete(owner);
+        if (!keepWorkspace && !workspace.list.childElementCount) { workspace.element.remove(); workspaces.delete(root); }
+    }
+    const handle = { element: section, dispose }; workspace.libraries.set(owner, handle);
+    close.addEventListener('click', () => dispose());
+    async function discover(append = false) {
+        if (!client || closed) return;
+        const current = ++generation; controller?.abort(); controller = new AbortController();
+        submit.disabled = true; more.hidden = true; status.textContent = 'Searching saved artifacts…';
+        if (!append) { query = search.value; cursor = null; results.replaceChildren(); }
+        try {
+            const page = await client.list(query, cursor, controller.signal);
+            if (closed || generation !== current) return;
+            for (const revision of page.items || []) {
+                const ref = artifactRef(revision.ref);
+                const card = element(doc, 'article', undefined, 'artifact-card');
+                const label = element(doc, 'strong', revision.title), open = element(doc, 'button', 'Open saved artifact', 'btn btn-secondary');
+                open.type = 'button'; open.addEventListener('click', () => openArtifactPanel({ client, ref, owner, root }));
+                card.append(label, element(doc, 'p', `Revision ${ref.revision_id}`, 'text-muted'), open); results.append(card);
+            }
+            cursor = page.next_cursor; more.hidden = !cursor;
+            status.textContent = results.childElementCount ? 'Saved artifacts' : cursor ? 'No matches in this page. Continue discovery to search the remaining artifacts.' : 'No saved artifacts match.';
+        } catch (error) {
+            if (closed || generation !== current) return;
+            results.replaceChildren(); cursor = null;
+            status.textContent = ['artifact_auth_unbound', 'artifact_auth_changed'].includes(error.code) || [401, 403].includes(error.status)
+                ? 'Artifact access requires a current API key or bearer credential. Reopen after authentication changes.' : 'Artifact discovery is unavailable. Search again to retry.';
+        } finally { if (!closed && generation === current) submit.disabled = false; }
+    }
+    form.addEventListener('submit', event => { event.preventDefault(); discover(); });
+    more.addEventListener('click', () => discover(true));
+    create.addEventListener('click', () => {
+        if (client) openArtifactPanel({ client, owner, root, source: { title: newTitle.value, path: 'notes.md', media_type: 'text/markdown', bytes: new TextEncoder().encode('') } });
+    });
+    upload.addEventListener('change', async () => {
+        const file = upload.files?.[0]; if (!client || !file || closed) return;
+        if (file.size > 16 * 1024 * 1024) { status.textContent = 'Upload source must be at most 16 MiB.'; upload.value = ''; return; }
+        upload.disabled = true;
+        try {
+            const bytes = new Uint8Array(await file.arrayBuffer());
+            if (!closed && bytes.length === file.size) openArtifactPanel({ client, owner, root, source: { title: file.name, path: file.name, media_type: file.type || 'application/octet-stream', bytes } });
+        } catch (_) { if (!closed) status.textContent = 'The upload could not be read.'; }
+        finally { if (!closed) { upload.disabled = false; upload.value = ''; } }
+    });
+    create.disabled = true; upload.disabled = true;
+    try {
+        client = await createArtifactClient(api, owner);
+        if (!closed) { create.disabled = false; upload.disabled = false; await discover(); }
+    } catch (_) { if (!closed) status.textContent = 'Artifact access requires an API key or bearer credential.'; }
+    return handle;
 }
 
 export function artifactPartRenderer(data, context = {}, api) {

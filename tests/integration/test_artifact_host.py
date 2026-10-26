@@ -451,7 +451,9 @@ async def test_keyed_real_boot_omits_subagent_claim_and_survives_wrong_artifact_
             await agent.initialize()
             feature = agent.features["ArtifactsFeature"]
             assert feature.get_router() is not None and feature._accepting
-            assert feature.tool_name not in {item["function"]["name"] for item in agent._build_all_tools()}
+            advertised = {item["function"]["name"] for item in agent._build_all_tools()}
+            assert {"artifact_publish_text", "artifact_get", "artifact_list", "artifact_publication_status"} <= advertised
+            assert feature.tool_name not in advertised
             assert feature.name not in agent._build_features_prompt_section()
             assert feature.tool_name not in agent._visible_features_by_tool_name()
             assert feature.tool_name not in agent._registered_features_by_tool_name()
@@ -586,3 +588,14 @@ async def test_outer_delivery_carries_complete_original_scope(host, monkeypatch)
     assert response.status_code == 200
     assert foreign_checks
     assert value.get() is None
+
+@pytest.mark.asyncio
+async def test_registered_host_discovery_search_is_authorized_and_owner_exact(host):
+    client, _, _ = host
+    ref, _ = await publish(client)
+    found = await client.get(path(), headers=AUTH, params={"q": "REPORT.TXT", "limit": 1})
+    assert found.status_code == 200 and found.json()["items"][0]["ref"] == ref
+    assert "no-store" in found.headers["cache-control"]
+    assert (await client.get(path("other"), headers=AUTH, params={"q": "report"})).json()["items"] == []
+    assert (await client.get(path(), params={"q": "report"})).status_code == 401
+    assert (await client.get(path(), headers=AUTH, params={"q": "x" * 201})).status_code == 400

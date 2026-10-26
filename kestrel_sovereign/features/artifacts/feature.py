@@ -29,7 +29,8 @@ from kestrel_sovereign.artifacts.service import (
     AuthorizedArtifactService,
 )
 from kestrel_sovereign.auth import (
-    AuthMethod, CallerContext, caller_context_scope,
+    AuthMethod, CallerContext, caller_context_scope, current_caller_context,
+    caller_context_binding_scope, capture_caller_context_binding,
 )
 from kestrel_sovereign.endpoints.agent_helpers import get_caller
 from kestrel_sovereign.features.base import Feature
@@ -43,12 +44,14 @@ from kestrel_sovereign.security.host_authority import (
 from kestrel_sovereign.execution_custody import is_execution_control_error
 from kestrel_sovereign.storage.privacy_wrapper import require_durable_persistence_gate
 from kestrel_sovereign.turn_scope import capture_turn_scope
+from .producers import ArtifactProducerTools
 
 
-class ArtifactsFeature(Feature):
+class ArtifactsFeature(ArtifactProducerTools, Feature):
     """Encrypted revisions served through the host's live feature router."""
 
     supports_subagent_dispatch = False
+    promote_tools_on_startup = True
 
     def __init__(self, agent):
         super().__init__(agent)
@@ -73,7 +76,7 @@ class ArtifactsFeature(Feature):
 
     @property
     def tool_description(self) -> str:
-        return "HTTP service for encrypted artifact revisions; no model-facing producer tools"
+        return "Publish, discover and reopen encrypted durable artifacts with exact revision references"
 
     async def initialize(self):
         if self._service is not None:
@@ -157,6 +160,8 @@ class ArtifactsFeature(Feature):
         ):
             raise ArtifactAccessDenied("artifact runtime is no longer current")
         # An explicit route must never fall back to this mount's first agent.
+        if request is None:
+            return  # Tool admission is bound to this original live feature.
         routed = getattr(request.state, "agent", None)
         if routed is not None and routed is not self.agent:
             raise ArtifactAccessDenied("artifact runtime does not match route")
@@ -170,26 +175,42 @@ class ArtifactsFeature(Feature):
     @asynccontextmanager
     async def _resolve_context(self, request):
         caller = get_caller(request)
-        if (
-            not isinstance(caller, CallerContext)
-            or caller.auth_method is not AuthMethod.API_KEY
-            or caller.is_sovereign is not True
-        ):
+        try:
+            secret = stable_sovereign_secret("artifact access")
+            bearer = request.headers.get("authorization", "")
+            presented = (request.headers.get("x-api-key", ""),
+                         bearer[7:] if bearer.startswith("Bearer ") else "")
+            if not any(hmac.compare_digest(value.encode("utf-8"), secret) for value in presented):
+                raise HostAuthorityError("explicit artifact credential required")
+        except HostAuthorityError:
+            raise ArtifactAccessDenied("artifact authority is unavailable") from None
+        async with self._bind_caller(caller, request=request) as context:
+            yield context
+
+    @asynccontextmanager
+    async def _resolve_tool_context(self):
+        # A tool cannot select a principal, agent, credential or delegated grant.
+        # The endpoint-bound original caller has the same revocable lifetime as
+        # HTTP admission, even when execution moves to a registered tool task.
+        async with self._bind_caller(current_caller_context()) as context:
+            yield context
+
+    @asynccontextmanager
+    async def _bind_caller(self, caller, *, request=None):
+        if (not isinstance(caller, CallerContext)
+                or caller.auth_method is not AuthMethod.API_KEY
+                or caller.is_sovereign is not True):
             raise ArtifactAccessDenied("artifact access requires sovereign authority")
         generation = self._generation
         self._require_live(request, generation)
-        # Only header/bearer API credentials are admitted, so browsers cannot
-        # attach the credential implicitly. Cookie/JWT callers are denied even
-        # with a CSRF token; a token must not create a missing artifact grant.
-        with caller_context_scope(caller):
+        binding = capture_caller_context_binding() if request is None else None
+        if request is None and (binding is None or binding.caller is not caller):
+            raise ArtifactAccessDenied("artifact tool caller is no longer current")
+        # HTTP owns this response lifetime. Tools MUST reuse the endpoint's
+        # existing binding; minting a scope here would outlive its revocation.
+        with (caller_context_binding_scope(binding) if request is None else caller_context_scope(caller)):
             try:
                 require_sovereign_caller("artifact access")
-                secret = stable_sovereign_secret("artifact access")
-                bearer = request.headers.get("authorization", "")
-                presented = (request.headers.get("x-api-key", ""),
-                             bearer[7:] if bearer.startswith("Bearer ") else "")
-                if not any(hmac.compare_digest(value.encode("utf-8"), secret) for value in presented):
-                    raise HostAuthorityError("explicit artifact credential required")
             except HostAuthorityError:
                 raise ArtifactAccessDenied("artifact authority is unavailable") from None
             request_scope = capture_turn_scope(self.agent)
@@ -210,11 +231,8 @@ class ArtifactsFeature(Feature):
 
             def check_current(context, action, link):
                 self._require_live(request, generation)
-                if get_caller(request) is not caller or link is not None:
+                if (request is not None and get_caller(request) is not caller) or link is not None:
                     raise ArtifactAccessDenied("artifact authority changed")
-                # The outer transport task predates this request's context.
-                # Carry every declared context through the canonical registry,
-                # including the SAME revocable caller lifetime, never a new one.
                 with request_scope.bind():
                     require_sovereign_caller("artifact access")
 

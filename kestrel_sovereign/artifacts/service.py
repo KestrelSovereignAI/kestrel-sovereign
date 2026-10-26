@@ -126,9 +126,9 @@ class AuthorizedArtifactService:
             lambda scope, check: self.repository.read(scope, ref, path, guard=check))
 
     async def list(self, context: OperatorContext, *, cursor: str | None = None,
-                   limit: int = 50) -> ArtifactPage:
+                   limit: int = 50, query: str = "") -> ArtifactPage:
         return await self._perform(context, ArtifactAction.READ,
-            lambda scope, check: self.repository.page(scope, cursor=cursor, limit=limit, guard=check))
+            lambda scope, check: self.repository.page(scope, cursor=cursor, limit=limit, query=query, guard=check))
 
     async def history(self, context: OperatorContext, artifact_id: str, *,
                       cursor: str | None = None, limit: int = 50) -> ArtifactPage:

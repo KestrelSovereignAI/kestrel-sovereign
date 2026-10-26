@@ -508,3 +508,56 @@ test('comparison reports typed deletion and revoked access without retaining an 
         assert.equal(draft.useComparedRevision(),false);assert.equal(draft.text,'retained');assert.equal(draft.hasUnsavedChanges,true);draft.close();
     }
 });
+
+test('a new upload shares durable receipt verification and same-key recovery with edits', async () => {
+    const item = await fixture(); item.draft.close();
+    const draft = new ArtifactDraft(item.client);
+    let saved, first = true;
+    const original = item.client.commit;
+    item.client.commit = async request => {
+        const reply = await original(request); reply.ref.artifact_id = 'new-artifact'; saved = reply;
+        if (first) { first = false; throw new Error('lost acknowledgement'); } return reply;
+    };
+    await draft.prepare({ title: 'Uploaded notes', path: 'notes.md', media_type: 'text/markdown', bytes: item.bytes });
+    assert.equal(draft.state, 'dirty'); assert.equal(draft.hasUnsavedChanges, true);
+    draft.edit('New document'); await draft.save();
+    assert.equal(draft.state, 'unknown'); assert.equal(item.committed[0].artifact_id, null);
+    const key = draft.pendingKey;
+    item.client.status = async value => { assert.equal(value, key); return saved; };
+    await draft.reconcile();
+    assert.equal(draft.state, 'saved'); assert.equal(draft.revision.ref.artifact_id, 'new-artifact');
+    assert.equal(draft.revision.title, 'Uploaded notes'); assert.equal(draft.text, 'New document');
+    assert.equal(item.committed.length, 1); draft.close();
+});
+
+test('a binary upload keeps exact source bytes, refuses oversized source, and never needs a decoder', async () => {
+    const item = await fixture(); item.draft.close();
+    const draft = new ArtifactDraft(item.client), bytes = new Uint8Array([0, 255, 1, 13, 10]);
+    item.client.commit = async request => ({ schema_version: 1, ref: { ...ref, artifact_id: 'uploaded' }, scope,
+        idempotency_key: request.idempotency_key, ...await publicationDigests(request) });
+    await draft.prepare({ title: 'Image', path: 'image.png', media_type: 'image/png', bytes });
+    assert.equal(draft.editable, false); await draft.save();
+    assert.equal(draft.state, 'saved'); assert.deepEqual(item.staged[0].content, bytes); draft.close();
+    const large = new ArtifactDraft(item.client);
+    await large.prepare({ title: 'Large', path: 'large', media_type: 'application/octet-stream', bytes: new Uint8Array(16 * 1024 * 1024 + 1) });
+    assert.equal(large.state, 'unavailable'); assert.equal(large.hasUnsavedChanges, false); large.close();
+});
+
+test('creation rejects mismatched receipt digests and never compares an unknown new artifact', async () => {
+    const item = await fixture(); item.draft.close();
+    const draft = new ArtifactDraft(item.client);
+    await draft.prepare({ title: 'New', path: 'new.md', media_type: 'text/markdown', bytes: item.bytes });
+    item.client.commit = async () => { throw { status: 409 }; };
+    await draft.save(); assert.equal(draft.state, 'unknown');
+    const key = draft.pendingKey; await draft.compareLatest(); assert.equal(draft.pendingKey, key);
+    draft.close();
+});
+
+test('creation cannot claim saved after receiving an unrelated or malformed receipt', async () => {
+    for (const change of [{ request_sha256:'0'.repeat(64) }, { idempotency_key:'other' }, { scope: {tenant_id:17,principal_id:'owner'} }, { ref: {artifact_id:'https://foreign',revision_id:'r'} }]) {
+        const item=await fixture();item.draft.close();const draft=new ArtifactDraft(item.client),commit=item.client.commit;
+        item.client.commit=async request=>({...await commit(request),...change});
+        await draft.prepare({title:'New',path:'notes.md',media_type:'text/markdown',bytes:item.bytes});await draft.save();
+        assert.equal(draft.state,'unknown');assert.ok(draft.pendingKey);assert.equal(draft.text,'# Original');draft.close();
+    }
+});
