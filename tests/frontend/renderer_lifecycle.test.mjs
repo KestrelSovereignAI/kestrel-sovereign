@@ -470,9 +470,11 @@ test(`a ${retirement} message cannot acquire new mounts after asynchronous final
             if (retirement === 'cleared-and-reattached') pane.element.append(message);
         }
         pane.thinkingItems = ['']; // a new turn started while the old finalizer was held
+        const retiredHtml = message.querySelector('.message-content').innerHTML;
         release();
         await finalizing;
         assert.equal(message.parentNode, retirement === 'cleared-and-reattached' ? pane.element : null);
+        assert.equal(message.querySelector('.message-content').innerHTML, retiredHtml, 'retired finalization rewrote obsolete chat content');
         assert.deepEqual(witness, { mounts: 1, clicks: 0, disposals: 1 });
     } finally {
         release();
