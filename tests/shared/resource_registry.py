@@ -1,8 +1,9 @@
 """
 Global resource registry for test cleanup.
 
-This module provides crash-safe tracking of:
-- RunPod GPU instances
+Historical Runpod IDs are retained for canonical original-lease reconciliation;
+they never authorize automatic cloud cleanup. Other resource types retain the
+existing best-effort legacy behavior, not a verified physical cleanup guarantee:
 - Docker containers
 - Server subprocesses
 - Temporary files/directories
@@ -68,7 +69,7 @@ class ResourceRegistry:
     """
     Singleton registry for tracked resources.
 
-    Ensures resources are cleaned up even on crashes via:
+    Records legacy test resources and installs best-effort cleanup hooks:
     - atexit handler (normal exit)
     - signal handlers (Ctrl+C, kill)
     - Persistent file for crash recovery
@@ -118,10 +119,15 @@ class ResourceRegistry:
         to handle the exit properly and complete its hooks.
         """
         print(f"\n[CLEANUP] Received signal {signum}, cleaning up resources...")
-        self.cleanup_all()
-        # Re-raise the original signal to let the default handler run
-        signal.signal(signum, signal.SIG_DFL)
-        os.kill(os.getpid(), signum)
+        try:
+            self.cleanup_all()
+        except LegacyRunpodPathError as error:
+            logger.error("Unresolved cloud resource during signal cleanup: %s", error)
+        finally:
+            # A refusal/logging failure must never convert SIGINT/SIGTERM into
+            # an ordinary caught error. Original unresolved records remain.
+            signal.signal(signum, signal.SIG_DFL)
+            os.kill(os.getpid(), signum)
 
     def _recover_from_crash(self):
         """Check for resources from a crashed previous run."""
@@ -339,7 +345,7 @@ registry = ResourceRegistry()
 
 # Convenience functions for common resource types
 def track_runpod(pod_id: str, name: str = "", cost_per_hr: float = 0.0) -> str:
-    """Track a RunPod instance for cleanup."""
+    """Retain a historical ID for reconciliation, never cleanup authority."""
     resource = TrackedResource(
         resource_type="runpod",
         resource_id=pod_id,

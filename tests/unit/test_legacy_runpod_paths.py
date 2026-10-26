@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import ast
+import hashlib
 import json
+import os
+import signal
 import subprocess
 import sys
 import tempfile
@@ -77,7 +80,65 @@ print(json.dumps({"error": error, "same_original_bytes": before == after,
 """
 
 
+SIGNAL_PROBE = """
+import atexit, hashlib, importlib.util, json, logging, os, pathlib, signal, sys
+from datetime import datetime, timezone
+repo, path, number, log_failure = sys.argv[1:]
+sys.path.insert(0, repo)
+def audit(event, arguments):
+    if event == "import" and arguments[0].split(".")[0] in {"runpod", "dotenv"}:
+        raise AssertionError("signal cleanup imported provider/credentials")
+    if event in {"socket.connect", "socket.getaddrinfo"}:
+        raise AssertionError("signal cleanup attempted network")
+sys.addaudithook(audit)
+spec = importlib.util.spec_from_file_location("owned_signal_registry", pathlib.Path(repo) / "tests/shared/resource_registry.py")
+module = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = module
+spec.loader.exec_module(module)
+module.REGISTRY_FILE = pathlib.Path(path)
+if log_failure == "fail-log":
+    class FailedOwnedLogSink(logging.Handler):
+        def emit(self, record):
+            os.write(-1, b"actual failed signal cleanup log write")
+    module.logger.addHandler(FailedOwnedLogSink())
+registry = module.registry
+record = module.TrackedResource("runpod", "synthetic-original-signal-id", datetime.now(timezone.utc))
+registry.register(record)
+print(json.dumps({"before_sha256": hashlib.sha256(module.REGISTRY_FILE.read_bytes()).hexdigest()}), flush=True)
+try:
+    try:
+        os.kill(os.getpid(), int(number))
+    except module.LegacyRunpodPathError as error:
+        print(json.dumps({"ordinary_cleanup_refusal_caught": str(error)}), flush=True)
+finally:
+    atexit.unregister(registry.cleanup_all)
+"""
+
+
 class LegacyRunpodPathsTests(unittest.TestCase):
+    @unittest.skipUnless(os.name == "posix", "native POSIX signal exit observation")
+    def test_refusal_never_swallows_real_sigint_or_sigterm(self):
+        with tempfile.TemporaryDirectory(prefix="owned-registry-signal-", dir=REPO.parent) as directory:
+            for number, log_failure in (
+                (signal.SIGINT, "normal"), (signal.SIGTERM, "normal"),
+                (signal.SIGINT, "fail-log"), (signal.SIGTERM, "fail-log"),
+            ):
+                with self.subTest(signal=number.name, log_failure=log_failure):
+                    path = Path(directory, number.name + log_failure + ".json")
+                    child = subprocess.run(
+                        [sys.executable, "-I", "-S", "-B", "-c", SIGNAL_PROBE, str(REPO), str(path), str(int(number)), log_failure],
+                        cwd=directory, env={}, stdin=subprocess.DEVNULL,
+                        capture_output=True, text=True, timeout=10, check=False,
+                    )
+                    self.assertEqual(child.returncode, -int(number), (child.stdout, child.stderr))
+                    observed = [json.loads(line) for line in child.stdout.splitlines() if line.startswith("{")]
+                    self.assertEqual(len(observed), 1, observed)
+                    self.assertTrue(path.exists())
+                    if log_failure == "normal":
+                        self.assertIn("remains unresolved", child.stderr)
+                    self.assertEqual(hashlib.sha256(path.read_bytes()).hexdigest(), observed[0]["before_sha256"])
+                    self.assertIn("synthetic-original-signal-id", json.loads(path.read_text()))
+
     def assert_refused(self, result: subprocess.CompletedProcess[str], path: str) -> None:
         self.assertEqual(result.returncode, 1, (path, result.stdout, result.stderr))
         self.assertIn("is retired; no provider operation was performed", result.stderr)
