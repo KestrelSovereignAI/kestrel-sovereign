@@ -3,12 +3,17 @@
 from __future__ import annotations
 
 import asyncio
-from typing import Any
+from typing import Any, Optional
 
 from kestrel_sdk.tools.base import ToolCategory
 from kestrel_sdk.tools.result import ToolResult
 
 from kestrel_sovereign.features.base import Feature, tool
+from kestrel_sovereign.features.paged_text import (
+    PageRequestError,
+    page_request,
+    paged_text_result,
+)
 
 from .adapters import CliAdapterError, GitCliAdapter
 from .terminal import CliRisk, TerminalExecutionService, redact_secrets
@@ -191,7 +196,7 @@ class CliFeature(Feature):
 
     @tool(
         name="git_show_file",
-        description="Read a local repository file from a git ref via `git show`. ref: single git ref, no ranges/`..`; path: repo-relative pathspec (no leading `/` or `..`); repo_path: within allowed repo roots (default cwd).",
+        description="Read a local repository file from a git ref via `git show`, in ranged chunks. ref: single git ref, no ranges/`..`; path: repo-relative pathspec (no leading `/` or `..`); repo_path: within allowed repo roots (default cwd). Each call returns as much as fits the tool-result cap, starting at offset (characters, default 0); limit caps the chunk. Each chunk reports total_chars and next_offset: call again with offset=next_offset until it is null, or, to read faster, call once for each batch_offsets entry with limit=batch_limit, all in one response.",
         category=ToolCategory.DATA_ACCESS,
         command_prefix="!git-show-file",
     )
@@ -200,7 +205,13 @@ class CliFeature(Feature):
         ref: str,
         path: str,
         repo_path: str = ".",
+        offset: int = 0,
+        limit: Optional[int] = None,
     ) -> ToolResult:
+        try:
+            page = page_request(offset, limit)
+        except PageRequestError as exc:
+            return ToolResult.failed(error=str(exc))
         try:
             payload = await self.adapters["git"].show_file(
                 repo_path=repo_path,
@@ -209,8 +220,12 @@ class CliFeature(Feature):
             )
         except (CliAdapterError, ValueError) as exc:
             return ToolResult.failed(error=str(exc))
-        return ToolResult.ok(
-            f"Read {path} at {ref} from {payload['repo_path']}.",
+        content = payload.pop("content")
+        return paged_text_result(
+            content,
+            page,
+            tool_name="git_show_file",
+            subject=f"{payload['path']} at {payload['ref']}",
             data=payload,
         )
 

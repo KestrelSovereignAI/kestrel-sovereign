@@ -266,7 +266,7 @@ Runtime security policy can still deny a discovered tool at call time; static ge
 | `git_diff` | `!git-diff` | `data_access` | `ref`, `path`, `repo_path` | 109 | `enabled` |
 | `git_log` | `!git-log` | `data_access` | `max_count`, `repo_path` | 79 | `enabled` |
 | `git_merge_base` | `!git-merge-base` | `data_access` | `left_ref`, `right_ref`, `repo_path` | 93 | `enabled` |
-| `git_show_file` | `!git-show-file` | `data_access` | `ref`, `path`, `repo_path` | 104 | `enabled` |
+| `git_show_file` | `!git-show-file` | `data_access` | `ref`, `path`, `repo_path`, `offset`, `limit` | 228 | `enabled` |
 | `git_status` | `!git-status` | `data_access` | `repo_path` | 57 | `enabled` |
 
 ### `compute` (ComputeFeature)
@@ -966,7 +966,7 @@ Runtime security policy can still deny a discovered tool at call time; static ge
 | `!git-diff` | `cli` | `[ref] [path] [repo_path]` | Read local repository diff via `git diff`. ref: single git ref, no ranges/`..`; path: repo-relative pathspec (no leading `/` or `..`); repo_path: within allowed repo roots (default cwd). |
 | `!git-log` | `cli` | `[max_count] [repo_path]` | Read recent local repository commits via `git log`. max_count is capped at 100; repo_path: within allowed repo roots (default cwd). |
 | `!git-merge-base` | `cli` | `<left_ref> <right_ref> [repo_path]` | Read the merge-base for two local git refs. left_ref/right_ref: single git refs, no ranges/`..`; repo_path: within allowed repo roots (default cwd). |
-| `!git-show-file` | `cli` | `<ref> <path> [repo_path]` | Read a local repository file from a git ref via `git show`. ref: single git ref, no ranges/`..`; path: repo-relative pathspec (no leading `/` or `..`); repo_path: within allowed repo roots (default cwd). |
+| `!git-show-file` | `cli` | `<ref> <path> [repo_path] [offset] [limit]` | Read a local repository file from a git ref via `git show`, in ranged chunks. ref: single git ref, no ranges/`..`; path: repo-relative pathspec (no leading `/` or `..`); repo_path: within allowed repo roots (default cwd). Each call returns as much as fits the tool-result cap, starting at offset (characters, default 0); limit caps the chunk. Each chunk reports total_chars and next_offset: call again with offset=next_offset until it is null, or, to read faster, call once for each batch_offsets entry with limit=batch_limit, all in one response. |
 | `!git-status` | `cli` | `[repo_path]` | Read local repository status via `git status --short --branch`. repo_path: within allowed repo roots (default cwd). |
 | `!compute-caps` | `compute` |  | Query what compute capabilities are available |
 | `!compute-empty-trash` | `compute` | `[older_than_days] [dry_run]` | Permanently delete old trash items (requires approval) |

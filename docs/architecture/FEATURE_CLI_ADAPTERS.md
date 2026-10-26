@@ -252,6 +252,33 @@ for diff reads. Local repository paths are constrained to the current process
 working directory plus any roots configured through
 `KESTREL_CLI_ALLOWED_REPO_ROOTS`.
 
+`git_show_file` returns a file in ranged chunks (#3740). It takes optional
+`offset` and `limit`, counted in characters, and returns as much as fits the
+orchestrator's tool-result cap (`KESTREL_MAX_TOOL_RESULT_CHARS`) together with
+its envelope, measured the way the orchestrator measures it, so no chunk is
+replaced by the head-and-tail preview. Each chunk reports `offset`,
+`returned_chars`, `total_chars`, `next_offset` (null at the end) and the
+`content_sha256` of the whole file. Following `next_offset` from 0 reads every
+character, and the chunks joined in order are the file; a changed digest means
+the file changed at that ref between calls. An `offset` past the end fails and
+reports `total_chars`. The envelope is `kestrel_sovereign.features.paged_text`,
+for any tool that reads a text in ranges. Each call still reads the whole file
+from git, so the terminal's 1 MiB capture limit bounds what can be paged.
+
+Following `next_offset` costs one model response per chunk, and the tool loop
+stops after 45 responses by default. The cap measures the escaped JSON, where
+a non-ASCII character takes six characters and one outside the BMP twelve, so
+50,000 such characters can need eighty chunks. A chunk that is not the last
+therefore also carries `batch_offsets` (starting at `next_offset`) and
+`batch_limit`: a call at each of those offsets with `limit=batch_limit`
+returns exactly that many characters and fits the cap, so a model can make
+them all in one response and read on without a gap. A batch's results total
+at most `MAX_BATCH_CHARS` (24,000 characters, three results at the default
+cap), so one response's reads stay small beside the orchestrator's 32,768-token
+fallback context window, which it prunes old tool results against. With a
+cap over 12,000 characters no batch is offered. Batched, 50,000 characters
+outside the BMP are read in 28 responses at the default cap.
+
 ## Future Work
 
 Mutating commands such as `git fetch`, cloud deploys, or package publishes can
