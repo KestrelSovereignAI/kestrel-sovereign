@@ -543,3 +543,201 @@ async def test_queued_old_socket_cancel_cannot_close_a_new_borrow_on_same_connec
                 await asyncio.gather(
                     one, *(tuple([two]) if two is not None else ()), return_exceptions=True
                 )
+
+
+async def test_request_write_restriction_expires_after_full_post_without_losing_response(
+    peer,
+):
+    from kestrel_sovereign.execution_sync_http import (
+        NATIVE_SYNC_HTTP_ADMISSION_API_VERSION,
+    )
+
+    assert NATIVE_SYNC_HTTP_ADMISSION_API_VERSION == 2
+    write = SimpleNamespace(current=True, checks=0)
+
+    def before_write():
+        write.checks += 1
+        if not write.current:
+            raise ExecutionAuthorityError("original spending plan expired")
+
+    with (
+        client(peer) as native,
+        bind_native_sync_http_execution_admission(
+            native, peer.check, check_before_request_write=before_write
+        ),
+    ):
+        task = asyncio.create_task(
+            await_native_sync_http(
+                native, lambda c: c.post(peer.url + "/hold", content=b"original").text
+            )
+        )
+        try:
+            assert await asyncio.to_thread(peer.entered.wait, 2)
+            writes_at_acceptance = write.checks
+            write.current = False
+            peer.release.set()
+            assert await task == "private-response"
+            assert write.checks == writes_at_acceptance and writes_at_acceptance > 0
+        finally:
+            peer.release.set()
+            if not task.done():
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+    assert peer.current and len(peer.requests) == 1
+
+
+async def test_request_write_restriction_refuses_after_tls_before_first_http_byte(
+    peer, monkeypatch
+):
+    original = SyncStream.start_tls
+    write = SimpleNamespace(current=True)
+
+    def after_tls(self, *args, **kwargs):
+        stream = original(self, *args, **kwargs)
+        write.current = False
+        return stream
+
+    def before_write():
+        if not write.current:
+            raise ExecutionAuthorityError("original spending plan expired")
+
+    monkeypatch.setattr(SyncStream, "start_tls", after_tls)
+    with (
+        client(peer) as native,
+        bind_native_sync_http_execution_admission(
+            native, peer.check, check_before_request_write=before_write
+        ),
+    ):
+        with pytest.raises(ExecutionAuthorityError, match="spending plan expired"):
+            await await_native_sync_http(
+                native, lambda c: c.post(peer.url, content=b"original")
+            )
+    assert peer.current and peer.requests == []
+
+
+async def test_request_write_restriction_rechecks_each_actual_partial_send(
+    peer, monkeypatch
+):
+    original = ssl.SSLSocket.send
+    write = SimpleNamespace(current=True)
+    writes = []
+
+    def partial(self, data, flags=0):
+        if self.getpeername()[1] == peer.port:
+            count = original(self, data[:17], flags)
+            writes.append(count)
+            write.current = False
+            return count
+        return original(self, data, flags)
+
+    def before_write():
+        if not write.current:
+            raise ExecutionAuthorityError("original spending plan expired")
+
+    monkeypatch.setattr(ssl.SSLSocket, "send", partial)
+    with (
+        client(peer) as native,
+        bind_native_sync_http_execution_admission(
+            native, peer.check, check_before_request_write=before_write
+        ),
+    ):
+        with pytest.raises(NativeSyncHTTPOutcomeUnknown) as caught:
+            await await_native_sync_http(
+                native, lambda c: c.post(peer.url, content=b"original")
+            )
+        assert isinstance(caught.value.original_error, ExecutionAuthorityError)
+    assert peer.current and writes == [17] and peer.requests == []
+
+
+@pytest.mark.parametrize("retirement", ["host-grant", "global-turn"])
+async def test_request_write_restriction_cannot_replace_original_read_authority(peer, retirement):
+    def before_write():
+        return None  # Restriction permits bytes; this supplies no authority.
+
+    with (
+        bind_execution_custody(ProcessRuntimeExecutionFence("owned-write-terminal-authority")) as scope,
+        client(peer) as native,
+        bind_native_sync_http_execution_admission(
+            native, peer.check, check_before_request_write=before_write
+        ),
+    ):
+        task = asyncio.create_task(
+            await_native_sync_http(
+                native,
+                lambda c: c.post(peer.url + "/held-body", content=b"original").text,
+            )
+        )
+        try:
+            assert await asyncio.to_thread(peer.entered.wait, 2)
+            if retirement == "global-turn":
+                scope.revoke("original global turn stopped")
+            else:
+                peer.current = False
+            peer.release.set()
+            with pytest.raises(NativeSyncHTTPOutcomeUnknown):
+                await task
+        finally:
+            peer.release.set()
+            if not task.done():
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+    assert len(peer.requests) == 1
+
+
+@pytest.mark.parametrize("mode", ["noncallable", "async-function"])
+def test_request_write_restriction_rejects_invalid_binding_before_installation(
+    peer, mode
+):
+    async def invalid():
+        return None
+
+    check = invalid if mode == "async-function" else False
+    with client(peer) as native:
+        with pytest.raises(TypeError, match="synchronous request-write restriction"):
+            with bind_native_sync_http_execution_admission(
+                native, peer.check, check_before_request_write=check
+            ):
+                pytest.fail("invalid extra restriction admitted")
+        assert getattr(native, "_kestrel_sync_admission", None) is None
+    assert peer.requests == []
+
+
+@pytest.mark.parametrize("mode", ["false", "coroutine-result"])
+async def test_request_write_restriction_requires_none_and_closes_coroutine_result(
+    peer, mode
+):
+    results = []
+
+    async def invalid():
+        return None
+
+    def check():
+        result = invalid() if mode == "coroutine-result" else False
+        results.append(result)
+        return result
+
+    with (
+        client(peer) as native,
+        bind_native_sync_http_execution_admission(
+            native, peer.check, check_before_request_write=check
+        ),
+    ):
+        with pytest.raises(TypeError, match="return None or raise"):
+            await await_native_sync_http(
+                native, lambda c: c.post(peer.url, content=b"original")
+            )
+    assert peer.requests == [] and len(results) == 1
+    if mode == "coroutine-result":
+        assert results[0].cr_frame is None
+
+
+async def test_request_write_restriction_copied_binding_stays_retired(peer):
+    with client(peer) as native:
+        with bind_native_sync_http_execution_admission(
+            native, peer.check, check_before_request_write=lambda: None
+        ):
+            copied = copy_context()
+        with bind_native_sync_http_execution_admission(native, peer.check):
+            with pytest.raises(ExecutionAuthorityError, match="restriction retired"):
+                copied.run(native.post, peer.url, content=b"original")
+    assert peer.requests == []

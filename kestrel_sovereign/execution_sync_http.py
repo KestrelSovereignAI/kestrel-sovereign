@@ -35,7 +35,7 @@ from kestrel_sovereign.execution_custody import (
     require_execution_work,
 )
 
-NATIVE_SYNC_HTTP_ADMISSION_API_VERSION = 1
+NATIVE_SYNC_HTTP_ADMISSION_API_VERSION = 2
 _Result = TypeVar("_Result")
 
 
@@ -56,16 +56,31 @@ class NativeSyncHTTPOutcomeUnknown(ExecutionAuthorityError):
 class _Restriction:
     client: httpx.Client
     current: Callable[[], None]
+    before_request_write: Callable[[], None] | None = None
     active: bool = True
 
     def check(self):
         if not self.active:
-            raise ExecutionAuthorityError("original synchronous HTTP restriction retired")
-        result = self.current()
-        if result is not None:
-            if inspect.iscoroutine(result):
-                result.close()
-            raise TypeError("synchronous HTTP restriction must return None or raise")
+            raise ExecutionAuthorityError(
+                "original synchronous HTTP restriction retired"
+            )
+        _check_sync_restriction(self.current)
+
+    def check_request_write(self):
+        if not self.active:
+            raise ExecutionAuthorityError(
+                "original synchronous HTTP restriction retired"
+            )
+        if self.before_request_write is not None:
+            _check_sync_restriction(self.before_request_write)
+
+
+def _check_sync_restriction(check):
+    result = check()
+    if result is not None:
+        if inspect.iscoroutine(result):
+            result.close()
+        raise TypeError("synchronous HTTP restriction must return None or raise")
 
 
 _RESTRICTIONS: ContextVar[tuple[_Restriction, ...]] = ContextVar(
@@ -179,7 +194,10 @@ class _Stream(httpcore.NetworkStream):
         self.native, self.client, self.tls = native, client, tls
         if tls:
             original_socket = native.get_extra_info("socket")
-            if type(original_socket) is not ssl.SSLSocket or original_socket.version() != "TLSv1.3":
+            if (
+                type(original_socket) is not ssl.SSLSocket
+                or original_socket.version() != "TLSv1.3"
+            ):
                 native.close()
                 raise TypeError("synchronous HTTP requires native TLS1.3")
             original_send = original_socket.send
@@ -190,6 +208,8 @@ class _Stream(httpcore.NetworkStream):
                 # This is the actual native handoff, repeated by SyncStream's
                 # existing loop for every partial send. No await/observer here.
                 request.check()
+                for restriction in request.restrictions:
+                    restriction.check_request_write()
                 request.sent = True
                 if request.thread is not None:
                     request.thread.sent = True
@@ -418,7 +438,10 @@ def _install(client):
 
 @contextmanager
 def bind_native_sync_http_execution_admission(
-    client: httpx.Client, check_current: Callable[[], None]
+    client: httpx.Client,
+    check_current: Callable[[], None],
+    *,
+    check_before_request_write: Callable[[], None] | None = None,
 ) -> Iterator[None]:
     """Borrow an original restriction; the installed native client stays gated.
 
@@ -426,11 +449,24 @@ def bind_native_sync_http_execution_admission(
     contexts retain denial after this lexical operation exits. Unsupported
     async native gates are refused, not bypassed. An installed client's future
     requests must also have an explicit live original restriction.
+
+    API2 optionally restricts EACH actual native request-byte send further.
+    This cannot replace current authority, which remains checked at every
+    existing IO/delivery boundary. Spending freshness may expire after a full
+    request without discarding its original terminal receipt. The two-argument
+    API1 call remains supported; the exported version identifies API2 support.
     """
     if not callable(check_current) or inspect.iscoroutinefunction(check_current):
         raise TypeError("synchronous HTTP requires an original synchronous restriction")
+    if check_before_request_write is not None and (
+        not callable(check_before_request_write)
+        or inspect.iscoroutinefunction(check_before_request_write)
+    ):
+        raise TypeError(
+            "synchronous HTTP requires a synchronous request-write restriction"
+        )
     _require_sync_work()
-    restriction = _Restriction(client, check_current)
+    restriction = _Restriction(client, check_current, check_before_request_write)
     restriction.check()
     _install(client)
     token = _RESTRICTIONS.set((*_RESTRICTIONS.get(), restriction))

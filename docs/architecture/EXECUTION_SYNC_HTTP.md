@@ -15,14 +15,14 @@ generated: false
 privacy: public
 ---
 
-# Original restrictions for native synchronous HTTP, API version 1
+# Original restrictions for native synchronous HTTP, API version 2
 
 `kestrel_sovereign.execution_sync_http` is an optional source prerequisite for
 hosts that need a synchronous HTTP client to retain original authorization
 through native I/O. It does not register a provider, acquire capacity or mint
 authority. Existing asynchronous APIs and execution custody remain unchanged.
 The installed Core must actually export `NATIVE_SYNC_HTTP_ADMISSION_API_VERSION
-== 1`; a source candidate with unchanged package metadata is not proof that the
+== 2`; a source candidate with unchanged package metadata is not proof that the
 same published version contains this API.
 
 ## Retaining the original operation
@@ -43,6 +43,28 @@ execution-custody snapshots remain mandatory at every boundary. Any original
 async native validator is explicitly refused, including in copied contexts;
 this module does not skip it, run it in another loop or replace it with a fresh
 checker. The host must not supply an invented callback as a grant substitute.
+
+API2 adds the optional keyword-only `check_before_request_write` synchronous
+restriction. The existing two-argument API1 function call remains supported;
+the exported constant is now 2, so consumers that require the extra boundary
+must explicitly negotiate 2. It does not claim an API1-only installed package
+has this feature. No package floor proves the feature before actual publication.
+
+The extra predicate runs after the original checks and immediately before EACH
+actual original `SSLSocket.send`, including every partial send. It must return
+None or raise; coroutine functions and non-None/awaitable results are refused.
+Its lexical lifetime and copied-context refusal match the original restriction.
+It cannot replace the original checker, execution custody or any IO/delivery
+check. It creates no new client, parser, partial-write loop or retry policy.
+
+A trusted host may put fixed spending-plan freshness in this additional
+predicate while retaining current owner/grant/privacy/lifecycle and immutable
+request integrity in `original_check`. Check the original plan before starting
+native work too. Plan expiry then prohibits later request bytes, while an
+already fully sent request can still yield its terminal receipt under the SAME
+current authority and integrity restrictions. Reads, response close and final
+delivery never invoke the extra write-only predicate. This is not permission
+to read or deliver after host/execution authority itself expires or is revoked.
 
 The binding installs guards on the EXISTING native client/pool once, before any
 connection is used. That client remains guarded: subsequent requests require
@@ -91,7 +113,9 @@ Unconsumed responses are closed and refused before returning; async callbacks
 and returned awaitables are refused. Do not detach work or wrap a raw
 `to_thread` call and let its original binding exit early. Native phase timeouts
 are not an end-to-end action deadline: the host's original checker must still
-enforce its own expiry and cost/policy lifetime.
+enforce its own authority expiry and continuing policy lifetime. A spending
+plan's admission freshness belongs in the optional request-write restriction,
+so it cannot discard terminal factual receipts after spending already began.
 
 After any possible native send, errors or denied delivery raise
 `NativeSyncHTTPOutcomeUnknown`, an execution-control denial. Original request,
