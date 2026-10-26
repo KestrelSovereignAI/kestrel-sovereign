@@ -240,8 +240,9 @@ async def test_result_writer_is_joined_after_repeated_observer_cancellation(cust
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize('custody', ['sqlite'], indirect=True)
 async def test_sqlite_lost_native_commit_ack_keeps_unknown_and_exact_row(custody,monkeypatch):
-    if custody[0].db.backend_type!='sqlite':pytest.skip('SQLite queue ACK boundary; PG native engine covered by signal suite')
+    assert custody[0].db.backend_type=='sqlite'
     from kestrel_sovereign.execution_custody import execution_commit_outcome
     store,_=custody;current,session,action=await prepared(store)
     connection=store.db.backend._connection;commit=connection.commit
@@ -261,8 +262,9 @@ async def test_sqlite_lost_native_commit_ack_keeps_unknown_and_exact_row(custody
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize('custody', ['sqlite'], indirect=True)
 async def test_sqlite_external_generation_cannot_borrow_retired_work(custody):
-    if custody[0].db.backend_type!='sqlite':pytest.skip('SQLite data_version boundary')
+    assert custody[0].db.backend_type=='sqlite'
     store,reopen=custody;current,session,action=await prepared(store)
     turn=ExecutionCustody(OriginalTurn('sqlite'))
     other=await reopen()
@@ -385,9 +387,10 @@ async def test_original_privacy_hold_retirement_at_last_native_probe_rolls_back(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize('custody', ['postgres'], indirect=True)
 async def test_original_result_uses_canonical_borrowed_postgres_pool_factory(custody):
     store,_=custody
-    if store.db.backend_type!='postgres':pytest.skip('native borrowed PostgreSQL pool factory')
+    assert store.db.backend_type=='postgres'
     from kestrel_sovereign.storage.async_database import AsyncDatabase
     from kestrel_sovereign.storage.db.postgres import PostgresBackend
     from kestrel_sovereign.visual_computer.repository import VisualCustodyRepository

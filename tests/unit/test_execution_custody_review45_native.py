@@ -161,12 +161,14 @@ async def test_cancel_resistant_default_refresh_cannot_publish_after_close(
 async def test_native_stdout_eof_retires_requests_before_restart():
     client = CodexAppServerClient(binary="offline-no-codex")
     entered, release = asyncio.Event(), asyncio.Event()
+    retirement_entered = asyncio.Event()
 
     async def handler(params):
         entered.set()
         try:
             await asyncio.Event().wait()
         finally:
+            retirement_entered.set()
             await release.wait()
 
     client._server_request_handlers[("offline/default", None)] = handler
@@ -179,7 +181,7 @@ async def test_native_stdout_eof_retires_requests_before_restart():
     try:
         await asyncio.wait_for(entered.wait(), 2)
         reader = asyncio.create_task(client._read_loop())
-        await asyncio.sleep(0.05)
+        await asyncio.wait_for(retirement_entered.wait(), 2)
         assert not reader.done(), "EOF escaped still-live request retirement"
         assert client._proc is proc and client._initialized
         with pytest.raises(CodexAppServerConnectionClosed):
