@@ -1,6 +1,6 @@
 [project]
 name = "kestrel_sovereign"
-version = "0.54.3"
+version = "0.54.4"
 description = "Kestrel Sovereign AI Agent Framework - Constitutional AI with cryptographic identity"
 readme = "README.md"
 requires-python = ">=3.11,<3.15"
@@ -105,7 +105,7 @@ dependencies = [
     # feature skill producers. The lock records the tested release; future minor versions remain
     # admissible. Verify installed host features against the resolved SDK
     # before release rather than preserving an obsolete minor ceiling.
-    "kestrel-sovereign-sdk[a2a,httpx,tracing]>=0.42.3,<1",
+    "kestrel-sovereign-sdk[a2a,httpx,tracing]>=0.42.4,<1",
     # Native A2A implementation is owned by the shared SDK [a2a] extra.
     # Core and feature skill producers use the same reviewed vendored types.
     "protobuf>=5.29.5",
@@ -203,7 +203,6 @@ dependencies = [
     # Graph operations (lightweight)
     "networkx==3.6.1",
     # Misc
-    "certifi==2026.5.20",
     "charset-normalizer==3.4.7",
     "idna>=3.20,<4",
     "packaging==26.2",
