@@ -21,6 +21,16 @@ const { expect } = require('@playwright/test');
         await workspace.getByRole('button', { name: 'Expand artifacts', exact: true }).click();
         assert.ok((await workspace.boundingBox()).width > narrow.width);
         await workspace.getByRole('button', { name: 'Restore panel width' }).click();
+        if (process.env.ARTIFACT_BROWSER_SCREENSHOT) {
+            await page.screenshot({ path: process.env.ARTIFACT_BROWSER_SCREENSHOT.replace(/\.png$/, '-library.png') });
+            await page.setViewportSize({ width: 390, height: 844 });
+            const mobile = await workspace.boundingBox();
+            assert.equal(Math.round(mobile.x + mobile.width), 390);
+            assert.equal(await workspace.evaluate(node => node.scrollWidth <= node.clientWidth), true);
+            await expect(library.getByLabel('New artifact title')).toBeVisible();
+            await page.screenshot({ path: process.env.ARTIFACT_BROWSER_SCREENSHOT.replace(/\.png$/, '-mobile-library.png') });
+            await page.setViewportSize({ width: 1440, height: 1000 });
+        }
         await library.getByLabel('Upload artifact').setInputFiles({ name: 'evidence.md', mimeType: 'text/markdown', buffer: Buffer.from('# Uploaded source\n') });
         let panel = page.getByRole('region', { name: 'Saved artifact' }).last();
         await expect(panel.getByRole('status')).toHaveText('Unsaved changes');
@@ -70,6 +80,15 @@ const { expect } = require('@playwright/test');
         await stale.getByRole('button', { name: 'Save revision', exact: true }).click();
         await expect(stale.getByRole('status')).toHaveText('Saved revision');
         await expect(stale.getByLabel('Artifact source')).toHaveValue('Retained conflicting draft');
+        if (process.env.ARTIFACT_BROWSER_SCREENSHOT) {
+            await stale.getByLabel('Artifact source').scrollIntoViewIfNeeded();
+            await page.screenshot({ path: process.env.ARTIFACT_BROWSER_SCREENSHOT.replace(/\.png$/, '-editor.png') });
+            await page.setViewportSize({ width: 390, height: 844 });
+            await stale.getByLabel('Artifact source').scrollIntoViewIfNeeded();
+            assert.equal(await workspace.evaluate(node => node.scrollWidth <= node.clientWidth), true);
+            await page.screenshot({ path: process.env.ARTIFACT_BROWSER_SCREENSHOT.replace(/\.png$/, '-mobile-editor.png') });
+            await page.setViewportSize({ width: 1440, height: 1000 });
+        }
         const previewFixtures = JSON.parse(process.env.ARTIFACT_TEST_PREVIEW_FIXTURES || '[]');
         for (const fixture of previewFixtures) {
             await library.getByLabel('Upload artifact').setInputFiles({ name: fixture.name, mimeType: fixture.mimeType, buffer: Buffer.from(fixture.base64, 'base64') });

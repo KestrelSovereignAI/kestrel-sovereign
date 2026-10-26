@@ -29,14 +29,14 @@ export function createArtifactPanel({ client, ref, source, document: doc = globa
     const root = element(doc, 'section', undefined, 'artifact-panel');
     root.setAttribute('aria-label', 'Saved artifact');
     root.style.cssText = 'padding:1rem 0;border-top:1px solid var(--border-color);';
-    const title = element(doc, 'h3', 'Artifact');
+    const title = element(doc, 'h3', 'Artifact', 'artifact-title');
     const identity = element(doc, 'p', '', 'artifact-revision text-muted');
-    const status = element(doc, 'p', STATUS.loading); status.setAttribute('role', 'status');
-    const toolbar = element(doc, 'div', undefined, 'row-flex');
+    const status = element(doc, 'p', STATUS.loading, 'artifact-state'); status.setAttribute('role', 'status');
+    const toolbar = element(doc, 'div', undefined, 'row-flex row-wrap artifact-toolbar');
     const viewer = element(doc, 'div');
     const comparison = element(doc, 'div');
     const history = element(doc, 'div');
-    const note = element(doc, 'p', 'Drafts stay in this panel until saved. Download a draft before closing if its save is unresolved.', 'text-muted');
+    const note = element(doc, 'p', '', 'text-muted artifact-note');
     root.append(title, identity, status, toolbar, viewer, comparison, history, note);
     let disposed = false, shownFile = null, editor = null, comparisonRef = null, shownPreview = null, previewURL = null, releaseBudget = null;
     const urls = new Set();
@@ -101,9 +101,14 @@ export function createArtifactPanel({ client, ref, source, document: doc = globa
     function render() {
         if (disposed) return;
         status.textContent = STATUS[draft.state] || 'Artifact unavailable';
+        status.dataset.state = draft.state;
         title.textContent = draft.title || 'Artifact';
         identity.textContent = draft.revision ? `Revision ${draft.revision.ref.revision_id}` : '';
         save.disabled = draft.state !== 'dirty';
+        save.className = draft.state === 'dirty' ? 'btn btn-primary' : 'btn btn-secondary';
+        note.textContent = draft.hasUnsavedChanges
+            ? 'Unsaved edits are kept only while this panel is open. Download a draft before closing.'
+            : draft.state === 'saved' ? 'Saved revisions remain in your library after this panel closes.' : '';
         check.hidden = !['unknown', 'conflict', 'compare_failed'].includes(draft.state);
         retry.hidden = draft.state !== 'unknown'; compare.hidden = !['conflict', 'compare_failed'].includes(draft.state);
         rebase.hidden = !draft.comparison || draft.state !== 'conflict';
@@ -113,9 +118,8 @@ export function createArtifactPanel({ client, ref, source, document: doc = globa
         if (draft.file && draft.file !== shownFile) {
             releasePreview(); viewer.replaceChildren(); editor = null; shownFile = draft.file;
             if (draft.editable) {
-                editor = element(doc, 'textarea'); editor.value = draft.text;
+                editor = element(doc, 'textarea', undefined, 'artifact-input artifact-editor'); editor.value = draft.text;
                 editor.setAttribute('aria-label', 'Artifact source'); editor.spellcheck = false;
-                editor.style.cssText = 'width:100%;min-height:18rem;box-sizing:border-box;font-family:monospace;';
                 editor.addEventListener('input', () => draft.edit(editor.value)); viewer.append(editor);
             } else if (IMAGES.has(draft.file.media_type)) {
                 viewer.append(element(doc, 'p', 'Download this image to view it. Inline preview is unavailable.'));
@@ -182,7 +186,7 @@ function workspaceFor(root) {
         const container = element(doc, 'aside', undefined, 'artifact-workspace');
         container.setAttribute('aria-label', 'Artifacts');
         container.style.cssText = 'position:fixed;right:0;top:0;height:100dvh;width:min(36rem,100vw);box-sizing:border-box;overflow:auto;z-index:1500;padding:1rem;background:var(--bg-secondary);color:var(--text-primary);border-left:1px solid var(--border-color);box-shadow:-4px 0 20px #0003;';
-        const header = element(doc, 'div', undefined, 'row-flex');
+        const header = element(doc, 'div', undefined, 'row-flex artifact-workspace-header');
         header.style.cssText = 'display:flex;align-items:center;gap:.5rem;flex-wrap:wrap;position:sticky;top:-1rem;margin:-1rem -1rem 1rem;padding:1rem;background:var(--bg-secondary);border-bottom:1px solid var(--border-color);z-index:1;';
         const heading = element(doc, 'h2', 'Artifacts'), list = element(doc, 'div');
         heading.style.cssText = 'margin:0;flex:1;font-size:1.15rem;';
@@ -225,21 +229,24 @@ export async function openArtifactLibrary({ api, owner = api.getHostAgent(), roo
     workspace.libraries.get(owner)?.dispose(true);
     const section = element(doc, 'section', undefined, 'artifact-library');
     section.setAttribute('aria-label', 'Artifact library');
-    const title = element(doc, 'h3', owner ? `Saved artifacts · ${owner}` : 'Saved artifacts');
-    const status = element(doc, 'p', 'Opening artifact library…'); status.setAttribute('role', 'status');
-    const form = element(doc, 'form'), search = element(doc, 'input');
+    const title = element(doc, 'h3', 'Library', 'artifact-title');
+    const status = element(doc, 'p', 'Opening library…', 'text-muted artifact-library-status'); status.setAttribute('role', 'status');
+    const form = element(doc, 'form', undefined, 'row-flex artifact-search'), search = element(doc, 'input', undefined, 'artifact-input');
     search.type = 'search'; search.maxLength = 200; search.placeholder = 'Title, file name or media type'; search.setAttribute('aria-label', 'Search artifacts');
-    form.style.cssText = 'display:flex;gap:.5rem;margin-bottom:.75rem;'; search.style.cssText = 'min-width:0;flex:1;padding:.5rem;border:1px solid var(--border-color);border-radius:6px;background:var(--bg-primary);color:var(--text-primary);';
     const submit = element(doc, 'button', 'Search', 'btn btn-secondary'); submit.type = 'submit';
-    const upload = element(doc, 'input'); upload.type = 'file'; upload.setAttribute('aria-label', 'Upload artifact');
+    const upload = element(doc, 'input', undefined, 'artifact-input artifact-upload'); upload.type = 'file'; upload.setAttribute('aria-label', 'Upload artifact');
     const create = element(doc, 'button', 'New text artifact', 'btn btn-secondary'); create.type = 'button';
-    const newTitle = element(doc, 'input'); newTitle.value = 'Untitled document'; newTitle.maxLength = 200; newTitle.setAttribute('aria-label', 'New artifact title');
-    const newDocument = element(doc, 'label', 'New document title '); newDocument.append(newTitle, create);
-    newDocument.style.cssText = 'display:flex;gap:.5rem;align-items:center;flex-wrap:wrap;margin-bottom:.75rem;';
-    const uploadLabel = element(doc, 'label', 'Upload source file '); uploadLabel.append(upload); uploadLabel.style.display = 'block';
+    const newTitle = element(doc, 'input', undefined, 'artifact-input'); newTitle.value = 'Untitled document'; newTitle.maxLength = 200; newTitle.setAttribute('aria-label', 'New artifact title');
+    const titleLabel = element(doc, 'label', undefined, 'artifact-field'); titleLabel.append(element(doc, 'span', 'New document title'), newTitle);
+    const newDocument = element(doc, 'div', undefined, 'artifact-create'); newDocument.append(titleLabel, create);
+    const uploadLabel = element(doc, 'label', undefined, 'artifact-field'); uploadLabel.append(element(doc, 'span', 'Upload source file'), upload);
     const close = element(doc, 'button', 'Close library', 'btn btn-secondary'); close.type = 'button';
-    const results = element(doc, 'div'), more = element(doc, 'button', 'Continue discovery', 'btn btn-secondary'); more.type = 'button'; more.hidden = true;
-    form.append(search, submit); section.append(title, status, form, newDocument, uploadLabel, close, results, more); workspace.list.prepend(section);
+    const results = element(doc, 'div', undefined, 'artifact-library-results'), more = element(doc, 'button', 'Continue discovery', 'btn btn-secondary'); more.type = 'button'; more.hidden = true;
+    const heading = element(doc, 'div', undefined, 'row-between artifact-library-heading'); heading.append(title, close);
+    const controls = element(doc, 'div', undefined, 'artifact-library-controls'); controls.append(form, newDocument, uploadLabel);
+    form.append(search, submit); section.append(heading);
+    if (owner) section.append(element(doc, 'p', `Agent: ${owner}`, 'text-muted artifact-library-owner'));
+    section.append(controls, status, results, more); workspace.list.prepend(section);
     let client, cursor = null, query = '', generation = 0, closed = false, controller = null;
     function dispose(keepWorkspace = false) {
         closed = true; generation++; controller?.abort(); section.remove(); workspace.libraries.delete(owner);
@@ -250,7 +257,7 @@ export async function openArtifactLibrary({ api, owner = api.getHostAgent(), roo
     async function discover(append = false) {
         if (!client || closed) return;
         const current = ++generation; controller?.abort(); controller = new AbortController();
-        submit.disabled = true; more.hidden = true; status.textContent = 'Searching saved artifacts…';
+        submit.disabled = true; more.hidden = true; status.textContent = 'Searching…';
         if (!append) { query = search.value; cursor = null; results.replaceChildren(); }
         try {
             const page = await client.list(query, cursor, controller.signal);
@@ -263,7 +270,10 @@ export async function openArtifactLibrary({ api, owner = api.getHostAgent(), roo
                 card.append(label, element(doc, 'p', `Revision ${ref.revision_id}`, 'text-muted'), open); results.append(card);
             }
             cursor = page.next_cursor; more.hidden = !cursor;
-            status.textContent = results.childElementCount ? 'Saved artifacts' : cursor ? 'No matches in this page. Continue discovery to search the remaining artifacts.' : 'No saved artifacts match.';
+            const count = results.childElementCount;
+            status.textContent = count ? `${count} saved artifact${count === 1 ? '' : 's'}${cursor ? ' shown · more available' : ''}`
+                : cursor ? 'No matches in this page. Continue discovery to search the remaining artifacts.'
+                : query ? 'No saved artifacts match.' : 'Your library is empty.';
         } catch (error) {
             if (closed || generation !== current) return;
             results.replaceChildren(); cursor = null;
