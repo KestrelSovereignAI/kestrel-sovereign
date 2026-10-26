@@ -45,7 +45,8 @@ async def test_capabilities_quote_and_refused_advanced_profiles():
     p = provider()
     capabilities = await p.capabilities()
     assert "takeover" in capabilities.operations
-    assert not {"navigate", "files", "exec", "clipboard"} & capabilities.operations
+    assert "files" in capabilities.operations
+    assert not {"navigate", "exec", "clipboard"} & capabilities.operations
     req = request()
     quote = await p.quote(req)
     assert quote.request_sha256 == req.digest()
@@ -79,7 +80,7 @@ async def test_stable_private_credentials_bind_exact_process_incarnation(monkeyp
         if arguments[0] == "exec":
             return incarnation[0]
         assert arguments == ["image", "inspect", "sha256:" + "a" * 64]
-        return json.dumps([{"Id": "sha256:" + "a" * 64}]).encode()
+        return json.dumps([{"Id": "sha256:" + "a" * 64, "Config": {"Labels": {docker.LABEL + ".worker-contract": docker.WORKER_CONTRACT}}}]).encode()
     monkeypatch.setattr(p.boundary, "inspect", inspect)
     monkeypatch.setattr(p.boundary, "invoke", invoke)
     one = await p.connect(SCOPE, lease)
@@ -143,7 +144,7 @@ async def test_priority_control_and_reconciliation_use_dedicated_transport(monke
     connection = DriverConnection(lease_id="lease", driver_id=docker.PROVIDER,
         endpoint=SecretStr("private"), credential=SecretStr("a"*64), expires_at=datetime.now(UTC)+timedelta(seconds=60))
     driver._connections["session"] = connection
-    async def bound(value):
+    async def bound(value, **options):
         return {"container_id": CID}
     calls = []
     async def rpc(cid, value, *, mode=None):
@@ -159,7 +160,7 @@ async def test_priority_control_and_reconciliation_use_dedicated_transport(monke
 
 def test_injected_container_environment_and_exec_entrypoint_are_refused():
     value = record("fixture")
-    image = {"Id": "sha256:" + "a" * 64, "Config": {"Env": ["PATH=/usr/bin"]}}
+    image = {"Id": "sha256:" + "a" * 64, "Config": {"Env": ["PATH=/usr/bin"], "Labels": {docker.LABEL + ".worker-contract": docker.WORKER_CONTRACT}}}
     value["Config"]["Env"] = ["PATH=/usr/bin"]
     docker._admit(value, image, "fixture")
     value["Config"]["Env"].append("CLOUD_CREDENTIAL=operator")
@@ -187,7 +188,7 @@ async def test_acquire_admits_actual_container_before_start(monkeypatch):
     async def invoke(arguments, **options):
         calls.append(arguments)
         if arguments[:2] == ["image", "inspect"]:
-            return json.dumps([{"Id": "sha256:" + "a" * 64, "Os": "linux", "Architecture": "arm64"}]).encode()
+            return json.dumps([{"Id": "sha256:" + "a" * 64, "Os": "linux", "Architecture": "arm64", "Config": {"Labels": {docker.LABEL + ".worker-contract": docker.WORKER_CONTRACT}}}]).encode()
         raise AssertionError("unsafe container reached start")
     async def inspect(name):
         return current
@@ -197,3 +198,9 @@ async def test_acquire_admits_actual_container_before_start(monkeypatch):
     with pytest.raises(RuntimeError, match="isolated"):
         await p.acquire(req, quote)
     assert not any(arguments[0] == "start" for arguments in calls)
+
+
+def test_private_daemon_diagnostics_do_not_enter_exception_repr_or_message():
+    error = docker.DockerCommandError("bounded_failure", diagnostics=b"PRIVATE DATA")
+    assert "PRIVATE" not in repr(error) and "PRIVATE" not in str(error)
+    assert error.diagnostics.get_secret_value() == b"PRIVATE DATA"

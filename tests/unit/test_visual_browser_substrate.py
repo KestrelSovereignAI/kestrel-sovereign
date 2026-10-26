@@ -248,3 +248,11 @@ def test_created_container_cannot_normalize_away_unreviewed_oom_setting():
     value["HostConfig"]["OomKillDisable"] = None
     with pytest.raises(RuntimeError):
         probe.verify_container(value, "sha256:test", "test")
+
+
+def test_reviewed_policy_resources_are_included_by_package_ignore_rules():
+    result = subprocess.run(["git", "check-ignore", "--no-index",
+        "kestrel_sovereign/visual_computer/docker_profile/seccomp.json",
+        "kestrel_sovereign/visual_computer/docker_profile/host-config.json"],
+        cwd=probe.ROOT, capture_output=True)
+    assert result.returncode == 1 and result.stdout == b"", "reviewed admission policies would be omitted from wheels"

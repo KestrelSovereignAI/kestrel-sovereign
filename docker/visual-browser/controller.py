@@ -73,7 +73,8 @@ class BrowserController:
 
     def __init__(self, page, request: dict, *, driver_id="local-docker-browser",
                  clock=lambda: datetime.now(UTC), monotonic=time.monotonic,
-                 action_limit=4096, frame_ttl_seconds=30):
+                 action_limit=4096, frame_ttl_seconds=30, workspace_enabled=False):
+        self.operations = OPERATIONS | ({"files"} if workspace_enabled else set())
         required = {"schema_version", "session_id", "scope", "lease_id", "surface",
                     "required_capabilities", "expires_at"}
         if not version_one(request) or set(request) != required:
@@ -88,7 +89,7 @@ class BrowserController:
         capabilities = request["required_capabilities"]
         if (request["surface"] != "browser" or not isinstance(capabilities, list)
                 or not all(isinstance(item, str) for item in capabilities)
-                or "screenshot" not in capabilities or not set(capabilities) <= OPERATIONS):
+                or "screenshot" not in capabilities or not set(capabilities) <= self.operations):
             raise Refused("unsupported_capability")
         self.clock, self.monotonic = clock, monotonic
         remaining = (instant(request["expires_at"]) - clock()).total_seconds()
@@ -101,7 +102,7 @@ class BrowserController:
         self._session = {"schema_version": 1, "session_id": identifier(request["session_id"]),
                          "scope": copy.deepcopy(scope), "lease_id": identifier(request["lease_id"]),
                          "driver_id": identifier(driver_id), "surface": "browser",
-                         "capabilities": sorted(OPERATIONS | {"takeover"}), "state": "ready", "controller": "agent",
+                         "capabilities": sorted(self.operations | {"takeover"}), "state": "ready", "controller": "agent",
                          "control_epoch": 0, "expires_at": request["expires_at"]}
         self._lock = asyncio.Lock()
         self._frame = None

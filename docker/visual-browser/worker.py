@@ -59,6 +59,8 @@ class Endpoint:
             return controller.action_status(**arguments)
         if operation == "control" and set(arguments) == {"session", "request"}:
             return await controller.control(**arguments)
+        if operation == "workspace" and set(arguments) == {"session", "operation", "arguments"} and hasattr(controller, "workspace"):
+            return await controller.workspace.dispatch(**arguments)
         raise Refused("unsupported_request")
 
     async def handle(self, reader, writer):
@@ -163,7 +165,9 @@ async def main():
             context = await browser.new_context(viewport={"width": 800, "height": 600},
                                                 accept_downloads=False, service_workers="block")
             page = await context.new_page()
-            controller = BrowserController(page, settings["request"])
+            from workspace import WorkspaceTransport
+            controller = BrowserController(page, settings["request"], workspace_enabled=True)
+            controller.workspace = WorkspaceTransport(controller, DIRECTORY / "workspace-transfer")
             await page.set_content(settings["document_html"], timeout=5000)
         signal.alarm(max(1, math.ceil(controller.deadline - controller.monotonic())) + 10)
         try:

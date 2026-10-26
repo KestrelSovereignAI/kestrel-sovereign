@@ -13,9 +13,9 @@ from decimal import Decimal
 from uuid import uuid4
 
 from kestrel_sdk.computer_use import ActionRequest, ControlRequest, EnvironmentRequest, SessionRequest, TypeText
-from kestrel_sdk.resources import ResourceConflict, ResourceNotFound, ResourceOutcomeUnknown, ResourceScope
+from kestrel_sdk.resources import ResourceConflict, ResourceNotFound, ResourceOutcomeUnknown, ResourceScope, ResourceUnsupported
 from kestrel_sovereign.visual_computer.docker import (
-    DockerComputerDriver, DockerEnvironmentProvider, LABEL, PROFILE, PROVIDER,
+    DockerCommandError, DockerComputerDriver, DockerEnvironmentProvider, LABEL, PROFILE, PROVIDER,
 )
 from scripts.verify_visual_browser_sandbox import CONTEXT, source_identity
 
@@ -34,7 +34,11 @@ async def run(output, socket):
     provider, lease, request = None, None, None
     uncertain = False
     try:
-        build = await boundary.invoke(["build", "--label", f"{LABEL}.proof={identity}", "--tag", tag, str(CONTEXT)], timeout=600)
+        try:
+            build = await boundary.invoke(["build", "--label", f"{LABEL}.proof={identity}", "--tag", tag, str(CONTEXT)], timeout=600)
+        except DockerCommandError as error:
+            (output / "build.log").write_bytes(error.diagnostics.get_secret_value())
+            raise
         (output / "build.log").write_bytes(build)
         image = json.loads(await boundary.invoke(["image", "inspect", tag]))[0]
         custody["image_id"] = image["Id"]
@@ -47,8 +51,8 @@ async def run(output, socket):
         now = datetime.now(UTC)
         request = EnvironmentRequest(request_id=identity, scope=scope, provider_id=PROVIDER,
             profile_id=PROFILE, image=provider.image, surface="browser",
-            required_capabilities=frozenset({"screenshot", "type", "key", "click", "takeover"}), location="local",
-            requested_at=now, expires_at=now + timedelta(seconds=65), idle_ttl_seconds=60,
+            required_capabilities=frozenset({"screenshot", "type", "key", "click", "takeover", "files"}), location="local",
+            requested_at=now, expires_at=now + timedelta(seconds=90), idle_ttl_seconds=80,
             ready_timeout_seconds=25, max_hourly_cost_usd=Decimal(0), max_total_cost_usd=Decimal(0))
         quote = await provider.quote(request)
         lease = await provider.acquire(request, quote)
@@ -87,6 +91,85 @@ async def run(output, socket):
         assert await reconnect.open(session_request, connection) == session
         assert await reconnect.action_status(session, typed.action_id) == receipt
         assert (await reconnect.observe(session)).image.get_secret_value() == after
+        from kestrel_sdk.artifacts import ArtifactRef, ArtifactFile, ArtifactManifest
+        from kestrel_sdk.workspaces import TransferLimits, WorkspaceExportRequest, WorkspaceImportRequest
+        from pydantic import SecretBytes
+        limits = TransferLimits(max_files=4, max_file_bytes=128*1024, max_total_bytes=256*1024)
+        session = await driver.control(session, ControlRequest(request_id="workspace-pause", session_id=session.session_id,
+            expected_control_epoch=session.control_epoch, operation="pause"))
+        transfer = driver.workspace_transfer()
+        def export_request(transfer_id, workspace_id="browser", paths=("document.html",)):
+            return WorkspaceExportRequest(transfer_id=transfer_id, session_id=session.session_id, lease_id=session.lease_id,
+                control_epoch=session.control_epoch, workspace_id=workspace_id, expires_at=session.expires_at,
+                limits=limits, paths=paths, entrypoint=paths[0])
+        frozen_request = export_request("browser-export")
+        snapshot = await transfer.prepare_export(session, frozen_request)
+        document = (await transfer.read_export(session, snapshot.snapshot_id, "document.html")).get_secret_value()
+        assert b"Persistent SDK browser draft" in document
+        assert await transfer.prepare_export(session, frozen_request) == snapshot
+        (output / "document.html").write_bytes(document)
+        changed = document.replace(b"Persistent SDK browser draft", b"Pinned revision materialized in Docker")
+        file = ArtifactFile(path="nested/document.html", sha256=hashlib.sha256(changed).hexdigest(),
+                            size_bytes=len(changed), media_type="text/html")
+        incoming = WorkspaceImportRequest(transfer_id="materialize", session_id=session.session_id, lease_id=session.lease_id,
+            control_epoch=session.control_epoch, workspace_id="fresh-revision", expires_at=session.expires_at, limits=limits,
+            source=ArtifactRef(artifact_id="synthetic-artifact", revision_id="synthetic-revision"),
+            manifest=ArtifactManifest(files=(file,), entrypoint=file.path))
+        assert (await transfer.prepare_import(session, incoming)).state == "ready"
+        await transfer.write_import_file(session, incoming.transfer_id, file, SecretBytes(changed))
+        materialized = await transfer.commit_import(session, incoming.transfer_id)
+        assert await transfer.commit_import(session, incoming.transfer_id) == materialized
+        assert (await transfer.prepare_import(session, incoming)).materialization == materialized
+        exported = await transfer.prepare_export(session, export_request("revision-export", "fresh-revision", (file.path,)))
+        assert (await transfer.read_export(session, exported.snapshot_id, file.path)).get_secret_value() == changed
+        assert (await transfer.release_export(session, "revision-export")).state == "released"
+        # Exercise real symlink, hardlink and FIFO boundaries in this exact
+        # uniquely owned container; no host filesystem is mounted or addressed.
+        cid = lease.provider_resource_id
+        adversarial = hashlib.sha256(b"adversarial").hexdigest()
+        rejected = []
+        for kind in ("symlink", "hardlink", "fifo"):
+            await boundary.invoke(["exec", cid, "python", "-c",
+                "from pathlib import Path; import os; "
+                "root=Path('/tmp/kestrel-browser/workspace-transfer/workspaces/" + adversarial + "'); "
+                "root.mkdir(exist_ok=True); p=root/'bad.txt'; p.unlink(missing_ok=True); "
+                "outside=Path('/tmp/adapter-proof-outside'); outside.write_bytes(b'PRIVATE FIXTURE'); "
+                + ("p.symlink_to(outside)" if kind == "symlink" else "os.link(outside,p)" if kind == "hardlink" else "os.mkfifo(p)")])
+            test_request = export_request("reject-" + kind, "adversarial", ("bad.txt",))
+            try:
+                await transfer.prepare_export(session, test_request)
+            except (ResourceUnsupported, ResourceOutcomeUnknown):
+                rejected.append(kind)
+            else:
+                raise AssertionError("unsupported filesystem object exported")
+            assert (await transfer.release_export(session, test_request.transfer_id)).state == "released"
+        assert rejected == ["symlink", "hardlink", "fifo"]
+        # Cleanup a partial import; no completion receipt can exist for it.
+        pending = incoming.model_copy(update={"transfer_id": "partial", "workspace_id": "partial-target"})
+        await transfer.prepare_import(session, pending)
+        assert (await transfer.abort_import(session, pending.transfer_id)).state == "aborted"
+        try:
+            await transfer.prepare_import(session, pending)
+        except ResourceNotFound:
+            pass
+        else:
+            raise AssertionError("aborted transfer was allocated again")
+        # A racing empty destination cannot be overwritten by atomic commit.
+        racing = incoming.model_copy(update={"transfer_id": "racing", "workspace_id": "racing-target"})
+        await transfer.prepare_import(session, racing)
+        await transfer.write_import_file(session, racing.transfer_id, file, SecretBytes(changed))
+        racing_key = hashlib.sha256(b"racing-target").hexdigest()
+        await boundary.invoke(["exec", cid, "python", "-c",
+            "from pathlib import Path; Path('/tmp/kestrel-browser/workspace-transfer/workspaces/" + racing_key + "').mkdir()"])
+        try:
+            await transfer.commit_import(session, racing.transfer_id)
+        except ResourceConflict:
+            pass
+        else:
+            raise AssertionError("atomic import replaced a racing destination")
+        assert (await transfer.abort_import(session, racing.transfer_id)).state == "aborted"
+        session = await driver.control(session, ControlRequest(request_id="workspace-resume", session_id=session.session_id,
+            expected_control_epoch=session.control_epoch, operation="resume"))
         # Occupy all normal slots at the real in-container Unix socket.
         cid = lease.provider_resource_id
         holding = asyncio.create_task(boundary.invoke(["exec", cid, "python", "-c",
@@ -107,10 +190,17 @@ async def run(output, socket):
         taken = await driver.control(session, ControlRequest(request_id="takeover", session_id=session.session_id,
             expected_control_epoch=session.control_epoch, operation="takeover"))
         control_seconds = asyncio.get_running_loop().time() - started
-        assert taken.controller == "human" and taken.state == "paused" and taken.control_epoch == 1
+        assert taken.controller == "human" and taken.state == "paused" and taken.control_epoch == session.control_epoch + 1
         assert control_seconds < 5
         assert await driver.status(scope, session.session_id) == taken
         await holding
+        try:
+            await transfer.read_export(taken, snapshot.snapshot_id, "document.html")
+        except ResourceConflict:
+            pass
+        else:
+            raise AssertionError("takeover did not fence workspace reads")
+        assert (await transfer.release_export(session, snapshot.snapshot_id)).state == "released"
         try:
             await driver.act(session, typed)
         except ResourceConflict:
@@ -128,8 +218,60 @@ async def run(output, socket):
             "\n finally: s.close()"
             "\nprint(json.dumps(result))"]))
         assert all(refused.values())
+        # Exercise Linux-only atomic rename and lost receipt reconciliation
+        # directly against the same image's production filesystem transport.
+        linux_filesystem = json.loads(await boundary.invoke(["exec", cid, "python", "-c", r'''
+import hashlib,json,secrets,sys
+sys.path.insert(0,'/opt/kestrel-browser')
+from pathlib import Path
+from datetime import UTC,datetime,timedelta
+from controller import BrowserController
+from workspace import WorkspaceTransport
+from kestrel_sdk.artifacts import ArtifactFile,ArtifactManifest,ArtifactRef
+from kestrel_sdk.workspaces import TransferLimits,WorkspaceImportRequest
+from kestrel_sdk.resources import ResourceConflict
+request={"schema_version":1,"session_id":"filesystem-proof","scope":{"schema_version":1,"tenant_id":"synthetic","principal_id":"filesystem-proof","agent_id":None},"lease_id":"filesystem-proof","surface":"browser","required_capabilities":["screenshot"],"expires_at":(datetime.now(UTC)+timedelta(seconds=30)).isoformat()}
+controller=BrowserController(object(),request)
+controller._session.update(state="paused",controller="none",control_epoch=1)
+session=dict(controller._session)
+transport=WorkspaceTransport(controller,Path('/tmp/filesystem-proof-'+secrets.token_hex(8)))
+content=b'VERIFIED REVISION'
+file=ArtifactFile(path="draft.txt",sha256=hashlib.sha256(content).hexdigest(),size_bytes=len(content),media_type="text/plain")
+def incoming(name):
+ return WorkspaceImportRequest(transfer_id=name,session_id=session['session_id'],lease_id=session['lease_id'],control_epoch=1,workspace_id=name,expires_at=datetime.now(UTC)+timedelta(seconds=20),limits=TransferLimits(max_files=2,max_file_bytes=1024,max_total_bytes=2048),source=ArtifactRef(artifact_id="artifact",revision_id="revision"),manifest=ArtifactManifest(files=(file,),entrypoint=file.path))
+racing=incoming('racing')
+transport.prepare_import(session,racing)
+transport.write_import_file(session,'racing',file,content)
+destination=transport._area('workspaces','racing');destination.mkdir();inode=destination.stat().st_ino
+try:transport.commit_import(session,'racing')
+except ResourceConflict:pass
+else:raise AssertionError('atomic install replaced a racing target')
+assert destination.stat().st_ino==inode and list(destination.iterdir())==[]
+assert transport.abort_import(session,'racing').state=='aborted'
+lost=incoming('lost-receipt')
+transport.prepare_import(session,lost);transport.write_import_file(session,lost.transfer_id,file,content)
+original=transport._persist
+failed=[False]
+def persist(record):
+ if record['status'].state=='complete' and not failed[0]:
+  failed[0]=True
+  raise OSError('injected receipt fsync failure')
+ return original(record)
+transport._persist=persist
+try:transport.commit_import(session,lost.transfer_id)
+except OSError:pass
+else:raise AssertionError('receipt persistence failure was hidden')
+assert transport.records[lost.transfer_id]['status'].state=='unknown'
+installed=transport._area('workspaces',lost.workspace_id);inode=installed.stat().st_ino
+status=transport.status(session,lost.transfer_id)
+assert status.state=='complete'
+assert transport.commit_import(session,lost.transfer_id)==status.materialization
+assert installed.stat().st_ino==inode
+assert transport._file(installed,file.path,1024)==content
+print(json.dumps({'racing_empty_target_not_replaced':True,'lost_receipt_reconciled_without_second_install':True}))
+''']))
         # No close: fixed lease expiry must terminate the actual PID tree.
-        deadline = asyncio.get_running_loop().time() + 75
+        deadline = asyncio.get_running_loop().time() + 100
         while asyncio.get_running_loop().time() < deadline:
             state = (await boundary.inspect(cid))["State"]
             if not state["Running"]:
@@ -144,6 +286,11 @@ async def run(output, socket):
             raise RuntimeError("source changed during real Docker acceptance")
         custody["source_unchanged"] = True
         custody["result"] = {
+            "workspace_snapshot": snapshot.model_dump(mode="json"),
+            "materialization": materialized.model_dump(mode="json"), "filesystem_refusals": rejected,
+            "linux_filesystem": linux_filesystem,
+            "partial_import_aborted": True, "racing_target_not_replaced": True,
+            "takeover_fenced_workspace_data": True,
             "persistent_pixels": True, "deduplicated_action": receipt.model_dump(mode="json"),
             "priority_takeover_seconds": control_seconds, "stale_control_refused": True,
             "refused_destinations": refused, "autonomous_expiry": state,
@@ -151,7 +298,9 @@ async def run(output, socket):
             "docker_version": json.loads(await boundary.invoke(["version", "--format", "{{json .}}"])),
             "sandbox_admission": admission, "png_sha256": hashlib.sha256(after).hexdigest()}
         record()
-    except ResourceOutcomeUnknown:
+    except ResourceOutcomeUnknown as error:
+        if isinstance(error, DockerCommandError):
+            (output / "operation.private.log").write_bytes(error.diagnostics.get_secret_value())
         uncertain = True
         custody["outcome_unknown"] = True
         record()

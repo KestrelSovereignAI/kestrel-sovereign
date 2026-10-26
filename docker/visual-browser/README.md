@@ -157,8 +157,7 @@ all adapter calls and deliveries. Docker labels reconcile a retained request;
 they do not authorize a caller or replace the host's released-request history.
 Idle policy belongs to that host; this worker independently enforces its fixed
 wall and monotonic expiry. No remote, x86_64, navigation, allowed egress,
-clipboard, unrestricted exec or workspace-file capability is advertised by
-`offline-v1`.
+clipboard or unrestricted exec capability is advertised by `offline-v1`.
 
 Run the opt-in SDK acceptance with a new private evidence directory:
 
@@ -174,3 +173,39 @@ occupies all normal transport slots before priority takeover, rejects stale
 control, checks IPv4/IPv6 network denial, waits for physical autonomous expiry,
 and verifies exact resource cleanup. Its screenshots are synthetic private
 fixtures. This local proof is not a completed product or a remote-provider claim.
+
+
+## Negotiated workspace transport
+
+The current image pins SDK 0.43.0 and carries the required
+`io.kestrel.visual-computer.worker-contract=sdk-0.43-workspace-v1` label.
+Older images are refused rather than claiming their file-transfer capability.
+The driver implements the SDK's `WorkspaceTransferProvider` extension;
+`workspace_transfer()` returns a distinct transport with all standard prepare,
+read/write, status, release/abort and commit methods. The host artifact service
+must hold its exact current owner/privacy/session guard across every call.
+
+Data requires a paused session with controller `none`, current epoch and live
+transfer/session expiry. Takeover fences data; authenticated cleanup remains
+available for retained partial state. The explicit `browser` workspace exports
+`document.html`, a frozen HTML source snapshot of the current browser DOM.
+HTML remains untrusted source, not an approved active renderer. Export IDs
+freeze once; released IDs cannot export again. Imported workspaces are fresh
+named targets; a complete identical retry returns the original receipt.
+
+Every path uses the SDK's alias/path validation plus descriptor-relative
+`O_NOFOLLOW` directory/file opens. Reads require owned regular files with one
+hard link, same filesystem, stable metadata, size and digest checks. FIFO,
+symlink, device and hard-link exports are refused. There is no archive or glob
+expansion. Imports use exclusive file creation, verify the exact manifest tree,
+and install through Linux `renameat2(RENAME_NOREPLACE)`; a racing target cannot
+be replaced. An unknown installation receipt reconciles the original intent
+and actual installed tree without another installation. Partial content never
+becomes a live workspace and is removed by explicit abort or physical lease
+retirement.
+
+Limits are 32 selected files, 128 KiB per file, 2 MiB per transfer, path depth
+16 and 1024 UTF-8 path bytes, 64 transfer IDs and 16 MiB reserved managed content
+per worker. Completed workspaces retain their quota until lease retirement.
+The outer tmpfs/resource limits still apply. This transport does not mount or
+address ambient host files and does not publish an artifact itself.

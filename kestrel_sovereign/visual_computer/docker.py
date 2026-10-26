@@ -35,10 +35,11 @@ from .docker_policy import container_arguments, verify_container
 
 PROVIDER = "local-docker-browser"
 PROFILE = "offline-v1"
-OPERATIONS = frozenset({"screenshot", "click", "type", "key", "scroll", "wait", "takeover"})
+OPERATIONS = frozenset({"screenshot", "click", "type", "key", "scroll", "wait", "takeover", "files"})
 # Takeover transfers custody and fences automation; human input transport is a
 # separate capability. It never exposes CDP or unrestricted browser execution.
 LABEL = "io.kestrel.visual-computer"
+WORKER_CONTRACT = "sdk-0.43-workspace-v1"
 MAX_OUTPUT = 24 * 1024 * 1024
 ID = re.compile(r"^[a-f0-9]{64}$")
 READ_INCARNATION = (
@@ -77,7 +78,11 @@ def _record(model, value):
 
 
 class DockerCommandError(ResourceOutcomeUnknown):
-    """A failed daemon operation is never proof of resource absence."""
+    """Private diagnostics require explicit access, never exception/repr logging."""
+
+    def __init__(self, reason, *, diagnostics=b""):
+        self.diagnostics = SecretBytes(diagnostics)
+        super().__init__(reason)
 
 
 class DockerBoundary:
@@ -134,7 +139,7 @@ class DockerBoundary:
                                     + re.escape(target.encode()) + rb"\s*")
                 if arguments[:2] in (["container", "inspect"], ["image", "inspect"]) and absent.fullmatch(error):
                     raise ResourceNotFound("docker_resource_absent")
-                raise DockerCommandError("docker_operation_outcome_unknown")
+                raise DockerCommandError("docker_operation_outcome_unknown", diagnostics=output + error)
             return output
 
     async def inspect(self, target):
@@ -181,7 +186,8 @@ def _scope(lease, scope):
 def _admit(record, image, identity):
     verify_container(record, image["Id"], identity, label=LABEL)
     config = record["Config"]
-    if (config.get("Env") != image.get("Config", {}).get("Env")
+    if (image.get("Config", {}).get("Labels", {}).get(LABEL + ".worker-contract") != WORKER_CONTRACT
+            or config.get("Env") != image.get("Config", {}).get("Env")
             or config.get("Cmd") != ["python", "/opt/kestrel-browser/worker.py"]
             or config.get("Entrypoint") is not None or config.get("OpenStdin") is not False
             or config.get("Tty") is not False or record.get("RestartCount") != 0
@@ -232,7 +238,8 @@ class DockerEnvironmentProvider:
         identity = _identity(request.scope, request.request_id)
         name = "kestrel-visual-" + identity
         image = json.loads(await self.boundary.invoke(["image", "inspect", self.image_id]))[0]
-        if image.get("Id") != self.image_id or image.get("Os") != "linux" or image.get("Architecture") != "arm64":
+        if (image.get("Id") != self.image_id or image.get("Os") != "linux" or image.get("Architecture") != "arm64"
+                or image.get("Config", {}).get("Labels", {}).get(LABEL + ".worker-contract") != WORKER_CONTRACT):
             raise ResourceUnsupported("unsupported_browser_image_platform")
         try:
             record = await self.boundary.inspect(name)
@@ -327,18 +334,24 @@ class DockerEnvironmentProvider:
 class DockerComputerDriver:
     driver_id = PROVIDER
 
-    def __init__(self, *, docker_socket):
+    def __init__(self, *, docker_socket, egress_guard=None):
+        if egress_guard is not None and not callable(egress_guard):
+            raise ResourceUnsupported("invalid_private_egress_guard")
         self.boundary = DockerBoundary(docker_socket)
+        self.egress_guard = egress_guard
         self._connections = {}
 
-    async def _bound(self, connection):
+    def workspace_transfer(self):
+        return DockerWorkspaceTransfer(self)
+
+    async def _bound(self, connection, *, cleanup=False):
         try:
             endpoint = json.loads(connection.endpoint.get_secret_value())
             if (set(endpoint) != {"container_id", "image_id", "identity", "scope", "lease_id", "expires_at", "pid", "started_at", "incarnation"}
                     or not ID.fullmatch(endpoint["container_id"]) or not ID.fullmatch(endpoint["incarnation"]) or not ID.fullmatch(endpoint["identity"])
                     or connection.driver_id != PROVIDER or endpoint["lease_id"] != connection.lease_id
                     or datetime.fromisoformat(endpoint["expires_at"]) != connection.expires_at
-                    or _now() >= connection.expires_at):
+                    or (_now() >= connection.expires_at and not cleanup)):
                 raise ValueError
             record = await self.boundary.inspect(endpoint["container_id"])
             image = json.loads(await self.boundary.invoke(["image", "inspect", endpoint["image_id"]]))[0]
@@ -409,11 +422,11 @@ class DockerComputerDriver:
             raise ResourceConflict("session_request_conflict")
         return session
 
-    async def _rpc(self, session_id, operation, arguments, *, priority=False):
+    async def _rpc(self, session_id, operation, arguments, *, priority=False, cleanup=False):
         connection = self._connections.get(session_id)
         if connection is None:
             raise ResourceNotFound("session_connection_unavailable")
-        endpoint = await self._bound(connection)
+        endpoint = await self._bound(connection, cleanup=cleanup)
         identifier = uuid4().hex
         response = await self.boundary.rpc(endpoint["container_id"], {"schema_version": 1,
             "secret": connection.credential.get_secret_value(), "id": identifier,
@@ -422,11 +435,11 @@ class DockerComputerDriver:
             raise ResourceOutcomeUnknown("worker_response_identity_unknown")
         if "error" in response:
             reason = response["error"]
-            if reason in {"stale_control", "stale_observation", "action_conflict", "control_conflict", "control_pending"}:
+            if reason in {"stale_control", "stale_observation", "action_conflict", "control_conflict", "control_pending", "workspace_conflict"}:
                 raise ResourceConflict(reason)
-            if reason in {"unsupported_request", "unsupported_action", "unsupported_control"}:
+            if reason in {"unsupported_request", "unsupported_action", "unsupported_control", "workspace_unsupported"}:
                 raise ResourceUnsupported(reason)
-            if reason in {"control_outcome_unknown", "transport_outcome_unknown"}:
+            if reason in {"control_outcome_unknown", "transport_outcome_unknown", "workspace_outcome_unknown"}:
                 raise ResourceOutcomeUnknown(reason)
             raise ResourceNotFound("session_operation_unavailable")
         if "result" not in response:
@@ -458,6 +471,68 @@ class DockerComputerDriver:
             "session": session.model_dump(mode="json"), "request": request.model_dump(mode="json")}, priority=True))
 
 
+class DockerWorkspaceTransfer:
+    """Negotiated bounded extension; the host ArtifactService remains the broker."""
+
+    def __init__(self, driver):
+        self.driver = driver
+
+    async def _call(self, session, operation, arguments):
+        return await self.driver._rpc(session.session_id, "workspace", {
+            "session": session.model_dump(mode="json"), "operation": operation, "arguments": arguments},
+            cleanup=operation in {"release_export", "abort_import"})
+
+    async def prepare_export(self, session, request):
+        from kestrel_sdk.workspaces import WorkspaceSnapshot
+        return _record(WorkspaceSnapshot, await self._call(session, "prepare_export", {"request": request.model_dump(mode="json")}))
+
+    async def read_export(self, session, snapshot_id, path):
+        status = await self.status(session, snapshot_id)
+        if status is None or status.snapshot is None:
+            raise ResourceNotFound("workspace_snapshot_unavailable")
+        file = next((file for file in status.snapshot.manifest.files if file.path == path), None)
+        if file is None:
+            raise ResourceNotFound("workspace_file_not_selected")
+        result = await self._call(session, "read_export", {"snapshot_id": snapshot_id, "path": path})
+        try:
+            content = base64.b64decode(result["content_base64"], validate=True)
+            if len(content) != file.size_bytes or hashlib.sha256(content).hexdigest() != file.sha256:
+                raise ValueError
+            return SecretBytes(content)
+        except (KeyError, ValueError, TypeError):
+            raise ResourceOutcomeUnknown("workspace_snapshot_integrity_failure") from None
+
+    async def release_export(self, session, transfer_id):
+        from kestrel_sdk.workspaces import WorkspaceTransferStatus
+        return _record(WorkspaceTransferStatus, await self._call(session, "release_export", {"transfer_id": transfer_id}))
+
+    async def prepare_import(self, session, request):
+        from kestrel_sdk.workspaces import WorkspaceTransferStatus
+        return _record(WorkspaceTransferStatus, await self._call(session, "prepare_import", {"request": request.model_dump(mode="json")}))
+
+    async def write_import_file(self, session, transfer_id, file, content):
+        from kestrel_sdk.workspaces import WorkspaceTransferStatus
+        value = content.get_secret_value()
+        if len(value) > 128 * 1024 or len(value) != file.size_bytes or hashlib.sha256(value).hexdigest() != file.sha256:
+            raise ResourceUnsupported("workspace_file_exceeds_transport_or_integrity_bounds")
+        return _record(WorkspaceTransferStatus, await self._call(session, "write_import_file", {
+            "transfer_id": transfer_id, "file": file.model_dump(mode="json"),
+            "content_base64": base64.b64encode(value).decode()}))
+
+    async def commit_import(self, session, transfer_id):
+        from kestrel_sdk.workspaces import WorkspaceMaterialization
+        return _record(WorkspaceMaterialization, await self._call(session, "commit_import", {"transfer_id": transfer_id}))
+
+    async def abort_import(self, session, transfer_id):
+        from kestrel_sdk.workspaces import WorkspaceTransferStatus
+        return _record(WorkspaceTransferStatus, await self._call(session, "abort_import", {"transfer_id": transfer_id}))
+
+    async def status(self, session, transfer_id):
+        from kestrel_sdk.workspaces import WorkspaceTransferStatus
+        result = await self._call(session, "status", {"transfer_id": transfer_id})
+        return _record(WorkspaceTransferStatus, result) if result is not None else None
+
+
 def environment_provider_factory(*, settings: Mapping[str, object]):
     if set(settings) - {"docker_socket", "image", "credential_key", "profile_id"}:
         raise ResourceUnsupported("unknown_private_docker_settings")
@@ -468,6 +543,6 @@ def environment_provider_factory(*, settings: Mapping[str, object]):
 
 
 def computer_driver_factory(*, settings: Mapping[str, object]):
-    if set(settings) != {"docker_socket"}:
+    if "docker_socket" not in settings or set(settings) - {"docker_socket", "egress_guard"}:
         raise ResourceUnsupported("invalid_private_docker_settings")
     return DockerComputerDriver(**settings)
