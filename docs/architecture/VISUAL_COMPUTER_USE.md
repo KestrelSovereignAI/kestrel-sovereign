@@ -323,6 +323,16 @@ operational names, decisions, error classes, timing and sizes. This diagnostic
 rule does not replace conversation retention policy, authorize a tool, or
 change the canonical encrypted source and its erasure semantics.
 
+The legacy Workflows artifact metadata family,
+`/api/workflows/runs/{run_id}/artifacts/{artifact_id}`, uses the same public
+diagnostic classifier as artifact/computer routes. Optional automatic tracing
+excludes it before span creation; native access logs and API error logs use
+`/api/workflows/artifact-metadata` without IDs, query values or exception text.
+This includes agent-prefixed and malformed descendant paths, including escaped
+path separators and delimiters. Classification never changes routing, grants
+or stored metadata. Other existing Workflows run, stream and control URLs are
+outside this privacy rule; it is not a claim that every Workflows URL is private.
+
 The computer view exposes session state, active controller, Stop and takeover.
 It links outputs by artifact reference, without embedding lifecycle ownership.
 Closing the view or losing its transport does not silently release or resume

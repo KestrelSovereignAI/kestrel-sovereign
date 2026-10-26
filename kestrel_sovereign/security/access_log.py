@@ -17,8 +17,29 @@ from urllib.parse import parse_qsl, urlencode
 
 
 _REDACTED_VALUE = "redacted"
+
+
+def _url_path_literal(value: str) -> str:
+    # ASGI supplies decoded paths. A double-escaped malformed target can leave
+    # encoded static segments after that decode. Recognize both representations
+    # for diagnostics only, including separators on unrouted failures.
+    return "".join(f"(?:{re.escape(char)}|%{ord(char):02x})" for char in value)
+
+
+_LEGACY_WORKFLOW_ARTIFACT_MARKER = "/api/workflows/artifact-metadata"
+_LEGACY_WORKFLOW_ARTIFACT_TARGET = (
+    "(?i:" + _url_path_literal("/api/workflows/runs/")
+    + r"[\s\S]*" + _url_path_literal("/artifacts") + r"(?:/|%(?:2f|3f|23)|[?#]|$)|"
+    # Escaped errors reach the outer error handler with this marker already
+    # installed. It must still classify as private to suppress exception text.
+    + re.escape(_LEGACY_WORKFLOW_ARTIFACT_MARKER) + r"(?:/|$))"
+)
+_PRIVATE_LEGACY_WORKFLOW_TARGET = re.compile(_LEGACY_WORKFLOW_ARTIFACT_TARGET)
 # Also used before optional auto-instrumentation creates a URL-bearing span.
-PRIVATE_CAPABILITY_URL_PATTERN = r"/api/(?:artifacts|visual-computer)(?:[/?#]|$)"
+PRIVATE_CAPABILITY_URL_PATTERN = (
+    r"/api/(?:artifacts|visual-computer)(?:[/?#]|$)|"
+    + _LEGACY_WORKFLOW_ARTIFACT_TARGET
+)
 _PRIVATE_TARGET = re.compile(r"/api/(artifacts|visual-computer)(?:/|$)")
 _PRIVATE_TOOL = re.compile(r"(?:^|__|:)(?:artifact_|visual_)")
 _SENSITIVE_QUERY_NAMES = frozenset(
@@ -39,6 +60,12 @@ def _is_sensitive_query_name(name: str) -> bool:
 
 def private_capability_path(path: str) -> str | None:
     """Return a content-free service path, including on unrouted failures."""
+    # Both ASGI and OTel's pre-span URL builder supply the decoded path. An
+    # escaped '?', '#' or newline in a malformed run ID is still path data;
+    # do not parse it as a query/fragment separator or normalize handler input.
+    # Only the legacy artifact metadata family is private here, not all runs.
+    if _PRIVATE_LEGACY_WORKFLOW_TARGET.search(path):
+        return _LEGACY_WORKFLOW_ARTIFACT_MARKER
     match = _PRIVATE_TARGET.search(path)
     return f"/api/{match[1]}" if match else None
 

@@ -123,6 +123,18 @@ def test_real_uvicorn_logs_redact_direct_and_multi_agent_sse_keys(monkeypatch):
                 assert "private-" in response.json()["path"]
             assert client.get("/api/artifacts/publications/denied-private-key").status_code == 401
 
+            for legacy_path in (
+                "/api/workflows/runs/private-run/artifacts/private-artifact",
+                "/api/agents/Kite/api/workflows/runs/private%3Frun/artifacts/private-artifact",
+                "/%61pi/workflows/runs/private-run/%61rtifacts/private-artifact",
+                "/api%2fworkflows%2fruns%2fprivate-run%2fartifacts%2fprivate-artifact",
+            ):
+                response = client.get(legacy_path, params={"signature": "private-signature"},
+                                      headers={"X-API-Key": "direct-secret-2429"})
+                assert response.status_code == 200
+                assert "private-" in response.json()["path"]
+            assert client.get("/api/workflows/runs/denied-private-run/artifacts/private-artifact").status_code == 401
+
         logs = output.getvalue()
         assert observed_keys[:2] == [key for _, key in paths_and_keys]
         assert observed_agents[:2] == [None, routed_agent]
@@ -134,6 +146,7 @@ def test_real_uvicorn_logs_redact_direct_and_multi_agent_sse_keys(monkeypatch):
         assert logs.count("/api/agent/notifications/sse?") == 2
         assert "private-" not in logs
         assert logs.count('GET /api/artifacts HTTP/') == 3
+        assert logs.count('GET /api/workflows/artifact-metadata HTTP/') == 5
     finally:
         server.should_exit = True
         thread.join(timeout=5.0)

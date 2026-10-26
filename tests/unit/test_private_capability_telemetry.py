@@ -24,6 +24,26 @@ async def test_inner_error_handler_does_not_log_cached_private_url_or_exception(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("escaped_to_outer_handler", [False, True])
+async def test_legacy_artifact_error_handler_redacts_cached_url_and_exception(caplog, escaped_to_outer_handler):
+    from kestrel_sovereign.api_errors import api_unhandled_exception_handler
+    path = "/api/agents/private-agent/api/workflows/runs/private?run\n/artifacts/private-artifact"
+    request = Request({"type": "http", "method": "GET", "path": path,
+                       "query_string": b"signature=private-source", "headers": []})
+    assert "private-artifact" in str(request.url)
+    if escaped_to_outer_handler:
+        # On an escaped failure, outer user middleware has already replaced
+        # scope.path while Request.url may still hold its original cached URL.
+        request.scope["path"] = "/api/workflows/artifact-metadata"
+    with caplog.at_level(logging.ERROR, logger="kestrel_sovereign.api_errors"):
+        response = await api_unhandled_exception_handler(request, RuntimeError("private-exception"))
+    assert response.status_code == 500
+    assert "Unhandled API error for GET /api/workflows/artifact-metadata" in caplog.text
+    assert "private-" not in caplog.text
+    assert caplog.records[-1].error_type == "RuntimeError"
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("env", ["OTEL_PYTHON_FASTAPI_EXCLUDED_URLS", "OTEL_PYTHON_EXCLUDED_URLS"])
 async def test_actual_otel_excludes_private_targets_before_span_creation(monkeypatch, env):
     pytest.importorskip("opentelemetry.instrumentation.fastapi")
@@ -52,9 +72,16 @@ async def test_actual_otel_excludes_private_targets_before_span_creation(monkeyp
     try:
         async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://synthetic.test") as client:
             for path in ("/api/artifacts/private-id/head", "/api/agents/owner/api/visual-computer/sessions/private-id",
-                         "/api/artifacts", "/api/visual-computer", "/operator-excluded"):
+                         "/api/artifacts", "/api/visual-computer", "/operator-excluded",
+                         "/api/workflows/runs/private-id/artifacts/private-artifact",
+                         "/%61pi/workflows/runs/private-id/%61rtifacts/private-artifact",
+                         "/api%2fworkflows%2fruns%2fprivate-id%2fartifacts%2fprivate-artifact"):
                 response = await client.get(path, params={"api_key": "private-key", "path": "private-source"})
                 assert response.status_code == 200
+            # Starlette's route regex rejects the decoded newline; exclusion
+            # must also happen before a span can expose this unrouted target.
+            response = await client.get("/api/agents/owner/api/workflows/runs/private%3Frun%23id%0A/artifacts/private-artifact")
+            assert response.status_code == 404
             assert not exporter.get_finished_spans()
             await client.get("/public")
         spans = exporter.get_finished_spans()
