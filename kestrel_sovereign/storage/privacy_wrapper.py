@@ -5585,6 +5585,12 @@ class PrivacyEnforcingStorage:
         """Read public, body-free identity-resource metadata."""
         return await self._storage.get_agent_resource_public_metadata(*args, **kwargs)
 
+    async def require_current_agent_resource_version(self, *args, **kwargs):
+        """Check which identity-resource version is current; writes nothing."""
+        return await self._storage.require_current_agent_resource_version(
+            *args, **kwargs
+        )
+
     async def promote_soul_seed(self, *args, **kwargs):
         """Promote local SOUL.md seed/cache content into canonical storage."""
         self._assert_private_resource_write_allowed(

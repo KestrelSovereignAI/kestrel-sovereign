@@ -41,8 +41,10 @@ from .async_rag_store import AsyncRAGStore
 from .agent_resource_store import (
     AgentResourceStore,
     AgentResourceVersion,
+    ExpectedCurrentVersion,
     SOUL_MARKDOWN_RESOURCE_TYPE,
     check_version_request,
+    surfacing_version_conflicts,
 )
 from .semantic_binding import SemanticAssertionBinding
 from .conversation_created_at import (
@@ -2633,6 +2635,26 @@ class AsyncStorage:
             resource_type
         )
 
+    async def require_current_agent_resource_version(
+        self,
+        expected_current: ExpectedCurrentVersion,
+        resource_type: str = SOUL_MARKDOWN_RESOURCE_TYPE,
+    ) -> None:
+        """Raise unless ``expected_current`` is the current version; write nothing.
+
+        The check :meth:`promote_soul_seed` makes before it writes, for a
+        writer that found nothing to write in the version it read (#3813).
+
+        Raises:
+            ~.agent_resource_store.ResourceVersionConflictError: a different
+                version is current.
+        """
+        if not self._initialized:
+            await self.initialize()
+        await self._require_agent_resource_store().require_current_version(
+            expected_current, resource_type
+        )
+
     async def promote_soul_seed(
         self,
         content: str,
@@ -2640,11 +2662,17 @@ class AsyncStorage:
         created_by: Optional[str] = None,
         source: str = "agent_data/SOUL.md",
         provenance: Optional[Mapping[str, Any]] = None,
+        expected_current: Optional[ExpectedCurrentVersion] = None,
     ) -> AgentResourceVersion:
         """Promote a local SOUL.md seed/cache body into canonical storage.
 
         ``provenance`` adds fields such as a revision's reason and actor to
         the version's provenance (#3779).
+
+        ``expected_current`` is the current version ``content`` was derived
+        from. If a different version is current when it is written,
+        :class:`~.agent_resource_store.ResourceVersionConflictError` is raised
+        and nothing is written (#3813).
 
         The new version, the deselection of the previous one and the graph
         reference to it commit together or not at all, so a failure leaves
@@ -2661,6 +2689,7 @@ class AsyncStorage:
                 created_by=created_by or self.agent_id,
                 source=source,
                 provenance=provenance,
+                expected_current=expected_current,
             )
         )
 
@@ -2675,7 +2704,7 @@ class AsyncStorage:
 
         ``create`` makes the version; its transaction joins this one.
         """
-        async with self.transaction(immediate=True):
+        async with surfacing_version_conflicts(), self.transaction(immediate=True):
             # The reference writes two graph nodes inside this transaction.
             # PostgreSQL refuses a nested graph write whose reservation shard
             # sorts before one already held, so take the whole set first.
