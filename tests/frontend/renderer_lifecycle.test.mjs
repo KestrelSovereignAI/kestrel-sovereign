@@ -7,6 +7,7 @@ const dom = new JSDOM('<!doctype html><body></body>', { url: 'https://console.ex
 Object.assign(globalThis, {
     window: dom.window,
     document: dom.window.document,
+    location: dom.window.location,
     sessionStorage: dom.window.sessionStorage,
     localStorage: dom.window.localStorage,
 });
