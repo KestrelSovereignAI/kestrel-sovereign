@@ -119,3 +119,54 @@ async def test_producer_checks_privacy_and_live_feature_before_staging(host, mon
         assert 'escape' not in result['error']
         await feature.on_disable()
         assert (await publish(agent))['data']['state'] == 'denied'
+
+
+@pytest.mark.asyncio
+async def test_real_registered_producer_dispatch_keeps_plaintext_audits_content_free(host, tmp_path):
+    import json
+    import aiosqlite
+    from kestrel_sovereign.a2a.stores.unified.observability_store import ObservabilityStore
+    from kestrel_sovereign.storage.db.sqlite import SQLiteBackend
+    from kestrel_sovereign.features.security.permissions import PermissionStore, PermissionLevel
+    from kestrel_sovereign.features.security.hooks import SecurityHook
+    from kestrel_sovereign.features.security.approval_queue import ApprovalQueue
+    from tests.unit.test_governed_tool_bindings import _Agent
+
+    _, agents, _ = host
+    feature = agents['kite'].features['ArtifactsFeature']
+    backend = SQLiteBackend(str(tmp_path / 'dispatch.db'))
+    await backend.connect()
+    store = ObservabilityStore(backend)
+    await store.initialize()
+    permissions = PermissionStore(str(tmp_path / 'permissions.db'))
+    await permissions.initialize()
+    dispatcher = _Agent(store)
+    dispatcher.did = agents['kite'].did
+    dispatcher.features = {feature.name: feature}
+    approvals = ApprovalQueue(permission_store=permissions, agent=dispatcher)
+    dispatcher.hooks_manager.register(SecurityHook(permissions, approvals))
+    tool = tools(agents['kite'])['artifact_publish_text']
+    bindings = []
+    dispatcher.register_dynamic_tools(feature.tool_name, [tool], on_registered=lambda _, binding: bindings.append(binding))
+    await permissions.set_permission(feature.tool_name, bindings[0].name, PermissionLevel.ALLOW)
+    source, title, private_path = 'CONFIDENTIAL-SOURCE-3703', 'CONFIDENTIAL-TITLE-3703', 'confidential-path-3703.md'
+    try:
+        with caller_context_scope(caller()):
+            result = await bindings[0].invoke(dict(title=title, text=source, path=private_path, publication_key='audit-private'), session_id='artifact-private-audit')
+        assert result['status'] == 'ok', result
+        assert result['data']['state'] == 'saved'
+        for table in ('a2a_tool_dispatches', 'a2a_observability'):
+            rows = await backend.fetch_all('SELECT * FROM ' + table)
+            assert rows
+            stored = str([tuple(row) for row in rows])
+            assert all(value not in stored for value in (source, title, private_path))
+        async with aiosqlite.connect(permissions.db_path) as db:
+            rows = await (await db.execute('SELECT * FROM security_audit_log')).fetchall()
+        assert rows and all(value not in str(rows) for value in (source, title, private_path))
+        ref = result['data']['receipt']['ref']
+        # Redaction changes diagnostics, never the actual canonical source.
+        with caller_context_scope(caller()):
+            opened = await tools(agents['kite'])['artifact_get'].execute(artifact_id=ref['artifact_id'], include_text=True)
+        assert opened['data']['source_text'] == source
+    finally:
+        await store.close()

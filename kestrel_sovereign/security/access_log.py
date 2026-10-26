@@ -20,6 +20,7 @@ _REDACTED_VALUE = "redacted"
 # Also used before optional auto-instrumentation creates a URL-bearing span.
 PRIVATE_CAPABILITY_URL_PATTERN = r"/api/(?:artifacts|visual-computer)(?:[/?#]|$)"
 _PRIVATE_TARGET = re.compile(r"/api/(artifacts|visual-computer)(?:/|$)")
+_PRIVATE_TOOL = re.compile(r"(?:^|__|:)(?:artifact_|visual_)")
 _SENSITIVE_QUERY_NAMES = frozenset(
     {
         "apikey",
@@ -40,6 +41,17 @@ def private_capability_path(path: str) -> str | None:
     """Return a content-free service path, including on unrouted failures."""
     match = _PRIVATE_TARGET.search(path)
     return f"/api/{match[1]}" if match else None
+
+
+def private_capability_tool_name(name: str | None) -> bool:
+    """Classify private tool diagnostics, including registered aliases.
+
+    These tool families carry artifact source, paths, screen prompts and input
+    text. Their operational audit rows remain, but payloads never belong in
+    plaintext diagnostic stores, even in NORMAL or PUBLIC privacy mode. This
+    is only a redaction rule and grants no execution or content authority.
+    """
+    return isinstance(name, str) and _PRIVATE_TOOL.search(name) is not None
 
 
 def redact_sensitive_query_string(query_string: bytes) -> bytes:

@@ -21,6 +21,7 @@ from pydantic import BaseModel
 from kestrel_sovereign.a2a.stores.base import generate_id, json_dumps, json_loads
 from kestrel_sovereign.a2a.stores.unified.base import UnifiedStoreBase
 from kestrel_sovereign.execution_custody import execution_terminal_error
+from kestrel_sovereign.security.access_log import private_capability_tool_name
 from kestrel_sovereign.storage.db.interface import DatabaseBackend
 
 logger = logging.getLogger(__name__)
@@ -385,6 +386,7 @@ class ObservabilityStore(UnifiedStoreBase):
         self, entry: ToolDispatchEntry, *, required: bool = False,
     ) -> None:
         """Write the canonical dispatch row; required callers observe failures."""
+        private = private_capability_tool_name(entry.tool_name)
         try:
             await self._backend.execute(
                 """
@@ -402,11 +404,13 @@ class ObservabilityStore(UnifiedStoreBase):
                     self.now_utc_param(),
                     entry.tool_name,
                     entry.adapter,
-                    self._privacy_gate_args_json(entry.args_redacted),
+                    self._privacy_gate_args_json(
+                        {"_private_capability": True} if private else entry.args_redacted
+                    ),
                     entry.result_status,
                     entry.error_class,
                     _cap_text(
-                        self._privacy_gate_text(entry.error_message),
+                        self._privacy_gate_text(None if private else entry.error_message),
                         MAX_TOOL_ERROR_MESSAGE_CHARS,
                     ),
                     int(entry.latency_ms),
@@ -653,6 +657,8 @@ class ObservabilityStore(UnifiedStoreBase):
         time (e.g. telemetry pushed after the fact); defaults to now.
         """
         event_id = generate_id()
+        if private_capability_tool_name(tool_name):
+            metadata = {"_private_capability": True}
         now = self.to_timestamp_param(timestamp) if timestamp else self.now_utc_param()
 
         await self._backend.execute(
@@ -681,6 +687,12 @@ class ObservabilityStore(UnifiedStoreBase):
         error_message: Optional[str] = None,
     ) -> None:
         """Log completion of tool call with timing."""
+        if error_message is not None:
+            row = await self._backend.fetch_one(
+                "SELECT tool_name FROM a2a_observability WHERE id = ?", (event_id,),
+            )
+            if row is not None and private_capability_tool_name(row[0]):
+                error_message = None
         await self._backend.execute(
             """
             UPDATE a2a_observability
