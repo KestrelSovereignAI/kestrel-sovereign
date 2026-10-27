@@ -33,6 +33,34 @@ class HumanRecord(BaseModel):
     revocation: HumanControlRevocation | None = None
     tombstone: HumanControlRevocationTombstone | None = None
 
+    def _require_successor(self, original):
+        """Same-row coherence only; the enclosing operation supplies authority."""
+        if type(self) is not HumanRecord or type(original) is not HumanRecord:
+            raise ResourceConflict("original human custody schema required")
+        if original.request is not None and self.request != original.request:
+            raise ResourceConflict("accepted human request changed")
+        if original.revocation is not None:
+            if (self.revocation is None or
+                    original.revocation.model_copy(update={"request_id": self.revocation.request_id}) != self.revocation):
+                raise ResourceConflict("accepted human revocation changed")
+            # A pre-open tombstone can acknowledge another request ID for the
+            # same target. Accepted leases retain their original revocation.
+            if (self.revocation != original.revocation
+                    and (original.lease is not None or original.tombstone is None)):
+                raise ResourceConflict("accepted human revocation changed")
+        if original.tombstone is not None:
+            if (self.tombstone is None or self.request is not None or self.lease is not None
+                    or self.tombstone.model_copy(update={"request": original.tombstone.request}) != original.tombstone
+                    or self.tombstone.request.model_copy(update={"request_id": original.tombstone.request.request_id}) != original.tombstone.request):
+                raise ResourceConflict("accepted human tombstone changed")
+        if original.lease is not None and original.lease.state == "revoked":
+            if (self.lease is None or self.lease.state != "revoked"
+                    or self.lease.request != original.lease.request):
+                raise ResourceConflict("retired human lease cannot become active")
+        if (original.revocation is not None or original.tombstone is not None
+                or (original.lease is not None and original.lease.state == "revoked")) and self.frame is not None:
+            raise ResourceConflict("retired human frame cannot become available")
+
 
 class HumanComputerRuntime:
     def __init__(self, runtime, *, lease_seconds=120):
@@ -74,17 +102,17 @@ class HumanComputerRuntime:
             def check():
                 view_check()
                 input_check()
-            record = await self.repository.get(scope, session_id=sid, guard=check)
             serial = r._control_serials.get(r._key(scope, sid), 0)
+            record = await self.repository.get(scope, session_id=sid, guard=check)
             try:
                 original = await self._record(scope, sid, cid, check=check)
             except ResourceNotFound:
                 original = None
             def current():
                 check()
+                if not revoke and serial != r._control_serials.get(r._key(scope, sid), 0):
+                    raise ResourceConflict("manual control changed before private delivery")
                 if not metadata and not revoke:
-                    if serial != r._control_serials.get(r._key(scope, sid), 0):
-                        raise ResourceConflict("manual control changed before private delivery")
                     self._ready(record)
                     if original is not None:
                         if original.revocation is not None or original.tombstone is not None:
@@ -104,12 +132,12 @@ class HumanComputerRuntime:
         borrows the original checker; IDs or stored leases grant no authority.
         """
         r, scope = self.runtime, self.runtime.scope(context)
+        serial = r._control_serials.get(r._key(scope, sid), 0)
         record = await self.repository.get(scope, session_id=sid, guard=check)
         stored = await self._record(scope, sid, cid, check=check)
         if stored.request is None:
             raise ResourceConflict("human delivery has no original channel")
         request = stored.request
-        serial = r._control_serials.get(r._key(scope, sid), 0)
         def current():
             check()
             if serial != r._control_serials.get(r._key(scope, sid), 0):
@@ -133,19 +161,19 @@ class HumanComputerRuntime:
     async def _operation(self, context, sid, cid, *, metadata=False, action=VisualAction.HUMAN_VIEW):
         r, scope = self.runtime, self.runtime.scope(context)
         async with r.operation(context, action) as check:
+            serial = r._control_serials.get(r._key(scope, sid), 0)
             record = await self.repository.get(scope, session_id=sid, guard=check)
             stored = await self._record(scope, sid, cid, check=check)
             if stored.request is None or stored.tombstone is not None:
                 raise ResourceConflict("original human control ID is fenced")
-            serial = r._control_serials.get(r._key(scope, sid), 0)
             def current():
                 check()
+                if serial != r._control_serials.get(r._key(scope, sid), 0):
+                    raise ResourceConflict("human control epoch changed")
                 if not metadata:
                     if stored.revocation is not None:
                         raise ResourceConflict("original human control is fenced")
                     self._ready(record)
-                    if serial != r._control_serials.get(r._key(scope, sid), 0):
-                        raise ResourceConflict("human control epoch changed")
                     if stored.lease is None:
                         raise ResourceOutcomeUnknown("reconcile original human open")
                     stored.lease.require_active(record.session, at=r._now())
@@ -385,6 +413,12 @@ class HumanComputerRuntime:
     async def _retire(self, context, record, stored, check):
         r = self.runtime
         request = stored.revocation
+        # Both callers have acknowledged the original pending revocation row.
+        # Fence/drain again at that publication boundary: earlier snapshots
+        # cannot adopt its new serial or register delivery after the first drain.
+        check()
+        r._fence(record.request.scope, record.session_id)
+        await r.egress.revoke_session(record.request.scope, record.session_id)
         value = await self._call(context, record, request.control_id, "revoke", check, self._extension(record).revoke, request)
         check()
         if isinstance(value, HumanControlRevocationTombstone):

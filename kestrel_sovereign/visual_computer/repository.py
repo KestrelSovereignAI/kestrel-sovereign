@@ -579,6 +579,11 @@ class VisualCustodyRepository:
 
     async def private_record(self, scope, session_id, kind, identity, model, *, accept=None, update=None, guard=None):
         """Bounded encrypted extension custody; identifiers confer no authority."""
+        if kind == "human":
+            from .human import HumanRecord
+            if (model is not HumanRecord or (accept is not None and type(accept) is not HumanRecord)
+                    or (update is not None and type(update) is not HumanRecord)):
+                raise ResourceConflict("original human custody schema required")
         async with self._transaction(guard, write=accept is not None or update is not None):
             owner = self._owner(scope)
             key = self._address("private", session_id, kind, identity)
@@ -602,6 +607,11 @@ class VisualCustodyRepository:
             else:
                 stored = self._open(owner, key, row[0], model)
             if update is not None:
+                if kind == "human":
+                    # Check the freshly decrypted row under the SAME native
+                    # owner lock/transaction. A captured snapshot grants no
+                    # right to discard terminal facts committed meanwhile.
+                    HumanRecord._require_successor(update, stored)
                 await self.db.execute("UPDATE visual_computer_private_records SET payload = ? WHERE owner = ? AND record_key = ?", (self._seal(owner, key, update), owner, key))
                 return update
             return stored

@@ -238,3 +238,224 @@ async def test_fenced_human_refusal_cannot_journal_foreign_or_unissued_identity(
     with pytest.raises((Refused,ValueError)):await h.act(session,supplied,request)
     assert not page.effects and not h.actions and not c._human_action_ids
     assert json.loads(h.journal.read_text())==before
+
+
+def advance_after_original_intent_fsync(human, request, wall, elapsed, advance, monkeypatch):
+    """Complete the real intent journal before injecting a finite clock cutoff."""
+    original = human._persist
+    accepted = []
+    action_id = request['action']['action_id']
+
+    def persist():
+        original()
+        if action_id in human.actions and not accepted:
+            payload = json.loads(human.journal.read_text())['payload']
+            assert payload['actions'][action_id]['receipt']['receipt']['outcome'] == 'unknown'
+            accepted.append(True)
+            wall[0] += advance
+            elapsed[0] += advance.total_seconds()
+
+    monkeypatch.setattr(human, '_persist', persist)
+    return original, accepted
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('seconds', [16, 61])
+async def test_final_expiry_after_durable_intent_is_denied_before_input(tmp_path, monkeypatch, seconds):
+    from datetime import UTC, datetime
+    wall, elapsed = [datetime.now(UTC)], [0.0]
+    c, page, session, human, _, lease = await opened(
+        tmp_path, clock=lambda: wall[0], monotonic=lambda: elapsed[0])
+    request = await action(c, session, human, lease)
+    original, accepted = advance_after_original_intent_fsync(
+        human, request, wall, elapsed, timedelta(seconds=seconds), monkeypatch)
+    try:
+        receipt = await human.act(session, lease, request)
+        assert accepted and not page.effects and not page.closed
+        assert receipt['receipt']['outcome'] == 'denied'
+        assert receipt['receipt']['action_id'] == request['action']['action_id']
+        assert human.action_status(session, lease, request['action']['action_id']) == receipt
+        durable = json.loads(human.journal.read_text())['payload']['actions']
+        assert durable[request['action']['action_id']]['receipt'] == receipt
+        assert c._session == session
+    finally:
+        monkeypatch.setattr(human, '_persist', original)
+        await c.retire()
+
+
+@pytest.mark.asyncio
+async def test_action_only_cutoff_after_intent_keeps_live_lease_and_fresh_input(tmp_path, monkeypatch):
+    from datetime import UTC, datetime
+    wall, elapsed = [datetime.now(UTC)], [0.0]
+    c, page, session, human, _, lease = await opened(
+        tmp_path, clock=lambda: wall[0], monotonic=lambda: elapsed[0])
+    request = await action(c, session, human, lease)
+    request['action']['not_after'] = (wall[0] + timedelta(milliseconds=1)).isoformat()
+    original, accepted = advance_after_original_intent_fsync(
+        human, request, wall, elapsed, timedelta(milliseconds=2), monkeypatch)
+    try:
+        receipt = await human.act(session, lease, request)
+        assert accepted and receipt['receipt']['outcome'] == 'denied'
+        assert not page.effects and not page.closed and c._session == session
+        module.HumanControlLease.model_validate_json(json.dumps(lease)).require_active(
+            human._session(), at=c.clock())
+        assert human.frame is None and human.focus is None
+        fresh = await action(c, session, human, lease)
+        fresh['action']['action_id'] = 'fresh-after-action-cutoff'
+        assert fresh['action']['observation_id'] != request['action']['observation_id']
+        assert (await human.act(session, lease, fresh))['receipt']['outcome'] == 'completed'
+        assert len(page.effects) == 1
+        assert await human.act(session, lease, request) == receipt
+        assert human.action_status(session, lease, request['action']['action_id']) == receipt
+        assert len(page.effects) == 1
+        assert 'PRIVATE-MANUAL-SECRET' not in human.journal.read_text()
+    finally:
+        monkeypatch.setattr(human, '_persist', original)
+        await c.retire()
+
+
+@pytest.mark.asyncio
+async def test_refused_after_effect_entry_is_still_unknown(tmp_path, monkeypatch):
+    c, page, session, human, _, lease = await opened(tmp_path)
+    request = await action(c, session, human, lease)
+    effect = page.keyboard.insert_text
+
+    async def entered_then_refused(*args, **kwargs):
+        await effect(*args, **kwargs)
+        raise Refused('stale_observation')
+
+    monkeypatch.setattr(page.keyboard, 'insert_text', entered_then_refused)
+    try:
+        receipt = await human.act(session, lease, request)
+        assert len(page.effects) == 1 and page.closed
+        assert receipt['receipt']['outcome'] == 'unknown'
+        assert human.action_status(session, lease, request['action']['action_id']) == receipt
+        with pytest.raises(Refused):
+            await human.act(session, lease, request)
+        assert len(page.effects) == 1
+    finally:
+        await c.retire()
+
+
+@pytest.mark.asyncio
+async def test_final_refusal_does_not_hide_network_cleanup_unknown():
+    from tests.unit.test_visual_browser_controller import action as agent_action
+    c, page, session = controller()
+    request = await agent_action(c, session)
+    retired = []
+
+    class Relay:
+        def begin(self, selected, original):
+            assert selected == session and original == request
+            c._control_pending = True
+
+        async def drain(self, action_id):
+            pytest.fail('no effect or network drain may start after final refusal')
+
+        async def end(self, action_id):
+            retired.append(action_id)
+            raise OSError('owned uncertain relay retirement')
+
+    c.network = Relay()
+    try:
+        receipt = await c.act(session, request)
+        assert not page.effects and retired == [request['action_id']]
+        assert receipt['outcome'] == 'unknown' and receipt['reason_code'] == 'network_outcome_unknown'
+        assert c._actions[request['action_id']][1] == receipt
+    finally:
+        await c.retire()
+
+
+@pytest.mark.asyncio
+async def test_failed_acceptance_persistence_ack_never_becomes_denied(tmp_path, monkeypatch):
+    c, page, session, human, _, lease = await opened(tmp_path)
+    request = await action(c, session, human, lease)
+    original, failed = human._persist, []
+    error = OSError('owned uncertain intent acknowledgement')
+
+    def persist_then_lose_ack():
+        original()
+        if request['action']['action_id'] in human.actions and not failed:
+            failed.append(True)
+            raise error
+
+    monkeypatch.setattr(human, '_persist', persist_then_lose_ack)
+    try:
+        with pytest.raises(OSError) as caught:
+            await human.act(session, lease, request)
+        assert caught.value is error and failed and not page.effects
+        assert c._actions[request['action']['action_id']][1]['outcome'] == 'unknown'
+        receipt = human.action_status(session, lease, request['action']['action_id'])
+        assert receipt['receipt']['outcome'] == 'unknown'
+        assert await human.act(session, lease, request) == receipt
+        assert not page.effects
+    finally:
+        monkeypatch.setattr(human, '_persist', original)
+        await c.retire()
+
+
+@pytest.mark.asyncio
+async def test_denial_needs_its_actual_persistence_ack(tmp_path, monkeypatch):
+    from datetime import UTC, datetime
+    wall, elapsed = [datetime.now(UTC)], [0.0]
+    c, page, session, human, _, lease = await opened(
+        tmp_path, clock=lambda: wall[0], monotonic=lambda: elapsed[0])
+    request = await action(c, session, human, lease)
+    request['action']['not_after'] = (wall[0] + timedelta(milliseconds=1)).isoformat()
+    original, accepted = advance_after_original_intent_fsync(
+        human, request, wall, elapsed, timedelta(milliseconds=2), monkeypatch)
+    intent_persist = human._persist
+    error, failures = OSError('owned denial journal error'), []
+
+    def fail_denial():
+        item = human.actions.get(request['action']['action_id'])
+        if item is not None and item['receipt']['receipt']['outcome'] == 'denied' and not failures:
+            failures.append(True)
+            raise error
+        intent_persist()
+
+    monkeypatch.setattr(human, '_persist', fail_denial)
+    try:
+        with pytest.raises(OSError) as caught:
+            await human.act(session, lease, request)
+        assert caught.value is error and accepted and failures
+        assert not page.effects and not page.closed
+        durable = json.loads(human.journal.read_text())['payload']['actions']
+        assert durable[request['action']['action_id']]['receipt']['receipt']['outcome'] == 'unknown'
+        monkeypatch.setattr(human, '_persist', original)
+        receipt = human.action_status(session, lease, request['action']['action_id'])
+        assert receipt['receipt']['outcome'] == 'denied'
+        durable = json.loads(human.journal.read_text())['payload']['actions']
+        assert durable[request['action']['action_id']]['receipt'] == receipt
+    finally:
+        monkeypatch.setattr(human, '_persist', original)
+        await c.retire()
+
+
+@pytest.mark.asyncio
+async def test_fence_fsync_error_releases_pending_for_original_control_retry(tmp_path, monkeypatch):
+    c, page, session, human, _, _ = await opened(tmp_path)
+    original, failures = module.os.fsync, []
+    error = OSError('owned fence fsync error')
+
+    def fail_once(descriptor):
+        if c._control_pending and not failures:
+            failures.append(True)
+            raise error
+        return original(descriptor)
+
+    request = control(session, 'close', 'close-after-fence-error')
+    monkeypatch.setattr(module.os, 'fsync', fail_once)
+    try:
+        with pytest.raises(OSError) as caught:
+            await c.control(session, request)
+        assert caught.value is error and failures
+        assert not c._control_pending and not page.closed and not page.effects
+        monkeypatch.setattr(module.os, 'fsync', original)
+        result = await c.control(session, request)
+        assert result['state'] == 'closed' and page.closed
+        assert not c._control_pending and human.leases['human']['state'] == 'revoked'
+        assert await c.control(session, request) == result
+    finally:
+        monkeypatch.setattr(module.os, 'fsync', original)
+        await c.retire()

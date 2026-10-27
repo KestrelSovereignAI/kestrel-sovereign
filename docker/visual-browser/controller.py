@@ -299,12 +299,21 @@ class BrowserController:
             relay.begin(session, request)
         try:
             # No await separates final input fencing from effect dispatch.
-            current()
-            async with asyncio.timeout(remaining):
-                await effect()
-                network_known = await relay.drain(action_id) if relay is not None else True
-            receipt.update(outcome="completed" if network_known else "unknown",
-                           reason_code=None if network_known else "network_outcome_unknown", recorded_at=self.clock().isoformat())
+            try:
+                current()
+            except Refused as refusal:
+                # Acceptance precedes the journal fsync. Its synchronous final
+                # check can then expire before the effect is ever entered.
+                # Persist this exact original denial in finally; errors from
+                # effect(), persistence, or a lost reply remain uncertain.
+                receipt.update(outcome="denied", reason_code=refusal.code,
+                               recorded_at=self.clock().isoformat())
+            else:
+                async with asyncio.timeout(remaining):
+                    await effect()
+                    network_known = await relay.drain(action_id) if relay is not None else True
+                receipt.update(outcome="completed" if network_known else "unknown",
+                               reason_code=None if network_known else "network_outcome_unknown", recorded_at=self.clock().isoformat())
         except asyncio.CancelledError:
             # Cancelling the Python waiter does not unsend a Chromium input.
             # Fence synchronously; the worker must physically retire it.
@@ -374,9 +383,9 @@ class BrowserController:
             raise Refused("control_budget_exhausted")
         self._control_pending = True
         human = getattr(self, "human", None)
-        if human is not None:
-            human.fence_all()
         try:
+            if human is not None:
+                human.fence_all()
             async with self._lock:
                 self._bound(session)
                 if self._session["state"] == "closed":
