@@ -273,6 +273,7 @@ class NativeArtifactAdmissions:
                 "plan_sha256": record.plan_sha256, "state": state,
                 "expires_at": None if record.expires_at is None else record.expires_at.isoformat(),
                 "activated": record.activation is not None,
+                "publication_cleanup": self._cleanup_state(record),
                 "reserved_publications": len(record.reservations),
                 "reserved_bytes": sum(value[1] for value in record.reservations.values())}
 
