@@ -2,6 +2,7 @@
 
 import asyncio
 import sqlite3
+from contextlib import closing
 
 import pytest
 
@@ -22,7 +23,7 @@ async def test_lazy_native_stream_is_registered_before_any_body_step(tmp_path, e
             return lock
     host = Host()
     def commit():
-        with sqlite3.connect(path) as connection:
+        with closing(sqlite3.connect(path)) as connection, connection:
             connection.execute("CREATE TABLE effects(id INTEGER)")
             connection.execute("INSERT INTO effects VALUES (1)")
     async def source():
@@ -43,7 +44,7 @@ async def test_lazy_native_stream_is_registered_before_any_body_step(tmp_path, e
         await stream.aclose()
         assert all(task.done() for task in registered)
         assert not lock.locked()
-        with sqlite3.connect(path) as connection:
+        with closing(sqlite3.connect(path)) as connection, connection:
             assert connection.execute("SELECT COUNT(*) FROM effects").fetchone() == (1,)
     finally:
         await stream.aclose()
@@ -57,7 +58,7 @@ async def test_exact_native_continuation_does_not_authorize_copied_context_sibli
     sibling_tasks = []
     path = tmp_path / "native.db"
     def commit():
-        with sqlite3.connect(path) as connection:
+        with closing(sqlite3.connect(path)) as connection, connection:
             connection.execute("CREATE TABLE effects(id INTEGER)")
             connection.execute("INSERT INTO effects VALUES (1)")
     async def sibling():
@@ -84,5 +85,5 @@ async def test_exact_native_continuation_does_not_authorize_copied_context_sibli
         for task in sibling_tasks:
             assert (await await_owned_task(task)).error is None
     assert sibling_entered.is_set() and not lock.locked()
-    with sqlite3.connect(path) as connection:
+    with closing(sqlite3.connect(path)) as connection, connection:
         assert connection.execute("SELECT COUNT(*) FROM effects").fetchone() == (1,)
