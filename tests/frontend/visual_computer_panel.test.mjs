@@ -71,3 +71,98 @@ test('takeover and agent changes discard late pixels and keep exact control requ
     assert.equal(h.body.querySelector('select').children.length,0);
     h.view.destroy();
 });
+
+function manualSetup({failInput=false, expires=120000}={}) {
+    const dom = new JSDOM('<main></main>', {url:'http://localhost/'});
+    globalThis.document = dom.window.document;
+    const calls=[];
+    const binding={control_id:'control',consumer_id:'consumer',session_id:'session',control_epoch:1,
+        expires_at:new Date(Date.now()+expires).toISOString()};
+    const lease={state:'active',request:binding};
+    const api={getHostAgent:()=> 'owner',onHostAgentChange:()=>()=>{},async requestForAgent(path,options,owner){
+        calls.push({path,options,owner});
+        if(options?.method==='POST' && /\/human\/[^/]+$/.test(path))binding.control_id=decodeURIComponent(path.split('/').at(-1));
+        if(path.endsWith('/sessions'))return [{session_id:'session',phase:'fenced'}];
+        if(path.endsWith('/sessions/session'))return {phase:'fenced',session:{session_id:'session',controller:'human',control_epoch:1},lease:{state:'ready'}};
+        if(path.endsWith('/observation'))return {control_id:binding.control_id,consumer_id:'consumer',image_base64:'eA==',
+            frame:{observation_id:'human-frame',session_id:'session',control_epoch:1,media_type:'image/png',width:800,height:600,observed_at:new Date().toISOString()}};
+        if(path.endsWith('/actions')) {
+            if(failInput)throw new Error('private diagnostic must not be rendered');
+            const id=JSON.parse(options.body).action.action_id;
+            return {control_id:binding.control_id,consumer_id:binding.consumer_id,receipt:{action_id:id,outcome:'completed'}};
+        }
+        if(path.endsWith('/revoke'))return {revoked:true};
+        return lease;
+    }};
+    const body=document.querySelector('main');const view=mountVisualComputer(body,api);
+    const click=label=>[...body.querySelectorAll('button')].find(node=>node.textContent===label).click();
+    return {dom,calls,body,view,click};
+}
+
+test('human view opens explicitly and input needs an independent arm and fresh frame', async()=>{
+    const h=manualSetup();await h.view.refresh();
+    assert.equal(h.calls.some(call=>call.path.includes('/human/')),false);
+    h.click('Open human view');await flush();await flush();
+    const image=h.body.querySelector('img');assert.equal(image.hidden,false);
+    const text=h.body.querySelector('textarea');text.value='private operator text';
+    h.click('Type private text');await flush();
+    assert.equal(h.calls.filter(call=>call.path.endsWith('/actions')).length,0);
+    h.click('Refresh human screen');await flush();
+    text.value='private operator text';h.body.querySelector('[aria-label="Enable manual input"]').checked=true;
+    h.click('Type private text');await flush();
+    const sent=h.calls.filter(call=>call.path.endsWith('/actions'));assert.equal(sent.length,1);
+    const payload=JSON.parse(sent[0].options.body);assert.equal(payload.action.action.text,'private operator text');
+    assert.equal(payload.consumer_id,'consumer');assert.equal(payload.action.observation_id,'human-frame');
+    assert.equal(text.value,'');assert.equal(h.body.querySelector('[aria-label="Enable manual input"]').checked,false);
+    assert.equal(image.hasAttribute('src'),false);
+    h.click('Type private text');await flush();assert.equal(h.calls.filter(call=>call.path.endsWith('/actions')).length,1);
+    h.view.destroy();await flush();
+});
+
+test('manual keyboard needs explicit focus and consumes the fresh frame once', async()=>{
+    const h=manualSetup();await h.view.refresh();h.click('Open human view');await flush();await flush();
+    const image=h.body.querySelector('img');
+    image.dispatchEvent(new h.dom.window.KeyboardEvent('keydown',{key:'End',bubbles:true}));
+    await flush();assert.equal(h.calls.filter(call=>call.path.endsWith('/actions')).length,0);
+    h.body.querySelector('[aria-label="Enable manual input"]').checked=true;
+    h.click('Focus screen keyboard');await flush();assert.equal(document.activeElement,image);
+    image.dispatchEvent(new h.dom.window.KeyboardEvent('keydown',{key:'End',bubbles:true}));
+    image.dispatchEvent(new h.dom.window.KeyboardEvent('keydown',{key:'Enter',bubbles:true}));
+    await flush();
+    const inputs=h.calls.filter(call=>call.path.endsWith('/actions'));assert.equal(inputs.length,1);
+    assert.deepEqual(JSON.parse(inputs[0].options.body).action.action,{kind:'key',key:'End'});
+    assert.equal(image.hasAttribute('src'),false);
+    h.view.destroy();await flush();
+});
+
+test('human error retains original input without retry and closing retires exact binding', async()=>{
+    const h=manualSetup({failInput:true});await h.view.refresh();h.click('Open human view');await flush();await flush();
+    h.body.querySelector('textarea').value='private';h.body.querySelector('[aria-label="Enable manual input"]').checked=true;
+    h.click('Type private text');await flush();
+    assert.equal(h.body.querySelector('img').hasAttribute('src'),false);
+    assert.equal(h.body.textContent.includes('private diagnostic'),false);
+    h.click('Type private text');await flush();assert.equal(h.calls.filter(call=>call.path.endsWith('/actions')).length,1);
+    h.view.hide();await flush();
+    const retire=h.calls.find(call=>call.path.endsWith('/revoke'));
+    assert.equal(retire.owner,'owner');assert.equal(JSON.parse(retire.options.body).control_epoch,1);
+    h.view.destroy();
+});
+
+test('human lease expiry clears pixels and closes without renewal or reopening', async()=>{
+    const h=manualSetup({expires:30});await h.view.refresh();h.click('Open human view');await flush();await flush();
+    await new Promise(resolve=>setTimeout(resolve,45));
+    assert.equal(h.body.querySelector('img').hasAttribute('src'),false);
+    assert.equal(h.calls.filter(call=>call.path.endsWith('/revoke')).length,1);
+    assert.equal(h.calls.filter(call=>call.options?.method==='POST' && /\/human\/[^/]+$/.test(call.path)).length,1);
+    h.view.destroy();
+});
+
+test('handback never sends sharing confirmation unless operator explicitly checks it', async()=>{
+    const h=manualSetup();await h.view.refresh();h.click('Hand back');await flush();
+    assert.equal(h.calls.some(call=>call.path.endsWith('/handback')),false);
+    h.body.querySelector('[aria-label="Screen is ready to share with the agent"]').checked=true;
+    h.click('Hand back');await flush();
+    const call=h.calls.find(call=>call.path.endsWith('/handback'));
+    assert.equal(JSON.parse(call.options.body).share_screen,true);
+    h.view.destroy();
+});

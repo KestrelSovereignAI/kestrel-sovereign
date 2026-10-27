@@ -49,9 +49,12 @@ class _ActiveCall:
         # sending another cancellation to the same job.
         self.active = False
         for task in tuple(self.accepted_jobs):
-            if not task.done() and task not in self.cancellation_requested:
-                self.cancellation_requested.add(task)
-                task.cancel()
+            self.cancel(task)
+
+    def cancel(self, task):
+        if not task.done() and task not in self.cancellation_requested:
+            self.cancellation_requested.add(task)
+            task.cancel()
 
     async def close(self):
         self.revoke()
@@ -97,11 +100,25 @@ class ActiveCallEgress:
             yield
 
     @asynccontextmanager
+    async def activate_human(self, session, identifier, check, *, deadline, metadata=False):
+        async with self._activate(session, identifier, check, deadline=deadline,
+                purpose="human-metadata" if metadata else "human"):
+            yield
+
+    @asynccontextmanager
+    async def activate_human_delivery(self, session, identifier, check, *, deadline, metadata=False):
+        async with self._activate(session, identifier, check, deadline=deadline,
+                purpose="human-metadata-delivery" if metadata else "human-delivery"):
+            yield
+
+    @asynccontextmanager
     async def _activate(self, session, action_id, check, *, deadline, purpose):
         valid_session = ((purpose == "action" and session.state == "ready" and session.controller == "agent")
-            or (purpose == "workspace" and session.state == "paused" and session.controller == "none"))
+            or (purpose == "workspace" and session.state == "paused" and session.controller == "none")
+            or (purpose in {"human", "human-delivery"} and session.state == "paused" and session.controller == "human")
+            or purpose in {"human-metadata", "human-metadata-delivery"})
         if (not callable(check) or not valid_session
-                or deadline.tzinfo is None or deadline <= self.clock() or deadline > session.expires_at):
+                or deadline.tzinfo is None or deadline <= self.clock() or (purpose not in {"human-metadata", "human-metadata-delivery"} and deadline > session.expires_at)):
             raise OperatorAuthorizationError("no originating visual action egress authority")
         key = self._key(session, action_id, purpose)
         if key in self._calls:
@@ -130,6 +147,30 @@ class ActiveCallEgress:
             yield check
 
     @asynccontextmanager
+    async def human_operation(self, session, identifier):
+        async with self._operation(session, identifier, purpose="human") as check:
+            yield check
+
+    @asynccontextmanager
+    async def human_status_operation(self, session, identifier):
+        async with self._operation(session, identifier, purpose="human-metadata") as check:
+            yield check
+
+    @asynccontextmanager
+    async def human_delivery_operation(self, session, identifier, *, metadata=False):
+        async with self._operation(session, identifier,
+                purpose="human-metadata-delivery" if metadata else "human-delivery") as check:
+            yield check
+
+    def cancel_human_delivery(self, session, identifier, task, *, metadata=False):
+        """Forward withdrawal once through the same exact delivery owner."""
+        purpose = "human-metadata-delivery" if metadata else "human-delivery"
+        call = self._calls.get(self._key(session, identifier, purpose))
+        if call is None or call.session != session:
+            raise OperatorAuthorizationError("original human delivery owner is unavailable")
+        call.cancel(task)
+
+    @asynccontextmanager
     async def _operation(self, session, action_id, *, purpose):
         call = self._calls.get(self._key(session, action_id, purpose))
         task = asyncio.current_task()
@@ -141,10 +182,22 @@ class ActiveCallEgress:
         call.jobs[task] = call.jobs.get(task, 0)+1
         try:
             remaining = (call.deadline-self.clock()).total_seconds()
-            async with asyncio.timeout(max(0, remaining)):
-                call.check()
-                yield call.check
-                call.check()
+            if purpose in {"human-delivery", "human-metadata-delivery"}:
+                # Expiry, Stop and HTTP withdrawal must share one cancellation
+                # request. A second timer cancellation must not interrupt an
+                # already accepted native transport's physical cleanup.
+                timer = asyncio.get_running_loop().call_later(max(0, remaining), call.cancel, task)
+                try:
+                    call.check()
+                    yield call.check
+                    call.check()
+                finally:
+                    timer.cancel()
+            else:
+                async with asyncio.timeout(max(0, remaining)):
+                    call.check()
+                    yield call.check
+                    call.check()
         finally:
             count = call.jobs.get(task, 0)-1
             if count > 0:

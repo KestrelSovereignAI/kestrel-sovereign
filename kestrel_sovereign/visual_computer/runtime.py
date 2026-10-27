@@ -42,6 +42,9 @@ class VisualAction(StrEnum):
     HANDBACK = "visual.handback"
     RELEASE = "visual.release"
     TRANSFER = "visual.transfer"
+    HUMAN_VIEW = "visual.human.view"
+    HUMAN_INPUT = "visual.human.input"
+    HUMAN_REVOKE = "visual.human.revoke"
 
 
 @dataclass(frozen=True)
@@ -78,6 +81,7 @@ class VisualComputerRuntime:
         self._control_serials = {}
         self._verified_sessions = set()
         self._inflight = 0
+        self.human = None
 
     @staticmethod
     def scope(context):
@@ -288,7 +292,7 @@ class VisualComputerRuntime:
         self._destination(record.request.location)
         key = self._key(record.request.scope, record.session_id)
         session = record.session
-        if (session is None or session.state != "paused" or session.controller != "none"
+        if (record.human_private or session is None or session.state != "paused" or session.controller != "none"
                 or record.pending_control is not None or record.phase != "fenced"
                 or key not in self._verified_sessions
                 or session.expires_at <= self._now() or record.lease.expires_at <= self._now()):
@@ -365,7 +369,7 @@ class VisualComputerRuntime:
                     elif _step_owner is not None:
                         raise ResourceConflict("Step promotion requires its original planning row")
                     if previous is not None:
-                        if previous.request != request:
+                        if previous.channel != "agent" or previous.request != request:
                             raise ResourceConflict("action ID already identifies different input")
                         if not previous.dispatch_started and previous.receipt is None:
                             previous = await self.repository.action(scope, request.session_id, request.action_id,
@@ -460,6 +464,21 @@ class VisualComputerRuntime:
                     self._inflight -= 1
                 await result_stack.aclose()
 
+    async def _retire_undispatched_action(self, scope, request, *, prepared, dispatched, driver_entered):
+        """One factual retirement mechanism for separately admitted input channels."""
+        if dispatched and not driver_entered:
+            # This origin owns the acknowledged one-shot dispatch CAS,
+            # and never entered a driver. Preserve that exact fact even
+            # if its authority retired. This grants no further I/O.
+            receipt = ActionReceipt(action_id=request.action_id, session_id=request.session_id,
+                observation_id=request.observation_id, control_epoch=request.control_epoch,
+                outcome="denied", recorded_at=self._now(), reason_code="host_not_dispatched")
+            await self.repository.action(scope, request.session_id, request.action_id, receipt=receipt)
+        elif prepared and not dispatched:
+            # A lost dispatch-CAS acknowledgement stays ambiguous.
+            await self.repository.action(scope, request.session_id, request.action_id,
+                abandon_prepared=True)
+
     @staticmethod
     def _receipt(request, receipt):
         if (receipt.action_id != request.action_id or receipt.session_id != request.session_id
@@ -474,6 +493,8 @@ class VisualComputerRuntime:
             from .step import PlanningRecord
             if type(accepted) is PlanningRecord:
                 raise ResourceOutcomeUnknown("Host visual step has no dispatched SDK action")
+            if accepted.channel != "agent":
+                raise ResourceNotFound("visual action not found")
             if not accepted.dispatch_started and accepted.receipt is None:
                 accepted = await self.repository.action(scope, session_id, action_id,
                     abandon_prepared=True, guard=check)
@@ -509,7 +530,7 @@ class VisualComputerRuntime:
                 self._verified_sessions.add(self._key(scope, session_id))
                 return session
 
-    async def control(self, context, session_id, request, *, action):
+    async def control(self, context, session_id, request, *, action, share_screen=False):
         request = ControlRequest.model_validate(request)
         expected = {VisualAction.STOP: "pause", VisualAction.TAKEOVER: "takeover", VisualAction.HANDBACK: "resume"}
         if action not in expected or request.operation != expected[action] or request.session_id != session_id:
@@ -541,10 +562,16 @@ class VisualComputerRuntime:
                 raise ResourceOutcomeUnknown("reconcile the original control request")
             if record.pending_control is None and request.expected_control_epoch != record.session.control_epoch:
                 raise ResourceConflict("stale visual control epoch")
+            if action == VisualAction.HANDBACK and self.human is not None and share_screen is not True:
+                raise ResourceConflict("confirm the screen is ready to share before handback")
             if action == VisualAction.HANDBACK:
                 self._destination(record.request.location)
             if action == VisualAction.HANDBACK and record.session.controller != "human":
                 raise ResourceConflict("handback requires explicit current human control")
+            if self.human is not None:
+                await self.human.retire_owned(context, record, check)
+                if action == VisualAction.HANDBACK and await self.repository.has_pending_actions(scope, session_id, guard=check):
+                    raise ResourceOutcomeUnknown("reconcile original accepted input before handback")
             record.pending_control, record.frame, record.phase = request, None, "fenced"
             await self.repository.save(scope, record, check)
             session = await self._call(context, check, self._driver(record).control, record.session, request)
@@ -554,6 +581,10 @@ class VisualComputerRuntime:
                 raise ResourceOutcomeUnknown("driver did not verify the requested control fence")
             record = await self.repository.get(scope, session_id=session_id, guard=check)
             record.session, record.pending_control = session, None
+            if self.human is not None and action == VisualAction.TAKEOVER:
+                record.human_private = True
+            if self.human is not None and action == VisualAction.HANDBACK:
+                record.human_private = False
             record.last_control, record.control_receipt = request, session
             record.phase = "active" if action == VisualAction.HANDBACK else "fenced"
             await self.repository.save(scope, record, check)
@@ -561,6 +592,10 @@ class VisualComputerRuntime:
             if action == VisualAction.HANDBACK:
                 # A fresh screen must be observed before any new action.
                 self._fences.discard(self._key(scope, session_id))
+                if self.human is not None:
+                    # Explicitly confirmed sharing gets a fresh agent frame,
+                    # never any retained human image or observation ID.
+                    await self.observe(context, session_id)
             return session
 
     @staticmethod

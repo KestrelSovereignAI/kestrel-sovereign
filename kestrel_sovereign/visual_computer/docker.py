@@ -47,7 +47,7 @@ OPERATIONS = frozenset({"screenshot", "click", "type", "key", "scroll", "wait", 
 # Takeover transfers custody and fences automation; human input transport is a
 # separate capability. It never exposes CDP or unrestricted browser execution.
 LABEL = "io.kestrel.visual-computer"
-WORKER_CONTRACT = "sdk-0.43-http-v1"
+WORKER_CONTRACT = "sdk-0.45-human-v1"
 MAX_OUTPUT = 24 * 1024 * 1024
 ID = re.compile(r"^[a-f0-9]{64}$")
 READ_INCARNATION = (
@@ -312,7 +312,9 @@ class DockerBoundary:
         command = ["exec", "-i", cid, "python", "/opt/kestrel-browser/rpc_client.py"]
         if mode:
             command.append(mode)
-        trace = native_trace() if value.get("operation") == "act" else None
+        is_input = (value.get("operation") == "act" or
+            (value.get("operation") == "human" and value.get("arguments", {}).get("operation") == "act"))
+        trace = native_trace() if is_input else None
         options = {"_input_trace":trace} if trace is not None else {}
         try:
             return json.loads(await self.invoke(command, data=_json(value) + b"\n", current=current, **options))
@@ -487,11 +489,14 @@ class DockerEnvironmentProvider:
 class DockerComputerDriver:
     driver_id = PROVIDER
 
-    def __init__(self, *, docker_socket, egress_guard=None, workspace_guard=None, network_policy=None):
+    def __init__(self, *, docker_socket, egress_guard=None, workspace_guard=None, human_guard=None, human_status_guard=None, network_policy=None):
         if egress_guard is not None and not callable(egress_guard):
             raise ResourceUnsupported("invalid_private_egress_guard")
         if workspace_guard is not None and not callable(workspace_guard):
             raise ResourceUnsupported("invalid_private_workspace_guard")
+        if any(guard is not None and not callable(guard) for guard in (human_guard, human_status_guard)):
+            raise ResourceUnsupported("invalid_private_human_guard")
+        self.human_guard, self.human_status_guard = human_guard, human_status_guard
         self.boundary = DockerBoundary(docker_socket)
         self.egress_guard = egress_guard
         self.workspace_guard = workspace_guard
@@ -502,6 +507,10 @@ class DockerComputerDriver:
         self._borrowers = {}
         self._workspace_borrowers = {}
         self._connections = {}
+
+    def human_control(self):
+        from .docker_human import DockerHumanControl
+        return DockerHumanControl(self)
 
     def workspace_transfer(self):
         return DockerWorkspaceTransfer(self)
@@ -595,7 +604,7 @@ class DockerComputerDriver:
             current()
         identifier = uuid4().hex
         trace = native_trace()
-        if operation == "act" and trace is not None:
+        if (operation == "act" or (operation == "human" and arguments.get("operation") == "act")) and trace is not None:
             trace.rpc_started = True
         response = await self.boundary.rpc(endpoint["container_id"], {"schema_version": 1,
             "secret": connection.credential.get_secret_value(), "id": identifier,
@@ -611,11 +620,11 @@ class DockerComputerDriver:
             raise ResourceOutcomeUnknown("worker_response_identity_unknown")
         if "error" in response:
             reason = response["error"]
-            if reason in {"stale_control", "stale_observation", "action_conflict", "control_conflict", "control_pending", "workspace_conflict"}:
+            if reason in {"stale_control", "stale_observation", "action_conflict", "control_conflict", "control_pending", "workspace_conflict", "human_conflict"}:
                 raise ResourceConflict(reason)
-            if reason in {"unsupported_request", "unsupported_action", "unsupported_control", "workspace_unsupported"}:
+            if reason in {"unsupported_request", "unsupported_action", "unsupported_control", "workspace_unsupported", "human_unsupported"}:
                 raise ResourceUnsupported(reason)
-            if reason in {"control_outcome_unknown", "transport_outcome_unknown", "workspace_outcome_unknown"}:
+            if reason in {"control_outcome_unknown", "transport_outcome_unknown", "workspace_outcome_unknown", "human_outcome_unknown"}:
                 raise ResourceOutcomeUnknown(reason)
             raise ResourceNotFound("session_operation_unavailable")
         if "result" not in response:
@@ -864,6 +873,6 @@ def environment_provider_factory(*, settings: Mapping[str, object]):
 
 
 def computer_driver_factory(*, settings: Mapping[str, object]):
-    if "docker_socket" not in settings or set(settings) - {"docker_socket", "egress_guard", "workspace_guard", "network_policy"}:
+    if "docker_socket" not in settings or set(settings) - {"docker_socket", "egress_guard", "workspace_guard", "human_guard", "human_status_guard", "network_policy"}:
         raise ResourceUnsupported("invalid_private_docker_settings")
     return DockerComputerDriver(**settings)

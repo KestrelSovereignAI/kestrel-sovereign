@@ -162,28 +162,34 @@ class BrowserController:
         self._session["state"] = "closed"
         return True
 
+    async def _capture_locked(self, current):
+        """Shared pixel mechanism; caller owns channel admission and frame custody."""
+        current()
+        try:
+            async with asyncio.timeout(min(10, self.deadline - self.monotonic())):
+                image = await self.page.screenshot(type="png", caret="hide")
+            current()
+            if not 24 <= len(image) <= 16 * 1024 * 1024 or image[:8] != b"\x89PNG\r\n\x1a\n":
+                raise Refused("invalid_observation")
+            width, height = struct.unpack(">II", image[16:24])
+            if not 1 <= width <= 16384 or not 1 <= height <= 16384 or width * height > 16_777_216:
+                raise Refused("invalid_observation")
+            frame = {"schema_version": 1, "observation_id": str(uuid4()), "session_id": self._session["session_id"],
+                     "control_epoch": self._session["control_epoch"], "observed_at": self.clock().isoformat(),
+                     "width": width, "height": height, "image_sha256": hashlib.sha256(image).hexdigest(), "media_type": "image/png"}
+            return frame, image
+        except Refused:
+            raise
+        except Exception:  # noqa: BLE001 — private browser details never enter IPC
+            raise Refused("observation_unavailable") from None
+
     async def observe(self, session):
         async with self._lock:
             self._bound(session, agent=True)
-            try:
-                async with asyncio.timeout(min(10, self.deadline - self.monotonic())):
-                    image = await self.page.screenshot(type="png", caret="hide")
-                self._bound(session, agent=True)
-                if not 24 <= len(image) <= 16 * 1024 * 1024 or image[:8] != b"\x89PNG\r\n\x1a\n":
-                    raise Refused("invalid_observation")
-                width, height = struct.unpack(">II", image[16:24])
-                if not 1 <= width <= 16384 or not 1 <= height <= 16384 or width * height > 16_777_216:
-                    raise Refused("invalid_observation")
-                frame = {"schema_version": 1, "observation_id": str(uuid4()), "session_id": self._session["session_id"],
-                         "control_epoch": self._session["control_epoch"], "observed_at": self.clock().isoformat(),
-                         "width": width, "height": height, "image_sha256": hashlib.sha256(image).hexdigest(), "media_type": "image/png"}
-                self._frame = (frame, self.monotonic())
-                return copy.deepcopy(frame), image
-            except Refused:
-                raise
-            except Exception:  # noqa: BLE001 — boundary keeps private browser details out of IPC/logs
-                self._frame = None
-                raise Refused("observation_unavailable") from None
+            self._frame = None
+            frame, image = await self._capture_locked(lambda: self._bound(session, agent=True))
+            self._frame = (frame, self.monotonic())
+            return copy.deepcopy(frame), image
 
     def _effect(self, action, frame):
         if not version_one(action):
@@ -252,68 +258,85 @@ class BrowserController:
                 if (self._frame is None or request["observation_id"] != self._frame[0]["observation_id"]
                         or self.monotonic() - self._frame[1] > self.frame_ttl):
                     raise Refused("stale_observation")
-                not_after = instant(request["not_after"])
-                effect = self._effect(request["action"], self._frame[0])
-                is_wait = request["action"]["kind"] == "wait"
-                frame_deadline = self._frame[1] + (not_after - instant(self._frame[0]["observed_at"])).total_seconds()
-                remaining = min((not_after - self.clock()).total_seconds(), frame_deadline - self.monotonic(),
-                                self.deadline - self.monotonic(), 11 if is_wait else 10)
-                if remaining <= 0 or (is_wait and request["action"]["milliseconds"] / 1000 >= remaining):
-                    raise Refused("action_expired")
+                return await self._input_locked(session, request, self._frame, request_hash,
+                    lambda: self._bound(session, agent=True), lambda: setattr(self, "_frame", None), lambda: None, network=True)
             except Refused as refusal:
-                # These are THIS controller's synchronous pre-effect checks,
-                # not an inference from generic host/transport exceptions.
-                receipt = {"schema_version": 1, "action_id": action_id,
-                    "session_id": request["session_id"], "observation_id": request["observation_id"],
-                    "control_epoch": request["control_epoch"], "outcome": "denied",
-                    "recorded_at": self.clock().isoformat(), "reason_code": refusal.code}
-                self._actions[action_id] = (request_hash, receipt)
+                self._record_refusal(request, request_hash, refusal)
                 raise
-            receipt = {"schema_version": 1, "action_id": action_id, "session_id": self._session["session_id"],
-                       "observation_id": request["observation_id"], "control_epoch": request["control_epoch"],
-                       "outcome": "unknown", "recorded_at": self.clock().isoformat(), "reason_code": "outcome_unknown"}
-            self._actions[action_id] = (request_hash, receipt)
-            self._frame = None
-            relay = getattr(self, "network", None)
+
+    def _record_refusal(self, request, request_hash, refusal):
+        """Only original pre-effect refusals; never overwrite accepted input."""
+        action_id = request["action_id"]
+        if action_id in self._actions or len(self._actions) >= self.action_limit:
+            return False
+        receipt = {"schema_version": 1, "action_id": action_id,
+            "session_id": request["session_id"], "observation_id": request["observation_id"],
+            "control_epoch": request["control_epoch"], "outcome": "denied",
+            "recorded_at": self.clock().isoformat(), "reason_code": refusal.code}
+        self._actions[action_id] = (request_hash, receipt)
+        return True
+
+    async def _input_locked(self, session, request, frame, request_hash, current, accepted, persisted, *, network=False):
+        """Canonical effect mechanism, shared by separately admitted input channels."""
+        action_id = request["action_id"]
+        if len(self._actions) >= self.action_limit:
+            raise Refused("action_budget_exhausted")
+        not_after = instant(request["not_after"])
+        effect = self._effect(request["action"], frame[0])
+        is_wait = request["action"]["kind"] == "wait"
+        frame_deadline = frame[1] + (not_after - instant(frame[0]["observed_at"])).total_seconds()
+        remaining = min((not_after - self.clock()).total_seconds(), frame_deadline - self.monotonic(),
+                        self.deadline - self.monotonic(), 11 if is_wait else 10)
+        if remaining <= 0 or (is_wait and request["action"]["milliseconds"] / 1000 >= remaining):
+            raise Refused("action_expired")
+        receipt = {"schema_version": 1, "action_id": action_id, "session_id": self._session["session_id"],
+                   "observation_id": request["observation_id"], "control_epoch": request["control_epoch"],
+                   "outcome": "unknown", "recorded_at": self.clock().isoformat(), "reason_code": "outcome_unknown"}
+        self._actions[action_id] = (request_hash, receipt)
+        accepted()
+        relay = getattr(self, "network", None) if network else None
+        if relay is not None:
+            relay.begin(session, request)
+        try:
+            # No await separates final input fencing from effect dispatch.
+            current()
+            async with asyncio.timeout(remaining):
+                await effect()
+                network_known = await relay.drain(action_id) if relay is not None else True
+            receipt.update(outcome="completed" if network_known else "unknown",
+                           reason_code=None if network_known else "network_outcome_unknown", recorded_at=self.clock().isoformat())
+        except asyncio.CancelledError:
+            # Cancelling the Python waiter does not unsend a Chromium input.
+            # Fence synchronously; the worker must physically retire it.
+            if is_wait:
+                receipt.update(outcome="denied", reason_code="wait_cancelled", recorded_at=self.clock().isoformat())
+            else:
+                self._fence_retirement()
+            raise
+        except Exception:  # noqa: BLE001 — accepted effect remains explicitly unknown
+            # A renderer can deliver a timed-out click later. Do not report
+            # a successful pause or permit resume with that input pending.
+            if is_wait:
+                # Wait never sends browser input, so interruption is known
+                # to have no pending physical effect and needs no retirement.
+                receipt.update(outcome="denied", reason_code="wait_interrupted", recorded_at=self.clock().isoformat())
+            else:
+                self._fence_retirement()
+                await self.retire()
+        finally:
             if relay is not None:
-                relay.begin(session, request)
-            try:
-                # No await separates final input fencing from effect dispatch.
-                self._bound(session, agent=True)
-                async with asyncio.timeout(remaining):
-                    await effect()
-                    network_known = await relay.drain(action_id) if relay is not None else True
-                receipt.update(outcome="completed" if network_known else "unknown",
-                               reason_code=None if network_known else "network_outcome_unknown", recorded_at=self.clock().isoformat())
-            except asyncio.CancelledError:
-                # Cancelling the Python waiter does not unsend a Chromium input.
-                # Fence synchronously; the worker must physically retire it.
-                if is_wait:
-                    receipt.update(outcome="denied", reason_code="wait_cancelled", recorded_at=self.clock().isoformat())
-                else:
+                try:
+                    await relay.end(action_id)
+                except (TimeoutError, ConnectionError, OSError):
                     self._fence_retirement()
-                raise
-            except Exception:  # noqa: BLE001 — accepted effect remains explicitly unknown
-                # A renderer can deliver a timed-out click later. Do not report
-                # a successful pause or permit resume with that input pending.
-                if is_wait:
-                    # Wait never sends browser input, so interruption is known
-                    # to have no pending physical effect and needs no retirement.
-                    receipt.update(outcome="denied", reason_code="wait_interrupted", recorded_at=self.clock().isoformat())
-                else:
-                    self._fence_retirement()
-                    await self.retire()
-            finally:
-                if relay is not None:
-                    try:
-                        await relay.end(action_id)
-                    except (TimeoutError, ConnectionError, OSError):
-                        self._fence_retirement()
-                        receipt.update(outcome="unknown", reason_code="network_outcome_unknown")
-            return copy.deepcopy(receipt)
+                    receipt.update(outcome="unknown", reason_code="network_outcome_unknown")
+            persisted()
+        return copy.deepcopy(receipt)
 
     def action_status(self, session, action_id):
         self._bound(session)
+        if action_id in getattr(self, "_human_action_ids", set()):
+            raise Refused("action_unavailable")
         previous = self._actions.get(identifier(action_id))
         if previous is None:
             raise Refused("action_unavailable")
@@ -350,6 +373,9 @@ class BrowserController:
         if len(self._controls) >= 1024 and request["operation"] == "resume":
             raise Refused("control_budget_exhausted")
         self._control_pending = True
+        human = getattr(self, "human", None)
+        if human is not None:
+            human.fence_all()
         try:
             async with self._lock:
                 self._bound(session)
@@ -357,9 +383,16 @@ class BrowserController:
                     raise Refused("session_closed")
                 operation = request["operation"]
                 if ((operation == "resume" and self._session["state"] != "paused")
-                        or (operation == "pause" and self._session["state"] != "ready")
+                        or (operation == "pause" and self._session["state"] not in {"ready", "paused"})
                         or (operation == "takeover" and self._session["state"] not in {"ready", "paused"})):
                     raise Refused("invalid_control_transition")
+                if human is not None:
+                    human.finish_retirement()
+                    if operation == "takeover":
+                        human.private = True
+                    elif operation == "resume":
+                        human.private = False
+                    human._persist()
                 self._session.update(control_epoch=self._session["control_epoch"] + 1,
                                      state="ready" if operation == "resume" else "paused" if operation in {"pause", "takeover"} else "closing",
                                      controller="agent" if operation == "resume" else "human" if operation == "takeover" else "none")

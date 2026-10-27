@@ -140,10 +140,13 @@ def create_visual_computer_router(runtime, *, resolve_context, plan_operation=No
     def control_route(operation, action):
         async def endpoint(session_id: str, request: Request):
             async def build(context, value):
+                share_screen = value.pop("share_screen", False)
+                if type(share_screen) is not bool:
+                    raise ValueError("explicit screen sharing confirmation must be boolean")
                 control = ControlRequest.model_validate_json(json.dumps(value))
                 if control.operation != operation:
                     raise ResourceConflict("control operation does not match route")
-                session = await runtime.control(context, session_id, control, action=action)
+                session = await runtime.control(context, session_id, control, action=action, share_screen=share_screen)
                 if action == VisualAction.STOP:
                     return _json({"session_id":session_id, "stopped":session.controller == "none"})
                 return _json(session)
@@ -160,4 +163,6 @@ def create_visual_computer_router(runtime, *, resolve_context, plan_operation=No
             return _json(await runtime.release(context, session_id))
         return respond(request, VisualAction.RELEASE, build)
 
+    from .human_http import add_human_routes
+    add_human_routes(router, runtime, resolve_context=resolve_context)
     return router

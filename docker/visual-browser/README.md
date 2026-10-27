@@ -103,14 +103,19 @@ Chromium input. That session cannot report a successful pause or be resumed.
 Pause and close remain available when the control-history budget is exhausted;
 resuming is refused. Transport has four connection slots with a 20-second bound;
 the trusted host must avoid holding idle slots and retain physical cleanup
-authority if control transport is unavailable. Priority human control remains
-part of host integration. Pause fences
+authority if control transport is unavailable. Authenticated manual control uses
+the same worker endpoint, priority socket and shared input journal. Pause fences
 queued input before draining accepted work, suspends observations and advances
 the control epoch; resume advances it again. Logical takeover fences the agent
-with a paused human controller; a human input transport is not installed. A frame
-is an observation identity, not a promise that autonomous page content is static.
+with a paused human controller. Published SDK 0.45 provides
+`HumanTransport`; the host must explicitly enable the manual channel and bind
+its original issued consumer lease. The built-image and host acceptance gates
+below still apply. A frame is an observation identity, not a promise that autonomous
+page content is static.
 
-Only screenshot, click, text, a restricted key set, scroll and wait are supported.
+The offline profile supports screenshot, click, text, a restricted key set,
+scroll and wait. The explicit HTTP profile also supports agent navigation;
+manual human navigation remains refused.
 Waits send no browser input: a wait that cannot fit its deadline is refused,
 and an interrupted wait has a known denial without retiring a healthy page.
 The maximum 10-second wait has a separate bounded scheduling allowance.
@@ -189,8 +194,12 @@ and cleanup verifies the original native container/network IDs and labels.
 
 ## Negotiated workspace transport
 
-The current image pins SDK 0.43.0 and carries the required
-`io.kestrel.visual-computer.worker-contract=sdk-0.43-http-v1` label.
+The worker pins published SDK `0.45.0` in its normal-index hash lock and requires
+the `io.kestrel.visual-computer.worker-contract=sdk-0.45-human-v1` label. Core
+declares SDK `>=0.45.0,<1`. The Dockerfile checks that the installed dependency
+satisfies the worker pin and exposes the human contract. Source changes still
+require a new built-image proof and complete host acceptance; a resolved SDK
+lock alone does not establish that this Core successor is released.
 Older images are refused rather than claiming their file-transfer capability.
 The driver implements the SDK's `WorkspaceTransferProvider` extension;
 `workspace_transfer()` returns a distinct transport with all standard prepare,
