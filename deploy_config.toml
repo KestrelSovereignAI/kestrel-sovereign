@@ -144,6 +144,13 @@ KESTREL_DB_BACKEND = "postgres"
 KESTREL_DB_PATH = "/app/agent_data"
 KESTREL_DEPLOYMENT_PERSISTENCE = "durable_sovereign"
 KESTREL_EXPECTED_DID = "${KESTREL_PROD_EXPECTED_DID}"
+# The public service authority and discovery registration are explicit. Reuse
+# the identity pin that validates the restored bundle, not a display name.
+KESTREL_BASE_URL = "https://kestrel-prod-7jpbsywhdq-uc.a.run.app"
+KESTREL_A2A_DISCOVERY_AGENT = "${KESTREL_PROD_EXPECTED_DID}"
+# This profile scales to zero; advertise push only after its background
+# delivery and independent wakeup path have been accepted for this service.
+KESTREL_A2A_PUSH_ENABLED = "false"
 KESTREL_REQUIRE_OAUTH = "true"
 KESTREL_ALLOWED_EMAILS = "${KESTREL_ALLOWED_EMAILS}"
 

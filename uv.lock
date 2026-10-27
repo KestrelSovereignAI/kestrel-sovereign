@@ -3040,7 +3040,7 @@ wheels = [
 
 [[package]]
 name = "kestrel-feature-mcp"
-version = "0.7.0"
+version = "0.8.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "anyio" },
@@ -3051,9 +3051,9 @@ dependencies = [
     { name = "pydantic" },
     { name = "requests" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/e5/dd/9736c451b242fa50127ac823303f6a60b1fa4565e38e679ec279b88a84c0/kestrel_feature_mcp-0.7.0.tar.gz", hash = "sha256:7d1e44284c71b98562b2ad6646f7286b5ba28ef811296c07aea0f97d44b8f99f", size = 204454, upload-time = "2026-10-19T19:49:30.822Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/57/2d/d5c51730cdcc9e25346dbaa3937164f9209759c10d54717eb411c080774b/kestrel_feature_mcp-0.8.0.tar.gz", hash = "sha256:0759e695f8bf80c01d89ec6be59ceba77c821d9c9ea204ea34b45d8e452c8f41", size = 799818, upload-time = "2026-10-26T22:42:10.896Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/ed/68/f253b78c798c8ec9406f407e6d04346438e3cb2f9a835b6dbee903f65bef/kestrel_feature_mcp-0.7.0-py3-none-any.whl", hash = "sha256:4515672929b788d669297c9c2af6e28d5593f338d0a274aac2e506236081d526", size = 75173, upload-time = "2026-10-19T19:49:29.448Z" },
+    { url = "https://files.pythonhosted.org/packages/0e/2a/46a2e62c0afff481bd3f3a459e8d588c9272e8343493827ec0ccdf7a4479/kestrel_feature_mcp-0.8.0-py3-none-any.whl", hash = "sha256:22fa9d8e777f0fce8e42f95fda12f99e5933bf90443463958b718bec68bbf759", size = 429146, upload-time = "2026-10-26T22:42:09.069Z" },
 ]
 
 [[package]]
@@ -3165,7 +3165,7 @@ all = [
 
 [[package]]
 name = "kestrel-sovereign"
-version = "0.55.1"
+version = "0.55.2"
 source = { editable = "." }
 dependencies = [
     { name = "aiohttp" },
@@ -3401,7 +3401,7 @@ requires-dist = [
     { name = "idna", specifier = ">=3.20,<4" },
     { name = "iniconfig", specifier = "==2.3.0" },
     { name = "itsdangerous", specifier = ">=2.2.0" },
-    { name = "kestrel-feature-mcp", marker = "extra == 'mcp-integration'", specifier = ">=0.7,<1" },
+    { name = "kestrel-feature-mcp", marker = "extra == 'mcp-integration'", specifier = ">=0.8,<1" },
     { name = "kestrel-llms", extras = ["all"], specifier = "==0.1.8" },
     { name = "kestrel-sovereign", extras = ["all-features"], marker = "extra == 'full'" },
     { name = "kestrel-sovereign", extras = ["cloud"], marker = "extra == 'all-features'" },
@@ -3412,7 +3412,7 @@ requires-dist = [
     { name = "kestrel-sovereign", extras = ["search"], marker = "extra == 'all-features'" },
     { name = "kestrel-sovereign", extras = ["test"], marker = "extra == 'full'" },
     { name = "kestrel-sovereign", extras = ["wallet"], marker = "extra == 'all-features'" },
-    { name = "kestrel-sovereign-sdk", extras = ["a2a", "httpx", "tracing"], specifier = ">=0.43.0,<1" },
+    { name = "kestrel-sovereign-sdk", extras = ["a2a", "httpx", "tracing"], specifier = ">=0.44.1,<1" },
     { name = "kestrel-sovereign-sdk", extras = ["metrics"], marker = "extra == 'observability'" },
     { name = "networkx", specifier = "==3.6.1" },
     { name = "numpy", specifier = ">=2.3.1" },
@@ -3500,15 +3500,15 @@ test = [
 
 [[package]]
 name = "kestrel-sovereign-sdk"
-version = "0.43.0"
+version = "0.44.1"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "idna" },
     { name = "pydantic" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/16/ee/f338dbe6d560a2d7cf59cda42300a82662c38fb7360ca3b144f80e19e256/kestrel_sovereign_sdk-0.43.0.tar.gz", hash = "sha256:bc639f24c57b7d2ab0bfd007f46496f86c854945226da683e8fb025347daadc3", size = 538249, upload-time = "2026-10-26T03:14:48.036Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/4f/04/7b07be66e0070eb639685f7399dcbc2bb4f8714268fa6ae17eef95dfad94/kestrel_sovereign_sdk-0.44.1.tar.gz", hash = "sha256:08cda3be82f98fcdfab9f98c5eaab9664b056d8a2da3536a5da97f7b7c0685d0", size = 547686, upload-time = "2026-10-26T22:02:44.719Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/63/c2/3ca8ac1265d4015ff130a475450582f53c2176208a36b0ff1629e82a34f8/kestrel_sovereign_sdk-0.43.0-py3-none-any.whl", hash = "sha256:b84aa2b47a1b535500747d17e3cea3021b50ee1cfc7761d404f74ab67a34d99c", size = 646365, upload-time = "2026-10-26T03:14:46.421Z" },
+    { url = "https://files.pythonhosted.org/packages/a4/5a/5d1bdef6c311d52f07440d107d39c6483a307082c0a481f54659e4466e98/kestrel_sovereign_sdk-0.44.1-py3-none-any.whl", hash = "sha256:8329a7d39fe6e83a803cb83f6aa3f09ceb1dc68ef05b627cdd4e5e8bfc155551", size = 655527, upload-time = "2026-10-26T22:02:46.333Z" },
 ]
 
 [package.optional-dependencies]

@@ -70,7 +70,7 @@ SECURITY_FLOORS = {
 # This is a Core-only release gate: sibling packages release independently.
 # Core must never lower its declared/locked line to accommodate an older
 # consumer. Host feature acceptance remains a release prerequisite in README.md.
-SDK_RELEASE_CASCADE_SPECIFIERS = frozenset({(">=", "0.43.0"), ("<", "1")})
+SDK_RELEASE_CASCADE_SPECIFIERS = frozenset({(">=", "0.44.1"), ("<", "1")})
 SDK_RELEASE_CASCADE_CONTRACTS = {
     "base": frozenset({"a2a", "httpx", "tracing"}),
     "observability": frozenset({"metrics"}),
@@ -100,7 +100,7 @@ def _assert_requirement_floor(requirement: Requirement, floor: Version) -> None:
 
 
 def test_installed_remote_mcp_campaign_requires_the_public_feature_contract():
-    """The real HTTPS campaign cannot resolve a Docker-only feature release."""
+    """The host installs the public native Apps and one-round-call contracts."""
     dependencies = _pyproject()["project"]["optional-dependencies"]["mcp-integration"]
     (requirement,) = [
         Requirement(raw)
@@ -108,12 +108,14 @@ def test_installed_remote_mcp_campaign_requires_the_public_feature_contract():
         if Requirement(raw).name == "kestrel-feature-mcp"
     ]
     assert not requirement.specifier.contains("0.6.0")
-    assert requirement.specifier.contains("0.7.0")
+    assert not requirement.specifier.contains("0.7.0")
+    assert not requirement.specifier.contains("0.7.2")
     assert requirement.specifier.contains("0.8.0")
+    assert requirement.specifier.contains("0.9.0")
     (package,) = [
         item for item in _lock()["package"] if item["name"] == "kestrel-feature-mcp"
     ]
-    assert Version(package["version"]) >= Version("0.7.0")
+    assert Version(package["version"]) >= Version("0.8.0")
     assert package["source"] == {"registry": "https://pypi.org/simple"}
 
 
@@ -332,7 +334,9 @@ def test_sdk_native_release_cascade_contract_is_declared():
         assert Version("0.42.2") not in specifier
         assert Version("0.42.3") not in specifier
         assert Version("0.42.4") not in specifier
-        assert Version("0.43.0") in specifier
+        assert Version("0.43.0") not in specifier
+        assert Version("0.44.0") not in specifier
+        assert Version("0.44.1") in specifier
         assert Version("1.0.0") not in specifier
 
 
@@ -368,5 +372,5 @@ def test_sdk_native_release_cascade_contract_is_locked():
     ]
     assert sdk_versions
     assert all(
-        Version("0.43.0") <= version < Version("1.0.0") for version in sdk_versions
+        Version("0.44.1") <= version < Version("1.0.0") for version in sdk_versions
     )

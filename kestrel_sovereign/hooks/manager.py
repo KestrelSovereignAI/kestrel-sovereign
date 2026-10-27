@@ -507,6 +507,8 @@ class HooksManager:
         self,
         event: HookEvent,
         input: HookInput,
+        *,
+        require_complete: bool = False,
     ) -> List[HookOutput]:
         """
         Execute all matching hooks in parallel (for post-hooks).
@@ -518,6 +520,8 @@ class HooksManager:
         Args:
             event: The hook event type
             input: HookInput containing context for the hooks
+            require_complete: Require a valid response from every matching hook;
+                failures deny the dependent publication instead of disappearing.
 
         Returns:
             List of HookOutput from all executed hooks
@@ -532,9 +536,13 @@ class HooksManager:
         async def execute_with_timeout(hook: Hook) -> Optional[HookOutput]:
             try:
                 if getattr(hook, "awaits_user_input", False):
-                    return await hook.execute(input)
-                async with asyncio.timeout(hook.timeout):
-                    return await hook.execute(input)
+                    output = await hook.execute(input)
+                else:
+                    async with asyncio.timeout(hook.timeout):
+                        output = await hook.execute(input)
+                if require_complete and not isinstance(output, HookOutput):
+                    raise TypeError("Required hook returned no valid output")
+                return output
             except asyncio.TimeoutError as error:
                 from kestrel_sovereign.execution_custody import (
                     is_execution_control_error,
@@ -542,6 +550,8 @@ class HooksManager:
                 if is_execution_control_error(error):
                     raise
                 logger.warning(f"Hook '{hook.name}' timed out (parallel)")
+                if require_complete or _hook_is_enforcing(hook):
+                    return _deny_for_failed_hook(hook, "timed out", [], None)
                 return None
             except Exception as e:
                 from kestrel_sovereign.execution_custody import (
@@ -550,6 +560,8 @@ class HooksManager:
                 if is_execution_control_error(e):
                     raise
                 logger.error(f"Hook '{hook.name}' failed (parallel): {e}")
+                if require_complete or _hook_is_enforcing(hook):
+                    return _deny_for_failed_hook(hook, "raised " + type(e).__name__, [], None)
                 return None
 
         from kestrel_sovereign._async_ownership import gather_owned
