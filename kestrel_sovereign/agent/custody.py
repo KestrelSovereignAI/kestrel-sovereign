@@ -30,8 +30,10 @@ from typing import Awaitable, Callable, Collection, Dict, Optional, Tuple
 #: Until every owner a boot acquires from is listed, an agent keeps its serving
 #: record until its process exits. An owner joins only once its own close
 #: stops swallowing failures; that it returned without raising never makes it
-#: truthful. ``task_manager`` joined with #3558. The conversions still filed
-#: are #3559 (``llm_service``) and #3560 (``feature``); every other owner a
+#: truthful. ``task_manager`` joined with #3558; ``host_key_database`` also
+#: has an audited native close. #3559 (``llm_service``) and #3560 (``feature``)
+#: were intentionally closed as not planned: those owners remain held.
+#: Closed issue status does not certify cleanup. Every other owner a
 #: boot acquires (``storage``, ``signal_dispatcher``, ``memory_system``,
 #: ``sync_service``, ``heartbeat_runner``, ``resume_monitor``,
 #: ``salvage_worker``, ``background_tasks``) needs its close shown truthful

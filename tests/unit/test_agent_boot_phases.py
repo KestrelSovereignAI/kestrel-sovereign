@@ -609,9 +609,9 @@ async def test_clean_boot_reaches_ready(tmp_path):
 # through its serving record, so the record must outlive every resource the
 # agent may still hold. Each resource enters the agent's custody when it is
 # acquired and leaves only when its release is reported by an owner in
-# ``TRUTHFUL_CLOSE_OWNERS``. That list holds only ``task_manager`` (#3558)
-# until the other owners' closes stop swallowing failures (#3559, #3560), so
-# for now the record stays until the process exits.
+# ``TRUTHFUL_CLOSE_OWNERS`` admits ``task_manager`` and ``host_key_database``.
+# #3559/#3560 intentionally left LLM/feature owners uncertified; the record
+# therefore stays while any such owner is held, and goes stale at process exit.
 # ---------------------------------------------------------------------------
 
 
