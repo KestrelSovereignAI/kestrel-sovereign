@@ -149,9 +149,14 @@ async def test_real_local_visual_product(tmp_path, monkeypatch):
             # negotiated SDK workspace transport, with a current host lease.
             from kestrel_sovereign.auth import CallerContext,caller_context_scope
             from kestrel_sdk.workspaces import WorkspaceExportRequest,TransferLimits
+            from kestrel_sovereign.visual_computer.runtime import VisualAccessDenied
             feature=agent.features["VisualComputerFeature"]
-            with caller_context_scope(CallerContext.sovereign(credential=key)):
-                async with feature._bind_context(CallerContext.sovereign(credential=key)) as context:
+            caller=CallerContext.sovereign(credential=key)
+            with caller_context_scope(caller):
+                with pytest.raises(VisualAccessDenied,match="caller is no longer current"):
+                    async with feature._bind_context(CallerContext.sovereign(credential=key)):
+                        pytest.fail("a copied caller borrowed the original workspace authority")
+                async with feature._bind_context(caller) as context:
                     async with feature.runtime.session_operation(context,sid) as (paused,driver,check):
                         transfer=driver.workspace_transfer()
                         export=WorkspaceExportRequest(transfer_id=uuid4().hex,session_id=sid,lease_id=paused.lease_id,

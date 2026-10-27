@@ -302,7 +302,7 @@ async def test_visual_plan_uses_original_caller_configured_model_and_host_router
 
 @pytest.mark.asyncio
 async def test_visual_tool_cannot_mint_authority_from_copied_caller(visual_host):
-    from kestrel_sovereign.auth import CallerContext
+    from kestrel_sovereign.auth import CallerContext, caller_context_scope
     from kestrel_sdk.operator import OperatorAuthorizationError
 
     _, agents, _ = visual_host
@@ -310,6 +310,13 @@ async def test_visual_tool_cannot_mint_authority_from_copied_caller(visual_host)
     with pytest.raises(OperatorAuthorizationError):
         async with feature._bind_context(CallerContext.sovereign(credential=KEY)):
             pytest.fail("a copied caller minted visual authority")
+    caller = CallerContext.sovereign(credential=KEY)
+    with caller_context_scope(caller):
+        with pytest.raises(OperatorAuthorizationError, match="caller is no longer current"):
+            async with feature._bind_context(CallerContext.sovereign(credential=KEY)):
+                pytest.fail("a copied caller borrowed another caller's visual authority")
+        async with feature._bind_context(caller) as context:
+            assert context.tenant_id == "did:test:kite"
 
 
 @pytest.mark.asyncio
