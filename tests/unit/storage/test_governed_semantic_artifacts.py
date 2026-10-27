@@ -33,8 +33,10 @@ from kestrel_sovereign.knowledge import (
     Literal,
     OntologyRef,
     SourceOccurrence,
+    SourceReferenceKind,
     Visibility,
     XSD_STRING,
+    source_reference_segment,
 )
 from kestrel_sovereign.security.assertion_tenant_resolver import (
     _resolve_authenticated_agent_assertion_capability,
@@ -669,6 +671,68 @@ async def test_tombstone_delta_is_revoked_and_physically_deleted_after_erasure(
         "WHERE tenant_id = ? AND acknowledged_at IS NULL",
         (storage.agent_id,),
     ) == 0
+
+
+@pytest.mark.asyncio
+async def test_corpus_holds_out_a_session_named_in_stored_provenance(
+    storage: AsyncStorage,
+) -> None:
+    exam_session = "dcd6f767-829d-4a7d-b8c7-d7a722e5de13"
+    stored = []
+    for name, segments in (
+        ("exam", (source_reference_segment(SourceReferenceKind.SESSION, exam_session),)),
+        ("everyday", ()),
+    ):
+        source = replace(
+            _source(),
+            source_occurrence_id=f"source:{name}",
+            locator="#".join(("POST:/api/agent/invoke", *segments, f"note:{name}")),
+        )
+        assertion = replace(
+            _assertion(storage.agent_id, f"{name}-revision"),
+            object=Literal(f"{name}-answer", XSD_STRING),
+            lineage=DirectLineage((source.source_occurrence_id,)),
+            assertion_id=None,
+        )
+        await storage.put_assertion(assertion, source_occurrences=(source,))
+        stored.append(assertion)
+    await storage.run_semantic_maintenance(None)
+    capabilities = await storage.semantic_maintenance_capability_versions(None)
+    policy = GovernedCorpusPolicy(
+        policy_id="exam-holdout",
+        policy_version="1",
+        accepted_epistemic_states=(EpistemicState.REPORTED,),
+        accepted_visibility=(Visibility.PRIVATE,),
+        accepted_privacy_classifications=("normal",),
+        accepted_consent_references=("policy:private-v1",),
+        accepted_grounding_classes=("test",),
+        accepted_source_kinds=("conversation",),
+        accepted_ontology_pins=(stored[0].ontology_version,),
+        accepted_semantic_capability_versions=tuple(capabilities.items()),
+    )
+    producer = {
+        "consumer_id": "parametric-self-test",
+        "consumer_key_id": "parametric-self-key-v1",
+        "consumer_public_key": _public_key(Ed25519PrivateKey.generate()),
+        "retention_seconds": 300,
+    }
+
+    unexcluded = await storage.governed_assertion_corpus_snapshot(
+        policy=policy, inference_profile=None, artifact_id=str(uuid4()), **producer,
+    )
+    held_out = await storage.governed_assertion_corpus_snapshot(
+        policy=replace(policy, excluded_session_ids=(exam_session,)),
+        inference_profile=None, artifact_id=str(uuid4()), **producer,
+    )
+
+    assert {item.assertion.revision_id for item in unexcluded.examples} == {
+        "exam-revision", "everyday-revision",
+    }
+    assert [item.assertion.revision_id for item in held_out.examples] == ["everyday-revision"]
+    assert held_out.observability.excluded == {"explicitly_excluded": 1}
+    assert all(
+        "exam-answer" not in str(item.canonical_mapping()) for item in held_out.examples
+    )
 
 
 @pytest.mark.asyncio

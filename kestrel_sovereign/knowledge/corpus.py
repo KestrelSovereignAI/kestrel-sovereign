@@ -15,7 +15,7 @@ becoming trainable data.
 from __future__ import annotations
 
 import asyncio
-from dataclasses import dataclass
+from dataclasses import MISSING, dataclass, fields as dataclass_fields
 from enum import Enum
 import hashlib
 import json
@@ -33,6 +33,7 @@ from .assertion import (
     EpistemicState,
     OntologyRef,
     SourceOccurrence,
+    SourceReferenceKind,
     Visibility,
 )
 from .maintenance import SemanticMaintenanceTrainingReadiness
@@ -57,6 +58,7 @@ class GovernedCorpusBudgetExceeded(GovernedCorpusError):
 
 class CorpusEligibilityReason(str, Enum):
     INCLUDED = "included"
+    EXCLUDED = "explicitly_excluded"
     LIFECYCLE = "lifecycle_ineligible"
     EPISTEMIC_STATE = "epistemic_state_disallowed"
     PRIVACY = "privacy_classification_disallowed"
@@ -97,15 +99,32 @@ def _digest(value: object) -> str:
     return hashlib.sha256(_canonical_json(value).encode("utf-8")).hexdigest()
 
 
-def _ordered_texts(values: Sequence[str], name: str) -> tuple[str, ...]:
+def _ordered_texts(
+    values: Sequence[str], name: str, *, allow_empty: bool = False
+) -> tuple[str, ...]:
     if isinstance(values, (str, bytes)) or not isinstance(values, Sequence):
         raise GovernedCorpusError(f"{name} must be an ordered sequence")
-    if not values or any(not isinstance(value, str) or not value for value in values):
+    if (not values and not allow_empty) or any(
+        not isinstance(value, str) or not value for value in values
+    ):
         raise GovernedCorpusError(f"{name} must contain non-empty values")
     normalized = tuple(values)
     if len(set(normalized)) != len(normalized):
         raise GovernedCorpusError(f"{name} must not contain duplicates")
     return tuple(sorted(normalized))
+
+
+def _mapping_items(value: object, name: str) -> tuple[object, ...]:
+    if isinstance(value, (str, bytes)) or not isinstance(value, Sequence):
+        raise GovernedCorpusError(f"{name} must be an array")
+    return tuple(value)
+
+
+_EXCLUSION_FIELDS = (
+    "excluded_saved_item_ids",
+    "excluded_session_ids",
+    "excluded_source_occurrence_ids",
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -142,6 +161,15 @@ class GovernedCorpusPolicy:
     All allow-lists are required.  A caller must consciously opt in to each
     source/consent/privacy/grounding class; this class is a policy value, not
     an inference from current database contents.
+
+    The exclusion sets hold out specific material that every class rule would
+    accept, such as a held-out exam.  They are checked before any acceptance
+    rule.  A revision is excluded when one of its direct source occurrences is
+    named in ``excluded_source_occurrence_ids``, or when such a source's
+    locator names an excluded saved item or session (see
+    :func:`~kestrel_sovereign.knowledge.assertion.source_reference_segment`).
+    A derived revision built on an excluded premise is rejected with it.  Ids
+    are compared exactly: a display prefix of a saved-item id matches nothing.
     """
 
     policy_id: str
@@ -156,6 +184,9 @@ class GovernedCorpusPolicy:
     accepted_semantic_capability_versions: tuple[tuple[str, str], ...]
     allow_inferred: bool = False
     accepted_derivation_profiles: tuple[str, ...] = ()
+    excluded_saved_item_ids: tuple[str, ...] = ()
+    excluded_session_ids: tuple[str, ...] = ()
+    excluded_source_occurrence_ids: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         if not isinstance(self.policy_id, str) or not self.policy_id:
@@ -227,6 +258,10 @@ class GovernedCorpusPolicy:
             self, "accepted_derivation_profiles",
             _ordered_texts(profiles, "accepted_derivation_profiles") if profiles else (),
         )
+        for name in _EXCLUSION_FIELDS:
+            object.__setattr__(
+                self, name, _ordered_texts(getattr(self, name), name, allow_empty=True)
+            )
         object.__setattr__(
             self,
             "accepted_ontology_pins",
@@ -249,7 +284,7 @@ class GovernedCorpusPolicy:
         )
 
     def to_mapping(self) -> dict[str, object]:
-        return {
+        mapping: dict[str, object] = {
             "schema_version": CORPUS_SCHEMA_VERSION,
             "policy_id": self.policy_id,
             "policy_version": self.policy_version,
@@ -269,10 +304,88 @@ class GovernedCorpusPolicy:
             "allow_inferred": self.allow_inferred,
             "accepted_derivation_profiles": list(self.accepted_derivation_profiles),
         }
+        # An empty exclusion set selects the same corpus as none at all, so it
+        # is left out: a policy without exclusions keeps the digest it had
+        # before they existed, and adapters trained under it stay verifiable.
+        for name in _EXCLUSION_FIELDS:
+            if getattr(self, name):
+                mapping[name] = list(getattr(self, name))
+        return mapping
+
+    @classmethod
+    def from_mapping(cls, value: object) -> GovernedCorpusPolicy:
+        """Rebuild a policy from :meth:`to_mapping` output.
+
+        A consumer that persists its policy restores it here.  Rebuilding it
+        field by field drops every field the consumer does not name, such as
+        an exclusion set, so an unknown key is refused rather than ignored.
+        """
+        if not isinstance(value, Mapping) or any(not isinstance(key, str) for key in value):
+            raise GovernedCorpusError("policy mapping must be a mapping with string keys")
+        missing = _POLICY_REQUIRED_KEYS - value.keys()
+        unknown = value.keys() - _POLICY_REQUIRED_KEYS - _POLICY_OPTIONAL_KEYS
+        if missing or unknown:
+            raise GovernedCorpusError(
+                f"policy mapping is missing {sorted(missing)} or has unknown {sorted(unknown)}"
+            )
+        version = value.get("schema_version", CORPUS_SCHEMA_VERSION)
+        if type(version) is not int or version != CORPUS_SCHEMA_VERSION:
+            raise GovernedCorpusError(
+                f"policy mapping schema_version must be {CORPUS_SCHEMA_VERSION}"
+            )
+        capabilities = _mapping_items(
+            value["accepted_semantic_capability_versions"],
+            "accepted_semantic_capability_versions",
+        )
+        if any(
+            not isinstance(item, Mapping) or set(item) != {"name", "version"}
+            for item in capabilities
+        ):
+            raise GovernedCorpusError(
+                "accepted_semantic_capability_versions entries must be name/version mappings"
+            )
+        values = {
+            key: _mapping_items(value[key], key) if key in _POLICY_SEQUENCE_KEYS else value[key]
+            for key in value
+            if key != "schema_version"
+        }
+        values["accepted_ontology_pins"] = tuple(
+            OntologyRef.from_mapping(item) for item in values["accepted_ontology_pins"]
+        )
+        values["accepted_semantic_capability_versions"] = tuple(
+            (item["name"], item["version"]) for item in capabilities
+        )
+        return cls(**values)
+
+    def excludes(
+        self, assertion: Assertion, sources: Sequence[SourceOccurrence]
+    ) -> bool:
+        """Whether a direct source this revision was read from is excluded."""
+        if isinstance(assertion.lineage, DirectLineage) and not set(
+            self.excluded_source_occurrence_ids
+        ).isdisjoint(assertion.lineage.source_occurrence_ids):
+            return True
+        references = {
+            (SourceReferenceKind.SAVED_ITEM, item) for item in self.excluded_saved_item_ids
+        } | {(SourceReferenceKind.SESSION, item) for item in self.excluded_session_ids}
+        return any(not references.isdisjoint(source.references) for source in sources)
 
     @property
     def digest(self) -> str:
         return _digest(self.to_mapping())
+
+
+_POLICY_FIELDS = dataclass_fields(GovernedCorpusPolicy)
+_POLICY_REQUIRED_KEYS = frozenset(
+    item.name for item in _POLICY_FIELDS
+    if item.default is MISSING and item.default_factory is MISSING
+)
+_POLICY_OPTIONAL_KEYS = frozenset(
+    {"schema_version"}.union(item.name for item in _POLICY_FIELDS)
+) - _POLICY_REQUIRED_KEYS
+_POLICY_SEQUENCE_KEYS = frozenset(item.name for item in _POLICY_FIELDS) - {
+    "policy_id", "policy_version", "allow_inferred",
+}
 
 
 @dataclass(frozen=True, slots=True)
@@ -722,18 +835,12 @@ class GovernedAssertionCorpusService:
         validations = dict(
             await self._storage.assertion_validation_statuses(tuple(candidates))
         )
+        # Exclusion is decided from a revision's provenance before any
+        # acceptance rule, so every direct candidate's sources are read.
         direct_revision_ids = tuple(
             assertion.revision_id
             for assertion in candidates
             if isinstance(assertion.lineage, DirectLineage)
-            and self._eligibility(
-                assertion,
-                validations.get(
-                    assertion.assertion_id, CorpusValidationStatus(None, None)
-                ),
-                policy,
-            )
-            is CorpusEligibilityReason.INCLUDED
         )
         source_cache = await self._source_batch(direct_revision_ids)
         examples: list[GovernedCorpusExample] = []
@@ -798,14 +905,21 @@ class GovernedAssertionCorpusService:
             raise GovernedCorpusBudgetExceeded(
                 "max_assertions exhausted by derivation traversal"
             )
-        reason = self._eligibility(assertion, validation, policy)
-        if reason is not CorpusEligibilityReason.INCLUDED:
-            return reason, ()
+        sources: tuple[SourceOccurrence, ...] = ()
         if isinstance(assertion.lineage, DirectLineage):
             if assertion.revision_id not in source_cache:
                 source_cache.update(await self._source_batch((assertion.revision_id,)))
             sources = source_cache.get(assertion.revision_id, ())
-            if not sources or any(
+        reason = self._eligibility(assertion, validation, policy, sources)
+        if reason is not CorpusEligibilityReason.INCLUDED:
+            return reason, ()
+        if isinstance(assertion.lineage, DirectLineage):
+            # An exclusion sees only the provenance the host returned, so a
+            # revision whose returned sources do not match its lineage cannot
+            # be shown to be clear of excluded material.
+            if {source.source_occurrence_id for source in sources} != set(
+                assertion.lineage.source_occurrence_ids
+            ) or any(
                 source.source_kind not in policy.accepted_source_kinds
                 for source in sources
             ):
@@ -858,14 +972,6 @@ class GovernedAssertionCorpusService:
             for item in inputs
             if isinstance(item.lineage, DirectLineage)
             and item.revision_id not in source_cache
-            and self._eligibility(
-                item,
-                validation_cache.get(
-                    item.assertion_id, CorpusValidationStatus(None, None)
-                ),
-                policy,
-            )
-            is CorpusEligibilityReason.INCLUDED
         )
         if missing_direct_sources:
             source_cache.update(await self._source_batch(missing_direct_sources))
@@ -887,6 +993,8 @@ class GovernedAssertionCorpusService:
                 governed_revisions=governed_revisions,
                 source_cache=source_cache,
             )
+            if item_reason is CorpusEligibilityReason.EXCLUDED:
+                return CorpusEligibilityReason.EXCLUDED, ()
             if item_reason is not CorpusEligibilityReason.INCLUDED:
                 return CorpusEligibilityReason.DERIVATION_INPUT, ()
             for source in item_sources:
@@ -905,7 +1013,14 @@ class GovernedAssertionCorpusService:
         )
 
     @staticmethod
-    def _eligibility(assertion: Assertion, validation: CorpusValidationStatus, policy: GovernedCorpusPolicy) -> CorpusEligibilityReason:
+    def _eligibility(
+        assertion: Assertion,
+        validation: CorpusValidationStatus,
+        policy: GovernedCorpusPolicy,
+        sources: Sequence[SourceOccurrence],
+    ) -> CorpusEligibilityReason:
+        if policy.excludes(assertion, sources):
+            return CorpusEligibilityReason.EXCLUDED
         if assertion.status is not AssertionStatus.ACTIVE:
             return CorpusEligibilityReason.LIFECYCLE
         if validation.state is not ValidationState.CONFORMS or validation.action not in (ValidationWriteAction.ACCEPT, ValidationWriteAction.ACCEPT_WITH_REPORT):

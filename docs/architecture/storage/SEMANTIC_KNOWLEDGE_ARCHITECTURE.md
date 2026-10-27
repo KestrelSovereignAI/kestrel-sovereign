@@ -642,7 +642,29 @@ accepted source classes, consent/release references, privacy classifications,
 visibility, grounding classes, epistemic states, and (where enabled) derived
 rule-profile versions. It also pins the accepted ontology artifacts and the
 complete semantic-maintenance capability map; initial and incremental reads
-reject a host whose active pins differ. The host admits only current,
+reject a host whose active pins differ.
+
+Class rules cannot hold out specific material that every class accepts, such as
+a held-out exam. The policy's exclusion sets (`excluded_saved_item_ids`,
+`excluded_session_ids`, `excluded_source_occurrence_ids`) do, and they are
+checked before any acceptance rule: such a revision is reported
+`explicitly_excluded`, and a derived revision built on it is rejected with it.
+A source occurrence names the saved item or session it was read from with a
+locator segment built by `source_reference_segment` (`saved-item:<id>`,
+`session:<id>`, percent-encoded), read back as `SourceOccurrence.references`.
+Ids are compared exactly, so a display prefix excludes nothing. A revision whose
+returned provenance does not match its lineage is rejected, since an exclusion
+cannot clear sources it was not shown. Exclusions are part of the policy value,
+so they change its digest and therefore the corpus manifest's `policy_pin`; an
+empty set is omitted from that value, so a policy without exclusions keeps its
+prior digest. A consumer that persists its policy restores it with
+`GovernedCorpusPolicy.from_mapping`, which refuses unknown fields rather than
+dropping them. No producer writes these segments yet (#3875): the existing
+`save_fact` and strategy-ledger sources name their request route and their own
+record, never the session, so material they recorded during an excluded session
+must be excluded by source-occurrence id.
+
+The host admits only current,
 projection-eligible, conformant assertions. Derived assertions recursively
 govern every exact input revision and aggregate only the accepted direct-source
 lineage; a restricted, stale, unvalidated, or otherwise ineligible premise
