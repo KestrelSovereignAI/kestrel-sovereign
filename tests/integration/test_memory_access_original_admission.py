@@ -17,6 +17,7 @@ from tests.integration.test_saved_items_original_control import (
     native_recall as native_recall,
 )
 from tests.unit.test_host_context_native_cleanup import _actual_operation
+from tests.shared.original_task_admission import assert_unknown_task_admission
 
 
 @pytest.mark.asyncio
@@ -85,9 +86,8 @@ async def test_partial_memory_task_admission_joins_accepted_children_and_fails_c
             failure = error
         loop.set_task_factory(previous)
         assert len(accepted) == 1 and len(refused) == 1
-        assert failure is original, (
-            f"{door} made refused admission an ordinary result {result!r}"
-        )
+        assert result is None
+        assert_unknown_task_admission(failure, original)
         assert all(task.done() for task in accepted), (
             "refusal abandoned an accepted child"
         )
