@@ -703,6 +703,7 @@ Runtime security policy can still deny a discovered tool at call time; static ge
 | `visual_computer_admit` |  | `unknown` | `request_json` | 38 | `enabled` |
 | `visual_computer_release` |  | `unknown` | `session_id` | 32 | `enabled` |
 | `visual_computer_status` |  | `unknown` | `session_id` | 35 | `enabled` |
+| `visual_computer_step` |  | `unknown` | `session_id`, `action_id`, `prompt` | 79 | `enabled` |
 | `visual_computer_stop` |  | `unknown` | `session_id`, `expected_control_epoch`, `request_id` | 63 | `enabled` |
 | `visual_plan` |  | `unknown` | `session_id`, `prompt` | 55 | `enabled` |
 

@@ -218,7 +218,8 @@ async def test_issued_record_requires_exact_self_service_identity_checker_and_op
             with pytest.raises(OperatorAuthorizationError):
                 counterfeit.require_issued()
         assert repr(original._issuer) == "<opaque original host operation issuance>"
-        with pytest.raises((TypeError, pickle.PicklingError)):
+        # Python 3.13 visits the local checker before the opaque issuer reducer.
+        with pytest.raises((TypeError, pickle.PicklingError, AttributeError)):
             pickle.dumps(original)
         with pytest.raises(TypeError):
             pickle.dumps(original._issuer)

@@ -217,7 +217,7 @@ class ToolRegistryMixin:
     # path without immediately evicting the first explored
     # feature. ``test_startup_promotion_stays_under_budget`` derives the
     # promoted set from discovery and fails when this is outgrown.
-    MAX_DIRECT_TOOLS = 98
+    MAX_DIRECT_TOOLS = 100
 
     # OpenAI (and most providers) cap function names at 64 chars matching
     # ``^[a-zA-Z0-9_-]+$``. A single over-length name rejects the entire tool

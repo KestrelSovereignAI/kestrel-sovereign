@@ -90,7 +90,9 @@ UNREPAIRABLE = [
 #: the text accepts it; converting to a Julian day first forces it through an
 #: actual instant, which both DETECTS it and repairs it to the instant it
 #: always was. Python refuses it outright, so it cannot join ``REPAIRABLE``.
-ENGINE_ONLY = [("2023-01-01 24:00:01", "2023-01-02 00:00:01")]
+#: Use exact midnight: SQLite 3.50.4 also accepts 24:00:01, but 3.54.1
+#: rejects that nonzero-second spelling. Both normalize 24:00:00.
+ENGINE_ONLY = [("2023-01-01 24:00:00", "2023-01-02 00:00:00")]
 
 
 async def _legacy_database(tmp_path, name, rows, ddl=LEGACY_DDL):
@@ -693,7 +695,7 @@ async def test_a_stamp_only_sqlite_thinks_is_real_is_treated_as_undatable(
 ):
     """The two values that made the first CHECK a weaker claim than it read as.
 
-    ``strftime`` reformats fields rather than instants, so ``24:00:01`` came
+    ``strftime`` reformats fields rather than instants, so ``24:00:00`` came
     back byte-identical and passed a round-trip written over the text; and
     SQLite's calendar runs earlier than Python's ``datetime``, so year 0000 is
     a real instant to one and no instant to the other. Both were stored, both
