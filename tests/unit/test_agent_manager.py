@@ -80,7 +80,7 @@ from kestrel_sovereign.spawn.mandate_reload import read_spawn_mandate
 from kestrel_sovereign.stop import AuthoritativeStopDescendant
 from tests.utils.aiosqlite_workers import aiosqlite_worker
 from tests.utils.scheduler_ticks import tick_and_settle
-from tests.utils.virtual_clock import pinned_loop_clock
+from tests.utils.virtual_clock import await_within_hang_guard, pinned_loop_clock
 
 
 def _make_mock_agent(agent_id: str = "did:pkh:eip155:1:0xABC"):
@@ -7032,7 +7032,7 @@ def test_registration_refuses_cyclic_restored_parent_authority(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_over_cap_spawn_retires_slot_before_rollback_allows_one_winner(
+async def test_over_cap_spawn_waits_for_rejected_rollback_before_one_winner(
     tmp_path,
 ):
     """One restored slot rejects one of two pending spawns, not both."""
@@ -7058,8 +7058,18 @@ async def test_over_cap_spawn_retires_slot_before_rollback_allows_one_winner(
     both_created = asyncio.Event()
     rollback_started = asyncio.Event()
     release_first_rollback = asyncio.Event()
+    contender_checked_cap = asyncio.Event()
     arrivals = 0
     rollback_names: list[str] = []
+    observed_cap_counts: list[int] = []
+    original_cap_slots_in_use = manager._spawn_cap_slots_in_use
+
+    def observe_contender_cap_check():
+        in_use = original_cap_slots_in_use()
+        if rollback_started.is_set() and not release_first_rollback.is_set():
+            observed_cap_counts.append(in_use)
+            contender_checked_cap.set()
+        return in_use
 
     async def create_after_both_reservations(name, **_kwargs):
         nonlocal arrivals
@@ -7087,6 +7097,7 @@ async def test_over_cap_spawn_retires_slot_before_rollback_allows_one_winner(
 
     manager.create_agent = create_after_both_reservations
     manager._rollback_uncommitted_spawn = rollback_rejected
+    manager._spawn_cap_slots_in_use = observe_contender_cap_check
     tasks = [
         asyncio.create_task(
             manager.spawn_agent(
@@ -7098,10 +7109,29 @@ async def test_over_cap_spawn_retires_slot_before_rollback_allows_one_winner(
         for name in fresh
     ]
 
-    await asyncio.wait_for(rollback_started.wait(), timeout=1)
-    await asyncio.sleep(0.05)
-    release_first_rollback.set()
-    outcomes = await asyncio.gather(*tasks, return_exceptions=True)
+    outcomes = None
+    try:
+        await await_within_hang_guard(
+            rollback_started.wait(), step="rejected spawn enters its paused rollback",
+        )
+        await await_within_hang_guard(
+            contender_checked_cap.wait(), step="other contender rechecks the occupied cap",
+        )
+        assert observed_cap_counts
+        assert all(count > manager._max_spawned_agents for count in observed_cap_counts)
+        assert not any(task.done() for task in tasks)
+        assert len(rollback_names) == 1
+        release_first_rollback.set()
+        outcomes = await await_within_hang_guard(
+            asyncio.gather(*tasks, return_exceptions=True), step="both spawn operations settle",
+        )
+    finally:
+        release_first_rollback.set()
+        if outcomes is None:
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
 
     assert sum(not isinstance(outcome, BaseException) for outcome in outcomes) == 1
     assert sum(isinstance(outcome, ValueError) for outcome in outcomes) == 1
