@@ -11,7 +11,8 @@ from hashlib import sha256
 import struct
 from uuid import uuid4
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, GetJsonSchemaHandler
+from pydantic.json_schema import JsonSchemaValue
 from kestrel_sdk.computer_use import ActionRequest, Click, Key, Navigate, Scroll, TypeText, Wait
 from kestrel_sdk.resources import ResourceConflict, ResourceUnsupported
 
@@ -26,6 +27,25 @@ class VisualProposal(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
     action: Click | TypeText | Key | Scroll | Wait | Navigate | None = Field(..., discriminator="kind")
     answer: str = Field(default="", max_length=2000)
+
+    @classmethod
+    def __get_pydantic_json_schema__(cls, core_schema, handler: GetJsonSchemaHandler) -> JsonSchemaValue:
+        schema = handler.resolve_ref_schema(handler(core_schema))
+        # SDK actions default their kind when constructed directly. This
+        # discriminated proposal parser requires it on input. Express that
+        # same contract without changing the canonical SDK classes or guessing
+        # a missing tag. Distinct required kind constants make anyOf disjoint;
+        # OpenAI's structured-output subset does not support oneOf/discriminator.
+        for alternative in schema["properties"]["action"]["anyOf"]:
+            if "oneOf" not in alternative:
+                continue
+            variants = alternative.pop("oneOf")
+            alternative.pop("discriminator", None)
+            alternative["anyOf"] = variants
+            for variant in variants:
+                action = handler.resolve_ref_schema(variant)
+                action["required"] = list(dict.fromkeys([*action.get("required", []), "kind"]))
+        return schema
 
 
 def _bounded_observation(observation):

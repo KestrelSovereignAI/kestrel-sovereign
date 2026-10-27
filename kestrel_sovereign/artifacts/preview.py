@@ -14,6 +14,7 @@ import json
 import os
 import re
 import struct
+import tempfile
 from uuid import uuid4
 import zlib
 
@@ -144,13 +145,25 @@ class DockerArtifactRenderer:
         self.image = image
 
     @staticmethod
-    def _env():
+    def _env(*, read_context=False):
         # Never forward deployment/provider credentials to a Docker CLI child.
-        return {**{name: os.environ[name] for name in ('PATH', 'HOME', 'DOCKER_CONFIG') if name in os.environ},
+        names = ('PATH', 'HOME', 'DOCKER_CONFIG') if read_context else ('PATH', 'HOME')
+        return {**{name: os.environ[name] for name in names if name in os.environ},
                 'LC_ALL': 'C'}
 
-    async def _command(self, arguments, *, stdin=None, check=lambda: None, output_limit=65536, timeout=4, classify_create=False):
-        process = await start_async_process(['docker', *arguments], env=self._env(),
+    async def _command(self, arguments, *, stdin=None, check=lambda: None, output_limit=65536,
+                       timeout=4, classify_create=False):
+        # Docker injects config.json proxy values into containers even with
+        # network=none. Keep operator contexts out of every engine command. The
+        # private configuration lives until the original CLI and I/O are joined.
+        with tempfile.TemporaryDirectory(prefix='kestrel-preview-docker-') as config:
+            return await self._command_native(['--config', config, *arguments],
+                environment=self._env(), stdin=stdin, check=check, output_limit=output_limit,
+                timeout=timeout, classify_create=classify_create)
+
+    async def _command_native(self, arguments, *, environment, stdin=None, check=lambda: None,
+                              output_limit=65536, timeout=4, classify_create=False):
+        process = await start_async_process(['docker', *arguments], env=environment,
             stdin=asyncio.subprocess.PIPE if stdin is not None else asyncio.subprocess.DEVNULL,
             stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
         native_wait = create_owned_task(process.wait(), name='preview-cli-exit')
@@ -205,7 +218,10 @@ class DockerArtifactRenderer:
             args = ['context', 'inspect']
             if os.environ.get('DOCKER_CONTEXT'):
                 args.append(os.environ['DOCKER_CONTEXT'])
-            status, value = await self._command([*args, '--format', '{{json .Endpoints.docker.Host}}'])
+            # This read-only CLI verb discovers the operator's selected local
+            # socket. Every later engine RPC goes through the private config.
+            status, value = await self._command_native([*args, '--format', '{{json .Endpoints.docker.Host}}'],
+                                                       environment=self._env(read_context=True))
             if status != 0:
                 raise ArtifactPreviewUnavailable('local Docker endpoint is unavailable')
             endpoint = json.loads(value)
@@ -234,6 +250,9 @@ class DockerArtifactRenderer:
                 or host.get('SecurityOpt') != ['no-new-privileges']
                 or host.get('Binds') or host.get('Devices') or host.get('DeviceRequests')
                 or config.get('OpenStdin') is not True or config.get('User') != '65532:65532' or config.get('Volumes')
+                or any(not isinstance(item, str) or item.partition('=')[0].lower() in {
+                    'http_proxy', 'https_proxy', 'ftp_proxy', 'all_proxy', 'no_proxy',
+                } for item in config.get('Env') or [])
                 or host.get('LogConfig', {}).get('Type') != 'none'
                 or host.get('Tmpfs') != {'/tmp': 'rw,nosuid,nodev,noexec,size=64m,mode=1777'}
                 or any(mount.get('Type') != 'tmpfs' or mount.get('Destination') != '/tmp' for mount in value.get('Mounts', []))):

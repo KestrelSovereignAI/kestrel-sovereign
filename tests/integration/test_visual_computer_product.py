@@ -177,36 +177,44 @@ async def test_real_local_visual_product(tmp_path, monkeypatch):
             reopened=await client.get(f'/api/artifacts/{ref["artifact_id"]}/revisions/{ref["revision_id"]}/file',params={"path":"document.html"})
             assert reopened.status_code==200 and reopened.content==document
             custody["artifact_survives_browser_release"]=True
-            custody["physical_cleanup_confirmed"]=True;record()
+            record()
         custody["source_unchanged"]=source_identity()==custody["source_before"]
         assert custody["source_unchanged"]
     finally:
-        if runner is not None and serving is not None and not serving.done() and custody["session_id"]:
+        custody["physical_cleanup_confirmed"]=False
+        custody["forced_cleanup_containers"]=[]
+        try:
             try:
-                async with httpx.AsyncClient(base_url=f"http://127.0.0.1:{port}",trust_env=False,
-                                             headers={"X-API-Key":key},timeout=30) as cleanup:
-                    response=await cleanup.post(f'/api/visual-computer/sessions/{custody["session_id"]}/release')
-                    custody["final_host_release_status"]=response.status_code
-            except Exception as error:
-                custody["final_host_release_error"]=type(error).__name__
-        if runner is not None:runner.should_exit=True
-        if serving is not None:await asyncio.wait_for(serving,15)
-        if sock is not None:sock.close()
-        if app is not None:
-            server._unmount_feature_routers(app);app.router.lifespan_context=lifespan
-        if agent is not None:
-            from tests.shared.native_shutdown_budget import shutdown_fixture_agent
-            await shutdown_fixture_agent(agent)
-        if llm is not None:await llm.close()
-        if custody["image_id"] is not None:
-            remaining=await boundary.invoke(["ps","-aq","--filter","ancestor="+custody["image_id"]])
-            # Test owner cleanup only: never an application execution fallback.
-            # Even a failed assertion must retire its uniquely labelled fixture.
-            for cid in remaining.decode().split():
-                owned=await boundary.inspect(cid)
-                assert owned["Image"]==custody["image_id"] and owned["Config"]["Labels"][LABEL+".proof"]==identity
-                await boundary.invoke(["container","rm","--force",owned["Id"]])
-            assert not (await boundary.invoke(["ps","-aq","--filter","ancestor="+custody["image_id"]])).strip()
-            await boundary.invoke(["image","rm",tag])
+                if runner is not None and serving is not None and not serving.done() and custody["session_id"]:
+                    try:
+                        async with httpx.AsyncClient(base_url=f"http://127.0.0.1:{port}",trust_env=False,
+                                                     headers={"X-API-Key":key},timeout=30) as cleanup:
+                            response=await cleanup.post(f'/api/visual-computer/sessions/{custody["session_id"]}/release')
+                            custody["final_host_release_status"]=response.status_code
+                    except Exception as error:
+                        custody["final_host_release_error"]=type(error).__name__
+                if runner is not None:runner.should_exit=True
+                if serving is not None:await asyncio.wait_for(serving,15)
+                if sock is not None:sock.close()
+                if app is not None:
+                    server._unmount_feature_routers(app);app.router.lifespan_context=lifespan
+                if agent is not None:
+                    from tests.shared.native_shutdown_budget import shutdown_fixture_agent
+                    await shutdown_fixture_agent(agent)
+                if llm is not None:await llm.close()
+            finally:
+                if custody["image_id"] is not None:
+                    remaining=await boundary.invoke(["ps","-aq","--filter","ancestor="+custody["image_id"]])
+                    # Retire only this fixture, even after another cleanup
+                    # failure. Forced test cleanup cannot prove host cleanup.
+                    for cid in remaining.decode().split():
+                        owned=await boundary.inspect(cid)
+                        assert owned["Image"]==custody["image_id"] and owned["Config"]["Labels"][LABEL+".proof"]==identity
+                        custody["forced_cleanup_containers"].append(owned["Id"])
+                        await boundary.invoke(["container","rm","--force",owned["Id"]])
+                    assert not (await boundary.invoke(["ps","-aq","--filter","ancestor="+custody["image_id"]])).strip()
+                    await boundary.invoke(["image","rm",tag])
+            assert not custody["forced_cleanup_containers"], "host left fixture containers requiring forced cleanup"
             custody["physical_cleanup_confirmed"]=True
-        record()
+        finally:
+            record()

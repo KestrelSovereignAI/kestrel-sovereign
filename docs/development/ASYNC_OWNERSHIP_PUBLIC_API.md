@@ -48,6 +48,16 @@ retirement debt rather than inventing a physical-close acknowledgement.
 Creation retains the canonical copied-context and failed-start-gate behavior;
 the public aliases add no admission policy, registry, retry, or new defaults.
 
+A custom task factory can make allocation ambiguous. If construction raises
+and the original native task registry cannot identify exactly one accepted
+Task, `admission.task is None` does not prove refusal. The original owner keeps
+that UNKNOWN admission and its error as retirement debt; it cannot release the
+resource budget or retry the work on that evidence. Independently identified
+physical owners may still finish and close their own resources. Their later
+completion does not erase the original UNKNOWN admission or make lifecycle
+completion successful; the original close-completion API continues to report
+the retained failure.
+
 ## Task completion is not process-tree drain
 
 A task or thread join proves only completion of that original operation. It

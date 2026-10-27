@@ -86,6 +86,15 @@ logger = logging.getLogger(__name__)
 _LENGTH_FINISH_REASON = "length"
 
 
+def _structured_response_format(model: Type[BaseModel]) -> Dict[str, Any]:
+    # Reuse the SDK's public strict Pydantic formatter. Root-only closure leaves
+    # defaulted and nested properties optional, which strict output rejects.
+    function = openai.pydantic_function_tool(model)["function"]
+    return {"type": "json_schema", "json_schema": {
+        "name": function["name"], "schema": function["parameters"], "strict": True,
+    }}
+
+
 def _finish_reason(choice: Any) -> Optional[str]:
     """A chat-completions choice's ``finish_reason``, if the provider gave one."""
     reason = getattr(choice, "finish_reason", None)
@@ -529,18 +538,7 @@ class OpenAIAdapter(LLMAdapter):
 
             # Handle structured output via Pydantic model
             if response_format is not None and issubclass(response_format, BaseModel):
-                # OpenAI structured output format with JSON schema
-                # OpenAI requires additionalProperties: false for strict mode
-                schema = response_format.model_json_schema()
-                schema["additionalProperties"] = False
-                extra_kwargs["response_format"] = {
-                    "type": "json_schema",
-                    "json_schema": {
-                        "name": response_format.__name__,
-                        "schema": schema,
-                        "strict": True
-                    }
-                }
+                extra_kwargs["response_format"] = _structured_response_format(response_format)
             elif format == "json":
                 extra_kwargs["response_format"] = {"type": "json_object"}
 
@@ -697,17 +695,7 @@ class OpenAIAdapter(LLMAdapter):
 
             # Handle structured output in streaming mode
             if response_format is not None and issubclass(response_format, BaseModel):
-                # OpenAI requires additionalProperties: false for strict mode
-                schema = response_format.model_json_schema()
-                schema["additionalProperties"] = False
-                extra_kwargs["response_format"] = {
-                    "type": "json_schema",
-                    "json_schema": {
-                        "name": response_format.__name__,
-                        "schema": schema,
-                        "strict": True
-                    }
-                }
+                extra_kwargs["response_format"] = _structured_response_format(response_format)
 
             # Pass through additional kwargs
             if "max_tokens" in kwargs:
@@ -849,16 +837,7 @@ class OpenAIAdapter(LLMAdapter):
 
             # Handle structured output in streaming mode
             if response_format is not None and issubclass(response_format, BaseModel):
-                schema = response_format.model_json_schema()
-                schema["additionalProperties"] = False
-                extra_kwargs["response_format"] = {
-                    "type": "json_schema",
-                    "json_schema": {
-                        "name": response_format.__name__,
-                        "schema": schema,
-                        "strict": True
-                    }
-                }
+                extra_kwargs["response_format"] = _structured_response_format(response_format)
 
             # Pass through additional kwargs
             if "max_tokens" in kwargs:

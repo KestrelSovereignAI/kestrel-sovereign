@@ -124,3 +124,48 @@ async def test_recovery_never_removes_a_foreign_or_malformed_container(monkeypat
     await renderer._cleanup_native(pool,job)
     assert pool.active_count==1 and not job.cleanup_confirmed, "foreign container reclaimed preview slot"
     assert not any("rm" in args for args in calls), "foreign cleanup was dispatched"
+
+
+@pytest.mark.asyncio
+async def test_every_engine_child_has_a_fresh_empty_config_until_native_join(monkeypatch, tmp_path):
+    import json
+    from pathlib import Path
+    import sys
+    from kestrel_sovereign.artifacts import preview
+    operator = tmp_path / "operator-config"; operator.mkdir()
+    (operator / "config.json").write_text('{"proxies":{"default":{"httpProxy":"synthetic-private"}}}')
+    monkeypatch.setenv("DOCKER_CONFIG", str(operator))
+    original = preview.start_async_process
+    commands = []
+    async def launch(arguments, **kwargs):
+        assert arguments[:2] == ["docker", "--config"]
+        config = Path(arguments[2])
+        assert config.is_dir() and not list(config.iterdir()) and config != operator
+        assert "DOCKER_CONFIG" not in kwargs["env"]
+        code = "from pathlib import Path;import sys;assert Path(sys.argv[1]).is_dir();print('native-config-present')"
+        child = await original([sys.executable, "-B", "-c", code, str(config)], **kwargs)
+        commands.append((config, child))
+        return child
+    monkeypatch.setattr(preview, "start_async_process", launch)
+    renderer = DockerArtifactRenderer(None)
+    for command in (["--host", "unix:///owned.sock", "info"], ["--host", "unix:///owned.sock", "create"]):
+        status, output = await renderer._command(command)
+        assert status == 0 and output.strip() == b"native-config-present"
+    assert len({config for config, _ in commands}) == 2
+    assert all(child.returncode == 0 and not config.exists() for config, child in commands)
+    assert json.loads((operator / "config.json").read_text())["proxies"]["default"]["httpProxy"] == "synthetic-private"
+
+
+@pytest.mark.parametrize("entry", ["HTTP_PROXY=synthetic-private", "https_proxy=synthetic-private",
+    "ALL_PROXY=synthetic-private", "ftp_proxy=synthetic-private", "No_Proxy=synthetic-private", 42])
+def test_native_descriptor_with_proxy_environment_refuses_before_decoder_start(entry):
+    value = {"Config": {"OpenStdin": True, "User": "65532:65532", "Env": [entry]}, "Mounts": [],
+        "HostConfig": {"Memory": 512 * 1024 * 1024, "MemorySwap": 512 * 1024 * 1024,
+            "NanoCpus": 500000000, "PidsLimit": 16, "NetworkMode": "none", "ReadonlyRootfs": True,
+            "IpcMode": "none", "PidMode": "", "CgroupnsMode": "private", "Runtime": "runc",
+            "Privileged": False, "CapDrop": ["ALL"], "SecurityOpt": ["no-new-privileges"],
+            "LogConfig": {"Type": "none"}, "Tmpfs": {"/tmp": "rw,nosuid,nodev,noexec,size=64m,mode=1777"}}}
+    with pytest.raises(ArtifactPreviewUnavailable, match="sandbox limits"):
+        DockerArtifactRenderer._verify_container(value)
+    value["Config"]["Env"] = ["PATH=/usr/local/bin:/usr/bin:/bin", "LANG=C.UTF-8"]
+    DockerArtifactRenderer._verify_container(value)

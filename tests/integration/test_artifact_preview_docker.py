@@ -98,6 +98,24 @@ async def test_real_worker_produces_bounded_inert_png_under_verified_cgroup(rend
 
 
 @pytest.mark.asyncio
+async def test_real_worker_never_inherits_operator_proxy_credentials(renderer_image, monkeypatch, tmp_path):
+    endpoint = await DockerArtifactRenderer(renderer_image)._endpoint()
+    config = tmp_path / 'synthetic-operator-config'; config.mkdir()
+    proxy = 'http://synthetic-user:synthetic-private-' + uuid4().hex + '@proxy.invalid:9999'
+    (config / 'config.json').write_text(json.dumps({'proxies': {'default': {
+        'httpProxy': proxy, 'httpsProxy': proxy, 'noProxy': 'synthetic-only.invalid'}}}))
+    monkeypatch.setenv('DOCKER_HOST', endpoint)
+    monkeypatch.setenv('DOCKER_CONFIG', str(config))
+    renderer = ObservedRenderer(renderer_image); pool = ArtifactPreviewPool()
+    result = await renderer.render(pool, png(), 'image/png', lambda: None)
+    assert result.png.startswith(b'\x89PNG\r\n\x1a\n')
+    assert renderer.descriptors and renderer.started.is_set()
+    assert all(proxy not in item for value in renderer.descriptors for item in value['Config'].get('Env') or [])
+    assert pool.active_count == 0
+    await absent(renderer, renderer.names)
+
+
+@pytest.mark.asyncio
 async def test_dimension_bomb_and_invalid_pdf_refuse_boundedly_without_source_exposure(renderer_image):
     def chunk(kind, data): return struct.pack('!I', len(data)) + kind + data + struct.pack('!I', zlib.crc32(kind + data))
     bomb = b'\x89PNG\r\n\x1a\n' + chunk(b'IHDR', struct.pack('!IIBBBBB', 100000, 100000, 8, 2, 0, 0, 0)) + chunk(b'IDAT', zlib.compress(b'')) + chunk(b'IEND', b'')
