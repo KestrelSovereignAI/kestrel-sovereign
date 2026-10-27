@@ -309,3 +309,39 @@ class VisualComputerFeature(Feature):
                 model_override=model,force_local_only=force_local)
             return {key:value.model_dump(mode="json") if hasattr(value,"model_dump") else value
                     for key,value in result.items()}
+
+    @tool(name="visual_computer_step", description="Plan and perform one visual step using a stable caller action ID; repeat that ID to inspect its original outcome")
+    async def visual_computer_step(self, session_id: str, action_id: str, prompt: str) -> dict:
+        from kestrel_sovereign.visual_computer.inference import VisualInference
+        from kestrel_sovereign.visual_computer.step import run_step
+        # Bind the original caller once. Configuration facts restrict this same
+        # operation; they do not resolve or replace any permission.
+        async with self._bind_context(current_caller_context()) as context:
+            service = getattr(self.agent, "llm_service", None)
+            if service is None:
+                raise RuntimeError("the host inference service is unavailable")
+            def configuration():
+                return {"visual_model":self._cfg.get("visual_model"),
+                    "visual_request_options":self._cfg.get("visual_request_options"),
+                    "force_local_only":getattr(getattr(self.agent,"privacy_config",None),"processing",None) != "cloud"}
+            original = json.dumps(configuration(), sort_keys=True, allow_nan=False)
+            def current_configuration():
+                if (json.dumps(configuration(), sort_keys=True, allow_nan=False) != original
+                        or getattr(self.agent, "llm_service", None) is not service):
+                    raise VisualAccessDenied("visual inference configuration retired")
+            config = json.loads(original)
+            model = config["visual_model"]
+            if model is not None and (not isinstance(model,str) or not model.strip() or len(model)>512):
+                raise ValueError("configured visual model is invalid")
+            options = {}
+            configured = config["visual_request_options"]
+            if configured is not None:
+                if not isinstance(configured,dict) or not model or set(configured)-{"reasoning_effort","thinking_budget_tokens","raw"}:
+                    raise ValueError("visual inference options require a configured model and reasoning options")
+                from kestrel_sdk.llm import RequestOptions
+                options["request_options"] = RequestOptions(**configured)
+            async def plan(owner):
+                return await VisualInference(self.runtime, service, **options).plan(context, session_id, prompt,
+                    model_override=model, force_local_only=config["force_local_only"], _step_owner=owner)
+            return await run_step(self.runtime, context, session_id, action_id, prompt,
+                planner=plan, configuration=config, configuration_current=current_configuration)

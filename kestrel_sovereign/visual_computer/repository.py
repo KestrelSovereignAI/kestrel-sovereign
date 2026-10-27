@@ -28,6 +28,7 @@ from kestrel_sdk.security.exceptions import DecryptionError
 from kestrel_sdk.storage.database.interface import TransactionError
 
 from kestrel_sovereign.execution_custody import execution_commit_outcome
+from .step import PlanningRecord, StepIntent
 
 
 class CustodyIntegrityError(ResourceError):
@@ -59,6 +60,7 @@ class ActionRecord(BaseModel):
     receipt: ActionReceipt | None = None
     # Legacy receipt-less rows may already have dispatched; never replay them.
     dispatch_started: bool = True
+    step_intent: StepIntent | None = None
 
 
 class VisualCustodyRepository:
@@ -118,8 +120,8 @@ class VisualCustodyRepository:
                                     await self.db.execute(f"UPDATE {table} SET released = ? WHERE owner = ? AND request_id = ?", (value, owner, identity))
                                 else:
                                     owner, session_key, action_id, payload = item[:4]
-                                    record = self._open(owner, f"{session_key}:{action_id}", payload, ActionRecord, key=key)
-                                    value = int(record.receipt is None or record.receipt.outcome == "unknown")
+                                    record = self._open_action(owner, f"{session_key}:{action_id}", payload, key=key)
+                                    value = int(record.pending() if type(record) is PlanningRecord else record.receipt is None or record.receipt.outcome == "unknown")
                                     await self.db.execute(f"UPDATE {table} SET pending = ? WHERE owner = ? AND session_key = ? AND action_id = ?", (value, owner, session_key, action_id))
                     if not await self.db.column_exists("visual_computer_requests", "retired"):
                         await self.db.execute("ALTER TABLE visual_computer_requests ADD COLUMN retired BIGINT NOT NULL DEFAULT 0")
@@ -339,6 +341,23 @@ class VisualCustodyRepository:
             elif acceptance is not None:
                 self._original_results.pop(acceptance, None)
 
+    def _open_action(self, owner, identity, payload, *, key=None):
+        try:
+            plain = AEADCipher(key or self._key).decrypt(bytes(payload), aad=f"{owner}:{identity}".encode())
+            raw = json.loads(plain)
+            if type(raw) is not dict: raise ValueError("invalid action payload")
+        except (DecryptionError, ValueError, TypeError):
+            raise CustodyIntegrityError("visual action custody verification failed") from None
+        if raw.get("kind") == "visual-step-v1":
+            try:
+                record = PlanningRecord.model_validate(raw)
+                if record.kind != "visual-step-v1" or record.state not in {"planning", "finished"} or (record.state == "planning" and record.answer is not None):
+                    raise ValueError("invalid step phase")
+                return record
+            except (ValueError, TypeError):
+                raise CustodyIntegrityError("invalid original visual step") from None
+        return self._open(owner, identity, payload, ActionRecord, key=key)
+
     async def action(self, scope, session_id, action_id, *, accept=None, receipt=None, guard=None,
                      prepare=False, dispatch_revision=None, abandon_prepared=False, _result_owner=None):
         async with self._transaction(guard, write=accept is not None or receipt is not None or dispatch_revision is not None or abandon_prepared):
@@ -359,7 +378,11 @@ class VisualCustodyRepository:
                 stored = ActionRecord(request=accept, dispatch_started=not prepare)
                 await self.db.execute("INSERT INTO visual_computer_actions (owner, session_key, action_id, payload) VALUES (?, ?, ?, ?)", (owner, session_key, action_id, self._seal(owner, identity, stored)))
             else:
-                stored = self._open(owner, identity, row[0], ActionRecord)
+                stored = self._open_action(owner, identity, row[0])
+                if type(stored) is PlanningRecord:
+                    if accept is not None or receipt is not None or dispatch_revision is not None or abandon_prepared or _result_owner is not None:
+                        raise ResourceOutcomeUnknown("Original planning row is not an SDK action")
+                    return stored
                 if accept is not None and stored.request != accept:
                     raise ResourceConflict("action ID already identifies different input")
             changed = False
@@ -395,13 +418,19 @@ class VisualCustodyRepository:
         await self.db.execute("INSERT INTO visual_computer_owners (owner, generation) VALUES (?, 0) ON CONFLICT (owner) DO NOTHING", (owner,))
         await self.db.execute("UPDATE visual_computer_owners SET generation = generation + 1 WHERE owner = ?", (owner,))
 
-    async def has_pending_actions(self, scope, session_id, guard=None):
+    async def has_pending_actions(self, scope, session_id, guard=None, *, _step_owner=None):
         async with self._transaction(guard, write=False):
             owner, session_key = self._owner(scope), self._address("session", session_id)
             rows = await self.db.fetchall("SELECT action_id, payload FROM visual_computer_actions WHERE owner = ? AND session_key = ?", (owner, session_key))
             for row in rows:
-                record = self._open(owner, f"{session_key}:{row[0]}", row[1], ActionRecord)
-                if record.receipt is None or record.receipt.outcome == "unknown":
+                record = self._open_action(owner, f"{session_key}:{row[0]}", row[1])
+                if _step_owner is not None:
+                    from .step import _OriginalVisualStep
+                    if type(_step_owner) is not _OriginalVisualStep:
+                        raise ResourceConflict("Original step owner required")
+                    if _step_owner.own_pending(scope, session_id, row[0], row[1]):
+                        continue
+                if (record.pending() if type(record) is PlanningRecord else record.receipt is None or record.receipt.outcome == "unknown"):
                     return True
             return False
 

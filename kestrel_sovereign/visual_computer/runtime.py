@@ -338,7 +338,7 @@ class VisualComputerRuntime:
             check()
             return observation
 
-    async def act(self, context, request):
+    async def act(self, context, request, *, _step_owner=None):
         request = ActionRequest.model_validate(request)
         async with self.operation(context, VisualAction.ACT) as check:
             scope = self.scope(context)
@@ -354,6 +354,16 @@ class VisualComputerRuntime:
                         previous = await self.repository.action(scope, request.session_id, request.action_id, guard=check)
                     except ResourceNotFound:
                         previous = None
+                    from .step import PlanningRecord, _OriginalVisualStep
+                    step_planning = type(previous) is PlanningRecord
+                    if step_planning:
+                        if type(_step_owner) is not _OriginalVisualStep or not _step_owner.own_pending(scope, request.session_id, request.action_id,
+                                _step_owner._claim):
+                            raise ResourceOutcomeUnknown("Original step planning cannot be dispatched")
+                        _step_owner._require_owner()
+                        previous = None
+                    elif _step_owner is not None:
+                        raise ResourceConflict("Step promotion requires its original planning row")
                     if previous is not None:
                         if previous.request != request:
                             raise ResourceConflict("action ID already identifies different input")
@@ -365,7 +375,7 @@ class VisualComputerRuntime:
                         check()
                         return previous.receipt
                     self._ready(record)
-                    if await self.repository.has_pending_actions(scope, request.session_id, guard=check):
+                    if await self.repository.has_pending_actions(scope, request.session_id, guard=check, _step_owner=_step_owner):
                         raise ResourceOutcomeUnknown("reconcile accepted session input before new actions")
                     frame = record.frame
                     if (frame is None or request.observation_id != frame.observation_id
@@ -382,6 +392,8 @@ class VisualComputerRuntime:
                     self._inflight += 1
                     inflight = True
                     serial = self._control_serials.get(self._key(scope, request.session_id), 0)
+                    if step_planning:
+                        await _step_owner.promote(record, request)
                     await self.repository.action(scope, request.session_id, request.action_id, accept=request, prepare=True, guard=check)
                     prepared = True
                     record.frame, record.last_activity_at = None, self._now()
@@ -396,6 +408,8 @@ class VisualComputerRuntime:
                     from kestrel_sovereign.execution_custody import require_execution_work
                     require_execution_work(self.repository.db.backend)
                     check()
+                    if _step_owner is not None:
+                        _step_owner._check_original()
                     self._ready(record)
                     if self._control_serials.get(self._key(scope, request.session_id), 0) != serial:
                         raise ResourceConflict("original action control epoch changed")
@@ -457,6 +471,9 @@ class VisualComputerRuntime:
             scope = self.scope(context)
             record = await self.repository.get(scope, session_id=session_id, guard=check)
             accepted = await self.repository.action(scope, session_id, action_id, guard=check)
+            from .step import PlanningRecord
+            if type(accepted) is PlanningRecord:
+                raise ResourceOutcomeUnknown("Host visual step has no dispatched SDK action")
             if not accepted.dispatch_started and accepted.receipt is None:
                 accepted = await self.repository.action(scope, session_id, action_id,
                     abandon_prepared=True, guard=check)

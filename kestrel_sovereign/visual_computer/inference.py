@@ -66,9 +66,14 @@ class VisualInference:
         self.runtime, self.llm_service = runtime, llm_service
         self.request_options = request_options
 
-    async def plan(self, context, session_id, prompt, *, model_override=None, force_local_only=False):
+    async def plan(self, context, session_id, prompt, *, model_override=None, force_local_only=False, _step_owner=None):
         if not isinstance(prompt, str) or not 0 < len(prompt.encode("utf-8")) <= 16 * 1024:
             raise ValueError("visual task requires bounded text")
+        if _step_owner is not None:
+            from .step import _OriginalVisualStep
+            if type(_step_owner) is not _OriginalVisualStep:
+                raise ExecutionAuthorityError("Exact original visual step owner required")
+            _step_owner.require_plan(self.runtime, context, session_id, prompt)
         observation = await self.runtime.observe(context, session_id)
         frame, pixels = _bounded_observation(observation)
         async with self.runtime.session_operation(context, session_id, VisualAction.OBSERVE) as (session, _, check):
@@ -78,6 +83,8 @@ class VisualInference:
                     raise ExecutionAuthorityError("visual inference admission retired")
                 try:
                     check()
+                    if _step_owner is not None:
+                        _step_owner._check_original()
                     now = self.runtime._now()
                     if (frame.session_id != session.session_id or frame.control_epoch != session.control_epoch
                             or not 0 <= (now-frame.observed_at).total_seconds() <= 60):
@@ -95,6 +102,8 @@ class VisualInference:
                 remaining = min(self.runtime.policy.operation_seconds,
                     (context.expires_at-self.runtime._now()).total_seconds(),
                     (session.expires_at-self.runtime._now()).total_seconds())
+                if _step_owner is not None:
+                    remaining = min(remaining, (_step_owner.action_deadline()-self.runtime._now()).total_seconds())
                 if remaining <= 0:
                     raise ExecutionAuthorityError("visual inference authority expired")
                 with bind_native_execution_admission(admit):
@@ -144,9 +153,10 @@ class VisualInference:
                             or (action_frame.width, action_frame.height) != (frame.width, frame.height)
                             or not 0 <= (self.runtime._now()-action_frame.observed_at).total_seconds() <= 15):
                         raise ResourceConflict("screen changed while the model was planning")
-                    request = ActionRequest(action_id=uuid4().hex, session_id=session_id,
+                    request = ActionRequest(action_id=uuid4().hex if _step_owner is None else _step_owner.proposal_action_id(), session_id=session_id,
                         observation_id=action_frame.observation_id, control_epoch=session.control_epoch,
                         not_after=min(context.expires_at, session.expires_at,
+                            _step_owner.action_deadline() if _step_owner is not None else context.expires_at,
                             action_frame.observed_at+timedelta(seconds=30),
                             self.runtime._now()+timedelta(seconds=min(15,self.runtime.policy.operation_seconds))),
                         action=action)

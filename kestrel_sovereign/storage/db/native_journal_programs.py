@@ -31,6 +31,10 @@ class NativeJournalDurabilityRefusal(NativeJournalConfigurationError):
     """Native preflight refused BEFORE the original sqlite COMMIT call."""
 
 
+class NativeJournalCurrentRefusal(NativeJournalConfigurationError):
+    """The exact current owner denied BEFORE native sqlite COMMIT entry."""
+
+
 class NativeJournalCancellationError(NativeJournalConfigurationError):
     """The native CancelRequest executor aborted an original journal session."""
 
@@ -348,6 +352,8 @@ class _NativeJournalSQLiteCursor(sqlite3.Cursor):
     def execute(self, query, parameters=()):
         native = self.connection
         if native._journal_program_seal is not None:
+            if native._current_row_owner is not None:
+                native._current_row_owner._require_native_commit(native)
             if (not native._original_journal_programs_supported()
                     or type(parameters) is not tuple
                     or any(not _has_exact_native_type(value, type(None), int, float, str, bytes) for value in parameters)
@@ -365,6 +371,7 @@ class _NativeJournalSQLiteConnection(sqlite3.Connection):
         self._journal_configuration_lock = threading.RLock()
         self._journal_programs_configured = False
         self._journal_program_seal = None
+        self._current_row_owner = None
         super().__init__(*args, **kwargs)
         # Native autocommit getters are thread-affine. Mirror only supported
         # configuration changes here/on their actual successful native setter;
@@ -504,7 +511,20 @@ class _NativeJournalSQLiteConnection(sqlite3.Connection):
         finally:
             cursor.close()
 
+    def _begin_current_row(self, owner):
+        from kestrel_sovereign.storage.current_visual_step import _CurrentVisualStepMutation
+        if type(owner) is not _CurrentVisualStepMutation or self._current_row_owner is not None:
+            raise NativeJournalConfigurationError('Exact original current row seal required')
+        self._begin_original_journal()
+        self._current_row_owner = owner
+        owner._bind_native_commit(self)
+
     def commit(self):
+        if self._current_row_owner is not None:
+            try:
+                self._current_row_owner._require_native_commit(self)
+            except BaseException as denial:
+                raise NativeJournalCurrentRefusal('Original current permission retired before COMMIT') from denial
         if (self._journal_program_seal is not None
                 and self._original_journal_configuration() != self._journal_program_seal):
             raise NativeJournalDurabilityRefusal('Original journal durability changed before native COMMIT')
@@ -512,6 +532,7 @@ class _NativeJournalSQLiteConnection(sqlite3.Connection):
         if self._journal_program_seal is not None and self.in_transaction:
             raise NativeJournalConfigurationError('Original native journal COMMIT did not end its transaction')
         self._journal_program_seal = None
+        self._current_row_owner = None
         return result
 
     def rollback(self):
@@ -519,6 +540,7 @@ class _NativeJournalSQLiteConnection(sqlite3.Connection):
         if self._journal_program_seal is not None and self.in_transaction:
             raise NativeJournalConfigurationError('Original native journal rollback did not end its transaction')
         self._journal_program_seal = None
+        self._current_row_owner = None
         return result
 
 
@@ -774,8 +796,8 @@ async def _native_journal_connect(*args, **kwargs):
     original = _ORIGINAL_POSTGRES_CONNECT.get()
     if original is not None:
         journal, backend, admission = original
-        from kestrel_sovereign.storage.db.original_result_custody import _require_original_result
-        _require_original_result(journal, backend, admission=admission)
+        from kestrel_sovereign.storage.db.native_row_custody import _require_native_row
+        _require_native_row(journal, backend, admission=admission)
         args, kwargs = journal._postgres_pool.parameters_for_connect(args, kwargs, admission=admission)
         with _OriginalNativeTLSPolicy(journal._postgres_pool.tls_context, journal._postgres_pool.tls_generation):
             return await asyncpg.connection.connect(*args, **kwargs)
