@@ -525,6 +525,101 @@ async def test_git_feature_tools_run_against_real_repo(git_repo, monkeypatch):
     assert "print('two')" in diff.data["diff"]
     assert show.status is ToolResultStatus.OK
     assert show.data["content"] == "# Demo\n"
+    assert show.data["total_chars"] == len("# Demo\n")
+    assert show.data["next_offset"] is None
+
+
+def _commit_large_file(repo, name: str = "docs/big.md") -> bytes:
+    """Commit a 50,000-character UTF-8 file that grows under JSON escaping."""
+    unit = '§ Zürich — “quoted” C:\\dir\\x 漢字 🦅\n\tascii filler text for the line. '
+    text = (unit * (50_000 // len(unit) + 1))[:50_000]
+    path = repo / name
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(text.encode("utf-8"))
+    _git(repo, "add", name)
+    _git(repo, "commit", "-m", "add a large file")
+    return path.read_bytes()
+
+
+@pytest.mark.asyncio
+async def test_git_show_file_reads_a_50k_file_in_ranged_chunks(git_repo, monkeypatch):
+    """#3740: following next_offset from the first call reads every byte, and
+    no chunk is large enough for the orchestrator to replace with a preview."""
+    from kestrel_sovereign import kestrel_agent
+    from kestrel_sovereign.features.base import serialized_result_len
+
+    monkeypatch.setattr(kestrel_agent, "MAX_TOOL_RESULT_CHARS", 8000)
+    _allow_repo_root(monkeypatch, git_repo)
+    expected = _commit_large_file(git_repo)
+    feature = CliFeature(Mock())
+
+    chunks = []
+    result = await feature.git_show_file(
+        repo_path=str(git_repo), ref="HEAD", path="docs/big.md"
+    )
+    while True:
+        assert result.status is ToolResultStatus.OK, result.error
+        assert serialized_result_len(result, tool_name="git_show_file") <= 8000
+        data = result.data
+        assert data["offset"] == sum(len(chunk) for chunk in chunks)
+        assert data["total_chars"] == 50_000
+        assert data["returned_chars"] == len(data["content"])
+        assert (data["ref"], data["path"]) == ("HEAD", "docs/big.md")
+        assert data["repo_path"] == str(git_repo.resolve())
+        chunks.append(data["content"])
+        if data["next_offset"] is None:
+            break
+        result = await feature.git_show_file(
+            repo_path=str(git_repo), ref="HEAD", path="docs/big.md",
+            offset=data["next_offset"],
+        )
+
+    assert len(chunks) > 1
+    assert "".join(chunks).encode("utf-8") == expected
+
+
+@pytest.mark.asyncio
+async def test_git_show_file_offset_and_limit_boundaries(git_repo, monkeypatch):
+    _allow_repo_root(monkeypatch, git_repo)
+    text = _commit_large_file(git_repo).decode("utf-8")
+    feature = CliFeature(Mock())
+
+    async def read(**page):
+        return await feature.git_show_file(
+            repo_path=str(git_repo), ref="HEAD", path="docs/big.md", **page
+        )
+
+    first = await read(offset=0, limit=100)
+    assert first.data["content"] == text[:100]
+    assert first.data["next_offset"] == 100
+
+    tail = await read(offset=49_950, limit=5_000)
+    assert tail.data["content"] == text[49_950:]
+    assert tail.data["returned_chars"] == 50
+    assert tail.data["next_offset"] is None
+
+    at_end = await read(offset=50_000)
+    assert at_end.status is ToolResultStatus.OK
+    assert (at_end.data["content"], at_end.data["next_offset"]) == ("", None)
+
+    past_end = await read(offset=50_001)
+    assert past_end.status is ToolResultStatus.ERROR
+    assert past_end.data["total_chars"] == 50_000
+
+
+@pytest.mark.asyncio
+async def test_git_show_file_refuses_a_bad_page_before_running_git(tmp_path, monkeypatch):
+    _allow_repo_root(monkeypatch, tmp_path)
+    feature = CliFeature(Mock())
+    terminal = FakeTerminal()  # runs nothing: a git call would raise
+    feature.adapters = {"git": GitCliAdapter(terminal)}  # type: ignore[arg-type]
+
+    for page in ({"offset": -1}, {"limit": 0}, {"offset": "middle"}):
+        result = await feature.git_show_file(
+            repo_path=str(tmp_path), ref="HEAD", path="README.md", **page
+        )
+        assert result.status is ToolResultStatus.ERROR
+    assert terminal.requests == []
 
 
 @pytest.mark.asyncio
@@ -626,6 +721,16 @@ def test_cli_command_prefixes_parse_positional_args():
         "ref": "HEAD",
         "path": "README.md",
         "repo_path": ".",
+        "offset": 0,
+    }
+    assert tools["git_show_file"].parse_command_args(
+        "!git-show-file HEAD README.md . 7000 500"
+    ) == {
+        "ref": "HEAD",
+        "path": "README.md",
+        "repo_path": ".",
+        "offset": 7000,
+        "limit": 500,
     }
     assert tools["git_merge_base"].parse_command_args(
         "!git-merge-base main feature/test"

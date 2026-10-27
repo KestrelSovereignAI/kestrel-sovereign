@@ -141,12 +141,17 @@ def orchestrator_result_cap() -> int:
     this cap is silently replaced downstream with a head+tail preview, and a
     feature that does not size against it can have its most important bytes
     fall in the discarded middle.
+
+    The configured value is returned as it is, however small: the orchestrator
+    applies no floor, so a floor here would size results past the cap that
+    replaces them (#3740: at 900, a 997-character page reached the model as a
+    preview). A value below zero is returned as zero, which no result fits.
     """
     try:
         from kestrel_sovereign.kestrel_agent import MAX_TOOL_RESULT_CHARS
     except Exception:  # pragma: no cover - defensive import fallback
         MAX_TOOL_RESULT_CHARS = 8000
-    return max(1000, int(MAX_TOOL_RESULT_CHARS))
+    return max(0, int(MAX_TOOL_RESULT_CHARS))
 
 
 def serialized_result_len(result: Any, *, tool_name: str = "") -> int:
