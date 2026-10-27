@@ -100,7 +100,7 @@ def _assert_requirement_floor(requirement: Requirement, floor: Version) -> None:
 
 
 def test_installed_remote_mcp_campaign_requires_the_public_feature_contract():
-    """The host installs the public native Apps and one-round-call contracts."""
+    """The host installs native Apps delivery behind completed post-tool policy."""
     dependencies = _pyproject()["project"]["optional-dependencies"]["mcp-integration"]
     (requirement,) = [
         Requirement(raw)
@@ -110,12 +110,13 @@ def test_installed_remote_mcp_campaign_requires_the_public_feature_contract():
     assert not requirement.specifier.contains("0.6.0")
     assert not requirement.specifier.contains("0.7.0")
     assert not requirement.specifier.contains("0.7.2")
-    assert requirement.specifier.contains("0.8.0")
+    assert not requirement.specifier.contains("0.8.0")
     assert requirement.specifier.contains("0.9.0")
+    assert requirement.specifier.contains("0.10.0")
     (package,) = [
         item for item in _lock()["package"] if item["name"] == "kestrel-feature-mcp"
     ]
-    assert Version(package["version"]) >= Version("0.8.0")
+    assert Version(package["version"]) >= Version("0.9.0")
     assert package["source"] == {"registry": "https://pypi.org/simple"}
 
 

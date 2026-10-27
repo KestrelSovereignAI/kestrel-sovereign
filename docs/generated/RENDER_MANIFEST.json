@@ -2133,6 +2133,7 @@
     },
     {
       "existing_code_refs": [
+        "pyproject.toml",
         "tests/frontend/api_client.test.mjs",
         "tests/integration/test_compute_security_integration.py",
         "tests/integration/test_core_only_boot.py",
@@ -2159,7 +2160,8 @@
         "tests/unit/test_security_feature.py",
         "tests/unit/test_sovereignty_export_receipt_contracts.py",
         "tests/unit/test_sse_connection_limits.py",
-        "tests/unit/test_webhooks_feature.py"
+        "tests/unit/test_webhooks_feature.py",
+        "uv.lock"
       ],
       "findings": [
         "missing_code_refs"
