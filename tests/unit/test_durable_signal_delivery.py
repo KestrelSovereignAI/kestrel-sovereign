@@ -71,6 +71,7 @@ from kestrel_sovereign.signals.sources.channels import (
 from kestrel_sovereign.storage.db import SQLiteBackend
 from kestrel_sovereign.storage.db.interface import QueryError, TransactionError
 from kestrel_sovereign.storage.privacy_wrapper import DurablePersistenceGate
+from tests.utils.virtual_clock import advanceable_loop_clock, await_within_hang_guard
 
 # How long a test waits for work it set in motion before calling it hung. This
 # bounds a deadlock, not the work: a passing run returns as soon as the awaited
@@ -2917,11 +2918,20 @@ async def test_public_claim_failed_hold_rollback_is_recovered_attempt_neutral(
         await _close(backend, agent)
 
 
-@pytest.mark.asyncio
-async def test_held_durable_cognition_survives_restart_and_runs_once_after_release(
-    tmp_path,
-):
-    """A restart preserves deferred channel work without terminal duplication."""
+async def _held_cognition_restart_scenario(tmp_path, *, stall=None) -> None:
+    """Hold work across a restart, release it, and see it run exactly once.
+
+    Each wait starts with ``stall`` queued on the loop, if one is given, so a
+    test can move the loop clock while the awaited work is in flight. The
+    waits are bounded on a thread, and the drain passes are awaited rather
+    than slept past or polled for, so nothing here reads the loop clock
+    (#3858: a 1s ``wait_for`` on the first admission timed out on CI).
+    """
+
+    async def settled(awaitable, *, step):
+        if stall is not None:
+            asyncio.get_running_loop().call_soon(stall)
+        return await await_within_hang_guard(awaitable, step=step)
 
     path = tmp_path / "held-cognition-restart.db"
     did = "did:agent:held-restart"
@@ -2945,10 +2955,11 @@ async def test_held_durable_cognition_survives_restart_and_runs_once_after_relea
             source_event_id="telegram:update:held-across-restart",
             consumer_id=consumer.consumer_id,
         )
-        admission = await asyncio.wait_for(
-            handle.wait_for_durable_admission(), timeout=1.0
+        admission = await settled(
+            handle.wait_for_durable_admission(),
+            step="the held signal's durable admission",
         )
-        result = await asyncio.wait_for(handle.wait(), timeout=1.0)
+        result = await settled(handle.wait(), step="the held signal's result")
         delivery = await dispatcher_a.get_durable_delivery_for_event(
             consumer_id=consumer.consumer_id,
             event_id=handle.signal_id,
@@ -2971,7 +2982,9 @@ async def test_held_durable_cognition_survives_restart_and_runs_once_after_relea
     try:
         await dispatcher_b.register_durable_consumer(consumer)
         await dispatcher_b.start_durable_cognition_consumer(consumer.consumer_id)
-        await asyncio.sleep(0.05)
+        held_pass = dispatcher_b._durable_cognition_drainers.get(consumer.consumer_id)
+        if held_pass is not None:
+            await settled(held_pass, step="the drain's pass under Hold")
         held_delivery = await dispatcher_b.get_durable_delivery_for_event(
             consumer_id=consumer.consumer_id,
             event_id=handle.signal_id,
@@ -2982,14 +2995,12 @@ async def test_held_durable_cognition_survives_restart_and_runs_once_after_relea
 
         snapshots.snapshots[:] = [EffectiveHoldState(host=None, agent=None)]
         dispatcher_b._start_durable_cognition_drain(consumer.consumer_id)
-        for _ in range(100):
-            delivery = await dispatcher_b.get_durable_delivery_for_event(
-                consumer_id=consumer.consumer_id,
-                event_id=handle.signal_id,
-            )
-            if delivery is not None and delivery.status == ACKNOWLEDGED:
-                break
-            await asyncio.sleep(0.01)
+        released_pass = dispatcher_b._durable_cognition_drainers[consumer.consumer_id]
+        await settled(released_pass, step="the drain's pass after Release")
+        delivery = await dispatcher_b.get_durable_delivery_for_event(
+            consumer_id=consumer.consumer_id,
+            event_id=handle.signal_id,
+        )
         assert delivery is not None and delivery.status == ACKNOWLEDGED
         assert delivery.attempts == 1
         agent_b.process_input.assert_awaited_once()
@@ -2999,16 +3010,43 @@ async def test_held_durable_cognition_survives_restart_and_runs_once_after_relea
             source_event_id="telegram:update:held-across-restart",
             consumer_id=consumer.consumer_id,
         )
-        duplicate_admission = await asyncio.wait_for(
-            duplicate.wait_for_durable_admission(), timeout=1.0
+        duplicate_admission = await settled(
+            duplicate.wait_for_durable_admission(),
+            step="the duplicate's durable admission",
         )
-        duplicate_result = await asyncio.wait_for(duplicate.wait(), timeout=1.0)
+        duplicate_result = await settled(
+            duplicate.wait(), step="the duplicate's result"
+        )
         assert duplicate_admission.disposition is DurableAdmissionDisposition.DUPLICATE
         assert duplicate_result.status is Status.COALESCED
         agent_b.process_input.assert_awaited_once()
     finally:
         await dispatcher_b.shutdown_durable_delivery()
         await _close(backend_b, agent_b)
+
+
+@pytest.mark.asyncio
+async def test_held_durable_cognition_survives_restart_and_runs_once_after_release(
+    tmp_path,
+):
+    """A restart preserves deferred channel work without terminal duplication."""
+
+    await _held_cognition_restart_scenario(tmp_path)
+
+
+@pytest.mark.asyncio
+async def test_held_cognition_restart_does_not_depend_on_the_loop_clock(tmp_path):
+    """The restart scenario holds however far the loop clock runs (#3858).
+
+    An hour of loop time passes inside every wait, including the first
+    admission's, which a 1s loop-clock ``wait_for`` once timed out on CI, and
+    the work still runs exactly once, after Release.
+    """
+
+    with advanceable_loop_clock() as clock:
+        await _held_cognition_restart_scenario(
+            tmp_path, stall=lambda: clock.advance(3600.0)
+        )
 
 
 def _native_a2a_snapshot(task, recipient_id, lifecycle_revision=0):

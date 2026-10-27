@@ -1,6 +1,8 @@
 """Irrevocable native authority across copied contexts (#3569)."""
 
 import asyncio
+import threading
+import time
 
 import pytest
 
@@ -13,6 +15,7 @@ from kestrel_sovereign.execution_custody import (
     require_execution_work,
 )
 from kestrel_sovereign.turn_scope import capture_turn_scope
+from tests.utils.aiosqlite_workers import close_sqla_factory_on_a_normal_schedule
 
 
 class Authority:
@@ -245,7 +248,110 @@ async def test_sqlalchemy_cached_factory_and_retained_connection_refuse_custody(
                     await connection.rollback()
             assert await connection.scalar(text("SELECT count(*) FROM effects")) == 0
     finally:
-        await factory.close()
+        # This test asserts custody refusal, not how fast a loaded host
+        # closes SQLite: on CI this close once took 1.41s against its 1.01s
+        # budget and failed the test (#3858).
+        await close_sqla_factory_on_a_normal_schedule(factory)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("schedule", ["deadline_passed", "normal_schedule"])
+async def test_factory_cleanup_close_survives_a_driver_close_stalled_past_its_budget(
+    monkeypatch, schedule,
+):
+    """The custody test's cleanup cannot fail on a slow host (#3858).
+
+    The native close is held from inside the engine disposal that the
+    factory close waits on, so the close has already taken its deadline when
+    the hold begins. With the loop clock moved past that deadline, the close
+    overruns. On the normal close schedule, real time passing beyond the
+    budget during the same hold cannot overrun it.
+    """
+    import kestrel_sovereign.storage.db.sqlite as sqlite_module
+    from sqlalchemy import text
+    from sqlalchemy.ext.asyncio import create_async_engine
+    from kestrel_sovereign.storage.db.interface import ConnectionError
+    from kestrel_sovereign.storage.sqla.session import SovereignSqlaSessionFactory
+    from tests.utils.aiosqlite_workers import (
+        aiosqlite_worker,
+        block_aiosqlite_native_close,
+        observe_bounded_close_stages,
+    )
+    from tests.utils.virtual_clock import (
+        HANG_GUARD_SECONDS,
+        await_within_hang_guard,
+        pinned_loop_clock,
+        wait_for_thread_event,
+    )
+
+    # A short budget lets a short real stall outlast it.
+    monkeypatch.setattr(sqlite_module, "AIOSQLITE_WORKER_SHUTDOWN_TIMEOUT_S", 0.05)
+    budget = sqlite_module._minimum_close_timeout_s()
+    factory = SovereignSqlaSessionFactory(create_async_engine("sqlite+aiosqlite:///:memory:"))
+    async with factory.read_session() as session:
+        await session.execute(text("SELECT 1"))
+    [connection] = factory._sqlite_connections
+    worker = aiosqlite_worker(connection)
+    entered, release = block_aiosqlite_native_close(connection)
+    held_for: list[float] = []
+
+    def release_after_the_budget() -> None:
+        # ``entered`` is set only once the factory close is waiting on its
+        # disposal, which it starts after taking its deadline.
+        if entered.wait(HANG_GUARD_SECONDS):
+            held_from = time.monotonic()
+            while time.monotonic() - held_from <= 2 * budget:
+                time.sleep(0.005)
+            held_for.append(time.monotonic() - held_from)
+        release.set()
+
+    releaser = None
+    try:
+        if schedule == "deadline_passed":
+            with observe_bounded_close_stages() as stages:
+                with pinned_loop_clock() as clock:
+                    close_started_at = clock.time()
+                    closing = asyncio.ensure_future(factory.close())
+                    await wait_for_thread_event(
+                        entered, step="the factory close holding its native close",
+                    )
+                    clock.advance(2 * budget)
+                    with pytest.raises(ConnectionError, match="did not complete within"):
+                        await await_within_hang_guard(
+                            closing, step="the overrun factory close failing",
+                        )
+                    # The deadline the close took, and passed to its driver
+                    # close, is the one the clock was moved past.
+                    assert stages.deadlines[connection] == close_started_at + budget
+                    assert clock.time() > stages.deadlines[connection]
+            retirements = [
+                retained.retirement_task
+                for retained in factory._retired_sqlite_closes.values()
+                if retained.retirement_task is not None
+            ]
+            release.set()
+            await await_within_hang_guard(
+                asyncio.gather(
+                    factory._engine_dispose_task, *factory._driver_close_tasks,
+                    *retirements, return_exceptions=True,
+                ),
+                step="the overrun close's owners settling",
+            )
+            factory.finalize_retirement()
+        else:
+            releaser = threading.Thread(target=release_after_the_budget, daemon=True)
+            releaser.start()
+            await close_sqla_factory_on_a_normal_schedule(factory)
+            assert held_for and held_for[0] > budget
+    finally:
+        release.set()
+        if releaser is not None:
+            await asyncio.to_thread(releaser.join, HANG_GUARD_SECONDS)
+        await asyncio.to_thread(worker.join, HANG_GUARD_SECONDS)
+
+    assert entered.is_set()
+    assert not worker.is_alive()
+    assert not factory.retirement_pending
 
 
 @pytest.mark.asyncio

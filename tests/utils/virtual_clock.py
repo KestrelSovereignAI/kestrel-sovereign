@@ -15,8 +15,10 @@ from __future__ import annotations
 
 import asyncio
 import threading
+import time
 from collections.abc import Awaitable, Callable
 from contextlib import contextmanager
+from types import SimpleNamespace
 from typing import Iterator, TypeVar
 from unittest.mock import patch
 
@@ -69,6 +71,28 @@ def pinned_loop_clock() -> Iterator[VirtualClock]:
     loop = asyncio.get_running_loop()
     clock = VirtualClock(loop.time())
     with patch.object(loop, "time", clock.time):
+        yield clock
+
+
+@contextmanager
+def pinned_shacl_validation_clock() -> Iterator[VirtualClock]:
+    """Freeze the clock SHACL validation measures its wall-time budget on.
+
+    ``GovernedShaclValidationService`` bounds each run by
+    ``ShaclValidationLimits.max_wall_time_seconds`` of ``time.monotonic``, so
+    a stalled host can exhaust it inside a validation that takes a few
+    milliseconds, and the governed write is rejected (#3858). Only that
+    module's ``time`` binding is replaced: the event loop and every other
+    clock keep real time. A test that asserts what a write stores pins it; a
+    test of the budget itself spends it with ``advance``.
+    """
+
+    from kestrel_sovereign.knowledge import shacl_validation
+
+    clock = VirtualClock(time.monotonic())
+    with patch.object(
+        shacl_validation, "time", SimpleNamespace(monotonic=clock.time)
+    ):
         yield clock
 
 

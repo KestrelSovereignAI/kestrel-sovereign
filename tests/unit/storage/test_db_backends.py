@@ -3671,6 +3671,142 @@ class TestAsyncDatabase:
         assert not worker.is_alive()
 
     @pytest.mark.asyncio
+    async def test_cancelled_raw_driver_close_waits_for_disposal_after_an_overrun(
+        self, tmp_path, monkeypatch,
+    ):
+        """A cancelled raw-driver close never starts a second close (#3858).
+
+        A factory close overran its deadline while disposal's ``close()`` of
+        the driver waited behind a slow statement. The event loop's teardown
+        then cancelled the raw-driver close task, which started a second
+        ``close()`` of the same driver. The worker exited on disposal's stop
+        sentinel and never answered the second one, so the teardown waited
+        until the xdist worker was killed.
+        """
+        from sqlalchemy import text
+
+        from kestrel_sovereign.storage.async_database import AsyncDatabase
+        from kestrel_sovereign.storage.sqla import make_session_factory
+
+        monkeypatch.setattr(
+            sqlite_backend_module,
+            "AIOSQLITE_WORKER_SHUTDOWN_TIMEOUT_S",
+            _CLOSE_BUDGET_SECONDS,
+        )
+        db = await AsyncDatabase.sqlite(str(tmp_path / "sqla-overrun-teardown.db"))
+        factory = make_session_factory(db)
+        async with factory.read_session() as session:
+            await session.execute(text("SELECT 1"))
+
+        connection = factory._sqlite_connections[0]
+        worker = aiosqlite_worker(connection)
+        entered_worker = threading.Event()
+        release_worker = threading.Event()
+        watchdog = threading.Timer(
+            _WORKER_RELEASE_WATCHDOG_SECONDS, release_worker.set
+        )
+        blocked_read = None
+        retirement_tasks = []
+        close_task = None
+
+        def block_in_worker() -> int:
+            entered_worker.set()
+            release_worker.wait()
+            return 1
+
+        await connection.create_function(
+            "block_in_worker", 0, block_in_worker
+        )
+
+        with advanceable_loop_clock() as clock:
+            try:
+                watchdog.start()
+                blocked_read = asyncio.create_task(
+                    connection.execute("SELECT block_in_worker()")
+                )
+                await wait_for_thread_event(
+                    entered_worker, step="the read entering its blocking UDF"
+                )
+                blocked_read.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await blocked_read
+
+                close_task = asyncio.create_task(
+                    db.dispose_cached_sqla_factory()
+                )
+                await _yield_until(
+                    lambda: factory._engine_dispose_task is not None,
+                    step="factory close starting engine disposal",
+                )
+                _expire_close_deadlines(clock)
+                with pytest.raises(
+                    ConnectionError,
+                    match="SQLite connection close did not complete",
+                ):
+                    await await_within_hang_guard(
+                        close_task,
+                        step="factory close after its deadline passed",
+                    )
+                assert not factory._engine_dispose_task.done()
+                [driver_close] = factory._driver_close_tasks
+                assert not driver_close.done()
+                retirement_tasks = [
+                    retained.retirement_task
+                    for retained in factory._retired_sqlite_closes.values()
+                    if retained.retirement_task is not None
+                ]
+
+                # What asyncio.Runner's teardown does to every pending task.
+                queued_before_cancel = connection._tx.qsize()
+                driver_close.cancel()
+                for _ in range(10):
+                    await asyncio.sleep(0)
+                assert connection._tx.qsize() == queued_before_cancel, (
+                    "the cancelled raw-driver close queued a second close"
+                )
+
+                release_worker.set()
+                await await_within_hang_guard(
+                    asyncio.gather(
+                        factory._engine_dispose_task,
+                        *retirement_tasks,
+                        return_exceptions=True,
+                    ),
+                    step="disposal and retirement after the worker resumed",
+                )
+                with pytest.raises(asyncio.CancelledError):
+                    await await_within_hang_guard(
+                        driver_close,
+                        step="the cancelled raw-driver close finishing",
+                    )
+                await _join_worker(worker)
+                assert not factory.retirement_pending
+                # The injected cancellation is the driver close's outcome; it
+                # is reported once, and the settled owner then detaches.
+                with pytest.raises(asyncio.CancelledError):
+                    await db.finalize_retired_sqla_factory()
+                assert db._sovereign_sqla_retirement_owner is None
+            finally:
+                watchdog.cancel()
+                release_worker.set()
+                if blocked_read is not None:
+                    await asyncio.gather(blocked_read, return_exceptions=True)
+                await asyncio.gather(*retirement_tasks, return_exceptions=True)
+                if factory._engine_dispose_task is not None:
+                    await asyncio.gather(
+                        factory._engine_dispose_task, return_exceptions=True
+                    )
+                if close_task is not None:
+                    await asyncio.gather(close_task, return_exceptions=True)
+                if db.connection_retirement_pending:
+                    await db.finalize_retired_sqla_factory()
+                if db.backend.is_connected:
+                    await db.close()
+                await _join_worker(worker)
+
+        assert not worker.is_alive()
+
+    @pytest.mark.asyncio
     async def test_factory_dispose_error_preserves_cleanup_timeout_for_checked_out_worker(
         self, tmp_path,
     ):

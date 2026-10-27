@@ -515,8 +515,23 @@ class SovereignSqlaSessionFactory:
                 owned_connection: Any = connection,
                 owned_dispose_task: asyncio.Task[None] = dispose_task,
             ) -> None:
+                # Disposal may be part-way through this driver's own
+                # ``close()``. A second ``close()`` started beside it queues a
+                # second stop sentinel behind the first; the worker exits on
+                # the first and never answers the second, so this task would
+                # wait forever (#3858). A cancellation therefore never ends
+                # the wait for disposal: it is raised once the driver is
+                # retired.
+                pending_cancellation: BaseException | None = None
+                while not owned_dispose_task.done():
+                    try:
+                        await asyncio.wait({owned_dispose_task})
+                    except asyncio.CancelledError as exc:
+                        pending_cancellation = execution_terminal_error(
+                            pending_cancellation, exc, retain_originals=True,
+                            isolate_control_originals=True,
+                        )
                 try:
-                    await asyncio.wait({owned_dispose_task})
                     owned_task_error(owned_dispose_task)
                 except BaseException:
                     # Disposal failure is surfaced by ``close``.  It cannot
@@ -524,6 +539,8 @@ class SovereignSqlaSessionFactory:
                     pass
                 if _aiosqlite_worker_is_alive(owned_connection):
                     await owned_connection.close()
+                if pending_cancellation is not None:
+                    raise pending_cancellation
 
             raw_close_task = create_owned_task(
                 close_after_dispose(),
