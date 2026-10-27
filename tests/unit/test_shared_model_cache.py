@@ -211,6 +211,8 @@ class TestSharedModelCache:
     async def test_refused_background_admission_closes_original_coroutine(self):
         import inspect
 
+        from kestrel_sovereign._async_ownership import OwnedTaskAdmission
+        from kestrel_sovereign.execution_custody import _explicit_control_chain, execution_cleanup_debts
         from tests.unit.test_cleanup_task_admission import _operation_name
 
         cache = SharedModelCache()
@@ -237,7 +239,13 @@ class TestSharedModelCache:
             loop.set_task_factory(allocate)
             with pytest.raises(RuntimeError) as caught:
                 cache.refresh_in_background(refresh)
-            assert caught.value is failures[0]
+            assert any(error is failures[0] for error in _explicit_control_chain(caught.value))
+            debts = tuple(execution_cleanup_debts(caught.value))
+            assert len(debts) == 1
+            admission, accepted_task = debts[0]
+            assert type(admission) is OwnedTaskAdmission
+            assert accepted_task is None and admission.task is None
+            assert admission._acceptance_unknown and admission._reconciled_tasks == ()
             assert refused and all(inspect.getcoroutinestate(coro) == inspect.CORO_CLOSED for coro in refused), (
                 "shared refresh admission left its unstarted original coroutine open"
             )
@@ -248,6 +256,8 @@ class TestSharedModelCache:
             task = cache._refresh_task
             await task
             assert entered.is_set()
+            assert admission._acceptance_unknown
+            assert execution_cleanup_debts(caught.value)[0][0] is admission
         finally:
             loop.set_task_factory(factory)
             for coroutine in refused:

@@ -8,7 +8,7 @@ import openai
 import pytest
 from tests.utils.original_failure import OriginalFailure
 
-from kestrel_sovereign._async_ownership import await_owned_task
+from kestrel_sovereign._async_ownership import OwnedTaskAdmission, await_owned_task
 from kestrel_sovereign.execution_custody import (
     _explicit_control_chain,
     execution_cleanup_debts,
@@ -316,7 +316,14 @@ async def test_refused_writer_wrapper_does_not_close_original_writers_database(
         with pytest.raises(RuntimeError) as caught:
             await service.close()
         loop.set_task_factory(previous)
-        assert caught.value is failure and refused
+        assert refused and any(error is failure for error in _explicit_control_chain(caught.value))
+        debts = tuple(execution_cleanup_debts(caught.value))
+        assert len(debts) == 1
+        original_admission, accepted_task = debts[0]
+        assert type(original_admission) is OwnedTaskAdmission
+        assert accepted_task is None and original_admission.task is None
+        assert original_admission._acceptance_unknown
+        assert original_admission._reconciled_tasks == ()
         assert transport.is_closed, (
             "refused writer wrapper skipped independent original SDK cleanup"
         )
@@ -333,7 +340,14 @@ async def test_refused_writer_wrapper_does_not_close_original_writers_database(
         )
         release.set()
         await await_owned_task(writer)
-        await service.wait_for_close_completion()
+        with pytest.raises(RuntimeError) as joined:
+            await service.wait_for_close_completion()
+        assert any(error is failure for error in _explicit_control_chain(joined.value))
+        assert len(execution_cleanup_debts(joined.value)) == 1
+        assert execution_cleanup_debts(joined.value)[0][0] is original_admission
+        assert execution_cleanup_debts(joined.value)[0][1] is None
+        # The genuine writer/DB are physically settled. The unproved wrapper
+        # admission remains a separate original error, not a successful ACK.
         assert (
             completed == [True] and not worker.is_alive() and service._usage_db is None
         )
@@ -346,8 +360,13 @@ async def test_refused_writer_wrapper_does_not_close_original_writers_database(
                 coroutine.close()
         await await_owned_task(writer)
         await client.close()
-        await service.wait_for_close_completion()
-        await db.close()
+        try:
+            with pytest.raises(RuntimeError) as cleanup:
+                await service.wait_for_close_completion()
+            assert any(error is failure for error in _explicit_control_chain(cleanup.value))
+            assert execution_cleanup_debts(cleanup.value)
+        finally:
+            await db.close()
 
 
 @pytest.mark.asyncio
