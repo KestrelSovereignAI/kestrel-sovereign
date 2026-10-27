@@ -112,7 +112,7 @@ async def _stream(adapter: OllamaAdapter, daemon: _Daemon, **kwargs) -> List[Any
 @pytest.mark.asyncio
 async def test_a_tool_bearing_chat_call_sends_the_default_cap():
     """The path the incident took: a turn always advertises tools, so the
-    Ollama adapter answers it with one non-streaming ``/api/chat`` call."""
+    Ollama adapter buffers one native streamed ``/api/chat`` call."""
     daemon = _replying("You work at Acme.")
 
     response = await _get_response(OllamaAdapter(), daemon)
@@ -219,8 +219,8 @@ def _assert_reported_usage(error: OutputCapReachedError) -> None:
 
 @pytest.mark.asyncio
 async def test_the_tool_stream_path_fails_on_the_cap_before_yielding_anything():
-    """With tools, the stream answers from one non-streaming probe: a capped
-    probe must surface as the failure, with no partial text ahead of it."""
+    """With tools, one native stream is logically buffered: a capped
+    generation must surface as the failure, with no partial text ahead of it."""
     daemon = _replying("loop loop loop", done_reason="length")
     seen: List[Any] = []
 

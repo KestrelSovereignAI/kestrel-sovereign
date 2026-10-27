@@ -7,6 +7,7 @@ from kestrel_sovereign.llm.anthropic_adapter import AnthropicAdapter
 from kestrel_sovereign.llm.ollama_adapter import OllamaAdapter
 import kestrel_sovereign.llm.ollama_adapter as ollama_module
 from tests.utils.anthropic_client import models_api
+from tests.utils.ollama_client import ollama_client
 
 
 class _AsyncStream:
@@ -192,25 +193,29 @@ async def test_ollama_with_tools_suppresses_thinking_under_structured_output(mon
     class Answer(BaseModel):
         value: int
 
-    async def chat(**kwargs):
-        return {
-            "message": {
-                "thinking": "Plan: emit JSON.",
-                "content": '{"value": 4}',
-            }
+    reply = {
+        "done": True,
+        "done_reason": "stop",
+        "message": {
+            "role": "assistant",
+            "thinking": "Plan: emit JSON.",
+            "content": '{"value": 4}',
         }
-
-    client = SimpleNamespace(chat=chat)
+    }
+    requests = []
 
     items = []
-    async for item in adapter.get_streaming_response_with_tools(
-        client=client,
-        model="gemma4:31b",
-        messages=[{"role": "user", "content": "2+2?"}],
-        tools=[{"type": "function", "function": {"name": "noop"}}],
-        response_format=Answer,
-    ):
-        items.append(item)
+    async with ollama_client(reply, requests=requests) as client:
+        async for item in adapter.get_streaming_response_with_tools(
+            client=client,
+            model="gemma4:31b",
+            messages=[{"role": "user", "content": "2+2?"}],
+            tools=[{"type": "function", "function": {"name": "noop"}}],
+            response_format=Answer,
+        ):
+            items.append(item)
+    assert len(requests) == 1
+    assert requests[0]["model"] == "gemma4:31b"
 
     # Structured-output mode must not leak the thinking field — callers
     # expect a clean JSON stream parseable by the response_format model.
@@ -224,27 +229,28 @@ async def test_ollama_with_tools_emits_native_thinking_on_no_tool_fallthrough(mo
     monkeypatch.setattr(ollama_module, "OLLAMA_AVAILABLE", True)
     adapter = OllamaAdapter()
 
-    async def chat(**kwargs):
-        # Non-streaming response: native thinking field present, content clean,
-        # no tool calls. Wrapper should yield the thinking as a ThinkingDelta
-        # before yielding the visible content.
-        return {
-            "message": {
-                "thinking": "Plan: compute 2+2.",
-                "content": "4.",
-            }
+    reply = {
+        "done": True,
+        "done_reason": "stop",
+        "message": {
+            "role": "assistant",
+            "thinking": "Plan: compute 2+2.",
+            "content": "4.",
         }
-
-    client = SimpleNamespace(chat=chat)
+    }
+    requests = []
 
     items = []
-    async for item in adapter.get_streaming_response_with_tools(
-        client=client,
-        model="gemma4:31b",
-        messages=[{"role": "user", "content": "2+2?"}],
-        tools=[{"type": "function", "function": {"name": "noop"}}],
-    ):
-        items.append(item)
+    async with ollama_client(reply, requests=requests) as client:
+        async for item in adapter.get_streaming_response_with_tools(
+            client=client,
+            model="gemma4:31b",
+            messages=[{"role": "user", "content": "2+2?"}],
+            tools=[{"type": "function", "function": {"name": "noop"}}],
+        ):
+            items.append(item)
+    assert len(requests) == 1
+    assert requests[0]["model"] == "gemma4:31b"
 
     thinking = [e for e in items if isinstance(e, ThinkingDelta)]
     assert len(thinking) == 1
@@ -258,26 +264,30 @@ async def test_ollama_with_tools_preserves_untagged_prose_as_visible(monkeypatch
     monkeypatch.setattr(ollama_module, "OLLAMA_AVAILABLE", True)
     adapter = OllamaAdapter()
 
-    async def chat(**kwargs):
-        return {
-            "message": {
-                "content": (
-                    "The user is asking for simple arithmetic.\n\n"
-                    "4"
-                )
-            }
+    reply = {
+        "done": True,
+        "done_reason": "stop",
+        "message": {
+            "role": "assistant",
+            "content": (
+                "The user is asking for simple arithmetic.\n\n"
+                "4"
+            )
         }
-
-    client = SimpleNamespace(chat=chat)
+    }
+    requests = []
 
     items = []
-    async for item in adapter.get_streaming_response_with_tools(
-        client=client,
-        model="qwen3",
-        messages=[{"role": "user", "content": "2+2?"}],
-        tools=[{"type": "function", "function": {"name": "noop"}}],
-    ):
-        items.append(item)
+    async with ollama_client(reply, requests=requests) as client:
+        async for item in adapter.get_streaming_response_with_tools(
+            client=client,
+            model="qwen3",
+            messages=[{"role": "user", "content": "2+2?"}],
+            tools=[{"type": "function", "function": {"name": "noop"}}],
+        ):
+            items.append(item)
+    assert len(requests) == 1
+    assert requests[0]["model"] == "qwen3"
 
     assert not any(isinstance(item, ThinkingDelta) for item in items)
     assert "".join(item for item in items if isinstance(item, str)) == (
@@ -290,23 +300,27 @@ async def test_ollama_non_reasoning_model_preserves_plain_intro(monkeypatch):
     monkeypatch.setattr(ollama_module, "OLLAMA_AVAILABLE", True)
     adapter = OllamaAdapter()
 
-    async def chat(**kwargs):
-        return {
-            "message": {
-                "content": (
-                    "Based on the logs, the service restarted cleanly.\n\n"
-                    "The fix is to refresh the page."
-                )
-            }
+    reply = {
+        "done": True,
+        "done_reason": "stop",
+        "message": {
+            "role": "assistant",
+            "content": (
+                "Based on the logs, the service restarted cleanly.\n\n"
+                "The fix is to refresh the page."
+            )
         }
+    }
+    requests = []
 
-    client = SimpleNamespace(chat=chat)
-
-    response = await adapter.get_response(
-        client=client,
-        model="llama3.2",
-        messages=[{"role": "user", "content": "what happened?"}],
-    )
+    async with ollama_client(reply, requests=requests) as client:
+        response = await adapter.get_response(
+            client=client,
+            model="llama3.2",
+            messages=[{"role": "user", "content": "what happened?"}],
+        )
+    assert len(requests) == 1
+    assert requests[0]["model"] == "llama3.2"
 
     assert response.content == (
         "Based on the logs, the service restarted cleanly.\n\n"

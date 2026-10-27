@@ -13,7 +13,7 @@ from typing import Any, Callable, Iterable, Optional, TypeVar
 from kestrel_sovereign.execution_custody import ExecutionAuthorityError, await_execution_work, is_execution_control_error
 
 from kestrel_sovereign.llm.generation_gate import first_unfinished_attempt
-from kestrel_sovereign.llm.output_ceiling import INCOMPLETE_ATTEMPT_ATTR
+from kestrel_sovereign.llm.output_ceiling import INCOMPLETE_ATTEMPT_ATTR, IncompleteGenerationError
 
 logger = logging.getLogger(__name__)
 
@@ -395,6 +395,7 @@ def is_retryable_error(error: Exception) -> bool:
     Check if an error is transient and should be retried.
 
     Order of checks:
+      -1. Typed unfinished generation → no retry, regardless of its wording.
       0. PLAN_LIMIT_PATTERNS (plan window wearing a non-429 status) → retry.
       1. NON_RETRYABLE_STATUS_CODES (401/403/404/422/400) → no retry.
       2. NON_RETRYABLE_PATTERNS (auth/quota/invalid) → no retry.
@@ -412,6 +413,11 @@ def is_retryable_error(error: Exception) -> bool:
     text doesn't literally contain the number — we classify on the actual
     error, not a hopeful substring.
     """
+    # A terminal generation verdict is not a transient transport error. Its
+    # model name or rendered cap (for example, 1,500) cannot grant a retry.
+    if isinstance(error, IncompleteGenerationError):
+        return False
+
     # 0a. Plan-limit window wearing a non-429 status. Checked before the
     #     status-code short-circuit below, which would otherwise classify the
     #     400 form as a permanent caller error and skip retry entirely.

@@ -1,11 +1,11 @@
 """#3572: Stop abandons an Ollama chat call even while the daemon sends nothing.
 
 A streamed turn checks Stop between stream items, so a call that has yielded
-nothing never reaches that check. With tools, the Ollama adapter answers a
-streamed turn with one non-streaming ``/api/chat`` call, which reads the whole
-response body before it returns; a daemon still evaluating a long prompt sends
-nothing at all. Stop therefore waited for the provider or the orchestrator's
-inactivity bound.
+nothing never reaches that check. Historically, the tool path read a whole
+non-streaming response before returning; the logical tool response remains
+buffered while its native SDK stream is now consumed internally. A daemon
+still evaluating a long prompt may send nothing at all. Every path must
+therefore admit Stop while awaiting the next native event.
 
 The adapter now honours the ``cancel_token`` it is passed on every chat path:
 a fired token cancels the pending request, which closes the HTTP response so
@@ -149,10 +149,10 @@ async def _assert_abandoned(call: Awaitable[Any]) -> None:
 
 #: Every chat path, as ``(name, call)``: ``call(daemon, seen)`` makes the call.
 PATHS: Dict[str, Callable[[_Daemon, List[Any]], Awaitable[Any]]] = {
-    # A non-streaming call with tools: what a tool-loop follow-up makes.
+    # A buffered logical call with tools: what a tool-loop follow-up makes.
     "get_response_with_tools": lambda d, seen: _get_response(d, TOOLS),
     "get_response_without_tools": lambda d, seen: _get_response(d, None),
-    # A streamed turn with tools: one non-streaming chat (#3572's case).
+    # A streamed turn with tools: one buffered logical chat (#3572's case).
     "stream_with_tools": lambda d, seen: _stream_with_tools(d, TOOLS, seen),
     # A streamed turn without tools: a streamed chat.
     "stream_without_tools": lambda d, seen: _stream_with_tools(d, None, seen),

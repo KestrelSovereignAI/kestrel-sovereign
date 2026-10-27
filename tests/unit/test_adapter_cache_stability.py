@@ -25,6 +25,7 @@ from kestrel_sovereign.llm.anthropic_adapter import AnthropicAdapter
 from kestrel_sovereign.llm.ollama_adapter import OllamaAdapter
 from kestrel_sovereign.llm.openai_adapter import OpenAIAdapter
 from tests.utils.anthropic_client import anthropic_client
+from tests.utils.ollama_client import ollama_client
 
 
 # ---------------------------------------------------------------------------
@@ -147,28 +148,23 @@ async def _run_anthropic_and_capture(
 async def _run_ollama_and_capture(
     messages: List[Dict[str, Any]]
 ) -> Dict[str, Any]:
-    """Drive the Ollama adapter; return kwargs sent to `client.chat`."""
-    fake_client = MagicMock()
-    chat_call = AsyncMock(
-        return_value={
-            "model": "llama3.2:3b",
-            "message": {"role": "assistant", "content": "ok"},
-            "done": True,
-            "prompt_eval_count": 10,
-            "eval_count": 1,
-        }
-    )
-    fake_client.chat = chat_call
-
-    adapter = OllamaAdapter()
-    await adapter.get_response(
-        client=fake_client,
-        model="llama3.2:3b",
-        messages=messages,
-    )
-    # Ollama adapter invokes client.chat via with_retry; captured kwargs
-    # include `messages=` verbatim.
-    return {"json": {"messages": chat_call.call_args.kwargs["messages"]}}
+    """Drive the native Ollama SDK and capture its serialized HTTP request."""
+    reply = {
+        "model": "llama3.2:3b",
+        "message": {"role": "assistant", "content": "ok"},
+        "done": True,
+        "done_reason": "stop",
+        "prompt_eval_count": 10,
+        "eval_count": 1,
+    }
+    requests = []
+    async with ollama_client(reply, requests=requests) as client:
+        await OllamaAdapter().get_response(
+            client=client, model="llama3.2:3b", messages=messages,
+        )
+    assert len(requests) == 1
+    assert requests[0]["model"] == "llama3.2:3b"
+    return {"json": requests[0]}
 
 
 # ---------------------------------------------------------------------------

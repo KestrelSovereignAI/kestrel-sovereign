@@ -17,6 +17,7 @@ from kestrel_sovereign.llm.openai_adapter import OpenAIAdapter
 from kestrel_sovereign.llm.anthropic_adapter import AnthropicAdapter
 from kestrel_sovereign.llm.ollama_adapter import OllamaAdapter
 from tests.utils.anthropic_client import anthropic_client
+from tests.utils.ollama_client import ollama_client
 
 
 # =============================================================================
@@ -130,22 +131,22 @@ class TestOllamaTokenExtraction:
         """Test that Ollama adapter extracts prompt_eval_count and eval_count."""
         adapter = OllamaAdapter()
 
-        # Mock response with Ollama-style metrics
-        mock_response = {
+        reply = {
             "message": {"role": "assistant", "content": "Hello!"},
             "prompt_eval_count": 12,
             "eval_count": 6,
-            "done": True
+            "done": True,
+            "done_reason": "stop",
         }
-
-        mock_client = MagicMock()
-        mock_client.chat = AsyncMock(return_value=mock_response)
-
-        response = await adapter.get_response(
-            client=mock_client,
-            model="llama3.2:3b",
-            messages=[{"role": "user", "content": "Hi"}]
-        )
+        requests = []
+        async with ollama_client(reply, requests=requests) as client:
+            response = await adapter.get_response(
+                client=client,
+                model="llama3.2:3b",
+                messages=[{"role": "user", "content": "Hi"}]
+            )
+        assert len(requests) == 1
+        assert requests[0]["messages"] == [{"role": "user", "content": "Hi"}]
 
         assert response.input_tokens == 12
         assert response.output_tokens == 6

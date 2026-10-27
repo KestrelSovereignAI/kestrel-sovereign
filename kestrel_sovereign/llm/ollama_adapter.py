@@ -704,8 +704,9 @@ class OllamaAdapter(LLMAdapter):
         async def once():
             stream = await client.chat(model=model, messages=messages,
                                        stream=True, **request)
-            content, thinking, tool_calls = [], [], []
+            content, thinking, tool_calls, logprobs = [], [], [], []
             content_seen = thinking_seen = False
+            logprobs_seen = False
             input_tokens = output_tokens = None
             generated_chunks = 0
             terminal = None
@@ -725,6 +726,10 @@ class OllamaAdapter(LLMAdapter):
                     raw_content = message.get("content") if isinstance(message, dict) else message.content
                     raw_thinking = message.get("thinking") if isinstance(message, dict) else message.thinking
                     calls = message.get("tool_calls") if isinstance(message, dict) else message.tool_calls
+                    probabilities = chunk.get("logprobs") if isinstance(chunk, dict) else chunk.logprobs
+                    if probabilities is not None:
+                        logprobs_seen = True
+                        logprobs.extend(probabilities)
                     if raw_content is not None:
                         content_seen = True
                         content.append(raw_content)
@@ -759,7 +764,8 @@ class OllamaAdapter(LLMAdapter):
             fields = {"content": "".join(content) if content_seen else None,
                       "thinking": "".join(thinking) if thinking_seen else None,
                       "tool_calls": tool_calls or None}
-            counts = {"prompt_eval_count": input_tokens, "eval_count": output_tokens}
+            counts = {"prompt_eval_count": input_tokens, "eval_count": output_tokens,
+                      "logprobs": logprobs if logprobs_seen else None}
             if isinstance(terminal, dict):
                 return {**terminal, **counts, "message": {**terminal["message"], **fields}}
             return terminal.model_copy(update={**counts,
@@ -1212,7 +1218,7 @@ class OllamaAdapter(LLMAdapter):
                             yield response.content
                 # Terminal LLMResponse carrying usage so the service layer meters
                 # this turn (#1684); content was already streamed above. `response`
-                # holds the token counts from the non-streaming probe.
+                # holds the token counts from the buffered logical completion.
                 yield response
                 return
 

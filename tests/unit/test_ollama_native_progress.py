@@ -85,6 +85,7 @@ class Peer:
                     values = self.values
                 if self.mode == 'retry-once' and len(self.requests) == 1:
                     values = [{'model': MODEL, 'message': {'role': 'assistant', 'content': 'DISCARD'},
+                               'logprobs': [{'token': 'DISCARD', 'logprob': -99.0}],
                                'done': False}, {'error': 'overloaded'}]
                 pieces = [(json.dumps(value) + '\n').encode() for value in values]
                 mime = b'application/x-ndjson'
@@ -294,6 +295,7 @@ async def test_retry_covers_lazy_drain_and_discards_failed_attempt_payload(peer)
         assert len(peer.requests) == 2
         assert response.content == 'Finished protocol response'
         assert 'DISCARD' not in response.content
+        assert response.raw.logprobs is None
         assert response.raw.message.thinking == ''.join(str(i) for i in range(peer.parts - 1)) + 'PRIVATE-native-thought'
         assert [call.id for call in response.tool_calls] == ['ollama_call_0']
 
