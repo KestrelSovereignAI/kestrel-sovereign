@@ -42,12 +42,14 @@ from .assertion import (
     Resource,
     SourceOccurrence,
     SourceProvenance,
+    SourceReferenceKind,
     TemporalInterval,
     Visibility,
     derive_assertion_id,
     identity_preimage,
     lineage_from_mapping,
     normalize_iri,
+    source_reference_segment,
 )
 if TYPE_CHECKING:
     from .corpus import (
@@ -270,6 +272,7 @@ __all__ = [
     "SemanticVersion",
     "SourceOccurrence",
     "SourceProvenance",
+    "SourceReferenceKind",
     "Sparql11AssertionReadAdapter",
     "Sparql12AssertionReadAdapter",
     "StandardsMaturity",
@@ -298,6 +301,7 @@ __all__ = [
     "lineage_from_mapping",
     "load_knowledge_registry",
     "normalize_iri",
+    "source_reference_segment",
     "maintenance_limits_from_config",
     "maintenance_allows_prior_verified_snapshot",
 ]

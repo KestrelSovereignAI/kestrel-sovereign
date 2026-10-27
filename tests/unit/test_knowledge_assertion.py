@@ -35,10 +35,12 @@ from kestrel_sovereign.knowledge import (
     LocalIdentifier,
     OntologyRef,
     SourceOccurrence,
+    SourceReferenceKind,
     TemporalInterval,
     derive_assertion_id,
     identity_preimage,
     normalize_iri,
+    source_reference_segment,
 )
 
 
@@ -248,6 +250,43 @@ def test_timezone_normalization_and_interval_validation() -> None:
 def test_literal_temporal_forms_reject_non_ascii_digits(lexical_form: str, datatype_iri: str) -> None:
     with pytest.raises(AssertionValidationError):
         Literal(lexical_form, datatype_iri)
+
+
+def test_source_locator_names_saved_items_and_sessions_by_exact_id() -> None:
+    # An imported saved-item id carries its importer's DID namespace, so it can
+    # contain ':' and '#'; the segment must still read back as exactly that id.
+    imported_item = "did:example:ava:imported#notes/1"
+    session = "dcd6f767-829d-4a7d-b8c7-d7a722e5de13"
+    locator = "#".join((
+        "POST:/api/agent/invoke",
+        source_reference_segment(SourceReferenceKind.SESSION, session),
+        source_reference_segment("saved-item", imported_item),
+        "span:0-120",
+    ))
+    source = SourceOccurrence(
+        source_occurrence_id="source:extract:1",
+        source_kind="http_request",
+        locator=locator,
+        received_at="2026-10-25T14:02:11Z",
+    )
+
+    assert source.references == frozenset({
+        (SourceReferenceKind.SESSION, session),
+        (SourceReferenceKind.SAVED_ITEM, imported_item),
+    })
+    assert SourceOccurrence.from_mapping(source.to_mapping()).references == source.references
+    assert source_reference_segment(SourceReferenceKind.SESSION, session) == f"session:{session}"
+    unrelated = SourceOccurrence(
+        source_occurrence_id="source:ledger:1",
+        source_kind="agent_strategy_ledger",
+        locator="ledger:STRATEGY.md#patterns:row-1#session:",
+        received_at="2026-10-25T14:02:11Z",
+    )
+    assert unrelated.references == frozenset()
+    with pytest.raises(AssertionValidationError):
+        source_reference_segment("conversation", session)
+    with pytest.raises(AssertionValidationError):
+        source_reference_segment(SourceReferenceKind.SAVED_ITEM, "")
 
 
 def test_direct_and_derived_provenance_round_trip_including_derivation_reference() -> None:

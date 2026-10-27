@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 from dataclasses import replace
 from decimal import Decimal
+import json
 from types import SimpleNamespace
 
 import pytest
@@ -19,6 +20,7 @@ from kestrel_sovereign.knowledge import (
     EpistemicState,
     GovernedAssertionCorpusService,
     GovernedCorpusBudgetExceeded,
+    GovernedCorpusError,
     GovernedCorpusLimits,
     GovernedCorpusPolicy,
     GovernedCorpusUnavailable,
@@ -27,10 +29,12 @@ from kestrel_sovereign.knowledge import (
     OntologyRef,
     SemanticMaintenanceTrainingReadiness,
     SourceOccurrence,
+    SourceReferenceKind,
     ValidationState,
     ValidationWriteAction,
     Visibility,
     XSD_STRING,
+    source_reference_segment,
 )
 
 
@@ -440,6 +444,241 @@ async def test_event_checkpoint_backend_failure_is_a_governed_error() -> None:
         await GovernedAssertionCorpusService(
             _BrokenCheckpointHost([_assertion("broken-checkpoint")])
         ).snapshot(policy=_policy(), inference_profile=None)
+
+
+EXAM_SESSION = "dcd6f767-829d-4a7d-b8c7-d7a722e5de13"
+EXAM_ITEM = "469a149e"
+
+
+def _exam_source(assertion: Assertion, *segments: str) -> SourceOccurrence:
+    """A source read during a turn, naming the saved items/sessions it read."""
+    return SourceOccurrence(
+        source_occurrence_id=assertion.lineage.source_occurrence_ids[0],
+        source_kind="operator-note",
+        locator="#".join(
+            ("POST:/api/agent/invoke", *segments, f"note:{assertion.revision_id}")
+        ),
+        received_at="2026-10-25T12:00:00Z",
+        content_digest="sha256:exam",
+    )
+
+
+def _corpus_text(examples) -> str:
+    return json.dumps([example.canonical_mapping() for example in examples])
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("segments", "exclusion"),
+    [
+        (
+            (source_reference_segment(SourceReferenceKind.SAVED_ITEM, EXAM_ITEM),),
+            {"excluded_saved_item_ids": (EXAM_ITEM, "ed452a4c")},
+        ),
+        (
+            (source_reference_segment(SourceReferenceKind.SESSION, EXAM_SESSION),),
+            {"excluded_session_ids": (EXAM_SESSION,)},
+        ),
+        ((), {"excluded_source_occurrence_ids": ("source:exam-answer",)}),
+    ],
+    ids=["saved-item", "session", "source-occurrence"],
+)
+async def test_excluded_material_is_held_out_even_when_every_class_rule_accepts_it(
+    segments: tuple[str, ...], exclusion: dict[str, tuple[str, ...]]
+) -> None:
+    exam = _assertion("exam-answer")
+    everyday = _assertion("everyday-note")
+    host = _CorpusHost([exam, everyday])
+    host.sources[exam.revision_id] = [_exam_source(exam, *segments)]
+    service = GovernedAssertionCorpusService(host)
+
+    unexcluded = await service.snapshot(policy=_policy(), inference_profile=None)
+    snapshot = await service.snapshot(policy=_policy(**exclusion), inference_profile=None)
+
+    # Without the exclusion every class rule admits the exam text.
+    assert {item.assertion.revision_id for item in unexcluded.examples} == {
+        "exam-answer", "everyday-note",
+    }
+    assert [item.assertion.revision_id for item in snapshot.examples] == ["everyday-note"]
+    assert snapshot.observability.excluded == {"explicitly_excluded": 1}
+    assert "exam-answer" in _corpus_text(unexcluded.examples)
+    assert "exam-answer" not in _corpus_text(snapshot.examples)
+
+
+@pytest.mark.asyncio
+async def test_exclusion_precedes_class_rules_and_holds_out_derived_assertions() -> None:
+    exam = _assertion("exam-premise")
+    restricted_exam = _assertion("restricted-exam", privacy="restricted")
+    inference = _derived("exam-inference", exam)
+    host = _CorpusHost([exam, restricted_exam, inference])
+    session = source_reference_segment(SourceReferenceKind.SESSION, EXAM_SESSION)
+    for item in (exam, restricted_exam):
+        host.sources[item.revision_id] = [_exam_source(item, session)]
+    host.derivation_inputs[inference.revision_id] = [exam]
+    inferred = {
+        "accepted_epistemic_states": (EpistemicState.ASSERTED, EpistemicState.INFERRED),
+        "allow_inferred": True,
+        "accepted_derivation_profiles": ("rule-profile-1",),
+    }
+    service = GovernedAssertionCorpusService(host)
+
+    unexcluded = await service.snapshot(policy=_policy(**inferred), inference_profile=None)
+    snapshot = await service.snapshot(
+        policy=_policy(**inferred, excluded_session_ids=(EXAM_SESSION,)),
+        inference_profile=None,
+    )
+
+    assert {item.assertion.revision_id for item in unexcluded.examples} == {
+        "exam-premise", "exam-inference",
+    }
+    assert unexcluded.observability.excluded == {"privacy_classification_disallowed": 1}
+    # The restricted exam reports its exclusion, not its privacy class, and
+    # the inference drawn from the exam is held out with its premise.
+    assert snapshot.examples == ()
+    assert snapshot.observability.excluded == {"explicitly_excluded": 3}
+    # Provenance is read in one batch per snapshot, ineligible revisions included.
+    assert len(host.source_batch_calls) == 2
+
+
+@pytest.mark.asyncio
+async def test_incremental_additions_hold_out_excluded_material() -> None:
+    policy = _policy(excluded_session_ids=(EXAM_SESSION,))
+    host = _CorpusHost([_assertion("before-exam")])
+    service = GovernedAssertionCorpusService(host)
+    snapshot = await service.snapshot(policy=policy, inference_profile=None)
+    exam = _assertion("exam-answer")
+    host.assertions.append(exam)
+    host.sources[exam.revision_id] = [
+        _exam_source(exam, source_reference_segment(SourceReferenceKind.SESSION, EXAM_SESSION))
+    ]
+    host.validations[exam.assertion_id] = CorpusValidationStatus(
+        ValidationState.CONFORMS, ValidationWriteAction.ACCEPT
+    )
+    host.checkpoint = CorpusCheckpoint(TENANT, 8, "event:8")
+    host.changes = [
+        SimpleNamespace(
+            event_id="event:8", assertion_id=exam.assertion_id, revision_id=exam.revision_id,
+            operation="accepted", generation=8, eligible=True,
+        )
+    ]
+
+    delta = await service.changes_since(snapshot, policy=policy, inference_profile=None)
+
+    assert delta.additions == ()
+    assert delta.observability.excluded == {"explicitly_excluded": 1}
+
+
+@pytest.mark.asyncio
+async def test_exclusions_are_part_of_the_policy_value_and_corpus_provenance() -> None:
+    without = _policy()
+    held_out = _policy(
+        excluded_saved_item_ids=("ed452a4c", EXAM_ITEM),
+        excluded_session_ids=(EXAM_SESSION,),
+    )
+
+    # A policy with no exclusions keeps the digest it had before they existed,
+    # so adapter manifests recorded under it still verify after an upgrade.
+    assert without.digest == "cca6d3e04faea101dc46369353451c50739a4087e4a2e7bd3ab6318b56a04d23"
+    assert not {"excluded_saved_item_ids", "excluded_session_ids"} & without.to_mapping().keys()
+    assert held_out.to_mapping()["excluded_saved_item_ids"] == [EXAM_ITEM, "ed452a4c"]
+    assert held_out.to_mapping()["excluded_session_ids"] == [EXAM_SESSION]
+    assert held_out.digest != without.digest
+    assert held_out.digest == _policy(
+        excluded_saved_item_ids=(EXAM_ITEM, "ed452a4c"),
+        excluded_session_ids=(EXAM_SESSION,),
+    ).digest
+
+    service = GovernedAssertionCorpusService(_CorpusHost([_assertion("note")]))
+    plain = await service.snapshot(policy=without, inference_profile=None)
+    governed = await service.snapshot(policy=held_out, inference_profile=None)
+    assert governed.snapshot_hash != plain.snapshot_hash
+    assert governed.observability.policy_digest == held_out.digest
+    assert governed.examples[0].decision.policy_digest == held_out.digest
+    with pytest.raises(GovernedCorpusError, match="same corpus policy"):
+        await service.changes_since(plain, policy=held_out, inference_profile=None)
+    for malformed in (EXAM_ITEM, (EXAM_ITEM, EXAM_ITEM), ("",), None):
+        with pytest.raises(GovernedCorpusError):
+            _policy(excluded_saved_item_ids=malformed)
+
+
+def test_policy_mapping_round_trips_exclusions_and_refuses_unknown_fields() -> None:
+    policy = _policy(
+        accepted_epistemic_states=(EpistemicState.INFERRED, EpistemicState.ASSERTED),
+        allow_inferred=True,
+        accepted_derivation_profiles=("rule-profile-1",),
+        excluded_session_ids=(EXAM_SESSION,),
+        excluded_source_occurrence_ids=("source:exam-answer",),
+    )
+    mapping = policy.to_mapping()
+
+    restored = GovernedCorpusPolicy.from_mapping(json.loads(json.dumps(mapping)))
+
+    assert restored == policy
+    assert restored.digest == policy.digest
+    assert GovernedCorpusPolicy.from_mapping(_policy().to_mapping()) == _policy()
+    with pytest.raises(GovernedCorpusError, match="unknown"):
+        GovernedCorpusPolicy.from_mapping({**mapping, "excluded_conversation_ids": ["x"]})
+    with pytest.raises(GovernedCorpusError, match="missing"):
+        GovernedCorpusPolicy.from_mapping(
+            {key: value for key, value in mapping.items() if key != "accepted_source_kinds"}
+        )
+    with pytest.raises(GovernedCorpusError, match="schema_version"):
+        GovernedCorpusPolicy.from_mapping({**mapping, "schema_version": 2})
+    with pytest.raises(GovernedCorpusError, match="array"):
+        GovernedCorpusPolicy.from_mapping({**mapping, "excluded_session_ids": EXAM_SESSION})
+    with pytest.raises(GovernedCorpusError, match="name/version"):
+        GovernedCorpusPolicy.from_mapping(
+            {**mapping, "accepted_semantic_capability_versions": [["shape_set", "shapes@1"]]}
+        )
+
+
+@pytest.mark.asyncio
+async def test_saved_item_exclusion_needs_the_full_id_not_a_display_prefix() -> None:
+    # Ids are compared exactly. A display prefix would also hold out any other
+    # item sharing it, so the operator resolves it to the stored id instead.
+    full_id = "469a149e-8f0c-4d7e-9a51-1c2b3d4e5f60"
+    exam = _assertion("exam-v01")
+    host = _CorpusHost([exam])
+    host.sources[exam.revision_id] = [
+        _exam_source(exam, source_reference_segment(SourceReferenceKind.SAVED_ITEM, full_id))
+    ]
+    service = GovernedAssertionCorpusService(host)
+
+    prefix = await service.snapshot(
+        policy=_policy(excluded_saved_item_ids=(EXAM_ITEM,)), inference_profile=None
+    )
+    exact = await service.snapshot(
+        policy=_policy(excluded_saved_item_ids=(full_id,)), inference_profile=None
+    )
+
+    assert [item.assertion.revision_id for item in prefix.examples] == ["exam-v01"]
+    assert exact.examples == ()
+
+
+@pytest.mark.asyncio
+async def test_provenance_that_does_not_cover_the_lineage_is_not_cleared() -> None:
+    # The host returns one of two lineage sources. The missing one could name
+    # an excluded session, so the revision cannot be shown to be clear of it.
+    partial = replace(
+        _assertion("partial"),
+        lineage=DirectLineage(("source:partial", "source:partial-unreturned")),
+    )
+    host = _CorpusHost([partial])
+    service = GovernedAssertionCorpusService(host)
+
+    snapshot = await service.snapshot(
+        policy=_policy(excluded_session_ids=(EXAM_SESSION,)), inference_profile=None
+    )
+    # An excluded source named in the lineage is held out as excluded even
+    # though the host did not return that source.
+    named = await service.snapshot(
+        policy=_policy(excluded_source_occurrence_ids=("source:partial-unreturned",)),
+        inference_profile=None,
+    )
+
+    assert snapshot.examples == ()
+    assert snapshot.observability.excluded == {"source_class_disallowed": 1}
+    assert named.observability.excluded == {"explicitly_excluded": 1}
 
 
 def test_public_contract_is_consumable_without_storage_or_graph_imports() -> None:

@@ -19,6 +19,7 @@ import re
 from collections.abc import Mapping, Sequence
 from typing import Any, ClassVar, TypeAlias
 import unicodedata
+from urllib.parse import quote, unquote
 
 
 MAPPING_SCHEMA_VERSION = 1
@@ -750,6 +751,34 @@ class OntologyRef:
         return cls(**{key: data[key] for key in ("namespace", "version", "content_digest", "compatibility_profile")})
 
 
+class SourceReferenceKind(str, Enum):
+    """An evidence artifact a source occurrence's locator can name.
+
+    A locator is a ``#``-separated path of segments, outermost first: the
+    turn's request locator, when there is one, then whatever the producer read.
+    A segment built by :func:`source_reference_segment` names one artifact, so a
+    reader can tell which saved item or conversation session an occurrence came
+    from without knowing any producer's own locator stem.
+    """
+
+    SAVED_ITEM = "saved-item"
+    SESSION = "session"
+
+
+_SOURCE_REFERENCE_KINDS = {kind.value: kind for kind in SourceReferenceKind}
+
+
+def source_reference_segment(kind: SourceReferenceKind | str, identifier: str) -> str:
+    """The locator segment naming one saved item or session, by its exact id.
+
+    The id is percent-encoded, so an id containing ``#`` or ``:`` still reads
+    back as one segment naming exactly that id.
+    """
+    reference_kind = _enum(kind, SourceReferenceKind, "source reference kind")
+    identifier = _plain_identifier(identifier, "source reference identifier")
+    return f"{reference_kind.value}:{quote(identifier, safe='')}"
+
+
 @dataclass(frozen=True, slots=True)
 class SourceOccurrence:
     """Immutable source-side provenance for a particular evidence encounter.
@@ -776,6 +805,17 @@ class SourceOccurrence:
             value = getattr(self, name)
             if value is not None:
                 object.__setattr__(self, name, _plain_identifier(value, f"source occurrence {name}"))
+
+    @property
+    def references(self) -> frozenset[tuple[SourceReferenceKind, str]]:
+        """The saved items and sessions this occurrence's locator names."""
+        found: set[tuple[SourceReferenceKind, str]] = set()
+        for segment in self.locator.split("#"):
+            kind, separator, encoded = segment.partition(":")
+            reference_kind = _SOURCE_REFERENCE_KINDS.get(kind)
+            if reference_kind is not None and separator and encoded:
+                found.add((reference_kind, unquote(encoded)))
+        return frozenset(found)
 
     def to_mapping(self) -> dict[str, object]:
         return {
@@ -1412,6 +1452,7 @@ __all__ = [
     "Resource",
     "SourceOccurrence",
     "SourceProvenance",
+    "SourceReferenceKind",
     "TemporalInterval",
     "Visibility",
     "XSD_BOOLEAN",
@@ -1426,4 +1467,5 @@ __all__ = [
     "identity_preimage",
     "lineage_from_mapping",
     "normalize_iri",
+    "source_reference_segment",
 ]
