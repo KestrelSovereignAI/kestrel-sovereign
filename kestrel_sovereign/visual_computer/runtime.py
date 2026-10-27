@@ -435,7 +435,7 @@ class VisualComputerRuntime:
                             except BaseException as settlement:
                                 from kestrel_sovereign.execution_custody import execution_observation_error
                                 raise execution_observation_error(fact.original, settlement) from None
-                            raise fact.original from None
+                            raise fact.original
                     receipt = await self._call(context, check, dispatch)
                 self._receipt(request, receipt)
                 # Preserve accepted outcome even if Stop raced its response;

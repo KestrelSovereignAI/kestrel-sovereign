@@ -226,7 +226,7 @@ class BorrowControl(asyncio.CancelledError):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize('kind', ['cause', 'group', 'commit', 'retirement', 'cancel-retirement', 'cancel-subclass', 'ordinary-cause', 'base-control'])
+@pytest.mark.parametrize('kind', ['cause', 'group', 'commit', 'retirement', 'cancel-retirement', 'cancel-subclass', 'ordinary-cause', 'nested-control', 'unknown-subclass', 'unknown-group', 'unknown-commit', 'unknown-debt', 'base-control'])
 async def test_borrower_preserves_original_explicit_control_graph(harness, tmp_path, kind):
     h = harness
     ctx = h.context()
@@ -236,7 +236,23 @@ async def test_borrower_preserves_original_explicit_control_graph(harness, tmp_p
         error.__cause__ = marker
     elif kind == 'ordinary-cause':
         error = asyncio.CancelledError('original child observation')
-        error.__cause__ = ResourceOutcomeUnknown('original native transport unknown')
+        error.__cause__ = RuntimeError('original arbitrary exception cause')
+    elif kind in {'nested-control', 'unknown-subclass', 'unknown-group', 'unknown-commit', 'unknown-debt'}:
+        error = asyncio.CancelledError('original nested native graph')
+        cause = ResourceOutcomeUnknown('original unknown')
+        if kind == 'nested-control':
+            cause.__cause__ = marker
+        elif kind == 'unknown-subclass':
+            class SpecificUnknown(ResourceOutcomeUnknown):
+                pass
+            cause = SpecificUnknown('original specific unknown')
+        elif kind == 'unknown-group':
+            cause = BaseExceptionGroup('original group', [cause, marker])
+        elif kind == 'unknown-commit':
+            cause.__cause__ = ExecutionCommitOutcomeError('unknown')
+        else:
+            cause._kestrel_native_retirement_debts = ((marker, None),)
+        error.__cause__ = cause
     elif kind == 'group':
         error = BaseExceptionGroup('original-controls', [asyncio.CancelledError('child'), marker])
     elif kind == 'commit':
@@ -367,3 +383,118 @@ async def test_original_inline_sqlite_commit_cancellation_is_not_availability(
     finally:
         await dispatcher.shutdown_durable_delivery()
         await _close(backend, agent)
+
+
+@pytest.mark.asyncio
+async def test_joined_native_unknown_cause_keeps_same_original_graph(harness, tmp_path):
+    """The real nested join creates C -> ordinary SDK Unknown after Stop."""
+    from kestrel_sovereign._async_ownership import await_owned_operation
+
+    h = harness
+    ctx = h.context()
+    entered = asyncio.Event()
+    originals = {}
+    with h.bind(ctx):
+        session = await h.runtime.admit(ctx, h.request(ctx))
+        driver = DockerComputerDriver(docker_socket=str(tmp_path / 'never-opened.sock'),
+                                      egress_guard=h.runtime.egress.operation)
+        async def origin():
+            async with (
+                h.runtime.operation(ctx, VisualAction.ACT) as check,
+                h.runtime.egress.activate(session, 'native-cause-action', check,
+                    deadline=datetime.now(UTC) + timedelta(seconds=10)),
+            ):
+                async def operation(current):
+                    async def command():
+                        current()
+                        entered.set()
+                        try:
+                            await asyncio.Event().wait()
+                        except asyncio.CancelledError:
+                            error = ResourceOutcomeUnknown('original joined transport unknown')
+                            originals['cause'] = error
+                            raise error from None
+                    outcome = await await_owned_operation(command(), cancel_on_caller_cancellation=True)
+                    originals['outcome'] = outcome
+                    try:
+                        return raise_owned_outcome(outcome, operation='original native command')
+                    except asyncio.CancelledError as error:
+                        originals['root'] = error
+                        raise
+                return await driver._guarded_call(session, 'native-cause-action', driver.egress_guard, operation)
+        active = asyncio.create_task(origin())
+        await asyncio.wait_for(entered.wait(), 5)
+        await h.runtime.egress.revoke_session(session.scope, session.session_id)
+        with pytest.raises(ResourceOutcomeUnknown) as caught:
+            await active
+        assert caught.value.__cause__ is originals['root']
+        assert originals['root'].__cause__ is originals['cause']
+        assert originals['outcome'].cancellation is originals['root']
+        assert driver._borrowers == {} and h.runtime.egress._calls == {}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('field', ['_kestrel_denied_execution_scopes', '_kestrel_unscoped_execution_denial',
+    '_kestrel_finite_native_sources', '_kestrel_owned_admission', 'foreign_control'])
+@pytest.mark.parametrize('on_cause', [False, True], ids=['root', 'cause'])
+async def test_unknown_or_empty_provenance_cannot_be_ordinary_interruption(harness, tmp_path, field, on_cause):
+    h = harness
+    ctx = h.context()
+    original = asyncio.CancelledError('original undecided provenance')
+    if on_cause:
+        original.__cause__ = ResourceOutcomeUnknown('original unknown provenance')
+    target = original.__cause__ if on_cause else original
+    # Negative metadata only: even an empty/unrecognized field cannot mint a
+    # control receipt or become evidence of an ordinary interruption.
+    setattr(target, field, ())
+    with h.bind(ctx):
+        session = await h.runtime.admit(ctx, h.request(ctx))
+        driver = DockerComputerDriver(docker_socket=str(tmp_path / 'never-opened.sock'),
+                                      egress_guard=h.runtime.egress.operation)
+        async with (
+            h.runtime.operation(ctx, VisualAction.ACT) as check,
+            h.runtime.egress.activate(session, 'provenance-action', check,
+                deadline=datetime.now(UTC) + timedelta(seconds=10)),
+        ):
+            async def operation(current):
+                current()
+                raise original
+            with pytest.raises(BaseException) as caught:
+                await driver._guarded_call(session, 'provenance-action', driver.egress_guard, operation)
+        assert caught.value is original
+        assert driver._borrowers == {} and h.runtime.egress._calls == {}
+
+
+@pytest.mark.asyncio
+async def test_runtime_original_no_input_rethrow_preserves_same_error_graph(harness, tmp_path, monkeypatch):
+    """Bounded zero-input driver; real original issuer/native SQLite settlement."""
+    from kestrel_sovereign.visual_computer.docker import PROVIDER
+    from tests.unit.visual_computer.test_runtime import opened
+
+    h = harness
+    ctx = h.context()
+    h.adapter.driver_id = PROVIDER
+    native = ResourceOutcomeUnknown('original native command unknown')
+    child = asyncio.CancelledError('original joined borrower')
+    child.__cause__ = native
+    original = ResourceOutcomeUnknown('original driver interruption')
+    original.__cause__ = child
+    with h.bind(ctx):
+        session, request = await opened(h, ctx)
+        driver = DockerComputerDriver(docker_socket=str(tmp_path / 'never-opened.sock'),
+                                      egress_guard=h.runtime.egress.operation)
+        async def zero_input(session, request, *, current):
+            current()
+            # No child/input started: the SAME production native_dispatch
+            # issuer accounts for zero commands and issues its own proof.
+            raise original
+        monkeypatch.setattr(driver, '_perform_act', zero_input)
+        h.runtime.drivers = {PROVIDER: driver}
+        with pytest.raises(ResourceOutcomeUnknown) as caught:
+            await h.runtime.act(ctx, request)
+        assert caught.value is original
+        assert caught.value.__cause__ is child and child.__cause__ is native
+        receipt = await h.runtime.action_status(ctx, session.session_id, request.action_id)
+        assert receipt.outcome == 'denied' and receipt.reason_code == 'host_not_dispatched'
+        assert await h.runtime.act(ctx, request) == receipt
+        assert not await h.repository.has_pending_actions(h.runtime.scope(ctx), session.session_id)
