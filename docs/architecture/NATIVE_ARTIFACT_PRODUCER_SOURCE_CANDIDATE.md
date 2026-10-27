@@ -1,3 +1,20 @@
+---
+type: Architecture Spec
+title: Native artifact producer source successor
+description: Explicit finite signed-run output admission through the canonical artifact authority; unpublished Core 0.57.0 source candidate.
+resource: /docs/architecture/NATIVE_ARTIFACT_PRODUCER_SOURCE_CANDIDATE.md
+tags:
+- docs
+- architecture
+- architecture-spec
+timestamp: '2026-10-27T00:00:00Z'
+status: implementation-candidate
+owner: architecture
+canonical: false
+generated: false
+privacy: public
+---
+
 # Native artifact producer: unpublished source candidate
 
 This implementation is an unpublished Core 0.57.0 source successor. Its normal
