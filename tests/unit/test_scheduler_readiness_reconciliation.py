@@ -15,6 +15,7 @@ no longer holds its schedule row.
 """
 
 import asyncio
+from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
@@ -25,11 +26,13 @@ from kestrel_sovereign.execution_custody import (
     ExecutionAuthorityError,
     ExecutionCommitOutcomeError,
     execution_evidence_carriers,
+    execution_terminal_error,
+    is_execution_control_error,
 )
 from kestrel_sovereign.features.scheduler.runner import (
     SCHEDULER_PROTOCOL_VERSION,
     SchedulerRunner,
-    _is_occurrence_storage_failure,
+    _is_plain_storage_failure,
     _is_reconcilable_occurrence_failure,
     _ReadinessReconciliation,
 )
@@ -84,9 +87,29 @@ async def _stop(runner) -> BaseException | None:
     """Stop ``runner``; return the control evidence ``stop()`` re-raises."""
     try:
         await runner.stop()
-    except ExecutionCommitOutcomeError as error:
+    except BaseException as error:
+        # A plain outcome, or one native cleanup grouped with cancellation.
+        if not is_execution_control_error(error):
+            raise
         return error
     return None
+
+
+def _lost_outcome(grouped: bool) -> BaseException:
+    """An unknown commit outcome, alone or as native cleanup groups it.
+
+    A lost COMMIT acknowledgement whose rollback is then cancelled reaches
+    the scheduler as one group of both, which is neither a ``CancelledError``
+    nor an ``Exception``.
+    """
+    outcome = ExecutionCommitOutcomeError("unknown")
+    if not grouped:
+        return outcome
+    group = execution_terminal_error(
+        outcome, asyncio.CancelledError(), isolate_control_originals=True
+    )
+    assert type(group) is BaseExceptionGroup
+    return group
 
 
 async def _renew_until_stopped(_task):
@@ -102,10 +125,10 @@ def test_storage_failure_classification():
     commit_carrier = QueryError("Query failed during commit")
     commit_carrier._kestrel_unresolved_commit_outcome = "unknown"
 
-    assert _is_occurrence_storage_failure(query_failure)
-    assert not _is_occurrence_storage_failure(commit_carrier)
-    assert not _is_occurrence_storage_failure(RuntimeError("claim-token read"))
-    assert not _is_occurrence_storage_failure(ExecutionCommitOutcomeError("unknown"))
+    assert _is_plain_storage_failure(query_failure)
+    assert not _is_plain_storage_failure(commit_carrier)
+    assert not _is_plain_storage_failure(RuntimeError("claim-token read"))
+    assert not _is_plain_storage_failure(ExecutionCommitOutcomeError("unknown"))
 
 
 def test_reconcilable_failure_classification():
@@ -285,6 +308,64 @@ async def test_the_polling_loop_clears_a_settled_latch(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_a_failed_reconciliation_read_keeps_the_latch_reconcilable(tmp_path):
+    """A storage error while checking a claim is not proof either way.
+
+    Escaping the polling loop, it reached the supervisor, which latched it
+    with no claim: the latch became permanent and the host recorded it for
+    its lifetime, though the claim settled moments later.
+    """
+
+    db = await _database(tmp_path / "failed-reconciliation-read.db")
+    executor = AsyncMock(side_effect=[ExecutionCommitOutcomeError("unknown"), "reconciled"])
+    notifications = []
+    runner = SchedulerRunner(
+        db, "agent-1", executor, owner_id="failed-reconciliation-read",
+        poll_interval=0.01, on_protocol_failure=notifications.append,
+    )
+    runner._renew_lease = _renew_until_stopped
+    real_claim_still_held = runner._claim_still_held
+    failed_reads = 0
+
+    async def fail_three_reads(pending):
+        nonlocal failed_reads
+        if failed_reads < 3:
+            failed_reads += 1
+            raise QueryError(
+                "Query failed: SQLite connection close did not complete within 1.01s"
+            )
+        return await real_claim_still_held(pending)
+
+    runner._claim_still_held = fail_three_reads
+    try:
+        await runner.start(polling=False)
+        await _seed_due(db)
+        await runner.arm()
+        await wait_until(
+            lambda: runner.readiness_failure is not None,
+            timeout=30, interval=0.01, message="the commit outcome never latched",
+        )
+        await wait_until(
+            lambda: failed_reads == 3,
+            timeout=30, interval=0.01, message="the reconciliation never read the claim",
+        )
+        assert runner.readiness_failure_reconcilable
+        assert runner._worker_restart_count == 0
+
+        await _expire_lease(db)
+        await wait_until(
+            lambda: runner.readiness_failure is None,
+            timeout=30, interval=0.01, message="the polling loop never cleared the latch",
+        )
+        assert notifications == []
+        assert runner._worker_restart_count == 0
+        assert executor.await_count == 2
+    finally:
+        await _stop(runner)
+        await db.close()
+
+
+@pytest.mark.asyncio
 async def test_settled_claims_never_clear_a_latch_another_failure_joined(tmp_path):
     """A protocol failure without a claim keeps the latch for the runner's life."""
 
@@ -318,6 +399,7 @@ async def test_settled_claims_never_clear_a_latch_another_failure_joined(tmp_pat
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("grouped", [False, True], ids=["plain", "grouped"])
 @pytest.mark.parametrize(
     "failing_renewal",
     [
@@ -330,13 +412,15 @@ async def test_settled_claims_never_clear_a_latch_another_failure_joined(tmp_pat
     ],
 )
 async def test_renewal_commit_outcome_latch_clears_once_its_claim_is_settled(
-    tmp_path, failing_renewal
+    tmp_path, failing_renewal, grouped
 ):
     """A renewal whose commit landed but whose outcome was lost ends one claim.
 
     Before the fix every observer after the first latched it without the
     claim, so the latch became permanent and the host recorded it for its
-    lifetime even after recovery finalized the execution.
+    lifetime even after recovery finalized the execution. A grouped failure
+    of the first renewal escaped ``_run_occurrence``, the only frame that
+    knew its claim, and was latched by the done callback without it.
     """
 
     db = await _database(tmp_path / "renewal-commit-outcome.db")
@@ -352,7 +436,8 @@ async def test_renewal_commit_outcome_latch_clears_once_its_claim_is_settled(
 
     notifications = []
     runner = SchedulerRunner(
-        db, "agent-1", execute, owner_id=f"renewal-outcome-{failing_renewal}",
+        db, "agent-1", execute,
+        owner_id=f"renewal-outcome-{failing_renewal}-{grouped}",
         lease_seconds=3, on_protocol_failure=notifications.append,
     )
     real_renew_lease_once = runner._renew_lease_once
@@ -365,7 +450,7 @@ async def test_renewal_commit_outcome_latch_clears_once_its_claim_is_settled(
         if renewals == failing_renewal:
             # The real SQLite renewal committed; its acknowledgement did not.
             outcome_lost.set()
-            raise ExecutionCommitOutcomeError("unknown")
+            raise _lost_outcome(grouped)
         return renewed
 
     runner._renew_lease_once = renew_then_lose_the_outcome
@@ -404,6 +489,166 @@ async def test_renewal_commit_outcome_latch_clears_once_its_claim_is_settled(
     finally:
         if not stopped:
             await _stop(runner)
+        await db.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("grouped", [False, True], ids=["plain", "grouped"])
+async def test_lost_claim_publication_acknowledgement_latch_clears_once_settled(
+    tmp_path, grouped
+):
+    """A claim whose COMMIT landed but whose acknowledgement was lost.
+
+    ``_claim`` raises, so ``_run_occurrence`` never receives the claim. Before
+    the fix the latch named no claim and was permanent, though recovery took
+    the claim and finalized its execution.
+    """
+
+    db = await _database(tmp_path / "claim-publication-outcome.db")
+    executor = AsyncMock(return_value="reconciled")
+    notifications = []
+    runner = SchedulerRunner(
+        db, "agent-1", executor, owner_id=f"claim-publication-{grouped}",
+        on_protocol_failure=notifications.append,
+    )
+    runner._renew_lease = _renew_until_stopped
+    real_claim = runner._claim
+    real_transaction = runner._transaction
+    claiming = False
+    lost = []
+
+    async def flagged_claim(task, now):
+        nonlocal claiming
+        claiming = True
+        try:
+            return await real_claim(task, now)
+        finally:
+            claiming = False
+
+    @asynccontextmanager
+    async def lose_the_claim_acknowledgement(**kwargs):
+        async with real_transaction(**kwargs):
+            yield
+        if claiming and not lost:
+            # The real SQLite claim committed; its acknowledgement did not.
+            lost.append(_lost_outcome(grouped))
+            raise lost[0]
+
+    runner._claim = flagged_claim
+    runner._transaction = lose_the_claim_acknowledgement
+    stopped = False
+    try:
+        await runner._ensure_tables()
+        await _seed_due(db)
+
+        await tick_and_settle(runner)
+
+        assert len(lost) == 1
+        executor.assert_not_awaited()
+        assert runner.readiness_failure is not None
+        assert runner.readiness_failure_reconcilable
+        assert notifications == []
+        # The latch names exactly the claim the lost COMMIT published.
+        [claim] = runner._readiness_reconciliations
+        assert await _held_claim(db) == (claim.execution_id, claim.claim_token)
+
+        await runner._reconcile_readiness_latch()
+        assert runner.readiness_failure is not None
+
+        await _expire_lease(db)
+        await tick_and_settle(runner)
+        await runner._reconcile_readiness_latch()
+
+        executor.assert_awaited_once()
+        assert runner.readiness_failure is None
+        assert notifications == []
+        assert await db.fetchone(
+            "SELECT status, attempt_count FROM task_execution_log WHERE id = ?",
+            (claim.execution_id,),
+        ) == ("success", 2)
+        stopped = True
+        assert await _stop(runner) is not None
+    finally:
+        if not stopped:
+            await _stop(runner)
+        await db.close()
+
+
+@pytest.mark.asyncio
+async def test_a_claim_publication_that_never_landed_settles_at_once(tmp_path):
+    """A publication that failed right after its CAS names the claim it wrote.
+
+    The claim is named before the CAS runs, not from the read after it: here
+    that read fails, the transaction rolls back, and the named claim holds no
+    row, so the latch settles at its first check.
+    """
+
+    db = await _database(tmp_path / "claim-publication-rolled-back.db")
+    runner = SchedulerRunner(db, "agent-1", AsyncMock(), owner_id="claim-rolled-back")
+    real_fetchone = db.fetchone
+    post_cas_reads = 0
+
+    async def fail_the_post_cas_read(sql, *args, **kwargs):
+        nonlocal post_cas_reads
+        if "SELECT claim_execution_id, attempt_count" in sql:
+            post_cas_reads += 1
+            raise ExecutionCommitOutcomeError("unknown")
+        return await real_fetchone(sql, *args, **kwargs)
+
+    try:
+        await runner._ensure_tables()
+        await _seed_due(db)
+        db.fetchone = fail_the_post_cas_read
+
+        await tick_and_settle(runner)
+
+        db.fetchone = real_fetchone
+        assert post_cas_reads == 1
+        assert runner.readiness_failure_reconcilable
+        [claim] = runner._readiness_reconciliations
+        assert (claim.schedule_id, claim.agent_id) == ("task-1", "agent-1")
+        assert await _held_claim(db) is None
+
+        await runner._reconcile_readiness_latch()
+
+        assert runner.readiness_failure is None
+    finally:
+        db.fetchone = real_fetchone
+        await _stop(runner)
+        await db.close()
+
+
+@pytest.mark.asyncio
+async def test_only_commit_outcome_evidence_carries_an_attempted_claim(tmp_path):
+    """Any other publication error rolled the CAS back, or never reconciles."""
+
+    db = await _database(tmp_path / "attempted-claim-evidence.db")
+    runner = SchedulerRunner(db, "agent-1", AsyncMock(), owner_id="attempted-evidence")
+    other = SchedulerRunner(db, "agent-1", AsyncMock(), owner_id="attempted-other")
+    claim = _ReadinessReconciliation("task-1", "agent-1", "execution-1", "token-1")
+    try:
+        for error, carried in (
+            (ExecutionCommitOutcomeError("unknown"), True),
+            (ExecutionCommitOutcomeError("committed"), True),
+            (ExecutionAuthorityError("runtime authority revoked"), False),
+            (QueryError("Query failed: database is locked"), False),
+        ):
+            with pytest.raises(type(error)):
+                async with runner._carrying_attempted_claim([claim]):
+                    raise error
+            assert runner._attempted_claims_of(error) == (
+                frozenset({claim}) if carried else frozenset()
+            )
+            # A claim belongs to the runner that wrote it.
+            assert other._attempted_claims_of(error) == frozenset()
+
+        # Nothing was written yet, so there is nothing to carry.
+        unwritten = ExecutionCommitOutcomeError("unknown")
+        with pytest.raises(ExecutionCommitOutcomeError):
+            async with runner._carrying_attempted_claim([]):
+                raise unwritten
+        assert runner._attempted_claims_of(unwritten) == frozenset()
+    finally:
         await db.close()
 
 

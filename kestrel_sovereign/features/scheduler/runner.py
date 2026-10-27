@@ -551,6 +551,20 @@ class _ReadinessClaimsReceipt:
     claims: frozenset
 
 
+@dataclass(frozen=True)
+class _AttemptedClaimReceipt:
+    """A claim ``_claim`` wrote before the error that ended it (#3782).
+
+    ``_claim`` returns nothing when its publication raises, yet the COMMIT
+    that raised may have landed. The identity it wrote travels on the original
+    error, so the latch that error causes can still name the claim. A claim
+    that never landed holds no row and settles at the next check.
+    """
+
+    owner: object
+    claim: _ReadinessReconciliation
+
+
 @dataclass
 class _LeaseRenewalState(ConfirmedLeaseDeadline):
     """Shared fail-closed state for an owned claim-renewal task.
@@ -594,13 +608,14 @@ _rollout_renewal_state: contextvars.ContextVar[_LeaseRenewalState | None] = cont
 )
 
 
-def _is_occurrence_storage_failure(error: BaseException) -> bool:
-    """A storage error that ended one occurrence, carrying no control evidence.
+def _is_plain_storage_failure(error: BaseException) -> bool:
+    """A storage error carrying no control evidence.
 
-    The claim protocol survives an occurrence that stops at any statement as
-    it survives the process dying there: the lease expires and a later poll
-    recovers the row. A failure like this is not a runtime safety failure
-    (#3782). Commit-outcome, authority and retirement evidence never is one.
+    It ended one statement and proves nothing about durable state. The claim
+    protocol survives an occurrence that stops at any statement as it survives
+    the process dying there: the lease expires and a later poll recovers the
+    row. A failure like this is not a runtime safety failure (#3782).
+    Commit-outcome, authority and retirement evidence never is one.
     """
 
     return (
@@ -1497,7 +1512,8 @@ class SchedulerRunner:
         """Retain local denials; latch host-wide safety failures.
 
         ``reconciliation`` names the exact claim a failure ended, when the
-        caller has one. Such a latch clears once that claim is settled. A
+        caller has one; a claim whose publication raised is named by its
+        error instead. Such a latch clears once that claim is settled. A
         failure this runner already found reconcilable keeps that finding
         when an observer that does not know its claim latches it again.
         """
@@ -1548,7 +1564,9 @@ class SchedulerRunner:
                 getattr(self, "_execution_control_error", None), error
             )
         found = self._reconcilable_claims_of(error)
-        claims = (found | {reconciliation}) if reconciliation is not None else found
+        claims = found | self._attempted_claims_of(error)
+        if reconciliation is not None:
+            claims |= {reconciliation}
         reconcilable = bool(claims) and _is_reconcilable_occurrence_failure(
             error,
             already_latched=bool(found) or self._readiness_failure is not None,
@@ -1571,7 +1589,7 @@ class SchedulerRunner:
             error._kestrel_scheduler_readiness_claims = _ReadinessClaimsReceipt(
                 self, claims
             )
-            # The host reads ``readiness_failure`` on every probe, so this
+            # The host reads ``readiness_latch`` on every probe, so this
             # latch is visible there and clears with the runner. The callback
             # records a failure for the host's lifetime.
             return
@@ -1590,6 +1608,16 @@ class SchedulerRunner:
             if isinstance(receipt, _ReadinessClaimsReceipt) and receipt.owner is self:
                 claims |= receipt.claims
         return claims
+
+    def _attempted_claims_of(self, error: BaseException) -> frozenset:
+        """The claims this runner's failed publications carried on ``error``."""
+
+        return frozenset(
+            receipt.claim
+            for carrier in execution_evidence_carriers(error)
+            for receipt in vars(carrier).get("_kestrel_scheduler_attempted_claims", ())
+            if isinstance(receipt, _AttemptedClaimReceipt) and receipt.owner is self
+        )
 
     async def _agent_is_currently_authorized(self, agent_id: str) -> bool:
         """Check the current fleet scope and an optional live authority view."""
@@ -2224,7 +2252,8 @@ class SchedulerRunner:
         """Claim and execute one admitted row, isolating its failures."""
 
         # The exact claim this occurrence holds once ``_claim`` returns it,
-        # so a failure observed here can name it (#3782).
+        # so a failure observed here can name it (#3782). A failure inside
+        # ``_claim`` carries the claim it may have published instead.
         claimed: Optional[ScheduledTask] = None
         try:
             async with self._occurrence_slots:
@@ -2256,7 +2285,7 @@ class SchedulerRunner:
             )
             raise
         except Exception as error:
-            if _is_occurrence_storage_failure(error):
+            if _is_plain_storage_failure(error):
                 # A read or write of this occurrence failed, as in the
                 # #3782 snapshot read. Its claim is recovered when the lease
                 # expires, so the runtime stays ready.
@@ -2281,6 +2310,23 @@ class SchedulerRunner:
             self._latch_protocol_failure(
                 error, reconciliation=self._readiness_reconciliation(claimed)
             )
+        except BaseException as error:
+            # Grouped evidence, such as a lost renewal acknowledgement whose
+            # rollback was cancelled, matches neither clause above. Only this
+            # frame knows its claim, so name it here; the done callback that
+            # latches it again keeps that finding (#3782).
+            if is_execution_control_error(error):
+                logger.error(
+                    "Scheduled occurrence for task %s (%s) ended with grouped "
+                    "authority/commit evidence",
+                    task.id,
+                    task.task_name,
+                    exc_info=(type(error), error, error.__traceback__),
+                )
+                self._latch_protocol_failure(
+                    error, reconciliation=self._readiness_reconciliation(claimed)
+                )
+            raise
 
     @staticmethod
     def _readiness_reconciliation(
@@ -2328,7 +2374,23 @@ class SchedulerRunner:
             return
         pending = self._readiness_reconciliations
         for reconciliation in tuple(pending):
-            if await self._claim_still_held(reconciliation):
+            try:
+                held = await self._claim_still_held(reconciliation)
+            except Exception as error:
+                if not _is_plain_storage_failure(error):
+                    raise
+                # An unread claim is not a settled one. Escaping to the
+                # supervisor would latch this read failure with no claim and
+                # make the latch permanent; a later poll reads it again.
+                logger.warning(
+                    "Scheduler execution %s for task %s: could not read whether it "
+                    "still holds its claim; readiness stays latched: %s",
+                    reconciliation.execution_id,
+                    reconciliation.schedule_id,
+                    error,
+                )
+                return
+            if held:
                 continue
             # A claim token is never issued twice, so a claim seen released
             # stays released even if it was latched again meanwhile. A later
@@ -3254,6 +3316,30 @@ class SchedulerRunner:
         digest = hashlib.sha256(schedule_id.encode("utf-8")).hexdigest()
         return f"legacy-sha256:{digest}"
 
+    @asynccontextmanager
+    async def _carrying_attempted_claim(
+        self, attempted: list[_ReadinessReconciliation]
+    ):
+        """Carry the claim publication wrote on an error that may have published it.
+
+        ``attempted`` holds the identity the claim CAS writes, recorded before
+        that statement runs. A COMMIT whose acknowledgement is lost may still
+        have published it, and the caller never receives the claim (#3782).
+        Only commit-outcome evidence says that; any other error rolled the
+        CAS back, and denial or retirement evidence never reconciles.
+        """
+
+        try:
+            yield
+        except BaseException as error:
+            if attempted and execution_commit_outcome(error) is not None:
+                carried = vars(error).get("_kestrel_scheduler_attempted_claims", ())
+                error._kestrel_scheduler_attempted_claims = (
+                    *carried,
+                    _AttemptedClaimReceipt(self, attempted[-1]),
+                )
+            raise
+
     async def _claim(
         self, task: ScheduledTask, _polled_at: datetime
     ) -> Optional[ScheduledTask]:
@@ -3294,9 +3380,14 @@ class SchedulerRunner:
             authorized_agent_ids
         )
         uses_database_clock = self._uses_database_clock()
+        # The identity the claim CAS writes, for an error that escapes its
+        # publication after the CAS (#3782).
+        attempted: list[_ReadinessReconciliation] = []
         # Claim publication is a reader too: it must not cross a transition,
         # but it can overlap an already-admitted sibling effect.
-        async with self._sqlite_rollout_gate(task.agent_id, shared=True):
+        async with self._carrying_attempted_claim(attempted), self._sqlite_rollout_gate(
+            task.agent_id, shared=True
+        ):
             async with self._transaction():
                 if uses_database_clock:
                     # Serialize claim publication with the same per-DID epoch
@@ -3356,6 +3447,9 @@ class SchedulerRunner:
                         "(lease_expires_at IS NULL OR lease_expires_at <= ?)"
                     )
                     log_clock = "?"
+                attempted.append(
+                    _ReadinessReconciliation(task.id, task.agent_id, execution_id, token)
+                )
                 updated = await self._db.execute(
                     f"""
                     UPDATE scheduled_tasks
