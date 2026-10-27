@@ -85,6 +85,7 @@ test('SVG, HTML and PDF remain downloadable without decoding active documents in
         const item = await fixture({ type });
         assert.equal(item.panel.element.querySelectorAll('script,object,embed,img,iframe,canvas').length, 0);
         assert.equal(button(item.panel, 'Download source file').disabled, false);
+        if (type === 'text/html') assert.equal(item.panel.element.querySelector('textarea').value, '<script>alert(1)</script>');
         if (type === 'application/pdf') assert.match(item.panel.element.textContent, /Download this PDF to view it/);
         item.close();
     }
@@ -276,4 +277,52 @@ test('failed comparison removes stale rebase controls and offers a visible retry
     assert.equal(button(item.panel,'Compare latest').hidden,false);assert.equal(button(item.panel,'Download draft').hidden,false);
     item.client.head=async()=>latest;button(item.panel,'Compare latest').click();await until(()=>item.panel.draft.comparison);
     assert.equal(button(item.panel,'Use latest as save base').hidden,false);assert.equal(item.panel.draft.text,'Keep draft');item.close();
+});
+
+test('deleted publication clears an already displayed comparison', async () => {
+    const item = await fixture();
+    const latest = structuredClone(item.panel.draft.revision); latest.ref.revision_id = 'latest';
+    item.client.get = async () => latest; item.client.head = async () => latest;
+    item.client.commit = async () => { throw { status: 409 }; };
+    edit(item.panel, item.dom.window, 'Keep draft'); button(item.panel, 'Save revision').click();
+    await until(() => item.panel.draft.state === 'conflict');
+    button(item.panel, 'Compare latest').click(); await until(() => item.panel.draft.comparison);
+    assert.ok(item.panel.element.querySelector('h4'));
+    item.client.status = async () => { throw { status: 404, code: 'artifact_not_found' }; };
+    button(item.panel, 'Check save').click(); await until(() => item.panel.draft.state === 'erased');
+    assert.equal(item.panel.element.querySelector('h4'), null);
+    assert.equal(item.panel.draft.comparison, null);
+    assert.equal(button(item.panel, 'Download source file').disabled, true);
+    assert.equal(item.panel.draft.text, 'Keep draft'); item.close();
+});
+
+test('raster sources never enter the browser image decoder without a bounded renderer', async () => {
+    for (const type of ['image/png', 'image/jpeg', 'image/gif', 'image/webp']) {
+        const item = await fixture({ type });
+        assert.equal(item.panel.element.querySelectorAll('img,canvas,iframe,object,embed').length, 0);
+        assert.match(item.panel.element.textContent, /Download this image to view it/);
+        assert.equal(button(item.panel, 'Download source file').disabled, false); item.close();
+    }
+});
+
+test('only bounded generated PNG previews enter the browser and the document admits at most two decoders',async()=>{
+    const item=await fixture({type:'image/png'}),{revision}=item.panel.draft;
+    item.panel.dispose();item.panel.element.remove();
+    const content_base64='iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC';
+    const bytes=Uint8Array.from(atob(content_base64), c=>c.charCodeAt(0));
+    item.client.preview=async()=>({source:ref,media_type:'image/png',width:1,height:1,content_base64,sha256:await sha256(bytes)});
+    const panels=[];
+    try {
+        for(let i=0;i<3;i++) {
+            const panel=createArtifactPanel({client:item.client,ref,document:item.dom.window.document});
+            panels.push(panel);item.dom.window.document.body.append(panel.element);await panel.ready;
+        }
+        assert.equal(item.dom.window.document.querySelectorAll('img').length,2);
+        assert.equal(panels[2].element.querySelector('img'),null);
+        assert.match(panels[2].element.textContent,/Close another preview/);
+        panels[0].dispose();button(panels[2],'Show preview').click();await tick();
+        assert.equal(item.dom.window.document.querySelectorAll('img').length,2);
+        assert.equal(panels[2].element.querySelector('img').width,1);
+        assert.equal(panels[2].element.querySelector('img').height,1);
+    } finally {for(const panel of panels)panel.dispose();item.close();}
 });

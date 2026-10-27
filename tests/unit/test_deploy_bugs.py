@@ -22,6 +22,7 @@ from kestrel_sovereign.features.deploy.models import (
     ReadinessStatus,
 )
 from kestrel_sovereign.features.deploy.providers.cloudrun import CloudRunProvider
+from tests.shared.environment_guard import unset_environment
 
 
 # ---------------------------------------------------------------------------
@@ -185,6 +186,17 @@ class TestBug2ReadinessStatusCodes:
 
 class TestBug3TempFileCleanup:
     """Verify temporary credential files are properly cleaned up."""
+
+    @pytest.fixture(autouse=True)
+    def isolate_credential_discovery(self, monkeypatch, tmp_path):
+        """Exercise real setup/cleanup without reading the operator's credentials."""
+        unset_environment(
+            monkeypatch, "GOOGLE_APPLICATION_CREDENTIALS", "GCP_SERVICE_ACCOUNT_KEY"
+        )
+        monkeypatch.setattr(
+            "kestrel_sovereign.features.deploy._gcp_auth._project_local_creds_path",
+            lambda: tmp_path / "missing-service-account.json",
+        )
 
     def test_cleanup_removes_temp_file(self):
         """cleanup() must remove the temp credentials file."""

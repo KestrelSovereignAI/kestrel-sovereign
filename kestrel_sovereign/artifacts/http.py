@@ -8,7 +8,6 @@ Host middleware remains responsible for credential verification and CSRF.
 
 from __future__ import annotations
 
-import asyncio
 import base64
 import binascii
 import math
@@ -27,82 +26,15 @@ from kestrel_sdk.resources import (
 from pydantic import BaseModel, ConfigDict, ValidationError
 from starlette.responses import JSONResponse, Response
 
+from kestrel_sovereign.security.private_delivery import (
+    AuthorizedCapabilityResponse, PRIVATE_RESPONSE_HEADERS,
+)
+
+from .preview import ArtifactPreviewRefused, ArtifactPreviewUnavailable
 from .repository import ArtifactIntegrityError, ArtifactQuotaExceeded
 from .service import ArtifactAccessDenied, ArtifactAction, AuthorizedArtifactService
 
 ContextResolver = Callable[[Request], AbstractAsyncContextManager[OperatorContext]]
-_HEADERS = {
-    "Cache-Control": "private, no-store, max-age=0",
-    "Pragma": "no-cache",
-    "X-Content-Type-Options": "nosniff",
-    "Referrer-Policy": "no-referrer",
-    "Content-Security-Policy": "sandbox; default-src 'none'",
-}
-
-_DELIVERY_KEY = "kestrel.artifact_delivery"
-
-
-class _ArtifactDelivery:
-    """One response's acknowledgement from the host's outer ASGI boundary."""
-
-    def __init__(self):
-        self.check_current = None
-        self.deadline = None
-        self.active = False
-        self.failed = False
-        self.finished = asyncio.Event()
-
-    def begin(self, check, deadline):
-        if self.check_current is not None:
-            raise ArtifactAccessDenied("artifact delivery already bound")
-        self.check_current, self.deadline, self.active = check, deadline, True
-
-    def check(self):
-        if not self.active or self.failed:
-            raise ArtifactAccessDenied("artifact delivery is no longer active")
-        self.check_current()
-
-
-class ArtifactDeliveryMiddleware:
-    """Install outside every buffering middleware on an artifact-serving host.
-
-    BaseHTTPMiddleware forwards messages through task queues. Its inner send
-    is not a delivery acknowledgement. Keep the endpoint's original leases
-    alive until this boundary sends the final body, and run its current-policy
-    checker here before each actual transport handoff. No second lease is
-    acquired on this task, which would deadlock behind a queued policy writer.
-    """
-
-    def __init__(self, app):
-        self.app = app
-
-    async def __call__(self, scope, receive, send):
-        if scope["type"] != "http":
-            await self.app(scope, receive, send)
-            return
-        delivery = _ArtifactDelivery()
-        scope[_DELIVERY_KEY] = delivery
-
-        async def guarded_send(message):
-            if delivery.check_current is None:
-                await send(message)
-                return
-            try:
-                async with asyncio.timeout_at(delivery.deadline):
-                    delivery.check()
-                    await send(message)
-            except BaseException:
-                delivery.failed = True
-                delivery.finished.set()
-                raise
-            if message["type"] == "http.response.body" and not message.get("more_body", False):
-                delivery.finished.set()
-
-        try:
-            await self.app(scope, receive, guarded_send)
-        finally:
-            delivery.active = False
-            delivery.finished.set()
 
 
 class _InvalidRequest(ValueError):
@@ -135,7 +67,7 @@ async def _body(request: Request, limit: int, model):
 def _json(value: Any, status: int = 200) -> JSONResponse:
     if isinstance(value, BaseModel):
         value = value.model_dump(mode="json")
-    return JSONResponse(value, status_code=status, headers=_HEADERS)
+    return JSONResponse(value, status_code=status, headers=PRIVATE_RESPONSE_HEADERS)
 
 
 def _error(error: Exception) -> Response:
@@ -147,6 +79,10 @@ def _error(error: Exception) -> Response:
         status, code = 409, "artifact_conflict"
     elif isinstance(error, ResourceOutcomeUnknown):
         status, code = 503, "artifact_outcome_unknown"
+    elif isinstance(error, ArtifactPreviewUnavailable):
+        status, code = 503, "artifact_preview_unavailable"
+    elif isinstance(error, ArtifactPreviewRefused):
+        status, code = 422, "artifact_preview_refused"
     elif isinstance(error, ArtifactQuotaExceeded):
         status, code = 413, "artifact_quota_exceeded"
     elif isinstance(error, ArtifactIntegrityError):
@@ -158,69 +94,14 @@ def _error(error: Exception) -> Response:
     return _json({"error": {"code": code}}, status)
 
 
-class _AuthorizedResponse(Response):
-    """Keep caller/privacy/grant custody until the final ASGI body is sent."""
-
-    def __init__(self, request, service, resolve_context, action, build, timeout_seconds, prepare=None):
-        super().__init__()
-        self.request, self.service = request, service
-        self.resolve_context, self.action, self.build = resolve_context, action, build
-        self.timeout_seconds = timeout_seconds
-        self.prepare = prepare
-
-    async def __call__(self, scope, receive, send):
-        started = False
-        prepared = False
-        delivery = scope.get(_DELIVERY_KEY)
-        async def guarded_send(message):
-            nonlocal started
-            check()
-            if message["type"] == "http.response.start":
-                started = True
-            await send(message)
-
-        try:
-            if not isinstance(delivery, _ArtifactDelivery):
-                raise ArtifactAccessDenied("artifact transport custody is unavailable")
-            async with asyncio.timeout(self.timeout_seconds) as request_timeout:
-                async with self.resolve_context(self.request) as context:
-                    remaining = (context.expires_at - self.service.authority.clock()).total_seconds()
-                    context_deadline = asyncio.get_running_loop().time() + max(0, remaining)
-                    async with asyncio.timeout(max(0, remaining)):
-                        # Authentication owns the context, but untrusted input
-                        # must not retain a privacy/revocation lease while it
-                        # trickles in. Recheck current policy AFTER parsing.
-                        value = await self.prepare() if self.prepare is not None else None
-                        async with self.service.authority.operation(
-                            context, self.action, self.service.repository.storage_id,
-                            link=value if isinstance(value, ArtifactLink) else None,
-                        ) as check:
-                            response = await self.build(context, value) if self.prepare is not None else await self.build(context)
-                            prepared = True
-                            check()
-                            delivery.begin(check, min(request_timeout.when(), context_deadline))
-                            try:
-                                await response(scope, receive, guarded_send)
-                                await delivery.finished.wait()
-                                delivery.check()
-                            finally:
-                                delivery.active = False
-        except Exception as error:
-            # Headers already sent cannot be replaced by a second response.
-            # Abort a partial transfer; never send private bytes after denial.
-            if started:
-                raise
-            if prepared and self.request.method in {"POST", "DELETE"}:
-                error = ResourceOutcomeUnknown("artifact result requires reconciliation")
-            if isinstance(error, TimeoutError):
-                # A timed-out mutation is never asserted to have rolled back.
-                # Body upload and blocked response sends also have a deadline,
-                # so a slow client cannot retain a revocation gate indefinitely.
-                code = ("artifact_outcome_unknown" if self.request.method in {"POST", "DELETE"}
-                        else "artifact_timeout")
-                await _json({"error": {"code": code}}, 503)(scope, receive, send)
-                return
-            await _error(error)(scope, receive, send)
+def _delivery_error(error: Exception, prepared: bool, request: Request) -> Response:
+    if prepared and request.method in {"POST", "DELETE"}:
+        error = ResourceOutcomeUnknown("artifact result requires reconciliation")
+    if isinstance(error, TimeoutError):
+        code = ("artifact_outcome_unknown" if request.method in {"POST", "DELETE"}
+                else "artifact_timeout")
+        return _json({"error": {"code": code}}, 503)
+    return _error(error)
 
 
 def create_artifact_router(service: AuthorizedArtifactService, *, resolve_context: ContextResolver,
@@ -232,8 +113,20 @@ def create_artifact_router(service: AuthorizedArtifactService, *, resolve_contex
         raise ValueError("artifact HTTP timeout must be positive and finite")
     router = APIRouter(prefix="/api/artifacts", tags=["artifacts"])
 
-    def respond(request, action, build, prepare=None):
-        return _AuthorizedResponse(request, service, resolve_context, action, build, timeout_seconds, prepare)
+    def respond(request, action, build, prepare=None, preview_ref=None):
+        def operation(context, value):
+            if preview_ref is not None:
+                return service.preview_delivery(context, preview_ref())
+            return service.authority.operation(
+                context, action, service.repository.storage_id,
+                link=value if isinstance(value, ArtifactLink) else None,
+            )
+        return AuthorizedCapabilityResponse(
+            request, authority=service.authority, resolve_context=resolve_context,
+            operation=operation, build=build, timeout_seconds=timeout_seconds, prepare=prepare,
+            error_response=lambda error, prepared: _delivery_error(error, prepared, request),
+            access_denied=ArtifactAccessDenied,
+        )
 
     def page_query(request):
         try:
@@ -245,7 +138,7 @@ def create_artifact_router(service: AuthorizedArtifactService, *, resolve_contex
     @router.get("")
     async def list_artifacts(request: Request) -> Response:
         async def build(context):
-            return _json(await service.list(context, **page_query(request)))
+            return _json(await service.list(context, query=request.query_params.get("q", ""), **page_query(request)))
         return respond(request, ArtifactAction.READ, build)
 
     @router.post("/staging")
@@ -311,22 +204,32 @@ def create_artifact_router(service: AuthorizedArtifactService, *, resolve_contex
             # Never let a supplied MIME type turn this origin into an HTML/SVG
             # application. The viewer fetches bytes and chooses safe renderers.
             return Response(content, media_type="application/octet-stream", headers={
-                **_HEADERS, "Content-Disposition": 'attachment; filename="artifact.bin"',
+                **PRIVATE_RESPONSE_HEADERS, "Content-Disposition": 'attachment; filename="artifact.bin"',
             })
         return respond(request, ArtifactAction.READ, build)
+
+    @router.get("/{artifact_id}/revisions/{revision_id}/preview")
+    async def preview(artifact_id: str, revision_id: str, request: Request) -> Response:
+        def reference():
+            return ArtifactRef(artifact_id=artifact_id, revision_id=revision_id)
+        async def build(context):
+            ref = reference()
+            result = await service.preview(context, ref)
+            return _json(result.payload(ref))
+        return respond(request, ArtifactAction.READ, build, preview_ref=reference)
 
     @router.post("/links")
     async def link(request: Request) -> Response:
         async def build(context, value):
             await service.link(context, value)
-            return Response(status_code=204, headers=_HEADERS)
+            return Response(status_code=204, headers=PRIVATE_RESPONSE_HEADERS)
         return respond(request, ArtifactAction.LINK, build, lambda: _body(request, 16384, ArtifactLink))
 
     @router.delete("/links")
     async def unlink(request: Request) -> Response:
         async def build(context, value):
             await service.unlink(context, value)
-            return Response(status_code=204, headers=_HEADERS)
+            return Response(status_code=204, headers=PRIVATE_RESPONSE_HEADERS)
         return respond(request, ArtifactAction.LINK, build, lambda: _body(request, 16384, ArtifactLink))
 
     @router.delete("/{artifact_id}")
@@ -335,7 +238,7 @@ def create_artifact_router(service: AuthorizedArtifactService, *, resolve_contex
             ref = ArtifactRef(artifact_id=artifact_id,
                               revision_id=request.query_params.get("expected_revision_id"))
             await service.delete(context, ref)
-            return Response(status_code=204, headers=_HEADERS)
+            return Response(status_code=204, headers=PRIVATE_RESPONSE_HEADERS)
         return respond(request, ArtifactAction.DELETE, build)
 
     return router

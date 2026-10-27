@@ -257,6 +257,18 @@
       "type": "Architecture Spec"
     },
     {
+      "existing_code_refs": [],
+      "findings": [],
+      "missing_code_refs": [],
+      "missing_links": [],
+      "path": "docs/architecture/EXECUTION_SYNC_HTTP.md",
+      "privacy": "public",
+      "render": "public",
+      "status": "active",
+      "title": "Original Restrictions for Native Synchronous HTTP",
+      "type": "Architecture Spec"
+    },
+    {
       "existing_code_refs": [
         "kestrel_sovereign/data/feature_registry.toml",
         "kestrel_sovereign/features/cli",
@@ -315,6 +327,18 @@
       "render": "public",
       "status": "active",
       "title": "Hosted Isolated Runtime Lifecycle",
+      "type": "Architecture Spec"
+    },
+    {
+      "existing_code_refs": [],
+      "findings": [],
+      "missing_code_refs": [],
+      "missing_links": [],
+      "path": "docs/architecture/HOST_SERVICE_DISCOVERY.md",
+      "privacy": "public",
+      "render": "public",
+      "status": "implementation-candidate",
+      "title": "Retained host service discovery",
       "type": "Architecture Spec"
     },
     {
@@ -733,8 +757,21 @@
       "type": "Architecture Spec"
     },
     {
+      "existing_code_refs": [],
+      "findings": [],
+      "missing_code_refs": [],
+      "missing_links": [],
+      "path": "docs/architecture/VISUAL_COMPUTER_RUNTIME.md",
+      "privacy": "public",
+      "render": "public",
+      "status": "implementation-candidate",
+      "title": "Governed visual computer runtime",
+      "type": "Architecture Spec"
+    },
+    {
       "existing_code_refs": [
         "AGENTS.md",
+        "kestrel_sovereign/artifacts/preview_worker/README.md",
         "pyproject.toml"
       ],
       "findings": [],

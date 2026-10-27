@@ -188,8 +188,9 @@ def test_bootstrap_is_one_shot_and_secret_file_is_private(ipc_dir, monkeypatch):
     _driver, _page, session = controller()
     request = {key: session[key] for key in ("schema_version", "session_id", "scope", "lease_id", "surface", "expires_at")}
     request["required_capabilities"] = ["screenshot"]
-    raw = wire.encode({"schema_version": 1, "secret": SECRET, "request": request, "document_html": "<input>"})
+    raw = wire.encode({"schema_version": 1, "secret": SECRET, "request": request, "document_html": "<input>", "incarnation": "c" * 64, "network_profile": None})
     monkeypatch.setattr(rpc, "DIRECTORY", ipc_dir)
+    (ipc_dir / "incarnation").write_text("c" * 64)
     assert wire.decode(rpc.initialize(raw))["submitted"]
     path = ipc_dir / "bootstrap.json"
     assert path.stat().st_mode & 0o777 == 0o600
@@ -197,7 +198,7 @@ def test_bootstrap_is_one_shot_and_secret_file_is_private(ipc_dir, monkeypatch):
     path.unlink()  # Worker consumes it; a second init still cannot replace custody.
     with pytest.raises(FileExistsError):
         rpc.initialize(raw)
-    for invalid in (b"{}", wire.encode({"schema_version": True, "secret": SECRET, "request": request, "document_html": ""})):
+    for invalid in (b"{}", wire.encode({"schema_version": True, "secret": SECRET, "request": request, "document_html": "", "incarnation": "c" * 64, "network_profile": None})):
         with pytest.raises(worker.Refused):
             worker.bootstrap(wire.decode(invalid))
 
@@ -206,7 +207,7 @@ def test_ipc_byte_budget_includes_worst_case_json_escaping():
     _driver, _page, session = controller()
     request = {key: session[key] for key in ("schema_version", "session_id", "scope", "lease_id", "surface", "expires_at")}
     request["required_capabilities"] = ["screenshot"]
-    initial = {"schema_version": 1, "secret": SECRET, "request": request, "document_html": "\x00" * 65536}
+    initial = {"schema_version": 1, "secret": SECRET, "request": request, "document_html": "\x00" * 65536, "incarnation": "c" * 64, "network_profile": None}
     assert len(wire.encode(worker.bootstrap(initial))) <= wire.MAX_REQUEST
     typed = message("act", {"session": session, "request": {"action": {"kind": "type", "text": "😀" * 16384}}})
     assert len(wire.encode(typed)) <= wire.MAX_REQUEST
@@ -265,3 +266,41 @@ async def test_shared_browser_admission_requires_all_sandboxes(omit):
     else:
         assert (await worker.chromium_evidence(Browser()))["browser_version"] == "synthetic"
     assert page.closed
+
+
+@pytest.mark.asyncio
+async def test_reserved_control_socket_fences_when_all_normal_slots_are_idle(ipc_dir):
+    driver, page, session = controller()
+    normal = worker.Endpoint(driver, SECRET)
+    priority = worker.Endpoint(driver, SECRET, priority=True)
+    path, control_path = ipc_dir / "worker.sock", ipc_dir / "control.sock"
+    async with await asyncio.start_unix_server(normal.handle, str(path), limit=wire.MAX_REQUEST), \
+               await asyncio.start_unix_server(priority.handle, str(control_path), limit=wire.MAX_REQUEST):
+        idle = [await asyncio.open_unix_connection(str(path)) for _ in range(4)]
+        await asyncio.sleep(.01)
+        assert normal.connections == 4
+        request = {"schema_version": 1, "request_id": "takeover", "session_id": session["session_id"],
+                   "expected_control_epoch": 0, "operation": "takeover"}
+        result = await asyncio.wait_for(exchange(control_path, message("control", {"session": session, "request": request})), 1)
+        assert result["result"]["controller"] == "human"
+        assert result["result"]["control_epoch"] == 1
+        assert (await exchange(control_path, message("observe", {"session": session})))["error"] == "priority_operation_required"
+        assert page.effects == []
+        for _, writer in idle:
+            writer.close()
+            await writer.wait_closed()
+        await asyncio.sleep(.01)
+
+
+def test_bootstrap_cannot_cross_a_worker_process_replacement(ipc_dir, monkeypatch):
+    _driver, _page, session = controller()
+    request = {key: session[key] for key in ("schema_version", "session_id", "scope", "lease_id", "surface", "expires_at")}
+    request["required_capabilities"] = ["screenshot"]
+    raw = wire.encode({"schema_version": 1, "secret": SECRET, "request": request,
+                       "document_html": "", "incarnation": "c" * 64, "network_profile": None})
+    monkeypatch.setattr(rpc, "DIRECTORY", ipc_dir)
+    (ipc_dir / "incarnation").write_text("d" * 64)
+    with pytest.raises(ValueError, match="incarnation"):
+        rpc.initialize(raw)
+    assert not (ipc_dir / "initialized").exists()
+    assert not (ipc_dir / "bootstrap.json").exists()

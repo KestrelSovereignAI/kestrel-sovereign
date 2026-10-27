@@ -1,6 +1,6 @@
 [project]
 name = "kestrel_sovereign"
-version = "0.55.3"
+version = "0.56.0"
 description = "Kestrel Sovereign AI Agent Framework - Constitutional AI with cryptographic identity"
 readme = "README.md"
 requires-python = ">=3.11,<3.15"
@@ -127,6 +127,7 @@ dependencies = [
     # present in the 3.13/3.14.0 lines (#2546).
     "aiohttp>=3.14.1",
     "httpx>=0.28.1",
+    "h11>=0.16.0,<1",
     "httpx2>=2.10,<3",
     # >=2.33.0 fixes unsafe .netrc credential handling (#2546).
     "requests>=2.33.0",
@@ -187,8 +188,8 @@ dependencies = [
     # >=0.0.30 fixes quadratic query parsing and unbounded part-header DoS.
     "python-multipart>=0.0.30",
     # Image processing
-    # >=12.2.0 fixes an OOB write and a FITS decompression bomb.
-    "pillow>=12.2.0",
+    # >=13.0.0 fixes decoder memory corruption and image/PDF denial of service.
+    "pillow>=13.0.0",
     # Token counting (lightweight)
     "tiktoken>=0.13.0,<1",
     # BM25 for hybrid search
@@ -389,6 +390,12 @@ kestrel = "kestrel_sovereign.testing.fixtures"
 [project.entry-points."kestrel_sovereign.voice_providers"]
 [project.entry-points."kestrel_sovereign.conversation_providers"]
 [project.entry-points."kestrel_sovereign.storage_providers"]
+
+[project.entry-points."kestrel_sovereign.environment_providers"]
+local-docker-browser = "kestrel_sovereign.visual_computer.docker:environment_provider_factory"
+
+[project.entry-points."kestrel_sovereign.computer_drivers"]
+local-docker-browser = "kestrel_sovereign.visual_computer.docker:computer_driver_factory"
 
 [dependency-groups]
 dev = [

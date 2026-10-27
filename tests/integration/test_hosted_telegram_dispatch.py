@@ -16,6 +16,7 @@ from kestrel_sdk.isolated_feature import (
 )
 
 from kestrel_sovereign.execution_custody import ExecutionAuthorityError
+from tests.shared.original_task_admission import assert_unknown_task_admission
 from kestrel_sovereign.feature_registry import InstalledFeatureRuntime
 from kestrel_sovereign.features.channels.route_ownership import (
     ChannelRouteOwnershipStore,
@@ -723,6 +724,9 @@ async def test_revoked_entry_does_not_export_hosted_arguments_or_poison_proxy(tm
 @pytest.mark.asyncio
 @pytest.mark.parametrize("phase", ["allocation", "publication"])
 async def test_scheduled_task_refusal_is_not_success_shaped_result(tmp_path, monkeypatch, phase):
+    from kestrel_sovereign.execution_custody import (
+        _explicit_control_chain, execution_commit_outcome,
+    )
     from kestrel_sovereign.features.isolated_runtime import (
         SchedulerExecutionContextUnavailable,
     )
@@ -730,26 +734,32 @@ async def test_scheduled_task_refusal_is_not_success_shaped_result(tmp_path, mon
         bind_scheduler_execution_scope,
     )
 
+    refusal = RuntimeError("controlled original task " + phase + " refusal")
+
     class RefusePublication(asyncio.Task):
         refused = False
 
         def add_done_callback(self, callback, *, context=None):
             if getattr(callback, "__name__", "") == "close_unstarted" and not self.refused:
                 self.refused = True
-                raise RuntimeError("controlled original task publication refusal")
+                raise refusal
             return super().add_done_callback(callback, context=context)
 
-    async with sdk_host(tmp_path, monkeypatch, ordinary_authority) as (proxy, services, _, _):
+    retained = None
+    async with sdk_host(
+        tmp_path, monkeypatch, ordinary_authority, expected_denied=phase == "allocation",
+    ) as (proxy, services, _, _):
         loop = asyncio.get_running_loop()
         previous = loop.get_task_factory()
-        observed, attempted = [], False
+        observed, refused, attempted = [], [], False
 
         def factory(loop, coroutine, **kwargs):
             nonlocal attempted
             if not attempted and coroutine.cr_code.co_qualname == "create_owned_task.<locals>.run":
                 attempted = True
                 if phase == "allocation":
-                    raise RuntimeError("controlled original task allocation refusal")
+                    refused.append(coroutine)
+                    raise refusal
                 task = RefusePublication(coroutine, loop=loop, **kwargs)
                 observed.append(task)
                 return task
@@ -758,14 +768,30 @@ async def test_scheduled_task_refusal_is_not_success_shaped_result(tmp_path, mon
 
         loop.set_task_factory(factory)
         try:
-            with bind_scheduler_execution_scope(scheduled_scope()), pytest.raises(SchedulerExecutionContextUnavailable):
+            expected = ExecutionAuthorityError if phase == "allocation" else SchedulerExecutionContextUnavailable
+            with bind_scheduler_execution_scope(scheduled_scope()), pytest.raises(expected) as caught:
                 await proxy.call_isolated_tool("telegram_send", {"to": "555", "message": "controlled"})
+            assert type(caught.value) is expected
+            if phase == "allocation":
+                import inspect
+                assert execution_commit_outcome(caught.value) is None
+                assert refusal not in tuple(_explicit_control_chain(caught.value)), "public frames leaked private ingress refusal"
+                assert len(proxy._host_ingress_admissions) == 1
+                retained = next(iter(proxy._host_ingress_admissions))
+                assert_unknown_task_admission(retained.opening, refusal, admission=retained.admission)
+                assert_unknown_task_admission(retained.native_error, refusal, admission=retained.admission)
+                assert not retained.provider_rpc_started and not retained.scopes
+                assert proxy._host_ingress_public_control.commit_outcome is None
+                assert refused and all(inspect.getcoroutinestate(coro) == inspect.CORO_CLOSED for coro in refused)
             assert attempted
             assert services[0].sends == []
             assert all(task.done() for task in observed)
         finally:
             loop.set_task_factory(previous)
             await asyncio.gather(*observed, return_exceptions=True)
+    if retained is not None:
+        assert retained in proxy._host_ingress_admissions
+        assert_unknown_task_admission(retained.native_error, refusal, admission=retained.admission)
 
 
 @pytest.mark.asyncio

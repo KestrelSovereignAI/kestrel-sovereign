@@ -23,6 +23,7 @@ from tests.integration.test_budget_refund_original_control import registered_cle
 from tests.integration.test_execution_authority_postgres import native_pg as native_pg
 from tests.unit.test_host_context_native_cleanup import _actual_operation
 from tests.integration.test_execution_custody_review56_pg import lose_native_ack
+from tests.shared.original_task_admission import assert_unknown_task_admission
 
 
 @pytest.mark.asyncio
@@ -76,6 +77,7 @@ async def test_monitor_refusal_keeps_bounded_retry_and_same_accepted_owner(
     native_fault = native_fault_context.__enter__()
     native_receipts = None
     native_original = None
+    admission_error = admission_receipt = None
     class RefusedCallback(asyncio.Task):
         def add_done_callback(self, callback, *, context=None):
             target = {"tracker": "completed", "canonical": "close_unstarted"}.get(
@@ -106,7 +108,13 @@ async def test_monitor_refusal_keeps_bounded_retry_and_same_accepted_owner(
         with pytest.raises(RuntimeError) as caught:
             dispatcher._start_runtime_owner_heartbeat()
         loop.set_task_factory(previous)
-        assert caught.value is refusal
+        if mode == "allocation":
+            admission_receipt = assert_unknown_task_admission(caught.value, refusal)
+            admission_error = dispatcher._outcome_log_control_error
+            assert_unknown_task_admission(admission_error, refusal, admission=admission_receipt)
+            assert dispatcher._runtime_owner_heartbeat_task is None
+        else:
+            assert caught.value is refusal
         retry = dispatcher._runtime_owner_heartbeat_timer
         assert retry is not None and not retry.cancelled(), "monitor admission/publication refusal abandoned original owner liveness"
         assert 0 < retry.when() - loop.time() <= dispatcher._runtime_owner_stale_after.total_seconds() / 3
@@ -202,8 +210,19 @@ async def test_monitor_refusal_keeps_bounded_retry_and_same_accepted_owner(
             for coroutine in pair:
                 coroutine.close()
         try:
-            await dispatcher.shutdown_durable_delivery()
-        except BaseException as error:
-            assert native_original is not None and native_original in tuple(_explicit_control_chain(error))
-        await child.llm_service.close()
-        await db.close()
+            try:
+                await dispatcher.shutdown_durable_delivery()
+            except BaseException as error:
+                if mode == "allocation":
+                    if admission_error is not None:
+                        assert admission_error in tuple(_explicit_control_chain(error))
+                    assert_unknown_task_admission(error, refusal, admission=admission_receipt)
+                else:
+                    assert native_original is not None and native_original in tuple(_explicit_control_chain(error))
+            else:
+                assert mode != "allocation", "shutdown erased unresolved original admission"
+        finally:
+            try:
+                await child.llm_service.close()
+            finally:
+                await db.close()

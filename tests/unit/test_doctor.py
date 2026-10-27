@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from contextlib import closing
 from pathlib import Path
 from uuid import uuid4
 
@@ -361,7 +362,7 @@ def _seed_with_anchored_constitution(
     if governed_by_target is _EDGE_MATCHES_ANCHOR:
         governed_by_target = stored_hash
 
-    with sqlite3.connect(str(db_path)) as conn:
+    with closing(sqlite3.connect(str(db_path))) as conn, conn:
         conn.executescript(
             """
             CREATE TABLE graph_nodes (
@@ -1029,7 +1030,7 @@ def test_governed_by_stale_extra_edge_warns_but_passes(tmp_path, monkeypatch):
     stored = _seed_matching_anchor(tmp_path, monkeypatch)
     ancient = hashlib.sha256(b"ancient constitution").hexdigest()
     db_path = tmp_path / "agent_data" / "test" / "kestrel_prime.db"
-    with sqlite3.connect(str(db_path)) as conn:
+    with closing(sqlite3.connect(str(db_path))) as conn, conn:
         conn.execute(
             "INSERT INTO graph_edges(source_id, target_id, label, properties) "
             "VALUES (?, ?, 'governed_by', NULL)",
@@ -1258,7 +1259,7 @@ def _graph_db(
     saw nothing — so the ledgers are part of the schema here, and a test that
     wants an unwitnessed row has to say so.
     """
-    with sqlite3.connect(str(path)) as conn:
+    with closing(sqlite3.connect(str(path))) as conn, conn:
         conn.executescript(_GRAPH_SCHEMA)
         conn.executemany("INSERT INTO graph_nodes VALUES (?, ?, ?, ?)", nodes)
         conn.executemany("INSERT INTO graph_edges VALUES (?, ?, ?, NULL)", edges)
@@ -1405,7 +1406,7 @@ def test_unexpected_sqlite_read_failures_do_not_gain_postgres_provenance(
 
 def _legacy_graph_db(path, *, nodes=(), edges=()):
     """A pre-#2649 database: graph tables, no ownership ledgers."""
-    with sqlite3.connect(str(path)) as conn:
+    with closing(sqlite3.connect(str(path))) as conn, conn:
         conn.executescript(
             """
             CREATE TABLE graph_nodes (
@@ -4029,7 +4030,7 @@ def test_sqlite_doctor_rejects_core_schema_startup_incompatibility(tmp_path):
     parent = tmp_path / "host-data"
     parent.mkdir(mode=0o700)
     database = parent / "host-features.db"
-    with sqlite3.connect(database) as connection:
+    with closing(sqlite3.connect(database)) as connection, connection:
         connection.execute("CREATE TABLE agent_metadata(foo TEXT)")
     if os.name != "nt":
         database.chmod(0o600)
@@ -4059,7 +4060,7 @@ def test_sqlite_doctor_rejects_incompatible_selected_migration_source(tmp_path):
     home = tmp_path / "runtime-home"
     previous = home / "host-data" / "host-features.db"
     previous.parent.mkdir(parents=True, mode=0o700)
-    with sqlite3.connect(previous) as connection:
+    with closing(sqlite3.connect(previous)) as connection, connection:
         connection.execute("CREATE TABLE graph_nodes(wrong TEXT)")
     data_root = tmp_path / "mounted-data"
     (data_root / "host-data").mkdir(parents=True, mode=0o700)
@@ -4095,7 +4096,7 @@ def test_sqlite_doctor_rejects_corrupt_hold_selected_migration_source(tmp_path):
     home = tmp_path / "runtime-home"
     previous = home / "host-data" / "host-features.db"
     previous.parent.mkdir(parents=True, mode=0o700)
-    with sqlite3.connect(previous) as connection:
+    with closing(sqlite3.connect(previous)) as connection, connection:
         connection.execute("CREATE TABLE hold_latches(wrong TEXT)")
     data_root = tmp_path / "mounted-data"
     (data_root / "host-data").mkdir(parents=True, mode=0o700)
@@ -4173,7 +4174,7 @@ def test_sqlite_doctor_rejects_legacy_and_destination_histories(tmp_path):
     legacy = tmp_path / "kestrel_host.db"
     destination.parent.mkdir(parents=True, mode=0o700)
     for path in (legacy, destination):
-        with sqlite3.connect(path) as connection:
+        with closing(sqlite3.connect(path)) as connection, connection:
             connection.execute("CREATE TABLE existing_state (value TEXT)")
         if os.name != "nt":
             path.chmod(0o600)
@@ -4197,7 +4198,7 @@ def test_sqlite_doctor_rejects_live_legacy_migration_source(tmp_path):
 
     home = tmp_path / "runtime-home"
     legacy = tmp_path / "kestrel_host.db"
-    with sqlite3.connect(legacy) as connection:
+    with closing(sqlite3.connect(legacy)) as connection, connection:
         connection.execute("CREATE TABLE existing_state (value TEXT)")
     sidecar = Path(f"{legacy}-wal")
     sidecar.write_bytes(b"possibly live")
@@ -4231,7 +4232,7 @@ def test_sqlite_doctor_rejects_previous_default_and_agent_root_histories(
     previous.parent.mkdir(parents=True, mode=0o700)
     destination.parent.mkdir(parents=True, mode=0o700)
     for path in (previous, destination):
-        with sqlite3.connect(path) as connection:
+        with closing(sqlite3.connect(path)) as connection, connection:
             connection.execute("CREATE TABLE existing_state (value TEXT)")
         if os.name != "nt":
             path.chmod(0o600)
@@ -4270,7 +4271,7 @@ def test_sqlite_doctor_checks_launcher_derived_host_path_migration(
     destination = data_root / "host-data" / "host-features.db"
     previous.parent.mkdir(parents=True, mode=0o700)
     destination.parent.mkdir(parents=True, mode=0o700)
-    with sqlite3.connect(previous) as connection:
+    with closing(sqlite3.connect(previous)) as connection, connection:
         connection.execute("CREATE TABLE existing_state (value TEXT)")
     Path(f"{previous}.hold-initialized-v1").write_text("custody")
     if os.name != "nt":
@@ -4664,7 +4665,7 @@ def test_a_postgres_host_whose_anchor_names_no_agent_is_skipped_not_guessed(
         tmp_path, constitution_text=b"# C\n", stored_hash=None
     )
     db_path = tmp_path / "agent_data" / "test" / "kestrel_prime.db"
-    with sqlite3.connect(db_path) as conn:
+    with closing(sqlite3.connect(db_path)) as conn, conn:
         conn.execute("DELETE FROM graph_nodes")
     fake = _FakePostgres({})
     _postgres_host(monkeypatch, fake)

@@ -19,6 +19,7 @@ from enum import Enum
 from typing import Any, Dict, List, Optional, Tuple
 
 from kestrel_sovereign.audit_time import utc_now_iso
+from kestrel_sovereign.security.access_log import private_capability_tool_name
 from kestrel_sovereign.features.security.args_summary import (
     _MAX_REPAIR_TRIM,
     mask_sensitive,
@@ -1214,6 +1215,8 @@ class PermissionStore:
             user_choice: User's choice if they were asked (once/session/always)
             args_summary: Summary of tool arguments (truncated for privacy)
         """
+        if private_capability_tool_name(tool_name):
+            args_summary = '{"_private_capability": true}'
         async with aiosqlite.connect(self.db_path) as db:
             # Write an explicit canonical UTC ISO-8601 stamp rather than relying
             # on the column's CURRENT_TIMESTAMP default (which is space-separated,

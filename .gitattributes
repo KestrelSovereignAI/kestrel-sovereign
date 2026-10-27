@@ -7,3 +7,6 @@
 tests/interop/a2a_tck/* text eol=lf
 # A unified diff's empty context lines contain a required space prefix.
 tests/interop/a2a_tck/UPSTREAM.patch -whitespace
+
+# Reviewed browser policy digests also survive Windows checkouts.
+/kestrel_sovereign/visual_computer/docker_profile/*.json text eol=lf

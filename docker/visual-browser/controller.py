@@ -73,7 +73,8 @@ class BrowserController:
 
     def __init__(self, page, request: dict, *, driver_id="local-docker-browser",
                  clock=lambda: datetime.now(UTC), monotonic=time.monotonic,
-                 action_limit=4096, frame_ttl_seconds=30):
+                 action_limit=4096, frame_ttl_seconds=30, workspace_enabled=False, network_enabled=False):
+        self.operations = OPERATIONS | ({"files"} if workspace_enabled else set()) | ({"navigate"} if network_enabled else set())
         required = {"schema_version", "session_id", "scope", "lease_id", "surface",
                     "required_capabilities", "expires_at"}
         if not version_one(request) or set(request) != required:
@@ -88,7 +89,7 @@ class BrowserController:
         capabilities = request["required_capabilities"]
         if (request["surface"] != "browser" or not isinstance(capabilities, list)
                 or not all(isinstance(item, str) for item in capabilities)
-                or "screenshot" not in capabilities or not set(capabilities) <= OPERATIONS):
+                or "screenshot" not in capabilities or not set(capabilities) <= self.operations):
             raise Refused("unsupported_capability")
         self.clock, self.monotonic = clock, monotonic
         remaining = (instant(request["expires_at"]) - clock()).total_seconds()
@@ -101,7 +102,7 @@ class BrowserController:
         self._session = {"schema_version": 1, "session_id": identifier(request["session_id"]),
                          "scope": copy.deepcopy(scope), "lease_id": identifier(request["lease_id"]),
                          "driver_id": identifier(driver_id), "surface": "browser",
-                         "capabilities": sorted(OPERATIONS), "state": "ready", "controller": "agent",
+                         "capabilities": sorted(self.operations | {"takeover"}), "state": "ready", "controller": "agent",
                          "control_epoch": 0, "expires_at": request["expires_at"]}
         self._lock = asyncio.Lock()
         self._frame = None
@@ -123,13 +124,17 @@ class BrowserController:
         if not version_one(scope) or scope != self._session["scope"] or session_id != self._session["session_id"]:
             raise Refused("session_unavailable")
 
-    def _bound(self, session, *, agent=False):
+    def _bound_owner(self, session):
         if not version_one(session) or not version_one(session.get("scope")):
             raise Refused("session_unavailable")
         self._owner(session.get("scope"), session.get("session_id"))
         if (session.get("lease_id") != self._session["lease_id"]
-                or session.get("driver_id") != self._session["driver_id"]
-                or type(session.get("control_epoch")) is not int
+                or session.get("driver_id") != self._session["driver_id"]):
+            raise Refused("stale_control")
+
+    def _bound(self, session, *, agent=False):
+        self._bound_owner(session)
+        if (type(session.get("control_epoch")) is not int
                 or session["control_epoch"] != self._session["control_epoch"]):
             raise Refused("stale_control")
         self._live()
@@ -197,6 +202,15 @@ class BrowserController:
         if (kind == "scroll" and set(action) == {"schema_version", "kind", "delta_x", "delta_y"}
                 and all(integer(action[name], -10000, 10000) for name in ("delta_x", "delta_y"))):
             return lambda: self.page.mouse.wheel(action["delta_x"], action["delta_y"])
+        if (kind == "navigate" and "navigate" in self.operations
+                and set(action) == {"schema_version", "kind", "url"}):
+            from kestrel_sdk.computer_use import Navigate
+            from pydantic import ValidationError
+            try:
+                navigation = Navigate.model_validate_json(json.dumps(action))
+            except (ValidationError, ValueError, TypeError):
+                raise Refused("unsupported_action") from None
+            return lambda: self.page.goto(navigation.url, wait_until="domcontentloaded")
         if (kind == "wait" and set(action) == {"schema_version", "kind", "milliseconds"}
                 and integer(action["milliseconds"], 0, 10000)):
             return lambda: asyncio.sleep(action["milliseconds"] / 1000)
@@ -204,44 +218,73 @@ class BrowserController:
 
     async def act(self, session, request):
         async with self._lock:
-            self._bound(session, agent=True)
             fields = {"schema_version", "action_id", "session_id", "observation_id", "control_epoch", "not_after", "action"}
             if not version_one(request) or set(request) != fields:
                 raise Refused("invalid_action")
+            # Authenticate the fixed owner/lease before journaling any input
+            # identity. A stale epoch can then receive an exact negative receipt.
+            if not version_one(session) or not version_one(session.get("scope")):
+                raise Refused("session_unavailable")
+            self._owner(session.get("scope"), session.get("session_id"))
+            if (session.get("lease_id") != self._session["lease_id"]
+                    or session.get("driver_id") != self._session["driver_id"]):
+                raise Refused("session_unavailable")
             action_id = identifier(request["action_id"])
-            if (request["session_id"] != self._session["session_id"] or type(request["control_epoch"]) is not int
-                    or request["control_epoch"] != self._session["control_epoch"]):
+            identifier(request["observation_id"])
+            if (request["session_id"] != self._session["session_id"]
+                    or not integer(request["control_epoch"], 0, 2**63-1)):
                 raise Refused("stale_control")
             request_hash = digest(request)
             previous = self._actions.get(action_id)
             if previous:
+                self._bound(session, agent=True)
+                if request["control_epoch"] != self._session["control_epoch"]:
+                    raise Refused("stale_control")
                 if previous[0] != request_hash:
                     raise Refused("action_conflict")
                 return copy.deepcopy(previous[1])
             if len(self._actions) >= self.action_limit:
                 raise Refused("action_budget_exhausted")
-            if (self._frame is None or request["observation_id"] != self._frame[0]["observation_id"]
-                    or self.monotonic() - self._frame[1] > self.frame_ttl):
-                raise Refused("stale_observation")
-            not_after = instant(request["not_after"])
-            effect = self._effect(request["action"], self._frame[0])
-            is_wait = request["action"]["kind"] == "wait"
-            frame_deadline = self._frame[1] + (not_after - instant(self._frame[0]["observed_at"])).total_seconds()
-            remaining = min((not_after - self.clock()).total_seconds(), frame_deadline - self.monotonic(),
-                            self.deadline - self.monotonic(), 11 if is_wait else 10)
-            if remaining <= 0 or (is_wait and request["action"]["milliseconds"] / 1000 >= remaining):
-                raise Refused("action_expired")
+            try:
+                self._bound(session, agent=True)
+                if request["control_epoch"] != self._session["control_epoch"]:
+                    raise Refused("stale_control")
+                if (self._frame is None or request["observation_id"] != self._frame[0]["observation_id"]
+                        or self.monotonic() - self._frame[1] > self.frame_ttl):
+                    raise Refused("stale_observation")
+                not_after = instant(request["not_after"])
+                effect = self._effect(request["action"], self._frame[0])
+                is_wait = request["action"]["kind"] == "wait"
+                frame_deadline = self._frame[1] + (not_after - instant(self._frame[0]["observed_at"])).total_seconds()
+                remaining = min((not_after - self.clock()).total_seconds(), frame_deadline - self.monotonic(),
+                                self.deadline - self.monotonic(), 11 if is_wait else 10)
+                if remaining <= 0 or (is_wait and request["action"]["milliseconds"] / 1000 >= remaining):
+                    raise Refused("action_expired")
+            except Refused as refusal:
+                # These are THIS controller's synchronous pre-effect checks,
+                # not an inference from generic host/transport exceptions.
+                receipt = {"schema_version": 1, "action_id": action_id,
+                    "session_id": request["session_id"], "observation_id": request["observation_id"],
+                    "control_epoch": request["control_epoch"], "outcome": "denied",
+                    "recorded_at": self.clock().isoformat(), "reason_code": refusal.code}
+                self._actions[action_id] = (request_hash, receipt)
+                raise
             receipt = {"schema_version": 1, "action_id": action_id, "session_id": self._session["session_id"],
                        "observation_id": request["observation_id"], "control_epoch": request["control_epoch"],
                        "outcome": "unknown", "recorded_at": self.clock().isoformat(), "reason_code": "outcome_unknown"}
             self._actions[action_id] = (request_hash, receipt)
             self._frame = None
+            relay = getattr(self, "network", None)
+            if relay is not None:
+                relay.begin(session, request)
             try:
                 # No await separates final input fencing from effect dispatch.
                 self._bound(session, agent=True)
                 async with asyncio.timeout(remaining):
                     await effect()
-                receipt.update(outcome="completed", reason_code=None, recorded_at=self.clock().isoformat())
+                    network_known = await relay.drain(action_id) if relay is not None else True
+                receipt.update(outcome="completed" if network_known else "unknown",
+                               reason_code=None if network_known else "network_outcome_unknown", recorded_at=self.clock().isoformat())
             except asyncio.CancelledError:
                 # Cancelling the Python waiter does not unsend a Chromium input.
                 # Fence synchronously; the worker must physically retire it.
@@ -260,6 +303,13 @@ class BrowserController:
                 else:
                     self._fence_retirement()
                     await self.retire()
+            finally:
+                if relay is not None:
+                    try:
+                        await relay.end(action_id)
+                    except (TimeoutError, ConnectionError, OSError):
+                        self._fence_retirement()
+                        receipt.update(outcome="unknown", reason_code="network_outcome_unknown")
             return copy.deepcopy(receipt)
 
     def action_status(self, session, action_id):
@@ -270,22 +320,35 @@ class BrowserController:
         return copy.deepcopy(previous[1])
 
     async def control(self, session, request):
-        self._bound(session)
+        self._bound_owner(session)
         fields = {"schema_version", "request_id", "session_id", "expected_control_epoch", "operation"}
         if not version_one(request) or set(request) != fields:
             raise Refused("invalid_control")
         request_id = identifier(request["request_id"])
         if (request["session_id"] != self._session["session_id"] or type(request["expected_control_epoch"]) is not int
-                or request["expected_control_epoch"] != self._session["control_epoch"]):
+                or type(session.get("control_epoch")) is not int
+                or request["expected_control_epoch"] != session["control_epoch"]):
             raise Refused("stale_control")
-        if not isinstance(request["operation"], str) or request["operation"] not in {"pause", "resume", "close"}:
+        if not isinstance(request["operation"], str) or request["operation"] not in {"pause", "takeover", "resume", "close"}:
             raise Refused("unsupported_control")
         if self._control_pending:
             raise Refused("control_pending")
+        previous = self._controls.get(request_id)
+        if previous is not None:
+            original, receipt = previous
+            if digest(request) != original:
+                raise Refused("control_conflict")
+            self._live()
+            if receipt is None:
+                raise Refused("control_outcome_unknown")
+            # A factual original reply cannot claim that a later transition
+            # is still paused/closed, nor restore any older input epoch.
+            if receipt != self._session:
+                raise Refused("stale_control")
+            return copy.deepcopy(receipt)
+        self._bound(session)
         if len(self._controls) >= 1024 and request["operation"] == "resume":
             raise Refused("control_budget_exhausted")
-        if request_id in self._controls:
-            raise Refused("control_conflict")
         self._control_pending = True
         try:
             async with self._lock:
@@ -294,14 +357,15 @@ class BrowserController:
                     raise Refused("session_closed")
                 operation = request["operation"]
                 if ((operation == "resume" and self._session["state"] != "paused")
-                        or (operation == "pause" and self._session["state"] != "ready")):
+                        or (operation == "pause" and self._session["state"] != "ready")
+                        or (operation == "takeover" and self._session["state"] not in {"ready", "paused"})):
                     raise Refused("invalid_control_transition")
                 self._session.update(control_epoch=self._session["control_epoch"] + 1,
-                                     state="ready" if operation == "resume" else "paused" if operation == "pause" else "closing",
-                                     controller="agent" if operation == "resume" else "none")
+                                     state="ready" if operation == "resume" else "paused" if operation in {"pause", "takeover"} else "closing",
+                                     controller="agent" if operation == "resume" else "human" if operation == "takeover" else "none")
                 self._frame = None
                 if len(self._controls) < 1024:
-                    self._controls[request_id] = digest(request)
+                    self._controls[request_id] = (digest(request), None)
                 if operation == "close":
                     try:
                         async with asyncio.timeout(5):
@@ -309,6 +373,8 @@ class BrowserController:
                     except Exception:  # noqa: BLE001 — boundary keeps private browser details out of IPC/logs
                         raise Refused("control_outcome_unknown") from None
                     self._session["state"] = "closed"
+                if request_id in self._controls:
+                    self._controls[request_id] = (digest(request), copy.deepcopy(self._session))
                 return copy.deepcopy(self._session)
         finally:
             self._control_pending = False

@@ -165,16 +165,27 @@ async def test_failed_stream_setup_joins_dispatch_gated_original_producer(
         with pytest.raises(RuntimeError) as caught:
             await anext(stream)
         loop.set_task_factory(factory)
-        assert caught.value is refusal
+        if failure == "watcher":
+            assert refusal in _explicit_control_chain(caught.value)
+            assert execution_cleanup_debts(caught.value), (
+                "opaque watcher factory acceptance cannot be certified absent"
+            )
+        else:
+            assert caught.value is refusal
         assert producers
         _, pending = await asyncio.wait(producers, timeout=0.1)
         assert not pending, (
             "original producer stranded at the constructor dispatch barrier"
         )
         assert not path.exists() and not lock.locked()
-        assert not execution_cleanup_debts(caught.value), (
-            "joined constructor reservation was not reconciled"
-        )
+        if failure != "watcher":
+            assert not execution_cleanup_debts(caught.value), (
+                "joined constructor reservation was not reconciled"
+            )
+        else:
+            assert all(task not in producers for _, task in execution_cleanup_debts(caught.value)), (
+                "joined producer was incorrectly relabelled as watcher debt"
+            )
         assert all(
             inspect.getcoroutinestate(coro) == inspect.CORO_CLOSED for coro in refused
         )
@@ -622,7 +633,10 @@ async def test_actual_resident_publisher_closes_both_coroutines_on_task_refusal(
             agent._track_runtime_task(
                 operation, name="native-original-resident-refused"
             )
-        assert propagated.value is failure and len(refused) == 1
+        assert failure in _explicit_control_chain(propagated.value) and len(refused) == 1
+        assert execution_cleanup_debts(propagated.value), (
+            "opaque resident factory acceptance must remain explicit debt"
+        )
         assert inspect.getcoroutinestate(operation) == inspect.CORO_CLOSED, (
             "original unadmitted resident coroutine leaked"
         )

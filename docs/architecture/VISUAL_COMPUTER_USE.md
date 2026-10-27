@@ -7,7 +7,7 @@ tags:
 - docs
 - architecture
 - architecture-spec
-timestamp: '2026-10-19T00:00:00Z'
+timestamp: '2026-10-26T00:00:00Z'
 status: design-of-record
 owner: architecture
 canonical: false
@@ -85,8 +85,13 @@ follow the selected agent and current feature instance, including reloads.
 The repository opens lazily inside the first authorized operation. An unavailable
 or incorrectly keyed artifact store returns an explicit storage failure without
 preventing the agent's other capabilities from starting. Original ciphertext and
-envelope keys are preserved; there is no replacement-key fallback. This HTTP
-service opts out of model subagent dispatch until producer tools are implemented.
+envelope keys are preserved; there is no replacement-key fallback. This feature opts out of model subagent dispatch. Its startup-promoted direct
+`artifact_publish_text`, `artifact_list`, `artifact_get` and
+`artifact_publication_status` tools use the original endpoint caller's revocable
+sovereign-key binding and the same service; a peer, unattended wake or delegated
+subagent gains no artifact grant. Publication takes a caller-selected original
+idempotency key. Successful output parts carry a pinned `ArtifactRef` for the
+shared panel, never a second content URL.
 
 The initial host policy admits only a current, configured sovereign API key in
 `X-API-Key` or `Authorization: Bearer`. Cookie, JWT, peer, unattended and delegated
@@ -107,6 +112,24 @@ offline: stop the host, rotate the same agent database, and restart. Native comm
 expiry or lost delivery requires publication reconciliation, not a failed-save
 claim. Host registration does not by itself complete workspace transfers, producer
 tools, delegated grants or the end-to-end computer-use epic.
+
+### Embedding host migration for Core 0.56
+
+Embedding hosts upgrading from Core 0.54.2–0.55.1 must replace the public
+`ArtifactDeliveryMiddleware` import from `kestrel_sovereign.artifacts.http`
+with `PrivateDeliveryMiddleware` from
+`kestrel_sovereign.security.private_delivery`. The shared middleware now serves
+both artifacts and visual computer responses. Core's standard server installs
+it already; custom ASGI hosts must install it outside response-buffering
+middleware so its final-send acknowledgement reaches the actual transport.
+Keep the authenticated context and original operation lease alive until that
+send completes.
+
+The middleware's internal scope entry changed from `kestrel.artifact_delivery`
+to `kestrel.private_delivery`. Hosts must let the middleware create and manage
+this entry; manually populating either scope key does not establish delivery
+custody. Routers without the current middleware fail closed. There is no legacy
+scope-key fallback.
 
 While enabled, the feature sweeps up to 100 owners' expired staging every minute,
 including owners who never return. Disable/shutdown join the current sweep and
@@ -200,6 +223,39 @@ transfer rather than substituting unrestricted shell/file access.
 
 ## Interaction and resource custody
 
+A host dispatch CAS is not proof that a native worker received input. Core's
+concrete Docker driver can report a private, invocation-bound non-dispatch fact
+only after all its preflight/RPC children physically settle and no application
+stdin write was attempted. The possible-write marker is set before the native
+write, so partial writes, lost replies and cancellation after possible input
+remain unknown. The original live host invocation validates the full normalized
+ActionRequest/session and journals its exact terminal denial; generic driver
+exceptions and copied/retired facts never establish non-dispatch. Original
+cancellation and private-delivery policy still propagate after factual storage.
+
+The local CPython POSIX boundary recognizes only native ENOENT/EACCES/ENOEXEC
+failures whose original constructor records the exact failed child and waitpid
+status. A delivered Process is retained before result publication and physically
+reaped instead. Task-construction failure alone proves neither absence nor
+cleanup: an exact native gated Task accepted by a failing factory is retained
+and joined without admitting its payload. Opaque wrappers, ambiguous native
+registry results and unsupported launch provenance retain uncertainty/debt.
+They cannot produce a no-input receipt. A synchronous admission debt returned
+to a direct caller does not create a new dispatcher-wide authority fence; that
+caller still owns the unresolved debt and must not claim its settlement.
+
+A request refused or cancelled before the acquiring CAS may retire without ever
+acquiring an environment. The same encrypted request row retains immutable
+original request/session IDs, pre-acquisition phase and retirement time. It is
+not a verified physical release and has no fabricated lease. Atomic owner and
+revision checks prevent retirement racing into acquisition, or a stale task
+saving over the tombstone. Only authenticated admitted/quoted phases with no
+lease, connection, session, control or action facts qualify. Acquiring, unknown
+or any legacy possible-effect custody remains live and charged. Release,
+request reconciliation and expired-request maintenance expose these separate
+retirement semantics; exact-ID reopen cannot restore quota or acquire again.
+
+
 Persist the admitted request and accepted quote before acquisition. Quotes bind
 exact constraints, owner, region, pinned image, lifetime and cost ceiling. A
 lease identifies its accepted quote. Unknown acquire outcomes retain the same
@@ -246,13 +302,87 @@ Credential-profile persistence (#3716) is a separate opt-in follow-up.
 
 ## Shared product surface
 
+The console's Artifacts chat-header action opens the shared expandable panel
+on the right. Its library reads current heads from the authenticated service;
+search matches decrypted title, file name and media type in bounded pages with
+query-bound continuation. It creates no plaintext metadata index. Empty search
+pages can have a continuation when more encrypted metadata remains to inspect.
+Uploads and new text drafts use the same immutable publication/receipt state
+machine as edits, and remain unsaved until a verified receipt arrives.
 Artifact cards open the same reusable panel from chat, uploads, tools and
 workflow outputs. Text/Markdown/code editing commits a new immutable revision;
-image/PDF viewing and download use authenticated revision-bound routes. Render
-untrusted content safely; HTML previews need isolation and cannot share host
-credentials/origin. No untrusted artifact script executes in the app origin.
+image/PDF source downloads use authenticated revision-bound routes. Configured
+local previews render the first page/frame inside a pinned Linux Poppler/Pillow
+container. Each process tree shares 512 MiB memory with no swap, half a CPU,
+16 processes and an eight-second independent supervisor deadline. An app-wide
+two-job pool admits source reads before decoding, retains uncertain cleanup
+slots and refuses excess work without queuing. The host receives bounded raw
+RGB and encodes a fresh PNG with stdlib code; the panel admits at most two
+1024-edge/one-megapixel derivatives per document. Original compressed sources
+never enter a browser decoder. The same current READ/privacy lease and
+per-artifact erasure fence cover rendering through the actual final response
+send. Missing or unsupported local sandboxes retain source-download behavior.
+See [renderer installation and bounds](../../kestrel_sovereign/artifacts/preview_worker/README.md).
+HTML previews need isolation and cannot share host credentials/origin.
+No untrusted artifact script executes in the app origin.
 The panel shows dirty, saving, saved, conflict, unknown and failed truthfully.
 A publication receipt is required for saved state.
+
+The artifact workspace broker negotiates only the SDK WorkspaceTransfer
+extension on the exact governed paused session. Host tools and authenticated
+`/api/artifacts/workspaces` routes independently bind `artifacts.transfer`
+plus READ/WRITE and the explicit `visual.transfer` grant from the same original
+caller. Both contexts retain matching tenant/principal/agent and overlapping
+deadlines; neither context promotes the other's grants. The lock order is
+original shared privacy, artifact authority, visual authority/session snapshot,
+then database. The retained visual checker also restricts canonical repository
+guards through COMMIT. No public host path or shell fallback is accepted.
+
+Exports select explicit regular files under at most 32 files, 128 KiB per file
+and 2 MiB total. They stage and publish into the existing ArtifactService,
+with a canonical publication key and a transfer-request digest in provenance.
+Imports verify an exact pinned source revision/manifest and its byte hashes
+before fresh atomic installation. Transfer IDs, workspace IDs and request
+deadlines are explicit before the first attempt; unknown outcomes reconcile
+the same IDs rather than silently replaying or changing targets. A durable
+publication receipt remains recoverable after source computer destruction.
+Retirement uses the already retained session/transport without minting fresh
+data authority, and cleanup status is separate from saved ownership. HTML
+source can be edited as inert text in the shared panel; it never executes or
+renders as a browser document there.
+
+First-party producers require `ArtifactsFeature.artifact_bridge_api_version`
+3. `async with feature.artifact_operation(request=None) as operation` yields
+one typed retained `ArtifactOperation`: `service`, `context`, fixed `expires_at`
+and synchronous `check_current`. Service methods still check each action.
+The checker is valid only inside that original lexical frame and can restrict
+an independently owned consumer transaction immediately before COMMIT.
+`feature.artifact_response(request, build, check_current=original_consumer_check)`
+calls `await build(operation)` and retains original artifact custody plus the
+consumer restriction through the actual final ASGI send. A workflow wrapper
+must separately retain its original independent run resolver through that
+Response's ASGI call. A closed resolver or copied context cannot grant later
+delivery; a run lease never becomes artifact authority. Consumer restrictions
+must synchronously return None or raise. Candidate Core availability is an
+explicit installation gate; consumers never fall back to private feature
+fields or another content store.
+
+Artifact and visual tool payloads also stay out of canonical plaintext
+`a2a_tool_dispatches`, tool-call observability metadata/errors and security
+decision summaries, including NORMAL and PUBLIC privacy modes. Those rows keep
+operational names, decisions, error classes, timing and sizes. This diagnostic
+rule does not replace conversation retention policy, authorize a tool, or
+change the canonical encrypted source and its erasure semantics.
+
+The legacy Workflows artifact metadata family,
+`/api/workflows/runs/{run_id}/artifacts/{artifact_id}`, uses the same public
+diagnostic classifier as artifact/computer routes. Optional automatic tracing
+excludes it before span creation; native access logs and API error logs use
+`/api/workflows/artifact-metadata` without IDs, query values or exception text.
+This includes agent-prefixed and malformed descendant paths, including escaped
+path separators and delimiters. Classification never changes routing, grants
+or stored metadata. Other existing Workflows run, stream and control URLs are
+outside this privacy rule; it is not a claim that every Workflows URL is private.
 
 The computer view exposes session state, active controller, Stop and takeover.
 It links outputs by artifact reference, without embedding lifecycle ownership.
@@ -282,3 +412,51 @@ are exhausted. That session-specific model choice does not replace the general
 repository policy. Record the complete verdict for the exact candidate, fix
 findings, and prove regression guards with failing mutations. Unit tests do
 not claim real provider support or a completed live-agent journey.
+
+### Original native result after turn retirement
+
+The host captures `repository.original_action_result(scope, session, request,
+guard=original_effect_check)` before its one-shot dispatch CAS. It seals one
+existing prepared action row, original full session/request, initialized
+repository/data key, native backing generation, and actual plain relation.
+The CAS binds its exact new encrypted attempt payload before any driver input.
+No SQL transaction, row lock or pool checkout remains held through driver IO.
+
+The result owner exposes only `not_dispatched(original_dispatch_owner,
+exact_native_fact)`. Core constructs the matched denied receipt from its
+admitted immutable snapshot; no caller supplies SQL, a table, a callback,
+replacement IDs or receipt content. The native writer uses the same sealed
+SQLite/PostgreSQL terminal-journal engine as signal outcomes, with a separate
+closed action-table profile. It can update only that existing owner/session/
+action and exact old ciphertext, set its terminal pending projection, verify
+the complete new ciphertext, and commit. It cannot create or resurrect a row,
+change a frame/lease/control epoch, repeat input, or grant reads or delivery.
+Native catalog/postmatch reads are bounded proofs of that one write.
+
+Both host non-entry and concrete native no-stdin refusal require the same
+original dispatch owner. Accepted subprocesses and terminal SQL/COMMIT/reset
+owners are physically joined. The database retains a resource hold until the
+lexical result owner closes; database close joins that hold before retiring
+its original connection/key. Closing from the owner itself or while holding
+its needed transaction refuses. A copied, unissued, closed, foreign-task or
+rebound result owner cannot submit. Partial input, ambiguous transport and
+lost application acknowledgements remain UNKNOWN and retain quota. A lost
+SQL acknowledgement still escapes as its original UNKNOWN even if the host's
+independent proven non-entry can settle the exact denied row.
+
+Global turn retirement remains visible to all ordinary SQL, tools, network and
+private delivery. The existing final-input checker also requires canonical
+execution work on the exact original repository backend. Retirement itself
+therefore fences Docker stdin even before task cancellation arrives. The fixed
+terminal write obtains no new work admission.
+Native schema/program/key/backing changes or a CAS conflict refuse and retain
+original evidence; they never trigger a reload, replacement row, or retry.
+SQLite also retains its conservative external data-generation rule: after a
+foreign native commit, a retired result cannot borrow fresh ordinary work to
+readmit the destination. Native COMMIT uncertainty keeps its original outcome
+and cleanup owners. This first result profile covers agent actions on SDK0.43;
+human input and environment acquisition need separately reviewed profiles.
+
+A never-acquired request whose global turn was cancelled before its retirement
+write remains charged until a fresh genuinely admitted original-owner reconcile
+performs the normal safe-phase CAS. Rebinding the retired turn cannot retire it.

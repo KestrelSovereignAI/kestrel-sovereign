@@ -2349,11 +2349,37 @@ async def test_actual_committed_journal_observation_is_not_a_projection_placehol
         loop.set_task_factory(previous)
     assert execution_commit_outcome(propagated.value) == 'committed'
     assert any(error is carrier for error in _explicit_control_chain(propagated.value))
-    assert execution_native_source_error(propagated.value) is None
-    assert c.dispatcher._outcome_log_control_error is None
+    if callback.endswith('allocation'):
+        from kestrel_sovereign.execution_custody import execution_cleanup_debts
+        assert execution_cleanup_debts(propagated.value)
+        if callback.startswith('inner_'):
+            assert c.dispatcher._outcome_log_control_error is not None
+        else:
+            # Synchronous outer refusal returns its debt to the ORIGINAL
+            # caller; no admitted writer exists to register another owner.
+            assert c.dispatcher._outcome_log_control_error is None
+    else:
+        assert execution_native_source_error(propagated.value) is None
+        assert c.dispatcher._outcome_log_control_error is None
     assert c.dispatcher._log_write_failures == 1
     assert await c.backend.fetch_val('SELECT COUNT(*) FROM signal_log WHERE id=?', (second.id,)) == 0
-    assert (await c.dispatcher.dispatch_signal(_signal('actual.committed.audit'))).action_result is not None
+    if callback == 'inner_allocation':
+        with pytest.raises(BaseException) as repeated:
+            await c.dispatcher.dispatch_signal(_signal('actual.committed.audit'))
+        assert carrier in _explicit_control_chain(repeated.value)
+        with pytest.raises(BaseException) as shutdown:
+            await c.dispatcher.shutdown_durable_delivery()
+        assert execution_cleanup_debts(shutdown.value)
+        assert carrier in _explicit_control_chain(shutdown.value)
+    elif callback == 'outer_allocation':
+        # This direct fixture has no retired execution root. The dispatcher
+        # transfers synchronous outer debt to its original caller, rather
+        # than owning a writer. A fresh call must not erase that old debt.
+        debt = execution_cleanup_debts(propagated.value)
+        assert (await c.dispatcher.dispatch_signal(_signal('actual.committed.audit'))).action_result is not None
+        assert execution_cleanup_debts(propagated.value) == debt
+    else:
+        assert (await c.dispatcher.dispatch_signal(_signal('actual.committed.audit'))).action_result is not None
 
 
 async def test_failed_sqlite_insert_preserves_cancellation_during_successful_rollback(dispatcher_components, monkeypatch):
@@ -2491,18 +2517,50 @@ async def test_unstarted_journal_writer_loss_is_counted_once_without_relabelling
     signal = _signal('unstarted.audit')
     loop.set_task_factory(factory)
     try:
-        result = await c.dispatcher.dispatch_signal(signal)
+        if failure == 'allocation':
+            from kestrel_sovereign.execution_custody import _explicit_control_chain, execution_cleanup_debts
+            with pytest.raises(BaseException) as caught:
+                await c.dispatcher.dispatch_signal(signal)
+            assert original in _explicit_control_chain(caught.value)
+            assert execution_cleanup_debts(caught.value)
+        else:
+            result = await c.dispatcher.dispatch_signal(signal)
     finally:
         loop.set_task_factory(previous)
     assert effects == ['genuine-completed-effect']
     assert c.dispatcher._log_write_failures == 1
-    assert result.status.value == 'ok'
+    if failure != 'allocation':
+        assert result.status.value == 'ok'
     assert all(task.done() for task in accepted)
     assert not c.dispatcher._outcome_log_tasks
     assert c.dispatcher._durable_active_admissions == 0
-    assert c.dispatcher._outcome_log_control_error is None
+    if failure == 'allocation':
+        if writer_method == '_write_outcome_log':
+            assert c.dispatcher._outcome_log_control_error is not None
+            assert original in _explicit_control_chain(c.dispatcher._outcome_log_control_error)
+        else:
+            assert c.dispatcher._outcome_log_control_error is None
+    else:
+        assert c.dispatcher._outcome_log_control_error is None
     assert await c.backend.fetch_val('SELECT COUNT(*) FROM signal_log WHERE id=?', (signal.id,)) == 0
-    assert (await c.dispatcher.dispatch_signal(_signal('unstarted.audit'))).action_result is not None
+    if failure == 'allocation' and writer_method == '_write_outcome_log':
+        # Zero native matches cannot settle an opaque factory's acceptance.
+        # Keep the original completed effect, but do not admit another one.
+        with pytest.raises(BaseException) as repeated:
+            await c.dispatcher.dispatch_signal(_signal('unstarted.audit'))
+        assert original in _explicit_control_chain(repeated.value)
+        assert effects == ['genuine-completed-effect']
+        with pytest.raises(BaseException) as shutdown:
+            await c.dispatcher.shutdown_durable_delivery()
+        assert execution_cleanup_debts(shutdown.value)
+        assert original in _explicit_control_chain(shutdown.value)
+    elif failure == 'allocation':
+        debt = execution_cleanup_debts(caught.value)
+        assert (await c.dispatcher.dispatch_signal(_signal('unstarted.audit'))).action_result is not None
+        assert effects == ['genuine-completed-effect', 'genuine-completed-effect']
+        assert execution_cleanup_debts(caught.value) == debt
+    else:
+        assert (await c.dispatcher.dispatch_signal(_signal('unstarted.audit'))).action_result is not None
 
 
 async def test_sqlite_failed_original_cleanup_does_not_lend_observer_withdrawal_to_close(dispatcher_components, monkeypatch):

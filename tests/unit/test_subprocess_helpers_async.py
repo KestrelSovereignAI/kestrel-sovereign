@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import os
 import sys
 import time
@@ -13,7 +14,7 @@ import pytest
 
 from kestrel_sovereign import _async_process as process_helpers
 from kestrel_sovereign import _bounded_subprocess as bounded_helpers
-from kestrel_sovereign._async_process import start_async_process
+from kestrel_sovereign._async_process import start_async_process, terminate_process_tree
 from kestrel_sovereign._bounded_subprocess import run_bounded_subprocess
 
 
@@ -74,6 +75,38 @@ def _parent_script(
         "print(child.pid, flush=True)\n"
         f"{epilogue}\n"
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX process-group assertion")
+async def test_explicit_stdin_pipe_preserves_private_tree_ownership(tmp_path):
+    payload = b"bounded artifact input\0" * 16_384
+    pid_file = tmp_path / "pipe-child.pid"
+    script = (
+        "import hashlib, pathlib, subprocess, sys, time\n"
+        "value = sys.stdin.buffer.read()\n"
+        "child = subprocess.Popen([sys.executable, '-c', sys.argv[2]])\n"
+        "pathlib.Path(sys.argv[1]).write_text(str(child.pid))\n"
+        "print(hashlib.sha256(value).hexdigest(), flush=True)\n"
+        "time.sleep(60)\n"
+    )
+    process = await start_async_process(
+        [sys.executable, "-c", script, str(pid_file), _descendant_script(ignore_sigterm=True)],
+        stdin=asyncio.subprocess.PIPE,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    try:
+        assert os.getpgid(process.pid) == process.pid
+        process.stdin.write(payload)
+        await process.stdin.drain()
+        process.stdin.close()
+        assert await asyncio.wait_for(process.stdout.readline(), 5) == hashlib.sha256(payload).hexdigest().encode() + b"\n"
+        await _wait_for_file(pid_file)
+    finally:
+        await terminate_process_tree(process, terminate_grace=0.1, reap_timeout=2)
+    assert process.returncode is not None
+    await _assert_pid_gone(int(pid_file.read_text()))
 
 
 @pytest.mark.asyncio

@@ -1,5 +1,6 @@
 """One bounded stdin/stdout exchange. Executed in the exact admitted container."""
 import os
+import hmac
 import socket
 import sys
 
@@ -7,13 +8,13 @@ from wire import DIRECTORY, MAX_REQUEST, MAX_RESPONSE, decode, encode
 from worker import bootstrap
 
 
-def exchange(raw):
+def exchange(raw, *, priority=False):
     if not raw.endswith(b"\n") or len(raw) > MAX_REQUEST:
         raise ValueError("invalid_request")
     decode(raw)
     with socket.socket(socket.AF_UNIX) as connection:
         connection.settimeout(22)
-        connection.connect(str(DIRECTORY / "worker.sock"))
+        connection.connect(str(DIRECTORY / ("control.sock" if priority else "worker.sock")))
         connection.sendall(raw)
         with connection.makefile("rb") as stream:
             response = stream.readline(MAX_RESPONSE + 1)
@@ -28,7 +29,9 @@ def initialize(raw):
     # seeing partial JSON; O_EXCL and one-shot startup prohibit a second session.
     if len(raw) > MAX_REQUEST:
         raise ValueError("invalid_bootstrap")
-    bootstrap(decode(raw))
+    value = bootstrap(decode(raw))
+    if not hmac.compare_digest(value["incarnation"], (DIRECTORY / "incarnation").read_text()):
+        raise ValueError("worker_incarnation_mismatch")
     (DIRECTORY / "initialized").touch(mode=0o600, exist_ok=False)
     path = DIRECTORY / "bootstrap.pending"
     with path.open("xb") as stream:
@@ -43,6 +46,8 @@ if __name__ == "__main__":
         raw = sys.stdin.buffer.read(MAX_REQUEST + 1)
         if sys.argv[1:] == ["initialize"]:
             result = initialize(raw)
+        elif sys.argv[1:] == ["priority"]:
+            result = exchange(raw, priority=True)
         elif not sys.argv[1:]:
             result = exchange(raw)
         else:

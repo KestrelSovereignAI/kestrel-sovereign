@@ -13,7 +13,7 @@ import contextvars
 import math
 from collections.abc import AsyncIterator, Callable
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from functools import wraps
 from typing import Generic, TypeVar, cast
 from weakref import WeakKeyDictionary
@@ -26,6 +26,11 @@ _TASK_ERROR_UNSET = object()
 # timer yields to the SAME native owner without another Task/collector or a
 # hot zero-delay loop; ordinary joins remain completion-driven.
 _OWNED_COMPLETION_RECHECK_SECONDS = 0.01
+_NATIVE_TASK = asyncio.Task
+_NATIVE_CREATE_TASK = asyncio.create_task
+_NATIVE_CREATE_TASK_CODE = asyncio.create_task.__code__
+_NATIVE_LOOP_CREATE_TASK = asyncio.BaseEventLoop.create_task
+_NATIVE_LOOP_CREATE_TASK_CODE = asyncio.BaseEventLoop.create_task.__code__
 
 
 @contextmanager
@@ -91,6 +96,9 @@ class OwnedTaskAdmission:
     then joins or retains that Task rather than treating failure as absence.
     """
     task: asyncio.Task | None = None
+    _acceptance_unknown: bool = field(default=False, repr=False)
+    _reconciled_tasks: tuple[asyncio.Task, ...] = field(default=(), repr=False)
+    _unpublished_wrapper: object = field(default=None, repr=False)
 
 
 def _has_owned_task_metadata(task) -> bool:
@@ -131,12 +139,15 @@ def create_owned_task(operation, *, name=None, context=None, retain_originals=Fa
     closer is explicit unstarted retirement debt, never a successful close.
     An explicit running loop preserves callers' native loop-admission surface;
     a different loop cannot receive ownership of this caller's operation.
+    A custom factory's opaque/ambiguous failure retains explicit acceptance
+    debt; zero exact native matches never certifies that factory's refusal.
     """
     started = False
     private_admission = admission is None
     if admission is None:
         admission = OwnedTaskAdmission()
     gate = None
+    unstarted_closed = False
     async def run():
         nonlocal started
         try:
@@ -165,17 +176,111 @@ def create_owned_task(operation, *, name=None, context=None, retain_originals=Fa
                 raise execution_observation_error(terminal, publication)
             raise
     wrapper = run()
+    def close_unstarted(_task):
+        nonlocal unstarted_closed
+        if not started and not unstarted_closed:
+            unstarted_closed = True
+            close = getattr(operation, "close", None)
+            if callable(close):
+                close()
+
+    def fail_start(task, opening):
+        from kestrel_sovereign.execution_custody import (
+            execution_observation_error, execution_terminal_error,
+        )
+        terminal = execution_terminal_error(opening, retain_originals=retain_originals)
+        try:
+            _retain_owned_admission_error(task, terminal)
+        except BaseException as publication:
+            terminal = execution_observation_error(terminal, publication)
+        finally:
+            try:
+                close_unstarted(task)
+            except BaseException as close_error:
+                terminal = execution_observation_error(terminal, close_error)
+            finally:
+                if not gate.done():
+                    gate.set_result(terminal)
+        return terminal
+
+    creation_attempted = False
+    owner_loop = task_factory = None
     try:
-        if type(admission) is not OwnedTaskAdmission or admission.task is not None:
+        if (type(admission) is not OwnedTaskAdmission or admission.task is not None
+                or admission._acceptance_unknown):
             raise TypeError("owned admission requires a fresh original receipt")
-        gate = asyncio.get_running_loop().create_future()
+        owner_loop = asyncio.get_running_loop()
+        gate = owner_loop.create_future()
+        task_factory = owner_loop.get_task_factory()
         if loop is None:
+            creation_attempted = True
             task = asyncio.create_task(wrapper, name=name, context=context)
         else:
-            if loop is not asyncio.get_running_loop():
+            if loop is not owner_loop:
                 raise RuntimeError("owned operation requires the original running loop")
+            creation_attempted = True
             task = loop.create_task(wrapper, name=name, context=context)
     except BaseException as error:
+        matches, query_error = [], None
+        if creation_attempted:
+            try:
+                # Same-turn native construction reconciliation, never an
+                # orphan scan or a claim from a factory's returned DTO. The
+                # fresh wrapper's gate has not admitted its payload.
+                for candidate in asyncio.all_tasks(owner_loop):
+                    if (isinstance(candidate, _NATIVE_TASK)
+                            and _NATIVE_TASK.get_coro(candidate) is wrapper
+                            and asyncio.Future.get_loop(candidate) is owner_loop):
+                        matches.append(candidate)
+            except BaseException as failure:
+                query_error = failure
+            if query_error is None and len(matches) == 1:
+                task = admission.task = matches[0]
+                try:
+                    task._kestrel_owned_admission = admission
+                    task.add_done_callback(close_unstarted)
+                except BaseException as publication:
+                    from kestrel_sovereign.execution_custody import execution_observation_error
+                    error = execution_observation_error(error, publication)
+                terminal = fail_start(task, error)
+                if private_admission:
+                    return task
+                raise terminal
+            native_constructor = False
+            if query_error is None:
+                try:
+                    native_constructor = (
+                        (loop is not None or (asyncio.create_task is _NATIVE_CREATE_TASK
+                            and _NATIVE_CREATE_TASK.__code__ is _NATIVE_CREATE_TASK_CODE))
+                        and getattr(owner_loop.create_task, "__func__", None) is _NATIVE_LOOP_CREATE_TASK
+                        and _NATIVE_LOOP_CREATE_TASK.__code__ is _NATIVE_LOOP_CREATE_TASK_CODE
+                        and asyncio.tasks.Task is _NATIVE_TASK)
+                except BaseException as failure:
+                    query_error = failure
+            if query_error is not None or matches or task_factory is not None or not native_constructor:
+                # A custom factory may hide an outer-await wrapper. Zero
+                # exact matches cannot certify its nonacceptance. Retain
+                # explicit debt; never pick one of multiple matching Tasks.
+                admission._acceptance_unknown = True
+                admission._reconciled_tasks = tuple(matches)
+                if query_error is not None or matches:
+                    admission._unpublished_wrapper = wrapper
+                else:
+                    wrapper.close()
+                try:
+                    close_unstarted(None)
+                except BaseException as close_error:
+                    from kestrel_sovereign.execution_custody import execution_observation_error
+                    error = execution_observation_error(error, close_error)
+                if not gate.done():
+                    gate.set_result(error)
+                if query_error is not None:
+                    from kestrel_sovereign.execution_custody import execution_observation_error
+                    error = execution_observation_error(error, query_error)
+                raise owned_task_admission_error(
+                    retirement_resource if retirement_resource is not None else admission,
+                    admission, error,
+                )
         wrapper.close()
         close = getattr(operation, "close", None)
         if callable(close):
@@ -193,14 +298,6 @@ def create_owned_task(operation, *, name=None, context=None, retain_originals=Fa
                 isolate_control_originals=True,
             )
         raise
-    unstarted_closed = False
-    def close_unstarted(_task):
-        nonlocal unstarted_closed
-        if not started and not unstarted_closed:
-            unstarted_closed = True
-            close = getattr(operation, "close", None)
-            if callable(close):
-                close()
     admission.task = task
     try:
         task._kestrel_owned_admission = admission
@@ -210,21 +307,7 @@ def create_owned_task(operation, *, name=None, context=None, retain_originals=Fa
             # The payload is still behind its failed gate. Retain this actual
             # source before any later consumer can cancel the Task before its
             # first step and replace the opening with a synthetic cancellation.
-            from kestrel_sovereign.execution_custody import (
-                execution_observation_error, execution_terminal_error,
-            )
-            terminal = execution_terminal_error(opening, retain_originals=retain_originals)
-            try:
-                _retain_owned_admission_error(task, terminal)
-            except BaseException as publication:
-                terminal = execution_observation_error(terminal, publication)
-            finally:
-                try:
-                    close_unstarted(task)
-                except BaseException as close_error:
-                    terminal = execution_observation_error(terminal, close_error)
-                finally:
-                    gate.set_result(terminal)
+            terminal = fail_start(task, opening)
             if private_admission:
                 return task
             raise terminal

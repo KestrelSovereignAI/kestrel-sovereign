@@ -442,6 +442,16 @@ class KeyRotationService:
             "optional": True,
             "require_all": True,
         },
+        {
+            # Visual leases/connections/actions retain the same stable envelope
+            # through offline master-key maintenance as saved artifacts.
+            "table": "visual_computer_keys",
+            "content_column": "wrapped_key",
+            "id_column": "key_id",
+            "agent_id_column": None,
+            "optional": True,
+            "require_all": True,
+        },
     ]
 
     async def _entry_available(self, entry: Dict[str, Any]) -> bool:

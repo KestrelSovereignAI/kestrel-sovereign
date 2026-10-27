@@ -22,6 +22,7 @@ from tests.unit.test_isolated_feature_runtime import (
     _configure_idle_lifecycle,
     _idle_test_runtime,
 )
+from tests.shared.original_task_admission import assert_unknown_task_admission
 
 
 @pytest.mark.asyncio
@@ -120,14 +121,9 @@ async def test_actual_telemetry_publication_does_not_retry_retired_coroutine(
             assert failure is None and accepted and observations
         else:
             assert sources
-            if kind == "native-control":
-                assert failure is sources[0], (
-                    f"telemetry normalized original native admission refusal: {failure!r}"
-                )
-            else:
-                assert failure is None, (
-                    "ordinary advisory refusal must not fail user work"
-                )
+            # Even an ordinary OSError from a substituted constructor leaves
+            # native acceptance unknown. Advisory telemetry cannot erase it.
+            assert_unknown_task_admission(failure, sources[0])
             assert not accepted and not observations
             assert all(
                 inspect.getcoroutinestate(operation) == inspect.CORO_CLOSED

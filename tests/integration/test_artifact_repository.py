@@ -672,3 +672,30 @@ async def test_head_validates_identifier_and_decodes_owner_bound_revision(reposi
                            (second.ref.revision_id, first.ref.artifact_id))
     with pytest.raises(ArtifactIntegrityError, match="head revision is unavailable"):
         await store.head(SCOPE, first.ref.artifact_id)
+
+@pytest.mark.asyncio
+async def test_search_scans_bounded_encrypted_current_metadata_with_query_bound_cursor(repository):
+    store, _ = repository
+    first, _ = await publish(store, key="first", title="Straße budget")
+    await publish(store, key="other", title="Unrelated")
+    newer, _ = await publish(store, key="newer", artifact=first.ref, title="Revised title")
+    page = await store.page(SCOPE, query="STRASSE", limit=1)
+    assert not page.items  # Old titles do not select the current head.
+    assert page.next_cursor
+    with pytest.raises(ValueError, match="cursor"):
+        await store.page(SCOPE, query="revised", cursor=page.next_cursor, limit=1)
+    matches = []
+    cursor = None
+    while True:
+        page = await store.page(SCOPE, query="REPORT.MD", cursor=cursor, limit=1)
+        matches.extend(page.items)
+        cursor = page.next_cursor
+        if not cursor:
+            break
+    assert len(matches) == 2 and newer.ref in [item.ref for item in matches]
+    other = ResourceScope(tenant_id="other", principal_id="person", agent_id="agent")
+    assert not (await store.page(other, query="report.md")).items
+    raw = await store.db.fetchall("SELECT payload FROM artifact_revisions")
+    assert all(b"Revised title" not in row[0] for row in raw)
+    with pytest.raises(ValueError, match="200"):
+        await store.page(SCOPE, query="x" * 201)

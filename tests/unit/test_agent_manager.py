@@ -11733,9 +11733,12 @@ class TestLoadFromConfig:
         future_agent = _make_mock_agent("did:future")
         mock_agent_cls.return_value = future_agent
         manager = AgentManager(base_data_dir=tmp_path)
+        from kestrel_sovereign.operator import OperatorRuntimeRegistry
+        services = OperatorRuntimeRegistry()
         registry = object()
         publication_gate = asyncio.Event()
         manager.bind_host_context_clause_registry(registry)
+        manager.bind_host_service_resolver(services)
         manager.set_host_context_publication_gate(publication_gate)
 
         async def initialize_with_gate_bound():
@@ -11759,6 +11762,7 @@ class TestLoadFromConfig:
             mock_agent_cls.call_args.kwargs["host_context_clause_registry"]
             is registry
         )
+        assert mock_agent_cls.call_args.kwargs["host_service_resolver"] is services
         assert future_agent._host_context_publication_gate is publication_gate
         future_agent.defer_agent_readiness_to_host.assert_called_once_with()
 
@@ -11778,6 +11782,8 @@ class TestLoadFromConfig:
     ):
         """An unregistered ready-hook turn observes the published host policy."""
 
+        from kestrel_sovereign.operator import OperatorRuntimeRegistry
+        old_services, current_services = OperatorRuntimeRegistry(), OperatorRuntimeRegistry()
         old_registry = object()
         current_registry = object()
         publication_gate = asyncio.Event()
@@ -11790,12 +11796,20 @@ class TestLoadFromConfig:
                 self._lock_manager = OrderedLockManager()
                 self._host_context_clause_registry = old_registry
                 self.observed_registry = None
+                self.observed_services = None
+                self.services = old_services
 
             def validate_host_context_clause_registry(self, registry):
                 return None
 
             def bind_host_context_clause_registry(self, registry):
                 self._host_context_clause_registry = registry
+
+            def validate_host_service_resolver(self, resolver):
+                pass
+
+            def bind_host_service_resolver(self, resolver):
+                self.services = resolver
 
             def defer_agent_readiness_to_host(self):
                 self.readiness_owned_by_host = True
@@ -11804,6 +11818,7 @@ class TestLoadFromConfig:
                 initialize_started.set()
                 async with self._turn_lifecycle():
                     self.observed_registry = self._host_context_clause_registry
+                    self.observed_services = self.services
 
             async def shutdown(self):
                 return None
@@ -11813,6 +11828,7 @@ class TestLoadFromConfig:
         mock_get_did.return_value = agent.did
         manager = AgentManager(base_data_dir=tmp_path)
         manager.bind_host_context_clause_registry(old_registry)
+        manager.bind_host_service_resolver(old_services)
         manager.set_host_context_publication_gate(publication_gate)
 
         with patch.object(LocalAgentConfig, "validate_runtime", return_value=[]):
@@ -11829,12 +11845,14 @@ class TestLoadFromConfig:
             # Host publication misses ``_agents`` but advances the shared state
             # before releasing every ready-hook turn waiting on the same gate.
             manager.bind_host_context_clause_registry(current_registry)
+            manager.bind_host_service_resolver(current_services)
             publication_gate.set()
             initialized = await asyncio.wait_for(initialize_task, timeout=1)
 
         assert initialized is agent
         assert agent.observed_registry is current_registry
-        assert agent._host_context_publication_generation == 2
+        assert agent.observed_services is current_services
+        assert agent._host_context_publication_generation == 4
         assert manager.list_agents() == {}
 
     @pytest.mark.asyncio

@@ -797,11 +797,12 @@ class OllamaAdapter(LLMAdapter):
                     # Return as JSON string for consistency with other adapters
                     content = validated.model_dump_json()
                 except (json.JSONDecodeError, ValueError) as e:
-                    logger.warning(f"Ollama structured output validation failed: {e}")
+                    # Validation errors include the rejected provider content.
+                    logger.warning("Ollama structured output validation failed: %s", type(e).__name__)
                 except Exception as e:
                     if is_execution_control_error(e):
                         raise
-                    logger.error(f"Unexpected error during Ollama structured output validation: {e}", exc_info=True)
+                    logger.error("Unexpected Ollama structured output validation failure: %s", type(e).__name__)
                     # Return raw content if validation fails
 
             # Parse tool calls if present (Ollama returns them in message.tool_calls)
@@ -855,10 +856,10 @@ class OllamaAdapter(LLMAdapter):
         except OutputCapReachedError:
             raise
         except ollama.ResponseError as e:
-            logger.error(f"Ollama API error: {e}")
+            logger.error("Ollama API error: %s", type(e).__name__)
             raise
         except Exception as e:
-            logger.error(f"Ollama adapter failed: {e}", exc_info=True)
+            logger.error("Ollama adapter failed: %s", type(e).__name__)
             raise
 
     async def _stream_with_usage(
@@ -998,11 +999,11 @@ class OllamaAdapter(LLMAdapter):
                     response_format.model_validate_json(response_accum)
                     logger.info("Ollama streaming structured output validated successfully")
                 except (json.JSONDecodeError, ValueError) as e:
-                    logger.warning(f"Ollama streaming structured output validation failed: {e}")
+                    logger.warning("Ollama streaming structured output validation failed: %s", type(e).__name__)
                 except Exception as e:
                     if is_execution_control_error(e):
                         raise
-                    logger.error(f"Unexpected error during Ollama streaming structured output validation: {e}", exc_info=True)
+                    logger.error("Unexpected Ollama streaming structured output validation failure: %s", type(e).__name__)
 
             total_tokens = None
             if input_tokens is not None and output_tokens is not None:
@@ -1018,12 +1019,12 @@ class OllamaAdapter(LLMAdapter):
         except OutputCapReachedError:
             raise
         except ollama.ResponseError as e:
-            logger.error(f"Ollama streaming API error: {e}")
+            logger.error("Ollama streaming API error: %s", type(e).__name__)
             raise
         except Exception as e:
             if is_execution_control_error(e):
                 raise
-            logger.error(f"Ollama streaming failed: {e}", exc_info=True)
+            logger.error("Ollama streaming failed: %s", type(e).__name__)
             raise
 
     async def get_streaming_response(
@@ -1157,12 +1158,12 @@ class OllamaAdapter(LLMAdapter):
         except OutputCapReachedError:
             raise
         except ollama.ResponseError as e:
-            logger.error(f"Ollama streaming with tools API error: {e}")
+            logger.error("Ollama streaming with tools API error: %s", type(e).__name__)
             raise
         except Exception as e:
             if is_execution_control_error(e):
                 raise
-            logger.error(f"Ollama streaming with tools failed: {e}", exc_info=True)
+            logger.error("Ollama streaming with tools failed: %s", type(e).__name__)
             raise
 
     async def continue_with_tool_results(
@@ -1361,9 +1362,6 @@ class OllamaAdapter(LLMAdapter):
                 if "embed" in lower_name or "nomic" in lower_name or "minilm" in lower_name:
                     category = ModelCategory.EMBEDDING
 
-                # Detect vision support
-                supports_vision = any(v in lower_name for v in ["vision", "llava", "llama3.2"])
-
                 try:
                     show_info = await client.show(model_name)
                 except Exception as e:  # noqa: BLE001 - per-model metadata is best-effort
@@ -1374,6 +1372,11 @@ class OllamaAdapter(LLMAdapter):
                 if show_info is not None and self._is_decision_only(show_info):
                     logger.debug(f"Skipping decision-only model {model_name} in chat listing")
                     continue
+
+                # Concrete daemon metadata is authoritative. A name can both
+                # miss a vision model (gemma4/qwen-vl) and falsely admit a blind
+                # one (llama3.2 text models). Missing metadata grants no vision.
+                supports_vision = "vision" in (_show_field(show_info, "capabilities") or []) if show_info is not None else False
 
                 # Detect tool support from the same /api/show metadata
                 supports_tools = (

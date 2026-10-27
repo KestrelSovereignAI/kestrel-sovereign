@@ -97,14 +97,15 @@ async def test_cancelled_accepted_effect_remains_unknown_without_replay():
 
 
 @pytest.mark.asyncio
-async def test_pending_pause_fences_queued_input_and_drains_accepted_effect():
+@pytest.mark.parametrize("operation", ["pause", "takeover"])
+async def test_pending_pause_fences_queued_input_and_drains_accepted_effect(operation):
     driver, page, session = controller()
     request = await action(driver, session)
     page.gate = asyncio.Event()
     active = asyncio.create_task(driver.act(session, request))
     await page.entered.wait()
     queued = asyncio.create_task(driver.act(session, {**request, "action_id": "queued"}))
-    pause = asyncio.create_task(driver.control(session, control(session, "pause")))
+    pause = asyncio.create_task(driver.control(session, control(session, operation)))
     await asyncio.sleep(0)
     page.gate.set()
     assert (await active)["outcome"] == "completed"
@@ -112,6 +113,7 @@ async def test_pending_pause_fences_queued_input_and_drains_accepted_effect():
         await queued
     paused = await pause
     assert paused["state"] == "paused" and paused["control_epoch"] == 1
+    assert paused["controller"] == ("human" if operation == "takeover" else "none")
     assert len(page.effects) == 1
     with pytest.raises(Refused, match="stale_control"):
         await driver.observe(session)
@@ -156,17 +158,22 @@ async def test_stale_expired_or_unsupported_input_has_no_effect(change, reason):
     with pytest.raises(Refused, match=reason):
         await driver.act(session, {**request, **change})
     assert page.effects == []
+    if "session_id" not in change:
+        receipt = driver.action_status(session, "input")
+        assert receipt["outcome"] == "denied" and receipt["reason_code"] == reason
+        assert receipt["control_epoch"] == change.get("control_epoch", request["control_epoch"])
+        assert receipt["observation_id"] == change.get("observation_id", request["observation_id"])
 
 
 @pytest.mark.asyncio
 async def test_owner_epoch_frame_age_and_receipt_budget_are_enforced():
     elapsed = [0]
-    driver, page, session = controller(monotonic=lambda: elapsed[0], action_limit=1)
+    driver, page, session = controller(monotonic=lambda: elapsed[0], action_limit=2)
     request = await action(driver, session)
     elapsed[0] = 31
     with pytest.raises(Refused, match="stale_observation"):
         await driver.act(session, request)
-    request = await action(driver, session)
+    request = await action(driver, session, action_id="after-negative-receipt")
     await driver.act(session, request)
     next_request = await action(driver, session, action_id="next")
     with pytest.raises(Refused, match="action_budget_exhausted"):
@@ -194,6 +201,7 @@ async def test_boolean_versions_and_clock_rollback_cannot_extend_input_authority
         await driver.act(session, {**request, "schema_version": True})
     with pytest.raises(Refused, match="invalid_action"):
         await driver.act(session, {**request, "action": {**request["action"], "schema_version": True}})
+    request = {**request, "action_id": "clock-expired"}
     elapsed[0] = 6
     now[0] -= timedelta(hours=1)
     with pytest.raises(Refused, match="action_expired"):
@@ -220,6 +228,81 @@ async def test_exhausting_control_budget_preserves_pause_and_close():
     closed = await driver.control(paused, control(paused, "close", "safety-close"))
     assert closed["state"] == "closed" and page.closed
     assert len(driver._controls) <= 1024
+
+
+@pytest.mark.parametrize("operation", ["pause", "takeover", "resume", "close"])
+async def test_lost_original_control_reply_reconciles_without_reapplying(operation):
+    driver, page, session = controller()
+    if operation == "resume":
+        session = await driver.control(session, control(session, "takeover", "takeover"))
+    request = control(session, operation, "lost-original")
+    applied = await driver.control(session, request)
+    assert await driver.control(session, request) == applied
+    assert driver.status(session["scope"], session["session_id"]) == applied
+    assert applied["control_epoch"] == session["control_epoch"] + 1
+    assert page.closed is (operation == "close")
+    with pytest.raises(Refused):
+        await driver.control(session, {**request, "request_id": "new-stale"})
+    with pytest.raises(Refused, match="control_conflict"):
+        await driver.control(session, {**request, "operation": "pause" if operation != "pause" else "takeover"})
+
+
+@pytest.mark.parametrize("field,value", [
+    ("lease_id", "other"), ("driver_id", "other"),
+    ("scope", {"schema_version": 1, "tenant_id": "tenant", "principal_id": "other", "agent_id": "agent"}),
+])
+async def test_original_control_receipt_still_requires_exact_owner_and_lease(field, value):
+    driver, page, session = controller()
+    request = control(session, "pause", "lost-original")
+    applied = await driver.control(session, request)
+    with pytest.raises(Refused):
+        await driver.control({**session, field: value}, request)
+    assert driver.status(session["scope"], session["session_id"]) == applied
+    assert not page.effects
+
+
+async def test_old_control_receipt_cannot_report_a_later_session_as_paused():
+    driver, page, session = controller()
+    request = control(session, "pause", "lost-original")
+    paused = await driver.control(session, request)
+    resumed = await driver.control(paused, control(paused, "resume", "new-resume"))
+    with pytest.raises(Refused, match="stale_control"):
+        await driver.control(session, request)
+    assert driver.status(session["scope"], session["session_id"]) == resumed
+    assert resumed["state"] == "ready" and resumed["control_epoch"] == 2
+
+
+async def test_original_control_receipt_does_not_restore_expired_authority():
+    driver, page, session = controller()
+    request = control(session, "pause", "lost-original")
+    await driver.control(session, request)
+    driver.deadline = 0
+    with pytest.raises(Refused, match="session_expired"):
+        await driver.control(session, request)
+    assert driver.status(session["scope"], session["session_id"])["state"] == "closing"
+
+
+async def test_failed_original_close_does_not_become_a_success_receipt_or_second_close():
+    driver, page, session = controller()
+    calls = []
+    original_close = page.close
+
+    async def close():
+        calls.append(True)
+        await original_close()
+
+    page.close = close
+    page.fail_close = True
+    request = control(session, "close", "lost-original")
+    with pytest.raises(Refused, match="control_outcome_unknown"):
+        await driver.control(session, request)
+    page.fail_close = False
+    with pytest.raises(Refused, match="control_outcome_unknown"):
+        await driver.control(session, request)
+    assert calls == [True] and not page.closed
+    current = driver.status(session["scope"], session["session_id"])
+    closed = await driver.control(current, control(current, "close", "explicit-close"))
+    assert closed["state"] == "closed" and page.closed and calls == [True, True]
 
 
 @pytest.mark.asyncio

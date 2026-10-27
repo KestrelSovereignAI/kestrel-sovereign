@@ -226,7 +226,13 @@ async def test_public_admission_keeps_exact_native_task_across_publication_failu
         loop.set_task_factory(factory)
         with pytest.raises(RuntimeError) as caught:
             public.create_owned_task(operation, admission=receipt, retain_originals=True)
-        assert caught.value is refusal
+        if failure == "allocation":
+            from kestrel_sovereign.execution_custody import _explicit_control_chain, execution_cleanup_debts
+            assert refusal in _explicit_control_chain(caught.value)
+            assert receipt._acceptance_unknown
+            assert execution_cleanup_debts(caught.value)
+        else:
+            assert caught.value is refusal
     finally:
         loop.set_task_factory(previous_factory)
         primary = sys.exception()

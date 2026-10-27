@@ -3,15 +3,49 @@
 import asyncio
 import base64
 import hashlib
+import ipaddress
 import json
+import re
 import signal
 import socket
+import sys
 
-from playwright.async_api import async_playwright
 from sandbox_checks import chromium_evidence, process_evidence
 
 
-async def probe():
+def refuse_owned_peers(fixture):
+    if (not isinstance(fixture, dict) or set(fixture) != {"proof_id", "server_id", "network_id", "targets"}
+            or not re.fullmatch(r"[a-f0-9]{32}", fixture["proof_id"])
+            or any(not re.fullmatch(r"[a-f0-9]{64}", fixture[key]) for key in ("server_id", "network_id"))
+            or not isinstance(fixture["targets"], list) or len(fixture["targets"]) != 2):
+        raise RuntimeError("exact owned network fixture is required")
+    targets = fixture["targets"]
+    refused = []
+    # Validate every supplied fact before touching any data-plane destination.
+    for target, family in zip(targets, (4, 6), strict=True):
+        if (not isinstance(target, dict) or set(target) != {"family", "host", "port"}
+                or target["family"] != f"ipv{family}" or type(target["port"]) is not int
+                or not 1 <= target["port"] <= 65535):
+            raise RuntimeError("owned peer endpoint differs")
+        address = ipaddress.ip_address(target["host"])
+        if (address.version != family or not address.is_private or address.is_loopback
+                or address.is_link_local or address.is_multicast or address.is_unspecified):
+            raise RuntimeError("owned peer must have an explicit private fixture address")
+    for target in targets:
+        family = socket.AF_INET if target["family"] == "ipv4" else socket.AF_INET6
+        with socket.socket(family) as connection:
+            connection.settimeout(.2)
+            try:
+                connection.connect((target["host"], target["port"]))
+            except OSError:
+                refused.append({**target, "refused":True})
+            else:
+                raise RuntimeError("offline container unexpectedly reached an owned peer")
+    return {"network_fixture":fixture, "refused_peers":refused}
+
+
+async def probe(fixture):
+    from playwright.async_api import async_playwright
     evidence = process_evidence()
     async with async_playwright() as playwright:
         browser = await playwright.chromium.launch(
@@ -32,18 +66,9 @@ async def probe():
             if result != "Persistent local browser draft":
                 raise RuntimeError("browser actions did not preserve fixture state")
             png = await page.screenshot()
-            refused = []
-            for address in ("1.1.1.1", "169.254.169.254"):
-                try:
-                    connection = socket.create_connection((address, 443), timeout=1)
-                except OSError:
-                    refused.append(address)
-                else:
-                    connection.close()
-                    raise RuntimeError("offline container unexpectedly reached a network destination")
             return {
                 **evidence,
-                "fixture_result": result, "refused_destinations": refused,
+                "fixture_result": result, **refuse_owned_peers(fixture),
                 "png_sha256": hashlib.sha256(png).hexdigest(),
                 "png_base64": base64.b64encode(png).decode(),
             }
@@ -55,4 +80,9 @@ if __name__ == "__main__":
     # Even a lost host controller cannot leave this probe's browser running.
     # This is an OS process deadline, separate from the async operation timeout.
     signal.alarm(90)
-    print(json.dumps(asyncio.run(asyncio.wait_for(probe(), timeout=60))))
+    if len(sys.argv) == 3 and sys.argv[1] == "--network-only":
+        print(json.dumps(refuse_owned_peers(json.loads(sys.argv[2]))))
+    elif len(sys.argv) == 2:
+        print(json.dumps(asyncio.run(asyncio.wait_for(probe(json.loads(sys.argv[1])), timeout=60))))
+    else:
+        raise RuntimeError("an exact owned network fixture argument is required")

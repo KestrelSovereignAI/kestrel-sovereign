@@ -10,7 +10,8 @@ import pytest_asyncio
 from fastapi import FastAPI
 from kestrel_sdk.operator import OperatorAuthorizationError
 
-from kestrel_sovereign.artifacts.http import ArtifactDeliveryMiddleware, create_artifact_router
+from kestrel_sovereign.artifacts.http import create_artifact_router
+from kestrel_sovereign.security.private_delivery import PrivateDeliveryMiddleware
 from tests.integration.test_artifact_repository import repository as _repository_fixture
 from tests.integration.test_artifact_service import access as _access_fixture
 
@@ -29,7 +30,7 @@ async def api(access):
         with access.bind(context):
             yield context
     app = FastAPI()
-    app.add_middleware(ArtifactDeliveryMiddleware)
+    app.add_middleware(PrivateDeliveryMiddleware)
     app.include_router(create_artifact_router(access.service, resolve_context=resolve))
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
         yield client, app
@@ -181,7 +182,7 @@ async def test_slow_upload_has_deadline_and_releases_authority(access):
         with access.bind(access.context()) as context:
             yield context
     app = FastAPI()
-    app.add_middleware(ArtifactDeliveryMiddleware)
+    app.add_middleware(PrivateDeliveryMiddleware)
     app.include_router(create_artifact_router(access.service, resolve_context=resolve, timeout_seconds=0.05))
     entered = asyncio.Event()
 
@@ -382,7 +383,7 @@ async def test_blocked_outer_send_obeys_deadline_and_releases_original_leases(ac
     @app.middleware("http")
     async def buffering(request, call_next):
         return await call_next(request)
-    app.add_middleware(ArtifactDeliveryMiddleware)
+    app.add_middleware(PrivateDeliveryMiddleware)
     app.include_router(create_artifact_router(access.service, resolve_context=resolve, timeout_seconds=0.05))
     entered, cancelled = asyncio.Event(), asyncio.Event()
     bodies = []

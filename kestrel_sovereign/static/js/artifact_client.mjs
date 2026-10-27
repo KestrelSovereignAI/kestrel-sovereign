@@ -2,8 +2,10 @@
 
 const TOKEN = /^[A-Za-z0-9](?:[A-Za-z0-9._:@-]{0,254}[A-Za-z0-9])?$/;
 const MAX_VIEW_BYTES = 16 * 1024 * 1024;
+export const MAX_PREVIEW_PIXELS = 1024 * 1024;
+const PREVIEW_TYPES = new Set(['application/pdf', 'image/png', 'image/jpeg', 'image/webp', 'image/gif']);
 export const MAX_EDIT_BYTES = 1024 * 1024;
-const EDIT_TYPES = new Set(['text/plain', 'text/markdown', 'text/x-python', 'text/javascript',
+const EDIT_TYPES = new Set(['text/plain', 'text/markdown', 'text/html', 'text/x-python', 'text/javascript',
     'text/css', 'application/json', 'application/javascript', 'application/xml', 'text/xml']);
 
 function token(value) {
@@ -62,9 +64,11 @@ export async function createArtifactClient(api, ownerAgent = api.getHostAgent())
     const bound = await api.bindAgentRequests(ownerAgent);
     const json = (path, body, signal) => bound.request(path, { method: 'POST', body: JSON.stringify(body), signal, cache: 'no-store' });
     return Object.freeze({
+        list: (query = '', cursor = null, signal) => bound.request(`/api/artifacts?limit=50&q=${encodeURIComponent(query)}${cursor ? `&cursor=${encodeURIComponent(cursor)}` : ''}`, { signal, cache: 'no-store' }),
         get: (ref, signal) => bound.request(revisionPath(ref), { signal, cache: 'no-store' }),
         head: (id, signal) => bound.request(`/api/artifacts/${encodeURIComponent(token(id))}/head`, { signal, cache: 'no-store' }),
         read: (ref, path, signal) => bound.readBytes(`${revisionPath(ref)}/file?path=${encodeURIComponent(path)}`, { signal, cache: 'no-store' }),
+        preview: (ref, signal) => bound.request(`${revisionPath(ref)}/preview`, { signal, cache: 'no-store' }),
         history: (id, cursor = null, signal) => bound.request(`/api/artifacts/${encodeURIComponent(token(id))}/history?limit=50${cursor ? `&cursor=${encodeURIComponent(cursor)}` : ''}`, { signal, cache: 'no-store' }),
         stage: (key, file, bytes, signal) => json('/api/artifacts/staging', {
             publication_key: key, path: file.path, media_type: file.media_type, content_base64: base64(bytes),
@@ -77,18 +81,26 @@ export async function createArtifactClient(api, ownerAgent = api.getHostAgent())
 export class ArtifactDraft {
     #client; #changed; #pending = null; #closed = false; #abort = new AbortController();
     #revision = null; #file = null; #bytes = null; #text = ''; #state = 'loading';
-    #editable = false; #comparison = null; #opened = false; #lineEnding = '\n';
+    #editable = false; #comparison = null; #opened = false; #lineEnding = '\n'; #newTitle = null; #preview = null; #previewState = 'unavailable';
     constructor(client, changed = () => {}) { this.#client = client; this.#changed = changed; }
     get state() { return this.#state; }
     get revision() { return this.#revision; }
+    get title() { return this.#revision?.title ?? this.#newTitle; }
     get file() { return this.#file; }
     get bytes() { return this.#bytes; }
     get text() { return this.#text; }
+    get preview() { return this.#preview; }
+    get previewState() { return this.#previewState; }
     get editable() { return this.#editable; }
     get pendingKey() { return this.#pending?.request.idempotency_key ?? null; }
     get comparison() { return this.#comparison; }
-    get hasUnsavedChanges() { return !!this.#revision && ['dirty', 'saving', 'unknown', 'conflict', 'compare_failed', 'denied', 'failed', 'rejected', 'erased'].includes(this.#state); }
-    #set(state) { if (!this.#closed) { this.#state = state; this.#changed(this); } }
+    get hasUnsavedChanges() { return (!!this.#revision || this.#newTitle !== null) && ['dirty', 'saving', 'unknown', 'conflict', 'compare_failed', 'denied', 'failed', 'rejected', 'erased'].includes(this.#state); }
+    #set(state) {
+        if (!this.#closed) {
+            if (['erased', 'denied', 'unavailable'].includes(state)) { this.#comparison = null; this.#preview = null; }
+            this.#state = state; this.#changed(this);
+        }
+    }
     async #loadRevision(ref) {
         ref = artifactRef(ref);
         const revision = await this.#client.get(ref, this.#abort.signal);
@@ -112,6 +124,28 @@ export class ArtifactDraft {
         const lineEnding = text === null ? null : sourceLineEnding(text);
         return { revision, file, bytes, text, lineEnding };
     }
+    async prepare({ title, path, media_type, bytes }) {
+        if (this.#closed || this.#opened) throw new Error('Create a new panel for each source.');
+        this.#opened = true;
+        if (!globalThis.crypto?.subtle || typeof globalThis.crypto.randomUUID !== 'function') {
+            this.#set('secure_context_required'); return;
+        }
+        bytes = new Uint8Array(bytes);
+        if (bytes.length > MAX_VIEW_BYTES || typeof title !== 'string' || !title.trim()) {
+            this.#set('unavailable'); return;
+        }
+        const file = { schema_version: 1, path, media_type, size_bytes: bytes.length, sha256: await sha256(bytes) };
+        if (this.#closed) return;
+        this.#bytes = bytes; this.#file = file; this.#newTitle = title;
+        if (EDIT_TYPES.has(media_type) && bytes.length <= MAX_EDIT_BYTES) {
+            try {
+                this.#text = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(bytes);
+                const ending = sourceLineEnding(this.#text);
+                this.#editable = ending !== null; this.#lineEnding = ending || '\n';
+            } catch (_) { /* Keep binary source unchanged and downloadable. */ }
+        }
+        this.#set('dirty');
+    }
     async open(ref) {
         if (this.#closed || this.#opened) throw new Error('Create a new panel to open another revision.');
         this.#opened = true;
@@ -126,6 +160,7 @@ export class ArtifactDraft {
             this.#editable = loaded.text !== null && loaded.lineEnding !== null && loaded.revision.manifest.files.length === 1;
             this.#lineEnding = loaded.lineEnding || '\n';
             this.#set('saved');
+            await this.#fetchPreview();
         } catch (error) { this.#set([401, 403].includes(error.status) || error.code === 'artifact_auth_changed' ? 'denied' : 'unavailable'); }
     }
     edit(text) {
@@ -135,17 +170,17 @@ export class ArtifactDraft {
         this.#text = String(text).replace(/\r\n|\r|\n/g, this.#lineEnding); this.#set('dirty'); return true;
     }
     async save() {
-        if (this.#closed || this.#pending || !this.#editable || this.#state !== 'dirty') return;
+        if (this.#closed || this.#pending || (!this.#editable && this.#newTitle === null) || this.#state !== 'dirty') return;
         this.#set('saving');
-        const bytes = new TextEncoder().encode(this.#text);
-        if (bytes.length > MAX_EDIT_BYTES) { this.#set('failed'); return; }
+        const bytes = this.#editable ? new TextEncoder().encode(this.#text) : this.#bytes;
+        if (bytes.length > (this.#editable ? MAX_EDIT_BYTES : MAX_VIEW_BYTES)) { this.#set('failed'); return; }
         try {
             const original = this.#file, revision = this.#revision;
             const file = { schema_version: 1, path: original.path, media_type: original.media_type,
                 size_bytes: bytes.length, sha256: await sha256(bytes) };
             const request = { schema_version: 1, idempotency_key: crypto.randomUUID(),
-                artifact_id: revision.ref.artifact_id, expected_revision_id: revision.ref.revision_id,
-                title: revision.title, manifest: { schema_version: 1, files: [file], entrypoint: file.path },
+                artifact_id: revision?.ref.artifact_id ?? null, expected_revision_id: revision?.ref.revision_id ?? null,
+                title: this.title, manifest: { schema_version: 1, files: [file], entrypoint: file.path },
                 provenance: { schema_version: 1, session_id: null, run_id: null, tool_name: null } };
             const digests = await publicationDigests(request);
             if (this.#closed) return;
@@ -155,9 +190,11 @@ export class ArtifactDraft {
     }
     async #accepted(receipt) {
         const pending = this.#pending;
-        if (!receipt || receipt.schema_version !== 1 || !sameScope(receipt.scope, this.#revision.scope)
+        if (!receipt || receipt.schema_version !== 1 || (this.#revision ? !sameScope(receipt.scope, this.#revision.scope) :
+                typeof receipt.scope?.tenant_id !== 'string' || !receipt.scope.tenant_id
+                    || typeof receipt.scope?.principal_id !== 'string' || !receipt.scope.principal_id)
             || receipt.idempotency_key !== pending.request.idempotency_key
-            || receipt.ref?.artifact_id !== pending.request.artifact_id
+            || (pending.request.artifact_id !== null && receipt.ref?.artifact_id !== pending.request.artifact_id)
             || receipt.ref?.revision_id === pending.request.expected_revision_id
             || receipt.manifest_sha256 !== pending.digests.manifest_sha256
             || receipt.request_sha256 !== pending.digests.request_sha256) {
@@ -165,10 +202,42 @@ export class ArtifactDraft {
         }
         const ref = artifactRef(receipt.ref);
         if (this.#closed) return;
-        this.#revision = { ...this.#revision, ref, parent_revision_id: pending.request.expected_revision_id,
+        this.#revision = { schema_version: 1, ...this.#revision, scope: receipt.scope, title: pending.request.title, ref, parent_revision_id: pending.request.expected_revision_id,
             manifest: pending.request.manifest, provenance: pending.request.provenance, committed_at: receipt.committed_at };
-        this.#bytes = pending.bytes; this.#file = pending.file; this.#pending = null; this.#comparison = null;
+        this.#bytes = pending.bytes; this.#file = pending.file; this.#newTitle = null; this.#pending = null; this.#comparison = null;
         this.#set('saved');
+        await this.#fetchPreview();
+    }
+    async #fetchPreview() {
+        if (!PREVIEW_TYPES.has(this.#file?.media_type) || !this.#client.preview || this.#closed) return;
+        const ref = this.#revision.ref;
+        this.#previewState = 'loading'; this.#changed(this);
+        try {
+            const result = await this.#client.preview(ref, this.#abort.signal);
+            if (this.#closed) return;
+            if (canonical(artifactRef(result.source)) !== canonical(ref) || result.media_type !== 'image/png'
+                || !Number.isInteger(result.width) || !Number.isInteger(result.height)
+                || result.width < 1 || result.width > 1024 || result.height < 1 || result.height > 1024
+                || result.width * result.height > MAX_PREVIEW_PIXELS
+                || typeof result.content_base64 !== 'string' || result.content_base64.length > 6 * 1024 * 1024) throw new Error('Invalid preview');
+            const bytes = Uint8Array.from(atob(result.content_base64), char => char.charCodeAt(0));
+            const view = new DataView(bytes.buffer);
+            if (bytes.length < 33 || bytes.length > 4 * 1024 * 1024
+                || [...bytes.subarray(0, 8)].join(',') !== '137,80,78,71,13,10,26,10'
+                || view.getUint32(8) !== 13 || view.getUint32(12) !== 0x49484452
+                || view.getUint32(16) !== result.width || view.getUint32(20) !== result.height
+                || bytes[24] !== 8 || bytes[25] !== 2 || bytes[26] !== 0 || bytes[27] !== 0 || bytes[28] !== 0
+                || await sha256(bytes) !== result.sha256) throw new Error('Invalid preview');
+            if (this.#closed) return;
+            this.#preview = { bytes, width: result.width, height: result.height };
+            this.#previewState = 'ready'; this.#changed(this);
+        } catch (error) {
+            if (this.#closed) return;
+            this.#preview = null; this.#previewState = 'unavailable';
+            if ([401, 403].includes(error.status) || error.code === 'artifact_auth_changed') this.#set('denied');
+            else if (error.code === 'artifact_not_found') this.#set('erased');
+            else this.#changed(this); // Refusal preserves authorized source download.
+        }
     }
     async #attempt() {
         const pending = this.#pending;
@@ -194,6 +263,7 @@ export class ArtifactDraft {
                 // The service rejected this attempt before commit. Determine
                 // whether its staging expired or the artifact was deleted.
                 pending.phase = 'stage';
+                if (!this.#revision) { this.#set('unknown'); return; }
                 try {
                     await this.#client.get(this.#revision.ref, this.#abort.signal);
                     this.#set('unknown');
@@ -207,7 +277,7 @@ export class ArtifactDraft {
                 // terminal erasure. Retry retains the exact key/request/bytes.
                 pending.phase = 'stage'; pending.uncertain = true; this.#set('unknown');
             }
-            else if (error.status === 409 && pending.phase === 'commit' && !pending.uncertain) this.#set('conflict');
+            else if (error.status === 409 && pending.phase === 'commit' && !pending.uncertain && this.#revision) this.#set('conflict');
             else { pending.uncertain ||= pending.phase === 'commit'; this.#set('unknown'); }
         }
     }
@@ -264,6 +334,6 @@ export class ArtifactDraft {
     }
     close() {
         this.#closed = true; this.#abort.abort(); this.#pending = null; this.#bytes = null;
-        this.#text = ''; this.#comparison = null; this.#revision = null; this.#file = null;
+        this.#text = ''; this.#newTitle = null; this.#preview = null; this.#comparison = null; this.#revision = null; this.#file = null;
     }
 }

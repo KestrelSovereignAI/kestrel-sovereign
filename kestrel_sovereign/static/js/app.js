@@ -4,6 +4,7 @@
  */
 
 import API from './api.js';
+import { openArtifactLibrary } from './artifact_panel.mjs';
 import { state, loadCommands } from './ui.js';
 import {
     initAgentFromUrl,
@@ -19,7 +20,7 @@ import {
     loadLocalFiles,
     loadIpfsStatus,
 } from './panels.js';
-import { mount as mountChat, loadModels, connectNotifications, updateContextStatus, subscribeSSE } from './chat.js';
+import { mount as mountChat, registerHeaderAction, loadModels, connectNotifications, updateContextStatus, subscribeSSE } from './chat.js';
 import { UI } from './ui-ext/registry.js';
 // Manifest-driven feature UI loader (#2043). Extracted into its own module
 // (#2048) so identity.js can re-run it after agent selection / capability flips
@@ -103,6 +104,8 @@ async function init() {
     // use, so the console dogfoods the extracted component instead of the old
     // initChat() path. Falls back to a document root if the panel is absent.
     mountChat(document.getElementById('panel-chat'));
+    registerHeaderAction({ id: 'artifacts', label: 'Artifacts', title: 'Open artifact library',
+        onClick: () => openArtifactLibrary({ api: API }) });
 
     // UI extension slots (#2038, ticket 02): mount the single shared overlay
     // root once at boot and render its zone (empty until a feature contributes a
@@ -165,11 +168,9 @@ async function init() {
     // Host-scoped UI surface (#2293): the multi-agent host serves host-feature
     // panels at /api/host/ui/contributions, a surface distinct from the
     // per-agent one above. It is NOT agent-bound, so it loads at host-console
-    // boot regardless of agent selection. Only meaningful in host mode — in
-    // standalone mode there is no host root and the endpoint 404s (swallowed).
-    if (bootConfig.multiAgentHost) {
-        await loadHostFeatureUIContributions();
-    }
+    // boot regardless of agent selection. Single-agent hosts also mount host
+    // features; an absent contribution returns an empty authenticated manifest.
+    await loadHostFeatureUIContributions();
 
     // Initialize tasks component
     initTasks();

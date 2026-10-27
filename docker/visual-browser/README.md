@@ -2,9 +2,10 @@
 
 This is the pinned browser image and sandbox verification for Core #3709,
 part of #3703. It contains Chromium, a synthetic offline probe and a private persistent
-browser worker. Host SDK-driver registration, current-grant authorization,
-provider custody, artifact transfer, human takeover and governed network access
-remain separate work. It is not a completed visual-computer capability.
+browser worker, concrete SDK adapters, contained workspace transport and a
+bounded active-call HTTP relay. Host authorization, durable custody and artifact
+publication remain the canonical host's responsibility. The local proofs below
+do not establish a completed visual-computer product or remote-provider support.
 
 Build and verify on an available local Docker daemon:
 
@@ -105,14 +106,16 @@ the trusted host must avoid holding idle slots and retain physical cleanup
 authority if control transport is unavailable. Priority human control remains
 part of host integration. Pause fences
 queued input before draining accepted work, suspends observations and advances
-the control epoch; resume advances it again. This is not human takeover. A frame
+the control epoch; resume advances it again. Logical takeover fences the agent
+with a paused human controller; a human input transport is not installed. A frame
 is an observation identity, not a promise that autonomous page content is static.
 
 Only screenshot, click, text, a restricted key set, scroll and wait are supported.
 Waits send no browser input: a wait that cannot fit its deadline is refused,
 and an interrupted wait has a known denial without retiring a healthy page.
 The maximum 10-second wait has a separate bounded scheduling allowance.
-Navigation, clipboard, files, exec and takeover are refused. Sessions last at most
+Navigation requires the explicit HTTP profile below; file bytes use the distinct
+negotiated workspace extension. Clipboard and unrestricted exec are refused. Sessions last at most
 one hour, with wall and monotonic expiry, bounded receipts and IPC, an async
 retirement loop and an OS process deadline (up to ten seconds of teardown grace).
 With the reviewed no-restart Docker configuration, process termination retires
@@ -120,3 +123,200 @@ its child processes. Lost worker state is not recoverable accepted-action state;
 a replacement is a new session. The host must retain custody until physical
 container retirement is confirmed. None of this is the host's authorization,
 privacy policy, egress gateway, inference adapter or SDK provider/driver factory.
+
+## Local SDK adapters
+
+`kestrel_sovereign.visual_computer.docker` supplies separate
+`environment_provider_factory` and `computer_driver_factory` SDK factories.
+The host supplies an explicit local Unix Docker socket; inherited Docker
+contexts, proxy configuration and operator credentials are excluded. Provider
+settings require a private 32-byte `credential_key`, a `profile_id` of
+`offline-v1`, and an `image` such as `local-worker@sha256:<configuration digest>`.
+For this local profile the digest is the exact locally built Docker image ID,
+not a registry manifest or multi-platform index digest. Build the reviewed
+worker first; the adapter never pulls an implicit replacement.
+
+The canonical reviewed profiles now live in
+[`docker_profile`](../../kestrel_sovereign/visual_computer/docker_profile/).
+The substrate verifier and installed adapters share those exact files. The
+measured Docker 29.8.2 cgroup-v2 API changes `OomKillDisable: false` to `null`
+after start; the policy explicitly recognizes that serialization only in
+running/exited states. Other changes to the complete HostConfig are refused.
+
+A connection binds the full immutable container ID, image ID, PID, start time,
+worker-generated startup nonce, owner and fixed expiry. One-shot bootstrap
+checks the nonce before accepting the secret, closing the inspect/start race.
+The private `control.sock` reserves two connections for status/action status
+and control, independently of the four normal IPC slots. Takeover fences queued
+input, drains accepted work, suspends agent observations and advances the epoch
+to a paused human controller. It does not enable a public human-input or CDP
+transport. An uncertain Chromium input still retires the browser and cannot
+report successful takeover or resume.
+
+The canonical host remains the only durable custody owner: encrypt
+`DriverConnection`, retain unknown acquisition and action outcomes, enforce
+released-request tombstones, and hold current authority/privacy guards through
+all adapter calls and deliveries. Docker labels reconcile a retained request;
+they do not authorize a caller or replace the host's released-request history.
+Idle policy belongs to that host; this worker independently enforces its fixed
+wall and monotonic expiry. No remote, x86_64, navigation, allowed egress,
+clipboard or unrestricted exec capability is advertised by `offline-v1`.
+
+Run the opt-in SDK acceptance with a new private evidence directory:
+
+```sh
+python -m scripts.verify_visual_docker_adapters \
+  --docker-socket /absolute/path/to/local/docker.sock \
+  --output /absolute/path/to/new/private-evidence
+```
+
+It drives the production adapters against the real daemon and Chromium,
+reconnects to the same page, verifies actual pixels and deduplicated receipts,
+occupies all normal transport slots before priority takeover, rejects stale
+control, checks IPv4/IPv6 network denial, waits for physical autonomous expiry,
+and verifies exact resource cleanup. Its screenshots are synthetic private
+fixtures. This local proof is not a completed product or a remote-provider claim.
+
+Network refusal checks use only a uniquely labelled server on an owned internal
+dual-stack Docker network. A separate bounded peer proves both inspected IPv4
+and IPv6 listeners are reachable before the unchanged `network=none` browser
+attempts those exact addresses. The standalone sandbox verifier uses the same
+fixture. No public, metadata-service or operator-LAN destination is probed.
+Missing IPv6 fixture support fails the check; it does not silently reduce the
+claim to IPv4. Peer containers have fixed process deadlines and resource bounds,
+and cleanup verifies the original native container/network IDs and labels.
+
+
+## Negotiated workspace transport
+
+The current image pins SDK 0.43.0 and carries the required
+`io.kestrel.visual-computer.worker-contract=sdk-0.43-http-v1` label.
+Older images are refused rather than claiming their file-transfer capability.
+The driver implements the SDK's `WorkspaceTransferProvider` extension;
+`workspace_transfer()` returns a distinct transport with all standard prepare,
+read/write, status, release/abort and commit methods. The host artifact service
+must hold its exact current owner/privacy/session guard across every call.
+
+The trusted host also injects `workspace_guard(session, original_transfer_id)`
+from the same original-call borrower machinery, with a separate workspace
+purpose. Every prepare/read/write/commit/status RPC borrows that retained checker
+on an owned child task through async inspection, process launch, final stdin
+write and private reply. Priority control cancels and joins workspace borrowers
+before fencing the worker. A pre-dispatch revocation sends no new file command;
+post-dispatch uncertainty retains the original transfer ID for reconciliation.
+Release/abort can retire retained original IDs without fresh data authority;
+that cleanup path cannot read or install new bytes. SDK signatures are unchanged.
+Bare SDK callers still supply their own authorization responsibility.
+
+Data requires a paused session with controller `none`, current epoch and live
+transfer/session expiry. Takeover fences data; authenticated cleanup remains
+available for retained partial state. The explicit `browser` workspace exports
+`document.html`, a frozen HTML source snapshot of the current browser DOM.
+HTML remains untrusted source, not an approved active renderer. Export IDs
+freeze once; released IDs cannot export again. Imported workspaces are fresh
+named targets; a complete identical retry returns the original receipt.
+
+Every path uses the SDK's alias/path validation plus descriptor-relative
+`O_NOFOLLOW` directory/file opens. Reads require owned regular files with one
+hard link, same filesystem, stable metadata, size and digest checks. FIFO,
+symlink, device and hard-link exports are refused. There is no archive or glob
+expansion. Imports use exclusive file creation, verify the exact manifest tree,
+and install through Linux `renameat2(RENAME_NOREPLACE)`; a racing target cannot
+be replaced. An unknown installation receipt reconciles the original intent
+and actual installed tree without another installation. Partial content never
+becomes a live workspace and is removed by explicit abort or physical lease
+retirement.
+
+Limits are 32 selected files, 128 KiB per file, 2 MiB per transfer, path depth
+16 and 1024 UTF-8 path bytes, 64 transfer IDs and 16 MiB reserved managed content
+per worker. Completed workspaces retain their quota until lease retirement.
+The outer tmpfs/resource limits still apply. This transport does not mount or
+address ambient host files and does not publish an artifact itself.
+
+## Bounded active-call HTTP profile
+
+The offline profile remains the default. An explicit private `network_policy`
+setting on both factories selects up to eight exact HTTP(S) origins and GET/HEAD
+methods; the provider's computed `profile_id` binds that policy digest. Normal
+settings contain `origins`, `methods` and an `address_pins` mapping from each
+hostname origin to one explicit trusted public IPv4 address. For example,
+`{"origins":["https://example.com"],"methods":["GET","HEAD"],"address_pins":{"https://example.com":"93.184.216.34"}}`
+describes an operator-maintained pin, not a verified current service address.
+Literal IPv4 origins pin themselves. Missing, extra or nonpublic pins and
+unmeasured IPv6 egress are refused. Runtime libc DNS is never scheduled: its
+accepted OS resolver work could outlive task cancellation. The gateway connects
+only the admitted literal address, retaining the original HTTP Host, TLS SNI
+and normal certificate validation. DNS changes require a newly admitted policy.
+No ambient proxy,
+cookie jar, authentication header, operator profile or retry is used.
+
+The browser still has `network=none`. A private authenticated relay carries
+bounded HTTP jobs through the exact session, control epoch and action ID to the
+host gateway. The trusted host injects its `egress_guard(session, action_id)`
+lexical callback. An owned child task holds the original operation's authority
+and privacy lease across each job; synchronous current checks run before
+connect, request send and response delivery. Another owned child retains this
+same guard for every input, including offline input, through asynchronous
+container inspection and the final stdin write. A guard rejection before that
+write sends no input; transport loss or revocation afterward remains unknown.
+The bare SDK adapter does not replace its caller's authorization responsibility.
+
+Only the original active `act` RPC can admit jobs. Its closure cancels and joins
+all gateway work and seals worker response handlers. Idle pages, waits, observe,
+status and background requests acquire no HTTP authority. Stop and takeover
+close accepted sockets and drain Chromium fulfillment handlers before a
+successful fence. Cancelled CDP input or uncertain response fulfillment still
+retires the worker; cancelling a waiter cannot unsend a browser effect.
+
+This deliberately narrow profile refuses redirects: Playwright's routing API
+does not intercept every redirect hop. It also refuses credentialed browser
+requests, Set-Cookie, compressed responses, attachments, protocol upgrades and
+informational responses. Service workers and downloads are disabled;
+WebSocket routes close, WebRTC constructors refuse, and unsupported non-HTTP
+channels have no gateway. Chromium's independent network namespace denies
+direct TCP/UDP and DNS. No unauthenticated CDP or browser socket is published.
+Per action limits are 16 HTTP requests, 4096 URL characters, 16 KiB response
+headers, 128 KiB per response body and eight seconds per job, within the action
+and fixed lease deadlines. Request URLs, query values, headers, bodies and
+remote exception messages never enter normal gateway logs or audit output.
+
+Run the explicit controlled test with a new private evidence directory:
+
+```sh
+python -m scripts.verify_visual_docker_egress \
+  --docker-socket /absolute/path/to/local/docker.sock \
+  --output /absolute/path/to/new/private-http-evidence
+```
+
+It creates two labelled, bounded synthetic Docker servers and verifies each
+exact container ID and local port. A test-only Python object admits only the
+one owned endpoint through the same literal-pin connection path; ordinary
+configuration cannot enable this exception. A host resolver sentinel fails the
+real proof if runtime libc DNS is called.
+Actual Chromium navigates, fetches a subresource, edits pixels, exports its DOM,
+refuses forbidden/background channels and redirects, and closes accepted slow
+HTTP sockets before both pause and takeover acknowledgements. Original unknown
+action IDs remain reconcilable; stale epochs fail. All owned containers and the
+image are removed by exact identity. This proves local controlled HTTP; it does
+not establish a public HTTPS interoperability, remote platform, cookie login,
+redirect, manual human-input or general browsing capability.
+
+The separate owned TLS proof runs with:
+
+```sh
+python -m scripts.verify_visual_docker_tls \
+  --docker-socket /absolute/path/to/local/docker.sock \
+  --output /absolute/path/to/new/private-tls-evidence
+```
+
+It creates a temporary CA and two owned certificate/server fixtures. Normal
+platform trust must refuse that CA; a verifier-only SSLContext trusts it while
+retaining normal verification flags, hostname checks and required certificate
+validation. A leaf with the wrong SAN must still fail. The matching leaf enables
+the actual browser edit/export journey over TLS, retaining original Host and
+SNI while connecting to the exact fixture pin. Stop must close its accepted TLS
+socket and join owned child borrowers before acknowledgement. The test-only TLS
+origin derives from its unique Docker ownership label and cannot be configured
+through normal settings. Production code has no TLS bypass, custom trust or
+certificate option. This measures owned HTTPS behavior, not public HTTPS
+interoperability.

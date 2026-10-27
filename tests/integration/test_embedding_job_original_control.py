@@ -28,6 +28,7 @@ from tests.integration.native_memory_original_control import (
 from tests.integration.test_execution_authority_postgres import GenerationFence
 from tests.integration.test_execution_authority_postgres import native_pg as native_pg
 from tests.utils.postgres_schema import pgvector_schema, quoted_search_path
+from tests.shared.original_task_admission import assert_unknown_task_admission
 
 
 async def _seed_job_corpus(n):
@@ -284,11 +285,8 @@ async def test_actual_reindex_refusal_cannot_publish_an_unowned_job(
         if refusal == "missing-owner":
             assert isinstance(failure, HTTPException) and failure.status_code == 503
         else:
-            assert (
-                sources
-                and failure is sources[0]
-                and is_execution_control_error(failure)
-            ), f"native job admission control was replaced: {failure!r}"
+            assert sources
+            assert_unknown_task_admission(failure, sources[0])
             assert submitted and all(
                 inspect.getcoroutinestate(op) == inspect.CORO_CLOSED for op in submitted
             )
@@ -439,7 +437,8 @@ async def test_actual_background_refusal_closes_unstarted_native_coroutine(
             agent._track_background_task(operation, name="refused-native-background")
         except BaseException as error:
             failure = error
-        assert sources and failure is sources[0] and is_execution_control_error(failure)
+        assert sources
+        assert_unknown_task_admission(failure, sources[0])
         assert inspect.getcoroutinestate(operation) == inspect.CORO_CLOSED, (
             "refused background publication left its native coroutine unowned"
         )

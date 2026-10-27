@@ -255,26 +255,33 @@ class TestOllamaAdapterListModels:
         assert all(m.category == ModelCategory.EMBEDDING for m in models)
 
     @pytest.mark.asyncio
-    async def test_list_models_detects_vision(self):
-        """Test that vision models are detected"""
+    @pytest.mark.parametrize("name,capabilities,expected", [
+        ("gemma4:31b", ["completion", "vision"], True),
+        ("llava:latest", None, False),
+        ("llama3.2:latest", ["completion"], False),
+    ])
+    async def test_list_models_detects_vision(self, name, capabilities, expected):
+        """Use concrete daemon capabilities; model names confer no vision."""
         from kestrel_sovereign.llm.ollama_adapter import OllamaAdapter
         adapter = OllamaAdapter()
 
         mock_models = {
             "models": [
-                {"name": "llava:latest", "size": 4_000_000_000},
+                {"name": name, "size": 4_000_000_000},
             ]
         }
 
         with patch("ollama.AsyncClient") as mock_client_class:
             mock_client = AsyncMock()
             mock_client.list.return_value = mock_models
+            mock_client.show.return_value = {"capabilities": capabilities}
             mock_client_class.return_value = mock_client
 
             models = await adapter.list_models()
 
         assert len(models) == 1
-        assert models[0].supports_vision is True
+        assert models[0].supports_vision is expected
+        mock_client.show.assert_awaited_once_with(name)
 
 
 class TestGoogleAdapterListModels:

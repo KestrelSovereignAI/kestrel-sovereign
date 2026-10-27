@@ -7,6 +7,7 @@ It exercises a synthetic offline page; it never invokes a production agent.
 from __future__ import annotations
 
 import argparse
+import asyncio
 import base64
 import hashlib
 import json
@@ -19,71 +20,31 @@ from pathlib import Path
 LABEL = "io.kestrel.visual-browser-probe"
 ROOT = Path(__file__).resolve().parents[1]
 CONTEXT = ROOT / "docker" / "visual-browser"
-SECCOMP_SHA256 = "38c15179be39d9bc1aadf19b06618bdb0dd9137f531435ff306c8dccf3b59f19"
-HOST_CONFIG_SHA256 = "5b9799bdf8e9f9292554007d64778a9941dedd78dee2797dac362e881c06f394"
+from kestrel_sovereign.visual_computer.docker_policy import (
+    POLICY_ROOT, verified_seccomp_policy, verified_host_configuration,
+    container_arguments, verify_container,
+)
+from kestrel_sovereign.visual_computer.docker import DockerCommandError
+if __package__:
+    from .visual_owned_peers import OwnedNetworkPeers
+else:
+    from visual_owned_peers import OwnedNetworkPeers
 
-
-def verified_seccomp_policy() -> dict:
-    content = (CONTEXT / "seccomp.json").read_bytes()
-    if hashlib.sha256(content).hexdigest() != SECCOMP_SHA256:
-        raise RuntimeError("browser seccomp policy digest differs from the reviewed profile")
-    return json.loads(content)
-
-
-
-def verified_host_configuration() -> dict:
-    content = (CONTEXT / "host-config.json").read_bytes()
-    if hashlib.sha256(content).hexdigest() != HOST_CONFIG_SHA256:
-        raise RuntimeError("browser host configuration digest differs from the reviewed profile")
-    return json.loads(content)
-
-def container_arguments(image: str, identity: str, *, worker: bool = False) -> list[str]:
-    return [
-        "create", "--name", f"kestrel-browser-probe-{identity}", "--label", f"{LABEL}={identity}",
-        "--init", "--network", "none", "--read-only", "--cap-drop", "ALL",
-        "--security-opt", "no-new-privileges",
-        "--security-opt", f"seccomp={CONTEXT / 'seccomp.json'}",
-        "--memory", "1g", "--memory-swap", "1g", "--ipc", "private",
-        "--cgroupns", "private", "--runtime", "runc", "--cpus", "2", "--pids-limit", "256", "--shm-size", "256m",
-        "--tmpfs", "/tmp:rw,nosuid,nodev,size=256m,mode=1777",
-        "--ulimit", "rtprio=0:0", "--log-driver", "none",
-        image, "python", "/opt/kestrel-browser/worker.py" if worker else "/opt/kestrel-browser/sandbox_probe.py",
-    ]
-
-
-def verify_container(record: dict, image: str, identity: str) -> None:
-    host, config = dict(record["HostConfig"]), record["Config"]
-    options = host.get("SecurityOpt") or []
-    policies = [option.partition("=")[2] for option in options if option.startswith("seccomp=")]
-    expected_policy = verified_seccomp_policy()
-    try:
-        policy_matches = len(policies) == 1 and json.loads(policies[0]) == expected_policy
-    except (TypeError, ValueError):
-        policy_matches = False
-    if policy_matches:
-        host["SecurityOpt"] = ["seccomp=reviewed-policy" if option.startswith("seccomp=") else option
-                               for option in options]
-    # Compare the complete reviewed map, including default-valued fields. New
-    # daemon settings are unsupported until reviewed; they never pass silently.
-    checks = (
-        host == verified_host_configuration(),
-        record["Image"] == image,
-        config["Labels"].get(LABEL) == identity,
-        config["User"] == "pwuser",
-        record.get("Mounts") == [],
-        policy_matches,
-    )
-    if not all(checks):
-        raise RuntimeError("Docker did not apply the required isolated browser configuration")
-
-
-def verify_result(result: dict) -> bytes:
+def verify_result(result: dict, *, network_fixture: dict) -> bytes:
+    if (not isinstance(network_fixture, dict)
+            or set(network_fixture) != {"proof_id", "server_id", "network_id", "targets"}
+            or not re.fullmatch(r"[a-f0-9]{32}", network_fixture["proof_id"])
+            or any(not re.fullmatch(r"[a-f0-9]{64}", network_fixture[key]) for key in ("server_id", "network_id"))
+            or len(network_fixture["targets"]) != 2
+            or [target["family"] for target in network_fixture["targets"]] != ["ipv4", "ipv6"]):
+        raise RuntimeError("owned dual-stack browser fixture evidence is incomplete")
     if (result.get("uid") in (None, 0) or result.get("capabilities") != {name: 0 for name in ("CapEff", "CapBnd", "CapPrm", "CapInh", "CapAmb")}
             or result.get("rtprio_limit") != [0, 0]
             or not isinstance(result.get("groups"), list) or 0 in result["groups"]
             or result.get("no_new_privileges") is not True
             or result.get("fixture_result") != "Persistent local browser draft"
-            or result.get("refused_destinations") != ["1.1.1.1", "169.254.169.254"]):
+            or result.get("network_fixture") != network_fixture
+            or result.get("refused_peers") != [{**target, "refused":True} for target in network_fixture["targets"]]):
         raise RuntimeError("browser probe evidence is incomplete")
     for expected in ("PID namespaces\tYes", "Network namespaces\tYes", "Seccomp-BPF sandbox\tYes"):
         if expected not in result.get("sandbox", ""):
@@ -99,6 +60,15 @@ def source_identity() -> dict:
     files = {path.relative_to(CONTEXT).as_posix(): hashlib.sha256(path.read_bytes()).hexdigest()
              for path in sorted(CONTEXT.rglob("*"))
              if path.is_file() and "__pycache__" not in path.parts and path.suffix != ".pyc"}
+    files.update({"reviewed-profile/" + path.name: hashlib.sha256(path.read_bytes()).hexdigest()
+                  for path in sorted(POLICY_ROOT.glob("*.json"))})
+    adapter_root = ROOT / "kestrel_sovereign" / "visual_computer"
+    files.update({"host-adapter/" + path.name: hashlib.sha256(path.read_bytes()).hexdigest()
+                  for path in sorted(adapter_root.glob("docker*.py"))})
+    for name in ("verify_visual_browser_sandbox.py", "verify_visual_browser_worker.py", "verify_visual_docker_adapters.py", "verify_visual_docker_egress.py", "verify_visual_docker_tls.py", "visual_owned_peers.py"):
+        path = ROOT / "scripts" / name
+        if path.is_file():
+            files["verification/" + name] = hashlib.sha256(path.read_bytes()).hexdigest()
     context_digest = hashlib.sha256(json.dumps(files, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
     revision = subprocess.run(["git", "-C", str(ROOT), "rev-parse", "HEAD"], capture_output=True, check=False)
     status = subprocess.run(["git", "-C", str(ROOT), "status", "--porcelain"], capture_output=True, check=False)
@@ -136,6 +106,7 @@ def run(output: Path, *, docker: str, worker_check=None) -> dict:
             raise RuntimeError(f"Docker {' '.join(arguments[:2])} failed: {result.stderr.decode(errors='replace')[-3000:]}")
         return result.stdout
 
+    peers = None
     record()
     try:
         build = invoke(["build", "--label", f"{LABEL}={identity}", "--tag", tag, str(CONTEXT)], timeout=600)
@@ -146,7 +117,17 @@ def run(output: Path, *, docker: str, worker_check=None) -> dict:
         if image["Config"]["Labels"].get(LABEL) != identity:
             raise RuntimeError("browser image ownership does not match")
         state["image_id"] = image["Id"]; record()
-        cid = checked(container_arguments(image["Id"], identity, worker=worker_check is not None)).decode().strip()
+        arguments = container_arguments(image["Id"], identity, worker=worker_check is not None)
+        if worker_check is None:
+            async def peer_invoke(arguments, **options):
+                result = invoke(arguments, timeout=options.get("timeout", 30), input=options.get("data"))
+                if result.returncode:
+                    raise DockerCommandError("owned_fixture_operation_unknown", diagnostics=result.stdout+result.stderr)
+                return result.stdout
+            peers = OwnedNetworkPeers(peer_invoke, image["Id"], identity, output/"owned-network", image_label=LABEL)
+            asyncio.run(peers.start())
+            arguments.append(json.dumps(peers.state["fixture"]))
+        cid = checked(arguments).decode().strip()
         if not re.fullmatch(r"[a-f0-9]{64}", cid):
             raise RuntimeError("Docker did not return an exact container identity")
         state["container_id"] = cid; record()
@@ -162,10 +143,19 @@ def run(output: Path, *, docker: str, worker_check=None) -> dict:
         if completed.returncode:
             raise RuntimeError("browser sandbox check failed; see browser.stderr")
         result = json.loads(completed.stdout)
-        (output / "browser.png").write_bytes(verify_result(result))
+        asyncio.run(peers.verify_live())
+        (output / "browser.png").write_bytes(verify_result(result, network_fixture=peers.state["fixture"]))
         result.pop("png_base64")
         state["result"] = result; record()
     finally:
+        peer_error = None
+        if peers is not None:
+            try:
+                asyncio.run(peers.close())
+            except BaseException as error:
+                peer_error = error
+                state["peer_cleanup_error"] = type(error).__name__
+                record()
         # Check labels before touching a resource; never prune unrelated state.
         def inspect_owned(kind, target):
             result = invoke([kind, "inspect", target])
@@ -190,7 +180,9 @@ def run(output: Path, *, docker: str, worker_check=None) -> dict:
                 raise RuntimeError("refusing cleanup of an unowned image")
             state["image_id"] = owned["Id"]; record()
             checked(["image", "rm", tag])
-        state["cleanup_confirmed"] = not state.get("outcome_unknown", False); record()
+        state["cleanup_confirmed"] = not state.get("outcome_unknown", False) and peer_error is None; record()
+        if peer_error is not None:
+            raise peer_error
     return state
 
 
@@ -204,7 +196,10 @@ def main():
         parser.error("Docker CLI is required")
     worker_check = None
     if args.worker:
-        from verify_visual_browser_worker import exercise
+        if __package__:
+            from .verify_visual_browser_worker import exercise
+        else:
+            from verify_visual_browser_worker import exercise
         worker_check = exercise
     result = run(args.output.resolve(), docker=docker, worker_check=worker_check)
     print(json.dumps({"passed": True, "cleanup_confirmed": result["cleanup_confirmed"], "evidence": str(args.output.resolve())}))

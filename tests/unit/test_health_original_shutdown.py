@@ -2,6 +2,7 @@
 
 import asyncio
 import sqlite3
+from contextlib import closing
 
 import pytest
 
@@ -83,7 +84,7 @@ async def test_public_health_shutdown_keeps_actual_write_and_original_owners(
         )
         assert caught is not None and execution_commit_outcome(caught) == "unknown"
         assert carries(caught, original)
-        with sqlite3.connect(db.backend.db_path) as independent:
+        with closing(sqlite3.connect(db.backend.db_path)) as independent, independent:
             assert (
                 independent.execute("SELECT COUNT(*) FROM health_log").fetchone()[0]
                 == 1
@@ -163,7 +164,7 @@ async def test_health_shutdown_joins_original_pending_native_commit_before_cance
         else:
             assert isinstance(outcome.error, asyncio.CancelledError)
             assert finished_run.error is None
-        with sqlite3.connect(db.backend.db_path) as independent:
+        with closing(sqlite3.connect(db.backend.db_path)) as independent, independent:
             assert (
                 independent.execute("SELECT COUNT(*) FROM health_log").fetchone()[0]
                 == 1

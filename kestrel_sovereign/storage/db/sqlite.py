@@ -748,6 +748,8 @@ class SQLiteBackend(DatabaseBackend):
         #: Committed-state fingerprint taken when an immutable read began.
         self._cold_read_marker: tuple = ()
         self._connection: Optional[aiosqlite.Connection] = None
+        self._original_result_holds = {}
+        self._original_results_closing = False
         self._connected_file_identity: Optional[tuple[int, int]] = None
         #: The journal mode SQLite reported when this backend set it at
         #: connect, and the page size it read then; ``None`` for a cold read,
@@ -1333,6 +1335,7 @@ class SQLiteBackend(DatabaseBackend):
             self._abandoned_read_cursors.clear()
             self._closing = False
             self._connection_generation = uuid.uuid4().hex
+            self._original_results_closing = False
             
             logger.debug(f"Connected to SQLite: {self.db_path}")
             
@@ -1341,6 +1344,8 @@ class SQLiteBackend(DatabaseBackend):
     
     async def close(self) -> None:
         """Close database connection and wait for background thread to stop."""
+        from .original_result_custody import _drain_original_results
+        await _drain_original_results(self)
         conn = self._connection
         failure = (
             self._cancelled_write_drain_error
@@ -2161,8 +2166,8 @@ class SQLiteBackend(DatabaseBackend):
         if original_outcome is None:
             self._require_execution_backend()
         else:
-            from kestrel_sovereign.signals.outcome_custody import _require_original_signal_outcome
-            _require_original_signal_outcome(original_outcome, self)
+            from kestrel_sovereign.storage.db.original_result_custody import _require_original_result
+            _require_original_result(original_outcome, self)
 
     async def _commit_write(self, conn: aiosqlite.Connection, *, original_outcome=None) -> None:
         """One native COMMIT handoff, including host/local-anchor receipts."""
@@ -2217,21 +2222,17 @@ class SQLiteBackend(DatabaseBackend):
         return await self._execute_write_operation(conn, query, params)
 
     async def _read_original_signal_outcome_relation(self, journal, *, capture=False):
-        from kestrel_sovereign.signals.outcome_custody import _OriginalSignalOutcome, _JOURNAL_ADMISSION
-        from kestrel_sovereign.signals.store import _OUTCOME_COLUMNS
+        from .original_result_custody import _original_result_profile
+        table, expected_columns = _original_result_profile(journal)
         from kestrel_sovereign.storage.db.native_journal_programs import (
             _original_sqlite_query, _original_sqlite_scalar_adapters_registered,
         )
-        if type(capture) is not bool or type(journal) is not _OriginalSignalOutcome:
+        if type(capture) is not bool:
             raise ExecutionAuthorityError('Original SQLite journal metadata owner required')
         def require_owner():
             if capture:
-                if (journal._admission_key is not _JOURNAL_ADMISSION or journal._backend is not self
-                        or journal._phase != 'accepted' or journal._acceptance.owner is not asyncio.current_task()
-                        or journal._dispatcher._accepted_signal_outcomes.get(journal._acceptance) is not journal):
-                    raise ExecutionAuthorityError('Original SQLite acceptance metadata owner differs')
+                journal.require_admission(self)
                 self._require_write_admission()
-                journal._require_backing()
             else:
                 journal.require_original(self)
                 journal.require_sqlite_cleanup(self, journal._backing)
@@ -2261,22 +2262,22 @@ class SQLiteBackend(DatabaseBackend):
                     return None
                 cursor.execute('PRAGMA main.schema_version')
                 version = cursor.fetchone()[0]
-                cursor.execute("SELECT rowid,rootpage,sql FROM main.sqlite_schema WHERE type='table' AND name='signal_log' COLLATE NOCASE")
+                cursor.execute(f"SELECT rowid,rootpage,sql FROM main.sqlite_schema WHERE type='table' AND name='{table}' COLLATE NOCASE")
                 row = cursor.fetchone()
                 if row is None or row[1] <= 0:
                     return None
                 if re.search(r'\b(?:CHECK|COLLATE|REFERENCES|FOREIGN|CONFLICT|AUTOINCREMENT)\b', row[2], re.IGNORECASE):
                     return None
-                cursor.execute("SELECT 1 FROM main.sqlite_schema WHERE type='trigger' AND tbl_name='signal_log' COLLATE NOCASE UNION ALL SELECT 1 FROM temp.sqlite_schema WHERE type='trigger' AND tbl_name='signal_log' COLLATE NOCASE LIMIT 1")
+                cursor.execute(f"SELECT 1 FROM main.sqlite_schema WHERE type='trigger' AND tbl_name='{table}' COLLATE NOCASE UNION ALL SELECT 1 FROM temp.sqlite_schema WHERE type='trigger' AND tbl_name='{table}' COLLATE NOCASE LIMIT 1")
                 if cursor.fetchone() is not None:
                     return None
-                cursor.execute("PRAGMA main.table_xinfo('signal_log')")
+                cursor.execute(f"PRAGMA main.table_xinfo('{table}')")
                 columns = tuple(cursor.fetchall())
-                if {column[1] for column in columns} != set(_OUTCOME_COLUMNS) or any(column[6] for column in columns):
+                if {column[1] for column in columns} != set(expected_columns) or any(column[6] for column in columns):
                     return None
-                if any(column[2].upper() != ('INTEGER' if column[1] == 'duration_ms' else 'TEXT') for column in columns):
+                if any(column[2].upper() != expected_columns[column[1]] for column in columns):
                     return None
-                cursor.execute("PRAGMA main.index_list('signal_log')")
+                cursor.execute(f"PRAGMA main.index_list('{table}')")
                 indexes = cursor.fetchall()
                 for index in indexes:
                     quoted = '"' + index[1].replace('"', '""') + '"'
@@ -2289,7 +2290,7 @@ class SQLiteBackend(DatabaseBackend):
                             sqlite3.Connection.getlimit(native, sqlite3.SQLITE_LIMIT_SQL_LENGTH),
                             database_encoding=native._original_journal_configuration()[-2]))
                         sql = cursor.fetchone()[0]
-                        if not re.fullmatch(r'CREATE\s+INDEX(?:\s+IF\s+NOT\s+EXISTS)?\s+idx_signal_log_constitution_hash\s+ON\s+signal_log\s*\(\s*constitution_hash\s*\)\s+WHERE\s+constitution_hash\s+IS\s+NOT\s+NULL\s*', sql, re.IGNORECASE):
+                        if table != 'signal_log' or not re.fullmatch(r'CREATE\s+INDEX(?:\s+IF\s+NOT\s+EXISTS)?\s+idx_signal_log_constitution_hash\s+ON\s+signal_log\s*\(\s*constitution_hash\s*\)\s+WHERE\s+constitution_hash\s+IS\s+NOT\s+NULL\s*', sql, re.IGNORECASE):
                             return None
                 return (version, *row, columns, native._original_journal_configuration())
             finally:
@@ -2413,6 +2414,11 @@ class SQLiteBackend(DatabaseBackend):
     async def _append_original_signal_outcome(self, journal):
         from kestrel_sovereign.signals.outcome_custody import _require_original_signal_outcome
         _require_original_signal_outcome(journal, self)
+        return await self._write_original_result(journal)
+
+    async def _write_original_result(self, journal):
+        from kestrel_sovereign.storage.db.original_result_custody import _require_original_result
+        _require_original_result(journal, self)
         if self.owns_open_transaction:
             raise ExecutionAuthorityError('Original signal journal refuses an enclosing transaction')
         entry = journal.begin(self)
@@ -2420,6 +2426,12 @@ class SQLiteBackend(DatabaseBackend):
             journal._query, entry.values, original_outcome=journal)
         journal.acknowledged(self)
         return entry.result_summary
+
+    async def _settle_original_action_result(self, journal):
+        from .original_result_custody import _original_result_profile
+        if _original_result_profile(journal)[0] != 'visual_computer_actions':
+            raise ExecutionAuthorityError('Original action result profile required')
+        return await self._write_original_result(journal)
 
     async def execute_many(self, query: str, params_list: List[Params]) -> int:
         """Execute query with multiple parameter sets."""

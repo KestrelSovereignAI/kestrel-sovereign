@@ -12,10 +12,13 @@ from kestrel_sovereign.execution_custody import (
 from kestrel_sovereign.multi_agent.agent_manager import AgentManager
 from tests.integration.test_execution_authority_postgres import GenerationFence, native_pg as native_pg
 from tests.integration.test_execution_custody_review30_pg import lose_ack
+from tests.shared.original_task_admission import assert_unknown_task_admission
+from tests.utils.native_admission_fault import NativeAdmissionFault
+from tests.utils.original_failure import OriginalFailure
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("mode", ["synchronous", "admission"])
+@pytest.mark.parametrize("mode", ["synchronous", "admission", "nested-admission"])
 async def test_refund_admission_retains_original_control_bearing_cancellation(native_pg, tmp_path, monkeypatch, mode):
     backend, observer, schema = native_pg
     entered, release = asyncio.Event(), asyncio.Event()
@@ -42,13 +45,33 @@ async def test_refund_admission_retains_original_control_bearing_cancellation(na
             release.set()
             await await_owned_task(source)
     assert isinstance(original, asyncio.CancelledError) and execution_commit_outcome(original) == "unknown"
-    source_graph = tuple(_explicit_control_chain(original))
+    native_source = source = OriginalFailure.capture(original)
     manager = AgentManager(base_data_dir=tmp_path)
     loop, previous = asyncio.get_running_loop(), asyncio.get_running_loop().get_task_factory()
     refused = []
 
     async def release_budget():
         await backend.execute("INSERT INTO effects VALUES (198, 'unaccepted refund must not execute')")
+
+    if mode == "nested-admission":
+        # A separate genuine unstarted recipe carries the original PG source;
+        # this does not retry or resolve an uncertain refund.
+        async def prior_recipe():
+            await backend.execute("INSERT INTO effects VALUES (199, 'unaccepted prior recipe')")
+
+        prior_fault = NativeAdmissionFault(
+            lambda operation: getattr(operation, "cr_code", None) is prior_recipe.__code__,
+            original, "refuse",
+        )
+        with prior_fault, pytest.raises(BaseException) as prior:
+            create_owned_task(prior_recipe(), retain_originals=True)
+        prior_fault.assert_terminal_unstarted()
+        prior_receipt = assert_unknown_task_admission(
+            prior.value, original, source=native_source, commit_outcome="unknown",
+        )
+        original = prior.value
+        source = OriginalFailure.capture(original)
+        assert any(resource is prior_receipt and task is None for resource, task in source.debts)
 
     def release_seam(_child):
         if mode == "synchronous":
@@ -76,12 +99,29 @@ async def test_refund_admission_retains_original_control_bearing_cancellation(na
         assert original in chain, "refund admission replaced its original cancellation"
         assert is_execution_control_error(manager._quarantined_shutdown_control), "refund admission erased its native unsafe-control latch"
         assert execution_commit_outcome(outcome.error) == "unknown"
-        assert tuple(_explicit_control_chain(original)) == source_graph
-        assert record.task.cancelled(), "legacy cancelled-Future compatibility changed"
-        if mode == "admission":
+        native_source.assert_retained(outcome.error)
+        source.assert_retained(outcome.error)
+        native_source.assert_retained(manager._quarantined_shutdown_control)
+        source.assert_retained(manager._quarantined_shutdown_control)
+        if mode == "synchronous":
+            assert record.task.cancelled(), "legacy cancelled-Future compatibility changed"
+        else:
+            assert type(record.task) is asyncio.Future, "invented an accepted native Task"
+            assert record.task.done() and not record.task.cancelled()
+            receipt = assert_unknown_task_admission(
+                outcome.error, original, source=source, commit_outcome="unknown",
+            )
+            assert_unknown_task_admission(
+                record.task.exception(), original, admission=receipt,
+                source=source, commit_outcome="unknown",
+            )
+            assert_unknown_task_admission(
+                manager._quarantined_shutdown_control, original, admission=receipt,
+                source=source, commit_outcome="unknown",
+            )
             assert refused and all(inspect.getcoroutinestate(coro) == inspect.CORO_CLOSED for pair in refused for coro in pair)
         assert await observer.fetchval(f'SELECT count(*) FROM "{schema}".effects WHERE id=197') == 1
-        assert await observer.fetchval(f'SELECT count(*) FROM "{schema}".effects WHERE id=198') == 0
+        assert await observer.fetchval(f'SELECT count(*) FROM "{schema}".effects WHERE id IN (198, 199)') == 0
     finally:
         loop.set_task_factory(previous)
         for pair in refused:

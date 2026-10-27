@@ -23,6 +23,7 @@ from tests.integration.native_memory_original_control import (
 from tests.integration.test_execution_authority_postgres import GenerationFence
 from tests.integration.test_execution_authority_postgres import native_pg as native_pg
 from tests.unit.test_host_context_native_cleanup import _actual_operation
+from tests.shared.original_task_admission import assert_unknown_task_admission
 
 
 @pytest.mark.asyncio
@@ -145,7 +146,7 @@ async def test_overlapping_memory_calls_do_not_borrow_peer_retirement(
                     "request refusal borrowed a peer's outstanding join"
                 )
                 result = await await_owned_task(second)
-                assert result.error is original_refusal
+                assert_unknown_task_admission(result.error, original_refusal)
                 assert len(accepted) == 1 and len(refused) == 1
                 assert all(task.done() for task in accepted)
                 assert all(

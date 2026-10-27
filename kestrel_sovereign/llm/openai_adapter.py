@@ -86,6 +86,15 @@ logger = logging.getLogger(__name__)
 _LENGTH_FINISH_REASON = "length"
 
 
+def _structured_response_format(model: Type[BaseModel]) -> Dict[str, Any]:
+    # Reuse the SDK's public strict Pydantic formatter. Root-only closure leaves
+    # defaulted and nested properties optional, which strict output rejects.
+    function = openai.pydantic_function_tool(model)["function"]
+    return {"type": "json_schema", "json_schema": {
+        "name": function["name"], "schema": function["parameters"], "strict": True,
+    }}
+
+
 def _finish_reason(choice: Any) -> Optional[str]:
     """A chat-completions choice's ``finish_reason``, if the provider gave one."""
     reason = getattr(choice, "finish_reason", None)
@@ -529,18 +538,7 @@ class OpenAIAdapter(LLMAdapter):
 
             # Handle structured output via Pydantic model
             if response_format is not None and issubclass(response_format, BaseModel):
-                # OpenAI structured output format with JSON schema
-                # OpenAI requires additionalProperties: false for strict mode
-                schema = response_format.model_json_schema()
-                schema["additionalProperties"] = False
-                extra_kwargs["response_format"] = {
-                    "type": "json_schema",
-                    "json_schema": {
-                        "name": response_format.__name__,
-                        "schema": schema,
-                        "strict": True
-                    }
-                }
+                extra_kwargs["response_format"] = _structured_response_format(response_format)
             elif format == "json":
                 extra_kwargs["response_format"] = {"type": "json_object"}
 
@@ -641,18 +639,18 @@ class OpenAIAdapter(LLMAdapter):
             ), finish_reason)
 
         except openai.RateLimitError as e:
-            logger.error(f"OpenAI rate limit exceeded: {e}")
+            logger.error("OpenAI rate limit exceeded: %s", type(e).__name__)
             raise
         except openai.APIConnectionError as e:
-            logger.error(f"OpenAI connection error: {e}")
+            logger.error("OpenAI connection error: %s", type(e).__name__)
             raise
         except openai.APIError as e:
-            logger.error(f"OpenAI API error: {e}")
+            logger.error("OpenAI API error: %s", type(e).__name__)
             raise
         except Exception as e:
             if is_execution_control_error(e):
                 raise
-            logger.error(f"OpenAI adapter failed: {e}", exc_info=True)
+            logger.error("OpenAI adapter failed: %s", type(e).__name__)
             raise
 
     async def get_streaming_response(
@@ -697,17 +695,7 @@ class OpenAIAdapter(LLMAdapter):
 
             # Handle structured output in streaming mode
             if response_format is not None and issubclass(response_format, BaseModel):
-                # OpenAI requires additionalProperties: false for strict mode
-                schema = response_format.model_json_schema()
-                schema["additionalProperties"] = False
-                extra_kwargs["response_format"] = {
-                    "type": "json_schema",
-                    "json_schema": {
-                        "name": response_format.__name__,
-                        "schema": schema,
-                        "strict": True
-                    }
-                }
+                extra_kwargs["response_format"] = _structured_response_format(response_format)
 
             # Pass through additional kwargs
             if "max_tokens" in kwargs:
@@ -784,16 +772,16 @@ class OpenAIAdapter(LLMAdapter):
             logger.info(f"Stream completed. Total chunks: {chunk_count}")
 
         except openai.RateLimitError as e:
-            logger.error(f"OpenAI rate limit exceeded during streaming: {e}")
+            logger.error("OpenAI rate limit exceeded during streaming: %s", type(e).__name__)
             raise
         except openai.APIConnectionError as e:
-            logger.error(f"OpenAI connection error during streaming: {e}")
+            logger.error("OpenAI connection error during streaming: %s", type(e).__name__)
             raise
         except openai.APIError as e:
-            logger.error(f"OpenAI API error during streaming: {e}")
+            logger.error("OpenAI API error during streaming: %s", type(e).__name__)
             raise
         except Exception as e:
-            logger.error(f"OpenAI streaming failed: {e}", exc_info=True)
+            logger.error("OpenAI streaming failed: %s", type(e).__name__)
             raise
 
     async def get_streaming_response_with_tools(
@@ -849,16 +837,7 @@ class OpenAIAdapter(LLMAdapter):
 
             # Handle structured output in streaming mode
             if response_format is not None and issubclass(response_format, BaseModel):
-                schema = response_format.model_json_schema()
-                schema["additionalProperties"] = False
-                extra_kwargs["response_format"] = {
-                    "type": "json_schema",
-                    "json_schema": {
-                        "name": response_format.__name__,
-                        "schema": schema,
-                        "strict": True
-                    }
-                }
+                extra_kwargs["response_format"] = _structured_response_format(response_format)
 
             # Pass through additional kwargs
             if "max_tokens" in kwargs:
@@ -1080,16 +1059,16 @@ class OpenAIAdapter(LLMAdapter):
             ), finish_reason)
 
         except openai.RateLimitError as e:
-            logger.error(f"OpenAI rate limit exceeded during streaming with tools: {e}")
+            logger.error("OpenAI rate limit exceeded during streaming with tools: %s", type(e).__name__)
             raise
         except openai.APIConnectionError as e:
-            logger.error(f"OpenAI connection error during streaming with tools: {e}")
+            logger.error("OpenAI connection error during streaming with tools: %s", type(e).__name__)
             raise
         except openai.APIError as e:
-            logger.error(f"OpenAI API error during streaming with tools: {e}")
+            logger.error("OpenAI API error during streaming with tools: %s", type(e).__name__)
             raise
         except Exception as e:
-            logger.error(f"OpenAI streaming with tools failed: {e}", exc_info=True)
+            logger.error("OpenAI streaming with tools failed: %s", type(e).__name__)
             raise
 
     async def continue_with_tool_results(

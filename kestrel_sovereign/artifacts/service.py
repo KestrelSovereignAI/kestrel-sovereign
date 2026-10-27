@@ -19,10 +19,9 @@ this is not a Python sandbox. No service entry point accepts an owner selector.
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Callable, Iterator
-from contextlib import asynccontextmanager, contextmanager
-from dataclasses import dataclass
-from datetime import UTC, datetime
+from collections.abc import Callable
+from contextlib import asynccontextmanager
+from datetime import datetime
 from enum import StrEnum
 
 from kestrel_sdk.artifacts import (
@@ -37,11 +36,11 @@ from kestrel_sdk.artifacts import (
 from kestrel_sdk.operator import OperatorAuthorizationError, OperatorContext
 from kestrel_sdk.resources import ResourceError, ResourceOutcomeUnknown, ResourceScope
 
-from kestrel_sovereign._async_rwlock import AsyncReaderWriterLock
-from kestrel_sovereign.privacy import PrivacyConfig, PrivacyMode
-from kestrel_sovereign.storage.privacy_wrapper import require_durable_persistence_gate
+from kestrel_sovereign.security.capability_authority import HostCapabilityAuthority
 
 from .repository import ArtifactRepository
+from .preview import ArtifactPreviewUnavailable, ArtifactPreviewRefused, MAX_SOURCE_BYTES
+from kestrel_sovereign._async_rwlock import AsyncReaderWriterLock
 
 
 class ArtifactAccessDenied(ResourceError, OperatorAuthorizationError):
@@ -53,115 +52,25 @@ class ArtifactAction(StrEnum):
     WRITE = "artifacts.write"
     LINK = "artifacts.link"
     DELETE = "artifacts.delete"
+    TRANSFER = "artifacts.transfer"
 
 
 CurrentAuthority = Callable[[OperatorContext, ArtifactAction, ArtifactLink | None], None]
 
 
-@dataclass
-class _Binding:
-    context: OperatorContext
-    privacy_holder: object
-    check_current: CurrentAuthority
-    authority_gate: AsyncReaderWriterLock
-    active: bool = True
-
-
-class ArtifactAuthority:
-    """Request-lifetime provenance for contexts resolved by trusted host code.
-
-Use one instance per host service. Bindings are removed on request exit and
-invalidate copied task contexts immediately. No external registration API may
-expose ``bind_authenticated``. The checker is required even for a sovereign
-caller: role alone does not prove a still-current credential or live grant.
-"""
+class ArtifactAuthority(HostCapabilityAuthority):
+    """Artifact policy over the canonical original-context host binding."""
 
     def __init__(self, *, clock: Callable[[], datetime] | None = None):
-        self.clock = clock or (lambda: datetime.now(UTC))
-        self._bindings: dict[int, _Binding] = {}
-        self._operations: dict[asyncio.Task, _Binding] = {}
-
-    @contextmanager
-    def bind_authenticated(
-        self, context: OperatorContext, *, privacy_holder: object,
-        check_current: CurrentAuthority, authority_gate: AsyncReaderWriterLock,
-    ) -> Iterator[OperatorContext]:
-        if not isinstance(context, OperatorContext) or not callable(check_current):
-            raise TypeError("host-resolved context and current authority checker required")
-        if not isinstance(authority_gate, AsyncReaderWriterLock):
-            raise TypeError("host authority transition gate required")
-        context.require_fresh(self.clock())
-        require_durable_persistence_gate(privacy_holder)
-        if id(context) in self._bindings:
-            raise ValueError("artifact context already has an active lifetime")
-        binding = _Binding(context, privacy_holder, check_current, authority_gate)
-        self._bindings[id(context)] = binding
-        try:
-            yield context
-        finally:
-            binding.active = False
-            self._bindings.pop(id(context), None)
-
-    def _check(self, binding: _Binding, context: OperatorContext,
-               action: ArtifactAction, storage_id: str,
-               link: ArtifactLink | None) -> None:
-        if (not binding.active or binding.context is not context
-                or self._bindings.get(id(context)) is not binding):
-            raise ArtifactAccessDenied("artifact context is not active")
-        try:
-            context.require_fresh(self.clock())
-            context.require_action(action.value)
-            context.require_capability("artifacts")
-            context.require_boundary(storage_id)
-            if binding.check_current(context, action, link) is not None:
-                raise TypeError("artifact authority checker must return None or raise")
-        except Exception:
-            # A failed current-grant lookup is a denial, including plain
-            # PermissionError or infrastructure failures. Never turn a checker
-            # failure after durable acceptance into an ordinary save failure.
-            raise ArtifactAccessDenied("artifact authority is unavailable") from None
-        # Generic binary/source artifacts have no PII/deidentification transform.
-        # Refuse those modes instead of treating persistent storage as consent
-        # to retain or reveal arbitrary originals. Explicit erasure stays usable.
-        if action is not ArtifactAction.DELETE:
-            holder = binding.privacy_holder
-            config = getattr(holder, "privacy_config", None)
-            if (getattr(holder, "privacy_mode", None) not in (PrivacyMode.NORMAL, PrivacyMode.PUBLIC)
-                    or not isinstance(config, PrivacyConfig)
-                    or config.storage != "full" or config.assurance != "none"
-                    or config.audit != "optional"):
-                raise ArtifactAccessDenied("privacy policy does not permit raw artifacts")
+        super().__init__(capability="artifacts", label="artifact",
+                         non_disclosing_actions=frozenset({ArtifactAction.DELETE.value}),
+                         access_denied=ArtifactAccessDenied, clock=clock)
 
     @asynccontextmanager
     async def operation(self, context: OperatorContext, action: ArtifactAction,
                         storage_id: str, *, link: ArtifactLink | None = None):
-        binding = self._bindings.get(id(context))
-        if binding is None or binding.context is not context:
-            raise ArtifactAccessDenied("artifact context was not resolved by this host")
-
-        def check() -> None:
-            self._check(binding, context, action, storage_id, link)
-
-        check()
-        task = asyncio.current_task()
-        existing = self._operations.get(task)
-        if existing is not None:
-            # A response retains the gates across service calls and ASGI send.
-            # Re-enter only on the SAME task and exact binding; copied task
-            # context does not grant a lease. Still check each nested action.
-            if existing is not binding:
-                raise ArtifactAccessDenied("nested artifact owner does not match")
+        async with super().operation(context, action, storage_id, target=link) as check:
             yield check
-            return
-        gate = require_durable_persistence_gate(binding.privacy_holder)
-        async with gate.shared():
-            async with binding.authority_gate.read():
-                check()
-                self._operations[task] = binding
-                try:
-                    yield check
-                finally:
-                    self._operations.pop(task, None)
 
 
 class AuthorizedArtifactService:
@@ -170,6 +79,11 @@ class AuthorizedArtifactService:
     def __init__(self, repository: ArtifactRepository, authority: ArtifactAuthority):
         self.repository = repository
         self.authority = authority
+        self.preview_pool = None
+        self.preview_renderer = None
+        self._erasure_fences = {}
+        self._preview_deliveries = {}
+        self._current_constraints = {}
 
     @staticmethod
     def _scope(context: OperatorContext) -> ResourceScope:
@@ -178,7 +92,15 @@ class AuthorizedArtifactService:
 
     async def _perform(self, context, action, operation, *, mutation=False, link=None):
         async with self.authority.operation(context, action, self.repository.storage_id,
-                                            link=link) as check:
+                                            link=link) as authority_check:
+            # Capture the original lexical restrictions for owned DB journal
+            # children too; a child does not inherit permission to admit work.
+            constraints = tuple(self._current_constraints.get(asyncio.current_task(), ()))
+            def check():
+                authority_check()
+                for bound, constraint in constraints:
+                    if bound is context:
+                        constraint()
             await self.repository.ensure_initialized()
             check()
             result = await operation(self._scope(context), check)
@@ -193,6 +115,26 @@ class AuthorizedArtifactService:
                     ) from None
                 raise ArtifactAccessDenied("artifact result authority is unavailable") from None
             return result
+
+    @asynccontextmanager
+    async def restrict_current(self, context, check):
+        """Add a lexical restriction, never a grant, to canonical DB guards.
+
+        A cross-capability broker retains its original visual/session check
+        here, so a revocation during an awaited DB step also fences COMMIT.
+        Exact task and context identity prevent inherited/background reuse.
+        """
+        task = asyncio.current_task()
+        constraints = self._current_constraints.setdefault(task, [])
+        entry = (context, check)
+        constraints.append(entry)
+        try:
+            check()
+            yield
+        finally:
+            constraints.remove(entry)
+            if not constraints:
+                self._current_constraints.pop(task, None)
 
     async def stage(self, context: OperatorContext, content: bytes, *, publication_key: str,
                     path: str, media_type: str) -> ArtifactFile:
@@ -221,9 +163,9 @@ class AuthorizedArtifactService:
             lambda scope, check: self.repository.read(scope, ref, path, guard=check))
 
     async def list(self, context: OperatorContext, *, cursor: str | None = None,
-                   limit: int = 50) -> ArtifactPage:
+                   limit: int = 50, query: str = "") -> ArtifactPage:
         return await self._perform(context, ArtifactAction.READ,
-            lambda scope, check: self.repository.page(scope, cursor=cursor, limit=limit, guard=check))
+            lambda scope, check: self.repository.page(scope, cursor=cursor, limit=limit, query=query, guard=check))
 
     async def history(self, context: OperatorContext, artifact_id: str, *,
                       cursor: str | None = None, limit: int = 50) -> ArtifactPage:
@@ -242,6 +184,65 @@ class AuthorizedArtifactService:
             lambda scope, check: self.repository.link(scope, link, remove=True, guard=check),
             mutation=True, link=link)
 
+    @asynccontextmanager
+    async def _erasure_fence(self, context, artifact_id, *, write=False):
+        scope = self._scope(context)
+        key = (scope.tenant_id, scope.principal_id, scope.agent_id, artifact_id)
+        record = self._erasure_fences.setdefault(key, [AsyncReaderWriterLock(), 0])
+        record[1] += 1
+        try:
+            async with (record[0] if write else record[0].read()):
+                yield
+        finally:
+            record[1] -= 1
+            if not record[1]:
+                self._erasure_fences.pop(key, None)
+
+    @asynccontextmanager
+    async def preview_delivery(self, context: OperatorContext, ref: ArtifactRef):
+        """Fence canonical erasure through derivative generation AND final send."""
+        ref = ArtifactRef.model_validate(ref)
+        task = asyncio.current_task()
+        if task in self._preview_deliveries:
+            raise ArtifactAccessDenied('preview delivery already bound')
+        async with self.authority.operation(context, ArtifactAction.READ, self.repository.storage_id) as check:
+            async with self._erasure_fence(context, ref.artifact_id):
+                self._preview_deliveries[task] = (context, ref, check)
+                try:
+                    check()
+                    yield check
+                finally:
+                    self._preview_deliveries.pop(task, None)
+
+    async def preview(self, context: OperatorContext, ref: ArtifactRef):
+        binding = self._preview_deliveries.get(asyncio.current_task())
+        if binding is None or binding[0] is not context or binding[1] != ref:
+            raise ArtifactAccessDenied('preview delivery is not host-bound')
+        check = binding[2]
+        revision = await self.get(context, ref)
+        if self.preview_pool is None or self.preview_renderer is None:
+            raise ArtifactPreviewUnavailable('host preview renderer is unavailable')
+        file = next(file for file in revision.manifest.files if file.path == revision.manifest.entrypoint)
+        if not 0 < file.size_bytes <= MAX_SOURCE_BYTES:
+            raise ArtifactPreviewRefused('source exceeds the preview bound')
+        await self.preview_renderer.reconcile_cleanup(self.preview_pool)
+        check()
+        # Admission precedes source bytes as well as the native decoder. A
+        # saturated renderer cannot accumulate an unbounded input-read queue.
+        job = self.preview_pool.reserve()
+        try:
+            content = await self.read(context, ref, file.path)
+            check()
+            result = await self.preview_renderer.render(self.preview_pool, content, file.media_type, check, job=job)
+            check()
+            return result
+        finally:
+            if not job.creation_started:
+                self.preview_pool.complete(job)
+
     async def delete(self, context: OperatorContext, expected_head: ArtifactRef) -> None:
-        await self._perform(context, ArtifactAction.DELETE,
-            lambda scope, check: self.repository.delete(scope, expected_head, guard=check), mutation=True)
+        expected_head = ArtifactRef.model_validate(expected_head)
+        async with self.authority.operation(context, ArtifactAction.DELETE, self.repository.storage_id):
+            async with self._erasure_fence(context, expected_head.artifact_id, write=True):
+                await self._perform(context, ArtifactAction.DELETE,
+                    lambda scope, check: self.repository.delete(scope, expected_head, guard=check), mutation=True)

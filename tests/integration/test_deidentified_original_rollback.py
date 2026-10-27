@@ -23,6 +23,7 @@ from tests.integration.native_memory_original_control import native_memory_owner
 from tests.integration.test_execution_authority_postgres import native_pg as native_pg
 from tests.unit.test_deidentified_storage_gate import _result
 from tests.unit.test_cleanup_task_admission import _operation_name
+from tests.shared.original_task_admission import assert_unknown_task_admission
 
 
 @pytest.mark.asyncio
@@ -129,10 +130,12 @@ async def test_refused_deidentified_save_does_not_acquire_native_transaction(
         with pytest.raises(RuntimeError) as caught:
             await wrapper.store_deidentified_records(_result())
         loop.set_task_factory(factory)
-        assert caught.value is refusal and refused
+        assert refused
+        assert_unknown_task_admission(caught.value, refusal)
         assert all(inspect.getcoroutinestate(coro) == inspect.CORO_CLOSED for coro in refused)
         assert wrapper._active_deidentified_save_leases == 0
-        assert not execution_cleanup_debts(caught.value)
+        # No native write ran, but closing the unstarted payload cannot certify
+        # that this opaque factory accepted no other native carrier.
         assert await n.observer.fetchval(f'SELECT COUNT(*) FROM "{n.schema}".files') == 0
         wrapper.set_privacy_mode(PrivacyMode.EPHEMERAL)
     finally:

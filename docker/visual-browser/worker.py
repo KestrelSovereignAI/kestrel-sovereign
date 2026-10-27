@@ -10,6 +10,7 @@ import hmac
 import math
 import os
 import signal
+import secrets
 from datetime import UTC, datetime
 
 from controller import BrowserController, Refused, identifier, instant, version_one
@@ -18,8 +19,11 @@ from wire import DIRECTORY, MAX_REQUEST, MAX_RESPONSE, SECRET, decode, encode
 
 
 def bootstrap(value):
-    if (not version_one(value) or set(value) != {"schema_version", "secret", "request", "document_html"}
+    if (not version_one(value) or set(value) != {"schema_version", "secret", "request", "document_html", "incarnation", "network_profile"}
             or not isinstance(value["secret"], str) or not SECRET.fullmatch(value["secret"])
+            or not isinstance(value["incarnation"], str) or not SECRET.fullmatch(value["incarnation"])
+            or (value["network_profile"] is not None and (not isinstance(value["network_profile"], str)
+                or not value["network_profile"].startswith("http-get-pinned-v1-")))
             or not isinstance(value["document_html"], str)
             or len(value["document_html"].encode()) > 65536):
         raise Refused("invalid_bootstrap")
@@ -29,9 +33,10 @@ def bootstrap(value):
 class Endpoint:
     """Transport retries query the same controller; they never construct a new one."""
 
-    def __init__(self, controller, secret):
+    def __init__(self, controller, secret, *, priority=False):
         self.controller, self.secret = controller, secret
         self.connections = 0
+        self.priority = priority
 
     async def dispatch(self, message):
         if (not version_one(message) or set(message) != {"schema_version", "secret", "id", "operation", "arguments"}
@@ -43,6 +48,8 @@ class Endpoint:
         if not isinstance(arguments, dict):
             raise Refused("invalid_request")
         controller = self.controller
+        if self.priority and operation not in {"status", "action_status", "control", "network_cancel"}:
+            raise Refused("priority_operation_required")
         if operation == "status" and set(arguments) == {"scope", "session_id"}:
             return controller.status(**arguments)
         if operation == "observe" and set(arguments) == {"session"}:
@@ -54,11 +61,19 @@ class Endpoint:
             return controller.action_status(**arguments)
         if operation == "control" and set(arguments) == {"session", "request"}:
             return await controller.control(**arguments)
+        if operation == "network_poll" and set(arguments) == {"session", "action_id"} and hasattr(controller, "network"):
+            return controller.network.poll(**arguments)
+        if operation == "network_reply" and set(arguments) == {"session", "action_id", "job_id", "reply"} and hasattr(controller, "network"):
+            return controller.network.reply(**arguments)
+        if operation == "network_cancel" and set(arguments) == {"session", "action_id"} and hasattr(controller, "network"):
+            return await controller.network.cancel(**arguments)
+        if operation == "workspace" and set(arguments) == {"session", "operation", "arguments"} and hasattr(controller, "workspace"):
+            return await controller.workspace.dispatch(**arguments)
         raise Refused("unsupported_request")
 
     async def handle(self, reader, writer):
         # Do not queue an unbounded number of requests behind the controller lock.
-        if self.connections >= 4:
+        if self.connections >= (2 if self.priority else 4):
             writer.close()
             return
         self.connections += 1
@@ -66,7 +81,8 @@ class Endpoint:
             async with asyncio.timeout(20):
                 request_id = None
                 try:
-                    raw = await reader.readline()
+                    async with asyncio.timeout(1 if self.priority else 20):
+                        raw = await reader.readline()
                     if not raw.endswith(b"\n") or len(raw) > MAX_REQUEST:
                         raise Refused("invalid_request")
                     message = decode(raw)
@@ -100,11 +116,15 @@ class Endpoint:
 
 async def serve(controller, secret, *, directory=DIRECTORY):
     endpoint = Endpoint(controller, secret)
+    priority = Endpoint(controller, secret, priority=True)
     socket_path = directory / "worker.sock"
+    priority_path = directory / "control.sock"
     server = await asyncio.start_unix_server(endpoint.handle, str(socket_path), limit=MAX_REQUEST)
+    control_server = await asyncio.start_unix_server(priority.handle, str(priority_path), limit=MAX_REQUEST)
     try:
         os.chmod(socket_path, 0o600)
-        async with server:
+        os.chmod(priority_path, 0o600)
+        async with server, control_server:
             while controller._session["state"] not in {"closing", "closed"}:
                 await asyncio.sleep(0.1)
                 try:
@@ -113,9 +133,12 @@ async def serve(controller, secret, *, directory=DIRECTORY):
                     break
     finally:
         server.close()
+        control_server.close()
         await server.wait_closed()
+        await control_server.wait_closed()
         await controller.retire()
         socket_path.unlink(missing_ok=True)
+        priority_path.unlink(missing_ok=True)
 
 
 async def main():
@@ -123,6 +146,8 @@ async def main():
     admission = process_evidence()
     os.umask(0o077)
     DIRECTORY.mkdir(mode=0o700, exist_ok=False)
+    incarnation = secrets.token_hex(32)
+    (DIRECTORY / "incarnation").write_text(incarnation)
     source = DIRECTORY / "bootstrap.json"
     async with asyncio.timeout(30):
         while not source.exists():
@@ -133,6 +158,8 @@ async def main():
         if len(raw) > MAX_REQUEST:
             raise Refused("invalid_bootstrap")
         settings = bootstrap(decode(raw))
+        if not hmac.compare_digest(settings["incarnation"], incarnation):
+            raise Refused("worker_incarnation_mismatch")
         remaining = (instant(settings["request"]["expires_at"]) - datetime.now(UTC)).total_seconds()
         if not 0 < remaining <= 3600:
             raise Refused("invalid_session_lifetime")
@@ -141,11 +168,29 @@ async def main():
         async with asyncio.timeout(20):
             browser = await playwright.chromium.launch(headless=True, chromium_sandbox=True, channel="chromium")
             admission.update(await chromium_evidence(browser))
+            admission["worker_incarnation"] = incarnation
             (DIRECTORY / "admission.json").write_bytes(encode(admission))
             context = await browser.new_context(viewport={"width": 800, "height": 600},
                                                 accept_downloads=False, service_workers="block")
             page = await context.new_page()
-            controller = BrowserController(page, settings["request"])
+            from workspace import WorkspaceTransport
+            controller = BrowserController(page, settings["request"], workspace_enabled=True,
+                                           network_enabled=settings["network_profile"] is not None)
+            controller.workspace = WorkspaceTransport(controller, DIRECTORY / "workspace-transfer")
+            async def deny_socket(connection):
+                await connection.close(code=1008, reason="unsupported_channel")
+            await context.route_web_socket("**/*", deny_socket)
+            await context.add_init_script("""for (const name of ['RTCPeerConnection','webkitRTCPeerConnection']) {
+                Object.defineProperty(globalThis,name,{value:class {constructor(){throw new DOMException('unsupported_channel','SecurityError')}},writable:false,configurable:false});
+            }""")
+            if settings["network_profile"] is not None:
+                from network import NetworkRelay
+                controller.network = NetworkRelay(controller)
+                await context.route("**/*", controller.network.route)
+            else:
+                async def deny_request(route):
+                    await route.abort("blockedbyclient")
+                await context.route("**/*", deny_request)
             await page.set_content(settings["document_html"], timeout=5000)
         signal.alarm(max(1, math.ceil(controller.deadline - controller.monotonic())) + 10)
         try:
