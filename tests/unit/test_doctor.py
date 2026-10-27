@@ -21,7 +21,7 @@ from kestrel_sovereign.multi_agent.config import (
     LocalAgentConfig,
     MultiAgentConfig,
 )
-from kestrel_sovereign.setup.env_file import write_env
+from kestrel_sovereign.setup.env_file import read_env, write_env
 from kestrel_sovereign.setup.toml_file import write_toml
 
 
@@ -251,6 +251,64 @@ def test_doctor_accepts_private_identity_export_metadata(tmp_path):
     report = diagnose(tmp_path)
 
     assert not any("identity-export" in message for message in report.warn)
+
+
+def _add_cohosted_peer(tmp_path: Path) -> None:
+    path = tmp_path / MULTI_AGENT_CONFIG_FILENAME
+    multi_agent = MultiAgentConfig.from_file(path)
+    multi_agent.agents["Peer"] = LocalAgentConfig(
+        data_dir=Path("agent_data/peer"), port=8802, autostart=True
+    )
+    multi_agent.save(path)
+    db_dir = tmp_path / "agent_data" / "peer"
+    db_dir.mkdir(parents=True)
+    (db_dir / "kestrel_prime.db").write_bytes(b"")
+
+
+def _unpublished_cohost_warnings(report) -> list[str]:
+    return [m for m in report.warn if m.startswith("KESTREL_BASE_URL is unset")]
+
+
+def test_doctor_warns_when_cohosted_agents_cannot_publish_native_a2a(
+    tmp_path, monkeypatch
+):
+    """Upgrading a local fleet without the variable is visible before any send."""
+    monkeypatch.delenv("KESTREL_BASE_URL", raising=False)
+    _seed_ready(tmp_path)
+    _add_cohosted_peer(tmp_path)
+
+    report = diagnose(tmp_path)
+
+    [warning] = _unpublished_cohost_warnings(report)
+    assert "none of this host's 2 agents publishes a native A2A interface" in warning
+    assert "KESTREL_BASE_URL=http://127.0.0.1:8888" in warning
+    assert "KESTREL_A2A_PUSH_ENABLED=false" in warning
+
+
+def test_doctor_reads_base_url_from_the_host_launch_environment(
+    tmp_path, monkeypatch
+):
+    monkeypatch.delenv("KESTREL_BASE_URL", raising=False)
+    _seed_ready(tmp_path)
+    _add_cohosted_peer(tmp_path)
+    env_path = tmp_path / ".env"
+    write_env(
+        env_path,
+        {
+            **read_env(env_path),
+            "KESTREL_BASE_URL": "http://127.0.0.1:8888",
+            "KESTREL_A2A_PUSH_ENABLED": "false",
+        },
+    )
+
+    assert _unpublished_cohost_warnings(diagnose(tmp_path)) == []
+
+
+def test_doctor_does_not_warn_a_single_agent_host(tmp_path, monkeypatch):
+    monkeypatch.delenv("KESTREL_BASE_URL", raising=False)
+    _seed_ready(tmp_path)
+
+    assert _unpublished_cohost_warnings(diagnose(tmp_path)) == []
 
 
 # ---------------------------------------------------------------------------

@@ -3842,6 +3842,18 @@ async def _lifespan_startup(app: FastAPI):
             # DID's durable protocol row before concurrent agent
             # initialization and post-load default seeding.
             await _prepare_shared_postgres_scheduler_protocol(app, manager, config)
+            # Onboarding reads publication from this same environment. Without
+            # a public base URL the host still starts healthy, so say so before
+            # any agent can attempt a co-hosted send (#3872).
+            from kestrel_sovereign.a2a.native_publication import (
+                unpublished_cohost_warning,
+            )
+
+            unpublished = unpublished_cohost_warning(
+                multi_agent_runtime_env, config
+            )
+            if unpublished is not None:
+                logger.warning(unpublished)
             # Scheduler preflight seeded authority from this exact reconciled
             # roster. Do not let load_from_config re-read multi_agent.toml after
             # that await and switch runtime tenants without re-seeding the

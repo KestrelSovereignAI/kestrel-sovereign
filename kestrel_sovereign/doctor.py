@@ -35,6 +35,10 @@ Checks performed:
   - Every pinned semantic resource still matches its manifest digest. One
     mismatch refuses agent boot wholesale, and a CRLF-smudged checkout breaks
     all of them at once — see ``_check_semantic_registry`` (#2924).
+  - A host serving two or more local agents sets ``KESTREL_BASE_URL``.
+    Without it no agent publishes a native A2A interface, and every co-hosted
+    A2A send fails at send time — see ``_check_native_a2a_publication``
+    (#3872).
   - Every package core's ``uv.lock`` pins is installed at the locked version,
     so the host runs what CI tested. A mismatch is reported, never repaired —
     see ``_check_core_lock`` (#3502).
@@ -155,10 +159,31 @@ def diagnose(project_dir: Path) -> DoctorReport:
     _check_sqlite_hold_readiness(resolved, project_dir, report)
     _check_postgres_hold_readiness(resolved, project_dir, readings, report)
     _check_legacy_identity_exports(project_dir, report)
+    _check_native_a2a_publication(multi_agent, resolved, report)
     _check_semantic_registry(report)
     _check_core_lock(report)
 
     return report
+
+
+def _check_native_a2a_publication(
+    multi_agent: MultiAgentConfig | None,
+    env: dict,
+    report: DoctorReport,
+) -> None:
+    """Warn, before any agent tries a send, that co-hosted A2A cannot work.
+
+    The host starts healthy without a public base URL, and each co-hosted send
+    fails only when it is attempted (#3872). This reports the host's own
+    startup warning from the environment ``kestrel start`` hands the host.
+    """
+    if multi_agent is None:
+        return
+    from kestrel_sovereign.a2a.native_publication import unpublished_cohost_warning
+
+    warning = unpublished_cohost_warning(env, multi_agent)
+    if warning is not None:
+        report.warn.append(warning)
 
 
 def _check_core_lock(report: DoctorReport) -> None:
