@@ -47,8 +47,11 @@ async def test_manager_admission_diagnostic_keeps_original_unexpected_control(
         manager._quarantined_shutdown_handoffs_open.clear()
     def predicate(operation):
         code = getattr(operation, "cr_code", None)
+        if surface == "spawn-wait":
+            frame = getattr(operation, "cr_frame", None)
+            return (code is asyncio.Event.wait.__code__ and frame is not None
+                    and frame.f_locals.get("self") is manager._quarantined_shutdown_handoffs_open)
         return (code is asyncio.Lock.acquire.__code__ if surface == "drain-admission"
-                else code is asyncio.Event.wait.__code__ if surface == "spawn-wait"
                 else getattr(code, "co_name", "") == "acquire_manager_lock")
     fault = NativeAdmissionFault(predicate, publication, "refuse")
     loop, previous = asyncio.get_running_loop(), asyncio.get_running_loop().get_task_factory()
