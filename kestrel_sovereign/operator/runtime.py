@@ -30,6 +30,100 @@ from kestrel_sdk.operator import (
 )
 
 
+class ServiceDiscoveryIdentity:
+    """Opaque identity comparison for fresh retained discovery operations.
+
+    This is metadata, never a credential or current checker. It is neither
+    serialized nor persisted. An equal identity cannot authorize a service
+    operation, and a closed operation's checker can never be revived by it.
+    """
+
+    __slots__ = ("_parts",)
+
+    def __new__(cls, *args, **kwargs):
+        raise TypeError("discovery identities are issued by retained host discovery")
+
+    @classmethod
+    def _from_registry(cls, registry, registration, issued_set, seal):
+        value = object.__new__(cls)
+        object.__setattr__(
+            value, "_parts", (registry, registration, issued_set, seal, None, None, None, None)
+        )
+        return value
+
+    def _with_host_binding(self, binding, generation, publication, publication_generation):
+        if type(generation) is not int or (
+            publication_generation is not None and type(publication_generation) is not int
+        ):
+            raise OperatorAuthorizationError("host discovery generation unavailable")
+        value = object.__new__(type(self))
+        object.__setattr__(
+            value,
+            "_parts",
+            (*self._parts[:4], binding, generation, publication, publication_generation),
+        )
+        return value
+
+    def matches(self, other):
+        """Compare only trusted exact identities and plain host generations.
+
+        A match supplies no authority. Consumers MUST separately retain the
+        fresh operation's checker and their independent capability policy.
+        """
+        if (
+            type(self) is not ServiceDiscoveryIdentity
+            or type(other) is not ServiceDiscoveryIdentity
+        ):
+            return False
+        first, second = getattr(self, "_parts", ()), getattr(other, "_parts", ())
+        if (
+            type(first) is not tuple
+            or type(second) is not tuple
+            or len(first) != 8
+            or len(second) != 8
+        ):
+            return False
+        if any(
+            value is not None and type(value) is not int
+            for value in (first[5], first[7], second[5], second[7])
+        ):
+            return False
+        return (
+            all(first[index] is second[index] for index in (0, 1, 2, 3, 4, 6))
+            and first[5] == second[5]
+            and first[7] == second[7]
+        )
+
+    def __setattr__(self, name, value):
+        raise AttributeError("discovery identity is immutable")
+
+    def __repr__(self):
+        return "<opaque host service discovery identity>"
+
+    def __reduce_ex__(self, protocol):
+        raise TypeError("discovery identity is not serializable")
+
+
+class _ServiceOperationIssuer:
+    """Lexical issuance provenance inside the existing discovery owner."""
+    __slots__ = ("operation", "service", "identity", "current")
+
+    def __init__(self, operation, current):
+        object.__setattr__(self, "operation", operation)
+        object.__setattr__(self, "service", operation.service)
+        object.__setattr__(self, "identity", operation.discovery_identity)
+        object.__setattr__(self, "current", current)
+
+    def __setattr__(self, name, value):
+        raise AttributeError("host operation issuance is immutable")
+
+    def __repr__(self):
+        return "<opaque original host operation issuance>"
+
+    def __reduce_ex__(self, protocol):
+        raise TypeError("host operation issuance is not serializable")
+
+
 @dataclass(frozen=True, slots=True)
 class ServiceOperation:
     """Exact retained registration discovery, never a capability grant.
@@ -39,6 +133,30 @@ class ServiceOperation:
     """
     service: object
     check_current: Callable[[], None]
+    discovery_identity: ServiceDiscoveryIdentity | None = None
+    _issuer: _ServiceOperationIssuer | None = field(default=None, init=False, repr=False, compare=False)
+
+    @classmethod
+    def _issue(cls, service, current, discovery_identity):
+        operation = cls(service, current, discovery_identity)
+        object.__setattr__(operation, "_issuer", _ServiceOperationIssuer(operation, current))
+        return operation
+
+    def require_issued(self):
+        """Check this exact original record and its still-live lexical owner.
+
+        This verifies discovery provenance only. It supplies no run/content
+        policy. Ordinary API1 two-field descriptions keep their existing
+        check_current behavior, but cannot satisfy this new provenance seam.
+        Trusted Python extensions remain trusted; this is not a Python sandbox.
+        """
+        issuer = self._issuer
+        if (type(issuer) is not _ServiceOperationIssuer or issuer.operation is not self
+                or issuer.service is not self.service or issuer.identity is not self.discovery_identity
+                or issuer.current is not self.check_current):
+            raise OperatorAuthorizationError("original issued host discovery is unavailable")
+        if issuer.current() is not None:
+            raise OperatorAuthorizationError("host discovery checker must return None or raise")
 
 
 class OperatorRegistrationError(RuntimeError):
@@ -131,6 +249,8 @@ class OperatorRuntimeRegistry:
     are never represented as an ownership stack, so removing one lifecycle
     cannot reveal a superseded inactive implementation.
     """
+
+    host_service_identity_api_version = 1
 
     def __init__(self, *, clock: Callable[[], datetime] | None = None) -> None:
         self._clock = clock or (lambda: datetime.now(UTC))
@@ -362,7 +482,8 @@ class OperatorRuntimeRegistry:
                     raise OperatorAuthorizationError("original host registration ended")
         try:
             check()
-            yield ServiceOperation(registration.service, check)
+            identity = ServiceDiscoveryIdentity._from_registry(self, registration, original, seal)
+            yield ServiceOperation._issue(registration.service, check, identity)
             check()
         finally:
             active = False
