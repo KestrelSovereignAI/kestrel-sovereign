@@ -1,10 +1,12 @@
 # Native artifact producer: unpublished source candidate
 
-This implementation is a development candidate. Its prototype metadata is not
-a released capability or permission to replace the immutable Core 0.56 release.
-It needs composition with the reviewed foundation, an appropriate successor
-version, published dependency floors and normal-index lock, and a full review
-before delivery. The original operator service operation API remains version 1;
+This implementation is an unpublished Core 0.57.0 source successor. Its normal
+source metadata neither reserves a release nor makes the producer capability
+publicly installable. Foundation Core 0.56 does not contain native producer API1
+or host discovery identity API1. Delivery still requires the approved foundation
+merge, whole-source review, CI, explicit release approval, actual immutable
+publication, and the consumer normal-index floor/lock and installed acceptance.
+The original operator service operation API remains version 1;
 the additional discovery identity advertisement is separately versioned.
 
 The ArtifactsFeature owns finite native output admissions and uses its existing
