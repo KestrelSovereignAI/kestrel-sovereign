@@ -50,6 +50,20 @@ from kestrel_sovereign.storage.sqla.migrations import (
     migrate_semantic_maintenance,
 )
 from tests.utils.native_a2a import manager_for
+from tests.utils.virtual_clock import pinned_shacl_validation_clock
+
+
+@pytest.fixture(autouse=True)
+def _pinned_shacl_validation_budget():
+    """Governed writes here assert storage parity, not validation speed.
+
+    Every governed write runs a SHACL validation bounded by its wall-time
+    budget. A host stall inside one rejected a fact save on CI, and the
+    ledger test saw two sources where it wrote three (#3858). The budget's
+    own behaviour is tested in ``tests/unit/test_shacl_validation.py``.
+    """
+    with pinned_shacl_validation_clock():
+        yield
 
 
 @pytest.mark.asyncio
@@ -3624,6 +3638,9 @@ async def test_explicit_fact_replays_append_and_delete_from_the_operation_ledger
             invocation_id="ledger-c",
         )
 
+        # A rejected save also reports ``idempotent=False``.
+        assert [receipt.error for receipt in (first, second, third)] == [None] * 3
+        assert first.saved and second.saved and third.saved
         assert first.idempotent is False
         assert second.idempotent is False
         assert third.idempotent is False

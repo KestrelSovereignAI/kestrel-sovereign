@@ -341,6 +341,50 @@ async def normal_close_schedule(*, prejoined: bool = False):
                 raise terminal
 
 
+async def close_sqla_factory_on_a_normal_schedule(factory) -> None:
+    """Close a SQLAlchemy factory's real SQLite drivers inside their budget.
+
+    For a test that closes a factory only to clean up after asserting
+    something else, not how fast a loaded host closes SQLite. The loop clock
+    is pinned from before the close takes its deadline until every driver's
+    worker has exited, so a slow or stalled host cannot expire that deadline
+    (#3858). The close's worker-exit polls then come due one poll interval
+    later, well inside the budget. Production close budgets and their expiry
+    keep their own tests; nothing here changes them.
+    """
+    workers = [
+        aiosqlite_worker(connection)
+        for connection in factory._sqlite_connections
+    ]
+    exited = asyncio.ensure_future(asyncio.gather(*(
+        asyncio.to_thread(worker.join, HANG_GUARD_SECONDS)
+        for worker in workers
+    )))
+    try:
+        with pinned_loop_clock() as clock:
+            closing = asyncio.ensure_future(factory.close())
+            await await_within_hang_guard(
+                asyncio.wait(
+                    {closing, exited}, return_when=asyncio.FIRST_COMPLETED,
+                ),
+                step="the factory close or its SQLite workers' exit",
+            )
+            if not closing.done():
+                await await_within_hang_guard(
+                    exited, step="the factory's SQLite workers exiting",
+                )
+                assert not any(worker.is_alive() for worker in workers)
+                clock.advance(sqlite_module._AIOSQLITE_WORKER_SHUTDOWN_POLL_S * 1.1)
+            await await_within_hang_guard(
+                closing, step="the factory close completing",
+            )
+    finally:
+        await await_within_hang_guard(
+            exited, step="the factory's SQLite workers exiting",
+        )
+    assert not any(worker.is_alive() for worker in workers)
+
+
 @contextmanager
 def delay_aiosqlite_worker_exit(
     release_worker: threading.Event,
