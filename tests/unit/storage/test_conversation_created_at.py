@@ -26,6 +26,7 @@ pinned below, because none of them fails loudly.
 
 from __future__ import annotations
 
+from contextlib import closing
 import sqlite3
 
 import pytest
@@ -138,21 +139,21 @@ def test_the_python_rendering_and_the_engines_agree_on_every_spelling():
     would re-spell would leave two forms of the same instant in the column.
     Asked of the real engine rather than of a second copy of the rule.
     """
-    engine = sqlite3.connect(":memory:")
-    engine.execute(
-        "CREATE TABLE t (created_at TIMESTAMP, "
-        f"CHECK ({created_at_check('sqlite')}))"
-    )
-    for spelling, expected in REPAIRABLE:
-        canonical = canonical_created_at(spelling)
-        assert canonical == expected, (
-            f"{spelling!r} was read as {canonical!r}, not {expected!r}"
+    with closing(sqlite3.connect(":memory:")) as engine:
+        engine.execute(
+            "CREATE TABLE t (created_at TIMESTAMP, "
+            f"CHECK ({created_at_check('sqlite')}))"
         )
-        engine.execute("INSERT INTO t (created_at) VALUES (?)", (canonical,))
-    stored = [row[0] for row in engine.execute("SELECT created_at FROM t")]
-    assert stored == [expected for _, expected in REPAIRABLE], (
-        "the CHECK accepted every canonical value but stored something else"
-    )
+        for spelling, expected in REPAIRABLE:
+            canonical = canonical_created_at(spelling)
+            assert canonical == expected, (
+                f"{spelling!r} was read as {canonical!r}, not {expected!r}"
+            )
+            engine.execute("INSERT INTO t (created_at) VALUES (?)", (canonical,))
+        stored = [row[0] for row in engine.execute("SELECT created_at FROM t")]
+        assert stored == [expected for _, expected in REPAIRABLE], (
+            "the CHECK accepted every canonical value but stored something else"
+        )
 
 
 def test_the_check_refuses_a_value_that_looks_nothing_like_a_date():
@@ -164,14 +165,14 @@ def test_the_check_refuses_a_value_that_looks_nothing_like_a_date():
     ``'2026-01-02T03:04:05'``: it rejects the near-misses and waves through the
     garbage, which is the worst of both. Measured on sqlite 3.50.4.
     """
-    engine = sqlite3.connect(":memory:")
-    engine.execute(
-        "CREATE TABLE t (created_at TIMESTAMP, "
-        f"CHECK ({created_at_check('sqlite')}))"
-    )
-    for value in [spelling for spelling, _ in REPAIRABLE[1:]] + UNREPAIRABLE:
-        with pytest.raises(sqlite3.IntegrityError):
-            engine.execute("INSERT INTO t (created_at) VALUES (?)", (value,))
+    with closing(sqlite3.connect(":memory:")) as engine:
+        engine.execute(
+            "CREATE TABLE t (created_at TIMESTAMP, "
+            f"CHECK ({created_at_check('sqlite')}))"
+        )
+        for value in [spelling for spelling, _ in REPAIRABLE[1:]] + UNREPAIRABLE:
+            with pytest.raises(sqlite3.IntegrityError):
+                engine.execute("INSERT INTO t (created_at) VALUES (?)", (value,))
 
 
 def test_the_check_admits_what_the_column_default_writes():
@@ -181,13 +182,13 @@ def test_the_check_admits_what_the_column_default_writes():
     CHECK that refused ``CURRENT_TIMESTAMP`` would turn those into hard errors
     at the moment the constraint landed.
     """
-    engine = sqlite3.connect(":memory:")
-    engine.execute(
-        "CREATE TABLE t (created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, "
-        f"CHECK ({created_at_check('sqlite')}))"
-    )
-    engine.execute("INSERT INTO t DEFAULT VALUES")
-    engine.execute("INSERT INTO t (created_at) VALUES (datetime('now'))")
+    with closing(sqlite3.connect(":memory:")) as engine:
+        engine.execute(
+            "CREATE TABLE t (created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, "
+            f"CHECK ({created_at_check('sqlite')}))"
+        )
+        engine.execute("INSERT INTO t DEFAULT VALUES")
+        engine.execute("INSERT INTO t (created_at) VALUES (datetime('now'))")
 
 
 def test_the_canonical_spelling_sorts_as_the_clock_does():
@@ -197,18 +198,18 @@ def test_the_canonical_spelling_sorts_as_the_clock_does():
     what allows ``julianday`` out of the ordering, the filtering and the index.
     If this ever stops holding, that simplification stops being available.
     """
-    engine = sqlite3.connect(":memory:")
-    engine.execute("CREATE TABLE t (v TEXT)")
-    values = [
-        "2026-01-02 03:04:05", "1970-01-01 00:00:00", "2026-01-02 03:04:06",
-        "2025-12-31 23:59:59", "0001-01-01 00:00:00", "9999-12-31 23:59:59",
-    ]
-    engine.executemany("INSERT INTO t VALUES (?)", [(v,) for v in values])
-    text_order = [r[0] for r in engine.execute("SELECT v FROM t ORDER BY v")]
-    clock_order = [
-        r[0] for r in engine.execute("SELECT v FROM t ORDER BY julianday(v)")
-    ]
-    assert text_order == clock_order
+    with closing(sqlite3.connect(":memory:")) as engine:
+        engine.execute("CREATE TABLE t (v TEXT)")
+        values = [
+            "2026-01-02 03:04:05", "1970-01-01 00:00:00", "2026-01-02 03:04:06",
+            "2025-12-31 23:59:59", "0001-01-01 00:00:00", "9999-12-31 23:59:59",
+        ]
+        engine.executemany("INSERT INTO t VALUES (?)", [(v,) for v in values])
+        text_order = [r[0] for r in engine.execute("SELECT v FROM t ORDER BY v")]
+        clock_order = [
+            r[0] for r in engine.execute("SELECT v FROM t ORDER BY julianday(v)")
+        ]
+        assert text_order == clock_order
 
 
 def test_an_undatable_row_prefers_the_row_before_it():
@@ -586,13 +587,13 @@ async def test_the_day_the_two_readers_disagree_about_is_settled_by_the_engine(
     it was always closest to. This pins the outcome rather than the reasoning,
     because reversing the two passes produces a plausible timestamp either way.
     """
-    engine = sqlite3.connect(":memory:")
-    assert engine.execute(
-        "SELECT julianday('2023-02-29T12:00:00')"
-    ).fetchone()[0] is not None, "the premise died: SQLite now refuses this"
-    assert canonical_created_at("2023-02-29T12:00:00") is None, (
-        "the premise died: Python now reads this, so nothing diverges"
-    )
+    with closing(sqlite3.connect(":memory:")) as engine:
+        assert engine.execute(
+            "SELECT julianday('2023-02-29T12:00:00')"
+        ).fetchone()[0] is not None, "the premise died: SQLite now refuses this"
+        assert canonical_created_at("2023-02-29T12:00:00") is None, (
+            "the premise died: Python now reads this, so nothing diverges"
+        )
 
     db = await _legacy_database(
         tmp_path, "impossible.db",
