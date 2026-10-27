@@ -24,7 +24,13 @@ async def test_registered_human_http_is_private_before_spans_and_native_access_l
     from kestrel_sovereign.visual_computer.runtime import VisualAction
     import uvicorn
 
-    app = visual_host[2]
+    from fastapi import FastAPI
+    # Other tests serve the shared host singleton first. Instrument a fresh
+    # public ASGI wrapper before its first request, retaining the genuinely
+    # registered host routes/middleware rather than retrofitting a cached stack.
+    app = FastAPI()
+    app.add_route('/health', visual_host[2], methods=['GET'])
+    app.mount('/', visual_host[2])
     exporter = InMemorySpanExporter()
     provider = TracerProvider()
     provider.add_span_processor(SimpleSpanProcessor(exporter))

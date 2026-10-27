@@ -145,3 +145,44 @@ async def test_arbitrary_human_rpc_refusal_is_not_original_native_no_send(harnes
         with pytest.raises(ResourceConflict):await h.runtime.human.act(context,session.session_id,'human',request)
         saved=await h.repository.action(h.runtime.scope(context),session.session_id,request.action.action_id)
         assert saved.receipt is None and await h.repository.has_pending_actions(h.runtime.scope(context),session.session_id)
+
+
+@pytest.mark.asyncio
+async def test_human_native_refusal_preserves_original_explicit_cause_graph(harness, monkeypatch, tmp_path):
+    """Zero-input driver; real Human issuer and original native settlement."""
+    from kestrel_sdk.resources import ResourceOutcomeUnknown
+    from kestrel_sovereign.visual_computer.docker_human import DockerHumanControl
+
+    h = harness
+    context = h.context()
+    native = ResourceOutcomeUnknown('original native command unknown')
+    child = asyncio.CancelledError('original joined Human borrower')
+    child.__cause__ = native
+    original = ResourceOutcomeUnknown('original Human driver interruption')
+    original.__cause__ = child
+    entries = []
+    with h.bind(context):
+        session, _, request, driver, received = await native_input(h, context, tmp_path, monkeypatch)
+        async def zero_input(self, selected, control_id, operation, arguments, action_id=None):
+            assert self.driver is driver and selected == session
+            assert control_id == 'human' and operation == 'act'
+            assert action_id == request.action.action_id
+            entries.append(action_id)
+            # The production native_human_dispatch issuer accounts for zero
+            # commands/input and issues its own exact original negative fact.
+            raise original
+        monkeypatch.setattr(DockerHumanControl, '_call', zero_input)
+        with pytest.raises(ResourceOutcomeUnknown) as caught:
+            await h.runtime.human.act(context, session.session_id, 'human', request)
+        saved = await h.repository.action(h.runtime.scope(context), session.session_id, request.action.action_id)
+        assert saved.channel == 'human' and saved.control_id == 'human'
+        assert saved.receipt.outcome == 'denied' and saved.receipt.reason_code == 'host_not_dispatched'
+        assert entries == [request.action.action_id] and not received.exists()
+        assert h.runtime._inflight == 0 and not h.runtime.egress._calls
+        assert not driver._workspace_borrowers and not h.repository._original_results
+        assert not h.db.backend._original_result_holds
+        assert not await h.repository.has_pending_actions(h.runtime.scope(context), session.session_id)
+        assert caught.value is original
+        assert original.__cause__ is child and child.__cause__ is native
+        replay = await h.runtime.human.act(context, session.session_id, 'human', request)
+        assert replay.receipt == saved.receipt and entries == [request.action.action_id]

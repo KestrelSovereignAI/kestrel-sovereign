@@ -312,7 +312,7 @@ class HumanComputerRuntime:
                             except BaseException as settlement:
                                 from kestrel_sovereign.execution_custody import execution_observation_error
                                 raise execution_observation_error(fact.original, settlement) from None
-                            raise fact.original from None
+                            raise fact.original
                     receipt = await self._call(context, record, cid, "act", effect_check, dispatch,
                         stored.lease, request, action_id=request.action.action_id, deadline=request.action.not_after)
                     receipt.require_request(request)
