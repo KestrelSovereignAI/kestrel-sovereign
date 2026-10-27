@@ -4,11 +4,12 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import time
 from dataclasses import replace
 from uuid import uuid4
 
 import pytest
-from rdflib import Graph, Literal, Namespace, RDF, URIRef
+from rdflib import Graph, Literal, Namespace, RDF
 
 from kestrel_sovereign.knowledge.registry import (
     ResourceKind,
@@ -32,6 +33,7 @@ from kestrel_sovereign.knowledge import (
     RDF_LANG_STRING,
     SourceOccurrence,
 )
+from kestrel_sovereign.knowledge import shacl_validation
 from kestrel_sovereign.knowledge.shacl_validation import (
     GovernedShaclValidationService,
     ShaclCapabilityUnavailable,
@@ -60,6 +62,7 @@ from kestrel_sovereign.storage.semantic_validation import (
     GovernedSemanticValidationService,
     SemanticValidationStoreError,
 )
+from tests.utils.virtual_clock import pinned_shacl_validation_clock
 
 
 EX = Namespace("https://example.test/")
@@ -231,6 +234,56 @@ def test_core_constraint_fixture_reports_nonconformance_without_data_values() ->
     assert {finding.code for finding in report.findings} == {"min_count"}
     assert "ava" not in repr(report)
     assert "name" in repr(report)  # pinned predicate path remains useful audit metadata.
+
+
+@pytest.mark.parametrize("stall", ["budget_clock", "host_only"])
+def test_a_stall_exhausts_the_validation_budget_only_on_its_own_clock(
+    stall, monkeypatch,
+) -> None:
+    """A stall spends the wall-time budget only on the clock it reads (#3858).
+
+    A host stall inside one validation of the storage parity suite rejected
+    a fact save, which surfaced only as a missing source. That suite pins the
+    budget clock with ``pinned_shacl_validation_clock``. It is pinned here
+    from before validation starts, so loading and parsing the shapes cannot
+    spend the budget, and the first target lookup is always reached. There
+    the clock is advanced past the budget, or real host time passes beyond
+    it while the clock stays pinned.
+    """
+    limits = ShaclValidationLimits(max_wall_time_seconds=0.01)
+    stall_seconds = 5 * limits.max_wall_time_seconds
+    host_stalls = []
+    targets_for_shape = shacl_validation._targets_for_shape
+
+    with pinned_shacl_validation_clock() as clock:
+        def stall_then_target(*args, **kwargs):
+            if not host_stalls:
+                if stall == "budget_clock":
+                    clock.advance(stall_seconds)
+                    host_stalls.append(0.0)
+                else:
+                    stalled_from = time.monotonic()
+                    time.sleep(stall_seconds)
+                    host_stalls.append(time.monotonic() - stalled_from)
+            return targets_for_shape(*args, **kwargs)
+
+        monkeypatch.setattr(shacl_validation, "_targets_for_shape", stall_then_target)
+        validation_started = clock.time()
+        report = _validate(CORE_SHAPES, _person_graph(names=("Ava",)), limits=limits)
+
+    assert len(host_stalls) == 1
+    if stall == "budget_clock":
+        assert clock.time() - validation_started > limits.max_wall_time_seconds
+        assert report.state is ValidationState.INCOMPLETE
+        assert [finding.code for finding in report.findings] == [
+            "wall_time_limit_exhausted"
+        ]
+        assert report.action is ValidationWriteAction.REJECT
+    else:
+        assert host_stalls[0] > limits.max_wall_time_seconds
+        assert clock.time() == validation_started
+        assert report.state is ValidationState.CONFORMS
+        assert report.action is ValidationWriteAction.ACCEPT
 
 
 @pytest.mark.parametrize(
