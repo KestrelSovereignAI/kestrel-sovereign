@@ -2,6 +2,7 @@
 
 import asyncio
 import sqlite3
+from contextlib import closing
 from unittest.mock import Mock
 
 import aiosqlite
@@ -172,7 +173,7 @@ async def test_standalone_sqlite_commit_keeps_uncertainty(tmp_path, monkeypatch,
             await backend.execute("INSERT INTO effects VALUES (1)")
         assert execution_commit_outcome(caught.value) == "unknown"
         assert carries(caught.value, original)
-        with sqlite3.connect(path) as observer:
+        with closing(sqlite3.connect(path)) as observer, observer:
             assert observer.execute("SELECT COUNT(*) FROM effects").fetchone() == (1,)
     finally:
         monkeypatch.undo()
