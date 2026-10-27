@@ -731,7 +731,9 @@ async def test_lifespan_reaps_phoenix_after_agent_manager_cancellation(
     config_path = tmp_path / "multi_agent.toml"
     config_path.write_text("[host]\nport = 8888\n")
     fake_config = SimpleNamespace(
-        host=SimpleNamespace(bind="127.0.0.1", port=8888), agents={}
+        host=SimpleNamespace(bind="127.0.0.1", port=8888),
+        agents={},
+        get_local_agents=lambda: fake_config.agents,
     )
     supervisor = _PhoenixSupervisor()
     supervisor.allow_close.set()
@@ -804,7 +806,9 @@ async def test_host_scheduler_startup_failure_rolls_back_loaded_agents(
     config_path = tmp_path / "multi_agent.toml"
     config_path.write_text("[host]\nport = 8888\n")
     fake_config = SimpleNamespace(
-        host=SimpleNamespace(bind="127.0.0.1", port=8888), agents={}
+        host=SimpleNamespace(bind="127.0.0.1", port=8888),
+        agents={},
+        get_local_agents=lambda: fake_config.agents,
     )
     loaded_agent = SimpleNamespace(shutdown=AsyncMock())
 

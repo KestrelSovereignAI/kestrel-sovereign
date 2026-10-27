@@ -363,6 +363,7 @@ async def test_server_lifespan_wires_and_closes_host_features(
     fake_config = SimpleNamespace(
         host=SimpleNamespace(bind="127.0.0.1", port=8888),
         agents={"Kite": object()},
+        get_local_agents=lambda: fake_config.agents,
     )
     class FakeAgent:
         is_test_instance = True
@@ -587,6 +588,7 @@ async def test_server_retains_control_context_after_optional_mount_failure(
     fake_config = SimpleNamespace(
         host=SimpleNamespace(bind="127.0.0.1", port=8888),
         agents={"Kite": object()},
+        get_local_agents=lambda: fake_config.agents,
     )
     fake_agent = SimpleNamespace(is_test_instance=True)
 
