@@ -25,6 +25,22 @@ only inside that original frame. It pins the exact registration set and its
 lifecycle seal: removing and re-registering even the same service and
 registration objects never revives an old operation.
 
+Identity-capable discovery separately advertises
+`host_service_identity_api_version = 1`. Its operation also carries an opaque
+`discovery_identity`. `identity.matches(other)` compares the exact original
+registration, issued set and seal, agent binding generation, and host
+publication object/generation. It never invokes service equality. It is
+metadata only, cannot be serialized, and cannot revive a closed checker.
+
+`operation.require_issued()` additionally requires the exact record issued
+inside that still-live discovery frame. Constructing or copying a
+`ServiceOperation`, replacing its checker, or copying its identity/issuer
+does not satisfy this provenance check. New background-producer admission
+uses fresh genuine discovery at every operation and separately validates its
+current content/run policies. Existing two-field API1 consumers keep their
+original `check_current` behavior. This is a trusted Python extension boundary,
+not a sandbox against arbitrary Python object mutation.
+
 The server binds the genuinely started host registry through
 `bind_host_service_resolver`. Each agent retains its own `operator_registry`.
 The manager propagates the host binding to constructors, the shared publication

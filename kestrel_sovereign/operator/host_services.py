@@ -3,11 +3,13 @@
 from contextlib import asynccontextmanager
 
 from kestrel_sdk.operator import OperatorAuthorizationError
-from .runtime import OperatorRuntimeRegistry, ServiceOperation
+from .runtime import OperatorRuntimeRegistry, ServiceOperation, ServiceDiscoveryIdentity
 
 
 class HostServiceBinding:
     """One agent's explicit binding to the original host registry lifecycle."""
+
+    host_service_identity_api_version = 1
 
     def __init__(self, agent, resolver=None):
         self._agent = agent
@@ -98,7 +100,25 @@ class HostServiceBinding:
                     original.check_current()
 
                 check()
-                yield ServiceOperation(original.service, check)
+                identity = getattr(original, "discovery_identity", None)
+                if type(identity) is ServiceDiscoveryIdentity:
+                    original.require_issued()
+                    identity = identity._with_host_binding(
+                        self, generation, publication, published_generation
+                    )
+                else:
+                    # Preserve operation API1; only the separately advertised
+                    # identity consumer requires genuine identity metadata.
+                    identity = None
+                if identity is None:
+                    yield ServiceOperation(original.service, check)
+                else:
+                    # The outer frame retains the genuine original registry
+                    # checker, not another record's copied metadata/callback.
+                    def issued_check():
+                        original.require_issued()
+                        check()
+                    yield ServiceOperation._issue(original.service, issued_check, identity)
                 check()
         finally:
             active = False

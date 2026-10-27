@@ -697,19 +697,46 @@ class DockerComputerDriver:
             self._workspace_borrowers.setdefault(session.session_id,set()).add(borrower)
         else:
             self._borrowers[session.session_id] = borrower
-        try:
-            return await borrower
-        finally:
-            if workspace:
-                retained = self._workspace_borrowers.get(session.session_id,set())
-                retained.discard(borrower)
-                if not retained:
-                    self._workspace_borrowers.pop(session.session_id,None)
-            else:
-                self._borrowers.pop(session.session_id, None)
-            if not borrower.done():
-                borrower.cancel()
-            await asyncio.gather(borrower, return_exceptions=True)
+        # A revoked borrower is not cancellation of its original ACT caller.
+        # Keep its exact map ownership until the canonical join returns; native
+        # admission/COMMIT/retirement controls retain their original graph.
+        outcome = await await_owned_task(borrower, cancel_on_caller_cancellation=True)
+        if workspace:
+            retained = self._workspace_borrowers.get(session.session_id,set())
+            retained.discard(borrower)
+            if not retained:
+                self._workspace_borrowers.pop(session.session_id,None)
+        else:
+            self._borrowers.pop(session.session_id, None)
+        error = outcome.error
+        from types import TracebackType
+
+        from kestrel_sovereign.execution_custody import (
+            execution_commit_outcome,
+            is_execution_control_error,
+        )
+        def descriptive_fields_only(node):
+            # Absence of a recognized control predicate is not proof that an
+            # original carrier has no other admission/native-source facts.
+            fields = vars(node)
+            if any(type(key) is not str or key not in {
+                    "__notes__", "_kestrel_retained_traceback"} for key in fields):
+                return False
+            notes = fields.get("__notes__", [])
+            trace = fields.get("_kestrel_retained_traceback")
+            return (type(notes) is list and all(type(note) is str for note in notes)
+                    and (trace is None or type(trace) is TracebackType))
+        cause = error.__cause__ if type(error) is asyncio.CancelledError else None
+        ordinary_cause = (cause is None or (type(cause) is ResourceOutcomeUnknown
+                          and cause.__cause__ is None and descriptive_fields_only(cause)))
+        if (outcome.cancellation is None and type(error) is asyncio.CancelledError
+                and ordinary_cause and descriptive_fields_only(error)
+                and not is_execution_control_error(error)
+                and execution_commit_outcome(error) is None):
+            # No receipt or no-effect claim follows from an interrupted driver.
+            # The original ledger/native dispatch owner still decides custody.
+            raise ResourceOutcomeUnknown("original_visual_operation_interrupted") from error
+        return raise_owned_outcome(outcome, operation="original visual driver borrow")
 
     async def _perform_act(self, session, request, *, current=None):
         if session.session_id in self._pumps:

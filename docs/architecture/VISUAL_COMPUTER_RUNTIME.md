@@ -188,6 +188,32 @@ policy when required. The result contains one host-generated, observation-bound
 ActionRequest or a finished answer. It does not automatically submit input;
 execution and original-ID status reconciliation use the existing action tools.
 
+`visual_computer_step(session_id, action_id, prompt)` plans one action and submits
+it within that same original caller operation. The caller supplies a stable
+`action_id`. A native, current admission first claims that ID in the existing
+encrypted action table and waits for the original transaction COMMIT and reset
+acknowledgments. Only the exact original step owner may plan and promote that
+claim into the ordinary prepared-action and one-shot dispatch path. Inference
+holds neither a SQL transaction nor the session lock, so priority Stop can
+fence it promptly. Both OBSERVE and ACT remain current through model and driver
+I/O; ordinary tool security policy still applies. No new grant, queue or store
+is introduced, and the current claim writer has no late-result privilege.
+
+The claim binds the original owner/session, prompt and host model/configuration
+facts. A repeat checks the same row before inference: a terminal SDK receipt or
+host no-action result is returned, while planning and uncertain dispatch remain
+UNKNOWN and are never planned or typed again. Changed prompt, configuration or
+source facts conflict with that original ID. Real input reconciliation also
+requires STATUS; returning an already terminal result does not. A host no-action
+result is a separate terminal fact with `receipt=null`, not an SDK input receipt.
+Missing or uncertain claim acknowledgment admits no model or input. Absence by
+itself is insufficient: a replacement must win a fresh atomic INSERT and native
+acknowledgment against every original writer. A committed planning intent stays
+charged across restart, Stop and physical release. Terminal payload reclamation
+follows the existing verified-release rules; unresolved ownership is not freed
+from task completion or inventory absence. The existing 15-second action
+proposal, frame, lease and original operation deadlines remain unchanged.
+
 Each proposal starts with a fresh driver screenshot and retains the original
 session/grant/privacy operation through model delivery. PNG identity, dimensions,
 byte count, epoch and freshness are checked before image transport. Every model

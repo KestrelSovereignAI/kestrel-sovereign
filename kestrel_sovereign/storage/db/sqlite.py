@@ -2166,8 +2166,8 @@ class SQLiteBackend(DatabaseBackend):
         if original_outcome is None:
             self._require_execution_backend()
         else:
-            from kestrel_sovereign.storage.db.original_result_custody import _require_original_result
-            _require_original_result(original_outcome, self)
+            from kestrel_sovereign.storage.db.native_row_custody import _require_native_row
+            _require_native_row(original_outcome, self)
 
     async def _commit_write(self, conn: aiosqlite.Connection, *, original_outcome=None) -> None:
         """One native COMMIT handoff, including host/local-anchor receipts."""
@@ -2176,7 +2176,11 @@ class SQLiteBackend(DatabaseBackend):
         try:
             await conn.commit()
         except BaseException as error:
-            from kestrel_sovereign.storage.db.native_journal_programs import NativeJournalDurabilityRefusal
+            from kestrel_sovereign.storage.db.native_journal_programs import (
+                NativeJournalDurabilityRefusal, NativeJournalCurrentRefusal,
+            )
+            if original_outcome is not None and type(error) is NativeJournalCurrentRefusal:
+                raise original_outcome.write_refusal('current_permission_retired', error.__cause__) from error
             if original_outcome is not None and type(error) is NativeJournalDurabilityRefusal:
                 # This exact native preflight never called COMMIT. Retain the
                 # actual writer through rollback; do not invent lost-ACK debt.
@@ -2221,9 +2225,9 @@ class SQLiteBackend(DatabaseBackend):
         conn = self._ensure_connected()
         return await self._execute_write_operation(conn, query, params)
 
-    async def _read_original_signal_outcome_relation(self, journal, *, capture=False):
-        from .original_result_custody import _original_result_profile
-        table, expected_columns = _original_result_profile(journal)
+    async def _read_original_signal_outcome_relation(self, journal, *, capture=False, role="primary"):
+        from .native_row_custody import _native_row_profile
+        table, expected_columns = _native_row_profile(journal, role=role)
         from kestrel_sovereign.storage.db.native_journal_programs import (
             _original_sqlite_query, _original_sqlite_scalar_adapters_registered,
         )
@@ -2334,6 +2338,12 @@ class SQLiteBackend(DatabaseBackend):
             raise journal.write_refusal('row_missing_or_changed')
         if await self._read_original_signal_outcome_relation(journal) != journal._sqlite_relation:
             raise journal.write_refusal('destination_changed')
+        from .native_row_custody import _current_step
+        if _current_step(journal):
+            for role, accepted in zip(("owners", "requests"), journal._aux_relations):
+                if await self._read_original_signal_outcome_relation(journal, role=role) != accepted:
+                    raise journal.write_refusal('auxiliary_destination_changed')
+
 
     async def _execute_write_operation(self, conn, query, params, *, original_outcome=None):
         if original_outcome is not None:
@@ -2349,7 +2359,11 @@ class SQLiteBackend(DatabaseBackend):
                     if original_outcome is not None:
                         # Exclude external DDL before inspecting the original
                         # relation and BEFORE a trigger program could execute.
-                        await conn._execute(conn._conn._begin_original_journal)
+                        from .native_row_custody import _current_row
+                        if _current_row(original_outcome):
+                            await conn._execute(conn._conn._begin_current_row, original_outcome)
+                        else:
+                            await conn._execute(conn._conn._begin_original_journal)
                         self._require_write_admission(original_outcome)
                         observed = await self._read_original_signal_outcome_relation(original_outcome)
                         accepted = original_outcome._sqlite_relation
@@ -2378,6 +2392,17 @@ class SQLiteBackend(DatabaseBackend):
                             finally:
                                 original_outcome._observer_depth -= 1
                             original_outcome._sqlite_relation = observed
+                    if original_outcome is not None:
+                        from .native_row_custody import _current_step
+                        if _current_step(original_outcome):
+                            for role, accepted in zip(("owners", "requests"), original_outcome._aux_relations):
+                                if await self._read_original_signal_outcome_relation(original_outcome, role=role) != accepted:
+                                    raise original_outcome.write_refusal('auxiliary_destination_changed')
+                            if original_outcome._mode == "claim":
+                                async with conn.execute("UPDATE main.visual_computer_owners SET generation = generation + 1 WHERE owner = ?", (original_outcome._identity[0],)) as locked:
+                                    if locked.rowcount != 1:
+                                        raise original_outcome.write_refusal('original_owner_absent')
+                            self._require_write_admission(original_outcome)
                     cursor = await conn.execute(query, params)
                     self._require_write_admission(original_outcome)
                     if original_outcome is not None:
@@ -2419,13 +2444,24 @@ class SQLiteBackend(DatabaseBackend):
     async def _write_original_result(self, journal):
         from kestrel_sovereign.storage.db.original_result_custody import _require_original_result
         _require_original_result(journal, self)
+        return await self._write_native_row(journal)
+
+    async def _write_native_row(self, journal):
+        from .native_row_custody import _require_native_row
+        _require_native_row(journal, self)
         if self.owns_open_transaction:
-            raise ExecutionAuthorityError('Original signal journal refuses an enclosing transaction')
+            raise ExecutionAuthorityError('Native row refuses an enclosing transaction')
         entry = journal.begin(self)
         await self._execute_write_operation(self._connection,
             journal._query, entry.values, original_outcome=journal)
         journal.acknowledged(self)
         return entry.result_summary
+
+    async def _commit_current_visual_step(self, journal):
+        from .native_row_custody import _current_step
+        if not _current_step(journal):
+            raise ExecutionAuthorityError('Exact current visual step required')
+        return await self._write_native_row(journal)
 
     async def _settle_original_action_result(self, journal):
         from .original_result_custody import _original_result_profile

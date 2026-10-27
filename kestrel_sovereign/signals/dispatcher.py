@@ -119,6 +119,7 @@ from kestrel_sovereign.execution_custody import (
     execution_finite_error,
     execution_observation_error,
     is_execution_control_error,
+    require_execution_work,
 )
 from kestrel_sovereign.features.storage_access import resolve_agent_privacy_config
 from kestrel_sovereign.hold import HoldStateError, HoldTurnRefusal
@@ -6813,6 +6814,10 @@ class SignalDispatcher:
                 if held_result is not None:
                     return held_result
 
+                # Resource/Hold admission can await after native Work was
+                # checked. Apply the SAME original custody at physical entry;
+                # a completed preflight is never continuing effect authority.
+                require_execution_work(self._agent)
                 if signal.mode == SignalMode.ACTION:
                     assert registration.handler is not None
                     write_audit_callback = requested_handler_write_audit_callback()

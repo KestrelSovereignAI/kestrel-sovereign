@@ -1053,6 +1053,7 @@ class KestrelAgent(
     #: error — an absent answer must not read as a clean one (#2951).
     rejected_feature_contributions: tuple = ()
     host_service_operation_api_version = 1
+    host_service_identity_api_version = 1
 
     def __init__(
         self,

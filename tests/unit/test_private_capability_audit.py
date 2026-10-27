@@ -13,7 +13,7 @@ from kestrel_sovereign.storage.db.sqlite import SQLiteBackend
 
 
 @pytest.mark.parametrize("name", [
-    "artifact_publish_text", "artifact_list", "visual_computer_action", "visual_plan",
+    "artifact_publish_text", "artifact_list", "visual_computer_action", "visual_plan", "visual_computer_step",
     "first_owner__artifact_get", "feature_dispatch:visual_plan",
 ])
 @pytest.mark.parametrize("mode", ["normal", "public", "anonymous", "ephemeral", "isolated"])

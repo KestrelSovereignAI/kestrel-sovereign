@@ -1363,7 +1363,7 @@ class PostgresBackend(DatabaseBackend):
         self, connection: Any, scopes: tuple[ExecutionCustody, ...],
         commit_state: _ExecutionCommitState | None = None,
         *, requires_commit_proof: bool | Callable[[], bool] = True,
-        admit_work: bool = False, original_result=None,
+        admit_work: bool = False, original_result=None, current_mutation=None,
     ) -> AsyncIterator[None]:
         """Classify native commit acknowledgement without granting work.
 
@@ -1411,6 +1411,11 @@ class PostgresBackend(DatabaseBackend):
             if original_result is not None:
                 from .original_result_custody import _require_original_result
                 _require_original_result(original_result, self)
+            if current_mutation is not None:
+                from .native_row_custody import _current_row, _require_native_row
+                if original_result is not None or not admit_work or not _current_row(current_mutation):
+                    raise ExecutionAuthorityError('Exact ordinary current mutation required')
+                _require_native_row(current_mutation, self)
             if admit_work:
                 require_execution_backend("postgres", scopes)
                 self._require_transaction_custody()
@@ -2267,11 +2272,11 @@ class PostgresBackend(DatabaseBackend):
                     )
                     return result == "UPDATE 1"
 
-    async def _read_original_signal_outcome_relation(self, connection, name, *, journal=None):
+    async def _read_original_signal_outcome_relation(self, connection, name, *, journal=None, role="primary"):
         from kestrel_sovereign.signals.outcome_custody import _OriginalPostgresJournalRelation
         from kestrel_sovereign.signals.store import _OUTCOME_COLUMNS
-        from .original_result_custody import _original_result_profile
-        table, profile_columns = (_original_result_profile(journal) if journal is not None
+        from .native_row_custody import _native_row_profile
+        table, profile_columns = (_native_row_profile(journal, role=role) if journal is not None
                                   else ('signal_log', None))
         row = await connection.fetchrow('''
             SELECT pg_catalog.current_database() AS database_name,
@@ -2357,15 +2362,15 @@ class PostgresBackend(DatabaseBackend):
         expected.update(duration_ms=builtin['int4'], payload_raw=builtin['jsonb'],
                         dispatched_at=builtin['timestamptz'], completed_at=builtin['timestamptz'],
                         retention_until=builtin['timestamptz'])
-        if table == 'visual_computer_actions':
+        if table != 'signal_log':
             expected = {name: builtin[{'TEXT':'text','BLOB':'bytea','BIGINT':'int8'}[kind]] for name, kind in profile_columns.items()}
         if len(types) != len(columns) or any(oid != expected[name] for name, oid in zip(columns, types)):
             return None
         return _OriginalPostgresJournalRelation(**fields)
 
-    async def _capture_original_signal_outcome_relation(self, journal):
-        from kestrel_sovereign.storage.db.original_result_custody import _require_original_result
-        _require_original_result(journal, self, admission=True)
+    async def _capture_original_signal_outcome_relation(self, journal, *, role="primary"):
+        from kestrel_sovereign.storage.db.native_row_custody import _require_native_row
+        _require_native_row(journal, self, admission=True)
         if self.owns_open_transaction:
             raise ExecutionAuthorityError('Original signal destination refuses an enclosing transaction')
         journal._require_backing()
@@ -2394,9 +2399,9 @@ class PostgresBackend(DatabaseBackend):
                 journal._require_backing()
                 require_execution_work(self)
                 journal._postgres_pool = journal._postgres_pool.with_actual_connection(native, principal)
-                from .original_result_custody import _original_result_profile
-                table = _original_result_profile(journal)[0]
-                relation = await self._read_original_signal_outcome_relation(connection, table, journal=journal)
+                from .native_row_custody import _native_row_profile
+                table = _native_row_profile(journal, role=role)[0]
+                relation = await self._read_original_signal_outcome_relation(connection, table, journal=journal, role=role)
                 if relation is None:
                     raise ExecutionAuthorityError('Original native signal journal requires its plain permanent audit table')
                 journal._require_backing()
@@ -2447,8 +2452,13 @@ class PostgresBackend(DatabaseBackend):
     async def _write_original_result(self, journal):
         from kestrel_sovereign.storage.db.original_result_custody import _require_original_result
         _require_original_result(journal, self)
+        return await self._write_native_row(journal)
+
+    async def _write_native_row(self, journal):
+        from .native_row_custody import _require_native_row
+        _require_native_row(journal, self)
         if self.owns_open_transaction:
-            raise ExecutionAuthorityError('Original signal journal refuses an enclosing transaction')
+            raise ExecutionAuthorityError('Native row refuses an enclosing transaction')
         entry = journal.begin(self)
         relation = journal._postgres_relation
         if relation is None:
@@ -2480,7 +2490,12 @@ class PostgresBackend(DatabaseBackend):
                 if await native._original_journal_principal() != journal._postgres_pool.principal:
                     raise journal.write_refusal('native_principal_changed')
                 journal.require_original(self)
-                async with self._tracked_native_transaction(connection, state.scopes, state, original_result=journal):
+                from .native_row_custody import _current_row, _current_step
+                current = _current_row(journal)
+                step = _current_step(journal)
+                async with self._tracked_native_transaction(connection, state.scopes, state,
+                        admit_work=current, original_result=None if current else journal,
+                        current_mutation=journal if current else None):
                     journal.require_original(self)
                     # Privileged catalog/proof operators must not resolve via
                     # an application's setup-controlled search_path.
@@ -2493,10 +2508,22 @@ class PostgresBackend(DatabaseBackend):
                     if await self._read_original_signal_outcome_relation(connection, relation.qualified_name, journal=journal) != relation:
                         raise journal.write_refusal('destination_changed')
                     journal.require_original(self)
+                    if step:
+                        for role, accepted in zip(("owners", "requests"), journal._aux_relations):
+                            await connection.execute(f'LOCK TABLE ONLY {accepted.qualified_name} IN SHARE UPDATE EXCLUSIVE MODE')
+                            journal.require_original(self)
+                            if await self._read_original_signal_outcome_relation(connection, accepted.qualified_name, journal=journal, role=role) != accepted:
+                                raise journal.write_refusal('auxiliary_destination_changed')
+                        if journal._mode == "claim":
+                            owners = journal._aux_relations[0].qualified_name
+                            status = await connection.execute(f'UPDATE {owners} SET generation = generation + 1 WHERE owner = $1', journal._identity[0])
+                            journal.require_original(self)
+                            if status != 'UPDATE 1':
+                                raise journal.write_refusal('original_owner_absent')
                     values = self._strip_tz(entry.values)
                     status = await connection.execute(query, *values)
                     journal.require_original(self)
-                    if status != ('UPDATE 1' if relation.relation_name == 'visual_computer_actions' else 'INSERT 0 1'):
+                    if status != ('INSERT 0 1' if step and journal._mode == 'claim' else 'UPDATE 1' if relation.relation_name == 'visual_computer_actions' else 'INSERT 0 1'):
                         raise journal.write_refusal('row_count')
                     matches = await connection.fetch(match_query, *values)
                     journal.require_original(self)
@@ -2505,6 +2532,10 @@ class PostgresBackend(DatabaseBackend):
                     journal.require_original(self)
                     if await self._read_original_signal_outcome_relation(connection, relation.qualified_name, journal=journal) != relation:
                         raise journal.write_refusal('destination_changed')
+                    if step:
+                        for role, accepted in zip(("owners", "requests"), journal._aux_relations):
+                            if await self._read_original_signal_outcome_relation(connection, accepted.qualified_name, journal=journal, role=role) != accepted:
+                                raise journal.write_refusal('auxiliary_destination_changed')
                     journal.require_original(self)
             journal._acknowledgments = tuple(state.acknowledgments)
             journal.acknowledged(self)
@@ -2523,6 +2554,12 @@ class PostgresBackend(DatabaseBackend):
                 journal._postgres_session = None
                 _ORIGINAL_POSTGRES_CONNECT.reset(connect_token)
         return entry.result_summary
+
+    async def _commit_current_visual_step(self, journal):
+        from .native_row_custody import _current_step
+        if not _current_step(journal):
+            raise ExecutionAuthorityError('Exact current visual step required')
+        return await self._write_native_row(journal)
 
     async def _settle_original_action_result(self, journal):
         from .original_result_custody import _original_result_profile

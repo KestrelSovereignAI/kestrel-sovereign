@@ -472,6 +472,18 @@
       "type": "Architecture Spec"
     },
     {
+      "existing_code_refs": [],
+      "findings": [],
+      "missing_code_refs": [],
+      "missing_links": [],
+      "path": "docs/architecture/NATIVE_ARTIFACT_PRODUCER_SOURCE_CANDIDATE.md",
+      "privacy": "public",
+      "render": "public",
+      "status": "implementation-candidate",
+      "title": "Native artifact producer source successor",
+      "type": "Architecture Spec"
+    },
+    {
       "existing_code_refs": [
         "kestrel_sovereign/a2a/transport_auth.py",
         "kestrel_sovereign/features/keys/feature.py",

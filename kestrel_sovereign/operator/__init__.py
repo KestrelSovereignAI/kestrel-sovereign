@@ -14,6 +14,7 @@ from .runtime import (
     OperatorRegistrationSet,
     OperatorRuntimeRegistry,
     ServiceOperation,
+    ServiceDiscoveryIdentity,
     service_registration_satisfies,
 )
 
@@ -26,5 +27,6 @@ __all__ = [
     "OperatorRegistrationSet",
     "OperatorRuntimeRegistry",
     "ServiceOperation",
+    "ServiceDiscoveryIdentity",
     "service_registration_satisfies",
 ]
