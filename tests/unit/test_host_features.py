@@ -462,8 +462,13 @@ async def test_server_lifespan_wires_and_closes_host_features(
         validate_host_context(registry)
         events.append("host-context-bind")
 
+    def validate_host_services(registry):
+        assert registry is host_runtime.operator_registry
+        events.append("host-services-validate")
+
     fake_manager.validate_host_context_clause_registry = validate_host_context
     fake_manager.bind_host_context_clause_registry = bind_host_context
+    fake_manager.validate_host_service_resolver = validate_host_services
 
     async def build_context(*, config):
         assert config["host_port"] == 9090
@@ -545,6 +550,7 @@ async def test_server_lifespan_wires_and_closes_host_features(
             "agents-load",
             "host-start",
             "host-context-validate",
+            "host-services-validate",
             "host-router-mount",
             "host-ui-mount",
             "host-context-validate",

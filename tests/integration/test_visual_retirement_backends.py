@@ -5,7 +5,8 @@ from datetime import UTC, datetime
 import pytest
 from kestrel_sdk.resources import ResourceConflict
 from kestrel_sovereign.visual_computer.repository import VisualCustodyRepository
-from tests.integration.test_visual_custody_backends import custody, record, SCOPE
+from tests.integration.test_visual_custody_backends import SCOPE, record
+from tests.integration.test_visual_custody_backends import custody as custody
 
 
 @pytest.mark.asyncio

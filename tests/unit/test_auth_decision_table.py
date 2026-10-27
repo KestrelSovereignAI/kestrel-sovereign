@@ -269,9 +269,15 @@ async def test_multi_agent_lifespan_checks_host_key_before_starting_resources(
         lambda _environ: (_ for _ in ()).throw(GuardReached("guard reached")),
     )
 
-    with pytest.raises(GuardReached, match="guard reached"):
-        async with server._lifespan_startup(FastAPI()):
-            pass
+    app = FastAPI()
+    try:
+        with pytest.raises(GuardReached, match="guard reached"):
+            async with server._lifespan_startup(app):
+                pass
+        assert getattr(app.state, "stop_receipt_db", None) is None
+        assert getattr(app.state, "distributed_invocation_registry", None) is None
+    finally:
+        await server._shutdown_server_resources(app)
 
 
 def test_auth_me_rejects_api_key_without_session():

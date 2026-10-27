@@ -8,7 +8,8 @@ from kestrel_sdk.computer_use import ActionRequest, ComputerSession
 from kestrel_sdk.resources import ResourceConflict, ResourceOutcomeUnknown
 from kestrel_sovereign.execution_custody import ExecutionAuthorityError, ExecutionCustody, bind_execution_custody_snapshot, require_execution_work, is_execution_control_error
 from kestrel_sovereign.visual_computer.dispatch import original_dispatch, native_dispatch
-from tests.integration.test_visual_custody_backends import custody, record, SCOPE
+from tests.integration.test_visual_custody_backends import SCOPE, record
+from tests.integration.test_visual_custody_backends import custody as custody
 
 
 class OriginalTurn:

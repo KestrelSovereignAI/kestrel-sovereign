@@ -3320,8 +3320,6 @@ async def _lifespan_startup(app: FastAPI):
     app.state.host_features = []
     app.state.host_context = None
     app.state.host_ui_manifest = []
-    await _initialize_stop_receipts(app)
-
     # Establish the authentication boundary before launching any host-owned
     # resources. Direct uvicorn starts must obey the same fail-closed rule as
     # `kestrel start`; otherwise get_api_key() would mint an undiscoverable key
@@ -3332,6 +3330,8 @@ async def _lifespan_startup(app: FastAPI):
     multi_agent_path = resolve_multi_agent_path(os.environ)
     if multi_agent_env or multi_agent_path.exists():
         _require_multi_agent_host_api_key(os.environ)
+
+    await _initialize_stop_receipts(app)
 
     # --- Host-supervised Phoenix trace backend (issue #2570) ---
     # Launch Phoenix BEFORE agents so the OTLP endpoint is on os.environ when
@@ -4090,10 +4090,16 @@ async def _lifespan_startup(app: FastAPI):
                 manager.validate_host_context_clause_registry(
                     host_context_registry
                 )
+                if runtime is not None:
+                    manager.validate_host_service_resolver(runtime.operator_registry)
             elif default_agent is not None:
                 default_agent.validate_host_context_clause_registry(
                     host_context_registry
                 )
+                if runtime is not None:
+                    default_agent.validate_host_service_resolver(runtime.operator_registry)
+            # Refuse a retired agent binding before publishing candidate routes
+            # or UI. The actual bind still revalidates the original lifecycle.
             if replacing_host_state:
                 _hf.unmount_host_features(app)
             _hf.mount_host_feature_routers(app, candidate_started)
