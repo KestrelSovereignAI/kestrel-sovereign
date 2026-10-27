@@ -111,6 +111,12 @@ retires before its connection returns to the pool. Its independent retirement
 flag/lock prevents an already queued old cancellation from closing a later
 borrower's connection.
 
+Cancellation interrupts the raw socket descriptor while preserving the
+`SSLSocket` TLS state. Calling `SSLSocket.shutdown()` would clear that state
+before kernel shutdown and let a concurrently admitted send fall back to
+plaintext. The final original-callback check also rechecks thread retirement;
+an original callback cannot cancel its caller and then admit another send.
+
 The callback consumes/closes its responses in that thread and returns a result.
 Unconsumed responses are closed and refused before returning; async callbacks
 and returned awaitables are refused. Do not detach work or wrap a raw
@@ -136,6 +142,9 @@ loopback sockets. They cover post-handshake revocation before HTTP bytes,
 per-partial-send denial, body/close/final-join revocation, original execution
 custody, copied/absent/async-validator refusal, real pooled reuse, queued old
 cancellation versus a new borrower, and joined thread/response retirement.
+The cancellation regression widens only the existing interval before kernel
+shutdown and observes actual native plaintext writes; a separate owned raw
+relay verifies encrypted wire bytes on Python 3.11 and 3.14.
 No cloud endpoint, provider, remote worker or paid capacity is exercised.
 
 The existing asynchronous admission hook checks before awaiting native

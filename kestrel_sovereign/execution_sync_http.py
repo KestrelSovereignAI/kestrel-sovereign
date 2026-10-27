@@ -9,6 +9,7 @@ supported. Async native admission cannot be evaluated here and is refused.
 from __future__ import annotations
 
 import asyncio
+import _socket
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from contextvars import ContextVar
@@ -120,7 +121,11 @@ class _SocketBorrow:
         with self.lock:
             if self.active:
                 try:
-                    self.socket.shutdown(socket.SHUT_RDWR)
+                    # SSLSocket.shutdown clears _sslobj before the kernel
+                    # shutdown. A concurrently admitted SSLSocket.send could
+                    # then use its plaintext fallback. Interrupt only the raw
+                    # fd; the native writer must retain its TLS state.
+                    _socket.socket.shutdown(self.socket, socket.SHUT_RDWR)
                 except OSError:
                     pass
 
@@ -178,6 +183,8 @@ class _Request:
             # Restriction callbacks can synchronously retire the original turn.
             # They never supply or replace Core's native execution admission.
             _require_sync_work(self.validators)
+            if self.thread is not None and not self.thread.active:
+                raise ExecutionAuthorityError("original synchronous HTTP thread is retiring")
 
 
 def _request(client):

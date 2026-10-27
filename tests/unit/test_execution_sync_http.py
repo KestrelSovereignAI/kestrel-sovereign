@@ -1,9 +1,11 @@
 """Actual direct native TLS, original restrictions and joined thread custody."""
 
 import asyncio
+import _socket
 from contextvars import copy_context
 from http.server import BaseHTTPRequestHandler
 import ssl
+import socket
 import threading
 from types import SimpleNamespace
 
@@ -275,6 +277,154 @@ async def test_cancel_fences_socket_and_physically_joins_original_native_thread(
         finally:
             peer.release.set()
             await asyncio.gather(task, return_exceptions=True)
+
+
+@pytest.mark.parametrize("retirement", ["caller-cancel", "turn-stop"])
+async def test_cancellation_cannot_turn_an_admitted_tls_send_into_plaintext(
+    peer, monkeypatch, retirement,
+):
+    from kestrel_sovereign import execution_sync_http
+
+    loop = asyncio.get_running_loop()
+    shutdown_ready, write_finished, native_finished = (
+        threading.Event() for _ in range(3)
+    )
+    state = {"socket": None, "task": None, "paused": False}
+    plaintext_writes = []
+    native_tls_send = ssl.SSLSocket.send
+    native_shutdown = _socket.socket.shutdown
+    native_plain_send = _socket.socket.send
+    cancel_borrow = execution_sync_http._SocketBorrow.cancel
+
+    def os_shutdown(sock, how):
+        if sock is state["socket"]:
+            # SSLSocket.shutdown has already cleared _sslobj here. Hold only
+            # the real interval before kernel shutdown, not a check/result.
+            shutdown_ready.set()
+            assert write_finished.wait(3)
+        return native_shutdown(sock, how)
+
+    def cancel_and_signal(borrow):
+        try:
+            return cancel_borrow(borrow)
+        finally:
+            # The corrected raw shutdown reaches this without clearing TLS.
+            shutdown_ready.set()
+
+    def plain_send(sock, data, flags=0):
+        size = native_plain_send(sock, data, flags)
+        if sock is state["socket"]:
+            plaintext_writes.append(bytes(data[:size]))
+        return size
+
+    monkeypatch.setattr(socket.socket, "shutdown", os_shutdown)
+    monkeypatch.setattr(socket.socket, "send", plain_send)
+    monkeypatch.setattr(execution_sync_http._SocketBorrow, "cancel", cancel_and_signal)
+
+    with bind_execution_custody(ProcessRuntimeExecutionFence("owned-tls-shutdown")) as scope:
+        def retire():
+            if retirement == "turn-stop":
+                scope.revoke("owned TLS cancellation probe")
+            state["task"].cancel()
+
+        def admitted_send(sock, data, flags=0):
+            if not state["paused"] and sock.getpeername()[1] == peer.port:
+                state.update(socket=sock, paused=True)
+                # This is AFTER the Core checks, at the actual native send.
+                loop.call_soon_threadsafe(retire)
+                try:
+                    assert shutdown_ready.wait(3)
+                    return native_tls_send(sock, data, flags)
+                finally:
+                    write_finished.set()
+            return native_tls_send(sock, data, flags)
+
+        monkeypatch.setattr(ssl.SSLSocket, "send", admitted_send)
+
+        def effect(native):
+            try:
+                return native.post(
+                    peer.url, content=b"owned-synthetic-private-body",
+                    headers={"Authorization": "Bearer owned-synthetic-secret"},
+                ).text
+            finally:
+                native_finished.set()
+
+        with client(peer) as native, bind_native_sync_http_execution_admission(native, peer.check):
+            task = state["task"] = asyncio.create_task(await_native_sync_http(native, effect))
+            try:
+                with pytest.raises(BaseException) as caught:
+                    await task
+                errors = [caught.value]
+                leaves = []
+                while errors:
+                    error = errors.pop()
+                    if isinstance(error, BaseExceptionGroup):
+                        errors.extend(error.exceptions)
+                    else:
+                        leaves.append(error)
+                assert any(isinstance(error, asyncio.CancelledError) for error in leaves)
+                assert state["paused"] and native_finished.is_set()
+            finally:
+                write_finished.set()
+                await asyncio.gather(task, return_exceptions=True)
+    # Observe actual successful raw socket.send calls, not a mocked backend.
+    assert plaintext_writes == []
+    assert peer.requests == []
+
+
+async def test_final_original_callback_cancellation_refuses_before_native_send(peer, monkeypatch):
+    from kestrel_sovereign import execution_sync_http
+
+    loop = asyncio.get_running_loop()
+    cancelled, finished = threading.Event(), threading.Event()
+    state = {"armed": False, "fired": False, "task": None}
+    attempted = []
+    native_send = ssl.SSLSocket.send
+    cancel_borrow = execution_sync_http._SocketBorrow.cancel
+
+    def cancel_and_signal(borrow):
+        try:
+            return cancel_borrow(borrow)
+        finally:
+            cancelled.set()
+
+    def before_write():
+        state["armed"] = True
+
+    def original_check():
+        peer.check()
+        if state["armed"] and not state["fired"]:
+            state["fired"] = True
+            loop.call_soon_threadsafe(state["task"].cancel)
+            # Cancellation lands inside the last original callback, after
+            # the entry thread.active check but before that callback returns.
+            assert cancelled.wait(3)
+
+    def observe(sock, data, flags=0):
+        if bytes(data).startswith(b"POST "):
+            attempted.append(len(data))
+        return native_send(sock, data, flags)
+
+    def effect(native):
+        try:
+            return native.post(peer.url, content=b"owned-cancelled-body").text
+        finally:
+            finished.set()
+
+    monkeypatch.setattr(execution_sync_http._SocketBorrow, "cancel", cancel_and_signal)
+    monkeypatch.setattr(ssl.SSLSocket, "send", observe)
+    with client(peer) as native, bind_native_sync_http_execution_admission(
+        native, original_check, check_before_request_write=before_write,
+    ):
+        task = state["task"] = asyncio.create_task(await_native_sync_http(native, effect))
+        try:
+            with pytest.raises(BaseException):
+                await task
+        finally:
+            await asyncio.gather(task, return_exceptions=True)
+    assert state["fired"] and cancelled.is_set() and finished.is_set()
+    assert attempted == [] and peer.requests == []
 
 
 def test_copied_original_context_cannot_borrow_a_later_callers_restriction(peer):

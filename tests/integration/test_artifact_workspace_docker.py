@@ -118,7 +118,7 @@ async def test_real_host_docker_source_destruction_panel_edit_and_pinned_materia
     app=server.app;lifespan=app.router.lifespan_context
     monkeypatch.setattr(app.state,'agent',agent,raising=False);monkeypatch.setattr(app.state,'agent_manager',None,raising=False)
     sock=socket.socket();sock.bind(('127.0.0.1',0));port=sock.getsockname()[1]
-    runner=None;serving=None;created=[];containers=[];released=[]
+    runner=None;serving=None;created=[];containers=[];released=[];control_reconciliations=[]
     boundary=DockerBoundary(docker_socket)
     try:
         await agent.initialize()
@@ -150,9 +150,32 @@ async def test_real_host_docker_source_destruction_panel_edit_and_pinned_materia
                 assert response.status_code==200,response.text
             async def pause(current):
                 sid=current['session_id']
-                response=await client.post('/api/visual-computer/sessions/'+sid+'/stop',json={'request_id':uuid4().hex,
-                    'session_id':sid,'expected_control_epoch':current['control_epoch'],'operation':'pause'})
-                assert response.status_code==200,response.text
+                request={'request_id':uuid4().hex,'session_id':sid,
+                    'expected_control_epoch':current['control_epoch'],'operation':'pause'}
+                driver=agent.features['VisualComputerFeature'].runtime.drivers['local-docker-browser']
+                native_control=driver.control;native_receipts=[]
+                async def lose_first_reply(session, original_request):
+                    from kestrel_sdk.resources import ResourceOutcomeUnknown
+                    receipt=await native_control(session,original_request)
+                    native_receipts.append(receipt)
+                    if len(native_receipts)==1:
+                        raise ResourceOutcomeUnknown('owned original control reply lost')
+                    return receipt
+                with monkeypatch.context() as patch:
+                    patch.setattr(driver,'control',lose_first_reply)
+                    route='/api/visual-computer/sessions/'+sid+'/stop'
+                    lost=await client.post(route,json=request)
+                    assert lost.status_code==503,lost.text
+                    response=await client.post(route,json=request)
+                    assert response.status_code==200,response.text
+                    repeated=await client.post(route,json=request)
+                    assert repeated.status_code==200 and repeated.json()==response.json(),repeated.text
+                assert len(native_receipts)==2 and native_receipts[0]==native_receipts[1]
+                assert native_receipts[1].control_epoch==current['control_epoch']+1
+                assert native_receipts[1].state=='paused' and native_receipts[1].controller=='none'
+                control_reconciliations.append({'session_id':sid,'request_id':request['request_id'],
+                    'lost_http_status':lost.status_code,'original_native_calls':len(native_receipts),
+                    'same_original_receipt':True,'control_epoch':native_receipts[1].control_epoch})
                 return (await client.get('/api/visual-computer/sessions/'+sid)).json()['session']
             def request(current,transfer_id,workspace='browser'):
                 return {'transfer_id':transfer_id,'session_id':current['session_id'],'lease_id':current['lease_id'],
@@ -220,6 +243,7 @@ async def test_real_host_docker_source_destruction_panel_edit_and_pinned_materia
                 assert result.content.decode()==browser['source_text'] and third_ref['artifact_id']==first_ref['artifact_id']
                 print(json.dumps({'verdict':'PASS','path':'real host+Docker export → physical source destruction → shipped panel edit revision2 → exact fresh workspace materialization → export CAS revision3',
                     'image':image,'containers':containers,'revisions':[first_ref,second_ref,third_ref],'dispatch_revocation':dispatch,
+                    'control_reconciliations':control_reconciliations,
                     'browser':{k:v for k,v in browser.items() if k!='source_text'}}))
             finally:
                 for sid in created:

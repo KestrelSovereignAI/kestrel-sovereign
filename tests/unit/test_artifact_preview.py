@@ -75,7 +75,7 @@ async def test_only_known_precreation_daemon_refusals_are_definitive_in_owned_na
     original = preview.start_async_process
     children = []
     async def launch(arguments, **kwargs):
-        child = await original([sys.executable, "-c", "import sys;sys.stderr.write("+repr(message)+");sys.exit(1)"], **kwargs)
+        child = await original([sys.executable, "-B", "-c", "import sys;sys.stderr.write("+repr(message)+");sys.exit(1)"], **kwargs)
         children.append(child)
         return child
     monkeypatch.setattr(preview, "start_async_process", launch)

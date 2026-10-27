@@ -126,6 +126,14 @@ or reconciles accepted work through the driver's priority control path and
 suspends agent observations. Handback is explicit, advances the epoch and
 requires a new observation before input. Physical release is a distinct
 operation; timeout, failure and lease expiry do not prove physical cleanup.
+
+A lost control reply leaves the original control request pending in encrypted
+custody. Retry that SAME request ID and input under current authorization.
+The existing worker returns its recorded successful receipt without applying
+the control twice, after checking the original owner, lease, driver and epoch.
+That receipt is usable only while its exact resulting session remains current
+and unexpired. A later transition, changed input or unknown original close
+cannot become a successful old receipt or restore an older input epoch.
 Safety calls consume no normal action/history slots. Lifecycle withdrawal
 fences retained sessions, while periodic maintenance releases expired or idle
 original leases. Uncertain cleanup retains its lease/connection for retries.

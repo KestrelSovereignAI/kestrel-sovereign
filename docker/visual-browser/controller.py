@@ -124,13 +124,17 @@ class BrowserController:
         if not version_one(scope) or scope != self._session["scope"] or session_id != self._session["session_id"]:
             raise Refused("session_unavailable")
 
-    def _bound(self, session, *, agent=False):
+    def _bound_owner(self, session):
         if not version_one(session) or not version_one(session.get("scope")):
             raise Refused("session_unavailable")
         self._owner(session.get("scope"), session.get("session_id"))
         if (session.get("lease_id") != self._session["lease_id"]
-                or session.get("driver_id") != self._session["driver_id"]
-                or type(session.get("control_epoch")) is not int
+                or session.get("driver_id") != self._session["driver_id"]):
+            raise Refused("stale_control")
+
+    def _bound(self, session, *, agent=False):
+        self._bound_owner(session)
+        if (type(session.get("control_epoch")) is not int
                 or session["control_epoch"] != self._session["control_epoch"]):
             raise Refused("stale_control")
         self._live()
@@ -316,22 +320,35 @@ class BrowserController:
         return copy.deepcopy(previous[1])
 
     async def control(self, session, request):
-        self._bound(session)
+        self._bound_owner(session)
         fields = {"schema_version", "request_id", "session_id", "expected_control_epoch", "operation"}
         if not version_one(request) or set(request) != fields:
             raise Refused("invalid_control")
         request_id = identifier(request["request_id"])
         if (request["session_id"] != self._session["session_id"] or type(request["expected_control_epoch"]) is not int
-                or request["expected_control_epoch"] != self._session["control_epoch"]):
+                or type(session.get("control_epoch")) is not int
+                or request["expected_control_epoch"] != session["control_epoch"]):
             raise Refused("stale_control")
         if not isinstance(request["operation"], str) or request["operation"] not in {"pause", "takeover", "resume", "close"}:
             raise Refused("unsupported_control")
         if self._control_pending:
             raise Refused("control_pending")
+        previous = self._controls.get(request_id)
+        if previous is not None:
+            original, receipt = previous
+            if digest(request) != original:
+                raise Refused("control_conflict")
+            self._live()
+            if receipt is None:
+                raise Refused("control_outcome_unknown")
+            # A factual original reply cannot claim that a later transition
+            # is still paused/closed, nor restore any older input epoch.
+            if receipt != self._session:
+                raise Refused("stale_control")
+            return copy.deepcopy(receipt)
+        self._bound(session)
         if len(self._controls) >= 1024 and request["operation"] == "resume":
             raise Refused("control_budget_exhausted")
-        if request_id in self._controls:
-            raise Refused("control_conflict")
         self._control_pending = True
         try:
             async with self._lock:
@@ -348,7 +365,7 @@ class BrowserController:
                                      controller="agent" if operation == "resume" else "human" if operation == "takeover" else "none")
                 self._frame = None
                 if len(self._controls) < 1024:
-                    self._controls[request_id] = digest(request)
+                    self._controls[request_id] = (digest(request), None)
                 if operation == "close":
                     try:
                         async with asyncio.timeout(5):
@@ -356,6 +373,8 @@ class BrowserController:
                     except Exception:  # noqa: BLE001 — boundary keeps private browser details out of IPC/logs
                         raise Refused("control_outcome_unknown") from None
                     self._session["state"] = "closed"
+                if request_id in self._controls:
+                    self._controls[request_id] = (digest(request), copy.deepcopy(self._session))
                 return copy.deepcopy(self._session)
         finally:
             self._control_pending = False
