@@ -53,6 +53,7 @@ import sqlite3
 import subprocess
 import sys
 from collections.abc import Callable
+from contextlib import closing
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from urllib.parse import parse_qsl, unquote, urlsplit
@@ -1440,7 +1441,7 @@ def _discover_agent_did(anchor_path: Path):
     to discover would be circular.
     """
     try:
-        with sqlite3.connect(str(anchor_path)) as conn:
+        with closing(sqlite3.connect(str(anchor_path))) as conn, conn:
             rows = conn.execute(_DISCOVER_AGENT_SQLITE).fetchall()
     except sqlite3.DatabaseError as exc:
         # 'file is not a database' (sqlcipher-encrypted) lands here.
@@ -1491,7 +1492,7 @@ def _has_ownership_ledger(source: _GovernanceSource) -> bool:
     """
     if source.reads_the_anchor:
         try:
-            with sqlite3.connect(str(source.anchor_path)) as conn:
+            with closing(sqlite3.connect(str(source.anchor_path))) as conn, conn:
                 row = conn.execute(
                     "SELECT 1 FROM sqlite_master "
                     "WHERE type='table' AND name='graph_node_owners'"
@@ -1844,7 +1845,7 @@ def _fetch_rows(
 ) -> list:
     """Run one read-only query through the same database driver as the runtime."""
     if source.reads_the_anchor:
-        with sqlite3.connect(str(source.anchor_path)) as conn:
+        with closing(sqlite3.connect(str(source.anchor_path))) as conn, conn:
             return conn.execute(sqlite_sql, sqlite_params).fetchall()
 
     return _fetch_postgres_rows_isolated(
