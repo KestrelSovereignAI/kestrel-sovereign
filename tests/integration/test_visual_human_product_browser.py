@@ -20,8 +20,11 @@ import pytest
 async def test_initialized_manual_browser_and_safe_artifact_after_destroy(tmp_path, monkeypatch, caplog):
     image = os.environ.get('HUMAN_TEST_WORKER_IMAGE')
     destination = os.environ.get('HUMAN_TEST_EVIDENCE_DIR')
-    if not image or not destination:
-        pytest.skip('Explicit owned worker image and private evidence directory are required')
+    docker_socket = os.environ.get('HUMAN_TEST_DOCKER_SOCKET')
+    docker_cli = os.environ.get('HUMAN_TEST_DOCKER_CLI')
+    if not all((image, destination, docker_socket, docker_cli)):
+        pytest.skip('Explicit owned image, Docker socket/CLI and private evidence directory are required')
+    assert Path(docker_socket).is_absolute() and Path(docker_cli).is_file()
     assert re.fullmatch(r'sha256:[0-9a-f]{64}', image)
     project_root = Path(__file__).resolve().parents[2]
     output = Path(destination)
@@ -44,7 +47,6 @@ async def test_initialized_manual_browser_and_safe_artifact_after_destroy(tmp_pa
     key = 'human-browser-disposable-'+uuid4().hex
     monkeypatch.setenv('KESTREL_API_KEY', key)
     monkeypatch.setenv('PYTHON_DOTENV_DISABLED','1')
-    docker_socket='/Users/jason/.docker/run/docker.sock'
     config={'enabled':True,'human_control_enabled':True,'granted_actions':[a.value for a in VisualAction],
         'providers':{PROVIDER:{'docker_socket':docker_socket,'image':'local-worker@'+image,'profile_id':'offline-v1'}},
         'drivers':{PROVIDER:{'docker_socket':docker_socket}}}
@@ -155,7 +157,7 @@ async def test_initialized_manual_browser_and_safe_artifact_after_destroy(tmp_pa
             ref=published.json()['receipt']['ref']
             released=await client.post(base+'/release');assert released.status_code==200,released.text
             assert released.json()['released'] is True
-            absent=subprocess.run(['/usr/local/bin/docker','inspect','--type','container',cid],cwd=Path.cwd(),capture_output=True)
+            absent=subprocess.run([docker_cli,'inspect','--type','container',cid],cwd=Path.cwd(),capture_output=True)
             (output/'browser-container-absence.stderr').write_bytes(absent.stderr)
             assert absent.returncode==1 and (('No such container: '+cid).encode() in absent.stderr or ('No such object: '+cid).encode() in absent.stderr)
             reopened=await client.get(f'/api/artifacts/{ref["artifact_id"]}/revisions/{ref["revision_id"]}/file',params={'path':'document.html'})
