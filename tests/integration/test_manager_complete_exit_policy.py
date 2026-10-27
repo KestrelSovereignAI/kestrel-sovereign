@@ -14,6 +14,7 @@ from tests.integration.test_execution_authority_postgres import native_pg as _na
 from tests.integration.test_host_onboarding_original_admission import onboarding_owner as _onboarding_owner
 from tests.integration.test_maintenance_original_retirement import _original_control
 from tests.integration.test_native_completion_vs_observation import observation_factory
+from tests.shared.original_task_admission import assert_unknown_task_admission
 from tests.utils.original_failure import OriginalFailure
 
 native_pg = _native_pg
@@ -35,6 +36,7 @@ async def test_manager_admission_diagnostic_keeps_original_unexpected_control(
     leaf = UnexpectedControl("actual original admission refusal")
     source = OriginalFailure.capture(leaf)
     publication = BaseExceptionGroup("original admission group", [leaf]) if grouped else leaf
+    publication_source = OriginalFailure.capture(publication)
     admission = manager_module.AgentOperationAdmission(
         name="Child", canonical_name="child", kind="spawn",
         registration_epoch=manager._agent_registration_shutdown_epoch,
@@ -71,7 +73,10 @@ async def test_manager_admission_diagnostic_keeps_original_unexpected_control(
             result = await ownership.await_owned_task(owner)
             assert attached.is_set() and len(accepted) == 1 and accepted[0].done()
         source.assert_retained(result.error)
-        assert not isinstance(result.error, Exception), "admission control became ordinary availability"
+        if surface == "drain-admission":
+            assert_unknown_task_admission(result.error, publication, source=publication_source)
+        else:
+            assert not isinstance(result.error, Exception), "admission control became ordinary availability"
         assert not manager._lock.locked() and not manager._quarantined_shutdown_drain_lock.locked()
         assert not manager._quarantined_shutdown_reapers
     finally:
