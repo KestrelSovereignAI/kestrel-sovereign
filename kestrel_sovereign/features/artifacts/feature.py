@@ -49,6 +49,7 @@ from kestrel_sovereign.security.private_delivery import AuthorizedCapabilityResp
 from kestrel_sovereign.execution_custody import is_execution_control_error
 from kestrel_sovereign.storage.privacy_wrapper import require_durable_persistence_gate
 from kestrel_sovereign.turn_scope import capture_turn_scope
+from .producer_admission import NativeArtifactAdmissions
 from .producers import ArtifactProducerTools
 from .workspace import ArtifactWorkspaceTools, create_workspace_router
 
@@ -77,6 +78,7 @@ class ArtifactsFeature(ArtifactProducerTools, ArtifactWorkspaceTools, Feature):
     supports_subagent_dispatch = False
     promote_tools_on_startup = True
     artifact_bridge_api_version = 3
+    native_artifact_producer_api_version = 1
 
     def __init__(self, agent):
         super().__init__(agent)
@@ -96,6 +98,7 @@ class ArtifactsFeature(ArtifactProducerTools, ArtifactWorkspaceTools, Feature):
         self._router = None
         self._agent_id: str | None = None
         self._sweep_task = None
+        self.native_output_admissions = NativeArtifactAdmissions(self)
 
     _sweep_seconds = 60
 
@@ -124,6 +127,8 @@ class ArtifactsFeature(ArtifactProducerTools, ArtifactWorkspaceTools, Feature):
             self._service, resolve_context=self._resolve_context,
         )
         self._router.include_router(create_workspace_router(self))
+        from .producer_http import create_native_output_router
+        self._router.include_router(create_native_output_router(self))
 
     def get_router(self):
         return self._router
@@ -248,6 +253,7 @@ class ArtifactsFeature(ArtifactProducerTools, ArtifactWorkspaceTools, Feature):
         # Re-enable cannot resurrect a context admitted in this generation.
         self._accepting = False
         self._generation += 1
+        self.native_output_admissions.retire()
         async with self._gate:
             pass  # Join every operation/response before lifecycle release.
         await self._cancel_owned_background_tasks()
