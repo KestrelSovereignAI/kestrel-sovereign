@@ -103,8 +103,14 @@ async def test_task_creation_failure_dispatches_no_native_body_or_dependency():
                     raise RuntimeError("native task factory refused dispatch")
                 loop.set_task_factory(refuse)
                 try:
-                    with pytest.raises(RuntimeError, match="refused dispatch"):
+                    with pytest.raises(RuntimeError) as caught:
                         lock.start_owned_native_work(native)
+                    from kestrel_sovereign.execution_custody import _explicit_control_chain, execution_cleanup_debts
+                    assert any(str(error) == "native task factory refused dispatch"
+                               for error in _explicit_control_chain(caught.value))
+                    assert execution_cleanup_debts(caught.value), (
+                        "opaque factory refusal cannot settle its native admission"
+                    )
                 finally:
                     loop.set_task_factory(previous)
     async with lock:

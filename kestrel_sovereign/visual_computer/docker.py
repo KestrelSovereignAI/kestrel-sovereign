@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import errno
 import hashlib
 import hmac
 import json
@@ -15,6 +16,7 @@ import os
 from pathlib import Path
 import re
 import shutil
+import subprocess
 import tempfile
 from collections.abc import Mapping
 from datetime import UTC, datetime
@@ -32,7 +34,10 @@ from kestrel_sdk.resources import (
     ResourceUnsupported,
 )
 from .dispatch import native_dispatch, native_trace
-from kestrel_sovereign._async_ownership import create_owned_task, await_owned_task, raise_owned_outcome
+from kestrel_sovereign._async_ownership import (
+    create_owned_task, await_owned_task, await_owned_operation, gather_owned, raise_owned_outcome,
+)
+from kestrel_sovereign.execution_custody import execution_cleanup_debts, execution_terminal_error
 from .docker_policy import container_arguments, verify_container
 from .docker_egress import DockerEgressPolicy, HTTPGateway, EgressDenied, EgressUnknown
 
@@ -51,6 +56,45 @@ READ_INCARNATION = (
     "\nprint(p.read_text())"
 )
 IMAGE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]*@sha256:[a-f0-9]{64}$")
+_NATIVE_POPEN = subprocess.Popen
+_NATIVE_CREATE_SUBPROCESS = asyncio.create_subprocess_exec
+_NATIVE_CREATE_SUBPROCESS_CODE = _NATIVE_CREATE_SUBPROCESS.__code__
+_NATIVE_EXEC_CHILD = getattr(subprocess.Popen, "_execute_child", None)
+_NATIVE_EXEC_CHILD_CODE = getattr(_NATIVE_EXEC_CHILD, "__code__", None)
+
+
+def _reaped_native_exec_refusal(error, argv, cwd):
+    """Finite POSIX exec failure ACK from this original native constructor.
+
+    An errno or a finished Task is insufficient. CPython's failed-exec path
+    records waitpid's exact child/status before raising. No delivered Process,
+    foreign wrapper error, unsupported platform, or incomplete wait can use
+    this proof. Successful launches are instead joined through their Process.
+    """
+    if (os.name != "posix" or type(error) not in (FileNotFoundError, PermissionError, OSError)
+            or error.errno not in (errno.ENOENT, errno.EACCES, errno.ENOEXEC)
+            or error.filename != argv[0] or _NATIVE_EXEC_CHILD is None
+            or asyncio.create_subprocess_exec is not _NATIVE_CREATE_SUBPROCESS
+            or _NATIVE_CREATE_SUBPROCESS.__code__ is not _NATIVE_CREATE_SUBPROCESS_CODE
+            or subprocess.Popen is not _NATIVE_POPEN
+            or subprocess.Popen._execute_child is not _NATIVE_EXEC_CHILD
+            or _NATIVE_EXEC_CHILD.__code__ is not _NATIVE_EXEC_CHILD_CODE):
+        return False
+    trace = error.__traceback__
+    while trace is not None:
+        if trace.tb_frame.f_code is _NATIVE_EXEC_CHILD_CODE:
+            facts = trace.tb_frame.f_locals
+            child = facts.get("self")
+            return (type(child) is _NATIVE_POPEN and child.args == tuple(argv)
+                    and facts.get("args") == argv
+                    and facts.get("cwd") == cwd and child._child_created
+                    and type(child.returncode) is int
+                    and type(facts.get("pid")) is int and facts["pid"] == child.pid
+                    and type(facts.get("sts")) is int and bool(facts.get("errpipe_data"))
+                    and facts.get("errno_num") == error.errno
+                    and facts.get("err_filename") == argv[0])
+        trace = trace.tb_next
+    return False
 
 
 def _json(value):
@@ -102,27 +146,30 @@ class DockerBoundary:
 
     async def invoke(self, arguments, *, data=None, timeout=25, current=None, _input_trace=None):
         trace = native_trace()
-        if trace is None:
-            return await self._invoke(arguments, data=data, timeout=timeout, current=current)
         # Every accepted native preflight/RPC child remains physically owned.
         # Repeated caller cancellation cannot interrupt its process cleanup.
-        trace.commands += 1
-        command = None
+        if trace is not None:
+            trace.commands += 1
+        joined = False
         owner = {"entered":False, "settled":False}
         try:
-            command = create_owned_task(self._invoke(arguments, data=data, timeout=timeout,
-                current=current, _input_trace=_input_trace, _native_owner=owner), name="visual-native-command")
-            outcome = await await_owned_task(command, cancel_on_caller_cancellation=True)
+            outcome = await await_owned_operation(self._invoke(arguments, data=data, timeout=timeout,
+                current=current, _input_trace=_input_trace, _native_owner=owner),
+                name="visual-native-command", cancel_on_caller_cancellation=True)
+            joined = not execution_cleanup_debts(outcome.error)
             return raise_owned_outcome(outcome, operation="visual native command")
         finally:
-            if (command is None or command.done()) and (not owner["entered"] or owner["settled"]):
+            if trace is not None and joined and (not owner["entered"] or owner["settled"]):
                 trace.commands -= 1
                 if _input_trace is trace:
                     trace.rpc_settled = True
 
     async def _invoke(self, arguments, *, data=None, timeout=25, current=None, _input_trace=None, _native_owner=None):
-        launch = process = None
-        streams = []
+        process = None
+        launch_started = launch_joined = exec_refused = False
+        streams_joined = True
+        reaped = False
+        failure = None
         if _native_owner is not None:
             _native_owner["entered"] = True
         try:
@@ -131,25 +178,27 @@ class DockerBoundary:
             environment = {"HOME": os.environ.get("HOME", ""), "PATH": os.defpath,
                            "PYTHON_DOTENV_DISABLED": "1"}
             with tempfile.TemporaryDirectory(prefix="kestrel-private-docker-") as config:
-                launch = asyncio.create_task(asyncio.create_subprocess_exec(
-                    self.executable, "--config", config, "--host", f"unix://{self.socket}",
-                    *arguments, stdin=asyncio.subprocess.PIPE,
-                    stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
-                    env=environment, cwd=Path(__file__).parent,
-                ))
-                try:
-                    process = await asyncio.shield(launch)
-                except BaseException:
-                    # Cancellation can race OS process creation. Retain the launch
-                    # until its exact process is known, then reap without stdin.
-                    process = await launch
-                    if process.returncode is None:
-                        try:
-                            process.kill()
-                        except ProcessLookupError:
-                            pass
-                    await process.wait()
-                    raise
+                argv = [self.executable, "--config", config, "--host", f"unix://{self.socket}", *arguments]
+                cwd = Path(__file__).parent
+                async def launch_process():
+                    nonlocal process, launch_started, exec_refused
+                    launch_started = True
+                    try:
+                        # Retain the actual Process INSIDE the accepted native
+                        # launch, before result/callback publication can fail.
+                        process = await asyncio.create_subprocess_exec(
+                            *argv, stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
+                            stderr=asyncio.subprocess.PIPE, env=environment, cwd=cwd)
+                    except OSError as error:
+                        exec_refused = _reaped_native_exec_refusal(error, argv, cwd)
+                        raise
+                    if type(process) is not asyncio.subprocess.Process:
+                        process = None
+                        raise ResourceOutcomeUnknown("native_process_not_verified")
+                    return process
+                launched = await await_owned_operation(launch_process(), name="visual-native-launch")
+                launch_joined = not execution_cleanup_debts(launched.error)
+                raise_owned_outcome(launched, operation="visual native launch")
                 async def read(stream):
                     chunks, size = [], 0
                     while chunk := await stream.read(min(65536, MAX_OUTPUT + 1 - size)):
@@ -173,37 +222,31 @@ class DockerBoundary:
                             await process.stdin.drain()
                     finally:
                         process.stdin.close()
-                async def retire():
-                    if process.returncode is None:
-                        try:
-                            process.kill()
-                        except ProcessLookupError:
-                            pass
-                    await process.wait()
-                streams = [asyncio.create_task(write()), asyncio.create_task(read(process.stdout)),
-                           asyncio.create_task(read(process.stderr))]
+                streams_joined = False
                 try:
                     async with asyncio.timeout(timeout):
-                        _, output, error = await asyncio.gather(*streams)
+                        try:
+                            _, output, error = await gather_owned(
+                                (operation() for operation in (write,
+                                    lambda: read(process.stdout), lambda: read(process.stderr))),
+                                name_prefix="visual-native-stream")
+                        except BaseException as stream_error:
+                            streams_joined = not execution_cleanup_debts(stream_error)
+                            raise
+                        streams_joined = True
                         await process.wait()
+                        reaped = True
                         if current is not None:
                             current()
                 except (TimeoutError, asyncio.CancelledError, OSError, DockerCommandError):
-                    await retire()
                     # Killing the CLI cannot unsend an accepted Docker/browser call.
                     raise ResourceOutcomeUnknown("docker_transport_outcome_unknown") from None
                 except BaseException:
                     # Authority can revoke during process launch or output delivery.
                     # Join this owned process even when its check rejects the call.
-                    await retire()
                     if dispatched:
                         raise ResourceOutcomeUnknown("driver_effect_outcome_unknown") from None
                     raise
-                finally:
-                    for task in streams:
-                        if not task.done():
-                            task.cancel()
-                    await asyncio.gather(*streams, return_exceptions=True)
                 if process.returncode:
                     # Only this exact daemon response establishes current absence.
                     target = arguments[-1]
@@ -213,12 +256,39 @@ class DockerBoundary:
                         raise ResourceNotFound("docker_resource_absent")
                     raise DockerCommandError("docker_operation_outcome_unknown", diagnostics=output + error)
                 return output
+        except BaseException as error:
+            failure = error
+            raise
         finally:
+            cleanup = None
+            if process is not None:
+                async def retire():
+                    nonlocal reaped
+                    errors = []
+                    try:
+                        process.stdin.close()
+                    except BaseException as error:
+                        errors.append(error)
+                    if process.returncode is None:
+                        try:
+                            process.kill()
+                        except ProcessLookupError:
+                            pass
+                        except BaseException as error:
+                            errors.append(error)
+                    await process.wait()
+                    reaped = True
+                    if errors:
+                        raise execution_terminal_error(*errors, retain_originals=True)
+                cleanup = await await_owned_operation(retire(), name="visual-native-reap",
+                    retirement_resource=process)
             if _native_owner is not None:
-                # Task completion alone is not proof of physical settlement.
-                _native_owner["settled"] = (launch is None or (
-                    process is not None and process.returncode is not None
-                    and launch.done() and all(task.done() for task in streams)))
+                _native_owner["settled"] = (launch_joined and streams_joined and (
+                    not launch_started or exec_refused or (process is not None and reaped))
+                    and not execution_cleanup_debts(failure)
+                    and (cleanup is None or (cleanup.error is None and cleanup.cancellation is None)))
+            if cleanup is not None and (cleanup.error is not None or cleanup.cancellation is not None):
+                raise execution_terminal_error(failure, cleanup.error, cleanup.cancellation, retain_originals=True)
 
     async def inspect(self, target):
         try:

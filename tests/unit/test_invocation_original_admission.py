@@ -199,7 +199,12 @@ async def test_invocation_admission_retires_exact_original_child_and_registratio
         owner = create_owned_task(invoke(agent, request_id=request_id), retain_originals=True)
         outcome = await await_owned_task(owner)
         loop.set_task_factory(previous)
-        assert outcome.error is refusal, "invocation admission failure replaced original refusal"
+        if mode == "allocation":
+            from kestrel_sovereign.execution_custody import _explicit_control_chain, execution_cleanup_debts
+            assert refusal in _explicit_control_chain(outcome.error)
+            assert execution_cleanup_debts(outcome.error), "opaque invocation admission was falsely settled"
+        else:
+            assert outcome.error is refusal, "invocation admission failure replaced original refusal"
         assert all(task.done() for task in accepted), "invocation returned with original accepted child still pending"
         assert all(inspect.getcoroutinestate(coro) == inspect.CORO_CLOSED for pair in refused for coro in pair), "refused invocation leaked unstarted operation"
         assert not any(task in members for members in vars(agent).get("_request_operation_tasks", {}).values() for task in accepted), "failed invocation binding left original operation published"

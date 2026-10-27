@@ -3,6 +3,7 @@
 import asyncio
 import inspect
 import sqlite3
+from contextlib import closing
 
 import aiosqlite
 import pytest
@@ -145,7 +146,7 @@ async def test_actual_host_bootstrap_unknown_is_not_a_degraded_context(
             "bootstrap normalized original native UNKNOWN into degraded context text"
         )
         assert context is None
-        with sqlite3.connect(path) as independent:
+        with closing(sqlite3.connect(path)) as independent:
             assert (
                 independent.execute(
                     "SELECT COUNT(*) FROM sqlite_master WHERE type='table'"

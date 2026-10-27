@@ -83,7 +83,9 @@ async def test_refused_original_gate_or_persist_coroutine_is_closed(
             else:
                 await feature._close_traffic_gate()
         loop.set_task_factory(previous)
-        assert caught.value is original and refused
+        from kestrel_sovereign.execution_custody import _explicit_control_chain, execution_cleanup_debts
+        assert original in _explicit_control_chain(caught.value) and refused
+        assert execution_cleanup_debts(caught.value), "opaque lifecycle admission was falsely settled"
         assert all(
             inspect.getcoroutinestate(coro) == inspect.CORO_CLOSED
             for pair in refused

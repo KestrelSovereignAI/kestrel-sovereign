@@ -3,7 +3,7 @@
 import asyncio
 import json
 import sqlite3
-from contextlib import suppress
+from contextlib import closing, suppress
 
 import httpx
 import pytest
@@ -31,7 +31,7 @@ async def _eventually(predicate):
 @pytest_asyncio.fixture
 async def native_snapshot(tmp_path, monkeypatch):
     db = tmp_path / "native-snapshot.db"
-    with sqlite3.connect(db) as connection:
+    with closing(sqlite3.connect(db)) as connection, connection:
         connection.execute("CREATE TABLE payload (value TEXT)")
         connection.execute("INSERT INTO payload VALUES ('actual local snapshot')")
     entered, release_server = asyncio.Event(), asyncio.Event()

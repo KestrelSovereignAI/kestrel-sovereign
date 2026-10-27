@@ -78,7 +78,15 @@ async def test_original_admission_cell_precedes_all_callback_publication(
         else:
             with pytest.raises(RuntimeError) as caught:
                 create_owned_task(original(), admission=admission, retain_originals=True)
-            assert caught.value is refusal
+            if mode == "allocation":
+                from kestrel_sovereign.execution_custody import _explicit_control_chain, execution_cleanup_debts
+                # An opaque factory may have accepted an outer-await wrapper.
+                # Keep its source error and explicit debt, never infer absence.
+                assert refusal in _explicit_control_chain(caught.value)
+                assert admission._acceptance_unknown
+                assert execution_cleanup_debts(caught.value)
+            else:
+                assert caught.value is refusal
         loop.set_task_factory(previous)
         if mode == "success":
             await entered.wait()

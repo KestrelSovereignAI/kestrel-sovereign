@@ -233,6 +233,17 @@ ActionRequest/session and journals its exact terminal denial; generic driver
 exceptions and copied/retired facts never establish non-dispatch. Original
 cancellation and private-delivery policy still propagate after factual storage.
 
+The local CPython POSIX boundary recognizes only native ENOENT/EACCES/ENOEXEC
+failures whose original constructor records the exact failed child and waitpid
+status. A delivered Process is retained before result publication and physically
+reaped instead. Task-construction failure alone proves neither absence nor
+cleanup: an exact native gated Task accepted by a failing factory is retained
+and joined without admitting its payload. Opaque wrappers, ambiguous native
+registry results and unsupported launch provenance retain uncertainty/debt.
+They cannot produce a no-input receipt. A synchronous admission debt returned
+to a direct caller does not create a new dispatcher-wide authority fence; that
+caller still owns the unresolved debt and must not claim its settlement.
+
 A request refused or cancelled before the acquiring CAS may retire without ever
 acquiring an environment. The same encrypted request row retains immutable
 original request/session IDs, pre-acquisition phase and retirement time. It is

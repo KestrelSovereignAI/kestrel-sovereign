@@ -63,7 +63,12 @@ async def test_refused_settlement_retires_only_its_original_registration(
                 if inspect.isawaitable(guard):
                     guard = await guard
                 pytest.fail("refused settlement published an owner")
-            assert caught.value is refusal
+            if mode == "allocation":
+                from kestrel_sovereign.execution_custody import _explicit_control_chain, execution_cleanup_debts
+                assert refusal in _explicit_control_chain(caught.value)
+                assert execution_cleanup_debts(caught.value), "opaque settlement admission was falsely retired"
+            else:
+                assert caught.value is refusal
             generations.append(agent._next_request_generation)
             expected = {(request_id, initial): 1} if prior else {}
             assert agent._active_request_generation_counts == expected, "refused settlement leaked its original active generation"
