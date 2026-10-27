@@ -1651,3 +1651,324 @@ async def test_concurrent_replicas_fence_late_legacy_write_with_nonce_cas(
         await db.execute("DELETE FROM task_execution_log WHERE task_id = ?", (task_id,))
         await db.execute("DELETE FROM scheduled_tasks WHERE id = ?", (task_id,))
         await db.execute("DELETE FROM scheduler_protocol_rollout WHERE agent_id = ?", (agent_id,))
+
+
+@pytest.mark.asyncio
+@pytest.mark.dual_backend
+async def test_unknown_commit_outcome_latch_clears_once_recovery_settles_its_claim(
+    db_backend, monkeypatch,
+):
+    """A fenced mid-commit cron run no longer latches readiness forever (#3782).
+
+    The latch holds while the original claim does. Once its lease elapses the
+    backend's own recovery settles the claim: SQLite, which persists no
+    effect-start marker, runs the occurrence again; PostgreSQL fences the
+    schedule as ``unresolved_effect`` without replaying it. Either way the
+    runner's readiness is restored without a restart.
+    """
+    from kestrel_sovereign.execution_custody import ExecutionCommitOutcomeError
+
+    db = AsyncDatabase(db_backend)
+    agent_id = f"scheduler-commit-outcome:{uuid4()}"
+    task_id = f"scheduler-commit-outcome-task:{uuid4()}"
+    calls = []
+
+    async def executor(_task_name, _args):
+        calls.append(get_current_scheduler_execution().id)
+        if len(calls) == 1:
+            raise ExecutionCommitOutcomeError("unknown")
+        return "reconciled"
+
+    async def renew_until_stopped(_task):
+        await asyncio.current_task()._kestrel_renewal_state.stop_requested.wait()
+
+    runner = None
+    try:
+        await _activate_protocol_for_test_agent(db, agent_id, monkeypatch)
+        runner = SchedulerRunner(db, agent_id, executor, owner_id="commit-outcome")
+        runner._renew_lease = renew_until_stopped
+        await runner._ensure_tables()
+        due = (datetime.now(timezone.utc) - timedelta(seconds=2)).isoformat()
+        await db.execute(
+            """
+            INSERT INTO scheduled_tasks
+                (id, agent_id, task_name, cron_expression, args_json, enabled,
+                 next_run_at, created_at, idempotency_key,
+                 scheduler_protocol_version)
+            VALUES (?, ?, 'wait_reconcile', '* * * * *', '{}', 1, ?, ?, ?, ?)
+            """,
+            (task_id, agent_id, due, due, "integration-commit-outcome",
+             SCHEDULER_PROTOCOL_VERSION),
+        )
+
+        await tick_and_settle(runner)
+        assert len(calls) == 1
+        assert runner.readiness_failure is not None
+        assert runner.readiness_failure_reconcilable
+        await runner._reconcile_readiness_latch()
+        assert runner.readiness_failure is not None
+
+        await db.execute(
+            "UPDATE scheduled_tasks SET lease_expires_at = ? WHERE id = ?",
+            ((datetime.now(timezone.utc) - timedelta(seconds=1)).isoformat(), task_id),
+        )
+        await tick_and_settle(runner)
+        await runner._reconcile_readiness_latch()
+
+        assert runner.readiness_failure is None
+        log = await db.fetchone(
+            "SELECT status FROM task_execution_log WHERE id = ?", (calls[0],)
+        )
+        schedule = await db.fetchone(
+            "SELECT enabled, terminal_status FROM scheduled_tasks WHERE id = ?",
+            (task_id,),
+        )
+        if db_backend.backend_type == "postgres":
+            assert calls == [calls[0]]
+            assert log == ("executing",)
+            assert schedule == (0, "unresolved_effect")
+        else:
+            assert calls == [calls[0], calls[0]]
+            assert log == ("success",)
+            assert schedule[1] is None
+    finally:
+        if runner is not None:
+            try:
+                await runner.stop()
+            except ExecutionCommitOutcomeError:
+                pass  # stop() still reports the run's control evidence.
+        await db.execute("DELETE FROM task_execution_log WHERE task_id = ?", (task_id,))
+        await db.execute("DELETE FROM scheduled_tasks WHERE id = ?", (task_id,))
+        await db.execute("DELETE FROM scheduler_protocol_rollout WHERE agent_id = ?", (agent_id,))
+
+
+@pytest.mark.asyncio
+@pytest.mark.dual_backend
+async def test_renewal_commit_outcome_latch_clears_once_recovery_settles_its_claim(
+    db_backend, monkeypatch,
+):
+    """A lease renewal whose commit outcome is lost ends its claim, not readiness.
+
+    The real renewal monitor raises it; its stop, the claim's retirement and
+    the occurrence each observe it again. Every one of them must keep the
+    exact claim, or the latch becomes permanent and reaches the host's
+    lifetime record (#3782).
+    """
+    from kestrel_sovereign.execution_custody import ExecutionCommitOutcomeError
+
+    db = AsyncDatabase(db_backend)
+    agent_id = f"scheduler-renewal-outcome:{uuid4()}"
+    task_id = f"scheduler-renewal-outcome-task:{uuid4()}"
+    calls = []
+    notifications = []
+    outcome_lost = asyncio.Event()
+
+    async def executor(_task_name, _args):
+        calls.append(get_current_scheduler_execution().id)
+        if not outcome_lost.is_set():
+            # Hold the effect until the lost lease cancels it.
+            await asyncio.Event().wait()
+        return "reconciled"
+
+    runner = None
+    try:
+        await _activate_protocol_for_test_agent(db, agent_id, monkeypatch)
+        runner = SchedulerRunner(
+            db, agent_id, executor, owner_id="renewal-outcome",
+            lease_seconds=3, on_protocol_failure=notifications.append,
+        )
+        real_renew_lease_once = runner._renew_lease_once
+        renewals = 0
+
+        async def renew_then_lose_the_outcome(task):
+            nonlocal renewals
+            renewals += 1
+            renewed = await real_renew_lease_once(task)
+            if renewals == 2:
+                # The monitor's first renewal committed; its outcome is lost.
+                outcome_lost.set()
+                raise ExecutionCommitOutcomeError("unknown")
+            return renewed
+
+        runner._renew_lease_once = renew_then_lose_the_outcome
+        await runner._ensure_tables()
+        due = (datetime.now(timezone.utc) - timedelta(seconds=2)).isoformat()
+        await db.execute(
+            """
+            INSERT INTO scheduled_tasks
+                (id, agent_id, task_name, cron_expression, args_json, enabled,
+                 next_run_at, created_at, idempotency_key,
+                 scheduler_protocol_version)
+            VALUES (?, ?, 'wait_reconcile', '* * * * *', '{}', 1, ?, ?, ?, ?)
+            """,
+            (task_id, agent_id, due, due, "integration-renewal-outcome",
+             SCHEDULER_PROTOCOL_VERSION),
+        )
+
+        await tick_and_settle(runner)
+        assert renewals == 2
+        assert len(calls) == 1
+        assert runner.readiness_failure is not None
+        assert runner.readiness_failure_reconcilable
+        assert notifications == []
+        await runner._reconcile_readiness_latch()
+        assert runner.readiness_failure is not None
+
+        await db.execute(
+            "UPDATE scheduled_tasks SET lease_expires_at = ? WHERE id = ?",
+            ((datetime.now(timezone.utc) - timedelta(seconds=1)).isoformat(), task_id),
+        )
+        await tick_and_settle(runner)
+        await runner._reconcile_readiness_latch()
+
+        assert runner.readiness_failure is None
+        assert notifications == []
+        log = await db.fetchone(
+            "SELECT status FROM task_execution_log WHERE id = ?", (calls[0],)
+        )
+        schedule = await db.fetchone(
+            "SELECT enabled, terminal_status FROM scheduled_tasks WHERE id = ?",
+            (task_id,),
+        )
+        if db_backend.backend_type == "postgres":
+            # The effect had started: recovery fences it rather than replay.
+            assert calls == [calls[0]]
+            assert log == ("executing",)
+            assert schedule == (0, "unresolved_effect")
+        else:
+            assert calls == [calls[0], calls[0]]
+            assert log == ("success",)
+            assert schedule[1] is None
+    finally:
+        if runner is not None:
+            try:
+                await runner.stop()
+            except ExecutionCommitOutcomeError:
+                pass  # stop() still reports the run's control evidence.
+        await db.execute("DELETE FROM task_execution_log WHERE task_id = ?", (task_id,))
+        await db.execute("DELETE FROM scheduled_tasks WHERE id = ?", (task_id,))
+        await db.execute("DELETE FROM scheduler_protocol_rollout WHERE agent_id = ?", (agent_id,))
+
+
+@pytest.mark.asyncio
+@pytest.mark.dual_backend
+async def test_lost_claim_publication_latch_clears_once_recovery_settles_its_claim(
+    db_backend, monkeypatch,
+):
+    """A claim whose COMMIT landed but whose acknowledgement was lost (#3782).
+
+    ``_claim`` raises, so no frame receives the claim; its error carries the
+    identity the CAS wrote. Here native cleanup groups the lost outcome with a
+    cancelled rollback, which is neither a ``CancelledError`` nor an
+    ``Exception``. No effect started, so both backends' recovery claims the
+    occurrence again and runs it, and readiness is restored.
+    """
+    from kestrel_sovereign.execution_custody import (
+        ExecutionCommitOutcomeError,
+        execution_terminal_error,
+        is_execution_control_error,
+    )
+
+    db = AsyncDatabase(db_backend)
+    agent_id = f"scheduler-claim-outcome:{uuid4()}"
+    task_id = f"scheduler-claim-outcome-task:{uuid4()}"
+    calls = []
+    notifications = []
+    lost = []
+
+    async def executor(_task_name, _args):
+        calls.append(get_current_scheduler_execution().id)
+        return "reconciled"
+
+    async def renew_until_stopped(_task):
+        await asyncio.current_task()._kestrel_renewal_state.stop_requested.wait()
+
+    runner = None
+    try:
+        await _activate_protocol_for_test_agent(db, agent_id, monkeypatch)
+        runner = SchedulerRunner(
+            db, agent_id, executor, owner_id="claim-outcome",
+            on_protocol_failure=notifications.append,
+        )
+        runner._renew_lease = renew_until_stopped
+        real_claim = runner._claim
+        real_transaction = runner._transaction
+        claiming = False
+
+        async def flagged_claim(task, now):
+            nonlocal claiming
+            claiming = True
+            try:
+                return await real_claim(task, now)
+            finally:
+                claiming = False
+
+        @asynccontextmanager
+        async def lose_the_claim_acknowledgement(**kwargs):
+            async with real_transaction(**kwargs):
+                yield
+            if claiming and not lost:
+                lost.append(execution_terminal_error(
+                    ExecutionCommitOutcomeError("unknown"),
+                    asyncio.CancelledError(),
+                    isolate_control_originals=True,
+                ))
+                raise lost[0]
+
+        runner._claim = flagged_claim
+        runner._transaction = lose_the_claim_acknowledgement
+        await runner._ensure_tables()
+        due = (datetime.now(timezone.utc) - timedelta(seconds=2)).isoformat()
+        await db.execute(
+            """
+            INSERT INTO scheduled_tasks
+                (id, agent_id, task_name, cron_expression, args_json, enabled,
+                 next_run_at, created_at, idempotency_key,
+                 scheduler_protocol_version)
+            VALUES (?, ?, 'wait_reconcile', '* * * * *', '{}', 1, ?, ?, ?, ?)
+            """,
+            (task_id, agent_id, due, due, "integration-claim-outcome",
+             SCHEDULER_PROTOCOL_VERSION),
+        )
+
+        await tick_and_settle(runner)
+        assert type(lost[0]) is BaseExceptionGroup
+        assert calls == []
+        assert runner.readiness_failure is not None
+        assert runner.readiness_failure_reconcilable
+        assert notifications == []
+        [claim] = runner._readiness_reconciliations
+        held = await db.fetchone(
+            "SELECT claim_execution_id, claim_token FROM scheduled_tasks "
+            "WHERE id = ? AND scheduler_claim_fenced = 1",
+            (task_id,),
+        )
+        assert tuple(held) == (claim.execution_id, claim.claim_token)
+        await runner._reconcile_readiness_latch()
+        assert runner.readiness_failure is not None
+
+        await db.execute(
+            "UPDATE scheduled_tasks SET lease_expires_at = ? WHERE id = ?",
+            ((datetime.now(timezone.utc) - timedelta(seconds=1)).isoformat(), task_id),
+        )
+        await tick_and_settle(runner)
+        await runner._reconcile_readiness_latch()
+
+        assert runner.readiness_failure is None
+        assert notifications == []
+        assert calls == [claim.execution_id]
+        assert await db.fetchone(
+            "SELECT status, attempt_count FROM task_execution_log WHERE id = ?",
+            (claim.execution_id,),
+        ) == ("success", 2)
+    finally:
+        if runner is not None:
+            try:
+                await runner.stop()
+            except BaseException as error:
+                # stop() still reports the run's control evidence.
+                if not is_execution_control_error(error):
+                    raise
+        await db.execute("DELETE FROM task_execution_log WHERE task_id = ?", (task_id,))
+        await db.execute("DELETE FROM scheduled_tasks WHERE id = ?", (task_id,))
+        await db.execute("DELETE FROM scheduler_protocol_rollout WHERE agent_id = ?", (agent_id,))

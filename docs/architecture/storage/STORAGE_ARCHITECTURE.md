@@ -185,6 +185,15 @@ SQLite connection close did not complete within 1.01s (elapsed=1.012s budget=1.0
 A worker that outlives the window reports the same fields after
 `SQLite worker did not terminate`.
 
+Either overrun raises `SQLiteCloseOverrunError`, a `ConnectionError`, and the
+backend keeps the close until its worker exits. A file-backed snapshot read
+(one made while another task holds the write transaction) has its rows before
+its connection closes. If that close overruns and the read itself succeeded,
+the read returns its rows and logs a second WARNING. It does not raise a
+`QueryError` (#3782). The read still fails when the read itself failed, when
+the overrun carries control evidence, or when the reading task was cancelled
+during the close.
+
 ## SQLAlchemy Layer
 
 SQLAlchemy is used for typed ORM views and vector search, not as a wholesale

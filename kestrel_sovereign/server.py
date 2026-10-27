@@ -370,6 +370,23 @@ def _is_enabled_scheduler_feature(name: object, feature: object) -> bool:
     ) and bool(getattr(feature, "enabled", True))
 
 
+def _scheduler_runner_latch(runner: object) -> tuple[object, bool]:
+    """A runner's latched failure and whether it clears itself (#3782).
+
+    ``readiness_latch`` is one pair read in a single step: a probe runs on
+    another thread from the runner, so reading the failure and its flag
+    separately could pair a failure with a stale flag. A runner without it
+    is never reconcilable.
+    """
+
+    latch = getattr(runner, "readiness_latch", None)
+    if isinstance(latch, tuple) and len(latch) == 2:
+        return latch[0], latch[1] is True
+    if hasattr(type(runner), "readiness_latch"):
+        return None, False
+    return getattr(runner, "readiness_failure", None), False
+
+
 def _latch_active_scheduler_runner_failures(
     app: FastAPI,
     agent,
@@ -384,7 +401,35 @@ def _latch_active_scheduler_runner_failures(
     ``readiness_failure`` latch at the health boundary and persist only a
     sanitized record; a scheduler protocol/database outage must not look
     healthy merely because a sibling agent remains routable.
+
+    A runner whose latch is reconcilable clears it itself once the claims
+    behind it are settled (#3782). Its record is reported while the runner
+    holds the latch, not for the host's lifetime.
     """
+
+    reconciling: list[dict] = []
+    # A runner that could not be inspected keeps its earlier record: an
+    # unreadable inventory must never read as a recovered scheduler.
+    inspected_all = True
+
+    def promote(
+        scope: str,
+        runner: object,
+        agent_name: Optional[str] = None,
+    ) -> None:
+        failure, reconcilable = _scheduler_runner_latch(runner)
+        if not isinstance(failure, BaseException):
+            return
+        if reconcilable:
+            record = _scheduler_readiness_failure_record(
+                scope, failure, agent_name=agent_name
+            )
+            if record not in reconciling:
+                reconciling.append(record)
+            return
+        _latch_scheduler_readiness_failure(
+            app, scope, failure, agent_name=agent_name
+        )
 
     candidates: list[tuple[str, object]] = []
     if agent is not None:
@@ -395,6 +440,7 @@ def _latch_active_scheduler_runner_failures(
         except Exception:  # pragma: no cover - health must not crash
             logger.warning("Unable to inspect managed scheduler readiness", exc_info=True)
             managed = {}
+            inspected_all = False
         if isinstance(managed, dict):
             candidates.extend(
                 (name, candidate)
@@ -411,6 +457,7 @@ def _latch_active_scheduler_runner_failures(
                 agent_name,
                 exc_info=True,
             )
+            inspected_all = False
             continue
         if not isinstance(features, dict):
             continue
@@ -419,26 +466,60 @@ def _latch_active_scheduler_runner_failures(
                 if not _is_enabled_scheduler_feature(name, feature):
                     continue
                 runner = getattr(feature, "_runner", None)
-                failure = getattr(runner, "readiness_failure", None)
+                promote("runtime", runner, agent_name=agent_name)
             except Exception:  # pragma: no cover - health must not crash
                 logger.warning(
                     "Unable to inspect scheduler runner for %s",
                     agent_name,
                     exc_info=True,
                 )
+                inspected_all = False
                 continue
-            if isinstance(failure, BaseException):
-                _latch_scheduler_readiness_failure(
-                    app,
-                    "runtime",
-                    failure,
-                    agent_name=agent_name,
-                )
 
     host_runner = getattr(app.state, "host_scheduler_runner", None)
-    host_failure = getattr(host_runner, "readiness_failure", None)
-    if isinstance(host_failure, BaseException):
-        _latch_scheduler_readiness_failure(app, "protocol", host_failure)
+    if host_runner is not None:
+        promote("protocol", host_runner)
+
+    previous = list(getattr(app.state, "scheduler_reconciling_failures", ()))
+    if not inspected_all:
+        reconciling.extend(
+            record for record in previous if record not in reconciling
+        )
+    for record in reconciling:
+        if record not in previous:
+            logger.error(
+                "Scheduler readiness failure (scope=%s, agent=%s, cause=%s); "
+                "it clears once the claims behind it are settled",
+                record["scope"],
+                record.get("agent"),
+                record["cause_type"],
+            )
+    for record in previous:
+        if record not in reconciling:
+            logger.warning(
+                "Scheduler readiness restored (scope=%s, agent=%s, cause=%s)",
+                record["scope"],
+                record.get("agent"),
+                record["cause_type"],
+            )
+    app.state.scheduler_reconciling_failures = reconciling
+
+
+def _scheduler_readiness_failures(app: FastAPI) -> list[dict]:
+    """Every scheduler readiness failure the host currently reports.
+
+    Latched records last for the host's lifetime; reconciling records last
+    while their runner holds its latch. Call after
+    ``_latch_active_scheduler_runner_failures`` so the second set is current.
+    """
+
+    failures = list(getattr(app.state, "scheduler_readiness_failures", ()))
+    failures.extend(
+        record
+        for record in getattr(app.state, "scheduler_reconciling_failures", ())
+        if record not in failures
+    )
+    return failures
 
 
 def _active_scheduler_workers_available(app: FastAPI, agent, manager) -> bool:
@@ -3313,6 +3394,7 @@ async def _lifespan_startup(app: FastAPI):
     app.state.identity_readiness_failures = []
     app.state.scheduler_cold_agent_failures = []
     app.state.scheduler_readiness_failures = []
+    app.state.scheduler_reconciling_failures = []
     # On a failed rollback this private owner remains reachable only to
     # teardown. It must never become the public routing manager.
     app.state.startup_cleanup_agent_manager = None
@@ -5092,11 +5174,7 @@ def health_check(request: Request):
     invocation_owners_healthy = _distributed_invocation_owners_healthy(
         agent, manager
     )
-    scheduler_failures = getattr(
-        request.app.state,
-        "scheduler_readiness_failures",
-        [],
-    )
+    scheduler_failures = _scheduler_readiness_failures(request.app)
     constitution_safe_mode = _constitution_safe_mode_records(agent, manager)
     any_initialized = bool(agent) or bool(manager and manager.list_agents())
     if (
@@ -5459,9 +5537,7 @@ async def health_detailed(request: Request):
     scheduler_workers_available = _active_scheduler_workers_available(
         request.app, agent, manager
     )
-    scheduler_failures = getattr(
-        request.app.state, "scheduler_readiness_failures", []
-    )
+    scheduler_failures = _scheduler_readiness_failures(request.app)
     scheduler_unavailable = bool(
         scheduler_failures or not scheduler_workers_available
     )

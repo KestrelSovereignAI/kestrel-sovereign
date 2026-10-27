@@ -136,9 +136,13 @@ async def test_original_acknowledged_commit_cannot_be_classified_as_local_denial
             "acknowledged original COMMIT control was silently localized as an empty denial"
         )
         assert execution_commit_outcome(runner.readiness_failure) == "committed"
-        assert notifications and all(
-            execution_commit_outcome(error) == "committed" for error in notifications
-        )
+        # The committed outcome ended this exact claim, so the latch holds
+        # until the durable rows settle it (#3782). Every later observer of
+        # the same failure keeps that: none records it for the host's lifetime.
+        assert runner.readiness_failure_reconcilable
+        [claim] = runner._readiness_reconciliations
+        assert claim.agent_id == did
+        assert notifications == []
         assert all(
             receipt is not outcome.error and execution_commit_outcome(receipt) is None
             for receipt in runner._occurrence_control_receipts

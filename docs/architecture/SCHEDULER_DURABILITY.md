@@ -117,6 +117,16 @@ failures are isolated and finalized on their own tasks, so one failed
 scheduled task neither cancels its siblings nor kills the polling worker.
 `stop()` cancels and joins in-flight occurrences along with the worker.
 
+A storage error (`QueryError`, `ConnectionError`, `TransactionError`) that
+ends one occurrence before it finalizes, with no commit-outcome, authority or
+retirement evidence behind it, does not latch readiness (#3782). The
+occurrence is treated as if its process had died at that statement: its
+lease expires and a later poll recovers the row. On PostgreSQL an occurrence
+whose effect-start marker is set is fenced as `unresolved_effect`, and one
+without the marker is claimed again and runs. SQLite records no effect-start
+marker, so there the occurrence is always claimed again. Any other exception
+reaching the occurrence boundary still latches readiness.
+
 Every poller emits one row per `(authorized agent, worker owner)` pair to
 `scheduler_runtime_status`, including agents with zero schedules. Publication
 and freshness use database statement time, so skew between PostgreSQL replica
@@ -355,3 +365,46 @@ available for small fleets and compatibility.
 Protocol failures and unresolved scheduler identities are safety outages: they
 are latched into public readiness as a sanitized HTTP 503, with detailed
 diagnostics exposed only through the authenticated readiness surface.
+
+One latch clears without a restart (#3782). An occurrence can end with an
+unknown or committed transaction outcome, for example a cron run cancelled
+mid-commit by a Stop-owner fence, or a renewal of its own lease whose commit
+landed but whose acknowledgement was lost. The outcome may arrive alone or
+grouped with a cancelled rollback. The claim's own publication can end this
+way too: its COMMIT may have landed though the runner never received the
+claim, so the error carries the claim identity written before the CAS. An
+occurrence can also end with an ordinary failure while readiness is already
+latched; one that would start a latch is scheduler infrastructure. Either
+way the runner records the exact claim (schedule, execution and claim token)
+and reports the latch as `readiness_failure_reconcilable`. Several observers
+see one failure: the renewal's stop, the claim's retirement, the occurrence,
+its done callback and `stop()`. The runner marks the failure with the claims
+it found it reconcilable for, so an observer that does not know the claim
+keeps that finding. SQLite recovery claims the same execution again under a
+new token; that is a separate claim, so a recovered attempt that also ends
+with an unknown outcome keeps the latch until its own claim is settled. Each
+poll checks whether every recorded claim still holds its schedule row; a
+check whose read fails proves nothing, so the latch stays until a later poll
+reads it. A claim stops holding it when the occurrence is finalized, or when
+recovery takes the expired lease exactly as it would after a crash (see
+above). The latch never changed what recovery does: a latched runner keeps
+polling. On PostgreSQL an effect that might have happened is still fenced as
+`unresolved_effect` for an operator. Once no recorded claim still holds its
+row, the runner clears the latch, normally within one lease interval plus
+one poll. The run's control evidence is still raised from `stop()`.
+`readiness_latch` exposes the failure and whether it is reconcilable as one
+pair, because health probes read it from another thread. A latch that any
+other failure contributed to (a worker crash, a rollout or schema failure,
+an authority denial, or physical retirement debt) is not reconcilable. It
+holds until the runner is replaced. The host records reconcilable latches in
+`scheduler_reconciling_failures`, only while the runner holds them, and
+every other runner latch in `scheduler_readiness_failures` for the host's
+lifetime.
+
+Readiness stays host-wide on purpose. Public `/health` is one aggregate
+readiness bit for load balancers. Every agent-local safety outage (safe mode,
+an identity failure, a failed mandatory feature, and a scheduler latch) fails
+it the same way, and `/health/detailed` names the affected agent in each
+record. A scheduler safety outage is a scheduler that cannot keep its
+delivery guarantees, so it is not degraded readiness. It now lasts only as
+long as its cause, so the host-wide scope no longer means "until restart".
