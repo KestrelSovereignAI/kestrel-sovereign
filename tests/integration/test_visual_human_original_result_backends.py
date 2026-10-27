@@ -20,7 +20,7 @@ from tests.integration.test_visual_custody_backends import custody as custody, r
 from tests.integration.test_visual_original_result_backends import OriginalTurn
 
 
-async def prepared_human(store):
+async def prepared_human(store, *, consumer_id=None):
     current = await store.admit(SCOPE, record(), lambda:None)
     session = ComputerSession(session_id=current.session_id, scope=SCOPE, lease_id='lease',
         driver_id='driver', surface='browser', capabilities=frozenset({'screenshot','type','click','takeover'}),
@@ -29,7 +29,8 @@ async def prepared_human(store):
     current.human_private, current.human_control_id, current.human_control_epoch = True, 'human', 1
     await store.save(SCOPE, current)
     now = datetime.now(UTC)
-    consumer = store._address('human-consumer', SCOPE.model_dump_json(), session.session_id, 'human')
+    consumer = (store._address('human-consumer', SCOPE.model_dump_json(), session.session_id, 'human')
+                if consumer_id is None else consumer_id)
     control = HumanControlRequest(control_id='human', consumer_id=consumer, scope=SCOPE,
         session_id=session.session_id, lease_id=session.lease_id, driver_id=session.driver_id,
         control_epoch=1, issued_at=now, expires_at=now+timedelta(seconds=60),
@@ -164,13 +165,9 @@ async def test_human_result_issuance_requires_original_private_binding(custody,w
 @pytest.mark.asyncio
 async def test_consistent_foreign_consumer_records_never_mint_original_human_owner(custody):
     store,_=custody
-    _,session,lease,frame,request,human=await prepared_human(store)
-    control=lease.request.model_copy(update={'consumer_id':'foreign-consumer'})
-    lease=lease.model_copy(update={'request':control,'request_sha256':control.digest()})
-    frame=frame.model_copy(update={'consumer_id':'foreign-consumer'})
-    request=request.model_copy(update={'consumer_id':'foreign-consumer'})
-    human.request,human.lease,human.frame=control,lease,frame
-    await store.private_record(SCOPE,session.session_id,'human','human',HumanRecord,update=human)
+    # Admit the deliberately coherent foreign fixture from the outset. The
+    # canonical row now correctly refuses rewriting an accepted request.
+    _,session,lease,frame,request,_=await prepared_human(store, consumer_id='foreign-consumer')
     with original_human_dispatch(session,lease,request,frame):
         with pytest.raises(ResourceConflict,match='consumer differs'):
             async with store.original_human_action_result(SCOPE,session,request,guard=lambda:None):pass
