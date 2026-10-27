@@ -10,7 +10,6 @@ import asyncio
 import json
 import logging
 import re
-import sqlite3
 import sys
 import threading
 import time
@@ -199,7 +198,6 @@ async def test_snapshot_close_records_actual_native_and_ack_stages(
     timeline = {"test_started_at": time.monotonic()}
     transaction = snapshot_read = original_close = None
     retirement_tasks = set()
-    expected_read_error = None
     failures = []
     original_open_snapshot = backend._open_snapshot_read_connection
 
@@ -255,13 +253,13 @@ async def test_snapshot_close_records_actual_native_and_ack_stages(
                 assert original_close.done() and not original_close.cancelled()
                 assert original_close.exception() is None
                 assert worker.is_alive()
-            with pytest.raises(QueryError) as raised:
-                await await_within_hang_guard(snapshot_read, step="the unchanged actual snapshot close deadline")
-            expected_read_error = raised.value
-            assert isinstance(expected_read_error.__cause__, ConnectionError)
+            # The read already has its committed row: a close past its
+            # budget is the backend's to retire, not a failed read (#3782).
+            assert await await_within_hang_guard(
+                snapshot_read, step="the unchanged actual snapshot close deadline"
+            ) == (0,)
             if stage == "after-native":
                 assert "native_close_returned_at" in timeline
-                assert isinstance(expected_read_error.__cause__.__cause__, sqlite3.ProgrammingError)
             assert worker.is_alive()
             assert backend.connection_retirement_pending
             retained = backend._retired_connection_closes[connection]
@@ -290,7 +288,7 @@ async def test_snapshot_close_records_actual_native_and_ack_stages(
             for task in originals:
                 try:
                     outcome = await await_within_hang_guard(await_owned_task(task), step="harvesting an original snapshot owner")
-                    if outcome.error is not None and outcome.error is not expected_read_error:
+                    if outcome.error is not None:
                         deadline_cancel = (
                             stage in {"before-native", "after-native"}
                             and (task is original_close or task in retirement_tasks)
@@ -793,6 +791,138 @@ async def test_missing_wal_is_reported_absent(tmp_path):
     assert "wal_bytes=absent wal_pages=absent" in diagnostics.describe(
         diagnostics.started_at
     )
+
+
+@pytest.mark.asyncio
+async def test_snapshot_read_cancelled_during_an_overrunning_close_returns_no_row(
+    tmp_path, monkeypatch
+):
+    """A slow close keeps a read's row only when nobody cancelled the read.
+
+    A cancellation that reaches the reader while its snapshot close waits for
+    the worker is kept under the close overrun. The read must fail, not
+    return its row as if it had not been cancelled (#3782).
+    """
+    backend = await _connected_wal_backend(tmp_path / "cancelled-snapshot.db")
+    primary = backend._ensure_connected()
+    captured = {}
+    transaction_entered = asyncio.Event()
+    release_transaction = asyncio.Event()
+    release_worker_exit = threading.Event()
+    worker_exit_entered = threading.Event()
+    worker_exit_waits = [asyncio.Event(), asyncio.Event()]
+    entered_waits = 0
+    original_open_snapshot = backend._open_snapshot_read_connection
+    real_worker_exit_wait = sqlite_backend_module._wait_for_aiosqlite_worker_shutdown
+    transaction = read = None
+    failures = []
+
+    async def observed_open_snapshot():
+        connection = await original_open_snapshot()
+        captured["connection"] = connection
+        captured["worker"] = aiosqlite_worker(connection)
+        return connection
+
+    async def counted_worker_exit_wait(connection, **kwargs):
+        nonlocal entered_waits
+        if entered_waits < len(worker_exit_waits):
+            worker_exit_waits[entered_waits].set()
+        entered_waits += 1
+        return await real_worker_exit_wait(connection, **kwargs)
+
+    async def hold_transaction():
+        async with backend.transaction():
+            await backend.execute("UPDATE snapshot_probe SET value = 1")
+            transaction_entered.set()
+            await release_transaction.wait()
+
+    try:
+        await backend.execute("CREATE TABLE snapshot_probe (value INTEGER NOT NULL)")
+        await backend.execute("INSERT INTO snapshot_probe VALUES (0)")
+        monkeypatch.setattr(backend, "_open_snapshot_read_connection", observed_open_snapshot)
+        monkeypatch.setattr(
+            sqlite_backend_module,
+            "_wait_for_aiosqlite_worker_shutdown",
+            counted_worker_exit_wait,
+        )
+        with delay_aiosqlite_worker_exit(
+            release_worker_exit, worker_exit_entered,
+            should_delay=lambda worker: worker is captured.get("worker"),
+        ), observe_bounded_close_stages() as stages:
+            transaction = asyncio.create_task(hold_transaction())
+            await await_within_hang_guard(
+                transaction_entered.wait(), step="the transaction routing reads to a snapshot"
+            )
+            with pinned_loop_clock() as clock:
+                read = asyncio.create_task(backend.fetch_one("SELECT value FROM snapshot_probe"))
+                await wait_for_thread_event(worker_exit_entered, step="the snapshot worker exit hold")
+                await await_within_hang_guard(
+                    worker_exit_waits[0].wait(), step="the close waiting for its worker"
+                )
+                read.cancel()
+                await await_within_hang_guard(
+                    worker_exit_waits[1].wait(),
+                    step="the cancelled close still waiting for its worker",
+                )
+                # Just past the close's own deadline: a timer scheduled while
+                # pinned stays this far ahead of real time once unpinned.
+                deadline = stages.deadlines[captured["connection"]]
+                clock.advance(deadline - clock.time() + 0.001)
+                with pytest.raises(QueryError) as raised:
+                    await await_within_hang_guard(read, step="the close deadline expiring")
+        assert isinstance(raised.value.__cause__, sqlite_backend_module.SQLiteCloseOverrunError)
+        assert captured["worker"].is_alive()
+        assert backend.connection_retirement_pending
+    except BaseException as error:  # noqa: BLE001 - retire the held worker before reporting
+        failures.append(error)
+    finally:
+        release_transaction.set()
+        if transaction is not None:
+            try:
+                await await_within_hang_guard(transaction, step="the transaction releasing")
+            except BaseException as error:  # noqa: BLE001 - still retire both workers
+                failures.append(error)
+        if "worker" in captured:
+            try:
+                await _retire(backend, release_worker_exit, captured["worker"])
+            except BaseException as error:  # noqa: BLE001 - still close the primary
+                failures.append(error)
+        else:
+            release_worker_exit.set()
+        try:
+            await _normal_backend_close(backend, original_connection=primary)
+        except BaseException as error:  # noqa: BLE001 - compose independent originals
+            failures.append(error)
+    terminal = execution_observation_error(*failures)
+    if terminal is not None:
+        raise terminal
+
+
+@pytest.mark.asyncio
+async def test_only_a_retained_uncontrolled_overrun_is_a_slow_close(tmp_path):
+    """The read keeps its row only for an overrun the backend still owns."""
+    backend = await _connected_wal_backend(tmp_path / "overrun-predicate.db")
+    connection = backend._ensure_connected()
+    overrun = sqlite_backend_module.SQLiteCloseOverrunError("close past its budget")
+    # Aggregation stamps an unresolved outcome on an ordinary carrier: not a
+    # control error, but still not a close that only ran slow.
+    committed = sqlite_backend_module.SQLiteCloseOverrunError("close past its budget")
+    committed._kestrel_unresolved_commit_outcome = "unknown"
+    try:
+        assert not backend._is_retained_close_overrun(connection, overrun)
+        backend._retired_connection_closes[connection] = (
+            sqlite_backend_module._RetainedAiosqliteClose(close_task=None)
+        )
+        try:
+            assert backend._is_retained_close_overrun(connection, overrun)
+            assert not backend._is_retained_close_overrun(
+                connection, ConnectionError("close failed")
+            )
+            assert not backend._is_retained_close_overrun(connection, committed)
+        finally:
+            del backend._retired_connection_closes[connection]
+    finally:
+        await _normal_backend_close(backend, original_connection=connection)
 
 
 @pytest.mark.asyncio

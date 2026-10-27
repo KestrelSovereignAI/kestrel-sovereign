@@ -38,6 +38,8 @@ from typing import (
     Union,
 )
 
+from kestrel_sdk.storage.database import DatabaseError
+
 from kestrel_sovereign._async_ownership import (
     await_owned_task,
     create_owned_task,
@@ -57,6 +59,7 @@ from kestrel_sovereign.execution_custody import (
     execution_cleanup_debts,
     execution_commit_outcome,
     execution_denial_scopes,
+    execution_evidence_carriers,
     execution_terminal_error,
     is_execution_control_error,
     require_execution_work,
@@ -514,6 +517,40 @@ class _SchedulerEffectFence(AdvisoryExecutionFence):
     """Typed occurrence lease, distinct from a resident runtime advisory lease."""
 
 
+@dataclass(frozen=True)
+class _ReadinessReconciliation:
+    """The exact claim whose unsettled outcome latched readiness (#3782).
+
+    The latch needs no operator: it holds until this claim no longer holds
+    its schedule row. Finalization releases the claim. Once the lease expires,
+    recovery takes it the way it would after a crash: PostgreSQL fences an
+    occurrence with an effect-start marker as ``unresolved_effect`` and claims
+    one without the marker again; SQLite records no marker and claims it
+    again. The latch never changed what recovery does; it only reported it.
+
+    The token is part of the identity: SQLite recovery claims the same
+    execution again under a new token, and that claim is a different one.
+    """
+
+    schedule_id: str
+    agent_id: str
+    execution_id: str
+    claim_token: str
+
+
+@dataclass(frozen=True)
+class _ReadinessClaimsReceipt:
+    """The claims a runner found a failure reconcilable for (#3782).
+
+    Carried by the original error, like ``_OriginalOccurrenceReceipt``, so an
+    observer that re-latches the same failure without knowing its claim (the
+    occurrence's done callback, ``stop()``) keeps its classification.
+    """
+
+    owner: object
+    claims: frozenset
+
+
 @dataclass
 class _LeaseRenewalState(ConfirmedLeaseDeadline):
     """Shared fail-closed state for an owned claim-renewal task.
@@ -529,6 +566,8 @@ class _LeaseRenewalState(ConfirmedLeaseDeadline):
     custody: tuple = ()
     occurrence_owner: object | None = None
     occurrence_scopes: tuple = ()
+    # The exact claim this lease keeps, for a readiness latch it ends (#3782).
+    reconciliation: Optional[_ReadinessReconciliation] = None
     backend_type: str = field(default="postgres", init=False)
 
     def retain_scope(self, scope) -> None:
@@ -553,6 +592,42 @@ class _OriginalOccurrenceReceipt:
 _rollout_renewal_state: contextvars.ContextVar[_LeaseRenewalState | None] = contextvars.ContextVar(
     "scheduler_rollout_renewal_state", default=None,
 )
+
+
+def _is_occurrence_storage_failure(error: BaseException) -> bool:
+    """A storage error that ended one occurrence, carrying no control evidence.
+
+    The claim protocol survives an occurrence that stops at any statement as
+    it survives the process dying there: the lease expires and a later poll
+    recovers the row. A failure like this is not a runtime safety failure
+    (#3782). Commit-outcome, authority and retirement evidence never is one.
+    """
+
+    return (
+        isinstance(error, DatabaseError)
+        and not is_execution_control_error(error)
+        and execution_commit_outcome(error) is None
+        and not execution_cleanup_debts(error)
+    )
+
+
+def _is_reconcilable_occurrence_failure(
+    error: BaseException, *, already_latched: bool
+) -> bool:
+    """Whether the durable rows of the occurrence it ended can settle it.
+
+    An unknown or committed outcome, or an ordinary failure while readiness
+    is already latched, is: the claim protocol never retries an effect it
+    cannot prove absent. An authority denial or retirement debt is not, and
+    neither is an ordinary failure that would start a latch: that is
+    scheduler infrastructure, not an occurrence outcome.
+    """
+
+    if execution_cleanup_debts(error):
+        return False
+    if execution_commit_outcome(error) is not None:
+        return True
+    return already_latched and not is_execution_control_error(error)
 
 
 @dataclass
@@ -1257,6 +1332,13 @@ class SchedulerRunner:
         self._is_agent_authorized = is_agent_authorized
         self._on_protocol_failure = on_protocol_failure
         self._readiness_failure: Optional[BaseException] = None
+        # ``(failure, reconcilable)``, replaced whole on every change so a
+        # health probe on another thread never pairs a failure with a stale
+        # flag. Reconcilable while every latch since readiness was last healthy
+        # came from an exact claim whose durable rows can settle it (#3782).
+        self._readiness_latch: Optional[tuple[BaseException, bool]] = None
+        # Every exact claim a reconcilable latch waits on, token included.
+        self._readiness_reconciliations: set[_ReadinessReconciliation] = set()
         self._execution_control_error: Optional[BaseException] = None
         self._occurrence_control_receipts: list[BaseException] = []
         self._schema_provenance: Optional[str] = None
@@ -1325,6 +1407,26 @@ class SchedulerRunner:
         return self._readiness_failure
 
     @property
+    def readiness_latch(self) -> Optional[tuple[BaseException, bool]]:
+        """The latched failure and whether it clears once its claims settle.
+
+        One immutable pair, read in a single step: a probe on another thread
+        sees the latch either before or after a change, never half of one.
+        Reconcilable only when every latch since readiness was last healthy
+        came from an exact claim the durable rows can settle (#3782). Polling
+        clears it then; any other latch holds until the runner is replaced.
+        """
+
+        return vars(self).get("_readiness_latch")
+
+    @property
+    def readiness_failure_reconcilable(self) -> bool:
+        """Whether the latched failure clears once its claims are settled."""
+
+        latch = self.readiness_latch
+        return latch is not None and latch[1]
+
+    @property
     def worker_available(self) -> bool:
         """Whether supervision currently owns a non-failing polling worker."""
 
@@ -1390,8 +1492,15 @@ class SchedulerRunner:
 
     def _latch_protocol_failure(
         self, error: BaseException, *, occurrence_state: _LeaseRenewalState | None = None,
+        reconciliation: Optional[_ReadinessReconciliation] = None,
     ) -> None:
-        """Retain local denials; latch host-wide safety failures."""
+        """Retain local denials; latch host-wide safety failures.
+
+        ``reconciliation`` names the exact claim a failure ended, when the
+        caller has one. Such a latch clears once that claim is settled. A
+        failure this runner already found reconcilable keeps that finding
+        when an observer that does not know its claim latches it again.
+        """
 
         denied = execution_denial_scopes(error)
         state = occurrence_state if occurrence_state is not None else _rollout_renewal_state.get()
@@ -1438,13 +1547,49 @@ class SchedulerRunner:
             self._execution_control_error = execution_terminal_error(
                 getattr(self, "_execution_control_error", None), error
             )
+        found = self._reconcilable_claims_of(error)
+        claims = (found | {reconciliation}) if reconciliation is not None else found
+        reconcilable = bool(claims) and _is_reconcilable_occurrence_failure(
+            error,
+            already_latched=bool(found) or self._readiness_failure is not None,
+        )
+        pending = vars(self).setdefault("_readiness_reconciliations", set())
         if self._readiness_failure is None:
+            pending.clear()
             self._readiness_failure = error
+            self._readiness_latch = (error, reconcilable)
+        else:
+            self._readiness_latch = (
+                self._readiness_failure,
+                reconcilable and self.readiness_failure_reconcilable,
+            )
+        if not self.readiness_failure_reconcilable:
+            pending.clear()
+        elif reconcilable:
+            pending.update(claims)
+        if reconcilable:
+            error._kestrel_scheduler_readiness_claims = _ReadinessClaimsReceipt(
+                self, claims
+            )
+            # The host reads ``readiness_failure`` on every probe, so this
+            # latch is visible there and clears with the runner. The callback
+            # records a failure for the host's lifetime.
+            return
         if self._on_protocol_failure is not None:
             try:
                 self._on_protocol_failure(error)
             except Exception:  # pragma: no cover - host observability must not mask safety
                 logger.exception("Scheduler protocol-failure callback failed")
+
+    def _reconcilable_claims_of(self, error: BaseException) -> frozenset:
+        """The claims this runner already found ``error``'s evidence reconcilable for."""
+
+        claims: frozenset = frozenset()
+        for carrier in execution_evidence_carriers(error):
+            receipt = vars(carrier).get("_kestrel_scheduler_readiness_claims")
+            if isinstance(receipt, _ReadinessClaimsReceipt) and receipt.owner is self:
+                claims |= receipt.claims
+        return claims
 
     async def _agent_is_currently_authorized(self, agent_id: str) -> bool:
         """Check the current fleet scope and an optional live authority view."""
@@ -1996,6 +2141,7 @@ class SchedulerRunner:
                 ).isoformat()
                 self._last_tick_started_at = self._open_tick_started_at()
                 await self._tick()
+                await self._reconcile_readiness_latch()
                 # Let every admitted occurrence take its first step, which is
                 # its slot acquisition. Only a row genuinely queued behind the
                 # cap may then keep the batch open; one that got a free slot
@@ -2077,6 +2223,9 @@ class SchedulerRunner:
     async def _run_occurrence(self, task: ScheduledTask) -> None:
         """Claim and execute one admitted row, isolating its failures."""
 
+        # The exact claim this occurrence holds once ``_claim`` returns it,
+        # so a failure observed here can name it (#3782).
+        claimed: Optional[ScheduledTask] = None
         try:
             async with self._occurrence_slots:
                 self._slot_acquired(task.id)
@@ -2097,7 +2246,9 @@ class SchedulerRunner:
         except asyncio.CancelledError as error:
             asyncio.current_task()._kestrel_owned_terminal_error = retained_execution_error(error)
             if is_execution_control_error(error):
-                self._latch_protocol_failure(error)
+                self._latch_protocol_failure(
+                    error, reconciliation=self._readiness_reconciliation(claimed)
+                )
             logger.warning(
                 "Scheduled occurrence for task %s (%s) was cancelled",
                 task.id,
@@ -2105,8 +2256,20 @@ class SchedulerRunner:
             )
             raise
         except Exception as error:
+            if _is_occurrence_storage_failure(error):
+                # A read or write of this occurrence failed, as in the
+                # #3782 snapshot read. Its claim is recovered when the lease
+                # expires, so the runtime stays ready.
+                logger.error(
+                    "Scheduled occurrence for task %s (%s) was ended by a storage "
+                    "error; its claim is left to lease recovery",
+                    task.id,
+                    task.task_name,
+                    exc_info=(type(error), error, error.__traceback__),
+                )
+                return
             # Executor failures are normalized and finalized inside
-            # ``_execute_claim``; anything reaching here is scheduler
+            # ``_execute_claim``; anything else reaching here is scheduler
             # infrastructure. It must not cancel sibling occurrences or kill
             # the poll loop, so latch readiness fail-closed instead.
             logger.error(
@@ -2115,7 +2278,81 @@ class SchedulerRunner:
                 task.task_name,
                 exc_info=(type(error), error, error.__traceback__),
             )
-            self._latch_protocol_failure(error)
+            self._latch_protocol_failure(
+                error, reconciliation=self._readiness_reconciliation(claimed)
+            )
+
+    @staticmethod
+    def _readiness_reconciliation(
+        task: Optional[ScheduledTask],
+    ) -> Optional[_ReadinessReconciliation]:
+        """Name the exact claim a latched failure ended, if it has one."""
+
+        if task is None or not task.claim_execution_id or not task.claim_token:
+            return None
+        return _ReadinessReconciliation(
+            schedule_id=task.id,
+            agent_id=task.agent_id,
+            execution_id=task.claim_execution_id,
+            claim_token=task.claim_token,
+        )
+
+    async def _claim_still_held(self, pending: _ReadinessReconciliation) -> bool:
+        """Whether the claim a latch names still holds its schedule row."""
+
+        row = await self._db.fetchone(
+            """
+            SELECT 1 FROM scheduled_tasks
+            WHERE id = ? AND agent_id = ?
+              AND scheduler_claim_fenced = 1
+              AND claim_token = ? AND claim_execution_id = ?
+            """,
+            (
+                pending.schedule_id,
+                pending.agent_id,
+                pending.claim_token,
+                pending.execution_id,
+            ),
+        )
+        return row is not None
+
+    async def _reconcile_readiness_latch(self) -> None:
+        """Clear a reconcilable latch once every claim it names is settled.
+
+        A settled claim no longer holds its row: its execution was finalized,
+        or lease recovery took it (see ``_ReadinessReconciliation``). A latch
+        that any other failure contributed to is never cleared here (#3782).
+        """
+
+        if not self.readiness_failure_reconcilable:
+            return
+        pending = self._readiness_reconciliations
+        for reconciliation in tuple(pending):
+            if await self._claim_still_held(reconciliation):
+                continue
+            # A claim token is never issued twice, so a claim seen released
+            # stays released even if it was latched again meanwhile. A later
+            # claim of the same execution has its own token and entry.
+            pending.discard(reconciliation)
+            logger.warning(
+                "Scheduler execution %s for task %s no longer holds its claim; "
+                "its outcome is reconciled from durable state",
+                reconciliation.execution_id,
+                reconciliation.schedule_id,
+            )
+        # Read after the last await: a latch that arrived meanwhile is
+        # either still pending here or made the failure non-reconcilable.
+        if pending or not self.readiness_failure_reconcilable:
+            return
+        failure = self._readiness_failure
+        self._readiness_latch = None
+        self._readiness_failure = None
+        logger.warning(
+            "SchedulerRunner %s readiness restored: every claim behind its "
+            "latched %s is settled",
+            self._owner_id,
+            type(failure).__name__,
+        )
 
     def _slot_acquired(self, schedule_id: str) -> None:
         occurrence = self._occurrences.get(schedule_id)
@@ -3462,6 +3699,7 @@ class SchedulerRunner:
         renewal_state = _LeaseRenewalState(
             confirmed_deadline=self._live_claim_deadlines.get(task.claim_execution_id),
             occurrence_owner=self,
+            reconciliation=self._readiness_reconciliation(task),
         )
         rollout_token = _rollout_renewal_state.set(renewal_state)
         deadline_watch = None
@@ -3699,7 +3937,9 @@ class SchedulerRunner:
             raise
         except SchedulerFeatureUnavailable as error:
             if is_execution_control_error(error):
-                self._latch_protocol_failure(error)
+                self._latch_protocol_failure(
+                    error, reconciliation=renewal_state.reconciliation
+                )
                 logger.error("Scheduler preparation %s requires authority/commit reconciliation: %s", execution.id, error)
                 return
             # Cold preparation can discover that a globally disabled or
@@ -3721,7 +3961,9 @@ class SchedulerRunner:
             return
         except Exception as error:
             if is_execution_control_error(error) or self._readiness_failure is not None:
-                self._latch_protocol_failure(error)
+                self._latch_protocol_failure(
+                    error, reconciliation=renewal_state.reconciliation
+                )
                 logger.error("Scheduler execution %s requires authority/commit reconciliation: %s", execution.id, error)
                 return
             if not in_preparation:
@@ -3781,7 +4023,11 @@ class SchedulerRunner:
             terminal = execution_terminal_error(*retirement_errors)
             if terminal is not None:
                 if is_execution_control_error(terminal):
-                    self._latch_protocol_failure(terminal, occurrence_state=renewal_state)
+                    self._latch_protocol_failure(
+                        terminal,
+                        occurrence_state=renewal_state,
+                        reconciliation=renewal_state.reconciliation,
+                    )
                 raise terminal
 
     def _prepared_executor_method(self) -> Optional[Callable[[SchedulerExecution], Any]]:
@@ -4068,7 +4314,9 @@ class SchedulerRunner:
                 lease_error, lease_cancellation, retain_originals=True,
             )
             if terminal is not None and is_execution_control_error(terminal):
-                self._latch_protocol_failure(terminal)
+                self._latch_protocol_failure(
+                    terminal, reconciliation=renewal_state.reconciliation
+                )
                 raise terminal
             if isinstance(watcher_admission_failure, Exception) and terminal is not None:
                 # An infrastructure observer could not start. Even if the
@@ -4121,7 +4369,15 @@ class SchedulerRunner:
         outcome = await await_owned_task(renewal)
         terminal = execution_terminal_error(outcome.error, outcome.cancellation)
         if terminal is not None and is_execution_control_error(terminal):
-            self._latch_protocol_failure(terminal)
+            # A renewal's unknown commit outcome ended this exact claim, as
+            # an effect's would (#3782): name it, or the latch is permanent.
+            self._latch_protocol_failure(
+                terminal,
+                reconciliation=(
+                    getattr(state, "reconciliation", None)
+                    or self._readiness_reconciliation(task)
+                ),
+            )
             raise terminal
         if outcome.cancellation is not None:
             raise outcome.cancellation

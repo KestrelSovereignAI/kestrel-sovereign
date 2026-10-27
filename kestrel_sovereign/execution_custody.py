@@ -188,6 +188,15 @@ def _explicit_control_chain(error: BaseException | None) -> Iterator[BaseExcepti
             pending.extend(current.exceptions)
 
 
+def execution_evidence_carriers(error: BaseException | None) -> tuple[BaseException, ...]:
+    """Every explicit cause/group carrier of ``error``, each once.
+
+    The graph every classifier in this module reads. Implicit handling
+    context is excluded, so an observer cannot borrow unrelated evidence.
+    """
+    return tuple(_explicit_control_chain(error))
+
+
 def _enclosing_original_errors(errors: list[BaseException]) -> list[BaseException]:
     """Keep representatives covering every explicit component, including cycles.
 

@@ -18,6 +18,7 @@ _READINESS_STATE_BASELINE = {
     "identity_readiness_failures": [],
     "scheduler_cold_agent_failures": [],
     "scheduler_readiness_failures": [],
+    "scheduler_reconciling_failures": [],
     "host_scheduler_runner": None,
     # HOST state, and these tests control only the agent. `server.app`'s real
     # lifespan starts whatever host features are installed, and one that fails
@@ -326,6 +327,47 @@ def test_health_latches_loaded_scheduler_runner_safety_failure():
         }
     ]
     assert "secret" not in detailed.text
+
+
+def test_health_recovers_when_a_reconciling_scheduler_latch_clears():
+    """A runner latch that clears itself stops failing readiness with it (#3782)."""
+    from server import app
+
+    @asynccontextmanager
+    async def noop_lifespan(_app):
+        yield
+
+    original_lifespan = app.router.lifespan_context
+    original_agent = getattr(app.state, "agent", None)
+    original_manager = getattr(app.state, "agent_manager", None)
+    runner = SimpleNamespace(
+        readiness_latch=(RuntimeError("execution transaction outcome is unknown"), True),
+        worker_available=True,
+    )
+    manager = MagicMock()
+    manager.list_agents.return_value = {
+        "Emma": SimpleNamespace(
+            features={"SchedulerFeature": SimpleNamespace(_runner=runner)}
+        )
+    }
+
+    try:
+        app.router.lifespan_context = noop_lifespan
+        app.state.agent = None
+        app.state.agent_manager = manager
+        with TestClient(app) as client:
+            latched = client.get("/health")
+            runner.readiness_latch = None
+            recovered = client.get("/health")
+    finally:
+        app.router.lifespan_context = original_lifespan
+        app.state.agent = original_agent
+        app.state.agent_manager = original_manager
+
+    assert latched.status_code == 503
+    assert recovered.status_code == 200
+    assert recovered.json() == {"status": "ok", "agent_initialized": True}
+    assert app.state.scheduler_readiness_failures == []
 
 
 def test_health_fails_while_scheduler_supervisor_has_no_worker():

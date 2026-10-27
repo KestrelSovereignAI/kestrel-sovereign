@@ -307,13 +307,22 @@ def _capture_close_diagnostics(
     return _SQLiteCloseDiagnostics(started_at, database, mode, wal)
 
 
+class SQLiteCloseOverrunError(ConnectionError):
+    """A connection close ran past its budget and was left still running.
+
+    The connection is not released: whoever owns it keeps its close until
+    the worker exits. This reports that the close was slow, not that
+    anything the connection did failed.
+    """
+
+
 def _close_overrun_error(
     summary: str, diagnostics: _SQLiteCloseDiagnostics, overrun_at: float
-) -> ConnectionError:
+) -> SQLiteCloseOverrunError:
     """Build the error for a close past its budget, and log it once."""
     message = f"{summary} ({diagnostics.describe(overrun_at)})"
     logger.warning("%s", message)
-    return ConnectionError(message)
+    return SQLiteCloseOverrunError(message)
 
 
 async def _wait_for_aiosqlite_worker_shutdown(
@@ -1563,6 +1572,26 @@ class SQLiteBackend(DatabaseBackend):
                 except BaseException as cleanup_error:
                     raise execution_terminal_error(body_error, cleanup_error)
 
+    def _is_retained_close_overrun(
+        self, connection: aiosqlite.Connection, error: BaseException
+    ) -> bool:
+        """Whether ``error`` only says this backend still owns a slow close.
+
+        True for a close that ran past its budget and is retained, with no
+        control evidence behind it, in a task nobody asked to cancel. A
+        cancellation that arrived during the close is kept under the overrun
+        as evidence; the caller must still see it. ``cancelling()`` counts it,
+        and not the budget timer's own cancellation, which it undoes.
+        """
+        task = asyncio.current_task()
+        return (
+            isinstance(error, SQLiteCloseOverrunError)
+            and connection in self._retired_connection_closes
+            and not is_execution_control_error(error)
+            and execution_commit_outcome(error) is None
+            and (task is None or task.cancelling() == 0)
+        )
+
     async def _open_snapshot_read_connection(self) -> aiosqlite.Connection:
         """Open a one-shot connection for committed reads during another task's txn."""
         self.assert_connected_file_still_valid()
@@ -1638,7 +1667,18 @@ class SQLiteBackend(DatabaseBackend):
                         diagnostics=self._close_diagnostics(),
                     )
                 except BaseException as cleanup_error:
-                    raise execution_terminal_error(body_error, cleanup_error)
+                    if body_error is not None or not self._is_retained_close_overrun(
+                        read_conn, cleanup_error
+                    ):
+                        raise execution_terminal_error(body_error, cleanup_error)
+                    # The read already has its rows; a slow close does not
+                    # change them (#3782). The overrun was logged where it
+                    # was detected, and the backend keeps the close until
+                    # its worker exits, as for any other overrun.
+                    logger.warning(
+                        "SQLite snapshot read succeeded; its connection close "
+                        "is still running and stays retained"
+                    )
             return
 
         # In-memory databases have no independent committed snapshot. Ordinary
