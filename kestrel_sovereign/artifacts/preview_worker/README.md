@@ -12,6 +12,14 @@ export KESTREL_ARTIFACT_RENDERER_IMAGE=sha256:<the-64-hex-local-image-id>
 The Dockerfile pins the multi-architecture Python base digest, dated Debian
 snapshot, Poppler version, and CPython 3.13 Linux Pillow wheel hashes. Building
 downloads those dependencies; request-time rendering never pulls an image.
+Pillow 13.0.0 is the minimum patched release for the decoder memory-corruption
+and denial-of-service advisories affecting 12.3.0, including
+[GHSA-5x8w-8jj5-q52h](https://github.com/advisories/GHSA-5x8w-8jj5-q52h) and
+[GHSA-v9pv-5gc8-w2m6](https://github.com/advisories/GHSA-v9pv-5gc8-w2m6).
+The two worker hashes select the non-yanked CPython 3.13 manylinux amd64/arm64
+wheels from the [official 13.0.0 release](https://pypi.org/project/pillow/13.0.0/).
+Rebuild the immutable renderer image when updating these pins; changing the
+host dependency alone does not update an already built decoder image.
 The Docker CLI must address a local Unix socket serving a Linux daemon with
 memory, swap, CPU quota and process-count cgroup support. Unsupported or absent
 runtime configuration refuses preview while keeping authorized source download.

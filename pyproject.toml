@@ -188,8 +188,8 @@ dependencies = [
     # >=0.0.30 fixes quadratic query parsing and unbounded part-header DoS.
     "python-multipart>=0.0.30",
     # Image processing
-    # >=12.2.0 fixes an OOB write and a FITS decompression bomb.
-    "pillow>=12.2.0",
+    # >=13.0.0 fixes decoder memory corruption and image/PDF denial of service.
+    "pillow>=13.0.0",
     # Token counting (lightweight)
     "tiktoken>=0.13.0,<1",
     # BM25 for hybrid search
