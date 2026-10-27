@@ -21,7 +21,9 @@ from pydantic import BaseModel
 from kestrel_sovereign.a2a.stores.base import generate_id, json_dumps, json_loads
 from kestrel_sovereign.a2a.stores.unified.base import UnifiedStoreBase
 from kestrel_sovereign.execution_custody import execution_terminal_error
-from kestrel_sovereign.security.access_log import private_capability_tool_name
+from kestrel_sovereign.security.access_log import (
+    private_capability_tool_name, redact_private_capability_tool_calls,
+)
 from kestrel_sovereign.storage.db.interface import DatabaseBackend
 
 logger = logging.getLogger(__name__)
@@ -1071,7 +1073,8 @@ class ObservabilityStore(UnifiedStoreBase):
         error_message = self._privacy_gate_text(error_message)
         metadata = self._privacy_gate_metadata(metadata)
         tool_calls_json = (
-            self._privacy_gate_args_json(tool_calls) if tool_calls else None
+            self._privacy_gate_args_json(redact_private_capability_tool_calls(tool_calls))
+            if tool_calls else None
         )
 
         # Truncate prompts/response to preview (first 500 chars)

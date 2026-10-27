@@ -4,7 +4,6 @@ Only an explicitly named already installed LOCAL Ollama model is used. This
 test provisions no cloud resource and never downloads model weights.
 """
 import asyncio
-import base64
 from datetime import UTC, datetime, timedelta
 from hashlib import sha256
 import json
@@ -112,7 +111,7 @@ async def test_real_local_visual_product(tmp_path, monkeypatch):
             now=datetime.now(UTC)
             value={"request_id":identity,"provider_id":PROVIDER,"profile_id":"offline-v1",
                 "image":"local-worker@"+image["Id"],"surface":"browser","location":"local",
-                "required_capabilities":["screenshot","click","type","key","takeover"],
+                "required_capabilities":["screenshot","click","type","key","takeover","files"],
                 "requested_at":now.isoformat(),"expires_at":(now+timedelta(minutes=10)).isoformat(),
                 "idle_ttl_seconds":300,"ready_timeout_seconds":30,"max_hourly_cost_usd":"0","max_total_cost_usd":"0"}
             response=await client.post(base+"/requests",json=value)
@@ -145,36 +144,24 @@ async def test_real_local_visual_product(tmp_path, monkeypatch):
             assert (await client.post(base+f"/sessions/{sid}/actions",json=request)).json()==receipt
             pause={"request_id":uuid4().hex,"session_id":sid,"expected_control_epoch":0,"operation":"pause"}
             response=await client.post(base+f"/sessions/{sid}/stop",json=pause);assert response.status_code==200,response.text
-            # Independently inspect the resulting document through the actual
-            # negotiated SDK workspace transport, with a current host lease.
-            from kestrel_sovereign.auth import CallerContext,caller_context_scope
-            from kestrel_sdk.workspaces import WorkspaceExportRequest,TransferLimits
-            from kestrel_sovereign.visual_computer.runtime import VisualAccessDenied
-            feature=agent.features["VisualComputerFeature"]
-            caller=CallerContext.sovereign(credential=key)
-            with caller_context_scope(caller):
-                with pytest.raises(VisualAccessDenied,match="caller is no longer current"):
-                    async with feature._bind_context(CallerContext.sovereign(credential=key)):
-                        pytest.fail("a copied caller borrowed the original workspace authority")
-                async with feature._bind_context(caller) as context:
-                    async with feature.runtime.session_operation(context,sid) as (paused,driver,check):
-                        transfer=driver.workspace_transfer()
-                        export=WorkspaceExportRequest(transfer_id=uuid4().hex,session_id=sid,lease_id=paused.lease_id,
-                            control_epoch=paused.control_epoch,workspace_id="browser",expires_at=paused.expires_at,
-                            limits=TransferLimits(max_files=1,max_file_bytes=128*1024,max_total_bytes=128*1024),
-                            paths=("document.html",),entrypoint="document.html")
-                        snapshot=await transfer.prepare_export(paused,export);check()
-                        document=(await transfer.read_export(paused,snapshot.snapshot_id,"document.html")).get_secret_value();check()
-                        await transfer.release_export(paused,export.transfer_id);check()
+            # The registered broker owns the original workspace operation and
+            # both visual/artifact policies through native export and commit.
+            current=await client.get(base+f"/sessions/{sid}")
+            assert current.status_code==200,current.text
+            paused=current.json()["session"]
+            export={"transfer_id":uuid4().hex,"session_id":sid,"lease_id":paused["lease_id"],
+                "control_epoch":paused["control_epoch"],"workspace_id":"browser","expires_at":paused["expires_at"],
+                "limits":{"max_files":1,"max_file_bytes":128*1024,"max_total_bytes":128*1024},
+                "paths":["document.html"],"entrypoint":"document.html"}
+            published=await client.post("/api/artifacts/workspaces/publish",json={"request":export,
+                "publication_key":identity,"title":"Visual product document"})
+            assert published.status_code==200,published.text
+            ref=published.json()["receipt"]["ref"]
+            saved=await client.get(f'/api/artifacts/{ref["artifact_id"]}/revisions/{ref["revision_id"]}/file',params={"path":"document.html"})
+            assert saved.status_code==200,saved.text
+            document=saved.content
             assert document.count(code.encode())==2
             (output/"document.html").write_bytes(document)
-            staged=await client.post("/api/artifacts/staging",json={"publication_key":identity,"path":"document.html",
-                "media_type":"text/html","content_base64":base64.b64encode(document).decode()})
-            assert staged.status_code==200,staged.text
-            published=await client.post("/api/artifacts/publications",json={"idempotency_key":identity,"title":"Visual product document",
-                "manifest":{"files":[staged.json()],"entrypoint":"document.html"}})
-            assert published.status_code==200,published.text
-            ref=published.json()["ref"]
             custody.update(cognitive_task=True,document_sha256=sha256(document).hexdigest(),
                 action_id=receipt["action_id"],observation_id=request["observation_id"],control_epoch=request["control_epoch"],artifact_ref=ref)
             response=await client.post(base+f"/sessions/{sid}/release")

@@ -18,6 +18,7 @@ from contextlib import asynccontextmanager, contextmanager
 from contextvars import ContextVar
 from dataclasses import replace
 from kestrel_sovereign._async_ownership import await_owned_task, raise_owned_outcome
+from kestrel_sovereign.security.access_log import redact_private_capability_tool_calls
 from kestrel_sovereign.llm.retry import state_aggregate_verdicts
 from kestrel_sovereign.kestrel_config.constants import STORAGE_CACHE_TTL_SECONDS
 from typing import AsyncIterator, Awaitable, Callable, List, Dict, Any, Mapping, Optional, Sequence, Union, Type, TYPE_CHECKING
@@ -848,7 +849,9 @@ class LLMService(DecisionServiceMixin, ModalityRecordingMixin, ModelDiscoveryMix
             return None
         if isinstance(result, LLMResponse):
             return result.content
-        return result if isinstance(result, str) else str(result)
+        return result if isinstance(result, str) else str(
+            redact_private_capability_tool_calls(result)
+        )
 
     def _annotate_and_return(self, span, result: Any, *, redact: bool = False) -> Any:
         """Stamp the served model / response onto ``span`` and pass ``result`` through.
@@ -927,7 +930,7 @@ class LLMService(DecisionServiceMixin, ModalityRecordingMixin, ModelDiscoveryMix
                 span_input = telemetry.serialize_llm_input(
                     system_prompt=system_prompt,
                     user_prompt=user_prompt,
-                    messages=messages,
+                    messages=redact_private_capability_tool_calls(messages),
                 )
             # Both session keys, from the one resolver every span type shares
             # (#2940): the fleet Timeline groups a lane on ``kestrel.session_id``,

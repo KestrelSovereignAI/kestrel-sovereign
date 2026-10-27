@@ -16,6 +16,11 @@ The Docker CLI must address a local Unix socket serving a Linux daemon with
 memory, swap, CPU quota and process-count cgroup support. Unsupported or absent
 runtime configuration refuses preview while keeping authorized source download.
 
+Read-only Docker context discovery can use the operator's CLI configuration.
+Every engine command uses a fresh empty private `--config` directory retained
+through the original CLI process and I/O join. The host also rejects proxy
+environment settings in the created container before starting the decoder.
+
 Every job has a unique native container identity. The host verifies its entire
 sandbox configuration before sending source bytes: no network, host binds,
 devices, capabilities or privilege escalation; read-only root; non-root user;

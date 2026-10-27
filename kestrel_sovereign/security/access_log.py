@@ -84,6 +84,96 @@ def private_capability_tool_name(name: str | None) -> bool:
     return isinstance(name, str) and _PRIVATE_TOOL.search(name) is not None
 
 
+def redact_private_capability_tool_calls(value: Any) -> Any:
+    """Copy recognized private calls/results for diagnostics, never execution.
+
+    Flat canonical, OpenAI function and Anthropic tool_use calls share the
+    existing name classifier. Only structural call/history fields are walked;
+    ordinary tool arguments and prose remain untouched. Original call IDs may
+    identify later result messages within THIS value; they grant no authority
+    and are never registered or retained outside this pure transformation.
+    """
+    private_ids: set[str] = set()
+
+    def private_call(item: dict) -> bool:
+        function = item.get("function")
+        return "role" not in item and (
+            private_capability_tool_name(item.get("name"))
+            or isinstance(function, dict)
+            and private_capability_tool_name(function.get("name"))
+        )
+
+    def collect(item: Any, depth: int = 0, call_position: bool = True) -> None:
+        if depth > 16:
+            return
+        if isinstance(item, (list, tuple)):
+            for child in item:
+                collect(child, depth + 1, call_position)
+        elif isinstance(item, dict):
+            if item.get("role") in ("tool", "function") or item.get("type") == "tool_result":
+                return
+            if not call_position and item.get("type") != "tool_use":
+                return
+            if private_call(item) and isinstance(item.get("id"), str):
+                private_ids.add(item["id"])
+            for key in ("tool_calls", "content"):
+                if isinstance(item.get(key), (dict, list, tuple)):
+                    collect(item[key], depth + 1, key == "tool_calls")
+
+    def elide(item: dict, fields: tuple[str, ...]) -> dict:
+        safe = {key: item[key] for key in fields
+                if isinstance(item.get(key), str)}
+        safe["_private_capability"] = True
+        for key in ("arguments", "input", "args", "parameters", "content"):
+            if key in item:
+                safe[key] = {"_private_capability": True}
+        return safe
+
+    def redact(item: Any, depth: int = 0, call_position: bool = True) -> Any:
+        if depth > 16:
+            return "<max-depth>"
+        if isinstance(item, (list, tuple)):
+            copied = [redact(child, depth + 1, call_position) for child in item]
+            return tuple(copied) if isinstance(item, tuple) else copied
+        if not isinstance(item, dict):
+            return item
+        if item.get("role") in ("tool", "function"):
+            if (private_capability_tool_name(item.get("name"))
+                    or isinstance(item.get("tool_call_id"), str)
+                    and item["tool_call_id"] in private_ids):
+                return elide(item, ("role", "name", "tool_call_id"))
+            return item
+        if item.get("type") == "tool_result":
+            if (isinstance(item.get("tool_use_id"), str)
+                    and item["tool_use_id"] in private_ids):
+                safe = elide(item, ("type", "tool_use_id"))
+                if isinstance(item.get("is_error"), bool):
+                    safe["is_error"] = item["is_error"]
+                return safe
+            return item
+        # Provider content blocks and ordinary result payloads are data. A
+        # name inside text/image data does not make that data a tool call.
+        if not call_position and item.get("type") != "tool_use":
+            return item
+        if private_call(item):
+            safe = elide(item, ("id", "type", "name"))
+            if "function" in item:
+                function = item["function"]
+                safe["function"] = (
+                    elide(function, ("name",)) if isinstance(function, dict)
+                    else {"_private_capability": True}
+                )
+            return safe
+        safe = dict(item)
+        for key in ("tool_calls", "content"):
+            if isinstance(item.get(key), (dict, list, tuple)):
+                safe[key] = redact(item[key], depth + 1, key == "tool_calls")
+        return safe
+
+    collect(value)
+    return redact(value)
+
+
 def redact_sensitive_query_string(query_string: bytes) -> bytes:
     """Return a log-safe query string with credential values replaced.
 

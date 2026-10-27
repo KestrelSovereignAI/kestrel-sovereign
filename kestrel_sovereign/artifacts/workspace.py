@@ -254,8 +254,8 @@ class ArtifactWorkspaceBroker:
             self._ack(lease)
             return {'state':'complete', 'materialization':receipt.model_dump(mode='json'), 'revision':revision.model_dump(mode='json')}
         except BaseException:
-            # Unknown commit can already be complete; SDK abort returns that
-            # original receipt and never uninstalls/replays a completed import.
+            # Unknown commit can already be complete; SDK abort observes that
+            # completed transfer and never uninstalls/replays its import.
             if attempted:
                 await self._cleanup(lease, lease.transfer.abort_import, request.transfer_id)
             raise
