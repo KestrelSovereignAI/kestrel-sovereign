@@ -213,7 +213,7 @@ async def test_original_logical_completion_survives_continued_native_payload(pee
                         adapter.get_streaming_response_with_tools(client, MODEL, MESSAGES, tools=TOOLS))]
                     response, = [item for item in seen if isinstance(item, LLMResponse)]
             except LLMCallInactivityTimeout as original:
-                assert len(peer.requests) == 1 and peer.requests[0]['body']['stream'] is False
+                assert len(peer.requests) == 1
                 assert len(peer.writes) >= 3
                 raise AssertionError('Native HTTP body progressed but logical completion went falsely idle') from original
         assert response.content == 'Finished protocol response'
