@@ -71,15 +71,6 @@ async def test_registered_human_http_is_private_before_spans_and_native_access_l
             assert failed.status_code == 500 and sentinel not in failed.text
             healthy = await client.get('/health')
             assert healthy.status_code == 200
-        spans = exporter.get_finished_spans()
-        assert any(span.kind.name == 'SERVER' and '/health' in span.name for span in spans)
-        projected = repr([(span.name, dict(span.attributes), [(event.name, dict(event.attributes)) for event in span.events]) for span in spans])
-        assert all(value not in projected for value in (sentinel, sid, frame_id, 'private-human-pixels', '/human/'))
-        # Client-side httpx diagnostics are not the server's access/error sinks.
-        records = [record.getMessage() for record in caplog.records if record.name.startswith(('uvicorn', 'kestrel_sovereign.api_errors'))]
-        assert records and any('/health' in text for text in records)
-        assert all(value not in '\n'.join(records) for value in (sentinel, sid, frame_id, 'private-human-pixels'))
-        assert extension.effects == 0
     finally:
         runner.should_exit = True
         if serving is not None:
@@ -88,3 +79,12 @@ async def test_registered_human_http_is_private_before_spans_and_native_access_l
         FastAPIInstrumentor.uninstrument_app(app)
         provider.shutdown()
     assert serving is not None and serving.done() and sock.fileno() == -1
+    spans = exporter.get_finished_spans()
+    assert any(span.kind.name == 'SERVER' and '/health' in span.name for span in spans)
+    projected = repr([(span.name, dict(span.attributes), [(event.name, dict(event.attributes)) for event in span.events]) for span in spans])
+    assert all(value not in projected for value in (sentinel, sid, frame_id, 'private-human-pixels', '/human/'))
+    # Client-side httpx diagnostics are not the server's access/error sinks.
+    records = [record.getMessage() for record in caplog.records if record.name.startswith(('uvicorn', 'kestrel_sovereign.api_errors'))]
+    assert records and any('/health' in text for text in records)
+    assert all(value not in '\n'.join(records) for value in (sentinel, sid, frame_id, 'private-human-pixels'))
+    assert extension.effects == 0
