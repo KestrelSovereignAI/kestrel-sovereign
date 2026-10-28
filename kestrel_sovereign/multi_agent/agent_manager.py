@@ -7150,6 +7150,7 @@ class AgentManager:
         *,
         authority_roots: frozenset[str] | None = None,
         restart_roster_reconciled: bool = False,
+        before_initialize: Callable[[tuple[str, ...]], None] | None = None,
     ) -> int:
         """Load all autostart agents from a MultiAgentConfig.
 
@@ -7167,6 +7168,12 @@ class AgentManager:
                 coupled to another authorization preflight. The server uses
                 this after seeding the shared scheduler protocol; ordinary
                 callers leave it false so restart authority is still enforced.
+            before_initialize: Called once with the names this load starts,
+                in config order, before any of them is admitted or
+                initialized: the ``autostart`` registrations plus any cold
+                ancestor an active signed child needs, less durably retired
+                children. An ``autostart=false`` registration no child needs
+                is not among them. An exception it raises propagates.
 
         Returns:
             Number of agents successfully loaded.
@@ -7255,6 +7262,8 @@ class AgentManager:
                         )
                         continue
             pending.append((name, agent_cfg))
+        if before_initialize is not None:
+            before_initialize(tuple(name for name, _agent_cfg in pending))
 
         # Admit every configured name before running concurrent initialization.
         # Each admission is held by this batch task until the exact result has

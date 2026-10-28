@@ -401,9 +401,11 @@ async def test_server_lifespan_wires_and_closes_host_features(
             config,
             *,
             restart_roster_reconciled,
+            before_initialize,
         ):
             assert config is fake_config
             assert restart_roster_reconciled is True
+            before_initialize(tuple(config.agents))
             assert not self.host_context_publication_gate.is_set()
             events.append("agents-load")
             return 1
@@ -604,8 +606,10 @@ async def test_server_retains_control_context_after_optional_mount_failure(
             _config,
             *,
             restart_roster_reconciled,
+            before_initialize,
         ):
             assert restart_roster_reconciled is True
+            before_initialize(tuple(_config.agents))
             return 1
 
         def list_agents(self):

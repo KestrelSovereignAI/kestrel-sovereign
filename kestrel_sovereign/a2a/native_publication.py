@@ -56,6 +56,46 @@ if TYPE_CHECKING:
     from kestrel_sovereign.kestrel_agent import KestrelAgent
     from kestrel_sovereign.multi_agent.agent_manager import AgentManager
 
+PUBLIC_BASE_URL_ENV = "KESTREL_BASE_URL"
+
+
+def _host_publishes_native_a2a(environment: Mapping[str, str]) -> bool:
+    """Only an explicit public base URL publishes; a listen address never does."""
+    return environment.get(PUBLIC_BASE_URL_ENV) is not None
+
+
+def unpublished_cohost_warning(
+    environment: Mapping[str, str], *, agents: int, host_port: int
+) -> str | None:
+    """Name a multi-agent host whose co-hosted agents cannot reach each other.
+
+    Core 0.53 defaulted the public URL to ``http://localhost:8888``. Native
+    publication requires it explicitly, so a host upgraded without it starts
+    healthy and every co-hosted send fails only when an agent first tries one
+    (#3872). ``agents`` counts the agents the host starts, never a registration
+    it leaves cold. The port is advice for the operator, never a substitute URL.
+    """
+    if agents < 2 or _host_publishes_native_a2a(environment):
+        return None
+    return (
+        f"{PUBLIC_BASE_URL_ENV} is unset: none of this host's {agents} agents "
+        "publishes a native A2A interface, so co-hosted agents cannot send A2A "
+        "tasks, messages, questions or stops to each other. For a local host "
+        f"set {PUBLIC_BASE_URL_ENV}=http://127.0.0.1:{host_port} and "
+        "KESTREL_A2A_PUSH_ENABLED=false."
+    )
+
+
+def unpublished_peer_detail(environment: Mapping[str, str]) -> str:
+    """Why a co-hosted recipient has no native interface to open."""
+    if _host_publishes_native_a2a(environment):
+        return "Peer has no published native A2A interface"
+    return (
+        "Peer has no published native A2A interface: this host has no "
+        f"{PUBLIC_BASE_URL_ENV}, so none of its agents publishes one. The "
+        f"operator must set {PUBLIC_BASE_URL_ENV} and restart the host."
+    )
+
 
 @dataclass(frozen=True)
 class NativeHostingConfiguration:
@@ -79,11 +119,11 @@ class NativeHostingConfiguration:
     @classmethod
     def from_environment(cls, environment: Mapping[str, str]):
         """Unconfigured hosts run operator APIs without public peer discovery."""
-        base = environment.get("KESTREL_BASE_URL")
+        base = environment.get(PUBLIC_BASE_URL_ENV)
         discovery = environment.get("KESTREL_A2A_DISCOVERY_AGENT")
-        if base is None:
+        if not _host_publishes_native_a2a(environment):
             if discovery is not None:
-                raise ValueError("A2A discovery requires KESTREL_BASE_URL")
+                raise ValueError(f"A2A discovery requires {PUBLIC_BASE_URL_ENV}")
             return None
         return cls(base, discovery, NativePushPolicy.from_environment(environment))
 
@@ -307,7 +347,8 @@ async def open_hosted_native_peer_session(
         recipient_policy = manager.a2a_hosted_policy_for(recipient)
         publication = getattr(recipient, "_native_a2a_publication", None)
         if not isinstance(publication, NativeA2APublication):
-            raise PeerUnavailableError("Peer has no published native A2A interface")
+            # Host onboarding decides publication from this same environment.
+            raise PeerUnavailableError(unpublished_peer_detail(os.environ))
         publication.registry.require_application(app)
         sender_identity = sender.identity
         recipient_identity = recipient.identity

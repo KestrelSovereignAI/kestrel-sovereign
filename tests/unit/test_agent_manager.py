@@ -22,6 +22,7 @@ from fastapi import APIRouter, FastAPI, HTTPException
 from fastapi.routing import iter_route_contexts
 from fastapi.testclient import TestClient
 
+from kestrel_sovereign.a2a.native_publication import unpublished_cohost_warning
 from kestrel_sovereign.agent.turn_lifecycle import TurnLifecycleMixin
 from kestrel_sovereign.features import MandatoryFeatureReadinessError
 from kestrel_sovereign.features.isolated_runtime import (
@@ -13949,6 +13950,121 @@ class TestLoadFromConfig:
             str(parent_config.resolve_data_dir(tmp_path)),
             mode=AgentDIDLookupMode.INSPECTION,
         )
+
+    @pytest.mark.asyncio
+    async def test_before_initialize_omits_an_inactive_registration(self, tmp_path):
+        """One active agent and a cold registration are a single-agent host.
+
+        The co-hosted publication warning counts this roster, so an
+        ``autostart=false`` row must not make a single-agent host warn (#3872).
+        """
+
+        config = MultiAgentConfig(
+            agents={
+                "Active": LocalAgentConfig(
+                    data_dir=Path("agent_data") / "Active", port=8801
+                ),
+                "Dormant": LocalAgentConfig(
+                    data_dir=Path("agent_data") / "Dormant",
+                    port=8802,
+                    autostart=False,
+                ),
+            }
+        )
+        manager = AgentManager(base_data_dir=tmp_path)
+        events = []
+        rosters = []
+
+        async def initialize(name, _config):
+            events.append(f"initialize:{name}")
+            return _make_mock_agent(f"did:test:{name.lower()}")
+
+        def before_initialize(roster):
+            events.append("roster")
+            rosters.append(roster)
+
+        manager._initialize_agent = AsyncMock(side_effect=initialize)
+        manager._on_agent_registered = AsyncMock()
+        manager._run_hosted_agent_ready_hooks = AsyncMock()
+
+        loaded = await manager.load_from_config(
+            config, before_initialize=before_initialize
+        )
+
+        assert loaded == 1
+        assert rosters == [("Active",)]
+        assert events == ["roster", "initialize:Active"]
+        assert (
+            unpublished_cohost_warning({}, agents=len(rosters[0]), host_port=8888)
+            is None
+        )
+
+    @pytest.mark.asyncio
+    async def test_before_initialize_counts_a_cold_authority_parent(self, tmp_path):
+        """A cold parent an active child needs is started, so it is a co-host."""
+
+        parent_did = "did:test:roster-cold-parent"
+        child_did = "did:test:roster-active-child"
+        parent, mandate = _signed_restored_mandate(parent_did, child_did)
+        child = _make_mock_agent(child_did)
+        child._persisted_spawn_mandate = mandate
+        parent_config = LocalAgentConfig(
+            data_dir=Path("agent_data") / "ColdParent",
+            port=8801,
+            autostart=False,
+        )
+        child_config = LocalAgentConfig(
+            data_dir=Path("agent_data") / "ActiveChild",
+            port=8802,
+            autostart=True,
+        )
+        dormant_config = LocalAgentConfig(
+            data_dir=Path("agent_data") / "Dormant",
+            port=8803,
+            autostart=False,
+        )
+        config = MultiAgentConfig(
+            agents={
+                "ColdParent": parent_config,
+                "ActiveChild": child_config,
+                "Dormant": dormant_config,
+            }
+        )
+        SpawnAuthorityRegistry(tmp_path).record_active(
+            child_name="ActiveChild",
+            child_did=child_did,
+            mandate=mandate,
+            config=child_config,
+        )
+        manager = AgentManager(base_data_dir=tmp_path)
+        anchors = {
+            str(parent_config.resolve_data_dir(tmp_path)): parent_did,
+        }
+
+        async def read_anchor(data_dir, *, mode):
+            if data_dir not in anchors:
+                raise RuntimeError("identity database is not initialized")
+            return anchors[data_dir]
+
+        async def initialize(name, _config):
+            return parent if name == "ColdParent" else child
+
+        rosters = []
+        manager._initialize_agent = AsyncMock(side_effect=initialize)
+        manager._on_agent_registered = AsyncMock()
+        manager._run_hosted_agent_ready_hooks = AsyncMock()
+
+        with patch(
+            "kestrel_sovereign.multi_agent.agent_manager.read_anchor_agent_did",
+            new=read_anchor,
+        ):
+            loaded = await manager.load_from_config(
+                config, before_initialize=rosters.append
+            )
+
+        assert loaded == 2
+        assert rosters == [("ColdParent", "ActiveChild")]
+        assert manager.get_agent("Dormant") is None
 
     @pytest.mark.asyncio
     async def test_restart_resolves_rotated_parent_alias_before_cold_boot(

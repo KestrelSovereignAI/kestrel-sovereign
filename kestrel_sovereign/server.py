@@ -3842,6 +3842,35 @@ async def _lifespan_startup(app: FastAPI):
             # DID's durable protocol row before concurrent agent
             # initialization and post-load default seeding.
             await _prepare_shared_postgres_scheduler_protocol(app, manager, config)
+
+            def _warn_unpublished_cohosts(roster: tuple[str, ...]) -> None:
+                # Onboarding reads publication from this same environment.
+                # Without a public base URL the host still starts healthy, so
+                # say so before any agent can attempt a co-hosted send. The
+                # roster is what this load starts: an autostart=false
+                # registration is not a co-hosted peer (#3872).
+                try:
+                    from kestrel_sovereign.a2a.native_publication import (
+                        unpublished_cohost_warning,
+                    )
+
+                    unpublished = unpublished_cohost_warning(
+                        multi_agent_runtime_env,
+                        agents=len(roster),
+                        host_port=config.host.port,
+                    )
+                except Exception:
+                    # A diagnostic must never stop the host it describes:
+                    # load_from_config propagates this hook's exceptions.
+                    logger.warning(
+                        "Could not check whether this host publishes native "
+                        "A2A for its co-hosted agents",
+                        exc_info=True,
+                    )
+                    return
+                if unpublished is not None:
+                    logger.warning(unpublished)
+
             # Scheduler preflight seeded authority from this exact reconciled
             # roster. Do not let load_from_config re-read multi_agent.toml after
             # that await and switch runtime tenants without re-seeding the
@@ -3849,6 +3878,7 @@ async def _lifespan_startup(app: FastAPI):
             loaded = await manager.load_from_config(
                 config,
                 restart_roster_reconciled=True,
+                before_initialize=_warn_unpublished_cohosts,
             )
             logger.info(f"Multi-agent mode: {loaded} agent(s) loaded")
 

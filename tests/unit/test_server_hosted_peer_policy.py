@@ -46,6 +46,8 @@ async def test_hosted_policy_refreshes_local_router_with_transport_key(monkeypat
     """Registration sees the peer key generated after feature initialization."""
 
     monkeypatch.delenv("KESTREL_HOST_URL", raising=False)
+    # This stub agent has no public profile, so it must not prepare publication.
+    monkeypatch.delenv("KESTREL_BASE_URL", raising=False)
     generated_key = "generated-after-feature-startup"
     monkeypatch.setenv("KESTREL_API_KEY", "sovereign-operator-key")
     monkeypatch.setenv("KESTREL_A2A_TRANSPORT_KEY", generated_key)

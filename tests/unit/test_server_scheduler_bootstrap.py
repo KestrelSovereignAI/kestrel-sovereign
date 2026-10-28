@@ -395,12 +395,14 @@ async def test_lifespan_preflights_before_parallel_agent_initialization(
             config,
             *,
             restart_roster_reconciled,
+            before_initialize,
         ) -> int:
             assert config is effective_config
             # Scheduler preflight seeded authority from this exact snapshot.
             # Loading must not re-read multi_agent.toml behind that authority
             # boundary and silently switch to a different tenant roster.
             assert restart_roster_reconciled is True
+            before_initialize(tuple(config.agents))
             events.append("load")
             return 0
 

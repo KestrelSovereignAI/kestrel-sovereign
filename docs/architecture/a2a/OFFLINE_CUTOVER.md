@@ -128,6 +128,34 @@ connection fails around commit, inspect the journal by the plan's migration ID
 and verify the protocol revision and archives before taking another action.
 Never interpret a lost acknowledgement as permission to replay or reconvert.
 
+## Start the native host
+
+A host that serves two or more agents needs `KESTREL_BASE_URL` before it
+starts. Core 0.53 defaulted it to `http://localhost:8888`; the native runtime
+never derives it from the listen address. Without it the host still reports
+healthy and every agent onboards, but no agent publishes a native A2A
+interface. Every co-hosted task, message, question and stop then fails when
+an agent first sends it, with "this host has no KESTREL_BASE_URL".
+
+For a local or self-hosted host, set the host's own loopback origin with no
+path, using the `[host]` port from `multi_agent.toml`, and disable push. Add
+these two lines to the project `.env`, which `kestrel start` reads:
+
+```ini
+KESTREL_BASE_URL=http://127.0.0.1:8888
+KESTREL_A2A_PUSH_ENABLED=false
+```
+
+A value exported in the launching shell instead must be `export`ed; a bare
+shell assignment does not reach the host process. The project `.env`
+overrides an exported value for `kestrel start`, so a stale entry there wins.
+
+Co-hosted sends poll their peer tasks. Push delivery additionally needs
+`KESTREL_DATA_KEY` and a process identity. A host that starts two or more
+agents without `KESTREL_BASE_URL` logs one startup warning naming it, before
+any agent initializes. A public deployment sets its stable public origin and
+`KESTREL_A2A_DISCOVERY_AGENT` instead (#3819).
+
 Start the native host only after its release gates pass. Verify historical task
 reads, context ownership, a fresh native exchange, and the absence of new wakes
 for historical rows. Roll back through the verified whole-backend backup and

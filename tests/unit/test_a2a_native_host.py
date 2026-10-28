@@ -1,7 +1,7 @@
 """Native manager construction and the real host's signal boot phase."""
 
 import asyncio
-from contextlib import AsyncExitStack
+from contextlib import AsyncExitStack, asynccontextmanager
 from dataclasses import replace
 from types import SimpleNamespace
 
@@ -923,32 +923,30 @@ async def test_actual_host_signal_boot_borrows_native_storage_and_rolls_back(
         await storage.close()
 
 
-@pytest_asyncio.fixture(params=["", "/proxy"])
-async def local_native_peer(publication, request):
-    from kestrel_sovereign.a2a.did_registry import HostA2ADidResolver
-    from kestrel_sovereign.a2a.inbound_authorization import RecipientA2ASenderAuthorizer
+@asynccontextmanager
+async def _cohosted_sender(p, register_recipient):
+    """Install a co-hosted sender whose directory opens the real host session.
+
+    ``register_recipient`` runs inside the same lifecycle lease that installs
+    the sender's hosted policy.
+    """
     from kestrel_sovereign.features.peers.directory import PeerIdentity, PeerRequester
     from kestrel_sovereign.identity.runtime_identity import AgentIdentity
     from tests.utils.native_a2a import manager_for
 
-    p = publication
-    from kestrel_sovereign.a2a.native_publication import NativeHostingConfiguration
-    from tests.utils.native_a2a import serve_native_app
-
-    async with serve_native_app(p.app, root_path=request.param) as public_base:
-        p.publication.configuration = NativeHostingConfiguration(public_base)
-        p.app.state.agent_manager = p.host
-        p.sender.identity = AgentIdentity(
-            hybrid_keypair=p.signing[0],
-            new_did=SENDER,
-            new_verification_methods=p.signing[1]["verificationMethod"],
-        )
-        sender_manager = manager_for(
-            p.backend,
-            NativeRecipientScope(PRINCIPAL, "sender-tenant"),
-            owns_backend=False,
-        )
-        await sender_manager.initialize()
+    p.app.state.agent_manager = p.host
+    p.sender.identity = AgentIdentity(
+        hybrid_keypair=p.signing[0],
+        new_did=SENDER,
+        new_verification_methods=p.signing[1]["verificationMethod"],
+    )
+    sender_manager = manager_for(
+        p.backend,
+        NativeRecipientScope(PRINCIPAL, "sender-tenant"),
+        owns_backend=False,
+    )
+    await sender_manager.initialize()
+    try:
         p.sender.task_manager = sender_manager
         requester = PeerRequester(PRINCIPAL, object())
         peer = PeerIdentity(p.recipient.did, "peer", "registered-agent", name="Peer")
@@ -995,18 +993,76 @@ async def local_native_peer(publication, request):
                 router=directory,
                 requester=requester,
             )
+            await register_recipient()
+        yield SimpleNamespace(
+            **vars(p),
+            sender_manager=sender_manager,
+            requester=requester,
+            peer=peer,
+            directory=directory,
+            route_state=state,
+        )
+    finally:
+        await sender_manager.close()
+
+
+@pytest_asyncio.fixture(params=["", "/proxy"])
+async def local_native_peer(publication, request):
+    from kestrel_sovereign.a2a.native_publication import NativeHostingConfiguration
+    from tests.utils.native_a2a import serve_native_app
+
+    p = publication
+    async with serve_native_app(p.app, root_path=request.param) as public_base:
+        p.publication.configuration = NativeHostingConfiguration(public_base)
+
+        async def register_recipient():
             p.host._register_agent("registered-agent", p.recipient)
-        try:
-            yield SimpleNamespace(
-                **vars(p),
-                sender_manager=sender_manager,
-                requester=requester,
-                peer=peer,
-                directory=directory,
-                route_state=state,
+
+        async with _cohosted_sender(p, register_recipient) as peer:
+            yield peer
+
+
+@pytest_asyncio.fixture(params=["loopback-base-url", "no-base-url"])
+async def env_onboarded_peer(publication, monkeypatch, request):
+    """Onboard the recipient through the real host hook from the environment (#3872)."""
+    from urllib.parse import urlsplit
+
+    from kestrel_sovereign import server
+    from tests.utils.native_a2a import serve_native_app
+
+    p = publication
+    # A freshly onboarded agent has no publication; the fixture's was prepared
+    # for another URL and is never published.
+    vars(p.recipient).pop("_native_a2a_publication")
+    async with serve_native_app(p.app) as public_base:
+        assert public_base.startswith("http://127.0.0.1:")
+        assert urlsplit(public_base).path == ""
+        if request.param == "loopback-base-url":
+            monkeypatch.setenv("KESTREL_BASE_URL", public_base)
+        else:
+            monkeypatch.delenv("KESTREL_BASE_URL", raising=False)
+        monkeypatch.setenv("KESTREL_A2A_PUSH_ENABLED", "false")
+        monkeypatch.delenv("KESTREL_A2A_DISCOVERY_AGENT", raising=False)
+        rollback = None
+
+        async def onboard_recipient():
+            nonlocal rollback
+            p.host._agents.pop("registered-agent")
+            p.host._agent_names.pop(p.recipient.agent_id)
+            p.host._onboarding_agents["registered-agent"] = p.recipient
+            rollback = await server._onboard_host_registered_agent(
+                p.app, p.host, "registered-agent", p.recipient
             )
-        finally:
-            await sender_manager.close()
+            p.host._register_agent("registered-agent", p.recipient)
+            p.host._onboarding_agents.pop("registered-agent")
+
+        async with _cohosted_sender(p, onboard_recipient) as peer:
+            try:
+                yield SimpleNamespace(**vars(peer), base_url_set=request.param)
+            finally:
+                async with p.host.a2a_lifecycle_lease():
+                    p.host._withdraw_initialized_agent("registered-agent", p.recipient)
+                    await rollback()
 
 
 async def test_same_host_session_uses_real_sdk_binding_and_creator_ledger(
@@ -1109,6 +1165,37 @@ async def test_native_peer_message_tool_reaches_official_host_binding(
     )
     assert task.history[0].parts[0].text == "Message from real peer tool"
     assert task.context_id == result.data["context_id"]
+
+
+async def test_cohosted_message_follows_the_host_base_url_setting(
+    env_onboarded_peer,
+):
+    """A loopback KESTREL_BASE_URL delivers; without it the error names the host."""
+    from kestrel_sovereign.features.peers.feature import PeersFeature
+
+    p = env_onboarded_peer
+    feature = PeersFeature(p.sender)
+    feature._peer_router = p.directory
+    feature._peer_requester = p.requester
+    feature._own_name = "Sender"
+    result = await feature.send_a2a_message("Peer", "Co-hosted delivery")
+    if p.base_url_set == "loopback-base-url":
+        assert result.data["sent"] is True
+        task = await p.manager.get_task_for_creator(
+            result.data["remote_task_id"],
+            PRINCIPAL,
+            recipient_agent_id=p.recipient.did,
+        )
+        assert task.history[0].parts[0].text == "Co-hosted delivery"
+        return
+    assert "_native_a2a_publication" not in vars(p.recipient)
+    assert result.data["sent"] is False
+    assert result.data["delivery_state"] == "not_submitted"
+    assert result.error.startswith(
+        "Could not send A2A message: Peer has no published native A2A interface: "
+        "this host has no KESTREL_BASE_URL"
+    )
+    assert await p.sender_manager.outbound_store.list_recent() == []
 
 
 @pytest.mark.parametrize("publication", [["application/json"]], indirect=True)

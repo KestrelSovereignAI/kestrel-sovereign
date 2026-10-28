@@ -753,9 +753,11 @@ async def test_lifespan_reaps_phoenix_after_agent_manager_cancellation(
             config,
             *,
             restart_roster_reconciled,
+            before_initialize,
         ) -> int:
             assert config is fake_config
             assert restart_roster_reconciled is True
+            before_initialize(tuple(config.agents))
             return 0
 
         def list_agents(self):
@@ -835,9 +837,11 @@ async def test_host_scheduler_startup_failure_rolls_back_loaded_agents(
             config,
             *,
             restart_roster_reconciled,
+            before_initialize,
         ) -> int:
             assert config is fake_config
             assert restart_roster_reconciled is True
+            before_initialize(tuple(config.agents))
             return 1
 
         def list_agents(self):

@@ -2,7 +2,11 @@
 
 import pytest
 
-from kestrel_sovereign.a2a.native_publication import NativeHostingConfiguration
+from kestrel_sovereign.a2a.native_publication import (
+    NativeHostingConfiguration,
+    unpublished_cohost_warning,
+    unpublished_peer_detail,
+)
 
 
 def test_operator_only_host_does_not_guess_a_public_peer_url():
@@ -52,3 +56,42 @@ def test_public_discovery_recipient_is_an_explicit_registration_key():
 def test_invalid_discovery_configuration_refuses_publication(environment):
     with pytest.raises(ValueError):
         NativeHostingConfiguration.from_environment(environment)
+
+
+def test_cohosted_fleet_without_base_url_is_named_with_its_remedy():
+    warning = unpublished_cohost_warning({"PORT": "8899"}, agents=2, host_port=8899)
+    assert warning is not None
+    assert warning.startswith("KESTREL_BASE_URL is unset: none of this host's 2 agents")
+    assert "cannot send A2A tasks, messages, questions or stops" in warning
+    assert "KESTREL_BASE_URL=http://127.0.0.1:8899 and" in warning
+    assert "KESTREL_A2A_PUSH_ENABLED=false" in warning
+    # The port is advice only: the same environment still publishes nothing.
+    assert NativeHostingConfiguration.from_environment({"PORT": "8899"}) is None
+
+
+@pytest.mark.parametrize(
+    ("environment", "agents"),
+    [
+        ({}, 0),
+        ({}, 1),
+        ({"KESTREL_BASE_URL": "http://127.0.0.1:8899"}, 2),
+        # An invalid value is set, so onboarding refuses it rather than this
+        # warning describing it as unset.
+        ({"KESTREL_BASE_URL": ""}, 3),
+    ],
+)
+def test_no_cohosted_warning_for_one_agent_or_a_set_base_url(environment, agents):
+    assert (
+        unpublished_cohost_warning(environment, agents=agents, host_port=8899)
+        is None
+    )
+
+
+def test_unpublished_peer_names_a_host_without_base_url():
+    detail = unpublished_peer_detail({})
+    assert detail.startswith("Peer has no published native A2A interface: ")
+    assert "this host has no KESTREL_BASE_URL" in detail
+    assert (
+        unpublished_peer_detail({"KESTREL_BASE_URL": "http://127.0.0.1:8899"})
+        == "Peer has no published native A2A interface"
+    )
