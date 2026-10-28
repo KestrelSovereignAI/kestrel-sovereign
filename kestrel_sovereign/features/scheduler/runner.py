@@ -627,22 +627,39 @@ def _is_plain_storage_failure(error: BaseException) -> bool:
 
 
 def _is_reconcilable_occurrence_failure(
-    error: BaseException, *, already_latched: bool
+    error: BaseException, *, already_latched: bool, own_scopes: tuple = ()
 ) -> bool:
     """Whether the durable rows of the occurrence it ended can settle it.
 
-    An unknown or committed outcome, or an ordinary failure while readiness
-    is already latched, is: the claim protocol never retries an effect it
-    cannot prove absent. An authority denial or retirement debt is not, and
-    neither is an ordinary failure that would start a latch: that is
-    scheduler infrastructure, not an occurrence outcome.
+    An unknown or committed outcome is: the claim protocol never retries an
+    effect it cannot prove absent. So is an authority denial, such as the
+    occurrence's lease expiring mid-effect (#3881): finalization, or recovery
+    of the expired lease, settles that claim from its row. A runner whose own
+    authority is gone cannot read that row, and its reconciliation read
+    escapes to the supervisor, whose latch names no claim and holds. A denial
+    of a scheduler scope outside ``own_scopes`` (the scopes the caller proved
+    are this occurrence's) is not: it is another runner's or an earlier
+    occurrence's admission, which is scheduler infrastructure this claim's row
+    cannot settle. Every carrier is read, so an unscoped denial grouped with
+    it cannot hide it. An ordinary failure is
+    reconcilable only while readiness is already latched; one that would
+    start a latch is scheduler infrastructure, not an occurrence outcome.
+    Retirement debt never is: a durable row says nothing about a physical
+    resource that was not released.
     """
 
     if execution_cleanup_debts(error):
         return False
     if execution_commit_outcome(error) is not None:
         return True
-    return already_latched and not is_execution_control_error(error)
+    if is_execution_control_error(error):
+        return not any(
+            isinstance(scope.fence, (_LeaseRenewalState, _SchedulerEffectFence))
+            and not any(scope is own for own in own_scopes)
+            for carrier in execution_evidence_carriers(error)
+            for scope in vars(carrier).get("_kestrel_denied_execution_scopes", ())
+        )
+    return already_latched
 
 
 @dataclass
@@ -1567,9 +1584,19 @@ class SchedulerRunner:
         claims = found | self._attempted_claims_of(error)
         if reconciliation is not None:
             claims |= {reconciliation}
+        # The same provenance as the local-receipt check above: only this
+        # occurrence's scopes, or an earlier proof for a context-free observer.
+        own_scopes = owned_scopes
+        if (
+            state is None
+            and isinstance(previous, _OriginalOccurrenceReceipt)
+            and previous.owner is self
+        ):
+            own_scopes = previous.scopes
         reconcilable = bool(claims) and _is_reconcilable_occurrence_failure(
             error,
             already_latched=bool(found) or self._readiness_failure is not None,
+            own_scopes=own_scopes,
         )
         pending = vars(self).setdefault("_readiness_reconciliations", set())
         if self._readiness_failure is None:
@@ -2327,6 +2354,24 @@ class SchedulerRunner:
                     error, reconciliation=self._readiness_reconciliation(claimed)
                 )
             raise
+        # Reconcile before the latch outlives its cause (#3881). A claim this
+        # occurrence's failure latched may already be settled, for example a
+        # lease that expired after another worker finalized or recovered the
+        # row. Reading it now clears that latch before the next poll would.
+        try:
+            await self._reconcile_readiness_latch()
+        except Exception as error:
+            # The polling loop's reconciliation escapes such a failure to the
+            # supervisor, which latches it with no claim. An occurrence has no
+            # supervisor, so it latches the failure the same way.
+            logger.error(
+                "Scheduled occurrence for task %s (%s) could not reconcile "
+                "scheduler readiness",
+                task.id,
+                task.task_name,
+                exc_info=(type(error), error, error.__traceback__),
+            )
+            self._latch_protocol_failure(error)
 
     @staticmethod
     def _readiness_reconciliation(
@@ -2342,6 +2387,62 @@ class SchedulerRunner:
             execution_id=task.claim_execution_id,
             claim_token=task.claim_token,
         )
+
+    @staticmethod
+    def _is_target_refusal(
+        error: BaseException, renewal_state: _LeaseRenewalState
+    ) -> bool:
+        """Whether a target raised ``error`` for an admission of its own (#3881).
+
+        A target can run leased work of its own: ``workflow_trigger_cron``
+        holds a workflow lease, and raises ``ExecutionAuthorityError`` when
+        that lease expires. That ends the target's work, not the occurrence:
+        the occurrence still holds its lease and its own custody admits work,
+        so the target's refusal is a known failed outcome, finalized under the
+        occurrence's live claim like any other target failure. Before #3881
+        the runner took it for its own authority loss and latched readiness
+        for the runner's lifetime.
+
+        Only a lease the target holds can refuse for the target. Every denied
+        scope must be typed evidence of a ``ConfirmedLeaseDeadline`` (a local
+        lease interval its holder pairs with its own exact-token CAS) that is
+        no scheduler's lease and no scope the occurrence holds (a scheduler
+        effect gate is an advisory fence, never a lease). A runtime or
+        transaction-bound authority (a runtime generation, a process runtime,
+        an advisory session) is the authority the effect ran under, so its
+        denial needs reconciliation even after the target's narrower binding
+        of it has ended (#3570). An unscoped denial names no scope, and the
+        custody layer never localizes one, so it is not a target refusal
+        either. Commit-outcome and retirement evidence never is. Call it in
+        the occurrence's own context, after the target has returned.
+        """
+
+        if not isinstance(error, Exception) or not is_execution_control_error(error):
+            return False
+        if execution_commit_outcome(error) is not None or execution_cleanup_debts(error):
+            return False
+        if not renewal_state.is_live():
+            return False
+        denied = execution_denial_scopes(error)
+        if not denied:
+            return False
+        held = current_execution_custody()
+        if any(
+            not isinstance(scope.fence, ConfirmedLeaseDeadline)
+            or isinstance(scope.fence, _LeaseRenewalState)
+            or any(scope is own for own in held)
+            for scope in denied
+        ):
+            return False
+        try:
+            require_execution_work()
+        except Exception:
+            # Any refusal of the occurrence's own custody (a fence may raise
+            # a native ConnectionError) means the target's refusal may be the
+            # occurrence's too. The caller then raises the target's original
+            # error down the fail-closed path; this refusal stays on its scope.
+            return False
+        return True
 
     async def _claim_still_held(self, pending: _ReadinessReconciliation) -> bool:
         """Whether the claim a latch names still holds its schedule row."""
@@ -3923,6 +4024,7 @@ class SchedulerRunner:
                                     dispatch,
                                     execution,
                                     renewal_state,
+                                    target=True,
                                 )
                                 if not completed:
                                     self._log_lease_loss(execution, phase="effect")
@@ -3975,11 +4077,16 @@ class SchedulerRunner:
                                     e,
                                 )
                             except Exception as e:
-                                if is_execution_control_error(e) or self._readiness_failure is not None:
+                                if is_execution_control_error(e) and not self._is_target_refusal(
+                                    e, renewal_state
+                                ):
                                     # Keep the pre-dispatch executing marker and
                                     # occurrence identity for reconciliation. A lost
                                     # acknowledgement is not a terminal task failure.
                                     raise
+                                # A target that failed, or refused under an
+                                # admission of its own, has a known outcome,
+                                # whatever else latched readiness (#3881).
                                 status = "failed"
                                 result_text = f"{type(e).__name__}: {e}"
                                 logger.error(
@@ -4054,7 +4161,11 @@ class SchedulerRunner:
                 await self._mark_effect_started(task, execution, preparation_deferred=True)
             return
         except Exception as error:
-            if is_execution_control_error(error) or self._readiness_failure is not None:
+            # Only control evidence needs reconciliation. A latch already held
+            # changes no other occurrence's outcome (#3881): before, every
+            # ordinary failure while latched was escalated here, so a failed
+            # backup_snapshot was never finalized and retried for hours.
+            if is_execution_control_error(error):
                 self._latch_protocol_failure(
                     error, reconciliation=renewal_state.reconciliation
                 )
@@ -4321,6 +4432,8 @@ class SchedulerRunner:
         dispatch: PreparedScheduledDispatch,
         execution: SchedulerExecution,
         renewal_state: _LeaseRenewalState,
+        *,
+        target: bool = False,
     ) -> tuple[bool, Any]:
         """Await an owned effect, cancelling it if its lease is lost.
 
@@ -4330,6 +4443,10 @@ class SchedulerRunner:
         prevents this worker from finalizing as the stale owner.  Both owned
         tasks are joined so cancellation never leaves a context-bearing effect
         detached in the background.
+
+        ``target`` marks the target's own dispatch. A refusal it raised under
+        an admission of its own is left to the caller to finalize, not
+        latched here (see ``_is_target_refusal``).
         """
 
         async def invoke_dispatch() -> Any:
@@ -4407,7 +4524,11 @@ class SchedulerRunner:
                 original, effect_outcome.error, effect_outcome.cancellation,
                 lease_error, lease_cancellation, retain_originals=True,
             )
-            if terminal is not None and is_execution_control_error(terminal):
+            if (
+                terminal is not None
+                and is_execution_control_error(terminal)
+                and not (target and self._is_target_refusal(terminal, renewal_state))
+            ):
                 self._latch_protocol_failure(
                     terminal, reconciliation=renewal_state.reconciliation
                 )
