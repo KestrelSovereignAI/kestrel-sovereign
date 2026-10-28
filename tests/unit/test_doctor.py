@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from contextlib import closing
 from pathlib import Path
 from uuid import uuid4
@@ -15,14 +16,19 @@ from kestrel_sovereign.doctor import (
 )
 from kestrel_sovereign.hold import HoldAuthority
 from kestrel_sovereign.hold.state import _HistoryAnchorFormat
+from kestrel_sovereign.inception_service import generate_secp256k1_keypair
+from kestrel_sovereign.multi_agent.agent_manager import AgentManager
 from kestrel_sovereign.multi_agent.config import (
     MULTI_AGENT_CONFIG_FILENAME,
+    RETIRED_SPAWN_MARKER,
     HostConfig,
     LocalAgentConfig,
     MultiAgentConfig,
 )
 from kestrel_sovereign.setup.env_file import read_env, write_env
 from kestrel_sovereign.setup.toml_file import write_toml
+from kestrel_sovereign.spawn.authority_registry import SpawnAuthorityRegistry
+from kestrel_sovereign.spawn.mandate import SpawnMandate, sign_mandate
 
 
 def _seed_ready(tmp_path: Path) -> None:
@@ -253,11 +259,11 @@ def test_doctor_accepts_private_identity_export_metadata(tmp_path):
     assert not any("identity-export" in message for message in report.warn)
 
 
-def _add_cohosted_peer(tmp_path: Path) -> None:
+def _add_cohosted_peer(tmp_path: Path, *, autostart: bool = True) -> None:
     path = tmp_path / MULTI_AGENT_CONFIG_FILENAME
     multi_agent = MultiAgentConfig.from_file(path)
     multi_agent.agents["Peer"] = LocalAgentConfig(
-        data_dir=Path("agent_data/peer"), port=8802, autostart=True
+        data_dir=Path("agent_data/peer"), port=8802, autostart=autostart
     )
     multi_agent.save(path)
     db_dir = tmp_path / "agent_data" / "peer"
@@ -309,6 +315,116 @@ def test_doctor_does_not_warn_a_single_agent_host(tmp_path, monkeypatch):
     _seed_ready(tmp_path)
 
     assert _unpublished_cohost_warnings(diagnose(tmp_path)) == []
+
+
+def test_doctor_does_not_count_an_inactive_registration(tmp_path, monkeypatch):
+    """The host never starts an autostart=false row, so it is no co-host."""
+    monkeypatch.delenv("KESTREL_BASE_URL", raising=False)
+    _seed_ready(tmp_path)
+    _add_cohosted_peer(tmp_path, autostart=False)
+
+    assert _unpublished_cohost_warnings(diagnose(tmp_path)) == []
+
+
+def test_doctor_does_not_count_a_retired_spawned_child(tmp_path, monkeypatch):
+    """A retirement tombstone denies the boot, whatever the row's autostart."""
+    monkeypatch.delenv("KESTREL_BASE_URL", raising=False)
+    _seed_ready(tmp_path)
+    _add_cohosted_peer(tmp_path)
+    marker = tmp_path / "agent_data" / "peer" / RETIRED_SPAWN_MARKER
+    marker.write_text("did:test:retired-peer\n", encoding="utf-8")
+
+    assert _unpublished_cohost_warnings(diagnose(tmp_path)) == []
+
+
+def _write_agent_anchor(data_dir: Path, did: str) -> None:
+    """The one-row birth record an ``INSPECTION`` anchor read returns."""
+    data_dir.mkdir(parents=True, exist_ok=True)
+    db_path = data_dir / "kestrel_prime.db"
+    with closing(sqlite3.connect(str(db_path))) as conn, conn:
+        conn.execute(
+            "CREATE TABLE graph_nodes (node_id TEXT PRIMARY KEY, node_type TEXT)"
+        )
+        conn.execute("INSERT INTO graph_nodes VALUES (?, 'agent')", (did,))
+
+
+def test_doctor_counts_the_cold_parent_host_startup_loads(tmp_path, monkeypatch):
+    """Doctor and startup agree on a cold parent an active signed child needs.
+
+    The parent is ``autostart=false``, but the host starts it so the child can
+    verify its authority, so the host serves two agents and must warn (#3872).
+    """
+    monkeypatch.delenv("KESTREL_BASE_URL", raising=False)
+    _seed_ready(tmp_path)
+    parent_did = "did:test:doctor-cold-parent"
+    child_did = "did:test:doctor-active-child"
+    private_key, _ = generate_secp256k1_keypair()
+    mandate = sign_mandate(
+        SpawnMandate(parent_did=parent_did, child_did=child_did, ttl_seconds=0),
+        private_key,
+    )
+    parent_config = LocalAgentConfig(
+        data_dir=Path("agent_data/parent"), port=8801, autostart=False
+    )
+    child_config = LocalAgentConfig(data_dir=Path("agent_data/child"), port=8802)
+    roster_path = tmp_path / MULTI_AGENT_CONFIG_FILENAME
+    MultiAgentConfig(
+        host=HostConfig(),
+        agents={"Parent": parent_config, "Child": child_config},
+    ).save(roster_path)
+    _write_agent_anchor(tmp_path / "agent_data" / "parent", parent_did)
+    (tmp_path / "agent_data" / "child").mkdir(parents=True)
+    (tmp_path / "agent_data" / "child" / "kestrel_prime.db").write_bytes(b"")
+    SpawnAuthorityRegistry(tmp_path).record_active(
+        child_name="Child",
+        child_did=child_did,
+        mandate=mandate,
+        config=child_config,
+    )
+
+    class _RosterSeen(Exception):
+        pass
+
+    started = []
+
+    def stop_before_initializing(roster):
+        started.append(roster)
+        raise _RosterSeen
+
+    manager = AgentManager(base_data_dir=tmp_path)
+    with pytest.raises(_RosterSeen):
+        asyncio.run(
+            manager.load_from_config(
+                MultiAgentConfig.from_file(roster_path),
+                before_initialize=stop_before_initializing,
+            )
+        )
+    assert started == [("Parent", "Child")]
+
+    [warning] = _unpublished_cohost_warnings(diagnose(tmp_path))
+    assert "none of this host's 2 agents" in warning
+
+
+def test_doctor_reports_an_unreadable_spawn_authority_registry(
+    tmp_path, monkeypatch
+):
+    """The roster cannot be read, so the check says so instead of crashing."""
+    monkeypatch.delenv("KESTREL_BASE_URL", raising=False)
+    _seed_ready(tmp_path)
+    _add_cohosted_peer(tmp_path)
+    registry = SpawnAuthorityRegistry(tmp_path)
+    registry.path.parent.mkdir(parents=True, exist_ok=True)
+    registry.path.write_text("{not json", encoding="utf-8")
+
+    report = diagnose(tmp_path)
+
+    assert _unpublished_cohost_warnings(report) == []
+    [unchecked] = [
+        message
+        for message in report.warn
+        if message.startswith("Could not check native A2A publication")
+    ]
+    assert "reading which agents this host starts failed" in unchecked
 
 
 # ---------------------------------------------------------------------------

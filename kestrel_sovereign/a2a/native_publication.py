@@ -55,7 +55,6 @@ from kestrel_sovereign.multi_agent.route_name import encode_agent_route_name
 if TYPE_CHECKING:
     from kestrel_sovereign.kestrel_agent import KestrelAgent
     from kestrel_sovereign.multi_agent.agent_manager import AgentManager
-    from kestrel_sovereign.multi_agent.config import MultiAgentConfig
 
 PUBLIC_BASE_URL_ENV = "KESTREL_BASE_URL"
 
@@ -66,23 +65,23 @@ def _host_publishes_native_a2a(environment: Mapping[str, str]) -> bool:
 
 
 def unpublished_cohost_warning(
-    environment: Mapping[str, str], config: "MultiAgentConfig"
+    environment: Mapping[str, str], *, agents: int, host_port: int
 ) -> str | None:
     """Name a multi-agent host whose co-hosted agents cannot reach each other.
 
     Core 0.53 defaulted the public URL to ``http://localhost:8888``. Native
     publication requires it explicitly, so a host upgraded without it starts
     healthy and every co-hosted send fails only when an agent first tries one
-    (#3872). The port is advice for the operator, never a substitute URL.
+    (#3872). ``agents`` counts the agents the host starts, never a registration
+    it leaves cold. The port is advice for the operator, never a substitute URL.
     """
-    agents = len(config.get_local_agents())
     if agents < 2 or _host_publishes_native_a2a(environment):
         return None
     return (
         f"{PUBLIC_BASE_URL_ENV} is unset: none of this host's {agents} agents "
         "publishes a native A2A interface, so co-hosted agents cannot send A2A "
         "tasks, messages, questions or stops to each other. For a local host "
-        f"set {PUBLIC_BASE_URL_ENV}=http://127.0.0.1:{config.host.port} and "
+        f"set {PUBLIC_BASE_URL_ENV}=http://127.0.0.1:{host_port} and "
         "KESTREL_A2A_PUSH_ENABLED=false."
     )
 

@@ -24,8 +24,12 @@ def _unpublished_warnings(records):
     ]
 
 
-async def _start_host(monkeypatch, tmp_path, caplog, *, agents):
-    """Run the real multi-agent lifespan to its yield over a stub manager."""
+async def _start_host(monkeypatch, tmp_path, caplog, *, started):
+    """Run the real multi-agent lifespan to its yield over a stub manager.
+
+    Every agent below is registered, but the stub load starts only the
+    ``started`` ones, as the real load leaves ``autostart=false`` rows cold.
+    """
     from kestrel_sovereign import host_features as hf
     from kestrel_sovereign import phoenix_supervisor as phoenix_module
     from kestrel_sovereign.multi_agent import agent_manager
@@ -35,12 +39,15 @@ async def _start_host(monkeypatch, tmp_path, caplog, *, agents):
         host=HostConfig(port=8877),
         agents={
             f"Agent{index}": LocalAgentConfig(
-                data_dir=tmp_path / f"agent{index}", port=8801 + index
+                data_dir=tmp_path / f"agent{index}",
+                port=8801 + index,
+                autostart=index < started,
             )
-            for index in range(agents)
+            for index in range(3)
         },
     )
-    seen_before_load = []
+    roster = tuple(config.get_autostart_agents())
+    seen_before_initialize = []
 
     class _Manager:
         init_failures = []
@@ -54,11 +61,14 @@ async def _start_host(monkeypatch, tmp_path, caplog, *, agents):
         def bind_hold_store(self, _store):
             return None
 
-        async def load_from_config(self, supplied, *, restart_roster_reconciled):
+        async def load_from_config(
+            self, supplied, *, restart_roster_reconciled, before_initialize
+        ):
             assert supplied is config and restart_roster_reconciled is True
+            before_initialize(roster)
             # No agent has initialized, so none can have attempted a send.
-            seen_before_load.extend(_unpublished_warnings(caplog.records))
-            return agents
+            seen_before_initialize.extend(_unpublished_warnings(caplog.records))
+            return len(roster)
 
         def list_agents(self):
             return {}
@@ -98,16 +108,18 @@ async def _start_host(monkeypatch, tmp_path, caplog, *, agents):
     app = FastAPI()
     async with server._lifespan_startup(app):
         assert app.state.startup_error is None
-    return seen_before_load
+    return seen_before_initialize
 
 
 async def test_two_agent_host_without_base_url_warns_once_before_agents_load(
     monkeypatch, tmp_path, caplog
 ):
     monkeypatch.delenv("KESTREL_BASE_URL", raising=False)
-    seen_before_load = await _start_host(monkeypatch, tmp_path, caplog, agents=2)
+    seen_before_initialize = await _start_host(
+        monkeypatch, tmp_path, caplog, started=2
+    )
     [warning] = _unpublished_warnings(caplog.records)
-    assert seen_before_load == [warning]
+    assert seen_before_initialize == [warning]
     message = warning.getMessage()
     assert "none of this host's 2 agents publishes a native A2A interface" in message
     assert "KESTREL_BASE_URL=http://127.0.0.1:8877" in message
@@ -115,16 +127,16 @@ async def test_two_agent_host_without_base_url_warns_once_before_agents_load(
 
 
 @pytest.mark.parametrize(
-    ("agents", "base_url"),
+    ("started", "base_url"),
     [(1, None), (2, "http://127.0.0.1:8877")],
-    ids=["single-agent", "base-url-set"],
+    ids=["single-agent-with-cold-registrations", "base-url-set"],
 )
 async def test_host_that_can_publish_or_has_no_peer_does_not_warn(
-    monkeypatch, tmp_path, caplog, agents, base_url
+    monkeypatch, tmp_path, caplog, started, base_url
 ):
     if base_url is None:
         monkeypatch.delenv("KESTREL_BASE_URL", raising=False)
     else:
         monkeypatch.setenv("KESTREL_BASE_URL", base_url)
-    await _start_host(monkeypatch, tmp_path, caplog, agents=agents)
+    await _start_host(monkeypatch, tmp_path, caplog, started=started)
     assert _unpublished_warnings(caplog.records) == []
