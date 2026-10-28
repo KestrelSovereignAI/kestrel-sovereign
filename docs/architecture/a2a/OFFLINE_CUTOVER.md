@@ -139,8 +139,7 @@ an agent first sends it, with "this host has no KESTREL_BASE_URL".
 
 For a local or self-hosted host, set the host's own loopback origin with no
 path, using the `[host]` port from `multi_agent.toml`, and disable push. Add
-these two lines to the project `.env`, which both `kestrel start` and
-`kestrel doctor` read:
+these two lines to the project `.env`, which `kestrel start` reads:
 
 ```ini
 KESTREL_BASE_URL=http://127.0.0.1:8888
@@ -152,10 +151,10 @@ shell assignment does not reach the host process. The project `.env`
 overrides an exported value for `kestrel start`, so a stale entry there wins.
 
 Co-hosted sends poll their peer tasks. Push delivery additionally needs
-`KESTREL_DATA_KEY` and a process identity. A host started without
-`KESTREL_BASE_URL` logs one startup warning naming it, and `kestrel doctor`
-reports the same warning before the host starts. A public deployment sets its
-stable public origin and `KESTREL_A2A_DISCOVERY_AGENT` instead (#3819).
+`KESTREL_DATA_KEY` and a process identity. A host that starts two or more
+agents without `KESTREL_BASE_URL` logs one startup warning naming it, before
+any agent initializes. A public deployment sets its stable public origin and
+`KESTREL_A2A_DISCOVERY_AGENT` instead (#3819).
 
 Start the native host only after its release gates pass. Verify historical task
 reads, context ownership, a fresh native exchange, and the absence of new wakes

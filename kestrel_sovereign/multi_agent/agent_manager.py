@@ -991,220 +991,6 @@ def _identity_bound_dids(stable_did: str, identity: object) -> frozenset[str]:
     return frozenset({stable_did, *identity_dids})
 
 
-class AmbiguousColdAuthorityParentError(RuntimeError):
-    """Two cold registrations claim the parent an active child needs.
-
-    Host startup refuses rather than boot either, since booting the wrong
-    one would hand the child's authority to another identity.
-    """
-
-
-async def required_cold_authority_names(
-    config: MultiAgentConfig,
-    *,
-    authority_records: tuple[SpawnAuthorityWitness, ...],
-    loaded_dids: frozenset[str],
-    base_data_dir: Path,
-    master_key: str | None = None,
-) -> frozenset[str]:
-    """Find cold ancestors that active signed children require at boot.
-
-    ``autostart=false`` remains the operator's durable policy.  This only
-    widens the effective boot set when an explicitly active descendant
-    cannot verify or publish without that ancestor in memory.
-
-    It reads and never writes: the host's spawn authority records, and each
-    cold candidate's identity through an ``INSPECTION`` anchor read.
-    ``loaded_dids`` are identities already in memory, which need no cold
-    boot. ``master_key`` decrypts a candidate's identity aliases; ``None``
-    reads ``KESTREL_DATA_KEY`` from this process.
-    """
-
-    active_records = tuple(
-        witness for witness in authority_records if witness.active
-    )
-    if not active_records:
-        return frozenset()
-
-    config_names = {
-        name.casefold(): name
-        for name, candidate in config.agents.items()
-        if isinstance(candidate, LocalAgentConfig)
-    }
-    by_child_did = {witness.child_did: witness for witness in active_records}
-    frontier: list[str] = []
-    for witness in active_records:
-        name = config_names.get(witness.child_name.casefold())
-        if name is None:
-            continue
-        candidate = config.agents[name]
-        if isinstance(candidate, LocalAgentConfig) and candidate.autostart:
-            frontier.append(witness.child_did)
-    if not frontier:
-        return frozenset()
-
-    required_parent_dids: set[str] = set()
-    while frontier:
-        child_did = frontier.pop()
-        witness = by_child_did.get(child_did)
-        if witness is None or witness.parent_did in loaded_dids:
-            continue
-        parent_did = witness.parent_did
-        if parent_did in required_parent_dids:
-            continue
-        required_parent_dids.add(parent_did)
-        if parent_did in by_child_did:
-            frontier.append(parent_did)
-
-    required_names: set[str] = set()
-    unresolved_root_dids = set(required_parent_dids)
-    for parent_did in required_parent_dids:
-        parent_witness = by_child_did.get(parent_did)
-        if parent_witness is None:
-            continue
-        unresolved_root_dids.discard(parent_did)
-        name = config_names.get(parent_witness.child_name.casefold())
-        if name is None:
-            continue
-        candidate = config.agents[name]
-        if isinstance(candidate, LocalAgentConfig) and not candidate.autostart:
-            required_names.add(name)
-
-    if not unresolved_root_dids:
-        return frozenset(required_names)
-
-    witnessed_names = {
-        witness.child_name.casefold() for witness in active_records
-    }
-    matched_roots: dict[str, str] = {}
-    for name, candidate in config.agents.items():
-        if (
-            not isinstance(candidate, LocalAgentConfig)
-            or candidate.autostart
-            or name.casefold() in witnessed_names
-        ):
-            continue
-        try:
-            resolved_dir = candidate.resolve_data_dir(base_data_dir)
-            anchored_did = await read_anchor_agent_did(
-                str(resolved_dir),
-                mode=AgentDIDLookupMode.INSPECTION,
-            )
-        except Exception:
-            logger.debug(
-                "Cold startup candidate %r could not be read while "
-                "resolving authority dependencies",
-                name,
-                exc_info=True,
-            )
-            continue
-        bound_dids = frozenset({anchored_did})
-        if anchored_did not in unresolved_root_dids:
-            try:
-                from kestrel_sovereign.identity.runtime_identity import (
-                    load_agent_identity,
-                )
-                from kestrel_sovereign.identity.signing import get_key_id
-
-                legacy_key_id = (
-                    None
-                    if anchored_did.startswith("did:web:")
-                    else get_key_id(anchored_did)
-                )
-                identity = await asyncio.to_thread(
-                    load_agent_identity,
-                    legacy_key_id,
-                    storage_dir=resolved_dir,
-                    master_key=master_key,
-                )
-                bound_dids = _identity_bound_dids(anchored_did, identity)
-            except Exception:
-                logger.debug(
-                    "Cold startup candidate %r could not load its verified "
-                    "identity aliases while resolving authority dependencies",
-                    name,
-                    exc_info=True,
-                )
-                continue
-        matched_dids = bound_dids.intersection(unresolved_root_dids)
-        if not matched_dids:
-            continue
-        for matched_did in matched_dids:
-            previous = matched_roots.get(matched_did)
-            if previous is not None:
-                raise AmbiguousColdAuthorityParentError(
-                    "Cold authority parent has ambiguous startup registrations"
-                )
-            matched_roots[matched_did] = name
-        required_names.add(name)
-
-    return frozenset(required_names)
-
-
-def startup_roster_candidates(
-    config: MultiAgentConfig,
-    *,
-    required_cold_names: frozenset[str],
-    base_data_dir: Path,
-) -> tuple[tuple[str, LocalAgentConfig], ...]:
-    """The local registrations a load of ``config`` starts, in config order.
-
-    That is every ``autostart`` registration and every cold ancestor in
-    ``required_cold_names``, less a spawned child whose identity-bound
-    retirement marker denies its boot. A remote registration, or an
-    ``autostart=false`` one no active child needs, is not started.
-    """
-
-    selected: list[tuple[str, LocalAgentConfig]] = []
-    for name, agent_cfg in config.agents.items():
-        if not isinstance(agent_cfg, LocalAgentConfig):
-            logger.info(f"Skipping remote agent '{name}' (not supported in-process)")
-            continue
-        if not agent_cfg.autostart and name not in required_cold_names:
-            logger.info(f"Skipping agent '{name}' (autostart=false)")
-            continue
-        if spawn_retirement_denies_startup(agent_cfg.resolve_data_dir(base_data_dir)):
-            continue
-        selected.append((name, agent_cfg))
-    return tuple(selected)
-
-
-async def read_startup_roster(
-    config: MultiAgentConfig,
-    *,
-    base_data_dir: Path,
-    master_key: str | None = None,
-) -> tuple[str, ...]:
-    """Name the agents a host started on ``config`` would start, writing nothing.
-
-    This is the selection ``AgentManager.load_from_config`` makes before it
-    initializes any agent, read from the same durable spawn authority under
-    ``base_data_dir``, for a host with nothing loaded yet. It takes ``config``
-    as the host's reconciled roster: before loading, host startup repairs the
-    roster against that authority: it restores a child row a crash left out
-    of ``multi_agent.toml``, drops the row of a retired or uncommitted spawn,
-    and retires an expired witness. That repair writes, so it is not
-    repeated here.
-    """
-
-    base = Path(base_data_dir).expanduser().resolve()
-    required = await required_cold_authority_names(
-        config,
-        authority_records=SpawnAuthorityRegistry(base).records(),
-        loaded_dids=frozenset(),
-        base_data_dir=base,
-        master_key=master_key,
-    )
-    return tuple(
-        name
-        for name, _agent_cfg in startup_roster_candidates(
-            config,
-            required_cold_names=required,
-            base_data_dir=base,
-        )
-    )
-
-
 @dataclass
 class _HostContextPublicationState:
     """Shared host registry generation observed by initializing agents."""
@@ -7149,17 +6935,137 @@ class AgentManager:
         *,
         authority_roots: frozenset[str] | None,
     ) -> frozenset[str]:
-        """Find cold ancestors that active signed children of this host need."""
+        """Find cold ancestors that active signed children require at boot.
+
+        ``autostart=false`` remains the operator's durable policy.  This only
+        widens the effective boot set when an explicitly active descendant
+        cannot verify or publish without that ancestor in memory.
+        """
+
+        active_records = tuple(
+            witness
+            for witness in self._selected_spawn_authority_records(authority_roots)
+            if witness.active
+        )
+        if not active_records:
+            return frozenset()
+
+        config_names = {
+            name.casefold(): name
+            for name, candidate in config.agents.items()
+            if isinstance(candidate, LocalAgentConfig)
+        }
+        by_child_did = {witness.child_did: witness for witness in active_records}
+        frontier: list[str] = []
+        for witness in active_records:
+            name = config_names.get(witness.child_name.casefold())
+            if name is None:
+                continue
+            candidate = config.agents[name]
+            if isinstance(candidate, LocalAgentConfig) and candidate.autostart:
+                frontier.append(witness.child_did)
+        if not frontier:
+            return frozenset()
 
         loaded_dids = set(authority_roots or ())
         for loaded_agent in self._agents.values():
             loaded_dids.update(_loaded_agent_bound_dids(loaded_agent))
-        return await required_cold_authority_names(
-            config,
-            authority_records=self._selected_spawn_authority_records(authority_roots),
-            loaded_dids=frozenset(loaded_dids),
-            base_data_dir=self._base_data_dir,
-        )
+
+        required_parent_dids: set[str] = set()
+        while frontier:
+            child_did = frontier.pop()
+            witness = by_child_did.get(child_did)
+            if witness is None or witness.parent_did in loaded_dids:
+                continue
+            parent_did = witness.parent_did
+            if parent_did in required_parent_dids:
+                continue
+            required_parent_dids.add(parent_did)
+            if parent_did in by_child_did:
+                frontier.append(parent_did)
+
+        required_names: set[str] = set()
+        unresolved_root_dids = set(required_parent_dids)
+        for parent_did in required_parent_dids:
+            parent_witness = by_child_did.get(parent_did)
+            if parent_witness is None:
+                continue
+            unresolved_root_dids.discard(parent_did)
+            name = config_names.get(parent_witness.child_name.casefold())
+            if name is None:
+                continue
+            candidate = config.agents[name]
+            if isinstance(candidate, LocalAgentConfig) and not candidate.autostart:
+                required_names.add(name)
+
+        if not unresolved_root_dids:
+            return frozenset(required_names)
+
+        witnessed_names = {
+            witness.child_name.casefold() for witness in active_records
+        }
+        matched_roots: dict[str, str] = {}
+        for name, candidate in config.agents.items():
+            if (
+                not isinstance(candidate, LocalAgentConfig)
+                or candidate.autostart
+                or name.casefold() in witnessed_names
+            ):
+                continue
+            try:
+                resolved_dir = candidate.resolve_data_dir(self._base_data_dir)
+                anchored_did = await read_anchor_agent_did(
+                    str(resolved_dir),
+                    mode=AgentDIDLookupMode.INSPECTION,
+                )
+            except Exception:
+                logger.debug(
+                    "Cold startup candidate %r could not be read while "
+                    "resolving authority dependencies",
+                    name,
+                    exc_info=True,
+                )
+                continue
+            bound_dids = frozenset({anchored_did})
+            if anchored_did not in unresolved_root_dids:
+                try:
+                    from kestrel_sovereign.identity.runtime_identity import (
+                        load_agent_identity,
+                    )
+                    from kestrel_sovereign.identity.signing import get_key_id
+
+                    legacy_key_id = (
+                        None
+                        if anchored_did.startswith("did:web:")
+                        else get_key_id(anchored_did)
+                    )
+                    identity = await asyncio.to_thread(
+                        load_agent_identity,
+                        legacy_key_id,
+                        storage_dir=resolved_dir,
+                    )
+                    bound_dids = _identity_bound_dids(anchored_did, identity)
+                except Exception:
+                    logger.debug(
+                        "Cold startup candidate %r could not load its verified "
+                        "identity aliases while resolving authority dependencies",
+                        name,
+                        exc_info=True,
+                    )
+                    continue
+            matched_dids = bound_dids.intersection(unresolved_root_dids)
+            if not matched_dids:
+                continue
+            for matched_did in matched_dids:
+                previous = matched_roots.get(matched_did)
+                if previous is not None:
+                    raise RuntimeError(
+                        "Cold authority parent has ambiguous startup registrations"
+                    )
+                matched_roots[matched_did] = name
+            required_names.add(name)
+
+        return frozenset(required_names)
 
     def reconcile_spawn_authority_restart_roster(
         self,
@@ -7263,11 +7169,11 @@ class AgentManager:
                 this after seeding the shared scheduler protocol; ordinary
                 callers leave it false so restart authority is still enforced.
             before_initialize: Called once with the names this load starts,
-                in config order, before any of them initializes: the
-                ``autostart`` registrations plus any cold ancestor an active
-                signed child needs, less durably retired children. An
-                ``autostart=false`` registration no child needs is not among
-                them.
+                in config order, before any of them is admitted or
+                initialized: the ``autostart`` registrations plus any cold
+                ancestor an active signed child needs, less durably retired
+                children. An ``autostart=false`` registration no child needs
+                is not among them. An exception it raises propagates.
 
         Returns:
             Number of agents successfully loaded.
@@ -7294,7 +7200,7 @@ class AgentManager:
                     witness.mandate,
                     authority_parent_did=witness.parent_did,
                 )
-        required_cold_names = await self._required_cold_authority_names(
+        required_cold_authority_names = await self._required_cold_authority_names(
             config,
             authority_roots=authority_roots,
         )
@@ -7313,11 +7219,17 @@ class AgentManager:
             if isinstance(agent_cfg, LocalAgentConfig):
                 self._reserved_ports.add(agent_cfg.port)
         pending: list[tuple[str, LocalAgentConfig]] = []
-        for name, agent_cfg in startup_roster_candidates(
-            config,
-            required_cold_names=required_cold_names,
-            base_data_dir=self._base_data_dir,
-        ):
+        for name, agent_cfg in config.agents.items():
+            if not isinstance(agent_cfg, LocalAgentConfig):
+                logger.info(f"Skipping remote agent '{name}' (not supported in-process)")
+                continue
+            if not agent_cfg.autostart and name not in required_cold_authority_names:
+                logger.info(f"Skipping agent '{name}' (autostart=false)")
+                continue
+            if spawn_retirement_denies_startup(
+                agent_cfg.resolve_data_dir(self._base_data_dir)
+            ):
+                continue
             if authority_roots is not None:
                 existing_name = next(
                     (

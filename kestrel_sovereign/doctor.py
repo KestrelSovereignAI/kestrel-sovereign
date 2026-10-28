@@ -35,10 +35,6 @@ Checks performed:
   - Every pinned semantic resource still matches its manifest digest. One
     mismatch refuses agent boot wholesale, and a CRLF-smudged checkout breaks
     all of them at once — see ``_check_semantic_registry`` (#2924).
-  - A host that starts two or more local agents sets ``KESTREL_BASE_URL``.
-    Without it no agent publishes a native A2A interface, and every co-hosted
-    A2A send fails at send time — see ``_check_native_a2a_publication``
-    (#3872).
   - Every package core's ``uv.lock`` pins is installed at the locked version,
     so the host runs what CI tested. A mismatch is reported, never repaired —
     see ``_check_core_lock`` (#3502).
@@ -49,7 +45,6 @@ This is deliberately minimal. We avoid reaching out to Ollama / OpenAI
 
 from __future__ import annotations
 
-import asyncio
 import hashlib
 import json
 import os
@@ -58,7 +53,6 @@ import sqlite3
 import subprocess
 import sys
 from collections.abc import Callable
-from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing
 from dataclasses import dataclass, field, replace
 from pathlib import Path
@@ -161,76 +155,10 @@ def diagnose(project_dir: Path) -> DoctorReport:
     _check_sqlite_hold_readiness(resolved, project_dir, report)
     _check_postgres_hold_readiness(resolved, project_dir, readings, report)
     _check_legacy_identity_exports(project_dir, report)
-    _check_native_a2a_publication(multi_agent, project_dir, resolved, report)
     _check_semantic_registry(report)
     _check_core_lock(report)
 
     return report
-
-
-def _check_native_a2a_publication(
-    multi_agent: MultiAgentConfig | None,
-    project_dir: Path,
-    env: dict,
-    report: DoctorReport,
-) -> None:
-    """Warn, before any agent tries a send, that co-hosted A2A cannot work.
-
-    The host starts healthy without a public base URL, and each co-hosted send
-    fails only when it is attempted (#3872). This reports the warning the host
-    logs at startup, read from the environment ``kestrel start`` hands the host.
-
-    It counts the agents the host starts, selected by the host's own
-    ``read_startup_roster``: the ``autostart`` registrations, plus any
-    ``autostart=false`` parent an active signed child needs, less a durably
-    retired child. An ``autostart=false`` registration no child needs is never
-    started, so it is no co-hosted peer.
-    """
-    if multi_agent is None:
-        return
-    from kestrel_sovereign.a2a.native_publication import unpublished_cohost_warning
-    from kestrel_sovereign.multi_agent.agent_manager import (
-        AmbiguousColdAuthorityParentError,
-        read_startup_roster,
-    )
-
-    def read_roster() -> tuple[str, ...]:
-        return asyncio.run(
-            read_startup_roster(
-                multi_agent,
-                base_data_dir=project_dir,
-                master_key=env.get("KESTREL_DATA_KEY") or None,
-            )
-        )
-
-    try:
-        # ``diagnose`` is synchronous but may be called from a coroutine, where
-        # ``asyncio.run`` refuses; its own loop on its own thread works in both.
-        with ThreadPoolExecutor(
-            max_workers=1, thread_name_prefix="kestrel-doctor-roster"
-        ) as pool:
-            started = pool.submit(read_roster).result()
-    except (
-        OSError,
-        ValueError,
-        TypeError,
-        AmbiguousColdAuthorityParentError,
-    ) as exc:
-        # The host's spawn authority is unreadable, or two cold registrations
-        # claim one required parent. Host startup stops on either; report it
-        # here and let the remaining checks run.
-        report.warn.append(
-            "Could not check native A2A publication: reading which agents "
-            f"this host starts failed: {exc}"
-        )
-        return
-    warning = unpublished_cohost_warning(
-        env,
-        agents=len(started),
-        host_port=multi_agent.host.port,
-    )
-    if warning is not None:
-        report.warn.append(warning)
 
 
 def _check_core_lock(report: DoctorReport) -> None:

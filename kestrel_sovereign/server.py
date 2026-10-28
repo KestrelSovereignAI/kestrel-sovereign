@@ -3842,9 +3842,6 @@ async def _lifespan_startup(app: FastAPI):
             # DID's durable protocol row before concurrent agent
             # initialization and post-load default seeding.
             await _prepare_shared_postgres_scheduler_protocol(app, manager, config)
-            from kestrel_sovereign.a2a.native_publication import (
-                unpublished_cohost_warning,
-            )
 
             def _warn_unpublished_cohosts(roster: tuple[str, ...]) -> None:
                 # Onboarding reads publication from this same environment.
@@ -3852,11 +3849,25 @@ async def _lifespan_startup(app: FastAPI):
                 # say so before any agent can attempt a co-hosted send. The
                 # roster is what this load starts: an autostart=false
                 # registration is not a co-hosted peer (#3872).
-                unpublished = unpublished_cohost_warning(
-                    multi_agent_runtime_env,
-                    agents=len(roster),
-                    host_port=config.host.port,
-                )
+                try:
+                    from kestrel_sovereign.a2a.native_publication import (
+                        unpublished_cohost_warning,
+                    )
+
+                    unpublished = unpublished_cohost_warning(
+                        multi_agent_runtime_env,
+                        agents=len(roster),
+                        host_port=config.host.port,
+                    )
+                except Exception:
+                    # A diagnostic must never stop the host it describes:
+                    # load_from_config propagates this hook's exceptions.
+                    logger.warning(
+                        "Could not check whether this host publishes native "
+                        "A2A for its co-hosted agents",
+                        exc_info=True,
+                    )
+                    return
                 if unpublished is not None:
                     logger.warning(unpublished)
 

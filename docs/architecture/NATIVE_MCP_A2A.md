@@ -455,13 +455,14 @@ configuration refuses publication.
 Co-hosted agents reach each other through those same published routes, so a
 multi-agent host without `KESTREL_BASE_URL` cannot deliver any co-hosted A2A
 send. When the host starts two or more local agents it logs one startup
-warning naming the variable, and `kestrel doctor` reports it. Only started
+warning naming the variable, before any agent initializes. Only started
 agents count: a registration with `autostart = false` is left cold unless an
-active signed child needs it. Each co-hosted
-send then fails with "this host has no KESTREL_BASE_URL", not only with the
-peer's missing interface. A local host sets `KESTREL_BASE_URL=http://127.0.0.1:<port>` explicitly; the
-warning names the configured port as advice, never as a substituted URL. See
-the [offline cutover runbook](a2a/OFFLINE_CUTOVER.md#start-the-native-host).
+active signed child needs it. The warning is diagnostic only and never stops
+the host. Each co-hosted send then fails with "this host has no
+KESTREL_BASE_URL", not only with the peer's missing interface. A local host
+sets `KESTREL_BASE_URL=http://127.0.0.1:<port>` explicitly; the warning names
+the configured port as advice, never as a substituted URL. See the
+[offline cutover runbook](a2a/OFFLINE_CUTOVER.md#start-the-native-host).
 
 The implementation uses the published SDK selected by Core's dependency
 manifest, including the reviewed signing and HTTP-authorization repairs.
