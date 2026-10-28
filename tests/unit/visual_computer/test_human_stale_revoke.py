@@ -202,8 +202,13 @@ async def test_pending_human_revoke_cannot_adopt_later_control_serial(
             'expected_control_epoch': lease.request.control_epoch,
             'operation': 'pause' if control == 'stop' else 'takeover'})
         assert control_reply.status_code == 200, control_reply.text
-        assert control_reply.json()['control_epoch'] > lease.request.control_epoch
-        assert control_reply.json()['controller'] == ('none' if control == 'stop' else 'human')
+        if control == 'stop':
+            assert control_reply.json() == {'session_id': sid, 'stopped': True}
+        status_reply = await client.get(base, headers=AUTH)
+        assert status_reply.status_code == 200, status_reply.text
+        current_session = status_reply.json()['session']
+        assert current_session['control_epoch'] > lease.request.control_epoch
+        assert current_session['controller'] == ('none' if control == 'stop' else 'human')
         serial = runtime._control_serials[key]
         assert key in runtime._fences
         terminal, ciphertext = await observed_original_human(repository, lease)
