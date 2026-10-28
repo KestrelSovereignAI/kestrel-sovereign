@@ -66,6 +66,7 @@ from .discovery_deadline import (
 )
 from .model_metadata import ModelInfo, ModelCategory
 from .image_utils import get_base64_only
+from .generation_gate import NoCompletionEvidenceError
 from .output_ceiling import (
     OutputCapReachedError,
     attach_stop_reason,
@@ -722,11 +723,11 @@ class OllamaAdapter(LLMAdapter):
                     report_call_progress()
                     if terminal is not None:
                         raise ValueError("Ollama sent an event after its terminal response")
-                    message = chunk.get("message", {}) if isinstance(chunk, dict) else chunk.message
-                    raw_content = message.get("content") if isinstance(message, dict) else message.content
-                    raw_thinking = message.get("thinking") if isinstance(message, dict) else message.thinking
-                    calls = message.get("tool_calls") if isinstance(message, dict) else message.tool_calls
-                    probabilities = chunk.get("logprobs") if isinstance(chunk, dict) else chunk.logprobs
+                    message = chunk.message
+                    raw_content = message.content
+                    raw_thinking = message.thinking
+                    calls = message.tool_calls
+                    probabilities = chunk.logprobs
                     if probabilities is not None:
                         logprobs_seen = True
                         logprobs.extend(probabilities)
@@ -751,7 +752,7 @@ class OllamaAdapter(LLMAdapter):
                         if generated_chunks > budget:
                             raise self._output_cap_reached(model, budget,
                                 input_tokens=input_tokens, output_tokens=output_tokens)
-                    done = chunk.get("done") if isinstance(chunk, dict) else chunk.done
+                    done = chunk.done
                     if done is True:
                         terminal = chunk
             finally:
@@ -759,15 +760,12 @@ class OllamaAdapter(LLMAdapter):
                 # response custody retains the original close and its debt.
                 await close_native_execution_stream(stream, self)
             if terminal is None:
-                from .generation_gate import NoCompletionEvidenceError
                 raise NoCompletionEvidenceError(provider="ollama", model=model)
             fields = {"content": "".join(content) if content_seen else None,
                       "thinking": "".join(thinking) if thinking_seen else None,
                       "tool_calls": tool_calls or None}
             counts = {"prompt_eval_count": input_tokens, "eval_count": output_tokens,
                       "logprobs": logprobs if logprobs_seen else None}
-            if isinstance(terminal, dict):
-                return {**terminal, **counts, "message": {**terminal["message"], **fields}}
             return terminal.model_copy(update={**counts,
                 "message": terminal.message.model_copy(update=fields)})
 
@@ -830,7 +828,7 @@ class OllamaAdapter(LLMAdapter):
             # separate raw_request contract, not a lazy iterator as an answer.
             if extra_kwargs.pop("stream", False) is not False:
                 raise ollama.RequestError(
-                    "Ollama logical completions do not accept raw stream=True"
+                    "Ollama logical completions require raw stream=False"
                 )
             response = await await_or_cancelled(
                 self._final_chat_response(client, model=model, messages=messages,

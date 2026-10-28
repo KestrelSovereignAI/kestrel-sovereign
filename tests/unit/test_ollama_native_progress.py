@@ -1,11 +1,12 @@
 """Actual Ollama SDK/native HTTP/watchdog; synthetic protocol, never inference."""
 
 import asyncio
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, contextmanager
 import json
 import os
 from pathlib import Path
 import time
+import sys
 
 import ollama
 import pytest
@@ -19,7 +20,7 @@ from kestrel_sovereign.execution_custody import (
     bind_execution_custody, execution_cleanup_debts, owned_native_http_client,
 )
 from kestrel_sovereign.llm.adapter import LLMResponse
-from kestrel_sovereign.llm.call_progress import call_progress_listener
+from kestrel_sovereign.llm.call_progress import call_progress_listener, report_call_progress
 from kestrel_sovereign.llm.generation_gate import NoCompletionEvidenceError, judge_generation
 from kestrel_sovereign.llm.ollama_adapter import OllamaAdapter
 
@@ -27,6 +28,33 @@ MODEL = 'owned-native-protocol-only'
 MESSAGES = [{'role': 'user', 'content': 'Protocol fixture only'}]
 TOOLS = [{'type': 'function', 'function': {'name': 'lookup', 'parameters': {}}}]
 BOUND = .3  # Existing real watchdog test scale; no production timeout change.
+
+
+@contextmanager
+def _observed_progress_calls():
+    """Observe original calls without replacing the watchdog's listener."""
+    previous = sys.getprofile()
+    report_code = report_call_progress.__code__
+    rearm_code = LLMCallWatchdog._rearm.__code__
+    observed = {'reports': [], 'watchdog_rearms': []}
+
+    def observe(frame, event, value):
+        if event == 'call':
+            if frame.f_code is report_code:
+                observed['reports'].append(id(frame))
+            elif frame.f_code is rearm_code:
+                caller = frame.f_back
+                if caller is not None and caller.f_code is report_code:
+                    observed['watchdog_rearms'].append(
+                        (id(caller), id(frame.f_locals['self'])))
+        if previous is not None:
+            previous(frame, event, value)
+
+    sys.setprofile(observe)
+    try:
+        yield observed
+    finally:
+        sys.setprofile(previous)
 
 
 class Peer:
@@ -166,7 +194,6 @@ async def peer(request, tmp_path):
         root.mkdir(exist_ok=True)
         (root / (request.node.name + '.json')).write_text(json.dumps({
             'requests': peer.requests, 'writes': peer.writes, 'cleanup': cleanup,
-            'synthetic_native_protocol_only': True, 'actual_model_call': False,
         }, indent=2) + '\n')
 
 
@@ -176,22 +203,26 @@ async def test_original_logical_completion_survives_continued_native_payload(pee
     async with peer.client() as client:
         adapter = OllamaAdapter()
         watchdog = LLMCallWatchdog(BOUND)
-        try:
-            if entry == 'direct':
-                response = await watchdog.call(adapter.get_response(
-                    client, MODEL, MESSAGES, tools=TOOLS))
-            else:
-                seen = [item async for item in watchdog.watch(
-                    adapter.get_streaming_response_with_tools(client, MODEL, MESSAGES, tools=TOOLS))]
-                response, = [item for item in seen if isinstance(item, LLMResponse)]
-        except LLMCallInactivityTimeout as original:
-            assert len(peer.requests) == 1 and peer.requests[0]['body']['stream'] is False
-            assert len(peer.writes) >= 3
-            raise AssertionError('Native HTTP body progressed but logical completion went falsely idle') from original
+        with _observed_progress_calls() as observed:
+            try:
+                if entry == 'direct':
+                    response = await watchdog.call(adapter.get_response(
+                        client, MODEL, MESSAGES, tools=TOOLS))
+                else:
+                    seen = [item async for item in watchdog.watch(
+                        adapter.get_streaming_response_with_tools(client, MODEL, MESSAGES, tools=TOOLS))]
+                    response, = [item for item in seen if isinstance(item, LLMResponse)]
+            except LLMCallInactivityTimeout as original:
+                assert len(peer.requests) == 1 and peer.requests[0]['body']['stream'] is False
+                assert len(peer.writes) >= 3
+                raise AssertionError('Native HTTP body progressed but logical completion went falsely idle') from original
         assert response.content == 'Finished protocol response'
         assert response.tool_calls[0].name == 'lookup'
         assert response.input_tokens == 3 and response.output_tokens == 5
         assert len(peer.requests) == 1
+        assert len(observed['reports']) == len(peer.writes)
+        assert observed['watchdog_rearms'] == [
+            (report, id(watchdog)) for report in observed['reports']]
 
 
 @pytest.mark.asyncio
@@ -207,13 +238,14 @@ async def test_existing_native_stream_control_survives_beyond_idle_window(peer):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize('stream', ['default', False, True], ids=['default', 'false', 'true'])
+@pytest.mark.parametrize('stream', ['default', False, True, None, 0],
+                         ids=['default', 'false', 'true', 'none', 'zero'])
 async def test_logical_raw_stream_options_keep_final_shape(peer, stream):
     peer.cadence = 0
     async with peer.client() as client:
         kwargs = {} if stream == 'default' else {'request_options': RequestOptions(raw={'stream': stream})}
-        if stream is True:
-            with pytest.raises(ollama.RequestError, match='raw stream=True'):
+        if stream != 'default' and stream is not False:
+            with pytest.raises(ollama.RequestError, match='raw stream=False'):
                 await OllamaAdapter().get_response(client, MODEL, MESSAGES, tools=TOOLS, **kwargs)
             assert peer.requests == []
         else:
@@ -226,13 +258,13 @@ async def test_logical_raw_stream_options_keep_final_shape(peer, stream):
 @pytest.mark.parametrize('mode', ['silent', 'partial-record'])
 async def test_unparsed_or_absent_wire_bytes_do_not_report_progress(peer, mode):
     peer.mode = mode
-    reports = []
     async with peer.client() as client:
-        with call_progress_listener(lambda: reports.append(())):
+        with _observed_progress_calls() as observed:
             with pytest.raises(LLMCallInactivityTimeout):
                 await LLMCallWatchdog(BOUND).call(
                     OllamaAdapter().get_response(client, MODEL, MESSAGES, tools=TOOLS))
-        assert reports == []
+        assert observed['reports'] == []
+        assert observed['watchdog_rearms'] == []
         assert len(peer.requests) == 1
         if mode == 'partial-record':
             assert len(peer.writes) >= 3
@@ -285,6 +317,28 @@ async def test_aggregate_preserves_complete_tool_order_usage_and_private_progres
         assert request['think'] is False and request['options']['num_ctx'] == 32768
         assert request['tools'] == [ollama.Tool(**tool).model_dump(exclude_none=True) for tool in TOOLS]
         assert judge_generation(response) is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('content', ['absent', None, ''], ids=['absent', 'null', 'empty'])
+async def test_native_optional_message_fields_preserve_the_sdk_terminal(peer, content):
+    peer.cadence = 0
+    terminal = {'model': MODEL, 'message': {'role': 'assistant'},
+                'done': True, 'done_reason': 'stop'}
+    if content != 'absent':
+        terminal['message']['content'] = content
+    peer.values = [
+        {'model': MODEL, 'message': {'role': 'assistant', 'content': 'A'}, 'done': False},
+        terminal,
+    ]
+    async with peer.client() as client:
+        response = await OllamaAdapter().get_response(client, MODEL, MESSAGES)
+        assert type(response.raw) is ollama.ChatResponse
+        assert type(response.raw.message) is ollama.Message
+        assert response.content == response.raw.message.content == 'A'
+        assert response.raw.message.thinking is None
+        assert response.raw.done is True and response.raw.done_reason == 'stop'
+        assert len(peer.requests) == 1
 
 
 @pytest.mark.asyncio

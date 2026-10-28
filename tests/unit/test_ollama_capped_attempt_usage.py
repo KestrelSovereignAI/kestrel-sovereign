@@ -69,13 +69,11 @@ def _capped(body: Dict[str, Any]) -> httpx.Response:
         prompt_eval_count=INPUT_TOKENS,
         eval_count=OUTPUT_TOKENS,
     )
-    if body.get("stream"):
-        # Text first; the counts and the stop reason arrive on the final
-        # (done) chunk.
-        return httpx.Response(
-            200, content=_line(_reply(done=False)) + _line(done),
-        )
-    return httpx.Response(200, json=done)
+    assert body["stream"] is True
+    # Text first; the counts and the stop reason arrive on the final chunk.
+    return httpx.Response(
+        200, content=_line(_reply(done=False)) + _line(done),
+    )
 
 
 #: How the turn reached Ollama, and whether ``/api/chat`` was streamed: a

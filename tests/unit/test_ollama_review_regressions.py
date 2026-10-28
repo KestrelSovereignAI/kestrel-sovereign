@@ -1,5 +1,6 @@
 """Review counterexamples: genuine SDK/owned loopback protocol, no inference."""
 import json
+from importlib.metadata import version
 from pathlib import Path
 import os
 import pytest
@@ -36,7 +37,7 @@ async def test_terminal_generation_failure_never_retries(peer, monkeypatch, kind
                 client, model, native.MESSAGES, tools=native.TOOLS, **kwargs)
         facts = {'error_type': type(caught.value).__name__, 'error_text': str(caught.value),
                  'requests': len(peer.requests), 'configured_cap': cap,
-                 'native_sdk': '0.6.1', 'retry_configuration_unmodified': True}
+                 'native_sdk': version('ollama')}
         if kind == 'cap':
             assert caught.value.cap == cap
             assert caught.value.usage.input_tokens == 3

@@ -83,9 +83,8 @@ class _Daemon:
 def _replying(content: str, *, done_reason: str = "stop") -> _Daemon:
     def respond(body: Dict[str, Any]) -> httpx.Response:
         reply = _chat_reply(content, done_reason=done_reason)
-        if body.get("stream"):
-            return httpx.Response(200, content=_line(reply))
-        return httpx.Response(200, json=reply)
+        assert body["stream"] is True
+        return httpx.Response(200, content=_line(reply))
 
     return _Daemon(respond)
 
