@@ -538,3 +538,65 @@ async def test_human_sdk_owner_cannot_register_itself_as_native_borrower(harness
         monkeypatch.setattr(extension, "observe", sdk)
         result = await h.runtime.human.observe(context, session.session_id, "human")
         assert result.control_id == "human" and not h.runtime.egress._calls
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("eager", [False, True])
+async def test_human_sdk_factory_accept_then_raise_joins_original_task_before_denial(
+    harness, monkeypatch, eager,
+):
+    """Actual Task admission fault; no physical browser behavior is claimed."""
+    from types import CodeType
+    from kestrel_sovereign.visual_computer.egress import _ActiveCall
+    from tests.unit.test_host_context_native_cleanup import _actual_operation
+
+    if eager and not hasattr(asyncio, "eager_task_factory"):
+        pytest.skip("eager native Tasks require Python 3.12 or later")
+    invoke_code, = (code for code in _ActiveCall.invoke_sdk.__code__.co_consts
+        if isinstance(code, CodeType) and code.co_name == "invoke")
+    h, context = harness, harness.context()
+    loop = asyncio.get_running_loop()
+    previous = loop.get_task_factory()
+    accepted, entries = [], []
+    original = RuntimeError("original SDK Task accepted before factory ACK failed")
+
+    def factory(loop, coroutine, **kwargs):
+        operation = _actual_operation(coroutine)
+        if not accepted and getattr(operation, "cr_code", None) is invoke_code:
+            if eager:
+                kwargs["eager_start"] = True
+            accepted.append(asyncio.Task(coroutine, loop=loop, **kwargs))
+            raise original
+        return (previous(loop, coroutine, **kwargs) if previous
+            else asyncio.Task(coroutine, loop=loop, **kwargs))
+
+    with h.bind(context):
+        session, lease, extension = await setup(h, context)
+        request = await input_request(h, context, session, lease)
+        act = extension.act
+        async def sdk(*args):
+            entries.append(args)
+            return await act(*args)
+        monkeypatch.setattr(extension, "act", sdk)
+        try:
+            loop.set_task_factory(factory)
+            with pytest.raises(RuntimeError) as caught:
+                await h.runtime.human.act(context, session.session_id, "human", request)
+            assert caught.value is original
+            # Assert before the test's final cleanup: Core must settle the
+            # exact accepted Task even when its SDK owner never bound itself.
+            assert len(accepted) == 1 and accepted[0].done()
+            assert accepted[0].exception() is original
+            assert not entries and extension.effects == 0
+            assert not h.runtime.egress._calls and h.runtime._inflight == 0
+        finally:
+            loop.set_task_factory(previous)
+            await asyncio.gather(*accepted, return_exceptions=True)
+        saved = await h.repository.action(h.runtime.scope(context), session.session_id,
+            request.action.action_id)
+        assert saved.channel == "human" and saved.control_id == "human"
+        assert saved.receipt.outcome == "denied"
+        assert saved.receipt.reason_code == "host_not_dispatched"
+        assert not await h.repository.has_pending_actions(h.runtime.scope(context), session.session_id)
+        replay = await h.runtime.human.act(context, session.session_id, "human", request)
+        assert replay.receipt == saved.receipt and not entries and extension.effects == 0
