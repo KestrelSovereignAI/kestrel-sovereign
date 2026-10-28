@@ -600,3 +600,253 @@ async def test_human_sdk_factory_accept_then_raise_joins_original_task_before_de
         assert not await h.repository.has_pending_actions(h.runtime.scope(context), session.session_id)
         replay = await h.runtime.human.act(context, session.session_id, "human", request)
         assert replay.receipt == saved.receipt and not entries and extension.effects == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("withdrawal", ["release", "caller", "expiry"])
+async def test_human_completed_native_borrower_does_not_hide_held_sdk_tail(
+    harness, monkeypatch, tmp_path, withdrawal,
+):
+    """Real host custody/Tasks with a controlled SDK, not browser conformance."""
+    from dataclasses import replace
+    from tests.unit.visual_computer.test_human import original_human_rpc
+
+    h, context = harness, harness.context()
+    with h.bind(context):
+        session, lease, extension = await setup(h, context)
+        assert VisualAction.HUMAN_INPUT.value in context.granted_actions
+        original_input = await input_request(h, context, session, lease)
+        original_frame_id = original_input.action.observation_id
+        observe, release_native = extension.observe, h.adapter.release
+        previous_policy = h.runtime.policy
+        if withdrawal == "expiry":
+            h.runtime.policy = replace(previous_policy, operation_seconds=0.2)
+        tail_entered, tail_finish = asyncio.Event(), asyncio.Event()
+        cleanup_entered, cleanup_finish = asyncio.Event(), asyncio.Event()
+        borrowers, owners, calls, frames = [], [], [], []
+        cleanup_interruptions, physical = [], []
+        facts = {"withdrawal": withdrawal, "physical_browser_claim": False}
+
+        async def sdk(*args):
+            call = original_human_rpc(h.runtime, session)
+            calls.append(call)
+            owners.append(asyncio.current_task())
+
+            async def borrowed():
+                async with h.runtime.egress.human_operation(
+                    session, human_operation_id("human", "observe"),
+                ) as check:
+                    borrowers.append(asyncio.current_task())
+                    check()
+                    value = await observe(*args)
+                    check()
+                    return value
+
+            outcome = await await_owned_operation(
+                borrowed(), retain_originals=True,
+                cancel_on_caller_cancellation=True,
+            )
+            value = raise_owned_outcome(
+                outcome, operation="original completed Human frame borrower",
+                retain_originals=True,
+            )
+            value.require_lease(lease, session, at=h.runtime._now())
+            assert value.observation.frame.observation_id != original_frame_id
+            assert borrowers[0] in call.accepted_jobs
+            assert borrowers[0].done() and call.accepted_jobs
+            assert all(task.done() for task in call.accepted_jobs)
+            assert call.sdk_owner is asyncio.current_task()
+            frames.append(value)
+            facts.update(
+                canonical_borrower_join_returned=True,
+                exact_completed_borrower_retained=True,
+                accepted_jobs_at_tail=len(call.accepted_jobs),
+                all_accepted_jobs_done_at_tail=True,
+            )
+            tail_entered.set()
+            try:
+                await tail_finish.wait()
+                return value
+            finally:
+                cleanup_entered.set()
+                try:
+                    await cleanup_finish.wait()
+                except asyncio.CancelledError as error:
+                    cleanup_interruptions.append(error)
+                    raise
+
+        async def release_original(scope, selected):
+            physical.append(selected)
+            assert cleanup_finish.is_set()
+            return await release_native(scope, selected)
+
+        monkeypatch.setattr(extension, "observe", sdk)
+        monkeypatch.setattr(h.adapter, "release", release_original)
+        original_call = asyncio.create_task(
+            h.runtime.human.observe(context, session.session_id, "human"),
+        )
+        release = None
+        try:
+            await asyncio.wait_for(tail_entered.wait(), 5)
+            async with h.runtime.operation(context, VisualAction.HUMAN_VIEW) as check:
+                stored = await h.runtime.human._record(
+                    h.runtime.scope(context), session.session_id, "human", check=check,
+                )
+            assert stored.frame.frame.observation_id == original_frame_id
+            assert not original_call.done() and not cleanup_entered.is_set()
+            if withdrawal == "release":
+                release = asyncio.create_task(h.runtime.release(context, session.session_id))
+            elif withdrawal == "caller":
+                original_call.cancel()
+            # Expiry uses the original operation timer, not a test cancellation.
+            await asyncio.wait_for(cleanup_entered.wait(), 5)
+            assert not original_call.done() and not physical
+            assert release is None or not release.done()
+            assert not cleanup_interruptions
+        finally:
+            facts.update(
+                cleanup_entered_before_test_unblocked=cleanup_entered.is_set(),
+                original_call_done_before_test_unblocked=original_call.done(),
+                release_ack_before_test_unblocked=release.done() if release is not None else False,
+                provider_release_before_test_unblocked=len(physical),
+                accepted_jobs_done_before_test_unblocked=(
+                    all(task.done() for task in calls[0].accepted_jobs) if calls else False
+                ),
+            )
+            # These exact original gates are the finite failure cleanup. Do not
+            # manufacture cancellation of the SDK owner to hide the baseline.
+            tail_finish.set()
+            cleanup_finish.set()
+            tasks = [original_call, *([release] if release is not None else [])]
+            outcomes = await asyncio.gather(*tasks, return_exceptions=True)
+            retained = list(dict.fromkeys([
+                *borrowers, *owners,
+                *(task for call in calls for task in call.accepted_jobs),
+            ]))
+            retained_outcomes = await asyncio.gather(*retained, return_exceptions=True)
+            monkeypatch.setattr(extension, "observe", observe)
+            monkeypatch.setattr(h.adapter, "release", release_native)
+            h.runtime.policy = previous_policy
+            facts.update(
+                host_outcomes=[type(value).__name__ for value in outcomes],
+                retained_outcomes=[type(value).__name__ for value in retained_outcomes],
+                all_original_host_tasks_joined=all(task.done() for task in tasks),
+                all_original_sdk_and_borrower_tasks_joined=all(task.done() for task in retained),
+                retained_original_tasks=len(retained),
+                cleanup_interruptions=len(cleanup_interruptions),
+                cleanup_eventually_entered=cleanup_entered.is_set(),
+                all_egress_calls_closed=not h.runtime.egress._calls,
+                original_frame_was_private_until_withdrawal=True,
+                input_effects=extension.effects,
+                provider_release_calls=len(physical),
+            )
+            persist(tmp_path, "sdk-tail-" + withdrawal, facts)
+            assert all(task.done() for task in [*tasks, *retained])
+            assert not h.runtime.egress._calls and not cleanup_interruptions
+            assert extension.effects == 0
+
+
+@pytest.mark.asyncio
+async def test_human_joined_cancelled_borrower_does_not_expose_sdk_cleanup_to_second_closer(
+    harness, monkeypatch, tmp_path,
+):
+    """The original native cancellation remains custody after its actual join."""
+    from tests.unit.visual_computer.test_human import original_human_rpc
+
+    h, context = harness, harness.context()
+    with h.bind(context):
+        session, _, extension = await setup(h, context)
+        await input_request(h, context, session, extension.lease)
+        entered, native_closing, native_finish = asyncio.Event(), asyncio.Event(), asyncio.Event()
+        sdk_closing, sdk_finish = asyncio.Event(), asyncio.Event()
+        borrowers, owners, calls, interruptions, physical = [], [], [], [], []
+        facts = {"physical_browser_claim": False}
+        observe, release_native = extension.observe, h.adapter.release
+
+        async def sdk(*args):
+            call = original_human_rpc(h.runtime, session)
+            calls.append(call)
+            owners.append(asyncio.current_task())
+
+            async def borrowed():
+                async with h.runtime.egress.human_operation(
+                    session, human_operation_id("human", "observe"),
+                ) as check:
+                    borrowers.append(asyncio.current_task())
+                    check()
+                    entered.set()
+                    try:
+                        await asyncio.Event().wait()
+                    finally:
+                        native_closing.set()
+                        await native_finish.wait()
+
+            try:
+                outcome = await await_owned_operation(
+                    borrowed(), retain_originals=True,
+                    cancel_on_caller_cancellation=True,
+                )
+                facts["canonical_native_join_returned"] = True
+                return raise_owned_outcome(outcome, operation="original cancelled Human borrower",
+                    retain_originals=True)
+            finally:
+                assert borrowers[0].done() and borrowers[0] in call.accepted_jobs
+                assert borrowers[0] in call.cancellation_requested
+                sdk_closing.set()
+                try:
+                    await sdk_finish.wait()
+                except asyncio.CancelledError as error:
+                    interruptions.append(error)
+                    raise
+
+        async def release_original(scope, selected):
+            physical.append(selected)
+            return await release_native(scope, selected)
+
+        monkeypatch.setattr(extension, "observe", sdk)
+        monkeypatch.setattr(h.adapter, "release", release_original)
+        original_call = asyncio.create_task(h.runtime.human.observe(context, session.session_id, "human"))
+        release = None
+        try:
+            await asyncio.wait_for(entered.wait(), 5)
+            release = asyncio.create_task(h.runtime.release(context, session.session_id))
+            await asyncio.wait_for(native_closing.wait(), 5)
+            assert not borrowers[0].done() and not original_call.done() and not release.done()
+            assert owners[0] not in calls[0].cancellation_requested
+            native_finish.set()
+            await asyncio.wait_for(sdk_closing.wait(), 5)
+            assert facts["canonical_native_join_returned"]
+            assert borrowers[0].done() and not owners[0].done()
+            assert owners[0] not in calls[0].cancellation_requested
+            # Original caller withdrawal is the second real closer. The native
+            # child's retained cancellation must still protect SDK cleanup.
+            original_call.cancel()
+            await asyncio.sleep(0.1)
+            assert not interruptions, "second closer interrupted already-unwinding original SDK cleanup"
+            assert owners[0] not in calls[0].cancellation_requested
+            assert not original_call.done() and not release.done() and not physical
+        finally:
+            facts.update(
+                sdk_cleanup_interruptions_before_gate=len(interruptions),
+                sdk_owner_cancel_requested_before_gate=(owners[0] in calls[0].cancellation_requested) if calls else False,
+                sdk_cleanup_entered=sdk_closing.is_set(),
+                provider_release_before_gate=len(physical),
+                release_ack_before_gate=release.done() if release is not None else False,
+            )
+            native_finish.set()
+            sdk_finish.set()
+            tasks=[original_call, *([release] if release is not None else [])]
+            outcomes=await asyncio.gather(*tasks, return_exceptions=True)
+            retained=list(dict.fromkeys([*borrowers,*owners]))
+            retained_outcomes=await asyncio.gather(*retained, return_exceptions=True)
+            monkeypatch.setattr(extension, "observe", observe)
+            monkeypatch.setattr(h.adapter, "release", release_native)
+            facts.update(host_outcomes=[type(x).__name__ for x in outcomes],
+                retained_outcomes=[type(x).__name__ for x in retained_outcomes],
+                all_original_tasks_joined=all(t.done() for t in [*tasks,*retained]),
+                original_cancelled_borrower_retained=bool(calls and borrowers[0] in calls[0].accepted_jobs),
+                all_egress_calls_closed=not h.runtime.egress._calls,
+                effects=extension.effects)
+            persist(tmp_path, "sdk-tail-second-closer", facts)
+            assert all(t.done() for t in [*tasks,*retained]) and not h.runtime.egress._calls
+            assert extension.effects == 0

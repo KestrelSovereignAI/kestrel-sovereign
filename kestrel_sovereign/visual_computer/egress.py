@@ -54,7 +54,12 @@ class _ActiveCall:
         self.active = False
         for task in tuple(self.accepted_jobs):
             self.cancel(task)
-        if not self.accepted_jobs and self.sdk_owner is not None:
+        # Completed successful borrowers must not hide an unrelated SDK tail.
+        # Retain original child cancellation even after its join: a later closer
+        # must not interrupt SDK cleanup already unwinding that cancellation.
+        if (self.sdk_owner is not None
+                and not any(not task.done() for task in self.accepted_jobs)
+                and not any(task in self.cancellation_requested for task in self.accepted_jobs)):
             self.cancel(self.sdk_owner)
 
     def cancel(self, task):
