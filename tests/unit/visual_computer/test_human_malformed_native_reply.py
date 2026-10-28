@@ -44,7 +44,9 @@ async def native_http(visual_host, harness, monkeypatch, tmp_path, mode):
     monkeypatch.setattr(driver, "_bound", bound)
     runtime.drivers[PROVIDER] = driver
     result = dict(good)
-    if mode == "observe-bad-base64":
+    if mode == "observe-valid":
+        pass
+    elif mode == "observe-bad-base64":
         result["image_base64"] = "!" + PRIVATE
     elif mode == "observe-bad-control-id":
         result["control_id"] = ""
@@ -83,6 +85,7 @@ async def native_http(visual_host, harness, monkeypatch, tmp_path, mode):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("mode", [
+    "observe-valid",  # Genuine original native data must still reach its owner.
     "observe-bad-base64", "observe-bad-control-id", "observe-bad-consumer-id",
     "observe-missing-image", "observe-null",
     "observe-invalid-frame",  # Existing _record UNKNOWN inverse, not new defect.
@@ -194,6 +197,11 @@ async def test_native_malformed_human_reply_classification_after_cleanup(
     }, indent=2) + "\n")
     # Classification LAST: unknown native reply is not malformed client input,
     # no replay or proven-no-input denial, and no private error text disclosure.
-    assert PRIVATE not in response.text and "image_base64" not in response.text
-    assert response.status_code == 503, (mode, response.status_code, response.text)
-    assert response.json() == {"error": {"code": "visual_outcome_unknown"}}
+    if mode == "observe-valid":
+        assert response.status_code == 200, response.text
+        assert response.json() == good
+        assert response.headers["cache-control"].startswith("private, no-store")
+    else:
+        assert PRIVATE not in response.text and "image_base64" not in response.text
+        assert response.status_code == 503, (mode, response.status_code, response.text)
+        assert response.json() == {"error": {"code": "visual_outcome_unknown"}}

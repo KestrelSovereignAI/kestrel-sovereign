@@ -38,14 +38,19 @@ export function mountVisualComputer(body, api = API) {
     let current = null;
     let generation = 0;
     let agent = api.getHostAgent();
-    let pending = null;
+    const pendingControls = new Map();
     let human = null;
     let humanFrame = null;
     let humanOwner = null;
     let opening = null;
     let lastInput = null;
     let expiryTimer = null;
-    let retirement = null;
+    // Retained UI request identities are descriptive; every retry still uses
+    // the original authenticated agent/channel and ordinary server checks.
+    const retirements = new Map();
+    const controlKey = (owner, id) => JSON.stringify([owner, id]);
+    const retirementKey = closing => JSON.stringify([closing.owner, closing.lease.session_id, closing.lease.control_id]);
+    const hasRetirement = (owner, id) => [...retirements.values()].some(closing => closing.owner === owner && closing.lease.session_id === id);
     const clearHumanPixels = () => {
         humanFrame = null; enable.checked = false; text.value = ''; share.checked = false;
         image.tabIndex = -1;
@@ -53,25 +58,60 @@ export function mountVisualComputer(body, api = API) {
     const clearPixels = () => { image.hidden = true; image.removeAttribute('src'); clearHumanPixels(); };
     const send = (path, options) => api.requestForAgent('/api/visual-computer' + path, options, agent);
     const humanPath = binding => `/sessions/${encodeURIComponent(binding.session_id)}/human/${encodeURIComponent(binding.control_id)}`;
+    const matchesRetirement = (closing, value) => {
+        const original = closing.lease;
+        const returned = value?.request;
+        if (value?.state !== 'revoked' || !/^[a-f0-9]{64}$/.test(closing.requestSha256 || '')
+                || value.request_sha256 !== closing.requestSha256 || !returned) return false;
+        const fields = ['schema_version', 'control_id', 'session_id', 'lease_id', 'driver_id', 'consumer_id',
+            'control_epoch', 'issued_at', 'expires_at', 'max_frame_age_seconds'];
+        return fields.every(key => original[key] === returned[key])
+            && ['tenant_id', 'principal_id', 'agent_id'].every(key => original.scope?.[key] === returned.scope?.[key])
+            && Array.isArray(original.capabilities) && Array.isArray(returned.capabilities)
+            && JSON.stringify([...original.capabilities].sort()) === JSON.stringify([...returned.capabilities].sort());
+    };
+    const retireHuman = async closing => {
+        const key = retirementKey(closing);
+        const path = '/api/visual-computer' + humanPath(closing.lease);
+        const reconcile = async () => {
+            const value = await api.requestForAgent(path, undefined, closing.owner);
+            if (!matchesRetirement(closing, value)) throw new Error('original channel retirement is unverified');
+        };
+        try {
+            if (closing.refused) await reconcile();
+            else {
+                try {
+                    await api.requestForAgent(path+'/revoke', {method:'POST',body:JSON.stringify(closing.payload)}, closing.owner);
+                } catch (error) {
+                    if (error?.status !== 409) throw error;
+                    // Definitively refused POSTs are not resent. Metadata may
+                    // prove a different tab retired this exact accepted lease.
+                    closing.refused = true;
+                    await reconcile();
+                }
+            }
+            if (retirements.get(key) !== closing) return;
+            retirements.delete(key);
+            if (!human && !opening && agent === closing.owner && selector.value === closing.lease.session_id)
+                manualState.textContent = 'Human channel revoked. A fresh takeover is required before opening another consumer.';
+        } catch {
+            if (retirements.get(key) !== closing) return;
+            if (!human && !opening && agent === closing.owner && selector.value === closing.lease.session_id)
+                manualState.textContent = 'Human retirement is uncertain. Use Stop or release; do not reconnect or retry input.';
+        }
+    };
     const revokeHuman = async () => {
-        const lease = retirement?.lease || human?.request || opening;
-        const owner = retirement?.owner || humanOwner;
+        const lease = human?.request || opening;
+        const owner = humanOwner;
+        const requestSha256 = human?.request_sha256;
         human = null; opening = null;
         clearTimeout(expiryTimer); clearPixels();
-        if (!lease) return;
-        const target = humanPath(lease) + '/revoke';
-        const closing = retirement || {lease, owner, payload:{request_id:crypto.randomUUID(), control_epoch:lease.control_epoch}};
-        retirement = closing;
-        manualState.textContent = 'Closing human channel; awaiting input retirement.';
-        try {
-            await api.requestForAgent('/api/visual-computer'+target, {method:'POST',body:JSON.stringify(closing.payload)}, owner);
-            if (retirement !== closing) return;
-            retirement = null;
-            manualState.textContent = 'Human channel revoked. A fresh takeover is required before opening another consumer.';
-        } catch {
-            if (retirement !== closing) return;
-            manualState.textContent = 'Human retirement is uncertain. Use Stop or release; do not reconnect or retry input.';
+        if (lease) {
+            const closing = {lease, owner, requestSha256, payload:{request_id:crypto.randomUUID(), control_epoch:lease.control_epoch}, refused:false};
+            const key = retirementKey(closing);
+            if (!retirements.has(key)) retirements.set(key, closing);
         }
+        await Promise.all([...retirements.values()].map(retireHuman));
     };
     const requireHuman = () => {
         if (!human || human.state !== 'active' || Date.now() >= Date.parse(human.request.expires_at)
@@ -82,7 +122,10 @@ export function mountVisualComputer(body, api = API) {
     const selected = () => encodeURIComponent(selector.value);
     const display = value => {
         current = value;
-        pending = value.pending_control || null;
+        const key = controlKey(agent, selector.value);
+        // A status read cannot acknowledge a locally retained lost reply.
+        if (!pendingControls.has(key) && value.pending_control?.session_id === selector.value)
+            pendingControls.set(key, value.pending_control);
         const session = value.session;
         const lease = value.lease;
         state.textContent = `${value.phase}; controller: ${session?.controller || 'none'}; epoch: ${session?.control_epoch ?? 'unavailable'}; physical resource: ${lease?.state || 'acquisition unknown'}${value.requires_reconciliation ? '; reconciliation required' : ''}`;
@@ -131,20 +174,23 @@ export function mountVisualComputer(body, api = API) {
         const owner = agent;
         clearPixels();
         if (operation === 'resume' && !shareConfirmed) throw new Error('confirm screen sharing');
-        pending = pending || { request_id: crypto.randomUUID(), session_id: selector.value,
-            expected_control_epoch: current.session.control_epoch, operation };
-        if (pending.operation !== operation) throw new Error('reconcile original control');
-        const original = pending;
-        await send(`/sessions/${selected()}/${suffix}`, { method: 'POST', body: JSON.stringify(
-            operation === 'resume' ? {...original, share_screen:true} : original) });
+        const key = controlKey(owner, id);
+        if (!pendingControls.has(key)) pendingControls.set(key, { request_id: crypto.randomUUID(), session_id: id,
+            expected_control_epoch: current.session.control_epoch, operation });
+        const original = pendingControls.get(key);
+        if (original.operation !== operation) throw new Error('reconcile original control');
+        await api.requestForAgent(`/api/visual-computer/sessions/${encodeURIComponent(id)}/${suffix}`, { method: 'POST', body: JSON.stringify(
+            operation === 'resume' ? {...original, share_screen:true} : original) }, owner);
         // This acknowledgement retires only the channel governed by this
         // control request, including a close whose network reply is delayed.
-        if (retirement?.owner === owner && retirement.lease.session_id === id
-                && retirement.lease.control_epoch === original.expected_control_epoch) retirement = null;
+        for (const [retiredKey, closing] of retirements) {
+            if (closing.owner === owner && closing.lease.session_id === id
+                    && closing.lease.control_epoch === original.expected_control_epoch) retirements.delete(retiredKey);
+        }
+        if (pendingControls.get(key) === original) pendingControls.delete(key);
         if (version !== generation || id !== selector.value || owner !== agent) return;
         // Preserve the original input ID until its outcome is reconciled.
         human = null; opening = null; clearTimeout(expiryTimer);
-        pending = null;
         await refreshState();
     };
     const manualButton = (label, run) => {
@@ -188,7 +234,7 @@ export function mountVisualComputer(body, api = API) {
         manualState.textContent = `Manual input ${result.receipt.outcome}. Reconcile its original receipt, then request a fresh view.`;
     };
     manualButton('Open human view', async () => {
-        if (human || opening || retirement || current?.session?.controller !== 'human') throw new Error('take over first');
+        if (human || opening || hasRetirement(agent, selector.value) || current?.session?.controller !== 'human') throw new Error('take over first');
         const version = generation;
         opening = {control_id:crypto.randomUUID(),session_id:selector.value,control_epoch:current.session.control_epoch};
         humanOwner = agent;
@@ -257,15 +303,17 @@ export function mountVisualComputer(body, api = API) {
     button('Take over', () => control('takeover', 'takeover'));
     button('Hand back', () => control('handback', 'resume'));
     button('Release environment', async () => {
-        generation++;
+        const version = ++generation;
+        const id = selector.value;
+        const owner = agent;
         await revokeHuman();
-        clearPixels();
-        const result = await send(`/sessions/${selected()}/release`, {method:'POST'});
+        const result = await api.requestForAgent(`/api/visual-computer/sessions/${encodeURIComponent(id)}/release`, {method:'POST'}, owner);
+        if (version !== generation || id !== selector.value || owner !== agent) return;
         state.textContent = result.released ? 'Physical release verified.' : 'Release remains uncertain; cleanup custody retained.';
         await refreshState();
     });
-    selector.addEventListener('change', () => { revokeHuman(); generation++; current = null; pending = null; clearPixels(); refreshState().catch(() => { state.textContent = 'Session status unavailable.'; }); });
-    const reset = () => { revokeHuman(); generation++; agent = api.getHostAgent(); current = null; pending = null; selector.replaceChildren(); clearPixels(); state.textContent = 'Refresh sessions for the selected agent.'; };
+    selector.addEventListener('change', () => { revokeHuman(); generation++; current = null; clearPixels(); refreshState().catch(() => { state.textContent = 'Session status unavailable.'; }); });
+    const reset = () => { revokeHuman(); generation++; agent = api.getHostAgent(); current = null; selector.replaceChildren(); clearPixels(); state.textContent = 'Refresh sessions for the selected agent.'; };
     const unsubscribe = api.onHostAgentChange(reset);
     return { refresh, hide: () => { generation++; revokeHuman(); clearPixels(); }, destroy: () => { generation++; revokeHuman(); clearPixels(); unsubscribe(); } };
 }

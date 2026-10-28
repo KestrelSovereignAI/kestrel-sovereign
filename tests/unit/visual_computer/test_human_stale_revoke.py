@@ -382,3 +382,71 @@ async def test_new_preopen_revocation_id_after_handback_uses_original_rpc_withou
     assert facts['stored_fact_matches_actual_original_rpc'] and facts['original_fenced_at_preserved'], facts
     assert facts['original_request_and_lease_still_none'], facts
     assert extension.effects == 0 and harness.adapter.effects == 0
+
+
+@pytest.mark.asyncio
+async def test_external_stop_retires_consumer_before_panel_request_arrives(
+    visual_host, harness, tmp_path,
+):
+    client, feature, extension, sid, base, body = await setup(visual_host, harness)
+    lease = HumanControlLease.model_validate_json(json.dumps(body))
+    runtime, repository = feature.runtime, feature.runtime.repository
+    assert repository.db is harness.db and repository.db.backend_type == "sqlite"
+    hp = base + "/human/" + lease.request.control_id
+    key = runtime._key(lease.request.scope, sid)
+    panel_request = {"request_id": "original-panel-close-R", "control_epoch": lease.request.control_epoch}
+    facts = {"controlled_SDK_only": True, "not_browser_or_cross_tab_runtime_proof": True,
+             "panel_request_preissued_only_not_sent_before_external_Stop": panel_request}
+    stop = metadata = refused = cleanup = None
+    retired = after = None
+    try:
+        original, _ = await observed_original_human(repository, lease)
+        assert original.revocation is None and original.lease.state == "active"
+        # A different HTTP caller uses the genuine current control API; no
+        # runtime/row/permission/native checker or SDK method is replaced.
+        stop = await client.post(base + "/stop", headers=AUTH, json={
+            "request_id": "external-tab-original-stop", "session_id": sid,
+            "expected_control_epoch": lease.request.control_epoch, "operation": "pause"})
+        assert stop.status_code == 200, stop.text
+        assert stop.json() == {"session_id": sid, "stopped": True}
+        # Inspect the original channel through its ordinary metadata API. This
+        # is a proposed concrete recovery fact; 409 alone is not release proof.
+        metadata = await client.get(hp, headers=AUTH)
+        retired, before_cipher = await observed_original_human(repository, lease)
+        serial = runtime._control_serials[key]
+        fenced = key in runtime._fences
+        refused = await client.post(hp + "/revoke", headers=AUTH, json=panel_request)
+        after, after_cipher = await observed_original_human(repository, lease)
+        facts.update(external_stop_status=stop.status_code,
+            original_channel_status=metadata.status_code,
+            original_channel_body=metadata.json(),
+            server_revocation_id=retired.revocation.request_id if retired.revocation else None,
+            panel_reply_status=refused.status_code, panel_reply_body=refused.json(),
+            serial_before=serial, serial_after=runtime._control_serials[key],
+            control_fence_unchanged=(key in runtime._fences) == fenced,
+            original_private_ciphertext_unchanged=before_cipher == after_cipher,
+            original_private_model_unchanged=after == retired)
+    finally:
+        # Always use the real foreground Release; no fence clearing, row
+        # repair, fake receipt or task.done-only owner retirement.
+        cleanup = await client.post(base + "/release", headers=AUTH)
+        facts.update(real_foreground_release_status=cleanup.status_code,
+            original_egress_empty=not runtime.egress._calls,
+            original_result_holds=len(harness.db.backend._original_result_holds),
+            original_inflight=runtime._inflight,
+            human_effects=extension.effects, agent_effects=harness.adapter.effects)
+        (Path(os.environ.get("CURRENT_ROW_PROOF_DIR", tmp_path)) /
+            "external-stop-panel-original-retirement.json").write_text(json.dumps(facts, indent=2) + "\n")
+    # Behavioral oracles follow original cleanup. This server case is expected
+    # to PASS on current source: it establishes the actual UI failure input.
+    assert cleanup.status_code == 200, cleanup.text
+    assert not runtime.egress._calls and not harness.db.backend._original_result_holds
+    assert runtime._inflight == 0 and extension.effects == 0 and harness.adapter.effects == 0
+    assert retired.request == lease.request and retired.lease.state == "revoked"
+    assert retired.revocation is not None and retired.revocation.request_id != panel_request["request_id"]
+    assert metadata.status_code == 200 and metadata.json()["state"] == "revoked", facts
+    assert HumanControlLease.model_validate_json(metadata.content).request == lease.request, facts
+    assert metadata.json()["request_sha256"] == body["request_sha256"], facts
+    assert refused.status_code == 409 and refused.json() == {"error": {"code": "visual_conflict"}}, facts
+    assert after == retired and facts["original_private_ciphertext_unchanged"], facts
+    assert facts["serial_after"] == facts["serial_before"] and facts["control_fence_unchanged"], facts
