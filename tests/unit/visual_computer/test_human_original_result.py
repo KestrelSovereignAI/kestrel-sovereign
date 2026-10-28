@@ -72,7 +72,7 @@ async def native_input(h, context, tmp_path, monkeypatch):
     monkeypatch.setattr(driver,'_bound',bound)
     received = tmp_path/'owned-stdin'
     executable = tmp_path/'owned-native-worker'
-    executable.write_text('#!'+sys.executable+'\nimport sys\nfrom pathlib import Path\ndata=sys.stdin.buffer.read()\nPath('+repr(str(received))+').write_bytes(data)\nprint("{}")\n')
+    executable.write_text('#!'+sys.executable+' -B\nimport sys\nfrom pathlib import Path\ndata=sys.stdin.buffer.read()\nPath('+repr(str(received))+').write_bytes(data)\nprint("{}")\n')
     executable.chmod(0o700)
     driver.boundary.executable = str(executable)
     return session,lease,request,driver,received
