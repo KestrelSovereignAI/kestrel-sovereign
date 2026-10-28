@@ -12,9 +12,16 @@ a restart:
 The first no longer latches: the occurrence's lease expires and a later poll
 recovers its row. The second still latches, but only until the claim it ended
 no longer holds its schedule row.
+
+#3881 found two more: a target's own refusal (``workflow_trigger_cron``'s
+workflow lease expiring) latched for the runner's lifetime, and while latched
+every ordinary target failure (``backup_snapshot``) was escalated instead of
+finalized. A target's failure or refusal is now a failed outcome, and an
+occurrence whose own lease expired latches only until its claim is settled.
 """
 
 import asyncio
+import time
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
@@ -23,8 +30,11 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from kestrel_sovereign.execution_custody import (
+    ConfirmedLeaseDeadline,
     ExecutionAuthorityError,
     ExecutionCommitOutcomeError,
+    ExecutionCustody,
+    bind_execution_custody_snapshot,
     execution_evidence_carriers,
     execution_terminal_error,
     is_execution_control_error,
@@ -34,7 +44,9 @@ from kestrel_sovereign.features.scheduler.runner import (
     SchedulerRunner,
     _is_plain_storage_failure,
     _is_reconcilable_occurrence_failure,
+    _LeaseRenewalState,
     _ReadinessReconciliation,
+    _rollout_renewal_state,
 )
 from kestrel_sovereign.storage.async_database import AsyncDatabase
 from kestrel_sovereign.storage.db import QueryError
@@ -49,7 +61,9 @@ async def _database(path) -> AsyncDatabase:
     return AsyncDatabase(backend)
 
 
-async def _seed_due(db, *, task_id: str = "task-1") -> str:
+async def _seed_due(
+    db, *, task_id: str = "task-1", task_name: str = "wait_reconcile"
+) -> str:
     due = (datetime.now(timezone.utc) - timedelta(seconds=2)).isoformat()
     await db.execute(
         """
@@ -57,10 +71,10 @@ async def _seed_due(db, *, task_id: str = "task-1") -> str:
             (id, agent_id, task_name, cron_expression, args_json, enabled,
              next_run_at, created_at, schedule_kind, run_at, timezone_name,
              misfire_policy, idempotency_key, scheduler_protocol_version)
-        VALUES (?, 'agent-1', 'wait_reconcile', '* * * * *', '{}', 1, ?, ?,
+        VALUES (?, 'agent-1', ?, '* * * * *', '{}', 1, ?, ?,
                 'cron', NULL, 'UTC', 'skip', 'stable-effect', ?)
         """,
-        (task_id, due, due, SCHEDULER_PROTOCOL_VERSION),
+        (task_id, task_name, due, due, SCHEDULER_PROTOCOL_VERSION),
     )
     return due
 
@@ -132,9 +146,11 @@ def test_storage_failure_classification():
 
 
 def test_reconcilable_failure_classification():
-    """Durable rows settle commit outcomes and ordinary failures, not denials."""
+    """Durable rows settle commit outcomes and denials, not retirement debt."""
     debt = ExecutionCommitOutcomeError("unknown")
     debt._kestrel_native_retirement_debts = ((object(), None),)
+    denied_debt = ExecutionAuthorityError("original confirmed lease expired")
+    denied_debt._kestrel_native_retirement_debts = ((object(), None),)
 
     for already_latched in (False, True):
         assert _is_reconcilable_occurrence_failure(
@@ -143,12 +159,17 @@ def test_reconcilable_failure_classification():
         assert _is_reconcilable_occurrence_failure(
             ExecutionCommitOutcomeError("committed"), already_latched=already_latched
         )
-        assert not _is_reconcilable_occurrence_failure(
-            ExecutionAuthorityError("runtime authority revoked"),
+        # An occurrence's lease expiring mid-effect is settled by its row:
+        # finalization or lease recovery releases the claim (#3881).
+        assert _is_reconcilable_occurrence_failure(
+            ExecutionAuthorityError("original confirmed lease expired"),
             already_latched=already_latched,
         )
         assert not _is_reconcilable_occurrence_failure(
             debt, already_latched=already_latched
+        )
+        assert not _is_reconcilable_occurrence_failure(
+            denied_debt, already_latched=already_latched
         )
     # An ordinary failure is an occurrence outcome only inside a latch; one
     # that would start a latch is scheduler infrastructure.
@@ -580,13 +601,16 @@ async def test_a_claim_publication_that_never_landed_settles_at_once(tmp_path):
 
     The claim is named before the CAS runs, not from the read after it: here
     that read fails, the transaction rolls back, and the named claim holds no
-    row, so the latch settles at its first check.
+    row, so the latch settles at its first check. That check runs as the
+    occurrence ends (#3881).
     """
 
     db = await _database(tmp_path / "claim-publication-rolled-back.db")
     runner = SchedulerRunner(db, "agent-1", AsyncMock(), owner_id="claim-rolled-back")
     real_fetchone = db.fetchone
     post_cas_reads = 0
+    real_claim_still_held = runner._claim_still_held
+    checked = []
 
     async def fail_the_post_cas_read(sql, *args, **kwargs):
         nonlocal post_cas_reads
@@ -595,6 +619,11 @@ async def test_a_claim_publication_that_never_landed_settles_at_once(tmp_path):
             raise ExecutionCommitOutcomeError("unknown")
         return await real_fetchone(sql, *args, **kwargs)
 
+    async def record_checked_claim(pending):
+        checked.append(pending)
+        return await real_claim_still_held(pending)
+
+    runner._claim_still_held = record_checked_claim
     try:
         await runner._ensure_tables()
         await _seed_due(db)
@@ -604,14 +633,11 @@ async def test_a_claim_publication_that_never_landed_settles_at_once(tmp_path):
 
         db.fetchone = real_fetchone
         assert post_cas_reads == 1
-        assert runner.readiness_failure_reconcilable
-        [claim] = runner._readiness_reconciliations
+        [claim] = checked
         assert (claim.schedule_id, claim.agent_id) == ("task-1", "agent-1")
         assert await _held_claim(db) is None
-
-        await runner._reconcile_readiness_latch()
-
         assert runner.readiness_failure is None
+        assert runner._readiness_reconciliations == set()
     finally:
         db.fetchone = real_fetchone
         await _stop(runner)
@@ -686,11 +712,12 @@ async def test_a_recovered_attempt_with_its_own_unknown_outcome_keeps_the_latch(
             schedule_id="task-1", agent_id="agent-1",
             execution_id=execution_id, claim_token=token,
         )
-        assert runner._readiness_reconciliations == {first, second}
+        # The recovered attempt reconciled as it ended (#3881): the first
+        # claim is settled; the recovered one still holds the row.
+        assert runner._readiness_reconciliations == {second}
 
         await runner._reconcile_readiness_latch()
 
-        # The first claim is settled; the recovered one still holds the row.
         assert runner._readiness_reconciliations == {second}
         assert runner.readiness_failure is not None
         assert runner.readiness_failure_reconcilable
@@ -838,6 +865,338 @@ async def test_an_ordinary_failure_starts_a_latch_only_as_infrastructure(tmp_pat
         assert latched.readiness_failure_reconcilable
         assert latched._readiness_reconciliations == {first, second}
     finally:
+        await db.close()
+
+
+_LIGHTHOUSE_FAILURE = (
+    "scheduled tool backup_snapshot failed (BACKUP_TARGET_FAILED_LIGHTHOUSE)"
+)
+
+
+async def _task_outcome(db, task_id: str) -> tuple:
+    """``(log status, log result, streak, still claimed)`` of one schedule."""
+    log = await db.fetchone(
+        "SELECT status, result_text FROM task_execution_log WHERE task_id = ? "
+        "ORDER BY claimed_at DESC LIMIT 1",
+        (task_id,),
+    )
+    row = await db.fetchone(
+        "SELECT failure_streak_count, scheduler_claim_fenced FROM scheduled_tasks "
+        "WHERE id = ?",
+        (task_id,),
+    )
+    return (*log, *row)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("returned", [False, True], ids=["raised", "returned"])
+@pytest.mark.parametrize("latched", [False, True], ids=["healthy", "already-latched"])
+async def test_a_failed_tool_result_is_finalized_and_leaves_readiness_healthy(
+    tmp_path, latched, returned
+):
+    """A tool that reports a failure has a known outcome (#3881).
+
+    In production ``backup_snapshot`` failed with
+    ``BACKUP_TARGET_FAILED_LIGHTHOUSE`` while another occurrence held
+    readiness latched. The runner escalated every ordinary failure while
+    latched, so the backup was never finalized or counted in its failure
+    streak, and ran again at every lease expiry. A latch now changes no
+    other occurrence's outcome.
+    """
+
+    db = await _database(tmp_path / f"failed-tool-{latched}-{returned}.db")
+    reconcile_outcomes = [ExecutionCommitOutcomeError("unknown"), "reconciled"]
+
+    async def execute(task_name, _args):
+        if task_name == "backup_snapshot":
+            if returned:
+                return SimpleNamespace(
+                    status="error", error="BACKUP_TARGET_FAILED_LIGHTHOUSE"
+                )
+            raise RuntimeError(_LIGHTHOUSE_FAILURE)
+        outcome = reconcile_outcomes.pop(0)
+        if isinstance(outcome, BaseException):
+            raise outcome
+        return outcome
+
+    notifications = []
+    runner = SchedulerRunner(
+        db, "agent-1", execute, owner_id=f"failed-tool-{latched}-{returned}",
+        on_protocol_failure=notifications.append,
+    )
+    runner._renew_lease = _renew_until_stopped
+    try:
+        await runner._ensure_tables()
+        latched_claims = set()
+        if latched:
+            await _seed_due(db, task_id="reconcile")
+            await tick_and_settle(runner)
+            assert runner.readiness_failure_reconcilable
+            latched_claims = set(runner._readiness_reconciliations)
+            assert len(latched_claims) == 1
+
+        await _seed_due(db, task_id="backup", task_name="backup_snapshot")
+        await tick_and_settle(runner)
+
+        status, result, streak, claimed = await _task_outcome(db, "backup")
+        assert status == "failed"
+        assert "BACKUP_TARGET_FAILED_LIGHTHOUSE" in result
+        assert (streak, claimed) == (1, 0)
+        assert notifications == []
+        # The backup's failure joined no latch.
+        assert runner._readiness_reconciliations == latched_claims
+        if not latched:
+            assert runner.readiness_failure is None
+            return
+
+        await _expire_lease(db, "reconcile")
+        await tick_and_settle(runner)
+
+        assert runner.readiness_failure is None
+        assert notifications == []
+        assert (await _task_outcome(db, "reconcile"))[0] == "success"
+    finally:
+        await _stop(runner)
+        await db.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("scoped", [True, False], ids=["scoped-denial", "unscoped-denial"])
+async def test_a_target_refusal_under_its_own_lease_is_a_failed_outcome(
+    tmp_path, scoped
+):
+    """A target's own lease expiring is not the occurrence's (#3881).
+
+    ``workflow_trigger_cron`` holds a workflow lease of its own and raises
+    ``ExecutionAuthorityError("original confirmed lease expired")`` when it
+    expires. In production the runner took that for its own authority loss
+    and latched readiness for its lifetime, taking the host's /health to 503
+    until a restart. The occurrence still held its lease, so the refusal is a
+    known failed outcome.
+    """
+
+    db = await _database(tmp_path / f"target-refusal-{scoped}.db")
+
+    async def execute(_task_name, _args):
+        workflow_lease = ConfirmedLeaseDeadline(
+            confirmed_deadline=time.monotonic() - 1
+        )
+        if scoped:
+            ExecutionCustody(workflow_lease).require_work()
+        workflow_lease.is_live()
+        raise workflow_lease.error
+
+    notifications = []
+    runner = SchedulerRunner(
+        db, "agent-1", execute, owner_id=f"target-refusal-{scoped}",
+        on_protocol_failure=notifications.append,
+    )
+    runner._renew_lease = _renew_until_stopped
+    stopped = False
+    try:
+        await runner._ensure_tables()
+        await _seed_due(db, task_name="workflow_trigger_cron")
+
+        await tick_and_settle(runner)
+
+        assert runner.readiness_failure is None
+        assert runner.readiness_latch is None
+        assert notifications == []
+        status, result, streak, claimed = await _task_outcome(db, "task-1")
+        assert status == "failed"
+        assert result.startswith("ExecutionAuthorityError: original confirmed lease")
+        assert (streak, claimed) == (1, 0)
+        stopped = True
+        # Nothing of the runner's own was denied, so it has no control
+        # evidence to raise either.
+        assert await _stop(runner) is None
+    finally:
+        if not stopped:
+            await _stop(runner)
+        await db.close()
+
+
+class _SwitchableFence:
+    """A custody fence a test can deny."""
+
+    backend_type = "sqlite"
+
+    def __init__(self):
+        self.live = True
+
+    def require_work(self):
+        if not self.live:
+            raise ExecutionAuthorityError("occurrence runtime revoked")
+
+    async def lock_and_validate(self, _connection):
+        self.require_work()
+
+
+def test_target_refusal_classification():
+    """Only a pure denial that leaves the occurrence's own authority intact."""
+
+    lease = _LeaseRenewalState(confirmed_deadline=time.monotonic() + 60)
+    foreign = ExecutionCustody(
+        ConfirmedLeaseDeadline(confirmed_deadline=time.monotonic() - 1)
+    )
+    with pytest.raises(ExecutionAuthorityError) as foreign_denial:
+        foreign.require_work()
+    refusal = foreign_denial.value
+    unscoped = ExecutionAuthorityError("original confirmed lease expired")
+    own_fence = _SwitchableFence()
+    own = ExecutionCustody(own_fence)
+    owned_lease = ExecutionCustody(
+        _LeaseRenewalState(confirmed_deadline=time.monotonic() - 1)
+    )
+    with pytest.raises(ExecutionAuthorityError) as own_lease_denial:
+        owned_lease.require_work()
+    debt = ExecutionAuthorityError("workflow connection not released")
+    debt._kestrel_native_retirement_debts = ((object(), None),)
+
+    with bind_execution_custody_snapshot((own,)):
+        assert SchedulerRunner._is_target_refusal(refusal, lease)
+        assert SchedulerRunner._is_target_refusal(unscoped, lease)
+        assert not SchedulerRunner._is_target_refusal(RuntimeError("failed"), lease)
+        assert not SchedulerRunner._is_target_refusal(
+            ExecutionCommitOutcomeError("unknown"), lease
+        )
+        assert not SchedulerRunner._is_target_refusal(debt, lease)
+        # A denial of the scheduler's own lease is never the target's.
+        assert not SchedulerRunner._is_target_refusal(own_lease_denial.value, lease)
+
+        own_fence.live = False
+        with pytest.raises(ExecutionAuthorityError) as own_denial:
+            own.require_work()
+        # The occurrence's own custody refused too: the refusal may be its own.
+        assert not SchedulerRunner._is_target_refusal(unscoped, lease)
+        assert not SchedulerRunner._is_target_refusal(own_denial.value, lease)
+
+    lost = _LeaseRenewalState(confirmed_deadline=time.monotonic() - 1)
+    assert not SchedulerRunner._is_target_refusal(refusal, lost)
+
+
+async def _settle_row_elsewhere(db, task_id: str = "task-1") -> None:
+    """Another worker recovered the expired claim and finalized its row."""
+    later = (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat()
+    await db.execute(
+        """
+        UPDATE scheduled_tasks
+        SET enabled = 1, next_run_at = ?, lease_owner = NULL,
+            lease_expires_at = NULL, claim_token = NULL, claim_execution_id = NULL,
+            claim_scheduled_for = NULL, scheduler_claim_fenced = 0
+        WHERE id = ?
+        """,
+        (later, task_id),
+    )
+    await db.execute(
+        "UPDATE task_execution_log SET status = 'success', "
+        "result_text = 'finalized by recovery' WHERE task_id = ?",
+        (task_id,),
+    )
+
+
+def _expire_occurrence_lease() -> ExecutionAuthorityError:
+    """Expire the running occurrence's lease, as a stalled renewal would."""
+    lease = _rollout_renewal_state.get()
+    lease.mark_lost(ExecutionAuthorityError("original confirmed lease expired"))
+    return lease.error
+
+
+@pytest.mark.asyncio
+async def test_an_expired_lease_whose_row_is_settled_reconciles_without_latching(
+    tmp_path,
+):
+    """Reconcile before latching (#3881).
+
+    The occurrence's lease expired mid-effect and another worker had already
+    finalized its row. The authority error the stale occurrence then sees is
+    settled by that row. Before #3881 it latched readiness for the runner's
+    lifetime and the host recorded it until a restart.
+    """
+
+    db = await _database(tmp_path / "expired-settled.db")
+
+    async def execute(_task_name, _args):
+        await _settle_row_elsewhere(db)
+        raise _expire_occurrence_lease()
+
+    notifications = []
+    runner = SchedulerRunner(
+        db, "agent-1", execute, owner_id="expired-settled",
+        on_protocol_failure=notifications.append,
+    )
+    runner._renew_lease = _renew_until_stopped
+    stopped = False
+    try:
+        await runner._ensure_tables()
+        await _seed_due(db)
+
+        await tick_and_settle(runner)
+
+        # The occurrence read its row as it ended; no poll was needed.
+        assert runner.readiness_failure is None
+        assert runner._readiness_reconciliations == set()
+        assert notifications == []
+        # The stale worker did not overwrite the recovered outcome.
+        assert await db.fetchone(
+            "SELECT status, result_text FROM task_execution_log WHERE task_id = ?",
+            ("task-1",),
+        ) == ("success", "finalized by recovery")
+        assert await _held_claim(db) is None
+        # Readiness is restored; the run's control evidence is not erased.
+        stopped = True
+        assert await _stop(runner) is not None
+    finally:
+        if not stopped:
+            await _stop(runner)
+        await db.close()
+
+
+@pytest.mark.asyncio
+async def test_an_expired_lease_latch_clears_once_recovery_settles_its_claim(tmp_path):
+    """The latch an expired lease leaves clears without a restart (#3881)."""
+
+    db = await _database(tmp_path / "expired-recovered.db")
+    calls = 0
+
+    async def execute(_task_name, _args):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise _expire_occurrence_lease()
+        return "reconciled"
+
+    notifications = []
+    runner = SchedulerRunner(
+        db, "agent-1", execute, owner_id="expired-recovered",
+        on_protocol_failure=notifications.append,
+    )
+    runner._renew_lease = _renew_until_stopped
+    try:
+        await runner._ensure_tables()
+        await _seed_due(db)
+
+        await tick_and_settle(runner)
+
+        # The row still holds this claim: recovery has not yet settled it.
+        assert runner.readiness_failure is not None
+        assert runner.readiness_failure_reconcilable
+        assert notifications == []
+        [claim] = runner._readiness_reconciliations
+        assert await _held_claim(db) == (claim.execution_id, claim.claim_token)
+
+        await _expire_lease(db)
+        await tick_and_settle(runner)
+
+        assert calls == 2
+        assert runner.readiness_failure is None
+        assert notifications == []
+        assert await db.fetchone(
+            "SELECT status, attempt_count FROM task_execution_log WHERE id = ?",
+            (claim.execution_id,),
+        ) == ("success", 2)
+    finally:
+        await _stop(runner)
         await db.close()
 
 
