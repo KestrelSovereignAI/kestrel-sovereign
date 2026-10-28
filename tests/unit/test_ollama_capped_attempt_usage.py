@@ -69,21 +69,19 @@ def _capped(body: Dict[str, Any]) -> httpx.Response:
         prompt_eval_count=INPUT_TOKENS,
         eval_count=OUTPUT_TOKENS,
     )
-    if body.get("stream"):
-        # Text first; the counts and the stop reason arrive on the final
-        # (done) chunk.
-        return httpx.Response(
-            200, content=_line(_reply(done=False)) + _line(done),
-        )
-    return httpx.Response(200, json=done)
+    assert body["stream"] is True
+    # Text first; the counts and the stop reason arrive on the final chunk.
+    return httpx.Response(
+        200, content=_line(_reply(done=False)) + _line(done),
+    )
 
 
 #: How the turn reached Ollama, and whether ``/api/chat`` was streamed: a
-#: non-streaming call, a streamed turn with tools (answered by a non-streaming
-#: probe), and a streamed turn without tools.
+#: logical non-streaming call, a logically buffered tool turn, and a text
+#: stream all consume one native SDK stream, with the same output budget.
 ENTRIES = {
-    "generate_with_messages": (TOOLS, False),
-    "stream_with_tools": (TOOLS, False),
+    "generate_with_messages": (TOOLS, True),
+    "stream_with_tools": (TOOLS, True),
     "stream": (None, True),
 }
 

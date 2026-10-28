@@ -51,6 +51,7 @@ from kestrel_sdk.llm.decisions import (
     DecisionTransportError,
     ValidatedDecisionRequest,
 )
+from .call_progress import report_call_progress
 from .cancellation import (
     CancelToken,
     anext_or_cancelled,
@@ -65,6 +66,7 @@ from .discovery_deadline import (
 )
 from .model_metadata import ModelInfo, ModelCategory
 from .image_utils import get_base64_only
+from .generation_gate import NoCompletionEvidenceError
 from .output_ceiling import (
     OutputCapReachedError,
     attach_stop_reason,
@@ -691,6 +693,84 @@ class OllamaAdapter(LLMAdapter):
 
         return messages
 
+    async def _final_chat_response(
+        self, client, *, model, messages, request, budget, cancel_token,
+    ):
+        """Collect one logical completion from the original native SDK stream.
+
+        The SDK stream is lazy: acquisition alone does not perform HTTP. Retry
+        the complete acquire/read/aggregate operation, just as the former
+        eager chat call did. No content or incomplete tool call escapes here.
+        """
+        async def once():
+            stream = await client.chat(model=model, messages=messages,
+                                       stream=True, **request)
+            content, thinking, tool_calls, logprobs = [], [], [], []
+            content_seen = thinking_seen = False
+            logprobs_seen = False
+            input_tokens = output_tokens = None
+            generated_chunks = 0
+            terminal = None
+            try:
+                chunks = stream.__aiter__()
+                while True:
+                    try:
+                        chunk = await anext_or_cancelled(chunks, cancel_token)
+                    except StopAsyncIteration:
+                        break
+                    # Genuine parsed provider events only, never polling,
+                    # request start or private text in the observation channel.
+                    report_call_progress()
+                    if terminal is not None:
+                        raise ValueError("Ollama sent an event after its terminal response")
+                    message = chunk.message
+                    raw_content = message.content
+                    raw_thinking = message.thinking
+                    calls = message.tool_calls
+                    probabilities = chunk.logprobs
+                    if probabilities is not None:
+                        logprobs_seen = True
+                        logprobs.extend(probabilities)
+                    if raw_content is not None:
+                        content_seen = True
+                        content.append(raw_content)
+                    if raw_thinking is not None:
+                        thinking_seen = True
+                        thinking.append(raw_thinking)
+                    if calls:
+                        # SDK tool records are complete Mapping arguments. A
+                        # repeated function name can be a distinct call; never
+                        # infer identity or merge partial JSON by its name.
+                        tool_calls.extend(calls)
+                    it, ot = _reported_counts(chunk)
+                    if it is not None:
+                        input_tokens = it
+                    if ot is not None:
+                        output_tokens = ot
+                    if raw_content or raw_thinking or calls:
+                        generated_chunks += 1
+                        if generated_chunks > budget:
+                            raise self._output_cap_reached(model, budget,
+                                input_tokens=input_tokens, output_tokens=output_tokens)
+                    done = chunk.done
+                    if done is True:
+                        terminal = chunk
+            finally:
+                # Includes read failure/Stop/abandoned lazy entry. Native
+                # response custody retains the original close and its debt.
+                await close_native_execution_stream(stream, self)
+            if terminal is None:
+                raise NoCompletionEvidenceError(provider="ollama", model=model)
+            fields = {"content": "".join(content) if content_seen else None,
+                      "thinking": "".join(thinking) if thinking_seen else None,
+                      "tool_calls": tool_calls or None}
+            counts = {"prompt_eval_count": input_tokens, "eval_count": output_tokens,
+                      "logprobs": logprobs if logprobs_seen else None}
+            return terminal.model_copy(update={**counts,
+                "message": terminal.message.model_copy(update=fields)})
+
+        return await with_retry(once)
+
     @native_sdk_operation
     async def get_response(
         self,
@@ -744,15 +824,15 @@ class OllamaAdapter(LLMAdapter):
 
             extra_kwargs, budget = self._chat_kwargs(extra_kwargs, kwargs, model)
 
-            # A non-streaming chat reads the whole body before it returns, so
-            # a Stop must not wait for it.
+            # Logical completions remain buffered. Raw native streaming is a
+            # separate raw_request contract, not a lazy iterator as an answer.
+            if extra_kwargs.pop("stream", False) is not False:
+                raise ollama.RequestError(
+                    "Ollama logical completions require raw stream=False"
+                )
             response = await await_or_cancelled(
-                with_retry(
-                    client.chat,
-                    model=model,
-                    messages=messages,
-                    **extra_kwargs
-                ),
+                self._final_chat_response(client, model=model, messages=messages,
+                    request=extra_kwargs, budget=budget, cancel_token=cancel_token),
                 cancel_token,
             )
 
@@ -1039,8 +1119,8 @@ class OllamaAdapter(LLMAdapter):
         """
         Gets a streaming response from Ollama (text/thinking contract).
 
-        Note: Tool calling during streaming is not well-supported by Ollama.
-        For tool calls, use the non-streaming get_response method.
+        Tool calls remain buffered through get_response until the native
+        generation has supplied its terminal evidence.
 
         Delegates to :meth:`_stream_with_usage` and drops the terminal
         usage-bearing :class:`LLMResponse` so existing callers keep their
@@ -1073,14 +1153,11 @@ class OllamaAdapter(LLMAdapter):
         """
         Stream response with tool call detection.
 
-        FALLBACK STRATEGY: Ollama doesn't support tool calls during streaming well.
-        This method uses a fallback approach:
-        1. If tools are provided, make a non-streaming call first to detect tool calls
-        2. If tool calls are detected, yield the LLMResponse immediately
-        3. Otherwise, stream the text response
-
-        This is slightly less efficient than true streaming with tool detection,
-        but provides a consistent interface across all providers.
+        Tools use one logically buffered get_response. It consumes the native
+        SDK stream internally and reports genuine progress, but no partial
+        tool calls escape. A completed tool response is yielded once; otherwise
+        its completed thinking/text and terminal usage retain this facade's
+        existing shape. No second inference request is made.
 
         Args:
             client: Ollama async client
@@ -1100,7 +1177,7 @@ class OllamaAdapter(LLMAdapter):
         try:
             logger.info(f"Starting Ollama stream with tools for model: {model}")
 
-            # If tools are provided, check for tool calls first via non-streaming
+            # With tools, retain the logical buffered response until completion
             if tools:
                 response = await self.get_response(
                     client=client,
@@ -1139,7 +1216,7 @@ class OllamaAdapter(LLMAdapter):
                             yield response.content
                 # Terminal LLMResponse carrying usage so the service layer meters
                 # this turn (#1684); content was already streamed above. `response`
-                # holds the token counts from the non-streaming probe.
+                # holds the token counts from the buffered logical completion.
                 yield response
                 return
 
