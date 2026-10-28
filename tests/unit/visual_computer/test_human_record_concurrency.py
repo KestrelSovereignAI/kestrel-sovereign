@@ -70,13 +70,17 @@ async def test_status_snapshot_cannot_erase_acknowledged_original_revocation(
 
     async def observed_status(session, request):
         nonlocal status_returned, status_owner
-        status_owner = asyncio.current_task()
+        calls = [call for call in runtime.egress._calls.values()
+                 if call.sdk_owner is asyncio.current_task() and call.session == session]
+        assert len(calls) == 1
+        # The SDK invocation now has its own joined Task. The second record
+        # read still belongs to this exact call's original host RPC Task.
+        status_owner = calls[0].origin
         value = await original_status(session, request)
         assert value.state == 'active' and value.request == lease.request
         # The production egress owner still retains this original status
         # borrow here. Its ordinary close, not this observer, joins it.
-        for call in runtime.egress._calls.values():
-            status_children.extend(call.accepted_jobs)
+        status_children.extend(calls[0].accepted_jobs)
         status_returned = True
         return value
 
