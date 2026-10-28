@@ -10,10 +10,16 @@ from __future__ import annotations
 
 import asyncio
 import math
+from collections.abc import Callable
+from contextlib import AbstractAsyncContextManager, AsyncExitStack
+from dataclasses import dataclass
 
 from starlette.responses import Response
 
 from .capability_authority import HostCapabilityAccessDenied
+from kestrel_sovereign._async_ownership import (
+    await_owned_task, create_owned_task, raise_owned_outcome,
+)
 
 
 PRIVATE_RESPONSE_HEADERS = {
@@ -26,6 +32,13 @@ PRIVATE_RESPONSE_HEADERS = {
 _DELIVERY_KEY = "kestrel.private_delivery"
 
 
+@dataclass(frozen=True)
+class PrivateTransportBorrow:
+    """Trusted original owner callbacks; this object confers no authority."""
+    operation: Callable[[], AbstractAsyncContextManager[Callable[[], None]]]
+    cancel: Callable[[asyncio.Task], None]
+
+
 class _Delivery:
     def __init__(self):
         self.check_current = None
@@ -34,12 +47,17 @@ class _Delivery:
         self.failed = False
         self.finished = asyncio.Event()
         self.access_denied = HostCapabilityAccessDenied
+        self.transport_borrow = None
 
-    def begin(self, check, deadline, access_denied):
+    def begin(self, check, deadline, access_denied, transport_borrow=None):
         if self.check_current is not None:
             raise access_denied("private delivery already bound")
+        if transport_borrow is not None and (not isinstance(transport_borrow, PrivateTransportBorrow)
+                or not callable(transport_borrow.operation) or not callable(transport_borrow.cancel)):
+            raise TypeError("original private transport ownership callbacks required")
         self.access_denied = access_denied
         self.check_current, self.deadline, self.active = check, deadline, True
+        self.transport_borrow = transport_borrow
 
     def check(self):
         if not self.active or self.failed:
@@ -67,7 +85,24 @@ class PrivateDeliveryMiddleware:
             try:
                 async with asyncio.timeout_at(delivery.deadline):
                     delivery.check()
-                    await send(message)
+                    if delivery.transport_borrow is None:
+                        await send(message)
+                    else:
+                        async def native_send():
+                            async with delivery.transport_borrow.operation() as current:
+                                delivery.check()
+                                current()
+                                await send(message)
+                                current()
+                        # The outer send may block after buffering middleware
+                        # has acknowledged its queue. Keep this exact child in
+                        # the capability's original borrower registry until
+                        # physical transport settlement, even under repeated
+                        # cancellation or cancellation-suppressing transports.
+                        child = create_owned_task(native_send(), name="private-capability-send")
+                        outcome = await await_owned_task(child,
+                            cancel_on_caller_cancellation=delivery.transport_borrow.cancel)
+                        raise_owned_outcome(outcome, operation="private capability transport")
             except BaseException:
                 delivery.failed = True
                 delivery.finished.set()
@@ -90,12 +125,16 @@ context manager, yielding a synchronous current-policy checker. The resolver
 must retain the original context binding. ``error_response(error, prepared)``
 maps failures using the capability's own mutation/reconciliation semantics.
 Untrusted body preparation runs after authentication and before policy leases.
+The optional trusted ``transport_operation(context, prepared_value, check)``
+retains that same authority and yields a ``PrivateTransportBorrow`` for each
+actual outer send. Its cancellation callback shares the original owner's
+single-cancellation custody. No context is resolved from response metadata.
 """
 
     def __init__(
         self, request, *, authority, resolve_context, operation, build,
         error_response, timeout_seconds=30, prepare=None,
-        access_denied=HostCapabilityAccessDenied,
+        access_denied=HostCapabilityAccessDenied, transport_operation=None,
     ):
         super().__init__()
         if (isinstance(timeout_seconds, bool) or not math.isfinite(timeout_seconds)
@@ -105,6 +144,9 @@ Untrusted body preparation runs after authentication and before policy leases.
         self.resolve_context, self.operation, self.build = resolve_context, operation, build
         self.error_response, self.access_denied = error_response, access_denied
         self.timeout_seconds, self.prepare = timeout_seconds, prepare
+        if transport_operation is not None and not callable(transport_operation):
+            raise TypeError("private transport operation must be callable")
+        self.transport_operation = transport_operation
 
     async def __call__(self, scope, receive, send):
         started = False
@@ -134,14 +176,18 @@ Untrusted body preparation runs after authentication and before policy leases.
                             check()
                             for key, header in PRIVATE_RESPONSE_HEADERS.items():
                                 response.headers[key] = header
-                            delivery.begin(check, min(request_timeout.when(), context_deadline),
-                                           self.access_denied)
-                            try:
-                                await response(scope, receive, guarded_send)
-                                await delivery.finished.wait()
-                                delivery.check()
-                            finally:
-                                delivery.active = False
+                            async with AsyncExitStack() as transport:
+                                guard = (await transport.enter_async_context(
+                                    self.transport_operation(context, value, check))
+                                    if self.transport_operation is not None else None)
+                                delivery.begin(check, min(request_timeout.when(), context_deadline),
+                                               self.access_denied, guard)
+                                try:
+                                    await response(scope, receive, guarded_send)
+                                    await delivery.finished.wait()
+                                    delivery.check()
+                                finally:
+                                    delivery.active = False
         except Exception as error:
             if started:
                 raise

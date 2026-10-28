@@ -17,7 +17,7 @@ from tests.unit.visual_computer.test_runtime import opened
 
 def executable(tmp_path, name, body):
     path = tmp_path / name
-    path.write_text(f'#!{sys.executable}\n' + body)
+    path.write_text(f'#!{sys.executable} -B\n' + body)
     path.chmod(0o700)
     return path
 

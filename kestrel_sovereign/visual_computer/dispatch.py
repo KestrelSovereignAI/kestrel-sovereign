@@ -11,6 +11,7 @@ from kestrel_sdk.computer_use import ActionRequest, ComputerSession
 from kestrel_sdk.resources import ResourceOutcomeUnknown
 
 _ORIGIN = ContextVar('visual-original-dispatch', default=None)
+_HUMAN_ORIGIN = ContextVar('visual-original-human-dispatch', default=None)
 _TRACE = ContextVar('visual-native-dispatch', default=None)
 
 
@@ -64,6 +65,70 @@ class _NativeDispatch:
             self.proof = NativeActionNotDispatched(self, original)
             return self.proof
         return None
+
+
+class _OriginalHumanDispatch:
+    """One normalized original human call, distinct from agent provenance."""
+    def __init__(self, session, lease, request, frame):
+        from kestrel_sdk.computer_use.human_control import (
+            HumanActionRequest, HumanControlLease, HumanScreenFrame,
+        )
+        self.session = ComputerSession.model_validate_json(session.model_dump_json())
+        self.lease = HumanControlLease.model_validate_json(lease.model_dump_json())
+        self.request = HumanActionRequest.model_validate_json(request.model_dump_json())
+        self.frame = HumanScreenFrame.model_validate_json(frame.model_dump_json())
+        self.binding = (self.session, self.lease, self.request, self.frame)
+        self.active, self.trace, self.driver_entered = True, None, False
+
+    def enter_driver(self):
+        if not self.active or _HUMAN_ORIGIN.get() is not self or self.driver_entered or self.trace is not None:
+            raise ResourceOutcomeUnknown('original_human_driver_entry_differs')
+        self.driver_entered = True
+
+    def refuse_unentered(self, error):
+        if not self.active or _HUMAN_ORIGIN.get() is not self or self.driver_entered or self.trace is not None:
+            raise ResourceOutcomeUnknown('original_human_dispatch_may_have_entered')
+        trace = self.trace = _NativeDispatch(self)
+        trace.finished = True
+        return trace.refusal(error)
+
+    def require(self, fact):
+        trace = getattr(fact, '_trace', None)
+        if (type(fact) is not NativeActionNotDispatched or not self.active
+                or _HUMAN_ORIGIN.get() is not self or trace is not self.trace or trace is None
+                or trace.origin is not self or trace.proof is not fact or not trace.finished
+                or not trace.no_input()):
+            raise ResourceOutcomeUnknown('native_human_non_dispatch_fact_not_original')
+
+
+@contextmanager
+def original_human_dispatch(session, lease, request, frame):
+    origin = _OriginalHumanDispatch(session, lease, request, frame)
+    token = _HUMAN_ORIGIN.set(origin)
+    try:
+        yield origin
+    finally:
+        origin.active = False
+        _HUMAN_ORIGIN.reset(token)
+
+
+@contextmanager
+def native_human_dispatch(session, lease, request, driver_id):
+    origin = _HUMAN_ORIGIN.get()
+    if origin is None:
+        yield None
+        return
+    if (type(origin) is not _OriginalHumanDispatch or not origin.active
+            or origin.trace is not None or origin.session != session
+            or origin.lease != lease or origin.request != request or session.driver_id != driver_id):
+        raise ResourceOutcomeUnknown('native_human_dispatch_invocation_not_original')
+    trace = origin.trace = _NativeDispatch(origin)
+    token = _TRACE.set(trace)
+    try:
+        yield trace
+    finally:
+        trace.finished = True
+        _TRACE.reset(token)
 
 
 @contextmanager

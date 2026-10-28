@@ -19,7 +19,7 @@ async def test_native_inspect_failure_before_rpc_does_not_wedge_original_action(
         driver = DockerComputerDriver(docker_socket='/tmp/owned-review02.sock', egress_guard=h.runtime.egress.operation)
         driver._connections[session.session_id] = object()
         executable = tmp_path/'owned-daemon'
-        executable.write_text(f'#!{sys.executable}\nimport sys\nsys.stderr.write("owned transient inspect failure")\nsys.exit(1)\n')
+        executable.write_text(f'#!{sys.executable} -B\nimport sys\nsys.stderr.write("owned transient inspect failure")\nsys.exit(1)\n')
         executable.chmod(0o700)
         driver.boundary.executable = str(executable)
         async def bound(connection, **kwargs):
