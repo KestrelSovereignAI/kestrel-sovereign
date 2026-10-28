@@ -107,7 +107,8 @@ dependencies = [
     # before release rather than preserving an obsolete minor ceiling.
     # 0.43 adds model exposure and governed registration bindings for external callers.
     # 0.44.1 adds private result delivery after completed post-tool policy.
-    # 0.45.0 adds the optional environment acquisition-custody contracts.
+    # 0.45 adds authenticated human control and acquisition custody; the
+    # normal lock must resolve this published contract before host delivery.
     "kestrel-sovereign-sdk[a2a,httpx,tracing]>=0.45.0,<1",
     # Native A2A implementation is owned by the shared SDK [a2a] extra.
     # Core and feature skill producers use the same reviewed vendored types.

@@ -79,11 +79,17 @@ function manualSetup({failInput=false, expires=120000}={}) {
     const binding={control_id:'control',consumer_id:'consumer',session_id:'session',control_epoch:1,
         expires_at:new Date(Date.now()+expires).toISOString()};
     const lease={state:'active',request:binding};
+    let controller='human';
+    let epoch=1;
     const api={getHostAgent:()=> 'owner',onHostAgentChange:()=>()=>{},async requestForAgent(path,options,owner){
         calls.push({path,options,owner});
         if(options?.method==='POST' && /\/human\/[^/]+$/.test(path))binding.control_id=decodeURIComponent(path.split('/').at(-1));
         if(path.endsWith('/sessions'))return [{session_id:'session',phase:'fenced'}];
-        if(path.endsWith('/sessions/session'))return {phase:'fenced',session:{session_id:'session',controller:'human',control_epoch:1},lease:{state:'ready'}};
+        if(path.endsWith('/sessions/session'))return {phase:controller==='agent'?'active':'fenced',session:{session_id:'session',controller,control_epoch:epoch},lease:{state:'ready'}};
+        if(path.endsWith('/stop')){controller='none';epoch++;return {};}
+        if(path.endsWith('/takeover')){controller='human';epoch++;return {};}
+        if(path.endsWith('/handback')){controller='agent';epoch++;return {};}
+        if(/\/human\/[^/]+\/actions\/[^/]+$/.test(path))return {control_id:binding.control_id,consumer_id:binding.consumer_id,receipt:{action_id:decodeURIComponent(path.split('/').at(-1)),outcome:'completed'}};
         if(path.endsWith('/observation'))return {control_id:binding.control_id,consumer_id:'consumer',image_base64:'eA==',
             frame:{observation_id:'human-frame',session_id:'session',control_epoch:1,media_type:'image/png',width:800,height:600,observed_at:new Date().toISOString()}};
         if(path.endsWith('/actions')) {
@@ -166,3 +172,37 @@ test('handback never sends sharing confirmation unless operator explicitly check
     assert.equal(JSON.parse(call.options.body).share_screen,true);
     h.view.destroy();
 });
+
+for (const [label, suffix] of [['Stop input','stop'], ['Take over','takeover']]) {
+    test(`${label} preserves the original uncertain manual input for reconciliation`, async()=>{
+        const h=manualSetup({failInput:true});
+        try {
+            await h.view.refresh();h.click('Open human view');await flush();await flush();
+            h.body.querySelector('textarea').value='private operator text';
+            h.body.querySelector('[aria-label="Enable manual input"]').checked=true;
+            h.click('Type private text');await flush();
+            const input=h.calls.find(call=>call.path.endsWith('/actions'));
+            assert.ok(input);
+            const original=JSON.parse(input.options.body);
+            h.click(label);await flush();await flush();
+            assert.equal(h.calls.filter(call=>call.path.endsWith('/'+suffix)).length,1);
+            assert.equal(h.body.querySelector('img').hasAttribute('src'),false);
+            assert.equal(h.body.querySelector('textarea').value,'');
+            assert.equal(h.body.querySelector('[aria-label="Enable manual input"]').checked,false);
+            h.click('Reconcile last manual input');await flush();
+            const reconciliations=h.calls.filter(call=>/\/human\/[^/]+\/actions\/[^/]+$/.test(call.path));
+            assert.equal(reconciliations.length,1,'the original action remains available after control changes');
+            assert.equal(reconciliations[0].path,input.path+'/'+encodeURIComponent(original.action.action_id));
+            assert.equal(reconciliations[0].options,undefined);
+            assert.equal(reconciliations[0].owner,input.owner);
+            assert.match(h.body.textContent,/Original manual input reconciled/);
+            h.click('Reconcile last manual input');await flush();
+            assert.equal(h.calls.filter(call=>/\/human\/[^/]+\/actions\/[^/]+$/.test(call.path)).length,1);
+            assert.equal(h.calls.filter(call=>call.path.endsWith('/actions')).length,1,'input is never retried');
+            assert.equal(h.body.querySelector('img').hasAttribute('src'),false);
+            assert.equal(h.body.textContent.includes('private diagnostic'),false);
+        } finally {
+            h.view.destroy();await flush();h.dom.window.close();
+        }
+    });
+}

@@ -133,7 +133,8 @@ export function mountVisualComputer(body, api = API) {
         if (pending.operation !== operation) throw new Error('reconcile original control');
         await send(`/sessions/${selected()}/${suffix}`, { method: 'POST', body: JSON.stringify(
             operation === 'resume' ? {...pending, share_screen:true} : pending) });
-        human = null; opening = null; lastInput = null; clearTimeout(expiryTimer);
+        // Preserve the original input ID until its outcome is reconciled.
+        human = null; opening = null; clearTimeout(expiryTimer);
         if (version !== generation || id !== selector.value) return;
         pending = null;
         await refreshState();
