@@ -16,8 +16,11 @@ no longer holds its schedule row.
 #3881 found two more: a target's own refusal (``workflow_trigger_cron``'s
 workflow lease expiring) latched for the runner's lifetime, and while latched
 every ordinary target failure (``backup_snapshot``) was escalated instead of
-finalized. A target's failure or refusal is now a failed outcome, and an
-occurrence whose own lease expired latches only until its claim is settled.
+finalized. A target's failure, or its refusal under a lease of its own, is
+now a failed outcome. Any other denial a target raises, and an occurrence
+whose own lease expired, latches only until its claim is settled; a denial
+of another admission's scheduler scope still latches until the runner is
+replaced.
 """
 
 import asyncio
@@ -35,9 +38,11 @@ from kestrel_sovereign.execution_custody import (
     ExecutionCommitOutcomeError,
     ExecutionCustody,
     bind_execution_custody_snapshot,
+    execution_denial_scopes,
     execution_evidence_carriers,
     execution_terminal_error,
     is_execution_control_error,
+    require_execution_work,
 )
 from kestrel_sovereign.features.scheduler.runner import (
     SCHEDULER_PROTOCOL_VERSION,
@@ -152,6 +157,23 @@ def test_reconcilable_failure_classification():
     denied_debt = ExecutionAuthorityError("original confirmed lease expired")
     denied_debt._kestrel_native_retirement_debts = ((object(), None),)
 
+    def deny_another_occurrence_lease() -> ExecutionAuthorityError:
+        lease = ExecutionCustody(
+            _LeaseRenewalState(confirmed_deadline=time.monotonic() - 1)
+        )
+        with pytest.raises(ExecutionAuthorityError) as denial:
+            lease.require_work()
+        return denial.value
+
+    other_lease = deny_another_occurrence_lease()
+    hidden = execution_terminal_error(
+        ExecutionAuthorityError("unscoped sibling"), deny_another_occurrence_lease()
+    )
+    # The aggregate names no scope as a whole, so only a carrier walk finds it.
+    assert execution_denial_scopes(hidden) is None
+    with pytest.raises(ExecutionAuthorityError) as runtime_denial:
+        _deny_runtime_bound_by_the_target()
+
     for already_latched in (False, True):
         assert _is_reconcilable_occurrence_failure(
             ExecutionCommitOutcomeError("unknown"), already_latched=already_latched
@@ -171,6 +193,34 @@ def test_reconcilable_failure_classification():
         assert not _is_reconcilable_occurrence_failure(
             denied_debt, already_latched=already_latched
         )
+        # A runtime the target bound around its work is settled with the
+        # occurrence's claim: the claim keeps the effect for reconciliation.
+        assert _is_reconcilable_occurrence_failure(
+            runtime_denial.value, already_latched=already_latched
+        )
+        # A scheduler scope that reaches a latch is another occurrence's or
+        # runner's admission, which this claim's row cannot settle; an
+        # unscoped sibling grouped with it cannot hide it.
+        assert not _is_reconcilable_occurrence_failure(
+            other_lease, already_latched=already_latched
+        )
+        assert not _is_reconcilable_occurrence_failure(
+            hidden, already_latched=already_latched
+        )
+    # The occurrence's own lease, denied together with a runtime, skips the
+    # local-receipt path; proven ownership keeps that latch reconcilable.
+    own_lease = ExecutionCustody(
+        _LeaseRenewalState(confirmed_deadline=time.monotonic() - 1)
+    )
+    with pytest.raises(ExecutionAuthorityError) as own_denial:
+        own_lease.require_work()
+    with pytest.raises(ExecutionAuthorityError) as grouped_runtime:
+        _deny_runtime_bound_by_the_target()
+    grouped = execution_terminal_error(own_denial.value, grouped_runtime.value)
+    assert _is_reconcilable_occurrence_failure(
+        grouped, already_latched=False, own_scopes=(own_lease,)
+    )
+    assert not _is_reconcilable_occurrence_failure(grouped, already_latched=False)
     # An ordinary failure is an occurrence outcome only inside a latch; one
     # that would start a latch is scheduler infrastructure.
     assert _is_reconcilable_occurrence_failure(
@@ -961,34 +1011,28 @@ async def test_a_failed_tool_result_is_finalized_and_leaves_readiness_healthy(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("scoped", [True, False], ids=["scoped-denial", "unscoped-denial"])
-async def test_a_target_refusal_under_its_own_lease_is_a_failed_outcome(
-    tmp_path, scoped
-):
+async def test_a_target_refusal_under_its_own_lease_is_a_failed_outcome(tmp_path):
     """A target's own lease expiring is not the occurrence's (#3881).
 
     ``workflow_trigger_cron`` holds a workflow lease of its own and raises
-    ``ExecutionAuthorityError("original confirmed lease expired")`` when it
-    expires. In production the runner took that for its own authority loss
-    and latched readiness for its lifetime, taking the host's /health to 503
-    until a restart. The occurrence still held its lease, so the refusal is a
-    known failed outcome.
+    ``ExecutionAuthorityError`` when it expires. In production the runner
+    took that for its own authority loss and latched readiness for its
+    lifetime, taking the host's /health to 503 until a restart. The
+    occurrence still held its lease, so the refusal is a known failed
+    outcome.
     """
 
-    db = await _database(tmp_path / f"target-refusal-{scoped}.db")
+    db = await _database(tmp_path / "target-refusal.db")
 
     async def execute(_task_name, _args):
         workflow_lease = ConfirmedLeaseDeadline(
             confirmed_deadline=time.monotonic() - 1
         )
-        if scoped:
-            ExecutionCustody(workflow_lease).require_work()
-        workflow_lease.is_live()
-        raise workflow_lease.error
+        ExecutionCustody(workflow_lease).require_work()
 
     notifications = []
     runner = SchedulerRunner(
-        db, "agent-1", execute, owner_id=f"target-refusal-{scoped}",
+        db, "agent-1", execute, owner_id="target-refusal",
         on_protocol_failure=notifications.append,
     )
     runner._renew_lease = _renew_until_stopped
@@ -1032,8 +1076,85 @@ class _SwitchableFence:
         self.require_work()
 
 
+def _deny_runtime_bound_by_the_target() -> None:
+    """Deny a runtime the target bound around its own work, as review17 does.
+
+    The binding ends before the scheduler sees the denial, so the denied
+    scope is not one the occurrence holds when it classifies the error.
+    """
+    runtime = ExecutionCustody(_SwitchableFence())
+    with bind_execution_custody_snapshot((runtime,)):
+        runtime.revoke("runtime authority lost after the target's effect")
+        require_execution_work()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("denial", ["unscoped", "runtime"])
+async def test_a_target_denial_the_runner_cannot_localize_latches_until_settled(
+    tmp_path, denial
+):
+    """Only a lease the target holds refuses for the target (#3881, #3570).
+
+    An unscoped denial names no scope, and a denied runtime is the authority
+    the effect ran under, even once the target's binding of it has ended. The
+    runner cannot call either outcome known, so the occurrence keeps its
+    claim and latches readiness until recovery settles that claim. The latch
+    then clears without a restart.
+    """
+
+    db = await _database(tmp_path / f"unlocalized-{denial}.db")
+    calls = 0
+
+    async def execute(_task_name, _args):
+        nonlocal calls
+        calls += 1
+        if calls > 1:
+            return "reconciled"
+        if denial == "runtime":
+            _deny_runtime_bound_by_the_target()
+        workflow_lease = ConfirmedLeaseDeadline(
+            confirmed_deadline=time.monotonic() - 1
+        )
+        workflow_lease.is_live()
+        raise workflow_lease.error
+
+    notifications = []
+    runner = SchedulerRunner(
+        db, "agent-1", execute, owner_id=f"unlocalized-{denial}",
+        on_protocol_failure=notifications.append,
+    )
+    runner._renew_lease = _renew_until_stopped
+    try:
+        await runner._ensure_tables()
+        await _seed_due(db, task_name="workflow_trigger_cron")
+
+        await tick_and_settle(runner)
+
+        assert runner.readiness_failure is not None
+        assert runner.readiness_failure_reconcilable
+        [claim] = runner._readiness_reconciliations
+        assert await _held_claim(db) == (claim.execution_id, claim.claim_token)
+        # Not finalized: SQLite records no effect-start marker, so the
+        # occurrence's row is still the claim's.
+        assert (await _task_outcome(db, "task-1"))[0] == "claimed"
+
+        await _expire_lease(db)
+        await tick_and_settle(runner)
+
+        assert calls == 2
+        assert runner.readiness_failure is None
+        assert notifications == []
+        assert await db.fetchone(
+            "SELECT status, attempt_count FROM task_execution_log WHERE id = ?",
+            (claim.execution_id,),
+        ) == ("success", 2)
+    finally:
+        await _stop(runner)
+        await db.close()
+
+
 def test_target_refusal_classification():
-    """Only a pure denial that leaves the occurrence's own authority intact."""
+    """Only a typed lease denial that leaves the occurrence's authority intact."""
 
     lease = _LeaseRenewalState(confirmed_deadline=time.monotonic() + 60)
     foreign = ExecutionCustody(
@@ -1043,6 +1164,8 @@ def test_target_refusal_classification():
         foreign.require_work()
     refusal = foreign_denial.value
     unscoped = ExecutionAuthorityError("original confirmed lease expired")
+    with pytest.raises(ExecutionAuthorityError) as runtime_denial:
+        _deny_runtime_bound_by_the_target()
     own_fence = _SwitchableFence()
     own = ExecutionCustody(own_fence)
     owned_lease = ExecutionCustody(
@@ -1055,7 +1178,13 @@ def test_target_refusal_classification():
 
     with bind_execution_custody_snapshot((own,)):
         assert SchedulerRunner._is_target_refusal(refusal, lease)
-        assert SchedulerRunner._is_target_refusal(unscoped, lease)
+        wrapped = RuntimeError("workflow trigger refused")
+        wrapped.__cause__ = refusal
+        assert SchedulerRunner._is_target_refusal(wrapped, lease)
+        # No scope: the custody layer never localizes an unscoped denial.
+        assert not SchedulerRunner._is_target_refusal(unscoped, lease)
+        # A runtime the effect ran under is not the target's lease (#3570).
+        assert not SchedulerRunner._is_target_refusal(runtime_denial.value, lease)
         assert not SchedulerRunner._is_target_refusal(RuntimeError("failed"), lease)
         assert not SchedulerRunner._is_target_refusal(
             ExecutionCommitOutcomeError("unknown"), lease
@@ -1068,11 +1197,67 @@ def test_target_refusal_classification():
         with pytest.raises(ExecutionAuthorityError) as own_denial:
             own.require_work()
         # The occurrence's own custody refused too: the refusal may be its own.
-        assert not SchedulerRunner._is_target_refusal(unscoped, lease)
+        assert not SchedulerRunner._is_target_refusal(refusal, lease)
         assert not SchedulerRunner._is_target_refusal(own_denial.value, lease)
 
     lost = _LeaseRenewalState(confirmed_deadline=time.monotonic() - 1)
     assert not SchedulerRunner._is_target_refusal(refusal, lost)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("owner", ["own", "other"])
+async def test_a_latch_naming_a_scheduler_scope_is_reconcilable_only_for_its_owner(
+    tmp_path, owner
+):
+    """The latch reads the occurrence's own scopes, not just fence types.
+
+    The occurrence's lease denied together with a runtime is still settled by
+    its claim (#3881). The same denial of another occurrence's lease is
+    scheduler infrastructure: it latches until the runner is replaced and
+    reaches the host's protocol-failure callback.
+    """
+
+    db = await _database(tmp_path / f"latch-scope-{owner}.db")
+    notifications = []
+    runner = SchedulerRunner(
+        db, "agent-1", AsyncMock(), owner_id=f"latch-scope-{owner}",
+        on_protocol_failure=notifications.append,
+    )
+    try:
+        await runner._ensure_tables()
+        lease = ExecutionCustody(
+            _LeaseRenewalState(confirmed_deadline=time.monotonic() - 1)
+        )
+        with pytest.raises(ExecutionAuthorityError) as lease_denial:
+            lease.require_work()
+        with pytest.raises(ExecutionAuthorityError) as runtime_denial:
+            _deny_runtime_bound_by_the_target()
+        error = execution_terminal_error(lease_denial.value, runtime_denial.value)
+        state = _LeaseRenewalState(confirmed_deadline=time.monotonic() + 60)
+        state.occurrence_owner = runner
+        if owner == "own":
+            state.retain_scope(lease)
+        claim = _ReadinessReconciliation(
+            schedule_id="task-1", agent_id="agent-1",
+            execution_id="execution-1", claim_token="token-1",
+        )
+
+        runner._latch_protocol_failure(
+            error, occurrence_state=state, reconciliation=claim
+        )
+
+        assert runner.readiness_failure is error
+        if owner == "own":
+            assert runner.readiness_failure_reconcilable
+            assert runner._readiness_reconciliations == {claim}
+            assert notifications == []
+        else:
+            assert not runner.readiness_failure_reconcilable
+            assert runner._readiness_reconciliations == set()
+            assert notifications == [error]
+    finally:
+        await _stop(runner)
+        await db.close()
 
 
 async def _settle_row_elsewhere(db, task_id: str = "task-1") -> None:

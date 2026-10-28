@@ -627,7 +627,7 @@ def _is_plain_storage_failure(error: BaseException) -> bool:
 
 
 def _is_reconcilable_occurrence_failure(
-    error: BaseException, *, already_latched: bool
+    error: BaseException, *, already_latched: bool, own_scopes: tuple = ()
 ) -> bool:
     """Whether the durable rows of the occurrence it ended can settle it.
 
@@ -636,17 +636,29 @@ def _is_reconcilable_occurrence_failure(
     occurrence's lease expiring mid-effect (#3881): finalization, or recovery
     of the expired lease, settles that claim from its row. A runner whose own
     authority is gone cannot read that row, and its reconciliation read
-    escapes to the supervisor, whose latch names no claim and holds. An
-    ordinary failure is reconcilable only while readiness is already latched;
-    one that would start a latch is scheduler infrastructure, not an
-    occurrence outcome. Retirement debt never is: a durable row says nothing
-    about a physical resource that was not released.
+    escapes to the supervisor, whose latch names no claim and holds. A denial
+    of a scheduler scope outside ``own_scopes`` (the scopes the caller proved
+    are this occurrence's) is not: it is another runner's or an earlier
+    occurrence's admission, which is scheduler infrastructure this claim's row
+    cannot settle. Every carrier is read, so an unscoped denial grouped with
+    it cannot hide it. An ordinary failure is
+    reconcilable only while readiness is already latched; one that would
+    start a latch is scheduler infrastructure, not an occurrence outcome.
+    Retirement debt never is: a durable row says nothing about a physical
+    resource that was not released.
     """
 
     if execution_cleanup_debts(error):
         return False
-    if execution_commit_outcome(error) is not None or is_execution_control_error(error):
+    if execution_commit_outcome(error) is not None:
         return True
+    if is_execution_control_error(error):
+        return not any(
+            isinstance(scope.fence, (_LeaseRenewalState, _SchedulerEffectFence))
+            and not any(scope is own for own in own_scopes)
+            for carrier in execution_evidence_carriers(error)
+            for scope in vars(carrier).get("_kestrel_denied_execution_scopes", ())
+        )
     return already_latched
 
 
@@ -1572,9 +1584,19 @@ class SchedulerRunner:
         claims = found | self._attempted_claims_of(error)
         if reconciliation is not None:
             claims |= {reconciliation}
+        # The same provenance as the local-receipt check above: only this
+        # occurrence's scopes, or an earlier proof for a context-free observer.
+        own_scopes = owned_scopes
+        if (
+            state is None
+            and isinstance(previous, _OriginalOccurrenceReceipt)
+            and previous.owner is self
+        ):
+            own_scopes = previous.scopes
         reconcilable = bool(claims) and _is_reconcilable_occurrence_failure(
             error,
             already_latched=bool(found) or self._readiness_failure is not None,
+            own_scopes=own_scopes,
         )
         pending = vars(self).setdefault("_readiness_reconciliations", set())
         if self._readiness_failure is None:
@@ -2381,9 +2403,18 @@ class SchedulerRunner:
         the runner took it for its own authority loss and latched readiness
         for the runner's lifetime.
 
-        Commit-outcome and retirement evidence is never a target refusal, nor
-        is a denial of any scope the occurrence holds. Call it in the
-        occurrence's own context, after the target has returned.
+        Only a lease the target holds can refuse for the target. Every denied
+        scope must be typed evidence of a ``ConfirmedLeaseDeadline`` (a local
+        lease interval its holder pairs with its own exact-token CAS) that is
+        no scheduler's lease and no scope the occurrence holds (a scheduler
+        effect gate is an advisory fence, never a lease). A runtime or
+        transaction-bound authority (a runtime generation, a process runtime,
+        an advisory session) is the authority the effect ran under, so its
+        denial needs reconciliation even after the target's narrower binding
+        of it has ended (#3570). An unscoped denial names no scope, and the
+        custody layer never localizes one, so it is not a target refusal
+        either. Commit-outcome and retirement evidence never is. Call it in
+        the occurrence's own context, after the target has returned.
         """
 
         if not isinstance(error, Exception) or not is_execution_control_error(error):
@@ -2392,11 +2423,15 @@ class SchedulerRunner:
             return False
         if not renewal_state.is_live():
             return False
+        denied = execution_denial_scopes(error)
+        if not denied:
+            return False
         held = current_execution_custody()
         if any(
-            type(scope.fence) in (_LeaseRenewalState, _SchedulerEffectFence)
+            not isinstance(scope.fence, ConfirmedLeaseDeadline)
+            or isinstance(scope.fence, _LeaseRenewalState)
             or any(scope is own for own in held)
-            for scope in execution_denial_scopes(error) or ()
+            for scope in denied
         ):
             return False
         try:

@@ -369,16 +369,23 @@ diagnostics exposed only through the authenticated readiness surface.
 A target that fails has a known outcome, whatever else latched readiness
 (#3881). A tool that raises or returns a failure, such as `backup_snapshot`
 reporting `BACKUP_TARGET_FAILED_LIGHTHOUSE`, is finalized as `failed` and
-counted in its failure streak. So is a refusal a target raises for an
-admission of its own: `workflow_trigger_cron` holds a workflow lease and
-raises `ExecutionAuthorityError("original confirmed lease expired")` when
-that lease expires. The runner treats such an error as the target's only
-while the occurrence still holds its own lease, no denied scope is one the
-occurrence holds, its own custody still admits work, and the error carries
-no commit-outcome or retirement evidence. Before #3881 the runner took that
-refusal for its own authority loss and latched readiness for its lifetime,
-and every ordinary failure while latched was escalated instead of
-finalized, so the failed backup ran again at each lease expiry.
+counted in its failure streak. So is a refusal a target raises for a lease
+of its own: `workflow_trigger_cron` holds a workflow delivery lease and
+raises `ExecutionAuthorityError` when that lease expires. The runner treats
+such an error as the target's only when every denied scope is typed
+evidence of a `ConfirmedLeaseDeadline` (a local lease interval its holder
+pairs with its own exact-token CAS) that is no scheduler's lease and no
+scope the occurrence holds, while the occurrence still holds its own lease,
+its own custody still admits work, and the error carries no commit-outcome
+or retirement evidence. Any other authority denial a target raises keeps
+the occurrence's executing marker and claim for reconciliation, even when
+the denied scope was a narrower one the target bound and has since left
+(#3570): a denied runtime is the authority the effect ran under, and an
+unscoped denial names no scope the runner could attribute to the target.
+Before #3881 the runner took the lease refusal for its own authority loss
+and latched readiness for its lifetime, and every ordinary failure while
+latched was escalated instead of finalized, so the failed backup ran again
+at each lease expiry.
 
 One latch clears without a restart (#3782). An occurrence can end with an
 unknown or committed transaction outcome, for example a cron run cancelled
@@ -388,10 +395,14 @@ grouped with a cancelled rollback. The claim's own publication can end this
 way too: its COMMIT may have landed though the runner never received the
 claim, so the error carries the claim identity written before the CAS. An
 occurrence can also end with an authority denial, such as its own lease
-expiring mid-effect (#3881): finalization or recovery of the expired lease
-settles that claim from its row, and a runner whose own authority is gone
-cannot read the row, so its reconciliation read escapes to the supervisor
-and latches with no claim. An occurrence can also end with an ordinary
+expiring mid-effect or a target's runtime denial (#3881): finalization or
+recovery of the expired lease settles that claim from its row, and a runner
+whose own authority is gone cannot read the row, so its reconciliation read
+escapes to the supervisor and latches with no claim. A denial that names a
+scheduler scope is not reconcilable: the runner keeps the occurrence's own
+scheduler denials as local receipts without latching, so a scheduler scope
+that reaches the latch is another runner's or an earlier occurrence's
+admission, and this claim's row cannot settle it. An occurrence can also end with an ordinary
 failure outside its target while readiness is already latched; one that
 would start a latch is scheduler infrastructure. Either way the runner
 records the exact claim (schedule, execution and claim token) and reports
@@ -417,7 +428,8 @@ one poll. The run's control evidence is still raised from `stop()`.
 `readiness_latch` exposes the failure and whether it is reconcilable as one
 pair, because health probes read it from another thread. A latch that any
 other failure contributed to (a worker crash, a rollout or schema failure,
-a failure that names no claim, or physical retirement debt) is not
+a failure that names no claim, a denial of another admission's scheduler
+scope, or physical retirement debt) is not
 reconcilable. It
 holds until the runner is replaced. The host records reconcilable latches in
 `scheduler_reconciling_failures`, only while the runner holds them, and
