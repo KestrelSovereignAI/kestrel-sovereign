@@ -48,7 +48,7 @@ export function mountVisualComputer(body, api = API) {
     // Retained UI request identities are descriptive; every retry still uses
     // the original authenticated agent/channel and ordinary server checks.
     const retirements = new Map();
-    const controlKey = (owner, id) => JSON.stringify([owner, id]);
+    const controlKey = (owner, id, operation) => JSON.stringify([owner, id, operation === 'pause' ? 'pause' : 'controller']);
     const retirementKey = closing => JSON.stringify([closing.owner, closing.lease.session_id, closing.lease.control_id]);
     const hasRetirement = (owner, id) => [...retirements.values()].some(closing => closing.owner === owner && closing.lease.session_id === id);
     const clearHumanPixels = () => {
@@ -122,13 +122,39 @@ export function mountVisualComputer(body, api = API) {
     const selected = () => encodeURIComponent(selector.value);
     const display = value => {
         current = value;
-        const key = controlKey(agent, selector.value);
+        const id = selector.value;
+        const pending = value.pending_control;
+        const key = controlKey(agent, id, pending?.operation);
         // A status read cannot acknowledge a locally retained lost reply.
-        if (!pendingControls.has(key) && value.pending_control?.session_id === selector.value)
-            pendingControls.set(key, value.pending_control);
+        if (!pendingControls.has(key) && pending?.session_id === id)
+            pendingControls.set(key, {request:pending,owner:agent});
+        const pauseKey = controlKey(agent, id, 'pause');
+        const pause = pendingControls.get(pauseKey);
+        const fresh = pending == null && value.session?.session_id === id
+            && Number.isSafeInteger(value.session.control_epoch);
+        if (fresh && pause?.refused && value.session.control_epoch >= pause.request.expected_control_epoch) {
+            // A refused S is retained as an unverified attempt, not resent.
+            // Fresh status permits only a NEXT explicit safety intent.
+            pause.history = true;
+            pendingControls.set(JSON.stringify([agent, id, 'refused-pause', pause.request.request_id]), pause);
+            if (pendingControls.get(pauseKey) === pause) pendingControls.delete(pauseKey);
+        } else if (fresh && pause?.acknowledged
+                && value.session.control_epoch > pause.request.expected_control_epoch) {
+            const controllerKey = controlKey(agent, id, 'takeover');
+            if (pause.previous && pendingControls.get(controllerKey) === pause.previous) {
+                // S was acknowledged; R's outcome remains unresolved. Retain
+                // its exact descriptor as history, never replay it as new work.
+                pause.previous.history = true;
+                pendingControls.set(JSON.stringify([agent, id, 'unresolved', pause.previous.request.request_id]), pause.previous);
+                pendingControls.delete(controllerKey);
+            }
+            if (pendingControls.get(pauseKey) === pause) pendingControls.delete(pauseKey);
+        }
         const session = value.session;
         const lease = value.lease;
         state.textContent = `${value.phase}; controller: ${session?.controller || 'none'}; epoch: ${session?.control_epoch ?? 'unavailable'}; physical resource: ${lease?.state || 'acquisition unknown'}${value.requires_reconciliation ? '; reconciliation required' : ''}`;
+        if ([...pendingControls.values()].some(entry => entry.history && entry.owner === agent && entry.request.session_id === id))
+            state.textContent += '; earlier control outcome unresolved';
         if (session?.controller !== 'agent' || value.phase !== 'active') clearPixels();
     };
     const refreshState = async () => {
@@ -174,20 +200,34 @@ export function mountVisualComputer(body, api = API) {
         const owner = agent;
         clearPixels();
         if (operation === 'resume' && !shareConfirmed) throw new Error('confirm screen sharing');
-        const key = controlKey(owner, id);
-        if (!pendingControls.has(key)) pendingControls.set(key, { request_id: crypto.randomUUID(), session_id: id,
-            expected_control_epoch: current.session.control_epoch, operation });
-        const original = pendingControls.get(key);
+        const key = controlKey(owner, id, operation);
+        const pauseKey = controlKey(owner, id, 'pause');
+        if (operation !== 'pause' && pendingControls.has(pauseKey)) throw new Error('reconcile original safety Stop');
+        if (!pendingControls.has(key)) pendingControls.set(key, {
+            request:{request_id:crypto.randomUUID(),session_id:id,expected_control_epoch:current.session.control_epoch,operation},owner,
+            previous:operation === 'pause' ? pendingControls.get(controlKey(owner, id, 'takeover')) : undefined,
+        });
+        const entry = pendingControls.get(key);
+        const original = entry.request;
         if (original.operation !== operation) throw new Error('reconcile original control');
-        await api.requestForAgent(`/api/visual-computer/sessions/${encodeURIComponent(id)}/${suffix}`, { method: 'POST', body: JSON.stringify(
+        if (entry.refused) throw new Error('refresh status before another safety Stop');
+        try {
+            await api.requestForAgent(`/api/visual-computer/sessions/${encodeURIComponent(id)}/${suffix}`, { method: 'POST', body: JSON.stringify(
             operation === 'resume' ? {...original, share_screen:true} : original) }, owner);
+        } catch (error) {
+            if (operation === 'pause' && error?.status === 409 && pendingControls.get(key) === entry) entry.refused = true;
+            throw error;
+        }
         // This acknowledgement retires only the channel governed by this
         // control request, including a close whose network reply is delayed.
         for (const [retiredKey, closing] of retirements) {
             if (closing.owner === owner && closing.lease.session_id === id
                     && closing.lease.control_epoch === original.expected_control_epoch) retirements.delete(retiredKey);
         }
-        if (pendingControls.get(key) === original) pendingControls.delete(key);
+        if (pendingControls.get(key) === entry) {
+            if (operation === 'pause') entry.acknowledged = true;
+            else pendingControls.delete(key);
+        }
         if (version !== generation || id !== selector.value || owner !== agent) return;
         // Preserve the original input ID until its outcome is reconciled.
         human = null; opening = null; clearTimeout(expiryTimer);

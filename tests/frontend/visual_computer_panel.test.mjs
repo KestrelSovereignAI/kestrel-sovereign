@@ -77,34 +77,57 @@ test('takeover and agent changes discard late pixels and keep exact control requ
 // Scripted UI transport; genuine authenticated terminal metadata/409 behavior
 // is separately exercised by test_human_stale_revoke.py. These facts grant no IO.
 function manualSetup({failInput=false, expires=120000, failRevoke=false, failControl=false,
-    deferFirstRevoke=false, lostControlReplies=0, externalRetirement409=false,
-    metadataChange=value=>value, deferMetadata=false, loseOpenReply=false, sessions=['session']}={}) {
+    deferFirstRevoke=false, lostControlReplies=0, lostHandbackReplies=0, lostStopReplies=0,
+    deferStopAck=false, externalRetirement409=false,
+    metadataChange=value=>value, statusChange=value=>value, deferMetadata=false, loseOpenReply=false, sessions=['session']}={}) {
     const dom = new JSDOM('<main></main>', {url:'http://localhost/'});
     globalThis.document = dom.window.document;
     const calls=[];
     let binding;
     let lease;
-    let controller='human';
-    let epoch=1;
     let releaseFirstRevoke;
     const firstRevoke=deferFirstRevoke ? new Promise(resolve=>{releaseFirstRevoke=resolve;}) : null;
     let releaseMetadata;
     const metadataWait=deferMetadata ? new Promise(resolve=>{releaseMetadata=resolve;}) : null;
+    let releaseStopAck;
+    const stopAck=deferStopAck ? new Promise(resolve=>{releaseStopAck=resolve;}) : null;
+    let stopRepliesLost=0;
+    let handbackRepliesLost=0;
     let revokeCount=0;
     let selectedOwner='owner';
     let ownerChanged;
-    const acceptedControls=new Map();
+    const lastControls=new Map();
+    const sessionStates=new Map();
+    const stateFor=(owner,sid)=>{
+        const key=JSON.stringify([owner,sid]);
+        if(!sessionStates.has(key))sessionStates.set(key,{controller:'human',epoch:1});
+        return sessionStates.get(key);
+    };
+    const applyControl=async(original,owner,target,controller)=>{
+        const key=JSON.stringify([owner,original.session_id]);
+        const last=lastControls.get(key);
+        if(last?.request_id===original.request_id){
+            if(JSON.stringify(last)!==JSON.stringify(original))throw new Error('control ID differs');
+            return;
+        }
+        if(original.expected_control_epoch!==target.epoch)throw await parseResponseError(new Response(JSON.stringify({error:{code:'visual_conflict'}}),{status:409,headers:{'Content-Type':'application/json'}}));
+        target.controller=controller;target.epoch++;
+        lastControls.set(key,structuredClone(original));
+    };
     let controlRepliesLost=0;
     const retired=new Map();
     const key=(owner,path)=>JSON.stringify([owner,path]);
     const channelPath=request=>`/api/visual-computer/sessions/${request.session_id}/human/${request.control_id}`;
     const api={getHostAgent:()=>selectedOwner,onHostAgentChange:fn=>{ownerChanged=fn;return()=>{};},async requestForAgent(path,options,owner){
         calls.push({path,options,owner});
+        const match=/\/sessions\/([^/]+)/.exec(path);
+        const sid=match ? decodeURIComponent(match[1]) : sessions[0];
+        const target=stateFor(owner,sid);
         if(path.endsWith('/sessions'))return sessions.map(session_id=>({session_id,phase:'fenced'}));
-        if(/\/sessions\/[^/]+$/.test(path))return {phase:controller==='agent'?'active':'fenced',session:{session_id:decodeURIComponent(path.split('/').at(-1)),controller,control_epoch:epoch},lease:{state:'ready'}};
+        if(/\/sessions\/[^/]+$/.test(path))return statusChange({phase:target.controller==='agent'?'active':'fenced',session:{session_id:sid,controller:target.controller,state:target.controller==='agent'?'ready':'paused',control_epoch:target.epoch},lease:{state:'ready'}});
         if(options?.method==='POST' && /\/human\/[^/]+$/.test(path)){
             binding={schema_version:1,control_id:decodeURIComponent(path.split('/').at(-1)),consumer_id:crypto.randomUUID(),
-                session_id:decodeURIComponent(path.split('/').at(-3)),lease_id:'lease',driver_id:'driver',control_epoch:epoch,
+                session_id:decodeURIComponent(path.split('/').at(-3)),lease_id:'lease',driver_id:'driver',control_epoch:target.epoch,
                 scope:{tenant_id:'tenant',principal_id:'principal',agent_id:owner},issued_at:new Date().toISOString(),
                 expires_at:new Date(Date.now()+expires).toISOString(),capabilities:['screenshot','click','type'],max_frame_age_seconds:15};
             lease={schema_version:1,state:'active',request:binding,
@@ -112,14 +135,26 @@ function manualSetup({failInput=false, expires=120000, failRevoke=false, failCon
             if(loseOpenReply)throw new Error('accepted open reply lost');
             return structuredClone(lease);
         }
-        if(path.endsWith('/stop')){controller='none';epoch++;return {};}
+        if(path.endsWith('/stop')){
+            const original=JSON.parse(options.body);
+            await applyControl(original,owner,target,'none');
+            if(stopRepliesLost++<lostStopReplies)throw new Error('original Stop ACK lost');
+            if(stopAck)await stopAck;
+            return {};
+        }
         if(path.endsWith('/takeover')){
             const original=JSON.parse(options.body);
-            if(!acceptedControls.has(original.request_id)){controller='human';epoch++;acceptedControls.set(original.request_id,original);}
+            await applyControl(original,owner,target,'human');
             if(controlRepliesLost++<lostControlReplies)throw new Error('original control ACK lost');
             return {};
         }
-        if(path.endsWith('/handback')){if(failControl)throw new Error('private control failure');controller='agent';epoch++;return {};}
+        if(path.endsWith('/handback')){
+            if(failControl)throw new Error('private control failure');
+            const original=JSON.parse(options.body);
+            await applyControl(original,owner,target,'agent');
+            if(handbackRepliesLost++<lostHandbackReplies)throw new Error('original handback ACK lost');
+            return {};
+        }
         if(/\/human\/[^/]+\/actions\/[^/]+$/.test(path))return {control_id:binding.control_id,consumer_id:binding.consumer_id,receipt:{action_id:decodeURIComponent(path.split('/').at(-1)),outcome:'completed'}};
         if(path.endsWith('/observation'))return {control_id:binding.control_id,consumer_id:binding.consumer_id,image_base64:'eA==',
             frame:{observation_id:'human-frame',session_id:binding.session_id,control_epoch:binding.control_epoch,media_type:'image/png',width:800,height:600,observed_at:new Date().toISOString()}};
@@ -144,8 +179,8 @@ function manualSetup({failInput=false, expires=120000, failRevoke=false, failCon
     }};
     const body=document.querySelector('main');const view=mountVisualComputer(body,api);
     const click=label=>[...body.querySelectorAll('button')].find(node=>node.textContent===label).click();
-    return {dom,calls,body,view,click,acceptedLease:()=>structuredClone(lease),releaseFirstRevoke:()=>releaseFirstRevoke?.(),releaseMetadata:()=>releaseMetadata?.(),
-        externalStop:()=>{retired.set(key(selectedOwner,channelPath(binding)),{...structuredClone(lease),state:'revoked'});controller='none';epoch++;},
+    return {dom,calls,body,view,click,acceptedLease:()=>structuredClone(lease),releaseFirstRevoke:()=>releaseFirstRevoke?.(),releaseMetadata:()=>releaseMetadata?.(),releaseStopAck:()=>releaseStopAck?.(),
+        externalStop:()=>{retired.set(key(selectedOwner,channelPath(binding)),{...structuredClone(lease),state:'revoked'});const target=stateFor(selectedOwner,binding.session_id);target.controller='none';target.epoch++;},
         switchSession:id=>{const node=body.querySelector('select');node.value=id;node.dispatchEvent(new dom.window.Event('change'));},
         switchAgent:(next='other')=>{selectedOwner=next;ownerChanged();}};
 }
@@ -496,3 +531,117 @@ test('lost control replies retain distinct original IDs across agent switches',a
         assert.deepEqual(controls.map(call=>call.owner),['owner','other','owner','other']);
     } finally {h.view.destroy();await flush();h.dom.window.close();}
 });
+
+
+for(const [label,suffix,option] of [['Take over','takeover','lostControlReplies'],['Hand back','handback','lostHandbackReplies']]) {
+    test(`dedicated Stop stays available after lost ${suffix} reply and refresh`,async()=>{
+        const h=manualSetup({[option]:1});let original,stops,shares;
+        try {
+            await h.view.refresh();
+            if(suffix==='handback')h.body.querySelector('[aria-label="Screen is ready to share with the agent"]').checked=true;
+            h.click(label);await flush();await flush();
+            await h.view.refresh();
+            shares=h.body.querySelector('[aria-label="Screen is ready to share with the agent"]').checked;
+            h.click('Stop input');await flush();await flush();
+            original=h.calls.filter(call=>call.path.endsWith('/'+suffix));
+            stops=h.calls.filter(call=>call.path.endsWith('/stop'));
+        } finally {h.view.destroy();await flush();h.dom.window.close();}
+        assert.equal(original.length,1,'Stop must not retry the unknown controller operation');
+        assert.equal(stops.length,1,'dedicated Stop must remain independently usable');
+        const control=JSON.parse(original[0].options.body);const pause=JSON.parse(stops[0].options.body);
+        assert.notEqual(pause.request_id,control.request_id);
+        assert.equal(pause.operation,'pause');assert.equal(pause.expected_control_epoch,2);
+        assert.equal(stops[0].owner,original[0].owner);
+        assert.equal(shares,false,'Stop does not borrow or require handback sharing consent');
+        if(suffix==='handback')assert.equal(control.share_screen,true);
+    });
+}
+
+test('lost Stop replies keep stable S then fresh takeover without replaying unresolved R',async()=>{
+    const h=manualSetup({lostControlReplies:1,lostStopReplies:2});let controls,stops;
+    try {
+        await h.view.refresh();h.click('Take over');await flush();await flush();await h.view.refresh();
+        for(let attempt=0;attempt<3;attempt++){
+            h.click('Stop input');await flush();await flush();await h.view.refresh();
+        }
+        // The actual host retains only last_control. The old R cannot replay
+        // after S: a fresh explicit intent must use the new status epoch.
+        h.click('Take over');await flush();await flush();
+        controls=h.calls.filter(call=>call.path.endsWith('/takeover'));
+        stops=h.calls.filter(call=>call.path.endsWith('/stop'));
+    } finally {h.view.destroy();await flush();h.dom.window.close();}
+    assert.equal(stops.length,3);
+    assert.ok(stops.every(call=>call.options.body===stops[0].options.body && call.owner===stops[0].owner),'Stop retries retain only their exact original S');
+    assert.equal(controls.length,2);
+    assert.match(h.body.textContent,/earlier control outcome unresolved/,'original R remains unclassified descriptive history');
+    assert.notEqual(JSON.parse(controls[0].options.body).request_id,JSON.parse(controls[1].options.body).request_id);
+    assert.equal(JSON.parse(controls[1].options.body).expected_control_epoch,3,'new explicit takeover uses the verified current epoch');
+    assert.notEqual(JSON.parse(stops[0].options.body).request_id,JSON.parse(controls[0].options.body).request_id);
+});
+
+test('late original Stop acknowledgement cannot clear another owner current Human frame',async()=>{
+    const h=manualSetup({lostControlReplies:1,deferStopAck:true});
+    try {
+        await h.view.refresh();h.click('Take over');await flush();await flush();await h.view.refresh();
+        h.click('Stop input');await flush();
+        h.switchAgent();await h.view.refresh();h.click('Take over');await flush();await flush();
+        h.click('Open human view');await flush();await flush();
+        const image=h.body.querySelector('img');const src=image.getAttribute('src');assert.ok(src);
+        h.body.querySelector('textarea').value='current private text';
+        h.body.querySelector('[aria-label="Enable manual input"]').checked=true;
+        h.releaseStopAck();await flush();await flush();
+        assert.equal(image.getAttribute('src'),src);
+        assert.equal(h.body.querySelector('textarea').value,'current private text');
+        assert.equal(h.body.querySelector('[aria-label="Enable manual input"]').checked,true);
+        const stop=h.calls.find(call=>call.path.endsWith('/stop'));assert.equal(stop.owner,'owner');
+        assert.equal(h.calls.filter(call=>call.path.endsWith('/actions')).length,0);
+    } finally {h.releaseStopAck();h.view.destroy();await flush();h.dom.window.close();}
+});
+
+
+test('refused stale Stop requires fresh status before a new explicit safety intent',async()=>{
+    const h=manualSetup({lostControlReplies:1});let controls,stops,beforeRefresh;
+    try {
+        await h.view.refresh();h.click('Take over');await flush();await flush();
+        // No Refresh: the server-side takeover advanced the epoch, while the
+        // panel still holds its original cached epoch. Canonical409, not loss.
+        h.click('Stop input');await flush();await flush();
+        h.click('Stop input');await flush();await flush();
+        beforeRefresh=h.calls.filter(call=>call.path.endsWith('/stop')).length;
+        await h.view.refresh();
+        h.click('Stop input');await flush();await flush();
+        controls=h.calls.filter(call=>call.path.endsWith('/takeover'));
+        stops=h.calls.filter(call=>call.path.endsWith('/stop'));
+    } finally {h.view.destroy();await flush();h.dom.window.close();}
+    assert.equal(controls.length,1);
+    assert.equal(beforeRefresh,1,'a refused S cannot be resent before fresh status');
+    assert.equal(stops.length,2);
+    assert.match(h.body.textContent,/earlier control outcome unresolved/);
+    const first=JSON.parse(stops[0].options.body);const next=JSON.parse(stops[1].options.body);
+    assert.equal(first.expected_control_epoch,1);assert.equal(next.expected_control_epoch,2);
+    assert.notEqual(first.request_id,next.request_id,'a fresh explicit Stop must not resend definitively refused S');
+});
+
+
+for(const [name,change] of [
+    ['unchanged epoch',value=>({...value,session:{...value.session,control_epoch:2}})],
+    ['foreign session',value=>({...value,session:{...value.session,session_id:'foreign'}})],
+    ['pending control',value=>({...value,pending_control:{request_id:'other',session_id:'session',expected_control_epoch:3,operation:'takeover'}})],
+]) {
+    test(`acknowledged Stop does not retire controller intent from ${name} status`,async()=>{
+        let blocked=false;
+        const h=manualSetup({lostControlReplies:1,statusChange:value=>blocked ? change(value) : value});
+        try {
+            await h.view.refresh();h.click('Take over');await flush();await flush();await h.view.refresh();
+            blocked=true;h.click('Stop input');await flush();await flush();
+            h.click('Take over');await flush();await flush();
+            assert.equal(h.calls.filter(call=>call.path.endsWith('/takeover')).length,1,'S needs its own fresh current status before a new controller intent');
+            blocked=false;await h.view.refresh();h.click('Take over');await flush();await flush();
+            const controls=h.calls.filter(call=>call.path.endsWith('/takeover'));
+            assert.equal(controls.length,2);
+            assert.equal(JSON.parse(controls[1].options.body).expected_control_epoch,3);
+            assert.notEqual(controls[0].options.body,controls[1].options.body);
+            assert.match(h.body.textContent,/earlier control outcome unresolved/);
+        } finally {h.view.destroy();await flush();h.dom.window.close();}
+    });
+}
