@@ -616,6 +616,8 @@ class DockerComputerDriver:
                 # The accepted native RPC may already have installed bytes or
                 # delivered input. Revoked private delivery is never no-effect.
                 raise ResourceOutcomeUnknown("driver_effect_outcome_unknown") from None
+        if type(response) is not dict:
+            raise ResourceOutcomeUnknown("invalid_private_worker_response") from None
         if response.get("id") != identifier:
             raise ResourceOutcomeUnknown("worker_response_identity_unknown")
         if "error" in response:

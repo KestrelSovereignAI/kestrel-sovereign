@@ -7,9 +7,9 @@ from __future__ import annotations
 
 import base64
 import json
-from pydantic import SecretBytes
+from pydantic import SecretBytes, ValidationError
 from kestrel_sdk.computer_use import human_control
-from kestrel_sdk.resources import ResourceUnsupported
+from kestrel_sdk.resources import ResourceUnsupported, ResourceOutcomeUnknown
 
 
 def human_operation_id(control_id, operation, action_id=None):
@@ -50,9 +50,12 @@ class DockerHumanControl:
     async def observe(self, session, lease):
         from kestrel_sdk.computer_use import ScreenFrame, ScreenObservation
         result = await self._call(session, lease.request.control_id, "observe", {"lease": lease.model_dump(mode="json")})
-        return human_control.HumanScreenObservation(control_id=result["control_id"], consumer_id=result["consumer_id"],
-            observation=ScreenObservation(frame=parse(ScreenFrame, result["frame"]),
-                image=SecretBytes(base64.b64decode(result["image_base64"], validate=True))))
+        try:
+            return human_control.HumanScreenObservation(control_id=result["control_id"], consumer_id=result["consumer_id"],
+                observation=ScreenObservation(frame=parse(ScreenFrame, result["frame"]),
+                    image=SecretBytes(base64.b64decode(result["image_base64"], validate=True))))
+        except (ValueError, KeyError, TypeError, ValidationError):
+            raise ResourceOutcomeUnknown("invalid_private_worker_response") from None
 
     async def act(self, session, lease, request):
         from .dispatch import native_human_dispatch
@@ -72,5 +75,7 @@ class DockerHumanControl:
 
     async def revoke(self, session, request):
         value = await self._call(session, request.control_id, "revoke", {"request": request.model_dump(mode="json")})
+        if type(value) is not dict:
+            raise ResourceOutcomeUnknown("invalid_private_worker_response") from None
         model = human_control.HumanControlLease if "request_sha256" in value else human_control.HumanControlRevocationTombstone
         return parse(model, value)
