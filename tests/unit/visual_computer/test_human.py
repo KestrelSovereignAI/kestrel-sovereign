@@ -82,6 +82,16 @@ async def input_request(h,ctx,s,lease):
             control_epoch=s.control_epoch,not_after=h.runtime._now()+timedelta(seconds=5),action=TypeText(kind='type',text='PRIVATE-HUMAN-TEXT')))
 
 
+def original_human_rpc(runtime, session):
+    """Observe the actual host/SDK owner relation without replacing either."""
+    task = asyncio.current_task()
+    calls = [call for call in runtime.egress._calls.values()
+             if call.sdk_owner is task and call.session == session]
+    assert len(calls) == 1
+    assert calls[0].origin is not task and not calls[0].origin.done()
+    return calls[0]
+
+
 @pytest.mark.asyncio
 async def test_private_human_lane_never_enters_agent_status_and_custody_is_encrypted(harness):
     h=harness;ctx=h.context()

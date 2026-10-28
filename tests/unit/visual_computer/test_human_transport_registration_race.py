@@ -12,6 +12,7 @@ from kestrel_sdk.computer_use.human_control import HumanControlLease
 from kestrel_sovereign.visual_computer.human import HumanRecord
 from tests.unit.visual_computer.test_host import AUTH, visual_host as visual_host
 from tests.unit.visual_computer.test_human_http import setup
+from tests.unit.visual_computer.test_human import original_human_rpc
 from tests.unit.visual_computer.test_human_delivery import OuterTransport
 from tests.unit.visual_computer.test_human_record_concurrency import _ciphertext
 
@@ -50,10 +51,10 @@ async def test_original_revoke_ack_prevents_post_fence_transport_snapshot_delive
 
     async def observed_rpc(session, original_lease):
         nonlocal observe_owner
-        observe_owner = asyncio.current_task()
+        call = original_human_rpc(runtime, session)
+        observe_owner = call.origin
         value = await original_observe(session, original_lease)
-        for call in runtime.egress._calls.values():
-            rpc_children.extend(call.accepted_jobs)
+        rpc_children.extend(call.accepted_jobs)
         return value
 
     async def after_original_transport_read(selected_scope, selected_sid, selected_cid, *, check, accept=None, update=None):
