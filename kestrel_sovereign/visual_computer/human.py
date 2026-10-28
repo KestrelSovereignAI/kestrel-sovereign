@@ -248,8 +248,14 @@ class HumanComputerRuntime:
                 if serial != r._control_serials.get(r._key(scope, sid), 0):
                     raise ResourceConflict("human open fenced before dispatch")
             lease = await self._call(context, record, cid, "open", current, self._extension(record).open, request, deadline=request.expires_at)
-            lease.require_request(request)
-            lease.require_active(record.session, at=r._now())
+            current()
+            now = r._now()
+            request.require_session(record.session, at=now)
+            try:
+                lease.require_request(request)
+                lease.require_active(record.session, at=now)
+            except ValueError:
+                raise ResourceOutcomeUnknown("invalid_private_worker_response") from None
             stored.lease = lease
             await self._record(scope, sid, cid, check=check, update=stored)
             return lease
@@ -257,7 +263,10 @@ class HumanComputerRuntime:
     async def status(self, context, sid, cid):
         async with self._operation(context, sid, cid, metadata=True) as (record, stored, check):
             lease = await self._call(context, record, cid, "status", check, self._extension(record).status, stored.request)
-            lease.require_request(stored.request)
+            try:
+                lease.require_request(stored.request)
+            except ValueError:
+                raise ResourceOutcomeUnknown("invalid_private_worker_response") from None
             stored = await self._record(self.runtime.scope(context), sid, cid, check=check)
             if stored.revocation is not None and lease.state == "active":
                 raise ResourceOutcomeUnknown("human retirement requires original-ID reconciliation")
@@ -271,7 +280,14 @@ class HumanComputerRuntime:
         async with self._operation(context, sid, cid) as (record, stored, check):
             value = await self._call(context, record, cid, "observe", check, self._extension(record).observe,
                 stored.lease, deadline=stored.request.expires_at)
-            value.require_lease(stored.lease, record.session, at=self.runtime._now())
+            now = self.runtime._now()
+            # Original currentness is not a malformed peer response.
+            check()
+            stored.lease.require_active(record.session, at=now)
+            try:
+                value.require_lease(stored.lease, record.session, at=now)
+            except ValueError:
+                raise ResourceOutcomeUnknown("invalid_private_worker_response") from None
             stored.frame = value.frame_record
             await self._record(self.runtime.scope(context), sid, cid, check=check, update=stored)
             return value
@@ -367,7 +383,10 @@ class HumanComputerRuntime:
                                 raise fact.original
                             raise
                     receipt = await dispatch(record.session, stored.lease, request)
-                    receipt.require_request(request)
+                    try:
+                        receipt.require_request(request)
+                    except ValueError:
+                        raise ResourceOutcomeUnknown("invalid_private_worker_response") from None
                     await self.repository.action(scope, sid, request.action.action_id, receipt=receipt.receipt, guard=check)
                     return receipt
                 except BaseException as failure:
@@ -403,7 +422,10 @@ class HumanComputerRuntime:
                     stored.lease, action_id, action_id=action_id)
             except ResourceNotFound:
                 raise ResourceOutcomeUnknown("original manual input is unknown to this worker") from None
-            receipt.require_request(request)
+            try:
+                receipt.require_request(request)
+            except ValueError:
+                raise ResourceOutcomeUnknown("invalid_private_worker_response") from None
             await self.repository.action(scope, sid, action_id, receipt=receipt.receipt, guard=check)
             return receipt
 
@@ -493,12 +515,18 @@ class HumanComputerRuntime:
         if isinstance(value, HumanControlRevocationTombstone):
             if stored.lease is not None:
                 raise ResourceOutcomeUnknown("accepted human lease cannot become a pre-open tombstone")
-            value.require_revocation(request, record.session)
+            try:
+                value.require_revocation(request, record.session)
+            except ValueError:
+                raise ResourceOutcomeUnknown("invalid_private_worker_response") from None
             stored.tombstone = value
         else:
-            request.require_target(value, record.session)
-            if stored.request is not None:
-                value.require_request(stored.request)
+            try:
+                request.require_target(value, record.session)
+                if stored.request is not None:
+                    value.require_request(stored.request)
+            except ValueError:
+                raise ResourceOutcomeUnknown("invalid_private_worker_response") from None
             if value.state != "revoked":
                 raise ResourceOutcomeUnknown("manual input retirement remains unverified")
             stored.lease = value

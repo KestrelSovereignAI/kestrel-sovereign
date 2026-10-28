@@ -43,19 +43,35 @@ export function mountVisualComputer(body, api = API) {
     let humanFrame = null;
     let humanOwner = null;
     let opening = null;
-    let lastInput = null;
+    const pendingInputs = new Map();
     let expiryTimer = null;
+    let viewRevision = 0;
+    const busyOwners = new WeakMap();
     // Retained UI request identities are descriptive; every retry still uses
     // the original authenticated agent/channel and ordinary server checks.
     const retirements = new Map();
     const controlKey = (owner, id, operation) => JSON.stringify([owner, id, operation === 'pause' ? 'pause' : 'controller']);
+    const inputKey = (owner, id) => JSON.stringify([owner, id]);
+    const originalInput = () => pendingInputs.get(inputKey(agent, selector.value));
+    const matchesControl = (original, pending) => pending?.schema_version === 1
+        && ['request_id', 'session_id', 'expected_control_epoch', 'operation'].every(key => original[key] === pending[key]);
+    // Descriptive DOM ownership only: these tokens grant no server operation.
+    const presentation = () => ({owner:agent, id:selector.value, generation, revision:viewRevision});
+    const currentScope = value => value.owner === agent && value.id === selector.value && value.generation === generation;
+    const ownsView = value => currentScope(value) && value.revision === viewRevision;
+    const claimView = value => { value.revision = ++viewRevision; };
+    const resetButtons = () => {
+        for (const node of body.querySelectorAll('button')) {
+            busyOwners.delete(node); node.disabled = false;
+        }
+    };
     const retirementKey = closing => JSON.stringify([closing.owner, closing.lease.session_id, closing.lease.control_id]);
     const hasRetirement = (owner, id) => [...retirements.values()].some(closing => closing.owner === owner && closing.lease.session_id === id);
     const clearHumanPixels = () => {
         humanFrame = null; enable.checked = false; text.value = ''; share.checked = false;
         image.tabIndex = -1;
     };
-    const clearPixels = () => { image.hidden = true; image.removeAttribute('src'); clearHumanPixels(); };
+    const clearPixels = () => { viewRevision++; image.hidden = true; image.removeAttribute('src'); clearHumanPixels(); };
     const send = (path, options) => api.requestForAgent('/api/visual-computer' + path, options, agent);
     const humanPath = binding => `/sessions/${encodeURIComponent(binding.session_id)}/human/${encodeURIComponent(binding.control_id)}`;
     const matchesRetirement = (closing, value) => {
@@ -132,7 +148,14 @@ export function mountVisualComputer(body, api = API) {
         const pause = pendingControls.get(pauseKey);
         const fresh = pending == null && value.session?.session_id === id
             && Number.isSafeInteger(value.session.control_epoch);
-        if (fresh && pause?.refused && value.session.control_epoch >= pause.request.expected_control_epoch) {
+        if (fresh && pause?.previous?.acknowledged
+                && value.session.control_epoch > pause.previous.request.expected_control_epoch) {
+            // An explicitly reconciled R permits a NEXT explicit safety intent.
+            // S remains unclassified descriptive history, never an inferred ACK.
+            pause.history = true;
+            pendingControls.set(JSON.stringify([agent, id, 'unresolved-pause', pause.request.request_id]), pause);
+            if (pendingControls.get(pauseKey) === pause) pendingControls.delete(pauseKey);
+        } else if (fresh && pause?.refused && value.session.control_epoch >= pause.request.expected_control_epoch) {
             // A refused S is retained as an unverified attempt, not resent.
             // Fresh status permits only a NEXT explicit safety intent.
             pause.history = true;
@@ -164,17 +187,35 @@ export function mountVisualComputer(body, api = API) {
         const value = await send(`/sessions/${selected()}`);
         if (version === generation && id === selector.value) display(value);
     };
+    const wireButton = (node, run, failed) => {
+        node.addEventListener('click', () => {
+            const owner = presentation();
+            // Each operation owns its busy state. A blocked observation never
+            // disables Stop/takeover or queues them behind a shared promise.
+            busyOwners.set(node, owner);
+            node.disabled = true;
+            Promise.resolve().then(() => {
+                if (!currentScope(owner)) return;
+                owner.revision = viewRevision;
+                const result = run(owner);
+                // Retain only this operation's synchronous presentation work.
+                owner.generation = generation; owner.revision = viewRevision;
+                return result;
+            }).catch(() => {
+                if (!ownsView(owner)) return;
+                clearPixels();
+                failed();
+            }).finally(() => {
+                if (busyOwners.get(node) !== owner) return;
+                busyOwners.delete(node); node.disabled = false;
+            });
+        });
+    };
     const button = (label, run) => {
         const node = element('button', label);
         node.type = 'button';
-        node.addEventListener('click', () => {
-            // Each operation owns its busy state. A blocked observation never
-            // disables Stop/takeover or queues them behind a shared promise.
-            node.disabled = true;
-            Promise.resolve().then(run).catch(() => {
-                clearPixels();
-                state.textContent = 'Operation did not complete. Refresh status and reconcile the original request before retrying input.';
-            }).finally(() => { node.disabled = false; });
+        wireButton(node, run, () => {
+            state.textContent = 'Operation did not complete. Refresh status and reconcile the original request before retrying input.';
         });
         controls.append(node);
     };
@@ -202,7 +243,10 @@ export function mountVisualComputer(body, api = API) {
         if (operation === 'resume' && !shareConfirmed) throw new Error('confirm screen sharing');
         const key = controlKey(owner, id, operation);
         const pauseKey = controlKey(owner, id, 'pause');
-        if (operation !== 'pause' && pendingControls.has(pauseKey)) throw new Error('reconcile original safety Stop');
+        const retained = pendingControls.get(key);
+        if (operation !== 'pause' && pendingControls.has(pauseKey)
+                && !(retained?.owner === owner && current.session.session_id === id
+                    && matchesControl(retained.request, current.pending_control))) throw new Error('reconcile original safety Stop');
         if (!pendingControls.has(key)) pendingControls.set(key, {
             request:{request_id:crypto.randomUUID(),session_id:id,expected_control_epoch:current.session.control_epoch,operation},owner,
             previous:operation === 'pause' ? pendingControls.get(controlKey(owner, id, 'takeover')) : undefined,
@@ -225,8 +269,8 @@ export function mountVisualComputer(body, api = API) {
                     && closing.lease.control_epoch === original.expected_control_epoch) retirements.delete(retiredKey);
         }
         if (pendingControls.get(key) === entry) {
-            if (operation === 'pause') entry.acknowledged = true;
-            else pendingControls.delete(key);
+            entry.acknowledged = true;
+            if (operation !== 'pause') pendingControls.delete(key);
         }
         if (version !== generation || id !== selector.value || owner !== agent) return;
         // Preserve the original input ID until its outcome is reconciled.
@@ -235,20 +279,17 @@ export function mountVisualComputer(body, api = API) {
     };
     const manualButton = (label, run) => {
         const node = element('button', label); node.type = 'button'; manual.append(node);
-        node.addEventListener('click', () => {
-            node.disabled = true;
-            Promise.resolve().then(run).catch(() => {
-                clearPixels();
-                manualState.textContent = 'Human operation failed or authority expired. Reconcile original IDs; do not retry input.';
-            }).finally(() => { node.disabled = false; });
+        wireButton(node, run, () => {
+            manualState.textContent = 'Human operation failed or authority expired. Reconcile original IDs; do not retry input.';
         });
     };
-    const showHuman = async () => {
+    const showHuman = async owner => {
         const binding = requireHuman();
-        if (lastInput) throw new Error('reconcile original input');
+        if (originalInput()) throw new Error('reconcile original input');
+        claimView(owner);
         const version = generation;
         const value = await send(humanPath(binding)+'/observation');
-        if (version !== generation || human?.request !== binding) return;
+        if (!ownsView(owner) || version !== generation || human?.request !== binding) return;
         requireHuman();
         if (value.control_id !== binding.control_id || value.consumer_id !== binding.consumer_id
                 || value.frame.control_epoch !== binding.control_epoch || value.frame.session_id !== binding.session_id
@@ -257,23 +298,36 @@ export function mountVisualComputer(body, api = API) {
         image.src = `data:image/png;base64,${value.image_base64}`; image.hidden = false; image.tabIndex = 0;
         manualState.textContent = 'Private human view. Enable input explicitly; focus the screen for pointer or keyboard control.';
     };
-    const manualInput = async action => {
+    const manualInput = async (action, displayOwner = presentation()) => {
         const binding = requireHuman();
         if (action.kind === 'type' && !action.text.length) throw new Error('enter private text');
-        if (!enable.checked || !humanFrame || lastInput) throw new Error('manual input is not armed');
+        if (!enable.checked || !humanFrame || originalInput()) throw new Error('manual input is not armed');
         const deadline = Math.min(Date.now()+10000, Date.parse(binding.expires_at), Date.parse(humanFrame.observed_at)+15000);
         if (deadline <= Date.now()) throw new Error('fresh human view required');
         const request = {control_id:binding.control_id,consumer_id:binding.consumer_id,action:{
             action_id:crypto.randomUUID(),session_id:binding.session_id,observation_id:humanFrame.observation_id,
             control_epoch:binding.control_epoch,not_after:new Date(deadline).toISOString(),action}};
-        lastInput = {action_id:request.action.action_id,control_id:binding.control_id,session_id:binding.session_id,binding,owner:agent};
+        const owner = agent, version = generation, key = inputKey(owner, binding.session_id);
+        const entry = {action_id:request.action.action_id,control_id:binding.control_id,session_id:binding.session_id,binding,owner};
+        pendingInputs.set(key, entry);
         clearPixels();
-        const result = await send(humanPath(binding)+'/actions', {method:'POST',body:JSON.stringify(request)});
-        if (result.control_id !== binding.control_id || result.consumer_id !== binding.consumer_id
-                || result.receipt?.action_id !== lastInput?.action_id || result.receipt.outcome === 'unknown') throw new Error('reconcile original input');
-        manualState.textContent = `Manual input ${result.receipt.outcome}. Reconcile its original receipt, then request a fresh view.`;
+        displayOwner.revision = viewRevision;
+        const currentInput = () => pendingInputs.get(key) === entry && version === generation
+            && ownsView(displayOwner) && owner === agent && selector.value === binding.session_id && human?.request === binding;
+        try {
+            const result = await api.requestForAgent('/api/visual-computer'+humanPath(binding)+'/actions', {method:'POST',body:JSON.stringify(request)}, owner);
+            if (result.control_id !== binding.control_id || result.consumer_id !== binding.consumer_id
+                    || result.receipt?.action_id !== entry.action_id || result.receipt.outcome === 'unknown') throw new Error('reconcile original input');
+            if (!currentInput()) return;
+            manualState.textContent = `Manual input ${result.receipt.outcome}. Reconcile its original receipt, then request a fresh view.`;
+        } catch (error) {
+            // A reconciled descriptor or a different current view owns its own
+            // pixels and arm state. The original unresolved ID stays retained.
+            if (!currentInput()) return;
+            throw error;
+        }
     };
-    manualButton('Open human view', async () => {
+    manualButton('Open human view', async owner => {
         if (human || opening || hasRetirement(agent, selector.value) || current?.session?.controller !== 'human') throw new Error('take over first');
         const version = generation;
         opening = {control_id:crypto.randomUUID(),session_id:selector.value,control_epoch:current.session.control_epoch};
@@ -286,24 +340,27 @@ export function mountVisualComputer(body, api = API) {
                 || !(Date.parse(value.request.expires_at) > Date.now())) throw new Error('human binding differs');
         human = value;
         expiryTimer = setTimeout(() => { revokeHuman(); }, Math.max(0, Date.parse(value.request.expires_at)-Date.now()));
-        await showHuman();
+        if (ownsView(owner)) await showHuman(owner);
     });
     manualButton('Refresh human screen', showHuman);
     manualButton('Focus screen keyboard', () => {
         requireHuman();
-        if (!enable.checked || !humanFrame || lastInput) throw new Error('arm a fresh human screen first');
+        if (!enable.checked || !humanFrame || originalInput()) throw new Error('arm a fresh human screen first');
         image.focus();
     });
-    manualButton('Type private text', () => manualInput({kind:'type',text:text.value}));
-    manualButton('Reconcile last manual input', async () => {
-        const binding = lastInput?.binding;
-        if (!lastInput || !binding) throw new Error('no original input');
-        const id = lastInput.action_id;
-        const result = await api.requestForAgent('/api/visual-computer'+humanPath(binding)+'/actions/'+encodeURIComponent(id), undefined, lastInput.owner);
+    manualButton('Type private text', owner => manualInput({kind:'type',text:text.value}, owner));
+    manualButton('Reconcile last manual input', async owner => {
+        const entry = originalInput();
+        const binding = entry?.binding;
+        if (!entry || !binding) throw new Error('no original input');
+        const id = entry.action_id, version = generation, key = inputKey(entry.owner, entry.session_id);
+        const result = await api.requestForAgent('/api/visual-computer'+humanPath(binding)+'/actions/'+encodeURIComponent(id), undefined, entry.owner);
         if (result.control_id !== binding.control_id || result.consumer_id !== binding.consumer_id
                 || result.receipt?.action_id !== id || result.receipt.outcome === 'unknown') throw new Error('input remains unknown');
-        lastInput = null;
-        manualState.textContent = 'Original manual input reconciled. Refresh human screen before more input.';
+        if (pendingInputs.get(key) !== entry) return;
+        pendingInputs.delete(key);
+        if (ownsView(owner) && version === generation && agent === entry.owner && selector.value === entry.session_id)
+            manualState.textContent = 'Original manual input reconciled. Refresh human screen before more input.';
     });
     manualButton('Close human view', revokeHuman);
     image.addEventListener('click', event => {
@@ -312,7 +369,9 @@ export function mountVisualComputer(body, api = API) {
         const x = Math.floor((event.clientX-bounds.left)*humanFrame.width/bounds.width);
         const y = Math.floor((event.clientY-bounds.top)*humanFrame.height/bounds.height);
         image.focus();
-        manualInput({kind:'click',x,y,button:'left'}).catch(() => {
+        const owner = presentation();
+        manualInput({kind:'click',x,y,button:'left'}, owner).catch(() => {
+            if (!ownsView(owner)) return;
             clearPixels(); manualState.textContent = 'Manual input uncertain or refused. Reconcile the original ID.';
         });
     });
@@ -323,17 +382,20 @@ export function mountVisualComputer(body, api = API) {
             : event.shiftKey && event.key === 'Tab' ? 'Shift+Tab' : event.key;
         if (!keys.has(key) && key !== 'Control+A' && key !== 'Shift+Tab' && !(key.length === 1 && !event.ctrlKey && !event.altKey && !event.metaKey)) return;
         event.preventDefault();
-        manualInput(key.length === 1 ? {kind:'type',text:key} : {kind:'key',key}).catch(() => {
+        const owner = presentation();
+        manualInput(key.length === 1 ? {kind:'type',text:key} : {kind:'key',key}, owner).catch(() => {
+            if (!ownsView(owner)) return;
             clearPixels(); manualState.textContent = 'Manual input uncertain or refused. Reconcile the original ID.';
         });
     });
     image.addEventListener('blur', () => { enable.checked = false; });
     button('Refresh sessions', refresh);
-    button('Show current screen', async () => {
+    button('Show current screen', async owner => {
+        claimView(owner);
         const version = generation;
         const id = selector.value;
         const value = await send(`/sessions/${selected()}/observation`);
-        if (version !== generation || id !== selector.value || current?.session?.controller !== 'agent') return;
+        if (!ownsView(owner) || version !== generation || id !== selector.value || current?.session?.controller !== 'agent') return;
         // The server verifies bytes, media type and bounded image dimensions.
         if (!['image/png', 'image/jpeg'].includes(value.frame.media_type)) throw new Error('invalid screen');
         image.src = `data:${value.frame.media_type};base64,${value.image_base64}`;
@@ -352,10 +414,10 @@ export function mountVisualComputer(body, api = API) {
         state.textContent = result.released ? 'Physical release verified.' : 'Release remains uncertain; cleanup custody retained.';
         await refreshState();
     });
-    selector.addEventListener('change', () => { revokeHuman(); generation++; current = null; clearPixels(); refreshState().catch(() => { state.textContent = 'Session status unavailable.'; }); });
-    const reset = () => { revokeHuman(); generation++; agent = api.getHostAgent(); current = null; selector.replaceChildren(); clearPixels(); state.textContent = 'Refresh sessions for the selected agent.'; };
+    selector.addEventListener('change', () => { revokeHuman(); generation++; current = null; clearPixels(); resetButtons(); refreshState().catch(() => { state.textContent = 'Session status unavailable.'; }); });
+    const reset = () => { revokeHuman(); generation++; agent = api.getHostAgent(); current = null; selector.replaceChildren(); clearPixels(); resetButtons(); state.textContent = 'Refresh sessions for the selected agent.'; };
     const unsubscribe = api.onHostAgentChange(reset);
-    return { refresh, hide: () => { generation++; revokeHuman(); clearPixels(); }, destroy: () => { generation++; revokeHuman(); clearPixels(); unsubscribe(); } };
+    return { refresh, hide: () => { generation++; revokeHuman(); clearPixels(); resetButtons(); }, destroy: () => { generation++; revokeHuman(); clearPixels(); resetButtons(); unsubscribe(); } };
 }
 
 let view = null;

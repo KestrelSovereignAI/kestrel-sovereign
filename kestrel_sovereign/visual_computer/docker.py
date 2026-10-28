@@ -622,6 +622,8 @@ class DockerComputerDriver:
             raise ResourceOutcomeUnknown("worker_response_identity_unknown")
         if "error" in response:
             reason = response["error"]
+            if type(reason) is not str:
+                raise ResourceOutcomeUnknown("invalid_private_worker_response") from None
             if reason in {"stale_control", "stale_observation", "action_conflict", "control_conflict", "control_pending", "workspace_conflict", "human_conflict"}:
                 raise ResourceConflict(reason)
             if reason in {"unsupported_request", "unsupported_action", "unsupported_control", "workspace_unsupported", "human_unsupported"}:
