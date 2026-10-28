@@ -72,7 +72,7 @@ test('takeover and agent changes discard late pixels and keep exact control requ
     h.view.destroy();
 });
 
-function manualSetup({failInput=false, expires=120000}={}) {
+function manualSetup({failInput=false, expires=120000, failRevoke=false, failControl=false, deferFirstRevoke=false}={}) {
     const dom = new JSDOM('<main></main>', {url:'http://localhost/'});
     globalThis.document = dom.window.document;
     const calls=[];
@@ -81,28 +81,34 @@ function manualSetup({failInput=false, expires=120000}={}) {
     const lease={state:'active',request:binding};
     let controller='human';
     let epoch=1;
-    const api={getHostAgent:()=> 'owner',onHostAgentChange:()=>()=>{},async requestForAgent(path,options,owner){
+    let releaseFirstRevoke;
+    const firstRevoke=deferFirstRevoke ? new Promise(resolve=>{releaseFirstRevoke=resolve;}) : null;
+    let revokeCount=0;
+    let selectedOwner='owner';
+    let ownerChanged;
+    const api={getHostAgent:()=>selectedOwner,onHostAgentChange:fn=>{ownerChanged=fn;return()=>{};},async requestForAgent(path,options,owner){
         calls.push({path,options,owner});
-        if(options?.method==='POST' && /\/human\/[^/]+$/.test(path))binding.control_id=decodeURIComponent(path.split('/').at(-1));
+        if(options?.method==='POST' && /\/human\/[^/]+$/.test(path)){binding.control_id=decodeURIComponent(path.split('/').at(-1));binding.control_epoch=epoch;}
         if(path.endsWith('/sessions'))return [{session_id:'session',phase:'fenced'}];
         if(path.endsWith('/sessions/session'))return {phase:controller==='agent'?'active':'fenced',session:{session_id:'session',controller,control_epoch:epoch},lease:{state:'ready'}};
         if(path.endsWith('/stop')){controller='none';epoch++;return {};}
         if(path.endsWith('/takeover')){controller='human';epoch++;return {};}
-        if(path.endsWith('/handback')){controller='agent';epoch++;return {};}
+        if(path.endsWith('/handback')){if(failControl)throw new Error('private control failure');controller='agent';epoch++;return {};}
         if(/\/human\/[^/]+\/actions\/[^/]+$/.test(path))return {control_id:binding.control_id,consumer_id:binding.consumer_id,receipt:{action_id:decodeURIComponent(path.split('/').at(-1)),outcome:'completed'}};
         if(path.endsWith('/observation'))return {control_id:binding.control_id,consumer_id:'consumer',image_base64:'eA==',
-            frame:{observation_id:'human-frame',session_id:'session',control_epoch:1,media_type:'image/png',width:800,height:600,observed_at:new Date().toISOString()}};
+            frame:{observation_id:'human-frame',session_id:'session',control_epoch:binding.control_epoch,media_type:'image/png',width:800,height:600,observed_at:new Date().toISOString()}};
         if(path.endsWith('/actions')) {
             if(failInput)throw new Error('private diagnostic must not be rendered');
             const id=JSON.parse(options.body).action.action_id;
             return {control_id:binding.control_id,consumer_id:binding.consumer_id,receipt:{action_id:id,outcome:'completed'}};
         }
-        if(path.endsWith('/revoke'))return {revoked:true};
+        if(path.endsWith('/revoke')){revokeCount++;if(deferFirstRevoke && revokeCount===1){await firstRevoke;return {revoked:true};}if(failRevoke)throw new Error('private revoke diagnostic');return {revoked:true};}
         return lease;
     }};
     const body=document.querySelector('main');const view=mountVisualComputer(body,api);
     const click=label=>[...body.querySelectorAll('button')].find(node=>node.textContent===label).click();
-    return {dom,calls,body,view,click};
+    return {dom,calls,body,view,click,releaseFirstRevoke:()=>releaseFirstRevoke?.(),
+        switchAgent:()=>{selectedOwner='other';ownerChanged();}};
 }
 
 test('human view opens explicitly and input needs an independent arm and fresh frame', async()=>{
@@ -206,3 +212,99 @@ for (const [label, suffix] of [['Stop input','stop'], ['Take over','takeover']])
         }
     });
 }
+
+
+for (const [label,suffix] of [['Stop input','stop'],['Take over','takeover'],['Hand back','handback']]) {
+    test(`verified ${suffix} clears only its old Human retirement retry`,async()=>{
+        const h=manualSetup({failRevoke:true});
+        try {
+            await h.view.refresh();h.click('Open human view');await flush();await flush();
+            h.view.hide();await flush();
+            const retires=()=>h.calls.filter(call=>call.path.endsWith('/revoke'));
+            assert.equal(retires().length,1);
+            const original=retires()[0];
+            if(suffix==='handback')h.body.querySelector('[aria-label="Screen is ready to share with the agent"]').checked=true;
+            h.click(label);await flush();await flush();
+            assert.equal(h.calls.filter(call=>call.path.endsWith('/'+suffix)).length,1);
+            const count=retires().length;
+            h.view.hide();await flush();
+            assert.equal(retires().length,count,'verified control ACK must retire pending channel retry');
+            assert.equal(h.body.querySelector('img').hasAttribute('src'),false);
+            assert.equal(h.body.querySelector('[aria-label="Enable manual input"]').checked,false);
+            assert.equal(h.body.querySelector('textarea').value,'');
+            if(suffix!=='takeover'){h.click('Take over');await flush();await flush();}
+            h.click('Open human view');await flush();await flush();
+            const opens=h.calls.filter(call=>call.options?.method==='POST' && /\/human\/[^/]+$/.test(call.path));
+            assert.equal(opens.length,2,'new view must open after verified original retirement');
+            assert.notEqual(opens[1].path,original.path.slice(0,-'/revoke'.length));
+            assert.equal(h.calls.filter(call=>call.path.endsWith('/actions')).length,0);
+            assert.ok(h.calls.every(call=>call.owner==='owner'));
+            assert.equal(h.body.textContent.includes('private revoke diagnostic'),false);
+        } finally {h.releaseFirstRevoke();h.view.destroy();await flush();h.dom.window.close();}
+    });
+}
+
+test('failed control keeps the exact unresolved Human retirement retry',async()=>{
+    const h=manualSetup({failRevoke:true,failControl:true});
+    try {
+        await h.view.refresh();h.click('Open human view');await flush();await flush();
+        h.view.hide();await flush();
+        const first=h.calls.find(call=>call.path.endsWith('/revoke'));
+        h.body.querySelector('[aria-label="Screen is ready to share with the agent"]').checked=true;
+        h.click('Hand back');await flush();await flush();
+        h.view.hide();await flush();
+        const retires=h.calls.filter(call=>call.path.endsWith('/revoke'));
+        assert.equal(retires.length,2);
+        assert.equal(retires[1].path,first.path);assert.equal(retires[1].options.body,first.options.body);
+        assert.equal(retires[1].owner,first.owner);
+        assert.equal(h.body.querySelector('img').hasAttribute('src'),false);
+        assert.equal(h.calls.filter(call=>call.path.endsWith('/actions')).length,0);
+        assert.equal(h.body.textContent.includes('private control failure'),false);
+    } finally {h.releaseFirstRevoke();h.view.destroy();await flush();h.dom.window.close();}
+});
+
+test('a late original retirement reply cannot erase a newer channel retirement',async()=>{
+    const h=manualSetup({failRevoke:true,deferFirstRevoke:true});
+    try {
+        await h.view.refresh();h.click('Open human view');await flush();await flush();
+        h.view.hide();await flush();
+        const first=h.calls.find(call=>call.path.endsWith('/revoke'));
+        h.body.querySelector('[aria-label="Screen is ready to share with the agent"]').checked=true;
+        h.click('Hand back');await flush();await flush();
+        h.click('Take over');await flush();await flush();h.click('Open human view');await flush();await flush();
+        const opens=h.calls.filter(call=>call.options?.method==='POST' && /\/human\/[^/]+$/.test(call.path));
+        assert.equal(opens.length,2,'new view must open while only the old network reply remains delayed');
+        h.view.hide();await flush();
+        const second=h.calls.filter(call=>call.path.endsWith('/revoke')).at(-1);
+        assert.notEqual(second.path,first.path);
+        h.releaseFirstRevoke();await flush();await flush();
+        h.view.hide();await flush();
+        const retires=h.calls.filter(call=>call.path.endsWith('/revoke'));
+        assert.equal(retires.length,3,'old completion must not clear the newer unresolved retirement');
+        assert.equal(retires[2].path,second.path);assert.equal(retires[2].options.body,second.options.body);
+        assert.equal(h.calls.filter(call=>call.path.endsWith('/actions')).length,0);
+        assert.equal(h.body.querySelector('img').hasAttribute('src'),false);
+    } finally {h.releaseFirstRevoke();await flush();await flush();h.view.destroy();await flush();h.dom.window.close();}
+});
+
+test('another agent control acknowledgement preserves the original retirement',async()=>{
+    const h=manualSetup({failRevoke:true});
+    try {
+        await h.view.refresh();h.click('Open human view');await flush();await flush();
+        h.view.hide();await flush();
+        const first=h.calls.find(call=>call.path.endsWith('/revoke'));
+        h.switchAgent();await flush();await h.view.refresh();
+        h.click('Take over');await flush();await flush();
+        const control=h.calls.find(call=>call.path.endsWith('/takeover'));
+        assert.equal(control.owner,'other');
+        const count=h.calls.filter(call=>call.path.endsWith('/revoke')).length;
+        h.view.hide();await flush();
+        const retires=h.calls.filter(call=>call.path.endsWith('/revoke'));
+        assert.equal(retires.length,count+1,'another agent ACK cannot retire the original channel');
+        assert.equal(retires.at(-1).owner,'owner');
+        assert.equal(retires.at(-1).path,first.path);
+        assert.equal(retires.at(-1).options.body,first.options.body);
+        assert.equal(h.calls.filter(call=>call.path.endsWith('/actions')).length,0);
+        assert.equal(h.body.querySelector('img').hasAttribute('src'),false);
+    } finally {h.view.destroy();await flush();h.dom.window.close();}
+});

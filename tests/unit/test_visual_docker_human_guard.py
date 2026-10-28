@@ -70,3 +70,33 @@ async def test_post_acceptance_reply_loss_is_unknown_and_missing_guard_refuses(m
     async def rpc(cid,payload,**options):active[0]=False;return {'id':payload['id'],'result':{}}
     monkeypatch.setattr(driver,'_bound',bound);monkeypatch.setattr(driver.boundary,'rpc',rpc)
     with pytest.raises(ResourceOutcomeUnknown):await driver.human_control()._call(session(),'control','act',{})
+
+
+@pytest.mark.parametrize("model_name", ["lease", "receipt", "tombstone", "frame"])
+def test_invalid_human_worker_model_is_unknown_not_invalid_client_input(model_name):
+    """Canonical result decoder + exact HTTP mapper, not HTTP admission proof."""
+    import json
+    from kestrel_sdk.computer_use import ScreenFrame, human_control
+    from kestrel_sovereign.visual_computer.docker_human import parse
+    from kestrel_sovereign.visual_computer.http import _error
+
+    model = {
+        "lease": human_control.HumanControlLease,
+        "receipt": human_control.HumanActionReceipt,
+        "tombstone": human_control.HumanControlRevocationTombstone,
+        "frame": ScreenFrame,
+    }[model_name]
+    private = "PRIVATE-MALFORMED-HUMAN-WORKER-RESULT"
+    caught = None
+    try:
+        parse(model, {"unexpected_worker_field": private})
+    except Exception as error:
+        caught = error
+    assert caught is not None, "malformed original worker result was accepted"
+    response = _error(caught, False)
+    assert response.status_code == 503
+    assert json.loads(response.body) == {"error": {"code": "visual_outcome_unknown"}}
+    assert type(caught) is ResourceOutcomeUnknown
+    assert str(caught) == "invalid_private_worker_response"
+    assert caught.__cause__ is None and caught.__suppress_context__
+    assert private not in response.body.decode() and private not in str(caught)

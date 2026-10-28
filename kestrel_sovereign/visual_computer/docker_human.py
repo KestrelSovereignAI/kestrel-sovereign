@@ -17,7 +17,8 @@ def human_operation_id(control_id, operation, action_id=None):
 
 
 def parse(model, value):
-    return model.model_validate_json(json.dumps(value))
+    from .docker import _record
+    return _record(model, value)
 
 
 
@@ -27,7 +28,6 @@ class DockerHumanControl:
         self.driver = driver
 
     async def _call(self, session, control_id, operation, arguments, action_id=None):
-        from .docker import _record
         identifier = human_operation_id(control_id, operation, action_id)
         metadata = operation in {"status", "action_status", "revoke"}
         async def dispatch(current=None):

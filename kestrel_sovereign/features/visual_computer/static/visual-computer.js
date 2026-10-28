@@ -60,14 +60,16 @@ export function mountVisualComputer(body, api = API) {
         clearTimeout(expiryTimer); clearPixels();
         if (!lease) return;
         const target = humanPath(lease) + '/revoke';
-        const payload = retirement?.payload || {request_id:crypto.randomUUID(), control_epoch:lease.control_epoch};
-        retirement = {lease, owner, payload};
+        const closing = retirement || {lease, owner, payload:{request_id:crypto.randomUUID(), control_epoch:lease.control_epoch}};
+        retirement = closing;
         manualState.textContent = 'Closing human channel; awaiting input retirement.';
         try {
-            await api.requestForAgent('/api/visual-computer'+target, {method:'POST',body:JSON.stringify(payload)}, owner);
+            await api.requestForAgent('/api/visual-computer'+target, {method:'POST',body:JSON.stringify(closing.payload)}, owner);
+            if (retirement !== closing) return;
             retirement = null;
             manualState.textContent = 'Human channel revoked. A fresh takeover is required before opening another consumer.';
         } catch {
+            if (retirement !== closing) return;
             manualState.textContent = 'Human retirement is uncertain. Use Stop or release; do not reconnect or retry input.';
         }
     };
@@ -126,16 +128,22 @@ export function mountVisualComputer(body, api = API) {
         const shareConfirmed = share.checked;
         const version = ++generation;
         const id = selector.value;
+        const owner = agent;
         clearPixels();
         if (operation === 'resume' && !shareConfirmed) throw new Error('confirm screen sharing');
         pending = pending || { request_id: crypto.randomUUID(), session_id: selector.value,
             expected_control_epoch: current.session.control_epoch, operation };
         if (pending.operation !== operation) throw new Error('reconcile original control');
+        const original = pending;
         await send(`/sessions/${selected()}/${suffix}`, { method: 'POST', body: JSON.stringify(
-            operation === 'resume' ? {...pending, share_screen:true} : pending) });
+            operation === 'resume' ? {...original, share_screen:true} : original) });
+        // This acknowledgement retires only the channel governed by this
+        // control request, including a close whose network reply is delayed.
+        if (retirement?.owner === owner && retirement.lease.session_id === id
+                && retirement.lease.control_epoch === original.expected_control_epoch) retirement = null;
+        if (version !== generation || id !== selector.value || owner !== agent) return;
         // Preserve the original input ID until its outcome is reconciled.
         human = null; opening = null; clearTimeout(expiryTimer);
-        if (version !== generation || id !== selector.value) return;
         pending = null;
         await refreshState();
     };

@@ -186,3 +186,52 @@ async def test_human_native_refusal_preserves_original_explicit_cause_graph(harn
         assert original.__cause__ is child and child.__cause__ is native
         replay = await h.runtime.human.act(context, session.session_id, 'human', request)
         assert replay.receipt == saved.receipt and entries == [request.action.action_id]
+
+
+@pytest.mark.asyncio
+async def test_malformed_native_human_receipt_retains_original_pending_input(
+    harness, monkeypatch, tmp_path,
+):
+    """Real owned stdin/driver/parser + original SQLite custody; no Docker daemon."""
+    from kestrel_sdk.resources import ResourceOutcomeUnknown
+
+    h, context = harness, harness.context()
+    with h.bind(context):
+        session, _, request, driver, received = await native_input(h, context, tmp_path, monkeypatch)
+        executable = tmp_path / "owned-native-worker"
+        # Keep native_input's exact owned executable/header. This controlled
+        # peer sends genuine JSON with the original RPC id and an invalid model.
+        header = executable.read_text().splitlines()[0]
+        executable.write_text(header + "\n" +
+            "import json,sys\nfrom pathlib import Path\n" +
+            "data=sys.stdin.buffer.read()\n" +
+            "Path(" + repr(str(received)) + ").write_bytes(data)\n" +
+            "value=json.loads(data)\n" +
+            "print(json.dumps({'id':value['id'],'result':{'unexpected_worker_field':"
+            "'PRIVATE-MALFORMED-HUMAN-WORKER-RESULT'}}))\n")
+        failure = None
+        try:
+            await h.runtime.human.act(context, session.session_id, "human", request)
+        except Exception as error:
+            failure = error
+        assert failure is not None, "invalid native result was accepted"
+        saved = await h.repository.action(h.runtime.scope(context), session.session_id, request.action.action_id)
+        assert saved.channel == "human" and saved.control_id == "human"
+        assert saved.dispatch_started and saved.receipt is None
+        assert await h.repository.has_pending_actions(h.runtime.scope(context), session.session_id)
+        assert received.is_file() and received.stat().st_size > 17
+        before = received.read_bytes()
+        import json
+        wire = json.loads(before)
+        assert wire["operation"] == "human" and wire["arguments"]["operation"] == "act"
+        assert wire["arguments"]["arguments"]["request"] == request.model_dump(mode="json")
+        with pytest.raises(ResourceOutcomeUnknown, match="without replay"):
+            await h.runtime.human.act(context, session.session_id, "human", request)
+        assert received.read_bytes() == before
+        assert h.runtime._inflight == 0 and not h.runtime.egress._calls
+        assert not driver._workspace_borrowers and not h.repository._original_results
+        assert not h.db.backend._original_result_holds
+        # Check classification LAST, so the baseline first proves native
+        # input/custody/no-replay invariants rather than skipping them.
+        assert type(failure) is ResourceOutcomeUnknown
+        assert str(failure) == "invalid_private_worker_response"

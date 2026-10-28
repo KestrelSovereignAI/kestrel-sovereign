@@ -410,41 +410,86 @@ class HumanComputerRuntime:
     async def revoke(self, context, sid, cid, request_id, epoch):
         r, scope = self.runtime, self.runtime.scope(context)
         async with r.operation(context, VisualAction.HUMAN_REVOKE) as check:
-            r._fence(scope, sid)
-            await r.egress.revoke_session(scope, sid)
-            try:
-                record = await self.repository.get(scope, session_id=sid, guard=check)
-            except ResourceNotFound:
-                r._fences.discard(r._key(scope, sid))
-                r._control_serials.pop(r._key(scope, sid), None)
-                raise
-            r._require_native_session(record)
+            key = r._key(scope, sid)
+            serial = r._control_serials.get(key, 0)
+            def current():
+                check()
+                if serial != r._control_serials.get(key, 0):
+                    raise ResourceConflict("original human revocation was superseded")
             consumer = self.repository._address("human-consumer", scope.model_dump_json(), sid, cid)
             request = HumanControlRevocation(request_id=request_id, control_id=cid, session_id=sid,
                 consumer_id=consumer, control_epoch=epoch)
-            stored = await self._record(scope, sid, cid, check=check, accept=HumanRecord(revocation=request))
+            record = await self.repository.get(scope, session_id=sid, guard=current)
+            r._require_native_session(record)
+            try:
+                stored = await self._record(scope, sid, cid, check=current)
+            except ResourceNotFound:
+                self._current_revoke_target(record, None, request)
+                stored = await self._record(scope, sid, cid, check=current, accept=HumanRecord(revocation=request))
             if stored.request is not None and (stored.request.control_epoch != epoch
-                    or stored.request.consumer_id != consumer):
+                    or stored.request.consumer_id != consumer
+                    or (stored.request.scope, stored.request.session_id, stored.request.lease_id, stored.request.driver_id)
+                    != (scope, sid, record.session.lease_id, record.session.driver_id)):
                 raise ResourceConflict("human revocation differs from the original accepted target")
             if stored.revocation is not None and stored.revocation != request:
                 if (stored.lease is not None or stored.tombstone is None
                         or stored.revocation.model_copy(update={"request_id":request.request_id}) != request):
                     raise ResourceConflict("original human revocation target differs")
+            current()
+            if stored.tombstone is not None and stored.tombstone.request == request:
+                stored.tombstone.require_revocation(request, record.session)
+                return stored.tombstone
+            if stored.lease is not None and stored.lease.state == "revoked" and stored.revocation == request:
+                request.require_target(stored.lease, record.session)
+                if stored.request is not None:
+                    stored.lease.require_request(stored.request)
+                return stored.lease
+            # Confirming a recorded pre-open fence needs a genuine new-ID RPC,
+            # but that original target cannot revoke a later agent's session.
+            drain = stored.tombstone is None
+            if drain:
+                self._current_revoke_target(record, stored, request)
+                current()
+                r._fence(scope, sid)
+                serial = r._control_serials[key]
+                await r.egress.revoke_session(scope, sid)
             stored.revocation, stored.frame = request, None
-            await self._record(scope, sid, cid, check=check, update=stored)
-            return await self._retire(context, record, stored, check)
+            await self._record(scope, sid, cid, check=current, update=stored)
+            return await self._retire(context, record, stored, check, serial=serial, drain=drain)
 
-    async def _retire(self, context, record, stored, check):
+    @staticmethod
+    def _current_revoke_target(record, stored, request):
+        session = record.session
+        if (session is None or session.controller != "human" or session.state != "paused"
+                or record.phase != "fenced" or record.pending_control is not None
+                or request.control_epoch != session.control_epoch):
+            raise ResourceConflict("human revocation requires its original current target or recorded fence")
+        # Never-opened IDs remain fenceable within the current Human epoch. An
+        # accepted channel must match the published consumer, except a prepared
+        # request whose channel publication has not yet completed.
+        if stored is not None and stored.request is not None:
+            if record.human_control_id != request.control_id or record.human_control_epoch != request.control_epoch:
+                if stored.lease is not None or record.human_control_id is not None:
+                    raise ResourceConflict("human revocation differs from the current consumer")
+
+    async def _retire(self, context, record, stored, check, *, serial, drain=True):
         r = self.runtime
         request = stored.revocation
+        key = r._key(record.request.scope, record.session_id)
+        def current():
+            check()
+            if serial != r._control_serials.get(key, 0):
+                raise ResourceConflict("original human retirement was superseded")
         # Both callers have acknowledged the original pending revocation row.
         # Fence/drain again at that publication boundary: earlier snapshots
         # cannot adopt its new serial or register delivery after the first drain.
-        check()
-        r._fence(record.request.scope, record.session_id)
-        await r.egress.revoke_session(record.request.scope, record.session_id)
-        value = await self._call(context, record, request.control_id, "revoke", check, self._extension(record).revoke, request)
-        check()
+        current()
+        if drain:
+            r._fence(record.request.scope, record.session_id)
+            serial = r._control_serials[key]
+            await r.egress.revoke_session(record.request.scope, record.session_id)
+        value = await self._call(context, record, request.control_id, "revoke", current, self._extension(record).revoke, request)
+        current()
         if isinstance(value, HumanControlRevocationTombstone):
             if stored.lease is not None:
                 raise ResourceOutcomeUnknown("accepted human lease cannot become a pre-open tombstone")
@@ -458,14 +503,21 @@ class HumanComputerRuntime:
                 raise ResourceOutcomeUnknown("manual input retirement remains unverified")
             stored.lease = value
         stored.frame = None
-        await self._record(record.request.scope, record.session_id, request.control_id, check=check, update=stored)
+        await self._record(record.request.scope, record.session_id, request.control_id, check=current, update=stored)
         return value
 
     async def retire_owned(self, context, record, check):
         """Existing runtime safety custody only; never opens or reads a screen."""
         if record.human_control_id is None:
             return
-        stored = await self._record(record.request.scope, record.session_id, record.human_control_id, check=check)
+        r = self.runtime
+        key = r._key(record.request.scope, record.session_id)
+        serial = r._control_serials.get(key, 0)
+        def current():
+            check()
+            if serial != r._control_serials.get(key, 0):
+                raise ResourceConflict("original owned human retirement was superseded")
+        stored = await self._record(record.request.scope, record.session_id, record.human_control_id, check=current)
         if stored.tombstone is not None or (stored.lease is not None and stored.lease.state == "revoked"):
             return
         if stored.revocation is None:
@@ -473,5 +525,5 @@ class HumanComputerRuntime:
                 control_id=stored.request.control_id, session_id=record.session_id,
                 consumer_id=stored.request.consumer_id, control_epoch=stored.request.control_epoch)
         stored.frame = None
-        await self._record(record.request.scope, record.session_id, record.human_control_id, check=check, update=stored)
-        await self._retire(context, record, stored, check)
+        await self._record(record.request.scope, record.session_id, record.human_control_id, check=current, update=stored)
+        await self._retire(context, record, stored, check, serial=serial)
