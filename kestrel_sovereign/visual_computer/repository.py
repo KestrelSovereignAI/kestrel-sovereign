@@ -54,7 +54,7 @@ class CustodyRecord(BaseModel):
     human_private: bool = False
     human_control_id: str | None = None
     human_control_epoch: int | None = None
-    phase: Literal["retired", "admitted", "quoted", "acquiring", "leased", "opening", "active", "fenced", "unknown", "released"] = "admitted"
+    phase: Literal["retired", "admitted", "quoted", "acquiring", "leased", "opening", "active", "fenced", "unknown", "releasing", "released"] = "admitted"
 
 
 class ActionRecord(BaseModel):
@@ -299,6 +299,8 @@ class VisualCustodyRepository:
                 return
             if record.phase == "retired":
                 raise ResourceConflict("retirement requires original never-acquired CAS")
+            if previous.phase == "releasing" and record.phase not in {"releasing", "released"}:
+                raise ResourceConflict("physical release intent cannot reopen a visual session")
             if previous.phase not in {"admitted", "quoted"} and record.phase in {"admitted", "quoted"}:
                 raise ResourceConflict("possible acquisition cannot become unacquired")
             released = record.phase == "released" and record.lease is not None and record.lease.state == "released"

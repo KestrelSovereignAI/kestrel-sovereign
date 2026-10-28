@@ -182,3 +182,31 @@ async def test_native_private_migration_never_projects_foreign_original_binding(
             await put(restarted, active, "new")
     finally:
         await db.close()
+
+
+@pytest.mark.asyncio
+async def test_native_release_intent_survives_reopen_and_refuses_fresh_revision_control(custody):
+    store, reopen = custody
+    original = await store.admit(SCOPE, record(), lambda: None)
+    await release(store, original, confirmed=False)
+    original.phase = "releasing"
+    await store.save(SCOPE, original)
+    db = await reopen()
+    try:
+        restarted = VisualCustodyRepository(db)
+        current = await restarted.get(SCOPE, session_id=original.session_id)
+        assert current == original and current.lease.state == "failed"
+        with pytest.raises(ResourceConflict, match="release intent"):
+            await restarted.save(SCOPE, current.model_copy(update={"phase": "active"}))
+        with pytest.raises(ResourceConflict, match="verified physical"):
+            await restarted.save(SCOPE, current.model_copy(update={"phase": "released"}))
+        assert await store.get(SCOPE, session_id=original.session_id) == original
+        # This storage fixture supplies a controlled SDK lease fact. It does
+        # not establish that a real Docker/provider resource was destroyed.
+        await release(restarted, current)
+        retired = await store.get(SCOPE, session_id=original.session_id)
+        assert retired.phase == "released" and retired.lease.state == "released"
+        assert retired.lease.lease_id == original.lease.lease_id
+        assert retired.request == original.request
+    finally:
+        await db.close()

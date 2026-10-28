@@ -134,8 +134,14 @@ class HumanTransport:
         return copy.deepcopy(lease)
 
     async def _focus(self):
-        value = await self.controller.page.evaluate("""() => { const e=document.activeElement; return [location.href,
-            document.hasFocus(), e?.tagName, e?.id, e?.getAttribute('type')]; }""")
+        try:
+            value = await self.controller.page.evaluate("""() => { const e=document.activeElement; return [location.href,
+                document.hasFocus(), e?.tagName, e?.id, e?.getAttribute('type')]; }""")
+        except Exception as error:
+            # No input intent exists at this point. Preserve an original known
+            # refusal through act's durable denial path; cancellation still
+            # belongs to the original caller and is never converted.
+            raise Refused("observation_unavailable") from error
         return hmac.new(self.key, json.dumps(value).encode(), hashlib.sha256).hexdigest()
 
     async def observe(self, session, lease):

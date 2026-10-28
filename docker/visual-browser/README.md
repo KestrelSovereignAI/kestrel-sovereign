@@ -107,8 +107,8 @@ authority if control transport is unavailable. Authenticated manual control uses
 the same worker endpoint, priority socket and shared input journal. Pause fences
 queued input before draining accepted work, suspends observations and advances
 the control epoch; resume advances it again. Logical takeover fences the agent
-with a paused human controller. Published SDK 0.45 provides
-`HumanTransport`; the host must explicitly enable the manual channel and bind
+with a paused human controller. Published SDK 0.45 provides the Human control
+contracts; this worker implements `HumanTransport`. The host must explicitly enable the manual channel and bind
 its original issued consumer lease. The built-image and host acceptance gates
 below still apply. A frame is an observation identity, not a promise that autonomous
 page content is static.

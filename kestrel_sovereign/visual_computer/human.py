@@ -49,7 +49,7 @@ class HumanRecord(BaseModel):
                     and (original.lease is not None or original.tombstone is None)):
                 raise ResourceConflict("accepted human revocation changed")
         if original.tombstone is not None:
-            if (self.tombstone is None or self.request is not None or self.lease is not None
+            if (self.tombstone is None or self.request != original.request or self.lease is not None
                     or self.tombstone.model_copy(update={"request": original.tombstone.request}) != original.tombstone
                     or self.tombstone.request.model_copy(update={"request_id": original.tombstone.request.request_id}) != original.tombstone.request):
                 raise ResourceConflict("accepted human tombstone changed")
@@ -134,6 +134,7 @@ class HumanComputerRuntime:
         r, scope = self.runtime, self.runtime.scope(context)
         serial = r._control_serials.get(r._key(scope, sid), 0)
         record = await self.repository.get(scope, session_id=sid, guard=check)
+        r._require_native_session(record)
         stored = await self._record(scope, sid, cid, check=check)
         if stored.request is None:
             raise ResourceConflict("human delivery has no original channel")
@@ -181,15 +182,29 @@ class HumanComputerRuntime:
             yield record, stored, current
             current()
 
-    async def _call(self, context, record, cid, operation, check, method, *args, action_id=None, deadline=None):
+    async def _call(self, context, record, cid, operation, check, method, *args, action_id=None, deadline=None, _origin=None):
         r = self.runtime
         identifier = human_operation_id(cid, operation, action_id)
         metadata = operation in {"status", "action_status", "revoke"}
+        r._require_native_session(record)
+        serial = r._control_serials.get(r._key(record.request.scope, record.session_id), 0)
+        def current():
+            check()
+            if serial != r._control_serials.get(r._key(record.request.scope, record.session_id), 0):
+                raise ResourceConflict("original human native call was fenced")
+        latest = await self.repository.get(record.request.scope, session_id=record.session_id, guard=current)
+        r._require_native_session(latest)
+        if latest.session != record.session or latest.lease != record.lease:
+            raise ResourceConflict("original human session changed before SDK entry")
         limit = min(context.expires_at, r._now()+timedelta(seconds=r.policy.operation_seconds))
         if not metadata:
             limit = min(limit, record.session.expires_at, deadline or record.session.expires_at)
-        async with r.egress.activate_human(record.session, identifier, check, deadline=limit, metadata=metadata):
-            return await r._call(context, check, method, record.session, *args)
+        async with r.egress.activate_human(record.session, identifier, current, deadline=limit, metadata=metadata) as call:
+            async def invoke():
+                if _origin is not None:
+                    _origin.enter_driver()
+                return await method(record.session, *args)
+            return await call.invoke_sdk(invoke)
 
     async def open(self, context, sid, cid):
         from kestrel_sdk.resources import Identifier
@@ -271,7 +286,7 @@ class HumanComputerRuntime:
                 def check():
                     input_check()
                     view_check()
-                prepared = dispatched = driver_entered = inflight = False
+                prepared = dispatched = inflight = False
                 result_stack = AsyncExitStack()
                 result_owner = original = None
                 try:
@@ -324,38 +339,46 @@ class HumanComputerRuntime:
                         if r._now() >= request.action.not_after:
                             raise ResourceConflict("original human action deadline expired")
                     async def dispatch(session, lease, human_request):
-                        nonlocal driver_entered
                         current = await self.repository.get(scope, session_id=sid, guard=effect_check)
                         if current.revision != record.revision or current.session != record.session or current.lease != record.lease:
                             raise ResourceConflict("manual session changed before native dispatch")
                         effect_check()
-                        driver_entered = True
-                        original.enter_driver()
                         try:
-                            return await self._extension(record).act(session, lease, human_request)
-                        except NativeActionNotDispatched as fact:
+                            return await self._call(context, record, cid, "act", effect_check,
+                                self._extension(record).act, lease, human_request,
+                                action_id=request.action.action_id, deadline=request.action.not_after, _origin=original)
+                        except BaseException as failure:
+                            # Caller cancellation can enclose the SDK's exact
+                            # negative result after its owned Task has joined.
+                            # Only the original native trace can supply this
+                            # fact; an arbitrary refusal remains unknown.
+                            fact = (failure if type(failure) is NativeActionNotDispatched
+                                else original.trace.proof if original.trace is not None else None)
+                            if fact is None:
+                                raise
                             original.require(fact)
+                            primary = fact.original if failure is fact else failure
                             try:
                                 await result_owner.not_dispatched(original, fact)
                             except BaseException as settlement:
                                 from kestrel_sovereign.execution_custody import execution_observation_error
-                                raise execution_observation_error(fact.original, settlement) from None
-                            raise fact.original
-                    receipt = await self._call(context, record, cid, "act", effect_check, dispatch,
-                        stored.lease, request, action_id=request.action.action_id, deadline=request.action.not_after)
+                                raise execution_observation_error(primary, settlement) from None
+                            if failure is fact:
+                                raise fact.original
+                            raise
+                    receipt = await dispatch(record.session, stored.lease, request)
                     receipt.require_request(request)
                     await self.repository.action(scope, sid, request.action.action_id, receipt=receipt.receipt, guard=check)
                     return receipt
                 except BaseException as failure:
-                    if result_owner is not None and not driver_entered:
+                    if result_owner is not None and not original.driver_entered:
                         try:
                             await result_owner.not_dispatched(original, original.refuse_unentered(failure))
                         except BaseException as settlement:
                             from kestrel_sovereign.execution_custody import execution_observation_error
                             raise execution_observation_error(failure, settlement) from None
                     elif prepared and not dispatched:
-                        await r._retire_undispatched_action(scope, request.action, prepared=prepared,
-                            dispatched=dispatched, driver_entered=driver_entered)
+                        await r._abandon_prepared_action(scope, request.action)
                     raise
                 finally:
                     if inflight:
@@ -395,6 +418,7 @@ class HumanComputerRuntime:
                 r._fences.discard(r._key(scope, sid))
                 r._control_serials.pop(r._key(scope, sid), None)
                 raise
+            r._require_native_session(record)
             consumer = self.repository._address("human-consumer", scope.model_dump_json(), sid, cid)
             request = HumanControlRevocation(request_id=request_id, control_id=cid, session_id=sid,
                 consumer_id=consumer, control_epoch=epoch)
