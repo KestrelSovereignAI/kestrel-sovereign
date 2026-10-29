@@ -18,8 +18,8 @@ generated: true
 Auto-generated file-tree + per-file purpose index. Always-loaded context for the kestrel-agent
 GitHub App (issue #791). Do **not** edit by hand — regenerate via `python scripts/generate_repo_map.py`.
 
-**Generated:** 2026-10-28
-**Scope:** 3487 tracked files (2630 `.py`, 374 `.md`, 483 other). Excludes `__pycache__`, `node_modules`, `.venv`, `.claude`, build artifacts.
+**Generated:** 2026-10-29
+**Scope:** 3489 tracked files (2631 `.py`, 375 `.md`, 483 other). Excludes `__pycache__`, `node_modules`, `.venv`, `.claude`, build artifacts.
 
 **Format per file:** `path — one-line purpose` plus the public top-level Python symbols on the next line
 (classes and functions; private `_name` skipped).
@@ -114,7 +114,7 @@ Repo entry points and standard project files.
 - **kestrel_sovereign/a2a/native_input.py** — Canonical native request digests and callback-free task input.
   - `class NativeSenderProofError`; `def native_request_digest(params, operation)`; `class NativeTaskInput`; `def prepare_native_task_input(request)`
 - **kestrel_sovereign/a2a/native_publication.py** — Host-owned publication of one current recipient's signed native contract.
-  - `class NativeHostingConfiguration`; `class NativeA2APublication`; `def native_publication_registry(app)`; `async def prepare_hosted_native_publication(app, manager, routing_key, recipient, …)`; `async def open_hosted_native_peer_session(app, manager)`; `async def open_native_peer_session()`
+  - `def unpublished_cohost_warning(environment)`; `def unpublished_peer_detail(environment)`; `class NativeHostingConfiguration`; `class NativeA2APublication`; `def native_publication_registry(app)`; `async def prepare_hosted_native_publication(app, manager, routing_key, recipient, …)`; `async def open_hosted_native_peer_session(app, manager)`; `async def open_native_peer_session()`
 - **kestrel_sovereign/a2a/native_routes.py** — One SDK route registration for dispatch, advertised URLs and peer admission.
   - `def native_route_prefix(routing_key)`; `def native_card_path(routing_key)`; `def native_http_interfaces(public_base_url)`; `class NativeA2AHTTP`; `class NativeA2AHTTPRegistry`
 - **kestrel_sovereign/a2a/native_schema.py** — Explicit stored-protocol boundary; runtime startup never converts draft data.
@@ -2362,6 +2362,7 @@ Repo entry points and standard project files.
 - **docs/releases/v0.53.33.md** — Core 0.53.33 — Wait-worker resident custody — Status: candidate; review, CI, publication and artifact verification are required.
 - **docs/releases/v0.53.34.md** — Core 0.53.34 — Sovereignty retrieval and portable conversations — Status: candidate; release review, CI, publication and artifact verification are required.
 - **docs/releases/v0.53.35.md** — Core 0.53.35 — Original Future and Task custody — Status: candidate; product merge, release review, CI, publication and artifact verification are required.
+- **docs/releases/v0.54.1.md** — Core 0.54.1 — upgrading a co-hosted host from 0.53 — Core 0.54.1 is the first published 0.54 release; 0.54.0 was tagged but never published.
 - **docs/releases/v0.54.2.md** — 0.54.2 — attended feature-recovery startup boundary — Candidate release notes; publication and downstream acceptance are separate gates, not established by this file.
 - **docs/research/DEVELOPMENT_THROUGHPUT.md** — Development Throughput: Scion, CI, and Parallel Lanes — **Started:** 2026-10-16.
 - **docs/research/FLUX2_TRAINING_CONFIG.md** — FLUX.2 LoRA Training Configuration — **Source**: [SimpleTuner FLUX2.md Quickstart](https://github.com/bghira/SimpleTuner/blob/main/documentation/quickstart/FLUX2.md)
@@ -3621,6 +3622,8 @@ Repo entry points and standard project files.
   - `def card_identity()`; `def card_arguments(card_identity)`; `def verify(card, card_identity)`; `def test_native_card_uses_sdk_json_and_independent_trusted_did(card_arguments, card_identity)`; `def test_public_wire_card_verifies_with_independent_jcs_and_ed25519(card_arguments, card_identity)`; `def test_push_capability_is_part_of_the_signed_native_contract(card_arguments, card_identity)`; `def test_push_capability_requires_an_explicit_boolean(card_arguments, value)`; `def test_signed_contract_mutations_fail(card_arguments, card_identity, field)`; `…`
 - **tests/unit/test_a2a_native_client.py** — Real SDK bindings, trusted cards, and durable outbound delivery evidence.
   - `def native_signing()`; `def recipient_identity()`; `async def peer_session(native_request_admission, recipient_identity, request)`; `async def network_peer(peer_session)`; `def request_for(p)`; `async def reserve(p)`; `async def test_official_client_records_exact_wire_and_keeps_distinct_ids(peer_session)`; `async def test_lost_acknowledgement_reconciles_by_read_without_resending(peer_session)`; `…`
+- **tests/unit/test_a2a_native_cohost_startup.py** — A co-hosted fleet without KESTREL_BASE_URL is named at startup (#3872).
+  - `async def test_two_agent_host_without_base_url_warns_once_before_agents_load(monkeypatch, tmp_path, caplog)`; `async def test_host_that_can_publish_or_has_no_peer_does_not_warn(monkeypatch, tmp_path, caplog, active, …)`; `async def test_a_failing_publication_check_never_stops_the_host(monkeypatch, tmp_path, caplog)`
 - **tests/unit/test_a2a_native_consumers.py** — Task tools, commands and pre-turn context consume actual native storage.
   - `async def inbox(native_a2a_backend_factory)`; `async def admit(manager)`; `async def test_status_commands_and_preturn_share_native_owner_and_text(inbox)`; `async def test_all_native_states_filter_and_render_without_private_enum_values(inbox, label)`; `async def test_responder_commits_one_native_transition_and_refuses_second_terminal_reply(inbox, label)`; `async def test_results_preserve_official_artifact_json_and_arbitrary_json_values(inbox)`; `async def test_foreign_recipient_and_unspecified_filter_cannot_expose_tasks(inbox)`; `async def test_catalog_commands_and_workflows_use_registered_native_skills(inbox)`; `…`
 - **tests/unit/test_a2a_native_context.py** — Real SDK client/HTTP bindings exercise recipient and tenant policy.
@@ -3670,7 +3673,7 @@ Repo entry points and standard project files.
 - **tests/unit/test_a2a_native_projections.py** — Native oneof selection is preserved in text-only presentation.
   - `def test_text_projection_ignores_other_parts_and_preserves_order_and_explicit_empty()`; `def test_text_projection_refuses_draft_or_duck_typed_messages()`; `def test_embedded_json_bytes_preserve_exact_values_and_explicit_null(value)`; `def test_embedded_json_bytes_fail_clearly_on_non_json_or_invalid_utf8(content)`; `def test_embedded_json_projection_does_not_fetch_urls_or_parse_untyped_bytes()`; `def test_embedded_json_projection_rejects_a_duck_typed_part()`
 - **tests/unit/test_a2a_native_publication.py** — Public native discovery requires explicit, validated host configuration.
-  - `def test_operator_only_host_does_not_guess_a_public_peer_url()`; `def test_public_discovery_recipient_is_an_explicit_registration_key()`; `def test_invalid_discovery_configuration_refuses_publication(environment)`
+  - `def test_operator_only_host_does_not_guess_a_public_peer_url()`; `def test_public_discovery_recipient_is_an_explicit_registration_key()`; `def test_invalid_discovery_configuration_refuses_publication(environment)`; `def test_cohosted_fleet_without_base_url_is_named_with_its_remedy()`; `def test_no_cohosted_warning_for_one_agent_or_a_set_base_url(environment, agents)`; `def test_unpublished_peer_names_a_host_without_base_url()`
 - **tests/unit/test_a2a_native_push_admission.py** — Callback validation releases topology ownership and rechecks before commit.
   - `async def test_callback_dns_releases_host_lease_and_rechecks_original_authority(wire, monkeypatch, operation, policy_change)`; `async def test_callback_commit_retains_authority_until_original_sql_ack(wire, monkeypatch, operation)`; `async def test_unauthorized_callback_does_not_resolve_peer_supplied_dns(wire, monkeypatch)`
 - **tests/unit/test_a2a_native_push_config_store.py** — Native task authority, real AEAD storage and retryable push retirement.
