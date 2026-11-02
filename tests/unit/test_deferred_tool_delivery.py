@@ -743,7 +743,9 @@ async def test_spent_factory_cannot_mask_an_original_audit_failure(boundary, pat
     with pytest.raises(expected) as captured:
         await peer.invoke(path)
     assert peer.tool.executions == [{}] and peer.tool.publications == []
-    assert failures[0] in tuple(_explicit_control_chain(captured.value))
+    retained = tuple(_explicit_control_chain(captured.value))
+    assert failures[0] in retained
+    assert any(type(error) is RuntimeError and "already finalized" in str(error) for error in retained)
     if failure != "database":
         assert captured.value is original
 
