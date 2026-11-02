@@ -5,6 +5,7 @@ is a trap after an actual original Pod POST; TLS peers are never Runpod.
 """
 
 import asyncio
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 
@@ -214,7 +215,7 @@ async def test_native_pod_without_quote_refuses_fresh_foreground_erase(custody, 
     holder = SimpleNamespace(privacy_mode=PrivacyMode.NORMAL, privacy_config=PrivacyConfig(),
         _get_durable_persistence_gate=lambda: privacy)
     def current(ctx, action, target):
-        assert ctx is context and action == VisualAction.RELEASE and target == h.store.storage_id
+        assert ctx is context and action == VisualAction.RELEASE and target is None
     turn = ExecutionCustody(OriginalTurn(h.store.db.backend_type))
     effects, caught = [], None
     async def release(scope, lease):
@@ -232,3 +233,16 @@ async def test_native_pod_without_quote_refuses_fresh_foreground_erase(custody, 
     assert isinstance(caught, ResourceUnsupported) and "private native quote" in str(caught)
     assert effects == [] and after == before
     assert len(peer.requests) == 1 and h.native.is_closed
+
+
+@pytest.mark.asyncio
+async def test_native_profile_rejects_local_before_preparation(custody, vendor, peer, monkeypatch):
+    async with original_host(custody, vendor, peer, monkeypatch) as h:
+        # This is an unissued request candidate, never a stored/acquired row.
+        # The exact canonical plan constructor revalidates its actual profile;
+        # changing the descriptive location cannot issue a native preparation.
+        local = h.request.model_copy(update={"location": "local"})
+        with pytest.raises(ResourceUnsupported, match="explicit remote browser"):
+            replace(h.plan, request=local)
+        assert h.plan.request is h.request
+    assert h.native.is_closed and not peer.requests
