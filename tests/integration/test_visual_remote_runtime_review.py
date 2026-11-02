@@ -5,14 +5,21 @@ is a trap after an actual original Pod POST; TLS peers are never Runpod.
 """
 
 import asyncio
-from datetime import timedelta
+from datetime import UTC, datetime, timedelta
+from types import SimpleNamespace
 
 import pytest
 from kestrel_sdk.resources import ResourceUnsupported
+from kestrel_sdk.operator import OperatorContext
 
 from kestrel_sovereign._async_ownership import await_owned_task, raise_owned_outcome
 from kestrel_sovereign.execution_custody import execution_evidence_carriers
+from kestrel_sovereign.execution_custody import ExecutionCustody, bind_execution_custody_snapshot
+from kestrel_sovereign._async_rwlock import AsyncReaderWriterLock
+from kestrel_sovereign.privacy import PrivacyConfig, PrivacyMode
+from kestrel_sovereign.storage.privacy_wrapper import DurablePersistenceGate
 from kestrel_sovereign.visual_computer.repository import CustodyRecord
+from kestrel_sovereign.visual_computer.runtime import VisualAction
 from tests.integration.test_visual_custodied_runtime import NativeFixtureProvider, runtime_for
 from tests.integration.test_visual_custody_backends import SCOPE
 from tests.integration.test_visual_custody_backends import custody as custody
@@ -21,6 +28,7 @@ from tests.integration.test_visual_runpod_acquisition import peer as peer, vendo
 from tests.integration.test_visual_runpod_lifecycle import lifecycle
 from tests.integration.test_visual_runpod_quote import quoted_operation
 from tests.integration.test_visual_runpod_quote import quote_peer as quote_peer
+from tests.integration.test_visual_original_result_backends import OriginalTurn
 
 
 class NoRemoteWorker:
@@ -183,3 +191,44 @@ async def test_revoke_joins_original_snapshot_after_natural_map_retirement(custo
     assert not h.store._original_results and not h.store.db.backend._original_result_holds
     assert outcome.error is None, "drain re-authenticated a naturally retired same-map owner after awaiting"
 
+
+@pytest.mark.asyncio
+async def test_native_pod_without_quote_refuses_fresh_foreground_erase(custody, vendor, peer, monkeypatch):
+    async with original_host(custody, vendor, peer, monkeypatch) as h:
+        provider = NativeFixtureProvider(h, mode="genuine")
+        runtime = runtime_for(h, provider, NoRemoteWorker())
+        row = await h.store.admit(SCOPE, CustodyRecord(request=h.request, session_id="unopened"), h.check)
+        row.quote, row.phase = original_quote(h.plan), "quoted"
+        await h.store.save(SCOPE, row, h.check)
+        row = await runtime._acquire_custodied(h.context, row, h.check, provider)
+        before = row.model_copy(deep=True)
+    # The original ADMIT has unwound. A real new foreground RELEASE admission
+    # does not reconstruct an absent original native quote or erase contract.
+    now = datetime.now(UTC)
+    context = OperatorContext(tenant_id=SCOPE.tenant_id, principal_id=SCOPE.principal_id,
+        acting_agent_id=SCOPE.agent_id, correlation_id="release-without-private-quote",
+        issued_at=now, expires_at=now+timedelta(seconds=30),
+        granted_actions={VisualAction.RELEASE.value}, granted_capabilities={"visual-computer"},
+        permitted_boundary_ids={h.store.storage_id})
+    privacy = DurablePersistenceGate()
+    holder = SimpleNamespace(privacy_mode=PrivacyMode.NORMAL, privacy_config=PrivacyConfig(),
+        _get_durable_persistence_gate=lambda: privacy)
+    def current(ctx, action, target):
+        assert ctx is context and action == VisualAction.RELEASE and target == h.store.storage_id
+    turn = ExecutionCustody(OriginalTurn(h.store.db.backend_type))
+    effects, caught = [], None
+    async def release(scope, lease):
+        effects.append(lease.provider_resource_id)
+        return lease
+    monkeypatch.setattr(provider, "release", release)
+    with (bind_execution_custody_snapshot((turn,)),
+          h.authority.bind_authenticated(context, privacy_holder=holder,
+              check_current=current, authority_gate=AsyncReaderWriterLock())):
+        try:
+            await runtime.release(context, row.session_id)
+        except BaseException as error:
+            caught = error
+        after = await h.store.get(SCOPE, session_id=row.session_id)
+    assert isinstance(caught, ResourceUnsupported) and "private native quote" in str(caught)
+    assert effects == [] and after == before
+    assert len(peer.requests) == 1 and h.native.is_closed

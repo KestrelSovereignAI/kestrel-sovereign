@@ -277,8 +277,7 @@ class VisualComputerRuntime:
         # own contract; no provider name/DTO can turn these native facts into
         # worker/bootstrap conformance or a resident erase permission.
         return (record.remote_environment is not None or
-            (record.request.location == "remote" and record.acquisition is not None
-             and record.acquisition.binding is not None))
+            (record.acquisition is not None and record.acquisition.binding is not None))
 
     async def _acquire_custodied(self, context, record, check, provider):
         from .storage_acquisition import _CoreAcquisitionCustody
