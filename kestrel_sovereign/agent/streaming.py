@@ -2306,10 +2306,7 @@ class StreamingMixin:
             # silently bypassed the structured log and runtime
             # tool-call queries returned stale data from before the
             # inline-execution migration.
-            from kestrel_sovereign.agent.orchestrator_engine import (
-                OrchestratorEngineMixin,
-                _extract_inline_error_fields,
-            )
+            from kestrel_sovereign.agent.orchestrator_engine import _record_inline_tool_dispatch
             from kestrel_sovereign.features.base import _serialize_tool_result
             from kestrel_sovereign.security.narration_check import (
                 summarize_tool_result_for_audit,
@@ -2330,25 +2327,9 @@ class StreamingMixin:
                     "arguments": e["arguments"],
                     "result": summarize_tool_result_for_audit(serialized),
                 })
-                # Structured dispatch log (codex app-server inline path).
-                # Latency=0 by design — accurate per-call latency needs
-                # adapter-level instrumentation, see codex_adapter's
-                # ``_make_inline_tool_executor``.
-                args = e["arguments"]
-                adapter = "inline:" + OrchestratorEngineMixin._tool_call_adapter(
-                    self, e["name"], features_by_tool_name,
-                )
-                err_msg, err_class = _extract_inline_error_fields(e["result"])
-                await OrchestratorEngineMixin._log_tool_dispatch(
-                    self,
-                    tool_name=e["name"],
-                    adapter=adapter,
-                    args=args if isinstance(args, dict) else {},
-                    result=e["result"],
-                    session_id=session_id,
-                    dispatch_start=time.time(),
-                    error_class=err_class,
-                    error_message=err_msg,
+                await _record_inline_tool_dispatch(
+                    self, e, session_id=session_id,
+                    features_by_tool_name=features_by_tool_name,
                 )
             # #1659: the codex tool sentinels rode the LLM stream itself, so
             # they're embedded in full_response. Strip them out of the

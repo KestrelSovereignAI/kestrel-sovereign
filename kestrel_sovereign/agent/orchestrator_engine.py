@@ -883,12 +883,13 @@ class _AuditedDeferredResult(dict):
 
     def __init__(self, result, *, host, tool_name, session_id):
         super().__init__(result)
-        self._host, self._tool_name, self._session_id = host, tool_name, session_id
+        self._host, self._tool_name = host, tool_name
+        self._session_id = real_session_id(session_id)
         self._claimed = False
 
     def claim(self, host, tool_name, session_id):
         if (self._claimed or self._host is not host or self._tool_name != tool_name
-                or self._session_id != session_id):
+                or self._session_id != real_session_id(session_id)):
             return False
         self._claimed = True
         return True
@@ -903,6 +904,29 @@ class _AuditedDeferredResult(dict):
         return dict, (dict(self),)
 
 
+def _discard_tool_supplied_receipt(result):
+    """A nested or fabricated receipt does not audit the enclosing execution."""
+    return dict(result) if isinstance(result, _AuditedDeferredResult) else result
+
+
+async def _record_inline_tool_dispatch(host, entry, *, session_id, features_by_tool_name):
+    """One recorder for both streaming and non-streaming inline history."""
+    result = entry["result"]
+    if isinstance(result, _AuditedDeferredResult) and result.claim(host, entry["name"], session_id):
+        return
+    args = entry["arguments"]
+    adapter = "inline:" + OrchestratorEngineMixin._tool_call_adapter(
+        host, entry["name"], features_by_tool_name,
+    )
+    error_message, error_class = _extract_inline_error_fields(result)
+    await OrchestratorEngineMixin._log_tool_dispatch(
+        host, tool_name=entry["name"], adapter=adapter,
+        args=args if isinstance(args, dict) else {}, result=result,
+        session_id=session_id, dispatch_start=time.time(),
+        error_message=error_message, error_class=error_class,
+    )
+
+
 async def _complete_post_tool_result(host, result, post_input, *, adapter,
                                      dispatch_start, on_audited=None):
     """Complete policy and required audit before invoking a private UI factory."""
@@ -913,7 +937,7 @@ async def _complete_post_tool_result(host, result, post_input, *, adapter,
     )
     require_execution_work(host)
     if not isinstance(result, DeferredToolResult):
-        return result
+        return _discard_tool_supplied_receipt(result)
     allowed = all(evaluate_blocking_decision(output) is None for output in post_outputs)
     post_result = post_input.tool_response
     if not isinstance(post_result, dict):
@@ -944,7 +968,8 @@ async def _complete_post_tool_result(host, result, post_input, *, adapter,
             "Reconcile before retrying. Do not replay to recover the UI",
         ) from error
     try:
-        completed = result.finalize(post_result, allowed=allowed)
+        changed_during_audit = dict(post_result) != reviewed
+        completed = result.finalize(post_result, allowed=allowed and not changed_during_audit)
     except Exception as error:
         if is_execution_control_error(error):
             raise
@@ -959,7 +984,10 @@ async def _complete_post_tool_result(host, result, post_input, *, adapter,
         }}]
         appended_parts = added
     else:
-        payload, added = completed.result, completed.parts
+        # The completed policy projection is sealed before awaiting storage.
+        # A retained tool reference cannot replace it during that await.
+        payload = reviewed if changed_during_audit else completed.result
+        added = completed.parts
         appended_parts = None
     from kestrel_sovereign.features.base import _attach_envelope_parts
     _attach_envelope_parts(payload, payload.pop("parts", None), None,
@@ -1531,34 +1559,9 @@ class OrchestratorEngineMixin:
                     "result": summarize_tool_result_for_audit(serialized),
                 })
 
-            # Structured dispatch log so a2a_tool_dispatches captures
-            # inline-executed calls (codex app-server path). Without
-            # this, the dominant execution path for openai:plan /
-            # gpt-5.5 silently bypasses structured logging.
-            tool_name = e["name"]
-            args = e["arguments"]
-            result = e["result"]
-            adapter = "inline:" + OrchestratorEngineMixin._tool_call_adapter(
-                self, tool_name, features_by_tool_name,
-            )
-            err_msg, err_class = _extract_inline_error_fields(result)
-            # ``dispatch_start = time.time()`` records latency_ms=0 for
-            # the structured log — accurate latency requires adapter-
-            # level instrumentation (see codex_adapter's
-            # ``_make_inline_tool_executor``) and is out of scope for
-            # this fix.
-            if isinstance(result, _AuditedDeferredResult) and result.claim(self, tool_name, session_id):
-                continue
-            await OrchestratorEngineMixin._log_tool_dispatch(
-                self,
-                tool_name=tool_name,
-                adapter=adapter,
-                args=args if isinstance(args, dict) else {},
-                result=result,
-                session_id=session_id,
-                dispatch_start=time.time(),
-                error_class=err_class,
-                error_message=err_msg,
+            await _record_inline_tool_dispatch(
+                self, e, session_id=session_id,
+                features_by_tool_name=features_by_tool_name,
             )
 
     async def execute_named_tool(
@@ -2097,6 +2100,7 @@ class OrchestratorEngineMixin:
                 result = await feature.execute_as_subagent(
                     task=task, context=context, denied_tools=denied_tools,
                 )
+                result = _discard_tool_supplied_receipt(result)
                 mark_current_invocation_effect_completed(session_id)
                 require_execution_work(self)
         except ExecutionAuthorityError:

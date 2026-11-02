@@ -290,6 +290,8 @@ write before invoking the one-shot publication factory. A missing writer,
 failed write or cancellation withholds the private view and consumes the
 factory; the tool may already have executed and must not be replayed to recover
 its UI. The audit records the reviewed public result, before UI parts are added.
+That projection is sealed before awaiting storage; later out-of-band mutations
+withhold private publication and cannot replace the reviewed public output.
 An in-process receipt prevents the outer dispatcher or inline history recorder
 from writing the same dispatch again. It is scoped to that host, session and
 tool, and is removed by copying or serialization. Public named-tool calls still

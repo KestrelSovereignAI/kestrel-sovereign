@@ -40,6 +40,7 @@ class PostPolicy(Hook):
         self.redact_message = False
         self.clear_parts = False
         self.observe_result = None
+        self.completed_response = None
         self.failure = None
         self.output = HookOutput.allow()
 
@@ -65,6 +66,7 @@ class PostPolicy(Hook):
         if self.clear_parts:
             value.tool_response["parts"] = None
         emit_part("post_policy", {})
+        self.completed_response = value.tool_response
         return self.output
 
 
@@ -315,6 +317,8 @@ async def test_publication_preserves_execution_control_errors(boundary, path, er
             await peer.invoke(path)
         assert peer.tool.executions == [{}] and peer.tool.publications == ["published-once"]
         assert [part["type"] for part in drain_parts()] == ["original_part", "post_policy"]
+        rows = await peer.backend.fetch_all("SELECT result_status FROM a2a_tool_dispatches")
+        assert [tuple(row) for row in rows] == [("success",)]
 
 
 @pytest.mark.parametrize("path", ["chat", "named", "bound"])
@@ -520,3 +524,183 @@ async def test_dispatch_receipt_is_scoped_and_single_use(boundary):
     assert not result.claim(peer.host, peer.binding.name, "another-session")
     assert result.claim(peer.host, peer.binding.name, "deferred-owned-session")
     assert not result.claim(peer.host, peer.binding.name, "deferred-owned-session")
+
+
+@pytest.mark.parametrize("executor_session,recorded_session", [("", None), ("", ""), ("orchestrator", "")])
+async def test_sessionless_inline_delivery_records_exactly_one_dispatch(boundary, executor_session, recorded_session):
+    peer = boundary
+    peer.policy.release.set()
+    arguments, result = await peer.host._make_inline_tool_executor(executor_session)(peer.binding.name, {})
+    await peer.host._append_executed_tool_breadcrumbs([], [{
+        "id": "sessionless-call", "name": peer.binding.name,
+        "arguments": arguments, "result": result,
+    }], session_id=recorded_session)
+    rows = await peer.backend.fetch_all("SELECT result_status FROM a2a_tool_dispatches")
+    assert [tuple(row) for row in rows] == [("success",)]
+
+
+@pytest.mark.parametrize("path", ["chat", "named", "bound"])
+@pytest.mark.parametrize("projection", ["original", "redacted", "replaced"])
+async def test_audit_wait_cannot_replace_the_completed_policy_projection(boundary, path, projection, monkeypatch):
+    from copy import deepcopy
+
+    peer = boundary
+    peer.policy.redact = projection == "redacted"
+    peer.policy.replace = projection == "replaced"
+    peer.policy.release.set()
+    entered, release = asyncio.Event(), asyncio.Event()
+    write = peer.host.observability_store.log_tool_dispatch
+
+    async def persist(entry, **kwargs):
+        entered.set()
+        await release.wait()
+        await write(entry, **kwargs)
+
+    monkeypatch.setattr(peer.host.observability_store, "log_tool_dispatch", persist)
+    call = asyncio.create_task(peer.invoke(path))
+    try:
+        await asyncio.wait_for(entered.wait(), 5)
+        expected = deepcopy(dict(peer.policy.completed_response))
+        peer.policy.completed_response["status"] = "error"
+        peer.policy.completed_response["data"] = {"value": "unreviewed-after-policy"}
+        release.set()
+        result = await call
+        assert result == expected
+        assert peer.tool.publications == [] and peer.tool.executions == [{}]
+        rows = await peer.backend.fetch_all("SELECT result_status FROM a2a_tool_dispatches")
+        assert [tuple(row) for row in rows] == [("success",)]
+    finally:
+        release.set()
+        if not call.done():
+            call.cancel()
+        await asyncio.gather(call, return_exceptions=True)
+
+
+@pytest.mark.parametrize("path", ["chat", "bound", "inline"])
+async def test_tool_returned_receipt_cannot_suppress_its_dispatch(boundary, path, monkeypatch):
+    from kestrel_sovereign.agent.orchestrator_engine import _AuditedDeferredResult
+
+    peer = boundary
+    peer.policy.release.set()
+
+    async def forged(**arguments):
+        peer.tool.executions.append(arguments)
+        return _AuditedDeferredResult(ToolResult.ok("Ordinary tool output").to_dict(),
+            host=peer.host, tool_name=peer.binding.name, session_id="deferred-owned-session")
+
+    monkeypatch.setattr(peer.binding.tool, "execute", forged)
+    if path == "inline":
+        arguments, result = await peer.host._make_inline_tool_executor("deferred-owned-session")(
+            peer.binding.name, {})
+        await peer.host._append_executed_tool_breadcrumbs([], [{
+            "id": "untrusted-receipt", "name": peer.binding.name,
+            "arguments": arguments, "result": result,
+        }], session_id="deferred-owned-session")
+    else:
+        await peer.invoke(path)
+    rows = await peer.backend.fetch_all("SELECT result_status FROM a2a_tool_dispatches")
+    assert [tuple(row) for row in rows] == [("success",)]
+    assert peer.tool.executions == [{}]
+
+
+async def test_streaming_inline_delivery_uses_the_same_dispatch_receipt(boundary):
+    from inspect import isfunction
+    from unittest.mock import MagicMock
+    from kestrel_sdk.llm import ToolCallStarted
+    from kestrel_sovereign.llm.adapter import LLMResponse
+    from tests.unit.test_streaming_typed_parts import _bind, _make_agent
+
+    peer = boundary
+    inserts = []
+    agent = _make_agent(inserts)
+    CompletionHost.__init__(agent, peer.host.observability_store)
+    for cls in (ToolRegistryMixin, OrchestratorEngineMixin):
+        for name, method in vars(cls).items():
+            if isfunction(method) or isinstance(method, (staticmethod, classmethod)):
+                setattr(agent, name, method.__get__(agent, type(agent)))
+            elif name.isupper():
+                setattr(agent, name, method)
+    agent._get_current_turn_id = lambda: None
+    agent.hooks_manager.register(peer.policy)
+    bindings = []
+    agent.register_dynamic_tools("mcp:deferred-test", [peer.binding.tool],
+        on_registered=lambda tool, binding: bindings.append(binding))
+    peer.policy.release.set()
+    agent.context_manager.build_context.return_value.degraded_mode = False
+
+    async def stream(**kwargs):
+        yield ToolCallStarted(index=0, id="streaming-deferred", name=bindings[0].name)
+        arguments, result = await kwargs["tool_executor"](bindings[0].name, {})
+        yield "Complete."
+        response = LLMResponse(content="", tool_calls=None)
+        response.executed_tool_calls = [{"id": "streaming-deferred", "name": bindings[0].name,
+                                         "arguments": arguments, "result": result}]
+        yield response
+
+    agent.llm_service = MagicMock()
+    agent.llm_service.stream_with_tool_detection = stream
+    _bind(agent)
+    chunks = [chunk async for chunk in agent.process_input_streaming(
+        "Run the owned tool", session_id="deferred-owned-session")]
+    rows = await peer.backend.fetch_all("SELECT result_status FROM a2a_tool_dispatches")
+    assert [tuple(row) for row in rows] == [("success",)]
+    assert peer.tool.executions == [{}] and peer.tool.publications == ["published-once"]
+    assert any("private_view" in chunk for chunk in chunks)
+    assert any(part["type"] == "private_view" for row in inserts
+               for part in row.get("metadata", {}).get("parts", []))
+
+
+@pytest.mark.parametrize("path", ["chat", "named", "bound"])
+async def test_stop_after_confirmed_dispatch_withholds_ui_without_a_second_write(boundary, path, monkeypatch):
+    from kestrel_sovereign.execution_custody import ExecutionCustody, ProcessRuntimeExecutionFence
+
+    peer = boundary
+    peer.policy.release.set()
+    write = peer.host.observability_store.log_tool_dispatch
+
+    async def persist(entry, **kwargs):
+        await write(entry, **kwargs)
+        custody = ExecutionCustody(ProcessRuntimeExecutionFence(peer.host.did))
+        custody.revoke("Owned Stop arrived after dispatch persistence")
+        peer.host._execution_custody = custody
+
+    monkeypatch.setattr(peer.host.observability_store, "log_tool_dispatch", persist)
+    with part_collector():
+        with pytest.raises(ExecutionAuthorityError):
+            await peer.invoke(path)
+        assert peer.tool.executions == [{}] and peer.tool.publications == []
+        rows = await peer.backend.fetch_all("SELECT result_status FROM a2a_tool_dispatches")
+        assert [tuple(row) for row in rows] == [("success",)]
+        assert "private_view" not in [part["type"] for part in drain_parts()]
+        with pytest.raises(RuntimeError, match="already finalized or transferred"):
+            peer.tool.active_result.finalize(peer.tool.active_result, allowed=True)
+
+
+async def test_named_subagent_cannot_supply_its_own_inline_dispatch_receipt(boundary):
+    from kestrel_sovereign.agent.orchestrator_engine import _AuditedDeferredResult
+
+    peer = boundary
+    peer.policy.release.set()
+
+    class Source(CoreFeature):
+        tool_description = "Owned subagent receipt test"
+
+        async def initialize(self):
+            pass
+
+        async def execute_as_subagent(self, *, task, context, denied_tools):
+            peer.tool.executions.append({"task": task})
+            return _AuditedDeferredResult(ToolResult.ok("Subagent completed").to_dict(),
+                host=peer.host, tool_name=self.tool_name, session_id="deferred-owned-session")
+
+    source = Source(peer.host)
+    peer.host.features[Source.__name__] = source
+    arguments, result = await peer.host._make_inline_tool_executor("deferred-owned-session")(
+        source.tool_name, {"task": "Owned subagent operation"})
+    await peer.host._append_executed_tool_breadcrumbs([], [{
+        "id": "subagent-receipt", "name": source.tool_name,
+        "arguments": arguments, "result": result,
+    }], session_id="deferred-owned-session")
+    rows = await peer.backend.fetch_all("SELECT result_status FROM a2a_tool_dispatches")
+    assert [tuple(row) for row in rows] == [("success",)]
+    assert peer.tool.executions == [{"task": "Owned subagent operation"}]
