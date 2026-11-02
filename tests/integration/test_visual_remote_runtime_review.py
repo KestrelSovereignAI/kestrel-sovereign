@@ -143,3 +143,40 @@ async def test_quote_preentry_refusal_preserves_original_and_no_worker_exit(cust
         assert closing in carriers
     assert h.call._worker_exited is False, "unentered worker was reported physically exited"
     assert not quote_peer.requests
+
+
+@pytest.mark.asyncio
+async def test_revoke_joins_original_snapshot_after_natural_map_retirement(custody, vendor, quote_peer, monkeypatch):
+    manager = lifecycle(custody, vendor, quote_peer, monkeypatch)
+    h = await manager.__aenter__()
+    original = h.runtime.egress._close_environment_call
+    joined_first, continue_drain = asyncio.Event(), asyncio.Event()
+    stopper = None
+
+    def pause_after_original_join(call):
+        pending = original(call)
+        async def join():
+            value = await pending
+            if call is h.call and asyncio.current_task() is stopper:
+                # Passive scheduling barrier AFTER the genuine original join.
+                # No replacement Future/receipt, close result or native effect.
+                joined_first.set()
+                await continue_drain.wait()
+            return value
+        return join()
+
+    monkeypatch.setattr(h.runtime.egress, "_close_environment_call", pause_after_original_join)
+    stopper = asyncio.create_task(h.runtime.egress.revoke_session(SCOPE, h.row.session_id))
+    try:
+        await asyncio.wait_for(joined_first.wait(), 5)
+    finally:
+        try:
+            # The issued but unused Inspect retires through its actual original
+            # context while an external closer is between captured owners.
+            await manager.__aexit__(None, None, None)
+        finally:
+            continue_drain.set()
+            outcome = await await_owned_task(stopper)
+    assert not h.runtime.egress._calls
+    assert not h.store._original_results and not h.store.db.backend._original_result_holds
+    assert outcome.error is None, "drain re-authenticated a naturally retired same-map owner after awaiting"
