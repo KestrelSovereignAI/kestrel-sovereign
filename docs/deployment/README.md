@@ -577,5 +577,16 @@ the watchdog thread could look. The `[event_loop_watchdog]` section of
 `kestrel.toml` sets the threshold, the heartbeat interval and `enabled`; see
 `kestrel.toml.example`.
 
+The `FENCED` line from the Stop relay names what it saw (#3745):
+
+- `event loop stalled N s; lease is L s`: the loop held the relay past the
+  lease between renewals. `N` is the time since the last successful renewal,
+  which exceeds the stall by at most one poll interval and one renewal.
+- `owner lease renewal was late in the relay (took N s; lease is L s)`: one
+  renewal outlasted the lease, because the database answered slowly or the
+  loop stalled while it waited.
+- `durable generation was lost in the relay`: a renewal found a row gone
+  although this process's renewals were current.
+
 ### Logs not appearing in Cloud Run
 Python `logging.info()` calls from request handlers don't always reach Cloud Run's structured log pipeline. Use `print(json.dumps({"severity": "WARNING", "message": "..."}), flush=True)` for debugging.

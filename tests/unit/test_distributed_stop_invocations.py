@@ -1,6 +1,9 @@
 """Cross-replica live-work authority for cooperative Stop (#3152)."""
 
 import asyncio
+import logging
+import re
+import time
 from unittest.mock import MagicMock
 from uuid import uuid4
 
@@ -1586,6 +1589,143 @@ async def test_relay_excludes_rows_completed_before_poll_snapshot(tmp_path):
         assert unrelated_generation_id in registry._active
     finally:
         release_poll.set()
+        store.poll_owner = original_poll
+        await registry.close()
+        await db.close()
+
+
+async def _first_owner_fence(caplog) -> str:
+    """The first ``Distributed Stop owner FENCED`` log message."""
+    for _ in range(3000):
+        for record in caplog.records:
+            message = record.getMessage()
+            if "Distributed Stop owner FENCED" in message:
+                return message
+        await asyncio.sleep(0.01)
+    raise AssertionError("the Stop owner was never fenced")
+
+
+@pytest.mark.asyncio
+async def test_relay_names_an_event_loop_stall_that_outlasts_the_lease(
+    tmp_path, caplog
+):
+    """A stall between renewals is logged as a stall, with its length (#3745).
+
+    The renewal poll after the stall is fast, so it is not late; it finds the
+    durable lease already expired. That was logged as "durable generation was
+    lost in the relay", which names no cause.
+    """
+    from kestrel_sovereign.storage.async_database import AsyncDatabase
+
+    caplog.set_level(logging.ERROR, logger="kestrel_sovereign.stop.invocation")
+    db = await AsyncDatabase.sqlite(str(tmp_path / "relay-loop-stall.db"))
+    store = DistributedInvocationStore(db)
+    await store.ensure_schema()
+    registry = DistributedInvocationRegistry(
+        store,
+        poll_seconds=0.05,
+        owner_lease_seconds=_HEALTHY_LEASE_SECONDS,
+    )
+    agent = _ReplicaAgent("did:test:relay-loop-stall")
+    original_poll = store.poll_owner
+    renewed = asyncio.Event()
+
+    async def report_renewal(*args, **kwargs):
+        polled = await original_poll(*args, **kwargs)
+        renewed.set()
+        return polled
+
+    try:
+        assert await registry.register(agent, "stalled-turn", 1)
+        store.poll_owner = report_renewal
+        registry.start()
+        # The relay sets this and runs on to its poll-interval sleep before
+        # this task can resume, so the stall below lands between polls.
+        await asyncio.wait_for(renewed.wait(), timeout=30)
+        time.sleep(_PAST_HEALTHY_LEASE_SECONDS)
+
+        message = await _first_owner_fence(caplog)
+
+        assert "durable generation was lost" not in message
+        assert f"lease is {_HEALTHY_LEASE_SECONDS:.1f} s" in message
+        stalled = re.search(r"event loop stalled ([0-9.]+) s", message)
+        assert stalled is not None, message
+        assert float(stalled.group(1)) >= _PAST_HEALTHY_LEASE_SECONDS
+    finally:
+        store.poll_owner = original_poll
+        await registry.close()
+        await db.close()
+
+
+@pytest.mark.asyncio
+async def test_relay_reports_a_lost_generation_that_no_stall_explains(
+    tmp_path, caplog
+):
+    """A durable row lost while renewals are current is not called a stall."""
+    from kestrel_sovereign.storage.async_database import AsyncDatabase
+
+    caplog.set_level(logging.ERROR, logger="kestrel_sovereign.stop.invocation")
+    db = await AsyncDatabase.sqlite(str(tmp_path / "relay-lost-row.db"))
+    store = DistributedInvocationStore(db)
+    await store.ensure_schema()
+    registry = DistributedInvocationRegistry(store, poll_seconds=0.05)
+    agent = _ReplicaAgent("did:test:relay-lost-row")
+    try:
+        assert await registry.register(agent, "reaped-turn", 1)
+        generation_id = registry._by_local_generation[
+            (id(agent), "reaped-turn", 1)
+        ]
+        registry.start()
+        await db.execute_commit(
+            "DELETE FROM stop_active_invocations WHERE generation_id = ?",
+            (generation_id,),
+        )
+
+        message = await _first_owner_fence(caplog)
+
+        assert "durable generation was lost in the relay" in message
+        assert "event loop stalled" not in message
+    finally:
+        await registry.close()
+        await db.close()
+
+
+@pytest.mark.asyncio
+async def test_late_relay_renewal_names_how_long_it_took(tmp_path, caplog):
+    from kestrel_sovereign.storage.async_database import AsyncDatabase
+
+    caplog.set_level(logging.ERROR, logger="kestrel_sovereign.stop.invocation")
+    db = await AsyncDatabase.sqlite(str(tmp_path / "relay-late-renewal.db"))
+    store = DistributedInvocationStore(db)
+    await store.ensure_schema()
+    registry = DistributedInvocationRegistry(
+        store,
+        poll_seconds=0.05,
+        owner_lease_seconds=_HEALTHY_LEASE_SECONDS,
+    )
+    agent = _ReplicaAgent("did:test:relay-late-renewal")
+    original_poll = store.poll_owner
+
+    async def late_poll(*args, **kwargs):
+        await asyncio.sleep(_PAST_HEALTHY_LEASE_SECONDS)
+        return await original_poll(*args, **kwargs)
+
+    try:
+        assert await registry.register(agent, "late-turn", 1)
+        store.poll_owner = late_poll
+        registry.start()
+
+        message = await _first_owner_fence(caplog)
+
+        took = re.search(
+            r"owner lease renewal was late in the relay \(took ([0-9.]+) s; "
+            r"lease is ([0-9.]+) s\)",
+            message,
+        )
+        assert took is not None, message
+        assert float(took.group(1)) >= _PAST_HEALTHY_LEASE_SECONDS
+        assert float(took.group(2)) == _HEALTHY_LEASE_SECONDS
+    finally:
         store.poll_owner = original_poll
         await registry.close()
         await db.close()

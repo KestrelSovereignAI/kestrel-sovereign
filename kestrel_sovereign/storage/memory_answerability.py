@@ -25,7 +25,9 @@ import json
 import logging
 import re
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Callable, Mapping, Optional, Sequence
+from typing import (
+    TYPE_CHECKING, AbstractSet, Any, Callable, Mapping, Optional, Sequence, Union,
+)
 
 from kestrel_sdk.llm.decisions import DecisionError, DecisionRequest, NoulQuestion
 
@@ -151,9 +153,18 @@ class AnswerabilityDecision:
     reason: str = ""
 
 
-def has_exact_lexical_evidence(query: str, content: str) -> bool:
-    """Return whether every canonical query token occurs in the candidate."""
-    query_tokens = set(_tokenize_for_search(_strip_search_wrappers(query)))
+def has_exact_lexical_evidence(
+    query: Union[str, AbstractSet[str]], content: str
+) -> bool:
+    """Return whether every canonical query token occurs in the candidate.
+
+    ``query`` may be the query's canonical token set already, so checking many
+    candidates against one query derives it once (#3745).
+    """
+    query_tokens = (
+        set(_tokenize_for_search(_strip_search_wrappers(query)))
+        if isinstance(query, str) else query
+    )
     if not query_tokens:
         return False
     content_tokens = set(_tokenize_for_search(_strip_search_wrappers(content)))

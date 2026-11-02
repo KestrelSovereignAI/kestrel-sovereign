@@ -1653,6 +1653,27 @@ class DistributedInvocationRegistry:
                 loop.time() + self._owner_lease_seconds
             )
 
+    def _stall_since_renewal(self, now: float) -> str | None:
+        """Name the stall that let the owner lease lapse before ``now``.
+
+        The relay renews every poll interval, and a renewal that itself
+        outlasts the lease is reported as late. So a gap since the last
+        successful renewal longer than the lease, at the start of a poll, means
+        the event loop held the relay between polls (#3745). The figure is that
+        gap: it exceeds the stall by at most one poll interval plus the
+        previous renewal's round trip.
+        """
+        renewed = self._last_heartbeat_monotonic
+        if renewed is None:
+            return None
+        stalled = now - renewed
+        if stalled < self._owner_lease_seconds:
+            return None
+        return (
+            f"event loop stalled {stalled:.1f} s; "
+            f"lease is {self._owner_lease_seconds:.1f} s"
+        )
+
     @_registry_control_boundary
     async def _relay(self) -> None:
         while not self._closing:
@@ -1678,6 +1699,7 @@ class DistributedInvocationRegistry:
                 continue
             try:
                 poll_started = asyncio.get_running_loop().time()
+                stall = self._stall_since_renewal(poll_started)
                 polled = await self._store.poll_owner(
                     owner_id,
                     lease_seconds=self._owner_lease_seconds,
@@ -1688,12 +1710,12 @@ class DistributedInvocationRegistry:
                     # generation the current lease protects.
                     await asyncio.sleep(self._poll_seconds)
                     continue
-                if (
-                    asyncio.get_running_loop().time() - poll_started
-                    >= self._owner_lease_seconds
-                ):
+                renewal_seconds = asyncio.get_running_loop().time() - poll_started
+                if renewal_seconds >= self._owner_lease_seconds:
                     self._fail_closed_owner(
-                        "owner lease renewal was late in the relay",
+                        "owner lease renewal was late in the relay "
+                        f"(took {renewal_seconds:.1f} s; lease is "
+                        f"{self._owner_lease_seconds:.1f} s)",
                         owner_id=owner_id,
                     )
                 else:
@@ -1719,7 +1741,7 @@ class DistributedInvocationRegistry:
                     for generation_id in lease_owned_generation_ids
                 ):
                     self._fail_closed_owner(
-                        "durable generation was lost in the relay",
+                        stall or "durable generation was lost in the relay",
                         owner_id=owner_id,
                     )
                 else:
