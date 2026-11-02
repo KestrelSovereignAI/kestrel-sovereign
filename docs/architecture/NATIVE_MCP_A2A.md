@@ -304,7 +304,8 @@ SDK 0.46's publication context binds an initial private result to its actual
 streaming chat destination. Core carries that metadata on the existing turn
 part collector, matches the exact host and session, and expires it when the
 owning turn exits. Foreign inline tasks borrow the same collector; headless
-calls and subagent buffers supply no destination. The original factory can
+calls and subagent buffers supply no destination. Copying or serializing the
+collector carries only part data. The original factory can
 read the context during publication even after tool-wrapper transfers. Features
 that need this association require `supports_tool_publication_context is True`.
 The context identifies the destination; authenticated View controllers still

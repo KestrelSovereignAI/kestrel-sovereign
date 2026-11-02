@@ -1,6 +1,8 @@
 """A private publisher receives only its live host-selected chat destination."""
 
 import asyncio
+import copy
+import pickle
 from types import SimpleNamespace
 
 import pytest
@@ -39,6 +41,22 @@ def test_sessionless_collector_does_not_invent_a_chat_destination(session_id):
         assert current_tool_publication_context(host, session_id) is None
     with part_collector(session_id="real-chat"):
         assert current_tool_publication_context(host, "real-chat") is None
+
+
+@pytest.mark.parametrize("transform", [copy.copy, copy.deepcopy, lambda value: pickle.loads(pickle.dumps(value))],
+                         ids=["copy", "deepcopy", "pickle"])
+def test_copied_part_data_cannot_copy_or_extend_a_chat_destination(transform):
+    host = SimpleNamespace(did="did:test:chat-owner")
+    with part_collector(host=host, session_id="chat-1"):
+        collector = current_part_collector()
+        collector.append({"type": "notice", "data": {"value": "public-part"}})
+        copied = transform(collector)
+        assert type(copied) is list
+        assert copied == list(collector)
+        with bind_part_collector(copied):
+            assert current_tool_publication_context(host, "chat-1") is None
+    with bind_part_collector(copied):
+        assert current_tool_publication_context(host, "chat-1") is None
 
 
 @pytest.mark.asyncio
