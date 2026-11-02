@@ -248,17 +248,6 @@ class _LifecycleOperation:
         if self._stage is not None and self._stage._thread is not None:
             self._stage._thread.cancel(None)
 
-    async def close(self):
-        from kestrel_sovereign._async_ownership import await_owned_operation
-
-        self.revoke()
-        if self._used:
-            async def settled():
-                await asyncio.shield(self._finished)
-            result = await await_owned_operation(settled(), retain_originals=True)
-            if result.error is not None or result.cancellation is not None:
-                raise execution_terminal_error(result.error, result.cancellation, retain_originals=True)
-
     def _quoted_plain(self, mutation):
         self._require_origin()
         if mutation is not self._mutation or self._projection is None or self._lease is None:

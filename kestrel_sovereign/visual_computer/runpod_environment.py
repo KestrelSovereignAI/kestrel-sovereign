@@ -372,13 +372,6 @@ class _OriginalRunpodQuote(_CurrentRunpodNativeResponse):
         if self._thread is not None:
             self._thread.cancel(None)
 
-    async def close(self):
-        self.revoke()
-        if self._used:
-            # The original native helper physically joins; this Future is set
-            # only after that await and the exact native SQL writer finish.
-            await asyncio.shield(self._finished)
-
     def _bind_original_vendor_quote(self, control):
         self._require_origin()
         canonical = self._host._canonical
@@ -515,6 +508,7 @@ class _OriginalRunpodQuote(_CurrentRunpodNativeResponse):
                         )
                     raise
                 self._program, self._state = _QuoteProgram(self), "prepared"
+                terminal = None
                 try:
                     with bind_native_sync_http_execution_admission(
                         self._client, self._invocation_current
@@ -522,11 +516,18 @@ class _OriginalRunpodQuote(_CurrentRunpodNativeResponse):
                         plan = await await_native_sync_http(
                             self._client, self._program, _original_quote=self
                         )
+                except BaseException as original:
+                    terminal = original
+                    raise
                 finally:
-                    self._worker_exited = True
+                    self._worker_exited = self._worker_entered
                     if not self._worker_entered:
-                        control.close()
-                        self._client_closed = True
+                        try:
+                            control.close()
+                            self._client_closed = True
+                        except BaseException as cleanup:  # noqa: BLE001 - preserve both original physical outcomes.
+                            from kestrel_sovereign.execution_custody import execution_terminal_error
+                            raise execution_terminal_error(terminal, cleanup, retain_originals=True)
                 self._require_origin()
                 if (
                     not self._client_closed

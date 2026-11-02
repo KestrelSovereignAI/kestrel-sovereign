@@ -312,6 +312,25 @@ encrypted row, runtime generation or source signature restores sovereign RELEASE
 after a restart. Maintenance retains the original Pod/cost debt instead of issuing
 automatic DELETE. A fresh explicit foreground release is the supported recovery.
 
+That recovery requires the original stored quote/plan and its exact vendor
+program, API-key fingerprint, CA bytes and account binding. Upgrading the vendor
+or rotating the key/CA can make Core inspection and foreground release unavailable.
+This source has no identity-rotation or permission-reconstruction bypass; retain
+the original Pod/cost debt and use a separately authorized operator recovery when
+those exact bindings cannot be supplied. Acquisition-only native rows without the
+private quote likewise refuse connect and Core foreground erase. Their Pod facts
+remain retained; they cannot fall through to ordinary provider cleanup.
+
+Periodic maintenance retires genuinely never-dispatched expired requests. For a
+possible native Pod it may fence expired input use, but it cannot revoke a fresh
+independently admitted quote/inspect/release or issue resident DELETE. Ordinary
+deterministic providers retain their existing fixed-lifetime cleanup contract.
+
+Owner-scoped STATUS includes the public SDK lease's `provider_resource_id`, so a
+Pod ID may be visible to that authorized caller/model. Private fact `repr` and
+generic dumps are not a promise to redact that public field. Worker credentials,
+connection endpoints, plan bytes and private bootstrap content remain excluded.
+
 The current strict CPU profile does not establish an authenticated isolated remote
 browser. Connect/bootstrap, renewal, remote worker/display transport, native amd64
 admission and physical cloud billing/termination conformance remain unsupported.

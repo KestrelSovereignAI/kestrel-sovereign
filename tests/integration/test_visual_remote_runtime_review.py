@@ -74,12 +74,14 @@ async def test_acquisition_only_native_pod_never_borrows_resident_release(custod
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("release", [False, True], ids=["inspect", "release"])
-async def test_live_foreground_lifecycle_survives_maintenance(custody, vendor, quote_peer, monkeypatch, release):
+@pytest.mark.parametrize("release,expired", [(False, False), (True, False), (True, True)], ids=["inspect", "release", "expired-release"])
+async def test_live_foreground_lifecycle_survives_maintenance(custody, vendor, quote_peer, monkeypatch, release, expired):
     failure = None
     async with lifecycle(custody, vendor, quote_peer, monkeypatch, release=release) as h:
         ready = asyncio.Event()
         loop = asyncio.get_running_loop()
+        if expired:
+            monkeypatch.setattr(h.runtime, "_now", lambda: h.row.lease.expires_at + timedelta(seconds=1))
         quote_peer.before_reply = lambda: loop.call_soon_threadsafe(ready.set)
         async def maintenance():
             await asyncio.wait_for(ready.wait(), 5)
@@ -180,3 +182,4 @@ async def test_revoke_joins_original_snapshot_after_natural_map_retirement(custo
     assert not h.runtime.egress._calls
     assert not h.store._original_results and not h.store.db.backend._original_result_holds
     assert outcome.error is None, "drain re-authenticated a naturally retired same-map owner after awaiting"
+

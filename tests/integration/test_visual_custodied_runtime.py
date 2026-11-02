@@ -129,8 +129,9 @@ async def test_runtime_requires_original_same_row_native_ack_before_open(custody
         provider, driver = NativeFixtureProvider(host, mode=mode), BoundedSessionDriver()
         runtime = runtime_for(host, provider, driver)
         if mode == 'genuine':
-            session = await runtime.admit(host.context, host.request)
-            assert session.controller == 'agent' and driver.opens == provider.connects == 1
+            with pytest.raises(ResourceUnsupported, match='bootstrap'):
+                await runtime.admit(host.context, host.request)
+            assert driver.opens == provider.connects == 0
         else:
             with pytest.raises((ResourceConflict, ResourceOutcomeUnknown)):
                 await runtime.admit(host.context, host.request)

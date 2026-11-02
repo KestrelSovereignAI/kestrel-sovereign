@@ -183,16 +183,19 @@ class ActiveCallEgress:
             raise pending_owned_retirement_error(call, (call._owner_task,),
                 message="original environment operation cannot acknowledge its own retirement")
 
-    async def _close_environment_call(self, call):
+    def _close_environment_call(self, call):
+        # Authenticate/capture synchronously, before ANY owner in a drain may
+        # finish and naturally remove its map entry. The returned coroutine
+        # joins only this original Future; it cannot resolve another call.
         self._require_environment_closer(call)
         call.revoke()
-        if call._used:
-            # This original settlement Future is published only after the
-            # native helper and its current SQL writer have physically joined.
-            # Observe that SAME Future through repeated caller withdrawal;
-            # there is no new Task admission, check, cloud call or SQL work.
-            outcome = await await_owned_task(call._finished)
-            raise_owned_outcome(outcome, operation="original environment invocation", retain_originals=True)
+        used, finished = call._used, call._finished
+        async def join_original():
+            if used:
+                # No Task.done/map-absence shortcut and no replacement receipt.
+                outcome = await await_owned_task(finished)
+                raise_owned_outcome(outcome, operation="original environment invocation", retain_originals=True)
+        return join_original()
 
     @asynccontextmanager
     async def _activate_environment_quote(self, call):
@@ -309,12 +312,21 @@ class ActiveCallEgress:
 
     async def revoke_session(self, scope, session_id):
         """Priority safety path; close every exact owner's active RPC borrow."""
+        await self._revoke_session(scope, session_id, session_use_only=False)
+
+    async def revoke_session_use(self, scope, session_id):
+        """Fixed-lifetime input retirement, without revoking current cloud IO."""
+        await self._revoke_session(scope, session_id, session_use_only=True)
+
+    async def _revoke_session(self, scope, session_id, *, session_use_only):
         owner = (scope.tenant_id, scope.principal_id, scope.agent_id, session_id)
         calls = [call for key, call in self._calls.items() if key[:4] == owner]
         # Validate the closed family before changing any owner's admission.
         for call in calls:
             if type(call) is not _ActiveCall:
                 self._require_environment_call(call)
+        if session_use_only:
+            calls = [call for call in calls if type(call) is _ActiveCall]
         for call in calls:
             if type(call) is _ActiveCall:
                 call.active = False
@@ -327,14 +339,16 @@ class ActiveCallEgress:
                 self._require_environment_closer(call)
         for call in calls:
             call.revoke()
-        withdrawal = None
-        for call in calls:
+        # Prepare every exact environment join while all authenticated entries
+        # are still present. Earlier joins may let later owners naturally exit.
+        joins = [call.close() if type(call) is _ActiveCall else
+                 self._close_environment_call(call) for call in calls]
+        terminal = None
+        for join in joins:
             try:
-                if type(call) is _ActiveCall:
-                    await call.close()
-                else:
-                    await self._close_environment_call(call)
-            except asyncio.CancelledError as error:
-                withdrawal = withdrawal or error
-        if withdrawal is not None:
-            raise withdrawal
+                await join
+            except BaseException as error:
+                from kestrel_sovereign.execution_custody import execution_terminal_error
+                terminal = execution_terminal_error(terminal, error, retain_originals=True)
+        if terminal is not None:
+            raise terminal

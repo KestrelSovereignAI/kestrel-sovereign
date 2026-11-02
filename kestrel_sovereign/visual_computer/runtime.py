@@ -269,6 +269,17 @@ class VisualComputerRuntime:
             raise ResourceUnsupported('Native current environment lifecycle negotiation is incomplete')
         return host
 
+    @staticmethod
+    def _requires_remote_worker_admission(record):
+        # Native preparation binding is authenticated on the SAME encrypted
+        # acquisition row even when the optional native quote was not used.
+        # A plain, genuinely supported deterministic provider remains on its
+        # own contract; no provider name/DTO can turn these native facts into
+        # worker/bootstrap conformance or a resident erase permission.
+        return (record.remote_environment is not None or
+            (record.request.location == "remote" and record.acquisition is not None
+             and record.acquisition.binding is not None))
+
     async def _acquire_custodied(self, context, record, check, provider):
         from .storage_acquisition import _CoreAcquisitionCustody
         scope = self.scope(context)
@@ -359,11 +370,12 @@ class VisualComputerRuntime:
             record.lease, record.phase = lease, "leased"
             await self.repository.save(scope, record, check)
         lease = record.lease
-        if record.remote_environment is not None:
-            host = self._native_lifecycle_host(provider)
-            async with host._activate_inspect(context, record) as original:
-                inspected = await self._call(context, check, provider.inspect, scope, lease)
-                record = await self.repository._accepted_runpod_lifecycle(scope, original, inspected)
+        if self._requires_remote_worker_admission(record):
+            if record.remote_environment is not None:
+                host = self._native_lifecycle_host(provider)
+                async with host._activate_inspect(context, record) as original:
+                    inspected = await self._call(context, check, provider.inspect, scope, lease)
+                    record = await self.repository._accepted_runpod_lifecycle(scope, original, inspected)
             # API placement facts cannot supply a supported isolated remote worker.
             raise ResourceUnsupported('Remote browser bootstrap and authenticated worker transport are unverified')
         connection = record.connection or await self._call(context, check, provider.connect, scope, lease)
@@ -784,6 +796,8 @@ class VisualComputerRuntime:
                     self._lease(record, lease, releasing=True)
                     record = await self.repository._accepted_runpod_lifecycle(scope, original, lease)
                 return {"session_id": session_id, "released": False}
+            if self._requires_remote_worker_admission(record):
+                raise ResourceUnsupported("Original private native quote required for foreground release; retained Pod custody is unresolved")
             await self._begin_release(scope, record, check)
             # Physical destruction has its own verb and outcome. A timeout
             # does not erase the original lease/connection or claim release.
@@ -851,13 +865,6 @@ class VisualComputerRuntime:
         for record in await self.repository.records(scope):
             if record.phase in {"released", "retired"}:
                 continue
-            if record.remote_environment is not None:
-                # Resident fixed-lifetime custody supplies no original current
-                # sovereign RELEASE grant. Fence/drain, retain the row and debt.
-                self._fence(scope, record.session_id)
-                await self.egress.revoke_session(scope, record.session_id)
-                uncertain.append(record.session_id)
-                continue
             if record.lease is None:
                 if record.phase in {"admitted", "quoted"} and record.request.expires_at <= self._now():
                     try:
@@ -868,6 +875,17 @@ class VisualComputerRuntime:
                     uncertain.append(record.session_id)
                 continue
             last = record.last_activity_at or record.request.requested_at
+            if self._requires_remote_worker_admission(record):
+                # Housekeeping owns expired input-use retirement, never a new
+                # current control-plane grant. In particular it must not revoke
+                # an independently admitted foreground Inspect or RELEASE.
+                if (record.phase == "releasing" or self._now() >= record.lease.expires_at
+                        or (self._now()-last).total_seconds() >= record.request.idle_ttl_seconds):
+                    if self._key(scope, record.session_id) not in self._fences:
+                        self._fence(scope, record.session_id)
+                    await self.egress.revoke_session_use(scope, record.session_id)
+                uncertain.append(record.session_id)
+                continue
             if (record.phase != "releasing" and self._now() < record.lease.expires_at
                     and (self._now()-last).total_seconds() < record.request.idle_ttl_seconds):
                 continue
