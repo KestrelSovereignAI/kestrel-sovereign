@@ -869,8 +869,84 @@ def _extract_inline_error_fields(result: Any) -> tuple[Optional[str], Optional[s
     return None, None
 
 
-async def _complete_post_tool_result(host, result, post_input):
-    """Complete policy before private UI delivery; execution is already done."""
+class _DeferredToolAuditError(ResourceOutcomeUnknown):
+    """Execution completed but its required audit could not be confirmed."""
+
+
+class _AuditedDeferredResult(dict):
+    """Single-use dispatch receipt; serialization carries only result data.
+
+    An inline adapter's history recorder must not write a second dispatch for
+    the same execution. The receipt belongs to the exact host, session and
+    tool. Copies and public named-call returns are ordinary dictionaries.
+    """
+
+    def __init__(self, result, *, host, tool_name, session_id):
+        super().__init__(result)
+        self._host, self._tool_name = host, tool_name
+        self._session_id = real_session_id(session_id)
+        self._claimed = False
+
+    def claim(self, host, tool_name, session_id):
+        if (self._claimed or self._host is not host or self._tool_name != tool_name
+                or self._session_id != real_session_id(session_id)):
+            return False
+        self._claimed = True
+        return True
+
+    def __copy__(self):
+        return dict(self)
+
+    def __deepcopy__(self, memo):
+        return deepcopy(dict(self), memo)
+
+    def __reduce_ex__(self, protocol):
+        return dict, (dict(self),)
+
+
+def _discard_tool_supplied_receipt(result):
+    """A nested or fabricated receipt does not audit the enclosing execution."""
+    return dict(result) if isinstance(result, _AuditedDeferredResult) else result
+
+
+def _mark_tool_dispatch_audited(dispatch_meta, bound_execution=None):
+    if dispatch_meta is not None:
+        dispatch_meta["audit_recorded"] = True
+    if bound_execution is not None:
+        bound_execution.audit_recorded = True
+
+
+def _raise_terminal_tool_error(error, dispatch_meta):
+    """An observer failure cannot relabel an already-confirmed tool effect."""
+    if is_execution_control_error(error) or isinstance(error, _DeferredToolAuditError):
+        raise error
+    if dispatch_meta is not None and dispatch_meta.get("audit_recorded"):
+        raise ResourceOutcomeUnknown(
+            "Tool completed and its dispatch was recorded, but final delivery failed. Do not replay",
+        ) from error
+
+
+async def _record_inline_tool_dispatch(host, entry, *, session_id, features_by_tool_name):
+    """One recorder for both streaming and non-streaming inline history."""
+    result = entry["result"]
+    if isinstance(result, _AuditedDeferredResult) and result.claim(host, entry["name"], session_id):
+        return
+    args = entry["arguments"]
+    adapter = "inline:" + OrchestratorEngineMixin._tool_call_adapter(
+        host, entry["name"], features_by_tool_name,
+    )
+    error_message, error_class = _extract_inline_error_fields(result)
+    await OrchestratorEngineMixin._log_tool_dispatch(
+        host, tool_name=entry["name"], adapter=adapter,
+        args=args if isinstance(args, dict) else {}, result=result,
+        session_id=session_id, dispatch_start=time.time(),
+        error_message=error_message, error_class=error_class,
+    )
+
+
+async def _complete_post_tool_result(host, result, post_input, *, adapter,
+                                     dispatch_start, on_audited=None):
+    """Complete policy and required audit before invoking a private UI factory."""
     deferred = isinstance(result, DeferredToolResult)
     post_outputs = await host.hooks_manager.execute_hooks_parallel(
         HookEvent.POST_TOOL_USE, post_input,
@@ -878,7 +954,7 @@ async def _complete_post_tool_result(host, result, post_input):
     )
     require_execution_work(host)
     if not isinstance(result, DeferredToolResult):
-        return result
+        return _discard_tool_supplied_receipt(result)
     allowed = all(evaluate_blocking_decision(output) is None for output in post_outputs)
     post_result = post_input.tool_response
     if not isinstance(post_result, dict):
@@ -888,7 +964,37 @@ async def _complete_post_tool_result(host, result, post_input):
         result.finalize(post_result, allowed=False)
     reviewed = deepcopy(dict(post_result))
     try:
-        completed = result.finalize(post_result, allowed=allowed)
+        error_message, error_class = _extract_inline_error_fields(post_result)
+        await OrchestratorEngineMixin._log_tool_dispatch(
+            host, tool_name=post_input.tool_name, adapter=adapter,
+            args=post_input.tool_input, result=reviewed,
+            session_id=post_input.session_id, dispatch_start=dispatch_start,
+            error_message=error_message, error_class=error_class, required=True,
+        )
+        if on_audited is not None:
+            on_audited()
+        require_execution_work(host)
+    except BaseException as error:
+        # Consume the factory when storage or Stop prevents publication.
+        # Execution already happened: never invite a replay to recover its UI.
+        try:
+            result.finalize(post_result, allowed=False)
+        except RuntimeError as discard_error:
+            # A second holder may already have consumed this one-shot result.
+            # Retain that diagnostic without replacing the original write or
+            # control failure, including its existing physical cause chain.
+            error = execution_terminal_error(
+                error, discard_error, retain_originals=True, prefer_cancellation=True,
+            )
+        if not isinstance(error, Exception) or is_execution_control_error(error):
+            raise error
+        raise _DeferredToolAuditError(
+            "Tool completed, but its audit could not be confirmed; UI withheld. "
+            "Reconcile before retrying. Do not replay to recover the UI",
+        ) from error
+    try:
+        changed_during_audit = dict(post_result) != reviewed
+        completed = result.finalize(post_result, allowed=allowed and not changed_during_audit)
     except Exception as error:
         if is_execution_control_error(error):
             raise
@@ -903,19 +1009,24 @@ async def _complete_post_tool_result(host, result, post_input):
         }}]
         appended_parts = added
     else:
-        payload, added = completed.result, completed.parts
+        # The completed policy projection is sealed before awaiting storage.
+        # A retained tool reference cannot replace it during that await.
+        payload = reviewed if changed_during_audit else completed.result
+        added = completed.parts
         appended_parts = None
     from kestrel_sovereign.features.base import _attach_envelope_parts
     _attach_envelope_parts(payload, payload.pop("parts", None), None,
                            appended_parts=appended_parts)
     host._reemit_envelope_parts({"parts": added})
-    return payload
+    return _AuditedDeferredResult(payload, host=host, tool_name=post_input.tool_name,
+                                  session_id=post_input.session_id)
 
 
 class OrchestratorEngineMixin:
     """Mixin providing orchestrator loop methods for KestrelAgent."""
 
     supports_deferred_tool_results: bool = True
+    supports_audited_deferred_tool_results: bool = True
 
     @staticmethod
     def _signals_unfinished_tool_work(content: Optional[str]) -> bool:
@@ -1087,6 +1198,8 @@ class OrchestratorEngineMixin:
         session_id: str,
         execute_fn,
         prepare_args=None,
+        audit_adapter=None,
+        on_audited=None,
     ) -> dict:
         """
         Execute a tool with PRE_TOOL_USE and POST_TOOL_USE hook enforcement.
@@ -1171,7 +1284,11 @@ class OrchestratorEngineMixin:
             tool_response=result if isinstance(result, dict) else {"result": str(result)},
             execution_time_ms=exec_duration_ms,
         )
-        return await _complete_post_tool_result(self, result, post_hook_input)
+        return await _complete_post_tool_result(
+            self, result, post_hook_input,
+            adapter=audit_adapter or f"{feature_name}.{tool_name}",
+            dispatch_start=exec_start, on_audited=on_audited,
+        )
 
     async def _generate_with_messages_bounded(
         self,
@@ -1467,32 +1584,9 @@ class OrchestratorEngineMixin:
                     "result": summarize_tool_result_for_audit(serialized),
                 })
 
-            # Structured dispatch log so a2a_tool_dispatches captures
-            # inline-executed calls (codex app-server path). Without
-            # this, the dominant execution path for openai:plan /
-            # gpt-5.5 silently bypasses structured logging.
-            tool_name = e["name"]
-            args = e["arguments"]
-            result = e["result"]
-            adapter = "inline:" + OrchestratorEngineMixin._tool_call_adapter(
-                self, tool_name, features_by_tool_name,
-            )
-            err_msg, err_class = _extract_inline_error_fields(result)
-            # ``dispatch_start = time.time()`` records latency_ms=0 for
-            # the structured log — accurate latency requires adapter-
-            # level instrumentation (see codex_adapter's
-            # ``_make_inline_tool_executor``) and is out of scope for
-            # this fix.
-            await OrchestratorEngineMixin._log_tool_dispatch(
-                self,
-                tool_name=tool_name,
-                adapter=adapter,
-                args=args if isinstance(args, dict) else {},
-                result=result,
-                session_id=session_id,
-                dispatch_start=time.time(),
-                error_class=err_class,
-                error_message=err_msg,
+            await _record_inline_tool_dispatch(
+                self, e, session_id=session_id,
+                features_by_tool_name=features_by_tool_name,
             )
 
     async def execute_named_tool(
@@ -1578,10 +1672,13 @@ class OrchestratorEngineMixin:
             return await handler(**(args or {}))
 
         with tool_call_scope(self, call_context):
-            return await self._dispatch_named_tool(
+            result = await self._dispatch_named_tool(
                 tool_name, args, session_id=session_id, source=source,
                 _capture=_capture, call_context=call_context,
             )
+            if isinstance(result, _AuditedDeferredResult) and _capture is None:
+                return dict(result)
+            return result
 
     async def _dispatch_named_tool(
         self,
@@ -1795,7 +1892,10 @@ class OrchestratorEngineMixin:
             tool_response=result if isinstance(result, dict) else {"result": str(result)},
             execution_time_ms=exec_duration_ms,
         )
-        return await _complete_post_tool_result(self, result, post_input)
+        return await _complete_post_tool_result(
+            self, result, post_input, adapter=f"named:{source}:{feature_name}.{tool_name}",
+            dispatch_start=exec_start,
+        )
 
     def _resolve_named_tool(self, tool_name: str) -> tuple[Any, Any]:
         """Find an ``(AgentTool, Feature)`` pair by tool name.
@@ -2025,6 +2125,7 @@ class OrchestratorEngineMixin:
                 result = await feature.execute_as_subagent(
                     task=task, context=context, denied_tools=denied_tools,
                 )
+                result = _discard_tool_supplied_receipt(result)
                 mark_current_invocation_effect_completed(session_id)
                 require_execution_work(self)
         except ExecutionAuthorityError:
@@ -2494,21 +2595,24 @@ class OrchestratorEngineMixin:
         if context_stats is not None and bound_tool is None:
             context_stats.record(tool_name, args, len(result_json))
 
-        await OrchestratorEngineMixin._log_tool_dispatch(
-            self,
-            tool_name=tool_name,
-            adapter=bound_adapter or OrchestratorEngineMixin._tool_call_adapter(
-                self, tool_name, features_by_tool_name
-            ),
-            args=dispatch_meta.get("arguments", args),
-            result=result,
-            session_id=session_id,
-            dispatch_start=dispatch_start,
-            status_hint=dispatch_meta.get("status"),
-            error_class=dispatch_meta.get("error_class"),
-            error_message=dispatch_meta.get("error_message"),
-            **({"required": True} if bound_tool is not None else {}),
-        )
+        audited = (isinstance(result, _AuditedDeferredResult)
+                   and result.claim(self, tool_name, session_id))
+        if not audited and not dispatch_meta.get("audit_recorded"):
+            await OrchestratorEngineMixin._log_tool_dispatch(
+                self,
+                tool_name=tool_name,
+                adapter=bound_adapter or OrchestratorEngineMixin._tool_call_adapter(
+                    self, tool_name, features_by_tool_name
+                ),
+                args=dispatch_meta.get("arguments", args),
+                result=result,
+                session_id=session_id,
+                dispatch_start=dispatch_start,
+                status_hint=dispatch_meta.get("status"),
+                error_class=dispatch_meta.get("error_class"),
+                error_message=dispatch_meta.get("error_message"),
+                **({"required": True} if bound_tool is not None else {}),
+            )
 
         if bound_execution is not None:
             bound_execution.audit_recorded = True
@@ -2518,7 +2622,7 @@ class OrchestratorEngineMixin:
         if bound_tool is not None and dispatch_meta.get("outcome_unknown"):
             raise ResourceOutcomeUnknown(dispatch_meta["error_message"]) from dispatch_meta["outcome_error"]
 
-        return result
+        return dict(result) if isinstance(result, _AuditedDeferredResult) else result
 
     def _tool_call_adapter(self, tool_name: str, features_by_tool_name: dict) -> str:
         """Return a stable adapter identifier for a dispatched tool call."""
@@ -2680,6 +2784,8 @@ class OrchestratorEngineMixin:
                 args=args,
                 session_id=session_id,
                 execute_fn=_exec_feature,
+                audit_adapter=f"{type(feature).__name__}.execute_as_subagent",
+                on_audited=lambda: _mark_tool_dispatch_audited(dispatch_meta),
             )
             # #2641: parts the subagent's tools produced ride the result
             # envelope; ``_execute_tool_with_hooks`` re-emitted them into this
@@ -2716,16 +2822,14 @@ class OrchestratorEngineMixin:
         except ExecutionAuthorityError:
             raise
         except (ConnectionError, TimeoutError, ValueError, KeyError, TypeError, AttributeError) as e:
-            if is_execution_control_error(e):
-                raise
+            _raise_terminal_tool_error(e, dispatch_meta)
             return await self._handle_feature_error(
                 e, tool_name, hook_feature_name, args, dispatch_start,
                 dispatch_event_id, tool_events=tool_events, streaming=streaming,
                 session_id=session_id, dispatch_meta=dispatch_meta,
             )
         except Exception as e:
-            if is_execution_control_error(e):
-                raise
+            _raise_terminal_tool_error(e, dispatch_meta)
             return await self._handle_feature_error(
                 e, tool_name, hook_feature_name, args, dispatch_start,
                 dispatch_event_id, tool_events=tool_events, streaming=streaming,
@@ -2940,6 +3044,9 @@ class OrchestratorEngineMixin:
                 args=args,
                 session_id=session_id,
                 execute_fn=_exec_direct,
+                audit_adapter=(f"{bound_tool.owner}.{tool_name}" if bound_tool is not None
+                               else OrchestratorEngineMixin._tool_call_adapter(self, tool_name, {})),
+                on_audited=lambda: _mark_tool_dispatch_audited(dispatch_meta, bound_execution),
                 **({"prepare_args": _prepare_bound_arguments} if bound_tool is not None else {}),
             )
             # #2641: direct tools carry the same envelope contract as
@@ -2961,8 +3068,7 @@ class OrchestratorEngineMixin:
                 tool_events.append({'type': 'complete', 'tool': tool_name, 'ms': dispatch_duration})
             return result
         except Exception as e:
-            if is_execution_control_error(e):
-                raise
+            _raise_terminal_tool_error(e, dispatch_meta)
             logging.error(f"[DIRECT-TOOL] {tool_name} failed: {e}")
             if bound_execution is not None and (
                 bound_execution.returned
