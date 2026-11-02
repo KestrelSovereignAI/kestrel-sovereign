@@ -112,6 +112,7 @@ class Boundary:
     tool: DeferredTool
     binding: object
     policy: PostPolicy
+    backend: object
 
     async def invoke(self, path):
         if path == "named":
@@ -156,7 +157,7 @@ async def boundary(tmp_path, request):
     host.register_dynamic_tools("mcp:deferred-test", [offered],
         on_registered=lambda tool, binding: bindings.append(binding))
     try:
-        yield Boundary(host, tool, bindings[0], policy)
+        yield Boundary(host, tool, bindings[0], policy, db)
     finally:
         policy.release.set()
         await store.close()
@@ -397,3 +398,125 @@ async def test_policy_can_remove_original_parts_with_null(boundary, path):
         assert peer.tool.executions == [{}] and not peer.tool.publications
         assert "parts" not in result
         assert [part["type"] for part in drain_parts()] == ["original_part", "post_policy"]
+
+
+@pytest.mark.parametrize("path", ["chat", "named", "bound"])
+async def test_private_publication_waits_for_required_dispatch_persistence(boundary, path, monkeypatch):
+    peer = boundary
+    peer.policy.release.set()
+    entered, release = asyncio.Event(), asyncio.Event()
+    writes = []
+    write = peer.host.observability_store.log_tool_dispatch
+
+    async def persist(entry, **kwargs):
+        writes.append(entry)
+        assert kwargs == {"required": True}
+        entered.set()
+        await release.wait()
+        assert peer.tool.publications == []
+        await write(entry, **kwargs)
+
+    monkeypatch.setattr(peer.host.observability_store, "log_tool_dispatch", persist)
+    with part_collector():
+        call = asyncio.create_task(peer.invoke(path))
+        try:
+            await asyncio.wait_for(entered.wait(), 5)
+            assert peer.tool.executions == [{}] and peer.tool.publications == []
+            assert "private_view" not in [part["type"] for part in drain_parts()]
+            release.set()
+            result = await call
+            assert len(writes) == 1
+            assert result["status"] == "ok" and peer.tool.publications == ["published-once"]
+            rows = await peer.backend.fetch_all("SELECT result_status FROM a2a_tool_dispatches")
+            assert [tuple(row) for row in rows] == [("success",)]
+            assert [part["type"] for part in drain_parts()] == ["private_view"]
+        finally:
+            release.set()
+            if not call.done():
+                call.cancel()
+            await asyncio.gather(call, return_exceptions=True)
+
+
+@pytest.mark.parametrize("path", ["chat", "named", "bound"])
+async def test_broken_dispatch_storage_never_publishes_a_private_view(boundary, path):
+    from kestrel_sdk.resources import ResourceOutcomeUnknown
+    from kestrel_sovereign.storage.db.interface import DatabaseError
+
+    peer = boundary
+    peer.policy.release.set()
+    await peer.backend.execute("DROP TABLE a2a_tool_dispatches")
+    with part_collector():
+        with pytest.raises((DatabaseError, ResourceOutcomeUnknown)):
+            await peer.invoke(path)
+        assert peer.tool.executions == [{}]
+        assert peer.tool.publications == []
+        assert "private_view" not in [part["type"] for part in drain_parts()]
+        with pytest.raises(RuntimeError, match="already finalized or transferred"):
+            peer.tool.active_result.finalize(peer.tool.active_result, allowed=True)
+
+
+@pytest.mark.parametrize("path", ["chat", "named", "bound"])
+async def test_cancelled_dispatch_write_consumes_private_factory(boundary, path, monkeypatch):
+    peer = boundary
+    peer.policy.release.set()
+
+    async def interrupted(entry, **kwargs):
+        raise asyncio.CancelledError("Owned audit writer interrupted")
+
+    monkeypatch.setattr(peer.host.observability_store, "log_tool_dispatch", interrupted)
+    with part_collector():
+        with pytest.raises(asyncio.CancelledError):
+            await peer.invoke(path)
+        assert peer.tool.executions == [{}] and peer.tool.publications == []
+        assert "private_view" not in [part["type"] for part in drain_parts()]
+        with pytest.raises(RuntimeError, match="already finalized or transferred"):
+            peer.tool.active_result.finalize(peer.tool.active_result, allowed=True)
+
+
+async def test_inline_delivery_records_one_dispatch_before_history_projection(boundary):
+    import json
+
+    peer = boundary
+    peer.policy.release.set()
+    executor = peer.host._make_inline_tool_executor("deferred-owned-session")
+    arguments, result = await executor(peer.binding.name, {})
+    # The provider keeps the original result for its execution breadcrumb and
+    # serializes only business fields onto its wire. No receipt enters JSON.
+    assert json.loads(json.dumps(result)) == dict(result)
+    executed = [{"id": "owned-inline-call", "name": peer.binding.name,
+                 "arguments": arguments, "result": result}]
+    await peer.host._append_executed_tool_breadcrumbs([], executed, session_id="deferred-owned-session")
+    rows = await peer.backend.fetch_all("SELECT result_status FROM a2a_tool_dispatches")
+    assert [tuple(row) for row in rows] == [("success",)]
+    assert peer.tool.executions == [{}] and peer.tool.publications == ["published-once"]
+
+
+@pytest.mark.parametrize("transform", ["copy", "deepcopy", "pickle", "json"])
+async def test_a_serialized_result_cannot_suppress_a_new_dispatch(boundary, transform):
+    import copy
+    import json
+    import pickle
+
+    peer = boundary
+    peer.policy.release.set()
+    _, result = await peer.host._make_inline_tool_executor("deferred-owned-session")(peer.binding.name, {})
+    copied = {"copy": copy.copy, "deepcopy": copy.deepcopy,
+              "pickle": lambda value: pickle.loads(pickle.dumps(value)),
+              "json": lambda value: json.loads(json.dumps(value))}[transform](result)
+    assert type(copied) is dict
+    executed = [{"id": "another-inline-call", "name": peer.binding.name,
+                 "arguments": {}, "result": copied}]
+    await peer.host._append_executed_tool_breadcrumbs([], executed, session_id="deferred-owned-session")
+    rows = await peer.backend.fetch_all("SELECT result_status FROM a2a_tool_dispatches")
+    assert len(rows) == 2
+
+
+async def test_dispatch_receipt_is_scoped_and_single_use(boundary):
+    peer = boundary
+    peer.policy.release.set()
+    _, result = await peer.host._make_inline_tool_executor("deferred-owned-session")(peer.binding.name, {})
+    assert not result.claim(object(), peer.binding.name, "deferred-owned-session")
+    assert not result.claim(peer.host, "another-tool", "deferred-owned-session")
+    assert not result.claim(peer.host, peer.binding.name, "another-session")
+    assert result.claim(peer.host, peer.binding.name, "deferred-owned-session")
+    assert not result.claim(peer.host, peer.binding.name, "deferred-owned-session")
