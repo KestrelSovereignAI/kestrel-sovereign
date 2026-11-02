@@ -309,7 +309,8 @@ collector carries only part data. The original factory can
 read the context during publication even after tool-wrapper transfers. Features
 that need this association require `supports_tool_publication_context is True`.
 The context identifies the destination; authenticated View controllers still
-authorize readers and tool calls independently.
+authorize readers and tool calls independently. It does not confirm delivery:
+later response policy can withhold the rendered parts.
 
 ### Tasks and operator input
 

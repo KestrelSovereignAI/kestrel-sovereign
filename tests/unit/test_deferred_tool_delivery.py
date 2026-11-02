@@ -8,7 +8,9 @@ import pytest_asyncio
 
 from kestrel_sdk.hooks.base import Hook, HookEvent, HookOutput
 from kestrel_sdk.llm.response import ToolCall
-from kestrel_sdk.tools import DeferredToolResult, ToolCategory, ToolResult, ToolSchema
+from kestrel_sdk.tools import (
+    DeferredToolResult, ToolCategory, ToolPublicationContext, ToolResult, ToolSchema,
+)
 from kestrel_sdk.features.base import Feature as SDKFeature, tool as feature_tool
 from kestrel_sovereign.a2a.stores.unified.observability_store import ObservabilityStore
 from kestrel_sovereign.agent.orchestrator_engine import OrchestratorEngineMixin
@@ -196,8 +198,6 @@ async def test_private_delivery_waits_for_actual_post_policy_and_honors_redactio
 
 @pytest.mark.parametrize("path", ["chat", "named", "bound"])
 async def test_live_chat_destination_reaches_the_original_publisher_only_after_completion(boundary, path):
-    from kestrel_sdk.tools import ToolPublicationContext
-
     peer = boundary
     peer.policy.release.set()
     with part_collector(host=peer.host, session_id="deferred-owned-session"):
@@ -209,7 +209,6 @@ async def test_live_chat_destination_reaches_the_original_publisher_only_after_c
 @pytest.mark.parametrize("active", [True, False])
 async def test_foreign_inline_task_borrows_only_a_live_publication_destination(boundary, active):
     from contextvars import Context
-    from kestrel_sdk.tools import ToolPublicationContext
 
     peer = boundary
     peer.policy.release.set()
@@ -681,6 +680,8 @@ async def test_streaming_inline_delivery_uses_the_same_dispatch_receipt(boundary
     rows = await peer.backend.fetch_all("SELECT result_status FROM a2a_tool_dispatches")
     assert [tuple(row) for row in rows] == [("success",)]
     assert peer.tool.executions == [{}] and peer.tool.publications == ["published-once"]
+    assert peer.tool.publication_contexts == [ToolPublicationContext(agent.did, "deferred-owned-session")]
+    assert peer.tool.last_result.publication_context is None
     assert any("private_view" in chunk for chunk in chunks)
     assert any(part["type"] == "private_view" for row in inserts
                for part in row.get("metadata", {}).get("parts", []))

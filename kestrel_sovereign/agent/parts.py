@@ -26,7 +26,6 @@ from __future__ import annotations
 
 import contextlib
 import contextvars
-from copy import deepcopy
 import json
 import logging
 from typing import Any, List, Optional
@@ -90,13 +89,8 @@ class _TurnPartCollector(list):
             and isinstance(session_id, str) and session_id.strip() else None
         )
 
-    def __copy__(self):
-        return list(self)
-
-    def __deepcopy__(self, memo):
-        return deepcopy(list(self), memo)
-
     def __reduce_ex__(self, protocol):
+        # copy.copy, copy.deepcopy and pickle all use this data-only shape.
         return list, (list(self),)
 
 

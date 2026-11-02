@@ -91,6 +91,7 @@ from kestrel_sovereign.agent.invocation import (
 from kestrel_sovereign.agent.parts import (
     build_part_sentinel,
     current_part_collector,
+    current_tool_publication_context,
     drain_parts,
     sanitize_part,
 )
@@ -994,7 +995,6 @@ async def _complete_post_tool_result(host, result, post_input, *, adapter,
         ) from error
     try:
         changed_during_audit = dict(post_result) != reviewed
-        from kestrel_sovereign.agent.parts import current_tool_publication_context
         completed = result.finalize(
             post_result, allowed=allowed and not changed_during_audit,
             context=current_tool_publication_context(host, post_input.session_id),
