@@ -20,8 +20,12 @@ from bisect import bisect_right
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from time import monotonic, perf_counter
-from typing import Any, Awaitable, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import (
+    AbstractSet, Any, Awaitable, Callable, Dict, Iterable, List, Optional, Sequence,
+    Tuple,
+)
 
+from kestrel_sovereign._async_ownership import run_blocking_operation
 from .async_database import AsyncDatabase
 from kestrel_sovereign.execution_custody import is_execution_control_error
 from .conversation_ids import coerce_persistent_message_id
@@ -579,6 +583,28 @@ def _token_match_score(query_tokens: Sequence[str], content_lower: str) -> float
 
     hits = sum(1 for t in query_tokens if t in content_lower)
     return hits / len(query_tokens)
+
+
+def _rank_lexical_candidates(
+    query_tokens: AbstractSet[str], candidates: Sequence[Dict[str, Any]]
+) -> List[Tuple[float, int, Dict[str, Any]]]:
+    """``(overlap, id, candidate)`` for each candidate sharing a query token.
+
+    ``overlap`` is the fraction of ``query_tokens`` the candidate holds. Pure,
+    and linear in each candidate's size, which can be megabytes, so callers
+    run it off the event loop (#3745).
+    """
+    ranked: List[Tuple[float, int, Dict[str, Any]]] = []
+    for candidate in candidates:
+        content = candidate.get("content") or ""
+        candidate_tokens = set(
+            _tokenize_for_search(_strip_search_wrappers(content))
+        )
+        overlap = len(query_tokens & candidate_tokens) / len(query_tokens)
+        if overlap <= 0:
+            continue
+        ranked.append((overlap, int(candidate["id"]), candidate))
+    return ranked
 
 
 _MATCH_SNIPPET_RADIUS = 60
@@ -5842,16 +5868,6 @@ class AsyncConversationStore:
         fallback_rows_scanned = 0
         fallback_reason: Optional[str] = None
 
-        def rank_candidate(candidate: Dict[str, Any]) -> None:
-            content = candidate.get("content") or ""
-            candidate_tokens = set(
-                _tokenize_for_search(_strip_search_wrappers(content))
-            )
-            overlap = len(query_tokens & candidate_tokens) / len(query_tokens)
-            if overlap <= 0:
-                return
-            ranked.append((overlap, int(candidate["id"]), candidate))
-
         index_available = True
         try:
             indexed_ids = await self._lexical_index.candidate_message_ids(
@@ -5861,8 +5877,9 @@ class AsyncConversationStore:
             )
             indexed_rows = await self.get_messages_by_ids(indexed_ids)
             indexed_candidates = len(indexed_rows)
-            for candidate in indexed_rows:
-                rank_candidate(candidate)
+            ranked.extend(await run_blocking_operation(
+                _rank_lexical_candidates, query_tokens, indexed_rows
+            ))
         except ValueError as exc:
             fallback_reason = "query_token_budget"
             logger.info(
@@ -5935,6 +5952,7 @@ class AsyncConversationStore:
             if not rows:
                 break
             fallback_rows_scanned += len(rows)
+            page: List[Dict[str, Any]] = []
             for row_id, role, encrypted_content, raw_meta, created_at, rendered in rows:
                 try:
                     meta = json.loads(raw_meta) if raw_meta else {}
@@ -5946,13 +5964,16 @@ class AsyncConversationStore:
                 )
                 cleaned_meta = remove_enc_flag(meta) or {}
                 cleaned_meta.pop("key_version", None)
-                rank_candidate({
+                page.append({
                     "id": row_id,
                     "role": role,
                     "content": content,
                     "metadata": cleaned_meta,
                     "created_at": created_at,
                 })
+            ranked.extend(await run_blocking_operation(
+                _rank_lexical_candidates, query_tokens, page
+            ))
             ranked.sort(key=lambda item: (item[0], item[1]), reverse=True)
             del ranked[max(1, int(limit)):]
             before_id = int(rows[-1][0])

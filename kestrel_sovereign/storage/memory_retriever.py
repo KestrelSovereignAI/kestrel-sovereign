@@ -34,11 +34,15 @@ Memory = "what did we experience together?"
 See docs/architecture/MEMORY_SYSTEM.md for the full decision matrix.
 """
 import asyncio
+import functools
 import logging
 import math
 import struct
+from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import List, Dict, Any, Iterable, Optional, Sequence, Tuple
+from typing import (
+    List, Dict, Any, FrozenSet, Iterable, Optional, Sequence, Tuple, Union,
+)
 import json
 
 from kestrel_sovereign.execution_custody import (
@@ -54,6 +58,7 @@ from kestrel_sovereign._async_ownership import (
     await_owned_task,
     create_owned_task,
     owned_task_error,
+    run_blocking_operation,
 )
 
 from .memory_models import MemoryMetadata
@@ -106,6 +111,37 @@ def _normalize_for_echo_check(text: str) -> str:
     return " ".join(tokens)
 
 
+@dataclass(frozen=True)
+class _RetrievalQuery:
+    """A query's derived forms, computed once per ``retrieve()`` (#3745).
+
+    Scoring compares the query with every candidate row. Deriving these forms
+    for each row made one retrieval cost O(rows x query length): a 26k
+    character message against ~700 rows held the event loop for 2.4 s.
+    """
+
+    text: str
+    #: Search tokens of the wrapper-free query, deduplicated in first-seen order.
+    tokens: Tuple[str, ...]
+    token_set: FrozenSet[str]
+    #: :func:`_normalize_for_echo_check` of the query.
+    echo_form: str
+
+    @classmethod
+    def of(cls, query: Union[str, "_RetrievalQuery"]) -> "_RetrievalQuery":
+        if isinstance(query, cls):
+            return query
+        tokens = tuple(dict.fromkeys(
+            _tokenize_for_search(_strip_search_wrappers(query))
+        ))
+        return cls(
+            text=query,
+            tokens=tokens,
+            token_set=frozenset(tokens),
+            echo_form=_normalize_for_echo_check(query),
+        )
+
+
 _INTERROGATIVE_OPENERS = frozenset({
     "what", "which", "who", "whom", "whose", "how", "when", "where", "why",
     "do", "does", "did", "can", "could", "would", "should", "is", "are",
@@ -113,7 +149,9 @@ _INTERROGATIVE_OPENERS = frozenset({
 })
 
 
-def _is_user_query_echo(content: str, query: str) -> bool:
+def _is_user_query_echo(
+    content: str, query: Union[str, _RetrievalQuery]
+) -> bool:
     """Drop a prior user *question* that contains this retrieval query.
 
     Exact normalization remains the first guard.  The containment rule applies
@@ -122,7 +160,8 @@ def _is_user_query_echo(content: str, query: str) -> bool:
     dogfood probes such as ``"Which memory mentions absentneedle?"`` cannot
     manufacture evidence for the later query ``"absentneedle"``.
     """
-    if _normalize_for_echo_check(content) == _normalize_for_echo_check(query):
+    query = _RetrievalQuery.of(query)
+    if _normalize_for_echo_check(content) == query.echo_form:
         return True
     stripped = content.strip()
     first = (
@@ -131,7 +170,7 @@ def _is_user_query_echo(content: str, query: str) -> bool:
     )
     if "?" not in stripped and first not in _INTERROGATIVE_OPENERS:
         return False
-    query_tokens = set(_tokenize_for_search(_strip_search_wrappers(query)))
+    query_tokens = query.token_set
     content_tokens = set(_tokenize_for_search(_strip_search_wrappers(stripped)))
     if bool(query_tokens) and query_tokens <= content_tokens:
         return True
@@ -449,18 +488,99 @@ class MemoryRetriever:
                     "(falling back to keyword overlap): %s", e,
                 )
 
-        # Normalize query for dedup comparison. The echo guard below is
-        # the only barrier between a literal prior user question and it
-        # resurfacing as a "memory" of itself — so the normalization
-        # needs to be aggressive enough to catch trivial variants
-        # (different punctuation, extra whitespace, casing) without
-        # being so loose it would conflate genuinely different
-        # sentences. Strip ASCII punctuation, collapse internal
-        # whitespace to single spaces, lowercase. (Codex P2 round 2
-        # on #1481 — exact-match was too strict.)
-        query_normalized = _normalize_for_echo_check(query)
+        retrieval_query = _RetrievalQuery.of(query)
+        # Scoring is pure CPU over in-memory rows, linear in each row's size,
+        # and rows can be megabytes. In a worker thread it cannot stall the
+        # event loop that every agent's turns, and the Stop owner's lease
+        # renewal, share (#3745).
+        scored = await run_blocking_operation(functools.partial(
+            self._score_candidates,
+            history,
+            retrieval_query,
+            emotional_context=emotional_context,
+            expanded_concepts=expanded_concepts,
+            query_embedding=query_embedding,
+            row_embeddings=row_embeddings,
+            semantic_similarities=semantic_similarities,
+            vector_cosine_floor=vector_cosine_floor,
+            min_relevance=min_relevance,
+            min_score=min_score,
+        ))
 
-        # Score each message
+        # Salience reranks genuinely competitive memories; it must not let a
+        # merely-above-threshold fresh/important row outrank the query's much
+        # stronger semantic match. The relative gate adapts to each query and
+        # embedding model while the absolute ``min_relevance`` gate still
+        # provides abstention. Empirical suite v1 selected 0.75: all 15
+        # answerable Qwen-8B and Nomic cases remained recallable/top-1 while
+        # high-salience distractors stopped winning.
+        if scored:
+            strongest_relevance = max(item[2]["semantic"] for item in scored)
+            competitive_floor = (
+                strongest_relevance * self.RELATIVE_RELEVANCE_RATIO
+            )
+            scored = [
+                item for item in scored
+                if item[2]["semantic"] >= competitive_floor
+            ]
+
+        # Some embedding models form useful topical neighborhoods but cannot
+        # reliably tell whether a candidate contains the requested attribute.
+        # Batch the competitive vector candidates through one evidence check.
+        # Lexical-only operation deliberately bypasses this gate; if the judge
+        # fails, retain only canonical lexical evidence rather than inventing
+        # an answer or making exact offline recall unavailable.
+        if (
+            scored
+            and query_embedding is not None
+            and self.answerability_enabled
+            and self._answerability_required()
+        ):
+            scored = await self._filter_answerable(
+                retrieval_query, scored, session_id=session_id
+            )
+
+        # Sort competitive candidates by human-like salience score.
+        scored.sort(key=lambda x: x[1], reverse=True)
+
+        # Return top results with scores
+        results = []
+        for msg, score, components in scored[:limit]:
+            result = dict(msg)
+            result["retrieval_score"] = round(score, 4)
+            result["relevance_score"] = round(components["semantic"], 4)
+            result["retrieval_components"] = {
+                key: round(value, 4) for key, value in components.items()
+            }
+            results.append(result)
+
+        if not read_only:
+            await self.record_accesses(
+                (result["id"] for result in results if result.get("id") is not None),
+                agent_id,
+            )
+
+        return results
+
+    def _score_candidates(
+        self,
+        history: Sequence[Dict[str, Any]],
+        query: _RetrievalQuery,
+        *,
+        emotional_context: Optional[MemoryMetadata],
+        expanded_concepts: List[str],
+        query_embedding: Optional[List[float]],
+        row_embeddings: Dict[Any, List[float]],
+        semantic_similarities: Dict[str, float],
+        vector_cosine_floor: float,
+        min_relevance: float,
+        min_score: float,
+    ) -> List[Tuple[Dict[str, Any], float, Dict[str, float]]]:
+        """Score every candidate row and keep those past both floors.
+
+        Pure: it reads only its arguments, so ``retrieve`` runs it off the
+        event loop.
+        """
         scored: List[Tuple[Dict[str, Any], float, Dict[str, float]]] = []
 
         for msg in history:
@@ -508,16 +628,15 @@ class MemoryRetriever:
             # (``<user_input>\n...\n</user_input>``) — strip the wrapper
             # before comparing so the echo guard fires on production
             # rows, not just on synthetic test data. (Codex P2 on PR-1481.)
-            comparison_content = content
+            #
+            # The normalization is aggressive enough to catch trivial variants
+            # (punctuation, whitespace, casing) without conflating genuinely
+            # different sentences. (Codex P2 round 2 on #1481.) A user row's
+            # question check begins with the same exact comparison.
             if msg.get("role") == "user":
-                comparison_content = raw_user_content
-            if (
-                _normalize_for_echo_check(comparison_content) == query_normalized
-                or (
-                    msg.get("role") == "user"
-                    and _is_user_query_echo(comparison_content, query)
-                )
-            ):
+                if _is_user_query_echo(raw_user_content, query):
+                    continue
+            elif _normalize_for_echo_check(content) == query.echo_form:
                 continue
 
             components = self._calculate_score_components(
@@ -544,60 +663,7 @@ class MemoryRetriever:
             if relevance >= min_relevance and score >= min_score:
                 scored.append((msg, score, components))
 
-        # Salience reranks genuinely competitive memories; it must not let a
-        # merely-above-threshold fresh/important row outrank the query's much
-        # stronger semantic match. The relative gate adapts to each query and
-        # embedding model while the absolute ``min_relevance`` gate still
-        # provides abstention. Empirical suite v1 selected 0.75: all 15
-        # answerable Qwen-8B and Nomic cases remained recallable/top-1 while
-        # high-salience distractors stopped winning.
-        if scored:
-            strongest_relevance = max(item[2]["semantic"] for item in scored)
-            competitive_floor = (
-                strongest_relevance * self.RELATIVE_RELEVANCE_RATIO
-            )
-            scored = [
-                item for item in scored
-                if item[2]["semantic"] >= competitive_floor
-            ]
-
-        # Some embedding models form useful topical neighborhoods but cannot
-        # reliably tell whether a candidate contains the requested attribute.
-        # Batch the competitive vector candidates through one evidence check.
-        # Lexical-only operation deliberately bypasses this gate; if the judge
-        # fails, retain only canonical lexical evidence rather than inventing
-        # an answer or making exact offline recall unavailable.
-        if (
-            scored
-            and query_embedding is not None
-            and self.answerability_enabled
-            and self._answerability_required()
-        ):
-            scored = await self._filter_answerable(
-                query, scored, session_id=session_id
-            )
-
-        # Sort competitive candidates by human-like salience score.
-        scored.sort(key=lambda x: x[1], reverse=True)
-
-        # Return top results with scores
-        results = []
-        for msg, score, components in scored[:limit]:
-            result = dict(msg)
-            result["retrieval_score"] = round(score, 4)
-            result["relevance_score"] = round(components["semantic"], 4)
-            result["retrieval_components"] = {
-                key: round(value, 4) for key, value in components.items()
-            }
-            results.append(result)
-
-        if not read_only:
-            await self.record_accesses(
-                (result["id"] for result in results if result.get("id") is not None),
-                agent_id,
-            )
-
-        return results
+        return scored
 
     def _answerability_required(self) -> bool:
         service = getattr(self.conversations, "embedding_service", None)
@@ -606,11 +672,12 @@ class MemoryRetriever:
 
     async def _filter_answerable(
         self,
-        query: str,
+        query: Union[str, _RetrievalQuery],
         scored: List[Tuple[Dict[str, Any], float, Dict[str, float]]],
         *,
         session_id: Optional[str] = None,
     ) -> List[Tuple[Dict[str, Any], float, Dict[str, float]]]:
+        query = _RetrievalQuery.of(query)
         semantic_order = sorted(
             scored, key=lambda item: item[2]["semantic"], reverse=True
         )
@@ -620,9 +687,11 @@ class MemoryRetriever:
                 "Embedding model requires answerability filtering but no judge "
                 "is configured; retaining lexical evidence only"
             )
-            return self._lexically_supported(query, semantic_order)
+            return await run_blocking_operation(
+                self._lexically_supported, query, semantic_order
+            )
         decision = await self.answerability_gate.filter(
-            query,
+            query.text,
             [
                 AnswerabilityCandidate(
                     memory_id=str(item[0].get("id")),
@@ -648,7 +717,9 @@ class MemoryRetriever:
                 "Memory answerability degraded to exact lexical evidence: %s",
                 decision.reason,
             )
-            return self._lexically_supported(query, semantic_order)
+            return await run_blocking_operation(
+                self._lexically_supported, query, semantic_order
+            )
         return [
             item for item in semantic_order
             if str(item[0].get("id")) in decision.answerable_ids
@@ -656,13 +727,14 @@ class MemoryRetriever:
 
     @staticmethod
     def _lexically_supported(
-        query: str,
+        query: _RetrievalQuery,
         scored: List[Tuple[Dict[str, Any], float, Dict[str, float]]],
     ) -> List[Tuple[Dict[str, Any], float, Dict[str, float]]]:
+        """Candidates holding every query token; pure, so run off the loop."""
         return [
             item for item in scored
             if has_exact_lexical_evidence(
-                query, str(item[0].get("content", ""))
+                query.token_set, str(item[0].get("content", ""))
             )
         ]
 
@@ -783,7 +855,7 @@ class MemoryRetriever:
     def _calculate_score(
         self,
         content: str,
-        query: str,
+        query: Union[str, _RetrievalQuery],
         metadata: Dict[str, Any],
         emotional_context: Optional[MemoryMetadata],
         created_at: Optional[str],
@@ -821,7 +893,7 @@ class MemoryRetriever:
     def _calculate_score_components(
         self,
         content: str,
-        query: str,
+        query: Union[str, _RetrievalQuery],
         metadata: Dict[str, Any],
         emotional_context: Optional[MemoryMetadata],
         created_at: Optional[str],
@@ -895,7 +967,7 @@ class MemoryRetriever:
     def _score_semantic(
         self,
         content: str,
-        query: str,
+        query: Union[str, _RetrievalQuery],
         expanded_concepts: List[str],
         query_embedding: Optional[List[float]] = None,
         content_embedding: Optional[List[float]] = None,
@@ -926,10 +998,9 @@ class MemoryRetriever:
         produce a discontinuity in the final ranking.
         """
         projected_content = _strip_search_wrappers(content)
-        query_tokens = list(dict.fromkeys(
-            _tokenize_for_search(_strip_search_wrappers(query))
-        ))
-        lexical = _token_match_score(query_tokens, projected_content.lower())
+        lexical = _token_match_score(
+            _RetrievalQuery.of(query).tokens, projected_content.lower()
+        )
         # Candidate generation deliberately accepts any overlap so it cannot
         # hide an old exact fact before final scoring. Eligibility uses the
         # canonical match threshold: a single shared word in a two-token
