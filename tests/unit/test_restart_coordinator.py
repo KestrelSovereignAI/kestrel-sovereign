@@ -9022,3 +9022,182 @@ async def test_restart_onto_installed_code_that_renders_differently_is_refused(
     row = await get_request(backend, request_id)
     assert row.status == "refused"
     assert sha256(_ANCHORED_TEXT + _RENDERED) in row.status_reason
+
+
+# ---------------------------------------------------------------------------
+# Offline migration gate (#3832): an agent must never deploy itself onto code
+# that requires an offline migration an agent database has not had. The 2026
+# native A2A release refused to start on draft A2A data and the fleet was down
+# 31 hours. The fetched revision's declarations are read before checkout; the
+# installed code judges its own before any restart. Refusal is terminal.
+# ---------------------------------------------------------------------------
+
+_OFFLINE_RUNBOOK = "docs/architecture/a2a/OFFLINE_CUTOVER.md"
+
+
+def _leave_draft_a2a_data(project, name="emma"):
+    db = project / "agent_data" / name / "kestrel_prime.db"
+    with sqlite3.connect(str(db)) as conn:
+        conn.execute("CREATE TABLE a2a_outbound_tasks (id TEXT PRIMARY KEY)")
+        conn.execute("INSERT INTO a2a_outbound_tasks VALUES ('draft-1')")
+    conn.close()
+
+
+@pytest.mark.asyncio
+async def test_update_onto_a_pending_offline_migration_is_refused_before_checkout(
+    tmp_path, monkeypatch, adoption_project,
+):
+    from kestrel_sovereign.offline_migrations import (
+        MANIFEST_RELPATH,
+        packaged_manifest,
+    )
+    from tests.utils.constitution_anchor import (
+        PACKAGED_CONSTITUTION_RELPATH,
+        git,
+        origin_and_clone,
+        seed_anchored_agents,
+    )
+
+    project, sha256 = adoption_project
+    origin, checkout = origin_and_clone(tmp_path, _ANCHORED_TEXT)
+    manifest = origin / MANIFEST_RELPATH
+    manifest.write_bytes(packaged_manifest())
+    git(origin, "add", MANIFEST_RELPATH)
+    git(origin, "commit", "-q", "-m", "merge the native A2A release")
+    monkeypatch.setattr(
+        "kestrel_sovereign.config.CONSTITUTION_PATH",
+        str(checkout / PACKAGED_CONSTITUTION_RELPATH),
+    )
+    seed_anchored_agents(project, {"Emma": sha256(_ANCHORED_TEXT)})
+    _leave_draft_a2a_data(project)
+    head = git(checkout, "rev-parse", "HEAD").strip()
+    feat, backend = await _make_feature(tmp_path)
+    created = await feat.request_restart(
+        reason="ship the native A2A release",
+        operation="update_then_restart",
+        update_profile="sovereign_local_uv_sync",
+        target_ref="main",
+        repo_path=str(checkout),
+    )
+    assert created.status is ToolResultStatus.OK, created.error
+    request_id = created.data["request"]["id"]
+
+    ran = []
+    real_step = RestartCoordinatorFeature._run_update_step
+
+    async def _step(self, step):
+        ran.append(step.name)
+        if step.name == "fetch":
+            return await real_step(self, step)
+        return {
+            "step": step.name, "argv": list(step.argv), "returncode": 0,
+            "ok": True, "stdout_tail": "", "stderr_tail": "",
+        }
+
+    with patch.object(RestartCoordinatorFeature, "_run_update_step", _step), \
+            patch.object(
+                RestartCoordinatorFeature, "_spawn_restart_subprocess",
+            ) as spawn:
+        result = await feat.restart_coordinator()
+        again = await feat.restart_coordinator()
+
+    assert ran == ["fetch"]
+    spawn.assert_not_called()
+    assert git(checkout, "rev-parse", "HEAD").strip() == head
+    assert not (checkout / MANIFEST_RELPATH).exists()
+    row = await get_request(backend, request_id)
+    assert row.status == "refused"
+    assert row.completed_at
+    for text in (
+        "offline migration required",
+        "Emma",
+        "native-a2a-cutover",
+        "Draft A2A data remains",
+        _OFFLINE_RUNBOOK,
+        "an agent cannot",
+    ):
+        assert text in row.status_reason
+    log = row.update_log_dict()
+    assert log["failed_step"] == "offline_migration"
+    [check] = log["offline_migration_checks"]
+    assert check["stage"] == "fetched_revision"
+    assert check["result"] == "refused"
+    assert check["code"] == f"FETCH_HEAD of {checkout}"
+    assert result.data["refused"] == [
+        {"request_id": request_id, "reason": row.status_reason}
+    ]
+    # Terminal: polling again cannot run the migration.
+    assert again.data["pending"] == 0
+    events = await list_events_for_request(backend, request_id)
+    assert [event.state for event in events][-1] == "refused"
+
+
+@pytest.mark.asyncio
+async def test_update_whose_installed_code_requires_a_pending_migration_is_refused(
+    tmp_path, monkeypatch, adoption_project,
+):
+    """The fetched revision declared nothing; the code it installed does."""
+    feat, backend, request_id, ran, step = (
+        await _request_update_onto_unchanged_text(
+            tmp_path, monkeypatch, adoption_project, install=lambda package: None,
+        )
+    )
+    project, _ = adoption_project
+    _leave_draft_a2a_data(project)
+
+    with patch.object(RestartCoordinatorFeature, "_run_update_step", step), \
+            patch.object(
+                RestartCoordinatorFeature, "_spawn_restart_subprocess",
+            ) as spawn:
+        result = await feat.restart_coordinator()
+
+    assert "install" in ran and ran[-1] == "resolve_ref"
+    spawn.assert_not_called()
+    row = await get_request(backend, request_id)
+    assert row.status == "refused"
+    for text in (
+        "Emma",
+        "the installed code",
+        _OFFLINE_RUNBOOK,
+        "The update itself is installed; only the restart was refused.",
+    ):
+        assert text in row.status_reason
+    log = row.update_log_dict()
+    assert log["failed_step"] == "offline_migration"
+    fetched, installed = log["offline_migration_checks"]
+    assert (fetched["stage"], fetched["result"]) == ("fetched_revision", "passed")
+    assert fetched["findings"] == []
+    assert (installed["stage"], installed["result"]) == ("installed_code", "refused")
+    assert result.data["refused"] == [
+        {"request_id": request_id, "reason": row.status_reason}
+    ]
+
+
+@pytest.mark.asyncio
+async def test_restart_onto_code_requiring_a_pending_migration_is_refused(
+    tmp_path, monkeypatch, adoption_project,
+):
+    from tests.utils.constitution_anchor import seed_anchored_agents
+
+    project, sha256 = adoption_project
+    _install_constitution(tmp_path, monkeypatch, _ANCHORED_TEXT)
+    seed_anchored_agents(project, {"Emma": sha256(_ANCHORED_TEXT)})
+    _leave_draft_a2a_data(project)
+    feat, backend = await _make_feature(tmp_path)
+    created = await feat.request_restart(reason="pick up the installed release")
+    request_id = created.data["request"]["id"]
+
+    with patch.object(
+        RestartCoordinatorFeature, "_spawn_restart_subprocess",
+    ) as spawn:
+        result = await feat.restart_coordinator()
+
+    spawn.assert_not_called()
+    row = await get_request(backend, request_id)
+    assert row.status == "refused"
+    for text in ("offline migration required", "Emma", _OFFLINE_RUNBOOK):
+        assert text in row.status_reason
+    assert result.data["refused"] == [
+        {"request_id": request_id, "reason": row.status_reason}
+    ]
+    assert result.data["executed"] == []

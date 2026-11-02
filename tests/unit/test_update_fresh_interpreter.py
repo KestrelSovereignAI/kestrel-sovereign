@@ -56,13 +56,17 @@ def steps(checkout, manifest, monkeypatch):
     monkeypatch.setattr(
         cli, "_run_git_fetch", lambda _: calls.append("fetch") or (0, "")
     )
-    monkeypatch.setattr(cli, "_pull_target_revision", lambda _: INCOMING)
+    monkeypatch.setattr(
+        cli,
+        "_resolve_pull_target",
+        lambda _: cli_lifecycle._PullTarget(upstream=INCOMING, revision=INCOMING),
+    )
     monkeypatch.setattr(
         cli, "_run_sync_preflight",
         lambda path, lock_revision=None, **kw: calls.append(("preflight", lock_revision)) or 0,
     )
     monkeypatch.setattr(
-        cli, "_run_git_pull", lambda _: calls.append("pull") or (0, "")
+        cli, "_run_git_fast_forward", lambda *_: calls.append("pull") or (0, "")
     )
     monkeypatch.setattr(
         cli, "_run_uv_sync", lambda _: calls.append("uv sync") or (0, "")
@@ -128,7 +132,8 @@ def test_without_an_install_nothing_hands_off(steps, monkeypatch):
 
     assert _update("--no-install") == 0
 
-    assert steps == ["pull", "feature sync", "reconcile", "restart"]
+    # The pull fetches once and merges what it fetched (#3832).
+    assert steps == ["fetch", "pull", "feature sync", "reconcile", "restart"]
 
 
 def test_a_dry_run_never_hands_off_and_still_checks_the_incoming_lock(
@@ -169,7 +174,7 @@ def test_an_empty_manifest_has_nothing_to_preflight(steps, manifest, monkeypatch
 
     assert _update() == 0
 
-    assert steps == ["pull", "uv sync", "continue"]
+    assert steps == ["fetch", "pull", "uv sync", "continue"]
 
 
 def test_the_phases_run_every_step_once_in_order(steps):

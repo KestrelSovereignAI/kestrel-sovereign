@@ -29,6 +29,7 @@ from kestrel_sovereign.cli_features import (
 from kestrel_sovereign.doctor import DoctorReport, _check_core_lock, diagnose
 from kestrel_sovereign.feature_registry import FeaturePackageInfo
 from kestrel_sovereign.multi_agent.config import LocalAgentConfig, MultiAgentConfig
+from kestrel_sovereign.offline_migrations import OfflineMigrationCheck
 from tests.utils.fake_uv import CORE, SDK, SDK_CHECKOUT, FakeUv, use_fake_uv
 
 VOICE = "kestrel-feature-voice"
@@ -1786,6 +1787,12 @@ def test_update_leaves_a_locked_package_at_the_locked_version(
     )
     monkeypatch.setattr(cli, "_get_project_dir", lambda: reconcile_host)
     monkeypatch.setattr(cli, "_resolve_source_checkout", lambda: None)
+    # The offline migration gate (#3832) asks a fresh interpreter, and the
+    # fake installer stands in for every subprocess here. Its own tests run it.
+    monkeypatch.setattr(
+        cli_lifecycle, "check_offline_migrations",
+        lambda *a, **k: OfflineMigrationCheck(),
+    )
     manifest = _voice_manifest(reconcile_host)
 
     rc = cli.cmd_update(argparse.Namespace(

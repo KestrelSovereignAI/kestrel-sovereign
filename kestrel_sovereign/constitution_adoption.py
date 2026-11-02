@@ -65,8 +65,8 @@ from kestrel_sovereign.doctor import (
     runtime_env,
 )
 from kestrel_sovereign.multi_agent.config import (
-    MULTI_AGENT_CONFIG_FILENAME,
     MultiAgentConfig,
+    load_host_registry,
 )
 
 #: Where the Sovereign reanchor (adoption) procedure is documented.
@@ -147,11 +147,14 @@ class ConstitutionAdoptionCheck:
 
 
 def _load_registry(project_dir: Path, env: dict) -> MultiAgentConfig:
-    """The project's multi-agent registry, loaded the way the launcher loads it."""
+    """The registry a host started in the project loads.
+
+    The one the server itself selects, ``KESTREL_MULTI_AGENT_CONFIG``
+    included (#3832): judging the project's default file instead would judge
+    agents other than the ones a restart boots.
+    """
     try:
-        return MultiAgentConfig.load(
-            project_dir / MULTI_AGENT_CONFIG_FILENAME, runtime_env=env
-        )
+        return load_host_registry(env, project_dir)
     except (OSError, ValueError) as exc:
         raise ConstitutionAdoptionError(
             f"multi-agent configuration is invalid: {exc}"
@@ -183,8 +186,8 @@ def check_constitution_adoption(
     """Compare each agent's anchored hash with what this process's code produces.
 
     ``agent_names`` limits the check to the agents a restart will boot; None
-    means every local agent in the project's multi-agent registry, loaded the
-    way the launcher loads it. ``deployed_content`` supplies the bytes a
+    means every local agent in the registry a host started in the project
+    loads (:func:`~kestrel_sovereign.multi_agent.config.load_host_registry`). ``deployed_content`` supplies the bytes a
     deploy is about to leave at a governing path, packaged or external (see
     :func:`deployed_content_at`); None judges the files on disk. It is asked
     at most once per path: about a governing source only when an agent that

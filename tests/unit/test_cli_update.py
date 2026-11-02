@@ -22,7 +22,10 @@ from unittest.mock import patch
 
 import pytest
 
-from kestrel_sovereign import cli
+from kestrel_sovereign import cli, cli_lifecycle
+
+#: The commit the stubbed upstream names: HEAD, so the pull brings nothing.
+UPSTREAM = "a" * 40
 
 
 @pytest.fixture
@@ -38,13 +41,18 @@ def stub_project_dir(tmp_path, monkeypatch):
     The manifest preflight (#3702) asks git which revision the pull lands on
     and reads its lock; that has its own tests (``test_sync_preflight.py``),
     so here the fetch is a no-op, the pull brings no new revision, and the
-    preflight agrees."""
+    preflight agrees. The pull then fast-forwards to the upstream as fetched
+    (#3832), which is where HEAD already is."""
     (tmp_path / ".git").mkdir()
     (tmp_path / "pyproject.toml").touch()
     monkeypatch.setattr(cli, "_get_project_dir", lambda: tmp_path)
     monkeypatch.setattr(cli, "_resolve_source_checkout", lambda: tmp_path)
     monkeypatch.setattr(cli, "_run_git_fetch", lambda _: (0, ""))
-    monkeypatch.setattr(cli, "_pull_target_revision", lambda _: None)
+    monkeypatch.setattr(
+        cli,
+        "_resolve_pull_target",
+        lambda _: cli_lifecycle._PullTarget(upstream=UPSTREAM, revision=None),
+    )
     monkeypatch.setattr(cli, "_run_sync_preflight", lambda *a, **kw: 0)
     return tmp_path
 
@@ -69,7 +77,7 @@ def test_update_full_pipeline_calls_each_step_in_order(stub_project_dir):
         calls.append("dirty_check")
         return False, ""
 
-    def fake_pull(_):
+    def fake_pull(*_):
         calls.append("pull")
         return 0, "Already up to date.\n"
 
@@ -90,7 +98,7 @@ def test_update_full_pipeline_calls_each_step_in_order(stub_project_dir):
 
     with patch.object(cli, "_project_dir_is_git", lambda _: True), \
          patch.object(cli, "_git_working_tree_dirty", fake_dirty), \
-         patch.object(cli, "_run_git_pull", fake_pull), \
+         patch.object(cli, "_run_git_fast_forward", fake_pull), \
          patch.object(cli, "_run_uv_pip_install_editable", fake_install), \
          patch.object(cli, "_host_manifest_path", lambda args: manifest), \
          patch.object(cli, "cmd_feature_sync", fake_sync), \
@@ -144,7 +152,7 @@ def test_update_runs_feature_sync_before_reconcile(stub_project_dir):
 
     with patch.object(cli, "_project_dir_is_git", lambda _: True), \
          patch.object(cli, "_git_working_tree_dirty", lambda _: (False, "")), \
-         patch.object(cli, "_run_git_pull", lambda _: (0, "ok\n")), \
+         patch.object(cli, "_run_git_fast_forward", lambda *_: (0, "ok\n")), \
          patch.object(cli, "_run_uv_pip_install_editable",
                       lambda *a, **kw: (0, "ok\n")), \
          patch.object(cli, "_host_manifest_path", lambda args: manifest), \
@@ -174,7 +182,7 @@ def test_update_no_host_manifest_skips_sync_but_still_reconciles(
 
     with patch.object(cli, "_project_dir_is_git", lambda _: True), \
          patch.object(cli, "_git_working_tree_dirty", lambda _: (False, "")), \
-         patch.object(cli, "_run_git_pull", lambda _: (0, "ok\n")), \
+         patch.object(cli, "_run_git_fast_forward", lambda *_: (0, "ok\n")), \
          patch.object(cli, "_run_uv_pip_install_editable",
                       lambda *a, **kw: (0, "ok\n")), \
          patch.object(cli, "_host_manifest_path", lambda args: missing), \
@@ -197,8 +205,8 @@ def test_update_short_circuits_when_pull_fails(stub_project_dir):
     half-applied update could be restarted into."""
     later = []
     with patch.object(cli, "_git_working_tree_dirty", lambda _: (False, "")), \
-         patch.object(cli, "_run_git_pull",
-                      lambda _: (1, "merge conflict\n")), \
+         patch.object(cli, "_run_git_fast_forward",
+                      lambda *_: (1, "merge conflict\n")), \
          patch.object(cli, "_run_uv_pip_install_editable",
                       lambda *a, **kw: later.append("install") or (0, "")), \
          patch.object(cli, "cmd_feature_sync",
@@ -215,7 +223,7 @@ def test_update_short_circuits_when_install_fails(stub_project_dir):
     """Install failure aborts before sync + restart."""
     later = []
     with patch.object(cli, "_git_working_tree_dirty", lambda _: (False, "")), \
-         patch.object(cli, "_run_git_pull", lambda _: (0, "")), \
+         patch.object(cli, "_run_git_fast_forward", lambda *_: (0, "")), \
          patch.object(cli, "_run_uv_pip_install_editable",
                       lambda *a, **kw: (1, "build failed\n")), \
          patch.object(cli, "cmd_feature_sync",
@@ -245,8 +253,8 @@ def test_allow_dirty_lets_pull_proceed(stub_project_dir):
     can update on top of work-in-progress when they know it's safe."""
     pull_calls = []
     with patch.object(cli, "_git_working_tree_dirty", lambda _: (True, "    M kestrel_sovereign/cli.py")), \
-         patch.object(cli, "_run_git_pull",
-                      lambda d: pull_calls.append(d) or (0, "ok")), \
+         patch.object(cli, "_run_git_fast_forward",
+                      lambda d, _revision: pull_calls.append(d) or (0, "ok")), \
          patch.object(cli, "_run_uv_pip_install_editable",
                       lambda *a, **kw: (0, "")), \
          patch.object(cli, "cmd_feature_sync", lambda args: 0), \
@@ -261,7 +269,7 @@ def test_dry_run_invokes_no_shell_commands(stub_project_dir, capsys):
     """``--dry-run`` MUST NOT call any of the real-action helpers."""
     forbidden = []
     with patch.object(cli, "_git_working_tree_dirty", lambda _: (False, "")), \
-         patch.object(cli, "_run_git_pull",
+         patch.object(cli, "_run_git_fast_forward",
                       lambda *_: forbidden.append("pull") or (0, "")), \
          patch.object(cli, "_run_uv_pip_install_editable",
                       lambda *_, **__: forbidden.append("install") or (0, "")), \
@@ -290,8 +298,8 @@ def test_no_flag_skips_individual_step(
     others."""
     called = []
     with patch.object(cli, "_git_working_tree_dirty", lambda _: (False, "")), \
-         patch.object(cli, "_run_git_pull",
-                      lambda _: called.append("pull") or (0, "")), \
+         patch.object(cli, "_run_git_fast_forward",
+                      lambda *_: called.append("pull") or (0, "")), \
          patch.object(cli, "_run_uv_pip_install_editable",
                       lambda *a, **kw: called.append("install") or (0, "")), \
          patch.object(cli, "cmd_feature_sync",
@@ -312,7 +320,7 @@ def test_continue_on_error_runs_restart_after_sync_failure(stub_project_dir):
     manifest = stub_project_dir / ".kestrel-host-features.toml"
     manifest.write_text("")
     with patch.object(cli, "_git_working_tree_dirty", lambda _: (False, "")), \
-         patch.object(cli, "_run_git_pull", lambda _: (0, "")), \
+         patch.object(cli, "_run_git_fast_forward", lambda *_: (0, "")), \
          patch.object(cli, "_run_uv_pip_install_editable",
                       lambda *a, **kw: (0, "")), \
          patch.object(cli, "_host_manifest_path", lambda args: manifest), \
@@ -345,7 +353,7 @@ def test_continue_on_error_does_not_restart_onto_an_undeclared_core(
     manifest = stub_project_dir / ".kestrel-host-features.toml"
     manifest.write_text("")
     with patch.object(cli, "_git_working_tree_dirty", lambda _: (False, "")), \
-         patch.object(cli, "_run_git_pull", lambda _: (0, "")), \
+         patch.object(cli, "_run_git_fast_forward", lambda *_: (0, "")), \
          patch.object(cli, "_run_uv_pip_install_editable",
                       lambda *a, **kw: (0, "")), \
          patch.object(cli, "_host_manifest_path", lambda args: manifest), \
@@ -372,7 +380,7 @@ def test_continue_on_error_does_not_restart_when_reconcile_reports_unsafe_core(
     manifest = stub_project_dir / ".kestrel-host-features.toml"
     manifest.write_text("")
     with patch.object(cli, "_git_working_tree_dirty", lambda _: (False, "")), \
-         patch.object(cli, "_run_git_pull", lambda _: (0, "")), \
+         patch.object(cli, "_run_git_fast_forward", lambda *_: (0, "")), \
          patch.object(cli, "_run_uv_pip_install_editable",
                       lambda *a, **kw: (0, "")), \
          patch.object(cli, "_host_manifest_path", lambda args: manifest), \
@@ -393,7 +401,7 @@ def test_target_agent_flows_to_restart_only(stub_project_dir):
     the other steps don't accept an agent target."""
     restart_target = []
     with patch.object(cli, "_git_working_tree_dirty", lambda _: (False, "")), \
-         patch.object(cli, "_run_git_pull", lambda _: (0, "")), \
+         patch.object(cli, "_run_git_fast_forward", lambda *_: (0, "")), \
          patch.object(cli, "_run_uv_pip_install_editable",
                       lambda *a, **kw: (0, "")), \
          patch.object(cli, "cmd_feature_sync", lambda args: 0), \
@@ -410,7 +418,7 @@ def test_no_deps_flag_threads_to_install_helper(stub_project_dir):
     is skipped when the operator wants the fast path."""
     seen = []
     with patch.object(cli, "_git_working_tree_dirty", lambda _: (False, "")), \
-         patch.object(cli, "_run_git_pull", lambda _: (0, "")), \
+         patch.object(cli, "_run_git_fast_forward", lambda *_: (0, "")), \
          patch.object(cli, "_run_uv_pip_install_editable",
                       lambda d, no_deps: seen.append(no_deps) or (0, "")), \
          patch.object(cli, "cmd_feature_sync", lambda args: 0), \
@@ -433,8 +441,8 @@ def test_pypi_install_skips_pull_and_install_silently(tmp_path, monkeypatch):
     called = []
     manifest = tmp_path / ".kestrel-host-features.toml"
     manifest.write_text("")
-    with patch.object(cli, "_run_git_pull",
-                      lambda _: called.append("pull") or (0, "")), \
+    with patch.object(cli, "_run_git_fast_forward",
+                      lambda *_: called.append("pull") or (0, "")), \
          patch.object(cli, "_run_uv_pip_install_editable",
                       lambda *a, **kw: called.append("install") or (0, "")), \
          patch.object(cli, "_host_manifest_path", lambda args: manifest), \
@@ -498,8 +506,8 @@ def test_git_error_in_real_checkout_aborts_update(stub_project_dir, capsys):
     with patch.object(cli, "_project_dir_is_git", lambda _: True), \
          patch.object(cli, "_git_working_tree_dirty",
                       lambda _: (_ for _ in ()).throw(boom)), \
-         patch.object(cli, "_run_git_pull",
-                      lambda _: later.append("pull") or (0, "")), \
+         patch.object(cli, "_run_git_fast_forward",
+                      lambda *_: later.append("pull") or (0, "")), \
          patch.object(cli, "_run_uv_pip_install_editable",
                       lambda *a, **kw: later.append("install") or (0, "")), \
          patch.object(cli, "cmd_feature_sync",
@@ -691,7 +699,7 @@ def test_install_step_uses_uv_sync_when_uv_lock_present(stub_project_dir):
     with patch.object(cli, "_project_dir_is_git", lambda _: True), \
          patch.object(cli, "_git_working_tree_dirty",
                       lambda _: (False, "")), \
-         patch.object(cli, "_run_git_pull", lambda _: (0, "")), \
+         patch.object(cli, "_run_git_fast_forward", lambda *_: (0, "")), \
          patch.object(cli, "_run_uv_sync",
                       lambda _: called.append("sync") or (0, "")), \
          patch.object(cli, "_run_uv_pip_install_editable",
@@ -714,7 +722,7 @@ def test_install_step_falls_back_to_uv_pip_install_without_uv_lock(
     with patch.object(cli, "_project_dir_is_git", lambda _: True), \
          patch.object(cli, "_git_working_tree_dirty",
                       lambda _: (False, "")), \
-         patch.object(cli, "_run_git_pull", lambda _: (0, "")), \
+         patch.object(cli, "_run_git_fast_forward", lambda *_: (0, "")), \
          patch.object(cli, "_run_uv_sync",
                       lambda _: called.append("sync") or (0, "")), \
          patch.object(cli, "_run_uv_pip_install_editable",
@@ -735,7 +743,7 @@ def test_uv_sync_flag_forces_uv_sync_even_without_uv_lock(stub_project_dir):
     with patch.object(cli, "_project_dir_is_git", lambda _: True), \
          patch.object(cli, "_git_working_tree_dirty",
                       lambda _: (False, "")), \
-         patch.object(cli, "_run_git_pull", lambda _: (0, "")), \
+         patch.object(cli, "_run_git_fast_forward", lambda *_: (0, "")), \
          patch.object(cli, "_run_uv_sync",
                       lambda _: called.append("sync") or (0, "")), \
          patch.object(cli, "_run_uv_pip_install_editable",
@@ -758,7 +766,7 @@ def test_no_uv_sync_flag_forces_pip_install_even_with_uv_lock(
     with patch.object(cli, "_project_dir_is_git", lambda _: True), \
          patch.object(cli, "_git_working_tree_dirty",
                       lambda _: (False, "")), \
-         patch.object(cli, "_run_git_pull", lambda _: (0, "")), \
+         patch.object(cli, "_run_git_fast_forward", lambda *_: (0, "")), \
          patch.object(cli, "_run_uv_sync",
                       lambda _: called.append("sync") or (0, "")), \
          patch.object(cli, "_run_uv_pip_install_editable",
@@ -803,7 +811,7 @@ def test_update_recovers_from_detached_head_and_retries_pull(stub_project_dir):
     retry the pull, then proceed (#1819 follow-up)."""
     pulls = []
 
-    def fake_pull(_):
+    def fake_pull(*_):
         pulls.append(1)
         # First call fails (detached HEAD), second (post-reattach) succeeds.
         return (1, "You are not currently on a branch.\n") if len(pulls) == 1 \
@@ -814,7 +822,7 @@ def test_update_recovers_from_detached_head_and_retries_pull(stub_project_dir):
     manifest.write_text("")
     with patch.object(cli, "_project_dir_is_git", lambda _: True), \
          patch.object(cli, "_git_working_tree_dirty", lambda _: (False, "")), \
-         patch.object(cli, "_run_git_pull", fake_pull), \
+         patch.object(cli, "_run_git_fast_forward", fake_pull), \
          patch.object(cli, "_git_reattach_if_safely_detached", lambda _: "main"), \
          patch.object(cli, "_run_uv_pip_install_editable",
                       lambda *a, **kw: later.append("install") or (0, "")), \
@@ -837,8 +845,8 @@ def test_update_aborts_when_detached_head_has_diverged(stub_project_dir):
     later = []
     with patch.object(cli, "_project_dir_is_git", lambda _: True), \
          patch.object(cli, "_git_working_tree_dirty", lambda _: (False, "")), \
-         patch.object(cli, "_run_git_pull",
-                      lambda _: (1, "You are not currently on a branch.\n")), \
+         patch.object(cli, "_run_git_fast_forward",
+                      lambda *_: (1, "You are not currently on a branch.\n")), \
          patch.object(cli, "_git_reattach_if_safely_detached", lambda _: None), \
          patch.object(cli, "_run_uv_pip_install_editable",
                       lambda *a, **kw: later.append("install") or (0, "")), \
@@ -942,7 +950,7 @@ def test_continue_on_error_does_not_restart_on_a_stale_core_checkout(
     manifest = stub_project_dir / ".kestrel-host-features.toml"
     manifest.write_text('[[feature]]\nname = "voice"\n')
     with patch.object(cli, "_git_working_tree_dirty", lambda _: (False, "")), \
-         patch.object(cli, "_run_git_pull", lambda _: (0, "")), \
+         patch.object(cli, "_run_git_fast_forward", lambda *_: (0, "")), \
          patch.object(cli, "_run_uv_pip_install_editable", lambda *a, **kw: (0, "")), \
          patch.object(cli, "_host_manifest_path", lambda args: manifest), \
          patch.object(cli, "cmd_feature_sync",

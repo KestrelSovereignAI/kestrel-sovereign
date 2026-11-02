@@ -970,9 +970,11 @@ def upstream(tmp_path, project, monkeypatch):
     monkeypatch.setattr(cli, "_get_project_dir", lambda: project)
     monkeypatch.setattr(cli, "_resolve_source_checkout", lambda: clone)
     steps = []
-    real_pull = cli._run_git_pull
+    real_pull = cli._run_git_fast_forward
     monkeypatch.setattr(
-        cli, "_run_git_pull", lambda c: steps.append("pull") or real_pull(c)
+        cli,
+        "_run_git_fast_forward",
+        lambda c, revision: steps.append("pull") or real_pull(c, revision),
     )
     monkeypatch.setattr(
         cli,
@@ -1083,12 +1085,23 @@ def test_update_without_a_restart_refuses_an_unverifiable_revision_under_running
 
     _, steps = upstream
     seed_anchored_agents(project, {"Emma": sha256(OLD)})
-    monkeypatch.setattr(cli, "_run_git_fetch", lambda _: (1, "network is down"))
+    real_fetch = cli._run_git_fetch
+    fetches = []
+
+    def network_down_for_the_checks(checkout):
+        # Down when the checks fetch, back when the pull fetches again: the
+        # pull lands what it fetched, as nothing could be judged (#3832).
+        fetches.append(checkout)
+        return (1, "network is down") if len(fetches) == 1 else real_fetch(checkout)
+
+    monkeypatch.setattr(cli, "_run_git_fetch", network_down_for_the_checks)
 
     # Nothing running: nothing reads what the install changes.
     assert cli.cmd_update(_update_args(restart=False)) == 0
     assert steps == ["pull", "install"]
+    assert len(fetches) == 2
     steps.clear()
+    monkeypatch.setattr(cli, "_run_git_fetch", lambda _: (1, "network is down"))
 
     host_pid = project / "logs" / ".host.pid"
     host_pid.parent.mkdir()
@@ -1197,7 +1210,7 @@ def test_update_refuses_a_revision_replacing_a_tracked_external_source(
     monkeypatch.setattr(cli, "_resolve_source_checkout", lambda: clone)
     steps = []
     monkeypatch.setattr(
-        cli, "_run_git_pull", lambda _: steps.append("pull") or (0, "")
+        cli, "_run_git_fast_forward", lambda *_: steps.append("pull") or (0, "")
     )
     monkeypatch.setattr(
         cli,
@@ -1311,7 +1324,7 @@ def unchanged_upstream(tmp_path, project, monkeypatch):
     monkeypatch.setattr(cli, "_resolve_source_checkout", lambda: clone)
     steps = []
     monkeypatch.setattr(
-        cli, "_run_git_pull", lambda _: steps.append("pull") or (0, "")
+        cli, "_run_git_fast_forward", lambda *_: steps.append("pull") or (0, "")
     )
     monkeypatch.setattr(
         cli, "cmd_terminate", lambda args: steps.append("terminate") or 0

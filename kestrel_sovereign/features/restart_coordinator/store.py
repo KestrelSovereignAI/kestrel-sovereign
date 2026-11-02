@@ -41,9 +41,10 @@ from .authority import (
 
 # Terminal states — a request in any of these is locked. The
 # coordinator must not re-execute, the agent must not re-modify.
-# ``refused`` is the restart the constitution adoption gate stopped because it
-# would have booted agents into constitution Safe Mode (#3517); ``rejected``
-# remains the authority/validity verdict.
+# ``refused`` is the restart a deploy gate stopped: it would have booted agents
+# into constitution Safe Mode (#3517), or onto code that requires an offline
+# migration an agent database has not had (#3832). ``rejected`` remains the
+# authority/validity verdict.
 TERMINAL_STATES = frozenset({"completed", "rejected", "refused", "canceled"})
 
 # In-flight states the coordinator considers when picking the next

@@ -22,7 +22,12 @@ from kestrel_sovereign.identity.local_anchor import (
     AgentDIDLookupMode,
     read_anchor_agent_did_sync,
 )
-from kestrel_sovereign.paths import guard_storage_path, spawned_agent_env
+from kestrel_sovereign.paths import (
+    MULTI_AGENT_CONFIG_ENV,
+    guard_storage_path,
+    runtime_path_env,
+    spawned_agent_env,
+)
 from kestrel_sovereign.security.path_identity import (
     paths_equal_by_filesystem_identity,
     paths_overlap_by_filesystem_identity,
@@ -858,3 +863,100 @@ class MultiAgentConfig(BaseModel):
             for name, config in self.get_local_agents().items()
             if config.autostart
         }
+
+
+def resolve_multi_agent_path(
+    env: Mapping[str, str], *, base: Optional[Path] = None
+) -> Path:
+    """Compute the multi_agent.toml path a host should load (#868).
+
+    The host's own decision (the server lifespan calls it), shared so that a
+    caller reasoning about what a host loads asks this function instead of
+    reimplementing it: the bug class it guards against (a demo run silently
+    mounting live agents, a deploy gate judging agents the host does not
+    load) is exactly where test-and-prod drift is dangerous.
+
+    Decision matrix:
+
+    ============================  =====================================
+     Inputs                        Result
+    ============================  =====================================
+     KESTREL_MULTI_AGENT_CONFIG    Honour it verbatim (operator opted in
+       set                          to a specific path)
+     KESTREL_DEMO_SERVER=1 + no    Refuse to auto-mount the project-root
+       explicit config + the       ``multi_agent.toml``.  Returns a path that
+       default ``multi_agent.toml``    does not exist so the lifespan skips
+       exists at the project       multi-agent setup.  This is the
+       root                        guard that would have stopped the
+                                   #867 wipe.
+     anything else                 Use the default path (the lifespan's
+                                   ``.exists()`` check handles missing
+                                   files; production behaviour preserved).
+    ============================  =====================================
+
+    Args:
+        env: Mapping of environment variables.  Pass ``os.environ`` in
+            production; tests pass a plain ``dict``.
+        base: The directory the host runs in. None (the server's own call)
+            means this process's working directory, and a relative result
+            stays relative to it. Otherwise a relative result is joined to
+            ``base``, where a host launched there would read it.
+
+    Returns:
+        :class:`pathlib.Path` the lifespan should attempt to load.  The
+        caller still uses ``.exists()`` to decide whether to enter
+        multi-agent mode.
+    """
+    configured = runtime_path_env(
+        MULTI_AGENT_CONFIG_ENV, MULTI_AGENT_CONFIG_FILENAME, environ=env, base=base
+    )
+    multi_agent_path = Path(configured) if base is None else Path(base) / configured
+    demo_server_env = env.get("KESTREL_DEMO_SERVER", "").lower() in (
+        "1", "true", "yes",
+    )
+    multi_agent_explicit = MULTI_AGENT_CONFIG_ENV in env
+    if demo_server_env and not multi_agent_explicit and multi_agent_path.exists():
+        logger.warning(
+            "[demo-server] KESTREL_DEMO_SERVER=1 with no explicit "
+            "KESTREL_MULTI_AGENT_CONFIG — refusing to auto-mount %s.  "
+            "A demo server must not silently load live agents.  Pass "
+            "KESTREL_MULTI_AGENT_CONFIG=<path> explicitly to opt in.",
+            multi_agent_path,
+        )
+        return Path("/dev/null/multi_agent-disabled")
+    return multi_agent_path
+
+
+def load_host_registry(env: Mapping[str, str], base: Path) -> MultiAgentConfig:
+    """The registry a multi-agent host running in ``base`` with ``env`` loads.
+
+    The server lifespan's load, for a host whose working directory is
+    ``base`` (``kestrel start`` launches it in the project directory): the
+    registry :func:`resolve_multi_agent_path` selects when that file exists,
+    else ``multi_agent.toml`` in ``base``, else the agents auto-discovered
+    below ``base``. Relative agent paths resolve against ``base`` whichever
+    file names them, so a registry kept outside the project
+    (``KESTREL_MULTI_AGENT_CONFIG``) still places agent data in the project.
+
+    For a caller that must judge the agents a restarted host would load (a
+    deploy gate, its liveness check), not whatever the project's default file
+    names.
+
+    Raises:
+        OSError, ValueError: As :meth:`MultiAgentConfig.load`.
+    """
+    base = Path(base)
+    selected = resolve_multi_agent_path(env, base=base)
+    if not selected.exists():
+        # The server asks ``load`` for its default here: ``multi_agent.toml``
+        # in its working directory, which is ``base``.
+        selected = guard_storage_path(
+            base / MULTI_AGENT_CONFIG_FILENAME,
+            source=f"{MULTI_AGENT_CONFIG_FILENAME} in the host's directory",
+        )
+    return MultiAgentConfig.load(
+        selected,
+        auto_discover_fallback=True,
+        runtime_env=env,
+        runtime_base=base,
+    )
