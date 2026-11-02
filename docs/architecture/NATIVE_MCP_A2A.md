@@ -300,6 +300,18 @@ return ordinary result dictionaries. Apps host composition must require
 alone does not promise this persistence boundary. This boundary does not by
 itself implement authenticated View routes, rendering or deployed Apps acceptance.
 
+SDK 0.46's publication context binds an initial private result to its actual
+streaming chat destination. Core carries that metadata on the existing turn
+part collector, matches the exact host and session, and expires it when the
+owning turn exits. Foreign inline tasks borrow the same collector; headless
+calls and subagent buffers supply no destination. Copying or serializing the
+collector carries only part data. The original factory can
+read the context during publication even after tool-wrapper transfers. Features
+that need this association require `supports_tool_publication_context is True`.
+The context identifies the destination; authenticated View controllers still
+authorize readers and tool calls independently. It does not confirm delivery:
+later response policy can withhold the rendered parts.
+
 ### Tasks and operator input
 
 An MCP task is identified by agent, connection and remote task ID. Its durable

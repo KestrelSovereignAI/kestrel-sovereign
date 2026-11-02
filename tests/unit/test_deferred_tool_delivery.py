@@ -8,7 +8,9 @@ import pytest_asyncio
 
 from kestrel_sdk.hooks.base import Hook, HookEvent, HookOutput
 from kestrel_sdk.llm.response import ToolCall
-from kestrel_sdk.tools import DeferredToolResult, ToolCategory, ToolResult, ToolSchema
+from kestrel_sdk.tools import (
+    DeferredToolResult, ToolCategory, ToolPublicationContext, ToolResult, ToolSchema,
+)
 from kestrel_sdk.features.base import Feature as SDKFeature, tool as feature_tool
 from kestrel_sovereign.a2a.stores.unified.observability_store import ObservabilityStore
 from kestrel_sovereign.agent.orchestrator_engine import OrchestratorEngineMixin
@@ -78,6 +80,7 @@ class DeferredTool:
     def __init__(self):
         self.executions = []
         self.publications = []
+        self.publication_contexts = []
         self.publication_error = None
         self.publication_parts = None
         self.mutate_before_error = False
@@ -89,6 +92,7 @@ class DeferredTool:
 
         def publish():
             self.publications.append("published-once")
+            self.publication_contexts.append(self.last_result.publication_context)
             if self.publication_error is not None:
                 if self.mutate_before_error:
                     self.active_result["data"]["value"] = "private-mutated-factory-sentinel"
@@ -190,6 +194,37 @@ async def test_private_delivery_waits_for_actual_post_policy_and_honors_redactio
             if not call.done():
                 call.cancel()
             await asyncio.gather(call, return_exceptions=True)
+
+
+@pytest.mark.parametrize("path", ["chat", "named", "bound"])
+async def test_live_chat_destination_reaches_the_original_publisher_only_after_completion(boundary, path):
+    peer = boundary
+    peer.policy.release.set()
+    with part_collector(host=peer.host, session_id="deferred-owned-session"):
+        await peer.invoke(path)
+    assert peer.tool.publication_contexts == [ToolPublicationContext(peer.host.did, "deferred-owned-session")]
+    assert peer.tool.last_result.publication_context is None
+
+
+@pytest.mark.parametrize("active", [True, False])
+async def test_foreign_inline_task_borrows_only_a_live_publication_destination(boundary, active):
+    from contextvars import Context
+
+    peer = boundary
+    peer.policy.release.set()
+
+    async def call(executor):
+        await executor(peer.binding.name, {})
+
+    with part_collector(host=peer.host, session_id="deferred-owned-session"):
+        executor = peer.host._make_inline_tool_executor("deferred-owned-session")
+        if active:
+            await asyncio.create_task(call(executor), context=Context())
+    if not active:
+        await asyncio.create_task(call(executor), context=Context())
+    expected = ToolPublicationContext(peer.host.did, "deferred-owned-session") if active else None
+    assert peer.tool.publication_contexts == [expected]
+    assert peer.tool.last_result.publication_context is None
 
 
 @pytest.mark.parametrize("path", ["chat", "named", "bound"])
@@ -645,6 +680,8 @@ async def test_streaming_inline_delivery_uses_the_same_dispatch_receipt(boundary
     rows = await peer.backend.fetch_all("SELECT result_status FROM a2a_tool_dispatches")
     assert [tuple(row) for row in rows] == [("success",)]
     assert peer.tool.executions == [{}] and peer.tool.publications == ["published-once"]
+    assert peer.tool.publication_contexts == [ToolPublicationContext(agent.did, "deferred-owned-session")]
+    assert peer.tool.last_result.publication_context is None
     assert any("private_view" in chunk for chunk in chunks)
     assert any(part["type"] == "private_view" for row in inserts
                for part in row.get("metadata", {}).get("parts", []))
