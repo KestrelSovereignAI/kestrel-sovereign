@@ -12,6 +12,7 @@ in opposite directions, and these tests pin both:
     so it would report pre-WAL state as current.
 """
 import sqlite3
+from contextlib import closing
 import asyncio
 
 import pytest
@@ -51,9 +52,11 @@ async def test_native_connection_and_snapshot_reader_keep_the_original_relative_
         assert not (other_dir / "authority.db").exists()
         await backend.execute("CREATE TABLE retained (value TEXT)")
         await backend.execute("INSERT INTO retained VALUES ('original')")
-        with sqlite3.connect(other_dir / "authority.db") as decoy:
+        with closing(sqlite3.connect(other_dir / "authority.db")) as decoy, decoy:
             decoy.execute("CREATE TABLE retained (value TEXT)")
             decoy.execute("INSERT INTO retained VALUES ('decoy')")
+        with pytest.raises(sqlite3.ProgrammingError, match="closed"):
+            _ = decoy.in_transaction
         async with backend.transaction():
             await backend.execute("INSERT INTO retained VALUES ('uncommitted')")
             # A sibling task gets the actual committed native snapshot, not
