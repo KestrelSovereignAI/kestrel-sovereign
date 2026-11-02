@@ -30,6 +30,8 @@ import json
 import logging
 from typing import Any, List, Optional
 
+from kestrel_sdk.tools import ToolPublicationContext
+
 # The "tool result under construction" buffer (#2641) lives in the SDK, NOT
 # here: external feature packages subclass the SDK ``Feature`` base, so their
 # tools are wrapped by the SDK's ``DynamicTool`` — which binds the SDK's
@@ -43,6 +45,7 @@ from kestrel_sdk.tools.parts import (  # noqa: F401  (re-export)
 )
 
 from kestrel_sovereign.turn_scope import turn_scoped
+from kestrel_sovereign.telemetry import real_session_id
 
 # Wire format mirrors the TOOL/THINK/REVISE sentinels: an ASCII Record
 # Separator (0x1e) bookends a ``KESTREL:PART:`` namespaced JSON payload. The RS
@@ -71,19 +74,53 @@ _part_collector: contextvars.ContextVar[Optional[List[dict]]] = contextvars.Cont
 )
 
 
+class _TurnPartCollector(list):
+    """A chat destination travels with its existing turn buffer, then expires."""
+
+    def __init__(self, host, session_id):
+        super().__init__()
+        self.host = host
+        self.active = True
+        agent_id = getattr(host, "did", None)
+        session_id = real_session_id(session_id)
+        self.publication_context = (
+            ToolPublicationContext(agent_id=agent_id, session_id=session_id)
+            if isinstance(agent_id, str) and agent_id.strip()
+            and isinstance(session_id, str) and session_id.strip() else None
+        )
+
+
 @contextlib.contextmanager
-def part_collector():
+def part_collector(*, host=None, session_id=None):
     """Bind a fresh per-turn part buffer for the duration of one agent turn.
 
     The streaming layer wraps each turn in this so ``emit_part`` calls made by
     tools during the turn accumulate on a turn-scoped list. Resets to the prior
     token on exit so nested/concurrent turns don't bleed parts into each other.
     """
-    token = _part_collector.set([])
+    collector = _TurnPartCollector(host, session_id)
+    token = _part_collector.set(collector)
     try:
         yield
     finally:
+        collector.active = False
         _part_collector.reset(token)
+
+
+def current_tool_publication_context(host, session_id) -> Optional[ToolPublicationContext]:
+    """Metadata for this live chat destination, never HTTP or tool authority.
+
+    Foreign inline tasks borrow the same collector. A plain subagent buffer,
+    a mismatched execution, or an expired captured turn supplies no destination.
+    No mutable agent-wide session field participates in this decision.
+    """
+    collector = _part_collector.get()
+    if not isinstance(collector, _TurnPartCollector) or not collector.active or collector.host is not host:
+        return None
+    context = collector.publication_context
+    if context is None or context.session_id != real_session_id(session_id):
+        return None
+    return context
 
 
 def current_part_collector() -> Optional[List[dict]]:

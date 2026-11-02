@@ -994,7 +994,11 @@ async def _complete_post_tool_result(host, result, post_input, *, adapter,
         ) from error
     try:
         changed_during_audit = dict(post_result) != reviewed
-        completed = result.finalize(post_result, allowed=allowed and not changed_during_audit)
+        from kestrel_sovereign.agent.parts import current_tool_publication_context
+        completed = result.finalize(
+            post_result, allowed=allowed and not changed_during_audit,
+            context=current_tool_publication_context(host, post_input.session_id),
+        )
     except Exception as error:
         if is_execution_control_error(error):
             raise
@@ -1027,6 +1031,7 @@ class OrchestratorEngineMixin:
 
     supports_deferred_tool_results: bool = True
     supports_audited_deferred_tool_results: bool = True
+    supports_tool_publication_context: bool = True
 
     @staticmethod
     def _signals_unfinished_tool_work(content: Optional[str]) -> bool:

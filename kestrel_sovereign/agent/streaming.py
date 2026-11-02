@@ -1178,7 +1178,7 @@ class StreamingMixin:
             # this wrapper believed the turn was non-enforcing. A plain ``str``
             # (pure-local command) reports ``enforcing=False`` via ``getattr``, so
             # its parts always flow.
-            with part_collector():
+            with part_collector(host=self, session_id=session_id):
                 # Preserve the pre-existing positional call shape
                 # (test_streaming_audit asserts it) — invocation_context
                 # rides as a trailing kwarg. Codex round-1 P1 backwards-compat.
@@ -1279,7 +1279,7 @@ class StreamingMixin:
                         # drains it into PART sentinels at the point each tool ran.
                         # #3426: publish the turn's identity for the embeddings it
                         # makes, as process_input does.
-                        with part_collector(), turn_invocation_scope(
+                        with part_collector(host=self, session_id=session_id), turn_invocation_scope(
                             getattr(self, "llm_service", None),
                             invocation_context,
                             session_id=session_id,

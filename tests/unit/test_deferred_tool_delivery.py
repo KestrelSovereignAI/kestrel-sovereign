@@ -78,6 +78,7 @@ class DeferredTool:
     def __init__(self):
         self.executions = []
         self.publications = []
+        self.publication_contexts = []
         self.publication_error = None
         self.publication_parts = None
         self.mutate_before_error = False
@@ -89,6 +90,7 @@ class DeferredTool:
 
         def publish():
             self.publications.append("published-once")
+            self.publication_contexts.append(self.last_result.publication_context)
             if self.publication_error is not None:
                 if self.mutate_before_error:
                     self.active_result["data"]["value"] = "private-mutated-factory-sentinel"
@@ -190,6 +192,18 @@ async def test_private_delivery_waits_for_actual_post_policy_and_honors_redactio
             if not call.done():
                 call.cancel()
             await asyncio.gather(call, return_exceptions=True)
+
+
+@pytest.mark.parametrize("path", ["chat", "named", "bound"])
+async def test_live_chat_destination_reaches_the_original_publisher_only_after_completion(boundary, path):
+    from kestrel_sdk.tools import ToolPublicationContext
+
+    peer = boundary
+    peer.policy.release.set()
+    with part_collector(host=peer.host, session_id="deferred-owned-session"):
+        await peer.invoke(path)
+    assert peer.tool.publication_contexts == [ToolPublicationContext(peer.host.did, "deferred-owned-session")]
+    assert peer.tool.last_result.publication_context is None
 
 
 @pytest.mark.parametrize("path", ["chat", "named", "bound"])
