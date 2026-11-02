@@ -262,128 +262,146 @@ class _NativeAcquisitionHandle(_BoundedOriginalResponse):
         No caller checker or DTO can supply authority. The retained original
         host restriction remains lexical through the same API2 worker/join.
         """
-        from kestrel_sovereign.execution_sync_http import (
-            await_native_sync_http, bind_native_sync_http_execution_admission,
-        )
+        from kestrel_sovereign.execution_sync_http import await_native_sync_http
         self._require_dispatch_owner(self._client, self._binding._operation)
         self._binding._require_saved_preparation()
         self._check_invocation_write()
-        with bind_native_sync_http_execution_admission(self._client,
-                self._check_invocation_current,
-                check_before_request_write=self._check_invocation_write):
-            return await await_native_sync_http(self._client, self._binding._operation,
-                _original_acquisition=self)
+        return await await_native_sync_http(self._client, self._binding._operation,
+            _original_acquisition=self)
 
     async def _await_original(self, client, operation):
         from kestrel_sovereign import execution_sync_http as native
         self._require_dispatch_owner(client, operation)
-        self._binding._require_native_entry()
-        original = tuple(value for value in native._RESTRICTIONS.get() if value.client is client)
-        if not original:
-            raise ExecutionAuthorityError('Original acquisition requires its original restriction')
-        for restriction in original:
-            restriction.check()
-        native._require_sync_work()
-        thread = self._thread = native._ThreadOperation(acquisition=self)
-        token = native._THREAD.set(thread)
-        admission = self._admission = OwnedTaskAdmission()
-        self._state = 'running'
-        result = terminal = None
+        # The canonical native entry owns this restriction even when a direct
+        # caller supplies an additional, weaker API2 restriction. Every actual
+        # request-byte send still checks original spending freshness.
+        with native.bind_native_sync_http_execution_admission(client,
+                self._check_invocation_current,
+                check_before_request_write=self._check_invocation_write):
+            self._binding._require_native_entry()
+            original = tuple(value for value in native._RESTRICTIONS.get() if value.client is client)
+            for restriction in original:
+                restriction.check()
+            native._require_sync_work()
+            thread = self._thread = native._ThreadOperation(acquisition=self)
+            token = native._THREAD.set(thread)
+            admission = self._admission = OwnedTaskAdmission()
+            self._state = 'running'
+            result = terminal = None
 
-        def run():
-            nonlocal result, terminal
-            self._worker, self._worker_entered = threading.current_thread(), True
-            try:
+            def run():
+                nonlocal result, terminal
+                self._worker, self._worker_entered = threading.current_thread(), True
                 try:
-                    result = operation(client)
-                    if inspect.isawaitable(result):
-                        if inspect.iscoroutine(result):
-                            result.close()
-                        raise TypeError('Original native acquisition returned an awaitable')
-                    # The canonical bounded phase is captured before SAME-run
-                    # cleanup can hide an otherwise returned original value.
-                    (self._phase, self._minimal_lease, self._captured_lease_json,
-                        self._captured_native_result) = self._binding._capture_phase(result)
-                except BaseException as error:
-                    terminal = error
-                for request in tuple(thread.requests):
                     try:
-                        request.response.close()
+                        result = operation(client)
+                        if inspect.isawaitable(result):
+                            if inspect.iscoroutine(result):
+                                result.close()
+                            raise TypeError('Original native acquisition returned an awaitable')
+                        # The canonical bounded phase is captured before SAME-run
+                        # cleanup can hide an otherwise returned original value.
+                        (self._phase, self._minimal_lease, self._captured_lease_json,
+                            self._captured_native_result) = self._binding._capture_phase(result)
                     except BaseException as error:
-                        terminal = execution_terminal_error(terminal, error, retain_originals=True)
-                self._sockets.update(borrow.socket for borrow in tuple(thread.sockets))
-                try:
-                    client.close()  # The ONE dedicated client close, in this native run.
-                except BaseException as error:
-                    terminal = execution_terminal_error(terminal, error, retain_originals=True)
-                # Actual socket identities are held independently of pool-list
-                # mutation. A thread return or is_closed flag is not an ACK.
-                for sock in self._sockets:
-                    if sock.fileno() != -1:
+                        terminal = error
+                    for request in tuple(thread.requests):
                         try:
-                            sock.close()
+                            request.response.close()
                         except BaseException as error:
                             terminal = execution_terminal_error(terminal, error, retain_originals=True)
-                for borrow in tuple(thread.sockets):
-                    if borrow.socket.fileno() == -1:
-                        borrow.retire()
-                        thread.sockets.discard(borrow)
-                self._client_closed = (client.is_closed and not self._binding._pool._requests and not thread.sockets
-                    and all(sock.fileno() == -1 for sock in self._sockets))
-                if not self._client_closed:
-                    terminal = execution_terminal_error(terminal,
-                        ExecutionAuthorityError('Original acquisition physical cleanup unresolved'), retain_originals=True)
-            finally:
-                self._worker_exited = True
-            if terminal is not None:
-                raise terminal
-            return result
+                    self._sockets.update(borrow.socket for borrow in tuple(thread.sockets))
+                    try:
+                        client.close()  # The ONE dedicated client close, in this native run.
+                    except BaseException as error:
+                        terminal = execution_terminal_error(terminal, error, retain_originals=True)
+                    # Actual socket identities are held independently of pool-list
+                    # mutation. A thread return or is_closed flag is not an ACK.
+                    for sock in self._sockets:
+                        if sock.fileno() != -1:
+                            try:
+                                sock.close()
+                            except BaseException as error:
+                                terminal = execution_terminal_error(terminal, error, retain_originals=True)
+                    for borrow in tuple(thread.sockets):
+                        if borrow.socket.fileno() == -1:
+                            borrow.retire()
+                            thread.sockets.discard(borrow)
+                    self._client_closed = (client.is_closed and not self._binding._pool._requests and not thread.sockets
+                        and all(sock.fileno() == -1 for sock in self._sockets))
+                    if not self._client_closed:
+                        terminal = execution_terminal_error(terminal,
+                            ExecutionAuthorityError('Original acquisition physical cleanup unresolved'), retain_originals=True)
+                finally:
+                    self._worker_exited = True
+                if terminal is not None:
+                    raise terminal
+                return result
 
-        opening = None
-        async def native_job():
-            # A settled failed start gate before this exact payload entered
-            # proves no executor job was submitted. Task.done alone does not.
-            self._job_entered = True
-            return await asyncio.to_thread(run)
-        try:
+            opening = None
+            async def native_job():
+                # A settled failed start gate before this exact payload entered
+                # proves no executor job was submitted. Task.done alone does not.
+                self._job_entered = True
+                return await asyncio.to_thread(run)
             try:
-                task = create_owned_task(native_job(), admission=admission,
-                    retain_originals=True, name='original-native-acquisition')
-            except BaseException as error:
-                opening = owned_task_admission_error(self, admission, error)
-                task = admission.task
-                if task is None:
+                try:
+                    task = create_owned_task(native_job(), admission=admission,
+                        retain_originals=True, name='original-native-acquisition')
+                except BaseException as error:
+                    opening = owned_task_admission_error(self, admission, error)
+                    task = admission.task
+                    if task is None:
+                        self._state = 'failed'
+                        raise opening
+                outcome = await await_owned_task(task, cancel_on_caller_cancellation=thread.cancel)
+                terminal = execution_terminal_error(terminal, opening, outcome.error, outcome.cancellation,
+                    retain_originals=True, isolate_control_originals=True)
+                if terminal is None:
+                    try:
+                        for restriction in original:
+                            restriction.check()
+                        native._require_sync_work()
+                    except BaseException as denial:
+                        terminal = native.NativeSyncHTTPOutcomeUnknown(denial) if thread.sent else denial
+                if self._worker_entered and self._worker_exited:
+                    self._receipt = _NativeAcquisitionReceipt(self, admission, self._worker,
+                        self._request, self._response, self._phase, self._minimal_lease,
+                        self._captured_lease_json, self._captured_native_result, self._raw_bytes,
+                        self._exhausted, self._response_closed, self._client_closed, terminal)
+                    self._state = 'joined'
+                    try:
+                        self._root._seal_native_result(self, self._receipt)
+                    except BaseException as sealing:
+                        terminal = execution_terminal_error(terminal, sealing, retain_originals=True)
+                else:
                     self._state = 'failed'
-                    raise opening
-            outcome = await await_owned_task(task, cancel_on_caller_cancellation=thread.cancel)
-            terminal = execution_terminal_error(terminal, opening, outcome.error, outcome.cancellation,
-                retain_originals=True, isolate_control_originals=True)
-            if terminal is None:
-                try:
-                    for restriction in original:
-                        restriction.check()
-                    native._require_sync_work()
-                except BaseException as denial:
-                    terminal = native.NativeSyncHTTPOutcomeUnknown(denial) if thread.sent else denial
-            if self._worker_entered and self._worker_exited:
-                self._receipt = _NativeAcquisitionReceipt(self, admission, self._worker,
-                    self._request, self._response, self._phase, self._minimal_lease,
-                    self._captured_lease_json, self._captured_native_result, self._raw_bytes,
-                    self._exhausted, self._response_closed, self._client_closed, terminal)
-                self._state = 'joined'
-                try:
-                    self._root._seal_native_result(self, self._receipt)
-                except BaseException as sealing:
-                    terminal = execution_terminal_error(terminal, sealing, retain_originals=True)
-            else:
-                self._state = 'failed'
-            if terminal is not None:
-                raise terminal
-            self._require_result(self._root)
-            return result
-        finally:
-            thread.active = False
-            native._THREAD.reset(token)
+                if terminal is not None:
+                    raise terminal
+                self._require_result(self._root)
+                return result
+            finally:
+                thread.active = False
+                native._THREAD.reset(token)
+
+    async def _finalize_original(self):
+        """Retain only this sealed joined fact before its host hold retires.
+
+        No response parser or optional-cost continuation is entered. A prior
+        attempt with an unresolved native ACK is never retried.
+        """
+        if (type(self) is not _NativeAcquisitionHandle or asyncio.current_task() is not self._owner_task
+                or self._root._native is not self):
+            raise ExecutionAuthorityError('Original acquisition finalization owner differs')
+        if (self._receipt is None or self._receipt is not self._root._registration.native_receipt
+                or self._minimal_acknowledged):
+            # A worker return cannot supply custody when the original backing
+            # refused its joined seal. Preserve that original refusal and the
+            # dispatching debt; do not adopt an unsealed receipt on close.
+            return
+        if self._minimal_attempted:
+            raise ExecutionAuthorityError('Original acquisition minimal ACK remains unresolved')
+        await self.persist_minimal()
 
     async def _close_original(self):
         """Drain only the originally transferred dedicated native resource."""

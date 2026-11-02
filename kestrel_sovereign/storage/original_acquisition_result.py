@@ -20,7 +20,7 @@ from kestrel_sovereign._async_ownership import (
     OwnedTaskAdmission, OwnedTaskOutcome, await_owned_task, create_owned_task, owned_task_admission_error,
 )
 from kestrel_sovereign.execution_custody import (
-    ExecutionAuthorityError, execution_observation_error, require_execution_work,
+    ExecutionAuthorityError, execution_observation_error, execution_terminal_error, require_execution_work,
 )
 from .original_result_backing import _OriginalResultBacking, _OriginalResultCustody
 
@@ -507,6 +507,19 @@ class _OriginalAcquisitionResult(_OriginalResultCustody):
     async def aclose(self):
         # A copied descriptor cannot close the genuine producer/client first.
         self._require_close_owner()
+        failures = []
         if self._native is not None:
-            await self._native._close_original()
-        self.close()
+            try:
+                await self._native._finalize_original()
+            except BaseException as error:
+                failures.append(error)
+            try:
+                await self._native._close_original()
+            except BaseException as error:
+                failures.append(error)
+        try:
+            self.close()
+        except BaseException as error:
+            failures.append(error)
+        if failures:
+            raise execution_terminal_error(*failures, retain_originals=True)

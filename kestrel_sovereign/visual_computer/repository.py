@@ -526,6 +526,7 @@ class VisualCustodyRepository:
         def checked_guard():
             _check_sync_restriction(guard)
         result = acceptance = None
+        original_failure = None
         try:
             async with self._transaction(checked_guard, write=False):
                 owner = self._owner(scope)
@@ -555,9 +556,19 @@ class VisualCustodyRepository:
             result._query, result._match_query = result._fixed_queries()
             await result.allocate(request, quote)
             yield _CoreAcquisitionAttempt(result)
+        except BaseException as error:
+            original_failure = error
+            raise
         finally:
             if result is not None:
-                await result.aclose()
+                try:
+                    await result.aclose()
+                except BaseException as cleanup:
+                    if original_failure is None:
+                        raise
+                    from kestrel_sovereign.execution_custody import execution_terminal_error
+                    raise execution_terminal_error(original_failure, cleanup,
+                        retain_originals=True, isolate_control_originals=True)
             elif acceptance is not None:
                 self._original_results.pop(acceptance, None)
 
