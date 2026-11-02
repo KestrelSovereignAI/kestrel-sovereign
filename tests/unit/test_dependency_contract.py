@@ -5,12 +5,17 @@ nothing imports it: ``chromadb==1.5.9`` sat unused in the ``local`` extra
 (propagated into ``all-features``/``full``) while carrying an unpatched
 pre-authentication code-injection CVE (CVE-2026-45829 / GHSA-f4j7-r4q5-qw2c).
 
-These tests pin two contracts: known-vulnerable, unused packages stay out of
-the declared and resolved graphs, and patched dependency floors cannot be
-silently lowered while refreshing ``uv.lock``.
+These tests pin three contracts: known-vulnerable, unused packages stay out
+of the declared and resolved graphs; patched dependency floors cannot be
+silently lowered while refreshing ``uv.lock`` or ``package-lock.json``; and
+the browser libraries the console loads from a CDN ship the locked, patched
+version rather than an older pin the npm lock never touches.
 """
 
+import json
+import re
 import tomllib
+from html.parser import HTMLParser
 from pathlib import Path
 
 from packaging.requirements import Requirement
@@ -33,13 +38,14 @@ BANNED_PACKAGES = {
 }
 
 #: Lowest patched versions for direct dependencies that closed the final
-#: Dependabot release block in #2546. Every declaration and lock entry for
-#: these packages must remain at or above the corresponding floor.
+#: Dependabot release block in #2546 (aiohttp and pypdf raised in #3771).
+#: Every declaration and lock entry for these packages must remain at or
+#: above the corresponding floor.
 SECURITY_FLOORS = {
-    "aiohttp": "3.14.1",
+    "aiohttp": "3.14.4",
     "diffusers": "0.38.0",
     "httplib2": "0.32.0",
-    "pypdf": "6.13.3",
+    "pypdf": "6.21.4",
     "pytest": "9.0.3",
     "requests": "2.33.0",
     "setuptools": "83.0.0",
@@ -47,6 +53,41 @@ SECURITY_FLOORS = {
     "transformers": "5.5.0",
     "web3": "7.15.0",
 }
+
+#: Lowest patched versions for undeclared transitive dependencies (#3771).
+#: Only ``uv.lock`` carries these fixes, so a lock refresh must not resolve
+#: back below them. Remove an entry only when the package leaves the graph.
+TRANSITIVE_SECURITY_FLOORS = {
+    # huggingface-hub and torch (ml/local extras)
+    "fsspec": "2026.6.0",
+    # requests-oauthlib via msrest (cloud extra)
+    "oauthlib": "4.0.0",
+    # google-auth (base) and ldap3 (observability extra)
+    "pyasn1": "0.6.5",
+}
+
+#: Lowest patched versions in ``package-lock.json`` (#3771). The npm lock
+#: feeds only the frontend tests; ``CONSOLE_CDN_PACKAGES`` covers what ships.
+NPM_SECURITY_FLOORS = {
+    "dompurify": "3.4.17",
+    # jsdom (frontend test DOM)
+    "undici": "7.30.1",
+    # css-tree via jsdom (frontend test DOM)
+    "source-map-js": "1.2.2",
+}
+
+#: npm packages the shipped console loads from a CDN URL in ``index.html``
+#: rather than from ``package-lock.json``. A lock bump alone never reaches a
+#: browser: #3771 raised the lock to DOMPurify 3.4.17 while the console still
+#: loaded 3.4.9. Each must be pinned to the exact locked version, so the
+#: frontend tests exercise what ships and its npm floor covers the console.
+CONSOLE_CDN_PACKAGES = frozenset({"dompurify"})
+
+CONSOLE_HTML = REPO_ROOT / "kestrel_sovereign" / "static" / "index.html"
+_JSDELIVR_NPM_SCRIPT = re.compile(
+    r"^https://cdn\.jsdelivr\.net/npm/"
+    r"(?P<name>(?:@[^/@]+/)?[^/@]+)@(?P<version>[^/]+)/"
+)
 
 # Private inference leases require the owner-scoped idle-renewal and absolute
 # lifetime-bound contracts, #2755 adds typed private host ingress, 0.36 adds
@@ -219,21 +260,94 @@ def test_security_floors_are_declared():
             _assert_requirement_floor(requirement, floor)
 
 
-def test_security_floors_are_locked():
-    lock = _lock()
-
+def _assert_locked_floors(floors: dict[str, str]) -> None:
     locked = {}
-    for package in lock.get("package", []):
+    for package in _lock().get("package", []):
         locked.setdefault(canonicalize_name(package["name"]), []).append(
             Version(package["version"])
         )
 
-    for package, floor_text in SECURITY_FLOORS.items():
+    for package, floor_text in floors.items():
         versions = locked.get(canonicalize_name(package), [])
         floor = Version(floor_text)
         assert versions, f"Security-floored dependency missing from uv.lock: {package}"
         assert all(version >= floor for version in versions), (
             f"uv.lock contains {package} below {floor}: {versions}"
+        )
+
+
+def test_security_floors_are_locked():
+    _assert_locked_floors(SECURITY_FLOORS)
+
+
+def test_transitive_security_floors_are_locked():
+    _assert_locked_floors(TRANSITIVE_SECURITY_FLOORS)
+
+
+def _npm_locked_versions(names) -> dict[str, list[str]]:
+    with open(REPO_ROOT / "package-lock.json", encoding="utf-8") as f:
+        packages = json.load(f)["packages"]
+    locked = {}
+    for path, entry in packages.items():
+        name = path.rsplit("node_modules/", 1)[-1]
+        if path and name in names:
+            locked.setdefault(name, []).append(entry["version"])
+    return locked
+
+
+class _ScriptSources(HTMLParser):
+    def __init__(self):
+        super().__init__()
+        self.sources: list[str] = []
+
+    def handle_starttag(self, tag, attrs):
+        src = dict(attrs).get("src")
+        if tag == "script" and src:
+            self.sources.append(src)
+
+
+def _console_script_sources() -> list[str]:
+    parser = _ScriptSources()
+    parser.feed(CONSOLE_HTML.read_text(encoding="utf-8"))
+    return parser.sources
+
+
+def test_npm_security_floors_are_locked():
+    locked = _npm_locked_versions(NPM_SECURITY_FLOORS)
+
+    for package, floor_text in NPM_SECURITY_FLOORS.items():
+        versions = locked.get(package, [])
+        floor = Version(floor_text)
+        assert versions, (
+            f"Security-floored npm package missing from package-lock.json: {package}"
+        )
+        assert all(Version(version) >= floor for version in versions), (
+            f"package-lock.json contains {package} below {floor}: {versions}"
+        )
+
+
+def test_console_cdn_scripts_ship_the_locked_patched_version():
+    """The console's CDN pin is the version the lock and its floor vouch for."""
+    sources = _console_script_sources()
+    locked = _npm_locked_versions(CONSOLE_CDN_PACKAGES)
+
+    for package in sorted(CONSOLE_CDN_PACKAGES):
+        loads = [src for src in sources if package in src.lower()]
+        assert len(loads) == 1, (
+            f"index.html must load {package} from exactly one script: {loads}"
+        )
+        match = _JSDELIVR_NPM_SCRIPT.match(loads[0])
+        assert match and match["name"] == package, (
+            f"index.html loads {package} from an unrecognised URL: {loads[0]}"
+        )
+        assert locked.get(package) == [match["version"]], (
+            f"index.html pins {package}@{match['version']} but package-lock.json "
+            f"resolves {locked.get(package)}; the frontend tests run the locked "
+            f"version, so the console must ship exactly that version"
+        )
+        floor = Version(NPM_SECURITY_FLOORS[package])
+        assert Version(match["version"]) >= floor, (
+            f"index.html ships {package}@{match['version']}, below {floor}"
         )
 
 
