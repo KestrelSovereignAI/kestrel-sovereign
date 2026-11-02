@@ -51,11 +51,16 @@ class CustodyRecord(BaseModel):
     control_receipt: ComputerSession | None = None
     retired_at: datetime | None = None
     retired_from: Literal["admitted", "quoted"] | None = None
-    phase: Literal["retired", "admitted", "quoted", "acquiring", "leased", "opening", "active", "fenced", "unknown", "released"] = "admitted"
+    human_private: bool = False
+    human_control_id: str | None = None
+    human_control_epoch: int | None = None
+    phase: Literal["retired", "admitted", "quoted", "acquiring", "leased", "opening", "active", "fenced", "unknown", "releasing", "released"] = "admitted"
 
 
 class ActionRecord(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
+    channel: Literal["agent", "human"] = "agent"
+    control_id: str | None = None
     request: ActionRequest
     receipt: ActionReceipt | None = None
     # Legacy receipt-less rows may already have dispatched; never replay them.
@@ -86,6 +91,7 @@ class VisualCustodyRepository:
                 async with self.db.migration_lock("visual-computer-custody-v1"):
                     binary = "BYTEA" if self.db.backend_type == "postgres" else "BLOB"
                     for sql in (
+                        f"CREATE TABLE IF NOT EXISTS visual_computer_private_records (owner TEXT NOT NULL, record_key TEXT NOT NULL, payload {binary} NOT NULL, PRIMARY KEY (owner, record_key))",
                         f"CREATE TABLE IF NOT EXISTS visual_computer_keys (key_id TEXT PRIMARY KEY, wrapped_key {binary} NOT NULL)",
                         "CREATE TABLE IF NOT EXISTS visual_computer_owners (owner TEXT PRIMARY KEY, generation BIGINT NOT NULL)",
                         f"CREATE TABLE IF NOT EXISTS visual_computer_requests (owner TEXT NOT NULL, request_id TEXT NOT NULL, session_key TEXT NOT NULL, payload {binary} NOT NULL, revision BIGINT NOT NULL, PRIMARY KEY (owner, request_id), UNIQUE(owner, session_key))",
@@ -131,6 +137,16 @@ class VisualCustodyRepository:
                                 if not self._retired(original):
                                     raise CustodyIntegrityError("invalid original acquisition retirement")
                                 await self.db.execute("UPDATE visual_computer_requests SET retired = 1 WHERE owner = ? AND request_id = ?", (owner, identity))
+                    # The original encrypted extension records remain forever. A
+                    # session address permits live-capacity accounting only after
+                    # authenticated migration; unscoped history stays charged.
+                    if not await self.db.column_exists("visual_computer_private_records", "session_key"):
+                        await self.db.execute("ALTER TABLE visual_computer_private_records ADD COLUMN session_key TEXT")
+                        for owner, identity, payload in await self.db.fetchall("SELECT owner, record_key, payload FROM visual_computer_private_records"):
+                            session_key = await self._private_session_projection(owner, identity, payload, key=key)
+                            if session_key is not None:
+                                await self.db.execute("UPDATE visual_computer_private_records SET session_key = ? WHERE owner = ? AND record_key = ?", (session_key, owner, identity))
+                    await self.db.execute("CREATE INDEX IF NOT EXISTS visual_computer_private_sessions ON visual_computer_private_records (owner, session_key)")
                     await self.db.execute("CREATE INDEX IF NOT EXISTS visual_computer_live_requests ON visual_computer_requests (owner, released)")
                     await self.db.execute("CREATE INDEX IF NOT EXISTS visual_computer_retired_requests ON visual_computer_requests (owner, retired, released)")
                     await self.db.execute("CREATE INDEX IF NOT EXISTS visual_computer_pending_actions ON visual_computer_actions (owner, session_key, pending)")
@@ -143,10 +159,62 @@ class VisualCustodyRepository:
                 raise
             self._key = key
 
-    def _address(self, *parts):
-        if self._key is None:
+    def _address(self, *parts, key=None):
+        material = key or self._key
+        if material is None:
             raise RuntimeError("visual custody is not initialized")
-        return hmac.new(self._key, json.dumps(parts, ensure_ascii=True).encode(), hashlib.sha256).hexdigest()
+        return hmac.new(material, json.dumps(parts, ensure_ascii=True).encode(), hashlib.sha256).hexdigest()
+
+    async def _private_session_projection(self, owner, identity, payload, *, key=None):
+        """Authenticate existing human facts before projecting their parent.
+
+        Unknown extension formats remain unscoped and charged. A corrupt AEAD
+        envelope fails initialization rather than becoming uncharged history.
+        This projection confers no grant and never changes the encrypted facts.
+        """
+        from .human import HumanRecord
+        material = key or self._key
+        try:
+            plain = AEADCipher(material).decrypt(bytes(payload), aad=f"{owner}:{identity}".encode())
+        except DecryptionError:
+            raise CustodyIntegrityError("visual custody verification failed") from None
+        try:
+            value = HumanRecord.model_validate_json(plain)
+        except ValueError:
+            return None
+        target = value.request or value.revocation
+        if target is None:
+            return None
+        sid, cid = target.session_id, target.control_id
+        if identity != self._address("private", sid, "human", cid, key=material):
+            return None
+        session_key = self._address("session", sid, key=material)
+        row = await self.db.fetchone("SELECT request_id, payload FROM visual_computer_requests WHERE owner = ? AND session_key = ?", (owner, session_key))
+        if row is None:
+            return None
+        parent = self._open(owner, row[0], row[1], CustodyRecord, key=material)
+        expected_owner = self._address("owner", parent.request.scope.tenant_id,
+            parent.request.scope.principal_id, parent.request.scope.agent_id, key=material)
+        expected_consumer = self._address("human-consumer", parent.request.scope.model_dump_json(), sid, cid, key=material)
+        if owner != expected_owner or parent.session_id != sid:
+            return None
+        for binding in (value.request, value.revocation,
+                        value.lease.request if value.lease is not None else None,
+                        value.tombstone.request if value.tombstone is not None else None):
+            if binding is not None and (binding.session_id != sid or binding.control_id != cid
+                    or binding.consumer_id != expected_consumer):
+                return None
+        for binding in (value.request, value.lease.request if value.lease is not None else None):
+            if binding is not None and (binding.scope != parent.request.scope
+                    or (parent.lease is not None and binding.lease_id != parent.lease.lease_id)
+                    or (parent.session is not None and binding.driver_id != parent.session.driver_id)
+                    or binding.control_epoch != target.control_epoch):
+                return None
+        if value.tombstone is not None and (value.tombstone.scope != parent.request.scope
+                or (parent.lease is not None and value.tombstone.lease_id != parent.lease.lease_id)
+                or (parent.session is not None and value.tombstone.driver_id != parent.session.driver_id)):
+            return None
+        return session_key
 
     def _owner(self, scope):
         scope = ResourceScope.model_validate(scope)
@@ -231,6 +299,8 @@ class VisualCustodyRepository:
                 return
             if record.phase == "retired":
                 raise ResourceConflict("retirement requires original never-acquired CAS")
+            if previous.phase == "releasing" and record.phase not in {"releasing", "released"}:
+                raise ResourceConflict("physical release intent cannot reopen a visual session")
             if previous.phase not in {"admitted", "quoted"} and record.phase in {"admitted", "quoted"}:
                 raise ResourceConflict("possible acquisition cannot become unacquired")
             released = record.phase == "released" and record.lease is not None and record.lease.state == "released"
@@ -253,7 +323,9 @@ class VisualCustodyRepository:
 
     @staticmethod
     def _unacquired(record):
-        return (record.phase in {"admitted", "quoted"} and all(value is None for value in (
+        return (record.phase in {"admitted", "quoted"} and not record.human_private
+            and record.human_control_id is None and record.human_control_epoch is None
+            and all(value is None for value in (
             record.lease, record.connection, record.session, record.frame, record.pending_control,
             record.last_control, record.control_receipt, record.retired_at, record.retired_from)))
 
@@ -261,6 +333,7 @@ class VisualCustodyRepository:
     def _retired(record):
         return (record.phase == "retired" and record.retired_at is not None
             and record.retired_at.tzinfo is not None and record.retired_from in {"admitted", "quoted"}
+            and not record.human_private and record.human_control_id is None and record.human_control_epoch is None
             and all(value is None for value in (record.lease, record.connection, record.session,
                 record.frame, record.pending_control, record.last_control, record.control_receipt)))
 
@@ -298,7 +371,6 @@ class VisualCustodyRepository:
         """Capture one existing prepared row before dispatch, never across IO."""
         from kestrel_sovereign.storage.original_action_result import _OriginalActionResult, _AcceptedActionResult
         from .dispatch import _ORIGIN
-        from kestrel_sovereign.storage.db.sqlite import SQLiteBackend
         result = acceptance = None
         try:
             async with self._transaction(guard, write=False):
@@ -314,26 +386,91 @@ class VisualCustodyRepository:
                 if original_session is None or original_session.session != session or request.control_epoch != session.control_epoch:
                     raise ResourceConflict("original action result custody session differs")
                 origin = _ORIGIN.get()
-                if (stored.request != request or stored.receipt is not None or stored.dispatch_started
+                if (stored.channel != "agent" or stored.control_id is not None
+                        or stored.request != request or stored.receipt is not None or stored.dispatch_started
                         or origin is None or origin.session != session):
                     raise ResourceConflict("original prepared action result differs")
                 acceptance = _AcceptedActionResult(asyncio.current_task(), origin,
                     (owner,session_key,request.action_id), bytes(row[0]), stored.model_dump_json())
                 self._original_results[acceptance] = None
                 result = _OriginalActionResult(self, origin, owner, session_key, row[0], stored, admission=acceptance)
-            backend = self.db.backend
-            if type(backend) is SQLiteBackend:
-                result._sqlite_relation = await backend._read_original_signal_outcome_relation(result, capture=True)
-                if result._sqlite_relation is None:
-                    raise CustodyIntegrityError("original action result requires its plain native relation")
-                table = 'main.visual_computer_actions'
-            else:
-                result._postgres_relation = await backend._capture_original_signal_outcome_relation(result)
-                table = result._postgres_relation.qualified_name
-            result._query = f"UPDATE {table} SET payload = ?, pending = 0 WHERE owner = ? AND session_key = ? AND action_id = ? AND payload = ? AND pending = 1"
-            cast = "?" if type(backend) is SQLiteBackend else "CAST(? AS BYTEA)"
-            result._match_query = f"SELECT 1 FROM {table} WHERE payload = ? AND owner = ? AND session_key = ? AND action_id = ? AND {cast} IS NOT NULL AND pending = 0"
-            guard()
+            await self._capture_original_action_relation(result, guard)
+            yield result
+        finally:
+            if result is not None:
+                result.close()
+            elif acceptance is not None:
+                self._original_results.pop(acceptance, None)
+
+    async def _capture_original_action_relation(self, result, guard):
+        from kestrel_sovereign.storage.db.sqlite import SQLiteBackend
+        backend = self.db.backend
+        if type(backend) is SQLiteBackend:
+            result._sqlite_relation = await backend._read_original_signal_outcome_relation(result, capture=True)
+            if result._sqlite_relation is None:
+                raise CustodyIntegrityError("original action result requires its plain native relation")
+            table = 'main.visual_computer_actions'
+        else:
+            result._postgres_relation = await backend._capture_original_signal_outcome_relation(result)
+            table = result._postgres_relation.qualified_name
+        result._query = f"UPDATE {table} SET payload = ?, pending = 0 WHERE owner = ? AND session_key = ? AND action_id = ? AND payload = ? AND pending = 1"
+        cast = "?" if type(backend) is SQLiteBackend else "CAST(? AS BYTEA)"
+        result._match_query = f"SELECT 1 FROM {table} WHERE payload = ? AND owner = ? AND session_key = ? AND action_id = ? AND {cast} IS NOT NULL AND pending = 0"
+        guard()
+
+    @asynccontextmanager
+    async def original_human_action_result(self, scope, session, request, *, guard):
+        """Authenticate original action AND private lease/frame before input."""
+        from datetime import UTC
+        from .dispatch import _HUMAN_ORIGIN, _OriginalHumanDispatch
+        from .human import HumanRecord
+        from kestrel_sovereign.storage.original_human_action_result import (
+            _AcceptedHumanActionResult, _OriginalHumanActionResult,
+        )
+        result = acceptance = None
+        try:
+            # The same existing owner lock serializes action/private/session
+            # writers. It is released before native capture and driver IO.
+            async with self._transaction(guard):
+                owner, session_key = self._owner(scope), self._address("session", session.session_id)
+                await self._lock_owner(owner)
+                action = request.action
+                if session.scope != scope or action.session_id != session.session_id:
+                    raise ResourceConflict("original human result session differs")
+                row = await self.db.fetchone("SELECT payload FROM visual_computer_actions WHERE owner = ? AND session_key = ? AND action_id = ?", (owner, session_key, action.action_id))
+                parent = await self.db.fetchone("SELECT request_id, payload FROM visual_computer_requests WHERE owner = ? AND session_key = ?", (owner, session_key))
+                key = self._address("private", session.session_id, "human", request.control_id)
+                private = await self.db.fetchone("SELECT payload FROM visual_computer_private_records WHERE owner = ? AND record_key = ?", (owner, key))
+                if row is None or parent is None or private is None:
+                    raise ResourceNotFound("original human result custody absent")
+                stored = self._open(owner, f"{session_key}:{action.action_id}", row[0], ActionRecord)
+                custody = self._open(owner, parent[0], parent[1], CustodyRecord)
+                human = self._open(owner, key, private[0], HumanRecord)
+                origin = _HUMAN_ORIGIN.get()
+                if (stored.channel != "human" or stored.control_id != request.control_id
+                        or stored.request != action or stored.receipt is not None or stored.dispatch_started
+                        or custody.session != session or custody.phase != "fenced" or not custody.human_private
+                        or custody.human_control_id != request.control_id
+                        or custody.human_control_epoch != session.control_epoch
+                        or custody.pending_control is not None
+                        or human.request is None or human.lease is None or human.frame is None
+                        or human.revocation is not None or human.tombstone is not None
+                        or type(origin) is not _OriginalHumanDispatch or not origin.active
+                        or origin.trace is not None or origin.driver_entered
+                        or origin.session != session or origin.request != request
+                        or origin.lease != human.lease or origin.frame != human.frame):
+                    raise ResourceConflict("original human result binding differs")
+                consumer = self._address("human-consumer", scope.model_dump_json(), session.session_id, request.control_id)
+                if request.consumer_id != consumer:
+                    raise ResourceConflict("original human result consumer differs")
+                human.lease.require_request(human.request)
+                request.require_lease(human.lease, session, human.frame, at=datetime.now(UTC))
+                acceptance = _AcceptedHumanActionResult(asyncio.current_task(), origin,
+                    (owner, session_key, action.action_id), bytes(row[0]), stored.model_dump_json(),
+                    origin.binding, (owner, key), bytes(private[0]))
+                self._original_results[acceptance] = None
+                result = _OriginalHumanActionResult(self, origin, owner, session_key, row[0], stored, admission=acceptance)
+            await self._capture_original_action_relation(result, guard)
             yield result
         finally:
             if result is not None:
@@ -359,7 +496,8 @@ class VisualCustodyRepository:
         return self._open(owner, identity, payload, ActionRecord, key=key)
 
     async def action(self, scope, session_id, action_id, *, accept=None, receipt=None, guard=None,
-                     prepare=False, dispatch_revision=None, abandon_prepared=False, _result_owner=None):
+                     prepare=False, dispatch_revision=None, abandon_prepared=False, channel="agent", control_id=None,
+                     _result_owner=None):
         async with self._transaction(guard, write=accept is not None or receipt is not None or dispatch_revision is not None or abandon_prepared):
             owner, session_key = self._owner(scope), self._address("session", session_id)
             if accept is not None or receipt is not None or dispatch_revision is not None or abandon_prepared:
@@ -375,7 +513,7 @@ class VisualCustodyRepository:
                 count = await self.db.fetchone("SELECT COUNT(*) FROM visual_computer_actions WHERE owner = ?", (owner,))
                 if count[0] >= self.max_actions:
                     raise ResourceConflict("visual custody action capacity exhausted")
-                stored = ActionRecord(request=accept, dispatch_started=not prepare)
+                stored = ActionRecord(request=accept, dispatch_started=not prepare, channel=channel, control_id=control_id)
                 await self.db.execute("INSERT INTO visual_computer_actions (owner, session_key, action_id, payload) VALUES (?, ?, ?, ?)", (owner, session_key, action_id, self._seal(owner, identity, stored)))
             else:
                 stored = self._open_action(owner, identity, row[0])
@@ -383,7 +521,7 @@ class VisualCustodyRepository:
                     if accept is not None or receipt is not None or dispatch_revision is not None or abandon_prepared or _result_owner is not None:
                         raise ResourceOutcomeUnknown("Original planning row is not an SDK action")
                     return stored
-                if accept is not None and stored.request != accept:
+                if accept is not None and (stored.request != accept or stored.channel != channel or stored.control_id != control_id):
                     raise ResourceConflict("action ID already identifies different input")
             changed = False
             if dispatch_revision is not None:
@@ -440,3 +578,42 @@ class VisualCustodyRepository:
             owner = self._owner(scope)
             rows = await self.db.fetchall("SELECT request_id, payload FROM visual_computer_requests r WHERE owner = ? AND ((released = 0 AND retired = 0) OR EXISTS (SELECT 1 FROM visual_computer_actions a WHERE a.owner = r.owner AND a.session_key = r.session_key AND a.pending = 1))", (owner,))
             return [self._open(owner, row[0], row[1], CustodyRecord) for row in rows]
+
+    async def private_record(self, scope, session_id, kind, identity, model, *, accept=None, update=None, guard=None):
+        """Bounded encrypted extension custody; identifiers confer no authority."""
+        if kind == "human":
+            from .human import HumanRecord
+            if (model is not HumanRecord or (accept is not None and type(accept) is not HumanRecord)
+                    or (update is not None and type(update) is not HumanRecord)):
+                raise ResourceConflict("original human custody schema required")
+        async with self._transaction(guard, write=accept is not None or update is not None):
+            owner = self._owner(scope)
+            key = self._address("private", session_id, kind, identity)
+            if accept is not None or update is not None:
+                await self._lock_owner(owner)
+            session_key = self._address("session", session_id)
+            parent = await self.db.fetchone("SELECT released FROM visual_computer_requests WHERE owner = ? AND session_key = ?", (owner, session_key))
+            if (accept is not None or update is not None) and (parent is None or parent[0]):
+                raise ResourceConflict("private custody session is absent or physically released")
+            row = await self.db.fetchone("SELECT payload FROM visual_computer_private_records WHERE owner = ? AND record_key = ?", (owner, key))
+            if row is None:
+                if accept is None:
+                    raise ResourceNotFound("private visual custody not found")
+                count = await self.db.fetchone("SELECT COUNT(*) FROM visual_computer_private_records p WHERE owner = ? AND (session_key IS NULL OR NOT EXISTS (SELECT 1 FROM visual_computer_requests r WHERE r.owner = p.owner AND r.session_key = p.session_key AND r.released = 1) OR EXISTS (SELECT 1 FROM visual_computer_actions a WHERE a.owner = p.owner AND a.session_key = p.session_key AND a.pending = 1))", (owner,))
+                if count[0] >= self.max_actions:
+                    raise ResourceConflict("private visual custody capacity exhausted")
+                payload = self._seal(owner, key, accept)
+                projection = await self._private_session_projection(owner, key, payload)
+                await self.db.execute("INSERT INTO visual_computer_private_records (owner, record_key, payload, session_key) VALUES (?, ?, ?, ?)", (owner, key, payload, projection))
+                stored = accept
+            else:
+                stored = self._open(owner, key, row[0], model)
+            if update is not None:
+                if kind == "human":
+                    # Check the freshly decrypted row under the SAME native
+                    # owner lock/transaction. A captured snapshot grants no
+                    # right to discard terminal facts committed meanwhile.
+                    HumanRecord._require_successor(update, stored)
+                await self.db.execute("UPDATE visual_computer_private_records SET payload = ? WHERE owner = ? AND record_key = ?", (self._seal(owner, key, update), owner, key))
+                return update
+            return stored

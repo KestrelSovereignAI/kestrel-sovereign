@@ -32,7 +32,7 @@ async def test_global_turn_cancellation_settles_original_known_no_dispatch(harne
             monkeypatch.setattr(h.repository,'action',block)
         else:
             executable=tmp_path/'owned-native-preflight'
-            executable.write_text(f'#!{sys.executable}\nimport time\ntime.sleep(60)\n')
+            executable.write_text(f'#!{sys.executable} -B\nimport time\ntime.sleep(60)\n')
             executable.chmod(0o700);driver.boundary.executable=str(executable)
             launch=asyncio.create_subprocess_exec
             async def capture(*args,**kwargs):
@@ -90,7 +90,7 @@ async def test_turn_retirement_without_cancellation_fences_actual_native_stdin(h
     h=harness;ctx=h.context();h.adapter.driver_id=PROVIDER
     received=tmp_path/'application-stdin'
     executable=tmp_path/'owned-native-rpc'
-    executable.write_text(f'#!{sys.executable}\nimport sys\nfrom pathlib import Path\ndata=sys.stdin.buffer.read()\nif data:Path({str(received)!r}).write_bytes(data)\nprint("{{}}")\n')
+    executable.write_text(f'#!{sys.executable} -B\nimport sys\nfrom pathlib import Path\ndata=sys.stdin.buffer.read()\nif data:Path({str(received)!r}).write_bytes(data)\nprint("{{}}")\n')
     executable.chmod(0o700)
     with h.bind(ctx):
         session,request=await opened(h,ctx)

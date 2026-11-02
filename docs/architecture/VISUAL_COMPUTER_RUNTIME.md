@@ -106,6 +106,27 @@ its authenticated synchronous pre-effect refusals, including stale frames and
 epochs. Status reconciles those receipts using the original action ID; input
 resumes only after unresolved actions have terminal receipts.
 
+Agent and manual input have distinct original result owners. Before consuming
+a manual frame, the host authenticates the full human request, installed
+consumer lease and pixel-free frame against the same encrypted action, private
+lease and session rows under both current input and view grants. Its fixed
+negative-result owner retains the original database, key, privacy holds and
+ciphertext CAS through native writer completion. Global turn retirement permits
+only that original, physically joined no-dispatch fact to clear the pending
+projection; it grants no ordinary SQL, input, observation or delivery. Later
+frame clearing or control changes do not erase this historical fact. Agent and
+human owners cannot settle each other's rows or facts.
+
+The Docker trace includes nested manual action RPCs and marks input possible
+before the first partial stdin write. A partial send or lost acknowledgement
+stays unknown. When the complete original RPC reaches the worker after Stop or
+handback, the worker authenticates its originally issued consumer lease before
+journaling a pre-effect denied receipt; current lease eligibility is still
+checked before any input or repeated act delivery. The manual composition uses
+published SDK 0.45 with normal-index host and worker locks. Core successor
+review, CI and actual merged-base host/worker acceptance remain release gates;
+SDK installability does not establish Core product readiness.
+
 The default limits are 256 active or unresolved requests and 4096 retained
 actions across an owner's live sessions and unresolved released sessions.
 Terminal action payloads are reclaimed only after verified physical release;

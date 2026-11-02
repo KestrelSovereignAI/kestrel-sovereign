@@ -79,6 +79,8 @@ class VisualComputerFeature(Feature):
             if name == "local-docker-browser":
                 settings["egress_guard"] = egress.operation
                 settings["workspace_guard"] = egress.transfer_operation
+                settings["human_guard"] = egress.human_operation
+                settings["human_status_guard"] = egress.human_status_operation
         if not providers or not drivers:
             raise ValueError("visual provider and driver factories must be explicitly configured")
         for name, settings in providers.items():
@@ -91,12 +93,15 @@ class VisualComputerFeature(Feature):
             max_total_cost_usd=Decimal(str(self._cfg.get("max_total_cost_usd", "0"))),
             operation_seconds=self._cfg.get("operation_seconds", 30))
         authority = HostCapabilityAuthority(capability="visual-computer", label="visual computer",
-            non_disclosing_actions=frozenset({VisualAction.STOP.value, VisualAction.RELEASE.value}),
-            priority_actions=frozenset({VisualAction.STOP.value, VisualAction.RELEASE.value}),
+            non_disclosing_actions=frozenset({VisualAction.STOP.value, VisualAction.RELEASE.value, VisualAction.HUMAN_REVOKE.value}),
+            priority_actions=frozenset({VisualAction.STOP.value, VisualAction.RELEASE.value, VisualAction.HUMAN_REVOKE.value}),
             access_denied=VisualAccessDenied)
         self._agent_id = agent_id
         self.runtime = VisualComputerRuntime(VisualCustodyRepository(db), authority,
             providers=providers, drivers=drivers, policy=policy, check_destination=self._check_destination, egress=egress)
+        if self._cfg.get("human_control_enabled") is True:
+            from kestrel_sovereign.visual_computer.human import HumanComputerRuntime
+            self.runtime.human = HumanComputerRuntime(self.runtime, lease_seconds=self._cfg.get("human_lease_seconds", 120))
         from kestrel_sovereign.visual_computer.http import create_visual_computer_router
         self._router = create_visual_computer_router(self.runtime, resolve_context=self._resolve_context,
                                                     plan_operation=self._plan)

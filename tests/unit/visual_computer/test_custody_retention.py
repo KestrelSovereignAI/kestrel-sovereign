@@ -168,5 +168,5 @@ async def test_uncertain_physical_release_preserves_terminal_action_payload(harn
         )
         assert retained.request == action and retained.receipt == receipt
         record = await h.repository.get(h.runtime.scope(ctx), session_id=session.session_id)
-        assert record.phase == "fenced" and record.connection is not None
+        assert record.phase == "releasing" and record.connection is not None
         assert (await h.db.fetchone("SELECT pending FROM visual_computer_actions"))[0] == 0

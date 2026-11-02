@@ -48,8 +48,14 @@ class Endpoint:
         if not isinstance(arguments, dict):
             raise Refused("invalid_request")
         controller = self.controller
-        if self.priority and operation not in {"status", "action_status", "control", "network_cancel"}:
+        if self.priority and operation not in {"status", "action_status", "control", "network_cancel", "human"}:
             raise Refused("priority_operation_required")
+        if operation == "human" and set(arguments) == {"session", "operation", "arguments"}:
+            if self.priority and arguments["operation"] not in {"status", "action_status", "revoke"}:
+                raise Refused("priority_operation_required")
+            if not hasattr(controller, "human"):
+                raise Refused("human_unsupported")
+            return await controller.human.dispatch(**arguments)
         if operation == "status" and set(arguments) == {"scope", "session_id"}:
             return controller.status(**arguments)
         if operation == "observe" and set(arguments) == {"session"}:
@@ -129,6 +135,8 @@ async def serve(controller, secret, *, directory=DIRECTORY):
                 await asyncio.sleep(0.1)
                 try:
                     controller._live()
+                    if hasattr(controller, "human"):
+                        await controller.human.expire()
                 except Refused:
                     break
     finally:
@@ -177,6 +185,8 @@ async def main():
             controller = BrowserController(page, settings["request"], workspace_enabled=True,
                                            network_enabled=settings["network_profile"] is not None)
             controller.workspace = WorkspaceTransport(controller, DIRECTORY / "workspace-transfer")
+            from human import HumanTransport
+            controller.human = HumanTransport(controller, DIRECTORY, settings["secret"])
             async def deny_socket(connection):
                 await connection.close(code=1008, reason="unsupported_channel")
             await context.route_web_socket("**/*", deny_socket)

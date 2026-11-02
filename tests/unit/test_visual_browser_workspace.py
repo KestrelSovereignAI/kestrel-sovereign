@@ -164,7 +164,7 @@ def test_oversized_transport_request_and_active_session_are_refused(transport):
 def test_worker_image_includes_workspace_contract_and_implementation():
     assert "workspace.py" in (root / "Dockerfile").read_text()
     assert "!workspace.py" in (root / ".dockerignore").read_text().splitlines()
-    assert "kestrel-sovereign-sdk==0.43.0" in (root / "requirements.in").read_text()
+    assert "kestrel-sovereign-sdk==0.45.0" in (root / "requirements.in").read_text()
 
 
 @pytest.mark.skipif(sys.platform != "linux", reason="atomic RENAME_NOREPLACE is a Linux worker capability")

@@ -133,7 +133,7 @@ async def test_unknown_acquire_and_release_keep_original_custody(harness):
             await h.runtime.release(ctx, session.session_id)
         record = await h.repository.get(h.runtime.scope(ctx), session_id=session.session_id)
         assert record.lease.state == "ready" and record.connection is not None
-        assert record.phase == "fenced"
+        assert record.phase == "releasing"
         h.adapter.unknown_release = False
         assert (await h.runtime.release(ctx, session.session_id))["released"] is True
 

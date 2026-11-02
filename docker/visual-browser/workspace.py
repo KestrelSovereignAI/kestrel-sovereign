@@ -71,7 +71,8 @@ class WorkspaceTransport:
     def _data(self, session, request=None):
         self.controller._bound(session)
         current = self.controller._session
-        if (current["state"] != "paused" or current["controller"] != "none"
+        if (getattr(getattr(self.controller, "human", None), "private", False)
+                or current["state"] != "paused" or current["controller"] != "none"
                 or self.controller._control_pending):
             raise ResourceConflict("workspace_requires_paused_uncontrolled_session")
         if request is not None:

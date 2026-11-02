@@ -1,6 +1,6 @@
 """Closed native terminal-result profiles, never an ordinary SQL admission.
 
-Only Core's two original producer owners can reach these fixed journal paths.
+Only Core's closed original producer owners can reach these fixed journal paths.
 The existing native program, relation, connection and COMMIT seals remain in
 force. A profile is not an application-supplied table, query or callback.
 """
@@ -14,6 +14,9 @@ def _original_result_profile(journal):
         from kestrel_sovereign.signals.store import _OUTCOME_COLUMNS
         return 'signal_log', {name: ('INTEGER' if name == 'duration_ms' else 'TEXT') for name in _OUTCOME_COLUMNS}
     if type(journal) is _OriginalActionResult:
+        return 'visual_computer_actions', {'owner':'TEXT', 'session_key':'TEXT', 'action_id':'TEXT', 'payload':'BLOB', 'pending':'BIGINT'}
+    from kestrel_sovereign.storage.original_human_action_result import _OriginalHumanActionResult
+    if type(journal) is _OriginalHumanActionResult:
         return 'visual_computer_actions', {'owner':'TEXT', 'session_key':'TEXT', 'action_id':'TEXT', 'payload':'BLOB', 'pending':'BIGINT'}
     raise ExecutionAuthorityError('Exact original native result owner required')
 

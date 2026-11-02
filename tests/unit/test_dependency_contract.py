@@ -67,7 +67,8 @@ SECURITY_FLOORS = {
 # Version 0.42.3 corrects native HTTP+JSON protocol error media types.
 # Version 0.42.4 owns the certifi floor for HTTPX/requests; OS roots are unaffected.
 # Version 0.43 adds model exposure and governed registration bindings.
-# Version 0.45.0 adds the optional environment acquisition-custody contracts.
+# Version 0.45 adds the authenticated human-control and acquisition-custody
+# contracts. A private development wheel does not satisfy the normal lock gate.
 # This is a Core-only release gate: sibling packages release independently.
 # Core must never lower its declared/locked line to accommodate an older
 # consumer. Host feature acceptance remains a release prerequisite in README.md.
@@ -344,7 +345,7 @@ def test_sdk_native_release_cascade_contract_is_declared():
 
 
 def test_sdk_native_release_cascade_contract_is_locked():
-    """The lock must exercise the outbound contract and one canonical floor."""
+    """The normal lock must exercise the declared human-control SDK floor."""
 
     root = _locked_root_package(_lock())
     locked_contracts = {

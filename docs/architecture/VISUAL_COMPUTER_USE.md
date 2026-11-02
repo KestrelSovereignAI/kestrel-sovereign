@@ -389,6 +389,63 @@ It links outputs by artifact reference, without embedding lifecycle ownership.
 Closing the view or losing its transport does not silently release or resume
 the environment. Export and transfer always select an exact source revision.
 
+### Manual human channel
+
+This source integration requires published SDK 0.45 human-control contracts.
+Core declares `>=0.45.0,<1`; its normal-index lock and the exact hash-locked
+worker requirements select 0.45.0. The Dockerfile verifies the installed worker
+pin and human contract. This Core 0.58 source successor still requires complete
+review, CI and built-image/host acceptance before release. Published SDK
+installability alone does not establish Core product readiness.
+
+Trusted visual configuration explicitly enables `human_control_enabled` and may
+set `human_lease_seconds` from 1 to 120 (default 120). The original session owner
+needs separate `visual.human.view`, `visual.human.input` and
+`visual.human.revoke` grants. Takeover alone grants no manual view or input.
+The authenticated `/sessions/{session_id}/human/{control_id}` routes open and
+reconcile one fixed consumer lease; their `/observation`, `/actions`,
+`/actions/{action_id}` and `/revoke` routes retain the original caller through
+native dispatch and private delivery. No human endpoints become model tools.
+
+The console opens the view only on request, arms manual input independently,
+and offers explicit screen keyboard focus. Each pointer, text or key submission
+consumes one fresh human frame and retains its original action ID until receipt
+reconciliation. Unknown outcomes do not permit replay. Both agent and manual actions use the
+same one-shot prepared-to-dispatched CAS; a host action proven never to have
+entered the driver receives an original terminal denial. Stale worker frames
+also journal a terminal denial under the original action ID. Neither path
+relabels an accepted or ambiguous input as effect-free. The short fixed lease
+cannot renew, reconnect or change consumers; a new consumer needs a fresh
+takeover epoch. Human navigation and background egress are refused. The browser
+keeps its sandbox, network isolation, resource limits and private Unix transport;
+no public CDP/VNC listener, host desktop or operator credential is forwarded.
+
+Human observations and inputs have distinct namespaces and encrypted custody.
+Their pixels never enter the agent observation path, generic status, conversation
+history or artifact export. The worker journals accepted input, exact pre-effect negative receipts and keyed content
+digests without raw input or pixels, and refuses to adopt a prior incarnation's
+journal. Priority Stop, revoke, expiry, handback and release fence admission and
+physically drain accepted inputs and private send children before acknowledging
+retirement. Cancellation cannot detach an accepted send; already transmitted
+network bytes cannot be recalled, and a lost acknowledgement remains uncertain.
+
+Human control history retains its original encrypted request, lease and channel
+identity indefinitely. The private-record capacity limits live custody, not the
+lifetime number of channels. An indexed HMAC session projection is populated
+only from authenticated original human facts and the same canonical request row.
+History ceases to count only when that row has both released phase and a verified
+released lease, and no unresolved action for that session remains. Stop, revoke,
+expiry and inventory absence never free capacity. Unknown formats or unmatched
+legacy records remain charged. Verified physical destruction settles the original
+worker/channel owner; an independently unresolved action remains charged even
+then. No original channel payload or anti-resurrection tombstone is deleted.
+
+Closing the view purges its pixels and requests channel revocation. It does not
+resume agent control. After manual Stop, workspace export remains private and
+fenced. Handback requires the operator to confirm that the screen is ready to
+share, retires the human channel, purges retained human frame metadata and obtains
+a fresh agent observation. There is no automatic secret detection or redaction.
+
 ## Delivery and evidence
 
 1. SDK #85 and Core #3707: contracts, owners, storage/policy decisions.
@@ -454,8 +511,13 @@ original evidence; they never trigger a reload, replacement row, or retry.
 SQLite also retains its conservative external data-generation rule: after a
 foreign native commit, a retired result cannot borrow fresh ordinary work to
 readmit the destination. Native COMMIT uncertainty keeps its original outcome
-and cleanup owners. This first result profile covers agent actions on SDK0.43;
-human input and environment acquisition need separately reviewed profiles.
+and cleanup owners. Agent and human actions have distinct closed result profiles.
+The Core `_OriginalHumanActionResult` binds the complete
+original human request, issued consumer/control lease and pixel-free frame;
+it cannot use the agent profile or change private lease/control/session facts.
+Both profiles share only the native writer, program, COMMIT/reset and original
+hold machinery. Environment acquisition still needs its separate positive and
+unknown result profile; neither negative action profile grants it authority.
 
 A never-acquired request whose global turn was cancelled before its retirement
 write remains charged until a fresh genuinely admitted original-owner reconcile
