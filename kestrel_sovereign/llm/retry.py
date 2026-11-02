@@ -10,6 +10,8 @@ import math
 import random
 from datetime import UTC, datetime, timedelta
 from typing import Any, Callable, Iterable, Optional, TypeVar
+
+import httpx
 from kestrel_sovereign.execution_custody import ExecutionAuthorityError, await_execution_work, is_execution_control_error
 
 from kestrel_sovereign.llm.generation_gate import first_unfinished_attempt
@@ -399,6 +401,7 @@ def is_retryable_error(error: Exception) -> bool:
       0. PLAN_LIMIT_PATTERNS (plan window wearing a non-429 status) → retry.
       1. NON_RETRYABLE_STATUS_CODES (401/403/404/422/400) → no retry.
       2. NON_RETRYABLE_PATTERNS (auth/quota/invalid) → no retry.
+      0c. Transport failure with no response (dropped connection) → retry.
       3. RETRYABLE_STATUS_CODES (429/5xx) → retry.
       4. RETRYABLE_PATTERNS (rate/timeout/etc) → retry.
       5. Default → no retry.
@@ -436,6 +439,14 @@ def is_retryable_error(error: Exception) -> bool:
         if status_code in RETRYABLE_STATUS_CODES:
             return True
 
+    # 0c. A transport failure got no response at all: a pooled keep-alive
+    #     connection the server had already closed, a reset, a DNS or connect
+    #     blip. The SDKs' own retries are off (this module is the single retry
+    #     owner), and the message ("Connection error.") matches no pattern, so
+    #     without this one dropped connection fails the whole turn.
+    if _is_transport_failure(error):
+        return True
+
     error_str = str(error).lower()
 
     # 1. Hard non-retryable status codes — word-boundary check to avoid
@@ -463,6 +474,27 @@ def is_retryable_error(error: Exception) -> bool:
 
     # 5. Default: don't retry unknown errors.
     return False
+
+
+# Transport failures that carry no response. Client-side protocol bugs
+# (httpx.LocalProtocolError, UnsupportedProtocol) and proxy misconfiguration
+# are deliberately excluded: retrying those cannot succeed.
+_TRANSPORT_FAILURES = (httpx.NetworkError, httpx.TimeoutException, httpx.RemoteProtocolError)
+
+
+def _is_transport_failure(error: BaseException) -> bool:
+    """True for a request that failed in transport, before any response.
+
+    Covers the SDKs' ``APIConnectionError`` (``APITimeoutError`` is a
+    subclass), which wraps the underlying httpx error, and a bare httpx
+    network, timeout or remote-protocol error. Execution-control errors
+    (cancellation, fences) are never transient.
+    """
+    if is_execution_control_error(error):
+        return False
+    if isinstance(error, _TRANSPORT_FAILURES):
+        return True
+    return any(cls.__name__ == "APIConnectionError" for cls in type(error).__mro__)
 
 
 def _is_throttle_error(error: Exception) -> bool:
