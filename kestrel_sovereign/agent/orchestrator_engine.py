@@ -909,6 +909,23 @@ def _discard_tool_supplied_receipt(result):
     return dict(result) if isinstance(result, _AuditedDeferredResult) else result
 
 
+def _mark_tool_dispatch_audited(dispatch_meta, bound_execution=None):
+    if dispatch_meta is not None:
+        dispatch_meta["audit_recorded"] = True
+    if bound_execution is not None:
+        bound_execution.audit_recorded = True
+
+
+def _raise_terminal_tool_error(error, dispatch_meta):
+    """An observer failure cannot relabel an already-confirmed tool effect."""
+    if is_execution_control_error(error) or isinstance(error, _DeferredToolAuditError):
+        raise error
+    if dispatch_meta is not None and dispatch_meta.get("audit_recorded"):
+        raise ResourceOutcomeUnknown(
+            "Tool completed and its dispatch was recorded, but final delivery failed. Do not replay",
+        ) from error
+
+
 async def _record_inline_tool_dispatch(host, entry, *, session_id, features_by_tool_name):
     """One recorder for both streaming and non-streaming inline history."""
     result = entry["result"]
@@ -960,9 +977,17 @@ async def _complete_post_tool_result(host, result, post_input, *, adapter,
     except BaseException as error:
         # Consume the factory when storage or Stop prevents publication.
         # Execution already happened: never invite a replay to recover its UI.
-        result.finalize(post_result, allowed=False)
+        try:
+            result.finalize(post_result, allowed=False)
+        except RuntimeError as discard_error:
+            # A second holder may already have consumed this one-shot result.
+            # Retain that diagnostic without replacing the original write or
+            # control failure, including its existing physical cause chain.
+            error = execution_terminal_error(
+                error, discard_error, retain_originals=True, prefer_cancellation=True,
+            )
         if not isinstance(error, Exception) or is_execution_control_error(error):
-            raise
+            raise error
         raise _DeferredToolAuditError(
             "Tool completed, but its audit could not be confirmed; UI withheld. "
             "Reconcile before retrying. Do not replay to recover the UI",
@@ -2759,6 +2784,8 @@ class OrchestratorEngineMixin:
                 args=args,
                 session_id=session_id,
                 execute_fn=_exec_feature,
+                audit_adapter=f"{type(feature).__name__}.execute_as_subagent",
+                on_audited=lambda: _mark_tool_dispatch_audited(dispatch_meta),
             )
             # #2641: parts the subagent's tools produced ride the result
             # envelope; ``_execute_tool_with_hooks`` re-emitted them into this
@@ -2795,16 +2822,14 @@ class OrchestratorEngineMixin:
         except ExecutionAuthorityError:
             raise
         except (ConnectionError, TimeoutError, ValueError, KeyError, TypeError, AttributeError) as e:
-            if is_execution_control_error(e):
-                raise
+            _raise_terminal_tool_error(e, dispatch_meta)
             return await self._handle_feature_error(
                 e, tool_name, hook_feature_name, args, dispatch_start,
                 dispatch_event_id, tool_events=tool_events, streaming=streaming,
                 session_id=session_id, dispatch_meta=dispatch_meta,
             )
         except Exception as e:
-            if is_execution_control_error(e):
-                raise
+            _raise_terminal_tool_error(e, dispatch_meta)
             return await self._handle_feature_error(
                 e, tool_name, hook_feature_name, args, dispatch_start,
                 dispatch_event_id, tool_events=tool_events, streaming=streaming,
@@ -3012,12 +3037,6 @@ class OrchestratorEngineMixin:
                 bound_execution.returned = True
             return result
 
-        def _deferred_audited():
-            if dispatch_meta is not None:
-                dispatch_meta["audit_recorded"] = True
-            if bound_execution is not None:
-                bound_execution.audit_recorded = True
-
         try:
             result = await self._execute_tool_with_hooks(
                 tool_name=tool_name,
@@ -3027,7 +3046,7 @@ class OrchestratorEngineMixin:
                 execute_fn=_exec_direct,
                 audit_adapter=(f"{bound_tool.owner}.{tool_name}" if bound_tool is not None
                                else OrchestratorEngineMixin._tool_call_adapter(self, tool_name, {})),
-                on_audited=_deferred_audited,
+                on_audited=lambda: _mark_tool_dispatch_audited(dispatch_meta, bound_execution),
                 **({"prepare_args": _prepare_bound_arguments} if bound_tool is not None else {}),
             )
             # #2641: direct tools carry the same envelope contract as
@@ -3049,8 +3068,7 @@ class OrchestratorEngineMixin:
                 tool_events.append({'type': 'complete', 'tool': tool_name, 'ms': dispatch_duration})
             return result
         except Exception as e:
-            if is_execution_control_error(e) or isinstance(e, _DeferredToolAuditError):
-                raise
+            _raise_terminal_tool_error(e, dispatch_meta)
             logging.error(f"[DIRECT-TOOL] {tool_name} failed: {e}")
             if bound_execution is not None and (
                 bound_execution.returned

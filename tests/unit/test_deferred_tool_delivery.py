@@ -704,3 +704,119 @@ async def test_named_subagent_cannot_supply_its_own_inline_dispatch_receipt(boun
     rows = await peer.backend.fetch_all("SELECT result_status FROM a2a_tool_dispatches")
     assert [tuple(row) for row in rows] == [("success",)]
     assert peer.tool.executions == [{"task": "Owned subagent operation"}]
+
+
+@pytest.mark.parametrize("path", ["chat", "named", "bound"])
+@pytest.mark.parametrize("failure", ["cancel", "stop", "database"])
+async def test_spent_factory_cannot_mask_an_original_audit_failure(boundary, path, failure, monkeypatch):
+    from kestrel_sdk.resources import ResourceOutcomeUnknown
+    from kestrel_sovereign.storage.db.interface import DatabaseError
+    from kestrel_sovereign.execution_custody import _explicit_control_chain
+
+    peer = boundary
+    peer.policy.release.set()
+    original = (asyncio.CancelledError("Original write cancellation") if failure == "cancel"
+                else ExecutionAuthorityError("Original Stop during write"))
+    write = peer.host.observability_store.log_tool_dispatch
+    first = True
+    failures = []
+
+    async def persist(entry, **kwargs):
+        nonlocal first
+        if first:
+            first = False
+            # Another holder consumes the same one-shot result while Core is
+            # awaiting storage. Withholding it must not replace a real Stop.
+            peer.tool.active_result.finalize(peer.tool.active_result, allowed=False)
+            if failure != "database":
+                failures.append(original)
+                raise original
+            await peer.backend.execute("DROP TABLE a2a_tool_dispatches")
+        try:
+            await write(entry, **kwargs)
+        except DatabaseError as error:
+            failures.append(error)
+            raise
+
+    monkeypatch.setattr(peer.host.observability_store, "log_tool_dispatch", persist)
+    expected = ResourceOutcomeUnknown if failure == "database" else type(original)
+    with pytest.raises(expected) as captured:
+        await peer.invoke(path)
+    assert peer.tool.executions == [{}] and peer.tool.publications == []
+    assert failures[0] in tuple(_explicit_control_chain(captured.value))
+    if failure != "database":
+        assert captured.value is original
+
+
+@pytest.mark.parametrize("path", ["chat", "bound"])
+@pytest.mark.parametrize("observer_error", [ValueError, RuntimeError])
+async def test_observer_failure_after_confirmed_dispatch_is_explicitly_not_replayable(boundary, path, observer_error, monkeypatch):
+    from kestrel_sdk.resources import ResourceOutcomeUnknown
+
+    peer = boundary
+    peer.policy.release.set()
+    original = observer_error("Owned post-dispatch observer failed")
+    observe = peer.host.observability_store.log_tool_response
+    attempts = []
+
+    async def response(**kwargs):
+        attempts.append(kwargs)
+        if len(attempts) == 1:
+            raise original
+        return await observe(**kwargs)
+
+    monkeypatch.setattr(peer.host.observability_store, "log_tool_response", response)
+    with pytest.raises(ResourceOutcomeUnknown, match="Tool completed.*Do not replay") as captured:
+        await peer.invoke(path)
+    assert captured.value.__cause__ is original
+    rows = await peer.backend.fetch_all("SELECT result_status FROM a2a_tool_dispatches")
+    assert [tuple(row) for row in rows] == [("success",)]
+    assert len(attempts) == 1 and peer.tool.executions == [{}]
+
+
+@pytest.mark.parametrize("failure", ["audit", "value-observer", "runtime-observer"])
+async def test_custom_feature_deferred_dispatch_uses_the_same_audit_completion(boundary, failure, monkeypatch):
+    from kestrel_sdk.resources import ResourceOutcomeUnknown
+
+    peer = boundary
+    peer.policy.release.set()
+
+    class Source(CoreFeature):
+        tool_description = "Owned deferred feature dispatch"
+
+        async def initialize(self):
+            pass
+
+        async def execute_as_subagent(self, **kwargs):
+            return await peer.tool.execute()
+
+    source = Source(peer.host)
+    peer.host.features[Source.__name__] = source
+    if failure == "audit":
+        await peer.backend.execute("DROP TABLE a2a_tool_dispatches")
+    else:
+        observe = peer.host.observability_store.log_tool_response
+        first = True
+
+        async def response(**kwargs):
+            nonlocal first
+            if first:
+                first = False
+                error = ValueError if failure == "value-observer" else RuntimeError
+                raise error("Owned feature observation failed")
+            return await observe(**kwargs)
+
+        monkeypatch.setattr(peer.host.observability_store, "log_tool_response", response)
+    with pytest.raises(ResourceOutcomeUnknown):
+        await peer.host._dispatch_tool_call(
+            ToolCall(id="custom-deferred-feature", name=source.tool_name, arguments={"task": "Owned call"}),
+            features_by_tool_name={source.tool_name: source}, known_tools=peer.host._known_tool_names(),
+            messages=[], iteration=0, user_message=None, session_id="deferred-owned-session",
+        )
+    assert peer.tool.executions == [{}]
+    if failure == "audit":
+        assert peer.tool.publications == []
+    else:
+        rows = await peer.backend.fetch_all("SELECT result_status FROM a2a_tool_dispatches")
+        assert [tuple(row) for row in rows] == [("success",)]
+        assert peer.tool.publications == ["published-once"]
