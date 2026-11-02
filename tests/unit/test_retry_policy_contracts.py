@@ -478,3 +478,67 @@ async def test_with_retry_rides_out_a_plan_limit_400_then_succeeds():
     with patch("kestrel_sovereign.llm.retry.asyncio.sleep", fake_sleep):
         assert await with_retry(flaky) == "recovered"
     assert calls["n"] == 3
+
+
+# --- Transport failures with no response (dropped pooled connection) ---------
+# 2026-11-02: Meridian's and Emma's turns failed on a single
+# ``anthropic.APIConnectionError("Connection error.")`` 27 ms into opening a
+# stream after a 48 s tool call, i.e. a keep-alive connection the server had
+# already closed. The SDKs' retries are off, so the classifier must own this.
+
+import asyncio
+
+import anthropic
+import httpx
+import openai
+
+_REQ = httpx.Request("POST", "https://api.example.test/v1/messages")
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        anthropic.APIConnectionError(request=_REQ),
+        anthropic.APITimeoutError(request=_REQ),
+        openai.APIConnectionError(request=_REQ),
+        httpx.ConnectError("connect failed", request=_REQ),
+        httpx.ReadError("read failed", request=_REQ),
+        httpx.RemoteProtocolError("server disconnected", request=_REQ),
+    ],
+    ids=lambda e: type(e).__module__.split(".")[0] + "." + type(e).__name__,
+)
+def test_transport_failure_without_response_is_retryable(error):
+    assert is_retryable_error(error)
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        httpx.LocalProtocolError("client sent a malformed request"),
+        httpx.UnsupportedProtocol("ftp is not supported"),
+        asyncio.CancelledError(),
+    ],
+    ids=lambda e: type(e).__name__,
+)
+def test_client_side_and_control_errors_are_not_transport_retries(error):
+    assert not is_retryable_error(error)
+
+
+@pytest.mark.asyncio
+async def test_with_retry_recovers_from_one_dropped_connection():
+    calls = {"n": 0}
+
+    async def flaky():
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise anthropic.APIConnectionError(request=_REQ)
+        return "ok"
+
+    async def fake_sleep(_d):
+        return None
+
+    with patch("kestrel_sovereign.llm.retry.asyncio.sleep", fake_sleep):
+        result = await with_retry(flaky)
+
+    assert result == "ok"
+    assert calls["n"] == 2
