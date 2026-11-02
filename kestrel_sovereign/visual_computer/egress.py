@@ -165,6 +165,54 @@ class ActiveCallEgress:
                 purpose="human-metadata-delivery" if metadata else "human-delivery"):
             yield
 
+    def _require_environment_call(self, call):
+        """Authenticate one finite original same-map cleanup owner; grant no IO."""
+        from .runpod_environment import _OriginalRunpodQuote
+        from .runpod_lifecycle import _OriginalRunpodInspect, _OriginalRunpodRelease
+
+        if (type(call) not in (_OriginalRunpodQuote, _OriginalRunpodInspect, _OriginalRunpodRelease)
+                or call._host._runtime.egress is not self
+                or self._calls.get(call._key) is not call
+                or call._loop is not asyncio.get_running_loop()):
+            raise OperatorAuthorizationError("Original environment cleanup owner differs")
+
+    def _require_environment_closer(self, call):
+        self._require_environment_call(call)
+        if (asyncio.current_task() is call._owner_task
+                and call._used and not call._finished.done()):
+            raise pending_owned_retirement_error(call, (call._owner_task,),
+                message="original environment operation cannot acknowledge its own retirement")
+
+    async def _close_environment_call(self, call):
+        self._require_environment_closer(call)
+        call.revoke()
+        if call._used:
+            # This original settlement Future is published only after the
+            # native helper and its current SQL writer have physically joined.
+            # Observe that SAME Future through repeated caller withdrawal;
+            # there is no new Task admission, check, cloud call or SQL work.
+            outcome = await await_owned_task(call._finished)
+            raise_owned_outcome(outcome, operation="original environment invocation", retain_originals=True)
+
+    @asynccontextmanager
+    async def _activate_environment_quote(self, call):
+        from .runpod_environment import _OriginalRunpodQuote
+        from .runpod_lifecycle import _OriginalRunpodInspect, _OriginalRunpodRelease
+        if (type(call) not in (_OriginalRunpodQuote, _OriginalRunpodInspect, _OriginalRunpodRelease) or call._host._runtime.egress is not self
+                or call._owner_task is not asyncio.current_task() or call._key in self._calls):
+            raise OperatorAuthorizationError('Original environment quote owner required')
+        self._calls[call._key] = call
+        try:
+            call._require_origin()
+            yield
+        finally:
+            try:
+                await self._close_environment_call(call)
+            finally:
+                if self._calls.get(call._key) is call:
+                    self._calls.pop(call._key)
+
+
     @asynccontextmanager
     async def _activate(self, session, action_id, check, *, deadline, purpose):
         valid_session = ((purpose == "action" and session.state == "ready" and session.controller == "agent")
@@ -263,16 +311,29 @@ class ActiveCallEgress:
         """Priority safety path; close every exact owner's active RPC borrow."""
         owner = (scope.tenant_id, scope.principal_id, scope.agent_id, session_id)
         calls = [call for key, call in self._calls.items() if key[:4] == owner]
+        # Validate the closed family before changing any owner's admission.
         for call in calls:
-            call.active = False
+            if type(call) is not _ActiveCall:
+                self._require_environment_call(call)
         for call in calls:
-            call._require_external_closer()
+            if type(call) is _ActiveCall:
+                call.active = False
+            else:
+                call._active = False
+        for call in calls:
+            if type(call) is _ActiveCall:
+                call._require_external_closer()
+            else:
+                self._require_environment_closer(call)
         for call in calls:
             call.revoke()
         withdrawal = None
         for call in calls:
             try:
-                await call.close()
+                if type(call) is _ActiveCall:
+                    await call.close()
+                else:
+                    await self._close_environment_call(call)
             except asyncio.CancelledError as error:
                 withdrawal = withdrawal or error
         if withdrawal is not None:

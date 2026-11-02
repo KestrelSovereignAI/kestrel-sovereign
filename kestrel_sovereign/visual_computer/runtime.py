@@ -21,7 +21,8 @@ from kestrel_sdk.computer_use import (
     ActionRequest, ControlRequest,
     EnvironmentRequest, SessionRequest,
 )
-from kestrel_sdk.resources import ResourceConflict, ResourceError, ResourceNotFound, ResourceOutcomeUnknown, ResourceScope
+from kestrel_sdk.resources import ResourceConflict, ResourceError, ResourceNotFound, ResourceOutcomeUnknown, ResourceScope, ResourceUnsupported
+from kestrel_sdk.computer_use.acquisition import CustodiedEnvironmentProvider
 from kestrel_sdk.operator import OperatorAuthorizationError
 
 from .dispatch import original_dispatch, NativeActionNotDispatched
@@ -236,6 +237,49 @@ class VisualComputerRuntime:
                 or (opening and (session.state != "ready" or session.control_epoch != 0))):
             raise ResourceConflict("computer session does not match admitted custody")
 
+    @staticmethod
+    def _custodied_provider(provider):
+        if isinstance(provider, CustodiedEnvironmentProvider):
+            if not callable(getattr(provider, 'acquire_with_custody', None)):
+                raise ResourceUnsupported('provider acquisition custody negotiation is invalid')
+            return True
+        if hasattr(provider, 'acquire_with_custody'):
+            raise ResourceUnsupported('provider acquisition custody contract is incomplete')
+        return False
+
+    def _native_quote_host(self, provider):
+        from .runpod_environment import RunpodEnvironmentHost
+        version = getattr(provider, 'native_environment_host_api_version', None)
+        host = getattr(provider, 'environment_host', None)
+        if version is None and host is None:
+            return None
+        if (type(version) is not int or version != 1 or type(host) is not RunpodEnvironmentHost
+                or host.api_version != 1 or host._runtime is not self or host._provider is not provider
+                or not self._custodied_provider(provider)):
+            raise ResourceUnsupported('Native environment quote custody negotiation is incomplete')
+        return host
+
+    def _native_lifecycle_host(self, provider):
+        from .runpod_environment import RunpodEnvironmentHost
+        version = getattr(provider, 'native_environment_lifecycle_api_version', None)
+        host = getattr(provider, 'environment_host', None)
+        if (type(version) is not int or version != 1 or type(host) is not RunpodEnvironmentHost
+                or host.lifecycle_api_version != 1 or host._runtime is not self
+                or host._provider is not provider or self._native_quote_host(provider) is not host):
+            raise ResourceUnsupported('Native current environment lifecycle negotiation is incomplete')
+        return host
+
+    async def _acquire_custodied(self, context, record, check, provider):
+        from .storage_acquisition import _CoreAcquisitionCustody
+        scope = self.scope(context)
+        custody = _CoreAcquisitionCustody(self.repository, scope, record, guard=check)
+        lease = await self._call(context, check, provider.acquire_with_custody,
+            record.request, record.quote, custody)
+        self._lease(record, lease, acquiring=True)
+        # The same original operation's accepted native ACK is mandatory.
+        # Reload its exact ciphertext/revision instead of saving a stale DTO.
+        return await self.repository._accepted_acquisition(scope, custody, lease, check)
+
     async def admit(self, context, request):
         async with self.operation(context, VisualAction.ADMIT) as check:
             request = self._request(context, request)
@@ -249,25 +293,51 @@ class VisualComputerRuntime:
                     raise ResourceConflict("original request retired without acquisition; use a new request ID")
                 if record.phase not in {"admitted", "quoted"}:
                     raise ResourceOutcomeUnknown("existing request requires original-ID reconciliation")
+                native_quote = record.remote_environment is not None
                 try:
                     provider = self._provider(record)
+                    native_quote = native_quote or (getattr(provider, "native_environment_host_api_version", None) is not None
+                        or getattr(provider, "environment_host", None) is not None)
+                    custodied = self._custodied_provider(provider)
+                    quote_host = self._native_quote_host(provider)
+                    if quote_host is not None and record.quote is not None and record.remote_environment is None:
+                        raise ResourceUnsupported('Original private native environment quote is absent; no retrofit')
+                    if record.remote_environment is not None:
+                        if quote_host is None:
+                            raise ResourceUnsupported('Original native environment quote custody is required; fallback forbidden')
+                        async with quote_host._activate_quote(context, record) as original_quote:
+                            original_quote.restore_original()
                     if record.quote is None:
                         capabilities = await self._call(context, check, provider.capabilities)
                         if (capabilities.provider_id != request.provider_id or capabilities.location != request.location
                                 or request.surface not in capabilities.surfaces
                                 or not request.required_capabilities <= capabilities.operations):
                             raise ResourceConflict("provider capabilities do not satisfy visual request")
-                        quote = await self._call(context, check, provider.quote, request)
-                        self._quote(record, quote)
-                        record.quote, record.phase = quote, "quoted"
-                        await self.repository.save(self.scope(context), record, check)
+                        if quote_host is not None:
+                            async with quote_host._activate_quote(context, record) as original_quote:
+                                quote = await self._call(context, check, provider.quote, request)
+                                self._quote(record, quote)
+                                if self._native_quote_host(provider) is not quote_host:
+                                    raise ResourceUnsupported('Native environment quote custody changed')
+                                record = await self.repository._accepted_runpod_quote(self.scope(context), original_quote, quote)
+                        else:
+                            quote = await self._call(context, check, provider.quote, request)
+                            self._quote(record, quote)
+                            record.quote, record.phase = quote, "quoted"
+                            await self.repository.save(self.scope(context), record, check)
                     self._quote(record, record.quote)
-                    record.phase = "acquiring"
-                    await self.repository.save(self.scope(context), record, check)
+                    if self._custodied_provider(provider) != custodied:
+                        raise ResourceUnsupported('provider acquisition custody negotiation changed')
+                    if custodied:
+                        record = await self._acquire_custodied(context, record, check, provider)
+                    else:
+                        record.phase = "acquiring"
+                        await self.repository.save(self.scope(context), record, check)
                     return await self._acquire_open(context, record, check)
                 except BaseException as original:
                     try:
-                        await self.repository.retire_unacquired(self.scope(context), record, at=self._now())
+                        await self.repository.retire_unacquired(self.scope(context), record, at=self._now(),
+                            guard=check if native_quote else None)
                     except ResourceConflict:
                         pass  # Acquiring/unknown or a newer owner remains charged.
                     except BaseException as retirement_error:
@@ -276,14 +346,26 @@ class VisualComputerRuntime:
 
     async def _acquire_open(self, context, record, check):
         scope, provider = self.scope(context), self._provider(record)
-        # Re-enter only through explicit request reconciliation. acquire is
-        # idempotent for this exact admitted request/accepted quote.
+        # Re-enter only through explicit request reconciliation. The existing
+        # deterministic provider contract is idempotent for this exact request
+        # and accepted quote. A custody provider never falls through to it.
         if record.lease is None:
+            if self._custodied_provider(provider) and record.acquisition is None:
+                raise ResourceOutcomeUnknown('custodied provider requires original quoted admission; uncustodied create is forbidden')
+            if record.acquisition is not None:
+                raise ResourceOutcomeUnknown('original custodied acquisition has no native resource ID; create replay is forbidden')
             lease = await self._call(context, check, provider.acquire, record.request, record.quote)
             self._lease(record, lease, acquiring=True)
             record.lease, record.phase = lease, "leased"
             await self.repository.save(scope, record, check)
         lease = record.lease
+        if record.remote_environment is not None:
+            host = self._native_lifecycle_host(provider)
+            async with host._activate_inspect(context, record) as original:
+                inspected = await self._call(context, check, provider.inspect, scope, lease)
+                record = await self.repository._accepted_runpod_lifecycle(scope, original, inspected)
+            # API placement facts cannot supply a supported isolated remote worker.
+            raise ResourceUnsupported('Remote browser bootstrap and authenticated worker transport are unverified')
         connection = record.connection or await self._call(context, check, provider.connect, scope, lease)
         if (connection.lease_id != lease.lease_id or connection.expires_at > lease.expires_at
                 or connection.expires_at <= self._now()):
@@ -694,6 +776,14 @@ class VisualComputerRuntime:
                 raise ResourceOutcomeUnknown("unknown acquisition retains request cleanup custody")
             if record.phase == "released":
                 return {"session_id": session_id, "released": True}
+            if record.remote_environment is not None:
+                provider = self._provider(record)
+                host = self._native_lifecycle_host(provider)
+                async with host._activate_release(context, record) as original:
+                    lease = await self._call(context, check, provider.release, scope, record.lease)
+                    self._lease(record, lease, releasing=True)
+                    record = await self.repository._accepted_runpod_lifecycle(scope, original, lease)
+                return {"session_id": session_id, "released": False}
             await self._begin_release(scope, record, check)
             # Physical destruction has its own verb and outcome. A timeout
             # does not erase the original lease/connection or claim release.
@@ -760,6 +850,13 @@ class VisualComputerRuntime:
         uncertain = []
         for record in await self.repository.records(scope):
             if record.phase in {"released", "retired"}:
+                continue
+            if record.remote_environment is not None:
+                # Resident fixed-lifetime custody supplies no original current
+                # sovereign RELEASE grant. Fence/drain, retain the row and debt.
+                self._fence(scope, record.session_id)
+                await self.egress.revoke_session(scope, record.session_id)
+                uncertain.append(record.session_id)
                 continue
             if record.lease is None:
                 if record.phase in {"admitted", "quoted"} and record.request.expires_at <= self._now():

@@ -276,3 +276,42 @@ Visual prompts, images, answers and provider exception chains are withheld from
 LLM telemetry. Content-free model/usage/failure classification remains available.
 Private artifact/computer HTTP URLs are excluded before optional OTel span
 construction; access and inner error paths redact private identifiers as well.
+
+## Current remote control-plane custody
+
+The optional Runpod source adapter uses the same encrypted request row and native
+SQL journal as local sessions. It requires public SDK 0.45 acquisition contracts
+and separately negotiated Core native HTTP admission API 2, acquisition capability
+1, environment quote capability 1 and current lifecycle capability 1. A package
+version alone does not establish those capabilities. The matching vendor source
+must provide its canonical prepared producer, bounded private plan codec and
+identity-encoding quote/lifecycle profiles; no provider entrypoint is registered.
+
+An original current ADMIT operation may capture the exact catalog plan, independent
+capabilities, quote, account/credential selector and native TLS/source bindings in
+one quoted CAS and native COMMIT/reset acknowledgment. The original preparation
+then retains the exact create bytes and worker identity on that same row. Only the
+original dispatch checkpoint acknowledgment arms one native create. Lost or unknown
+acknowledgments, including unknown creates without a Pod ID, never permit replay.
+The native producer must persist its bounded non-cost identity/UNKNOWN fact before
+optional cost parsing; a returned provider DTO cannot replace that acknowledgment.
+
+Current quote/inspect/release writes use a distinct closed current owner alongside
+Step. They cannot enter Signal, Action, Human or Acquisition late-result privileges. Both
+current owners share the existing native SQLite/PG engine, physical backing and
+COMMIT/reset seals. Step's owner-row capacity lock, auxiliary relation checks and
+planning-row discriminator remain intact. Late native Acquisition facts grant no
+new request, parse, data delivery, release or other I/O authority.
+
+Inspect requires a current original ADMIT grant. Foreground release requires a
+separate current RELEASE grant and drains older calls before activating itself;
+its exact intent acknowledgment precedes the original-ID GET/DELETE. A native 204
+is retained only as a control-plane fact: SDK state remains UNKNOWN, SQL released
+remains false and billing/physical teardown remain unverified. No lease ID, plan,
+encrypted row, runtime generation or source signature restores sovereign RELEASE
+after a restart. Maintenance retains the original Pod/cost debt instead of issuing
+automatic DELETE. A fresh explicit foreground release is the supported recovery.
+
+The current strict CPU profile does not establish an authenticated isolated remote
+browser. Connect/bootstrap, renewal, remote worker/display transport, native amd64
+admission and physical cloud billing/termination conformance remain unsupported.

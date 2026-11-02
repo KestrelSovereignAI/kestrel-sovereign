@@ -2523,7 +2523,7 @@ class PostgresBackend(DatabaseBackend):
                     values = self._strip_tz(entry.values)
                     status = await connection.execute(query, *values)
                     journal.require_original(self)
-                    if status != ('INSERT 0 1' if step and journal._mode == 'claim' else 'UPDATE 1' if relation.relation_name == 'visual_computer_actions' else 'INSERT 0 1'):
+                    if status != ('INSERT 0 1' if step and journal._mode == 'claim' else 'UPDATE 1' if relation.relation_name in {'visual_computer_actions', 'visual_computer_requests'} else 'INSERT 0 1'):
                         raise journal.write_refusal('row_count')
                     matches = await connection.fetch(match_query, *values)
                     journal.require_original(self)
@@ -2555,6 +2555,12 @@ class PostgresBackend(DatabaseBackend):
                 _ORIGINAL_POSTGRES_CONNECT.reset(connect_token)
         return entry.result_summary
 
+    async def _commit_current_runpod_quote(self, journal):
+        from .native_row_custody import _current_quote
+        if not _current_quote(journal):
+            raise ExecutionAuthorityError('Exact current Runpod quote required')
+        return await self._write_native_row(journal)
+
     async def _commit_current_visual_step(self, journal):
         from .native_row_custody import _current_step
         if not _current_step(journal):
@@ -2565,6 +2571,12 @@ class PostgresBackend(DatabaseBackend):
         from .original_result_custody import _original_result_profile
         if _original_result_profile(journal)[0] != 'visual_computer_actions':
             raise ExecutionAuthorityError('Original action result profile required')
+        return await self._write_original_result(journal)
+
+    async def _settle_original_acquisition_result(self, journal):
+        from .original_result_custody import _original_result_profile
+        if _original_result_profile(journal)[0] != 'visual_computer_requests':
+            raise ExecutionAuthorityError('Original acquisition result profile required')
         return await self._write_original_result(journal)
 
     async def purge_retired_ephemeral_session(self, wrapper, *, reason: str):

@@ -37,6 +37,7 @@ from kestrel_sovereign.execution_custody import (
 )
 
 NATIVE_SYNC_HTTP_ADMISSION_API_VERSION = 2
+NATIVE_SYNC_HTTP_ACQUISITION_API_VERSION = 1
 _Result = TypeVar("_Result")
 
 
@@ -136,6 +137,8 @@ class _ThreadOperation:
     sent: bool = False
     sockets: set[_SocketBorrow] = field(default_factory=set)
     requests: set[_Request] = field(default_factory=set)
+    acquisition: object | None = None
+    environment_quote: object | None = None
 
     def cancel(self, _task):
         # Do NOT cancel asyncio.to_thread's Task: that loses the running native
@@ -161,6 +164,9 @@ class _Request:
             borrow = _SocketBorrow(original_socket)
             self.borrows[original_socket] = borrow
             self.thread.sockets.add(borrow)
+            acquisition = _native_request_owner(self)
+            if acquisition is not None:
+                acquisition._socket_borrowed(original_socket, self)
 
     def retire_sockets(self):
         # Do this BEFORE native response.close returns the connection to its
@@ -180,6 +186,11 @@ class _Request:
                 raise ExecutionAuthorityError("synchronous HTTP requires an original restriction")
             for restriction in self.restrictions:
                 restriction.check()
+            acquisition = _native_request_owner(self)
+            if acquisition is not None:
+                # The original row owner's restriction is additional to all
+                # existing native admission, never supplied by a callback.
+                acquisition.check_parse_current()
             # Restriction callbacks can synchronously retire the original turn.
             # They never supply or replace Core's native execution admission.
             _require_sync_work(self.validators)
@@ -193,6 +204,26 @@ def _request(client):
         raise ExecutionAuthorityError("native synchronous IO has no original request")
     request.check()
     return request
+
+
+def _native_request_owner(request):
+    acquisition = request.thread.acquisition if request.thread is not None else None
+    quote = request.thread.environment_quote if request.thread is not None else None
+    if acquisition is not None and quote is not None:
+        raise ExecutionAuthorityError('Native request has conflicting original owners')
+    if acquisition is not None:
+        from kestrel_sovereign.visual_computer.acquisition_native import _NativeAcquisitionHandle
+        if type(acquisition) is not _NativeAcquisitionHandle:
+            raise ExecutionAuthorityError('Exact original acquisition handle required')
+        acquisition._require_worker(request)
+        return acquisition
+    if quote is not None:
+        from kestrel_sovereign.visual_computer.runpod_environment import _OriginalRunpodQuote
+        from kestrel_sovereign.visual_computer.runpod_lifecycle import _OriginalRunpodNativeStage
+        if type(quote) not in (_OriginalRunpodQuote, _OriginalRunpodNativeStage):
+            raise ExecutionAuthorityError('Exact original quote owner required')
+        quote._require_worker(request)
+    return quote
 
 
 class _Stream(httpcore.NetworkStream):
@@ -297,7 +328,13 @@ class _Body(httpx.SyncByteStream):
             self.request.check()
             for data in self.original:
                 self.request.check()
+                acquisition = _native_request_owner(self.request)
+                if acquisition is not None:
+                    acquisition._raw_chunk(data, self.request)
                 yield data
+            acquisition = _native_request_owner(self.request)
+            if acquisition is not None:
+                acquisition._body_exhausted(self.request)
         except BaseException as original:
             try:
                 self.response.close()
@@ -310,6 +347,9 @@ class _Body(httpx.SyncByteStream):
     def close(self):
         self.request.retire_sockets()
         self.original.close()
+        acquisition = _native_request_owner(self.request)
+        if acquisition is not None:
+            acquisition._body_closed(self.request)
         if self.request.thread is not None:
             self.request.thread.requests.discard(self.request)
         self.request.check()  # Native close can block after the last body read.
@@ -427,12 +467,17 @@ def _install(client):
         if type(timeout) is not dict or set(timeout) != {"connect", "read", "write", "pool"}:
             raise TypeError("synchronous HTTP requires explicit native timeouts")
         _bounded_timeouts(timeout.values())
+        acquisition = _native_request_owner(original)
+        if acquisition is not None:
+            acquisition._request_started(request, original)
         response = native_dispatch(request)
         original.response = response
         if original.thread is not None:
             original.thread.requests.add(original)
         response.stream = _Body(response, response.stream, original)
         try:
+            if acquisition is not None:
+                acquisition._response_started(response, original)
             original.check()
         except BaseException as denial:
             try:
@@ -491,7 +536,8 @@ def bind_native_sync_http_execution_admission(
 
 
 async def await_native_sync_http(
-    client: httpx.Client, operation: Callable[[httpx.Client], _Result]
+    client: httpx.Client, operation: Callable[[httpx.Client], _Result], *,
+    _original_acquisition=None, _original_quote=None, _original_lifecycle=None,
 ) -> _Result:
     """Run/join native work on its original thread through caller cancellation.
 
@@ -500,6 +546,22 @@ async def await_native_sync_http(
     unconsumed stream or detach a worker. Cancellation fences/shuts down only
     this operation's exact retained sockets and physically joins the thread.
     """
+    if _original_lifecycle is not None:
+        from kestrel_sovereign.visual_computer.runpod_lifecycle import _OriginalRunpodNativeStage
+        if (type(_original_lifecycle) is not _OriginalRunpodNativeStage
+                or _original_quote is not None or _original_acquisition is not None):
+            raise ExecutionAuthorityError('Exact original current lifecycle stage required')
+        _original_lifecycle._require_native_invocation(client, operation)
+    if _original_quote is not None:
+        from kestrel_sovereign.visual_computer.runpod_environment import _OriginalRunpodQuote
+        if type(_original_quote) is not _OriginalRunpodQuote or _original_acquisition is not None:
+            raise ExecutionAuthorityError('Exact original current quote required')
+        _original_quote._require_native_invocation(client, operation)
+    if _original_acquisition is not None:
+        from kestrel_sovereign.visual_computer.acquisition_native import _NativeAcquisitionHandle
+        if type(_original_acquisition) is not _NativeAcquisitionHandle:
+            raise ExecutionAuthorityError('Exact original acquisition handle required')
+        return await _original_acquisition._await_original(client, operation)
     if not callable(operation) or inspect.iscoroutinefunction(operation):
         raise TypeError("original native synchronous operation required")
     original = tuple(value for value in _RESTRICTIONS.get() if value.client is client)
@@ -508,7 +570,11 @@ async def await_native_sync_http(
     for restriction in original:
         restriction.check()
     _require_sync_work()
-    thread = _ThreadOperation()
+    thread = _ThreadOperation(environment_quote=_original_quote if _original_quote is not None else _original_lifecycle)
+    if _original_lifecycle is not None:
+        _original_lifecycle._thread = thread
+    if _original_quote is not None:
+        _original_quote._thread = thread
     token = _THREAD.set(thread)
 
     def run():

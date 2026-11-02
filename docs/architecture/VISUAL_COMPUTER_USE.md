@@ -522,3 +522,18 @@ unknown result profile; neither negative action profile grants it authority.
 A never-acquired request whose global turn was cancelled before its retirement
 write remains charged until a fresh genuinely admitted original-owner reconcile
 performs the normal safe-phase CAS. Rebinding the retired turn cannot retire it.
+
+## Optional remote control-plane source
+
+Remote quote/acquisition/current inspect/release contracts require a matching
+capability-bearing Core and vendor release plus SDK 0.45 or later. Installing a
+historical Core version or the SDK alone does not enable a remote provider. There
+is no registered CPU browser provider or silent fallback to an uncustodied create.
+
+The source retains original quote/preparation/Pod identity and uncertain cost on
+the canonical encrypted request row. Unknown create outcomes are reconciled under
+the original ID and are never automatically repeated. An explicit foreground
+RELEASE grant is separate from ADMIT; a cloud API acknowledgment is not proof of
+physical destruction or billing end. Restart maintenance cannot synthesize that
+grant and leaves unresolved custody visible. Authenticated remote browser bootstrap
+and connection are unsupported by this source slice.

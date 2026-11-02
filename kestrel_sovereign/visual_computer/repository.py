@@ -8,6 +8,7 @@ unknown effects; records are never deleted merely because a lease expired.
 from __future__ import annotations
 
 import asyncio
+import base64
 import hashlib
 import hmac
 import json
@@ -16,7 +17,7 @@ from datetime import datetime
 from contextlib import asynccontextmanager
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field, SecretBytes
 from kestrel_sdk.computer_use import (
     ActionReceipt, ActionRequest, ComputerSession, ControlRequest, DriverConnection,
     EnvironmentLease, EnvironmentQuote, EnvironmentRequest, ScreenFrame,
@@ -29,10 +30,46 @@ from kestrel_sdk.storage.database.interface import TransactionError
 
 from kestrel_sovereign.execution_custody import execution_commit_outcome
 from .step import PlanningRecord, StepIntent
+from .runpod_quote_storage import _RunpodEnvironmentEnvelope
 
 
 class CustodyIntegrityError(ResourceError):
     """Original encrypted custody cannot be verified; never replace its key."""
+
+
+class _AcquisitionEnvelope(BaseModel):
+    """Private value on the original row, never an independent authority."""
+    model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
+    storage: SecretBytes = Field(exclude=True, repr=False)
+    binding: SecretBytes | None = Field(default=None, exclude=True, repr=False)
+    native_result: SecretBytes | None = Field(default=None, exclude=True, repr=False)
+
+    def private_value(self):
+        from kestrel_sdk.computer_use.acquisition import EnvironmentAcquisitionStorage
+        EnvironmentAcquisitionStorage.deserialize_private(self.storage)
+        # The canonical bounded non-cost phase reserves 1MiB before POST;
+        # prepared native configuration has its separate small allowance.
+        for value, limit in ((self.binding, 16384), (self.native_result, 1024*1024)):
+            if value is not None and not 0 < len(value.get_secret_value()) <= limit:
+                raise CustodyIntegrityError("original acquisition binding exceeds bounds")
+        return {"schema_version": 1, "storage": base64.b64encode(self.storage.get_secret_value()).decode("ascii"),
+            "binding": base64.b64encode(self.binding.get_secret_value()).decode("ascii") if self.binding is not None else None,
+            "native_result": base64.b64encode(self.native_result.get_secret_value()).decode("ascii") if self.native_result is not None else None}
+
+    @classmethod
+    def from_private(cls, value):
+        if type(value) is not dict or set(value) != {"schema_version", "storage", "binding", "native_result"} or type(value["schema_version"]) is not int or value["schema_version"] != 1:
+            raise ValueError("invalid original acquisition envelope")
+        if type(value["storage"]) is not str or len(value["storage"]) > 1398104:
+            raise ValueError("invalid original acquisition storage bounds")
+        for item, limit in ((value["binding"], 21848), (value["native_result"], 1398104)):
+            if item is not None and (type(item) is not str or len(item) > limit):
+                raise ValueError("invalid original acquisition binding bounds")
+        result = cls(storage=SecretBytes(base64.b64decode(value["storage"], validate=True)),
+            binding=SecretBytes(base64.b64decode(value["binding"], validate=True)) if value["binding"] is not None else None,
+            native_result=SecretBytes(base64.b64decode(value["native_result"], validate=True)) if value["native_result"] is not None else None)
+        result.private_value()
+        return result
 
 
 class CustodyRecord(BaseModel):
@@ -54,6 +91,8 @@ class CustodyRecord(BaseModel):
     human_private: bool = False
     human_control_id: str | None = None
     human_control_epoch: int | None = None
+    acquisition: _AcquisitionEnvelope | None = Field(default=None, exclude=True, repr=False)
+    remote_environment: _RunpodEnvironmentEnvelope | None = Field(default=None, exclude=True, repr=False)
     phase: Literal["retired", "admitted", "quoted", "acquiring", "leased", "opening", "active", "fenced", "unknown", "releasing", "released"] = "admitted"
 
 
@@ -227,14 +266,85 @@ class VisualCustodyRepository:
         if isinstance(value, CustodyRecord) and value.connection is not None:
             payload["connection"].update(endpoint=value.connection.endpoint.get_secret_value(),
                                          credential=value.connection.credential.get_secret_value())
+        if isinstance(value, CustodyRecord) and value.acquisition is not None:
+            payload["acquisition"] = value.acquisition.private_value()
+        if isinstance(value, CustodyRecord) and value.remote_environment is not None:
+            payload["remote_environment"] = value.remote_environment.private_value()
         return AEADCipher(self._key).encrypt(json.dumps(payload).encode(), aad=f"{owner}:{identity}".encode())
 
     def _open(self, owner, identity, payload, model, *, key=None):
         try:
             plain = AEADCipher(key or self._key).decrypt(bytes(payload), aad=f"{owner}:{identity}".encode())
-            return model.model_validate_json(plain)
-        except (DecryptionError, ValueError):
+            value = json.loads(plain)
+            if type(value) is not dict:
+                raise ValueError("visual custody requires an object")
+            acquisition = None
+            remote_environment = None
+            if model is CustodyRecord and "acquisition" in value:
+                acquisition = _AcquisitionEnvelope.from_private(value.pop("acquisition"))
+            if model is CustodyRecord and "remote_environment" in value:
+                remote_environment = _RunpodEnvironmentEnvelope.from_private(value.pop("remote_environment"))
+            record = model.model_validate_json(json.dumps(value))
+            if remote_environment is not None:
+                record.remote_environment = remote_environment
+            if acquisition is not None:
+                record.acquisition = acquisition
+                self._validate_acquisition_record(record)
+            if model is CustodyRecord:
+                self._validate_remote_record(record)
+            return record
+        except (DecryptionError, ValueError, TypeError, KeyError, ResourceConflict):
             raise CustodyIntegrityError("visual custody verification failed") from None
+
+    @staticmethod
+    def _validate_remote_record(record):
+        remote = record.remote_environment
+        if remote is None:
+            return
+        if record.quote is None or remote.capabilities != record.quote.capabilities:
+            raise CustodyIntegrityError('Original remote quote capabilities absent or changed')
+        if record.acquisition is None:
+            if record.phase not in {'quoted', 'retired'} or remote.prepared is not None:
+                raise CustodyIntegrityError('Original remote quote requires native acquisition custody')
+            return
+        from kestrel_sdk.computer_use.acquisition import EnvironmentAcquisitionStorage
+        import hashlib
+        storage = EnvironmentAcquisitionStorage.deserialize_private(record.acquisition.storage)
+        correlation = remote.prepared
+        if correlation is not None and (storage.preparation is None
+                or correlation.plan_sha256 != remote.plan_digest
+                or hashlib.sha256(storage.preparation.create_payload.get_secret_value()).hexdigest() != correlation.create_sha256
+                or hashlib.sha256(storage.preparation.worker_identity.get_secret_value()).hexdigest() != correlation.worker_identity_sha256):
+            raise CustodyIntegrityError('Original remote preparation correlation differs')
+
+    @staticmethod
+    def _validate_acquisition_record(record):
+        from kestrel_sdk.computer_use.acquisition import EnvironmentAcquisitionStorage
+        if record.acquisition is None:
+            return
+        if record.quote is None:
+            raise CustodyIntegrityError("original acquisition quote absent")
+        checkpoint = EnvironmentAcquisitionStorage.deserialize_private(record.acquisition.storage).checkpoint
+        checkpoint.require_original(record.request, record.quote)
+        derivatives = (record.connection, record.session, record.frame, record.pending_control,
+            record.last_control, record.control_receipt)
+        human_effects = (record.human_private or record.human_control_id is not None
+            or record.human_control_epoch is not None)
+        if checkpoint.state in {"unprepared", "prepared"}:
+            if (record.phase not in {"quoted", "retired"} or record.lease is not None
+                    or human_effects or any(value is not None for value in derivatives)):
+                raise CustodyIntegrityError("undispatched original acquisition has effect facts")
+        elif record.phase in {"admitted", "quoted", "retired"}:
+            raise CustodyIntegrityError("original dispatch cannot become unacquired")
+        if checkpoint.lease is None and (record.lease is not None or human_effects
+                or any(value is not None for value in derivatives)):
+            raise CustodyIntegrityError("original acquisition has no authenticated resource fact")
+        if checkpoint.lease is not None:
+            if record.acquisition.native_result is None:
+                raise CustodyIntegrityError("original acquisition native phase absent")
+            if record.lease is None or any(getattr(record.lease, name) != getattr(checkpoint.lease, name)
+                    for name in ("lease_id", "request_id", "quote_id", "scope", "provider_id", "location", "expires_at", "provider_resource_id")):
+                raise CustodyIntegrityError("original acquisition resource identity changed")
 
     @asynccontextmanager
     async def _transaction(self, guard=None, *, write=True):
@@ -283,6 +393,31 @@ class VisualCustodyRepository:
                 raise ResourceNotFound("visual custody not found")
             return self._open(owner, row[0], row[1], CustodyRecord)
 
+    async def _accepted_acquisition(self, scope, custody, lease, guard):
+        """Read the exact ACKed row under fresh ordinary original admission.
+
+        A returned provider DTO cannot replace a checkpoint, revive a row or
+        overwrite a concurrently advanced revision. This is no late-write path.
+        """
+        from .storage_acquisition import _CoreAcquisitionCustody
+        if type(custody) is not _CoreAcquisitionCustody:
+            raise ResourceConflict('original host acquisition custody required')
+        proof = custody._accepted(self, scope, lease)
+        root, ack = proof.root, proof.ack
+        async with self._transaction(guard, write=False):
+            owner = self._owner(scope)
+            row = await self.db.fetchone('SELECT payload, revision, session_key, released, retired FROM visual_computer_requests WHERE owner = ? AND request_id = ?',
+                (owner, custody._record.request.request_id))
+            if (row is None or root._identity != (owner, custody._record.request.request_id, row[2])
+                    or bytes(row[0]) != ack.entry.values[0] or row[1] != ack.entry.values[1]
+                    or row[3] != 0 or row[4] != 0):
+                raise ResourceConflict('original acquisition checkpoint changed; reconcile')
+            current = self._open(owner, custody._record.request.request_id, row[0], CustodyRecord)
+            if (current.phase != 'leased' or current.session_id != custody._record.session_id
+                    or current.lease is None or current.lease.model_dump_json().encode() != proof.lease_json):
+                raise ResourceConflict('original accepted acquisition facts differ')
+            return current
+
     async def save(self, scope, record, guard=None):
         async with self._transaction(guard):
             owner = self._owner(scope)
@@ -293,6 +428,14 @@ class VisualCustodyRepository:
             previous = self._open(owner, record.request.request_id, original[0], CustodyRecord)
             if previous.request != record.request or previous.session_id != record.session_id:
                 raise ResourceConflict("original visual custody identity changed")
+            if previous.acquisition != record.acquisition:
+                raise ResourceConflict("original acquisition requires its native checkpoint CAS")
+            if previous.remote_environment != record.remote_environment:
+                raise ResourceConflict("original remote environment requires its current native quote CAS")
+            if previous.remote_environment is not None and previous.quote != record.quote:
+                raise ResourceConflict('Original remote quote cannot be repriced')
+            self._validate_acquisition_record(record)
+            self._validate_remote_record(record)
             if previous.phase == "retired":
                 if record != previous:
                     raise ResourceConflict("retired visual custody is immutable")
@@ -323,7 +466,9 @@ class VisualCustodyRepository:
 
     @staticmethod
     def _unacquired(record):
-        return (record.phase in {"admitted", "quoted"} and not record.human_private
+        from kestrel_sdk.computer_use.acquisition import EnvironmentAcquisitionStorage
+        no_dispatch = record.acquisition is None or EnvironmentAcquisitionStorage.deserialize_private(record.acquisition.storage).checkpoint.state in {"unprepared", "prepared"}
+        return (no_dispatch and record.phase in {"admitted", "quoted"} and not record.human_private
             and record.human_control_id is None and record.human_control_epoch is None
             and all(value is None for value in (
             record.lease, record.connection, record.session, record.frame, record.pending_control,
@@ -365,6 +510,153 @@ class VisualCustodyRepository:
             if count != 1:
                 raise ResourceConflict("original retirement changed concurrently")
             return retired
+
+    @asynccontextmanager
+    async def original_acquisition_result(self, scope, record, request, quote, *, guard):
+        """Reserve the exact existing quoted row; allocate its attempt only once.
+
+        Legacy possible-effect phases are not a new acquisition opportunity.
+        Capture and each CAS finish before yielding to a native producer.
+        """
+        from kestrel_sovereign.storage.original_acquisition_result import (
+            _AcceptedAcquisitionResult, _OriginalAcquisitionResult,
+        )
+        from .storage_acquisition import _CoreAcquisitionAttempt
+        from kestrel_sovereign.execution_sync_http import _check_sync_restriction
+        def checked_guard():
+            _check_sync_restriction(guard)
+        result = acceptance = None
+        try:
+            async with self._transaction(checked_guard, write=False):
+                owner = self._owner(scope)
+                row = await self.db.fetchone("SELECT session_key, payload, revision, released, retired FROM visual_computer_requests WHERE owner = ? AND request_id = ?", (owner, request.request_id))
+                if row is None:
+                    raise ResourceNotFound("original acquisition request absent")
+                original = self._open(owner, request.request_id, row[1], CustodyRecord)
+                if (request.scope != scope or original.request != request or original.quote != quote
+                        or original.session_id != record.session_id or original.revision != record.revision
+                        or original.revision != row[2] or row[0] != self._address("session", record.session_id)
+                        or original != record or row[3] or row[4]
+                        or (original.acquisition is None and (original.phase != 'quoted' or not self._unacquired(original)))):
+                    raise ResourceConflict("original acquisition custody differs or may already have dispatched")
+                plain = AEADCipher(self._key).decrypt(bytes(row[1]), aad=f'{owner}:{request.request_id}'.encode())
+                acceptance = _AcceptedAcquisitionResult(asyncio.current_task(),
+                    (owner, request.request_id, row[0]), bytes(row[1]), plain, row[2], guard)
+                self._original_results[acceptance] = None
+                result = _OriginalAcquisitionResult(self, acceptance)
+            from kestrel_sovereign.storage.db.sqlite import SQLiteBackend
+            backend = self.db.backend
+            if type(backend) is SQLiteBackend:
+                result._sqlite_relation = await backend._read_original_signal_outcome_relation(result, capture=True)
+                if result._sqlite_relation is None:
+                    raise CustodyIntegrityError("original acquisition requires its plain native relation")
+            else:
+                result._postgres_relation = await backend._capture_original_signal_outcome_relation(result)
+            result._query, result._match_query = result._fixed_queries()
+            await result.allocate(request, quote)
+            yield _CoreAcquisitionAttempt(result)
+        finally:
+            if result is not None:
+                await result.aclose()
+            elif acceptance is not None:
+                self._original_results.pop(acceptance, None)
+
+    @asynccontextmanager
+    async def _current_runpod_quote(self, operation):
+        from .runpod_environment import _OriginalRunpodQuote
+        from kestrel_sovereign.storage.current_runpod_quote import (
+            _AcceptedCurrentQuote, _CurrentRunpodQuoteMutation,
+        )
+        from .runpod_lifecycle import _OriginalRunpodInspect, _OriginalRunpodRelease
+        lifecycle = type(operation) in (_OriginalRunpodInspect, _OriginalRunpodRelease)
+        if type(operation) is not _OriginalRunpodQuote and not lifecycle:
+            raise CustodyIntegrityError('Exact original current environment operation required')
+        operation._check_original()
+        root = acceptance = None
+        try:
+            record, scope = operation._record, operation._record.request.scope
+            async with self._transaction(operation._check_original, write=False):
+                owner = self._owner(scope)
+                row = await self.db.fetchone('SELECT session_key, payload, revision, released, retired FROM visual_computer_requests WHERE owner = ? AND request_id = ?',
+                    (owner, record.request.request_id))
+                if row is None:
+                    raise ResourceNotFound('Original quote request absent')
+                original = self._open(owner, record.request.request_id, row[1], CustodyRecord)
+                invalid = (original != record or row[2] != record.revision or row[3] or row[4]
+                        or row[0] != self._address('session', record.session_id))
+                if lifecycle:
+                    invalid = invalid or (original.remote_environment is None or original.quote is None
+                        or original.lease is None or original.lease.provider_resource_id != operation._pod_id
+                        or original.phase in {"released", "retired"})
+                else:
+                    invalid = invalid or (original.phase != 'admitted' or original.quote is not None
+                        or original.acquisition is not None or original.remote_environment is not None)
+                if invalid:
+                    raise ResourceConflict('Original quote row changed or already quoted')
+                plain = AEADCipher(self._key).decrypt(bytes(row[1]), aad=f'{owner}:{record.request.request_id}'.encode())
+                acceptance = _AcceptedCurrentQuote(operation, asyncio.current_task(),
+                    (owner, record.request.request_id, row[0]), bytes(row[1]), plain, row[2])
+                self._original_results[acceptance] = None
+                root = _CurrentRunpodQuoteMutation(self, acceptance)
+            from kestrel_sovereign.storage.db.sqlite import SQLiteBackend
+            if type(self.db.backend) is SQLiteBackend:
+                root._sqlite_relation = await self.db.backend._read_original_signal_outcome_relation(root, capture=True)
+                if root._sqlite_relation is None:
+                    raise CustodyIntegrityError('Current quote requires its original native relation')
+            else:
+                root._postgres_relation = await self.db.backend._capture_original_signal_outcome_relation(root)
+            root._query, root._match_query = root._fixed_queries()
+            root.check_current()
+            yield root
+        finally:
+            if root is not None:
+                root.close()
+            elif acceptance is not None:
+                self._original_results.pop(acceptance, None)
+
+    async def _accepted_runpod_quote(self, scope, operation, quote):
+        return await self._accepted_current_runpod(scope, operation, quote)
+
+    async def _accepted_runpod_lifecycle(self, scope, operation, lease):
+        return await self._accepted_current_runpod(scope, operation, lease, lifecycle=True)
+
+    async def _accepted_current_runpod(self, scope, operation, value, *, lifecycle=False):
+        from .runpod_environment import _OriginalRunpodQuote
+        from kestrel_sovereign.storage.current_runpod_quote import _CurrentQuoteAck, _CurrentRunpodQuoteMutation
+        from kestrel_sovereign._async_ownership import OwnedTaskAdmission
+        from .runpod_lifecycle import _OriginalRunpodInspect, _OriginalRunpodRelease
+        expected = (_OriginalRunpodInspect, _OriginalRunpodRelease) if lifecycle else (_OriginalRunpodQuote,)
+        if type(operation) not in expected:
+            raise ResourceConflict('Original current environment operation required')
+        operation._require_origin()
+        ack, root = operation._ack, operation._mutation
+        if (type(root) is not _CurrentRunpodQuoteMutation or type(ack) is not _CurrentQuoteAck
+                or root._repository is not self or root._phase != 'closed' or not root._closed.done()
+                or ack is not root._ack or ack is not root._registration.ack
+                or ack.owner is not root or ack.entry is not root._entry
+                or ack.writer is not root._writer_admission or type(ack.writer) is not OwnedTaskAdmission
+                or ack.writer.task is None or not ack.writer.task.done() or ack.writer.task.cancelled()
+                or not (ack.sqlite_connection is root._backing or any(value.acknowledged for value in ack.acknowledgments))
+                or value != (operation._lease if lifecycle else operation._quote)
+                or scope != operation._record.request.scope):
+            raise ResourceConflict('Original current quote native ACK absent or changed')
+        async with self._transaction(operation._check_original, write=False):
+            owner, request_id, session_key = root._identity
+            if owner != self._owner(scope):
+                raise ResourceConflict('Original current quote owner differs')
+            row = await self.db.fetchone('SELECT payload, revision, session_key, released, retired FROM visual_computer_requests WHERE owner = ? AND request_id = ?', (owner, request_id))
+            if (row is None or bytes(row[0]) != ack.entry.values[0] or row[1] != ack.entry.values[1]
+                    or row[2] != session_key or row[3] or row[4]):
+                raise ResourceConflict('Original quote checkpoint changed; reconcile')
+            current = self._open(owner, request_id, row[0], CustodyRecord)
+            if current.remote_environment is None:
+                raise ResourceConflict('Original current environment facts absent')
+            if lifecycle:
+                if current.lease != value or current.remote_environment != operation._projection:
+                    raise ResourceConflict('Original lifecycle facts differ')
+            elif current.phase != 'quoted' or current.quote != value:
+                raise ResourceConflict('Original quoted facts differ')
+            return current
 
     @asynccontextmanager
     async def original_action_result(self, scope, session, request, *, guard):

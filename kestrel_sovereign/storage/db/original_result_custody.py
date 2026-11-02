@@ -18,6 +18,10 @@ def _original_result_profile(journal):
     from kestrel_sovereign.storage.original_human_action_result import _OriginalHumanActionResult
     if type(journal) is _OriginalHumanActionResult:
         return 'visual_computer_actions', {'owner':'TEXT', 'session_key':'TEXT', 'action_id':'TEXT', 'payload':'BLOB', 'pending':'BIGINT'}
+    from kestrel_sovereign.storage.original_acquisition_result import _OriginalAcquisitionResult
+    if type(journal) is _OriginalAcquisitionResult:
+        return 'visual_computer_requests', {'owner':'TEXT', 'request_id':'TEXT', 'session_key':'TEXT',
+            'payload':'BLOB', 'revision':'BIGINT', 'released':'BIGINT', 'retired':'BIGINT'}
     raise ExecutionAuthorityError('Exact original native result owner required')
 
 

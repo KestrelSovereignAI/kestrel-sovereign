@@ -5,7 +5,7 @@ from datetime import UTC, datetime, timedelta
 import pytest
 from kestrel_sdk.computer_use import ActionRequest, ControlRequest
 from kestrel_sdk.operator import OperatorAuthorizationError
-from kestrel_sdk.resources import ResourceConflict, ResourceNotFound, ResourceOutcomeUnknown
+from kestrel_sdk.resources import ResourceConflict, ResourceNotFound, ResourceOutcomeUnknown, ResourceUnsupported
 from kestrel_sovereign.visual_computer.repository import VisualCustodyRepository
 from kestrel_sovereign.visual_computer.runtime import VisualAction, VisualComputerRuntime
 from kestrel_sovereign.privacy import PrivacyMode
@@ -470,3 +470,75 @@ async def test_slow_observation_cannot_overwrite_newer_frame(harness):
             await pending
         record=await h.repository.get(h.runtime.scope(ctx),session_id=session.session_id)
         assert record.frame == newest.frame
+
+
+@pytest.mark.asyncio
+async def test_modern_unknown_without_native_id_never_uses_legacy_create_reconciliation(harness):
+    """A native stored-history fixture grants no new dispatch permission."""
+    from pydantic import SecretBytes
+    from kestrel_sdk.computer_use.acquisition import (
+        EnvironmentAcquisitionCheckpoint, EnvironmentAcquisitionPreparation, EnvironmentAcquisitionStorage,
+    )
+    from kestrel_sovereign.visual_computer.repository import CustodyRecord, _AcquisitionEnvelope
+    h = harness
+    ctx = h.context()
+    request = h.request(ctx)
+    with h.bind(ctx):
+        async with h.runtime.operation(ctx, VisualAction.ADMIT) as check:
+            value = await h.repository.admit(request.scope, CustodyRecord(request=request, session_id='unknown-session'), check)
+            value.quote = await h.adapter.quote(request)
+            value.phase = 'quoted'
+            await h.repository.save(request.scope, value, check)
+            original = EnvironmentAcquisitionPreparation(create_payload=SecretBytes(b'original payload'), worker_identity=SecretBytes(b'original TLS identity'))
+            checkpoint = EnvironmentAcquisitionCheckpoint.from_original('original-attempt', request, value.quote).prepared(original).dispatched().unknown()
+            value.acquisition = _AcquisitionEnvelope(storage=EnvironmentAcquisitionStorage(checkpoint=checkpoint, preparation=original).serialize_private())
+            value.phase = 'acquiring'
+            owner = h.repository._owner(request.scope)
+            await h.db.execute('UPDATE visual_computer_requests SET payload = ? WHERE owner = ? AND request_id = ?',
+                (h.repository._seal(owner, request.request_id, value), owner, request.request_id))
+        for runtime in (h.runtime, VisualComputerRuntime(h.repository, h.runtime.authority,
+                providers=h.runtime.providers, drivers=h.runtime.drivers)):
+            with pytest.raises(ResourceOutcomeUnknown, match='create replay is forbidden'):
+                await runtime.reconcile_request(ctx, request.request_id)
+        current = await h.repository.get(request.scope, request_id=request.request_id)
+        assert current.phase == 'acquiring' and current.lease is None
+        assert current.acquisition == value.acquisition
+        assert h.adapter.acquires == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('extension', ['none', 'partial'])
+async def test_invalid_custody_negotiation_never_falls_back_to_legacy_create(harness, monkeypatch, extension):
+    from types import SimpleNamespace
+    h, ctx = harness, harness.context()
+    if extension == 'none':
+        monkeypatch.setattr(h.adapter, 'acquire_with_custody', None, raising=False)
+        provider = h.adapter
+    else:
+        async def unsupported(*args):
+            pytest.fail('incomplete protocol was invoked')
+        provider = SimpleNamespace(capabilities=h.adapter.capabilities, quote=h.adapter.quote,
+            acquire_with_custody=unsupported)
+    h.runtime.providers['test-provider'] = provider
+    request = h.request(ctx)
+    with h.bind(ctx):
+        with pytest.raises(ResourceUnsupported, match='custody'):
+            await h.runtime.admit(ctx, request)
+        current = await h.repository.get(request.scope, request_id=request.request_id)
+        assert current.phase == 'retired' and current.lease is None
+        assert h.adapter.acquires == 0
+
+
+@pytest.mark.asyncio
+async def test_supported_deterministic_provider_keeps_its_native_pre_save_contract(harness, monkeypatch):
+    h, ctx = harness, harness.context()
+    acquire, stages = h.adapter.acquire, []
+    async def legacy(request, quote):
+        current = await h.repository.get(request.scope, request_id=request.request_id)
+        stages.append(current.phase)
+        return await acquire(request, quote)
+    monkeypatch.setattr(h.adapter, 'acquire', legacy)
+    with h.bind(ctx):
+        session = await h.runtime.admit(ctx, h.request(ctx))
+        assert session.state == 'ready' and h.adapter.acquires == 1
+    assert stages == ['acquiring']

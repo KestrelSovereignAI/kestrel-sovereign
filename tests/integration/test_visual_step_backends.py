@@ -5,7 +5,7 @@ COMMIT/reset, current host gate and execution lifetime is production code.
 """
 
 import asyncio
-from contextlib import contextmanager
+from contextlib import asynccontextmanager, contextmanager
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 
@@ -39,8 +39,8 @@ from tests.integration.test_visual_custody_backends import record
 from tests.unit.visual_computer.conftest import Adapter
 
 
-@pytest_asyncio.fixture
-async def step_host(custody):
+@asynccontextmanager
+async def original_step_host(custody, *, request_id="original"):
     store, reopen = custody
     authority = HostCapabilityAuthority(
         capability="visual-computer",
@@ -95,6 +95,7 @@ async def step_host(custody):
     with bind():
         request = record().request.model_copy(
             update={
+                "request_id": request_id,
                 "required_capabilities": frozenset(
                     {"screenshot", "click", "type", "takeover"}
                 )
@@ -112,6 +113,12 @@ async def step_host(custody):
         revoked=revoked,
         privacy=privacy,
     )
+
+
+@pytest_asyncio.fixture
+async def step_host(custody):
+    async with original_step_host(custody) as host:
+        yield host
 
 
 async def invoke(

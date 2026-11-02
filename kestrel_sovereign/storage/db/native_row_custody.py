@@ -11,8 +11,14 @@ def _current_step(owner):
     return type(owner) is _CurrentVisualStepMutation
 
 
+def _current_quote(owner):
+    from kestrel_sovereign.storage.current_runpod_quote import _CurrentRunpodQuoteMutation
+
+    return type(owner) is _CurrentRunpodQuoteMutation
+
+
 def _current_row(owner):
-    return _current_step(owner)
+    return _current_step(owner) or _current_quote(owner)
 
 
 def _native_row_profile(owner, *, role="primary"):
@@ -38,6 +44,11 @@ def _native_row_profile(owner, *, role="primary"):
                 "pending": "BIGINT",
             }
     elif role == "primary":
+        if _current_quote(owner):
+            return "visual_computer_requests", {
+                "owner": "TEXT", "request_id": "TEXT", "session_key": "TEXT",
+                "payload": "BLOB", "revision": "BIGINT", "released": "BIGINT", "retired": "BIGINT",
+            }
         return _original_result_profile(owner)
     raise ExecutionAuthorityError("Exact closed native relation required")
 
@@ -90,4 +101,24 @@ def _step_row_queries(owner):
     return (
         f"UPDATE {table} AS a SET payload = ?, pending = ? WHERE owner = ? AND session_key = ? AND action_id = ? AND payload = ? AND pending = 1 AND {parent}",
         f"SELECT 1 FROM {table} WHERE payload = ? AND pending = ? AND owner = ? AND session_key = ? AND action_id = ? AND {cast} IS NOT NULL AND ? >= 0",
+    )
+
+
+def _request_row_queries(owner):
+    """The one closed request-row CAS/postmatch program, without admission."""
+    from .sqlite import SQLiteBackend
+
+    if _native_row_profile(owner)[0] != "visual_computer_requests":
+        from kestrel_sovereign.execution_custody import ExecutionAuthorityError
+
+        raise ExecutionAuthorityError("Exact closed request-row program required")
+    table = (
+        "main.visual_computer_requests"
+        if type(owner._backend) is SQLiteBackend
+        else owner._postgres_relation.qualified_name
+    )
+    cast = "?" if type(owner._backend) is SQLiteBackend else "CAST(? AS BYTEA)"
+    return (
+        f"UPDATE {table} SET payload = ?, revision = ? WHERE owner = ? AND request_id = ? AND session_key = ? AND payload = ? AND revision = ? AND released = 0 AND retired = 0",
+        f"SELECT 1 FROM {table} WHERE payload = ? AND revision = ? AND owner = ? AND request_id = ? AND session_key = ? AND {cast} IS NOT NULL AND revision - 1 = ? AND released = 0 AND retired = 0",
     )
