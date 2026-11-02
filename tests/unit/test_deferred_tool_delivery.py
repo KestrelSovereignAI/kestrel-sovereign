@@ -206,6 +206,28 @@ async def test_live_chat_destination_reaches_the_original_publisher_only_after_c
     assert peer.tool.last_result.publication_context is None
 
 
+@pytest.mark.parametrize("active", [True, False])
+async def test_foreign_inline_task_borrows_only_a_live_publication_destination(boundary, active):
+    from contextvars import Context
+    from kestrel_sdk.tools import ToolPublicationContext
+
+    peer = boundary
+    peer.policy.release.set()
+
+    async def call(executor):
+        await executor(peer.binding.name, {})
+
+    with part_collector(host=peer.host, session_id="deferred-owned-session"):
+        executor = peer.host._make_inline_tool_executor("deferred-owned-session")
+        if active:
+            await asyncio.create_task(call(executor), context=Context())
+    if not active:
+        await asyncio.create_task(call(executor), context=Context())
+    expected = ToolPublicationContext(peer.host.did, "deferred-owned-session") if active else None
+    assert peer.tool.publication_contexts == [expected]
+    assert peer.tool.last_result.publication_context is None
+
+
 @pytest.mark.parametrize("path", ["chat", "named", "bound"])
 async def test_pre_tool_refusal_never_executes_or_publishes_a_deferred_result(boundary, path):
     class Refuse(Hook):
