@@ -512,8 +512,8 @@ class _NativeJournalSQLiteConnection(sqlite3.Connection):
             cursor.close()
 
     def _begin_current_row(self, owner):
-        from kestrel_sovereign.storage.current_visual_step import _CurrentVisualStepMutation
-        if type(owner) is not _CurrentVisualStepMutation or self._current_row_owner is not None:
+        from .native_row_custody import _current_row
+        if not _current_row(owner) or self._current_row_owner is not None:
             raise NativeJournalConfigurationError('Exact original current row seal required')
         self._begin_original_journal()
         self._current_row_owner = owner

@@ -276,3 +276,107 @@ Visual prompts, images, answers and provider exception chains are withheld from
 LLM telemetry. Content-free model/usage/failure classification remains available.
 Private artifact/computer HTTP URLs are excluded before optional OTel span
 construction; access and inner error paths redact private identifiers as well.
+
+## Current remote control-plane custody
+
+The optional Runpod source adapter uses the same encrypted request row and native
+SQL journal as local sessions. It requires public SDK 0.45 acquisition contracts
+and separately negotiated Core native HTTP admission API 2, acquisition capability
+1, environment quote capability 1 and current lifecycle capability 1. A package
+version alone does not establish those capabilities. The matching vendor source
+must provide its canonical prepared producer, bounded private plan codec and
+identity-encoding quote/lifecycle profiles; no provider entrypoint is registered.
+
+An original current ADMIT operation may capture the exact catalog plan, independent
+capabilities, quote, account/credential selector and native TLS/source bindings in
+one quoted CAS and native COMMIT/reset acknowledgment. The original preparation
+then retains the exact create bytes and worker identity on that same row. Only the
+original dispatch checkpoint acknowledgment arms one native create. Lost or unknown
+acknowledgments, including unknown creates without a Pod ID, never permit replay.
+The native producer must persist its bounded non-cost identity/UNKNOWN fact before
+optional cost parsing; a returned provider DTO cannot replace that acknowledgment.
+
+Current quote/inspect/release writes use a distinct closed current owner alongside
+Step. They cannot enter Signal, Action, Human or Acquisition late-result privileges. Both
+current owners share the existing native SQLite/PG engine, physical backing and
+COMMIT/reset seals. Step's owner-row capacity lock, auxiliary relation checks and
+planning-row discriminator remain intact. Late native Acquisition facts grant no
+new request, parse, data delivery, release or other I/O authority.
+
+Inspect requires a current original ADMIT grant. Foreground release requires a
+separate current RELEASE grant and drains older calls before activating itself;
+its exact intent acknowledgment precedes the original-ID GET/DELETE. A native 204
+is retained only as a control-plane fact: SDK state remains UNKNOWN, SQL released
+remains false and billing/physical teardown remain unverified. No lease ID, plan,
+encrypted row, runtime generation or source signature restores sovereign RELEASE
+after a restart. Maintenance retains the original Pod/cost debt instead of issuing
+automatic DELETE. A fresh explicit foreground release is the supported recovery.
+
+That recovery requires the original stored quote/plan and its exact vendor
+program, API-key fingerprint, CA bytes and account binding. Upgrading the vendor
+or rotating the key/CA can make Core inspection and foreground release unavailable.
+This source has no identity-rotation or permission-reconstruction bypass; retain
+the original Pod/cost debt and use a separately authorized operator recovery when
+those exact bindings cannot be supplied. Acquisition-only native rows without the
+private quote likewise refuse connect and Core foreground erase. Their Pod facts
+remain retained; they cannot fall through to ordinary provider cleanup.
+
+Periodic maintenance retires genuinely never-dispatched expired requests. For a
+possible native Pod it may fence expired input use, but it cannot revoke a fresh
+independently admitted quote/inspect/release or issue resident DELETE. Ordinary
+deterministic providers retain their existing fixed-lifetime cleanup contract.
+
+Owner-scoped STATUS includes the public SDK lease's `provider_resource_id`, so a
+Pod ID may be visible to that authorized caller/model. Private fact `repr` and
+generic dumps are not a promise to redact that public field. Worker credentials,
+connection endpoints, plan bytes and private bootstrap content remain excluded.
+
+The current strict CPU profile does not establish an authenticated isolated remote
+browser. Connect/bootstrap, renewal, remote worker/display transport, native amd64
+admission and physical cloud billing/termination conformance remain unsupported.
+
+The private native preparation stores only a repository-keyed, domain-separated
+fingerprint of the exact request, headers, configuration, source programs and
+original row/request/quote/attempt/preparation identities. Bearer headers and the
+credential-bearing client configuration remain in the live original binding;
+they are not serialized into the row. Rebinding must reproduce the same complete
+fingerprint, and changed credentials or native facts refuse without dispatch.
+
+Runtime admission refuses the authenticated native acquisition profile before
+attaching its producer, saving its preparation or acknowledging dispatch. The
+restriction belongs to the original runtime provider invocation and accepted
+Acquisition registration before the provider receives the facade. Canonical
+allocation and its native COMMIT/reset ACK occur first, so even a provider that
+never enters its SDK operation can leave an unprepared checkpoint. Its one-shot
+SDK operation exposes that same attempt. Closing the root releases its physical
+hold after the original joins, but retains the invocation restriction until the
+outer Core context has actually finalized. Fresh issuance before, inside or after
+the SDK operation cannot remove it; this uses the original Task, repository and
+consumer lineage rather than stale ciphertext or row revision. It does not depend on a
+provider name, the request's location label or the presence of a private quote.
+A catalog quote and current read-only inspection remain available. Explicit
+repository-issued producer conformance is a separate source-test scope, not a
+runtime admission or a supported remote worker. Existing deterministic providers
+continue under their own supported contracts.
+
+Overlapping foreground RELEASE operations or withdrawal may leave the original
+DELETE outcome uncertain. A later 404 is not an authenticated physical-destruction
+or final-billing receipt; the original resource identity, intent and cost debt
+remain. A fresh RELEASE also requires the current destination/privacy policy. If
+remote processing has been disabled, Core does not bypass that policy to delete;
+recovery needs a fresh permitted RELEASE or a separately authorized operator path.
+
+The sealed native Acquisition receipt has no original no-send attestation. A
+failure without a known Pod ID therefore retains charged UNKNOWN debt even when
+Task completion or local socket state appears to suggest no send. Those local
+observations cannot refund capacity, prove no cloud effect, or authorize another
+create. This is a conservative recovery limitation, not a new sent=false field or
+automatic cleanup permission.
+
+The same immutable Acquisition acceptance also restricts the logical Runtime
+provider invocation through context inherited by joined child tasks. Changing
+the request row or forwarding the guard cannot create a second acquisition in
+that invocation. The context value only restricts issuance; it grants no host,
+native, or persistence authority. Independently admitted tasks retain their own
+original checks. Physical close and outer retirement still use the same original
+owner, backend hold, and actual native joins.
