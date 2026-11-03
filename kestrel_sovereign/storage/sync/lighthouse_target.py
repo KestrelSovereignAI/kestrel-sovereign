@@ -8,7 +8,9 @@ and cold-start restore support.
 import hashlib
 import json
 import logging
+import math
 import os
+from collections.abc import Mapping
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Dict, Optional
@@ -22,10 +24,18 @@ from kestrel_sovereign.storage.car_builder import (
     single_raw_block_car_prefix,
 )
 from kestrel_sovereign.storage.sync.manifest_manager import ManifestManagerMixin
+from kestrel_sovereign.storage.sync.quota import (
+    DEFAULT_QUOTA_THRESHOLD,
+    StorageQuota,
+    StorageQuotaExceeded,
+    format_bytes,
+    validate_quota_threshold,
+)
 from kestrel_sovereign.storage.sync.retention import (
     RetentionItem,
     RetentionPolicy,
     classify,
+    load_retention_policy,
     parse_timestamp,
 )
 from kestrel_sovereign.storage.sync.targets import (
@@ -52,6 +62,25 @@ def _snapshot_size(manifest: Optional[Dict[str, Any]]) -> Optional[int]:
     return size or None
 
 
+def _byte_count(value: Any) -> Optional[int]:
+    """A non-negative byte count from a usage field (number or numeric
+    string), else ``None``."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, str):
+        try:
+            value = float(value.strip())
+        except ValueError:
+            return None
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            return None
+        value = int(value)
+    if not isinstance(value, int) or value < 0:
+        return None
+    return value
+
+
 class LighthouseTarget(ManifestManagerMixin, SyncTarget):
     """
     Lighthouse (Filecoin) storage target.
@@ -63,6 +92,13 @@ class LighthouseTarget(ManifestManagerMixin, SyncTarget):
     CID tracking: After each snapshot upload, a manifest file is uploaded
     containing the snapshot CID. The manifest CID is stored locally and
     can also be found via the Lighthouse uploads API.
+
+    Quota: before each upload the target reads the account's
+    ``user_data_usage``. When the upload would take ``dataUsed`` past
+    ``quota_threshold`` of ``dataLimit`` it logs a WARNING and prunes under
+    ``retention_policy`` first; an upload that then fails for lack of room
+    reports ``dataUsed`` against ``dataLimit``. The last reading is
+    ``storage_quota`` (#3894).
     """
 
     # Tag prefix for filtering uploads via Lighthouse API
@@ -77,6 +113,9 @@ class LighthouseTarget(ManifestManagerMixin, SyncTarget):
         api_key: str,
         agent_id: str,
         state_dir: Optional[Path] = None,
+        *,
+        retention_policy: Optional[RetentionPolicy] = None,
+        quota_threshold: float = DEFAULT_QUOTA_THRESHOLD,
     ):
         """
         Initialize Lighthouse target.
@@ -86,12 +125,20 @@ class LighthouseTarget(ManifestManagerMixin, SyncTarget):
             agent_id: Unique agent identifier for namespacing
             state_dir: Directory to store local state (latest CID tracking).
                        Defaults to parent of the DB path.
+            retention_policy: The policy a prune before an upload applies:
+                the sync service's, which also prunes after each success.
+                Loaded from the host config when not given.
+            quota_threshold: The fraction of ``dataLimit`` an upload may
+                take ``dataUsed`` to before retention prunes first.
         """
         self.api_key = api_key
         self.agent_id = agent_id
         self._state_dir = state_dir
         self._manifest_filename = f".lighthouse_manifest_{self.agent_id}.json"
         self._latest_cid: Optional[str] = None
+        self._retention_policy = retention_policy
+        self._quota_threshold = validate_quota_threshold(quota_threshold)
+        self.storage_quota: Optional[StorageQuota] = None
 
     kind = "lighthouse"
 
@@ -145,11 +192,19 @@ class LighthouseTarget(ManifestManagerMixin, SyncTarget):
                     snapshot_filename = self._structured_snapshot_filename(timestamp_token)
                     body, payload_cid = self._snapshot_car_body(digest, snapshot_path, raw_size)
                     with body:
-                        result = await client.upload_car(
-                            body=body,
-                            tag=tag,
-                            filename=snapshot_filename,
-                        )
+                        pruned_first = await self._make_room(client, body.length)
+                        try:
+                            result = await client.upload_car(
+                                body=body,
+                                tag=tag,
+                                filename=snapshot_filename,
+                            )
+                        except Exception as upload_error:
+                            if is_execution_control_error(upload_error):
+                                raise
+                            raise await self._named_upload_failure(
+                                client, upload_error, body.length
+                            )
 
                     cid = result.get("Hash") or result.get("cid")
                     size = int(result.get("Size", body.length))
@@ -178,13 +233,16 @@ class LighthouseTarget(ManifestManagerMixin, SyncTarget):
                 finally:
                     await close_native_execution_stream(client, retain_originals=True)
 
+            metadata: Dict[str, Any] = {"cid": cid, "format": self.SNAPSHOT_FORMAT_CAR_V1}
+            if pruned_first is not None:
+                metadata["prune_before_upload"] = pruned_first
             return SyncResult(
                 success=True,
                 target_name=self.name,
                 bytes_synced=size,
                 frames_synced=0,
                 timestamp=timestamp,
-                metadata={"cid": cid, "format": self.SNAPSHOT_FORMAT_CAR_V1},
+                metadata=metadata,
             )
 
         except Exception as e:
@@ -204,6 +262,124 @@ class LighthouseTarget(ManifestManagerMixin, SyncTarget):
                 timestamp=timestamp,
                 error=f"{type(e).__name__}: {e}",
             )
+
+    def _retention(self) -> RetentionPolicy:
+        if self._retention_policy is None:
+            self._retention_policy = load_retention_policy()
+        return self._retention_policy
+
+    async def _read_quota(self, client: Any) -> Optional[StorageQuota]:
+        """The account's ``user_data_usage`` as a quota, recorded as
+        ``storage_quota``; ``None`` when it cannot be read or names no
+        ``dataUsed`` and positive ``dataLimit``."""
+        try:
+            response = await client.get_balance()
+        except Exception as e:
+            if is_execution_control_error(e):
+                raise
+            logger.warning(
+                "Could not read Lighthouse storage usage for %s: %s: %s",
+                self.name,
+                type(e).__name__,
+                e,
+            )
+            return None
+        data = response.get("data") if isinstance(response, Mapping) else None
+        used = _byte_count(data.get("dataUsed")) if isinstance(data, Mapping) else None
+        limit = _byte_count(data.get("dataLimit")) if isinstance(data, Mapping) else None
+        if used is None or not limit:
+            logger.warning(
+                "Lighthouse user_data_usage for %s named no dataUsed and positive "
+                "dataLimit; its quota is unknown",
+                self.name,
+            )
+            return None
+        self.storage_quota = StorageQuota(
+            used_bytes=used,
+            limit_bytes=limit,
+            observed_at=datetime.now(timezone.utc),
+            threshold=self._quota_threshold,
+        )
+        return self.storage_quota
+
+    async def _make_room(self, client: Any, upload_bytes: int) -> Optional[Dict[str, Any]]:
+        """Before an upload: when ``upload_bytes`` would take the account past
+        the quota threshold, warn and prune under retention first.
+
+        Returns the prune's result when one ran. Never fails the upload: an
+        unreadable usage or a failed prune is logged, and the upload goes
+        ahead.
+        """
+        quota = await self._read_quota(client)
+        if quota is None or not quota.would_cross_threshold(upload_bytes):
+            return None
+        logger.warning(
+            "Lighthouse account near quota before uploading %s's snapshot: dataUsed "
+            "%s of dataLimit %s (%.1f%%); a %s upload would cross %.0f%% of "
+            "dataLimit, so retention prunes first",
+            self.agent_id,
+            format_bytes(quota.used_bytes),
+            format_bytes(quota.limit_bytes),
+            quota.used_fraction * 100,
+            format_bytes(upload_bytes),
+            quota.threshold * 100,
+        )
+        try:
+            pruned = await self._prune_uploads(client, self._retention())
+        except Exception as e:
+            if is_execution_control_error(e):
+                raise
+            logger.warning(
+                "Retention prune before upload failed for %s: %s: %s",
+                self.name,
+                type(e).__name__,
+                e,
+            )
+            return {"error": f"{type(e).__name__}: {e}"}
+        if pruned["deleted"]:
+            quota = await self._read_quota(client) or quota
+        if quota.would_cross_threshold(upload_bytes):
+            logger.warning(
+                "Lighthouse account still near quota after pruning %d of %s's "
+                "upload(s): dataUsed %s of dataLimit %s (%.1f%%); uploading %s anyway",
+                pruned["deleted"],
+                self.agent_id,
+                format_bytes(quota.used_bytes),
+                format_bytes(quota.limit_bytes),
+                quota.used_fraction * 100,
+                format_bytes(upload_bytes),
+            )
+        else:
+            logger.info(
+                "Pruned %d of %s's Lighthouse upload(s) before uploading: dataUsed "
+                "now %s of dataLimit %s",
+                pruned["deleted"],
+                self.agent_id,
+                format_bytes(quota.used_bytes),
+                format_bytes(quota.limit_bytes),
+            )
+        return pruned
+
+    async def _named_upload_failure(
+        self, client: Any, error: Exception, upload_bytes: int
+    ) -> Exception:
+        """``error``, or, when the account has no room for the upload, a
+        ``StorageQuotaExceeded`` naming dataUsed against dataLimit and
+        chained from it. The usage is read again: the precheck's reading may
+        predate other agents' uploads to the same account."""
+        quota = await self._read_quota(client)
+        if quota is None or quota.fits(upload_bytes):
+            return error
+        failure = StorageQuotaExceeded(
+            quota,
+            upload_bytes,
+            account="Lighthouse",
+            used_label="dataUsed",
+            limit_label="dataLimit",
+            cause=error,
+        )
+        failure.__cause__ = error
+        return failure
 
     async def _upload_manifest(self, client: Any, manifest: Dict[str, Any]) -> None:
         """Upload manifest file to Lighthouse and save locally."""
@@ -566,83 +742,90 @@ class LighthouseTarget(ManifestManagerMixin, SyncTarget):
         """Prune Lighthouse upload records when the API can enumerate/delete."""
         from kestrel_sovereign.storage.providers.lighthouse_rest import (
             LighthouseRestClient,
-            list_all_uploads,
         )
 
         client = LighthouseRestClient(api_key=self.api_key)
         try:
-            uploads = await list_all_uploads(client)
-
-            items: list[RetentionItem] = []
-            for upload in uploads:
-                # Only prune uploads attributable to THIS agent by name:
-                # structured snapshots/manifests, and the legacy agent-scoped
-                # manifest_<did>.json. Legacy flat / `*-wal` uploads carry no
-                # agent id, so on a shared Lighthouse key (multi-tenant host)
-                # pruning them here could delete another agent's data. That
-                # unattributed legacy backlog is handled by the cleanup tool
-                # (#1841) via manifest attribution under dry-run + confirm.
-                #
-                # Sovereignty exports are not this target's: the agent's
-                # Lighthouse provider publishes and thins them, on the account
-                # its PayerPolicy resolves, which need not be this target's
-                # (#2874).
-                if self._is_structured_snapshot_upload(upload):
-                    role = "snapshot"
-                elif self._is_structured_manifest_upload(
-                    upload
-                ) or self._is_legacy_agent_manifest_upload(upload):
-                    role = "identity"
-                else:
-                    continue
-                cid = self._upload_cid(upload)
-                if not cid:
-                    continue
-                ts = self._upload_timestamp(upload)
-                if ts is None:
-                    logger.debug(
-                        "Lighthouse retention skipped upload without timestamp: %s",
-                        cid,
-                    )
-                    continue
-                item_data = {
-                    "role": role,
-                    "tag": upload.get("tag"),
-                    "fileName": self._upload_filename(upload),
-                    "cid": cid,
-                }
-                items.append(
-                    RetentionItem(
-                        key=str(cid),
-                        name=str(item_data.get("fileName") or cid),
-                        timestamp=ts,
-                        data_class=classify(item_data),
-                        metadata=upload,
-                    )
-                )
-
-            deletions = policy.deletions(items)
-            deleted = []
-            skipped_missing_id = 0
-            for item in deletions:
-                file_id = item.metadata.get("id")
-                if not file_id:
-                    skipped_missing_id += 1
-                    logger.warning(
-                        "Skipping Lighthouse prune delete for %s without file id",
-                        item.key,
-                    )
-                    continue
-                await client.delete_file(str(file_id))
-                deleted.append(item.key)
-            return {
-                "deleted": len(deleted),
-                "cids": deleted,
-                "scanned": len(items),
-                "skipped_missing_id": skipped_missing_id,
-            }
+            return await self._prune_uploads(client, policy)
         finally:
             await close_native_execution_stream(client, retain_originals=True)
+
+    async def _prune_uploads(self, client: Any, policy: RetentionPolicy) -> Dict[str, Any]:
+        """Delete this agent's upload records that ``policy`` does not keep."""
+        from kestrel_sovereign.storage.providers.lighthouse_rest import (
+            list_all_uploads,
+        )
+
+        uploads = await list_all_uploads(client)
+
+        items: list[RetentionItem] = []
+        for upload in uploads:
+            # Only prune uploads attributable to THIS agent by name:
+            # structured snapshots/manifests, and the legacy agent-scoped
+            # manifest_<did>.json. Legacy flat / `*-wal` uploads carry no
+            # agent id, so on a shared Lighthouse key (multi-tenant host)
+            # pruning them here could delete another agent's data. That
+            # unattributed legacy backlog is handled by the cleanup tool
+            # (#1841) via manifest attribution under dry-run + confirm.
+            #
+            # Sovereignty exports are not this target's: the agent's
+            # Lighthouse provider publishes and thins them, on the account
+            # its PayerPolicy resolves, which need not be this target's
+            # (#2874).
+            if self._is_structured_snapshot_upload(upload):
+                role = "snapshot"
+            elif self._is_structured_manifest_upload(
+                upload
+            ) or self._is_legacy_agent_manifest_upload(upload):
+                role = "identity"
+            else:
+                continue
+            cid = self._upload_cid(upload)
+            if not cid:
+                continue
+            ts = self._upload_timestamp(upload)
+            if ts is None:
+                logger.debug(
+                    "Lighthouse retention skipped upload without timestamp: %s",
+                    cid,
+                )
+                continue
+            item_data = {
+                "role": role,
+                "tag": upload.get("tag"),
+                "fileName": self._upload_filename(upload),
+                "cid": cid,
+            }
+            items.append(
+                RetentionItem(
+                    key=str(cid),
+                    name=str(item_data.get("fileName") or cid),
+                    timestamp=ts,
+                    data_class=classify(item_data),
+                    metadata=upload,
+                )
+            )
+
+        deletions = policy.deletions(items)
+        deleted = []
+        skipped_missing_id = 0
+        for item in deletions:
+            file_id = item.metadata.get("id")
+            if not file_id:
+                skipped_missing_id += 1
+                logger.warning(
+                    "Skipping Lighthouse prune delete for %s without file id",
+                    item.key,
+                )
+                continue
+            await client.delete_file(str(file_id))
+            deleted.append(item.key)
+        return {
+            "deleted": len(deleted),
+            "cids": deleted,
+            "scanned": len(items),
+            "skipped_missing_id": skipped_missing_id,
+        }
 
     async def health_check(self) -> bool:
         """Check Lighthouse API connectivity."""

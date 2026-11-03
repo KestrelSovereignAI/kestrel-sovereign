@@ -12,6 +12,7 @@ import logging
 import os
 import sqlite3
 import tempfile
+from contextlib import closing
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
@@ -22,6 +23,7 @@ from kestrel_sovereign.execution_custody import (
     execution_terminal_error,
     is_execution_control_error,
 )
+from kestrel_sovereign.storage.sync.quota import StorageQuota
 from kestrel_sovereign.storage.sync.retention import (
     RetentionPolicy,
     load_retention_policy,
@@ -327,6 +329,45 @@ class SyncService:
     def stats(self) -> Optional[SyncStats]:
         return self._state.stats if self._state else None
 
+    @property
+    def retention_policy(self) -> RetentionPolicy:
+        """The policy every target's prune applies; a target that prunes
+        before uploading (Lighthouse near its quota) is built with it."""
+        return self._retention_policy
+
+    def storage_quotas(self) -> Dict[str, StorageQuota]:
+        """Each configured target's storage quota, by target name, as the
+        target last read it: this process's reading, else the one the state
+        file kept from an earlier one. A target that never read one is
+        absent (#3894)."""
+        quotas: Dict[str, StorageQuota] = {}
+        for target in self._targets:
+            quota = getattr(target, "storage_quota", None)
+            if not isinstance(quota, StorageQuota) and self._state is not None:
+                recorded = (
+                    self._state.targets.get(target.name)
+                    if isinstance(self._state.targets, dict)
+                    else None
+                )
+                if isinstance(recorded, dict):
+                    quota = StorageQuota.from_dict(recorded.get("storage_quota"))
+            if isinstance(quota, StorageQuota):
+                quotas[target.name] = quota
+        return quotas
+
+    def _record_storage_quota(self, target: SyncTarget) -> None:
+        """Keep the target's latest quota reading in the state file, so the
+        health check still has it after a restart."""
+        quota = getattr(target, "storage_quota", None)
+        if not isinstance(quota, StorageQuota) or self._state is None:
+            return
+        if not isinstance(self._state.targets, dict):
+            self._state.targets = {}
+        recorded = self._state.targets.get(target.name)
+        if not isinstance(recorded, dict):
+            recorded = self._state.targets[target.name] = {}
+        recorded["storage_quota"] = quota.to_dict()
+
     async def start(self) -> None:
         """Load state and optionally start periodic sync if wal_sync_interval is set."""
         await self._load_state()
@@ -491,6 +532,7 @@ class SyncService:
                     error=f"{type(e).__name__}: {e}",
                     kind=target.kind,
                 )
+            self._record_storage_quota(target)
 
         if self._state:
             self._warn_if_repeated_empty_syncs(successful_snapshots)
@@ -525,7 +567,9 @@ class SyncService:
         )
 
     def _database_is_empty_and_bootstrap_pending(self) -> bool:
-        with sqlite3.connect(str(self.db_path)) as conn:
+        # ``with`` on a sqlite3 connection ends a transaction; it does not
+        # close the connection, so each backup leaked one.
+        with closing(sqlite3.connect(str(self.db_path))) as conn:
             conversations = self._table_row_count(conn, "conversation_history")
             episodes = self._table_row_count(conn, "memory_episodes")
             if conversations > 0 or episodes > 0:

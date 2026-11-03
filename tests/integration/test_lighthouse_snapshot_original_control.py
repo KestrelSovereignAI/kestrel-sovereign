@@ -56,6 +56,18 @@ async def native_snapshot(tmp_path, monkeypatch):
                 else 0
             )
             await reader.readexactly(size)
+            if headers.startswith(b"GET /api/user/user_data_usage "):
+                # The upload's quota precheck (#3894) is answered at once, so
+                # the request held below is still the one these tests name.
+                usage = json.dumps(
+                    {"data": {"dataUsed": "0", "dataLimit": str(10**12)}}
+                ).encode()
+                writer.write(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
+                    b"Content-Length: " + str(len(usage)).encode() + b"\r\n\r\n" + usage
+                )
+                await writer.drain()
+                return
             hold_path = state["hold_path"]
             if hold_path is None or hold_path.encode() in headers.split(b"\r\n", 1)[0]:
                 entered.set()

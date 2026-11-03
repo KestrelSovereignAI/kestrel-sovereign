@@ -372,15 +372,28 @@ banned = []
 # Retention is split by data class. Working-memory snapshots are thinned more
 # aggressively; identity/constitutional artifacts keep monthly restore points
 # indefinitely until an explicit sovereign purge.
+#
+# Working memory is bounded: every snapshot younger than keep_all_days, then
+# the newest per ISO week until weekly_until_weeks, then the newest per month
+# until monthly_until_months, then nothing. Each snapshot is a full database
+# (about 2 GB for an active agent), so weekly_forever or monthly_forever here
+# grows without bound until a fixed storage quota fills (#3894).
 [backup.retention.working_memory]
-keep_all_days = 14
-weekly_forever = true
-monthly_forever = false
+keep_all_days = 7
+weekly_until_weeks = 8
+monthly_until_months = 12
 
 [backup.retention.identity]
 keep_all_days = 30
 weekly_until_months = 12
 monthly_forever = true
+
+# Before each Lighthouse snapshot upload the target reads the account's usage.
+# When the upload would take dataUsed past this fraction of dataLimit it logs
+# a WARNING and prunes under retention first, and the backup_quota health
+# check warns while the account is at or past it.
+[backup.quota]
+threshold = 0.9
 
 # =============================================================================
 # Voice Configuration (Kestrel-Squack)

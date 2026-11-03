@@ -94,6 +94,8 @@ async def test_apply_without_confirmation_refuses_to_delete(tmp_path):
                             "keep_all_days": 0,
                             "weekly_forever": False,
                             "monthly_forever": False,
+                            "weekly_until_weeks": 0,
+                            "monthly_until_months": 0,
                         }
                     }
                 }
@@ -160,6 +162,8 @@ async def test_apply_with_confirmation_deletes_and_audits_gcs_and_lighthouse(tmp
                             "keep_all_days": 0,
                             "weekly_forever": False,
                             "monthly_forever": False,
+                            "weekly_until_weeks": 0,
+                            "monthly_until_months": 0,
                         }
                     }
                 }
@@ -313,6 +317,8 @@ async def test_unattributed_lighthouse_files_are_reported_and_never_deleted():
                             "keep_all_days": 0,
                             "weekly_forever": False,
                             "monthly_forever": False,
+                            "weekly_until_weeks": 0,
+                            "monthly_until_months": 0,
                         }
                     }
                 }
@@ -795,6 +801,8 @@ def _expire_everything_policy():
                         "keep_all_days": 0,
                         "weekly_forever": False,
                         "monthly_forever": False,
+                        "weekly_until_weeks": 0,
+                        "monthly_until_months": 0,
                     }
                 }
             }
@@ -1185,7 +1193,8 @@ def test_delete_plan_prunes_old_gcs_snapshot_but_protects_newest():
         records,
         RetentionPolicy.from_config(
             {"backup": {"retention": {"working_memory": {
-                "keep_all_days": 0, "weekly_forever": False, "monthly_forever": False}}}}
+                "keep_all_days": 0, "weekly_forever": False, "monthly_forever": False,
+                "weekly_until_weeks": 0, "monthly_until_months": 0}}}}
         ),
         quarantine_state={"objects": {}},
         now=NOW,

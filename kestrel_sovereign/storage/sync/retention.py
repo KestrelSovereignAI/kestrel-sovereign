@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 import re
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from enum import Enum
 from pathlib import Path
 from typing import Any, Iterable, Mapping
@@ -44,10 +44,29 @@ WORKING_MEMORY_TOKENS = (
 
 @dataclass(frozen=True)
 class RetentionClassPolicy:
+    """How long one data class keeps its backups, by age from now.
+
+    Every backup younger than ``keep_all_days`` is kept. Older ones are thinned
+    to the newest per ISO week while weekly retention applies, then to the
+    newest per calendar month while monthly retention applies, and are deleted
+    after that. Weekly retention applies to a backup younger than
+    ``weekly_until_weeks`` weeks or ``weekly_until_months`` months (when both
+    are set, the longer), or to every backup with ``weekly_forever``; monthly
+    retention likewise with ``monthly_until_months`` and ``monthly_forever``.
+    A class's newest backup is always kept.
+    """
+
     keep_all_days: int
     weekly_until_months: int | None = None
     weekly_forever: bool = False
     monthly_forever: bool = False
+    weekly_until_weeks: int | None = None
+    monthly_until_months: int | None = None
+
+    @property
+    def bounded(self) -> bool:
+        """Whether every backup of this class is eventually deleted."""
+        return not (self.weekly_forever or self.monthly_forever)
 
 
 @dataclass(frozen=True)
@@ -73,9 +92,14 @@ class RetentionItem:
 
 
 DEFAULT_RETENTION_POLICY = {
+    # Bounded (#3894). Each working-memory backup is a full database snapshot
+    # (about 2 GB for an active agent), so keeping one a week forever grew a
+    # four-agent host by about 8 GB a week until it filled a fixed 500 GiB
+    # Lighthouse quota and every upload failed.
     DataClass.WORKING_MEMORY: RetentionClassPolicy(
-        keep_all_days=14,
-        weekly_forever=True,
+        keep_all_days=7,
+        weekly_until_weeks=8,
+        monthly_until_months=12,
     ),
     DataClass.IDENTITY: RetentionClassPolicy(
         keep_all_days=30,
@@ -114,6 +138,12 @@ class RetentionPolicy:
                 ),
                 monthly_forever=bool(
                     override.get("monthly_forever", default.monthly_forever)
+                ),
+                weekly_until_weeks=_optional_int(
+                    override.get("weekly_until_weeks", default.weekly_until_weeks)
+                ),
+                monthly_until_months=_optional_int(
+                    override.get("monthly_until_months", default.monthly_until_months)
                 ),
             )
         return cls(policies)
@@ -163,7 +193,7 @@ class RetentionPolicy:
                     initial[item.key] = RetentionDecision(item, False, "weekly_thinned")
                     continue
 
-                if policy.monthly_forever:
+                if _uses_monthly(policy, item.timestamp, now):
                     bucket = (item.timestamp.year, item.timestamp.month)
                     current = monthly_keep.get(bucket)
                     if current is None or item.timestamp > current.timestamp:
@@ -202,7 +232,18 @@ def load_retention_policy() -> RetentionPolicy:
     except Exception as e:  # noqa: BLE001
         logger.warning("Failed to load backup retention config: %s", e)
         backup = {}
-    return RetentionPolicy.from_config({"backup": backup})
+    policy = RetentionPolicy.from_config({"backup": backup})
+    working = policy.policies[DataClass.WORKING_MEMORY]
+    if not working.bounded:
+        logger.warning(
+            "Working-memory backup retention is unbounded "
+            "([backup.retention.working_memory] weekly_forever=%s, "
+            "monthly_forever=%s): every full snapshot it keeps is kept forever, "
+            "so a fixed storage quota fills (#3894)",
+            working.weekly_forever,
+            working.monthly_forever,
+        )
+    return policy
 
 
 def classify(item: Any) -> DataClass:
@@ -276,9 +317,27 @@ def _uses_weekly(
 ) -> bool:
     if policy.weekly_forever:
         return True
+    timestamp = _normalize_ts(timestamp)
+    if (
+        policy.weekly_until_weeks is not None
+        and now - timestamp < timedelta(weeks=policy.weekly_until_weeks)
+    ):
+        return True
     if policy.weekly_until_months is None:
         return False
-    return _months_between(_normalize_ts(timestamp), now) < policy.weekly_until_months
+    return _months_between(timestamp, now) < policy.weekly_until_months
+
+
+def _uses_monthly(
+    policy: RetentionClassPolicy,
+    timestamp: datetime,
+    now: datetime,
+) -> bool:
+    if policy.monthly_forever:
+        return True
+    if policy.monthly_until_months is None:
+        return False
+    return _months_between(_normalize_ts(timestamp), now) < policy.monthly_until_months
 
 
 def _reserve_periodic_bucket(
@@ -290,7 +349,7 @@ def _reserve_periodic_bucket(
 ) -> None:
     if _uses_weekly(policy, item.timestamp, now):
         weekly_keep[item.timestamp.isocalendar()[:2]] = item
-    elif policy.monthly_forever:
+    elif _uses_monthly(policy, item.timestamp, now):
         monthly_keep[(item.timestamp.year, item.timestamp.month)] = item
 
 

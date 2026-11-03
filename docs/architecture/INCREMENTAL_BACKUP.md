@@ -40,7 +40,7 @@ For a busy agent whose DB changes every cycle, this is the dominant ongoing cost
 | Path-keyed targets | GCS `…/snapshots/<ts>.db`, S3 `snapshots/<ts>.db` (+ `latest` pointer) | `gcs_target.py:106-118`, `s3_target.py:101-114` |
 | Content-addressed targets | Lighthouse wraps whole DB in a one-block CAR → one CID; IPFS `add` → one CID | `lighthouse_target.py:263-268`, `car_builder.py:121` |
 | Manifest | Per-backup, per-target: whole-file `content_hash`, CID/blob name, size, ts | `manifest_manager.py`, `gcs_target.py:124-131`, `lighthouse_target.py:134-145` |
-| Retention | GFS per data class (WORKING_MEMORY: 14d all + weekly forever) | `storage/sync/retention.py:75-85` |
+| Retention | GFS per data class (WORKING_MEMORY: 7d all, weekly to 8 weeks, monthly to 12 months, then deleted; was 14d all + weekly forever until #3894) | `storage/sync/retention.py` |
 | WAL | **Enabled** (`PRAGMA journal_mode=WAL`). The scheduled sync snapshots via `sqlite3.backup()` **with an active WAL** — it materializes a consistent full-DB copy but does **not** truncate the live `-wal`. `wal_checkpoint(TRUNCATE)` runs only in the *separate* `AsyncStorage.create_backup_blob` export path, not the scheduled cron. | `storage/db/sqlite.py:82`, `storage/sync/targets.py:57-87`, `async_storage.py:761` |
 | `sync_wal()` | No-op on every target ("new CID on every write, not recoverable without the matching DB") | `lighthouse_target.py:439-445`, `targets.py:140-151` |
 

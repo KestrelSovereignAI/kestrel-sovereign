@@ -383,7 +383,12 @@ def _add_lighthouse_snapshot_target(
     storage (``NONE``, or a resolution that failed) there is no target, so
     the policy that gates live storage gates snapshot uploads too. Without a
     host key there is no target either.
+
+    The target prunes under the service's own retention policy before an
+    upload that would take the account past ``[backup.quota] threshold``
+    (#3894).
     """
+    from kestrel_sovereign.storage.sync.quota import load_quota_threshold
     from kestrel_sovereign.storage.sync.targets import LighthouseTarget, TrustTier
 
     api_key = os.environ.get("LIGHTHOUSE_API_KEY")
@@ -396,6 +401,8 @@ def _add_lighthouse_snapshot_target(
             api_key=api_key,
             agent_id=agent_id,
             state_dir=state_dir,
+            retention_policy=sync_service.retention_policy,
+            quota_threshold=load_quota_threshold(),
         ),
     )
 
