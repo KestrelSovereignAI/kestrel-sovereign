@@ -154,6 +154,7 @@ def _client_over(backend: _MemoryBioTLSBackend) -> type[LighthouseRestClient]:
     class _Client(LighthouseRestClient):
         # A failed patch must not reach the real service.
         UPLOAD_URL = "https://upload.lighthouse.invalid"
+        API_URL = "https://api.lighthouse.invalid"
 
         async def _get_client(self) -> httpx.AsyncClient:
             if self._client is None or self._client.is_closed:
@@ -234,7 +235,9 @@ async def test_a_snapshot_whose_car_outgrows_one_tls_write_is_backed_up(tmp_path
     result = await target.sync_snapshot(db)
 
     assert result.success is True, result.error
-    snapshot, manifest_upload = backend.requests
+    # The quota precheck reads the account's usage first (#3894).
+    usage, snapshot, manifest_upload = backend.requests
+    assert usage.head.startswith(b"GET /api/user/user_data_usage ")
     assert snapshot.body_bytes == snapshot.content_length
     assert snapshot.max_body_write <= UPLOAD_CHUNK_BYTES
     uploaded_car = _multipart_file(bytes(snapshot.body))
@@ -243,7 +246,7 @@ async def test_a_snapshot_whose_car_outgrows_one_tls_write_is_backed_up(tmp_path
     assert target._extract_snapshot_content(uploaded_car) == raw
 
     manifest = target._load_local_manifest()
-    assert manifest["snapshot_cid"] == "QmFake1"
+    assert manifest["snapshot_cid"] == "QmFake2"
     assert manifest["raw_snapshot_size"] == len(raw)
     assert manifest["content_hash"] == hashlib.sha256(raw).hexdigest()
     assert manifest["snapshot_payload_cid"] == target._build_snapshot_car(raw)[1]
@@ -277,7 +280,7 @@ async def test_a_snapshot_over_2_gib_is_never_held_whole_in_memory(tmp_path, mon
         tracemalloc.stop()
 
     assert result.success is True, result.error
-    snapshot = backend.requests[0]
+    snapshot = backend.requests[1]
     assert snapshot.body_bytes == snapshot.content_length > size
     assert snapshot.max_body_write <= UPLOAD_CHUNK_BYTES
     assert peak < 32 * 1024 * 1024, f"peak traced allocation {peak:,} bytes"

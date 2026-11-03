@@ -30,6 +30,38 @@ DEFAULT_MISFIRE_GRACE_SECONDS = 600
 DEFAULT_LEASE_SECONDS = 120
 RUNTIME_STATUS_RETENTION_SECONDS = 24 * 60 * 60
 
+#: A boolean projection over a ``... FROM scheduled_tasks`` read: whether the
+#: row was paused by the scheduler itself before ``terminal_status`` existed.
+#: From #2457 until #2739 a permission block disabled the row and recorded only
+#: ``last_run_at``, set to the same instant as the blocked execution's
+#: ``executed_at``. Such a row reads like an operator pause, so status called
+#: it ``operator_paused`` (#3749). The match is exact to that runner: it
+#: predates claims, so its executions have no ``claimed_at``; an operator pause
+#: never writes ``last_run_at``; and the blocked run must still be the
+#: schedule's newest.
+LEGACY_SCHEDULER_PAUSE_PROJECTION = """
+    (scheduled_tasks.enabled = 0
+     AND scheduled_tasks.terminal_status IS NULL
+     AND EXISTS (
+        SELECT 1 FROM task_execution_log paused_by
+        WHERE paused_by.task_id = scheduled_tasks.id
+          AND paused_by.agent_id = scheduled_tasks.agent_id
+          AND paused_by.status = 'blocked'
+          AND paused_by.claimed_at IS NULL
+          AND paused_by.executed_at = scheduled_tasks.last_run_at
+          AND NOT EXISTS (
+            SELECT 1 FROM task_execution_log later_run
+            WHERE later_run.task_id = paused_by.task_id
+              AND later_run.agent_id = paused_by.agent_id
+              AND later_run.executed_at > paused_by.executed_at
+          )
+     ))
+"""
+
+#: The ``terminal_status`` the runner records when a permission gate's DENY or
+#: ASK pauses a schedule, and the reason status reports for that pause.
+SCHEDULER_BLOCKED_REASON = "blocked"
+
 _RUNTIME_STATUS_TABLE_SQL = f"""
     CREATE TABLE IF NOT EXISTS {RUNTIME_STATUS_TABLE} (
         agent_id TEXT NOT NULL,
@@ -88,6 +120,7 @@ def classify_disablement(
     claim_fenced: bool = False,
     lease_owner: Optional[str] = None,
     lease_expires_at: Optional[str] = None,
+    legacy_scheduler_pause: bool = False,
 ) -> Dict[str, Any]:
     """Describe why a row is not enabled without collapsing transient fences.
 
@@ -95,6 +128,10 @@ def classify_disablement(
     safely: an ordinary disabled row with no scheduler terminal reason is an
     operator pause, while scheduler safety paths always retain a terminal
     status.  Rollout and claim fences are transient protocol state, not pauses.
+    The one exception is a permission block paused before ``terminal_status``
+    existed; ``legacy_scheduler_pause`` (read through
+    :data:`LEGACY_SCHEDULER_PAUSE_PROJECTION`) reports it as the scheduler's
+    pause it was rather than an operator's (#3749).
     """
 
     if rollout_fenced:
@@ -148,6 +185,8 @@ def classify_disablement(
             "recoverable": False,
             "recovery_action": None,
         }
+    if not terminal_status and legacy_scheduler_pause:
+        terminal_status = SCHEDULER_BLOCKED_REASON
     if terminal_status:
         one_shot_inconsistent = (
             schedule_kind == "one_shot"
@@ -164,6 +203,11 @@ def classify_disablement(
             )
         elif one_shot_inconsistent:
             action = "reconcile the execution log and recreate the one-shot schedule"
+        elif terminal_status == SCHEDULER_BLOCKED_REASON:
+            action = (
+                "grant the tool's permission (set it to Auto), then run "
+                "schedule_resume"
+            )
         elif recoverable:
             action = "run schedule_resume after correcting the reported cause"
         else:
@@ -365,6 +409,7 @@ def _inventory_from_rows(
             claim_fenced=bool(row[5]),
             lease_owner=row[6],
             lease_expires_at=row[7],
+            legacy_scheduler_pause=bool(row[9]) if len(row) > 9 else False,
         )
         state = disablement["state"]
         if state in {"enabled", "executing"}:
@@ -462,7 +507,8 @@ async def _schedule_inventories(
         f"""
         SELECT agent_id, enabled, next_run_at, terminal_status, schedule_kind,
                scheduler_rollout_fenced, scheduler_claim_fenced,
-               lease_owner, lease_expires_at, misfire_grace_seconds
+               lease_owner, lease_expires_at, misfire_grace_seconds,
+               {LEGACY_SCHEDULER_PAUSE_PROJECTION}
         FROM scheduled_tasks
         WHERE agent_id IN ({placeholders})
         """,
@@ -1041,8 +1087,10 @@ __all__ = [
     "DEFAULT_MISFIRE_GRACE_SECONDS",
     "DEFAULT_LEASE_SECONDS",
     "DEFAULT_STALE_AFTER_TICKS",
+    "LEGACY_SCHEDULER_PAUSE_PROJECTION",
     "RUNTIME_STATUS_TABLE",
     "RUNTIME_STATUS_RETENTION_SECONDS",
+    "SCHEDULER_BLOCKED_REASON",
     "SCHEDULER_SAFETY_DISABLEMENT_REASONS",
     "classify_disablement",
     "emit_runtime_status",

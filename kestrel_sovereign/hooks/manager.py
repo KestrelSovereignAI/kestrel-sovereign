@@ -7,6 +7,7 @@ hooks are called in priority order with proper timeout handling.
 
 import asyncio
 import logging
+from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
 from kestrel_sdk.hooks.base import (
@@ -18,6 +19,21 @@ from kestrel_sdk.hooks.base import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class FailedHookDenial(HookOutput):
+    """A DENY the manager produced because an enforcing hook FAILED.
+
+    The hook raised or timed out, so it decided nothing; the manager denied by
+    fail-closed policy (#1723). To every caller that only reads the decision
+    this is an ordinary DENY. A caller that must not treat an infrastructure
+    failure as a policy verdict, such as the scheduler, which pauses a schedule
+    on a policy deny, can tell the two apart by this type (#3749). Only
+    :func:`_deny_for_failed_hook` constructs it.
+    """
+
+    failed_hook: str = ""
 
 
 def _hook_is_enforcing(hook) -> bool:
@@ -38,10 +54,12 @@ def _hook_is_enforcing(hook) -> bool:
 
 def _deny_for_failed_hook(hook, reason, accumulated_warnings, max_warning_severity):
     """Build a DENY HookOutput for an enforcing hook that failed (fail closed)."""
-    out = HookOutput.deny(
-        f"Enforcing hook '{getattr(hook, 'name', '?')}' failed ({reason}); "
+    name = getattr(hook, "name", "?")
+    out = FailedHookDenial.deny(
+        f"Enforcing hook '{name}' failed ({reason}); "
         f"denying by fail-closed policy."
     )
+    out.failed_hook = name
     if accumulated_warnings:
         out.warning_message = " | ".join(accumulated_warnings)
         out.warning_severity = max_warning_severity

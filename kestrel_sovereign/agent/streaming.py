@@ -1178,7 +1178,7 @@ class StreamingMixin:
             # this wrapper believed the turn was non-enforcing. A plain ``str``
             # (pure-local command) reports ``enforcing=False`` via ``getattr``, so
             # its parts always flow.
-            with part_collector():
+            with part_collector(host=self, session_id=session_id):
                 # Preserve the pre-existing positional call shape
                 # (test_streaming_audit asserts it) — invocation_context
                 # rides as a trailing kwarg. Codex round-1 P1 backwards-compat.
@@ -1279,7 +1279,7 @@ class StreamingMixin:
                         # drains it into PART sentinels at the point each tool ran.
                         # #3426: publish the turn's identity for the embeddings it
                         # makes, as process_input does.
-                        with part_collector(), turn_invocation_scope(
+                        with part_collector(host=self, session_id=session_id), turn_invocation_scope(
                             getattr(self, "llm_service", None),
                             invocation_context,
                             session_id=session_id,
@@ -1378,6 +1378,16 @@ class StreamingMixin:
             if hook_input.tool_input and "user_message" in hook_input.tool_input:
                 user_input = hook_input.tool_input["user_message"]
 
+        # Pre-turn state blocks, prepared exactly as process_input prepares
+        # them: before #3900 a console turn skipped this, so it never saw the
+        # operational block (restart events, codex declines, active todos,
+        # strategy decisions recorded in another session). Best-effort.
+        from kestrel_sovereign.agent.preturn_state import (
+            prepare_turn_state_addendum,
+        )
+
+        system_prompt_addendum = await prepare_turn_state_addendum(self, None)
+
         # #1844 Stage 2: Kestrel-owned compaction for openai:plan. Compact +
         # reset the codex thread BEFORE fetching history / building context so
         # the freshly-seeded thread carries the compacted view rather than
@@ -1446,6 +1456,7 @@ class StreamingMixin:
             privacy_mode=privacy_mode,
             conversation_history=history,
             reflection_guidance=reflection_guidance,
+            system_prompt_addendum=system_prompt_addendum,
             tools=feature_tools,
             # Span attribution only (#2940) — same as the non-streaming path.
             session_id=session_id,
@@ -2306,10 +2317,7 @@ class StreamingMixin:
             # silently bypassed the structured log and runtime
             # tool-call queries returned stale data from before the
             # inline-execution migration.
-            from kestrel_sovereign.agent.orchestrator_engine import (
-                OrchestratorEngineMixin,
-                _extract_inline_error_fields,
-            )
+            from kestrel_sovereign.agent.orchestrator_engine import _record_inline_tool_dispatch
             from kestrel_sovereign.features.base import _serialize_tool_result
             from kestrel_sovereign.security.narration_check import (
                 summarize_tool_result_for_audit,
@@ -2330,25 +2338,9 @@ class StreamingMixin:
                     "arguments": e["arguments"],
                     "result": summarize_tool_result_for_audit(serialized),
                 })
-                # Structured dispatch log (codex app-server inline path).
-                # Latency=0 by design — accurate per-call latency needs
-                # adapter-level instrumentation, see codex_adapter's
-                # ``_make_inline_tool_executor``.
-                args = e["arguments"]
-                adapter = "inline:" + OrchestratorEngineMixin._tool_call_adapter(
-                    self, e["name"], features_by_tool_name,
-                )
-                err_msg, err_class = _extract_inline_error_fields(e["result"])
-                await OrchestratorEngineMixin._log_tool_dispatch(
-                    self,
-                    tool_name=e["name"],
-                    adapter=adapter,
-                    args=args if isinstance(args, dict) else {},
-                    result=e["result"],
-                    session_id=session_id,
-                    dispatch_start=time.time(),
-                    error_class=err_class,
-                    error_message=err_msg,
+                await _record_inline_tool_dispatch(
+                    self, e, session_id=session_id,
+                    features_by_tool_name=features_by_tool_name,
                 )
             # #1659: the codex tool sentinels rode the LLM stream itself, so
             # they're embedded in full_response. Strip them out of the

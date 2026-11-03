@@ -250,7 +250,8 @@ BACKUP_DIR_ENV = "KESTREL_BACKUP_DIR"
 #: The backup root's default name, below the project directory.
 DEFAULT_BACKUP_DIRNAME = "backups"
 
-#: The ``multi_agent.toml`` a host loads (see ``server.resolve_multi_agent_path``).
+#: The ``multi_agent.toml`` a host loads (see
+#: ``multi_agent.config.resolve_multi_agent_path``).
 #: A file, not a root, but it names every hosted agent's data and
 #: identity-export directory, so choosing it chooses where agent state lives.
 MULTI_AGENT_CONFIG_ENV = "KESTREL_MULTI_AGENT_CONFIG"

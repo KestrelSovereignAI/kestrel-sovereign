@@ -56,13 +56,20 @@ def steps(checkout, manifest, monkeypatch):
     monkeypatch.setattr(
         cli, "_run_git_fetch", lambda _: calls.append("fetch") or (0, "")
     )
-    monkeypatch.setattr(cli, "_pull_target_revision", lambda _: INCOMING)
     monkeypatch.setattr(
-        cli, "_run_sync_preflight",
-        lambda path, lock_revision=None, **kw: calls.append(("preflight", lock_revision)) or 0,
+        cli,
+        "_resolve_pull_target",
+        lambda _: cli_lifecycle._PullTarget(
+            upstream=INCOMING, revision=INCOMING, head="0" * 40
+        ),
+    )
+    # The pull landed the revision the checks judged (#3832).
+    monkeypatch.setattr(cli, "_git_head", lambda _: INCOMING)
+    monkeypatch.setattr(
+        cli, "_run_sync_preflight", lambda path, **kw: calls.append(_preflight(kw)) or 0,
     )
     monkeypatch.setattr(
-        cli, "_run_git_pull", lambda _: calls.append("pull") or (0, "")
+        cli, "_run_git_fast_forward", lambda *_: calls.append("pull") or (0, "")
     )
     monkeypatch.setattr(
         cli, "_run_uv_sync", lambda _: calls.append("uv sync") or (0, "")
@@ -79,6 +86,12 @@ def steps(checkout, manifest, monkeypatch):
         cli, "cmd_restart", lambda args: calls.append("restart") or 0
     )
     return calls
+
+
+def _preflight(kw):
+    """A preflight step, named by the commit of the core it was handed (#3832)."""
+    (judged,) = kw.values()
+    return ("preflight", judged.revision)
 
 
 def _record_continuation(monkeypatch, calls, rc=0):
@@ -128,7 +141,8 @@ def test_without_an_install_nothing_hands_off(steps, monkeypatch):
 
     assert _update("--no-install") == 0
 
-    assert steps == ["pull", "feature sync", "reconcile", "restart"]
+    # The pull fetches once and merges what it fetched (#3832).
+    assert steps == ["fetch", "pull", "feature sync", "reconcile", "restart"]
 
 
 def test_a_dry_run_never_hands_off_and_still_checks_the_incoming_lock(
@@ -146,8 +160,7 @@ def test_a_dry_run_never_hands_off_and_still_checks_the_incoming_lock(
 def test_a_refused_preflight_stops_the_update_before_the_pull(steps, monkeypatch):
     _record_continuation(monkeypatch, steps)
     monkeypatch.setattr(
-        cli, "_run_sync_preflight",
-        lambda path, lock_revision=None, **kw: steps.append(("preflight", lock_revision)) or 1,
+        cli, "_run_sync_preflight", lambda path, **kw: steps.append(_preflight(kw)) or 1,
     )
 
     assert _update() == 1
@@ -155,12 +168,37 @@ def test_a_refused_preflight_stops_the_update_before_the_pull(steps, monkeypatch
     assert steps == ["fetch", ("preflight", INCOMING)]
 
 
-def test_without_a_pull_the_preflight_reads_the_lock_on_disk(steps, monkeypatch):
+def test_without_a_pull_the_preflight_reads_the_lock_at_head(steps, monkeypatch):
+    """The sync is handed the checkout at HEAD and pulls nothing (#3832)."""
+    head = "4ead" + "0" * 36
+    monkeypatch.setattr(cli, "_git_head", lambda _: head)
     _record_continuation(monkeypatch, steps)
 
     assert _update("--no-pull") == 0
 
-    assert steps[:2] == [("preflight", None), "uv sync"]
+    assert steps[:2] == [("preflight", head), "uv sync"]
+
+
+@pytest.mark.parametrize(
+    "upstream", ["4ead" + "0" * 36, "be41" + "0" * 36], ids=["up-to-date", "ahead"],
+)
+def test_a_pull_that_brings_nothing_has_its_lock_read_at_head(
+    steps, monkeypatch, upstream,
+):
+    """Not a lock a second fetch would find upstream, nor the upstream's own
+    when the checkout is ahead of it: the pull leaves HEAD where it is (#3832)."""
+    head = "4ead" + "0" * 36
+    monkeypatch.setattr(
+        cli,
+        "_resolve_pull_target",
+        lambda _: cli_lifecycle._PullTarget(upstream=upstream, revision=None, head=head),
+    )
+    monkeypatch.setattr(cli, "_git_head", lambda _: head)
+    _record_continuation(monkeypatch, steps)
+
+    assert _update() == 0
+
+    assert steps[:3] == ["fetch", ("preflight", head), "pull"]
 
 
 def test_an_empty_manifest_has_nothing_to_preflight(steps, manifest, monkeypatch):
@@ -169,7 +207,7 @@ def test_an_empty_manifest_has_nothing_to_preflight(steps, manifest, monkeypatch
 
     assert _update() == 0
 
-    assert steps == ["pull", "uv sync", "continue"]
+    assert steps == ["fetch", "pull", "uv sync", "continue"]
 
 
 def test_the_phases_run_every_step_once_in_order(steps):
@@ -315,13 +353,15 @@ def test_the_continuation_ignores_a_checkout_in_the_working_directory(
     assert cli_lifecycle._run_update_continuation(["--version"]) == 0
 
 
-@pytest.mark.parametrize(
-    ("flags", "fetch", "allow_dirty"),
-    [((), True, False), (("--dry-run",), False, False), (("--allow-dirty",), True, True)],
-)
-def test_the_preflight_pulls_as_the_update_would(steps, monkeypatch, flags, fetch, allow_dirty):
-    """A dry run fetches nothing; ``--allow-dirty`` reaches the pull the sync
-    makes of a declared core, as it reaches the sync itself."""
+@pytest.mark.parametrize("flags", [(), ("--dry-run",), ("--allow-dirty",)])
+def test_the_preflight_is_handed_the_core_the_sync_is_handed(
+    steps, checkout, monkeypatch, flags,
+):
+    """The source checkout at the commit the pull lands, and nothing that would
+    have it predict a pull of its own: the sync makes none (#3832). A dry run
+    reads that commit as last fetched."""
+    from kestrel_sovereign.cli_features import JudgedCore
+
     _record_continuation(monkeypatch, steps)
     seen = []
     monkeypatch.setattr(
@@ -330,8 +370,7 @@ def test_the_preflight_pulls_as_the_update_would(steps, monkeypatch, flags, fetc
 
     assert _update(*flags) == 0
 
-    ((kw),) = seen
-    assert (kw["fetch"], kw["allow_dirty"]) == (fetch, allow_dirty)
+    assert seen == [{"judged": JudgedCore(checkout=checkout, revision=INCOMING)}]
 
 
 def test_the_continuation_does_not_judge_the_revision_again(steps, monkeypatch):

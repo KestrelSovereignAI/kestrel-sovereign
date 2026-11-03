@@ -18,8 +18,8 @@ generated: true
 Auto-generated file-tree + per-file purpose index. Always-loaded context for the kestrel-agent
 GitHub App (issue #791). Do **not** edit by hand — regenerate via `python scripts/generate_repo_map.py`.
 
-**Generated:** 2026-11-02
-**Scope:** 3489 tracked files (2631 `.py`, 375 `.md`, 483 other). Excludes `__pycache__`, `node_modules`, `.venv`, `.claude`, build artifacts.
+**Generated:** 2026-11-03
+**Scope:** 3526 tracked files (2665 `.py`, 375 `.md`, 486 other). Excludes `__pycache__`, `node_modules`, `.venv`, `.claude`, build artifacts.
 
 **Format per file:** `path — one-line purpose` plus the public top-level Python symbols on the next line
 (classes and functions; private `_name` skipped).
@@ -231,7 +231,7 @@ Repo entry points and standard project files.
 - **kestrel_sovereign/agent/orchestrator_engine.py** — Orchestrator engine mixin for tool execution and response handling.
   - `class LLMCallInactivityTimeout`; `class LLMCallWatchdog`; `class IterationTracker`; `class ContextStats`; `class ToolNotRegisteredError`; `class OrchestratorEngineMixin`
 - **kestrel_sovereign/agent/parts.py** — In-band typed-part emission for first-class console components (#1914).
-  - `def part_collector()`; `def current_part_collector()`; `def bind_part_collector(collector)`; `def emit_part(part_type, data, part_id)`; `def sanitize_part(entry)`; `def drain_parts()`; `def build_part_sentinel(part)`
+  - `def part_collector()`; `def current_tool_publication_context(host, session_id)`; `def current_part_collector()`; `def bind_part_collector(collector)`; `def emit_part(part_type, data, part_id)`; `def sanitize_part(entry)`; `def drain_parts()`; `def build_part_sentinel(part)`
 - **kestrel_sovereign/agent/preturn_state.py** — Pre-turn state-load block (epic #1290, D3).
   - `async def build_preturn_state_block(agent)`; `async def build_operational_state_block(agent)`
 - **kestrel_sovereign/agent/privacy_state.py** — The agent's privacy mode, recorded durably per agent (#3554).
@@ -377,6 +377,7 @@ Repo entry points and standard project files.
 - **kestrel_sovereign/data/feature_template/feature.py.tpl** — —
 - **kestrel_sovereign/data/feature_template/pyproject.toml.tpl** — —
 - **kestrel_sovereign/data/feature_template/test_feature.py.tpl** — —
+- **kestrel_sovereign/data/offline_migrations.toml** — (configuration)
 - **kestrel_sovereign/data/semantic/fixtures/rdf11-direct-language.nt** — —
 - **kestrel_sovereign/data/semantic/fixtures/rdf11-projection-digests.txt** — —
 - **kestrel_sovereign/data/semantic/ontologies/kestrel-vocab-1.0.0.ttl** — —
@@ -736,7 +737,7 @@ Repo entry points and standard project files.
 - **kestrel_sovereign/features/scheduler/execution_log_retention.py** — Age out old ``task_execution_log`` rows (#3785).
   - `async def purge_execution_log(db)`
 - **kestrel_sovereign/features/scheduler/failure_streak.py** — Consecutive-failure tracking for scheduled tasks (#3280).
-  - `class FailureStreak`; `class FailureStreakTransition`; `def next_failure_streak(prior)`; `def failure_streak_view(values)`; `async def load_failure_markers(db, agent_id)`
+  - `class FailureStreak`; `class FailureStreakTransition`; `def next_failure_streak(prior)`; `def hook_failure_backoff(consecutive_failures)`; `def failure_streak_view(values)`; `async def load_failure_markers(db, agent_id)`
 - **kestrel_sovereign/features/scheduler/feature.py** — Scheduler Feature -- cron-based scheduled task execution for agents.
   - `def backup_target_failure_code(kind)`; `class SchedulerFeature`
 - **kestrel_sovereign/features/scheduler/outcome.py** — Structured outcomes returned by scheduled task executors.
@@ -912,7 +913,7 @@ Repo entry points and standard project files.
 - **kestrel_sovereign/hooks/decision_gate.py** — Shared PRE-hook decision gate.
   - `class BlockedDecision`; `def evaluate_blocking_decision(hook_output)`
 - **kestrel_sovereign/hooks/manager.py** — Kestrel Hooks Manager - Central registration and execution.
-  - `class HooksManager`
+  - `class FailedHookDenial`; `class HooksManager`
 - **kestrel_sovereign/host_features/__init__.py** — Host-scoped feature runtime for the multi-agent host (issue #2293, Phase 1).
 - **kestrel_sovereign/host_features/context.py** — Concrete :class:`~kestrel_sdk.features.host_base.HostContext` for the host.
   - `class FleetSessionFactory`; `class SovereignHostContext`; `async def close_host_context_resources(context)`; `async def build_host_context()`; `async def close_host_context(ctx)`
@@ -1181,7 +1182,7 @@ Repo entry points and standard project files.
 - **kestrel_sovereign/multi_agent/agent_manager.py** — In-process multi-agent manager for Kestrel.
   - `class HostedIsolatedRuntimeLifecyclePolicy`; `def public_exception_type_name(error)`; `class RuntimeOffboardingRetainedError`; `class RuntimeOffboardingNotPerformedError`; `class ChildTerminationReconciliationError`; `class ChildTerminationNotPerformedError`; `class PersistedSpawnParentUnavailableError`; `class InflightRuntimeOffboarding`; `…`
 - **kestrel_sovereign/multi_agent/config.py** — MultiAgent Configuration - Registry of agents managed by a Kestrel Host.
-  - `def spawn_retirement_denies_startup(data_dir)`; `class HostConfig`; `class LocalAgentConfig`; `class RemoteAgentConfig`; `class MultiAgentConfig`
+  - `def spawn_retirement_denies_startup(data_dir)`; `class HostConfig`; `class LocalAgentConfig`; `class RemoteAgentConfig`; `class MultiAgentConfig`; `def resolve_multi_agent_path(env)`; `def load_host_registry(env, base)`; `def launched_host_registry(project_dir)`
 - **kestrel_sovereign/multi_agent/liveness.py** — Whether a live process is serving an agent, however it was launched (#3522).
   - `class AgentHolder`; `class ProcessIdentityUnavailable`; `def process_identity()`; `class ServingRecord`; `def same_process_identity(first, second)`; `def recorded_process_exited(path, payload)`; `def serving_holder(data_dir)`; `def agent_holder(project_dir, agent_name, data_dir)`
 - **kestrel_sovereign/multi_agent/process_manager.py** — Agent Process Manager - Starts, stops, and monitors agent subprocesses.
@@ -1192,6 +1193,8 @@ Repo entry points and standard project files.
   - `def encode_agent_route_name(agent_name)`; `def decode_agent_route_name(segment)`
 - **kestrel_sovereign/native_retirement.py** — Passive observation of original native resource/epilogue lifetimes.
   - `class NativeExecutionObserver`; `def bind_native_execution_observer(observer)`
+- **kestrel_sovereign/offline_migrations.py** — Refuse a deploy onto a release that needs an offline migration not yet done (#3832).
+  - `class OfflineMigrationError`; `class OfflineMigration`; `class MigrationFinding`; `class OfflineMigrationCheck`; `def parse_manifest(content)`; `def packaged_manifest()`; `def manifest_at(repo_path, revision)`; `def judge(project_dir, migrations)`; `…`
 - **kestrel_sovereign/operator/__init__.py** — Generic runtime support for SDK operator contracts.
 - **kestrel_sovereign/operator/host_services.py** — Retained host service discovery; this supplies no operator/content grant.
   - `class HostServiceBinding`
@@ -1280,7 +1283,7 @@ Repo entry points and standard project files.
 - **kestrel_sovereign/security/principal_master_key_store.py** — Shared persistence for principal-scoped master credentials.
   - `class MasterKeyTable`; `class MasterKeyRecord`; `class PrincipalMasterKeyScope`; `def master_key_hash(api_key)`; `class PrincipalMasterKeyStore`
 - **kestrel_sovereign/security/private_delivery.py** — Retain private host capability authority through the actual ASGI send.
-  - `class PrivateDeliveryMiddleware`; `class AuthorizedCapabilityResponse`
+  - `class PrivateTransportBorrow`; `class PrivateDeliveryMiddleware`; `class AuthorizedCapabilityResponse`
 - **kestrel_sovereign/security/release_manifest.py** — Release manifest — Wave 5 sub-PR 1 of Quantum Hardening (#921, #920).
   - `class ArtifactEntry`; `class ReleaseManifest`; `class ReleaseManifestError`; `def signable_payload(manifest)`; `def compute_manifest_id(manifest)`; `def new_manifest()`; `def add_artifact_entry(manifest, path, content)`; `def add_artifact_entry_from_path(manifest, rel_path, abs_path)`; `…`
 - **kestrel_sovereign/security/sealed_capsule.py** — Sealed capsule — Wave 4 sub-PR 3 of Quantum Hardening (#921, #919).
@@ -1306,7 +1309,7 @@ Repo entry points and standard project files.
 - **kestrel_sovereign/security/verify_policy.py** — Verify-policy modes for signed identity artifacts.
   - `class VerifyPolicy`; `class Context`; `def default_policy_for(context)`; `class PolicyResult`; `def evaluate_signatures(signatures, policy)`
 - **kestrel_sovereign/server.py** — A FastAPI server to expose Kestrel agent functionality as a service.
-  - `def load_server_dotenv(package_dir)`; `def resolve_multi_agent_path(env)`; `def get_api_key()`; `async def verify_api_key(request, api_key_header, token)`; `async def lifespan(app)`; `class MultiAgentAgentRoutingMiddleware`; `def canonical_rate_limit_exceeded_handler(request, exc)`; `class CanonicalCORSMiddleware`; `…`
+  - `def load_server_dotenv(package_dir)`; `def get_api_key()`; `async def verify_api_key(request, api_key_header, token)`; `async def lifespan(app)`; `class MultiAgentAgentRoutingMiddleware`; `def canonical_rate_limit_exceeded_handler(request, exc)`; `class CanonicalCORSMiddleware`; `async def logging_context_middleware(request, call_next)`; `…`
 - **kestrel_sovereign/services/__init__.py** — Kestrel Services.
 - **kestrel_sovereign/services/key_resolution.py** — Key Resolution Service for Kestrel.
   - `class KeyNotConfiguredError`; `class KeyUnreadableError`; `class KeyResolutionService`; `async def resolve_key(provider, agent_did, storage, require)`
@@ -1632,6 +1635,7 @@ Repo entry points and standard project files.
 - **kestrel_sovereign/storage/operator_notice_store.py** — Durable operator-notice audit record (#2530).
   - `class OperatorNoticeState`; `class OperatorNoticeRecord`; `class OperatorNoticeAuditStore`
 - **kestrel_sovereign/storage/original_action_result.py** — One existing encrypted action row's physically owned negative result.
+- **kestrel_sovereign/storage/original_human_action_result.py** — Exact original human negative result; no agent or ordinary SQL authority.
 - **kestrel_sovereign/storage/original_result_backing.py** — Physical holds shared only by Core's closed visual result owners.
 - **kestrel_sovereign/storage/privacy_wrapper.py** — Privacy-Enforcing Storage Wrapper for Kestrel.
   - `def get_anonymize_text()`; `class PrivacyViolationError`; `class OperationType`; `def bind_transition_lock_reentry(token)`; `def current_bound_reentry_token()`; `def held_transition_reentry_token(agent)`; `def capture_transition_lock_reentry(agent)`; `class ReentrantTransitionLock`; `…`
@@ -1760,11 +1764,13 @@ Repo entry points and standard project files.
 - **kestrel_sovereign/visual_computer/discovery.py** — Distinct SDK environment and driver factory discovery; no host fallback.
   - `def discover_factories(group)`; `def construct_adapters()`
 - **kestrel_sovereign/visual_computer/dispatch.py** — Original native non-dispatch facts, never authority or a retry permission.
-  - `class NativeActionNotDispatched`; `def original_dispatch(session, request)`; `def native_dispatch(session, request, driver_id)`; `def native_trace()`
+  - `class NativeActionNotDispatched`; `def original_human_dispatch(session, lease, request, frame)`; `def native_human_dispatch(session, lease, request, driver_id)`; `def original_dispatch(session, request)`; `def native_dispatch(session, request, driver_id)`; `def native_trace()`
 - **kestrel_sovereign/visual_computer/docker.py** — Concrete SDK adapters for one reviewed, local, offline Docker browser.
   - `class DockerCommandError`; `class DockerBoundary`; `class DockerEnvironmentProvider`; `class DockerComputerDriver`; `class DockerWorkspaceTransfer`; `def environment_provider_factory()`; `def computer_driver_factory()`
 - **kestrel_sovereign/visual_computer/docker_egress.py** — Active-call HTTP gateway; the browser itself retains Docker network=none.
   - `class EgressDenied`; `class EgressUnknown`; `def origin(value)`; `def public_address(value)`; `class OwnedTestServer`; `class DockerEgressPolicy`; `class HTTPGateway`
+- **kestrel_sovereign/visual_computer/docker_human.py** — SDK0.45 human extension over exact-incarnation authenticated Docker IPC.
+  - `def human_operation_id(control_id, operation, action_id)`; `def parse(model, value)`; `class DockerHumanControl`
 - **kestrel_sovereign/visual_computer/docker_policy.py** — Canonical reviewed offline Docker browser profile, shared with real verification.
   - `def verified_seccomp_policy()`; `def verified_host_configuration()`; `def container_arguments(image, identity)`; `def verify_container(record, image, identity)`
 - **kestrel_sovereign/visual_computer/docker_profile/host-config.json** — (configuration)
@@ -1773,6 +1779,10 @@ Repo entry points and standard project files.
   - `class ActiveCallEgress`
 - **kestrel_sovereign/visual_computer/http.py** — Authorized visual session routes with original private delivery custody.
   - `def create_visual_computer_router(runtime)`
+- **kestrel_sovereign/visual_computer/human.py** — Original-owner manual view/input; never registered as agent/model tools.
+  - `class HumanRecord`; `class HumanComputerRuntime`
+- **kestrel_sovereign/visual_computer/human_http.py** — Private authenticated manual proxy; no agent tools or raw remote endpoint.
+  - `def add_human_routes(router, runtime)`
 - **kestrel_sovereign/visual_computer/inference.py** — One fresh visual proposal through the existing model router and SDK actions.
   - `class VisualProposal`; `class VisualInference`
 - **kestrel_sovereign/visual_computer/repository.py** — Encrypted visual custody in the original agent database.
@@ -2004,6 +2014,8 @@ Repo entry points and standard project files.
 - **docker/visual-browser/README.md** — Local visual browser substrate — This is the pinned browser image and sandbox verification for Core #3709, part of #3703.
 - **docker/visual-browser/controller.py** — Private in-container browser state machine; the host owns admission/policy.
   - `class Refused`; `def identifier(value)`; `def instant(value)`; `def integer(value, minimum, maximum)`; `def version_one(record)`; `def digest(value)`; `class BrowserController`
+- **docker/visual-browser/human.py** — Candidate SDK human channel; authenticated worker IPC is its only transport.
+  - `class HumanTransport`
 - **docker/visual-browser/network.py** — HTTP request relay bound to one active, authenticated host action.
   - `class NetworkRelay`
 - **docker/visual-browser/requirements.in** — —
@@ -2546,6 +2558,8 @@ Repo entry points and standard project files.
 - **tests/frontend/ui_state.test.mjs** — (mjs asset)
 - **tests/frontend/upgrade_prompt.test.mjs** — (mjs asset)
 - **tests/frontend/visual_computer_panel.test.mjs** — (mjs asset)
+- **tests/frontend/visual_human_artifact_after_destroy.browser.cjs** — —
+- **tests/frontend/visual_human_product.browser.cjs** — —
 - **tests/frontend/voice_capability.test.mjs** — (mjs asset)
 - **tests/frontend/voice_default_pane.test.mjs** — (mjs asset)
 - **tests/frontend/voice_provider_attribution.test.mjs** — (mjs asset)
@@ -3235,7 +3249,7 @@ Repo entry points and standard project files.
 - **tests/integration/test_scheduler_committed_control.py** — Successful native COMMIT remains a control receipt after observer withdrawal.
   - `async def test_original_acknowledged_commit_cannot_be_classified_as_local_denial(native_pg, monkeypatch, with_denial)`
 - **tests/integration/test_scheduler_failure_streak_backends.py** — Repeated scheduled-task failure on both production backends (#3280).
-  - `async def test_failure_streak_marks_and_clears_on_backend(db_backend, monkeypatch)`
+  - `async def test_failure_streak_marks_and_clears_on_backend(db_backend, monkeypatch)`; `async def test_hook_failures_back_off_without_pausing_on_backend(db_backend, monkeypatch)`; `async def test_a_legacy_scheduler_pause_is_labelled_on_backend(db_backend, monkeypatch)`
 - **tests/integration/test_scheduler_isolated_execution_context.py** — Core-to-SDK propagation of durable scheduler execution identity.
   - `async def test_scheduler_context_crosses_real_sdk_json_rpc_and_is_revoked(monkeypatch, tmp_path, schedule_id, expected_source_id)`; `async def test_revoked_core_scope_fails_closed_before_sdk_json_rpc(monkeypatch, tmp_path)`
 - **tests/integration/test_scheduler_original_denial_scope.py** — A second native scheduler admission is not this occurrence's authority.
@@ -3396,6 +3410,14 @@ Repo entry points and standard project files.
   - `async def test_original_lost_worker_reply_survives_host_restart_without_second_control(harness, custody, operation, action)`
 - **tests/integration/test_visual_custody_backends.py** — Canonical visual receipt/owner/CAS semantics on both native databases.
   - `async def custody(tmp_path, monkeypatch, request)`; `def record()`; `async def test_original_admission_cas_and_owner_survive_native_restart(custody)`; `async def test_native_accepted_input_receipt_is_encrypted_and_never_replaced(custody)`; `async def test_native_current_guard_rolls_back_admission_after_sql_before_commit(custody, monkeypatch)`; `async def test_native_preparation_dispatch_cas_and_restart_never_replay(custody)`; `async def test_native_verified_release_capacity_and_unknown_action_retention(custody)`
+- **tests/integration/test_visual_human_composed_backing.py** — Real original Human and shipped Step ownership on their one native engine.
+  - `async def test_copied_human_owner_close_cannot_retire_original_registration(custody, replacement)`; `async def test_original_human_close_requires_actual_native_writer_join(custody, monkeypatch)`; `async def test_genuine_human_native_writer_cannot_borrow_current_step(custody, monkeypatch)`; `async def test_genuine_current_step_native_writer_cannot_borrow_human_late(step_host, monkeypatch)`; `async def test_native_step_planning_identity_never_becomes_manual_input(step_host, operation)`
+- **tests/integration/test_visual_human_custody_backends.py** — Retain private identities while bounding live manual custody on native DBs.
+  - `def channel(store, parent, cid)`; `async def put(store, parent, cid)`; `async def release(store, parent)`; `def another()`; `async def test_native_private_populated_migration_retains_exact_history_and_legacy_charge(custody)`; `async def test_native_private_last_slot_serializes_across_repository_connections(custody, monkeypatch)`; `async def test_native_private_unknown_release_or_input_keeps_capacity_charged(custody)`; `async def test_native_private_migration_refuses_corrupt_encrypted_history(custody)`; `…`
+- **tests/integration/test_visual_human_original_result_backends.py** — Distinct human original results on real SQLite and PostgreSQL.
+  - `async def prepared_human(store)`; `async def dispatch(store, current, request, result)`; `async def test_only_exact_human_negative_fact_survives_global_stop_and_private_frame_clear(custody)`; `async def test_human_original_result_rejects_foreign_or_replaced_owners(custody, wrong)`; `async def test_human_and_agent_original_profiles_never_convert_channels(custody)`; `async def test_human_result_issuance_requires_original_private_binding(custody, wrong)`; `async def test_consistent_foreign_consumer_records_never_mint_original_human_owner(custody)`; `async def test_human_owner_cannot_be_issued_after_driver_entry(custody)`; `…`
+- **tests/integration/test_visual_human_product_browser.py** — Production initialized feature/HTTP/component; no model or genesis invoke.
+  - `async def test_initialized_manual_browser_and_safe_artifact_after_destroy(tmp_path, monkeypatch, caplog)`
 - **tests/integration/test_visual_original_result_backends.py** — Only the original fixed native action result survives turn retirement.
   - `class OriginalTurn`; `async def prepared(store)`; `async def test_global_turn_stop_keeps_only_exact_original_negative_fact(custody)`; `async def test_original_result_refuses_forged_stale_or_rebound_uses(custody, wrong)`; `async def test_original_result_cas_cannot_overwrite_later_original_revision(custody)`; `async def test_possible_partial_send_never_uses_result_permission(custody)`; `async def test_native_database_close_joins_original_result_before_retirement(custody)`; `async def test_exact_owner_rechecked_after_last_native_proof_before_commit(custody, monkeypatch)`; `…`
 - **tests/integration/test_visual_retirement_backends.py** — Never-acquired tombstones use the same authenticated native request row.
@@ -3888,6 +3910,8 @@ Repo entry points and standard project files.
   - `def tmp_agent_dir(tmp_path)`; `def mock_storage()`; `class TestTruncateBootstrapContent`; `class TestBootstrapFileLoading`; `class TestBuildSystemPromptWithBootstrap`
 - **tests/unit/test_bootstrap_key_persistence.py** — The OpenRouter bootstrap child key must be reused across restarts.
   - `async def host_db(tmp_path)`; `async def test_bootstrap_key_persisted_and_reused_across_restart(host_db)`; `async def test_separate_accounts_get_separate_bootstrap_keys(host_db)`; `async def test_without_host_db_still_mints_once_per_process(host_db)`; `async def test_provider_id_is_stable_and_account_scoped()`
+- **tests/unit/test_bootstrap_key_source_scoping.py** — Who ``/api/auth/key`` hands the API key to (#3804).
+  - `def served_standalone(monkeypatch, tmp_path)`; `def test_uvicorn_trusts_only_ipv4_loopback_to_name_the_client(monkeypatch)`; `def test_a_remote_peer_is_refused(served_standalone)`; `def test_a_remote_peer_cannot_claim_a_local_address_in_x_forwarded_for(served_standalone, claimed)`; `def test_q1a_a_loopback_proxy_that_sets_no_forwarding_header_is_admitted(served_standalone)`; `def test_q1b_a_loopback_proxy_that_names_a_remote_client_is_refused(served_standalone, forwarded_for)`; `def test_a_loopback_proxy_that_declares_a_remote_client_is_refused(served_standalone, peer, headers)`; `def test_q1c_the_docker_bridge_gateway_is_admitted_by_default(served_standalone)`; `…`
 - **tests/unit/test_bootstrap_loader_log_level.py** — Log-level regression for #659.
   - `class TestMissingOptionalFilesAreDebugNotWarning`
 - **tests/unit/test_bootstrap_model_defaults.py** — Contracts for bootstrap/example model selection defaults.
@@ -4257,7 +4281,7 @@ Repo entry points and standard project files.
 - **tests/unit/test_decryption_failure.py** — Tests for decryption failure behavior.
   - `class TestDecryptionFailure`; `class TestDecryptionErrorMessage`; `class TestNoSilentFailures`
 - **tests/unit/test_deferred_tool_delivery.py** — Real dispatch and post-tool hooks gate private render delivery.
-  - `class CompletionHost`; `class PostPolicy`; `class DeferredTool`; `class Boundary`; `async def boundary(tmp_path, request)`; `async def test_private_delivery_waits_for_actual_post_policy_and_honors_redaction(boundary, path, redact)`; `async def test_pre_tool_refusal_never_executes_or_publishes_a_deferred_result(boundary, path)`; `async def test_decision_only_post_policy_withholds_private_parts_without_replaying_the_tool(boundary, path, decision)`; `…`
+  - `class CompletionHost`; `class PostPolicy`; `class DeferredTool`; `class Boundary`; `async def boundary(tmp_path, request)`; `async def test_private_delivery_waits_for_actual_post_policy_and_honors_redaction(boundary, path, redact)`; `async def test_live_chat_destination_reaches_the_original_publisher_only_after_completion(boundary, path)`; `async def test_foreign_inline_task_borrows_only_a_live_publication_destination(boundary, active)`; `…`
 - **tests/unit/test_deidentification_pipeline.py** — De-identification pipeline and evidence artifact (#1761).
   - `class ListedNames`; `def test_deidentified_preset_dimensions_stay_distinct_from_anonymous()`; `def test_safe_harbor_identifier_list_has_all_eighteen_categories()`; `def test_pii_redaction_is_not_deidentification()`; `def test_every_category_can_be_removed_by_schema(category)`; `def test_generalizations_follow_safe_harbor()`; `def test_dates_ninety_years_old_are_aggregated_in_every_date_role()`; `def test_evidence_counts_each_birth_year_once()`; `…`
 - **tests/unit/test_deidentified_storage_gate.py** — The evidence-gated de-identified save on PrivacyEnforcingStorage (#1761).
@@ -4277,7 +4301,7 @@ Repo entry points and standard project files.
 - **tests/unit/test_denied_tools_dispatch.py** — Tests for security DENY enforcement at orchestrator dispatch level.
   - `class TestDeniedToolsStripping`; `class TestSubagentDeniedToolsExclusion`
 - **tests/unit/test_dependency_contract.py** — Security contracts for declared dependencies and the resolved lock.
-  - `def test_installed_remote_mcp_campaign_requires_the_public_feature_contract()`; `def test_native_a2a_streams_require_server_scoped_shutdown()`; `def test_shared_sdk_owns_the_current_https_trust_bundle_policy()`; `def test_banned_packages_not_declared()`; `def test_banned_packages_not_locked()`; `def test_security_floors_are_declared()`; `def test_security_floors_are_locked()`; `def test_windows_tzdata_is_a_direct_base_dependency_and_is_locked()`; `…`
+  - `def test_installed_remote_mcp_campaign_requires_the_public_feature_contract()`; `def test_native_a2a_streams_require_server_scoped_shutdown()`; `def test_shared_sdk_owns_the_current_https_trust_bundle_policy()`; `def test_banned_packages_not_declared()`; `def test_banned_packages_not_locked()`; `def test_security_floors_are_declared()`; `def test_security_floors_are_locked()`; `def test_transitive_security_floors_are_locked()`; `…`
 - **tests/unit/test_deploy_azure.py** — Unit tests for Azure Container Apps deployment provider.
   - `def deployment_profile()`; `def provider_and_client()`; `async def test_deploy_logs_create_only_for_resource_not_found(deployment_profile, provider_and_client, caplog)`; `async def test_deploy_logs_update_when_resource_exists(deployment_profile, provider_and_client, caplog)`; `async def test_deploy_does_not_misclassify_lookup_failure_as_absent(deployment_profile, provider_and_client)`; `async def test_deploy_lookup_preserves_caller_cancellation(deployment_profile, provider_and_client)`
 - **tests/unit/test_deploy_bugs.py** — Unit tests for deploy feature bug fixes (#101).
@@ -4946,6 +4970,8 @@ Repo entry points and standard project files.
   - `def test_summarize_separates_retrieval_from_abstention_quality()`; `def test_rank_query_uses_production_salience_components_but_relevance_gate()`; `def test_fixture_ids_and_labels_are_well_formed()`; `def test_partial_lexical_overlap_below_canonical_threshold_is_not_relevance()`; `async def test_general_recall_excludes_explicitly_superseded_memory()`; `async def test_salience_only_reranks_semantically_competitive_candidates()`; `def test_interrogative_echo_is_dropped_without_hiding_user_fact()`
 - **tests/unit/test_memory_retriever_cosine.py** — Tests for the vector-cosine semantic-score path on :class:`MemoryRetriever`.
   - `def test_cosine_unit_identical_vectors_is_one()`; `def test_cosine_unit_opposite_vectors_is_zero()`; `def test_cosine_unit_orthogonal_vectors_is_zero()`; `def test_cosine_unit_returns_none_on_length_mismatch()`; `def test_cosine_unit_returns_none_on_zero_norm()`; `async def test_embed_query_returns_none_without_service()`; `async def test_embed_query_returns_none_for_empty_query()`; `async def test_embed_query_returns_none_on_aembed_failure()`; `…`
+- **tests/unit/test_memory_retriever_loop_cost.py** — A long query cannot stall the event loop in memory retrieval (#3745).
+  - `async def test_query_derived_values_are_computed_once_per_retrieve(monkeypatch)`; `async def test_long_query_retrieval_never_blocks_the_event_loop(tmp_path, monkeypatch)`
 - **tests/unit/test_memory_search_compact_results.py** — search_memory returns compact, size-bounded hits (#3784).
   - `def result_cap(monkeypatch)`; `async def store(tmp_path)`; `async def test_a_million_character_message_cannot_make_a_large_search_result(store, result_cap)`; `async def test_twenty_huge_hits_shrink_and_drop_but_stay_under_the_cap(store, result_cap)`; `async def test_snippets_shrink_before_any_hit_is_dropped(store, result_cap)`; `async def test_the_smallest_cap_still_fits_with_a_huge_query(store, result_cap)`; `async def test_hits_carry_no_metadata_envelope_and_bare_concepts(store, result_cap)`; `async def test_term_fallback_hits_report_their_score(store, result_cap)`; `…`
 - **tests/unit/test_memory_system.py** — Unit tests for Human-Like Memory System.
@@ -5044,6 +5070,8 @@ Repo entry points and standard project files.
   - `def test_core_does_not_register_events_route()`; `def test_core_keeps_summary_and_metrics_but_not_events_or_host_namespace()`
 - **tests/unit/test_observability_writer_identity_convention.py** — What in-repo recorders put in `a2a_observability.agent_name` (#3215).
   - `def test_the_scan_covers_every_recorder_the_store_defines()`; `def test_every_recorder_of_our_own_events_writes_the_did()`
+- **tests/unit/test_offline_migrations.py** — The offline migration gate on deploys (#3832).
+  - `def project(tmp_path)`; `def test_the_packaged_manifest_declares_the_native_a2a_cutover()`; `def test_every_declared_migration_has_a_probe_and_every_probe_is_declared()`; `def test_every_declared_runbook_is_in_the_checkout()`; `def test_the_packaged_manifest_is_where_a_revision_carries_it()`; `def test_a_manifest_this_code_cannot_read_whole_is_refused(content, why)`; `def test_a_manifest_declaring_nothing_is_read_as_nothing()`; `def repo(tmp_path)`; `…`
 - **tests/unit/test_ollama_cancellation.py** — #3572: Stop abandons an Ollama chat call even while the daemon sends nothing.
   - `async def test_stop_abandons_a_call_the_daemon_has_sent_nothing_of(path)`; `async def test_stop_between_streamed_tokens_abandons_the_stream()`; `async def test_stop_before_the_daemon_answers_drops_the_connection(path)`; `async def test_a_call_stopped_before_it_starts_sends_nothing(path)`; `async def test_a_token_that_never_fires_changes_nothing(path)`
 - **tests/unit/test_ollama_capped_attempt_usage.py** — #3577: an Ollama attempt cut at its output cap still records its usage.
@@ -5334,6 +5362,8 @@ Repo entry points and standard project files.
   - `async def db(tmp_path)`; `async def test_failures_below_the_threshold_record_no_marker(db, caplog)`; `async def test_reaching_the_threshold_records_the_marker_and_warns_once(db, caplog)`; `async def test_further_failures_count_up_without_another_warning(db, caplog)`; `async def test_one_success_clears_the_marker_and_logs_recovery(db, caplog)`; `async def test_failures_interleaved_with_successes_never_reach_the_threshold(db, caplog)`; `async def test_the_threshold_is_the_runners_configured_value(db, caplog)`; `async def test_a_paused_schedule_is_not_flagged_for_runs_that_never_happened(db, caplog)`; `…`
 - **tests/unit/test_scheduler_feature.py** — Unit tests for the SchedulerFeature and SchedulerRunner.
   - `async def feature()`; `async def feature_no_db()`; `class TestSchedulerTools`; `class TestScheduleList`; `class TestRetiredCronCleanup`; `class TestSleepCronHandler`; `class TestSleepActivityGateSoftDelete`; `class TestScheduleAdd`; `…`
+- **tests/unit/test_scheduler_hook_failure.py** — A failing enforcing hook fails one tick closed; it does not pause (#3749).
+  - `async def harness(tmp_path)`; `async def test_a_failed_enforcing_hook_denies_and_names_itself(behaviour)`; `async def test_a_deny_the_hook_decided_is_not_a_hook_failure()`; `async def test_a_failed_parallel_enforcing_hook_is_marked_too()`; `async def test_a_hook_that_raises_once_leaves_the_row_enabled_and_the_next_tick_runs(harness, caplog)`; `async def test_a_genuine_policy_block_still_pauses_the_schedule(harness, level)`; `async def test_repeated_hook_failures_back_off_and_are_reported_without_pausing(harness, caplog)`; `async def test_a_one_shot_deadline_whose_hook_failed_is_retried_not_consumed(harness)`; `…`
 - **tests/unit/test_scheduler_native_admission_retirement.py** — Actual SQLite COMMIT retirement precedes scheduler Stop/effect publication.
   - `async def test_stop_during_native_admission_commit_joins_original_ack_and_dispatches_nothing(tmp_path, monkeypatch, receipt)`
 - **tests/unit/test_scheduler_occurrence_liveness.py** — One slow occurrence must not stop the scheduler claiming other due work.
@@ -5734,6 +5764,8 @@ Repo entry points and standard project files.
   - `async def test_tool_dispatch_schema_uses_database_dialect_helpers()`; `async def test_tool_dispatch_write_path_redacts_and_queries(tmp_path)`; `async def test_llm_call_observability_records_and_filters_agent_did(tmp_path)`; `async def test_broken_direct_tool_dispatch_writes_failure_row(tmp_path)`; `def test_redact_args_json_caps_large_payloads()`
 - **tests/unit/test_tool_honesty_prompt.py** — Tests for the tool-honesty system prompt addendum (issue #1042 Fix 1).
   - `class TestToolHonestyPromptConstant`; `class TestAppendSecurityAddendum`; `class TestProductionCallSites`
+- **tests/unit/test_tool_publication_context.py** — A private publisher receives only its live host-selected chat destination.
+  - `def test_publication_destination_requires_exact_owner_and_session()`; `def test_sessionless_collector_does_not_invent_a_chat_destination(session_id)`; `def test_copied_part_data_cannot_copy_or_extend_a_chat_destination(transform)`; `async def test_copied_and_borrowed_turn_context_expires_on_owning_scope_exit()`; `async def test_concurrent_chat_destinations_on_the_same_host_stay_separate()`
 - **tests/unit/test_tool_result_contract.py** — Tests for kestrel_sovereign.tools.result_contract.
   - `def test_pilot_features_pass_contract(feature_cls)`; `def test_pilot_modules_are_in_allowlist(feature_cls)`; `def test_assert_feature_returns_tool_result_does_not_raise(feature_cls)`; `def test_mcp_external_feature_allowlisted_and_clean()`; `def test_non_migrated_module_is_not_validated()`; `def test_find_violations_catches_dict_return()`; `def test_find_violations_catches_missing_annotation()`; `def test_find_violations_rejects_optional_tool_result()`; `…`
 - **tests/unit/test_tool_result_persistence.py** — Tests for large tool result persistence — preview with head+tail.
@@ -5796,6 +5828,10 @@ Repo entry points and standard project files.
   - `def test_advanceable_clock_keeps_real_time_and_jumps_forward()`; `async def test_advance_brings_an_armed_deadline_due()`; `async def test_advanceable_clock_runs_loop_sleeps_in_real_time()`; `async def test_leaving_advanceable_clock_takes_the_jumps_back_out()`; `async def test_hang_guard_returns_the_result_and_raises_the_failure()`; `async def test_hang_guard_fires_while_the_loop_clock_is_pinned()`; `async def test_hang_guard_survives_a_jump_of_the_loop_clock()`; `async def test_hang_guard_leaves_an_awaited_task_and_cancels_its_own()`; `…`
 - **tests/unit/test_visual_browser_controller.py** — Private browser worker execution boundaries; no host capability is enabled.
   - `class Page`; `def controller()`; `async def action(driver, session)`; `def control(session, operation, request_id)`; `async def test_accepted_input_is_not_replayed_and_different_reuse_conflicts()`; `async def test_cancelled_accepted_effect_remains_unknown_without_replay()`; `async def test_pending_pause_fences_queued_input_and_drains_accepted_effect(operation)`; `async def test_close_uncertainty_cannot_be_resumed_or_claimed_closed()`; `…`
+- **tests/unit/test_visual_browser_human.py** — Candidate SDK contract against the actual worker state engine; no isolation claim.
+  - `async def opened(tmp_path)`; `async def action(c, session, human, lease)`; `async def test_separate_channel_pixels_once_receipt_and_private_custody(tmp_path)`; `async def test_foreign_binding_never_effects(tmp_path, field, value)`; `async def test_display_or_focus_change_refuses_before_input(tmp_path)`; `async def test_revoke_before_open_is_permanent_durable_fence(tmp_path)`; `async def test_new_revocation_id_confirms_same_preopen_fence_without_renewing_it(tmp_path)`; `async def test_priority_revoke_drains_input_before_ack_and_old_epoch_cannot_reopen(tmp_path)`; `…`
+- **tests/unit/test_visual_browser_human_focus.py** — Original worker engine with its existing bounded page double; no browser claim.
+  - `def facts_path(tmp_path)`; `async def test_focus_failure_before_intent_has_original_durable_denial(tmp_path, monkeypatch)`; `async def test_focus_cancellation_keeps_original_exception_and_no_intent(tmp_path, monkeypatch)`
 - **tests/unit/test_visual_browser_network.py** — Private active-action relay guards; real Chromium boundary is opt-in.
   - `class Route`; `def relay()`; `async def test_no_autonomous_or_wait_action_http_authority()`; `async def test_job_is_exact_action_epoch_and_sealed_before_late_background_requests()`; `async def test_cancel_drains_handlers_and_preserves_unknown_network_effect()`; `async def test_known_method_refusal_does_not_claim_unknown_external_effect()`; `async def test_credentialed_request_is_refused_instead_of_silently_stripping_semantics(header)`; `async def test_reply_and_final_delivery_recheck_current_epoch()`; `…`
 - **tests/unit/test_visual_browser_substrate.py** — Substrate admission/cleanup checks; the real browser probe is opt-in.
@@ -5814,6 +5850,8 @@ Repo entry points and standard project files.
   - `class Revoked`; `def current_check(active)`; `def executable(tmp_path)`; `async def test_revocation_during_process_launch_prevents_actual_stdin_effect(tmp_path, monkeypatch)`; `async def test_cancel_during_process_launch_joins_exact_child_without_sending_input(tmp_path, monkeypatch)`; `async def test_revocation_after_stdin_is_unknown_and_owned_process_is_joined(tmp_path)`; `async def test_revocation_during_inspection_does_not_dispatch_action_and_joins_borrower(monkeypatch)`
 - **tests/unit/test_visual_docker_egress.py** — Real loopback HTTP plus gateway guards; Docker/browser proof is separate.
   - `def test_no_private_special_multicast_or_transition_destination(value)`; `def test_normal_settings_cannot_admit_test_exception_or_implicit_authority(configuration)`; `async def controlled_server(response)`; `def job(url)`; `async def test_raw_gateway_uses_exact_server_and_never_host_proxy_credentials(monkeypatch, caplog)`; `async def test_redirect_is_explicitly_refused_without_following_new_destination()`; `async def test_pinned_hostname_never_schedules_delayed_libc_resolver(monkeypatch)`; `def test_production_origin_requires_exact_public_ipv4_pin(pins)`; `…`
+- **tests/unit/test_visual_docker_human_guard.py** — Human native dispatch retains the original lexical grant through every await.
+  - `def session()`; `async def test_each_human_rpc_uses_exact_purpose_original_id_and_child(operation, monkeypatch)`; `async def test_grant_revocation_after_inspect_refuses_final_dispatch(operation, monkeypatch)`; `async def test_post_acceptance_reply_loss_is_unknown_and_missing_guard_refuses(monkeypatch)`; `def test_invalid_human_worker_model_is_unknown_not_invalid_client_input(model_name)`
 - **tests/unit/test_visual_docker_workspace_guard.py** — Retained workspace authority reaches the same native stdin guard as input.
   - `def session()`; `async def test_data_rpc_borrows_exact_original_id_in_owned_child(operation, arguments, monkeypatch)`; `async def test_revoked_original_transfer_after_inspect_cannot_dispatch(monkeypatch)`; `async def test_revoked_private_reply_after_native_acceptance_remains_unknown(monkeypatch)`; `async def test_retained_cleanup_never_borrows_new_data_authority(operation, monkeypatch)`; `async def test_priority_control_physically_joins_workspace_borrower(monkeypatch)`; `def test_factory_rejects_invalid_workspace_guard()`
 - **tests/unit/test_visual_native_dispatch_fact.py** — Concrete native facts require their original live invocation and settlement.
@@ -5872,10 +5910,40 @@ Repo entry points and standard project files.
   - `async def test_workspace_borrow_is_paused_original_and_cannot_use_action_lane(harness)`; `async def test_priority_stop_joins_original_workspace_borrow_before_ack(harness)`; `async def test_egress_borrows_only_exact_original_active_rpc(harness)`; `async def test_rpc_exit_revokes_and_physically_joins_socket_job(harness)`; `async def test_priority_revoke_is_owner_exact_and_joins_before_control(harness)`; `async def test_original_current_checker_and_deadline_fence_network_effect(harness)`; `async def test_runtime_act_owns_egress_and_stop_revokes_before_driver_control(harness)`; `async def test_repeated_origin_cancellation_cannot_abandon_gateway_cleanup(harness)`
 - **tests/unit/visual_computer/test_host.py** — Actual host auth and feature routing with real SQLite and a bounded driver.
   - `async def visual_host(harness, monkeypatch)`; `def path(name)`; `def intent()`; `async def test_real_host_auth_admission_owner_binding_and_stop(visual_host)`; `async def test_explicit_grant_current_rotation_privacy_and_lifecycle(visual_host, monkeypatch)`; `async def test_owner_payload_cookie_and_peer_never_mint_visual_grant(visual_host)`; `async def test_bound_context_rechecks_live_grant_and_exact_feature_generation(visual_host)`; `async def test_bound_context_retains_configured_fixed_deadline_and_current_grant(visual_host, monkeypatch, budget)`; `…`
+- **tests/unit/visual_computer/test_human.py** — Original host policy/custody with SDK doubles; actual Docker proof is separate.
+  - `class Extension`; `async def setup(h, ctx)`; `async def input_request(h, ctx, s, lease)`; `def original_human_rpc(runtime, session)`; `async def test_private_human_lane_never_enters_agent_status_and_custody_is_encrypted(harness)`; `async def test_separate_view_and_input_grants_are_current_after_dispatch_wait(harness)`; `async def test_human_callback_cannot_borrow_agent_or_workspace_authority(harness)`; `async def test_delivery_cannot_borrow_native_foreign_consumer_or_replacement_epoch(harness)`; `…`
+- **tests/unit/visual_computer/test_human_composition.py** — Composition of original host custody with the actual shared worker engine.
+  - `async def test_manual_preparation_stop_retires_without_an_effect_or_agent_receipt(harness, monkeypatch, at)`; `async def test_actual_worker_manual_focus_denial_reconciles_then_fresh_input_completes(harness, tmp_path)`; `async def test_released_original_human_channel_cannot_reopen(harness)`
+- **tests/unit/visual_computer/test_human_delivery.py** — Actual buffered host ASGI sends; SDK doubles do not prove Docker isolation.
+  - `class OuterTransport`; `async def test_safety_joins_actual_outer_human_send_before_ack(visual_host, harness, operation)`; `async def test_stop_and_repeated_cancellation_cannot_detach_suppressed_outer_send(visual_host, harness)`; `async def test_partial_transport_failure_has_unknown_delivery_without_replay_or_leak(visual_host, harness)`; `async def test_fixed_human_expiry_joins_outer_send_and_never_delivers_late_body(visual_host, harness)`
+- **tests/unit/visual_computer/test_human_http.py** — Authenticated human HTTP routes; SDK doubles do not prove Docker isolation.
+  - `async def setup(visual_host, harness)`; `async def test_human_private_http_auth_separate_grants_and_no_generic_frame_leak(visual_host, harness)`; `async def test_human_handback_confirmation_and_revoke_are_explicit(visual_host, harness)`; `async def test_human_http_disabled_lane_refuses_without_candidate_shim(visual_host)`
+- **tests/unit/visual_computer/test_human_lifecycle_recovery.py** — Native encrypted SQLite and original authority, with controlled SDK endpoints.
+  - `def persist(tmp_path, name, facts)`; `async def test_same_handback_id_reconciles_failed_fresh_agent_observation(harness, tmp_path, monkeypatch)`; `async def test_release_refuses_late_human_admission_and_joins_before_ack(harness, tmp_path, monkeypatch, operation)`; `async def test_missing_handback_frame_requires_fresh_observe_grant_and_confirmation(harness, monkeypatch)`; `async def test_release_intent_is_monotonic_and_maintenance_retries_original_lease(harness)`; `async def test_release_joins_previously_entered_sdk_call_cleanup(harness, monkeypatch, operation)`; `async def test_second_release_drain_joins_human_reader_between_fence_and_publication(harness, monkeypatch)`; `async def test_releasing_human_metadata_is_read_only_without_new_native_reconciliation(harness, monkeypatch)`; `…`
+- **tests/unit/visual_computer/test_human_malformed_native_reply.py** — Malformed native Human replies remain unknown after original cleanup.
+  - `async def native_http(visual_host, harness, monkeypatch, tmp_path, …)`; `async def test_native_malformed_human_reply_classification_after_cleanup(visual_host, harness, monkeypatch, tmp_path, …)`
+- **tests/unit/visual_computer/test_human_observability.py** — Real instrumented native HTTP for registered Human routes; no model calls.
+  - `async def test_registered_human_http_is_private_before_spans_and_native_access_logs(visual_host, harness, monkeypatch, caplog)`
+- **tests/unit/visual_computer/test_human_original_result.py** — Manual input keeps its own original no-dispatch fact through global Stop.
+  - `async def test_original_manual_host_refusal_survives_global_turn_retirement(harness, monkeypatch, cancel)`; `async def native_input(h, context, tmp_path, monkeypatch)`; `async def test_human_actual_native_launch_revocation_never_writes_input(harness, monkeypatch, tmp_path, cancel)`; `async def test_human_partial_native_stdin_retains_unknown_original_input(harness, monkeypatch, tmp_path)`; `async def test_arbitrary_human_rpc_refusal_is_not_original_native_no_send(harness, monkeypatch, tmp_path)`; `async def test_human_native_refusal_preserves_original_explicit_cause_graph(harness, monkeypatch, tmp_path)`; `async def test_malformed_native_human_receipt_retains_original_pending_input(harness, monkeypatch, tmp_path)`
+- **tests/unit/visual_computer/test_human_peer_binding.py** — Returned SDK bindings are untrusted facts; original host checks remain errors.
+  - `async def test_foreign_sdk_result_is_unknown_for_non_docker_provider(harness, operation)`; `async def test_original_provider_error_and_current_authority_are_not_peer_decode_errors(harness, failure_kind)`
+- **tests/unit/visual_computer/test_human_record_concurrency.py** — Original authenticated host + native SQLite, controlled SDK worker only.
+  - `async def test_status_snapshot_cannot_erase_acknowledged_original_revocation(visual_host, harness, monkeypatch, tmp_path)`; `async def test_atomic_human_successor_preserves_original_terminal_row(harness, change)`; `async def test_atomic_preopen_tombstone_preserves_fact_and_allows_same_target_request_id(harness, change)`; `async def test_nonterminal_human_snapshots_and_original_terminal_status_remain_valid(visual_host, harness)`; `async def test_post_fence_observe_cannot_replace_terminal_row_or_deliver_frame(visual_host, harness, monkeypatch, tmp_path)`; `async def test_private_human_schema_never_invokes_an_unrelated_model_callback(harness)`
+- **tests/unit/visual_computer/test_human_stale_revoke.py** — Genuine registered HTTP/auth/SQLite custody; controlled SDK, not Chromium.
+  - `async def observed_original_human(repository, lease)`; `async def test_old_human_revoke_does_not_fence_handed_back_agent(visual_host, harness, monkeypatch, tmp_path, …)`; `async def test_pending_human_revoke_cannot_adopt_later_control_serial(visual_host, harness, monkeypatch, tmp_path, …)`; `async def test_invalid_original_human_target_refuses_before_fence_or_rpc(visual_host, harness, monkeypatch, tmp_path, …)`; `async def test_new_preopen_revocation_id_after_handback_uses_original_rpc_without_agent_fence(visual_host, harness, monkeypatch, tmp_path)`; `async def test_external_stop_retires_consumer_before_panel_request_arrives(visual_host, harness, tmp_path)`
+- **tests/unit/visual_computer/test_human_tombstone_reconciliation.py** — Genuine registered host/native encrypted SQLite; controlled SDK worker only.
+  - `class UnknownOpenBeforeLease`; `async def test_original_unknown_open_tombstone_reconciles_same_target_revoke(visual_host, harness, tmp_path, retry)`; `async def test_original_preopen_tombstone_still_refuses_new_request(visual_host, harness, tmp_path)`
+- **tests/unit/visual_computer/test_human_transport_lifecycle.py** — Host lifecycle regressions using the original authenticated local fixtures.
+  - `def save(tmp_path, name, value)`; `async def test_original_operation_snapshot_cannot_admit_a_retired_observe_rpc(visual_host, harness, monkeypatch, tmp_path)`; `async def test_prepared_status_cannot_report_active_after_original_revoke_ack(visual_host, harness, monkeypatch, tmp_path)`; `async def test_publication_drain_joins_original_send_admitted_after_initial_drain(visual_host, harness, monkeypatch, tmp_path)`
+- **tests/unit/visual_computer/test_human_transport_registration_race.py** — Actual authenticated host ASGI/SQLite with controlled SDK pixels only.
+  - `async def test_original_revoke_ack_prevents_post_fence_transport_snapshot_delivery(visual_host, harness, monkeypatch, tmp_path)`
 - **tests/unit/visual_computer/test_inference.py** — Real router and OpenAI image transport; only the model server is scripted.
   - `async def inference(harness, monkeypatch, tmp_path)`; `async def test_actual_router_transports_image_and_proposal_uses_canonical_receipt(inference)`; `async def test_changed_screen_after_model_never_rebinds_the_proposed_action(inference)`; `async def test_blind_route_is_not_dispatched_and_fallback_keeps_image(inference)`; `async def test_all_blind_routes_explicitly_refuse_without_model_submission(inference)`; `async def test_private_native_model_error_never_enters_adapter_or_host_logs(inference, caplog)`; `async def test_unknown_vision_evidence_never_becomes_family_level_fallback(inference, mode)`; `async def test_takeover_fence_blocks_native_dispatch_or_delivery_and_fallback(inference, phase)`; `…`
 - **tests/unit/visual_computer/test_launch_settlement.py** — Original native launch facts require real exec/reap and exact gated owners.
   - `def executable(tmp_path, name, body)`; `async def test_real_exec_refusal_settles_original_action_and_dedup(harness, monkeypatch, tmp_path, code, …)`; `async def test_factory_accept_then_raise_keeps_payload_gated_and_exact_owners_joined(monkeypatch, tmp_path, at, eager)`; `async def test_launch_result_publication_failure_reaps_retained_exact_process(monkeypatch, tmp_path)`; `async def test_possible_partial_stdin_remains_unknown_after_exact_reap(monkeypatch, tmp_path)`; `async def test_repeated_cancellation_joins_accepted_launch_without_stdin(monkeypatch, tmp_path)`; `async def test_foreign_launch_error_after_acceptance_is_unknown_not_exec_refusal(monkeypatch, tmp_path)`; `async def test_opaque_task_factory_keeps_explicit_native_dispatch_debt(tmp_path)`; `…`
+- **tests/unit/visual_computer/test_native_human_peer.py** — Actual HTTP/SQLite/native peer validation; no Docker daemon or browser effects.
+  - `async def test_original_native_human_peer_reply_classification(visual_host, harness, monkeypatch, tmp_path, …)`
 - **tests/unit/visual_computer/test_original_result.py** — Production host paths retain only original facts across global turn Stop.
   - `async def test_global_turn_cancellation_settles_original_known_no_dispatch(harness, monkeypatch, tmp_path, at)`; `async def test_global_quote_cancellation_needs_fresh_genuine_reconcile_not_old_task(harness, monkeypatch)`; `async def test_turn_retirement_without_cancellation_fences_actual_native_stdin(harness, monkeypatch, tmp_path)`
 - **tests/unit/visual_computer/test_repository.py** — —
@@ -5888,6 +5956,8 @@ Repo entry points and standard project files.
   - `async def step(x, ctx, sid)`; `async def test_claim_before_inference_same_id_receipt_no_second_model(inference)`; `async def test_no_action_host_terminal_is_not_sdk_receipt(inference)`; `async def test_failed_planning_stays_charged_no_replan_or_generic_abandon(inference)`; `async def test_act_withdrawn_before_native_model_send_admits_no_model(inference)`; `async def test_configuration_withdrawal_after_dispatch_cas_before_effect(inference, monkeypatch)`; `async def test_copied_step_owner_cannot_close_original_intent(inference)`; `async def test_copied_current_writer_cannot_release_original_physical_hold(inference, monkeypatch)`; `…`
 - **tests/unit/visual_computer/test_step_host.py** — Real feature caller binding and private diagnostics for the same-row step.
   - `async def test_step_feature_binds_original_host_and_does_not_replan(visual_host, monkeypatch)`; `def test_step_classifier_redacts_actual_prompt_request_result()`
+- **tests/unit/visual_computer/test_ui_pending_control_contract.py** — Original pending-control host/auth/native SQLite contract; controlled SDK, not Docker.
+  - `async def test_original_pending_control_refuses_other_stop_and_reconciles_same_id(visual_host, harness, monkeypatch, tmp_path, …)`
 - **tests/utils/__init__.py** — Test utilities for Kestrel test suite.
 - **tests/utils/agent_identities.py** — Real ``AgentIdentity`` values in each of the three on-disk shapes.
   - `def legacy_identity(did)`; `def rotated_identity(legacy_did, successor_did)`; `def born_hybrid_identity(did)`

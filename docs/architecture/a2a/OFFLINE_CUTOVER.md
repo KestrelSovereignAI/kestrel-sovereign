@@ -21,6 +21,37 @@ unversioned A2A store refuses startup until this offline cutover succeeds.
 This command is part of the native cutover branch. Its availability does not
 mean the full protocol cutover or a release has been completed.
 
+## Deploy gate
+
+On 2026-10-24 an agent's `update_then_restart` installed the native release
+over undrained draft data and restarted; every agent refused to start until an
+operator rolled the install back 31 hours later (#3832). A release therefore
+declares the offline migrations it requires, and every deploy path asks each
+agent database, read-only, whether they are done before it changes anything.
+The native cutover is declared as `native-a2a-cutover`; its check is the
+startup preflight itself (`kestrel_sovereign.offline_migrations`).
+
+- `kestrel update` reads the declarations from the revision its pull will land
+  on, with git, before it pulls. A pending migration refuses the update with
+  exit status 6, naming the agents, their databases and this runbook. Nothing
+  is pulled, installed or restarted.
+- `kestrel restart`, including the update's own restart step, judges the
+  installed code before it stops anything.
+- The restart coordinator judges an `update_then_restart` after its fetch and
+  before its checkout, then the installed code before the restart, and a plain
+  restart before it is dispatched. Its refusal is terminal: an agent cannot
+  run the migration, and cannot override the gate.
+
+A migration the judging code has no check for, or a database it cannot read,
+refuses as well: nothing was learned about it. `--allow-pending-offline-migration`
+on `kestrel update` or `kestrel restart` proceeds anyway, for an operator who
+has checked.
+
+To cross the gate, follow this runbook with the host stopped:
+`kestrel terminate`, then `kestrel update --no-restart` (it refuses only while
+an affected agent is still running), then the preview and apply below, then
+`kestrel start`. `kestrel restart` refuses until the migration has completed.
+
 ## Prepare the old host
 
 Drain legacy work while the old host can still communicate with its peers.

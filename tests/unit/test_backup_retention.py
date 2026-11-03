@@ -3,11 +3,14 @@ from pathlib import Path
 
 import pytest
 
+from kestrel_sovereign.storage.sync import retention as retention_module
 from kestrel_sovereign.storage.sync.retention import (
     DataClass,
+    RetentionClassPolicy,
     RetentionItem,
     RetentionPolicy,
     classify,
+    load_retention_policy,
     parse_timestamp,
 )
 from kestrel_sovereign.storage.sync.service import SyncService
@@ -34,26 +37,174 @@ def _deleted_keys(policy: RetentionPolicy, items: list[RetentionItem]) -> set[st
     return {item.key for item in policy.deletions(items, now=NOW)}
 
 
-def test_working_memory_keeps_all_under_14_days_then_one_per_iso_week():
+# Monday of ISO week 2026-W45.
+BOUNDED_NOW = datetime(2026, 11, 2, 12, 0, tzinfo=timezone.utc)
+
+
+def _at(key: str, timestamp: datetime) -> RetentionItem:
+    return RetentionItem(
+        key=key,
+        name=key,
+        timestamp=timestamp,
+        data_class=DataClass.WORKING_MEMORY,
+    )
+
+
+def test_default_working_memory_retention_is_bounded_and_identity_keeps_its_own():
+    """No working-memory backup is kept forever (#3894); identity is unchanged."""
     policy = RetentionPolicy()
+
+    assert policy.policies[DataClass.WORKING_MEMORY] == RetentionClassPolicy(
+        keep_all_days=7,
+        weekly_until_weeks=8,
+        monthly_until_months=12,
+    )
+    assert policy.policies[DataClass.WORKING_MEMORY].bounded
+    assert policy.policies[DataClass.IDENTITY] == RetentionClassPolicy(
+        keep_all_days=30,
+        weekly_until_months=12,
+        monthly_forever=True,
+    )
+    assert RetentionPolicy.from_config({}).policies == policy.policies
+
+
+def test_bounded_working_memory_policy_keeps_the_expected_set():
+    """Every snapshot for 7 days, the newest per ISO week to 8 weeks, the
+    newest per month to 12 months, and nothing older."""
     items = [
-        _item("newest.db", 1),
-        _item("recent-a.db", 7),
-        _item("recent-b.db", 13),
-        _item("week-a-old.db", 18),
-        _item("week-a-new.db", 17),
-        _item("week-b-old.db", 33),
-        _item("week-b-new.db", 32),
+        # Inside the 7-day keep-all window.
+        _at("newest", datetime(2026, 11, 1, 12, tzinfo=timezone.utc)),
+        _at("keep-all", datetime(2026, 10, 27, 12, tzinfo=timezone.utc)),
+        # Weekly window (7 days to 8 weeks): two per ISO week.
+        _at("w43-new", datetime(2026, 10, 22, 8, tzinfo=timezone.utc)),
+        _at("w43-old", datetime(2026, 10, 21, 8, tzinfo=timezone.utc)),
+        _at("w37-new", datetime(2026, 9, 10, 8, tzinfo=timezone.utc)),
+        _at("w37-old", datetime(2026, 9, 9, 8, tzinfo=timezone.utc)),
+        # Monthly window (8 weeks to 12 months): two per calendar month.
+        _at("aug-new", datetime(2026, 8, 20, 8, tzinfo=timezone.utc)),
+        _at("aug-old", datetime(2026, 8, 5, 8, tzinfo=timezone.utc)),
+        _at("jan-new", datetime(2026, 1, 15, 8, tzinfo=timezone.utc)),
+        _at("jan-old", datetime(2026, 1, 10, 8, tzinfo=timezone.utc)),
+        _at("dec-2025", datetime(2025, 12, 20, 8, tzinfo=timezone.utc)),
+        # Twelve months and older: kept weekly forever before #3894.
+        _at("oct-2025", datetime(2025, 10, 15, 8, tzinfo=timezone.utc)),
+        _at("jun-2024", datetime(2024, 6, 1, 8, tzinfo=timezone.utc)),
     ]
 
-    deleted = _deleted_keys(policy, items)
+    decisions = {
+        decision.item.key: (decision.keep, decision.reason)
+        for decision in RetentionPolicy().decide(items, now=BOUNDED_NOW)
+    }
 
-    assert "recent-a.db" not in deleted
-    assert "recent-b.db" not in deleted
-    assert "week-a-old.db" in deleted
-    assert "week-a-new.db" not in deleted
-    assert "week-b-old.db" in deleted
-    assert "week-b-new.db" not in deleted
+    assert decisions == {
+        "newest": (True, "newest"),
+        "keep-all": (True, "keep_all_window"),
+        "w43-new": (True, "weekly"),
+        "w43-old": (False, "weekly_thinned"),
+        "w37-new": (True, "weekly"),
+        "w37-old": (False, "weekly_thinned"),
+        "aug-new": (True, "monthly"),
+        "aug-old": (False, "monthly_thinned"),
+        "jan-new": (True, "monthly"),
+        "jan-old": (False, "monthly_thinned"),
+        "dec-2025": (True, "monthly"),
+        "oct-2025": (False, "expired"),
+        "jun-2024": (False, "expired"),
+    }
+
+
+def test_bounded_working_memory_retention_stops_growing():
+    """Six full snapshots a day keep a bounded set, however long they run:
+    a third year adds nothing to what is kept."""
+
+    def snapshots(days: int) -> list[RetentionItem]:
+        return [
+            _at(f"s{index}", BOUNDED_NOW - timedelta(hours=4 * index + 1))
+            for index in range(days * 6)
+        ]
+
+    def kept(items: list[RetentionItem]) -> set[str]:
+        return {
+            decision.item.key
+            for decision in RetentionPolicy().decide(items, now=BOUNDED_NOW)
+            if decision.keep
+        }
+
+    two_years = kept(snapshots(730))
+    three_years = kept(snapshots(1095))
+
+    assert two_years == three_years
+    # 42 in the 7-day window, at most 8 ISO weeks and 12 months beyond it.
+    assert 42 < len(three_years) <= 42 + 8 + 12
+    oldest_kept = min(
+        BOUNDED_NOW - timedelta(hours=4 * int(key[1:]) + 1) for key in three_years
+    )
+    assert BOUNDED_NOW - oldest_kept < timedelta(days=366)
+
+
+def test_config_sets_working_memory_weekly_and_monthly_bounds():
+    policy = RetentionPolicy.from_config(
+        {
+            "backup": {
+                "retention": {
+                    "working_memory": {
+                        "keep_all_days": 2,
+                        "weekly_until_weeks": 3,
+                        "monthly_until_months": 2,
+                    }
+                }
+            }
+        }
+    )
+    items = [
+        _at("newest", datetime(2026, 11, 2, 8, tzinfo=timezone.utc)),
+        # One ISO week (W42), under three weeks old: weekly under both.
+        _at("oct-14", datetime(2026, 10, 14, 8, tzinfo=timezone.utc)),
+        _at("oct-13", datetime(2026, 10, 13, 8, tzinfo=timezone.utc)),
+        # Four weeks old, in different ISO weeks: weekly under the default,
+        # thinned to one for October under a three-week weekly bound.
+        _at("oct-5", datetime(2026, 10, 5, 8, tzinfo=timezone.utc)),
+        _at("oct-1", datetime(2026, 10, 1, 8, tzinfo=timezone.utc)),
+        # Three months old: monthly under the default, expired under two.
+        _at("aug-1", datetime(2026, 8, 1, 8, tzinfo=timezone.utc)),
+    ]
+
+    configured = {
+        item.key for item in policy.deletions(items, now=BOUNDED_NOW)
+    }
+    default = {
+        item.key for item in RetentionPolicy().deletions(items, now=BOUNDED_NOW)
+    }
+
+    assert configured == {"oct-13", "oct-1", "aug-1"}
+    assert default == {"oct-13"}
+
+
+def test_load_retention_policy_warns_when_working_memory_is_unbounded(
+    monkeypatch, caplog
+):
+    import kestrel_sovereign.config as config
+
+    monkeypatch.setattr(
+        config,
+        "load_section",
+        lambda section: {
+            "retention": {"working_memory": {"weekly_forever": True}}
+        },
+    )
+    with caplog.at_level("WARNING", logger=retention_module.__name__):
+        policy = load_retention_policy()
+
+    assert policy.policies[DataClass.WORKING_MEMORY].weekly_forever is True
+    assert "unbounded" in caplog.text and "#3894" in caplog.text
+
+    caplog.clear()
+    monkeypatch.setattr(config, "load_section", lambda section: {})
+    with caplog.at_level("WARNING", logger=retention_module.__name__):
+        policy = load_retention_policy()
+
+    assert policy.policies[DataClass.WORKING_MEMORY].bounded
+    assert "unbounded" not in caplog.text
 
 
 def test_identity_keeps_all_under_30_days_and_survives_longer_than_working():
@@ -102,6 +253,8 @@ def test_newest_item_per_class_is_never_pruned():
                         "keep_all_days": 0,
                         "weekly_forever": False,
                         "monthly_forever": False,
+                        "weekly_until_weeks": 0,
+                        "monthly_until_months": 0,
                     },
                     "identity": {
                         "keep_all_days": 0,

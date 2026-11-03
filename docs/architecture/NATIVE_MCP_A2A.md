@@ -284,6 +284,34 @@ both surfaces; vendor visibility never grants authority beyond host policy.
 See [tool visibility](https://apps.extensions.modelcontextprotocol.io/api/interfaces/app.McpUiToolMeta.html).
 Unmount/disconnect invalidates outstanding bridges.
 
+Private render publication uses the host's deferred-tool-result contract.
+Core completes post-tool policy and confirms a required structured dispatch
+write before invoking the one-shot publication factory. A missing writer,
+failed write or cancellation withholds the private view and consumes the
+factory; the tool may already have executed and must not be replayed to recover
+its UI. The audit records the reviewed public result, before UI parts are added.
+That projection is sealed before awaiting storage; later out-of-band mutations
+withhold private publication and cannot replace the reviewed public output.
+An in-process receipt prevents the outer dispatcher or inline history recorder
+from writing the same dispatch again. It is scoped to that host, session and
+tool, and is removed by copying or serialization. Public named-tool calls still
+return ordinary result dictionaries. Apps host composition must require
+`supports_audited_deferred_tool_results is True`; support for deferred results
+alone does not promise this persistence boundary. This boundary does not by
+itself implement authenticated View routes, rendering or deployed Apps acceptance.
+
+SDK 0.46's publication context binds an initial private result to its actual
+streaming chat destination. Core carries that metadata on the existing turn
+part collector, matches the exact host and session, and expires it when the
+owning turn exits. Foreign inline tasks borrow the same collector; headless
+calls and subagent buffers supply no destination. Copying or serializing the
+collector carries only part data. The original factory can
+read the context during publication even after tool-wrapper transfers. Features
+that need this association require `supports_tool_publication_context is True`.
+The context identifies the destination; authenticated View controllers still
+authorize readers and tool calls independently. It does not confirm delivery:
+later response policy can withhold the rendered parts.
+
 ### Tasks and operator input
 
 An MCP task is identified by agent, connection and remote task ID. Its durable

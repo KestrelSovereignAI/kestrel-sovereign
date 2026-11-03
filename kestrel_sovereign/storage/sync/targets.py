@@ -24,6 +24,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, Dict, Iterator, Optional
 
+from kestrel_sovereign.storage.sync.quota import StorageQuota
 from kestrel_sovereign.storage.sync.retention import RetentionPolicy
 
 logger = logging.getLogger(__name__)
@@ -152,6 +153,12 @@ class SyncTarget(ABC):
     #: as a scheduled task's ``reason_code``. Empty means undeclared: such a
     #: target is reported as failed without its kind.
     kind: str = ""
+
+    #: The storage quota of this target's account as the target last read it,
+    #: or ``None`` for a target whose account has no quota it can read. The
+    #: sync service persists it and the health check warns when it is near or
+    #: over (#3894).
+    storage_quota: Optional[StorageQuota] = None
 
     @property
     def trust_tier(self) -> TrustTier:

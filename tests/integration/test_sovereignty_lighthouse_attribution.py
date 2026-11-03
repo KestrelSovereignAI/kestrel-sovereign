@@ -112,6 +112,8 @@ NEWEST_ONLY = RetentionPolicy.from_config(
                     "keep_all_days": 0,
                     "weekly_forever": False,
                     "monthly_forever": False,
+                    "weekly_until_weeks": 0,
+                    "monthly_until_months": 0,
                 },
                 "identity": {
                     "keep_all_days": 0,

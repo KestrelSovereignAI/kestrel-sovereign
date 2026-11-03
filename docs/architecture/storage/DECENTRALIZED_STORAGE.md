@@ -207,6 +207,17 @@ keep falling back on any storage failure.
   set, whichever key the agent's exports use, so a key the agent holds but
   cannot read stops its exports, not its snapshots. The prune leaves exports
   alone.
+- Before each snapshot upload the target reads the host account's
+  `user_data_usage` (#3894). When the upload would take `dataUsed` past
+  `[backup.quota] threshold` (default 0.9) of `dataLimit`, it logs a WARNING
+  and runs the same retention prune first, then uploads. An upload that fails
+  while the account has no room for it reports `dataUsed` against
+  `dataLimit`, with the transport error, instead of a bare `ReadError`. The
+  last reading is kept in the sync state file, and the `backup_quota` health
+  check warns while an account is at or past the threshold. Working-memory
+  retention is bounded by default (7 days of every snapshot, then weekly to
+  8 weeks, then monthly to 12 months), since every snapshot is a full
+  database and an unbounded policy fills a fixed quota.
 - `!check-sovereignty-status` and `kestrel storage health` report the agent's
   latest export on the export account, attributed to the agent, with its
   Filecoin deal status, whether or not this host still holds the export's

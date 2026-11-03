@@ -193,10 +193,18 @@ def test_named_start_output_uses_assigned_agent_port(tmp_path, capsys):
         config.agents[DEFAULT_QUICKSTART_AGENT_NAME],
         DEFAULT_HOST_BIND,
     )
-    assert start_agent.call_args.kwargs == {
+    kwargs = dict(start_agent.call_args.kwargs)
+    roster = kwargs.pop("roster")
+    assert kwargs == {
         "standalone": True,
         "detach_output": True,
     }
+    # The registry the agent was found in, so the launcher does not reload
+    # another one and refuse her (#3832).
+    assert (
+        roster.get_local_agents()[DEFAULT_QUICKSTART_AGENT_NAME]
+        is start_agent.call_args.args[1]
+    )
     assert (
         f"Starting {DEFAULT_QUICKSTART_AGENT_NAME} "
         f"on :{DEFAULT_AGENT_START_PORT}"

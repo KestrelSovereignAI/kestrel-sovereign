@@ -383,7 +383,12 @@ def _add_lighthouse_snapshot_target(
     storage (``NONE``, or a resolution that failed) there is no target, so
     the policy that gates live storage gates snapshot uploads too. Without a
     host key there is no target either.
+
+    The target prunes under the service's own retention policy before an
+    upload that would take the account past ``[backup.quota] threshold``
+    (#3894).
     """
+    from kestrel_sovereign.storage.sync.quota import load_quota_threshold
     from kestrel_sovereign.storage.sync.targets import LighthouseTarget, TrustTier
 
     api_key = os.environ.get("LIGHTHOUSE_API_KEY")
@@ -396,6 +401,8 @@ def _add_lighthouse_snapshot_target(
             api_key=api_key,
             agent_id=agent_id,
             state_dir=state_dir,
+            retention_policy=sync_service.retention_policy,
+            quota_threshold=load_quota_threshold(),
         ),
     )
 
@@ -8694,43 +8701,20 @@ Expected Duration: {expected_duration}
             if hook_input.tool_input and "user_message" in hook_input.tool_input:
                 user_input = hook_input.tool_input["user_message"]
 
-        # Pre-turn state-load block (epic #1290, D3). Opt-in per agent via
-        # [preturn_state]. Merged into the addendum so it rides the same
-        # budget-aware injection path as the constitutional canary; the
-        # canary stays last (a directive the model must echo), the state
-        # snapshot precedes it. Best-effort: never blocks the turn.
-        #
-        # The operational block (#1571) carries required lifecycle events
-        # — currently restart_status — and runs unconditionally so the
-        # agent sees them even when the proactive [preturn_state] feature
-        # is off. Order: operational block first (closest to the user
-        # turn), then opt-in state snapshot, then whatever the canary path
-        # appends downstream.
-        try:
-            from kestrel_sovereign.agent.preturn_state import (
-                build_operational_state_block,
-                build_preturn_state_block,
-            )
+        # Pre-turn state blocks: the always-on operational block (#1571 —
+        # restart events, codex declines, active todos, recent strategy
+        # decisions) and the opt-in [preturn_state] snapshot (epic #1290,
+        # D3), put ahead of the caller's addendum so they ride the same
+        # budget-aware injection path as the constitutional canary, which
+        # stays last. process_input_streaming runs the same preparation
+        # (#3900). Best-effort: never blocks the turn.
+        from kestrel_sovereign.agent.preturn_state import (
+            prepare_turn_state_addendum,
+        )
 
-            _op_block = await build_operational_state_block(self)
-            if _op_block:
-                system_prompt_addendum = (
-                    f"{_op_block}\n\n{system_prompt_addendum}"
-                    if system_prompt_addendum
-                    else _op_block
-                )
-
-            _state_block = await build_preturn_state_block(self)
-            if _state_block:
-                system_prompt_addendum = (
-                    f"{_state_block}\n\n{system_prompt_addendum}"
-                    if system_prompt_addendum
-                    else _state_block
-                )
-        except Exception as _e:  # noqa: BLE001 - never break a turn
-            logging.warning(
-                "preturn_state: injection skipped: %s", _e, exc_info=True
-            )
+        system_prompt_addendum = await prepare_turn_state_addendum(
+            self, system_prompt_addendum
+        )
 
         # #1844 Stage 2: Kestrel-owned compaction for openai:plan. If codex's
         # server-side thread occupancy has crossed the threshold, compact our

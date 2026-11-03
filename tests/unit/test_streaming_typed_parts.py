@@ -109,6 +109,10 @@ async def test_post_tool_part_passes_through_and_persists_to_metadata():
     # post-tool prose halves — so the streaming persist path sees the identical
     # stream.
     async def mock_orchestrator_streaming(**kwargs):
+        from kestrel_sdk.tools import ToolPublicationContext
+        from kestrel_sovereign.agent.parts import current_tool_publication_context
+
+        assert current_tool_publication_context(agent, "s1") == ToolPublicationContext(agent.did, "s1")
         yield "Done — "
         yield part_sentinel
         yield "added one item."
@@ -405,7 +409,8 @@ async def test_bang_command_emitted_part_reaches_stream():
     collector around the delegation so a todo tool's ``emit_part`` still surfaces
     as a live PART sentinel; otherwise ``!todo add`` mutates the graph but the
     typed bubble silently vanishes (``emit_part`` no-ops with no collector)."""
-    from kestrel_sovereign.agent.parts import current_part_collector, emit_part
+    from kestrel_sdk.tools import ToolPublicationContext
+    from kestrel_sovereign.agent.parts import current_part_collector, current_tool_publication_context, emit_part
 
     add_convo_calls = []
     agent = _make_agent(add_convo_calls)
@@ -414,6 +419,7 @@ async def test_bang_command_emitted_part_reaches_stream():
         # Simulate the command handler running the todo_add tool, which emits a
         # typed part. It only lands if the streaming layer bound a collector.
         assert current_part_collector() is not None, "command path bound no collector"
+        assert current_tool_publication_context(agent, "s8") == ToolPublicationContext(agent.did, "s8")
         emit_part("todo", {"title": "ship #1894", "status": "open"}, part_id="t9")
         return "Added todo: ship #1894"
 

@@ -49,7 +49,10 @@ from kestrel_sdk.signals import (
     Trust,
 )
 from kestrel_sdk.tools.result import ToolResult, ToolResultStatus
-from kestrel_sovereign.features.scheduler.outcome import ScheduledTaskOutcome
+from kestrel_sovereign.features.scheduler.outcome import (
+    GATE_OUTCOME_STATUSES,
+    ScheduledTaskOutcome,
+)
 from kestrel_sovereign.signals.sources.self_followup import (
     TASK_NAME as SELF_FOLLOWUP_TASK_NAME,
     build_self_followup_registration,
@@ -251,13 +254,16 @@ def _require_successful_task_result(
     Permission blocks remain normal handler results: the scheduler runner needs
     their structured outcome to pause the schedule and persist operator-facing
     recovery guidance without making an expected policy decision look like a
-    dispatcher error. ``decode_json_envelope`` is reserved for bespoke built-in
+    dispatcher error. A gate that failed closed because its enforcing hook
+    failed (``hook_failed``) is returned the same way, so the runner can keep
+    the schedule enabled and back off (#3749). ``decode_json_envelope`` is
+    reserved for bespoke built-in
     handlers, whose documented wire result is a JSON object string. Feature
     tools may legitimately return arbitrary string artifacts, so their strings
     must never be interpreted as scheduler control envelopes.
     """
     if isinstance(result, ScheduledTaskOutcome):
-        if result.status == "blocked":
+        if result.status in GATE_OUTCOME_STATUSES:
             return result
         # ``result_text`` is the task_execution_log artifact and may contain a
         # complete sleep report, third-party hook payloads, or governed

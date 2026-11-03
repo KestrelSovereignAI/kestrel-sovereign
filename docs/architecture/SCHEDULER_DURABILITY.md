@@ -209,8 +209,8 @@ row while every health surface read healthy.
 Each schedule row now carries a failure streak (`failure_streak_*` columns),
 written by the same finalize transaction that records the execution:
 
-- a `failed` execution extends the streak, recording the first and latest
-  failure times and the latest failed execution's ID;
+- a `failed` or `hook_failed` execution extends the streak, recording the
+  first and latest failure times and the latest failed execution's ID;
 - a `success` ends it;
 - every other outcome (`skipped_misfire`, `missed`, `blocked`) leaves it
   unchanged, and a paused schedule runs nothing and so changes nothing.
@@ -233,6 +233,40 @@ Two readers report the marker:
   than making the agent unhealthy.
 
 The marker is visibility only. It adds no retry, pause, or remediation.
+
+## Permission-gate outcomes
+
+A scheduled feature tool runs through the same `PRE_TOOL_USE` hooks as a chat
+call, so the security gate applies on every tick. The gate can stop a tick in
+two different ways, and the scheduler treats them differently (#3749):
+
+- **Policy block.** A hook decided DENY or ASK (the tool's permission is Deny,
+  or it needs an approver and a tick has none). The execution is `blocked`,
+  and the schedule pauses (`enabled = 0`, `terminal_status = 'blocked'`) so a
+  denial that recurs on every tick does not repeat forever (#2430). Status
+  reports it as a scheduler disablement with reason `blocked`; grant the
+  tool's permission, then run `schedule_resume`.
+- **Hook failure.** An enforcing hook raised or timed out (for example
+  `security_guard` hitting `database is locked`), and the hook manager failed
+  closed with a DENY it marks as a failure. Nothing decided anything, so the
+  scheduler fails closed for that tick only. The execution is `hook_failed`,
+  the tool does not run, and the schedule stays enabled; a one-shot deadline
+  stays pending rather than being consumed. The next attempt waits at least
+  the hook-failure backoff: one minute after the first consecutive failure,
+  doubling with each further one, capped at fifteen minutes. A `hook_failed`
+  execution extends the failure streak, so after `[scheduler]
+  failure_alert_threshold` consecutive failures the marker, its WARNING, and
+  the `scheduled_task_failures` health check report the task.
+
+Before #3749 both read as policy blocks: one locked database at the top of the
+hour paused `restart_coordinator` on several agents until someone resumed it.
+
+Rows paused by a permission block before `terminal_status` existed (#2457,
+before #2739) carry no terminal status. Status recognizes them by what that
+runner wrote, a pre-claim `blocked` execution that is the schedule's newest and
+whose `executed_at` equals the row's `last_run_at`, and reports them as the
+scheduler's `blocked` pause rather than `operator_paused`. Nothing rewrites
+those rows; they stay paused until resumed.
 
 ## Protocol-v2 rollout fence
 
