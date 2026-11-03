@@ -36,6 +36,7 @@ def _make_agent(add_convo_calls):
     agent.privacy_agent = privacy_agent
     agent.features = {}
     agent.did = "test-did"
+    agent._get_privacy_policy_epoch = lambda: "normal:streaming-test:0"
     agent.extension = None
     agent._cached_features_prompt = ""
     agent.is_request_cancelled = MagicMock(return_value=False)

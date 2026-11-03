@@ -67,7 +67,8 @@ async def _database(path) -> AsyncDatabase:
 
 
 async def _seed_due(
-    db, *, task_id: str = "task-1", task_name: str = "wait_reconcile"
+    db, *, task_id: str = "task-1", task_name: str = "wait_reconcile",
+    cron_expression: str = "* * * * *",
 ) -> str:
     due = (datetime.now(timezone.utc) - timedelta(seconds=2)).isoformat()
     await db.execute(
@@ -76,10 +77,10 @@ async def _seed_due(
             (id, agent_id, task_name, cron_expression, args_json, enabled,
              next_run_at, created_at, schedule_kind, run_at, timezone_name,
              misfire_policy, idempotency_key, scheduler_protocol_version)
-        VALUES (?, 'agent-1', ?, '* * * * *', '{}', 1, ?, ?,
+        VALUES (?, 'agent-1', ?, ?, '{}', 1, ?, ?,
                 'cron', NULL, 'UTC', 'skip', 'stable-effect', ?)
         """,
-        (task_id, task_name, due, due, SCHEDULER_PROTOCOL_VERSION),
+        (task_id, task_name, cron_expression, due, due, SCHEDULER_PROTOCOL_VERSION),
     )
     return due
 
@@ -408,9 +409,27 @@ async def test_a_failed_reconciliation_read_keeps_the_latch_reconcilable(tmp_pat
         return await real_claim_still_held(pending)
 
     runner._claim_still_held = fail_three_reads
+    original_execute_claim = runner._execute_claim
+    retry_started = asyncio.Event()
+    allow_retry = asyncio.Event()
+    starts = 0
+
+    async def hold_retry(task):
+        nonlocal starts
+        starts += 1
+        if starts == 2:
+            retry_started.set()
+            await allow_retry.wait()
+        return await original_execute_claim(task)
+
+    runner._execute_claim = hold_retry
     try:
         await runner.start(polling=False)
-        await _seed_due(db)
+        # Keep the next scheduled occurrence outside this controlled retry.
+        next_occurrence = datetime.now(timezone.utc) + timedelta(hours=1)
+        await _seed_due(
+            db, cron_expression=f"{next_occurrence.minute} {next_occurrence.hour} * * *"
+        )
         await runner.arm()
         await wait_until(
             lambda: runner.readiness_failure is not None,
@@ -422,16 +441,31 @@ async def test_a_failed_reconciliation_read_keeps_the_latch_reconcilable(tmp_pat
         )
         assert runner.readiness_failure_reconcilable
         assert runner._worker_restart_count == 0
+        [pending] = runner._readiness_reconciliations
 
         await _expire_lease(db)
         await wait_until(
             lambda: runner.readiness_failure is None,
             timeout=30, interval=0.01, message="the polling loop never cleared the latch",
         )
+        await wait_until(
+            retry_started.is_set, timeout=30, interval=0.01,
+            message="the recovered occurrence never reached execution",
+        )
+        # Releasing the old claim restores readiness before the new effect.
+        assert executor.await_count == 1
+        allow_retry.set()
+        await settle_occurrences(runner)
         assert notifications == []
         assert runner._worker_restart_count == 0
         assert executor.await_count == 2
+        assert await db.fetchone(
+            "SELECT status, attempt_count FROM task_execution_log WHERE id = ?",
+            (pending.execution_id,),
+        ) == ("success", 2)
     finally:
+        allow_retry.set()
+        await settle_occurrences(runner)
         await _stop(runner)
         await db.close()
 

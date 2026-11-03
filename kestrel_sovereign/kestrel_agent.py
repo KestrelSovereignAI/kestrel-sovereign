@@ -136,6 +136,7 @@ from kestrel_sovereign.agent.streaming import (
 from kestrel_sovereign.agent.tool_registry import ToolRegistryMixin
 from kestrel_sovereign.agent.tool_allowlist import bump_registry_generation
 from kestrel_sovereign.agent.turn_lifecycle import TurnLifecycleMixin
+from kestrel_sovereign.mcp_apps import MCPAppsHostMixin
 from kestrel_sovereign.agent.turn_outcome import settle_turn_outcome
 from kestrel_sovereign.bootstrap import BootstrapService, BootstrapState
 from kestrel_sovereign.bootstrap.soul_durability import inspect_soul_file
@@ -1049,6 +1050,7 @@ class KestrelAgent(
     EventManagerMixin,
     RequestLifecycleMixin,
     TurnLifecycleMixin,
+    MCPAppsHostMixin,
 ):
     """
     The Kestrel Agent orchestrates memory, reasoning, and actions, bound by the Kestrel Constitution.
@@ -5365,6 +5367,12 @@ class KestrelAgent(
         (``/api/model/set``) neither lands between the transition's writes nor
         has its own write overtaken by them.
         """
+        # The persistence gate is already exclusive: earlier private sends have
+        # settled. Erase App associations before installing another policy. A
+        # refused transition leaves them withdrawn; native tools are not replayed.
+        if mode != self._privacy_mode:
+            self._withdraw_mcp_apps_for_privacy_transition()
+
         # Record agent consent before applying the change
         consent = self.features.get("ConsentFeature") if hasattr(self, 'features') else None
         if consent:

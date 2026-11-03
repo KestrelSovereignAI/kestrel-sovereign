@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import contextlib
 import contextvars
+import inspect
 import json
 import logging
 from typing import Any, List, Optional
@@ -88,6 +89,17 @@ class _TurnPartCollector(list):
             if isinstance(agent_id, str) and agent_id.strip()
             and isinstance(session_id, str) and session_id.strip() else None
         )
+        # A generic chat host need not implement Apps privacy metadata. Only
+        # consult an explicitly declared interface, not a synthesized dynamic
+        # attribute. A declared but invalid provider still fails immediately.
+        declared = inspect.getattr_static(host, "_get_privacy_policy_epoch", None)
+        epoch_provider = (getattr(host, "_get_privacy_policy_epoch")
+                          if declared is not None and self.publication_context is not None else None)
+        self.publication_epoch = epoch_provider() if epoch_provider is not None else None
+        if epoch_provider is not None and (
+            not isinstance(self.publication_epoch, str) or not self.publication_epoch.strip()
+        ):
+            raise ValueError("chat publication requires the original privacy policy epoch")
 
     def __reduce_ex__(self, protocol):
         # copy.copy, copy.deepcopy and pickle all use this data-only shape.
@@ -125,6 +137,13 @@ def current_tool_publication_context(host, session_id) -> Optional[ToolPublicati
     if context is None or context.session_id != real_session_id(session_id):
         return None
     return context
+
+
+def current_tool_publication_epoch(host, session_id) -> Optional[str]:
+    """The original live turn's policy installation, never a renewed grant."""
+    if current_tool_publication_context(host, session_id) is None:
+        return None
+    return _part_collector.get().publication_epoch
 
 
 def current_part_collector() -> Optional[List[dict]]:
