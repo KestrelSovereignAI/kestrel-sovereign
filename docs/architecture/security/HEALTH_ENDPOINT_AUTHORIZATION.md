@@ -48,6 +48,34 @@ and bootstrap results, plus controlled multi-agent and safe-mode records. These
 details can contain operational failure messages and therefore must not be
 copied into public routes, middleware errors, or load-balancer logs.
 
+## Readiness and the health tick answer different questions
+
+`/health` and the HealthFeature tick (also served by `/health/detailed`) can
+disagree, and both can be right. A tick that reads `degraded` while `/health`
+returns `ok` is what a standing warning looks like, not a fault in either
+surface.
+
+- `/health` asks whether the host may receive traffic. It reads only the
+  readiness latches: a startup error, mandatory-feature or identity failures,
+  constitutional Safe Mode, scheduler worker availability, and invocation
+  ownership. It never runs the per-check diagnostics.
+- The tick runs the standard checks
+  (`kestrel_sovereign/features/health/checks.py:run_standard_checks`) and
+  derives its status with `derive_overall_status`: any `warn`, or a `fail` of
+  a non-critical check, gives `degraded`; a `fail` of `database`,
+  `llm_service` or `scheduler_liveness` gives `unhealthy`. A warning names a
+  condition an operator should act on while the agent keeps serving, such as
+  a schedule the scheduler disabled or a provider whose model discovery
+  failed.
+
+A tick that is `degraded` on every tick therefore names a standing condition.
+Read its `warn` checks and act on, or accept, each one; do not treat the
+status as noise. Each check's message says what it found. For example,
+`scheduler_liveness` names every schedule the scheduler disabled, with the
+structured cause of a permission-block pause, and no longer warns about a
+pause that a later registration under the same idempotency key replaced
+(#3873).
+
 ## Regression history
 
 [Issue #137](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/137)

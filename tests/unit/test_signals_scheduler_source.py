@@ -486,7 +486,6 @@ async def test_permission_block_is_expected_outcome_without_dispatcher_traceback
     blocked = ScheduledTaskOutcome.blocked(
         task_name="restart_coordinator",
         decision="ask",
-        reason="operator approval required",
     )
 
     async def lookup_blocked(name, args):
@@ -552,7 +551,6 @@ async def test_dispatch_audit_and_scheduler_history_agree_end_to_end(
     blocked = ScheduledTaskOutcome.blocked(
         task_name="restart_coordinator",
         decision="ask",
-        reason="operator approval required",
     )
 
     async def lookup(name, args):
@@ -632,7 +630,7 @@ async def test_dispatch_audit_and_scheduler_history_agree_end_to_end(
         assert "sleep exploded" not in (signal_row[1] or "")
     elif case == "blocked":
         assert signal_row[1] is None
-        assert "operator approval required" in (execution_row[1] or "")
+        assert "decided ask for tool restart_coordinator" in (execution_row[1] or "")
 
 
 @pytest.mark.parametrize(

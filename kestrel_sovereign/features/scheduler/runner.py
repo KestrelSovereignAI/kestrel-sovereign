@@ -80,10 +80,16 @@ from kestrel_sovereign.features.scheduler.failure_streak import (
     hook_failure_backoff,
     next_failure_streak,
 )
-from kestrel_sovereign.features.scheduler.outcome import ScheduledTaskOutcome
+from kestrel_sovereign.features.scheduler.outcome import (
+    NO_PAUSE_CAUSE_PARAMS,
+    PAUSE_CAUSE_COLUMNS,
+    PauseCause,
+    ScheduledTaskOutcome,
+)
 from kestrel_sovereign.features.scheduler.status import (
     DEFAULT_LEASE_SECONDS,
     DEFAULT_MISFIRE_GRACE_SECONDS,
+    SUPERSESSION_INDEX,
     emit_runtime_status,
     ensure_runtime_status_table,
     mark_runtime_owner_stopped,
@@ -4006,6 +4012,7 @@ class SchedulerRunner:
                         result_text: Optional[str] = None
                         outcome_signal: Optional[float] = None
                         pause_schedule = False
+                        pause_cause: Optional[PauseCause] = None
                         ran = True
                         scope = _SchedulerExecutionScope(execution, occurrence_task=occurrence_task)
                         token = _current_execution.set(scope)
@@ -4053,6 +4060,8 @@ class SchedulerRunner:
                                     outcome_signal,
                                     pause_schedule,
                                 ) = self._normalise_result(raw, task)
+                                if pause_schedule:
+                                    pause_cause = raw.pause_cause
                             except asyncio.CancelledError:
                                 raise
                             except SchedulerFeatureUnavailable as error:
@@ -4137,6 +4146,7 @@ class SchedulerRunner:
                             outcome_signal=outcome_signal,
                             ran=ran,
                             pause_schedule=pause_schedule,
+                            pause_cause=pause_cause,
                         )
 
             # Cold preparation and dispatch share one owned task. Expiry
@@ -4779,6 +4789,7 @@ class SchedulerRunner:
         outcome_signal: Optional[float],
         ran: bool,
         pause_schedule: bool = False,
+        pause_cause: Optional[PauseCause] = None,
     ) -> None:
         if not await self._agent_is_currently_authorized(task.agent_id):
             logger.warning(
@@ -4823,6 +4834,14 @@ class SchedulerRunner:
             ) or pause_schedule
             enabled = 0 if terminal else 1
             terminal_status = status if terminal else None
+            # Why a permission block paused the row, stored beside its status
+            # so status names it after the execution log row is gone (#3873).
+            # Structured fields only; every other outcome clears them.
+            cause_params = (
+                pause_cause.as_params()
+                if pause_schedule and pause_cause is not None
+                else NO_PAUSE_CAUSE_PARAMS
+            )
             next_at: Optional[str] = None
             if not terminal and one_shot:
                 next_at = schedule_now.isoformat()
@@ -4870,6 +4889,9 @@ class SchedulerRunner:
                 streak_sql = ", ".join(
                     f"{column} = ?" for column in FAILURE_STREAK_COLUMNS
                 )
+                cause_sql = ", ".join(
+                    f"{column} = ?" for column in PAUSE_CAUSE_COLUMNS
+                )
                 updated = await self._db.execute(
                     f"""
                     UPDATE scheduled_tasks
@@ -4878,7 +4900,7 @@ class SchedulerRunner:
                         terminal_at = CASE WHEN ? THEN {now_sql} ELSE NULL END,
                         lease_owner = NULL, lease_expires_at = NULL, claim_token = NULL,
                         claim_execution_id = NULL, claim_scheduled_for = NULL,
-                        scheduler_claim_fenced = 0, {streak_sql}
+                        scheduler_claim_fenced = 0, {streak_sql}, {cause_sql}
                     WHERE id = ? AND agent_id = ?
                       AND scheduler_protocol_version = ?
                       AND scheduler_rollout_fenced = 0
@@ -4893,6 +4915,7 @@ class SchedulerRunner:
                         terminal_status,
                         record_terminal_at,
                         *failure_streak.streak.as_params(),
+                        *cause_params,
                         task.id,
                         task.agent_id,
                         SCHEDULER_PROTOCOL_VERSION,
@@ -4936,14 +4959,19 @@ class SchedulerRunner:
                     params.append(now_iso)
                 params.extend([
                     next_at, enabled, next_attempt_count, terminal_status, terminal_at,
+                    *cause_params,
                     task.id, task.agent_id, SCHEDULER_PROTOCOL_VERSION,
                     self._owner_id, task.claim_token, execution.id, now_iso,
                 ])
+                cause_sql = ", ".join(
+                    f"{column} = ?" for column in PAUSE_CAUSE_COLUMNS
+                )
                 updated = await self._db.execute(
                     f"""
                     UPDATE scheduled_tasks
                     SET {last_run_sql}, next_run_at = ?, enabled = ?,
                         attempt_count = ?, terminal_status = ?, terminal_at = ?,
+                        {cause_sql},
                         lease_owner = NULL, lease_expires_at = NULL, claim_token = NULL,
                         claim_execution_id = NULL, claim_scheduled_for = NULL,
                         scheduler_claim_fenced = 0
@@ -5667,6 +5695,8 @@ class SchedulerRunner:
             # Added only here, never in CREATE TABLE above: the streak's
             # columns have one definition, shared with its readers (#3280).
             **FAILURE_STREAK_COLUMNS,
+            # Likewise for a pause's structured cause (#3873).
+            **PAUSE_CAUSE_COLUMNS,
         }
         log_columns = {
             "outcome_signal": "REAL",
@@ -5719,6 +5749,13 @@ class SchedulerRunner:
                                scheduler_rollout_fenced,
                                scheduler_claim_fenced, next_run_at)
             """
+        )
+        # Status finds the row that superseded a paused schedule with one
+        # lookup through this index (#3873): same agent and idempotency key,
+        # created later, the newest first by (created_at, id).
+        await self._db.execute(
+            f"CREATE INDEX IF NOT EXISTS {SUPERSESSION_INDEX} "
+            "ON scheduled_tasks(agent_id, idempotency_key, created_at, id)"
         )
         await self._db.execute("CREATE INDEX IF NOT EXISTS idx_task_execution_log_task ON task_execution_log(task_id, executed_at DESC)")
         await self._db.execute("CREATE INDEX IF NOT EXISTS idx_task_execution_log_idempotency ON task_execution_log(agent_id, idempotency_key)")
