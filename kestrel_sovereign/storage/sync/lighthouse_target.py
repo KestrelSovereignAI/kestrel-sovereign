@@ -42,7 +42,7 @@ from kestrel_sovereign.storage.sync.targets import (
     SyncResult,
     SyncTarget,
     TrustTier,
-    _consistent_snapshot_file,
+    _offloaded_snapshot_file,
 )
 
 if TYPE_CHECKING:
@@ -156,7 +156,8 @@ class LighthouseTarget(ManifestManagerMixin, SyncTarget):
         Uses sqlite3.backup() for a consistent snapshot and skips upload
         if the content hash matches the previous upload. The snapshot stays
         on disk and its CAR is streamed from the file in bounded chunks:
-        neither is ever held in memory whole (#3662).
+        neither is ever held in memory whole (#3662). The backup and the
+        hash run off the event loop (#3916).
         """
         timestamp = datetime.now(timezone.utc)
 
@@ -166,10 +167,10 @@ class LighthouseTarget(ManifestManagerMixin, SyncTarget):
             )
 
             # Use sqlite3.backup() for consistent snapshot (safe with active WAL)
-            with _consistent_snapshot_file(db_path) as snapshot_path:
-                with open(snapshot_path, "rb") as snapshot:
-                    digest = hashlib.file_digest(snapshot, "sha256").digest()
-                raw_size = snapshot_path.stat().st_size
+            async with _offloaded_snapshot_file(db_path) as snapshot:
+                snapshot_path = snapshot.path
+                digest = snapshot.sha256
+                raw_size = snapshot.size
 
                 # Skip upload if content unchanged
                 content_hash = digest.hex()
