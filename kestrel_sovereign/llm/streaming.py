@@ -124,7 +124,6 @@ from .output_ceiling import (
 from .provider_policy import ProviderPolicyRefusal, fallback_selection
 from .provider_registry import provider_cache_body
 from .remote_backend import REMOTE_ROUTE_NAME
-from .route_calls import record_route_call
 
 if TYPE_CHECKING:
     from .invocation_context import LLMInvocationContext
@@ -1346,17 +1345,6 @@ class StreamingMixin:
                 # Explicit control must never invoke ordinary accounting,
                 # even for legacy/unbound consumers with no custody guard.
                 raise failure
-            # The route's own outcome, for the health check (#3873). A stream
-            # closed or cancelled by its consumer says nothing about the route
-            # unless the route had already answered.
-            if completed or rejected is not None:
-                record_route_call(self, provider_name)
-            elif failure is not None and not isinstance(
-                failure, (asyncio.CancelledError, GeneratorExit)
-            ):
-                record_route_call(self, provider_name, failure)
-            elif emitted:
-                record_route_call(self, provider_name)
             try:
                 aborted = isinstance(failure, (asyncio.CancelledError, GeneratorExit)) or (
                     failure is not None and is_execution_control_error(failure)

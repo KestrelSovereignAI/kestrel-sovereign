@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import time
 from datetime import datetime, timedelta, timezone
-from typing import Any, Collection, Dict, Optional
+from typing import Any, Collection, Dict, List, Mapping, Optional, Sequence
 
 from kestrel_sovereign._async_ownership import await_owned_task, create_owned_task, raise_owned_outcome
 
@@ -19,7 +19,9 @@ from kestrel_sovereign.features.scheduler.constants import (
     SCHEDULER_SAFETY_DISABLEMENT_REASONS,
 )
 from kestrel_sovereign.features.scheduler.outcome import (
-    withhold_stored_cause_detail,
+    PAUSE_CAUSE_PROJECTION,
+    PAUSE_CAUSE_PROJECTION_WIDTH,
+    PauseCause,
 )
 from kestrel_sovereign.storage.database_clock import (
     database_clock as scheduler_database_clock,
@@ -61,27 +63,15 @@ LEGACY_SCHEDULER_PAUSE_PROJECTION = """
      ))
 """
 
-#: A projection over a ``... FROM scheduled_tasks`` read: for a disabled row,
-#: the id of the newest other schedule of the same agent registered after it
-#: under the same idempotency key, else NULL. A caller that re-registers a
-#: schedule by inserting a new row, rather than resuming the paused one,
-#: leaves the old row paused for good (#3873); status reports such a row as
-#: superseded history instead of a standing scheduler disablement.
-SUPERSEDING_SCHEDULE_PROJECTION = """
-    (CASE WHEN scheduled_tasks.enabled = 0 THEN (
-        SELECT newer.id FROM scheduled_tasks newer
-        WHERE newer.agent_id = scheduled_tasks.agent_id
-          AND newer.idempotency_key = scheduled_tasks.idempotency_key
-          AND newer.id <> scheduled_tasks.id
-          AND newer.created_at > scheduled_tasks.created_at
-        ORDER BY newer.created_at DESC, newer.id DESC
-        LIMIT 1
-    ) END)
-"""
-
 #: The ``terminal_status`` the runner records when a permission gate's DENY or
 #: ASK pauses a schedule, and the reason status reports for that pause.
 SCHEDULER_BLOCKED_REASON = "blocked"
+
+#: The ``scheduled_tasks`` index :func:`superseding_schedules` reads through:
+#: ``(agent_id, idempotency_key, created_at, id)``, created by the runner. The
+#: trailing ``id`` orders replacements created at the same instant, so the
+#: newest is the index's last entry for its key and no sort is needed.
+SUPERSESSION_INDEX = "idx_scheduled_tasks_agent_idempotency"
 
 #: Most disabled or superseded schedules one status read names individually;
 #: the counts stay exact past it.
@@ -146,10 +136,7 @@ def classify_disablement(
     lease_owner: Optional[str] = None,
     lease_expires_at: Optional[str] = None,
     legacy_scheduler_pause: bool = False,
-    terminal_cause: Optional[str] = None,
-    terminal_cause_detail: Optional[str] = None,
-    withhold_cause_detail: bool = True,
-    superseded_by: Optional[str] = None,
+    pause_cause: Optional[PauseCause] = None,
 ) -> Dict[str, Any]:
     """Describe why a row is not enabled without collapsing transient fences.
 
@@ -162,20 +149,12 @@ def classify_disablement(
     :data:`LEGACY_SCHEDULER_PAUSE_PROJECTION`) reports it as the scheduler's
     pause it was rather than an operator's (#3749).
 
-    A scheduler disablement carries ``cause``, the content-free
-    ``terminal_cause`` the runner stored with it (``None`` for a row disabled
-    before causes were stored, or by a path whose ``terminal_status`` is its
-    own cause), and ``cause_detail``, the free-form reason behind it. The
-    detail can repeat the blocked call's arguments, so it is withheld while
-    ``withhold_cause_detail`` holds: the caller's
-    ``hides_persisted_user_content(agent)`` verdict, read at read time.
-    Withholding is the default, so a reader that cannot tell never shows it. A
-    permission-block pause that a later registration under the same
-    idempotency key replaced (``superseded_by``, read through
-    :data:`SUPERSEDING_SCHEDULE_PROJECTION`) is ``superseded`` history, not a
-    standing disablement: nothing will run it, and its replacement is what
-    runs (#3873). Other safety disablements stay disablements when replaced,
-    since each names work an operator must still reconcile.
+    A permission-block pause carries ``cause``: the structured
+    :class:`~kestrel_sovereign.features.scheduler.outcome.PauseCause` the
+    runner stored with it (the deciding hook, its decision and the tool), or
+    ``None`` for a pause stored before causes were. The hook's free-form
+    reason is never part of it (#3873). A pause that a later registration
+    replaced is reported by :func:`superseded_disablement`.
     """
 
     if rollout_fenced:
@@ -231,23 +210,6 @@ def classify_disablement(
         }
     if not terminal_status and legacy_scheduler_pause:
         terminal_status = SCHEDULER_BLOCKED_REASON
-    cause_detail = withhold_stored_cause_detail(
-        withhold_cause_detail, terminal_cause_detail
-    )
-    if terminal_status == SCHEDULER_BLOCKED_REASON and superseded_by:
-        return {
-            "state": "superseded",
-            "source": "scheduler_history",
-            "reason": terminal_status,
-            "recoverable": False,
-            "recovery_action": (
-                f"remove this row with schedule_remove; schedule "
-                f"{superseded_by} replaced it"
-            ),
-            "cause": terminal_cause,
-            "cause_detail": cause_detail,
-            "superseded_by": superseded_by,
-        }
     if terminal_status:
         one_shot_inconsistent = (
             schedule_kind == "one_shot"
@@ -273,21 +235,110 @@ def classify_disablement(
             action = "run schedule_resume after correcting the reported cause"
         else:
             action = "repair or recreate the schedule with a valid idempotency key"
-        return {
+        disablement: Dict[str, Any] = {
             "state": "disabled",
             "source": "scheduler",
             "reason": terminal_status,
             "recoverable": recoverable,
             "recovery_action": action,
-            "cause": terminal_cause,
-            "cause_detail": cause_detail,
         }
+        if terminal_status == SCHEDULER_BLOCKED_REASON:
+            disablement["cause"] = (
+                pause_cause.as_dict() if pause_cause is not None else None
+            )
+        return disablement
     return {
         "state": "paused",
         "source": "operator",
         "reason": "operator_paused",
         "recoverable": True,
         "recovery_action": "run schedule_resume",
+    }
+
+
+def is_supersedable(disablement: Mapping[str, Any]) -> bool:
+    """Whether a newer registration under the same key replaces this pause.
+
+    Only a permission-block pause: nothing will run it again, and the
+    schedule's owner re-registering it is the fix that pause asked for. Every
+    other scheduler disablement names work an operator must still reconcile,
+    so a replacement does not retire it (#3873).
+    """
+
+    return (
+        disablement.get("state") == "disabled"
+        and disablement.get("reason") == SCHEDULER_BLOCKED_REASON
+    )
+
+
+def superseded_disablement(
+    disablement: Mapping[str, Any], *, superseded_by: str
+) -> Dict[str, Any]:
+    """Describe a permission-block pause that ``superseded_by`` replaced.
+
+    History, like a finished one-shot: the row keeps its status and cause, and
+    is no longer a standing disablement (#3873).
+    """
+
+    return {
+        "state": "superseded",
+        "source": "scheduler_history",
+        "reason": disablement["reason"],
+        "recoverable": False,
+        "recovery_action": (
+            f"remove this row with schedule_remove; schedule {superseded_by} "
+            "replaced it"
+        ),
+        "cause": disablement.get("cause"),
+        "superseded_by": superseded_by,
+    }
+
+
+async def superseding_schedules(
+    db: Any, paused_ids: Collection[str]
+) -> Dict[str, str]:
+    """For each paused row id, the newest row of its agent that replaced it.
+
+    A replacement is another row with the same agent and idempotency key,
+    created strictly later. A caller that re-registers a paused schedule
+    inserts such a row instead of resuming the old one, and the old row then
+    never runs again (#3873). Equal creation times are not ordered, so they
+    replace nothing; two replacements created at the same instant are told
+    apart by id.
+
+    One query for any number of rows, and none at all when ``paused_ids`` is
+    empty, which is every read with no permission-block pause. Each paused
+    row, found by its primary key, reads one entry of
+    :data:`SUPERSESSION_INDEX`: the newest later row under its key, in index
+    order. The query returns one row per paused id, so many pauses under one
+    key cost what as many pauses under separate keys do. A join to every
+    later row under the key instead returned N(N-1)/2 rows for N pauses
+    sharing one key.
+    """
+
+    ids = tuple(sorted(set(paused_ids)))
+    if not ids:
+        return {}
+    placeholders = ", ".join("?" for _ in ids)
+    rows = await db.fetchall(
+        f"""
+        SELECT paused.id,
+               (SELECT newer.id
+                FROM scheduled_tasks newer
+                WHERE newer.agent_id = paused.agent_id
+                  AND newer.idempotency_key = paused.idempotency_key
+                  AND newer.created_at > paused.created_at
+                ORDER BY newer.created_at DESC, newer.id DESC
+                LIMIT 1) AS superseded_by
+        FROM scheduled_tasks paused
+        WHERE paused.id IN ({placeholders})
+        """,
+        ids,
+    )
+    return {
+        str(paused_id): str(superseded_by)
+        for paused_id, superseded_by in rows
+        if superseded_by is not None
     }
 
 
@@ -441,16 +492,52 @@ async def _postgres_runtime_status_primary_key(
     return (str(primary_key[0]) if primary_key is not None else None), key_columns
 
 
-def _named_schedule(row: Any, disablement: Dict[str, Any]) -> Dict[str, Any]:
-    """One disabled or superseded row as status names it: what, why, since when."""
+#: Columns of the inventory read, after its leading ``agent_id``.
+_INVENTORY_COLUMNS = f"""
+    enabled, next_run_at, terminal_status, schedule_kind,
+    scheduler_rollout_fenced, scheduler_claim_fenced,
+    lease_owner, lease_expires_at, misfire_grace_seconds,
+    {LEGACY_SCHEDULER_PAUSE_PROJECTION},
+    id, task_name, terminal_at, {PAUSE_CAUSE_PROJECTION}
+"""
+_ROW_ID = 10
+_ROW_TASK_NAME = 11
+_ROW_TERMINAL_AT = 12
+_ROW_PAUSE_CAUSE = 13
 
-    named = {
-        "task_id": row[10] if len(row) > 10 else None,
-        "task_name": row[11] if len(row) > 11 else None,
+
+def _row_disablement(row: Sequence[Any], database_now: datetime) -> Dict[str, Any]:
+    """Classify one inventory row, before supersession is known."""
+
+    return classify_disablement(
+        enabled=bool(row[0]),
+        terminal_status=row[2],
+        schedule_kind=str(row[3] or "cron"),
+        database_now=database_now,
+        rollout_fenced=bool(row[4]),
+        claim_fenced=bool(row[5]),
+        lease_owner=row[6],
+        lease_expires_at=row[7],
+        legacy_scheduler_pause=bool(row[9]) if len(row) > 9 else False,
+        pause_cause=PauseCause.from_row(
+            row[_ROW_PAUSE_CAUSE:_ROW_PAUSE_CAUSE + PAUSE_CAUSE_PROJECTION_WIDTH]
+        ),
+    )
+
+
+def _named_schedule(row: Sequence[Any], disablement: Mapping[str, Any]) -> Dict[str, Any]:
+    """One disabled or superseded row as status names it: what, why, since when.
+
+    Identifiers and the structured cause only: nothing a hook or the call
+    wrote (#3873).
+    """
+
+    named: Dict[str, Any] = {
+        "task_id": row[_ROW_ID],
+        "task_name": row[_ROW_TASK_NAME],
         "reason": disablement["reason"],
         "cause": disablement.get("cause"),
-        "cause_detail": disablement.get("cause_detail"),
-        "terminal_at": row[13] if len(row) > 13 else None,
+        "terminal_at": row[_ROW_TERMINAL_AT],
         "recovery_action": disablement["recovery_action"],
     }
     if "superseded_by" in disablement:
@@ -459,13 +546,14 @@ def _named_schedule(row: Any, disablement: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _inventory_from_rows(
-    rows: Collection[Any],
+    entries: Collection[tuple[Sequence[Any], Dict[str, Any]]],
     *,
     database_now: datetime,
     default_misfire_grace_seconds: int = DEFAULT_MISFIRE_GRACE_SECONDS,
     overdue_grace_floor_seconds: int = 0,
-    withhold_cause_detail: bool = True,
 ) -> Dict[str, Any]:
+    """Count one agent's ``(row, disablement)`` pairs."""
+
     configured_enabled_count = 0
     enabled_count = 0
     executing_count = 0
@@ -475,30 +563,14 @@ def _inventory_from_rows(
     system_disabled_count = 0
     terminal_count = 0
     superseded_count = 0
-    system_disabled_schedules: list[Dict[str, Any]] = []
-    superseded_schedules: list[Dict[str, Any]] = []
+    system_disabled_schedules: List[Dict[str, Any]] = []
+    superseded_schedules: List[Dict[str, Any]] = []
     disabled_reasons: Dict[str, int] = {}
     non_runnable_reasons: Dict[str, int] = {}
     next_runs: list[datetime] = []
     overdue_candidates: list[datetime] = []
     overdue_entries: list[tuple[datetime, datetime]] = []
-    for row in rows:
-        enabled = bool(row[0])
-        disablement = classify_disablement(
-            enabled=enabled,
-            terminal_status=row[2],
-            schedule_kind=str(row[3] or "cron"),
-            database_now=database_now,
-            rollout_fenced=bool(row[4]),
-            claim_fenced=bool(row[5]),
-            lease_owner=row[6],
-            lease_expires_at=row[7],
-            legacy_scheduler_pause=bool(row[9]) if len(row) > 9 else False,
-            terminal_cause=row[12] if len(row) > 12 else None,
-            terminal_cause_detail=row[15] if len(row) > 15 else None,
-            withhold_cause_detail=withhold_cause_detail,
-            superseded_by=row[14] if len(row) > 14 else None,
-        )
+    for row, disablement in entries:
         state = disablement["state"]
         if state in {"enabled", "executing"}:
             configured_enabled_count += 1
@@ -526,9 +598,7 @@ def _inventory_from_rows(
             terminal_count += 1
             superseded_count += 1
             if len(superseded_schedules) < MAX_NAMED_SCHEDULES:
-                superseded_schedules.append(
-                    _named_schedule(row, disablement)
-                )
+                superseded_schedules.append(_named_schedule(row, disablement))
         elif state in {"paused", "disabled"}:
             disabled_count += 1
             reason = str(disablement["reason"])
@@ -565,7 +635,7 @@ def _inventory_from_rows(
     )
 
     return {
-        "schedule_count": len(rows),
+        "schedule_count": len(entries),
         "configured_enabled_count": configured_enabled_count,
         "enabled_count": enabled_count,
         "executing_count": executing_count,
@@ -599,7 +669,6 @@ async def _schedule_inventories(
     database_now: datetime,
     default_misfire_grace_seconds: int = DEFAULT_MISFIRE_GRACE_SECONDS,
     overdue_grace_floor_seconds: int = 0,
-    withhold_cause_detail: bool = True,
 ) -> Dict[str, Dict[str, Any]]:
     """Load one grouped inventory snapshot for a worker's whole scope."""
 
@@ -609,30 +678,41 @@ async def _schedule_inventories(
     placeholders = ", ".join("?" for _ in normalized_ids)
     rows = await db.fetchall(
         f"""
-        SELECT agent_id, enabled, next_run_at, terminal_status, schedule_kind,
-               scheduler_rollout_fenced, scheduler_claim_fenced,
-               lease_owner, lease_expires_at, misfire_grace_seconds,
-               {LEGACY_SCHEDULER_PAUSE_PROJECTION},
-               id, task_name, terminal_cause, terminal_at,
-               {SUPERSEDING_SCHEDULE_PROJECTION},
-               terminal_cause_detail
+        SELECT agent_id, {_INVENTORY_COLUMNS}
         FROM scheduled_tasks
         WHERE agent_id IN ({placeholders})
         """,
         normalized_ids,
     )
+    classified = [
+        (str(row[0]), row[1:], _row_disablement(row[1:], database_now))
+        for row in rows
+    ]
+    # One lookup for the whole scope, made only when a permission-block pause
+    # exists: a pause that a re-registration replaced is history (#3873).
+    replacements = await superseding_schedules(
+        db,
+        [
+            row[_ROW_ID]
+            for _agent_id, row, disablement in classified
+            if is_supersedable(disablement)
+        ],
+    )
     grouped: Dict[str, list[Any]] = {agent_id: [] for agent_id in normalized_ids}
-    for row in rows:
-        agent_id = str(row[0])
+    for agent_id, row, disablement in classified:
+        replacement = replacements.get(row[_ROW_ID])
+        if replacement is not None:
+            disablement = superseded_disablement(
+                disablement, superseded_by=replacement
+            )
         if agent_id in grouped:
-            grouped[agent_id].append(row[1:])
+            grouped[agent_id].append((row, disablement))
     return {
         agent_id: _inventory_from_rows(
             grouped[agent_id],
             database_now=database_now,
             default_misfire_grace_seconds=default_misfire_grace_seconds,
             overdue_grace_floor_seconds=overdue_grace_floor_seconds,
-            withhold_cause_detail=withhold_cause_detail,
         )
         for agent_id in normalized_ids
     }
@@ -645,7 +725,6 @@ async def _schedule_inventory(
     database_now: datetime,
     default_misfire_grace_seconds: int = DEFAULT_MISFIRE_GRACE_SECONDS,
     overdue_grace_floor_seconds: int = 0,
-    withhold_cause_detail: bool = True,
 ) -> Dict[str, Any]:
     return (
         await _schedule_inventories(
@@ -654,7 +733,6 @@ async def _schedule_inventory(
             database_now=database_now,
             default_misfire_grace_seconds=default_misfire_grace_seconds,
             overdue_grace_floor_seconds=overdue_grace_floor_seconds,
-            withhold_cause_detail=withhold_cause_detail,
         )
     )[agent_id]
 
@@ -722,18 +800,7 @@ def scheduler_status_parameters(feature: Any) -> Dict[str, Any]:
             0, int(default_misfire_grace or 0)
         ),
         "lease_seconds": max(1, int(lease_seconds or 0)),
-        # A disabled schedule's stored cause detail is free-form gate text;
-        # status withholds it under the privacy mode in force now (#3873).
-        "withhold_cause_detail": _withholds_persisted_content(feature),
     }
-
-
-def _withholds_persisted_content(feature: Any) -> bool:
-    from kestrel_sovereign.features.storage_access import (
-        hides_persisted_user_content,
-    )
-
-    return hides_persisted_user_content(getattr(feature, "agent", None))
 
 
 async def _write_runtime_status(operation):
@@ -899,14 +966,8 @@ async def scheduler_status(
     expected_started_at: Optional[str] = None,
     default_misfire_grace_seconds: int = DEFAULT_MISFIRE_GRACE_SECONDS,
     lease_seconds: int = DEFAULT_LEASE_SECONDS,
-    withhold_cause_detail: bool = True,
 ) -> Dict[str, Any]:
-    """Read and diagnose scheduler liveness plus current durable row state.
-
-    ``withhold_cause_detail`` withholds each named schedule's free-form cause
-    detail (:func:`classify_disablement`); :func:`scheduler_status_parameters`
-    supplies it from the agent's live privacy mode.
-    """
+    """Read and diagnose scheduler liveness plus current durable row state."""
 
     stale_after_seconds = max(1, int(poll_interval)) * max(
         1, int(stale_after_ticks)
@@ -925,7 +986,6 @@ async def scheduler_status(
             0, int(default_misfire_grace_seconds)
         ),
         overdue_grace_floor_seconds=stale_after_seconds,
-        withhold_cause_detail=withhold_cause_detail,
     )
     report_columns = (
         "owner_id, worker_state, reported_at, last_tick_started_at, "
@@ -1220,7 +1280,7 @@ __all__ = [
     "RUNTIME_STATUS_RETENTION_SECONDS",
     "SCHEDULER_BLOCKED_REASON",
     "SCHEDULER_SAFETY_DISABLEMENT_REASONS",
-    "SUPERSEDING_SCHEDULE_PROJECTION",
+    "SUPERSESSION_INDEX",
     "classify_disablement",
     "emit_runtime_status",
     "ensure_runtime_status_table",
@@ -1228,4 +1288,7 @@ __all__ = [
     "scheduler_status",
     "scheduler_status_parameters",
     "scheduler_tick_in_progress_limit_seconds",
+    "superseded_disablement",
+    "superseding_schedules",
+    "is_supersedable",
 ]

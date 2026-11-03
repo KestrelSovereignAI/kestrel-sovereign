@@ -22,15 +22,9 @@ MISSED_COGNITION_STATUS = "missed"
 # attempt backs off (#3749).
 HOOK_FAILED_STATUS = "hook_failed"
 
-# Longest ``scheduled_tasks.terminal_cause_detail`` the runner stores: the
-# free-form reason behind the cause the scheduler recorded when it disabled a
-# row, beside ``terminal_status`` and ``terminal_cause`` (#3873).
-TERMINAL_CAUSE_MAX_CHARS = 500
-
 __all__ = [
     "HOOK_FAILED_STATUS",
     "MISSED_COGNITION_STATUS",
     "ROLLOUT_AMBIGUOUS_LEGACY_OCCURRENCE",
     "SCHEDULER_SAFETY_DISABLEMENT_REASONS",
-    "TERMINAL_CAUSE_MAX_CHARS",
 ]

@@ -39,7 +39,6 @@ from .provider_registry import (
     provider_cache_body,
 )
 from .call_progress import bound_attempt_call, report_call_attempt
-from .route_calls import RouteCallLedger, record_route_call
 from .cancellation import CancelToken
 from .error_handling import (
     handle_llm_errors,
@@ -765,11 +764,6 @@ class LLMService(DecisionServiceMixin, ModalityRecordingMixin, ModelDiscoveryMix
         # Cleared by restarting the service (picks up rotated keys). Keys
         # are provider route names (matches provider["name"]).
         self._disabled_routes: dict[str, str] = {}
-
-        # How the most recent real call on each route ended (#3873): the
-        # ``llm_service`` health check's evidence for the routes in use, so it
-        # never sends a paid completion of its own to probe one.
-        self.route_calls = RouteCallLedger()
 
         # Schema modules are imported while FastAPI builds its routes, before a
         # real agent-scoped LLM service exists. Freeze the conversation vector
@@ -1996,16 +1990,6 @@ class LLMService(DecisionServiceMixin, ModalityRecordingMixin, ModelDiscoveryMix
             "auth failure: %s. Rotate the key and restart to re-enable.",
             name, reason,
         )
-
-    def disabled_routes(self) -> Dict[str, str]:
-        """Routes disabled this session by a permanent auth failure (#3873).
-
-        Each name maps to the reason :meth:`_maybe_disable_route` recorded.
-        Routing skips these until restart, so they are not in
-        :meth:`routes_in_use`; a real call on each failed, so none is a
-        standby route either. The ``llm_service`` health check reports them.
-        """
-        return dict(self._disabled_routes)
 
     def _available_providers(
         self, providers: Optional[List[Dict[str, Any]]] = None,
@@ -3364,41 +3348,6 @@ class LLMService(DecisionServiceMixin, ModalityRecordingMixin, ModelDiscoveryMix
         return RoutingResolution(
             providers_to_use, target_model, meta, mandate_pin=mandate_pin
         )
-
-    def routes_in_use(self) -> List[str]:
-        """The routes the agent's next turn would try, in order (#3873).
-
-        An active private inference lease that the next call would take
-        (:meth:`_remote_route_selected`, the predicate the dispatch itself
-        reads) is the only route in use: it takes precedence and has no cloud
-        fallback, so it is reported as ``remote_gpu``, the name its calls are
-        recorded under. Otherwise the routes come from the same routing pass
-        every call makes (:meth:`resolve_provider_routing`, with no override,
-        under the live privacy state), less the routes the dispatch loops skip
-        before dispatch: an unauthorized vendor's and a refused plan-to-paid
-        downgrade. Every other configured route is standby or disabled
-        (:meth:`disabled_routes`): no turn tries it until routing changes. The
-        ``llm_service`` health check judges these routes, so a standby
-        provider that is down does not degrade the agent. Routing's own
-        refusal (no usable route) propagates.
-        """
-        if self._remote_route_selected(
-            force_local_only=self._effective_force_local_only(False),
-            model_override=None,
-        ):
-            return [REMOTE_ROUTE_NAME]
-        resolution = self.resolve_provider_routing()
-        explicit_selection, authorized_vendors = resolution.meta
-        providers = resolution.providers
-        return [
-            provider["name"]
-            for index, provider in enumerate(providers)
-            if explicit_selection
-            or not (
-                self._skip_paid_fallback(provider, providers, index)
-                or self._skip_unconfigured_route(provider, authorized_vendors)
-            )
-        ]
 
     @staticmethod
     def _provider_supports_embeddings(provider: Dict[str, Any]) -> bool:
@@ -4902,7 +4851,6 @@ class LLMService(DecisionServiceMixin, ModalityRecordingMixin, ModelDiscoveryMix
             started = time.monotonic()
             try:
                 response = await bound_attempt_call(route, provider_name, model, attempt)
-                record_route_call(self, provider_name)
                 await require_native_execution_admission(self)
             except ExecutionAuthorityError:
                 raise
@@ -4913,7 +4861,6 @@ class LLMService(DecisionServiceMixin, ModalityRecordingMixin, ModelDiscoveryMix
             except Exception as exc:
                 if is_execution_control_error(exc):
                     raise
-                record_route_call(self, provider_name, exc)
                 await require_native_execution_admission(self)
                 reported = reported_usage(exc)
                 usage_available = response_usage_available(reported)

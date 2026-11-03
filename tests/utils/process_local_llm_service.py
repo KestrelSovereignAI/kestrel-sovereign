@@ -9,7 +9,6 @@ starting point of ``kestrel embeddings reindex`` and
 
 from __future__ import annotations
 
-from kestrel_sovereign.llm.route_calls import RouteCallLedger
 from kestrel_sovereign.llm.service import LLMService
 
 
@@ -41,8 +40,6 @@ def process_local_service(
     service.providers = providers
     service.disabled = False
     service._disabled_routes = {}
-    service.route_calls = RouteCallLedger()
-    service._remote_lease = None  # no private inference lease is active
     service._mandate_preference = {}
     service._mandate_fallbacks = []
     service._mandate_load_error = None

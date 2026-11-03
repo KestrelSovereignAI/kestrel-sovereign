@@ -3,9 +3,7 @@ Health Feature - periodic liveness probes.
 
 Runs configurable periodic checks on the agent's infrastructure:
 - Database connectivity
-- LLM service availability: providers populated, and the routes in use
-  judged on the last real call on each (no LLM call; standby routes are
-  reported, not judged)
+- LLM service availability (object exists + providers populated, no LLM call)
 - Memory system health
 - Disk space
 - Context window utilization

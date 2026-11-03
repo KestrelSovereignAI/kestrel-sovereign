@@ -23,7 +23,10 @@ from kestrel_sovereign.features.scheduler.failure_streak import (
     hook_failure_backoff,
 )
 from kestrel_sovereign.features.scheduler.feature import SchedulerFeature
-from kestrel_sovereign.features.scheduler.outcome import ScheduledTaskOutcome
+from kestrel_sovereign.features.scheduler.outcome import (
+    PAUSE_CAUSE_COLUMNS,
+    ScheduledTaskOutcome,
+)
 from kestrel_sovereign.features.scheduler.runner import (
     SCHEDULER_PROTOCOL_VERSION,
     SchedulerRunner,
@@ -289,6 +292,109 @@ async def test_a_legacy_scheduler_pause_is_labelled_on_backend(
                 "DELETE FROM task_execution_log WHERE task_id = ?", (task_id,)
             )
             await db.execute("DELETE FROM scheduled_tasks WHERE id = ?", (task_id,))
+        await db.execute(
+            "DELETE FROM scheduler_protocol_rollout WHERE agent_id = ?", (agent_id,)
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.dual_backend
+async def test_a_pause_cause_and_its_supersession_on_backend(db_backend, monkeypatch):
+    """#3873: the finalize stores a permission pause's structured cause, and a
+    later registration under the same idempotency key makes the pause history,
+    found through the composite index, on PostgreSQL as on SQLite."""
+
+    db = AsyncDatabase(db_backend)
+    agent_id = f"scheduler-pause-cause:{uuid4()}"
+    task_id = f"scheduler-pause-cause-task:{uuid4()}"
+    replacement_id = f"scheduler-pause-cause-replacement:{uuid4()}"
+    idempotency_key = f"pause-cause-effect:{uuid4()}"
+
+    async def executor(task_name, _args):
+        return ScheduledTaskOutcome.blocked(
+            task_name=task_name,
+            decision="deny",
+            hook="security_guard",
+        )
+
+    agent = SimpleNamespace(did=agent_id)
+    feature = SchedulerFeature(agent)
+    feature._db = db
+    feature._agent_id = agent_id
+    agent.features = {"SchedulerFeature": feature}
+    try:
+        await _activate_protocol_for_test_agent(db, agent_id, monkeypatch)
+        runner = SchedulerRunner(db, agent_id, executor, owner_id="pause-cause-replica")
+        await runner._ensure_tables()
+        now = datetime.now(timezone.utc)
+        await db.execute(
+            """
+            INSERT INTO scheduled_tasks
+                (id, agent_id, task_name, cron_expression, args_json, enabled,
+                 next_run_at, created_at, idempotency_key,
+                 scheduler_protocol_version)
+            VALUES (?, ?, 'workflow_trigger_cron', '* * * * *', '{}', 1, ?, ?, ?, ?)
+            """,
+            (
+                task_id, agent_id, (now - timedelta(seconds=1)).isoformat(),
+                now.isoformat(), idempotency_key, SCHEDULER_PROTOCOL_VERSION,
+            ),
+        )
+        await tick_and_settle(runner)
+
+        row = await db.fetchone(
+            f"SELECT enabled, terminal_status, {', '.join(PAUSE_CAUSE_COLUMNS)} "
+            "FROM scheduled_tasks WHERE id = ?",
+            (task_id,),
+        )
+        assert tuple(row) == (
+            0, "blocked", "security_guard", "deny", "workflow_trigger_cron",
+        )
+        status = await scheduler_status(db, agent_id=agent_id, poll_interval=30)
+        assert status["system_disabled_count"] == 1
+        [named] = status["system_disabled_schedules"]
+        assert named["cause"] == {
+            "hook": "security_guard", "decision": "deny",
+            "tool": "workflow_trigger_cron",
+        }
+        # The execution's persisted text is worded from the cause alone.
+        [(result_text,)] = await db.fetchall(
+            "SELECT result_text FROM task_execution_log WHERE task_id = ?",
+            (task_id,),
+        )
+        assert result_text == (
+            "blocked: the permission gate stopped this tick (hook security_guard "
+            "decided deny for tool workflow_trigger_cron). Set this tool's "
+            f"permission to Auto, then resume the schedule. Schedule id: {task_id}."
+        )
+
+        await db.execute(
+            """
+            INSERT INTO scheduled_tasks
+                (id, agent_id, task_name, cron_expression, args_json, enabled,
+                 next_run_at, created_at, idempotency_key,
+                 scheduler_protocol_version)
+            VALUES (?, ?, 'workflow_trigger_cron', '* * * * *', '{}', 1, ?, ?, ?, ?)
+            """,
+            (
+                replacement_id, agent_id, "2999-01-01T00:00:00+00:00",
+                (now + timedelta(seconds=1)).isoformat(), idempotency_key,
+                SCHEDULER_PROTOCOL_VERSION,
+            ),
+        )
+        status = await scheduler_status(db, agent_id=agent_id, poll_interval=30)
+        assert status["system_disabled_count"] == 0
+        assert status["superseded_count"] == 1
+        [superseded] = status["superseded_schedules"]
+        assert (superseded["task_id"], superseded["superseded_by"]) == (
+            task_id, replacement_id,
+        )
+    finally:
+        for schedule in (task_id, replacement_id):
+            await db.execute(
+                "DELETE FROM task_execution_log WHERE task_id = ?", (schedule,)
+            )
+            await db.execute("DELETE FROM scheduled_tasks WHERE id = ?", (schedule,))
         await db.execute(
             "DELETE FROM scheduler_protocol_rollout WHERE agent_id = ?", (agent_id,)
         )

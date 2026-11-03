@@ -36,14 +36,18 @@ def _snapshot_outcome_data(value, memo=None):
 
     Read builtin container storage directly, including for subclasses. Unknown
     objects fail explicitly: invoking their constructors/copy protocols cannot
-    prove that a projection no longer retains a mutable alias. The two native
+    prove that a projection no longer retains a mutable alias. The native
     immutable record types retain identity (scheduler callers rely on it), but
-    only when every stored field is itself an immutable canonical value.
+    only when every stored field is itself an immutable canonical value. A
+    scheduled outcome's ``PauseCause`` is one of them, so the outcome that
+    carries it keeps its identity too (#3873).
     """
     from kestrel_sdk.signals.models import (
         CausationFrame, SignalMode, Status, Trust, Urgency, Visibility,
     )
-    from kestrel_sovereign.features.scheduler.outcome import ScheduledTaskOutcome
+    from kestrel_sovereign.features.scheduler.outcome import (
+        PauseCause, ScheduledTaskOutcome,
+    )
 
     scalar_types = (type(None), bool, int, float, str, bytes, date, timedelta,
                     Decimal, UUID, timezone, ZoneInfo)
@@ -74,7 +78,7 @@ def _snapshot_outcome_data(value, memo=None):
     identity = id(value)
     if identity in memo:
         return memo[identity]
-    if _has_exact_native_type(value, CausationFrame, ScheduledTaskOutcome):
+    if _has_exact_native_type(value, CausationFrame, ScheduledTaskOutcome, PauseCause):
         for field in fields(value):
             stored = object.__getattribute__(value, field.name)
             if _snapshot_outcome_data(stored, memo) is not stored:

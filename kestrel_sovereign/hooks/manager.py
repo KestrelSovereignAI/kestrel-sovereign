@@ -36,6 +36,23 @@ class FailedHookDenial(HookOutput):
     failed_hook: str = ""
 
 
+#: The attribute naming the hook whose DENY or ASK ended a chain (#3873).
+#: ``HookOutput`` is an SDK type with no field for it, so the manager records
+#: it on the output the deciding hook returned, as it already records the
+#: chain's accumulated warnings there. Read it with :func:`deciding_hook`.
+DECIDING_HOOK_ATTRIBUTE = "deciding_hook"
+
+
+def deciding_hook(output: Any) -> Optional[str]:
+    """The name of the hook that decided ``output``'s DENY or ASK, if known.
+
+    ``None`` for an output no chain decided (a caller's double, an ALLOW), and
+    for a :class:`FailedHookDenial`: a hook that failed decided nothing.
+    """
+    name = getattr(output, DECIDING_HOOK_ATTRIBUTE, None)
+    return name if isinstance(name, str) and name else None
+
+
 def _hook_is_enforcing(hook) -> bool:
     """Whether a hook must FAIL CLOSED (deny) if it errors/times out.
 
@@ -430,6 +447,8 @@ class HooksManager:
                     if accumulated_warnings:
                         output.warning_message = " | ".join(accumulated_warnings)
                         output.warning_severity = max_warning_severity
+                    if isinstance(output, HookOutput):
+                        setattr(output, DECIDING_HOOK_ATTRIBUTE, hook.name)
                     return output
 
                 # MODIFY updates input for next hook.  Explicit

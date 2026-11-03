@@ -188,8 +188,9 @@ Tick boundaries are stamped from database time as well.
 A current worker with zero schedules passes. A live claim is reported as
 executing and remains configured-enabled; only an absent or expired claim lease
 is classified as protocol recovery. Scheduler-disabled rows warn with their
-reason and stored cause; operator pauses, completed one-shot history and
-superseded pauses do not impersonate a worker outage. Scheduler safety reasons remain disablements even on one-shot
+reason, and a permission-block pause with its stored cause; operator pauses,
+completed one-shot history and superseded pauses do not impersonate a worker
+outage. Scheduler safety reasons remain disablements even on one-shot
 rows and retain their explicit recovery contract. In particular, an
 `execution_log_inconsistent` one-shot cannot be replayed at its old deadline or
 have its marker cleared by `schedule_resume`; the execution log must be
@@ -244,15 +245,10 @@ two different ways, and the scheduler treats them differently (#3749):
   or it needs an approver and a tick has none). The execution is `blocked`,
   and the schedule pauses (`enabled = 0`, `terminal_status = 'blocked'`) so a
   denial that recurs on every tick does not repeat forever (#2430). The same
-  finalize records why, in two columns, so the pause names its cause after
-  the execution's `result_text` has aged out of the log (#3873):
-  `terminal_cause` is content-free, built from the gate's decision alone
-  (`the permission gate decided deny`), and `terminal_cause_detail` is the
-  reason the hook gave. Status reports the pause as a scheduler disablement
-  with reason `blocked`, its `cause` and its `cause_detail`;
-  `scheduler_liveness` names each disabled schedule with both. Grant the
-  tool's permission, then run `schedule_resume`, which clears both with the
-  pause.
+  finalize records the pause's cause (see below). Status reports it as a
+  scheduler disablement with reason `blocked` and its `cause`; grant the
+  tool's permission, then run `schedule_resume`, which clears the cause with
+  the pause.
 - **Hook failure.** An enforcing hook raised or timed out (for example
   `security_guard` hitting `database is locked`), and the hook manager failed
   closed with a DENY it marks as a failure. Nothing decided anything, so the
@@ -275,36 +271,67 @@ whose `executed_at` equals the row's `last_run_at`, and reports them as the
 scheduler's `blocked` pause rather than `operator_paused`. Nothing rewrites
 those rows; they stay paused until resumed.
 
-`terminal_cause` and `terminal_cause_detail` are written wherever the
-finalizer disables a row: a permission block, and a cron expression it can no
-longer compute a next run for (`invalid_cron`, whose detail is the parse
-error). The other safety disablements (`invalid_idempotency_key`,
-`execution_log_inconsistent`, `unresolved_effect`,
-`rollout_ambiguous_legacy_occurrence`) name their cause in `terminal_status`
-itself and store none. A row paused before causes were stored reports
-`cause: null`, and `scheduler_liveness` says no cause was recorded.
+### The cause of a permission-block pause
 
-A hook's reason is free-form and can repeat the blocked call's arguments: a
-spawn mandate's `MandateRestrictionHook` names the argument value it rejected.
-The detail is therefore held to the rule that governs `result_text`. In a
-volatile privacy mode (EPHEMERAL, ISOLATED or DEIDENTIFIED) every reader —
-`schedule_list`, scheduler status and `scheduler_liveness` — returns
-`[redacted: volatile privacy mode]` in its place, decided when it reads, so a
-detail stored under a durable mode is withheld once the agent enters a
-volatile one. The content-free cause stays visible. A status reader given no
-privacy verdict withholds the detail.
+Before #3873 a paused row recorded only `terminal_status = 'blocked'`, so
+once its execution's `result_text` aged out of the log nothing said why it
+was paused. The finalize that pauses the row now stores three structured
+columns beside its status:
+
+| Column | Holds |
+|---|---|
+| `terminal_cause_hook` | the name of the hook whose decision paused it (`security_guard`, `mandate_restriction`), which the hook manager records on the DENY or ASK it returns |
+| `terminal_cause_decision` | that decision: `deny` or `ask` |
+| `terminal_cause_tool` | the tool the gate refused |
+
+These are identifiers set in code. A name that is not a plain identifier is
+stored as unknown (`NULL`), never as text. The hook's reason is deliberately
+not stored: it is free-form, and a hook can repeat the call's arguments in it
+(`MandateRestrictionHook` names the argument value it rejected). Because
+nothing in the cause came from the call, every reader can show it in every
+privacy mode, with no withholding. The scheduler's log line for the block
+names the same three fields and not the reason, and so does the execution's
+`result_text` in `task_execution_log`: it is worded from the cause alone,
+for example `blocked: the permission gate stopped this tick (hook
+mandate_restriction decided deny for tool spawn_agent). Set this tool's
+permission to Auto, then resume the schedule. Schedule id: <id>.`
+
+Scheduler status, `schedule_list` and `scheduler_liveness` report the cause as
+`{"hook", "decision", "tool"}` on each `blocked` disablement, and the health
+check's message names it, for example
+`restart_coordinator (45a190ee) blocked: hook security_guard decided deny for
+tool restart_coordinator`. Status names at most 20 disabled schedules in
+`system_disabled_schedules`; the counts stay exact past that. A pause stored
+before #3873 reports `cause: null`, and the health check says no cause was
+recorded. A hook failure stores no cause, since it pauses nothing.
+
+### A superseded pause is history
 
 A caller can re-register a paused schedule by inserting a new row under the
 same idempotency key instead of resuming the old one. The old row then never
-runs again but used to hold `scheduler_liveness` at warn forever (#3873).
-Status excludes such rows at read time rather than retiring them on
-re-registration: a permission-block pause with a newer row of the same agent
-and idempotency key is `superseded` history, counted in `superseded_count` (and
-`terminal_count`) instead of `system_disabled_count`, and named with the
-`superseded_by` row that replaced it. Nothing rewrites the old row; it keeps
-its status and cause until an operator removes it with `schedule_remove`. Other
-safety disablements stay disablements when replaced, because each names work
-an operator must still reconcile.
+runs again, and before #3873 it held `scheduler_liveness` at warn on every tick
+until an operator deleted it. Status now reports a permission-block pause as
+`superseded` when another row of the same agent has the same idempotency key
+and a strictly later `created_at`. Such a row counts in `superseded_count` and
+`terminal_count` instead of `system_disabled_count`, and is named in
+`superseded_schedules` with the `superseded_by` row that replaced it. Equal
+creation times order nothing and replace nothing.
+
+Status decides this when it reads; nothing rewrites the old row. It keeps its
+status and cause until an operator removes it with `schedule_remove`. Only a
+permission-block pause is superseded. Every other scheduler disablement names
+work an operator must still reconcile, so a replacement does not retire it.
+
+The lookup is one query per status read, whatever the number of paused rows.
+It runs only when the read found a permission-block pause, so heartbeats over
+schedules with none of them make no extra query. Each paused row, found by its
+primary key, reads one entry of the
+`idx_scheduled_tasks_agent_idempotency (agent_id, idempotency_key,
+created_at, id)` index the runner creates at bootstrap: the newest later row
+under its key. The query returns one row per paused row, so it scans no table
+whatever the history size, and many pauses re-registered under one key cost no
+more than as many pauses under separate keys. Two replacements created at the
+same instant are told apart by `id`.
 
 ## Protocol-v2 rollout fence
 

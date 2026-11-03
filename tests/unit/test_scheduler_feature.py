@@ -1903,7 +1903,6 @@ class TestSchedulerRunner:
             return_value=ScheduledTaskOutcome.blocked(
                 task_name="restart_coordinator",
                 decision="ask",
-                reason="headless scheduler cannot approve this operation",
             )
         )
         runner = SchedulerRunner(db, "test-agent", executor)
@@ -1916,7 +1915,7 @@ class TestSchedulerRunner:
         )
         outcome_params = outcome_call[0][1]
         assert outcome_params[0] == "blocked"
-        assert "headless scheduler" in outcome_params[1]
+        assert "decided ask for tool restart_coordinator" in outcome_params[1]
         assert "Schedule id: restart-task" in outcome_params[1]
         assert "resume the schedule" in outcome_params[1]
 
@@ -1948,7 +1947,6 @@ class TestSchedulerRunner:
             return_value=ScheduledTaskOutcome.blocked(
                 task_name="restart_coordinator",
                 decision="ask",
-                reason="operator approval required",
             )
         )
         runner = SchedulerRunner(db, "test-agent", executor)
@@ -1995,7 +1993,7 @@ class TestSchedulerRunner:
             )
             assert history is not None
             assert history[0] == "blocked"
-            assert "operator approval required" in history[1]
+            assert "decided ask for tool restart_coordinator" in history[1]
             assert "permission to Auto" in history[1]
             assert "resume the schedule" in history[1]
 
@@ -2470,8 +2468,12 @@ class TestTaskExecutor:
         assert isinstance(result, ScheduledTaskOutcome)
         assert result.status == "blocked"
         assert result.pause_schedule is True
-        assert decision in result.result_text
-        assert "policy forbids it" in result.result_text
+        assert result.pause_cause.as_dict() == {
+            "hook": None, "decision": decision, "tool": "dangerous_op",
+        }
+        assert f"decided {decision} for tool dangerous_op" in result.result_text
+        # The hook's free-form reason is never kept (#3873).
+        assert "policy forbids it" not in result.result_text
         assert "permission to Auto" in result.result_text
         # The tool never ran — the gate blocked it before execute().
         mock_tool.execute.assert_not_awaited()
@@ -2877,7 +2879,6 @@ class TestTranslateSignalResult:
         blocked = ScheduledTaskOutcome.blocked(
             task_name="restart_coordinator",
             decision="ask",
-            reason="approval is unavailable in a headless tick",
         )
         result = feature._translate_signal_result(
             self._make_result(

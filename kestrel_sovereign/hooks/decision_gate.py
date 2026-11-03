@@ -23,7 +23,7 @@ from typing import Any, Optional
 
 from kestrel_sdk.hooks.base import PermissionDecision
 
-from kestrel_sovereign.hooks.manager import FailedHookDenial
+from kestrel_sovereign.hooks.manager import FailedHookDenial, deciding_hook
 
 __all__ = ["BlockedDecision", "evaluate_blocking_decision"]
 
@@ -44,6 +44,11 @@ class BlockedDecision:
     #: DENY, or ``None`` when a hook decided it. A failed hook decided
     #: nothing: the manager failed closed on its behalf (#3749).
     failed_hook: Optional[str] = None
+    #: The hook whose DENY or ASK this is, as the hook manager recorded it,
+    #: or ``None`` when that is not known (a failed hook, an output no
+    #: manager chain produced). An identifier, never the hook's reason
+    #: (#3873).
+    deciding_hook: Optional[str] = None
 
     @property
     def is_ask(self) -> bool:
@@ -82,13 +87,15 @@ def evaluate_blocking_decision(
       as a DENY-equivalent stop.
 
     A DENY the hook manager produced because an enforcing hook failed is
-    still blocking, and carries the hook's name in ``failed_hook``.
+    still blocking, and carries the hook's name in ``failed_hook``. A decided
+    DENY or ASK carries the deciding hook's name in ``deciding_hook``.
     """
     if hook_output is None:
         return None
 
     decision = getattr(hook_output, "permission_decision", None)
     reason_attr = getattr(hook_output, "permission_reason", None)
+    decided_by = deciding_hook(hook_output)
 
     if decision == PermissionDecision.DENY:
         return BlockedDecision(
@@ -99,10 +106,13 @@ def evaluate_blocking_decision(
                 if isinstance(hook_output, FailedHookDenial)
                 else None
             ),
+            deciding_hook=decided_by,
         )
     if decision == PermissionDecision.ASK:
         return BlockedDecision(
-            PermissionDecision.ASK, reason_attr or ask_reason_default
+            PermissionDecision.ASK,
+            reason_attr or ask_reason_default,
+            deciding_hook=decided_by,
         )
 
     if getattr(hook_output, "continue_execution", True) is False:
@@ -111,6 +121,8 @@ def evaluate_blocking_decision(
             or getattr(hook_output, "stop_reason", None)
             or deny_reason_default
         )
-        return BlockedDecision(PermissionDecision.DENY, reason)
+        return BlockedDecision(
+            PermissionDecision.DENY, reason, deciding_hook=decided_by
+        )
 
     return None

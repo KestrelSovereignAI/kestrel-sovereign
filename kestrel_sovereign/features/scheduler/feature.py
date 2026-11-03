@@ -76,9 +76,12 @@ from kestrel_sovereign.features.scheduler.constants import (
     MISSED_COGNITION_STATUS,
 )
 from kestrel_sovereign.features.scheduler.outcome import (
+    PAUSE_CAUSE_COLUMNS,
+    PAUSE_CAUSE_PROJECTION,
+    PAUSE_CAUSE_PROJECTION_WIDTH,
+    PauseCause,
     ScheduledTaskOutcome,
     redact_stored_result_text,
-    withhold_stored_cause_detail,
 )
 from kestrel_sovereign.features.base import Feature, tool
 from kestrel_sovereign.features.scheduler.cron import (
@@ -107,7 +110,6 @@ from kestrel_sovereign.features.scheduler.runner import (
 )
 from kestrel_sovereign.features.scheduler.status import (
     LEGACY_SCHEDULER_PAUSE_PROJECTION,
-    SUPERSEDING_SCHEDULE_PROJECTION,
 )
 from kestrel_sovereign.features.storage_access import resolve_feature_database
 from kestrel_sovereign.signals.sources.self_followup import (
@@ -1337,14 +1339,20 @@ class SchedulerFeature(Feature):
                     reason=blocked.reason,
                 )
             if blocked is not None:
+                # Only the structured cause is logged or kept: the hook's
+                # reason is free-form and can repeat the call's arguments, so
+                # neither this log line nor the outcome's persisted
+                # result_text carries it (#3873).
                 logger.warning(
-                    "Scheduler: tool %r blocked (%s) on tick: %s",
-                    agent_tool.name, blocked.decision.value, blocked.reason,
+                    "Scheduler: tool %r blocked on tick: hook %r decided %s",
+                    agent_tool.name,
+                    blocked.deciding_hook or "unknown",
+                    blocked.decision.value,
                 )
                 return ScheduledTaskOutcome.blocked(
                     task_name=agent_tool.name,
                     decision=blocked.decision.value,
-                    reason=blocked.reason or blocked.error,
+                    hook=blocked.deciding_hook,
                 )
 
             result = await agent_tool.execute(**effective_args)
@@ -2949,9 +2957,7 @@ class SchedulerFeature(Feature):
                        scheduler_rollout_fenced, scheduler_claim_fenced,
                        {FAILURE_STREAK_PROJECTION},
                        {LEGACY_SCHEDULER_PAUSE_PROJECTION},
-                       terminal_cause,
-                       {SUPERSEDING_SCHEDULE_PROJECTION},
-                       terminal_cause_detail
+                       {PAUSE_CAUSE_PROJECTION}
                 FROM scheduled_tasks
                 WHERE agent_id = ?
                 ORDER BY created_at ASC
@@ -2971,11 +2977,6 @@ class SchedulerFeature(Feature):
         tasks = []
         load_errors = []
         failing_count = 0
-        from kestrel_sovereign.features.storage_access import (
-            hides_persisted_user_content,
-        )
-
-        withhold_cause_detail = hides_persisted_user_content(self.agent)
         for row in rows:
             args: Dict[str, Any] = {}
             raw_args = row[3]
@@ -3000,19 +3001,7 @@ class SchedulerFeature(Feature):
             # rows that predate the streak; they have none to report.
             streak_values = row[21:21 + FAILURE_STREAK_PROJECTION_WIDTH]
             legacy_pause_index = 21 + FAILURE_STREAK_PROJECTION_WIDTH
-            terminal_cause_index = legacy_pause_index + 1
-            superseded_by_index = legacy_pause_index + 2
-            terminal_cause_detail_index = legacy_pause_index + 3
-            terminal_cause = (
-                row[terminal_cause_index]
-                if len(row) > terminal_cause_index
-                else None
-            )
-            terminal_cause_detail = (
-                row[terminal_cause_detail_index]
-                if len(row) > terminal_cause_detail_index
-                else None
-            )
+            pause_cause_index = legacy_pause_index + 1
             consecutive_failures, failure_marker = (
                 failure_streak_view(streak_values, agent=self.agent)
                 if len(streak_values) == FAILURE_STREAK_PROJECTION_WIDTH
@@ -3041,12 +3030,6 @@ class SchedulerFeature(Feature):
                 "lease_expires_at": row[15] if len(row) > 15 else None,
                 "attempt_count": row[16] if len(row) > 16 else 0,
                 "terminal_status": row[17] if len(row) > 17 else None,
-                "terminal_cause": terminal_cause,
-                # Free-form gate text: withheld in a volatile privacy mode,
-                # by the same rule as an execution's result_text (#3873).
-                "terminal_cause_detail": withhold_stored_cause_detail(
-                    withhold_cause_detail, terminal_cause_detail
-                ),
                 "terminal_at": row[18] if len(row) > 18 else None,
                 "disablement": self._schedule_disablement(
                     enabled=bool(row[4]),
@@ -3064,13 +3047,11 @@ class SchedulerFeature(Feature):
                         if len(row) > legacy_pause_index
                         else False
                     ),
-                    terminal_cause=terminal_cause,
-                    terminal_cause_detail=terminal_cause_detail,
-                    withhold_cause_detail=withhold_cause_detail,
-                    superseded_by=(
-                        row[superseded_by_index]
-                        if len(row) > superseded_by_index
-                        else None
+                    pause_cause=PauseCause.from_row(
+                        row[
+                            pause_cause_index:
+                            pause_cause_index + PAUSE_CAUSE_PROJECTION_WIDTH
+                        ]
                     ),
                 ),
                 # Repeated-failure visibility (#3280): the current streak, and
@@ -3079,11 +3060,37 @@ class SchedulerFeature(Feature):
                 "failure_marker": failure_marker,
             })
 
+        from kestrel_sovereign.features.scheduler.status import (
+            is_supersedable,
+            scheduler_status,
+            scheduler_status_parameters,
+            superseded_disablement,
+            superseding_schedules,
+        )
+
+        # A pause that a re-registration replaced is history, as status
+        # reports it (#3873).
         try:
-            from kestrel_sovereign.features.scheduler.status import (
-                scheduler_status,
-                scheduler_status_parameters,
+            replacements = await superseding_schedules(
+                self._db,
+                [
+                    task["id"] for task in tasks
+                    if is_supersedable(task["disablement"])
+                ],
             )
+        except Exception as e:
+            if is_execution_control_error(e):
+                raise
+            logger.error("Failed to list scheduled tasks: %s", e)
+            return ToolResult.failed(str(e))
+        for task in tasks:
+            replacement = replacements.get(task["id"])
+            if replacement is not None:
+                task["disablement"] = superseded_disablement(
+                    task["disablement"], superseded_by=replacement
+                )
+
+        try:
             liveness = await scheduler_status(
                 self._db,
                 agent_id=self._agent_id,
@@ -3140,10 +3147,7 @@ class SchedulerFeature(Feature):
         lease_owner: Optional[str] = None,
         lease_expires_at: Optional[str] = None,
         legacy_scheduler_pause: bool = False,
-        terminal_cause: Optional[str] = None,
-        terminal_cause_detail: Optional[str] = None,
-        withhold_cause_detail: bool = True,
-        superseded_by: Optional[str] = None,
+        pause_cause: Optional[PauseCause] = None,
     ) -> Dict[str, Any]:
         from kestrel_sovereign.features.scheduler.status import (
             classify_disablement,
@@ -3159,10 +3163,7 @@ class SchedulerFeature(Feature):
             lease_owner=lease_owner,
             lease_expires_at=lease_expires_at,
             legacy_scheduler_pause=legacy_scheduler_pause,
-            terminal_cause=terminal_cause,
-            terminal_cause_detail=terminal_cause_detail,
-            withhold_cause_detail=withhold_cause_detail,
-            superseded_by=superseded_by,
+            pause_cause=pause_cause,
         )
 
     @tool(
@@ -4163,11 +4164,15 @@ class SchedulerFeature(Feature):
                         next_run_at = None
                         cron_now_invalid = True
 
+                # The pause's cause goes with the pause (#3873).
+                clear_cause = ", ".join(
+                    f"{column} = NULL" for column in PAUSE_CAUSE_COLUMNS
+                )
                 resumed = await self._db.execute(
-                    """
+                    f"""
                     UPDATE scheduled_tasks
                     SET enabled = 1, next_run_at = ?, terminal_status = NULL,
-                        terminal_cause = NULL, terminal_cause_detail = NULL,
+                        {clear_cause},
                         terminal_at = NULL, lease_owner = NULL, lease_expires_at = NULL,
                         claim_token = NULL, claim_execution_id = NULL,
                         claim_scheduled_for = NULL, scheduler_claim_fenced = 0,
