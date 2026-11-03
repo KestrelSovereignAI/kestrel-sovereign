@@ -5,12 +5,21 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
+from kestrel_sovereign.features.scheduler.constants import HOOK_FAILED_STATUS
 from kestrel_sovereign.features.storage_access import (
     hides_persisted_user_content,
 )
 
 #: What a reader returns in place of a stored ``result_text`` it may not show.
 REDACTED_RESULT_TEXT = "[redacted: volatile privacy mode]"
+
+#: A permission gate's decision (DENY or ASK) blocked the tool.
+BLOCKED_STATUS = "blocked"
+
+#: Outcomes the signal-handler boundary returns to the runner rather than
+#: raising: each is an expected state of the permission gate, and the runner
+#: needs its structure (the pause instruction, or the hook-failure backoff).
+GATE_OUTCOME_STATUSES = frozenset({BLOCKED_STATUS, HOOK_FAILED_STATUS})
 
 
 def redact_stored_result_text(agent: Any, result_text: Any) -> Any:
@@ -47,10 +56,13 @@ class ScheduledTaskOutcome:
     """A non-success task outcome that the runner must handle explicitly.
 
     Pausing is reserved for ``blocked`` outcomes, which travel through the
-    dispatcher as expected policy states. Failed outcomes deliberately raise at
-    the signal-handler boundary so signal and scheduler audit rows agree; they
-    therefore cannot carry a pause instruction that the failed SignalResult
-    has no structured channel to preserve.
+    dispatcher as expected policy states. A ``hook_failed`` outcome travels the
+    same way but never pauses: the gate's enforcing hook failed rather than
+    decided, so the runner keeps the schedule enabled and backs off its next
+    attempt (#3749). Failed outcomes deliberately raise at the signal-handler
+    boundary so signal and scheduler audit rows agree; they therefore cannot
+    carry a pause instruction that the failed SignalResult has no structured
+    channel to preserve.
     """
 
     status: str
@@ -65,7 +77,7 @@ class ScheduledTaskOutcome:
     reason_code: str = ""
 
     def __post_init__(self) -> None:
-        if self.pause_schedule and self.status != "blocked":
+        if self.pause_schedule and self.status != BLOCKED_STATUS:
             raise ValueError(
                 "pause_schedule=True is only valid for blocked scheduled outcomes"
             )
@@ -80,11 +92,34 @@ class ScheduledTaskOutcome:
     ) -> "ScheduledTaskOutcome":
         detail = reason.strip() or "operator approval is required"
         return cls(
-            status="blocked",
+            status=BLOCKED_STATUS,
             result_text=(
                 f"blocked: {task_name} was denied by the {decision} permission "
                 f"gate: {detail}. Set this tool's permission to Auto, then "
                 "resume the schedule."
             ),
             pause_schedule=True,
+        )
+
+    @classmethod
+    def hook_failed(
+        cls,
+        *,
+        task_name: str,
+        reason: str,
+    ) -> "ScheduledTaskOutcome":
+        """The permission gate failed closed because an enforcing hook failed.
+
+        Not a policy verdict, so the schedule is not paused: nothing an
+        operator changes would make the next tick different, and a transient
+        failure (``database is locked``) clears by itself (#3749).
+        """
+        detail = reason.strip().rstrip(".") or "an enforcing permission hook failed"
+        return cls(
+            status=HOOK_FAILED_STATUS,
+            result_text=(
+                f"hook_failed: {task_name} was not run on this tick: {detail}. "
+                "The scheduler failed closed for this tick only; the schedule "
+                "stays enabled and retries on a later tick."
+            ),
         )

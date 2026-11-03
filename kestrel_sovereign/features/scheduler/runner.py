@@ -66,14 +66,18 @@ from kestrel_sovereign.execution_custody import (
     retained_execution_error,
 )
 from kestrel_sovereign.features.scheduler.constants import (
+    HOOK_FAILED_STATUS,
     ROLLOUT_AMBIGUOUS_LEGACY_OCCURRENCE,
 )
 from kestrel_sovereign.features.scheduler.cron import CronParseError, next_run
 from kestrel_sovereign.features.scheduler.failure_streak import (
     DEFAULT_FAILURE_ALERT_THRESHOLD,
+    DEFAULT_HOOK_FAILURE_BACKOFF_BASE_SECONDS,
+    DEFAULT_HOOK_FAILURE_BACKOFF_MAX_SECONDS,
     FAILURE_STREAK_COLUMNS,
     FailureStreak,
     FailureStreakTransition,
+    hook_failure_backoff,
     next_failure_streak,
 )
 from kestrel_sovereign.features.scheduler.outcome import ScheduledTaskOutcome
@@ -1273,6 +1277,12 @@ class SchedulerRunner:
         runtime_task_factory=None,
         occurrence_task_factory=None,
         failure_alert_threshold: int = DEFAULT_FAILURE_ALERT_THRESHOLD,
+        hook_failure_backoff_base_seconds: int = (
+            DEFAULT_HOOK_FAILURE_BACKOFF_BASE_SECONDS
+        ),
+        hook_failure_backoff_max_seconds: int = (
+            DEFAULT_HOOK_FAILURE_BACKOFF_MAX_SECONDS
+        ),
     ):
         try:
             normalized_lease_seconds = int(lease_seconds)
@@ -1350,6 +1360,14 @@ class SchedulerRunner:
         # Consecutive failures of one schedule before its marker is recorded
         # (#3280). Visibility only; it changes no execution decision.
         self._failure_alert_threshold = max(1, int(failure_alert_threshold))
+        # How far a hook_failed tick pushes its schedule's next attempt out,
+        # growing with the failure streak (#3749).
+        self._hook_failure_backoff_base_seconds = max(
+            0, int(hook_failure_backoff_base_seconds)
+        )
+        self._hook_failure_backoff_max_seconds = max(
+            0, int(hook_failure_backoff_max_seconds)
+        )
         # Bounds the occurrences between claim and finalization across every
         # tick (#1675). It is runner-wide because occurrences outlive the
         # tick that admitted them.
@@ -4795,11 +4813,20 @@ class SchedulerRunner:
             else:
                 schedule_now = datetime.now(timezone.utc)
 
-            terminal = task.schedule_kind == SCHEDULE_ONE_SHOT or pause_schedule
+            # A hook_failed tick never ran its tool: the gate failed closed
+            # because its enforcing hook failed, not because policy refused
+            # (#3749). Neither a recurring row nor a one-shot deadline is
+            # finished by it; both stay enabled and retry after a backoff.
+            one_shot = task.schedule_kind == SCHEDULE_ONE_SHOT
+            terminal = (
+                one_shot and status != HOOK_FAILED_STATUS
+            ) or pause_schedule
             enabled = 0 if terminal else 1
             terminal_status = status if terminal else None
             next_at: Optional[str] = None
-            if not terminal:
+            if not terminal and one_shot:
+                next_at = schedule_now.isoformat()
+            elif not terminal:
                 try:
                     after = schedule_now
                     if task.misfire_policy == MISFIRE_CATCH_UP and task.next_run_at:
@@ -4831,6 +4858,10 @@ class SchedulerRunner:
                 # outcome extends or ends is the one this commit replaces.
                 failure_streak = await self._failure_streak_transition(
                     task, execution, status=status, at=schedule_now
+                )
+                next_at = self._hook_failure_retry_at(
+                    status, next_at, schedule_now,
+                    consecutive_failures=failure_streak.streak.count,
                 )
                 now_sql = self._database_now_sql()
                 last_run_sql = (
@@ -4891,8 +4922,12 @@ class SchedulerRunner:
                 # doubles. Real SQLite and PostgreSQL always use the branch
                 # above and therefore never publish host-clock lease state.
                 # Nor do these doubles keep a failure streak: they model no
-                # schedule row to read one from.
+                # schedule row to read one from, so a hook failure backs off
+                # as a first failure.
                 failure_streak = None
+                next_at = self._hook_failure_retry_at(
+                    status, next_at, schedule_now, consecutive_failures=1,
+                )
                 now_iso = datetime.now(timezone.utc).isoformat()
                 terminal_at = now_iso if record_terminal_at else None
                 last_run_sql = "last_run_at = ?" if ran else "last_run_at = last_run_at"
@@ -4945,8 +4980,47 @@ class SchedulerRunner:
             "Scheduled task %s (%s) finalized %s (%dms, attempt=%d)",
             task.id, task.task_name, status, duration_ms, execution.attempt,
         )
+        if status == HOOK_FAILED_STATUS:
+            logger.warning(
+                "Scheduled task %s (%s) for %s was not run because an "
+                "enforcing permission hook failed; it failed closed for this "
+                "tick only and stays enabled. Next attempt at %s (%s "
+                "consecutive failure(s); reported as failing at %d).",
+                task.id, task.task_name, task.agent_id, next_at,
+                failure_streak.streak.count if failure_streak else "unknown",
+                self._failure_alert_threshold,
+            )
         if failure_streak is not None:
             self._log_failure_streak_transition(task, failure_streak)
+
+    def _hook_failure_retry_at(
+        self,
+        status: str,
+        next_at: Optional[str],
+        schedule_now: datetime,
+        *,
+        consecutive_failures: int,
+    ) -> Optional[str]:
+        """Return ``next_at``, held back by the hook-failure backoff (#3749).
+
+        A ``hook_failed`` tick keeps its schedule enabled. A recurring row's
+        cron decides the next occurrence, and this only stops it from coming
+        sooner than the backoff allows; a one-shot deadline retries at the
+        backoff. Any other outcome, and a row with no next occurrence, is
+        returned unchanged.
+        """
+
+        if status != HOOK_FAILED_STATUS or next_at is None:
+            return next_at
+        retry_at = schedule_now + hook_failure_backoff(
+            consecutive_failures,
+            base_seconds=self._hook_failure_backoff_base_seconds,
+            max_seconds=self._hook_failure_backoff_max_seconds,
+        )
+        scheduled = self._parse_utc(next_at)
+        if scheduled is not None and scheduled >= retry_at:
+            return next_at
+        return retry_at.isoformat()
 
     async def _failure_streak_transition(
         self,

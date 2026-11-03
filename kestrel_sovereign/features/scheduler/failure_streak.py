@@ -8,20 +8,30 @@ beside it made the pair read as healthy.
 The runner keeps a durable streak on each schedule row, written in the same
 transaction that finalizes the execution. When the streak reaches the
 configured threshold it records a marker, and readers (``schedule_list`` and
-the ``scheduled_task_failures`` health check) report that marker. This is
-visibility only: nothing here retries, pauses, or remediates a task.
+the ``scheduled_task_failures`` health check) report that marker. The marker
+is visibility only: it retries, pauses, or remediates nothing.
 
-Only a ``failed`` execution extends a streak and only a ``success`` ends one.
-Every other outcome (a misfire skip, a dropped cognition turn, a permission
-block) is a run that did not happen or did not fail, so it leaves the streak
-as it was. A paused schedule runs nothing and so changes nothing.
+Only a ``failed`` or ``hook_failed`` execution extends a streak and only a
+``success`` ends one. Every other outcome (a misfire skip, a dropped cognition
+turn, a permission block) is a run that did not happen or did not fail, so it
+leaves the streak as it was. A paused schedule runs nothing and so changes
+nothing.
+
+A ``hook_failed`` tick is a failure the scheduler also acts on. It did not
+run the tool because the permission gate's enforcing hook failed, so it failed
+closed for that tick and kept the schedule enabled (#3749). The runner delays
+that schedule's next attempt by :func:`hook_failure_backoff`, which grows with
+the streak, so a hook that keeps failing is not retried every minute while the
+marker reports it.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
+from datetime import timedelta
 from typing import Any, Dict, Optional, Sequence
 
+from kestrel_sovereign.features.scheduler.constants import HOOK_FAILED_STATUS
 from kestrel_sovereign.features.scheduler.outcome import (
     redact_stored_result_text,
 )
@@ -32,6 +42,12 @@ DEFAULT_FAILURE_ALERT_THRESHOLD = 3
 #: The execution statuses that move a streak. Anything else leaves it alone.
 FAILED_STATUS = "failed"
 SUCCESS_STATUS = "success"
+FAILURE_STATUSES = frozenset({FAILED_STATUS, HOOK_FAILED_STATUS})
+
+#: Delay before the first retry after a ``hook_failed`` tick; each further
+#: consecutive failure doubles it, up to the maximum.
+DEFAULT_HOOK_FAILURE_BACKOFF_BASE_SECONDS = 60
+DEFAULT_HOOK_FAILURE_BACKOFF_MAX_SECONDS = 15 * 60
 
 #: How much of the last failure's stored result a marker repeats.
 FAILURE_SUMMARY_MAX_CHARS = 500
@@ -129,7 +145,7 @@ def next_failure_streak(
 
     if status == SUCCESS_STATUS:
         return FailureStreakTransition(prior=prior, streak=FailureStreak())
-    if status != FAILED_STATUS:
+    if status not in FAILURE_STATUSES:
         return FailureStreakTransition(prior=prior, streak=prior)
     count = prior.count + 1
     flagged_at = prior.flagged_at
@@ -146,6 +162,32 @@ def next_failure_streak(
             flagged_at=flagged_at,
         ),
     )
+
+
+def hook_failure_backoff(
+    consecutive_failures: int,
+    *,
+    base_seconds: int = DEFAULT_HOOK_FAILURE_BACKOFF_BASE_SECONDS,
+    max_seconds: int = DEFAULT_HOOK_FAILURE_BACKOFF_MAX_SECONDS,
+) -> timedelta:
+    """How long after a ``hook_failed`` tick the schedule may next run.
+
+    ``consecutive_failures`` is the streak including that tick. The first
+    failure waits ``base_seconds``, so an every-minute schedule simply runs on
+    its next tick; each further one doubles the wait, capped at
+    ``max_seconds``.
+    """
+
+    base = max(0, int(base_seconds))
+    if base == 0:
+        return timedelta(0)
+    ceiling = max(base, int(max_seconds))
+    exponent = max(0, int(consecutive_failures) - 1)
+    # Past the cap the doubling no longer matters; bound the exponent so a
+    # long streak cannot build an enormous integer.
+    if exponent >= ceiling.bit_length():
+        return timedelta(seconds=ceiling)
+    return timedelta(seconds=min(ceiling, base * (2 ** exponent)))
 
 
 def failure_streak_view(
@@ -202,7 +244,10 @@ async def load_failure_markers(
 
 __all__ = [
     "DEFAULT_FAILURE_ALERT_THRESHOLD",
+    "DEFAULT_HOOK_FAILURE_BACKOFF_BASE_SECONDS",
+    "DEFAULT_HOOK_FAILURE_BACKOFF_MAX_SECONDS",
     "FAILED_STATUS",
+    "FAILURE_STATUSES",
     "FAILURE_STREAK_COLUMNS",
     "FAILURE_STREAK_PROJECTION",
     "FAILURE_STREAK_PROJECTION_WIDTH",
@@ -211,6 +256,7 @@ __all__ = [
     "FailureStreakTransition",
     "SUCCESS_STATUS",
     "failure_streak_view",
+    "hook_failure_backoff",
     "load_failure_markers",
     "next_failure_streak",
 ]
