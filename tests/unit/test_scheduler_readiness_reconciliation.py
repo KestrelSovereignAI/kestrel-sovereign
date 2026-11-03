@@ -426,7 +426,10 @@ async def test_a_failed_reconciliation_read_keeps_the_latch_reconcilable(tmp_pat
     try:
         await runner.start(polling=False)
         # Keep the next scheduled occurrence outside this controlled retry.
-        await _seed_due(db, cron_expression="0 0 1 1 *")
+        next_occurrence = datetime.now(timezone.utc) + timedelta(hours=1)
+        await _seed_due(
+            db, cron_expression=f"{next_occurrence.minute} {next_occurrence.hour} * * *"
+        )
         await runner.arm()
         await wait_until(
             lambda: runner.readiness_failure is not None,
