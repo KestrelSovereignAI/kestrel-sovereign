@@ -376,15 +376,25 @@ class _RunpodBinding:
         parts = self._request_parts = _parts(self._native_request)
         if parts[0] != 'POST' or parts[1] != b'https' or parts[-1] != self._body:
             raise ExecutionAuthorityError('Original Runpod prepared native request differs')
-        self._binding_bytes = json.dumps(dict(schema_version=1,
+        original_binding = json.dumps(dict(schema_version=2,
             method=parts[0], scheme=parts[1].hex(), host=parts[2].hex(), port=parts[3],
             path=parts[4].hex(), headers=[(name.hex(), value.hex()) for name, value in parts[5]],
             timeout=parts[6], body_sha256=hashlib.sha256(parts[7]).hexdigest(),
             configuration=self._config, plan_sha256=self._plan.digest(),
+            row_identity=self._root._identity, request_sha256=self._plan.request.digest(),
+            quote_id=self._lease_facts['quote_id'], lease_id=self._lease_facts['lease_id'],
+            preparation_sha256=self._preparation.digest(),
             canonical_sources=self._canonical.source_sha256,
             canonical_decoders=self._canonical.decoder.source_sha256), sort_keys=True, separators=(',', ':')).encode()
-        if len(self._binding_bytes) > 16384:
+        if len(original_binding) > 16384:
             raise ResourceUnsupported('original native preparation binding exceeds bounds')
+        # Keep exact credential-bearing native facts only in the original
+        # in-memory binding. The row retains a keyed, domain-separated
+        # fingerprint, never reversible headers or prepared configuration.
+        fingerprint = hmac.new(self._root._key,
+            b'runpod-acquisition-binding-v2\0'+original_binding, hashlib.sha256).hexdigest()
+        self._binding_bytes = json.dumps(dict(schema_version=2, fingerprint=fingerprint),
+            sort_keys=True, separators=(',', ':')).encode()
         self._require_integrity()
 
     def _require_saved_preparation(self):
