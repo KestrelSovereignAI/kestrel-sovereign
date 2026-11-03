@@ -33,6 +33,7 @@ from kestrel_sovereign.storage.consolidation_drain import (
     reconcile_consolidation_drains,
 )
 from kestrel_sovereign.storage.footprint import measure_database_size
+from kestrel_sovereign.storage.sync.quota import StorageQuota
 
 logger = logging.getLogger(__name__)
 
@@ -874,6 +875,88 @@ async def check_scheduled_task_failures(agent, db) -> Dict[str, Any]:
     }
 
 
+async def check_backup_quota(agent) -> Dict[str, Any]:
+    """Warn when a backup target's account is near or over its quota (#3894).
+
+    Reports what each target last read of its account (Lighthouse reads its
+    ``user_data_usage`` before every snapshot upload), with when it read it;
+    the check itself makes no network call. The host's Lighthouse account
+    filled and every snapshot upload failed for days before anything named
+    the quota.
+    """
+    start = time.monotonic()
+    sync_service = getattr(agent, "_sync_service", None)
+    reader = getattr(sync_service, "storage_quotas", None)
+    if not callable(reader):
+        return {
+            "name": "backup_quota",
+            "status": "pass",
+            "message": "No backup target reports a storage quota",
+            "details": {"state": "not_configured"},
+            "duration_ms": _elapsed(start),
+        }
+    try:
+        reported = reader()
+    except Exception as error:
+        if is_execution_control_error(error):
+            raise
+        return {
+            "name": "backup_quota",
+            "status": "warn",
+            "message": f"Backup target storage quotas could not be read: {error}",
+            "details": {"state": "inspection_failed"},
+            "duration_ms": _elapsed(start),
+        }
+    quotas = {
+        str(name): quota
+        for name, quota in (reported.items() if isinstance(reported, dict) else ())
+        if isinstance(quota, StorageQuota)
+    }
+    if not quotas:
+        return {
+            "name": "backup_quota",
+            "status": "pass",
+            "message": "No backup target has read its storage quota yet",
+            "details": {"state": "not_observed", "targets": {}},
+            "duration_ms": _elapsed(start),
+        }
+
+    targets = {
+        name: {
+            **quota.to_dict(),
+            "near_quota": quota.near_quota,
+            "over_quota": quota.over_quota,
+        }
+        for name, quota in sorted(quotas.items())
+    }
+    crowded = {name: quota for name, quota in sorted(quotas.items()) if quota.near_quota}
+    if crowded:
+        summary = "; ".join(
+            f"{name} is {'over' if quota.over_quota else 'near'} quota: "
+            f"{quota.describe()}, threshold {quota.threshold:.0%}, read "
+            f"{quota.observed_at.isoformat()}"
+            for name, quota in crowded.items()
+        )
+        return {
+            "name": "backup_quota",
+            "status": "warn",
+            "message": f"Backup target near or over quota: {summary}",
+            "details": {"state": "near_or_over_quota", "targets": targets},
+            "duration_ms": _elapsed(start),
+        }
+    summary = "; ".join(
+        f"{name}: {quota.describe()}, read {quota.observed_at.isoformat()}"
+        for name, quota in sorted(quotas.items())
+    )
+    return {
+        "name": "backup_quota",
+        "status": "pass",
+        "message": f"Backup target quota OK: {summary}",
+        "details": {"state": "within_quota", "targets": targets},
+        "duration_ms": _elapsed(start),
+    }
+
+
 async def check_bootstrap_state(agent, threshold_seconds: int = 3600) -> Dict[str, Any]:
     """Check whether first-contact bootstrap is stuck in PENDING."""
     start = time.monotonic()
@@ -1437,6 +1520,7 @@ async def run_standard_checks(agent, db) -> List[Dict[str, Any]]:
             "scheduled_task_failures",
             check_scheduled_task_failures(agent, db),
         ),
+        await check_backup_quota(agent),
         await _run_database_bound_check(
             "bootstrap_state",
             check_bootstrap_state(agent),

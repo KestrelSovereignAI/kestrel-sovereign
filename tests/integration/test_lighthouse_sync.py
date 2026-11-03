@@ -628,6 +628,10 @@ class TestPrune:
                                     "keep_all_days": 0,
                                     "weekly_forever": False,
                                     "monthly_forever": False,
+                                    # The bounded default keeps weekly and
+                                    # monthly windows (#3894); expire them.
+                                    "weekly_until_weeks": 0,
+                                    "monthly_until_months": 0,
                                 },
                                 "identity": {
                                     "keep_all_days": 0,
@@ -798,7 +802,8 @@ async def test_prune_paginates_with_id_cursor_across_pages():
     with patch(LIGHTHOUSE_REST_CLIENT, return_value=client):
         result = await target.prune(RetentionPolicy.from_config(
             {"backup": {"retention": {"working_memory": {
-                "keep_all_days": 0, "weekly_forever": False, "monthly_forever": False}}}}))
+                "keep_all_days": 0, "weekly_forever": False, "monthly_forever": False,
+                "weekly_until_weeks": 0, "monthly_until_months": 0}}}}))
 
     # All three pages consumed via id cursor; older snapshots pruned, newest kept.
     assert calls == [None, "b", "c"]
