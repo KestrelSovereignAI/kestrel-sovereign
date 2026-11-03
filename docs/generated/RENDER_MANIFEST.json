@@ -1917,6 +1917,7 @@
     },
     {
       "existing_code_refs": [
+        "kestrel_sovereign/security/bootstrap_access.py",
         "server.py"
       ],
       "findings": [],
