@@ -1,6 +1,8 @@
 """Actual middleware credentials remain bound to their original request."""
 
 from base64 import b64encode
+import asyncio
+from contextvars import Context
 from dataclasses import replace
 from datetime import UTC, datetime
 import json
@@ -22,6 +24,7 @@ from kestrel_sovereign.security.request_auth import (
     AuthenticatedSessionMiddleware, InteractiveAuthenticationLifetimeMiddleware,
     RequestAuthenticationService, current_request_authentication,
 )
+from kestrel_sovereign.turn_scope import capture_turn_scope
 
 
 API_KEY = "owned-private-request-api-key"
@@ -46,6 +49,20 @@ def authenticated_app(monkeypatch):
                        session_cookie="kestrel_session", max_age=600)
     bindings = []
     producers = []
+    carried_scopes = []
+
+    @app.get("/api/owned-carried")
+    async def carried():
+        original = current_request_authentication()
+        snapshot = capture_turn_scope(None)
+        carried_scopes.append(snapshot)
+        async def foreign_reader():
+            assert current_request_authentication() is None
+            with snapshot.bind():
+                assert current_request_authentication() is original
+                original.require_current()
+        await asyncio.create_task(foreign_reader(), context=Context())
+        return {"carried": True}
 
     @app.get("/api/agents")
     async def roster(request: Request):
@@ -111,6 +128,7 @@ def authenticated_app(monkeypatch):
 
     with TestClient(app, raise_server_exceptions=True) as client:
         app.state.producer_bindings = producers
+        app.state.carried_scopes = carried_scopes
         yield client, bindings
 
 
@@ -204,3 +222,12 @@ def test_peer_and_eventsource_lanes_do_not_gain_interactive_authority(authentica
 def test_nested_public_asgi_request_cannot_borrow_interactive_owner(authenticated_app):
     client, _ = authenticated_app
     assert client.get("/api/owned-nested", headers={"X-API-Key": API_KEY}).json() == {"isolated": True}
+
+
+def test_original_http_authentication_follows_foreign_turn_callbacks_and_expires_with_its_owner(authenticated_app):
+    client, _ = authenticated_app
+    response = client.get("/api/owned-carried", headers={"X-API-Key": API_KEY})
+    assert response.status_code == 200 and response.json() == {"carried": True}
+    with client.app.state.carried_scopes[0].bind():
+        with pytest.raises(HostCapabilityAccessDenied, match="ended"):
+            current_request_authentication()

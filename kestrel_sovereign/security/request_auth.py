@@ -24,6 +24,7 @@ from kestrel_sovereign.auth import AuthMethod, CallerContext
 from kestrel_sovereign.security.capability_authority import HostCapabilityAccessDenied
 from kestrel_sovereign.security.csrf import enforce_csrf
 from kestrel_sovereign.security.sovereign_key import sovereign_key_fingerprint
+from kestrel_sovereign.turn_scope import turn_scoped
 
 
 _SESSION_KEY = "kestrel.authenticated_session"
@@ -168,6 +169,22 @@ def current_request_authentication() -> InteractiveRequestAuthentication | None:
     if binding is not None:
         binding.require_current()
     return binding
+
+
+@contextmanager
+def _bind_request_authentication(binding):
+    """Re-present the original owner's revocable grant on a foreign turn task."""
+    if binding is not None and not isinstance(binding, InteractiveRequestAuthentication):
+        raise TypeError("original interactive request binding required")
+    token = _CURRENT.set(binding)
+    try:
+        yield
+    finally:
+        _CURRENT.reset(token)
+
+
+turn_scoped("interactive_request_authentication", variables=(_CURRENT,),
+            capture=lambda _agent: _CURRENT.get(), bind=_bind_request_authentication)
 
 
 class InteractiveAuthenticationLifetimeMiddleware:
