@@ -6,7 +6,6 @@ The historical managed node is decommissioned; construct this target only
 after a reachable replacement node has been configured.
 """
 
-import hashlib
 import logging
 import os
 from datetime import datetime, timezone
@@ -19,7 +18,7 @@ from kestrel_sovereign.storage.sync.targets import (
     SyncTarget,
     SyncResult,
     TrustTier,
-    _create_consistent_snapshot,
+    _offloaded_snapshot_bytes,
 )
 
 logger = logging.getLogger(__name__)
@@ -69,8 +68,7 @@ class SovereignIPFSTarget(ManifestManagerMixin, SyncTarget):
         timestamp = datetime.now(timezone.utc)
 
         try:
-            content = _create_consistent_snapshot(db_path)
-            content_hash = hashlib.sha256(content).hexdigest()
+            content, content_hash = await _offloaded_snapshot_bytes(db_path)
 
             # Content-hash dedup
             manifest = self._load_local_manifest()

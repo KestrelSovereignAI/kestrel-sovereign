@@ -4,7 +4,6 @@ GCS Sync Target
 Google Cloud Storage sync target with content-hash deduplication.
 """
 
-import hashlib
 import logging
 from datetime import datetime, timezone
 from pathlib import Path
@@ -21,7 +20,7 @@ from kestrel_sovereign.storage.sync.targets import (
     SyncTarget,
     SyncResult,
     TrustTier,
-    _create_consistent_snapshot,
+    _offloaded_snapshot_bytes,
 )
 
 logger = logging.getLogger(__name__)
@@ -88,8 +87,7 @@ class GCSTarget(ManifestManagerMixin, SyncTarget):
         timestamp = datetime.now(timezone.utc)
 
         try:
-            content = _create_consistent_snapshot(db_path)
-            content_hash = hashlib.sha256(content).hexdigest()
+            content, content_hash = await _offloaded_snapshot_bytes(db_path)
 
             # Check local manifest for dedup
             manifest = self._load_local_manifest()

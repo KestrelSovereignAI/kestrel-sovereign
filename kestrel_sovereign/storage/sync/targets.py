@@ -11,19 +11,21 @@ reflecting how much sovereignty the agent retains over its data:
 Write to all configured targets. Restore from most trusted.
 """
 
+import hashlib
 import logging
 import os
 import shutil
 import sqlite3
 import tempfile
 from abc import ABC, abstractmethod
-from contextlib import contextmanager
+from contextlib import asynccontextmanager, contextmanager
 from dataclasses import dataclass
 from datetime import datetime
 from enum import Enum
 from pathlib import Path
-from typing import Any, Dict, Iterator, Optional
+from typing import Any, AsyncIterator, Dict, Iterator, Optional
 
+from kestrel_sovereign._async_ownership import run_blocking_operation
 from kestrel_sovereign.storage.sync.quota import StorageQuota
 from kestrel_sovereign.storage.sync.retention import RetentionPolicy
 
@@ -57,47 +59,113 @@ TIER_LABELS = {
 }
 
 
+def _new_snapshot_temp_path() -> Path:
+    """A new, empty temporary file for a snapshot; the caller removes it."""
+    with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as tmp:
+        return Path(tmp.name)
+
+
+def _remove_snapshot_file(snapshot_path: Path) -> None:
+    try:
+        os.unlink(snapshot_path)
+    except OSError:
+        pass
+
+
+def _write_consistent_snapshot(db_path: Path, snapshot_path: Path) -> None:
+    """Copy ``db_path`` into ``snapshot_path`` consistently. Blocking.
+
+    Uses sqlite3.backup(), so it is safe while the database is in use with an
+    active WAL. Falls back to a raw copy of the file if backup fails (e.g.
+    not a SQLite DB). Both connections are opened, used and closed in the
+    calling thread.
+    """
+    try:
+        src = sqlite3.connect(str(db_path))
+        try:
+            dst = sqlite3.connect(str(snapshot_path))
+            try:
+                src.backup(dst)
+            finally:
+                dst.close()
+        finally:
+            src.close()
+    except sqlite3.DatabaseError:
+        logger.debug(f"sqlite3.backup() failed for {db_path}, using a raw copy")
+        shutil.copyfile(db_path, snapshot_path)
+
+
 @contextmanager
 def _consistent_snapshot_file(db_path: Path) -> Iterator[Path]:
     """A consistent snapshot of ``db_path`` in a temporary file, removed on exit.
 
-    Uses sqlite3.backup(), so it is safe while the database is in use with an
-    active WAL. Falls back to a raw copy of the file if backup fails (e.g.
-    not a SQLite DB). A caller that streams the file never holds the snapshot
-    in memory.
+    Blocking: a coroutine uses ``_offloaded_snapshot_file`` instead. A caller
+    that streams the file never holds the snapshot in memory.
     """
-    with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as tmp:
-        tmp_path = Path(tmp.name)
+    snapshot_path = _new_snapshot_temp_path()
     try:
-        try:
-            src = sqlite3.connect(str(db_path))
-            try:
-                dst = sqlite3.connect(str(tmp_path))
-                try:
-                    src.backup(dst)
-                finally:
-                    dst.close()
-            finally:
-                src.close()
-        except sqlite3.DatabaseError:
-            logger.debug(f"sqlite3.backup() failed for {db_path}, using a raw copy")
-            shutil.copyfile(db_path, tmp_path)
-        yield tmp_path
+        _write_consistent_snapshot(db_path, snapshot_path)
+        yield snapshot_path
     finally:
-        try:
-            os.unlink(tmp_path)
-        except OSError:
-            pass
+        _remove_snapshot_file(snapshot_path)
+
+
+@dataclass(frozen=True)
+class SnapshotFile:
+    """A consistent snapshot on disk, with its SHA-256 digest and size."""
+
+    path: Path
+    sha256: bytes
+    size: int
+
+
+def _write_and_digest_snapshot(db_path: Path, snapshot_path: Path) -> SnapshotFile:
+    """``_write_consistent_snapshot``, then hash the snapshot. Blocking."""
+    _write_consistent_snapshot(db_path, snapshot_path)
+    with open(snapshot_path, "rb") as snapshot:
+        digest = hashlib.file_digest(snapshot, "sha256").digest()
+    return SnapshotFile(snapshot_path, digest, snapshot_path.stat().st_size)
+
+
+@asynccontextmanager
+async def _offloaded_snapshot_file(db_path: Path) -> AsyncIterator[SnapshotFile]:
+    """A consistent snapshot of ``db_path`` in a temporary file, made and
+    hashed off the event loop, and removed on exit.
+
+    Backing up and hashing a multi-GB agent DB takes seconds; on the event
+    loop that outlasts the distributed Stop owner's lease, which fences the
+    owner and cancels every in-flight turn on the host (#3916). The worker
+    finishes before a cancellation propagates, so the file is never removed
+    while the worker is still writing it.
+    """
+    snapshot_path = _new_snapshot_temp_path()
+    try:
+        yield await run_blocking_operation(
+            _write_and_digest_snapshot, db_path, snapshot_path
+        )
+    finally:
+        _remove_snapshot_file(snapshot_path)
 
 
 def _create_consistent_snapshot(db_path: Path) -> bytes:
-    """Create a consistent snapshot using sqlite3.backup().
+    """Create a consistent snapshot using sqlite3.backup(). Blocking.
 
     Safe to call while the database is in use with an active WAL.
     Falls back to raw file read if backup fails (e.g. not a SQLite DB).
     """
     with _consistent_snapshot_file(db_path) as snapshot_path:
         return snapshot_path.read_bytes()
+
+
+def _hashed_snapshot_bytes(db_path: Path) -> tuple[bytes, str]:
+    content = _create_consistent_snapshot(db_path)
+    return content, hashlib.sha256(content).hexdigest()
+
+
+async def _offloaded_snapshot_bytes(db_path: Path) -> tuple[bytes, str]:
+    """``_create_consistent_snapshot`` and its SHA-256 hex digest, computed
+    off the event loop (#3916). The snapshot is held in memory whole."""
+    return await run_blocking_operation(_hashed_snapshot_bytes, db_path)
 
 
 #: The kinds of sync target this package ships. A target's ``kind`` is the
@@ -241,8 +309,11 @@ __all__ = [
     "TIER_LABELS",
     "SyncResult",
     "SyncTarget",
+    "SnapshotFile",
     "_consistent_snapshot_file",
     "_create_consistent_snapshot",
+    "_offloaded_snapshot_bytes",
+    "_offloaded_snapshot_file",
     "DataClass",
     "RetentionItem",
     "RetentionPolicy",

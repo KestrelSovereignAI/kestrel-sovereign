@@ -50,7 +50,7 @@ from kestrel_sovereign.signals.sources.scheduler import (
     cron_source_name,
 )
 from kestrel_sovereign.storage.db import SQLiteBackend
-from kestrel_sovereign.storage.sync import gcs_target, sovereign_ipfs_target
+from kestrel_sovereign.storage.sync import targets as sync_targets
 from kestrel_sovereign.storage.sync.gcs_target import GCSTarget
 from kestrel_sovereign.storage.sync.lighthouse_target import LighthouseTarget
 from kestrel_sovereign.storage.sync.s3_target import S3Target
@@ -713,7 +713,7 @@ async def _timing_out_async(*_args, **_kwargs):
 
 
 def _gcs(tmp, monkeypatch):
-    monkeypatch.setattr(gcs_target, "_create_consistent_snapshot", _timing_out)
+    monkeypatch.setattr(sync_targets, "_create_consistent_snapshot", _timing_out)
     return GCSTarget("bucket", agent_id="a", state_dir=tmp)
 
 
@@ -724,7 +724,7 @@ def _s3(tmp, monkeypatch):
 
 
 def _ipfs(tmp, monkeypatch):
-    monkeypatch.setattr(sovereign_ipfs_target, "_create_consistent_snapshot", _timing_out)
+    monkeypatch.setattr(sync_targets, "_create_consistent_snapshot", _timing_out)
     return SovereignIPFSTarget("http://ipfs.invalid", "a", state_dir=tmp)
 
 

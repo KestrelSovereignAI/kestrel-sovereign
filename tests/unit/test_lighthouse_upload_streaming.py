@@ -25,7 +25,6 @@ import logging
 import re
 import sqlite3
 import tracemalloc
-from contextlib import contextmanager
 from pathlib import Path
 from typing import Optional
 
@@ -45,7 +44,7 @@ from kestrel_sovereign.storage.providers.lighthouse_rest import (
     UploadBody,
     describe_upload_failure,
 )
-from kestrel_sovereign.storage.sync import lighthouse_target, targets
+from kestrel_sovereign.storage.sync import targets
 from kestrel_sovereign.storage.sync.lighthouse_target import LighthouseTarget
 
 #: Stands in for the BIO's 1,902,794,056 bytes: the largest single write the
@@ -259,15 +258,12 @@ async def test_a_snapshot_over_2_gib_is_never_held_whole_in_memory(tmp_path, mon
     snapshot and its CAR whole (a 12 GiB peak for that size, measured);
     the streamed upload's Python allocations stay within a few chunks."""
     size = 2 * 1024**3 + 3 * UPLOAD_CHUNK_BYTES + 17
-    sparse = tmp_path / "sparse.db"
-    with open(sparse, "wb") as f:
-        f.truncate(size)
 
-    @contextmanager
-    def _the_sparse_snapshot(db_path):
-        yield sparse
+    def _a_sparse_snapshot(db_path, snapshot_path):
+        with open(snapshot_path, "wb") as f:
+            f.truncate(size)
 
-    monkeypatch.setattr(lighthouse_target, "_consistent_snapshot_file", _the_sparse_snapshot)
+    monkeypatch.setattr(targets, "_write_consistent_snapshot", _a_sparse_snapshot)
     backend = _MemoryBioTLSBackend()
     monkeypatch.setattr(lighthouse_rest, "LighthouseRestClient", _client_over(backend))
     target = LighthouseTarget(api_key="k", agent_id="agent", state_dir=tmp_path)
