@@ -872,6 +872,27 @@ role = "technical_reviewer"
 # agents = ["Emma"]
 # max_tokens = 500
 
+# ---------------------------------------------------------------------------
+# [operational_state.recent_decisions] — recent strategy decisions (#3900)
+# ---------------------------------------------------------------------------
+# The always-on operational block (not [preturn_state]: it runs for every
+# agent, on streamed console turns and on wake and signal turns alike)
+# re-reads STRATEGY.yaml at the start of every turn and lists the decisions
+# recorded in the window, so a decision made in one session is visible to a
+# turn started later in another without a tool call. Decisions record a day,
+# so the window is widened to whole local days: 24 hours shows today's and
+# yesterday's decisions. Newest first; older entries past max_entries or
+# max_chars are dropped and counted in a final "not shown" line, and an
+# excerpt longer than excerpt_chars ends in "…".
+# Every key is optional; these are the defaults. An unknown key or invalid
+# value is reported in the block instead of the decisions.
+#
+# [operational_state.recent_decisions]
+# window_hours = 24     # at most 87840 (ten years)
+# max_entries = 8      # at most 100
+# excerpt_chars = 240
+# max_chars = 1600     # whole section, ~400 tokens; at least excerpt_chars + 400
+
 
 # ---------------------------------------------------------------------------
 # Semantic inference — bounded RDFS / approved OWL 2 RL maintenance (#2746)

@@ -1378,6 +1378,16 @@ class StreamingMixin:
             if hook_input.tool_input and "user_message" in hook_input.tool_input:
                 user_input = hook_input.tool_input["user_message"]
 
+        # Pre-turn state blocks, prepared exactly as process_input prepares
+        # them: before #3900 a console turn skipped this, so it never saw the
+        # operational block (restart events, codex declines, active todos,
+        # strategy decisions recorded in another session). Best-effort.
+        from kestrel_sovereign.agent.preturn_state import (
+            prepare_turn_state_addendum,
+        )
+
+        system_prompt_addendum = await prepare_turn_state_addendum(self, None)
+
         # #1844 Stage 2: Kestrel-owned compaction for openai:plan. Compact +
         # reset the codex thread BEFORE fetching history / building context so
         # the freshly-seeded thread carries the compacted view rather than
@@ -1446,6 +1456,7 @@ class StreamingMixin:
             privacy_mode=privacy_mode,
             conversation_history=history,
             reflection_guidance=reflection_guidance,
+            system_prompt_addendum=system_prompt_addendum,
             tools=feature_tools,
             # Span attribution only (#2940) — same as the non-streaming path.
             session_id=session_id,
