@@ -529,6 +529,48 @@ semantically interchangeable across providers or embedding models. Operators
 who switch embedding models need to re-embed existing rows or ensure vector
 columns match the new dimensions.
 
+### Local model loading trust boundary
+
+GHSA-jhr6-gm9c-rqjv (CVE-2026-68770, #3718): before 6.0, sentence-transformers
+imports the custom module class a local model directory's `modules.json` names,
+even when the caller passes `trust_remote_code=False`. Whoever can write that
+directory can run code in the process that loads it. The advisory lists 5.6.0
+as patched, but 5.6 and 5.7 only emit a `FutureWarning` and still import; 6.0
+refuses before importing anything. On any earlier release,
+`trust_remote_code=False` is not a remediation.
+
+No Core module imports `sentence_transformers`. The `local` extra installs it
+into the host venv, where only another package or script could call it. A
+read-only search of the sibling feature checkouts on 2026-11-03 found no caller
+either, and the images under `docker/` install Core without the `local` extra.
+Core's local model loading paths, as of #3718:
+
+| Path | Where | What loads the model |
+|---|---|---|
+| Route embeddings (saved items, RAG, memory) | `kestrel_sovereign/llm/embedding_service.py:539`, sending at `kestrel_sovereign/llm/ollama_adapter.py:621` and `:650` | The Ollama server, a separate process. Kestrel sends the route's `embedding_model` string in `POST /api/embed` and reads nothing from disk. |
+| Legacy Ollama `EmbeddingService` | `kestrel_sovereign/llm/embedding_service.py:252`, sending at `:337`, `:367`, `:393`, `:417` and `:452` | The Ollama server, as above. |
+| spaCy NER (PII detection, emotional tagging) | `kestrel_sovereign/features/privacy/pii_detector.py:131`, `kestrel_sovereign/storage/emotional_tagger.py:265` | spaCy, in process, by package name (`en_core_web_sm` by default). spaCy does not use sentence-transformers. |
+| Local MPS image training | `kestrel_sovereign/features/training/adapters/local_mps_adapter.py:191` | diffusers, in a child process running a generated script. Not sentence-transformers. |
+
+The boundary that follows:
+
+- An embedding model name is configuration: the route's `embedding_model` in
+  `[llm]`, or a pin set through `POST /api/embedding/route-model`. Core passes
+  it to the provider as an opaque string. Naming a local directory does not
+  make Kestrel load that directory.
+- Code that loads a sentence-transformers model in the host process must treat
+  the model directory as code: load only directories it controls, and only on
+  6.0 or later, where `trust_remote_code=False` refuses custom modules.
+- `pyproject.toml` requires `sentence-transformers>=6.0.0,<7`, and
+  `SECURITY_FLOORS` in `tests/unit/test_dependency_contract.py` holds both the
+  declaration and `uv.lock` at 6.0.0 or above.
+
+`tests.unit.test_local_model_trust_boundary` fails if a Core module imports
+`sentence_transformers`. It also drives both Ollama paths with a fabricated
+model directory shaped like the advisory's exploit, behind an import tripwire,
+and on a host with the `local` extra checks that the installed library refuses
+that directory. Adding an in-process loader means updating this section.
+
 ---
 
 ## Decisions

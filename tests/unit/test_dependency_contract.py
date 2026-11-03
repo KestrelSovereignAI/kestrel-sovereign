@@ -48,6 +48,9 @@ SECURITY_FLOORS = {
     "pypdf": "6.21.4",
     "pytest": "9.0.3",
     "requests": "2.33.0",
+    # GHSA-jhr6-gm9c-rqjv (#3718). The advisory names 5.6.0, which only warns
+    # before importing a local model directory's custom code; 6.0 refuses it.
+    "sentence-transformers": "6.0.0",
     "setuptools": "83.0.0",
     "torch": "2.13.0",
     "transformers": "5.5.0",
