@@ -12,8 +12,35 @@ from kestrel_sovereign.agent.parts import (
     bind_part_collector,
     current_part_collector,
     current_tool_publication_context,
+    current_tool_publication_epoch,
     part_collector,
 )
+
+
+def test_publication_epoch_stays_with_original_live_turn_and_cannot_be_copied():
+    epoch = ["normal:original:0"]
+    host = SimpleNamespace(did="did:test:chat-owner", _get_privacy_policy_epoch=lambda: epoch[0])
+    with part_collector(host=host, session_id="chat-1"):
+        collector = current_part_collector()
+        assert current_tool_publication_epoch(host, "chat-1") == epoch[0]
+        epoch[0] = "normal:original:2"
+        assert current_tool_publication_epoch(host, "chat-1") == "normal:original:0"
+        assert current_tool_publication_epoch(host, "chat-2") is None
+        assert current_tool_publication_epoch(SimpleNamespace(did=host.did), "chat-1") is None
+        with bind_part_collector(copy.copy(collector)):
+            assert current_tool_publication_epoch(host, "chat-1") is None
+    with bind_part_collector(collector):
+        assert current_tool_publication_epoch(host, "chat-1") is None
+    with part_collector(host=SimpleNamespace(did=host.did), session_id="chat-1"):
+        assert current_tool_publication_epoch(host, "chat-1") is None
+
+
+@pytest.mark.parametrize("epoch", [None, "", " ", 1, False])
+def test_invalid_host_epoch_is_refused(epoch):
+    host = SimpleNamespace(did="did:test:chat-owner", _get_privacy_policy_epoch=lambda: epoch)
+    with pytest.raises(ValueError, match="original privacy policy epoch"):
+        with part_collector(host=host, session_id="chat-1"):
+            pytest.fail("invalid epoch was accepted")
 
 
 def test_publication_destination_requires_exact_owner_and_session():

@@ -310,6 +310,36 @@ test('wiping one real chat pane releases its parts and preserves a background pa
     }
 });
 
+test('part render and mount receive the exact owning pane session even in a detached pane', () => {
+    const contexts = [];
+    registry.registerRenderer({id: 'original-chat-destination', match: {contentType: 'mcp_app'},
+        render(_data, context) { contexts.push(context); return '<button>Open</button>'; },
+        mount(_root, context) { contexts.push(context); }});
+    const a = getOrCreateChatPane('session-agent-a');
+    const b = getOrCreateChatPane('session-agent-b');
+    a.sessionId = 'chat-a'; b.sessionId = 'chat-b';
+    document.body.append(a.element);
+    try {
+        chat.appendMessagePart('mcp_app', {}, a.element);
+        chat.appendMessagePart('mcp_app', {}, b.element);
+        assert.deepEqual(contexts.map(c => [c.ownerAgent, c.sessionId]), [
+            ['session-agent-a', 'chat-a'], ['session-agent-a', 'chat-a'],
+            ['session-agent-b', 'chat-b'], ['session-agent-b', 'chat-b'],
+        ]);
+        assert.equal(contexts[0], contexts[1]);
+        assert.equal(contexts[2], contexts[3]);
+        assert.equal(b.element.isConnected, false);
+        assert.equal(contexts[0].isCurrentChat(), true);
+        assert.equal(contexts[2].isCurrentChat(), false);
+        a.sessionId = 'different-chat';
+        assert.equal(contexts[0].isCurrentChat(), false);
+        document.body.append(b.element);
+        assert.equal(contexts[2].isCurrentChat(), true);
+    } finally {
+        registry._reset(); a.element.remove(); b.element.remove();
+    }
+});
+
 for (const phase of ['streaming', 'finalization', 'thinking-finalization']) {
     test(`${phase} replaces tool-card mounts without retaining old listeners`, async () => {
         const id = 'lifecycle-tool-' + phase;

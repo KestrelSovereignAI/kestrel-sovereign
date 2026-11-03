@@ -5,8 +5,40 @@ import json
 from pathlib import Path
 import socket
 
+from mcp import types
 from mcp.server import MCPServer
+from mcp.server.apps import Apps
 import uvicorn
+
+
+def create_server(witness: Path, *, apps: bool = False):
+    """One native effect witness for both permission and Apps campaigns."""
+    extension = Apps()
+
+    def record_marker(marker: str) -> str:
+        with witness.open("a") as stream:
+            stream.write(marker + "\n")
+        return "Recorded: " + marker
+
+    if apps:
+        def native_result(marker):
+            text = record_marker(marker)
+            return types.CallToolResult(content=[types.TextContent(type="text", text=text)],
+                structured_content={"marker": marker}, meta={"private-witness": marker})
+
+        @extension.tool(resource_uri="ui://witness/app.html", visibility=["model", "app"])
+        def open_marker(marker: str) -> types.CallToolResult:
+            return native_result(marker)
+
+        @extension.tool(resource_uri="ui://witness/app.html", visibility=["app"])
+        def mutate_marker(marker: str) -> types.CallToolResult:
+            return native_result(marker)
+
+        extension.add_html_resource("ui://witness/app.html", "<!doctype html><p>Owned native MCP App</p>")
+
+    server = MCPServer("permission-boundary-witness", extensions=[extension] if apps else [])
+    server.tool()(record_marker)
+    return server
 
 
 def main():
@@ -20,13 +52,7 @@ def main():
     if tls and not all((args.tls_cert, args.tls_key, args.witness, args.ready)):
         parser.error("TLS mode requires certificate, key, witness and ready paths")
     witness = Path(args.witness) if tls else Path("/tmp/permission-witness")
-    server = MCPServer("permission-boundary-witness")
-
-    @server.tool()
-    def record_marker(marker: str) -> str:
-        with witness.open("a") as stream:
-            stream.write(marker + "\n")
-        return "Recorded: " + marker
+    server = create_server(witness)
 
     if not tls:
         server.run(transport="streamable-http", host="0.0.0.0", port=8000,

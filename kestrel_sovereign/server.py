@@ -732,10 +732,10 @@ def _require_multi_agent_host_api_key(environ: Mapping[str, str]) -> str:
     )
 
 
-def get_api_key():
+def get_api_key(*, generate_if_missing: bool = True):
     """Get or generate the API key."""
     api_key = normalize_api_key(os.environ.get("KESTREL_API_KEY"))
-    if not api_key:
+    if not api_key and generate_if_missing:
         generated_key = secrets.token_urlsafe(32)
         os.environ["KESTREL_API_KEY"] = generated_key
         mark_ephemeral_sovereign_key(generated_key)
@@ -4327,6 +4327,11 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(lifespan=lifespan)
+from kestrel_sovereign.security.request_auth import RequestAuthenticationService
+
+app.state.request_authentication = RequestAuthenticationService(
+    api_key=lambda: get_api_key(generate_if_missing=False),
+)
 register_api_error_handlers(app)
 
 
@@ -4658,6 +4663,11 @@ async def agent_routing_middleware(request: Request, call_next):
     return await call_next(request)
 
 
+from kestrel_sovereign.security.request_auth import InteractiveAuthenticationLifetimeMiddleware
+
+app.add_middleware(InteractiveAuthenticationLifetimeMiddleware)
+
+
 @app.middleware("http")
 async def auth_middleware(request: Request, call_next):
     """Global authentication middleware.
@@ -4920,7 +4930,7 @@ app.middleware("http")(logging_context_middleware)
 
 # Session middleware must be added AFTER auth_middleware so it's outermost
 # (Starlette processes middleware in reverse order of addition)
-from starlette.middleware.sessions import SessionMiddleware
+from kestrel_sovereign.security.request_auth import AuthenticatedSessionMiddleware as SessionMiddleware
 
 
 def _get_session_secret() -> str:

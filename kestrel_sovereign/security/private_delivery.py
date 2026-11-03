@@ -88,12 +88,28 @@ class PrivateDeliveryMiddleware:
                     if delivery.transport_borrow is None:
                         await send(message)
                     else:
+                        borrowing = False
                         async def native_send():
+                            nonlocal borrowing
                             async with delivery.transport_borrow.operation() as current:
-                                delivery.check()
-                                current()
-                                await send(message)
-                                current()
+                                borrowing = True
+                                try:
+                                    delivery.check()
+                                    current()
+                                    await send(message)
+                                    current()
+                                finally:
+                                    borrowing = False
+                        def cancel_original_child(task):
+                            if task is not child:
+                                raise self.access_denied("private transport child changed")
+                            if borrowing:
+                                delivery.transport_borrow.cancel(task)
+                            else:
+                                # Core owns this fresh child before the View
+                                # admits it. Cancellation cannot be delegated
+                                # to a registry it has not entered yet.
+                                task.cancel()
                         # The outer send may block after buffering middleware
                         # has acknowledged its queue. Keep this exact child in
                         # the capability's original borrower registry until
@@ -101,7 +117,7 @@ class PrivateDeliveryMiddleware:
                         # cancellation or cancellation-suppressing transports.
                         child = create_owned_task(native_send(), name="private-capability-send")
                         outcome = await await_owned_task(child,
-                            cancel_on_caller_cancellation=delivery.transport_borrow.cancel)
+                            cancel_on_caller_cancellation=cancel_original_child)
                         raise_owned_outcome(outcome, operation="private capability transport")
             except BaseException:
                 delivery.failed = True

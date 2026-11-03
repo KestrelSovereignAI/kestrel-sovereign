@@ -1363,6 +1363,11 @@ function noteChatAppend(target, { force = false } = {}) {
  * them would plant state that the next detach overwrites anyway.
  */
 function resolveDetachedPane(target, container) {
+    const pane = findPaneForElement(target);
+    return pane && !(container && pane.element.parentNode === container) ? pane : null;
+}
+
+function findPaneForElement(target) {
     if (!target) return null;
     const panes = deps().state.chatPanes;
     if (!panes || typeof panes.values !== 'function') return null;
@@ -1372,7 +1377,7 @@ function resolveDetachedPane(target, container) {
         const hit = el === target
             || (typeof el.contains === 'function' && el.contains(target));
         if (!hit) continue;
-        return (container && el.parentNode === container) ? null : pane;
+        return pane;
     }
     return null;
 }
@@ -4810,7 +4815,10 @@ export function appendMessagePart(type, data, paneElement = null) {
     const ownerAgent = paneRoot && paneRoot.dataset ? paneRoot.dataset.agent : undefined;
     // Feature matching, rendering and mounting need this same owner context.
     // Mount runs before attachment, so its root cannot discover the pane yet.
-    const partContext = { type, ownerAgent, paneElement: target };
+    const ownerPane = findPaneForElement(target);
+    const sessionId = ownerPane?.sessionId ?? null;
+    const partContext = { type, ownerAgent, paneElement: target, sessionId,
+        isCurrentChat: () => !!ownerPane && ownerPane.sessionId === sessionId && target.isConnected };
 
     const renderer = _partRenderers[type];
     // Two distinct trust levels (#2038 ticket 06), kept distinct:

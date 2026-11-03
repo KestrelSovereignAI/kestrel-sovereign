@@ -33,6 +33,7 @@ __all__ = [
     "CurrentHostAuthority",
     "HostCapabilityAccessDenied",
     "HostCapabilityAuthority",
+    "require_raw_capability_disclosure",
 ]
 
 
@@ -41,6 +42,17 @@ class HostCapabilityAccessDenied(ResourceError, OperatorAuthorizationError):
 
 
 CurrentHostAuthority = Callable[[OperatorContext, StrEnum, object | None], None]
+
+
+def require_raw_capability_disclosure(holder, capability: str, *,
+                                     access_denied=HostCapabilityAccessDenied) -> None:
+    """One policy for raw publication and private capability observation."""
+    config = getattr(holder, "privacy_config", None)
+    if (getattr(holder, "privacy_mode", None) not in (PrivacyMode.NORMAL, PrivacyMode.PUBLIC)
+            or not isinstance(config, PrivacyConfig)
+            or config.storage != "full" or config.assurance != "none"
+            or config.audit != "optional"):
+        raise access_denied(f"privacy policy does not permit raw {capability}")
 
 
 @dataclass
@@ -114,13 +126,8 @@ class HostCapabilityAuthority:
             # An unavailable checker must never become an admission fallback.
             raise self.access_denied(f"{self.label} authority is unavailable") from None
         if action.value not in self.non_disclosing_actions:
-            holder = binding.privacy_holder
-            config = getattr(holder, "privacy_config", None)
-            if (getattr(holder, "privacy_mode", None) not in (PrivacyMode.NORMAL, PrivacyMode.PUBLIC)
-                    or not isinstance(config, PrivacyConfig)
-                    or config.storage != "full" or config.assurance != "none"
-                    or config.audit != "optional"):
-                raise self.access_denied(f"privacy policy does not permit raw {self.capability}")
+            require_raw_capability_disclosure(binding.privacy_holder, self.capability,
+                                              access_denied=self.access_denied)
 
     @asynccontextmanager
     async def operation(self, context: OperatorContext, action: StrEnum,

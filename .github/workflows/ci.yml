@@ -465,6 +465,7 @@ jobs:
         # conftest also enforces the 180s per-test ceiling on these tests.
         run: >-
           uv run --no-sync python -m pytest tests/integration/test_mcp_permission_boundary.py
+          tests/integration/test_mcp_apps_host.py
           -q --timeout=120 --session-timeout=480
         timeout-minutes: 12
 
