@@ -8,6 +8,13 @@ then attaches its `AppPublications` instance. This Core component requires the
 owned delivery contract in MCP 0.10.1; complete console composition is supplied
 by the MCP feature separately.
 
+The feature declares fixed routes with `agent.create_mcp_apps_router(feature,
+resolve_host=...)` before Apps are configured. Core's normal live feature router
+therefore mounts them at startup. Each request captures its current original
+host once; a disabled or replaced host cannot retarget an in-flight response.
+The renderer's static assets are declared independently of Apps enablement so
+the normal console can enable Apps without remounting routes or assets.
+
 ## Publication and HTTP authority
 
 A chat part contains only `reference` and `session_id`. Those values locate a

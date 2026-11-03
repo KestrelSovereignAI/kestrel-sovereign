@@ -168,7 +168,8 @@ async def apps_boundary(tmp_path, monkeypatch):
         app.add_middleware(AuthenticatedSessionMiddleware, secret_key="owned-apps-session-signing-key",
                            session_cookie="kestrel_session", max_age=600)
         app.add_middleware(PrivateDeliveryMiddleware)
-        app.include_router(host.router)
+        feature.apps_host = host
+        app.include_router(agent.create_mcp_apps_router(feature, resolve_host=lambda: feature.apps_host))
 
         @app.post("/api/owned-initial")
         async def initial_call(request: Request):
@@ -203,6 +204,17 @@ async def test_initial_result_is_private_and_reopens_without_replaying_native_to
     assert b.markers == ["once"]
     rows = await b.backend.fetch_all("SELECT session_id,result_status FROM a2a_tool_dispatches")
     assert [tuple(row) for row in rows] == [("original-chat", "success")]
+
+
+async def test_fixed_routes_resolve_the_current_optional_host_without_retargeting_views(apps_boundary):
+    b = apps_boundary
+    reference = await b.publish()
+    b.feature.apps_host = None
+    assert (await b.open(reference)).status_code == 404
+    b.feature.apps_host = b.host
+    opened = await b.open(reference)
+    assert opened.status_code == 200 and opened.json()["result"]["_meta"]["private-witness"] == "once"
+    assert b.markers == ["once"]
 
 
 @pytest.mark.parametrize("owner,reader,session", [("key", ALICE, "original-chat"),

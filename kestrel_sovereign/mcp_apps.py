@@ -17,7 +17,7 @@ from enum import StrEnum
 import secrets
 from uuid import uuid4
 
-from fastapi import APIRouter, Request
+from fastapi import APIRouter, HTTPException, Request
 from kestrel_sdk.operator import OperatorContext
 from kestrel_sdk.resources import ResourceConflict, ResourceOutcomeUnknown
 from kestrel_sdk.tools import ToolPublicationContext
@@ -316,69 +316,82 @@ class MCPAppsHost:
         if getattr(publications.executor, "supports_owned_delivery", None) is not True:
             raise TypeError("MCP Apps require native owned delivery support")
         self._publications = publications
-        self.router = self._create_router()
+        self.router = self.router_for(lambda: self)
 
-    def _create_router(self):
+    @staticmethod
+    def router_for(resolve_host):
         router = APIRouter(prefix="/api/mcp/apps", tags=["mcp-apps"])
-        def respond(request, action, build, model=None):
-            return AuthorizedCapabilityResponse(request, authority=self.authority,
-                resolve_context=self._resolve_context,
-                operation=lambda context, _value: self._operation(context, action),
-                build=build, error_response=_error, timeout_seconds=self._policy.operation_seconds,
-                prepare=(lambda: self._body(request, model)) if model is not None else None,
-                transport_operation=self._transport_operation)
+        def original_host():
+            host = resolve_host()
+            if host is None:
+                raise HTTPException(status_code=404, detail="mcp_app_unavailable")
+            if not isinstance(host, MCPAppsHost) or host._publications is None:
+                raise TypeError("original attached MCP Apps host required")
+            return host
+
+        def respond(host, request, action, build, model=None):
+            return AuthorizedCapabilityResponse(request, authority=host.authority,
+                resolve_context=host._resolve_context,
+                operation=lambda context, _value: host._operation(context, action),
+                build=build, error_response=_error, timeout_seconds=host._policy.operation_seconds,
+                prepare=(lambda: host._body(request, model)) if model is not None else None,
+                transport_operation=host._transport_operation)
 
         @router.post("/publications/{reference}/views")
         async def open_view(reference: str, request: Request):
+            host = original_host()
             async def build(_context, _value):
                 browser_origin = request.headers.get("origin")
-                if browser_origin is not None and browser_origin != self._policy.host_origin:
+                if browser_origin is not None and browser_origin != host._policy.host_origin:
                     raise HostCapabilityAccessDenied("original MCP Apps browser origin is required")
-                view = self._publications.open_view(reference)
-                reader = self._reader.get()
+                view = host._publications.open_view(reference)
+                reader = host._reader.get()
                 view_id = secrets.token_urlsafe(32)
-                if view_id in self._views:
-                    await self._publications.close_view(view)
+                if view_id in host._views:
+                    await host._publications.close_view(view)
                     raise ResourceConflict("MCP Apps View identifier collision")
                 physical = _PhysicalView(view, _Publisher(reader.caller,
-                    self.agent._get_privacy_policy_epoch()), reader.session_id)
-                self._views[view_id] = reader.physical = physical
+                    host.agent._get_privacy_policy_epoch()), reader.session_id)
+                host._views[view_id] = reader.physical = physical
                 reader.opened_id = view_id
                 resource = await view.read_resource(view.source.tool.resource_uri,
-                                                 max_html_bytes=self._policy.max_html_bytes)
-                arguments, result = self._publications.initial_result(reference, view)
+                                                 max_html_bytes=host._policy.max_html_bytes)
+                arguments, result = host._publications.initial_result(reference, view)
                 return JSONResponse({"view_id": view_id, "arguments": arguments, "result": _native(result),
                     "resource": {"uri": resource.uri, "html": resource.html, "_meta": resource.metadata},
-                    "sandbox_url": self._policy.sandbox_url,
-                    "host_origin": self._policy.host_origin,
-                    "max_message_bytes": self._policy.max_message_bytes,
-                    "max_html_bytes": self._policy.max_html_bytes,
-                    "policy": deepcopy(self._policy.connection_policies.get(view.caller.name, {}))})
-            return respond(request, _Action.READ, build, _Empty)
+                    "sandbox_url": host._policy.sandbox_url,
+                    "host_origin": host._policy.host_origin,
+                    "max_message_bytes": host._policy.max_message_bytes,
+                    "max_html_bytes": host._policy.max_html_bytes,
+                    "policy": deepcopy(host._policy.connection_policies.get(view.caller.name, {}))})
+            return respond(host, request, _Action.READ, build, _Empty)
 
         @router.get("/views/{view_id}/tools")
         async def list_tools(view_id: str, request: Request):
+            host = original_host()
             async def build(_context):
-                physical = self._physical(view_id)
+                physical = host._physical(view_id)
                 return JSONResponse({"tools": [_native(tool) for tool in physical.view.list_tools()]})
-            return respond(request, _Action.READ, build)
+            return respond(host, request, _Action.READ, build)
 
         @router.post("/views/{view_id}/tools/call")
         async def call_tool(view_id: str, request: Request):
+            host = original_host()
             async def build(_context, value):
-                physical = self._physical(view_id)
-                result = await self._publications.executor.invoke(physical.view, value.name, value.arguments)
+                physical = host._physical(view_id)
+                result = await host._publications.executor.invoke(physical.view, value.name, value.arguments)
                 return JSONResponse(_native(result))
-            return respond(request, _Action.CALL, build, _Call)
+            return respond(host, request, _Action.CALL, build, _Call)
 
         @router.delete("/views/{view_id}")
         async def close_view(view_id: str, request: Request):
+            host = original_host()
             async def build(_context):
-                physical = self._physical(view_id, closing=True)
-                await self._publications.close_view(physical.view)
-                self._views.pop(view_id, None)
+                physical = host._physical(view_id, closing=True)
+                await host._publications.close_view(physical.view)
+                host._views.pop(view_id, None)
                 return JSONResponse({"closed": True})
-            return respond(request, _Action.CLOSE, build)
+            return respond(host, request, _Action.CLOSE, build)
         return router
 
     def withdraw_private_data(self):
@@ -401,6 +414,18 @@ class MCPAppsHost:
 
 class MCPAppsHostMixin:
     supports_mcp_apps_host = True
+
+    def create_mcp_apps_router(self, feature, *, resolve_host):
+        """Mount fixed native routes before optional Apps configuration exists."""
+        if not callable(resolve_host):
+            raise TypeError("original MCP Apps host resolver required")
+        def original_host():
+            host = resolve_host()
+            if host is not None and (not isinstance(host, MCPAppsHost)
+                    or host.agent is not self or host.feature is not feature):
+                raise HostCapabilityAccessDenied("original MCP Apps host was replaced")
+            return host
+        return MCPAppsHost.router_for(original_host)
 
     def validate_mcp_apps_host_configuration(self, configuration):
         """Validate without withdrawing an already usable host incarnation."""
