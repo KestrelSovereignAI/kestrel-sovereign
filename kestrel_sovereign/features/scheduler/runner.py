@@ -35,6 +35,7 @@ from typing import (
     List,
     Optional,
     Protocol,
+    Tuple,
     Union,
 )
 
@@ -68,6 +69,7 @@ from kestrel_sovereign.execution_custody import (
 from kestrel_sovereign.features.scheduler.constants import (
     HOOK_FAILED_STATUS,
     ROLLOUT_AMBIGUOUS_LEGACY_OCCURRENCE,
+    TERMINAL_CAUSE_MAX_CHARS,
 )
 from kestrel_sovereign.features.scheduler.cron import CronParseError, next_run
 from kestrel_sovereign.features.scheduler.failure_streak import (
@@ -4006,6 +4008,8 @@ class SchedulerRunner:
                         result_text: Optional[str] = None
                         outcome_signal: Optional[float] = None
                         pause_schedule = False
+                        pause_cause: Optional[str] = None
+                        pause_cause_detail: Optional[str] = None
                         ran = True
                         scope = _SchedulerExecutionScope(execution, occurrence_task=occurrence_task)
                         token = _current_execution.set(scope)
@@ -4053,6 +4057,7 @@ class SchedulerRunner:
                                     outcome_signal,
                                     pause_schedule,
                                 ) = self._normalise_result(raw, task)
+                                pause_cause, pause_cause_detail = self._pause_cause(raw)
                             except asyncio.CancelledError:
                                 raise
                             except SchedulerFeatureUnavailable as error:
@@ -4137,6 +4142,8 @@ class SchedulerRunner:
                             outcome_signal=outcome_signal,
                             ran=ran,
                             pause_schedule=pause_schedule,
+                            pause_cause=pause_cause,
+                            pause_cause_detail=pause_cause_detail,
                         )
 
             # Cold preparation and dispatch share one owned task. Expiry
@@ -4768,6 +4775,17 @@ class SchedulerRunner:
             )
         return "success", raw if isinstance(raw, str) else (str(raw) if raw is not None else None), None, False
 
+    @staticmethod
+    def _pause_cause(raw: Any) -> Tuple[Optional[str], Optional[str]]:
+        """The cause a pausing outcome recorded, stored with its pause (#3873).
+
+        ``(cause, detail)``: the content-free cause, and the gate's free-form
+        reason, which readers withhold in a volatile privacy mode.
+        """
+        if isinstance(raw, ScheduledTaskOutcome) and raw.pause_schedule:
+            return raw.pause_cause, raw.pause_cause_detail or None
+        return None, None
+
     async def _finalize(
         self,
         task: ScheduledTask,
@@ -4779,6 +4797,8 @@ class SchedulerRunner:
         outcome_signal: Optional[float],
         ran: bool,
         pause_schedule: bool = False,
+        pause_cause: Optional[str] = None,
+        pause_cause_detail: Optional[str] = None,
     ) -> None:
         if not await self._agent_is_currently_authorized(task.agent_id):
             logger.warning(
@@ -4823,6 +4843,13 @@ class SchedulerRunner:
             ) or pause_schedule
             enabled = 0 if terminal else 1
             terminal_status = status if terminal else None
+            # Why the scheduler disabled the row, kept beside its status so
+            # status readers can name it after the execution log row is gone
+            # (#3873). None when nothing disabled the row. The cause is
+            # content-free; the detail is free-form text that readers withhold
+            # in a volatile privacy mode, as they withhold ``result_text``.
+            terminal_cause = pause_cause if pause_schedule else None
+            terminal_cause_detail = pause_cause_detail if pause_schedule else None
             next_at: Optional[str] = None
             if not terminal and one_shot:
                 next_at = schedule_now.isoformat()
@@ -4843,6 +4870,13 @@ class SchedulerRunner:
                     ).strip()
                     enabled = 0
                     terminal_status = "invalid_cron"
+                    terminal_cause = (
+                        "the scheduler cannot compute a next run from the "
+                        "cron expression"
+                    )
+                    terminal_cause_detail = str(e)
+            if terminal_cause_detail is not None:
+                terminal_cause_detail = terminal_cause_detail[:TERMINAL_CAUSE_MAX_CHARS]
 
             # A recurring row now represents a *new* occurrence. Recovery of
             # the same occurrence increments its count in _claim; normal cron
@@ -4874,7 +4908,8 @@ class SchedulerRunner:
                     f"""
                     UPDATE scheduled_tasks
                     SET {last_run_sql}, next_run_at = ?, enabled = ?,
-                        attempt_count = ?, terminal_status = ?,
+                        attempt_count = ?, terminal_status = ?, terminal_cause = ?,
+                        terminal_cause_detail = ?,
                         terminal_at = CASE WHEN ? THEN {now_sql} ELSE NULL END,
                         lease_owner = NULL, lease_expires_at = NULL, claim_token = NULL,
                         claim_execution_id = NULL, claim_scheduled_for = NULL,
@@ -4891,6 +4926,8 @@ class SchedulerRunner:
                         enabled,
                         next_attempt_count,
                         terminal_status,
+                        terminal_cause,
+                        terminal_cause_detail,
                         record_terminal_at,
                         *failure_streak.streak.as_params(),
                         task.id,
@@ -4935,7 +4972,8 @@ class SchedulerRunner:
                 if ran:
                     params.append(now_iso)
                 params.extend([
-                    next_at, enabled, next_attempt_count, terminal_status, terminal_at,
+                    next_at, enabled, next_attempt_count, terminal_status,
+                    terminal_cause, terminal_cause_detail, terminal_at,
                     task.id, task.agent_id, SCHEDULER_PROTOCOL_VERSION,
                     self._owner_id, task.claim_token, execution.id, now_iso,
                 ])
@@ -4943,7 +4981,8 @@ class SchedulerRunner:
                     f"""
                     UPDATE scheduled_tasks
                     SET {last_run_sql}, next_run_at = ?, enabled = ?,
-                        attempt_count = ?, terminal_status = ?, terminal_at = ?,
+                        attempt_count = ?, terminal_status = ?, terminal_cause = ?,
+                        terminal_cause_detail = ?, terminal_at = ?,
                         lease_owner = NULL, lease_expires_at = NULL, claim_token = NULL,
                         claim_execution_id = NULL, claim_scheduled_for = NULL,
                         scheduler_claim_fenced = 0
@@ -5653,6 +5692,12 @@ class SchedulerRunner:
             "attempt_count": "INTEGER NOT NULL DEFAULT 0",
             "terminal_status": "TEXT",
             "terminal_at": "TEXT",
+            # Why the scheduler disabled the row (#3873), written with
+            # terminal_status by the finalizer and cleared by schedule_resume:
+            # the content-free cause, and the free-form detail behind it that
+            # readers withhold in a volatile privacy mode.
+            "terminal_cause": "TEXT",
+            "terminal_cause_detail": "TEXT",
             # Nullable on an additive migration is intentional: NULL proves a
             # row could have been written by a legacy, pre-claim runner. Every
             # v2 writer explicitly supplies the marker; there is deliberately

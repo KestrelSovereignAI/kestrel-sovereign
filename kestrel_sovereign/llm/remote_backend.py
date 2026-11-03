@@ -28,7 +28,9 @@ from .lifecycle import harvest_llm_close_task, llm_close_observation_control, st
 from kestrel_sovereign.execution_custody import (
     await_execution_work, bind_execution_custody_snapshot,
     current_execution_custody, execution_terminal_error,
+    is_execution_control_error,
 )
+from .route_calls import record_route_call
 
 from kestrel_sovereign.kestrel_config.constants import (
     HTTP_TIMEOUT_MEDIUM,
@@ -362,6 +364,26 @@ class RemoteBackendMixin:
 
         logger.info("Deactivated private inference lease %s", lease_id)
 
+    def _remote_route_selected(
+        self,
+        *,
+        force_local_only: bool,
+        model_override: str | None,
+    ) -> bool:
+        """Whether a call with these routing inputs takes the lease route.
+
+        The lease route takes precedence over every configured route and has
+        no cloud fallback, so while it is selected it is the only route a call
+        tries. Read by :meth:`_remote_route_attempt` to dispatch and by
+        ``LLMService.routes_in_use`` to report (#3873).
+        """
+
+        return (
+            self._remote_lease is not None
+            and not force_local_only
+            and self._remote_first_allowed(model_override)
+        )
+
     @asynccontextmanager
     async def _remote_route_attempt(
         self,
@@ -387,111 +409,120 @@ class RemoteBackendMixin:
         touch_lease: InferenceLeaseTouch | None = None
         selected_route_epoch: int | None = None
         captured = current_execution_custody(self)
-        async with self._remote_route_condition:
-            lease = self._remote_lease
-            client = self._remote_client
-            route_selected = (
-                lease is not None
-                and not force_local_only
-                and self._remote_first_allowed(model_override)
-            )
-            if route_selected:
-                if (
-                    self._backend is not BackendType.REMOTE_GPU
-                    or not self._remote_accepting
-                    or client is None
-                ):
-                    raise LLMServiceError(
-                        "private inference route is draining or unavailable; no "
-                        "cloud fallback was attempted"
-                    )
-                missing = set(required_capabilities).difference(
-                    self._remote_capabilities
-                )
-                if missing:
-                    names = ", ".join(sorted(missing))
-                    raise LLMServiceError(
-                        f"private inference lease lacks required capabilities: {names}"
-                    )
-                if datetime.now(UTC) >= lease.expires_at:
-                    self._remote_accepting = False
-                    raise LLMServiceError(
-                        "private inference lease expired; reconcile or release it "
-                        "before another LLM request"
-                    )
-                touch_lease = self._remote_touch_lease
-                if touch_lease is None:
-                    raise LLMServiceError(
-                        "private inference route has no idle-deadline renewal "
-                        "handler; no cloud fallback was attempted"
-                    )
-                selected_lease_id = lease.lease_id
-                selected_route_epoch = self._remote_route_epoch
-
-        if selected_lease_id is not None:
-            assert touch_lease is not None
-            assert selected_route_epoch is not None
-            touched: InferenceLease | None = None
-            try:
-                with bind_execution_custody_snapshot(captured):
-                    touched = await await_execution_work(
-                        self, lambda: touch_lease(selected_lease_id),
-                    )
-            except Exception as exc:  # noqa: BLE001 - provider boundary
-                self._raise_managed_remote_failure(exc)
-            if (
-                not isinstance(touched, InferenceLease)
-                or touched.lease_id != selected_lease_id
-                or touched.state is not InferenceLeaseState.READY
-            ):
-                raise LLMServiceError(
-                    "private inference lease is no longer ready; no cloud "
-                    "fallback was attempted"
-                )
-
-            # Touch runs outside the route condition because it may refresh
-            # credentials through ``activate_inference_lease``. Re-check every
-            # invariant before pinning: an owner release may have won the race
-            # after touch completed, in which case this call fails closed.
+        route_selected = False
+        try:
             async with self._remote_route_condition:
                 lease = self._remote_lease
                 client = self._remote_client
-                if self._remote_route_epoch != selected_route_epoch:
-                    # The route was torn down while this call was renewing.
-                    # Comparing observable state is not enough: ``touch`` ends
-                    # in ``activate_inference_lease`` for a READY lease, which
-                    # rebuilds a route that looks identical to the one that was
-                    # just deactivated - including after ``close()`` has already
-                    # drained and returned. Refuse rather than resurrect it.
-                    raise LLMServiceError(
-                        "private inference route was released during renewal; no "
-                        "cloud fallback was attempted"
+                route_selected = self._remote_route_selected(
+                    force_local_only=force_local_only,
+                    model_override=model_override,
+                )
+                if route_selected:
+                    if (
+                        self._backend is not BackendType.REMOTE_GPU
+                        or not self._remote_accepting
+                        or client is None
+                    ):
+                        raise LLMServiceError(
+                            "private inference route is draining or unavailable; no "
+                            "cloud fallback was attempted"
+                        )
+                    missing = set(required_capabilities).difference(
+                        self._remote_capabilities
                     )
+                    if missing:
+                        names = ", ".join(sorted(missing))
+                        raise LLMServiceError(
+                            f"private inference lease lacks required capabilities: {names}"
+                        )
+                    if datetime.now(UTC) >= lease.expires_at:
+                        self._remote_accepting = False
+                        raise LLMServiceError(
+                            "private inference lease expired; reconcile or release it "
+                            "before another LLM request"
+                        )
+                    touch_lease = self._remote_touch_lease
+                    if touch_lease is None:
+                        raise LLMServiceError(
+                            "private inference route has no idle-deadline renewal "
+                            "handler; no cloud fallback was attempted"
+                        )
+                    selected_lease_id = lease.lease_id
+                    selected_route_epoch = self._remote_route_epoch
+
+            if selected_lease_id is not None:
+                assert touch_lease is not None
+                assert selected_route_epoch is not None
+                touched: InferenceLease | None = None
+                try:
+                    with bind_execution_custody_snapshot(captured):
+                        touched = await await_execution_work(
+                            self, lambda: touch_lease(selected_lease_id),
+                        )
+                except Exception as exc:  # noqa: BLE001 - provider boundary
+                    self._raise_managed_remote_failure(exc)
                 if (
-                    lease is None
-                    or lease.lease_id != selected_lease_id
-                    or self._backend is not BackendType.REMOTE_GPU
-                    or not self._remote_accepting
-                    or client is None
+                    not isinstance(touched, InferenceLease)
+                    or touched.lease_id != selected_lease_id
+                    or touched.state is not InferenceLeaseState.READY
                 ):
                     raise LLMServiceError(
-                        "private inference route is draining or unavailable; no "
-                        "cloud fallback was attempted"
-                    )
-                if datetime.now(UTC) >= lease.expires_at:
-                    self._remote_accepting = False
-                    raise LLMServiceError(
-                        "private inference lease expired during renewal; no cloud "
+                        "private inference lease is no longer ready; no cloud "
                         "fallback was attempted"
                     )
-                self._remote_inflight += 1
-                snapshot = RemoteRouteSnapshot(
-                    lease_id=lease.lease_id,
-                    model=lease.model,
-                    client=client,
-                    adapter=self._remote_adapter,
-                    capabilities=self._remote_capabilities,
-                )
+
+                # Touch runs outside the route condition because it may refresh
+                # credentials through ``activate_inference_lease``. Re-check every
+                # invariant before pinning: an owner release may have won the race
+                # after touch completed, in which case this call fails closed.
+                async with self._remote_route_condition:
+                    lease = self._remote_lease
+                    client = self._remote_client
+                    if self._remote_route_epoch != selected_route_epoch:
+                        # The route was torn down while this call was renewing.
+                        # Comparing observable state is not enough: ``touch`` ends
+                        # in ``activate_inference_lease`` for a READY lease, which
+                        # rebuilds a route that looks identical to the one that was
+                        # just deactivated - including after ``close()`` has already
+                        # drained and returned. Refuse rather than resurrect it.
+                        raise LLMServiceError(
+                            "private inference route was released during renewal; no "
+                            "cloud fallback was attempted"
+                        )
+                    if (
+                        lease is None
+                        or lease.lease_id != selected_lease_id
+                        or self._backend is not BackendType.REMOTE_GPU
+                        or not self._remote_accepting
+                        or client is None
+                    ):
+                        raise LLMServiceError(
+                            "private inference route is draining or unavailable; no "
+                            "cloud fallback was attempted"
+                        )
+                    if datetime.now(UTC) >= lease.expires_at:
+                        self._remote_accepting = False
+                        raise LLMServiceError(
+                            "private inference lease expired during renewal; no cloud "
+                            "fallback was attempted"
+                        )
+                    self._remote_inflight += 1
+                    snapshot = RemoteRouteSnapshot(
+                        lease_id=lease.lease_id,
+                        model=lease.model,
+                        client=client,
+                        adapter=self._remote_adapter,
+                        capabilities=self._remote_capabilities,
+                    )
+        except Exception as exc:
+            if route_selected and not is_execution_control_error(exc):
+                # The lease route refused this call before any adapter ran:
+                # a failed attempt on the route in use, which the health
+                # check judges on (#3873). An adapter failure is recorded by
+                # the attempt that ran it.
+                record_route_call(self, REMOTE_ROUTE_NAME, exc)
+            raise
         try:
             yield snapshot
         finally:

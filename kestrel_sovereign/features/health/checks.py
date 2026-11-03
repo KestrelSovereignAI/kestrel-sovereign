@@ -16,7 +16,7 @@ import asyncio
 import logging
 import shutil
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Awaitable, Dict, List, Optional, Tuple
 
 from kestrel_sdk.signals import ResourceLock
@@ -215,11 +215,186 @@ async def check_database(db) -> Dict[str, Any]:
         }
 
 
-async def check_llm_service(agent) -> Dict[str, Any]:
-    """Verify that an LLM provider is configured and accessible.
+def _routes_in_use(llm_service) -> Optional[List[str]]:
+    """The routes the agent's next turn would try, or ``None`` when unknown.
 
-    This does NOT make an LLM call -- it only checks that the
-    service object exists and has a provider configured.
+    Asks the service's own routing (``LLMService.routes_in_use``), so a route
+    is in use exactly when a turn would attempt it. ``None`` for a service
+    that cannot say (a stand-in without the method); callers then judge every
+    configured route, as they did before routes in use were told apart from
+    standby ones. Routing's own refusal (no usable route) propagates.
+    """
+    resolver = getattr(llm_service, "routes_in_use", None)
+    if not callable(resolver):
+        return None
+    routes = resolver()
+    if not isinstance(routes, list) or not all(isinstance(r, str) for r in routes):
+        return None
+    return routes
+
+
+def _disabled_routes(llm_service) -> Dict[str, str]:
+    """Routes the service disabled this session after a failure, by name.
+
+    Read from ``LLMService.disabled_routes``: routing skips these until
+    restart, so they are not routes in use, and a real call on each failed, so
+    none is standby either (#3873). Empty for a service that cannot say.
+    """
+    reader = getattr(llm_service, "disabled_routes", None)
+    if not callable(reader):
+        return {}
+    disabled = reader()
+    if not isinstance(disabled, dict):
+        return {}
+    return {
+        str(name): str(reason)
+        for name, reason in disabled.items()
+        if isinstance(name, str)
+    }
+
+
+def _provider_name(provider: Dict[str, Any]) -> str:
+    return provider.get("name", provider.get("vendor", "?"))
+
+
+def _describe_age(seconds: float) -> str:
+    if seconds < 120:
+        return f"{seconds:.0f}s"
+    if seconds < 2 * 3600:
+        return f"{seconds / 60:.0f}m"
+    if seconds < 2 * 86400:
+        return f"{seconds / 3600:.0f}h"
+    return f"{seconds / 86400:.0f}d"
+
+
+def _route_coverage(
+    llm_service,
+    providers: List[Dict[str, Any]],
+    routes: List[str],
+    reachability: Optional[List[Dict[str, Any]]],
+) -> Tuple[str, Dict[str, Any], str]:
+    """Judge the routes in use and the disabled ones; list the rest as standby.
+
+    Evidence for a route in use is, newest first: how the last real call on it
+    ended (``LLMService.route_calls``), then the startup reachability probe,
+    which covers local routes only. A route with neither is reported
+    ``unprobed``: the check never sends a completion to find out (#3873).
+    A route in use whose evidence is a failure warns, and routing that
+    selects no route at all fails.
+
+    A configured route the service disabled after a permanent auth failure is
+    not standby, although routing no longer selects it: a real call on it
+    failed, and it stays out of every turn until its key is rotated and the
+    service restarted. It is reported ``disabled``, with the recorded reason
+    and its last call, and warns. A standby route is configured, not
+    disabled and not in use: it is reported, never judged, since no turn
+    tries it until routing changes.
+
+    Returns ``(status, details, message)``.
+    """
+    from kestrel_sovereign.llm.route_calls import RouteCallLedger
+
+    probes = {
+        entry.get("name"): entry.get("status")
+        for entry in reachability or []
+        if isinstance(entry, dict)
+    }
+    ledger = getattr(llm_service, "route_calls", None)
+    if not isinstance(ledger, RouteCallLedger):
+        ledger = None
+    now = datetime.now(timezone.utc)
+
+    in_use: List[Dict[str, Any]] = []
+    notes: List[str] = []
+    status = "pass"
+    for name in routes:
+        call = ledger.latest(name) if ledger is not None else None
+        probe = probes.get(name)
+        if call is not None:
+            entry = {"name": name, **call.to_dict(now=now)}
+            age = _describe_age(entry["age_seconds"])
+            if call.answered:
+                notes.append(f"route in use {name}: last call answered {age} ago")
+            else:
+                status = worst_status(status, "warn")
+                error = call.error_type or "error"
+                if call.status_code is not None:
+                    error = f"{error}, HTTP {call.status_code}"
+                notes.append(f"last call on route in use {name} failed {age} ago ({error})")
+        elif probe in ("reachable", "unreachable"):
+            entry = {"name": name, "status": probe, "evidence": "startup_probe"}
+            if probe == "unreachable":
+                status = worst_status(status, "warn")
+                notes.append(
+                    f"route in use {name} was unreachable at startup and "
+                    "has had no call since"
+                )
+            else:
+                notes.append(f"route in use {name}: reachable at startup")
+        else:
+            entry = {"name": name, "status": "unprobed", "evidence": None}
+            notes.append(
+                f"route in use {name} unprobed: no call on it since startup, "
+                "and this check sends none"
+            )
+        in_use.append(entry)
+
+    if not routes:
+        status = worst_status(status, "fail")
+        notes.append("routing selects no route the next turn would try")
+
+    selected = set(routes)
+    disabled_reasons = _disabled_routes(llm_service)
+    disabled: List[Dict[str, Any]] = []
+    standby: List[Dict[str, Any]] = []
+    for provider in providers:
+        name = _provider_name(provider)
+        if name in selected:
+            continue
+        if name in disabled_reasons:
+            call = ledger.latest(name) if ledger is not None else None
+            disabled.append({
+                "name": name,
+                "status": "disabled",
+                "reason": disabled_reasons[name],
+                "last_call": call.to_dict(now=now) if call is not None else None,
+            })
+            status = worst_status(status, "warn")
+            notes.append(
+                f"route {name} disabled this session after a permanent auth "
+                f"failure ({disabled_reasons[name]}); routing skips it until "
+                "its key is rotated and the service restarted"
+            )
+            continue
+        standby.append({
+            "name": name,
+            "status": "standby",
+            "startup_probe": probes.get(name),
+        })
+    if standby:
+        notes.append(
+            f"{len(standby)} standby route(s) not in use, not judged"
+        )
+    return (
+        status,
+        {
+            "routes_in_use": in_use,
+            "disabled_routes": disabled,
+            "standby_routes": standby,
+        },
+        "; ".join(notes),
+    )
+
+
+async def check_llm_service(agent) -> Dict[str, Any]:
+    """Verify that an LLM provider is configured and the routes in use work.
+
+    This does NOT make an LLM call. The routes the agent's next turn would
+    try are judged on passive evidence: the last real call on each, else the
+    startup reachability probe; a route with neither is reported unprobed.
+    A route disabled this session by a permanent auth failure is reported as
+    disabled and warns. Every other configured route is reported as standby
+    and never degrades the check (#3873).
 
     Args:
         agent: KestrelAgent instance
@@ -285,8 +460,29 @@ async def check_llm_service(agent) -> Dict[str, Any]:
             details: Dict[str, Any] = {}
             if reachability:
                 details["reachability"] = reachability
-                if any(r.get("status") == "unreachable" for r in reachability):
-                    status = worst_status(status, "warn")
+            try:
+                routes = _routes_in_use(llm_service)
+            except Exception as error:
+                if is_execution_control_error(error):
+                    raise
+                status = worst_status(status, "fail")
+                details["routing_error"] = str(error)
+                msg += f" — no route can serve the next turn: {error}"
+            else:
+                if routes is None:
+                    # A service that cannot name its routes in use: every
+                    # configured route is judged, as before #3873.
+                    if reachability and any(
+                        r.get("status") == "unreachable" for r in reachability
+                    ):
+                        status = worst_status(status, "warn")
+                else:
+                    coverage, coverage_details, coverage_note = _route_coverage(
+                        llm_service, providers, routes, reachability
+                    )
+                    status = worst_status(status, coverage)
+                    details.update(coverage_details)
+                    msg += f" — {coverage_note}"
 
             # A persisted mandate that failed to apply (#3190): the operator set
             # a model and it is NOT in effect, so this agent is running on
@@ -657,6 +853,24 @@ def _enabled_scheduler_feature(agent) -> Optional[Any]:
     return None
 
 
+def _describe_disabled_schedule(schedule: Dict[str, Any]) -> str:
+    """Name one scheduler-disabled schedule and the cause stored with it.
+
+    The detail arrives already withheld by scheduler status when the agent's
+    privacy mode forbids reading it back (#3873).
+    """
+
+    task_id = str(schedule.get("task_id") or "?")
+    label = f"{schedule.get('task_name') or '?'} ({task_id[:8]}) {schedule.get('reason')}"
+    cause = schedule.get("cause")
+    if not cause:
+        return f"{label}, no cause recorded"
+    detail = schedule.get("cause_detail")
+    if detail:
+        return f"{label}: {cause}: {detail}"
+    return f"{label}: {cause}"
+
+
 async def check_scheduler_liveness(agent, db) -> Dict[str, Any]:
     """Verify that an enabled SchedulerFeature has a current worker report."""
 
@@ -778,6 +992,12 @@ async def check_scheduler_liveness(agent, db) -> Dict[str, Any]:
             f"Scheduler worker is current; {status['system_disabled_count']} "
             "schedule(s) were disabled by scheduler safety policy"
         )
+        named = [
+            _describe_disabled_schedule(schedule)
+            for schedule in status.get("system_disabled_schedules") or []
+        ]
+        if named:
+            message += ": " + "; ".join(named)
     elif state == "protocol_fenced_schedules":
         message = (
             f"Scheduler worker is current; {status['fenced_count']} "
@@ -1377,11 +1597,14 @@ async def check_model_discovery(agent) -> Dict[str, Any]:
     a WARNING line — dropping the whole fleet onto a 1B local model with no
     health signal anywhere.
 
-    ``warn`` when any vendor's discovery failed. ``fail`` when the failing
-    vendor is the one THIS agent's mandate points at, since that is the pin
-    actually at risk. Neither is critical in
+    ``warn`` when discovery failed for a vendor a route in use selects, or
+    whose route was disabled this session by a permanent auth failure.
+    ``fail`` when the failing vendor is the one THIS agent's mandate points
+    at, since that is the pin actually at risk. Neither is critical in
     :func:`derive_overall_status`, so this reports ``degraded`` rather than
-    taking the host to ``unhealthy`` for a catalog problem.
+    taking the host to ``unhealthy`` for a catalog problem. Any other vendor
+    is standby: its failure is reported, and passes (#3873). An operator may
+    keep a local or rented provider configured and idle on purpose.
 
     The outcome is read from the process-wide catalog snapshot, not from the
     service that happened to run discovery (#3197): every agent on a host reads
@@ -1444,6 +1667,42 @@ async def check_model_discovery(agent) -> Dict[str, Any]:
     vendors = sorted(failures)
     pinned_at_risk = pinned_vendor in failures if pinned_vendor else False
 
+    try:
+        routes = _routes_in_use(llm_service)
+    except Exception as error:
+        if is_execution_control_error(error):
+            raise
+        # A routing refusal is the llm_service check's to report.
+        routes = None
+    vendors_in_use: Optional[List[str]] = None
+    standby_vendors: List[str] = []
+    if routes is not None:
+        # A route disabled by a failure is not standby: its vendor is judged
+        # like a vendor in use (#3873).
+        routes = routes + [
+            name for name in _disabled_routes(llm_service) if name not in routes
+        ]
+        route_vendors = {
+            _provider_name(provider): (
+                provider.get("vendor") or _provider_name(provider).split(":", 1)[0]
+            )
+            for provider in getattr(llm_service, "providers", None) or []
+            if isinstance(provider, dict)
+        }
+        vendors_in_use = sorted({
+            route_vendors.get(name, name.split(":", 1)[0]) for name in routes
+        })
+        standby_vendors = [
+            v for v in vendors if v not in vendors_in_use and v != pinned_vendor
+        ]
+    failing = [v for v in vendors if v not in standby_vendors]
+    standby_note = (
+        f" Discovery also failed for standby vendor(s) no route in use "
+        f"selects, not judged: {', '.join(standby_vendors)}."
+        if standby_vendors
+        else ""
+    )
+
     if pinned_at_risk:
         # Say what is true: the catalog needed to VALIDATE the pin is missing.
         # Whether the pin would actually be dropped on restart depends on
@@ -1457,20 +1716,27 @@ async def check_model_discovery(agent) -> Dict[str, Any]:
             f"against a live catalog while this persists. "
             f"{failures[pinned_vendor]}"
         )
-    else:
+    elif failing:
         message = (
-            f"Model discovery failed for {len(vendors)} vendor(s): "
-            f"{', '.join(vendors)}. Pinned models for these vendors cannot be "
+            f"Model discovery failed for {len(failing)} vendor(s): "
+            f"{', '.join(failing)}. Pinned models for these vendors cannot be "
             f"validated. Check the vendor API credentials."
         )
+    else:
+        message = (
+            "Model discovery healthy for every vendor a route in use selects."
+        )
+    message += standby_note
 
     return {
         "name": "model_discovery",
-        "status": "fail" if pinned_at_risk else "warn",
+        "status": "fail" if pinned_at_risk else ("warn" if failing else "pass"),
         "message": message,
         "details": {
             "catalog_version": snapshot.catalog_version,
             "failed_vendors": {v: failures[v] for v in vendors},
+            "vendors_in_use": vendors_in_use,
+            "standby_vendors": standby_vendors,
             # The publication of this snapshot issued no request for these
             # vendors; the failure is the last one observed for each.
             "not_reattempted_vendors": [

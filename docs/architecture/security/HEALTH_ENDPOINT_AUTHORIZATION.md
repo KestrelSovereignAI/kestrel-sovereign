@@ -48,6 +48,43 @@ and bootstrap results, plus controlled multi-agent and safe-mode records. These
 details can contain operational failure messages and therefore must not be
 copied into public routes, middleware errors, or load-balancer logs.
 
+## Readiness and diagnostic status answer different questions
+
+`/health` and the HealthFeature tick (also served by `/health/detailed`) can
+disagree, and both can be right. A tick that reads `degraded` while `/health`
+returns `ok` is the expected outcome of a standing warning, not a fault in
+either surface.
+
+- `/health` asks whether the host may receive traffic. It reads only the
+  readiness latches: a startup error, mandatory-feature or identity failures,
+  constitutional Safe Mode, scheduler worker availability, and invocation
+  ownership. It never runs the per-check diagnostics.
+- The tick runs the standard checks
+  (`kestrel_sovereign/features/health/checks.py:run_standard_checks`) and
+  derives its status with `derive_overall_status`: any `warn` or non-critical
+  `fail` gives `degraded`; a `fail` of `database`, `llm_service` or
+  `scheduler_liveness` gives `unhealthy`. A warning names a condition an
+  operator should act on, such as a schedule the scheduler disabled or a
+  route in use whose last call failed, while the agent keeps serving.
+
+A tick that is `degraded` on every tick therefore names a standing condition.
+Read its warning checks rather than treating the status as noise. The checks
+only warn about what affects this agent (#3873): a provider configured but
+selected by no route in use is reported as `standby` by `llm_service` and
+`model_discovery` without degrading the tick, and a scheduler-paused schedule
+that a later registration under the same idempotency key replaced is reported
+as superseded history rather than a standing disablement.
+
+`llm_service` never sends a completion to judge a route. The routes in use
+are the ones the next turn would try: an active private inference lease the
+next call would take (`remote_gpu`, which has no cloud fallback), else the
+routes routing selects. Each is judged on how the last real call on it ended,
+including a lease refusing a call before any adapter ran; with no call since
+startup it is reported `unprobed`. A route disabled this session by a
+permanent auth failure is not standby: routing skips it until its key is
+rotated and the service restarted, so it is reported `disabled`, with the
+recorded reason and its last call, and warns.
+
 ## Regression history
 
 [Issue #137](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/137)

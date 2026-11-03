@@ -188,8 +188,8 @@ Tick boundaries are stamped from database time as well.
 A current worker with zero schedules passes. A live claim is reported as
 executing and remains configured-enabled; only an absent or expired claim lease
 is classified as protocol recovery. Scheduler-disabled rows warn with their
-reason; operator pauses and completed one-shot history do not impersonate a
-worker outage. Scheduler safety reasons remain disablements even on one-shot
+reason and stored cause; operator pauses, completed one-shot history and
+superseded pauses do not impersonate a worker outage. Scheduler safety reasons remain disablements even on one-shot
 rows and retain their explicit recovery contract. In particular, an
 `execution_log_inconsistent` one-shot cannot be replayed at its old deadline or
 have its marker cleared by `schedule_resume`; the execution log must be
@@ -243,9 +243,16 @@ two different ways, and the scheduler treats them differently (#3749):
 - **Policy block.** A hook decided DENY or ASK (the tool's permission is Deny,
   or it needs an approver and a tick has none). The execution is `blocked`,
   and the schedule pauses (`enabled = 0`, `terminal_status = 'blocked'`) so a
-  denial that recurs on every tick does not repeat forever (#2430). Status
-  reports it as a scheduler disablement with reason `blocked`; grant the
-  tool's permission, then run `schedule_resume`.
+  denial that recurs on every tick does not repeat forever (#2430). The same
+  finalize records why, in two columns, so the pause names its cause after
+  the execution's `result_text` has aged out of the log (#3873):
+  `terminal_cause` is content-free, built from the gate's decision alone
+  (`the permission gate decided deny`), and `terminal_cause_detail` is the
+  reason the hook gave. Status reports the pause as a scheduler disablement
+  with reason `blocked`, its `cause` and its `cause_detail`;
+  `scheduler_liveness` names each disabled schedule with both. Grant the
+  tool's permission, then run `schedule_resume`, which clears both with the
+  pause.
 - **Hook failure.** An enforcing hook raised or timed out (for example
   `security_guard` hitting `database is locked`), and the hook manager failed
   closed with a DENY it marks as a failure. Nothing decided anything, so the
@@ -267,6 +274,37 @@ runner wrote, a pre-claim `blocked` execution that is the schedule's newest and
 whose `executed_at` equals the row's `last_run_at`, and reports them as the
 scheduler's `blocked` pause rather than `operator_paused`. Nothing rewrites
 those rows; they stay paused until resumed.
+
+`terminal_cause` and `terminal_cause_detail` are written wherever the
+finalizer disables a row: a permission block, and a cron expression it can no
+longer compute a next run for (`invalid_cron`, whose detail is the parse
+error). The other safety disablements (`invalid_idempotency_key`,
+`execution_log_inconsistent`, `unresolved_effect`,
+`rollout_ambiguous_legacy_occurrence`) name their cause in `terminal_status`
+itself and store none. A row paused before causes were stored reports
+`cause: null`, and `scheduler_liveness` says no cause was recorded.
+
+A hook's reason is free-form and can repeat the blocked call's arguments: a
+spawn mandate's `MandateRestrictionHook` names the argument value it rejected.
+The detail is therefore held to the rule that governs `result_text`. In a
+volatile privacy mode (EPHEMERAL, ISOLATED or DEIDENTIFIED) every reader —
+`schedule_list`, scheduler status and `scheduler_liveness` — returns
+`[redacted: volatile privacy mode]` in its place, decided when it reads, so a
+detail stored under a durable mode is withheld once the agent enters a
+volatile one. The content-free cause stays visible. A status reader given no
+privacy verdict withholds the detail.
+
+A caller can re-register a paused schedule by inserting a new row under the
+same idempotency key instead of resuming the old one. The old row then never
+runs again but used to hold `scheduler_liveness` at warn forever (#3873).
+Status excludes such rows at read time rather than retiring them on
+re-registration: a permission-block pause with a newer row of the same agent
+and idempotency key is `superseded` history, counted in `superseded_count` (and
+`terminal_count`) instead of `system_disabled_count`, and named with the
+`superseded_by` row that replaced it. Nothing rewrites the old row; it keeps
+its status and cause until an operator removes it with `schedule_remove`. Other
+safety disablements stay disablements when replaced, because each names work
+an operator must still reconcile.
 
 ## Protocol-v2 rollout fence
 

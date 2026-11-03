@@ -78,6 +78,7 @@ from kestrel_sovereign.features.scheduler.constants import (
 from kestrel_sovereign.features.scheduler.outcome import (
     ScheduledTaskOutcome,
     redact_stored_result_text,
+    withhold_stored_cause_detail,
 )
 from kestrel_sovereign.features.base import Feature, tool
 from kestrel_sovereign.features.scheduler.cron import (
@@ -106,6 +107,7 @@ from kestrel_sovereign.features.scheduler.runner import (
 )
 from kestrel_sovereign.features.scheduler.status import (
     LEGACY_SCHEDULER_PAUSE_PROJECTION,
+    SUPERSEDING_SCHEDULE_PROJECTION,
 )
 from kestrel_sovereign.features.storage_access import resolve_feature_database
 from kestrel_sovereign.signals.sources.self_followup import (
@@ -2946,7 +2948,10 @@ class SchedulerFeature(Feature):
                        lease_expires_at, attempt_count, terminal_status, terminal_at,
                        scheduler_rollout_fenced, scheduler_claim_fenced,
                        {FAILURE_STREAK_PROJECTION},
-                       {LEGACY_SCHEDULER_PAUSE_PROJECTION}
+                       {LEGACY_SCHEDULER_PAUSE_PROJECTION},
+                       terminal_cause,
+                       {SUPERSEDING_SCHEDULE_PROJECTION},
+                       terminal_cause_detail
                 FROM scheduled_tasks
                 WHERE agent_id = ?
                 ORDER BY created_at ASC
@@ -2966,6 +2971,11 @@ class SchedulerFeature(Feature):
         tasks = []
         load_errors = []
         failing_count = 0
+        from kestrel_sovereign.features.storage_access import (
+            hides_persisted_user_content,
+        )
+
+        withhold_cause_detail = hides_persisted_user_content(self.agent)
         for row in rows:
             args: Dict[str, Any] = {}
             raw_args = row[3]
@@ -2990,6 +3000,19 @@ class SchedulerFeature(Feature):
             # rows that predate the streak; they have none to report.
             streak_values = row[21:21 + FAILURE_STREAK_PROJECTION_WIDTH]
             legacy_pause_index = 21 + FAILURE_STREAK_PROJECTION_WIDTH
+            terminal_cause_index = legacy_pause_index + 1
+            superseded_by_index = legacy_pause_index + 2
+            terminal_cause_detail_index = legacy_pause_index + 3
+            terminal_cause = (
+                row[terminal_cause_index]
+                if len(row) > terminal_cause_index
+                else None
+            )
+            terminal_cause_detail = (
+                row[terminal_cause_detail_index]
+                if len(row) > terminal_cause_detail_index
+                else None
+            )
             consecutive_failures, failure_marker = (
                 failure_streak_view(streak_values, agent=self.agent)
                 if len(streak_values) == FAILURE_STREAK_PROJECTION_WIDTH
@@ -3018,6 +3041,12 @@ class SchedulerFeature(Feature):
                 "lease_expires_at": row[15] if len(row) > 15 else None,
                 "attempt_count": row[16] if len(row) > 16 else 0,
                 "terminal_status": row[17] if len(row) > 17 else None,
+                "terminal_cause": terminal_cause,
+                # Free-form gate text: withheld in a volatile privacy mode,
+                # by the same rule as an execution's result_text (#3873).
+                "terminal_cause_detail": withhold_stored_cause_detail(
+                    withhold_cause_detail, terminal_cause_detail
+                ),
                 "terminal_at": row[18] if len(row) > 18 else None,
                 "disablement": self._schedule_disablement(
                     enabled=bool(row[4]),
@@ -3034,6 +3063,14 @@ class SchedulerFeature(Feature):
                         bool(row[legacy_pause_index])
                         if len(row) > legacy_pause_index
                         else False
+                    ),
+                    terminal_cause=terminal_cause,
+                    terminal_cause_detail=terminal_cause_detail,
+                    withhold_cause_detail=withhold_cause_detail,
+                    superseded_by=(
+                        row[superseded_by_index]
+                        if len(row) > superseded_by_index
+                        else None
                     ),
                 ),
                 # Repeated-failure visibility (#3280): the current streak, and
@@ -3103,6 +3140,10 @@ class SchedulerFeature(Feature):
         lease_owner: Optional[str] = None,
         lease_expires_at: Optional[str] = None,
         legacy_scheduler_pause: bool = False,
+        terminal_cause: Optional[str] = None,
+        terminal_cause_detail: Optional[str] = None,
+        withhold_cause_detail: bool = True,
+        superseded_by: Optional[str] = None,
     ) -> Dict[str, Any]:
         from kestrel_sovereign.features.scheduler.status import (
             classify_disablement,
@@ -3118,6 +3159,10 @@ class SchedulerFeature(Feature):
             lease_owner=lease_owner,
             lease_expires_at=lease_expires_at,
             legacy_scheduler_pause=legacy_scheduler_pause,
+            terminal_cause=terminal_cause,
+            terminal_cause_detail=terminal_cause_detail,
+            withhold_cause_detail=withhold_cause_detail,
+            superseded_by=superseded_by,
         )
 
     @tool(
@@ -4122,6 +4167,7 @@ class SchedulerFeature(Feature):
                     """
                     UPDATE scheduled_tasks
                     SET enabled = 1, next_run_at = ?, terminal_status = NULL,
+                        terminal_cause = NULL, terminal_cause_detail = NULL,
                         terminal_at = NULL, lease_owner = NULL, lease_expires_at = NULL,
                         claim_token = NULL, claim_execution_id = NULL,
                         claim_scheduled_for = NULL, scheduler_claim_fenced = 0,

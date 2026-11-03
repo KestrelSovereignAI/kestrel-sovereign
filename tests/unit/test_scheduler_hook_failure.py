@@ -16,6 +16,7 @@ names is a stub; no test reaches a real restart (see ``_no_real_restart``).
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import sqlite3
 from datetime import datetime, timedelta, timezone
@@ -38,7 +39,10 @@ from kestrel_sovereign.features.scheduler.failure_streak import (
     hook_failure_backoff,
 )
 from kestrel_sovereign.features.scheduler.feature import SchedulerFeature
-from kestrel_sovereign.features.scheduler.outcome import ScheduledTaskOutcome
+from kestrel_sovereign.features.scheduler.outcome import (
+    REDACTED_RESULT_TEXT,
+    ScheduledTaskOutcome,
+)
 from kestrel_sovereign.features.scheduler.runner import (
     SCHEDULER_PROTOCOL_VERSION,
     SchedulerRunner,
@@ -51,6 +55,8 @@ from kestrel_sovereign.features.security.hooks import SecurityHook
 from kestrel_sovereign.features.security.permissions import PermissionLevel
 from kestrel_sovereign.hooks import HooksManager, evaluate_blocking_decision
 from kestrel_sovereign.hooks.manager import FailedHookDenial
+from kestrel_sovereign.privacy import PrivacyConfig
+from kestrel_sovereign.spawn.mandate_hook import MandateRestrictionHook
 from kestrel_sovereign.signals import (
     OrderedLockManager,
     SignalDispatcher,
@@ -639,3 +645,261 @@ async def test_a_plain_operator_pause_is_still_an_operator_pause(harness):
 
     assert disablement["source"] == "operator"
     assert status["disabled_reasons"] == {"operator_paused": 1}
+
+
+# ---------------------------------------------------------------------------
+# A scheduler pause records its cause, and a replaced pause stops warning
+# (#3873)
+# ---------------------------------------------------------------------------
+
+
+async def _terminal_cause(h, task_id=TASK):
+    """The stored ``(terminal_cause, terminal_cause_detail)`` of a row."""
+
+    return tuple(
+        await h.db.fetchone(
+            "SELECT terminal_cause, terminal_cause_detail FROM scheduled_tasks "
+            "WHERE id = ?",
+            (task_id,),
+        )
+    )
+
+
+async def _liveness(h):
+    """Publish a current worker report, then run the health check on it."""
+
+    now = datetime.now(timezone.utc).isoformat()
+    await emit_runtime_status(
+        h.db,
+        agent_ids=(h.feature._agent_id,),
+        owner_id=h.runner._owner_id,
+        worker_state="running",
+        last_tick_started_at=now,
+        last_tick_completed_at=now,
+        restart_count=0,
+        consecutive_failures=0,
+        last_error_type=None,
+    )
+    return await health_checks.check_scheduler_liveness(h.feature.agent, h.db)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "level, hook_reason",
+    [
+        (PermissionLevel.DENY, "Blocked by policy: "),
+        # A tick has no approver, so the security hook answers ASK with a DENY.
+        (PermissionLevel.ASK, "requires operator approval"),
+    ],
+    ids=["deny", "ask"],
+)
+async def test_a_policy_pause_stores_its_cause_and_liveness_names_it(
+    harness, level, hook_reason
+):
+    h = await harness(level)
+    await h.fire()
+
+    cause, detail = await _terminal_cause(h)
+    # The cause is built from the gate's decision alone; the hook's own words
+    # are the detail.
+    assert cause == "the permission gate decided deny"
+    assert hook_reason in detail
+    status, disablement = await _status(h)
+    assert (disablement["cause"], disablement["cause_detail"]) == (cause, detail)
+    [named] = status["system_disabled_schedules"]
+    assert named["task_id"] == TASK and named["task_name"] == TASK_NAME
+    assert (named["reason"], named["cause"]) == ("blocked", cause)
+    assert named["terminal_at"] is not None
+
+    check = await _liveness(h)
+    assert check["status"] == "warn"
+    assert check["details"]["state"] == "system_disabled_schedules"
+    assert (
+        f"{TASK_NAME} ({TASK[:8]}) blocked: {cause}: {detail}" in check["message"]
+    )
+    [named] = check["details"]["system_disabled_schedules"]
+    assert named["cause_detail"] == detail
+
+    # The cause survives the execution log row it was first written to.
+    await h.db.execute("DELETE FROM task_execution_log WHERE task_id = ?", (TASK,))
+    assert (await _status(h))[1]["cause"] == cause
+
+    # Resuming clears it with the pause.
+    resumed = await h.feature.schedule_resume(TASK)
+    assert resumed.status.value == "ok"
+    assert await _terminal_cause(h) == (None, None)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("storage", ["none", "temp", "deidentified"])
+async def test_a_volatile_mode_withholds_the_gate_reason_a_pause_stored(
+    harness, storage
+):
+    """A gate's reason can repeat the call's arguments; the cause cannot.
+
+    A spawn mandate's ``MandateRestrictionHook`` names the argument value it
+    rejected. That reason is stored as the pause's detail and withheld, by
+    every reader, once the agent is in a volatile privacy mode, exactly as
+    ``schedule_history`` withholds the execution's ``result_text``. The
+    detail here was stored under a durable mode, before the switch.
+    """
+
+    secret = "private-target-7f3a"
+    h = await harness(PermissionLevel.AUTO)
+    h.feature.agent.hooks_manager.register(
+        MandateRestrictionHook(
+            (), restricted_tool_args={TASK_NAME: {"target": ["approved"]}},
+        )
+    )
+    await h.db.execute(
+        "UPDATE scheduled_tasks SET args_json = ? WHERE id = ?",
+        (json.dumps({"target": secret}), TASK),
+    )
+    await h.fire()
+
+    cause, detail = await _terminal_cause(h)
+    assert cause == "the permission gate decided deny"
+    assert secret in detail
+    assert secret in (await _liveness(h))["message"]
+
+    h.feature.agent.privacy_config = PrivacyConfig(storage=storage)
+
+    check = await _liveness(h)
+    assert check["status"] == "warn"
+    assert secret not in json.dumps(check)
+    assert (
+        f"{TASK_NAME} ({TASK[:8]}) blocked: {cause}: {REDACTED_RESULT_TEXT}"
+        in check["message"]
+    )
+    listed = (await h.feature.schedule_list()).data
+    [task] = listed["tasks"]
+    assert task["terminal_cause"] == cause
+    assert task["terminal_cause_detail"] == REDACTED_RESULT_TEXT
+    assert task["disablement"]["cause"] == cause
+    assert task["disablement"]["cause_detail"] == REDACTED_RESULT_TEXT
+    assert secret not in json.dumps(listed["scheduler_status"])
+    history = (await h.feature.schedule_history()).data
+    assert secret not in json.dumps(history)
+
+
+@pytest.mark.asyncio
+async def test_a_status_reader_without_the_privacy_verdict_withholds_it(harness):
+    """Withholding is the default: a reader that cannot tell never shows it."""
+
+    h = await harness(PermissionLevel.DENY)
+    await h.fire()
+    cause, _detail = await _terminal_cause(h)
+
+    status = await scheduler_status(
+        h.db, agent_id=h.feature._agent_id, poll_interval=30
+    )
+
+    [named] = status["system_disabled_schedules"]
+    assert (named["cause"], named["cause_detail"]) == (cause, REDACTED_RESULT_TEXT)
+
+
+def test_a_blocked_outcome_names_a_blocking_decision():
+    with pytest.raises(ValueError, match="blocking gate decision"):
+        ScheduledTaskOutcome.blocked(
+            task_name=TASK_NAME, decision="allow", reason="x"
+        )
+
+
+@pytest.mark.asyncio
+async def test_a_hook_failure_stores_no_cause_and_does_not_pause(harness):
+    """#3749's distinction stands: a failed hook decided nothing."""
+
+    h = await harness(_locked(), PermissionLevel.AUTO)
+    await h.fire()
+
+    enabled, terminal_status, _next = await h.schedule()
+    assert (enabled, terminal_status) == (1, None)
+    assert await _terminal_cause(h) == (None, None)
+    status, _disablement = await _status(h)
+    assert status["system_disabled_count"] == 0
+    assert status["system_disabled_schedules"] == []
+
+
+@pytest.mark.asyncio
+async def test_a_blocked_row_without_a_stored_cause_says_so(harness):
+    """A pause from before causes were stored is still named."""
+
+    h = await harness(PermissionLevel.DENY)
+    await h.fire()
+    await h.db.execute(
+        "UPDATE scheduled_tasks SET terminal_cause = NULL, "
+        "terminal_cause_detail = NULL WHERE id = ?",
+        (TASK,),
+    )
+
+    check = await _liveness(h)
+
+    assert f"{TASK_NAME} ({TASK[:8]}) blocked, no cause recorded" in check["message"]
+
+
+async def _reregister(h, *, idempotency_key):
+    added = await h.feature.schedule_add(
+        cron_expression="* * * * *",
+        task_name=TASK_NAME,
+        idempotency_key=idempotency_key,
+    )
+    assert added.status.value == "ok", added.error
+    return added.data["task_id"]
+
+
+@pytest.mark.asyncio
+async def test_a_blocked_row_superseded_by_a_reregistration_stops_the_warning(
+    harness,
+):
+    """Excluded at read time: the old row is history, never retired by a write.
+
+    Emma's ``workflow_trigger_cron`` was paused, and its owner registered a
+    replacement under the same idempotency key less than a second later. The
+    replacement ran fine; the old row held ``scheduler_liveness`` at warn on
+    every tick until an operator deleted it.
+    """
+
+    h = await harness(PermissionLevel.DENY)
+    await h.fire()
+    assert (await _liveness(h))["status"] == "warn"
+
+    replacement = await _reregister(h, idempotency_key="hook-failure-effect")
+
+    check = await _liveness(h)
+    assert check["status"] == "pass"
+    details = check["details"]
+    assert details["state"] not in {"system_disabled_schedules"}
+    assert details["system_disabled_count"] == 0
+    assert details["superseded_count"] == 1
+    [superseded] = details["superseded_schedules"]
+    assert superseded["task_id"] == TASK
+    assert superseded["superseded_by"] == replacement
+    assert (superseded["cause"], superseded["cause_detail"]) == (
+        await _terminal_cause(h)
+    )
+
+    # The paused row is untouched: still disabled, still blocked, its cause kept.
+    enabled, terminal_status, _next = await h.schedule()
+    assert (enabled, terminal_status) == (0, "blocked")
+    tasks = {
+        task["id"]: task for task in (await h.feature.schedule_list()).data["tasks"]
+    }
+    old = tasks[TASK]["disablement"]
+    assert (old["state"], old["superseded_by"]) == ("superseded", replacement)
+    assert replacement in old["recovery_action"]
+    assert tasks[replacement]["disablement"]["state"] == "enabled"
+
+
+@pytest.mark.asyncio
+async def test_a_schedule_under_another_key_does_not_supersede_a_blocked_row(
+    harness,
+):
+    h = await harness(PermissionLevel.DENY)
+    await h.fire()
+
+    await _reregister(h, idempotency_key="some-other-effect")
+
+    check = await _liveness(h)
+    assert check["status"] == "warn"
+    assert check["details"]["system_disabled_count"] == 1
+    assert check["details"]["superseded_count"] == 0

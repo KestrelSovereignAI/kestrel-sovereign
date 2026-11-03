@@ -5,7 +5,10 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
-from kestrel_sovereign.features.scheduler.constants import HOOK_FAILED_STATUS
+from kestrel_sovereign.features.scheduler.constants import (
+    HOOK_FAILED_STATUS,
+    TERMINAL_CAUSE_MAX_CHARS,
+)
 from kestrel_sovereign.features.storage_access import (
     hides_persisted_user_content,
 )
@@ -15,6 +18,12 @@ REDACTED_RESULT_TEXT = "[redacted: volatile privacy mode]"
 
 #: A permission gate's decision (DENY or ASK) blocked the tool.
 BLOCKED_STATUS = "blocked"
+
+#: The gate decisions that block a scheduled tool: the
+#: ``PermissionDecision`` values a :class:`ScheduledTaskOutcome.blocked`
+#: outcome may name. Its stored cause is built from these alone, so the cause
+#: is content-free whatever the hook's reason says (#3873).
+BLOCKING_GATE_DECISIONS = frozenset({"deny", "ask"})
 
 #: Outcomes the signal-handler boundary returns to the runner rather than
 #: raising: each is an expected state of the permission gate, and the runner
@@ -51,6 +60,25 @@ def redact_stored_result_text(agent: Any, result_text: Any) -> Any:
     return REDACTED_RESULT_TEXT
 
 
+def withhold_stored_cause_detail(withhold: bool, detail: Any) -> Any:
+    """Withhold a stored ``scheduled_tasks.terminal_cause_detail`` (#3873).
+
+    The detail is the free-form reason a gate gave when it blocked a scheduled
+    tool, and a gate's reason can repeat the call's arguments: a spawn
+    mandate's ``MandateRestrictionHook`` names the rejected argument value. It
+    is therefore held to the same rule as ``result_text``
+    (:func:`redact_stored_result_text`), decided by the reader at read time so
+    a detail stored under a durable mode is withheld once the agent enters a
+    volatile one. ``withhold`` is that rule's verdict,
+    ``hides_persisted_user_content(agent)``, computed by a reader that has the
+    agent; status readers that do not, receive it as a parameter. The
+    content-free ``terminal_cause`` beside it is never withheld.
+    """
+    if not detail or not withhold:
+        return detail
+    return REDACTED_RESULT_TEXT
+
+
 @dataclass(frozen=True)
 class ScheduledTaskOutcome:
     """A non-success task outcome that the runner must handle explicitly.
@@ -75,12 +103,24 @@ class ScheduledTaskOutcome:
     # free-form prose; the raise site bounds it by membership in that
     # declaration and drops — and logs — anything else.
     reason_code: str = ""
+    # Why a pausing outcome paused the schedule, in two parts the runner
+    # stores on the schedule row beside ``terminal_status`` (#3873), so the
+    # pause still names its cause once the execution's ``result_text`` has
+    # aged out of the log. ``pause_cause`` is content-free, built only from
+    # controlled values (the gate's decision), and every reader shows it.
+    # ``pause_cause_detail`` is the reason the gate gave: free-form hook text
+    # that can repeat the call's arguments, so readers withhold it in a
+    # volatile privacy mode exactly as they withhold ``result_text``.
+    pause_cause: str = ""
+    pause_cause_detail: str = ""
 
     def __post_init__(self) -> None:
         if self.pause_schedule and self.status != BLOCKED_STATUS:
             raise ValueError(
                 "pause_schedule=True is only valid for blocked scheduled outcomes"
             )
+        if self.pause_schedule and not self.pause_cause.strip():
+            raise ValueError("a pausing scheduled outcome must record its cause")
 
     @classmethod
     def blocked(
@@ -90,6 +130,11 @@ class ScheduledTaskOutcome:
         decision: str,
         reason: str,
     ) -> "ScheduledTaskOutcome":
+        if decision not in BLOCKING_GATE_DECISIONS:
+            raise ValueError(
+                f"a blocked scheduled outcome needs a blocking gate decision "
+                f"({', '.join(sorted(BLOCKING_GATE_DECISIONS))}), not {decision!r}"
+            )
         detail = reason.strip() or "operator approval is required"
         return cls(
             status=BLOCKED_STATUS,
@@ -99,6 +144,8 @@ class ScheduledTaskOutcome:
                 "resume the schedule."
             ),
             pause_schedule=True,
+            pause_cause=f"the permission gate decided {decision}",
+            pause_cause_detail=detail[:TERMINAL_CAUSE_MAX_CHARS],
         )
 
     @classmethod
