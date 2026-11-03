@@ -104,6 +104,9 @@ from kestrel_sovereign.features.scheduler.runner import (
     scheduler_database_now_sql,
     validate_schedule_idempotency_base,
 )
+from kestrel_sovereign.features.scheduler.status import (
+    LEGACY_SCHEDULER_PAUSE_PROJECTION,
+)
 from kestrel_sovereign.features.storage_access import resolve_feature_database
 from kestrel_sovereign.signals.sources.self_followup import (
     TASK_NAME as SELF_FOLLOWUP_TASK_NAME,
@@ -1275,7 +1278,9 @@ class SchedulerFeature(Feature):
         gate applies on every tick: a DENY or ASK decision becomes a
         structured blocked outcome (so the runner records the reason and
         pauses the schedule), and a MODIFY hook's redacted args are the ones
-        actually passed to the tool.
+        actually passed to the tool. A DENY the hook manager produced because
+        an enforcing hook failed is not a decision: it becomes a non-pausing
+        ``hook_failed`` outcome instead (#3749).
         """
         hooks_manager = getattr(self.agent, "hooks_manager", None)
         effective_args = args
@@ -1311,6 +1316,24 @@ class SchedulerFeature(Feature):
             # raising also keeps this expected policy state out of the signal
             # dispatcher's ERROR/traceback path (#2430).
             blocked = evaluate_blocking_decision(pre_output)
+            if blocked is not None and blocked.failed_hook is not None:
+                # The DENY is the hook manager failing closed because an
+                # enforcing hook raised or timed out ("database is locked"),
+                # not a policy decision. Fail closed for this tick only:
+                # pausing on it left restart_coordinator off for days on every
+                # agent the lock touched (#3749). The runner keeps the row
+                # enabled, backs off the next attempt, and reports the task
+                # through its failure marker once the failures repeat.
+                logger.warning(
+                    "Scheduler: tool %r not run on this tick because enforcing "
+                    "hook %r failed; the schedule stays enabled and retries "
+                    "on a later tick (%s)",
+                    agent_tool.name, blocked.failed_hook, blocked.reason,
+                )
+                return ScheduledTaskOutcome.hook_failed(
+                    task_name=agent_tool.name,
+                    reason=blocked.reason,
+                )
             if blocked is not None:
                 logger.warning(
                     "Scheduler: tool %r blocked (%s) on tick: %s",
@@ -2922,7 +2945,8 @@ class SchedulerFeature(Feature):
                        misfire_grace_seconds, idempotency_key, lease_owner,
                        lease_expires_at, attempt_count, terminal_status, terminal_at,
                        scheduler_rollout_fenced, scheduler_claim_fenced,
-                       {FAILURE_STREAK_PROJECTION}
+                       {FAILURE_STREAK_PROJECTION},
+                       {LEGACY_SCHEDULER_PAUSE_PROJECTION}
                 FROM scheduled_tasks
                 WHERE agent_id = ?
                 ORDER BY created_at ASC
@@ -2965,6 +2989,7 @@ class SchedulerFeature(Feature):
             # Rows shorter than the full projection are legacy test/upgrade
             # rows that predate the streak; they have none to report.
             streak_values = row[21:21 + FAILURE_STREAK_PROJECTION_WIDTH]
+            legacy_pause_index = 21 + FAILURE_STREAK_PROJECTION_WIDTH
             consecutive_failures, failure_marker = (
                 failure_streak_view(streak_values, agent=self.agent)
                 if len(streak_values) == FAILURE_STREAK_PROJECTION_WIDTH
@@ -3005,6 +3030,11 @@ class SchedulerFeature(Feature):
                     claim_fenced=bool(row[20]) if len(row) > 20 else False,
                     lease_owner=row[14] if len(row) > 14 else None,
                     lease_expires_at=row[15] if len(row) > 15 else None,
+                    legacy_scheduler_pause=(
+                        bool(row[legacy_pause_index])
+                        if len(row) > legacy_pause_index
+                        else False
+                    ),
                 ),
                 # Repeated-failure visibility (#3280): the current streak, and
                 # the marker the runner records once it reaches the threshold.
@@ -3072,6 +3102,7 @@ class SchedulerFeature(Feature):
         rollout_fenced: bool, claim_fenced: bool,
         lease_owner: Optional[str] = None,
         lease_expires_at: Optional[str] = None,
+        legacy_scheduler_pause: bool = False,
     ) -> Dict[str, Any]:
         from kestrel_sovereign.features.scheduler.status import (
             classify_disablement,
@@ -3086,6 +3117,7 @@ class SchedulerFeature(Feature):
             claim_fenced=claim_fenced,
             lease_owner=lease_owner,
             lease_expires_at=lease_expires_at,
+            legacy_scheduler_pause=legacy_scheduler_pause,
         )
 
     @tool(

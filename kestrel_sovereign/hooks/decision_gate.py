@@ -23,6 +23,8 @@ from typing import Any, Optional
 
 from kestrel_sdk.hooks.base import PermissionDecision
 
+from kestrel_sovereign.hooks.manager import FailedHookDenial
+
 __all__ = ["BlockedDecision", "evaluate_blocking_decision"]
 
 
@@ -38,6 +40,10 @@ class BlockedDecision:
 
     decision: PermissionDecision
     reason: str
+    #: The enforcing hook whose failure (a raise or a timeout) produced this
+    #: DENY, or ``None`` when a hook decided it. A failed hook decided
+    #: nothing: the manager failed closed on its behalf (#3749).
+    failed_hook: Optional[str] = None
 
     @property
     def is_ask(self) -> bool:
@@ -74,6 +80,9 @@ def evaluate_blocking_decision(
       (the call is queued for approval; it must NOT run now).
     - ``continue_execution is False`` with no explicit DENY/ASK → treated
       as a DENY-equivalent stop.
+
+    A DENY the hook manager produced because an enforcing hook failed is
+    still blocking, and carries the hook's name in ``failed_hook``.
     """
     if hook_output is None:
         return None
@@ -83,7 +92,13 @@ def evaluate_blocking_decision(
 
     if decision == PermissionDecision.DENY:
         return BlockedDecision(
-            PermissionDecision.DENY, reason_attr or deny_reason_default
+            PermissionDecision.DENY,
+            reason_attr or deny_reason_default,
+            failed_hook=(
+                hook_output.failed_hook
+                if isinstance(hook_output, FailedHookDenial)
+                else None
+            ),
         )
     if decision == PermissionDecision.ASK:
         return BlockedDecision(
