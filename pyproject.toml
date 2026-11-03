@@ -300,7 +300,11 @@ ml = [
 # Local LLM support (adds ~2GB+ for torch, sentence-transformers)
 local = [
     "ollama>=0.6.1",
-    "sentence-transformers==5.5.1",
+    # Core never imports sentence-transformers (local embeddings go through
+    # Ollama), but this extra installs it into the host venv. Before 6.0 it
+    # imports a local model directory's custom modules even with
+    # trust_remote_code=False (GHSA-jhr6-gm9c-rqjv); 5.6 and 5.7 only warn.
+    "sentence-transformers>=6.0.0,<7",
     "spacy>=3.7.0",
     "setuptools>=83.0.0",
     "numpy==2.4.6",
