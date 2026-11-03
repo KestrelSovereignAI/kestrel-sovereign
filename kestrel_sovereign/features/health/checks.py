@@ -657,6 +657,26 @@ def _enabled_scheduler_feature(agent) -> Optional[Any]:
     return None
 
 
+def _describe_disabled_schedule(schedule: Dict[str, Any]) -> str:
+    """Name one scheduler-disabled schedule and the cause stored with it.
+
+    The cause is structured (the deciding hook, its decision and the tool),
+    never the hook's own reason, so this message carries nothing the call or
+    the hook wrote (#3873).
+    """
+
+    from kestrel_sovereign.features.scheduler.outcome import PauseCause
+
+    task_id = str(schedule.get("task_id") or "?")
+    label = f"{schedule.get('task_name') or '?'} ({task_id[:8]}) {schedule.get('reason')}"
+    cause = schedule.get("cause")
+    if schedule.get("reason") != "blocked":
+        return label
+    if not cause:
+        return f"{label}, no cause recorded"
+    return f"{label}: {PauseCause.of(**cause).describe()}"
+
+
 async def check_scheduler_liveness(agent, db) -> Dict[str, Any]:
     """Verify that an enabled SchedulerFeature has a current worker report."""
 
@@ -778,6 +798,12 @@ async def check_scheduler_liveness(agent, db) -> Dict[str, Any]:
             f"Scheduler worker is current; {status['system_disabled_count']} "
             "schedule(s) were disabled by scheduler safety policy"
         )
+        named = [
+            _describe_disabled_schedule(schedule)
+            for schedule in status.get("system_disabled_schedules") or []
+        ]
+        if named:
+            message += ": " + "; ".join(named)
     elif state == "protocol_fenced_schedules":
         message = (
             f"Scheduler worker is current; {status['fenced_count']} "

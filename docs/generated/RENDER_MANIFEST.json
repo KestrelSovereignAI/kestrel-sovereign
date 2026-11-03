@@ -1282,7 +1282,9 @@
       "type": "Architecture Spec"
     },
     {
-      "existing_code_refs": [],
+      "existing_code_refs": [
+        "kestrel_sovereign/features/health/checks.py"
+      ],
       "findings": [],
       "missing_code_refs": [],
       "missing_links": [],

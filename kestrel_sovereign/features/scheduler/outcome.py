@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Dict, Optional, Sequence
 
 from kestrel_sovereign.features.scheduler.constants import HOOK_FAILED_STATUS
 from kestrel_sovereign.features.storage_access import (
@@ -20,6 +21,108 @@ BLOCKED_STATUS = "blocked"
 #: raising: each is an expected state of the permission gate, and the runner
 #: needs its structure (the pause instruction, or the hook-failure backoff).
 GATE_OUTCOME_STATUSES = frozenset({BLOCKED_STATUS, HOOK_FAILED_STATUS})
+
+#: The permission decisions that block a scheduled tool, as
+#: ``PermissionDecision`` values: the decision a :class:`PauseCause` records.
+BLOCKING_DECISIONS = frozenset({"deny", "ask"})
+
+#: Additive ``scheduled_tasks`` columns holding a pause's :class:`PauseCause`,
+#: in its field order. Written with ``terminal_status`` by the finalizer and
+#: cleared by ``schedule_resume`` (#3873).
+PAUSE_CAUSE_COLUMNS = {
+    "terminal_cause_hook": "TEXT",
+    "terminal_cause_decision": "TEXT",
+    "terminal_cause_tool": "TEXT",
+}
+
+#: Projection appended to a ``... FROM scheduled_tasks`` read, decoded by
+#: :meth:`PauseCause.from_row`.
+PAUSE_CAUSE_PROJECTION = ", ".join(PAUSE_CAUSE_COLUMNS)
+
+#: Number of values :data:`PAUSE_CAUSE_PROJECTION` yields.
+PAUSE_CAUSE_PROJECTION_WIDTH = len(PAUSE_CAUSE_COLUMNS)
+
+#: What a hook or tool name must look like to be recorded: a name set in code.
+_IDENTIFIER = re.compile(r"[A-Za-z0-9_.:-]{1,128}")
+
+
+def _identifier(value: Any) -> Optional[str]:
+    return value if isinstance(value, str) and _IDENTIFIER.fullmatch(value) else None
+
+
+@dataclass(frozen=True)
+class PauseCause:
+    """Why a permission gate paused a schedule, as structured fields (#3873).
+
+    The hook whose decision paused it, that decision (``deny`` or ``ask``),
+    and the tool it gated: identifiers set in code, never text. The reason the
+    hook gave is deliberately not part of it. A hook's reason is free-form and
+    can repeat the call's arguments (a spawn mandate's hook names the argument
+    value it rejected), so nothing the scheduler stores, logs or surfaces
+    carries it, the blocked outcome's ``result_text`` included. This cause
+    needs no privacy withholding, because nothing in it came from the call. A
+    name that is not a plain identifier is recorded as unknown (``None``)
+    rather than kept as text.
+    """
+
+    hook: Optional[str]
+    decision: str
+    tool: Optional[str]
+
+    def __post_init__(self) -> None:
+        if self.decision not in BLOCKING_DECISIONS:
+            raise ValueError(
+                "a pause cause needs a blocking decision "
+                f"({', '.join(sorted(BLOCKING_DECISIONS))}), not {self.decision!r}"
+            )
+        for field_name in ("hook", "tool"):
+            value = getattr(self, field_name)
+            if value is not None and _identifier(value) is None:
+                raise ValueError(
+                    f"a pause cause's {field_name} must be an identifier or None"
+                )
+
+    @classmethod
+    def of(
+        cls, *, hook: Any, decision: str, tool: Any
+    ) -> "PauseCause":
+        """Build a cause, recording a name that is not an identifier as unknown."""
+
+        return cls(hook=_identifier(hook), decision=decision, tool=_identifier(tool))
+
+    @classmethod
+    def from_row(cls, values: Optional[Sequence[Any]]) -> Optional["PauseCause"]:
+        """Decode :data:`PAUSE_CAUSE_PROJECTION`; ``None`` when none is stored.
+
+        A row whose stored decision is not a blocking one names no cause.
+        """
+
+        if values is None or len(values) != PAUSE_CAUSE_PROJECTION_WIDTH:
+            return None
+        hook, decision, tool = values
+        if decision not in BLOCKING_DECISIONS:
+            return None
+        return cls.of(hook=hook, decision=decision, tool=tool)
+
+    def as_params(self) -> tuple[Any, ...]:
+        """Values for the :data:`PAUSE_CAUSE_COLUMNS` in declaration order."""
+
+        return (self.hook, self.decision, self.tool)
+
+    def as_dict(self) -> Dict[str, Optional[str]]:
+        return {"hook": self.hook, "decision": self.decision, "tool": self.tool}
+
+    def describe(self) -> str:
+        """The cause as every surface words it, from its fields alone."""
+
+        return (
+            f"hook {self.hook or 'unknown'} decided {self.decision} "
+            f"for tool {self.tool or 'unknown'}"
+        )
+
+
+#: :data:`PAUSE_CAUSE_COLUMNS` values for a row the finalizer did not pause.
+NO_PAUSE_CAUSE_PARAMS: tuple[Any, ...] = (None,) * PAUSE_CAUSE_PROJECTION_WIDTH
 
 
 def redact_stored_result_text(agent: Any, result_text: Any) -> Any:
@@ -75,12 +178,19 @@ class ScheduledTaskOutcome:
     # free-form prose; the raise site bounds it by membership in that
     # declaration and drops — and logs — anything else.
     reason_code: str = ""
+    # Why a pausing outcome paused, which the runner stores on the schedule
+    # row beside ``terminal_status`` so status can name it after the
+    # execution's ``result_text`` has aged out of the log (#3873). Structured
+    # fields only; a blocked ``result_text`` is worded from them too.
+    pause_cause: Optional[PauseCause] = None
 
     def __post_init__(self) -> None:
         if self.pause_schedule and self.status != BLOCKED_STATUS:
             raise ValueError(
                 "pause_schedule=True is only valid for blocked scheduled outcomes"
             )
+        if self.pause_schedule and self.pause_cause is None:
+            raise ValueError("a pausing scheduled outcome must record its cause")
 
     @classmethod
     def blocked(
@@ -88,17 +198,26 @@ class ScheduledTaskOutcome:
         *,
         task_name: str,
         decision: str,
-        reason: str,
+        hook: Optional[str] = None,
     ) -> "ScheduledTaskOutcome":
-        detail = reason.strip() or "operator approval is required"
+        """A permission gate's DENY or ASK blocked ``task_name``; pause it.
+
+        ``hook`` names the hook that decided, when the gate says. The outcome
+        takes no reason: a hook's reason is free-form and can repeat the
+        call's arguments, and ``result_text`` is persisted in
+        ``task_execution_log``. So the text is worded from the
+        :class:`PauseCause` alone, as every other surface words it (#3873).
+        """
+        cause = PauseCause.of(hook=hook, decision=decision, tool=task_name)
         return cls(
             status=BLOCKED_STATUS,
             result_text=(
-                f"blocked: {task_name} was denied by the {decision} permission "
-                f"gate: {detail}. Set this tool's permission to Auto, then "
-                "resume the schedule."
+                f"blocked: the permission gate stopped this tick "
+                f"({cause.describe()}). Set this tool's permission to Auto, "
+                "then resume the schedule."
             ),
             pause_schedule=True,
+            pause_cause=cause,
         )
 
     @classmethod
