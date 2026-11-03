@@ -93,6 +93,7 @@ from .ledger_index import (
     search_rows,
 )
 from .morning_signal import generate_morning_signal
+from .recent_decisions import RecentDecisions, decisions_since
 from .run_history import (
     SEND_TASK_TOOL,
     TALON_WAIT_KIND,
@@ -382,6 +383,10 @@ class StrategicMemoryFeature(Feature):
         # What each settled dispatch to the executor said, by dispatch id: it
         # cannot change, so it is read from the executor once (#3838).
         self._settled_work_orders: Dict[str, SettledDispatch] = {}
+        # The decision entries of the STRATEGY.yaml bytes last read for a
+        # turn, keyed by their digest: the file is read at every turn start,
+        # and parsed again only when its bytes changed (#3900).
+        self._turn_decisions: Optional[Tuple[str, List[Dict[str, Any]]]] = None
 
     @property
     def tool_description(self) -> str:
@@ -857,6 +862,39 @@ class StrategicMemoryFeature(Feature):
         if report.get("failed") or report.get("skipped_reason"):
             logger.info("decision index: %s", report)
         return report
+
+    async def recent_decisions(self, earliest: date) -> RecentDecisions:
+        """Decisions dated ``earliest`` or later, read from STRATEGY.yaml now.
+
+        For the always-on operational block, which calls this at the start of
+        every turn (#3900). It reads the file on disk rather than this
+        feature's copy or the bootstrap loader's: those were read at start, so
+        a decision recorded since -- in another session, or by hand -- would be
+        missing from them. Not a tool, so the block can render plain values.
+        Never raises: a file that cannot be read is reported in ``error``.
+        """
+        path = self._strategy_path
+        if path is None:
+            return RecentDecisions()
+        if not HAS_YAML:
+            return RecentDecisions(error="PyYAML is not installed")
+        try:
+            raw = await asyncio.to_thread(_read_strategy_bytes, path)
+        except OSError as e:
+            return RecentDecisions(error=f"{path.name} could not be read: {e}")
+        if raw is None:
+            return RecentDecisions()
+        digest = _strategy_digest(raw)
+        if self._turn_decisions is not None and self._turn_decisions[0] == digest:
+            entries = self._turn_decisions[1]
+        else:
+            try:
+                data = await asyncio.to_thread(_parse_strategy, raw, path)
+            except _StrategyFileConflict as e:
+                return RecentDecisions(error=str(e))
+            entries = decision_entries(data)
+            self._turn_decisions = (digest, entries)
+        return RecentDecisions(decisions=decisions_since(entries, earliest))
 
     def _save(self) -> _SaveOutcome:
         """Persist strategic memory back to STRATEGY.yaml.

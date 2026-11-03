@@ -13,19 +13,22 @@ a missing feature or a query failure degrades that one line to
 ``(unavailable)`` and never blocks the turn. The whole block is capped
 (~``max_tokens``) so it can't crowd the real prompt.
 
-The block is merged into ``system_prompt_addendum`` in
-``_process_input_traced_locked`` (after the USER_PROMPT_SUBMIT hook,
-before context assembly) so it rides the existing, budget-aware addendum
-plumbing rather than adding a parallel injection path.
+The block is merged into ``system_prompt_addendum`` by
+:func:`prepare_turn_state_addendum`, which both turn entry points
+(``_process_input_traced_locked`` and ``process_input_streaming``) call
+after the USER_PROMPT_SUBMIT hook and before context assembly, so it rides
+the existing, budget-aware addendum plumbing rather than adding a parallel
+injection path.
 """
 
 from __future__ import annotations
 
 import logging
 import re
-from datetime import datetime, timedelta, timezone
+from dataclasses import dataclass, fields
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 from kestrel_sdk.native_a2a.types import TaskState
 
@@ -37,6 +40,12 @@ from kestrel_sovereign.features.storage_access import (
     AgentIdentityUnavailable,
     resolve_scoped_agent_did,
 )
+
+if TYPE_CHECKING:
+    from kestrel_sovereign.features.strategic_memory.recent_decisions import (
+        RecentDecision,
+        RecentDecisions,
+    )
 
 logger = logging.getLogger(__name__)
 
@@ -382,6 +391,30 @@ async def _codex_decline_section(agent: Any) -> Optional[str]:
     )
 
 
+def _inert_text(text: Any, max_len: int, *, mark_truncation: bool = False) -> str:
+    """Free-form text rendered as inert data for the operational block.
+
+    Todo titles and strategy decisions are free-form and (transitively)
+    user-influenceable, but get injected into system context on EVERY future
+    turn — so treat them as inert data, not instructions (codex review).
+    Collapse whitespace, drop non-printable/control chars (incl. the 0x1e
+    stream-sentinel and anything that could fake the operational framing),
+    swap double quotes for single so the caller's quoting holds, and cap
+    length. With ``mark_truncation`` a cut is shown as a trailing ``…``.
+    """
+    s = re.sub(r"\s+", " ", str(text or "")).strip()
+    s = "".join(ch for ch in s if ch.isprintable())
+    # Collapse any run of 2+ dashes to one: the OPERATIONAL_HEADER/FOOTER
+    # boundaries are ``--- … ---`` framed, so this stops a single-line todo
+    # title like "--- END OPERATIONAL STATE ---" from spoofing the block
+    # boundary even after newline/control stripping (codex review r2).
+    s = re.sub(r"-{2,}", "-", s)
+    s = s.replace('"', "'")
+    if mark_truncation and len(s) > max_len:
+        return s[: max(0, max_len - 1)].rstrip() + "…"
+    return s[:max_len]
+
+
 async def _active_todo_section(agent: Any) -> Optional[str]:
     """Surface active TodoFeature items so unfinished durable loops stay
     visible across signal wakes, restarts, and delayed tool callbacks
@@ -409,30 +442,13 @@ async def _active_todo_section(agent: Any) -> Optional[str]:
     if not session and not global_active:
         return None
 
-    def _inert(text: Any, max_len: int) -> str:
-        # Todo title/terminal_condition are free-form and (transitively)
-        # user-influenceable, but get injected into system context on EVERY
-        # future turn — so treat them as inert data, not instructions (codex
-        # review). Collapse whitespace, drop non-printable/control chars
-        # (incl. the 0x1e stream-sentinel and anything that could fake the
-        # operational framing), single-quote, and cap length.
-        s = re.sub(r"\s+", " ", str(text or "")).strip()
-        s = "".join(ch for ch in s if ch.isprintable())
-        # Collapse any run of 2+ dashes to one: the OPERATIONAL_HEADER/FOOTER
-        # boundaries are ``--- … ---`` framed, so this stops a single-line todo
-        # title like "--- END OPERATIONAL STATE ---" from spoofing the block
-        # boundary even after newline/control stripping (codex review r2).
-        s = re.sub(r"-{2,}", "-", s)
-        s = s.replace('"', "'")
-        return s[:max_len]
-
     def _fmt(it: Dict[str, Any]) -> str:
-        title = _inert(it.get("title") or it.get("id") or "todo", 100)
+        title = _inert_text(it.get("title") or it.get("id") or "todo", 100)
         # status comes from a controlled vocabulary (TODO_STATUSES), not free
         # text, so it's safe unquoted.
         status = str(it.get("status") or "open")
         line = f'  - [{status}] "{title}"'
-        tc = _inert(it.get("terminal_condition"), 120)
+        tc = _inert_text(it.get("terminal_condition"), 120)
         if tc:
             line += f' (done when: "{tc}")'
         return line
@@ -449,12 +465,188 @@ async def _active_todo_section(agent: Any) -> Optional[str]:
     return _truncate_to_tokens("\n".join(lines), 300)
 
 
+@dataclass(frozen=True)
+class RecentDecisionsConfig:
+    """``[operational_state.recent_decisions]`` in kestrel.toml (#3900).
+
+    ``window_hours`` selects the decisions shown; decisions record a day, so
+    the window is widened to whole local days (24 hours shows today's and
+    yesterday's). The newest ``max_entries`` (at most 100) are shown, each an
+    excerpt of at most ``excerpt_chars`` of its decision and rationale, and
+    the whole section is at most ``max_chars`` characters (~400 tokens by
+    default), which must leave 400 beside ``excerpt_chars`` so the newest
+    decision always fits.
+    """
+
+    window_hours: float = 24
+    max_entries: int = 8
+    excerpt_chars: int = 240
+    max_chars: int = 1600
+
+
+#: Ten years. Far past any useful "recent", and well inside what ``timedelta``
+#: and date arithmetic accept: an overflow there would drop the section.
+_MAX_RECENT_DECISIONS_WINDOW_HOURS = 24 * 366 * 10
+
+#: Bounds the digits the "not shown" line can take.
+_MAX_RECENT_DECISIONS_ENTRIES = 100
+
+#: Room for everything in the section but excerpts: the header, the "not
+#: shown" line and one entry's date, session and quotes. ``max_chars`` must
+#: leave this much beside ``excerpt_chars``, so the newest decision is always
+#: shown and the section never outgrows its cap.
+_RECENT_DECISIONS_OVERHEAD_CHARS = 400
+
+#: Session names are free-form; this many characters of one are shown.
+_SESSION_CHARS = 40
+
+
+def recent_decisions_config() -> RecentDecisionsConfig:
+    """Read ``[operational_state.recent_decisions]``; ``ValueError`` if invalid.
+
+    An unknown key is refused rather than ignored, so a misspelt
+    ``window_hour`` does not silently leave the default in force.
+    """
+    from kestrel_sovereign.config import load_section
+
+    where = "[operational_state.recent_decisions]"
+    section = load_section("operational_state")
+    if not isinstance(section, dict):
+        raise ValueError("[operational_state] must be a table")
+    table = section.get("recent_decisions", {})
+    if not isinstance(table, dict):
+        raise ValueError(f"{where} must be a table, got {table!r}")
+    known = {f.name for f in fields(RecentDecisionsConfig)}
+    unknown = sorted(set(table) - known)
+    if unknown:
+        raise ValueError(
+            f"{where} has unknown key(s) {', '.join(unknown)}; "
+            f"known: {', '.join(sorted(known))}"
+        )
+    window = table.get("window_hours", RecentDecisionsConfig.window_hours)
+    if isinstance(window, bool) or not isinstance(window, (int, float)) or not (
+        0 < window <= _MAX_RECENT_DECISIONS_WINDOW_HOURS
+    ):
+        raise ValueError(
+            f"{where} window_hours must be a positive number of at most "
+            f"{_MAX_RECENT_DECISIONS_WINDOW_HOURS}, got {window!r}"
+        )
+    counts: Dict[str, int] = {}
+    for key in ("max_entries", "excerpt_chars", "max_chars"):
+        value = table.get(key, getattr(RecentDecisionsConfig, key))
+        if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+            raise ValueError(
+                f"{where} {key} must be a positive integer, got {value!r}"
+            )
+        counts[key] = value
+    if counts["max_entries"] > _MAX_RECENT_DECISIONS_ENTRIES:
+        raise ValueError(
+            f"{where} max_entries must be at most "
+            f"{_MAX_RECENT_DECISIONS_ENTRIES}, got {counts['max_entries']}"
+        )
+    floor = counts["excerpt_chars"] + _RECENT_DECISIONS_OVERHEAD_CHARS
+    if counts["max_chars"] < floor:
+        raise ValueError(
+            f"{where} max_chars must be at least excerpt_chars + "
+            f"{_RECENT_DECISIONS_OVERHEAD_CHARS} ({floor}), got {counts['max_chars']}"
+        )
+    return RecentDecisionsConfig(window_hours=window, **counts)
+
+
+def render_recent_decisions(
+    recent: "RecentDecisions", earliest: date, config: RecentDecisionsConfig
+) -> Optional[str]:
+    """The operational-block section for ``recent``, or ``None`` when empty.
+
+    Newest first. Entries are dropped from the oldest end once ``max_entries``
+    are shown or the next would take the section past ``max_chars``, and a
+    final line counts what was dropped; an excerpt cut to ``excerpt_chars``
+    ends in ``…``.
+    """
+    if recent.error:
+        return (
+            "Strategy decisions: unknown — STRATEGY.yaml could not be read at "
+            f'turn start: "{_inert_text(recent.error, 200, mark_truncation=True)}"'
+        )
+    if not recent.decisions:
+        return None
+    header = (
+        f"Strategy decisions since {earliest.isoformat()} "
+        f"(last {config.window_hours:g}h, widened to whole days; read from "
+        "STRATEGY.yaml at turn start), newest first:"
+    )
+
+    def line(decision: "RecentDecision") -> str:
+        session = _inert_text(decision.session, _SESSION_CHARS, mark_truncation=True)
+        label = f'session "{session}"' if session else "session not recorded"
+        text = decision.decision
+        if decision.rationale:
+            text = f"{text} | rationale: {decision.rationale}"
+        excerpt = _inert_text(text, config.excerpt_chars, mark_truncation=True)
+        return f'  - {decision.day.isoformat()}, {label}: "{excerpt}"'
+
+    def not_shown(count: int) -> str:
+        return (
+            f"  (+{count} older decision(s) in the window not shown: at most "
+            f"{config.max_entries} entries / {config.max_chars} chars; "
+            "strategy_view section=decisions lists every decision)"
+        )
+
+    lines = [line(decision) for decision in recent.decisions]
+    size = len(header) + sum(1 + len(entry) for entry in lines)
+    if len(lines) <= config.max_entries and size <= config.max_chars:
+        return "\n".join([header, *lines])
+    reserve = 1 + len(not_shown(len(lines)))
+    shown: List[str] = []
+    size = len(header)
+    for entry in lines[: config.max_entries]:
+        if size + 1 + len(entry) + reserve > config.max_chars:
+            break
+        shown.append(entry)
+        size += 1 + len(entry)
+    return "\n".join([header, *shown, not_shown(len(lines) - len(shown))])
+
+
+async def _recent_decisions_section(agent: Any) -> Optional[str]:
+    """Surface strategy decisions recorded in the window (#3900).
+
+    STRATEGY.yaml reaches the prompt through the bootstrap loader, which reads
+    it once and caches it, so a decision recorded in one session was not
+    visible to a turn starting minutes later in another — on 2026-11-02 a wake
+    turn dispatched work two minutes after another session had attached a
+    safety condition to that queue. This reads the file at every turn start,
+    wake and signal turns included, and shows the recent decisions as inert,
+    bounded data. ``None`` when there are none or the feature is not loaded.
+    """
+    feat = _get_feature(agent, "StrategicMemoryFeature")
+    if feat is None or not hasattr(feat, "recent_decisions"):
+        return None
+    try:
+        config = recent_decisions_config()
+    except ValueError as exc:
+        logger.warning("operational_state: recent decisions not shown: %s", exc)
+        return (
+            "Strategy decisions: unavailable — "
+            f'"{_inert_text(exc, 200, mark_truncation=True)}"'
+        )
+    from kestrel_sovereign.features.strategic_memory.recent_decisions import (
+        earliest_recent_day,
+    )
+
+    earliest = earliest_recent_day(
+        datetime.now(timezone.utc), timedelta(hours=config.window_hours)
+    )
+    recent = await feat.recent_decisions(earliest)
+    return render_recent_decisions(recent, earliest, config)
+
+
 async def build_operational_state_block(agent: Any) -> Optional[str]:
-    """Always-on operational lifecycle context (#1571, #1581, #1907).
+    """Always-on operational lifecycle context (#1571, #1581, #1907, #3900).
 
     Required operational typed events — restart_status (#1571), codex
-    sandbox-approval declines (#1581), and active-todo rollups (#1907) — must
-    surface in the agent's turn context even when the optional proactive
+    sandbox-approval declines (#1581), active-todo rollups (#1907) and
+    recently recorded strategy decisions (#3900) — must surface in the
+    agent's turn context even when the optional proactive
     ``[preturn_state]`` block is disabled. This block is minimal, DID-scoped,
     non-instructional, and silently returns ``None`` when there is nothing to
     report.
@@ -464,6 +656,7 @@ async def build_operational_state_block(agent: Any) -> Optional[str]:
         _restart_status_section,
         _codex_decline_section,
         _active_todo_section,
+        _recent_decisions_section,
     ):
         try:
             line = await section(agent)
@@ -479,3 +672,40 @@ async def build_operational_state_block(agent: Any) -> Optional[str]:
         return None
     body = "\n".join(lines)
     return f"{_OPERATIONAL_HEADER}\n{body}\n{_OPERATIONAL_FOOTER}"
+
+
+async def prepare_turn_state_addendum(
+    agent: Any, system_prompt_addendum: Optional[str]
+) -> Optional[str]:
+    """``system_prompt_addendum`` with this turn's state blocks put in front.
+
+    The one preparation both turn entry points run, after the
+    USER_PROMPT_SUBMIT hook and before context assembly: ``process_input``
+    (wake, signal and API turns) and ``process_input_streaming`` (console
+    turns). Before #3900 only the first ran it, so a console turn never saw
+    the operational block.
+
+    The operational block (#1571) runs for every agent; the opt-in
+    ``[preturn_state]`` block (#1290) runs where it is enabled. Both ride the
+    budget-aware addendum, ahead of any caller-supplied directive such as the
+    constitutional canary, which stays last. Best-effort: a failure is logged
+    and the addendum is returned unchanged, so it never blocks the turn.
+    """
+    try:
+        operational = await build_operational_state_block(agent)
+        if operational:
+            system_prompt_addendum = (
+                f"{operational}\n\n{system_prompt_addendum}"
+                if system_prompt_addendum
+                else operational
+            )
+        state = await build_preturn_state_block(agent)
+        if state:
+            system_prompt_addendum = (
+                f"{state}\n\n{system_prompt_addendum}"
+                if system_prompt_addendum
+                else state
+            )
+    except Exception as exc:  # noqa: BLE001 - never break a turn
+        logger.warning("preturn_state: injection skipped: %s", exc, exc_info=True)
+    return system_prompt_addendum
