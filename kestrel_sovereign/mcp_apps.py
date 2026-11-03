@@ -15,14 +15,13 @@ from dataclasses import dataclass, field
 from datetime import timedelta
 from enum import StrEnum
 import secrets
-from urllib.parse import urlsplit
 from uuid import uuid4
 
 from fastapi import APIRouter, Request
 from kestrel_sdk.operator import OperatorContext
 from kestrel_sdk.resources import ResourceConflict, ResourceOutcomeUnknown
 from kestrel_sdk.tools import ToolPublicationContext
-from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
+from pydantic import AnyHttpUrl, BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
 from starlette.responses import JSONResponse
 
 from kestrel_sovereign.agent.parts import current_tool_publication_epoch
@@ -40,11 +39,26 @@ from kestrel_sovereign.security.request_auth import (
 )
 
 
+def _endpoint(value):
+    url = AnyHttpUrl(value)
+    if url.username or url.password or url.query or url.fragment:
+        raise ValueError("MCP Apps endpoints must not contain credentials, queries or fragments")
+    if url.scheme == "http" and url.host not in {"localhost", "127.0.0.1", "[::1]"}:
+        raise ValueError("MCP Apps endpoints require HTTPS outside loopback")
+    return url
+
+
+def _origin(url):
+    port = "" if url.port == (443 if url.scheme == "https" else 80) else f":{url.port}"
+    return f"{url.scheme}://{url.host}{port}"
+
+
 class MCPAppsHostPolicy(BaseModel):
     """Host settings, never server metadata or App-selected grants."""
 
     model_config = ConfigDict(extra="forbid", strict=True, frozen=True, allow_inf_nan=False)
     sandbox_url: str
+    host_origin: str
     max_html_bytes: int = Field(default=1_048_576, gt=0, le=16_777_216)
     max_message_bytes: int = Field(default=2_097_152, gt=0, le=33_554_432)
     max_request_bytes: int = Field(default=65_536, gt=0, le=1_048_576)
@@ -54,13 +68,21 @@ class MCPAppsHostPolicy(BaseModel):
     @field_validator("sandbox_url")
     @classmethod
     def sandbox_endpoint(cls, value):
-        url = urlsplit(value)
-        if (url.scheme not in {"https", "http"} or not url.hostname or url.username
-                or url.password or url.fragment or url.query):
-            raise ValueError("MCP Apps sandbox requires an explicit HTTP(S) endpoint without credentials")
-        if url.scheme == "http" and url.hostname not in {"localhost", "127.0.0.1", "::1"}:
-            raise ValueError("MCP Apps sandbox requires HTTPS outside loopback")
-        return value
+        return str(_endpoint(value))
+
+    @field_validator("host_origin")
+    @classmethod
+    def public_host_origin(cls, value):
+        url = _endpoint(value)
+        if url.path not in (None, "/"):
+            raise ValueError("MCP Apps host_origin must contain only an origin")
+        return _origin(url)
+
+    @model_validator(mode="after")
+    def different_origins(self):
+        if _origin(_endpoint(self.sandbox_url)) == self.host_origin:
+            raise ValueError("MCP Apps sandbox must use a different origin")
+        return self
 
 
 class _Action(StrEnum):
@@ -309,12 +331,9 @@ class MCPAppsHost:
         @router.post("/publications/{reference}/views")
         async def open_view(reference: str, request: Request):
             async def build(_context, _value):
-                sandbox = urlsplit(self._policy.sandbox_url)
-                endpoint = urlsplit(str(request.url))
-                def origin(url):
-                    return url.scheme, url.hostname, url.port or (443 if url.scheme == "https" else 80)
-                if origin(sandbox) == origin(endpoint):
-                    raise ValueError("MCP Apps sandbox must use a different origin")
+                browser_origin = request.headers.get("origin")
+                if browser_origin is not None and browser_origin != self._policy.host_origin:
+                    raise HostCapabilityAccessDenied("original MCP Apps browser origin is required")
                 view = self._publications.open_view(reference)
                 reader = self._reader.get()
                 view_id = secrets.token_urlsafe(32)
@@ -331,6 +350,7 @@ class MCPAppsHost:
                 return JSONResponse({"view_id": view_id, "arguments": arguments, "result": _native(result),
                     "resource": {"uri": resource.uri, "html": resource.html, "_meta": resource.metadata},
                     "sandbox_url": self._policy.sandbox_url,
+                    "host_origin": self._policy.host_origin,
                     "max_message_bytes": self._policy.max_message_bytes,
                     "max_html_bytes": self._policy.max_html_bytes,
                     "policy": deepcopy(self._policy.connection_policies.get(view.caller.name, {}))})
@@ -382,7 +402,17 @@ class MCPAppsHost:
 class MCPAppsHostMixin:
     supports_mcp_apps_host = True
 
+    def validate_mcp_apps_host_configuration(self, configuration):
+        """Validate without withdrawing an already usable host incarnation."""
+        if any(getattr(self, name, None) is not True for name in (
+            "supports_deferred_tool_results", "supports_audited_deferred_tool_results",
+            "supports_tool_publication_context",
+        )):
+            raise TypeError("MCP Apps require audited deferred results and live chat publication")
+        return MCPAppsHostPolicy.model_validate(deepcopy(configuration)).model_dump(mode="json")
+
     def create_mcp_apps_host(self, feature, *, configuration, is_current):
+        configuration = self.validate_mcp_apps_host_configuration(configuration)
         hosts = getattr(self, "_mcp_apps_hosts", None)
         if hosts is None:
             hosts = self._mcp_apps_hosts = []

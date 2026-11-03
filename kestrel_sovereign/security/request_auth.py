@@ -8,7 +8,7 @@ selector into credentials and never retries authentication with another lane.
 from __future__ import annotations
 
 from collections.abc import Callable
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
@@ -18,7 +18,6 @@ import math
 from itsdangerous import BadSignature
 from starlette.middleware.sessions import SessionMiddleware
 from starlette.requests import HTTPConnection, Request
-from starlette.responses import JSONResponse
 
 from kestrel_sovereign.auth import AuthMethod, CallerContext
 from kestrel_sovereign.security.capability_authority import HostCapabilityAccessDenied
@@ -223,25 +222,19 @@ class InteractiveAuthenticationLifetimeMiddleware:
         service = getattr(request.app.state, "request_authentication", None)
         if not isinstance(service, RequestAuthenticationService):
             raise RuntimeError("host request authentication service is unavailable")
-        started = False
-
-        async def original_send(message):
-            nonlocal started
-            if message["type"] == "http.response.start":
-                started = True
-            await send(message)
-
-        try:
+        with ExitStack() as owner:
             # Existing chat CSRF policy is unchanged. Each private View mutation
             # uses bind()'s default canonical CSRF check before its own body.
-            with service.bind(request, require_csrf=False) as binding:
-                token = _CURRENT.set(binding)
-                try:
-                    await self.app(scope, receive, original_send)
-                finally:
-                    _CURRENT.reset(token)
-        except HostCapabilityAccessDenied:
-            if started:
-                raise
-            await JSONResponse({"error": {"code": "interactive_authentication_required"}},
-                               status_code=403)(scope, receive, send)
+            try:
+                binding = owner.enter_context(service.bind(request, require_csrf=False))
+            except HostCapabilityAccessDenied:
+                # This middleware supplies optional initial-publication
+                # metadata. Private endpoints independently REQUIRE bind().
+                # An unrelated header or unavailable private grant cannot
+                # promote a query credential or relabel another endpoint.
+                binding = None
+            token = _CURRENT.set(binding)
+            try:
+                await self.app(scope, receive, send)
+            finally:
+                _CURRENT.reset(token)

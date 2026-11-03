@@ -45,7 +45,10 @@ physical delivery. Errors returned to readers contain generic codes, not
 credential diagnostics or native private payloads. An uncertain result never
 invites an automatic retry of a tool call.
 
-The host configuration requires an explicit different-origin `sandbox_url`.
+The host configuration requires an explicit public `host_origin` and a
+different-origin `sandbox_url`. Origin separation is validated before replacing
+an existing host, using operator configuration rather than a TLS proxy's
+internal request URL. The sandbox service must use that same public host origin.
 HTML, message, request and operation budgets are bounded. Connection policies
 are operator configuration indexed by the original connection name; server
 resource metadata requests grants but cannot select or increase host policy.

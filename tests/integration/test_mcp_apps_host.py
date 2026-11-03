@@ -138,7 +138,8 @@ async def apps_boundary(tmp_path, monkeypatch):
         feature = MCPAgent(agent)
         feature.enabled = True
         agent.features[feature.name] = feature
-        host = agent.create_mcp_apps_host(feature, configuration={"sandbox_url": "https://sandbox.apps.test/"},
+        host = agent.create_mcp_apps_host(feature, configuration={"sandbox_url": "https://sandbox.apps.test/",
+                                        "host_origin": "https://host.apps.test"},
                                            is_current=lambda: agent.features.get(feature.name) is feature)
         connection = MCPConnection(f"http://127.0.0.1:{listener.getsockname()[1]}/mcp")
         native_tools = await connection.connect()
@@ -367,3 +368,33 @@ async def test_cancellation_before_transport_borrow_cancels_the_original_unsent_
         release.set()
         await asyncio.gather(call, *children, return_exceptions=True)
     assert not b.host._views and b.markers == ["once"]
+
+
+@pytest.mark.parametrize("configuration", [{}, {"sandbox_url": "javascript:invalid"},
+    {"sandbox_url": "https://sandbox.apps.test/", "host_origin": "https://host.apps.test", "max_html_bytes": True},
+    {"sandbox_url": "https://host.apps.test/proxy", "host_origin": "https://host.apps.test"},
+    {"sandbox_url": "https://host.apps.test:443/proxy", "host_origin": "https://host.apps.test/"}])
+async def test_host_configuration_preflight_keeps_the_existing_owner(apps_boundary, configuration):
+    b = apps_boundary
+    with pytest.raises(ValueError):
+        b.agent.validate_mcp_apps_host_configuration(configuration)
+    assert b.agent._mcp_apps_hosts == [b.host] and not b.host.retired
+
+
+async def test_public_origin_is_explicit_and_is_not_inferred_from_a_proxy_backend_url(apps_boundary):
+    b = apps_boundary
+    reference = await b.publish()
+    async with httpx2.AsyncClient(transport=httpx2.ASGITransport(app=b.app), base_url="http://internal-backend") as client:
+        path = f"/api/mcp/apps/publications/{reference}/views?session_id=original-chat"
+        opened = await client.post(path, json={}, headers={**b.headers(), "Origin": "https://host.apps.test"})
+        assert opened.status_code == 200 and opened.json()["host_origin"] == "https://host.apps.test"
+        refused = await client.post(path, json={}, headers={**b.headers(), "Origin": "https://foreign.apps.test"})
+        assert refused.status_code == 403
+
+
+async def test_host_configuration_preflight_requires_the_actual_audited_publication_contract(apps_boundary):
+    b = apps_boundary
+    b.agent.supports_audited_deferred_tool_results = False
+    with pytest.raises(TypeError, match="audited deferred results"):
+        b.agent.validate_mcp_apps_host_configuration({"sandbox_url": "https://sandbox.apps.test/"})
+    assert b.agent._mcp_apps_hosts == [b.host] and not b.host.retired

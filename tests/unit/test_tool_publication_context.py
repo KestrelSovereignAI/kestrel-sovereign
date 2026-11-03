@@ -61,6 +61,19 @@ def test_publication_destination_requires_exact_owner_and_session():
         assert current_tool_publication_context(host, "chat-1").session_id == "chat-1"
 
 
+def test_generic_chat_host_does_not_invent_a_privacy_interface_from_dynamic_attributes():
+    class GenericHost:
+        did = "did:test:generic-chat"
+        def __getattr__(self, name):
+            if name == "_get_privacy_policy_epoch":
+                raise AssertionError("generic chat queried an undeclared privacy interface")
+            raise AttributeError(name)
+    host = GenericHost()
+    with part_collector(host=host, session_id="chat-1"):
+        assert current_tool_publication_epoch(host, "chat-1") is None
+        assert current_tool_publication_context(host, "chat-1") == ToolPublicationContext(host.did, "chat-1")
+
+
 @pytest.mark.parametrize("session_id", [None, "", " ", "original", "orchestrator"])
 def test_sessionless_collector_does_not_invent_a_chat_destination(session_id):
     host = SimpleNamespace(did="did:test:chat-owner")

@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import contextlib
 import contextvars
+import inspect
 import json
 import logging
 from typing import Any, List, Optional
@@ -88,7 +89,11 @@ class _TurnPartCollector(list):
             if isinstance(agent_id, str) and agent_id.strip()
             and isinstance(session_id, str) and session_id.strip() else None
         )
-        epoch_provider = getattr(host, "_get_privacy_policy_epoch", None)
+        # A generic chat host need not implement Apps privacy metadata. Only
+        # consult an explicitly declared interface, not a synthesized dynamic
+        # attribute. A declared but invalid provider still fails immediately.
+        declared = inspect.getattr_static(host, "_get_privacy_policy_epoch", None)
+        epoch_provider = getattr(host, "_get_privacy_policy_epoch") if declared is not None else None
         self.publication_epoch = epoch_provider() if epoch_provider is not None else None
         if epoch_provider is not None and (
             not isinstance(self.publication_epoch, str) or not self.publication_epoch.strip()

@@ -102,7 +102,7 @@ class PrivateDeliveryMiddleware:
                                     borrowing = False
                         def cancel_original_child(task):
                             if task is not child:
-                                raise self.access_denied("private transport child changed")
+                                raise delivery.access_denied("private transport child changed")
                             if borrowing:
                                 delivery.transport_borrow.cancel(task)
                             else:

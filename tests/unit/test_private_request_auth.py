@@ -51,6 +51,14 @@ def authenticated_app(monkeypatch):
     producers = []
     carried_scopes = []
 
+    @app.get("/api/owned-normal")
+    async def normal():
+        return {"interactive": current_request_authentication() is not None}
+
+    @app.get("/api/owned-unexpected-denial")
+    async def unexpected_denial():
+        raise HostCapabilityAccessDenied("unexpected capability refusal")
+
     @app.get("/api/owned-carried")
     async def carried():
         original = current_request_authentication()
@@ -231,3 +239,28 @@ def test_original_http_authentication_follows_foreign_turn_callbacks_and_expires
     with client.app.state.carried_scopes[0].bind():
         with pytest.raises(HostCapabilityAccessDenied, match="ended"):
             current_request_authentication()
+
+
+@pytest.mark.parametrize("headers", [{"Authorization": "Basic unrelated"},
+    {"Authorization": "Bearer unrelated"}, {"X-API-Key": "unrelated"}])
+def test_unrelated_header_cannot_promote_or_reject_query_authenticated_eventsource(authenticated_app, headers):
+    client, bindings = authenticated_app
+    response = client.get("/api/agent/notifications/sse", params={"api_key": API_KEY}, headers=headers)
+    assert response.status_code == 200 and response.json()["lane"] == "api_key"
+    assert not bindings
+
+
+@pytest.mark.parametrize("lane", ["jwt", "cookie"])
+def test_nonprivate_route_does_not_gain_or_require_a_private_grant(authenticated_app, monkeypatch, lane):
+    client, _ = authenticated_app
+    headers = credentials(client, lane)
+    monkeypatch.setenv("KESTREL_ALLOWED_EMAILS", "another@example.test")
+    response = client.get("/api/owned-normal", headers=headers)
+    assert response.status_code == 200 and response.json() == {"interactive": False}
+    assert client.get("/api/private", headers=headers).status_code == 403
+
+
+def test_unexpected_endpoint_capability_failure_is_not_rewritten_as_authentication_failure(authenticated_app):
+    client, _ = authenticated_app
+    with pytest.raises(HostCapabilityAccessDenied, match="unexpected capability refusal"):
+        client.get("/api/owned-unexpected-denial", headers={"X-API-Key": API_KEY})
