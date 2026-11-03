@@ -478,6 +478,28 @@ async def test_a_timestamp_with_no_local_day_does_not_hide_the_rest(
     assert "year one" not in section
 
 
+@pytest.mark.asyncio
+async def test_a_timestamp_with_no_utc_instant_does_not_hide_the_rest(tmp_path):
+    # Normalised to UTC, year 1 east of UTC is year 0 and year 9999 west of it
+    # is year 10000. Quoted, such a date once raised OverflowError out of the
+    # reader, and the block dropped the whole section with today's decision.
+    feature = await _feature(
+        tmp_path,
+        [
+            {"date": "0001-01-01T00:00:00+01:00", "decision": "year one, east"},
+            {"date": "9999-12-31T23:00:00-05:00", "decision": "year 9999, west"},
+            _decision(SAFETY_DECISION, session="A"),
+        ],
+    )
+    block = await build_operational_state_block(_agent_with(feature))
+
+    assert block is not None
+    section = _section(block)
+    assert SAFETY_DECISION in section
+    assert "year one" not in section and "year 9999" not in section
+    assert "could not be read" not in block
+
+
 def test_a_timestamped_date_is_read_as_the_local_day(new_york_clock):
     # 02:00Z on the 3rd is still the 2nd in New York, the day date.today()
     # would have written there.
@@ -487,7 +509,8 @@ def test_a_timestamped_date_is_read_as_the_local_day(new_york_clock):
     assert decision_day("2026-11-03") == date(2026, 11, 3)
     for unreadable in (
         None, "", "soon", 20261103, "2026-13-01", datetime(1, 1, 1),
-        "0001-01-01T00:00:00",
+        "0001-01-01T00:00:00", "0001-01-01T00:00:00+01:00",
+        "9999-12-31T23:00:00-05:00",
     ):
         assert decision_day(unreadable) is None
 

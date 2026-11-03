@@ -57,8 +57,9 @@ def decision_day(value: Any) -> Optional[date]:
     an unquoted date, which YAML loads as a ``date``, or a full timestamp. A
     timestamp is converted to the host's local day, the day ``date.today()``
     would have written for it; one without an offset is UTC, as YAML and
-    :func:`parse_instant` both read it. A timestamp with no local day (year 1
-    west of UTC) is unreadable, never an error.
+    :func:`parse_instant` both read it. A timestamp with no UTC instant (year 1
+    east of UTC, year 9999 west of it) or no local day (year 1 west of UTC) is
+    unreadable, never an error.
     """
     if isinstance(value, datetime):
         instant: Optional[datetime] = value
@@ -73,7 +74,11 @@ def decision_day(value: Any) -> Optional[date]:
                 return date.fromisoformat(text)
             except ValueError:
                 return None
-        instant = parse_instant(text)
+        try:
+            instant = parse_instant(text)
+        except OverflowError:
+            # parse_instant normalises to UTC, which such a timestamp has not.
+            return None
     if instant is None:
         return None
     if instant.tzinfo is None:
