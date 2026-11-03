@@ -37,7 +37,7 @@ RUN --mount=type=secret,id=github_token \
     if [ -n "$GIT_AUTH" ]; then \
         git config --global url."https://${GIT_AUTH}@github.com/".insteadOf "https://github.com/"; \
     fi && \
-    uv pip install --python /app/.venv/bin/python . && \
+    uv pip install --python /app/.venv/bin/python '.[mcp-integration]' && \
     uv pip install --python /app/.venv/bin/python \
         "kestrel-feature-github-app @ git+https://github.com/KestrelSovereignAI/kestrel-feature-github-app.git" && \
     (uv pip uninstall --python /app/.venv/bin/python ollama || true) && \
