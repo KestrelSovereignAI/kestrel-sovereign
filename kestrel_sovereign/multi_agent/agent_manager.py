@@ -991,6 +991,426 @@ def _identity_bound_dids(stable_did: str, identity: object) -> frozenset[str]:
     return frozenset({stable_did, *identity_dids})
 
 
+# --- The startup roster ------------------------------------------------------
+#
+# Which agents a host starts is decided here, once, for both the host's own
+# startup (``AgentManager``) and ``kestrel doctor`` (#3878): the registry is
+# reconciled against durable spawn authority, then every ``autostart`` row and
+# each cold ancestor an active signed child needs is selected, less a durably
+# retired child. Nothing below writes.
+
+
+class StartupRosterError(RuntimeError):
+    """Host startup refuses this roster against its durable spawn authority."""
+
+
+class StartupRosterRepairPending(RuntimeError):
+    """Startup must write a spawn-authority repair before its roster is known.
+
+    Restart reconciliation reaps a pre-inception reservation whose producer
+    died, retires a provisional witness nobody owns, and retires an expired or
+    ``retiring`` one. Each decision takes a producer lock or writes a marker,
+    and its outcome changes which rows load, so a reader that must not write
+    cannot know the roster until a startup has made it.
+    """
+
+
+def restart_terminal_authority_witnesses(
+    records: tuple[SpawnAuthorityWitness, ...],
+) -> list[SpawnAuthorityWitness]:
+    """Witnesses restart reconciliation retires before it repairs the roster.
+
+    A ``retiring`` witness, and an active one whose signed TTL has run out.
+    """
+
+    return [
+        witness
+        for witness in records
+        if witness.state == "retiring"
+        or (
+            witness.active
+            and witness.mandate.ttl_seconds > 0
+            and remaining_spawn_ttl_seconds(
+                witness.mandate.created_at,
+                witness.mandate.ttl_seconds,
+            )
+            <= 0
+        )
+    ]
+
+
+def repair_restart_roster(
+    config: MultiAgentConfig,
+    *,
+    denials: tuple[PendingSpawnAuthority | SpawnAuthorityWitness, ...],
+    records: tuple[SpawnAuthorityWitness, ...],
+    registry: SpawnAuthorityRegistry,
+    base_data_dir: Path,
+    runtime_env: Mapping[str, str],
+) -> tuple[MultiAgentConfig, bool]:
+    """Repair a copy of ``config`` against durable spawn authority.
+
+    ``denials`` are the pre-inception reservations and provisional witnesses
+    whose rows must not load. Of ``records``, an active witness restores the
+    row of a child a crash left out of ``multi_agent.toml``, and a terminal one
+    drops the row its own retired identity still occupies. The copy is
+    validated against the host's path context, ``base_data_dir`` and
+    ``runtime_env``. Returns it and whether it differs from ``config``; the
+    caller decides whether to persist it.
+
+    Raises:
+        StartupRosterError: A witness or reservation claims more than one row,
+            or an active witness conflicts with the row in its slot.
+        ValueError: The repaired roster is invalid.
+    """
+
+    reconciled = config.model_copy(deep=True)
+    changed = False
+    for reservation in denials:
+        matching = [
+            name
+            for name, candidate in reconciled.agents.items()
+            if name.casefold() == reservation.child_name.casefold()
+            or (
+                isinstance(candidate, LocalAgentConfig)
+                and registry.same_data_slot(
+                    candidate,
+                    reservation.config,
+                )
+            )
+        ]
+        if len(matching) > 1:
+            raise StartupRosterError(
+                "Uncommitted spawn authority has an ambiguous startup registration"
+            )
+        if matching:
+            del reconciled.agents[matching[0]]
+            changed = True
+    for witness in records:
+        matching = [
+            name
+            for name, candidate in reconciled.agents.items()
+            if name.casefold() == witness.child_name.casefold()
+            or (
+                isinstance(candidate, LocalAgentConfig)
+                and registry.same_data_slot(
+                    candidate,
+                    witness.config,
+                )
+            )
+        ]
+        if len(matching) > 1:
+            raise StartupRosterError(
+                "Host spawn witness has an ambiguous startup registration"
+            )
+        if not witness.active:
+            if not matching:
+                continue
+            existing_name = matching[0]
+            existing_config = reconciled.agents[existing_name]
+            # A finalized DID must not suppress a legitimate replacement
+            # that an operator has incepted under the old name or data
+            # directory. Bind destructive reconciliation to the immutable
+            # local birth record, just as runtime offboarding does.
+            if not isinstance(existing_config, LocalAgentConfig):
+                continue
+            resolved_dir = existing_config.resolve_data_dir(base_data_dir)
+            try:
+                anchored_did = read_anchor_agent_did_sync(
+                    str(resolved_dir),
+                    mode=AgentDIDLookupMode.INSPECTION,
+                )
+            except Exception as exc:
+                # The row cannot be proven to belong to this terminal DID,
+                # so fail closed by leaving it untouched. Normal batch
+                # initialization will isolate a missing/unreadable identity
+                # to this tenant instead of making roster reconciliation a
+                # fleet-wide startup gate.
+                logger.warning(
+                    "Could not verify terminal spawn witness %r against its "
+                    "startup registration; preserving the row: %s",
+                    witness.child_name,
+                    exc,
+                )
+                continue
+            if anchored_did != witness.child_did:
+                continue
+            del reconciled.agents[existing_name]
+            changed = True
+            continue
+        if matching:
+            existing_name = matching[0]
+            existing_config = reconciled.agents[existing_name]
+            if (
+                existing_name.casefold() != witness.child_name.casefold()
+                or not isinstance(existing_config, LocalAgentConfig)
+                or not registry.same_data_slot(
+                    existing_config,
+                    witness.config,
+                )
+            ):
+                raise StartupRosterError(
+                    "Host spawn witness conflicts with the startup roster"
+                )
+            continue
+        reconciled.agents[witness.child_name] = witness.config.model_copy(
+            deep=True
+        )
+        changed = True
+    type(reconciled).model_validate(reconciled.model_dump())
+    # Registry-first spawn persistence can leave an active child absent
+    # from multi_agent.toml after a crash. Validate the repaired, effective
+    # roster against this host's original path context before persisting it
+    # or allowing the server to create Hold custody. Model validation alone
+    # has no runtime base/environment with which to resolve this relation.
+    reconciled.validate_host_custody_paths(
+        base_dir=base_data_dir,
+        runtime_env=runtime_env,
+    )
+    return reconciled, changed
+
+
+async def required_cold_authority_names(
+    config: MultiAgentConfig,
+    *,
+    authority_records: tuple[SpawnAuthorityWitness, ...],
+    loaded_dids: frozenset[str],
+    base_data_dir: Path,
+    master_key: str | None = None,
+) -> frozenset[str]:
+    """Find cold ancestors that active signed children require at boot.
+
+    ``autostart=false`` remains the operator's durable policy.  This only
+    widens the effective boot set when an explicitly active descendant
+    cannot verify or publish without that ancestor in memory.
+
+    ``loaded_dids`` are identities already in memory, which need no cold
+    boot. A cold candidate's identity is read, never written: an
+    ``INSPECTION`` anchor read, and its verified aliases decrypted with
+    ``master_key`` (``None`` reads ``KESTREL_DATA_KEY`` from this process).
+
+    Raises:
+        StartupRosterError: Two cold registrations claim one required parent.
+    """
+
+    active_records = tuple(
+        witness for witness in authority_records if witness.active
+    )
+    if not active_records:
+        return frozenset()
+
+    config_names = {
+        name.casefold(): name
+        for name, candidate in config.agents.items()
+        if isinstance(candidate, LocalAgentConfig)
+    }
+    by_child_did = {witness.child_did: witness for witness in active_records}
+    frontier: list[str] = []
+    for witness in active_records:
+        name = config_names.get(witness.child_name.casefold())
+        if name is None:
+            continue
+        candidate = config.agents[name]
+        if isinstance(candidate, LocalAgentConfig) and candidate.autostart:
+            frontier.append(witness.child_did)
+    if not frontier:
+        return frozenset()
+
+    required_parent_dids: set[str] = set()
+    while frontier:
+        child_did = frontier.pop()
+        witness = by_child_did.get(child_did)
+        if witness is None or witness.parent_did in loaded_dids:
+            continue
+        parent_did = witness.parent_did
+        if parent_did in required_parent_dids:
+            continue
+        required_parent_dids.add(parent_did)
+        if parent_did in by_child_did:
+            frontier.append(parent_did)
+
+    required_names: set[str] = set()
+    unresolved_root_dids = set(required_parent_dids)
+    for parent_did in required_parent_dids:
+        parent_witness = by_child_did.get(parent_did)
+        if parent_witness is None:
+            continue
+        unresolved_root_dids.discard(parent_did)
+        name = config_names.get(parent_witness.child_name.casefold())
+        if name is None:
+            continue
+        candidate = config.agents[name]
+        if isinstance(candidate, LocalAgentConfig) and not candidate.autostart:
+            required_names.add(name)
+
+    if not unresolved_root_dids:
+        return frozenset(required_names)
+
+    witnessed_names = {
+        witness.child_name.casefold() for witness in active_records
+    }
+    matched_roots: dict[str, str] = {}
+    for name, candidate in config.agents.items():
+        if (
+            not isinstance(candidate, LocalAgentConfig)
+            or candidate.autostart
+            or name.casefold() in witnessed_names
+        ):
+            continue
+        try:
+            resolved_dir = candidate.resolve_data_dir(base_data_dir)
+            anchored_did = await read_anchor_agent_did(
+                str(resolved_dir),
+                mode=AgentDIDLookupMode.INSPECTION,
+            )
+        except Exception:
+            logger.debug(
+                "Cold startup candidate %r could not be read while "
+                "resolving authority dependencies",
+                name,
+                exc_info=True,
+            )
+            continue
+        bound_dids = frozenset({anchored_did})
+        if anchored_did not in unresolved_root_dids:
+            try:
+                from kestrel_sovereign.identity.runtime_identity import (
+                    load_agent_identity,
+                )
+                from kestrel_sovereign.identity.signing import get_key_id
+
+                legacy_key_id = (
+                    None
+                    if anchored_did.startswith("did:web:")
+                    else get_key_id(anchored_did)
+                )
+                identity = await asyncio.to_thread(
+                    load_agent_identity,
+                    legacy_key_id,
+                    storage_dir=resolved_dir,
+                    master_key=master_key,
+                )
+                bound_dids = _identity_bound_dids(anchored_did, identity)
+            except Exception:
+                logger.debug(
+                    "Cold startup candidate %r could not load its verified "
+                    "identity aliases while resolving authority dependencies",
+                    name,
+                    exc_info=True,
+                )
+                continue
+        matched_dids = bound_dids.intersection(unresolved_root_dids)
+        if not matched_dids:
+            continue
+        for matched_did in matched_dids:
+            previous = matched_roots.get(matched_did)
+            if previous is not None:
+                raise StartupRosterError(
+                    "Cold authority parent has ambiguous startup registrations"
+                )
+            matched_roots[matched_did] = name
+        required_names.add(name)
+
+    return frozenset(required_names)
+
+
+def startup_roster_candidates(
+    config: MultiAgentConfig,
+    *,
+    required_cold_names: frozenset[str],
+    base_data_dir: Path,
+) -> tuple[tuple[str, LocalAgentConfig], ...]:
+    """The local registrations a load of ``config`` starts, in config order.
+
+    Every ``autostart`` row and every cold ancestor in ``required_cold_names``,
+    less a spawned child whose identity-bound retirement marker denies its
+    boot. A remote registration, and an ``autostart=false`` one no active
+    child needs, is not started.
+    """
+
+    selected: list[tuple[str, LocalAgentConfig]] = []
+    for name, agent_cfg in config.agents.items():
+        if not isinstance(agent_cfg, LocalAgentConfig):
+            logger.info(f"Skipping remote agent '{name}' (not supported in-process)")
+            continue
+        if not agent_cfg.autostart and name not in required_cold_names:
+            logger.info(f"Skipping agent '{name}' (autostart=false)")
+            continue
+        if spawn_retirement_denies_startup(agent_cfg.resolve_data_dir(base_data_dir)):
+            continue
+        selected.append((name, agent_cfg))
+    return tuple(selected)
+
+
+async def read_startup_roster(
+    config: MultiAgentConfig,
+    *,
+    base_data_dir: Path,
+    runtime_env: Mapping[str, str],
+) -> tuple[str, ...]:
+    """Name the agents a host started on ``config`` would start, writing nothing.
+
+    The selection host startup makes before any agent initializes, for a host
+    with nothing loaded yet: ``config``, the registry as loaded, reconciled
+    against the durable spawn authority below ``base_data_dir``
+    (:func:`repair_restart_roster`), then its ``autostart`` rows and each cold
+    ancestor an active signed child needs (:func:`required_cold_authority_names`),
+    less a durably retired child (:func:`startup_roster_candidates`).
+    ``runtime_env`` is the environment the host runs with: it validates the
+    repaired roster and holds the key that decrypts a cold candidate's
+    identity.
+
+    Raises:
+        StartupRosterRepairPending: Startup must write a spawn-authority
+            repair first, and its outcome decides the roster.
+        StartupRosterError: Host startup would refuse this roster.
+        OSError, ValueError, TypeError: The spawn authority registry cannot be
+            read, or the repaired roster is invalid, as at startup.
+    """
+
+    base = Path(base_data_dir).expanduser().resolve()
+    registry = SpawnAuthorityRegistry(base)
+    records = registry.records()
+    pending = registry.pending()
+    provisional = tuple(
+        witness
+        for witness in records
+        if witness.active and not witness.mandate.authority_committed
+    )
+    terminal = restart_terminal_authority_witnesses(records)
+    if pending or provisional or terminal:
+        raise StartupRosterRepairPending(
+            "the host's spawn authority holds "
+            f"{len(pending)} interrupted spawn reservation(s), "
+            f"{len(provisional)} uncommitted spawn(s) and {len(terminal)} "
+            "expired or retiring spawned agent(s), which the next host startup "
+            "repairs before it chooses which agents to start"
+        )
+    reconciled, _changed = repair_restart_roster(
+        config,
+        denials=(),
+        records=records,
+        registry=registry,
+        base_data_dir=base,
+        runtime_env=runtime_env,
+    )
+    required = await required_cold_authority_names(
+        reconciled,
+        authority_records=records,
+        loaded_dids=frozenset(),
+        base_data_dir=base,
+        master_key=runtime_env.get("KESTREL_DATA_KEY") or None,
+    )
+    return tuple(
+        name
+        for name, _agent_cfg in startup_roster_candidates(
+            reconciled,
+            required_cold_names=required,
+            base_data_dir=base,
+        )
+    )
+
+
 @dataclass
 class _HostContextPublicationState:
     """Shared host registry generation observed by initializing agents."""
@@ -6611,20 +7031,7 @@ class AgentManager:
         # granted it. Existing crash-ordered ``retiring`` records take the same
         # recovery path, but a live in-process child prevents this startup helper
         # from stealing an active finalizer.
-        terminal_roots = [
-            witness
-            for witness in all_records
-            if witness.state == "retiring"
-            or (
-                witness.active
-                and witness.mandate.ttl_seconds > 0
-                and remaining_spawn_ttl_seconds(
-                    witness.mandate.created_at,
-                    witness.mandate.ttl_seconds,
-                )
-                <= 0
-            )
-        ]
+        terminal_roots = restart_terminal_authority_witnesses(all_records)
         records_by_parent: dict[str, list[SpawnAuthorityWitness]] = {}
         for witness in all_records:
             if witness.state != "retired":
@@ -6753,111 +7160,15 @@ class AgentManager:
             # The caller's host projection can contain process-local listen
             # overrides and is restored only on the returned runtime model.
             runtime_host = config.host.model_copy(deep=True)
-            reconciled = self._load_startup_config(
-                self._startup_config_path
-            ).model_copy(deep=True)
+            snapshot = self._load_startup_config(self._startup_config_path)
         else:
-            reconciled = config.model_copy(deep=True)
-        changed = False
-        for reservation in (*pending, *provisional):
-            matching = [
-                name
-                for name, candidate in reconciled.agents.items()
-                if name.casefold() == reservation.child_name.casefold()
-                or (
-                    isinstance(candidate, LocalAgentConfig)
-                    and self._spawn_authority_registry.same_data_slot(
-                        candidate,
-                        reservation.config,
-                    )
-                )
-            ]
-            if len(matching) > 1:
-                raise RuntimeError(
-                    "Uncommitted spawn authority has an ambiguous startup registration"
-                )
-            if matching:
-                del reconciled.agents[matching[0]]
-                changed = True
-        for witness in records:
-            matching = [
-                name
-                for name, candidate in reconciled.agents.items()
-                if name.casefold() == witness.child_name.casefold()
-                or (
-                    isinstance(candidate, LocalAgentConfig)
-                    and self._spawn_authority_registry.same_data_slot(
-                        candidate,
-                        witness.config,
-                    )
-                )
-            ]
-            if len(matching) > 1:
-                raise RuntimeError(
-                    "Host spawn witness has an ambiguous startup registration"
-                )
-            if not witness.active:
-                if not matching:
-                    continue
-                existing_name = matching[0]
-                existing_config = reconciled.agents[existing_name]
-                # A finalized DID must not suppress a legitimate replacement
-                # that an operator has incepted under the old name or data
-                # directory. Bind destructive reconciliation to the immutable
-                # local birth record, just as runtime offboarding does.
-                if not isinstance(existing_config, LocalAgentConfig):
-                    continue
-                resolved_dir = existing_config.resolve_data_dir(self._base_data_dir)
-                try:
-                    anchored_did = read_anchor_agent_did_sync(
-                        str(resolved_dir),
-                        mode=AgentDIDLookupMode.INSPECTION,
-                    )
-                except Exception as exc:
-                    # The row cannot be proven to belong to this terminal DID,
-                    # so fail closed by leaving it untouched. Normal batch
-                    # initialization will isolate a missing/unreadable identity
-                    # to this tenant instead of making roster reconciliation a
-                    # fleet-wide startup gate.
-                    logger.warning(
-                        "Could not verify terminal spawn witness %r against its "
-                        "startup registration; preserving the row: %s",
-                        witness.child_name,
-                        exc,
-                    )
-                    continue
-                if anchored_did != witness.child_did:
-                    continue
-                del reconciled.agents[existing_name]
-                changed = True
-                continue
-            if matching:
-                existing_name = matching[0]
-                existing_config = reconciled.agents[existing_name]
-                if (
-                    existing_name.casefold() != witness.child_name.casefold()
-                    or not isinstance(existing_config, LocalAgentConfig)
-                    or not self._spawn_authority_registry.same_data_slot(
-                        existing_config,
-                        witness.config,
-                    )
-                ):
-                    raise RuntimeError(
-                        "Host spawn witness conflicts with the startup roster"
-                    )
-                continue
-            reconciled.agents[witness.child_name] = witness.config.model_copy(
-                deep=True
-            )
-            changed = True
-        type(reconciled).model_validate(reconciled.model_dump())
-        # Registry-first spawn persistence can leave an active child absent
-        # from multi_agent.toml after a crash. Validate the repaired, effective
-        # roster against this host's original path context before persisting it
-        # or allowing the server to create Hold custody. Model validation alone
-        # has no runtime base/environment with which to resolve this relation.
-        reconciled.validate_host_custody_paths(
-            base_dir=self._base_data_dir,
+            snapshot = config
+        reconciled, changed = repair_restart_roster(
+            snapshot,
+            denials=(*pending, *provisional),
+            records=records,
+            registry=self._spawn_authority_registry,
+            base_data_dir=self._base_data_dir,
             runtime_env=self._startup_runtime_env,
         )
         if changed and self._startup_config_path is not None:
@@ -6935,137 +7246,18 @@ class AgentManager:
         *,
         authority_roots: frozenset[str] | None,
     ) -> frozenset[str]:
-        """Find cold ancestors that active signed children require at boot.
+        """Find cold ancestors that this manager's active signed children need."""
 
-        ``autostart=false`` remains the operator's durable policy.  This only
-        widens the effective boot set when an explicitly active descendant
-        cannot verify or publish without that ancestor in memory.
-        """
-
-        active_records = tuple(
-            witness
-            for witness in self._selected_spawn_authority_records(authority_roots)
-            if witness.active
-        )
-        if not active_records:
-            return frozenset()
-
-        config_names = {
-            name.casefold(): name
-            for name, candidate in config.agents.items()
-            if isinstance(candidate, LocalAgentConfig)
-        }
-        by_child_did = {witness.child_did: witness for witness in active_records}
-        frontier: list[str] = []
-        for witness in active_records:
-            name = config_names.get(witness.child_name.casefold())
-            if name is None:
-                continue
-            candidate = config.agents[name]
-            if isinstance(candidate, LocalAgentConfig) and candidate.autostart:
-                frontier.append(witness.child_did)
-        if not frontier:
-            return frozenset()
-
+        authority_records = self._selected_spawn_authority_records(authority_roots)
         loaded_dids = set(authority_roots or ())
         for loaded_agent in self._agents.values():
             loaded_dids.update(_loaded_agent_bound_dids(loaded_agent))
-
-        required_parent_dids: set[str] = set()
-        while frontier:
-            child_did = frontier.pop()
-            witness = by_child_did.get(child_did)
-            if witness is None or witness.parent_did in loaded_dids:
-                continue
-            parent_did = witness.parent_did
-            if parent_did in required_parent_dids:
-                continue
-            required_parent_dids.add(parent_did)
-            if parent_did in by_child_did:
-                frontier.append(parent_did)
-
-        required_names: set[str] = set()
-        unresolved_root_dids = set(required_parent_dids)
-        for parent_did in required_parent_dids:
-            parent_witness = by_child_did.get(parent_did)
-            if parent_witness is None:
-                continue
-            unresolved_root_dids.discard(parent_did)
-            name = config_names.get(parent_witness.child_name.casefold())
-            if name is None:
-                continue
-            candidate = config.agents[name]
-            if isinstance(candidate, LocalAgentConfig) and not candidate.autostart:
-                required_names.add(name)
-
-        if not unresolved_root_dids:
-            return frozenset(required_names)
-
-        witnessed_names = {
-            witness.child_name.casefold() for witness in active_records
-        }
-        matched_roots: dict[str, str] = {}
-        for name, candidate in config.agents.items():
-            if (
-                not isinstance(candidate, LocalAgentConfig)
-                or candidate.autostart
-                or name.casefold() in witnessed_names
-            ):
-                continue
-            try:
-                resolved_dir = candidate.resolve_data_dir(self._base_data_dir)
-                anchored_did = await read_anchor_agent_did(
-                    str(resolved_dir),
-                    mode=AgentDIDLookupMode.INSPECTION,
-                )
-            except Exception:
-                logger.debug(
-                    "Cold startup candidate %r could not be read while "
-                    "resolving authority dependencies",
-                    name,
-                    exc_info=True,
-                )
-                continue
-            bound_dids = frozenset({anchored_did})
-            if anchored_did not in unresolved_root_dids:
-                try:
-                    from kestrel_sovereign.identity.runtime_identity import (
-                        load_agent_identity,
-                    )
-                    from kestrel_sovereign.identity.signing import get_key_id
-
-                    legacy_key_id = (
-                        None
-                        if anchored_did.startswith("did:web:")
-                        else get_key_id(anchored_did)
-                    )
-                    identity = await asyncio.to_thread(
-                        load_agent_identity,
-                        legacy_key_id,
-                        storage_dir=resolved_dir,
-                    )
-                    bound_dids = _identity_bound_dids(anchored_did, identity)
-                except Exception:
-                    logger.debug(
-                        "Cold startup candidate %r could not load its verified "
-                        "identity aliases while resolving authority dependencies",
-                        name,
-                        exc_info=True,
-                    )
-                    continue
-            matched_dids = bound_dids.intersection(unresolved_root_dids)
-            if not matched_dids:
-                continue
-            for matched_did in matched_dids:
-                previous = matched_roots.get(matched_did)
-                if previous is not None:
-                    raise RuntimeError(
-                        "Cold authority parent has ambiguous startup registrations"
-                    )
-                matched_roots[matched_did] = name
-            required_names.add(name)
-
-        return frozenset(required_names)
+        return await required_cold_authority_names(
+            config,
+            authority_records=authority_records,
+            loaded_dids=frozenset(loaded_dids),
+            base_data_dir=self._base_data_dir,
+        )
 
     def reconcile_spawn_authority_restart_roster(
         self,
@@ -7200,7 +7392,7 @@ class AgentManager:
                     witness.mandate,
                     authority_parent_did=witness.parent_did,
                 )
-        required_cold_authority_names = await self._required_cold_authority_names(
+        required_cold_names = await self._required_cold_authority_names(
             config,
             authority_roots=authority_roots,
         )
@@ -7219,17 +7411,11 @@ class AgentManager:
             if isinstance(agent_cfg, LocalAgentConfig):
                 self._reserved_ports.add(agent_cfg.port)
         pending: list[tuple[str, LocalAgentConfig]] = []
-        for name, agent_cfg in config.agents.items():
-            if not isinstance(agent_cfg, LocalAgentConfig):
-                logger.info(f"Skipping remote agent '{name}' (not supported in-process)")
-                continue
-            if not agent_cfg.autostart and name not in required_cold_authority_names:
-                logger.info(f"Skipping agent '{name}' (autostart=false)")
-                continue
-            if spawn_retirement_denies_startup(
-                agent_cfg.resolve_data_dir(self._base_data_dir)
-            ):
-                continue
+        for name, agent_cfg in startup_roster_candidates(
+            config,
+            required_cold_names=required_cold_names,
+            base_data_dir=self._base_data_dir,
+        ):
             if authority_roots is not None:
                 existing_name = next(
                     (

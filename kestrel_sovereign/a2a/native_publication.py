@@ -59,7 +59,7 @@ if TYPE_CHECKING:
 PUBLIC_BASE_URL_ENV = "KESTREL_BASE_URL"
 
 
-def _host_publishes_native_a2a(environment: Mapping[str, str]) -> bool:
+def host_publishes_native_a2a(environment: Mapping[str, str]) -> bool:
     """Only an explicit public base URL publishes; a listen address never does."""
     return environment.get(PUBLIC_BASE_URL_ENV) is not None
 
@@ -75,7 +75,7 @@ def unpublished_cohost_warning(
     (#3872). ``agents`` counts the agents the host starts, never a registration
     it leaves cold. The port is advice for the operator, never a substitute URL.
     """
-    if agents < 2 or _host_publishes_native_a2a(environment):
+    if agents < 2 or host_publishes_native_a2a(environment):
         return None
     return (
         f"{PUBLIC_BASE_URL_ENV} is unset: none of this host's {agents} agents "
@@ -88,7 +88,7 @@ def unpublished_cohost_warning(
 
 def unpublished_peer_detail(environment: Mapping[str, str]) -> str:
     """Why a co-hosted recipient has no native interface to open."""
-    if _host_publishes_native_a2a(environment):
+    if host_publishes_native_a2a(environment):
         return "Peer has no published native A2A interface"
     return (
         "Peer has no published native A2A interface: this host has no "
@@ -121,7 +121,7 @@ class NativeHostingConfiguration:
         """Unconfigured hosts run operator APIs without public peer discovery."""
         base = environment.get(PUBLIC_BASE_URL_ENV)
         discovery = environment.get("KESTREL_A2A_DISCOVERY_AGENT")
-        if not _host_publishes_native_a2a(environment):
+        if not host_publishes_native_a2a(environment):
             if discovery is not None:
                 raise ValueError(f"A2A discovery requires {PUBLIC_BASE_URL_ENV}")
             return None
