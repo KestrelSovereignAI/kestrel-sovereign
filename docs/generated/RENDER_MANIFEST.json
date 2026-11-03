@@ -418,6 +418,18 @@
       "findings": [],
       "missing_code_refs": [],
       "missing_links": [],
+      "path": "docs/architecture/MCP_APPS_HOST.md",
+      "privacy": "public",
+      "render": "public",
+      "status": "active",
+      "title": "Authenticated MCP Apps host",
+      "type": "Architecture Spec"
+    },
+    {
+      "existing_code_refs": [],
+      "findings": [],
+      "missing_code_refs": [],
+      "missing_links": [],
       "path": "docs/architecture/MEMORY_OWNERSHIP.md",
       "privacy": "public",
       "render": "public",
