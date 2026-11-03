@@ -64,10 +64,16 @@ class AuthenticatedSessionMiddleware(SessionMiddleware):
             identity = session.get("user_email") if session is not None else None
             if scope["type"] == "http" and isinstance(identity, str) and identity:
                 raw = HTTPConnection(scope).cookies[self.session_cookie].encode("utf-8")
-                _, issued_at = self.signer.unsign(raw, max_age=self.max_age, return_timestamp=True)
-                expires_at = (issued_at + timedelta(seconds=self.max_age)
-                              if self.max_age is not None else None)
-                scope[_SESSION_KEY] = _SignedSession(scope, session, raw, self, identity, expires_at)
+                try:
+                    _, issued_at = self.signer.unsign(raw, max_age=self.max_age, return_timestamp=True)
+                except BadSignature:
+                    # Match native expired-cookie handling if expiry falls
+                    # between Starlette's decode and timestamp retention.
+                    session.clear()
+                else:
+                    expires_at = (issued_at + timedelta(seconds=self.max_age)
+                                  if self.max_age is not None else None)
+                    scope[_SESSION_KEY] = _SignedSession(scope, session, raw, self, identity, expires_at)
             await app(scope, receive, send)
         super().__init__(retain_session, **settings)
 

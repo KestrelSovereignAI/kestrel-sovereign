@@ -76,7 +76,8 @@ def test_generic_chat_host_does_not_invent_a_privacy_interface_from_dynamic_attr
 
 @pytest.mark.parametrize("session_id", [None, "", " ", "original", "orchestrator"])
 def test_sessionless_collector_does_not_invent_a_chat_destination(session_id):
-    host = SimpleNamespace(did="did:test:chat-owner")
+    host = SimpleNamespace(did="did:test:chat-owner",
+        _get_privacy_policy_epoch=lambda: pytest.fail("sessionless turn queried private publication policy"))
     with part_collector(host=host, session_id=session_id):
         assert current_tool_publication_context(host, session_id) is None
     with part_collector(session_id="real-chat"):

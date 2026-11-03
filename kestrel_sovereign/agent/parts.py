@@ -93,7 +93,8 @@ class _TurnPartCollector(list):
         # consult an explicitly declared interface, not a synthesized dynamic
         # attribute. A declared but invalid provider still fails immediately.
         declared = inspect.getattr_static(host, "_get_privacy_policy_epoch", None)
-        epoch_provider = getattr(host, "_get_privacy_policy_epoch") if declared is not None else None
+        epoch_provider = (getattr(host, "_get_privacy_policy_epoch")
+                          if declared is not None and self.publication_context is not None else None)
         self.publication_epoch = epoch_provider() if epoch_provider is not None else None
         if epoch_provider is not None and (
             not isinstance(self.publication_epoch, str) or not self.publication_epoch.strip()

@@ -18,11 +18,6 @@ import pytest
 import pytest_asyncio
 import uvicorn
 
-from kestrel_feature_mcp.apps_execution import RegisteredAppTool
-from kestrel_feature_mcp.apps_publication import AppPublications
-from kestrel_feature_mcp.connection import MCPConnection, bind_tool_caller
-from kestrel_feature_mcp.dynamic_tools import MCPToolWrapper
-from kestrel_feature_mcp.feature import MCPAgent
 from kestrel_sovereign import server
 from kestrel_sovereign.a2a.stores.unified.observability_store import ObservabilityStore
 from kestrel_sovereign.agent.parts import part_collector
@@ -40,7 +35,6 @@ from kestrel_sovereign.security.request_auth import (
     RequestAuthenticationService,
 )
 from kestrel_sovereign.storage.db.sqlite import SQLiteBackend
-from tests.integration.mcp_permission_peer import create_server
 
 
 pytestmark = [pytest.mark.mcp_integration, pytest.mark.timeout(30)]
@@ -97,6 +91,13 @@ class Boundary:
 
 @pytest_asyncio.fixture
 async def apps_boundary(tmp_path, monkeypatch):
+    from kestrel_feature_mcp.apps_execution import RegisteredAppTool
+    from kestrel_feature_mcp.apps_publication import AppPublications
+    from kestrel_feature_mcp.connection import MCPConnection, bind_tool_caller
+    from kestrel_feature_mcp.dynamic_tools import MCPToolWrapper
+    from kestrel_feature_mcp.feature import MCPAgent
+    from tests.integration.mcp_permission_peer import create_server
+
     monkeypatch.setenv("KESTREL_API_KEY", API_KEY)
     monkeypatch.setenv("JWT_SECRET_KEY", "owned-apps-jwt-signing-key-with-enough-entropy")
     monkeypatch.setenv("KESTREL_REQUIRE_OAUTH", "1")

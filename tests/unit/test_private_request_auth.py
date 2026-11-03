@@ -11,7 +11,7 @@ import os
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 from fastapi.testclient import TestClient
-from itsdangerous import TimestampSigner
+from itsdangerous import SignatureExpired, TimestampSigner
 import jwt
 import httpx2
 import pytest
@@ -215,6 +215,21 @@ def test_expired_native_session_is_rejected_before_private_access(authenticated_
             return super().get_timestamp() - 700
     raw = OldSigner(SESSION_KEY).sign(b64encode(json.dumps({"user_email": ALICE}).encode())).decode()
     client.cookies.set("kestrel_session", raw)
+    assert client.get("/api/private").status_code == 401 and not bindings
+
+
+def test_session_expiring_after_native_decode_is_refused_without_a_server_error(authenticated_app, monkeypatch):
+    client, bindings = authenticated_app
+    credentials(client, "cookie")
+    middleware = client.app.middleware_stack
+    while not isinstance(middleware, AuthenticatedSessionMiddleware):
+        middleware = middleware.app
+    original = middleware.signer.unsign
+    def expires_on_timestamp_read(value, **settings):
+        if settings.get("return_timestamp"):
+            raise SignatureExpired("native session expired before timestamp retention")
+        return original(value, **settings)
+    monkeypatch.setattr(middleware.signer, "unsign", expires_on_timestamp_read)
     assert client.get("/api/private").status_code == 401 and not bindings
 
 
