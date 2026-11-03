@@ -72,7 +72,10 @@ from kestrel_sovereign.llm.service import LLMService
 from kestrel_sovereign.main import get_agent_did_async
 from kestrel_sovereign.paths import SKIP_DOTENV_ENV
 from kestrel_sovereign.rate_limit import limiter
-from kestrel_sovereign.security.bootstrap_access import is_bootstrap_host_allowed
+from kestrel_sovereign.security.bootstrap_access import (
+    forwarding_header_names,
+    is_bootstrap_host_allowed,
+)
 from kestrel_sovereign.security.sovereign_key import mark_ephemeral_sovereign_key
 from kestrel_sovereign.telemetry import setup_tracing
 
@@ -690,6 +693,23 @@ def _oauth_required(environ: Mapping[str, str] | None = None) -> bool:
 def _bootstrap_key_enabled() -> bool:
     """Localhost API-key bootstrap is available when OAuth is not required."""
     return not _oauth_required() and not is_a2a_transport_only_process()
+
+
+def _is_fleet_host(app: FastAPI) -> bool:
+    """Whether this process is a fleet (multi-agent) host.
+
+    The lifespan's own verdict, recorded on ``app.state.fleet_host`` before it
+    can fail, so a host whose startup failed before publishing its registry is
+    still a fleet host here (#3904). A published manager or registry is the
+    consequence of that verdict; it counts too, for an app whose fleet state
+    was published without this lifespan.
+    """
+    state = app.state
+    return (
+        bool(getattr(state, "fleet_host", False))
+        or getattr(state, "agent_manager", None) is not None
+        or getattr(state, "multi_agent_config", None) is not None
+    )
 
 
 def _require_multi_agent_host_api_key(environ: Mapping[str, str]) -> str:
@@ -3356,7 +3376,12 @@ async def _lifespan_startup(app: FastAPI):
         "1", "true", "yes"
     )
     multi_agent_path = resolve_multi_agent_path(os.environ)
-    if multi_agent_env or multi_agent_path.exists():
+    fleet_host = multi_agent_env or multi_agent_path.exists()
+    # Recorded before anything can fail: a fleet host whose startup fails
+    # before it publishes its registry keeps serving, and must still never
+    # bootstrap its out-of-band key (#3904). See _is_fleet_host.
+    app.state.fleet_host = fleet_host
+    if fleet_host:
         _require_multi_agent_host_api_key(os.environ)
 
     await _initialize_stop_receipts(app)
@@ -3471,7 +3496,7 @@ async def _lifespan_startup(app: FastAPI):
         app.state.phoenix = None
         app.state.phoenix_disabled_reason = reason
 
-    if multi_agent_env or multi_agent_path.exists():
+    if fleet_host:
         # --- Multi-agent mode ---
         manager = None
         try:
@@ -5070,11 +5095,7 @@ async def get_bootstrap_key(request: Request):
     # address: both reach this endpoint over loopback. Once this process owns a
     # fleet, localhost therefore is not an authority boundary and the host key
     # must be provisioned out of band instead of returned by a public route.
-    multi_agent_host = (
-        getattr(request.app.state, "agent_manager", None) is not None
-        or getattr(request.app.state, "multi_agent_config", None) is not None
-    )
-    if not _bootstrap_key_enabled() or multi_agent_host:
+    if not _bootstrap_key_enabled() or _is_fleet_host(request.app):
         raise HTTPException(status_code=404, detail="API key bootstrap endpoint is disabled")
 
     # Narrowed from the whole 172.16.0.0/12 bridge range to loopback + the
@@ -5083,6 +5104,16 @@ async def get_bootstrap_key(request: Request):
     client_host = request.client.host if request.client else None
     if not is_bootstrap_host_allowed(client_host):
         logger.warning(f"Auth key request from non-allowed host: {client_host}")
+        raise HTTPException(status_code=403, detail="API key bootstrap only accessible from localhost")
+    # A forwarded request did not originate on this host, whatever client host
+    # the server made of its forwarding headers (#3905).
+    forwarding_headers = forwarding_header_names(request.headers.keys())
+    if forwarding_headers:
+        logger.warning(
+            "Auth key request from %s carries forwarding headers %s; refused",
+            client_host,
+            ", ".join(forwarding_headers),
+        )
         raise HTTPException(status_code=403, detail="API key bootstrap only accessible from localhost")
 
     response = {

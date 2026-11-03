@@ -8,9 +8,9 @@ the real server app wrapped exactly as uvicorn's defaults wrap it, so they pin
 what the gate sees on a real launch, not what it would see if it read the
 socket.
 
-Expected refusals pass. Reproduced bypasses are strict ``xfail`` tests whose
-reason names the follow-up issue; fixing one turns its test into an XPASS
-failure, which is the prompt to drop the marker.
+Two bypasses #3804 reproduced are refused since #3904 and #3905: a fleet host
+whose startup failed before it published its registry, and a loopback proxy
+whose forwarding headers uvicorn does not read.
 """
 
 from __future__ import annotations
@@ -27,13 +27,11 @@ from uvicorn.main import main as uvicorn_cli
 
 from kestrel_sovereign import server
 from kestrel_sovereign.rate_limit import limiter
+from kestrel_sovereign.security.bootstrap_access import forwarding_header_names
 
 REMOTE = "203.0.113.7"  # TEST-NET-3: a client that is not on this host.
 STANDALONE_KEY = "bootstrap-scoping-standalone-key"
 FLEET_KEY = "bootstrap-scoping-fleet-key"
-
-FLEET_STARTUP_ISSUE = "#3904"
-FORWARDING_EVIDENCE_ISSUE = "#3905"
 
 pytestmark = pytest.mark.usefixtures("isolated_process_rate_limiter")
 
@@ -145,14 +143,6 @@ def test_q1b_a_loopback_proxy_that_names_a_remote_client_is_refused(
     _assert_refused(response, 403)
 
 
-@pytest.mark.xfail(
-    strict=True,
-    raises=AssertionError,
-    reason=(
-        f"{FORWARDING_EVIDENCE_ISSUE}: uvicorn does not consume these forwarding "
-        "headers, so the gate sees the loopback proxy and admits a remote client"
-    ),
-)
 @pytest.mark.parametrize(
     ("peer", "headers"),
     [
@@ -176,6 +166,53 @@ def test_a_loopback_proxy_that_declares_a_remote_client_is_refused(
     default trusted forwarder is ``127.0.0.1`` only.
     """
     _assert_refused(_request_key(served_standalone, peer, headers), 403)
+
+
+@pytest.mark.parametrize(
+    ("peer", "headers"),
+    [
+        ("127.0.0.1", [("X-Real-IP", REMOTE)]),
+        ("127.0.0.1", [("CF-Connecting-IP", REMOTE)]),
+        ("127.0.0.1", [("True-Client-IP", REMOTE)]),
+        ("127.0.0.1", [("Via", "1.1 edge-proxy")]),
+        ("127.0.0.1", [("X-Forwarded-Proto", "https")]),
+        ("127.0.0.1", [("X-Forwarded-Host", "kestrel.example")]),
+        ("127.0.0.1", [("Forwarded", "for=127.0.0.1")]),
+        ("172.17.0.1", [("X-Forwarded-For", REMOTE)]),
+    ],
+    ids=[
+        "x-real-ip",
+        "cloudflared-tunnel",
+        "true-client-ip",
+        "via-only",
+        "x-forwarded-proto-only",
+        "x-forwarded-host-only",
+        "forwarded-claims-loopback",
+        "docker-gateway-proxy",
+    ],
+)
+def test_any_forwarding_header_refuses_an_otherwise_admitted_peer(
+    served_standalone, peer, headers
+):
+    """The headers' presence refuses, not the client they name (#3905).
+
+    uvicorn reads none of these from this peer, so the gate sees an allowed
+    host; a proxy that says the client is local is refused all the same.
+    """
+    _assert_refused(_request_key(served_standalone, peer, headers), 403)
+
+
+def test_ordinary_local_client_headers_are_not_forwarding_evidence():
+    browser = [
+        "host", "user-agent", "accept", "accept-language", "accept-encoding",
+        "cookie", "referer", "origin", "sec-fetch-site", "x-api-key",
+        "authorization", "x-requested-with", "x-correlation-id",
+    ]
+
+    assert forwarding_header_names(browser) == []
+    assert forwarding_header_names(
+        ["X-Forwarded-For", "x-forwarded-for", "VIA", "accept"]
+    ) == ["via", "x-forwarded-for"]
 
 
 def test_q1c_the_docker_bridge_gateway_is_admitted_by_default(served_standalone):
@@ -219,18 +256,64 @@ def test_q2_oauth_mode_and_managed_peers_turn_bootstrap_off(
     _assert_refused(_request_key(served_standalone, "127.0.0.1"), 404)
 
 
+def _stub_host_resources(monkeypatch):
+    """Replace what the lifespan starts around its fleet/standalone decision."""
+    from kestrel_sovereign import host_features as hf
+    from kestrel_sovereign import phoenix_supervisor as phoenix_module
+    from kestrel_sovereign.security import demo_isolation
+
+    async def _noop(*_args):
+        return None
+
+    monkeypatch.setenv("KESTREL_REQUIRE_OAUTH", "false")
+    monkeypatch.setenv("KESTREL_DB_BACKEND", "sqlite")
+    monkeypatch.setenv("KESTREL_PHOENIX_ENABLED", "0")
+    for name in (
+        "PORT",
+        "KESTREL_SERVER_HOST",
+        "KESTREL_DATABASE_URL",
+        "KESTREL_A2A_TRANSPORT_ONLY",
+        "KESTREL_BOOTSTRAP_ALLOWED_HOSTS",
+        "KESTREL_KITE_RELEASE_EVIDENCE",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setattr(server, "_initialize_stop_receipts", _noop)
+    monkeypatch.setattr(server, "_prepare_shared_postgres_scheduler_protocol", _noop)
+    monkeypatch.setattr(server, "_start_host_scheduler", _noop)
+    monkeypatch.setattr(phoenix_module, "should_supervise_phoenix", lambda: False)
+    monkeypatch.setattr(demo_isolation, "classify_server_mode", lambda _agents: False)
+    monkeypatch.setattr(server, "_mount_feature_ui_assets", lambda _app: None)
+    monkeypatch.setattr(server, "_mount_feature_routers", lambda _app: None)
+    monkeypatch.setattr(server, "setup_tracing", lambda _app: None)
+    monkeypatch.setattr(hf, "instantiate_host_features", lambda **_k: [])
+
+
+def _bootstrap_app() -> FastAPI:
+    app = FastAPI()
+    app.state.limiter = limiter
+    app.middleware("http")(server.auth_middleware)
+    app.add_api_route("/api/auth/key", server.get_bootstrap_key, methods=["GET"])
+    return app
+
+
 @asynccontextmanager
-async def _fleet_host(monkeypatch, tmp_path, registry_text: str):
+async def _fleet_host(
+    monkeypatch,
+    tmp_path,
+    registry_text: str,
+    *,
+    multi_agent_env: bool = True,
+    host_context=None,
+):
     """Run the real fleet-host startup on a ``multi_agent.toml`` of ``registry_text``.
 
     The registry is loaded by the real ``MultiAgentConfig.load``; only the
     resources started after it (Hold custody, agents, scheduler, features)
-    are replaced, as in ``test_a2a_native_cohost_startup``.
+    are replaced, as in ``test_a2a_native_cohost_startup``. Without
+    ``multi_agent_env`` the host is a fleet only because its registry exists.
+    ``host_context`` replaces the Hold custody step.
     """
-    from kestrel_sovereign import host_features as hf
-    from kestrel_sovereign import phoenix_supervisor as phoenix_module
     from kestrel_sovereign.multi_agent import agent_manager
-    from kestrel_sovereign.security import demo_isolation
 
     registry = tmp_path / "multi_agent.toml"
     registry.write_text(registry_text, encoding="utf-8")
@@ -261,46 +344,28 @@ async def _fleet_host(monkeypatch, tmp_path, registry_text: str):
         def list_agents(self):
             return {}
 
+        async def shutdown_all(self):
+            return None
+
     async def _host_context(app, _config):
         app.state.host_context = SimpleNamespace(
             hold_store=object(), feature_contribution_runtime=None
         )
         return app.state.host_context
 
-    async def _noop(*_args):
-        return None
-
-    monkeypatch.setenv("KESTREL_MULTI_AGENT", "1")
+    _stub_host_resources(monkeypatch)
+    if multi_agent_env:
+        monkeypatch.setenv("KESTREL_MULTI_AGENT", "1")
+    else:
+        monkeypatch.delenv("KESTREL_MULTI_AGENT", raising=False)
     monkeypatch.setenv("KESTREL_MULTI_AGENT_CONFIG", str(registry))
     monkeypatch.setenv("KESTREL_API_KEY", FLEET_KEY)
-    monkeypatch.setenv("KESTREL_REQUIRE_OAUTH", "false")
-    monkeypatch.setenv("KESTREL_DB_BACKEND", "sqlite")
-    monkeypatch.setenv("KESTREL_PHOENIX_ENABLED", "0")
-    for name in (
-        "PORT",
-        "KESTREL_SERVER_HOST",
-        "KESTREL_DATABASE_URL",
-        "KESTREL_A2A_TRANSPORT_ONLY",
-        "KESTREL_BOOTSTRAP_ALLOWED_HOSTS",
-        "KESTREL_KITE_RELEASE_EVIDENCE",
-    ):
-        monkeypatch.delenv(name, raising=False)
     monkeypatch.setattr(agent_manager, "AgentManager", lambda **_k: _Manager())
-    monkeypatch.setattr(server, "_build_host_control_context", _host_context)
-    monkeypatch.setattr(server, "_initialize_stop_receipts", _noop)
-    monkeypatch.setattr(server, "_prepare_shared_postgres_scheduler_protocol", _noop)
-    monkeypatch.setattr(server, "_start_host_scheduler", _noop)
-    monkeypatch.setattr(phoenix_module, "should_supervise_phoenix", lambda: False)
-    monkeypatch.setattr(demo_isolation, "classify_server_mode", lambda _agents: False)
-    monkeypatch.setattr(server, "_mount_feature_ui_assets", lambda _app: None)
-    monkeypatch.setattr(server, "_mount_feature_routers", lambda _app: None)
-    monkeypatch.setattr(server, "setup_tracing", lambda _app: None)
-    monkeypatch.setattr(hf, "instantiate_host_features", lambda **_k: [])
+    monkeypatch.setattr(
+        server, "_build_host_control_context", host_context or _host_context
+    )
 
-    app = FastAPI()
-    app.state.limiter = limiter
-    app.middleware("http")(server.auth_middleware)
-    app.add_api_route("/api/auth/key", server.get_bootstrap_key, methods=["GET"])
+    app = _bootstrap_app()
     async with server._lifespan_startup(app):
         yield app
 
@@ -321,15 +386,6 @@ async def test_a_fleet_host_that_published_its_registry_never_bootstraps(
     _assert_refused(response, 404)
 
 
-@pytest.mark.xfail(
-    strict=True,
-    raises=AssertionError,
-    reason=(
-        f"{FLEET_STARTUP_ISSUE}: the endpoint recognizes a fleet host only by "
-        "state published after its registry loads, so a host whose startup "
-        "failed first serves its out-of-band sovereign key to loopback callers"
-    ),
-)
 async def test_a_fleet_host_whose_registry_failed_to_load_never_bootstraps(
     monkeypatch, tmp_path
 ):
@@ -341,3 +397,62 @@ async def test_a_fleet_host_whose_registry_failed_to_load_never_bootstraps(
         response = await _loopback_get_key(app)
 
     _assert_refused(response, 404)
+
+
+async def _refuse_hold_custody(_app, _config):
+    raise RuntimeError(
+        "Host Hold control state is unavailable before work admission: refused"
+    )
+
+
+@pytest.mark.parametrize(
+    ("registry_text", "multi_agent_env", "host_context"),
+    [
+        ("[host\nport = = 1\n", False, None),
+        ('[host]\nbind = "127.0.0.1"\n', True, _refuse_hold_custody),
+    ],
+    ids=["found-by-registry-file", "hold-custody-refused"],
+)
+async def test_every_failed_fleet_startup_keeps_the_fleet_verdict(
+    monkeypatch, tmp_path, registry_text, multi_agent_env, host_context
+):
+    """The verdict is the lifespan's, however the host is a fleet and wherever
+    its startup fails before publishing the registry (#3904)."""
+    async with _fleet_host(
+        monkeypatch,
+        tmp_path,
+        registry_text,
+        multi_agent_env=multi_agent_env,
+        host_context=host_context,
+    ) as app:
+        assert app.state.startup_error
+        assert getattr(app.state, "multi_agent_config", None) is None
+        assert getattr(app.state, "agent_manager", None) is None
+        response = await _loopback_get_key(app)
+
+    _assert_refused(response, 404)
+
+
+async def test_a_standalone_host_whose_startup_failed_still_bootstraps(
+    monkeypatch, tmp_path
+):
+    """The recorded verdict is the lifespan's decision, not "startup failed"."""
+
+    async def _no_identity(*_args, **_kwargs):
+        raise RuntimeError("agent identity is unavailable")
+
+    _stub_host_resources(monkeypatch)
+    monkeypatch.delenv("KESTREL_MULTI_AGENT", raising=False)
+    monkeypatch.setenv(
+        "KESTREL_MULTI_AGENT_CONFIG", str(tmp_path / "no-multi-agent.toml")
+    )
+    monkeypatch.setenv("KESTREL_DB_PATH", str(tmp_path))
+    monkeypatch.setenv("KESTREL_API_KEY", STANDALONE_KEY)
+    monkeypatch.setattr(server, "get_agent_did_async", _no_identity)
+
+    app = _bootstrap_app()
+    async with server._lifespan_startup(app):
+        assert app.state.startup_error
+        response = await _loopback_get_key(app)
+
+    assert _issued(response)
