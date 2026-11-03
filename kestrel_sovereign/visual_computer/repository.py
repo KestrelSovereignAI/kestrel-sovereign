@@ -28,7 +28,7 @@ from kestrel_sdk.security.encryption import get_fernet
 from kestrel_sdk.security.exceptions import DecryptionError
 from kestrel_sdk.storage.database.interface import TransactionError
 
-from kestrel_sovereign.execution_custody import execution_commit_outcome
+from kestrel_sovereign.execution_custody import ExecutionAuthorityError, execution_commit_outcome
 from .step import PlanningRecord, StepIntent
 from .runpod_quote_storage import _RunpodEnvironmentEnvelope
 
@@ -512,7 +512,7 @@ class VisualCustodyRepository:
             return retired
 
     @asynccontextmanager
-    async def original_acquisition_result(self, scope, record, request, quote, *, guard):
+    async def original_acquisition_result(self, scope, record, request, quote, *, guard, runtime_custody=None):
         """Reserve the exact existing quoted row; allocate its attempt only once.
 
         Legacy possible-effect phases are not a new acquisition opportunity.
@@ -521,7 +521,32 @@ class VisualCustodyRepository:
         from kestrel_sovereign.storage.original_acquisition_result import (
             _AcceptedAcquisitionResult, _OriginalAcquisitionResult,
         )
-        from .storage_acquisition import _CoreAcquisitionAttempt
+        from .storage_acquisition import (
+            _CoreAcquisitionAttempt, _CoreAcquisitionCustody, _RUNTIME_ACQUISITION_RESTRICTION,
+        )
+        # A provider's inherited invocation cannot request a fresh native
+        # acquisition under another row or a forwarding guard in a child Task.
+        # Independently admitted Tasks do not inherit this restriction.
+        if _RUNTIME_ACQUISITION_RESTRICTION.get() is not None:
+            raise ExecutionAuthorityError('Original runtime provider invocation already owns acquisition')
+        # A closed SDK operation/root cannot shed the SAME original runtime
+        # invocation restriction by requesting another genuine acceptance.
+        # This is task/repository/consumer lineage, never a stale-row blacklist.
+        identity = (self._owner(scope), request.request_id, self._address('session', record.session_id))
+        for accepted, retained in tuple(self._original_results.items()):
+            if (type(accepted) is _AcceptedAcquisitionResult
+                    and accepted.runtime_custody is not None
+                    and (accepted.task is asyncio.current_task()
+                        or accepted.identity == identity or accepted.guard is guard)):
+                if type(retained) is not _OriginalAcquisitionResult or retained._acceptance is not accepted:
+                    raise ExecutionAuthorityError('Original runtime acquisition registration differs')
+                retained._require_registered()
+                accepted.runtime_custody._require_invocation(retained)
+                raise ExecutionAuthorityError('Original runtime provider invocation already owns acquisition')
+        if runtime_custody is not None:
+            if type(runtime_custody) is not _CoreAcquisitionCustody:
+                raise ExecutionAuthorityError('Exact original runtime acquisition consumer required')
+            runtime_custody._require_issuing(self, scope, record)
         from kestrel_sovereign.execution_sync_http import _check_sync_restriction
         def checked_guard():
             _check_sync_restriction(guard)
@@ -542,7 +567,7 @@ class VisualCustodyRepository:
                     raise ResourceConflict("original acquisition custody differs or may already have dispatched")
                 plain = AEADCipher(self._key).decrypt(bytes(row[1]), aad=f'{owner}:{request.request_id}'.encode())
                 acceptance = _AcceptedAcquisitionResult(asyncio.current_task(),
-                    (owner, request.request_id, row[0]), bytes(row[1]), plain, row[2], guard)
+                    (owner, request.request_id, row[0]), bytes(row[1]), plain, row[2], guard, runtime_custody)
                 self._original_results[acceptance] = None
                 result = _OriginalAcquisitionResult(self, acceptance)
             from kestrel_sovereign.storage.db.sqlite import SQLiteBackend
@@ -555,7 +580,10 @@ class VisualCustodyRepository:
                 result._postgres_relation = await backend._capture_original_signal_outcome_relation(result)
             result._query, result._match_query = result._fixed_queries()
             await result.allocate(request, quote)
-            yield _CoreAcquisitionAttempt(result)
+            attempt = _CoreAcquisitionAttempt(result)
+            if runtime_custody is not None:
+                runtime_custody._bind_original_attempt(attempt)
+            yield attempt
         except BaseException as error:
             original_failure = error
             raise
@@ -563,6 +591,14 @@ class VisualCustodyRepository:
             if result is not None:
                 try:
                     await result.aclose()
+                    if runtime_custody is not None:
+                        result._require_registered()
+                        runtime_custody._require_invocation(result)
+                        result._require_close_owner()
+                        if (result._phase != 'closed' or not result._closed.done()
+                                or result in result._backend._original_result_holds):
+                            raise ExecutionAuthorityError('Original runtime acquisition physical retirement absent')
+                        self._original_results.pop(acceptance)
                 except BaseException as cleanup:
                     if original_failure is None:
                         raise

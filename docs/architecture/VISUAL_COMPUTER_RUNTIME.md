@@ -334,3 +334,42 @@ connection endpoints, plan bytes and private bootstrap content remain excluded.
 The current strict CPU profile does not establish an authenticated isolated remote
 browser. Connect/bootstrap, renewal, remote worker/display transport, native amd64
 admission and physical cloud billing/termination conformance remain unsupported.
+
+Runtime admission refuses the authenticated native acquisition profile before
+attaching its producer, saving its preparation or acknowledging dispatch. The
+restriction belongs to the original runtime provider invocation and accepted
+Acquisition registration before the provider receives the facade. Canonical
+allocation and its native COMMIT/reset ACK occur first, so even a provider that
+never enters its SDK operation can leave an unprepared checkpoint. Its one-shot
+SDK operation exposes that same attempt. Closing the root releases its physical
+hold after the original joins, but retains the invocation restriction until the
+outer Core context has actually finalized. Fresh issuance before, inside or after
+the SDK operation cannot remove it; this uses the original Task, repository and
+consumer lineage rather than stale ciphertext or row revision. It does not depend on a
+provider name, the request's location label or the presence of a private quote.
+A catalog quote and current read-only inspection remain available. Explicit
+repository-issued producer conformance is a separate source-test scope, not a
+runtime admission or a supported remote worker. Existing deterministic providers
+continue under their own supported contracts.
+
+Overlapping foreground RELEASE operations or withdrawal may leave the original
+DELETE outcome uncertain. A later 404 is not an authenticated physical-destruction
+or final-billing receipt; the original resource identity, intent and cost debt
+remain. A fresh RELEASE also requires the current destination/privacy policy. If
+remote processing has been disabled, Core does not bypass that policy to delete;
+recovery needs a fresh permitted RELEASE or a separately authorized operator path.
+
+The sealed native Acquisition receipt has no original no-send attestation. A
+failure without a known Pod ID therefore retains charged UNKNOWN debt even when
+Task completion or local socket state appears to suggest no send. Those local
+observations cannot refund capacity, prove no cloud effect, or authorize another
+create. This is a conservative recovery limitation, not a new sent=false field or
+automatic cleanup permission.
+
+The same immutable Acquisition acceptance also restricts the logical Runtime
+provider invocation through context inherited by joined child tasks. Changing
+the request row or forwarding the guard cannot create a second acquisition in
+that invocation. The context value only restricts issuance; it grants no host,
+native, or persistence authority. Independently admitted tasks retain their own
+original checks. Physical close and outer retirement still use the same original
+owner, backend hold, and actual native joins.

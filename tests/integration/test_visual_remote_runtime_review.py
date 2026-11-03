@@ -21,7 +21,7 @@ from kestrel_sovereign.privacy import PrivacyConfig, PrivacyMode
 from kestrel_sovereign.storage.privacy_wrapper import DurablePersistenceGate
 from kestrel_sovereign.visual_computer.repository import CustodyRecord
 from kestrel_sovereign.visual_computer.runtime import VisualAction
-from tests.integration.test_visual_custodied_runtime import NativeFixtureProvider, runtime_for
+from tests.integration.test_visual_custodied_runtime import NativeFixtureProvider, runtime_for, source_acquisition
 from tests.integration.test_visual_custody_backends import SCOPE
 from tests.integration.test_visual_custody_backends import custody as custody
 from tests.integration.test_visual_runpod_acquisition import original_host, original_quote
@@ -52,10 +52,10 @@ async def test_acquisition_only_native_pod_cannot_reach_connect(custody, vendor,
         except BaseException as error:
             caught = error
         row = await h.store.get(SCOPE, request_id=h.request.request_id, guard=h.check)
-        assert row.remote_environment is None and row.acquisition.binding is not None
-        assert row.lease.provider_resource_id == "owned-native-pod"
-    assert len(peer.requests) == 1 and h.native.is_closed
-    assert isinstance(caught, ResourceUnsupported) and "bootstrap" in str(caught)
+        assert row.remote_environment is None and row.acquisition.binding is None
+        assert row.lease is None and row.phase == "quoted"
+    assert not peer.requests and h.native.is_closed
+    assert isinstance(caught, ResourceUnsupported) and "worker" in str(caught)
     assert calls == []
 
 
@@ -67,7 +67,8 @@ async def test_acquisition_only_native_pod_never_borrows_resident_release(custod
         row = await h.store.admit(SCOPE, CustodyRecord(request=h.request, session_id="unopened"), h.check)
         row.quote, row.phase = original_quote(h.plan), "quoted"
         await h.store.save(SCOPE, row, h.check)
-        row = await runtime._acquire_custodied(h.context, row, h.check, provider)
+        await source_acquisition(h, provider)
+        row = await h.store.get(SCOPE, session_id=row.session_id, guard=h.check)
         effects = []
         async def release(scope, lease):
             effects.append(lease.provider_resource_id)
@@ -201,7 +202,8 @@ async def test_native_pod_without_quote_refuses_fresh_foreground_erase(custody, 
         row = await h.store.admit(SCOPE, CustodyRecord(request=h.request, session_id="unopened"), h.check)
         row.quote, row.phase = original_quote(h.plan), "quoted"
         await h.store.save(SCOPE, row, h.check)
-        row = await runtime._acquire_custodied(h.context, row, h.check, provider)
+        await source_acquisition(h, provider)
+        row = await h.store.get(SCOPE, session_id=row.session_id, guard=h.check)
         before = row.model_copy(deep=True)
     # The original ADMIT has unwound. A real new foreground RELEASE admission
     # does not reconstruct an absent original native quote or erase contract.

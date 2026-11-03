@@ -631,10 +631,19 @@ async def test_runtime_uses_quote_native_ack_and_never_generic_presave(
         )
         value = await h.store.get(SCOPE, request_id=h.request.request_id, guard=h.check)
         assert (
-            value.phase == "retired"
+            value.phase == "quoted"
             and value.quote is not None
             and value.remote_environment is not None
         )
+        # The original allocation ACK now precedes provider exposure, including
+        # providers that never enter the SDK operation. Stale generic retirement
+        # cannot overwrite that original, still-unprepared checkpoint.
+        from kestrel_sdk.computer_use.acquisition import EnvironmentAcquisitionStorage
+        saved = EnvironmentAcquisitionStorage.deserialize_private(value.acquisition.storage)
+        assert saved.checkpoint.state == 'unprepared' and saved.preparation is None
+        assert value.acquisition.binding is None and value.lease is None
+        assert value.revision == provider.acquisition_entries[0].revision
+        assert not h.store._original_results and not h.store.db.backend._original_result_holds
         assert len(quote_peer.requests) == 1
 
 

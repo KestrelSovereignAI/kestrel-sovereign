@@ -283,8 +283,9 @@ class VisualComputerRuntime:
         from .storage_acquisition import _CoreAcquisitionCustody
         scope = self.scope(context)
         custody = _CoreAcquisitionCustody(self.repository, scope, record, guard=check)
-        lease = await self._call(context, check, provider.acquire_with_custody,
-            record.request, record.quote, custody)
+        async with custody._activate_original():
+            lease = await self._call(context, check, provider.acquire_with_custody,
+                record.request, record.quote, custody)
         self._lease(record, lease, acquiring=True)
         # The same original operation's accepted native ACK is mandatory.
         # Reload its exact ciphertext/revision instead of saving a stale DTO.

@@ -35,6 +35,7 @@ class _AcceptedAcquisitionResult:
     plain: bytes
     revision: int
     guard: object
+    runtime_custody: object = None
 
 
 @dataclass(frozen=True, eq=False, repr=False)
@@ -59,6 +60,7 @@ class _AcquisitionAdmission:
     native_backing: object
     expires_at: datetime
     spending_expires_at: datetime
+    runtime_custody: object = None
     writer: object = None
     entry: object = None
     native: object = None
@@ -98,6 +100,7 @@ class _OriginalAcquisitionResult(_OriginalResultCustody):
         self._identity = acceptance.identity
         self._expected, self._plain, self._revision = acceptance.payload, acceptance.plain, acceptance.revision
         self._guard = acceptance.guard
+        self._runtime_custody = acceptance.runtime_custody
         self._entry = self._writer_admission = None
         self._postgres_relation = self._postgres_session = self._sqlite_relation = None
         self._query = self._match_query = None
@@ -115,7 +118,8 @@ class _OriginalAcquisitionResult(_OriginalResultCustody):
         self._spending_expires_at = datetime.fromisoformat(original['quote']['expires_at'])
         self._registration = _AcquisitionAdmission(self._owner_task, self._identity,
             self._expected, self._plain, self._revision, self._guard,
-            self._native_backing.privacy_holds, self._native_backing, self._expires_at, self._spending_expires_at)
+            self._native_backing.privacy_holds, self._native_backing, self._expires_at, self._spending_expires_at,
+            self._runtime_custody)
         repository._original_results[acceptance] = self
         self._backend._original_result_holds[self] = self._closed
         try:
@@ -141,8 +145,15 @@ class _OriginalAcquisitionResult(_OriginalResultCustody):
                 or type(self._revision) is not int or self._revision != r.revision
                 or self._guard is not r.guard or self._writer_admission is not r.writer
                 or self._entry is not r.entry or self._native is not r.native
-                or self._last_ack is not r.last_ack or self._join is not r.join or self._observer_depth):
+                or self._last_ack is not r.last_ack or self._join is not r.join or self._observer_depth
+                or self._runtime_custody is not r.runtime_custody
+                or self._runtime_custody is not self._acceptance.runtime_custody):
             raise ExecutionAuthorityError('Original acquisition identity retired')
+        if self._runtime_custody is not None:
+            from kestrel_sovereign.visual_computer.storage_acquisition import _CoreAcquisitionCustody
+            if type(self._runtime_custody) is not _CoreAcquisitionCustody:
+                raise ExecutionAuthorityError('Original runtime acquisition consumer changed')
+            self._runtime_custody._require_issued()
         if self._expires_at is not r.expires_at or self._spending_expires_at is not r.spending_expires_at:
             raise ExecutionAuthorityError('Original acquisition lifetime changed')
         if (self._query is not None or self._match_query is not None) and (self._query, self._match_query) != self._fixed_queries():
@@ -242,6 +253,8 @@ class _OriginalAcquisitionResult(_OriginalResultCustody):
         self.check_current()
         if type(native) is not _NativeAcquisitionHandle or native._root is not self or self._native is not None:
             raise ExecutionAuthorityError('Original acquisition native preparation differs')
+        if self._runtime_custody is not None:
+            self._runtime_custody._refuse_native_worker(self, native._binding._attempt)
         self._native = native
         self._registration = replace(self._registration, native=native)
 
@@ -499,7 +512,10 @@ class _OriginalAcquisitionResult(_OriginalResultCustody):
         if self._native is not None and self._native._state != 'closed':
             raise ExecutionAuthorityError('Original acquisition native owner must close first')
         self._phase = 'closed'
-        self._repository._original_results.pop(self._acceptance, None)
+        # Physical retirement does not end the enclosing runtime invocation.
+        # Its canonical repository context alone retires that restriction.
+        if self._acceptance.runtime_custody is None:
+            self._repository._original_results.pop(self._acceptance, None)
         self._backend._original_result_holds.pop(self, None)
         if not self._closed.done():
             self._closed.set_result(None)

@@ -1,4 +1,4 @@
-"""Original host lifetime must retain joined native facts without provider help.
+"""Explicit source-only host lifetime retains native facts without provider help.
 
 Only owned TLS peers are contacted; no Pod, remote worker or billing proof.
 """
@@ -16,7 +16,7 @@ from kestrel_sdk.computer_use.acquisition import EnvironmentAcquisitionPreparati
 from kestrel_sovereign.execution_custody import _explicit_control_chain, is_execution_control_error
 from kestrel_sovereign.execution_sync_http import await_native_sync_http, bind_native_sync_http_execution_admission
 from kestrel_sovereign.visual_computer.runpod_acquisition import prepare_runpod_acquisition_producer
-from tests.integration.test_visual_custodied_runtime import NativeFixtureProvider, BoundedSessionDriver, runtime_for
+from tests.integration.test_visual_custodied_runtime import NativeFixtureProvider, BoundedSessionDriver, source_acquisition
 from tests.integration.test_visual_runpod_acquisition import (
     custody as custody, vendor as vendor, peer as peer, SCOPE,
     original_host, original_acquisition,
@@ -33,30 +33,28 @@ class FailingAfterNativeProvider(NativeFixtureProvider):
         super().__init__(host, mode='raise-after-native')
         self.error, self.after_native, self.explicit = error, after_native, explicit
 
-    async def acquire_with_custody(self, request, quote, custody):
-        self.modern_calls += 1
+    async def _run_original_attempt(self, attempt, request, quote):
         host = self.host
-        async with custody.operation(request, quote) as attempt:
-            dto = host.plan.pod_request(request, host.plan.profile, host.plan.noncompute, at=host.plan.planned_at)
-            prepared = host.control.prepare_cpu_pod(dto, plan=host.plan)
-            preparation = EnvironmentAcquisitionPreparation(create_payload=SecretBytes(prepared.exact_body()),
-                worker_identity=SecretBytes(b'PRIVATE-ORIGINAL-WORKER-TLS-IDENTITY'))
-            producer = await prepare_runpod_acquisition_producer(attempt, host.control, dto,
-                prepared=prepared, plan=host.plan, preparation=preparation)
-            self.original = SimpleNamespace(attempt=attempt, producer=producer, handle=producer._original_acquisition)
-            assert await attempt.begin_dispatch() is True
-            phase = await self.original.handle.run_original()
-            if self.explicit is not None:
-                checkpoint = await self.original.handle.persist_minimal()
-                if self.explicit == 'accepted':
-                    producer.finish_optional_cost(phase)
-                    await attempt.record_accepted(checkpoint.lease.model_copy(update={'state': 'pending'}))
-            if self.after_native is not None:
-                await self.after_native(self.original)
-            # The HOST sealed the original phase; no caller supplied Pod DTO,
-            # optional-cost continuation or minimal-persistence call occurs.
-            assert self.original.handle._receipt.lease.provider_resource_id == 'owned-native-pod'
-            raise self.error
+        dto = host.plan.pod_request(request, host.plan.profile, host.plan.noncompute, at=host.plan.planned_at)
+        prepared = host.control.prepare_cpu_pod(dto, plan=host.plan)
+        preparation = EnvironmentAcquisitionPreparation(create_payload=SecretBytes(prepared.exact_body()),
+            worker_identity=SecretBytes(b'PRIVATE-ORIGINAL-WORKER-TLS-IDENTITY'))
+        producer = await prepare_runpod_acquisition_producer(attempt, host.control, dto,
+            prepared=prepared, plan=host.plan, preparation=preparation)
+        self.original = SimpleNamespace(attempt=attempt, producer=producer, handle=producer._original_acquisition)
+        assert await attempt.begin_dispatch() is True
+        phase = await self.original.handle.run_original()
+        if self.explicit is not None:
+            checkpoint = await self.original.handle.persist_minimal()
+            if self.explicit == 'accepted':
+                producer.finish_optional_cost(phase)
+                await attempt.record_accepted(checkpoint.lease.model_copy(update={'state': 'pending'}))
+        if self.after_native is not None:
+            await self.after_native(self.original)
+        # The HOST sealed the original phase; no caller supplied Pod DTO,
+        # optional-cost continuation or minimal-persistence call occurs.
+        assert self.original.handle._receipt.lease.provider_resource_id == 'owned-native-pod'
+        raise self.error
 
 
 @pytest.mark.asyncio
@@ -93,9 +91,8 @@ async def test_host_retains_original_pod_fact_when_provider_raises_after_native_
         error = ProviderAfterNativeError('provider failed after original native return')
         provider = FailingAfterNativeProvider(host, error)
         driver = BoundedSessionDriver()
-        runtime = runtime_for(host, provider, driver)
         with pytest.raises(ProviderAfterNativeError) as raised:
-            await runtime.admit(host.context, host.request)
+            await source_acquisition(host, provider)
         assert raised.value is error
         assert provider.modern_calls == 1 and provider.legacy_calls == provider.connects == driver.opens == 0
         assert len(peer.requests) == 1 and peer.requests[0][0] == '/v2/pods'
@@ -163,7 +160,7 @@ async def test_host_finalization_preserves_explicit_original_ack_without_another
         provider = FailingAfterNativeProvider(host, error, explicit=explicit)
         driver = BoundedSessionDriver()
         with pytest.raises(ProviderAfterNativeError) as raised:
-            await runtime_for(host, provider, driver).admit(host.context, host.request)
+            await source_acquisition(host, provider)
         assert raised.value is error and calls.count('minimal') == 1
         assert calls.count('accepted') == (1 if explicit == 'accepted' else 0)
         current = await host.store.get(SCOPE, request_id=host.request.request_id, guard=host.check)
@@ -183,7 +180,7 @@ async def test_host_finalization_retains_fact_after_original_grant_is_withdrawn(
         error = ProviderAfterNativeError('original grant withdrawn after native join')
         provider = FailingAfterNativeProvider(host, error, after_native=withdraw)
         with pytest.raises(ProviderAfterNativeError) as raised:
-            await runtime_for(host, provider, BoundedSessionDriver()).admit(host.context, host.request)
+            await source_acquisition(host, provider)
         assert raised.value is error and host.current['live'] is False
         # The fixture observes its own encrypted database, without supplying a
         # substitute current checker. No operation/parse permission is renewed.
@@ -212,7 +209,7 @@ async def test_host_finalization_retains_fact_on_actual_original_caller_withdraw
             provider = FailingAfterNativeProvider(host, ProviderAfterNativeError('unreached'), after_native=after_native)
             driver = BoundedSessionDriver()
             try:
-                await runtime_for(host, provider, driver).admit(host.context, host.request)
+                await source_acquisition(host, provider)
             except BaseException as error:
                 observed['returned_error'] = error
                 observed['record'] = await host.store.get(SCOPE, request_id=host.request.request_id, guard=host.check)
@@ -267,7 +264,7 @@ async def test_host_finalization_keeps_original_cause_and_uncertainty_without_re
         provider = FailingAfterNativeProvider(host, provider_error, after_native=close_fault)
         driver = BoundedSessionDriver()
         with pytest.raises(BaseException) as raised:
-            await runtime_for(host, provider, driver).admit(host.context, host.request)
+            await source_acquisition(host, provider)
         chain = tuple(_explicit_control_chain(raised.value))
         assert any(error is provider_error for error in chain)
         assert any(error is finalization_error for error in chain)
