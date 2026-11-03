@@ -1,3 +1,22 @@
+---
+type: Architecture Spec
+title: Authenticated MCP Apps host
+description: Original interactive chat authority, privacy policy and physical delivery for optional native MCP Apps.
+resource: /docs/architecture/MCP_APPS_HOST.md
+tags:
+- docs
+- architecture
+- mcp
+- mcp-apps
+- security
+timestamp: '2026-11-03T00:00:00Z'
+status: active
+owner: architecture
+canonical: true
+generated: false
+privacy: public
+---
+
 # Authenticated MCP Apps host
 
 Core owns interactive identity, routed-agent membership and privacy policy.
