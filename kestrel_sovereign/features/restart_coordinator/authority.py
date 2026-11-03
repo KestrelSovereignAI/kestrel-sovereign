@@ -191,8 +191,9 @@ def agent_request_bounds_violation(
             "target_ref must be the default Sovereign checkout's default "
             f"branch {default_branch!r}; got {update_target_ref!r}"
         )
-    # The profile runs ``git fetch origin <name>`` and lands on FETCH_HEAD;
-    # when a tag and a branch share the name, git fetches the TAG. An agent
+    # The profile runs ``git fetch origin <name>`` and lands on the commit
+    # FETCH_HEAD then names; when a tag and a branch share the name, git
+    # fetches the TAG. An agent
     # request is bound to the branch, so a same-named tag refuses it.
     shadowing_tag = update_profiles.checkout_has_tag(
         default_repo, default_branch, fresh=fresh,

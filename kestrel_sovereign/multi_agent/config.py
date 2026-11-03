@@ -960,3 +960,27 @@ def load_host_registry(env: Mapping[str, str], base: Path) -> MultiAgentConfig:
         runtime_env=env,
         runtime_base=base,
     )
+
+
+def launched_host_registry(
+    project_dir: Path, *, env: Optional[Mapping[str, str]] = None
+) -> MultiAgentConfig:
+    """The registry the host ``kestrel start`` launches in ``project_dir`` loads.
+
+    The one registry every lifecycle path names its agents from (#3832):
+    ``kestrel start`` and ``kestrel terminate`` find an agent in it, and the
+    deploy gates and their liveness checks judge the databases its agents
+    open. Two registries would let a named restart stop and start an agent
+    whose database no gate read. ``kestrel start`` launches the host with the
+    project as its working directory and
+    :func:`~kestrel_sovereign.paths.spawned_agent_env` as its environment, so
+    this is :func:`load_host_registry` with both. ``env`` is that environment
+    when the caller has already built it.
+
+    Raises:
+        OSError, ValueError: As :meth:`MultiAgentConfig.load`.
+    """
+    project_dir = Path(project_dir)
+    return load_host_registry(
+        spawned_agent_env(project_dir) if env is None else env, project_dir
+    )

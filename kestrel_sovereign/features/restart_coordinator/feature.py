@@ -23,6 +23,7 @@ import glob
 import json
 import logging
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -99,6 +100,7 @@ from .store import (
 )
 from .update_profiles import (
     KNOWN_UPDATE_PROFILES,
+    UpdateStep,
     default_sovereign_repo_path,
     get_update_profile,
     is_valid_target_ref,
@@ -108,6 +110,13 @@ from .update_profiles import (
 
 # Cap on captured stdout/stderr per update step kept in the durable log.
 _OUTPUT_TAIL_CHARS = 2000
+
+# The update-log step that resolves what the fetch landed to one commit, the
+# one every later step and check names (#3832).
+_PIN_FETCHED_COMMIT_STEP = "pin_fetched_commit"
+
+# What ``git rev-parse`` prints for a commit: a SHA-1 or SHA-256 object id.
+_COMMIT_ID = re.compile(r"[0-9a-f]{40}(?:[0-9a-f]{24})?")
 
 # Active request ids older than this are treated as abandoned markers
 # (endpoint cleanup never ran — client disconnect, crashed generator)
@@ -3172,11 +3181,31 @@ class RestartCoordinatorFeature(Feature):
         # refusal is terminal, like the adoption gate's.
         migration_checks: List[Dict[str, Any]] = []
         migration_refusal: Optional[str] = None
+        # The one commit the fetch landed, pinned right after it: what the
+        # checks judge and what every later step checks out (#3832).
+        fetched_commit = ""
         try:
             # Clear the previous attempt's checks before this one runs, so the
             # row never presents them as this attempt's.
             await self._record_constitution_checks(req, constitution_checks)
             for step in steps:
+                if step.names_fetched_commit:
+                    if not fetched_commit:
+                        # A profile step names the fetched commit, but no
+                        # fetch pinned one: it would run against nothing.
+                        results.append({
+                            "step": step.name,
+                            "argv": list(step.argv),
+                            "returncode": None,
+                            "ok": False,
+                            "error": "no fetched commit was pinned before this step",
+                            "stdout_tail": "",
+                            "stderr_tail": "",
+                        })
+                        ok = False
+                        failed_step = step.name
+                        break
+                    step = step.bound(fetched_commit)
                 outcome = await self._run_update_step(step)
                 results.append(outcome)
                 if step.name == "resolve_ref" and outcome.get("ok"):
@@ -3188,6 +3217,18 @@ class RestartCoordinatorFeature(Feature):
                     failed_step = step.name
                     break
                 if step.name == "fetch":
+                    # FETCH_HEAD names whatever the last fetch in this checkout
+                    # wrote, and another fetch can rewrite it. Resolve it to
+                    # one commit now: the checks judge that commit and every
+                    # later step lands it, so a revision nothing judged cannot
+                    # be checked out (#3832).
+                    pinned = await self._pin_fetched_commit(req.update_repo_path)
+                    results.append(pinned)
+                    if not pinned["ok"]:
+                        ok = False
+                        failed_step = _PIN_FETCHED_COMMIT_STEP
+                        break
+                    fetched_commit = pinned["stdout_tail"]
                     # The fetch only moved remote-tracking refs. Judge the
                     # revision it fetched before checkout lands it: an agent
                     # not anchored to that revision's constitution would boot
@@ -3197,7 +3238,7 @@ class RestartCoordinatorFeature(Feature):
                         await self._check_constitution_adoption(
                             stage=_FETCHED_REVISION_CHECK,
                             repo_path=req.update_repo_path,
-                            revision="FETCH_HEAD",
+                            revision=fetched_commit,
                         )
                     )
                     constitution_checks.append(check)
@@ -3216,7 +3257,7 @@ class RestartCoordinatorFeature(Feature):
                     check, migration_refusal = await self._check_offline_migrations(
                         stage=_FETCHED_REVISION_CHECK,
                         repo_path=req.update_repo_path,
-                        revision="FETCH_HEAD",
+                        revision=fetched_commit,
                     )
                     migration_checks.append(check)
                     if migration_refusal is not None:
@@ -3305,6 +3346,31 @@ class RestartCoordinatorFeature(Feature):
             "offline_migration_refusal": migration_refusal,
         }
 
+    async def _pin_fetched_commit(self, repo_path: str) -> Dict[str, Any]:
+        """Resolve what the fetch landed to one commit, as an update-log outcome.
+
+        ``stdout_tail`` is the commit id when ``ok``. Anything git prints that
+        is not a commit id fails the outcome: nothing could then be judged
+        (#3832).
+        """
+        outcome = await self._exec_update_step(
+            UpdateStep(
+                _PIN_FETCHED_COMMIT_STEP,
+                [
+                    "git", "-C", repo_path,
+                    "rev-parse", "--verify", "FETCH_HEAD^{commit}",
+                ],
+            )
+        )
+        commit = (outcome.get("stdout_tail") or "").strip()
+        if outcome.get("ok") and not _COMMIT_ID.fullmatch(commit):
+            return {
+                **outcome,
+                "ok": False,
+                "error": f"FETCH_HEAD resolved to {commit!r}, not a commit id",
+            }
+        return {**outcome, "stdout_tail": commit}
+
     async def _run_update_step(self, step) -> Dict[str, Any]:
         """Run one allowlisted argv step; capture rc + truncated output.
 
@@ -3365,7 +3431,9 @@ class RestartCoordinatorFeature(Feature):
     async def _reattach_branch_step(self, step) -> Dict[str, Any]:
         """Native reattach: land the local branch on the fetched commit.
 
-        Runs after the profile's ``checkout --detach FETCH_HEAD``. A single
+        Runs after the profile's ``checkout --detach`` of the commit the
+        coordinator pinned after the fetch, which arrives as the step's third
+        native argument (#3832). A single
         argv command cannot express the required guard — a name can exist
         as BOTH a tag and a branch, and ``git fetch <name>`` lands on the
         TAG commit, so attaching to ``origin/<name>`` could install a
@@ -3379,17 +3447,20 @@ class RestartCoordinatorFeature(Feature):
 
         1. fetch selected ``tag '<ref>'``    → skip, stay detached.
         2. fetch selected no ``branch '<ref>'`` (sha target) → skip.
-        3. ``origin/<ref>`` != FETCH_HEAD    → skip (defensive).
-        4. otherwise ``checkout -B <ref> FETCH_HEAD`` and set the branch
+        3. ``origin/<ref>`` != the pinned commit → skip (defensive).
+        4. otherwise ``checkout -B <ref> <pinned commit>`` and set the branch
            upstream to ``origin/<ref>`` — a NEW local branch without
-           ``@{u}`` would fail the next ``kestrel update``'s bare
-           ``git pull --ff-only`` (codex round-2).
+           ``@{u}`` would fail the next ``kestrel update``'s pull, which
+           merges ``@{u}`` (codex round-2).
+
+        Never ``FETCH_HEAD^{commit}``: another fetch may have rewritten it
+        since the commit was judged and checked out.
 
         Skips report ``ok=True`` with the reason in ``stdout_tail``; the
         step is additionally ``allow_failure`` so even unexpected git
         errors never abort the update.
         """
-        repo, ref = step.native_args
+        repo, ref, fetched = step.native_args
         # A caller may pass the fully-qualified form (refs/heads/main —
         # accepted by is_valid_target_ref); FETCH_HEAD records the SHORT
         # name ("branch 'main'"), and checkout/upstream want it too
@@ -3467,15 +3538,12 @@ class RestartCoordinatorFeature(Feature):
                     True, 0,
                     f"skip: no origin branch {ref!r}; staying detached",
                 )
-            rc, fetch_sha, _err = await _git(
-                "rev-parse", "--verify", "FETCH_HEAD^{commit}"
-            )
-            if rc != 0 or branch_sha.strip() != fetch_sha.strip():
+            if branch_sha.strip() != fetched:
                 return _outcome(
                     True, 0,
-                    f"skip: origin/{ref} != FETCH_HEAD; staying detached",
+                    f"skip: origin/{ref} != the fetched commit; staying detached",
                 )
-            rc, out, err = await _git("checkout", "-B", ref, fetch_sha.strip())
+            rc, out, err = await _git("checkout", "-B", ref, fetched)
             if rc != 0:
                 return _outcome(False, rc, out, err)
             rc, up_out, up_err = await _git(

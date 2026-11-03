@@ -42,7 +42,7 @@ def stub_project_dir(tmp_path, monkeypatch):
     and reads its lock; that has its own tests (``test_sync_preflight.py``),
     so here the fetch is a no-op, the pull brings no new revision, and the
     preflight agrees. The pull then fast-forwards to the upstream as fetched
-    (#3832), which is where HEAD already is."""
+    (#3832), which is where HEAD already is, and stays."""
     (tmp_path / ".git").mkdir()
     (tmp_path / "pyproject.toml").touch()
     monkeypatch.setattr(cli, "_get_project_dir", lambda: tmp_path)
@@ -51,8 +51,11 @@ def stub_project_dir(tmp_path, monkeypatch):
     monkeypatch.setattr(
         cli,
         "_resolve_pull_target",
-        lambda _: cli_lifecycle._PullTarget(upstream=UPSTREAM, revision=None),
+        lambda _: cli_lifecycle._PullTarget(
+            upstream=UPSTREAM, revision=None, head=UPSTREAM
+        ),
     )
+    monkeypatch.setattr(cli, "_git_head", lambda _: UPSTREAM)
     monkeypatch.setattr(cli, "_run_sync_preflight", lambda *a, **kw: 0)
     return tmp_path
 
@@ -823,7 +826,7 @@ def test_update_recovers_from_detached_head_and_retries_pull(stub_project_dir):
     with patch.object(cli, "_project_dir_is_git", lambda _: True), \
          patch.object(cli, "_git_working_tree_dirty", lambda _: (False, "")), \
          patch.object(cli, "_run_git_fast_forward", fake_pull), \
-         patch.object(cli, "_git_reattach_if_safely_detached", lambda _: "main"), \
+         patch.object(cli, "_git_reattach_if_safely_detached", lambda *_: "main"), \
          patch.object(cli, "_run_uv_pip_install_editable",
                       lambda *a, **kw: later.append("install") or (0, "")), \
          patch.object(cli, "_host_manifest_path", lambda args: manifest), \
@@ -847,7 +850,7 @@ def test_update_aborts_when_detached_head_has_diverged(stub_project_dir):
          patch.object(cli, "_git_working_tree_dirty", lambda _: (False, "")), \
          patch.object(cli, "_run_git_fast_forward",
                       lambda *_: (1, "You are not currently on a branch.\n")), \
-         patch.object(cli, "_git_reattach_if_safely_detached", lambda _: None), \
+         patch.object(cli, "_git_reattach_if_safely_detached", lambda *_: None), \
          patch.object(cli, "_run_uv_pip_install_editable",
                       lambda *a, **kw: later.append("install") or (0, "")), \
          patch.object(cli, "cmd_feature_sync",

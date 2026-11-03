@@ -62,11 +62,22 @@ CORE_STALE = 3
 # (issue #3047).
 CORE_UNRESOLVED = 4
 
+# Return code for "the sync would put core code in place that the caller's
+# checks did not judge" (#3832). `kestrel update` and the restart coordinator
+# judge one core (a checkout at one commit, or the release installed now: its
+# constitution, the offline migrations it requires) before they change
+# anything; a sync that pulled that checkout again, or moved core to another
+# source or release, would install code no check read. Refused before anything
+# is installed, and returned after a batch that moved core past the hold
+# anyway. Not 5 or 6: `kestrel update` returns those for the constitution and
+# offline migration refusals.
+CORE_UNJUDGED = 7
+
 # Exit-code severity, worst first. `max()` on the raw ints is WRONG (CORE_STALE
 # is 3 and CORE_UNSAFE is 2), which is exactly why ranking these by hand at each
 # assignment site kept losing the stronger code. An undeclared core outranks an
 # unloadable one, which outranks one merely running old code.
-_RC_SEVERITY = (CORE_UNSAFE, CORE_UNRESOLVED, CORE_STALE, 1, 0)
+_RC_SEVERITY = (CORE_UNJUDGED, CORE_UNSAFE, CORE_UNRESOLVED, CORE_STALE, 1, 0)
 
 
 #: Every core state no caller may continue past, and the sentence each one
@@ -88,6 +99,13 @@ NON_CONTINUABLE_CORE = {
         "core is the declared install, but the pass that validates its "
         "dependencies did not complete, so a restart could bring agents up on "
         "a core they cannot load. Resolve what failed and re-run"
+    ),
+    CORE_UNJUDGED: (
+        "the sync would put in place core code the update's checks did not "
+        "judge. Declare core from the checkout being updated (for a core "
+        "installed from the index: declare none, or a window its installed "
+        "release satisfies), or switch core's source with `kestrel feature "
+        "sync` first"
     ),
 }
 
@@ -2000,6 +2018,11 @@ class CoreInstallGuard:
         # The lock note for the last core install, whose lock is its target's
         # (:meth:`install_core`), not the one feature installs keep.
         self._core_lock_note: Optional[str] = None
+        # A FOURTH set: core held at the installed release a caller's checks
+        # judged (:meth:`hold_judged`, #3832). Kept apart from core's policy
+        # pin, which :meth:`refresh` re-derives from the live install, because
+        # this one comes from the caller and must hold whatever the batch does.
+        self._judged_bounds: list = []
         # The one file a restore's bounds are written to, created on first use
         # and reused for the life of the guard — see :meth:`_restore_constraints`.
         self._restore_constraint_path: Optional[str] = None
@@ -2191,6 +2214,25 @@ class CoreInstallGuard:
         """The same sentence for the last :meth:`install_core`, whose lock is its target's."""
         return self._core_lock_note
 
+    def hold_judged(self, judged: Optional["JudgedCore"]) -> None:
+        """Hold core at the installed release *judged*, for every install this guard runs.
+
+        A caller's checks judged the core installed now (#3832). An index wheel
+        has no source policy to hold (:func:`~kestrel_sovereign.feature_reconcile.resolve_core_policy`),
+        so without this a feature whose requirement the installed release
+        fails resolves a newer core from the index: a release whose offline
+        migrations and constitution no check read. The pin is on core's own
+        installs too: a manifest entry the release satisfies only adds its
+        extras. Nothing for a judged checkout, which the editable policy and
+        the sync's own refusals already hold, or a release whose version could
+        not be read, which :func:`resolve_core_policy` already holds by its
+        unreadable source.
+        """
+        if judged is None or not judged.installed_release or judged.version is None:
+            self._judged_bounds = []
+            return
+        self._judged_bounds = [f"{CORE_DISTRIBUTION}=={judged.version}"]
+
     @property
     def install_constraints(self) -> list:
         """Every line a guarded install carries: core's pin, the manifest's, the lock's.
@@ -2208,6 +2250,7 @@ class CoreInstallGuard:
         """
         return (
             list(self._constraints)
+            + list(self._judged_bounds)
             + list(self._manifest_bounds)
             + list(self._lock_bounds)
         )
@@ -2274,8 +2317,11 @@ class CoreInstallGuard:
             pip_args,
             # Never core's own pin — this IS the operator moving core — but the
             # rest of the manifest still binds: a core install must not drag a
-            # declared feature outside its window either (issue #3106).
-            constraints=(list(self._manifest_bounds) + lines) or None,
+            # declared feature outside its window either (issue #3106). Nor
+            # may it move core off a release a caller's checks judged (#3832).
+            constraints=(
+                list(self._judged_bounds) + list(self._manifest_bounds) + lines
+            ) or None,
             reinstall=reinstall,
             timeout=timeout,
         )
@@ -2958,6 +3004,7 @@ def sync_preflight(
     *,
     lock_revision: Optional[str] = None,
     lock_checkout: Optional[Path] = None,
+    judged: Optional["JudgedCore"] = None,
     fetch: bool = True,
     allow_dirty: bool = False,
 ) -> SyncPreflight:
@@ -2975,6 +3022,14 @@ def sync_preflight(
       that is the checkout holding the sync, its lock is read as it lands
       there, before the new code does: that code may not even import against
       the packages installed now.
+    * *judged* is the core the caller's checks judged, which the sync it
+      predicts is handed too (#3832). That sync links core where the caller
+      left it and never pulls it, so neither is a pull predicted here, nor
+      anything fetched: the lock is the one at ``judged.revision`` on
+      ``judged.checkout``, which stand for *lock_revision* and *lock_checkout*
+      when the caller names no revision. Predicting the pull that a sync
+      handed no judged core makes would read the lock of whatever the
+      upstream names by then.
     * Otherwise a declared core the sync acts on is pulled by the sync itself
       before it is linked, so it is read where that pull lands
       (:func:`_pending_core_pull`; *fetch* and *allow_dirty* as for the pull).
@@ -2996,6 +3051,8 @@ def sync_preflight(
         read_core_lock_landing,
     )
 
+    if judged is not None and lock_revision is None and judged.revision is not None:
+        lock_revision, lock_checkout = judged.revision, judged.checkout
     guard = CoreInstallGuard.snapshot(source_index)
     core = source_index.get(fr.CORE_DISTRIBUTION)
     if core is not None and not core.editable and core.pypi is not None:
@@ -3023,7 +3080,7 @@ def sync_preflight(
         ):
             return read_core_lock_landing(holder, lock_revision)
         on_installed = installed is not None and fr._same_path(str(holder), str(installed))
-        if declared is not None and (not on_installed or core.extras):
+        if judged is None and declared is not None and (not on_installed or core.extras):
             revision = _pending_core_pull(declared, fetch=fetch, allow_dirty=allow_dirty)
             if revision is not None:
                 return read_core_lock_landing(declared, revision)
@@ -3089,6 +3146,7 @@ def run_sync_preflight(
     *,
     lock_revision: Optional[str] = None,
     lock_checkout: Optional[Path] = None,
+    judged: Optional["JudgedCore"] = None,
     fetch: bool = True,
     allow_dirty: bool = False,
 ) -> int:
@@ -3117,7 +3175,7 @@ def run_sync_preflight(
         return 0
     result = sync_preflight(
         fr.build_source_index(entries, load_registry()),
-        lock_revision=lock_revision, lock_checkout=lock_checkout,
+        lock_revision=lock_revision, lock_checkout=lock_checkout, judged=judged,
         fetch=fetch, allow_dirty=allow_dirty,
     )
     report_sync_preflight(
@@ -3294,6 +3352,176 @@ def _core_entry_first(entries: list, registry: dict) -> list:
     return core + [e for e in entries if not is_core(e)] if core else entries
 
 
+@dataclass(frozen=True)
+class JudgedCore:
+    """The core a caller's checks judged (#3832).
+
+    ``kestrel update`` and the restart coordinator decide, before they change
+    anything, whether the core they are about to install requires an offline
+    migration or a constitution the agents are not anchored to. A sync run
+    after them must not put any other core in place.
+
+    Usually that core is a checkout at one commit, which the caller then puts
+    in place. The sync does not pull :attr:`checkout` (a pull fetches again and
+    lands whatever the upstream names now), it links it only while HEAD is
+    :attr:`revision`, and it does not move core to any other source.
+    *revision* is None when the checkout is not a git checkout: its files were
+    judged as they are, and nothing pulls them.
+
+    With no :attr:`checkout`, the checks judged the core *installed* now: an
+    index wheel, or another install with no checkout to pull, at
+    :attr:`version` (None when its metadata names none). The sync then installs
+    no core from a checkout or from the index, and holds every install it runs
+    to that version, so no feature's requirement can resolve a newer core from
+    the index either.
+    """
+
+    checkout: Optional[Path] = None
+    revision: Optional[str] = None
+    version: Optional[str] = None
+
+    @property
+    def installed_release(self) -> bool:
+        """Is this the core installed now, rather than a checkout?"""
+        return self.checkout is None
+
+    def describe(self) -> str:
+        if self.checkout is not None:
+            return f"{self.checkout}, the checkout the checks judged"
+        at = f" {self.version}" if self.version else ""
+        return f"the installed {CORE_DISTRIBUTION}{at}, the release the checks judged"
+
+
+def installed_judged_core() -> JudgedCore:
+    """The :class:`JudgedCore` for the core installed now, with no checkout to pull.
+
+    For a caller whose checks judged the installed code because there is no
+    source checkout to update (#3832). Core linked editable from a directory
+    with no git checkout is that directory, as it is: nothing pulls it. Any
+    other install is the installed release, at its version.
+    """
+    shape = _core_install_shape()
+    if shape.editable_path:
+        return JudgedCore(checkout=Path(shape.editable_path))
+    return JudgedCore(version=shape.version or None)
+
+
+def judged_core_from_args(args) -> Optional[JudgedCore]:
+    """The :class:`JudgedCore` ``--core-checkout``/``--core-revision``/``--core-installed`` name.
+
+    None when they name none.
+
+    Raises:
+        ValueError: ``--core-revision`` without ``--core-checkout``, or
+            ``--core-installed`` with it.
+    """
+    checkout = getattr(args, "core_checkout", None)
+    revision = getattr(args, "core_revision", None) or None
+    installed = bool(getattr(args, "core_installed", False))
+    if installed:
+        if checkout or revision is not None:
+            raise ValueError(
+                "--core-installed names the installed core; it takes no "
+                "--core-checkout or --core-revision"
+            )
+        return installed_judged_core()
+    if not checkout:
+        if revision is not None:
+            raise ValueError("--core-revision needs --core-checkout")
+        return None
+    return JudgedCore(checkout=Path(checkout).expanduser(), revision=revision)
+
+
+def unjudged_core_source(entries: list, registry: dict, judged: JudgedCore) -> Optional[str]:
+    """Why syncing *entries* would move core off the core *judged*, else None (#3832).
+
+    Asked before anything is fetched or installed. For a judged checkout it is
+    decided from the manifest alone: an ``editable`` core entry naming another
+    checkout, which the sync would pull and link, or a ``pypi`` one, which it
+    would install from the index. Neither is the code the caller judged.
+
+    For the judged installed release, any ``editable`` core entry: the sync
+    would pull and link a checkout no check read. A ``pypi`` one only when the
+    sync would reinstall core (:func:`_resolve_manifest_action`): the installed
+    release is not from the index, or the declared window excludes it, so the
+    index would supply another. One the installed release satisfies keeps it,
+    held at its version.
+
+    A core entry declaring neither keeps whatever core is installed, and none
+    at all leaves core alone.
+    """
+    from kestrel_sovereign import feature_reconcile as fr
+
+    for entry in entries:
+        if package_for_label(entry["name"], registry) != CORE_DISTRIBUTION:
+            continue
+        editable = entry["editable"]
+        if editable:
+            if judged.installed_release or not fr._same_path(
+                str(Path(editable).expanduser()), str(judged.checkout)
+            ):
+                return (
+                    f"the manifest declares {CORE_DISTRIBUTION} from {editable}, "
+                    f"not {judged.describe()}"
+                )
+        elif entry.get("pypi") is not None:
+            if judged.installed_release:
+                _, current, action = _resolve_manifest_action(entry, registry)
+                if action not in ("reinstall", "install") and current == judged.version:
+                    continue
+            window = entry["pypi"] or " (any version)"
+            return (
+                f"the manifest declares {CORE_DISTRIBUTION}{window} from the "
+                f"package index, not {judged.describe()}"
+            )
+    return None
+
+
+def judged_release_drift(judged: Optional[JudgedCore]) -> Optional[str]:
+    """How core left the installed release *judged*, else None (#3832).
+
+    Asked after a batch whose every install was held to that release
+    (:meth:`CoreInstallGuard.hold_judged`): an install that bypassed the
+    constraints still put a core no check judged in place, and the caller
+    must not restart onto it. None for a judged checkout, which the sync
+    links itself and :func:`_judged_core_head_refusal` checks.
+    """
+    if judged is None or not judged.installed_release:
+        return None
+    shape = _core_install_shape()
+    if shape.editable_path:
+        return (
+            f"{CORE_DISTRIBUTION} is now linked from {shape.editable_path}, "
+            f"not {judged.describe()}"
+        )
+    if judged.version is not None and shape.version != judged.version:
+        return (
+            f"{CORE_DISTRIBUTION} is now {shape.version or 'an unreadable version'}, "
+            f"not {judged.describe()}"
+        )
+    return None
+
+
+def _judged_core_head_refusal(judged: JudgedCore) -> Optional[str]:
+    """Why ``judged.checkout`` is not at the commit the checks judged, else None."""
+    if judged.revision is None:
+        return None
+    head = cli._git_head(judged.checkout)
+    pinned = cli._git_resolve_commit(judged.checkout, judged.revision)
+    if head is not None and pinned is not None and head == pinned:
+        return None
+    return (
+        f"{judged.checkout} is at {(head or 'an unreadable HEAD')[:12]}, not "
+        f"{(pinned or judged.revision)[:12]}, the commit the checks judged"
+    )
+
+
+def _refuse_unjudged_core(reason: str) -> int:
+    print(f"Refusing to sync: {reason}.")
+    print(f"  {NON_CONTINUABLE_CORE[CORE_UNJUDGED]}.")
+    return CORE_UNJUDGED
+
+
 def cmd_feature_sync(args) -> int:
     """Restore the host's declared feature packages (counterpart to upgrade)."""
     from kestrel_sovereign.feature_registry import load_registry
@@ -3311,11 +3539,35 @@ def cmd_feature_sync(args) -> int:
         print("  kestrel feature sync --capture")
         return 1
 
+    try:
+        judged = judged_core_from_args(args)
+    except ValueError as exc:
+        print(f"Error: {exc}")
+        return 1
+
     if getattr(args, "preflight", False):
+        if judged is not None:
+            # Before the caller fetches or checks anything out: a manifest
+            # that moves core off the judged checkout refuses whatever the
+            # lock says (#3832).
+            try:
+                from kestrel_sovereign.feature_registry import load_registry
+
+                reason = unjudged_core_source(
+                    _load_host_manifest(path), load_registry(), judged
+                )
+            except (ValueError, OSError) as exc:
+                print(f"Failed to read manifest {path}: {exc}")
+                return 1
+            if reason is not None:
+                return _refuse_unjudged_core(reason)
         return run_sync_preflight(
             path,
             lock_revision=getattr(args, "lock_revision", None),
             lock_checkout=getattr(args, "lock_checkout", None),
+            # The sync handed this core links it and never pulls it, so the
+            # lock is read where the caller left it (#3832).
+            judged=judged,
             # A dry run contacts nothing, as it installs nothing.
             fetch=not getattr(args, "dry_run", False),
             allow_dirty=getattr(args, "allow_dirty", False),
@@ -3338,6 +3590,12 @@ def cmd_feature_sync(args) -> int:
         return 0
 
     registry = load_registry()
+    if judged is not None:
+        # Before anything installs: the caller judged core at one checkout and
+        # commit, and this sync must not put any other core in place (#3832).
+        reason = unjudged_core_source(entries, registry, judged)
+        if reason is not None:
+            return _refuse_unjudged_core(reason)
     # Keyed on the same canonical identity ``_resolve_manifest_action`` resolves
     # an entry's target to, so the lookup can't miss on spelling alone.
     git_urls = {
@@ -3354,6 +3612,9 @@ def cmd_feature_sync(args) -> int:
 
     source_index = fr.build_source_index(entries, registry)
     guard = CoreInstallGuard.snapshot(source_index)
+    # A caller that judged the installed release has every install below held
+    # to it, core's own included (#3832).
+    guard.hold_judged(judged)
 
     # The manifest is a declaration, not a program: its order says nothing about
     # dependency order. Core is what every other entry depends on, so its
@@ -3416,9 +3677,26 @@ def cmd_feature_sync(args) -> int:
                 # code did not move rather than being told nothing.
                 from kestrel_sovereign import cli_lifecycle
 
-                rc_pull, out_pull = cli_lifecycle._editable_git_pull(
-                    checkout, allow_dirty=getattr(args, "allow_dirty", False),
-                )
+                if judged is not None:
+                    # Except where the caller already put the commit its
+                    # checks judged in place (#3832): a pull here fetches again
+                    # and lands whatever the upstream names now, which no
+                    # check has read. The manifest names this checkout (else
+                    # the sync refused above), so link it as it is, and only
+                    # while it is still on the judged commit.
+                    refusal = _judged_core_head_refusal(judged)
+                    if refusal is not None:
+                        return _refuse_unjudged_core(refusal)
+                    rc_pull, out_pull = 0, (
+                        f"not pulled: {checkout} is at {judged.revision[:12]}, "
+                        "the commit the caller's checks judged"
+                        if judged.revision is not None
+                        else f"not pulled: the caller's checks judged {checkout} as it is"
+                    )
+                else:
+                    rc_pull, out_pull = cli_lifecycle._editable_git_pull(
+                        checkout, allow_dirty=getattr(args, "allow_dirty", False),
+                    )
                 for line in (out_pull or "").strip().splitlines():
                     print(f"      {line}")
                 if rc_pull != 0:
@@ -3596,6 +3874,12 @@ def cmd_feature_sync(args) -> int:
         # the first rather than assigned over it — a repaired-core `1` must not
         # erase a CORE_STALE recorded by the pull above.
         core_state = _worst_rc(core_state, guard.verify())
+        # The hold above prevents it; this catches an install that bypassed
+        # the constraints and moved core off the release the caller judged.
+        drift = judged_release_drift(judged)
+        if drift is not None:
+            print(f"• core: ERROR — {drift}.", file=sys.stderr)
+            core_state = _worst_rc(core_state, CORE_UNJUDGED)
         # The lock holds every install above, but a checkout the manifest
         # declares, or an install that bypassed the constraints, can still
         # leave a locked package below the lock. Named here, after everything
@@ -4140,6 +4424,37 @@ def add_feature_subparser(subparsers) -> None:
         help=(
             "Pull a declared editable checkout even when it has modified "
             "tracked files (same meaning as on `kestrel update`)"
+        ),
+    )
+    feat_sync.add_argument(
+        "--core-checkout",
+        metavar="PATH",
+        help=(
+            "The core checkout the caller's checks judged (`kestrel update` "
+            "and the restart coordinator pass it): the sync does not pull it "
+            "and refuses a manifest that declares core from anywhere else. "
+            "With --preflight, its lock is read where the caller left it, "
+            "and nothing is fetched"
+        ),
+    )
+    feat_sync.add_argument(
+        "--core-revision",
+        metavar="REV",
+        help=(
+            "With --core-checkout: the commit those checks judged; the sync "
+            "links core only while that checkout is on it, and --preflight "
+            "reads its lock at that commit unless --lock-revision names one"
+        ),
+    )
+    feat_sync.add_argument(
+        "--core-installed",
+        action="store_true",
+        help=(
+            "The caller's checks judged the core installed now, with no "
+            "checkout to pull (`kestrel update` on an index install passes "
+            "it): the sync refuses a manifest that would install core from a "
+            "checkout or another release, and holds every install to the "
+            "installed version"
         ),
     )
 

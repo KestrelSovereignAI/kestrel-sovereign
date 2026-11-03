@@ -66,7 +66,7 @@ from kestrel_sovereign.doctor import (
 )
 from kestrel_sovereign.multi_agent.config import (
     MultiAgentConfig,
-    load_host_registry,
+    launched_host_registry,
 )
 
 #: Where the Sovereign reanchor (adoption) procedure is documented.
@@ -149,12 +149,13 @@ class ConstitutionAdoptionCheck:
 def _load_registry(project_dir: Path, env: dict) -> MultiAgentConfig:
     """The registry a host started in the project loads.
 
-    The one the server itself selects, ``KESTREL_MULTI_AGENT_CONFIG``
-    included (#3832): judging the project's default file instead would judge
-    agents other than the ones a restart boots.
+    The one ``kestrel start`` and ``kestrel terminate`` read too
+    (:func:`~kestrel_sovereign.multi_agent.config.launched_host_registry`),
+    ``KESTREL_MULTI_AGENT_CONFIG`` included (#3832): judging any other file
+    would judge agents other than the ones a restart boots.
     """
     try:
-        return load_host_registry(env, project_dir)
+        return launched_host_registry(project_dir, env=env)
     except (OSError, ValueError) as exc:
         raise ConstitutionAdoptionError(
             f"multi-agent configuration is invalid: {exc}"
@@ -171,9 +172,21 @@ def local_agents(project_dir: Path) -> dict:
 
 
 def _select(local: dict, agent_names: Iterable[str] | None) -> list[str]:
+    """The agents to judge; a named one the registry lacks refuses (#3832).
+
+    Judging nothing for it would pass a restart the launcher might resolve
+    elsewhere.
+    """
     if agent_names is None:
         return list(local)
-    return [name for name in agent_names if name in local]
+    names = list(agent_names)
+    missing = [name for name in names if name not in local]
+    if missing:
+        raise ConstitutionAdoptionError(
+            f"no local agent named {', '.join(missing)} in the registry the "
+            "host loads, so what it would boot cannot be judged"
+        )
+    return names
 
 
 def check_constitution_adoption(
@@ -187,12 +200,13 @@ def check_constitution_adoption(
 
     ``agent_names`` limits the check to the agents a restart will boot; None
     means every local agent in the registry a host started in the project
-    loads (:func:`~kestrel_sovereign.multi_agent.config.load_host_registry`). ``deployed_content`` supplies the bytes a
-    deploy is about to leave at a governing path, packaged or external (see
-    :func:`deployed_content_at`); None judges the files on disk. It is asked
-    at most once per path: about a governing source only when an agent that
-    source governs is actually compared, and about the descriptor and trust
-    root of every selected agent that configures a descriptor.
+    loads (:func:`~kestrel_sovereign.multi_agent.config.launched_host_registry`).
+    ``deployed_content`` supplies the bytes a deploy is about to leave at a
+    governing path, packaged or external (see :func:`deployed_content_at`);
+    None judges the files on disk. It is asked at most once per path: about a
+    governing source only when an agent that source governs is actually
+    compared, and about the descriptor and trust root of every selected agent
+    that configures a descriptor.
 
     The bytes go through the resolver this process imported. Judging code that
     was installed after that import is :func:`check_installed_constitution_adoption`.
@@ -201,10 +215,10 @@ def check_constitution_adoption(
     agent databases, and the governing source through the canonical resolver.
 
     Raises:
-        ConstitutionAdoptionError: The registry cannot be loaded,
-            ``deployed_content`` could not produce the incoming bytes, or the
-            deploy replaces a descriptor or trust root that selects a selected
-            agent's governing source.
+        ConstitutionAdoptionError: The registry cannot be loaded or lacks a
+            named agent, ``deployed_content`` could not produce the incoming
+            bytes, or the deploy replaces a descriptor or trust root that
+            selects a selected agent's governing source.
     """
     env = runtime_env(project_dir)
     multi_agent = _load_registry(project_dir, env)
@@ -342,9 +356,10 @@ def check_installed_constitution_adoption(
     :func:`check_constitution_adoption`.
 
     Raises:
-        ConstitutionAdoptionError: The registry cannot be loaded, or the
-            installed code could not answer: it failed to start or to check,
-            timed out, or answered in a form this process cannot read.
+        ConstitutionAdoptionError: The registry cannot be loaded or lacks a
+            named agent, or the installed code could not answer: it failed to
+            start or to check, timed out, or answered in a form this process
+            cannot read.
     """
     # Absolute, because the child runs with the project as its working
     # directory and would resolve a relative path against it a second time.

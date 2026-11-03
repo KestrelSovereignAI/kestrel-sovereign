@@ -257,6 +257,10 @@ def update(venv, tmp_path, monkeypatch):
     steps = []
     monkeypatch.setattr(cli, "_get_project_dir", lambda: tmp_path)
     monkeypatch.setattr(cli, "_resolve_source_checkout", lambda: checkout)
+    # What git answers for this empty .git: no HEAD to name (the fake venv
+    # stands in for every subprocess, git included). The update then judges
+    # the checkout's files as they are, and the preflight reads its lock.
+    monkeypatch.setattr(cli, "_git_head", lambda _: None)
     monkeypatch.setattr(cli, "_run_uv_sync", lambda _: steps.append("uv sync") or (0, ""))
     monkeypatch.setattr(
         cli, "cmd_feature_sync", lambda args: steps.append("feature sync") or 0,
@@ -402,7 +406,28 @@ def real_update(incoming, tmp_path, monkeypatch):
     monkeypatch.setattr(cli_lifecycle, "_run_feature_reconcile", lambda *a, **kw: 0)
     monkeypatch.setattr(cli_lifecycle, "_report_core_lock", lambda: None)
     monkeypatch.setattr(cli, "cmd_restart", lambda args: steps.append("restart") or 0)
+    monkeypatch.setattr(
+        cli, "_run_uv_pip_install_editable",
+        lambda *a, **kw: steps.append("pip install -e") or (0, ""),
+    )
+    _refuse_the_process_lifecycle(monkeypatch)
     return clone, new, project, steps
+
+
+def _refuse_the_process_lifecycle(monkeypatch):
+    """Nothing here may start, stop or signal a process (#3832).
+
+    The restart above is recorded, and the update continues in this process
+    (``tests/conftest.py``); a path that reached the launcher or either
+    lifecycle command any other way fails the test instead.
+    """
+
+    def refuse(*_args, **_kwargs):
+        pytest.fail("reached the real process lifecycle")
+
+    monkeypatch.setattr(cli, "cmd_start", refuse)
+    monkeypatch.setattr(cli, "cmd_terminate", refuse)
+    monkeypatch.setattr(cli_lifecycle, "ProcessManager", refuse)
 
 
 def test_update_refuses_the_incoming_lock_before_pulling_anything(
@@ -431,6 +456,139 @@ def test_update_pulls_and_installs_when_the_incoming_lock_agrees(real_update):
     assert rc == 0
     assert _git(clone, "rev-parse", "HEAD") == new
     assert steps == ["uv sync", "feature sync", "restart"]
+
+
+# --- the lock of the core the update judged, never a newer one (#3832) ------
+
+
+def _declare_core_on(project, clone, window):
+    """The manifest ``feature sync --capture`` writes for core on *clone*, with
+    an extra, and a phoenix window: the extra is what made the sync act on
+    core, and so what the preflight predicted a pull for."""
+    return _manifest(
+        project,
+        f'[[feature]]\nname = "{CORE}"\neditable = "{clone}"\n'
+        'extras = ["observability"]\n'
+        f'[[feature]]\nname = "arize-phoenix"\npypi = "{window}"\n',
+    )
+
+
+def _recorded_fetches(monkeypatch, *, then=None):
+    """Every fetch, run for real; *then* runs once, after the first."""
+    real_fetch = cli._run_git_fetch
+    fetches = []
+
+    def fetch(checkout):
+        result = real_fetch(checkout)
+        fetches.append(checkout)
+        if then is not None and len(fetches) == 1:
+            then()
+        return result
+
+    monkeypatch.setattr(cli, "_run_git_fetch", fetch)
+    return fetches
+
+
+def test_update_without_a_pull_reads_the_lock_at_head_not_upstreams(
+    real_update, monkeypatch, capsys,
+):
+    """The reviewer's reproduction: HEAD locks phoenix 17.7.0, upstream locks
+    20.23.0, and the manifest requires >=20.23. The update's sync links core at
+    HEAD and pulls nothing, so every restore it makes is held to 17.7.0 and
+    refuses. The preflight used to predict the pull a plain sync makes: it
+    fetched, read upstream's lock, passed, and let ``uv sync`` prune."""
+    clone, _, project, steps = real_update
+    _declare_core_on(project, clone, ">=20.23")
+    fetches = _recorded_fetches(monkeypatch)
+    head = _git(clone, "rev-parse", "HEAD")
+
+    rc = cli.cmd_update(cli.build_parser().parse_args(["update", "--no-pull"]))
+
+    assert rc == 1
+    assert steps == [] and fetches == []
+    assert _git(clone, "rev-parse", "HEAD") == head
+    err = capsys.readouterr().err
+    assert "arize-phoenix>=20.23, the lock pins 17.7.0" in err
+    assert "nothing was pulled, installed or restarted" in err
+
+
+def test_a_pull_that_brings_nothing_reads_the_lock_it_leaves_in_place(
+    real_update, monkeypatch, capsys,
+):
+    """Upstream is at HEAD when the update fetches, then gains a release
+    locking 20.23.0. The pull merges what the checks judged, which moves
+    nothing, so the sync is held to HEAD's 17.7.0. The preflight used to fetch
+    a second time, read the new release's lock, and pass."""
+    clone, new, project, steps = real_update
+    head = _git(clone, "rev-parse", "HEAD")
+    origin = Path(_git(clone, "remote", "get-url", "origin"))
+    _git(origin, "reset", "-q", "--hard", head)
+    _declare_core_on(project, clone, ">=20.23")
+    fetches = _recorded_fetches(
+        monkeypatch, then=lambda: _git(origin, "reset", "-q", "--hard", new),
+    )
+
+    rc = cli.cmd_update(cli.build_parser().parse_args(["update"]))
+
+    assert rc == 1
+    assert steps == []
+    assert fetches == [clone], "the update fetches once, for its checks"
+    assert _git(origin, "rev-parse", "HEAD") == new, "upstream never moved"
+    assert _git(clone, "rev-parse", "HEAD") == head
+    assert "arize-phoenix>=20.23, the lock pins 17.7.0" in capsys.readouterr().err
+
+
+def test_the_update_installs_when_the_judged_lock_agrees(
+    real_update, monkeypatch,
+):
+    """The same manifest against the lock the pull lands passes, and the update
+    goes on: the refusals above are about which lock, not any lock."""
+    clone, new, project, steps = real_update
+    _declare_core_on(project, clone, ">=20.23")
+    fetches = _recorded_fetches(monkeypatch)
+
+    rc = cli.cmd_update(cli.build_parser().parse_args(["update"]))
+
+    assert rc == 0
+    assert fetches == [clone]
+    assert _git(clone, "rev-parse", "HEAD") == new
+    assert steps == ["uv sync", "feature sync", "restart"]
+
+
+def test_a_judged_core_is_read_at_its_revision_and_fetches_nothing(
+    incoming, tmp_path, monkeypatch,
+):
+    """Handed the core the caller judged, the preflight predicts the sync that
+    is handed it too: one that links core where the caller left it."""
+    from kestrel_sovereign.cli_features import JudgedCore
+
+    clone, new = incoming
+    head = _git(clone, "rev-parse", "HEAD")
+    manifest = _declare_core_on(tmp_path, clone, ">=20.23")
+    index = _index(manifest)
+    fetches = []
+    monkeypatch.setattr(cli, "_run_git_fetch", lambda c: fetches.append(c) or (0, ""))
+
+    # A sync handed no judged core pulls this one: upstream's lock decides.
+    assert not sync_preflight(index).refuses
+    assert fetches == [clone]
+    fetches.clear()
+
+    pinned = sync_preflight(index, judged=JudgedCore(checkout=clone, revision=head))
+    assert [c.locked for c in pinned.conflicts] == ["17.7.0"]
+    assert not sync_preflight(
+        index, judged=JudgedCore(checkout=clone, revision=new)
+    ).refuses
+    # No commit to name: the checkout as it is.
+    as_is = sync_preflight(index, judged=JudgedCore(checkout=clone))
+    assert [c.locked for c in as_is.conflicts] == ["17.7.0"]
+    # The CLI the coordinator runs hands it on.
+    rc = cli.cmd_feature_sync(argparse.Namespace(
+        manifest=str(manifest), capture=False, dry_run=False, allow_dirty=False,
+        preflight=True, core_checkout=str(clone), core_revision=head,
+    ))
+    assert rc == 1
+    assert fetches == []
 
 
 def test_core_declared_on_the_checkout_being_pulled_is_read_at_the_revision(
@@ -510,9 +668,9 @@ def test_a_core_the_sync_will_pull_is_read_at_that_pulls_revision(
 def test_core_on_the_installed_checkout_is_read_where_the_sync_leaves_it(
     incoming, tmp_path, extras, refuses,
 ):
-    """With no pull of its own (``--no-pull``), the update leaves the checkout
-    to the sync, which pulls a declared core it has to act on: one whose extras
-    it ensures. One linked exactly as declared it leaves alone."""
+    """A plain ``kestrel feature sync``, handed no judged core, pulls a declared
+    core it has to act on: one whose extras it ensures. One linked exactly as
+    declared it leaves alone. (``kestrel update``'s sync pulls neither, #3832.)"""
     clone, new = incoming
     index = _index(_manifest(
         tmp_path,

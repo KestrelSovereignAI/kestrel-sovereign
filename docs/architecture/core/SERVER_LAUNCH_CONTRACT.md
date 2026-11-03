@@ -74,7 +74,12 @@ cannot look like a successful launch.
 
 `kestrel start` is the normal fleet launcher. It reads the host bind and port
 from the `[host]` section of `multi_agent.toml`; `kestrel start <name>` reads the
-selected agent's registered port. The command intentionally does not accept
+selected agent's registered port. The registry is the one the launched host
+loads (`kestrel_sovereign.multi_agent.config.launched_host_registry`): the file
+`KESTREL_MULTI_AGENT_CONFIG` names when it exists, else the project's
+`multi_agent.toml`. `kestrel terminate` and the deploy gates read the same one,
+so a named restart cannot stop and start an agent whose database no gate
+judged (#3832). The command intentionally does not accept
 direct-server `--host` or `--port` options. Edit the registry when changing a
 managed fleet address.
 

@@ -47,7 +47,7 @@ from collections.abc import Awaitable, Callable, Iterable
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 
-from kestrel_sovereign.multi_agent.config import load_host_registry
+from kestrel_sovereign.multi_agent.config import launched_host_registry
 from kestrel_sovereign.paths import spawned_agent_env
 
 #: Where a release declares its offline migrations, relative to the checkout
@@ -413,12 +413,13 @@ async def _probe_database(
 def _local_agents(project_dir: Path, env: dict) -> dict:
     """The local agents a host started in the project loads.
 
-    The registry the server itself selects (``KESTREL_MULTI_AGENT_CONFIG``
-    included), so the gate judges the databases a restart would open rather
-    than whatever the project's default file names.
+    From the registry ``kestrel start`` and ``kestrel terminate`` read too
+    (:func:`~kestrel_sovereign.multi_agent.config.launched_host_registry`,
+    ``KESTREL_MULTI_AGENT_CONFIG`` included), so the gate judges the
+    databases a restart would open rather than whatever another file names.
     """
     try:
-        registry = load_host_registry(env, project_dir)
+        registry = launched_host_registry(project_dir, env=env)
     except (OSError, ValueError) as exc:
         raise OfflineMigrationError(
             f"multi-agent configuration is invalid: {exc}"
@@ -427,9 +428,21 @@ def _local_agents(project_dir: Path, env: dict) -> dict:
 
 
 def _select(local: dict, agent_names: Iterable[str] | None) -> list[str]:
+    """The agents to judge; a named one the registry lacks refuses.
+
+    Judging nothing for it would pass a restart the launcher might resolve
+    elsewhere.
+    """
     if agent_names is None:
         return list(local)
-    return [name for name in agent_names if name in local]
+    names = list(agent_names)
+    missing = [name for name in names if name not in local]
+    if missing:
+        raise OfflineMigrationError(
+            f"no local agent named {', '.join(missing)} in the registry the "
+            "host loads, so its database cannot be judged"
+        )
+    return names
 
 
 def judge(
@@ -444,7 +457,8 @@ def judge(
     ``agent_names`` None means every local agent.
 
     Raises:
-        OfflineMigrationError: The registry cannot be loaded.
+        OfflineMigrationError: The registry cannot be loaded or lacks a named
+            agent.
     """
     env = spawned_agent_env(project_dir)
     local = _local_agents(project_dir, env)
@@ -518,8 +532,9 @@ def check_offline_migrations(
     environment the launcher hands a spawned host. Read-only.
 
     Raises:
-        OfflineMigrationError: The manifest or registry cannot be read, or the
-            fresh interpreter could not answer: it failed to start or to
+        OfflineMigrationError: The manifest or registry cannot be read, the
+            registry lacks a named agent, or the fresh interpreter could not
+            answer: it failed to start or to
             check, timed out, or answered in a form this process cannot read.
     """
     # Absolute, because the child runs with the project as its working
@@ -698,9 +713,11 @@ def refusal_lines(check: OfflineMigrationCheck) -> list[str]:
     """The operator-facing explanation of a blocking check, and how to migrate."""
     statuses = {f.status for f in check.blocking}
     lines = [
-        f"{check.code_label} requires offline migrations not known to be done; "
-        f"restarting onto it would leave {len(check.blocking_agents)} agent(s) "
-        "unable to start:",
+        (
+            f"{check.code_label} requires offline migrations not known to be "
+            f"done; restarting onto it would leave "
+            f"{len(check.blocking_agents)} agent(s) unable to start:"
+        ),
         *(f"  {_describe(finding)}" for finding in check.blocking),
         *(
             f"Runbook for {migration}: {runbook}"

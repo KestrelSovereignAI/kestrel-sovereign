@@ -32,6 +32,7 @@ import subprocess
 import sys
 from contextlib import closing
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -79,6 +80,33 @@ def _manifest(*entries: dict) -> bytes:
 
 def _entry(mid: str = NATIVE, runbook: str = RUNBOOK) -> dict:
     return {"id": mid, "summary": f"{mid} summary", "runbook": runbook}
+
+
+@pytest.fixture(autouse=True)
+def _no_real_process_lifecycle(monkeypatch):
+    """Nothing here may start, stop or signal a real process.
+
+    A reproduction of this change once reached the real host lifecycle and
+    started a second server on a live host. The process launcher and both
+    lifecycle commands fail the test unless the test replaces them; ``kestrel
+    update``'s continuation already runs in this process (``tests/conftest.py``).
+    """
+
+    def refuse(*_args, **_kwargs):
+        pytest.fail("reached the real process lifecycle")
+
+    class _Refusing(type):
+        def __getattr__(cls, _name):
+            refuse()
+
+        def __call__(cls, *args, **kwargs):
+            refuse()
+
+    monkeypatch.setattr(
+        cli_lifecycle, "ProcessManager", _Refusing("ProcessManager", (), {})
+    )
+    monkeypatch.setattr(cli, "cmd_terminate", refuse)
+    monkeypatch.setattr(cli, "cmd_start", refuse)
 
 
 @pytest.fixture(autouse=True)
@@ -337,18 +365,34 @@ def test_agent_names_limit_the_check(project):
 
 
 def test_no_selected_agent_reads_no_declarations_and_starts_nothing(
-    project, monkeypatch
+    tmp_path, monkeypatch
 ):
     def unreachable(*args, **kwargs):
         raise AssertionError("nothing to judge")
 
     monkeypatch.setattr(offline_migrations.subprocess, "run", unreachable)
+    empty = tmp_path / "empty"
+    empty.mkdir()
 
-    check = check_offline_migrations(
-        project, agent_names=["Nobody"], manifest=unreachable
-    )
+    check = check_offline_migrations(empty, manifest=unreachable)
 
     assert check.safe and check.findings == ()
+
+
+def test_a_named_agent_the_registry_lacks_is_refused_not_passed(
+    project, monkeypatch
+):
+    """An empty pass would let a launcher that resolves the name elsewhere
+    restart a database no gate read (#3832)."""
+    def unreachable(*args, **kwargs):
+        raise AssertionError("nothing to judge")
+
+    monkeypatch.setattr(offline_migrations.subprocess, "run", unreachable)
+
+    with pytest.raises(OfflineMigrationError, match="no local agent named Nobody"):
+        check_offline_migrations(
+            project, agent_names=["Nobody"], manifest=unreachable
+        )
 
 
 def test_a_release_declaring_nothing_starts_nothing(project, monkeypatch):
@@ -712,7 +756,7 @@ def test_update_reports_a_restart_the_installed_code_refuses(
 
 
 def test_update_onto_a_release_that_declares_nothing_passes(project, upstream):
-    origin, clone, steps = upstream
+    origin, _, steps = upstream
     git(origin, "reset", "-q", "--hard", "HEAD~1")
     commit_constitution(origin, b"# amended\n", "a release with no declarations")
     _leave_draft_a2a_data(_db(project, "Emma"))
@@ -785,8 +829,11 @@ def test_a_host_with_no_agents_does_no_git_work_for_the_gate(
     monkeypatch.setattr(
         cli,
         "_resolve_pull_target",
-        lambda _: cli_lifecycle._PullTarget(upstream="a" * 40, revision=None),
+        lambda _: cli_lifecycle._PullTarget(
+            upstream="a" * 40, revision=None, head="a" * 40
+        ),
     )
+    monkeypatch.setattr(cli, "_git_head", lambda _: "a" * 40)
     monkeypatch.setattr(
         cli, "_run_git_fast_forward", lambda *_: git_work.append("pull") or (0, "")
     )
@@ -897,6 +944,109 @@ def test_a_missing_external_registry_falls_back_as_the_host_does(
     assert check.blocking_agents == ("Kite",)
 
 
+def _recording_launcher(monkeypatch, project: Path) -> list:
+    """The real ``kestrel start``/``terminate`` over a launcher that runs nothing.
+
+    Returns the record of each agent they start or terminate. The commands
+    resolve their agents for real; only the process work is replaced. The
+    launcher demands the registry the agent was found in, as the real one
+    needs it: without it ``ProcessManager.start_agent`` reloads the project's
+    default file (#3832).
+    """
+    calls: list = []
+
+    class Launcher:
+        def __init__(self, _project_dir):
+            self._agents = {}
+
+        def start_agent(self, name, cfg, _bind, *, roster, **_kwargs):
+            assert roster.get_local_agents()[name] == cfg
+            calls.append(("start", name, cfg.port))
+
+        def wait_for_health(self, _port, timeout=None):
+            return True
+
+        def register_agent(self, name, _cfg):
+            self._agents[name] = SimpleNamespace(pid=4242, stop_failure="")
+
+        def terminate_agent(self, name):
+            calls.append(("terminate", name))
+            return True
+
+        @staticmethod
+        def is_port_in_use(_port, _bind):
+            return False
+
+    monkeypatch.setattr(cli_lifecycle, "ProcessManager", Launcher)
+    monkeypatch.setattr(cli, "_get_project_dir", lambda: project)
+    monkeypatch.setattr(cli, "_maybe_first_run_setup", lambda _project: None)
+    monkeypatch.setattr(cli, "cmd_terminate", cli_lifecycle.cmd_terminate)
+    monkeypatch.setattr(cli, "cmd_start", cli_lifecycle.cmd_start)
+    return calls
+
+
+def test_start_and_terminate_name_agents_from_the_registry_the_gates_judge(
+    project, external_registry, monkeypatch
+):
+    """One registry for the gates and the launcher: the host's (#3832)."""
+    calls = _recording_launcher(monkeypatch, project)
+
+    assert cli.cmd_terminate(_restart_args(name="Emma")) == 0
+    assert cli.cmd_start(_restart_args(name="Emma")) == 0
+    assert calls == [("terminate", "Emma"), ("start", "Emma", 8801)]
+    # Kite is only in the project's default file, which the host does not load.
+    assert cli.cmd_terminate(_restart_args(name="Kite")) == 1
+    assert cli.cmd_start(_restart_args(name="Kite")) == 1
+    assert calls == [("terminate", "Emma"), ("start", "Emma", 8801)]
+
+
+def test_a_named_restart_of_a_hosted_agent_judges_its_database(
+    project, external_registry, monkeypatch
+):
+    calls = _recording_launcher(monkeypatch, project)
+    monkeypatch.setattr(
+        cli_lifecycle, "check_installed_constitution_adoption",
+        lambda *a, **k: ConstitutionAdoptionCheck(),
+    )
+    _leave_draft_a2a_data(_db(project, "Emma"))
+
+    assert cli.cmd_restart(_restart_args(name="Emma")) == OFFLINE_MIGRATION_REQUIRED
+    assert calls == []
+
+
+def test_a_named_restart_cannot_stop_and_start_an_agent_no_gate_read(
+    tmp_path, project, monkeypatch, capsys
+):
+    """The reviewer's reproduction: Emma is named only by the project's
+    default file, the host loads an external registry. The gates used to judge
+    nothing for Emma while terminate and start found her in the other file."""
+    from kestrel_sovereign.constitution_adoption import (
+        CONSTITUTION_ADOPTION_REQUIRED,
+    )
+
+    _register_only(project / "multi_agent.toml", "Emma", 8801)
+    registry = tmp_path / "fleet" / "fleet.toml"
+    registry.parent.mkdir()
+    _register_only(registry, "Kite", 8802)
+    monkeypatch.setenv("KESTREL_MULTI_AGENT_CONFIG", str(registry))
+    _leave_draft_a2a_data(_db(project, "Emma"))
+    calls = _recording_launcher(monkeypatch, project)
+
+    # Each gate refuses an agent it cannot find, rather than judging nothing.
+    assert cli.cmd_restart(_restart_args(name="Emma")) == CONSTITUTION_ADOPTION_REQUIRED
+    assert "no local agent named Emma" in capsys.readouterr().err
+    monkeypatch.setattr(
+        cli_lifecycle, "check_installed_constitution_adoption",
+        lambda *a, **k: ConstitutionAdoptionCheck(),
+    )
+    assert cli.cmd_restart(_restart_args(name="Emma")) == OFFLINE_MIGRATION_REQUIRED
+    assert "no local agent named Emma" in capsys.readouterr().err
+    # And the launcher reads the registry they read.
+    assert cli.cmd_terminate(_restart_args(name="Emma")) == 1
+    assert cli.cmd_start(_restart_args(name="Emma")) == 1
+    assert calls == []
+
+
 def _upstream_moves_before_the_pull(origin, clone, monkeypatch):
     """Publish the cutover upstream once the checks have judged, before the pull.
 
@@ -989,3 +1139,457 @@ def test_the_pull_refuses_a_checkout_with_no_upstream(
     assert cli.cmd_update(_update_args(restart=False)) == 1
     assert "no upstream branch to pull from" in capsys.readouterr().err
 
+
+def _detached_behind_a_judged_upstream(tmp_path, project, monkeypatch):
+    """A detached checkout one release behind its upstream, which the checks judge.
+
+    Returns ``(origin, clone, detached, judged, installs)``: the upstream
+    release declares nothing, so the checks pass it. The pull, which moves
+    only this test's clone, is real; the install is recorded.
+    """
+    origin, clone = origin_and_clone(tmp_path, b"# Kestrel Constitution\n")
+    detached = _head(clone)
+    (origin / "README.md").write_text("a release that declares nothing\n")
+    git(origin, "add", "README.md")
+    git(origin, "commit", "-q", "-m", "an ordinary release")
+    judged = git(origin, "rev-parse", "HEAD").strip()
+    git(clone, "checkout", "-q", "--detach", detached)
+    monkeypatch.setattr(cli, "_get_project_dir", lambda: project)
+    monkeypatch.setattr(cli, "_resolve_source_checkout", lambda: clone)
+    monkeypatch.setattr(
+        cli_lifecycle, "check_constitution_adoption",
+        lambda *a, **k: ConstitutionAdoptionCheck(),
+    )
+    installs = []
+    monkeypatch.setattr(
+        cli, "_run_uv_pip_install_editable",
+        lambda *a, **kw: installs.append("install") or (0, ""),
+    )
+    _leave_draft_a2a_data(_db(project, "Emma"))
+    return origin, clone, detached, judged, installs
+
+
+def test_detached_recovery_lands_the_judged_commit(tmp_path, project, monkeypatch):
+    _, clone, _, judged, installs = _detached_behind_a_judged_upstream(
+        tmp_path, project, monkeypatch
+    )
+
+    assert cli.cmd_update(_update_args(restart=False)) == 0
+
+    assert git(clone, "symbolic-ref", "--short", "HEAD").strip() == "main"
+    assert _head(clone) == judged
+    assert installs == ["install"]
+
+
+def test_detached_recovery_refuses_a_local_branch_past_the_judged_commit(
+    tmp_path, project, monkeypatch, capsys
+):
+    """The reviewer's reproduction: the checks judge the upstream commit, but
+    the local branch recovery reattaches to is already past it, at a commit
+    requiring the cutover Emma still needs. Checking it out installed that."""
+    _, clone, detached, judged, installs = _detached_behind_a_judged_upstream(
+        tmp_path, project, monkeypatch
+    )
+    git(clone, "fetch", "-q")
+    git(clone, "branch", "-q", "-f", "main", judged)
+    git(clone, "checkout", "-q", "main")
+    ahead = _commit_manifest(clone, packaged_manifest())
+    git(clone, "checkout", "-q", "--detach", detached)
+
+    assert cli.cmd_update(_update_args(restart=False)) == 1
+
+    assert installs == []
+    # Nothing moved: not HEAD, not the branch, not the working tree.
+    assert _head(clone) == detached
+    assert git(clone, "rev-parse", "refs/heads/main").strip() == ahead
+    assert not (clone / MANIFEST_RELPATH).exists()
+    assert "pull: FAILED" in capsys.readouterr().err
+
+
+def test_nothing_installs_unless_the_pull_left_head_on_the_judged_commit(
+    tmp_path, project, monkeypatch, capsys
+):
+    """However the pull got there: a merge that lands anywhere else stops the
+    update before the install."""
+    origin, clone, _, judged, installs = _detached_behind_a_judged_upstream(
+        tmp_path, project, monkeypatch
+    )
+    git(clone, "checkout", "-q", "main")
+    beyond = _commit_manifest(origin, packaged_manifest())
+    git(clone, "fetch", "-q")
+    real_pull = cli._run_git_fast_forward
+    monkeypatch.setattr(
+        cli, "_run_git_fast_forward", lambda c, _revision: real_pull(c, beyond)
+    )
+    monkeypatch.setattr(cli, "_run_git_fetch", lambda _checkout: (0, ""))
+    monkeypatch.setattr(
+        cli,
+        "_resolve_pull_target",
+        lambda _checkout: cli_lifecycle._PullTarget(
+            upstream=judged, revision=judged, head=_head(clone)
+        ),
+    )
+
+    assert cli.cmd_update(_update_args(restart=False)) == 1
+
+    assert installs == []
+    assert f"not {judged[:12]}, the revision the checks judged" in (
+        capsys.readouterr().err
+    )
+
+
+# ---------------------------------------------------------------------------
+# The feature sync installs the core the checks judged, and no other
+# ---------------------------------------------------------------------------
+
+
+def _declare_core(project: Path, checkout: Path) -> Path:
+    """A host manifest declaring core editable from ``checkout``, with an extra.
+
+    The extra is what makes the sync act on a core already linked from the
+    checkout (``ensure``), which is where it used to pull it again.
+    """
+    manifest = project / ".kestrel-host-features.toml"
+    manifest.write_text(
+        "[[feature]]\n"
+        'name = "kestrel-sovereign"\n'
+        f'editable = "{checkout}"\n'
+        'extras = ["observability"]\n'
+    )
+    return manifest
+
+
+def _fake_venv_with_real_git(monkeypatch, checkout: Path, *, linked: bool = True, **venv_options):
+    """The sync's installs land in a modelled venv; git still runs for real.
+
+    ``FakeUv`` replaces ``subprocess.run`` everywhere, git included. Git is
+    routed back to the real one so the sync's pull, had it run, would move
+    this test's clone, and so is this interpreter, which runs the offline
+    migration probe. Core is modelled linked from ``checkout``, or with
+    ``linked=False`` as an index wheel. Returns the double and the install
+    argvs as the sync issued them: the double models no extras on a
+    checkout, so it is shown the checkout alone.
+    """
+    from tests.utils.fake_uv import FakeUv, use_fake_uv
+
+    real_run = subprocess.run
+    venv = FakeUv(
+        core_checkout=str(checkout) if linked else None, sdk_checkout=None,
+        **venv_options,
+    )
+    use_fake_uv(monkeypatch, venv)
+    # use_fake_uv stubs the pull. The real one is the point here.
+    monkeypatch.setattr(
+        cli_lifecycle, "_editable_git_pull", _REAL_EDITABLE_GIT_PULL
+    )
+    issued = []
+
+    def run(cmd, *args, **kwargs):
+        if cmd and (
+            Path(str(cmd[0])).name == "git" or str(cmd[0]) == sys.executable
+        ):
+            return real_run(cmd, *args, **kwargs)
+        issued.append(list(cmd))
+        extra = "[observability]"
+        if str(cmd[-1]).endswith(extra):
+            cmd = [*cmd[:-1], str(cmd[-1])[: -len(extra)]]
+        return venv.run(
+            cmd,
+            capture_output=kwargs.get("capture_output", True),
+            text=kwargs.get("text", True),
+            timeout=kwargs.get("timeout"),
+        )
+
+    monkeypatch.setattr(subprocess, "run", run)
+    return venv, issued
+
+
+_REAL_EDITABLE_GIT_PULL = cli_lifecycle._editable_git_pull
+
+
+@pytest.fixture
+def judged_core_update(tmp_path, project, monkeypatch):
+    """``kestrel update`` over a checkout the host manifest declares as core.
+
+    Upstream holds one ordinary release, which the checks judge. Once the pull
+    has landed it, the install step publishes a release requiring the cutover
+    Emma still needs, and fetches it into the clone, as a concurrent fetch (or
+    the sync's own pull) would. Reconcile, the lock report and the restart are
+    out of scope; the sync and git are real.
+    """
+    origin, clone = origin_and_clone(tmp_path, b"# Kestrel Constitution\n")
+    (origin / "README.md").write_text("a release that declares nothing\n")
+    git(origin, "add", "README.md")
+    git(origin, "commit", "-q", "-m", "an ordinary release")
+    judged = git(origin, "rev-parse", "HEAD").strip()
+    manifest = _declare_core(project, clone)
+    _leave_draft_a2a_data(_db(project, "Emma"))
+    monkeypatch.setattr(cli, "_get_project_dir", lambda: project)
+    monkeypatch.setattr(cli, "_resolve_source_checkout", lambda: clone)
+    monkeypatch.setattr(
+        cli_lifecycle, "check_constitution_adoption",
+        lambda *a, **k: ConstitutionAdoptionCheck(),
+    )
+    # The lock preflight has its own tests; this clone carries no uv.lock.
+    monkeypatch.setattr(cli, "_run_sync_preflight", lambda *a, **k: 0)
+    monkeypatch.setattr(cli_lifecycle, "_run_feature_reconcile", lambda *a, **k: 0)
+    monkeypatch.setattr(cli_lifecycle, "_report_core_lock", lambda: None)
+    venv, issued = _fake_venv_with_real_git(monkeypatch, clone)
+    beyond = []
+
+    def install(*_args, **_kwargs):
+        beyond.append(_commit_manifest(origin, packaged_manifest()))
+        git(clone, "fetch", "-q")
+        return 0, ""
+
+    monkeypatch.setattr(cli, "_run_uv_pip_install_editable", install)
+    return SimpleNamespace(
+        clone=clone, manifest=manifest, judged=judged, beyond=beyond, venv=venv,
+        issued=issued,
+    )
+
+
+def test_the_feature_sync_links_core_at_the_judged_commit_without_pulling_it(
+    judged_core_update, capsys
+):
+    """The reviewer's reproduction: the checks judged the ordinary release,
+    upstream then gained the cutover, and the sync's own ``git pull`` of the
+    declared core landed it and reached the core installer."""
+    run = judged_core_update
+
+    rc = cli.cmd_update(
+        _update_args(features=True, restart=False, manifest=str(run.manifest))
+    )
+
+    assert rc == 0, capsys.readouterr()
+    assert run.beyond, "upstream never moved past the judged commit"
+    assert _head(run.clone) == run.judged
+    assert not (run.clone / MANIFEST_RELPATH).exists()
+    # Core was still linked: the judged checkout, at the judged commit.
+    assert [cmd[-1] for cmd in run.issued if "-e" in cmd] == [
+        f"{run.clone}[observability]"
+    ], run.issued
+    out = capsys.readouterr().out
+    assert f"--judged-core-revision {run.judged}" in out
+    assert f"not pulled: {run.clone} is at {run.judged[:12]}" in out
+
+
+def test_the_feature_sync_refuses_a_core_checkout_moved_off_the_judged_commit(
+    judged_core_update, monkeypatch, capsys
+):
+    """Whatever moved it after the install: the sync links no core then."""
+    from kestrel_sovereign.cli_features import CORE_UNJUDGED
+
+    run = judged_core_update
+    install = cli._run_uv_pip_install_editable
+
+    def install_then_move(*args, **kwargs):
+        result = install(*args, **kwargs)
+        git(run.clone, "merge", "-q", "--ff-only", run.beyond[-1])
+        return result
+
+    monkeypatch.setattr(cli, "_run_uv_pip_install_editable", install_then_move)
+
+    rc = cli.cmd_update(
+        _update_args(features=True, restart=False, manifest=str(run.manifest))
+    )
+
+    assert rc == CORE_UNJUDGED
+    assert not [cmd for cmd in run.issued if "-e" in cmd], run.issued
+    captured = capsys.readouterr()
+    assert f"not {run.judged[:12]}, the commit the checks judged" in captured.out
+    assert "--continue-on-error does not cover this" in captured.err
+
+
+def test_update_refuses_a_manifest_declaring_core_elsewhere_before_anything(
+    tmp_path, project, upstream, monkeypatch, capsys
+):
+    """The sync would pull and link a core no check judged: refused before
+    the fetch, the pull and the install."""
+    from kestrel_sovereign.cli_features import CORE_UNJUDGED
+
+    _, clone, steps = upstream
+    elsewhere = tmp_path / "another-core"
+    elsewhere.mkdir()
+    manifest = _declare_core(project, elsewhere)
+    fetches = []
+    monkeypatch.setattr(
+        cli, "_run_git_fetch", lambda checkout: fetches.append(checkout) or (0, "")
+    )
+    head = _head(clone)
+
+    rc = cli.cmd_update(
+        _update_args(features=True, restart=False, manifest=str(manifest))
+    )
+
+    assert rc == CORE_UNJUDGED
+    assert steps == [] and fetches == []
+    assert _head(clone) == head
+    err = capsys.readouterr().err
+    assert str(elsewhere) in err and "Nothing was pulled" in err
+
+
+@pytest.fixture
+def index_core_update(tmp_path, project, monkeypatch):
+    """``kestrel update`` on a core installed from the index (#3832).
+
+    There is no source checkout to pull or install, so the checks judge the
+    release installed now. The host manifest declares core editable from a
+    scratch clone whose upstream has since gained a release requiring a
+    migration this code has no check for: the sync's own pull would land it.
+    The gates and git are real; reconcile, the lock report and the restart
+    are out of scope.
+    """
+    origin, clone = origin_and_clone(tmp_path, b"# Kestrel Constitution\n")
+    beyond = _commit_manifest(origin, _manifest(_entry("a-future-cutover")))
+    monkeypatch.setattr(cli, "_get_project_dir", lambda: project)
+    monkeypatch.setattr(cli, "_resolve_source_checkout", lambda: None)
+    monkeypatch.setattr(
+        cli_lifecycle, "check_constitution_adoption",
+        lambda *a, **k: ConstitutionAdoptionCheck(),
+    )
+    reconciled = []
+    monkeypatch.setattr(
+        cli_lifecycle, "_run_feature_reconcile",
+        lambda *a, **k: reconciled.append(k) or 0,
+    )
+    monkeypatch.setattr(cli_lifecycle, "_report_core_lock", lambda: None)
+    return SimpleNamespace(
+        origin=origin, clone=clone, beyond=beyond, head=_head(clone),
+        reconciled=reconciled,
+    )
+
+
+def test_an_index_core_update_refuses_a_manifest_declaring_a_core_checkout(
+    index_core_update, project, monkeypatch, capsys
+):
+    """The reviewer's reproduction: the installed-code gate passed, then the
+    feature sync pulled the declared core checkout, landing a release whose
+    migration no check read, and reached its installer."""
+    run = index_core_update
+    manifest = _declare_core(project, run.clone)
+    venv, issued = _fake_venv_with_real_git(monkeypatch, run.clone, linked=False)
+    assert check_revision_offline_migrations(
+        project, run.origin, run.beyond, code_label="the release beyond"
+    ).safe is False, "the release beyond the judged one is not refused"
+
+    rc = cli.cmd_update(
+        _update_args(features=True, restart=False, manifest=str(manifest))
+    )
+
+    from kestrel_sovereign.cli_features import CORE_UNJUDGED
+
+    assert rc == CORE_UNJUDGED
+    assert _head(run.clone) == run.head
+    assert not (run.clone / MANIFEST_RELPATH).exists()
+    assert issued == [] and venv.installed["kestrel-sovereign"] == "0.52.0"
+    assert run.reconciled == []
+    err = capsys.readouterr().err
+    assert str(run.clone) in err and "Nothing was pulled" in err
+    assert "the release the checks judged" in err
+
+
+def test_an_index_core_update_holds_core_at_the_judged_release(
+    index_core_update, project, monkeypatch, capsys
+):
+    """A missing feature wants a newer core than the installed wheel. Without
+    the hold, the sync resolves that newer release from the index: one no
+    check read. The update holds every sync install to the installed release,
+    and hands reconcile the same release to hold."""
+    from kestrel_sovereign.cli_features import JudgedCore
+
+    run = index_core_update
+    manifest = project / ".kestrel-host-features.toml"
+    manifest.write_text('[[feature]]\nname = "voice"\n')
+    venv, _ = _fake_venv_with_real_git(
+        monkeypatch, run.clone, linked=False, feature_requires=">=0.53",
+    )
+
+    rc = cli.cmd_update(
+        _update_args(
+            features=True, restart=False, manifest=str(manifest),
+            continue_on_error=True,
+        )
+    )
+
+    assert rc == 0, capsys.readouterr()
+    assert venv.installed["kestrel-sovereign"] == "0.52.0"
+    assert venv.pins and set(venv.pins) == {"==0.52.0"}
+    (reconcile,) = run.reconciled
+    assert reconcile["judged"] == JudgedCore(version="0.52.0")
+
+
+def test_the_continuation_carries_the_judged_commit():
+    """A fresh interpreter that lost it would pull the core checkout again."""
+    args = cli.build_parser().parse_args(
+        ["update", "--judged-core-revision", "a" * 40]
+    )
+
+    argv = cli_lifecycle._update_argv(args)
+
+    assert argv[argv.index("--judged-core-revision") + 1] == "a" * 40
+
+
+# ---------------------------------------------------------------------------
+# The launcher starts the agent from the registry it was found in
+# ---------------------------------------------------------------------------
+
+
+def test_a_named_start_hands_the_launcher_the_registry_it_read(
+    tmp_path, project, monkeypatch
+):
+    """The reviewer's reproduction, through the real ``ProcessManager``.
+
+    Both registries name Emma, at different data directories. ``cmd_start``
+    found her in the host's external registry, but ``start_agent`` reloaded
+    the project's default file and refused her as not matching "the active
+    launcher roster", after a named restart had already terminated her.
+    Spawning is replaced; everything before it runs.
+    """
+    from kestrel_sovereign.multi_agent.config import (
+        HostConfig,
+        LocalAgentConfig,
+        MultiAgentConfig,
+    )
+    from kestrel_sovereign.multi_agent.process_manager import ProcessManager
+
+    registry = tmp_path / "fleet" / "fleet.toml"
+    registry.parent.mkdir()
+    MultiAgentConfig(
+        host=HostConfig(),
+        agents={"Emma": LocalAgentConfig(data_dir="agent_data/emma-fleet", port=18803)},
+    ).save(registry)
+    from tests.utils.constitution_anchor import write_agent_anchor
+
+    write_agent_anchor(
+        project / "agent_data" / "emma-fleet" / "kestrel_prime.db",
+        name="Emma",
+        constitution_hash="e" * 64,
+    )
+    monkeypatch.setenv("KESTREL_MULTI_AGENT_CONFIG", str(registry))
+    monkeypatch.delenv("KESTREL_API_KEY", raising=False)
+    spawned = []
+
+    def spawn_detached(self, cmd, env, log_file, pid_file, *, port):
+        spawned.append((port, str(pid_file)))
+        return 4242
+
+    def refuse(*_args, **_kwargs):
+        pytest.fail("reached the real process lifecycle")
+
+    monkeypatch.setattr(cli_lifecycle, "ProcessManager", ProcessManager)
+    monkeypatch.setattr(ProcessManager, "_spawn_detached", spawn_detached)
+    monkeypatch.setattr(ProcessManager, "_spawn", refuse)
+    monkeypatch.setattr(
+        ProcessManager, "is_port_in_use", staticmethod(lambda port, host="": False)
+    )
+    monkeypatch.setattr(
+        ProcessManager, "wait_for_health", staticmethod(lambda *a, **k: True)
+    )
+    monkeypatch.setattr(cli, "_get_project_dir", lambda: project)
+    monkeypatch.setattr(cli, "_maybe_first_run_setup", lambda _project: None)
+
+    assert cli_lifecycle.cmd_start(_restart_args(name="Emma")) == 0
+    ((port, pid_file),) = spawned
+    assert port == 18803
+    assert Path(pid_file).is_relative_to(project / "agent_data" / "emma-fleet")

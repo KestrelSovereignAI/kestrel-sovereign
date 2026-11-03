@@ -3840,6 +3840,21 @@ async def test_failed_update_emits_each_lifecycle_transition_once(tmp_path):
     ] == ["pending", "updating", "pending"]
 
 
+#: The commit a faked fetch "lands", for tests that fake every step.
+_FAKE_FETCHED = "c" * 40
+
+
+async def _fake_pin(self, repo_path):
+    return {
+        "step": "pin_fetched_commit",
+        "argv": ["git", "-C", repo_path, "rev-parse", "--verify", "FETCH_HEAD^{commit}"],
+        "returncode": 0,
+        "ok": True,
+        "stdout_tail": _FAKE_FETCHED,
+        "stderr_tail": "",
+    }
+
+
 @pytest.mark.asyncio
 async def test_run_update_records_steps_and_resolved_ref(tmp_path):
     feat, backend = await _make_feature(tmp_path)
@@ -3869,14 +3884,17 @@ async def test_run_update_records_steps_and_resolved_ref(tmp_path):
 
     with patch.object(
         RestartCoordinatorFeature, "_run_update_step", _fake_step,
-    ):
+    ), patch.object(RestartCoordinatorFeature, "_pin_fetched_commit", _fake_pin):
         update = await feat._run_update(req, profile)
 
     assert update["ok"] is True
     assert update["resolved_ref"] == "deadbeef"
     assert {s["step"] for s in update["steps"]} >= {
-        "fetch", "checkout", "install", "resolve_ref",
+        "fetch", "pin_fetched_commit", "checkout", "install", "resolve_ref",
     }
+    # Every step after the fetch lands the pinned commit, never FETCH_HEAD.
+    checkout = next(s for s in update["steps"] if s["step"] == "checkout")
+    assert checkout["argv"][-2:] == ["--detach", _FAKE_FETCHED]
     assert update["migration"]["ran"] is False
 
 
@@ -3911,14 +3929,14 @@ async def test_run_update_stops_at_first_failing_step(tmp_path):
 
     with patch.object(
         RestartCoordinatorFeature, "_run_update_step", _fake_step,
-    ):
+    ), patch.object(RestartCoordinatorFeature, "_pin_fetched_commit", _fake_pin):
         update = await feat._run_update(req, profile)
 
     assert update["ok"] is False
     assert update["failed_step"] == "checkout"
     # Stopped before install/resolve_ref ran.
     assert [s["step"] for s in update["steps"]] == [
-        "fetch", "feature_preflight", "checkout",
+        "fetch", "pin_fetched_commit", "feature_preflight", "checkout",
     ]
 
 
@@ -3953,12 +3971,14 @@ async def test_a_refused_manifest_preflight_stops_the_update_before_the_checkout
 
     with patch.object(
         RestartCoordinatorFeature, "_run_update_step", _fake_step,
-    ):
+    ), patch.object(RestartCoordinatorFeature, "_pin_fetched_commit", _fake_pin):
         update = await feat._run_update(req, profile)
 
     assert update["ok"] is False
     assert update["failed_step"] == "feature_preflight"
-    assert [s["step"] for s in update["steps"]] == ["fetch", "feature_preflight"]
+    assert [s["step"] for s in update["steps"]] == [
+        "fetch", "pin_fetched_commit", "feature_preflight",
+    ]
 
 
 @pytest.mark.asyncio
@@ -4074,14 +4094,12 @@ async def test_profile_checkout_lands_on_fetched_branch_commit(tmp_path):
     steps = profile.build_steps(
         repo_path=str(work), target_ref="main", allow_migrations=False,
     )
-    for step in steps:
-        if step.name in ("install", "feature_sync"):
-            # Do not run `uv sync` or a real `kestrel feature sync` in a unit
-            # test. The suite's project directory carries a host manifest, so
-            # the profile includes the sync step.
-            continue
-        outcome = await feat._run_update_step(step)
-        assert outcome["ok"], f"step {step.name!r} failed: {outcome}"
+    # Not `uv sync` or a real `kestrel feature sync` in a unit test. The
+    # suite's project directory carries a host manifest, so the profile
+    # includes the sync step.
+    outcomes = await _run_profile_git_steps(feat, steps, work)
+    for name, outcome in outcomes.items():
+        assert outcome["ok"], f"step {name!r} failed: {outcome}"
 
     head_after = _head(work)
     assert head_after == remote_head, (
@@ -5448,6 +5466,27 @@ def _git_out(repo, *args):
     ).stdout.strip()
 
 
+async def _run_profile_git_steps(feat, steps, repo):
+    """Run *steps* as the coordinator does, skipping install/feature_sync.
+
+    The commit the fetch landed is pinned right after it, and every later
+    step that names it runs against that commit (#3832).
+    """
+    outcomes = {}
+    fetched = ""
+    for step in steps:
+        if step.name in ("install", "feature_sync"):
+            continue
+        if step.names_fetched_commit:
+            step = step.bound(fetched)
+        outcomes[step.name] = await feat._run_update_step(step)
+        if step.name == "fetch":
+            pinned = await feat._pin_fetched_commit(str(repo))
+            assert pinned["ok"], pinned
+            fetched = pinned["stdout_tail"]
+    return outcomes
+
+
 async def _run_git_steps(feat, repo, target_ref):
     """Run the profile's git steps (fetch/checkout/reattach) for real,
     skipping install/feature_sync which need a real project."""
@@ -5455,12 +5494,7 @@ async def _run_git_steps(feat, repo, target_ref):
     steps = profile.build_steps(
         repo_path=str(repo), target_ref=target_ref, allow_migrations=False
     )
-    outcomes = {}
-    for step in steps:
-        if step.name in ("install", "feature_sync"):
-            continue
-        outcomes[step.name] = await feat._run_update_step(step)
-    return outcomes
+    return await _run_profile_git_steps(feat, steps, repo)
 
 
 @pytest.mark.asyncio
@@ -8591,7 +8625,12 @@ async def test_an_update_records_both_adoption_checks(
     spawn.assert_called_once()
     fetched, installed = row.constitution_checks_list()
     assert fetched["stage"] == "fetched_revision"
-    assert fetched["code"].startswith("FETCH_HEAD of ")
+    # The commit pinned after the fetch, never the movable FETCH_HEAD (#3832).
+    [pin] = [
+        s for s in row.update_log_dict()["steps"]
+        if s["step"] == "pin_fetched_commit"
+    ]
+    assert fetched["code"].startswith(f"{pin['stdout_tail']} of ")
     assert installed["stage"] == "installed_code"
     anchored = sha256(_ANCHORED_TEXT)
     for check in (fetched, installed):
@@ -9122,7 +9161,7 @@ async def test_update_onto_a_pending_offline_migration_is_refused_before_checkou
     [check] = log["offline_migration_checks"]
     assert check["stage"] == "fetched_revision"
     assert check["result"] == "refused"
-    assert check["code"] == f"FETCH_HEAD of {checkout}"
+    assert check["code"] == f"{git(origin, 'rev-parse', 'HEAD').strip()} of {checkout}"
     assert result.data["refused"] == [
         {"request_id": request_id, "reason": row.status_reason}
     ]
@@ -9201,3 +9240,86 @@ async def test_restart_onto_code_requiring_a_pending_migration_is_refused(
         {"request_id": request_id, "reason": row.status_reason}
     ]
     assert result.data["executed"] == []
+
+
+@pytest.mark.asyncio
+async def test_a_fetch_after_the_checks_cannot_retarget_the_checkout(
+    tmp_path, monkeypatch, adoption_project,
+):
+    """The reviewer's reproduction (#3832): the checks passed commit A, then
+    another fetch rewrote FETCH_HEAD to B, which requires the cutover Emma
+    still needs, and the profile checked out FETCH_HEAD. Every step after the
+    fetch now lands the commit pinned right after it."""
+    from kestrel_sovereign.offline_migrations import (
+        MANIFEST_RELPATH,
+        packaged_manifest,
+    )
+    from tests.utils.constitution_anchor import (
+        PACKAGED_CONSTITUTION_RELPATH,
+        git,
+        origin_and_clone,
+        seed_anchored_agents,
+    )
+
+    project, sha256 = adoption_project
+    origin, checkout = origin_and_clone(tmp_path, _ANCHORED_TEXT)
+    (origin / "README.md").write_text("a release that declares nothing\n")
+    git(origin, "add", "README.md")
+    git(origin, "commit", "-q", "-m", "a release that declares nothing")
+    judged = git(origin, "rev-parse", "HEAD").strip()
+    monkeypatch.setattr(
+        "kestrel_sovereign.config.CONSTITUTION_PATH",
+        str(checkout / PACKAGED_CONSTITUTION_RELPATH),
+    )
+    seed_anchored_agents(project, {"Emma": sha256(_ANCHORED_TEXT)})
+    _leave_draft_a2a_data(project)
+    feat, backend = await _make_feature(tmp_path)
+    profile = get_update_profile("sovereign_local_uv_sync")
+    row = await insert_request(
+        backend, requested_by_agent="did:test:agent", reason="update",
+    )
+    req = SimpleNamespace(
+        id=row.id,
+        update_repo_path=str(checkout),
+        update_target_ref="main",
+        update_allow_migrations=False,
+    )
+    real_step = RestartCoordinatorFeature._run_update_step
+
+    async def _step(self, step):
+        if step.name == "checkout":
+            # Another fetch lands B on FETCH_HEAD after the checks judged A.
+            manifest = origin / MANIFEST_RELPATH
+            manifest.parent.mkdir(parents=True, exist_ok=True)
+            manifest.write_bytes(packaged_manifest())
+            git(origin, "add", MANIFEST_RELPATH)
+            git(origin, "commit", "-q", "-m", "merge the native A2A release")
+            git(checkout, "fetch", "-q", "origin", "main")
+        if step.name in ("fetch", "checkout", "reattach_branch"):
+            return await real_step(self, step)
+        ok = step.name != "install"
+        return {
+            "step": step.name, "argv": list(step.argv),
+            "returncode": 0 if ok else 1, "ok": ok,
+            "stdout_tail": "", "stderr_tail": "" if ok else "stop here",
+        }
+
+    with patch.object(RestartCoordinatorFeature, "_run_update_step", _step), \
+            patch.object(
+                RestartCoordinatorFeature, "_spawn_restart_subprocess",
+            ) as spawn:
+        update = await feat._run_update(req, profile)
+
+    spawn.assert_not_called()
+    assert git(checkout, "rev-parse", "FETCH_HEAD").strip() != judged
+    assert git(checkout, "rev-parse", "HEAD").strip() == judged
+    assert not (checkout / MANIFEST_RELPATH).exists()
+    steps = {s["step"]: s for s in update["steps"]}
+    assert steps["pin_fetched_commit"]["stdout_tail"] == judged
+    assert steps["checkout"]["argv"][-1] == judged
+    assert "staying detached" in steps["reattach_branch"]["stdout_tail"]
+    [migration] = update["offline_migration_checks"]
+    assert (migration["result"], migration["code"]) == (
+        "passed", f"{judged} of {checkout}",
+    )
+    assert update["failed_step"] == "install"
