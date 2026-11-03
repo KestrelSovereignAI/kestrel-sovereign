@@ -39,6 +39,7 @@ agent_data/
 **/*.pem
 **/*.key
 **/*credentials*.json
+**/gha-creds-*.json
 **/*service-account*.json
 **/*-key.json
 **/*.private.json
