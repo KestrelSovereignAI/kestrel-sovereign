@@ -335,6 +335,13 @@ The current strict CPU profile does not establish an authenticated isolated remo
 browser. Connect/bootstrap, renewal, remote worker/display transport, native amd64
 admission and physical cloud billing/termination conformance remain unsupported.
 
+The private native preparation stores only a repository-keyed, domain-separated
+fingerprint of the exact request, headers, configuration, source programs and
+original row/request/quote/attempt/preparation identities. Bearer headers and the
+credential-bearing client configuration remain in the live original binding;
+they are not serialized into the row. Rebinding must reproduce the same complete
+fingerprint, and changed credentials or native facts refuse without dispatch.
+
 Runtime admission refuses the authenticated native acquisition profile before
 attaching its producer, saving its preparation or acknowledging dispatch. The
 restriction belongs to the original runtime provider invocation and accepted

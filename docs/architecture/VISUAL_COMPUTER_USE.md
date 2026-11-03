@@ -516,8 +516,8 @@ The Core `_OriginalHumanActionResult` binds the complete
 original human request, issued consumer/control lease and pixel-free frame;
 it cannot use the agent profile or change private lease/control/session facts.
 Both profiles share only the native writer, program, COMMIT/reset and original
-hold machinery. Environment acquisition still needs its separate positive and
-unknown result profile; neither negative action profile grants it authority.
+hold machinery. Environment acquisition has its own closed positive and unknown
+result profile in the same native engine; neither action profile grants it authority.
 
 A never-acquired request whose global turn was cancelled before its retirement
 write remains charged until a fresh genuinely admitted original-owner reconcile
