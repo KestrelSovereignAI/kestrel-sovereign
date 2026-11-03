@@ -1,0 +1,25 @@
+# Offline migrations this release requires before it may start (#3832).
+#
+# Some releases refuse to start on data an earlier release wrote until an
+# operator migrates it offline. `kestrel update` and the restart coordinator
+# read this file from the revision they are about to install, BEFORE they
+# install it, and refuse while any agent database still needs one of these
+# migrations. An agent can therefore never deploy itself into a release that
+# will not start; only an operator can cross one.
+#
+# Every `id` needs a probe in `kestrel_sovereign/offline_migrations.py`: a
+# read-only run of the check the release's startup applies. A release that
+# requires a new offline migration adds the entry and its probe in the same
+# change. A host whose code has no probe for an id cannot judge it and refuses,
+# so the first crossing of a new migration is always an operator's.
+#
+# Entries accumulate: a later release still requires an earlier migration to
+# have completed. Remove one only when no supported upgrade path starts before
+# it. The format is strict; a new field needs a new `version`.
+
+version = 1
+
+[[migration]]
+id = "native-a2a-cutover"
+summary = "Native A2A 1.0.1 (Core 0.54) refuses to start on stored draft-protocol A2A data"
+runbook = "docs/architecture/a2a/OFFLINE_CUTOVER.md"

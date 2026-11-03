@@ -370,7 +370,7 @@ kestrel update --dry-run          # preview (incl. the reconcile plan); mutate n
 
 What it actually does:
 
-1. `git pull --ff-only` in the source checkout (NOT `KESTREL_HOME`). Refuses on modified TRACKED files only — untracked `kestrel.toml.backup-*` etc. are ignored. `--allow-dirty` bypasses.
+1. `git pull --ff-only` in the source checkout (NOT `KESTREL_HOME`), as its two halves: the pre-pull checks fetch once, and the pull fast-forwards to exactly the commit they judged (#3832). Refuses on modified TRACKED files only — untracked `kestrel.toml.backup-*` etc. are ignored. `--allow-dirty` bypasses.
    - **Preflight** (#3702), before the pull when features will sync: a `.kestrel-host-features.toml` window that excludes the version the incoming `uv.lock` pins (read from git at the revision the pull lands on) refuses the update, naming each entry. Every restore in step 3 is held to both, so it could only fail — after `uv sync` had pruned the packages it restores. Same check: `kestrel feature sync --preflight [--lock-revision REV]`. A package the lock covers is best declared `pypi = ""`: the lock decides its version.
 2. Install step **auto-detects** by `uv.lock` presence:
    - With `uv.lock` → `uv sync --active` (refreshes deps from lock + prunes anything not in it).

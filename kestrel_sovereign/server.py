@@ -135,9 +135,9 @@ from kestrel_sovereign.logging_config import (
     session_id_var,
     setup_logging,
 )
+from kestrel_sovereign.multi_agent.config import resolve_multi_agent_path
 from kestrel_sovereign.paths import (
     AGENT_DB_PATH_ENV,
-    MULTI_AGENT_CONFIG_ENV,
     runtime_path_env,
 )
 
@@ -209,60 +209,6 @@ def _standalone_runtime_execution_custody(name, did, config):
         ProcessRuntimeExecutionFence,
     )
     return ExecutionCustody(ProcessRuntimeExecutionFence(agent_id=did))
-
-
-def resolve_multi_agent_path(env: dict | os._Environ) -> Path:
-    """Compute the multi_agent.toml path the lifespan should load (#868).
-
-    Centralised so unit tests can exercise the real decision logic
-    instead of reimplementing it locally — the bug class this guards
-    against (a demo run silently mounting live agents) is exactly the
-    kind of thing where test-and-prod-drift is dangerous.
-
-    Decision matrix:
-
-    ============================  =====================================
-     Inputs                        Result
-    ============================  =====================================
-     KESTREL_MULTI_AGENT_CONFIG    Honour it verbatim (operator opted in
-       set                          to a specific path)
-     KESTREL_DEMO_SERVER=1 + no    Refuse to auto-mount the project-root
-       explicit config + the       ``multi_agent.toml``.  Returns a path that
-       default ``multi_agent.toml``    does not exist so the lifespan skips
-       exists at the project       multi-agent setup.  This is the
-       root                        guard that would have stopped the
-                                   #867 wipe.
-     anything else                 Use the default path (the lifespan's
-                                   ``.exists()`` check handles missing
-                                   files; production behaviour preserved).
-    ============================  =====================================
-
-    Args:
-        env: Mapping of environment variables.  Pass ``os.environ`` in
-            production; tests pass a plain ``dict``.
-
-    Returns:
-        :class:`pathlib.Path` the lifespan should attempt to load.  The
-        caller still uses ``.exists()`` to decide whether to enter
-        multi-agent mode.
-    """
-    multi_agent_path = Path(
-        runtime_path_env(MULTI_AGENT_CONFIG_ENV, "multi_agent.toml", environ=env)
-    )
-    demo_server_env = env.get("KESTREL_DEMO_SERVER", "").lower() in (
-        "1", "true", "yes",
-    )
-    multi_agent_explicit = MULTI_AGENT_CONFIG_ENV in env
-    if demo_server_env and not multi_agent_explicit and multi_agent_path.exists():
-        logger.warning(
-            "[demo-server] KESTREL_DEMO_SERVER=1 with no explicit "
-            "KESTREL_MULTI_AGENT_CONFIG — refusing to auto-mount %s.  "
-            "A demo server must not silently load live agents.  Pass "
-            "KESTREL_MULTI_AGENT_CONFIG=<path> explicitly to opt in.",
-            multi_agent_path,
-        )
-        return Path("/dev/null/multi_agent-disabled")
-    return multi_agent_path
 
 
 def _set_startup_error(app: FastAPI, error: Optional[Exception]) -> None:

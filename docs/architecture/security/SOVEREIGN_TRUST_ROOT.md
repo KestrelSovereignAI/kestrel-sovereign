@@ -514,12 +514,13 @@ Mode. `kestrel start` is not gated. Either order works:
 `kestrel update` hashes the incoming bytes with the resolver it was started
 with. Its restart step checks again, in a fresh interpreter, against what was
 installed. That second check catches a revision that changes how the resolver
-or the Amendment VIII rendering produces the governing bytes, a feature step
-that upgraded the core package, and an upstream that moved between the gate's
-fetch and the pull. It refuses before anything restarts, leaving the new code
-installed and the running agents on the old code. Adopt the constitution
-before they restart, and before their next periodic integrity audit if the
-installed text itself changed.
+or the Amendment VIII rendering produces the governing bytes, and a feature
+step that upgraded the core package. It refuses before anything restarts,
+leaving the new code installed and the running agents on the old code. Adopt
+the constitution before they restart, and before their next periodic
+integrity audit if the installed text itself changed. An upstream that moves
+after the gate's fetch cannot land at all: the pull fast-forwards to exactly
+the commit the gate judged and fetches nothing itself (#3832).
 
 ## Rotation
 

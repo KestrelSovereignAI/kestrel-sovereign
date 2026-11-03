@@ -2119,6 +2119,259 @@ def test_a_declared_editable_core_is_pulled_before_it_is_linked(
     assert venv.editable.get(CORE) == str(checkout)  # ...and then linked
 
 
+def _judged_args(manifest, checkout, revision=None, **overrides):
+    """``feature sync`` as ``kestrel update`` and the coordinator call it (#3832)."""
+    args = _args(manifest)
+    args.core_checkout = str(checkout)
+    args.core_revision = revision
+    for name, value in overrides.items():
+        setattr(args, name, value)
+    return args
+
+
+@pytest.mark.parametrize(
+    "declaration",
+    ['editable = "{other}"', 'pypi = ">=0.54"', 'pypi = ""'],
+    ids=["another-checkout", "index-window", "index-any-version"],
+)
+def test_a_judged_core_refuses_a_manifest_moving_core_elsewhere(
+    monkeypatch, fake_registry, tmp_path, capsys, declaration,
+):
+    """The caller's checks judged ``checkout``. Pulling and linking another
+    checkout, or installing core from the index, puts a core no check read in
+    place, so the sync refuses before it installs anything (#3832)."""
+    checkout = tmp_path / "judged-core"
+    other = tmp_path / "another-core"
+    checkout.mkdir()
+    other.mkdir()
+    manifest = tmp_path / "m.toml"
+    manifest.write_text(
+        f'[[feature]]\nname = "{CORE}"\n'
+        + declaration.format(other=other)
+        + '\n\n[[feature]]\nname = "voice"\n'
+    )
+    venv = FakeUv(core_checkout=str(checkout), checkouts={str(other): "0.54.0"})
+    use_fake_uv(monkeypatch, venv)
+    monkeypatch.setattr(
+        "kestrel_sovereign.cli_lifecycle._editable_git_pull",
+        lambda *a, **k: pytest.fail("pulled a core no check judged"),
+    )
+
+    rc = cli.cmd_feature_sync(_judged_args(manifest, checkout))
+
+    assert rc == cli_features.CORE_UNJUDGED
+    assert cli_features.core_state_refusal(rc)
+    assert venv.commands == []
+    assert venv.editable[CORE] == str(checkout)
+    assert str(checkout) in capsys.readouterr().out
+
+
+def test_a_judged_core_preflight_refuses_before_the_caller_checks_out(
+    monkeypatch, fake_registry, tmp_path, capsys,
+):
+    """The coordinator's preflight runs before its checkout; a manifest moving
+    core off the checkout it is about to land must stop it there."""
+    checkout = tmp_path / "judged-core"
+    checkout.mkdir()
+    manifest = tmp_path / "m.toml"
+    manifest.write_text(
+        f'[[feature]]\nname = "{CORE}"\neditable = "{tmp_path / "elsewhere"}"\n'
+    )
+    monkeypatch.setattr(
+        cli_features, "run_sync_preflight",
+        lambda *a, **k: pytest.fail("judged the lock of a sync that cannot run"),
+    )
+
+    rc = cli.cmd_feature_sync(_judged_args(manifest, checkout, preflight=True))
+
+    assert rc == cli_features.CORE_UNJUDGED
+
+
+def test_a_judged_core_preflight_defers_to_the_lock_check_otherwise(
+    monkeypatch, fake_registry, tmp_path,
+):
+    checkout = tmp_path / "judged-core"
+    checkout.mkdir()
+    manifest = tmp_path / "m.toml"
+    manifest.write_text(f'[[feature]]\nname = "{CORE}"\neditable = "{checkout}"\n')
+    seen = []
+    monkeypatch.setattr(
+        cli_features, "run_sync_preflight", lambda *a, **k: seen.append(a) or 0,
+    )
+
+    assert cli.cmd_feature_sync(_judged_args(manifest, checkout, preflight=True)) == 0
+    assert seen
+
+
+def test_a_core_revision_names_the_checkout_it_belongs_to(
+    monkeypatch, fake_registry, tmp_path, capsys,
+):
+    manifest = tmp_path / "m.toml"
+    manifest.write_text('[[feature]]\nname = "voice"\n')
+    args = _args(manifest)
+    args.core_revision = "a" * 40
+
+    assert cli.cmd_feature_sync(args) == 1
+    assert "--core-revision needs --core-checkout" in capsys.readouterr().out
+
+
+def test_the_parser_takes_the_judged_core():
+    args = cli.build_parser().parse_args(
+        ["feature", "sync", "--core-checkout", "/repo", "--core-revision", "abc"]
+    )
+
+    assert cli_features.judged_core_from_args(args) == cli_features.JudgedCore(
+        checkout=Path("/repo"), revision="abc"
+    )
+
+
+# --- the judged installed release: an index-installed core (#3832) ----------
+
+
+def _installed_args(manifest, **overrides):
+    """``feature sync`` as ``kestrel update`` calls it on an index install."""
+    args = _args(manifest)
+    args.core_installed = True
+    for name, value in overrides.items():
+        setattr(args, name, value)
+    return args
+
+
+def test_the_parser_takes_the_installed_core(monkeypatch):
+    use_fake_uv(monkeypatch, FakeUv(core_checkout=None))
+    args = cli.build_parser().parse_args(["feature", "sync", "--core-installed"])
+
+    assert cli_features.judged_core_from_args(args) == cli_features.JudgedCore(
+        version="0.52.0"
+    )
+
+
+def test_the_installed_core_takes_no_checkout(monkeypatch, fake_registry, tmp_path, capsys):
+    manifest = tmp_path / "m.toml"
+    manifest.write_text('[[feature]]\nname = "voice"\n')
+
+    rc = cli.cmd_feature_sync(_installed_args(manifest, core_checkout="/repo"))
+
+    assert rc == 1
+    assert "--core-installed names the installed core" in capsys.readouterr().out
+
+
+def test_an_installed_core_with_no_git_checkout_is_judged_where_it_is(monkeypatch, tmp_path):
+    """Linked from a directory nothing pulls: those files, as they are."""
+    use_fake_uv(monkeypatch, FakeUv(core_checkout=str(tmp_path)))
+
+    assert cli_features.installed_judged_core() == cli_features.JudgedCore(
+        checkout=tmp_path
+    )
+
+
+@pytest.mark.parametrize(
+    "declaration",
+    ['editable = "{checkout}"', 'pypi = ">=0.53"'],
+    ids=["a-core-checkout", "a-window-the-release-fails"],
+)
+def test_an_installed_release_refuses_a_manifest_installing_another_core(
+    monkeypatch, fake_registry, tmp_path, capsys, declaration,
+):
+    """The checks judged the release installed now. Pulling and linking a
+    checkout, or installing a release the window names from the index, puts
+    a core no check read in place: refused before anything (#3832)."""
+    checkout = tmp_path / "core-checkout"
+    checkout.mkdir()
+    manifest = tmp_path / "m.toml"
+    manifest.write_text(
+        f'[[feature]]\nname = "{CORE}"\n'
+        + declaration.format(checkout=checkout)
+        + '\n\n[[feature]]\nname = "voice"\n'
+    )
+    venv = FakeUv(core_checkout=None, checkouts={str(checkout): "0.53.0"})
+    use_fake_uv(monkeypatch, venv)
+    monkeypatch.setattr(
+        "kestrel_sovereign.cli_lifecycle._editable_git_pull",
+        lambda *a, **k: pytest.fail("pulled a core no check judged"),
+    )
+
+    rc = cli.cmd_feature_sync(_installed_args(manifest))
+
+    assert rc == cli_features.CORE_UNJUDGED
+    assert venv.commands == []
+    assert venv.installed[CORE] == "0.52.0" and CORE not in venv.editable
+    assert "the release the checks judged" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("judged", [False, True], ids=["unjudged", "judged"])
+def test_an_installed_release_holds_core_against_a_feature_that_wants_more(
+    monkeypatch, fake_registry, tmp_path, judged,
+):
+    """A missing feature requires a newer core than the installed wheel.
+
+    An undeclared index wheel has no source policy, so unjudged the resolve
+    replaces core with the newer index release: one whose offline migrations
+    no check read. Judged, every install is held to the installed version, so
+    the feature fails instead and core stays the release the checks judged."""
+    manifest = tmp_path / "m.toml"
+    manifest.write_text('[[feature]]\nname = "voice"\n')
+    venv = FakeUv(core_checkout=None, feature_requires=">=0.53")
+    use_fake_uv(monkeypatch, venv)
+
+    args = _installed_args(manifest) if judged else _args(manifest)
+    rc = cli.cmd_feature_sync(args)
+
+    if judged:
+        assert rc == 1
+        assert venv.installed[CORE] == "0.52.0"
+        # The install and its git fallback, both held.
+        assert venv.pins and set(venv.pins) == {"==0.52.0"}
+    else:
+        assert venv.installed[CORE] == "0.53.0"
+
+
+def test_an_installed_release_keeps_a_window_it_satisfies_held_at_its_version(
+    monkeypatch, fake_registry, tmp_path,
+):
+    """Declaring the installed release's own source only ensures its extras,
+    and that install is held to the installed version too."""
+    manifest = tmp_path / "m.toml"
+    manifest.write_text(
+        f'[[feature]]\nname = "{CORE}"\npypi = ">=0.52"\nextras = ["observability"]\n'
+    )
+    venv = FakeUv(core_checkout=None)
+    use_fake_uv(monkeypatch, venv)
+    issued = []
+
+    def run(cmd, *args, **kwargs):
+        # The double models no extras on a core spec: shown the spec alone.
+        issued.append(list(cmd))
+        return venv.run([*cmd[:-1], str(cmd[-1]).replace("[observability]", "")], *args, **kwargs)
+
+    monkeypatch.setattr(cli.subprocess, "run", run)
+
+    rc = cli.cmd_feature_sync(_installed_args(manifest))
+
+    assert rc == 0
+    assert [cmd[-1] for cmd in issued] == [f"{CORE}[observability]>=0.52"]
+    assert venv.installed[CORE] == "0.52.0"
+    assert venv.pins == ["==0.52.0"]
+
+
+def test_an_installed_release_moved_past_the_hold_is_refused(
+    monkeypatch, fake_registry, tmp_path, capsys,
+):
+    """An install that bypasses the constraints (a build step, a direct pip
+    call) still replaced core: the caller must not restart onto it."""
+    manifest = tmp_path / "m.toml"
+    manifest.write_text('[[feature]]\nname = "voice"\n')
+    venv = FakeUv(core_checkout=None, feature_requires=">=0.53", honours_constraints=False)
+    use_fake_uv(monkeypatch, venv)
+
+    rc = cli.cmd_feature_sync(_installed_args(manifest))
+
+    assert rc == cli_features.CORE_UNJUDGED
+    assert cli_features.core_state_refusal(rc)
+    assert venv.installed[CORE] == "0.53.0"
+    assert "is now 0.53.0, not the installed" in capsys.readouterr().err
+
+
 def test_a_dirty_core_checkout_is_reported_not_silently_linked_stale(
     monkeypatch, fake_registry, tmp_path, capsys,
 ):

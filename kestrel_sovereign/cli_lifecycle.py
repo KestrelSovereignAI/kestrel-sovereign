@@ -16,6 +16,7 @@ import subprocess
 import sys
 import time
 from collections.abc import Callable
+from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
 from typing import Optional, Tuple
@@ -34,7 +35,10 @@ from kestrel_sovereign.constitution_adoption import (
     refusal_lines,
     unverified_lines,
 )
-from kestrel_sovereign.multi_agent.config import MULTI_AGENT_CONFIG_FILENAME
+from kestrel_sovereign.multi_agent.config import (
+    MULTI_AGENT_CONFIG_FILENAME,
+    launched_host_registry,
+)
 from kestrel_sovereign.multi_agent.liveness import AgentHolder
 from kestrel_sovereign.multi_agent.process_manager import (
     DEFAULT_STARTUP_HEALTH_TIMEOUT_SECONDS,
@@ -43,6 +47,22 @@ from kestrel_sovereign.multi_agent.process_manager import (
     PidStatus,
     ProcessManager,
     server_command,
+)
+from kestrel_sovereign.offline_migrations import (
+    MANIFEST_RELPATH as MIGRATION_MANIFEST_RELPATH,
+)
+from kestrel_sovereign.offline_migrations import (
+    OFFLINE_MIGRATION_REQUIRED,
+    OfflineMigrationCheck,
+    OfflineMigrationError,
+    check_offline_migrations,
+    manifest_at,
+)
+from kestrel_sovereign.offline_migrations import (
+    OVERRIDE_FLAG as MIGRATION_OVERRIDE_FLAG,
+)
+from kestrel_sovereign.offline_migrations import (
+    refusal_lines as migration_refusal_lines,
 )
 
 
@@ -213,6 +233,20 @@ def _add_constitution_override_argument(parser: argparse.ArgumentParser) -> None
     )
 
 
+def _add_offline_migration_override_argument(parser: argparse.ArgumentParser) -> None:
+    """Register the deliberate override of the offline migration gate (#3832)."""
+    parser.add_argument(
+        MIGRATION_OVERRIDE_FLAG,
+        action="store_true",
+        help=(
+            "Proceed even though the code about to run requires an offline "
+            "migration an agent database is not known to have had, so that "
+            "agent may refuse to start. For an operator who has checked the "
+            "database or is about to migrate it."
+        ),
+    )
+
+
 def _format_uptime(pid: int) -> str:
     """Get uptime string for a running process."""
     try:
@@ -255,14 +289,19 @@ def _host_log_file(project_dir: Optional[Path] = None) -> Path:
 # ---------------------------------------------------------------------------
 
 def cmd_start(args) -> int:
-    """Start host and/or agents."""
+    """Start host and/or agents.
+
+    Agents come from the registry the host loads, the one the deploy gates
+    judge (:func:`~kestrel_sovereign.multi_agent.config.launched_host_registry`,
+    #3832).
+    """
     project_dir = cli._get_project_dir()
 
     first_run_rc = cli._maybe_first_run_setup(project_dir)
     if first_run_rc is not None:
         return first_run_rc
 
-    multi_agent = cli.MultiAgentConfig.load(project_dir / MULTI_AGENT_CONFIG_FILENAME)
+    multi_agent = launched_host_registry(project_dir)
     pm = ProcessManager(project_dir)
     startup_timeout = _startup_timeout(args)
 
@@ -282,6 +321,11 @@ def cmd_start(args) -> int:
                 agent_cfg,
                 multi_agent.host.bind,
                 standalone=True,
+                # The registry the agent was found in. Without it the
+                # launcher reloads the project's default file, which an
+                # external registry (KESTREL_MULTI_AGENT_CONFIG) is not, and
+                # refuses an agent the two place differently (#3832).
+                roster=multi_agent,
                 detach_output=True,
             )
         except RuntimeError as e:
@@ -532,9 +576,13 @@ def _report_port_still_held(label: str, port: int) -> None:
 
 
 def cmd_terminate(args) -> int:
-    """Terminate host and/or agent processes."""
+    """Terminate host and/or agent processes.
+
+    Agents come from the registry :func:`cmd_start` and the deploy gates read
+    (#3832).
+    """
     project_dir = cli._get_project_dir()
-    multi_agent = cli.MultiAgentConfig.load(project_dir / MULTI_AGENT_CONFIG_FILENAME)
+    multi_agent = launched_host_registry(project_dir)
     pm = ProcessManager(project_dir)
     force = getattr(args, "force", False)
 
@@ -807,6 +855,84 @@ def _constitution_adoption_gate(
     return CONSTITUTION_ADOPTION_REQUIRED
 
 
+def _offline_migration_gate(
+    run_check: Callable[[], OfflineMigrationCheck],
+    *,
+    allow_pending: bool,
+    refuse: bool = True,
+    running: Optional[Callable[[Optional[list[str]]], dict[str, AgentHolder]]] = None,
+    command: str = "restart",
+    untouched: str = "nothing was changed",
+) -> int:
+    """Refuse a restart onto code an agent database cannot start under (#3832).
+
+    ``run_check`` produces the check (:mod:`kestrel_sovereign.offline_migrations`).
+    Returns 0 to proceed, or ``OFFLINE_MIGRATION_REQUIRED`` after printing each
+    migration, the databases still needing it and its runbook. With
+    ``allow_pending`` the same findings are printed and the restart proceeds
+    deliberately. ``untouched`` says what a refusal left as it was.
+
+    ``refuse=False`` installs without restarting, which is how the offline
+    migration itself runs: terminate, install, migrate, start. That still
+    refuses while an affected agent is served by a live process: it keeps its
+    old code only until its next restart, and the migration needs its database
+    to itself. ``running`` reports those agents (see :func:`_report_running`).
+    Otherwise the findings only warn about the next restart.
+
+    A gate that cannot establish what the code requires refuses as well: it
+    has learned nothing about any agent.
+    """
+    try:
+        check = run_check()
+    except OfflineMigrationError as exc:
+        print(
+            f"• offline migrations: cannot verify what the code about to run "
+            f"requires: {exc}",
+            file=sys.stderr,
+        )
+        agents = None
+    else:
+        if check.safe:
+            if check.findings:
+                migrations = ", ".join(sorted({f.migration for f in check.findings}))
+                print(
+                    f"• offline migrations: none pending for what "
+                    f"{check.code_label} requires ({migrations})"
+                )
+            return 0
+        for line in migration_refusal_lines(check):
+            print(f"  {line}", file=sys.stderr)
+        agents = list(check.blocking_agents)
+
+    if allow_pending:
+        print(
+            f"• offline migrations: proceeding deliberately "
+            f"({MIGRATION_OVERRIDE_FLAG}).",
+            file=sys.stderr,
+        )
+        return 0
+    if not refuse:
+        if not _report_running(running, agents):
+            print(
+                "• offline migrations: none of these agents is running, so the "
+                "install proceeds; the next restart is refused until the "
+                "migration is done.",
+                file=sys.stderr,
+            )
+            return 0
+        print(
+            "  A running agent keeps its old code only until its next restart, "
+            "and the migration needs its database to itself.",
+            file=sys.stderr,
+        )
+    print(
+        f"❌ offline migrations: {command} REFUSED — {untouched}. Run the "
+        f"migration first, or pass {MIGRATION_OVERRIDE_FLAG} to proceed anyway.",
+        file=sys.stderr,
+    )
+    return OFFLINE_MIGRATION_REQUIRED
+
+
 def _report_running(
     running: Optional[Callable[[Optional[list[str]]], dict[str, AgentHolder]]],
     agent_names: Optional[list[str]],
@@ -866,9 +992,14 @@ def cmd_restart(args) -> int:
     interpreter, because this one may have imported ``kestrel_sovereign``
     before ``kestrel update`` installed a new one.
 
+    Then refuses, again before terminating anything, when the installed code
+    requires an offline migration an agent's database has not had, so that
+    agent would refuse to start (#3832), unless
+    ``--allow-pending-offline-migration``.
+
     A named restart judges that agent only, unless ``kestrel update`` sets
     ``constitution_check_all_agents``: the package it changed governs every
-    local agent, restarted now or not.
+    local agent, restarted now or not. Both gates honour it.
     """
     name = getattr(args, "name", None)
     judged = (
@@ -883,6 +1014,13 @@ def cmd_restart(args) -> int:
         ),
         code_label=INSTALLED_CODE,
         allow_safe_mode=bool(getattr(args, "allow_constitution_safe_mode", False)),
+        untouched="no agent was stopped",
+    )
+    if rc != 0:
+        return rc
+    rc = _offline_migration_gate(
+        lambda: check_offline_migrations(project_dir, agent_names=judged),
+        allow_pending=bool(getattr(args, "allow_pending_offline_migration", False)),
         untouched="no agent was stopped",
     )
     if rc != 0:
@@ -1017,7 +1155,9 @@ def _run_git_pull(project_dir: Path) -> Tuple[int, str]:
     return result.returncode, out
 
 
-def _git_reattach_if_safely_detached(project_dir: Path) -> Optional[str]:
+def _git_reattach_if_safely_detached(
+    project_dir: Path, target: Optional[str] = None
+) -> Optional[str]:
     """Reattach a detached-HEAD checkout to its default branch, but ONLY when
     doing so loses no commits. Returns the branch name if it reattached, else
     ``None``.
@@ -1035,6 +1175,15 @@ def _git_reattach_if_safely_detached(project_dir: Path) -> Optional[str]:
     returns ``None`` and leaves it untouched so a human decides. Call AFTER a
     fetch (e.g. a failed ``git pull``, which fetches before the merge) so
     ``origin/<branch>`` is current.
+
+    ``target`` pins the commit the branch lands on (#3832): the one
+    ``kestrel update``'s checks judged. HEAD must then be contained in that
+    commit rather than in whatever ``origin/<branch>`` names now, and the
+    local branch must not already hold commits past it: checking out a branch
+    ahead of the judged commit installs code no check has seen. The branch is
+    moved to ``target`` (a fast-forward, or created there) and checked out,
+    so the checkout is on exactly the judged commit. Without ``target`` the
+    local branch is checked out as it is.
     """
     def _git(*args: str) -> subprocess.CompletedProcess:
         return subprocess.run(
@@ -1049,13 +1198,33 @@ def _git_reattach_if_safely_detached(project_dir: Path) -> Optional[str]:
 
         branch = _reattach_branch(_git)
 
-        # Reattach ONLY if the detached commit is already contained in
-        # origin/<branch> — i.e. a no-loss fast-forward.
-        if _git("merge-base", "--is-ancestor", "HEAD", f"origin/{branch}").returncode != 0:
-            return None
+        if target is None:
+            # Reattach ONLY if the detached commit is already contained in
+            # origin/<branch> — i.e. a no-loss fast-forward.
+            if _git(
+                "merge-base", "--is-ancestor", "HEAD", f"origin/{branch}"
+            ).returncode != 0:
+                return None
+            if _git("checkout", branch).returncode != 0:
+                return None
+            return branch
 
-        if _git("checkout", branch).returncode != 0:
+        if _git("merge-base", "--is-ancestor", "HEAD", target).returncode != 0:
             return None
+        local = _git(
+            "rev-parse", "--verify", "--quiet", f"refs/heads/{branch}^{{commit}}"
+        )
+        if local.returncode == 0 and _git(
+            "merge-base", "--is-ancestor", local.stdout.strip(), target
+        ).returncode != 0:
+            # The local branch holds commits the checks never judged.
+            return None
+        if _git("checkout", "-B", branch, target).returncode != 0:
+            return None
+        if local.returncode != 0:
+            # A branch created here tracks nothing; the next update pulls
+            # through its upstream.
+            _git("branch", f"--set-upstream-to=refs/remotes/origin/{branch}", branch)
         return branch
     except (FileNotFoundError, OSError):
         return None
@@ -1079,8 +1248,9 @@ def _run_git_fetch(project_dir: Path) -> Tuple[int, str]:
 
     Updates remote-tracking refs only; the checkout is untouched, and so is
     ``FETCH_HEAD``: a restart coordinator update fetches its target ref and
-    then checks out ``FETCH_HEAD``, and a preflight that reads another fetch
-    in the same checkout between the two must not retarget it (#3702).
+    then resolves ``FETCH_HEAD`` to the commit it judges and checks out, and
+    a preflight that reads another fetch in the same checkout between the two
+    must not retarget it (#3702, #3832).
     Returns ``(returncode, combined_output)``.
     """
     try:
@@ -1096,14 +1266,36 @@ def _run_git_fetch(project_dir: Path) -> Tuple[int, str]:
     return result.returncode, (result.stdout or "") + (result.stderr or "")
 
 
-def _pull_target_revision(project_dir: Path) -> Optional[str]:
-    """The commit ``kestrel update``'s pull will land on, after a fetch.
+@dataclass(frozen=True)
+class _PullTarget:
+    """What ``kestrel update``'s pull fast-forwards to, read once after a fetch."""
 
-    None when the pull will not move HEAD: already up to date, ahead of the
-    upstream, or refused (no upstream, or not a fast-forward — the update
-    aborts on those before it restarts). A detached checkout is judged as
-    the update recovers it: reattached to origin's default branch, but only
-    when that loses no commits (``_git_reattach_if_safely_detached``).
+    #: The commit the pull merges: what the upstream ref named when it was
+    #: read, or None when the checkout has no upstream to pull from.
+    upstream: Optional[str]
+    #: ``upstream`` when merging it moves HEAD; None when it would not (up to
+    #: date, ahead of the upstream, no upstream, or not a fast-forward).
+    revision: Optional[str]
+    #: The commit HEAD named when the target was read.
+    head: str
+
+    @property
+    def landing(self) -> str:
+        """The commit the checks judged, which the pull must leave HEAD on.
+
+        ``revision`` when the pull moves HEAD; otherwise the checks judged the
+        checkout as it was, and a pull that succeeds leaves HEAD there.
+        """
+        return self.revision or self.head
+
+
+def _resolve_pull_target(project_dir: Path) -> _PullTarget:
+    """What ``kestrel update``'s pull will merge, and the commit it lands on.
+
+    Reads the remote-tracking refs as they are now; fetching first is the
+    caller's. A detached checkout is judged as the update recovers it:
+    reattached to origin's default branch, but only when that loses no
+    commits (``_git_reattach_if_safely_detached``).
 
     Raises :class:`_GitFailedError` when git cannot name HEAD.
     """
@@ -1123,43 +1315,125 @@ def _pull_target_revision(project_dir: Path) -> Optional[str]:
             upstream = "@{upstream}"
         else:
             upstream = f"refs/remotes/origin/{_reattach_branch(_git)}"
+        head_commit = head.stdout.strip()
         target = _git("rev-parse", "--verify", "--quiet", f"{upstream}^{{commit}}")
         if target.returncode != 0:
-            return None
-        revision = target.stdout.strip()
-        if revision == head.stdout.strip():
-            return None
-        if _git("merge-base", "--is-ancestor", "HEAD", revision).returncode != 0:
-            return None
-        return revision
+            return _PullTarget(upstream=None, revision=None, head=head_commit)
+        commit = target.stdout.strip()
+        if commit == head_commit:
+            return _PullTarget(upstream=commit, revision=None, head=head_commit)
+        if _git("merge-base", "--is-ancestor", head_commit, commit).returncode != 0:
+            return _PullTarget(upstream=commit, revision=None, head=head_commit)
+        return _PullTarget(upstream=commit, revision=commit, head=head_commit)
     except (FileNotFoundError, OSError) as exc:
         raise _GitFailedError(f"git not available: {exc}") from exc
 
 
-def _incoming_revision(checkout: Path, *, fetch: bool):
+def _pull_target_revision(project_dir: Path) -> Optional[str]:
+    """The commit ``kestrel update``'s pull will land on, after a fetch.
+
+    None when the pull will not move HEAD: already up to date, ahead of the
+    upstream, or refused (no upstream, or not a fast-forward — the update
+    aborts on those before it restarts). See :func:`_resolve_pull_target`.
+
+    Raises :class:`_GitFailedError` when git cannot name HEAD.
+    """
+    return _resolve_pull_target(project_dir).revision
+
+
+def _git_resolve_commit(project_dir: Path, revision: str) -> Optional[str]:
+    """The full commit ``revision`` names in ``project_dir``, or None when git cannot say."""
+    if not revision or revision.startswith("-"):
+        return None
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "--verify", "--quiet", f"{revision}^{{commit}}"],
+            cwd=str(project_dir),
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except (FileNotFoundError, OSError):
+        return None
+    return result.stdout.strip() if result.returncode == 0 else None
+
+
+def _git_head(project_dir: Path) -> Optional[str]:
+    """The commit HEAD names in ``project_dir``, or None when git cannot say."""
+    return _git_resolve_commit(project_dir, "HEAD")
+
+
+def _run_git_fast_forward(project_dir: Path, revision: str) -> Tuple[int, str]:
+    """Fast-forward the branch checked out in ``project_dir`` to ``revision``.
+
+    The merge half of ``git pull --ff-only``, with no fetch of its own: the
+    commit merged is exactly ``revision``, wherever the upstream has moved
+    since. ``kestrel update`` merges the commit its checks judged (#3832).
+    Refuses on a detached HEAD, as ``git pull`` does, so the caller's no-loss
+    reattach applies. Returns ``(returncode, combined_output)``.
+    """
+    try:
+        branch = subprocess.run(
+            ["git", "symbolic-ref", "-q", "HEAD"],
+            cwd=str(project_dir),
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if branch.returncode != 0:
+            return 1, "fatal: HEAD is detached; not fast-forwarding a detached checkout"
+        result = subprocess.run(
+            ["git", "merge", "--ff-only", revision],
+            cwd=str(project_dir),
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except (FileNotFoundError, OSError) as exc:
+        return 1, f"git not available: {exc}"
+    return result.returncode, (result.stdout or "") + (result.stderr or "")
+
+
+class _IncomingRevision:
     """The revision the update's pull will land on, resolved once when first asked.
 
-    Returns a function answering the commit, or None when the pull brings
-    nothing. Fetches first (unless ``fetch`` is False, for a dry run that
-    mutates nothing and so reads the remote-tracking refs as last fetched).
-    Shared by every check that judges the incoming revision before the pull,
-    so they judge one revision and the update fetches once. Raises
-    :class:`_GitFailedError` when git cannot fetch or answer.
+    Calling it answers the commit, or None when the pull brings nothing.
+    Fetches first (unless ``fetch`` is False, for a dry run that mutates
+    nothing and so reads the remote-tracking refs as last fetched). Shared by
+    every check that judges the incoming revision before the pull, so they
+    judge one revision and the update fetches once. The pull itself merges
+    :meth:`target`, the same resolution, and fetches nothing: an upstream that
+    moves after the checks cannot land a commit they never judged (#3832).
+    A failed fetch is not remembered, so the pull asks again; a check that
+    got the failure has already refused, unless its policy proceeds without
+    knowing (``--no-restart`` with nothing running, or an override).
+    Raises :class:`_GitFailedError` when git cannot fetch or answer.
     """
-    resolved: list = []
 
-    def revision() -> Optional[str]:
-        if not resolved:
-            if fetch:
-                rc, out = cli._run_git_fetch(checkout)
+    def __init__(self, checkout: Path, *, fetch: bool) -> None:
+        self._checkout = checkout
+        self._fetch = fetch
+        self._target: Optional[_PullTarget] = None
+
+    def target(self) -> _PullTarget:
+        """What the pull merges and lands on, fetched and read on first use."""
+        if self._target is None:
+            if self._fetch:
+                rc, out = cli._run_git_fetch(self._checkout)
                 if rc != 0:
                     raise _GitFailedError(
-                        f"git fetch failed in {checkout}: {out.strip()}"
+                        f"git fetch failed in {self._checkout}: {out.strip()}"
                     )
-            resolved.append(cli._pull_target_revision(checkout))
-        return resolved[0]
+            self._target = cli._resolve_pull_target(self._checkout)
+        return self._target
 
-    return revision
+    def __call__(self) -> Optional[str]:
+        return self.target().revision
+
+
+def _incoming_revision(checkout: Path, *, fetch: bool) -> _IncomingRevision:
+    """The revision the update's pull will land on (see :class:`_IncomingRevision`)."""
+    return _IncomingRevision(checkout, fetch=fetch)
 
 
 def _incoming_content(checkout: Path, revision):
@@ -1190,6 +1464,40 @@ def _incoming_content(checkout: Path, revision):
         return None if content is None else content(path)
 
     return load
+
+
+def _incoming_offline_migration_manifest(checkout: Path, revision):
+    """What the update's pull leaves in the offline migration manifest (#3832).
+
+    A function answering the manifest's bytes, or None when the revision
+    declares no offline migration. Read from git at *revision* (from
+    :func:`_incoming_revision`): the pulled code cannot be imported before it
+    is installed. With no new revision the install installs the checkout on
+    disk, so its manifest is read from there. The revision is resolved only
+    when asked, which is only when an agent is judged.
+    """
+
+    def read() -> Optional[bytes]:
+        try:
+            revision_id = revision()
+        except _GitFailedError as exc:
+            raise OfflineMigrationError(str(exc)) from exc
+        if revision_id is None:
+            print(
+                "• offline migrations: the pull brings no new revision; "
+                "checking the checkout on disk"
+            )
+            path = checkout / MIGRATION_MANIFEST_RELPATH
+            try:
+                return path.read_bytes()
+            except FileNotFoundError:
+                return None
+            except OSError as exc:
+                raise OfflineMigrationError(f"cannot read {path}: {exc}") from exc
+        print(f"• offline migrations: checking incoming revision {revision_id[:12]}")
+        return manifest_at(checkout, revision_id)
+
+    return read
 
 
 def _run_uv_sync(project_dir: Path) -> Tuple[int, str]:
@@ -1273,6 +1581,30 @@ def _run_uv_pip_install_editable(project_dir: Path, no_deps: bool) -> Tuple[int,
     return result.returncode, out
 
 
+def _manifest_core_source_refusal(
+    manifest_override: Optional[str], judged
+) -> Optional[str]:
+    """Why the host manifest's sync would move core off *judged*, else None (#3832).
+
+    :func:`~kestrel_sovereign.cli_features.unjudged_core_source` for the
+    manifest ``kestrel update``'s feature sync reads, and *judged* the
+    :class:`~kestrel_sovereign.cli_features.JudgedCore` its checks judge. None
+    when there is no manifest, or one that will not read: the sync reports
+    that itself, and the preflight before the pull already does.
+    """
+    from kestrel_sovereign.cli_features import unjudged_core_source
+    from kestrel_sovereign.feature_registry import load_registry
+
+    path = cli._host_manifest_path(argparse.Namespace(manifest=manifest_override))
+    try:
+        if not path.exists():
+            return None
+        entries = cli._load_host_manifest(path)
+    except (ValueError, OSError):
+        return None
+    return unjudged_core_source(entries, load_registry(), judged)
+
+
 def _editable_git_pull(checkout: Path, allow_dirty: bool) -> Tuple[int, str]:
     """``git pull --ff-only`` an editable feature checkout (issue #1788).
 
@@ -1325,6 +1657,7 @@ def _run_feature_reconcile(
     allow_dirty: bool,
     continue_on_error: bool,
     prefer: Optional[str],
+    judged=None,
 ) -> int:
     """Reconcile the host venv against ``union(per-agent feature allowlists)``.
 
@@ -1340,9 +1673,19 @@ def _run_feature_reconcile(
 
     Returns 0 on success, non-zero on any hard error or per-package failure
     (unless ``continue_on_error`` downgrades package failures to warnings).
+
+    *judged* is the :class:`~kestrel_sovereign.cli_features.JudgedCore` the
+    caller's checks judged. An installed release holds every install here to
+    its version, and a batch that moved core anyway returns
+    :data:`~kestrel_sovereign.cli_features.CORE_UNJUDGED` (#3832).
     """
     from kestrel_sovereign import feature_reconcile as fr
-    from kestrel_sovereign.cli_features import CoreInstallGuard, core_state_refusal
+    from kestrel_sovereign.cli_features import (
+        CORE_UNJUDGED,
+        CoreInstallGuard,
+        core_state_refusal,
+        judged_release_drift,
+    )
     from kestrel_sovereign.feature_registry import load_registry
     import importlib.metadata as md
 
@@ -1478,6 +1821,9 @@ def _run_feature_reconcile(
     # `source_index` is the one the plan read, `--prefer-*` included, so the
     # lock holds each package to the source the plan chose for it.
     guard = CoreInstallGuard.snapshot(source_index)
+    # An index wheel has no source policy to hold, and a feature `--upgrade`
+    # would otherwise resolve a newer core than the one the checks judged.
+    guard.hold_judged(judged)
 
     print(f"  {'PACKAGE':<34} {'CURRENT':<10} {'ACTION'}")
     print(f"  {'-' * 62}")
@@ -1544,6 +1890,10 @@ def _run_feature_reconcile(
         core_rc = guard.verify()
         if core_state_refusal(core_rc):
             return core_rc
+        drift = judged_release_drift(judged)
+        if drift is not None:
+            print(f"• core: ERROR — {drift}.", file=sys.stderr)
+            return CORE_UNJUDGED
         if core_rc:
             rc = 1
 
@@ -1749,8 +2099,12 @@ def cmd_update(args) -> int:
 
     Safety:
       - A dirty working tree refuses the pull unless ``--allow-dirty``.
-      - ``git pull --ff-only`` so a non-fast-forward upstream aborts
-        cleanly instead of producing a surprise merge commit.
+      - The pull is ``git pull --ff-only`` split in two: the checks below
+        fetch once, and the pull fast-forwards (``git merge --ff-only``) to
+        exactly the commit they judged, so an upstream that moves meanwhile
+        cannot land an unjudged revision (#3832), and a non-fast-forward
+        upstream aborts cleanly instead of producing a surprise merge
+        commit.
       - Any failure short-circuits the remaining steps so a
         half-applied update doesn't get restarted into.
       - ``--continue-on-error`` lets ``feature sync`` fail without
@@ -1767,6 +2121,15 @@ def cmd_update(args) -> int:
         restart checks again, in a fresh interpreter, against what was
         installed, because a revision can change how the constitution is
         rendered as well as its text.
+      - Before any step runs, a revision that requires an offline migration
+        an agent database has not had refuses the whole update (#3832): the
+        agent would refuse to start on the code it installs. The revision's
+        declarations are read from git; the probes are this code's, read-only
+        against every local agent's database. ``--allow-pending-offline-migration``
+        overrides it; with ``--no-restart`` it refuses only while an affected
+        agent is running, since installing with every agent stopped is how
+        the migration itself runs. The restart checks again with the installed
+        code.
       - Feature installs are held to core's ``uv.lock`` (#3502), and before
         the restart (not on ``--dry-run``) the venv is compared against it.
         Every mismatch is printed; nothing is repaired and the exit status
@@ -1781,7 +2144,12 @@ def cmd_update(args) -> int:
         and packages now on disk rather than the ones this process imported
         (#3702).
     """
-    from kestrel_sovereign.cli_features import core_state_refusal
+    from kestrel_sovereign.cli_features import (
+        CORE_UNJUDGED,
+        JudgedCore,
+        core_state_refusal,
+        installed_judged_core,
+    )
 
     # cli._get_project_dir() returns the RUNTIME data root (honors
     # KESTREL_HOME) which is the wrong place for git pull and
@@ -1799,6 +2167,9 @@ def cmd_update(args) -> int:
     no_deps = bool(getattr(args, "no_deps", False))
     continue_on_error = bool(getattr(args, "continue_on_error", False))
     allow_safe_mode = bool(getattr(args, "allow_constitution_safe_mode", False))
+    allow_pending_migration = bool(
+        getattr(args, "allow_pending_offline_migration", False)
+    )
     # Set on the continuation of an install (#3702): this phase skips the pull
     # and install, but they ran, so the package changed.
     after_install = bool(getattr(args, "after_install", False))
@@ -1850,6 +2221,53 @@ def cmd_update(args) -> int:
     )
     package_changing = after_install or pull or install or features
     judged = None if package_changing or not target else [target]
+    # The commit of the source checkout the checks below judge, which every
+    # later step must leave in place (#3832): the commit the pull lands (set
+    # once it has), HEAD when nothing pulls, and the install phase's answer in
+    # its continuation. The feature sync is handed it so it neither pulls the
+    # checkout again nor moves core to another source.
+    if after_install:
+        judged_core_revision = getattr(args, "judged_core_revision", None)
+    elif (
+        not pulling
+        and source_checkout is not None
+        and cli._project_dir_is_git(source_checkout)
+    ):
+        judged_core_revision = cli._git_head(source_checkout)
+    else:
+        judged_core_revision = None
+
+    # The core the checks below judge: the source checkout, or, with none to
+    # pull (an index install), the core installed now. The feature sync and
+    # reconcile put no other core in place (#3832).
+    judged_core = (
+        JudgedCore(checkout=source_checkout)
+        if source_checkout is not None
+        else installed_judged_core()
+    )
+
+    # Step -1: a host manifest that declares core from somewhere else would
+    # have the feature sync pull and link, or install from the index, a core
+    # no check read, after the install (#3832). Refused now, while nothing has
+    # changed.
+    if features and not after_install:
+        reason = _manifest_core_source_refusal(
+            getattr(args, "manifest", None), judged_core
+        )
+        if reason is not None:
+            print(
+                f"• features: REFUSED — {reason}. Nothing was pulled, "
+                "installed or restarted. Declare core from "
+                + (
+                    str(source_checkout)
+                    if source_checkout is not None
+                    else "the installed release (or not at all)"
+                )
+                + ", switch core's source with `kestrel feature sync` first, "
+                "or pass --no-features.",
+                file=sys.stderr,
+            )
+            return CORE_UNJUDGED
     incoming_revision = (
         _incoming_revision(source_checkout, fetch=not dry_run) if pulling else None
     )
@@ -1886,6 +2304,43 @@ def cmd_update(args) -> int:
         if rc != 0:
             return rc
 
+    # Step 0.25: offline migration gate (#3832), before anything changes. A
+    # release can refuse to start on data an earlier release wrote until an
+    # operator migrates it offline: on 2026-10-24 an update installed native
+    # A2A over draft A2A data and every agent refused to start for 31 hours.
+    # The incoming revision declares what it requires; each local agent's
+    # database is asked, read-only, whether it is done. Judged for every local
+    # agent for the same reason as the constitution: the package is shared.
+    # With --no-restart it refuses only while an affected agent runs, because
+    # installing with every agent stopped is the offline migration's own path.
+    if after_install:
+        print(
+            "• offline migrations: judged before the install; the restart "
+            "judges what it installed"
+        )
+    else:
+        rc = _offline_migration_gate(
+            lambda: check_offline_migrations(
+                project_dir,
+                agent_names=judged,
+                manifest=(
+                    _incoming_offline_migration_manifest(
+                        source_checkout, incoming_revision
+                    )
+                    if pulling
+                    else None
+                ),
+                code_label=code_label,
+            ),
+            allow_pending=allow_pending_migration,
+            refuse=restart,
+            running=lambda names: _running_agents(project_dir, names),
+            command="update",
+            untouched="nothing was pulled, installed or restarted",
+        )
+        if rc != 0:
+            return rc
+
     # Step 0.5: preflight (#3702). `uv sync` prunes every package its lock does
     # not name and `feature sync` restores them, holding each install to the
     # lock and to the manifest's windows. A window that excludes the locked
@@ -1906,8 +2361,19 @@ def cmd_update(args) -> int:
         except (ValueError, OSError):
             declares = True
         if declares:
+            # The sync is handed the core the checks judged (#3832): the
+            # source checkout, at the commit the pull lands (or HEAD, when
+            # nothing pulls). It links that core and never pulls it, so its
+            # lock is the one at that commit, and the preflight reads it there
+            # without fetching again. A preflight that predicted the sync's
+            # own pull, as before #3832, read the lock of whatever the
+            # upstream named by then, while the install was pinned elsewhere.
             try:
-                lock_revision = incoming_revision() if pulling else None
+                pinned = (
+                    incoming_revision.target().landing
+                    if pulling
+                    else judged_core_revision
+                )
             except _GitFailedError as exc:
                 print(
                     f"• preflight: FAILED — {exc}. Nothing was pulled, "
@@ -1917,10 +2383,7 @@ def cmd_update(args) -> int:
                 return 1
             rc = cli._run_sync_preflight(
                 preflight_manifest,
-                lock_revision=lock_revision,
-                # A dry run reads what was last fetched, as the gate does.
-                fetch=not dry_run,
-                allow_dirty=allow_dirty,
+                judged=JudgedCore(checkout=source_checkout, revision=pinned),
             )
             if rc != 0 and not continue_on_error:
                 print(
@@ -1938,18 +2401,22 @@ def cmd_update(args) -> int:
                     file=sys.stderr,
                 )
 
-    # Step 1: git pull --ff-only against the source checkout (NOT the
-    # data root, which may be a non-git KESTREL_HOME).
+    # Step 1: the pull: fast-forward the source checkout (NOT the data root,
+    # which may be a non-git KESTREL_HOME) to the commit the checks above
+    # judged, fetched once by them (#3832).
     if pull:
         if source_checkout is None:
             print(
                 "• pull: skipped (no editable source checkout — "
                 "kestrel_sovereign is installed from PyPI)"
             )
-        elif not cli._project_dir_is_git(source_checkout):
+        elif incoming_revision is None or not cli._project_dir_is_git(
+            source_checkout
+        ):
             # Defensive: _resolve_source_checkout already checked for
             # .git, but if it disappeared between resolution and now
-            # treat as non-checkout rather than erroring.
+            # treat as non-checkout rather than erroring. Nor is a .git
+            # that appeared after the checks pulled: they judged no revision.
             print("• pull: skipped (source checkout has no .git)")
         else:
             try:
@@ -1972,24 +2439,56 @@ def cmd_update(args) -> int:
                 return 2
             if dry_run:
                 print(
-                    f"• pull: would run `git pull --ff-only` "
-                    f"in {source_checkout}"
+                    f"• pull: would fast-forward {source_checkout} to the "
+                    "revision judged above (`git merge --ff-only`)"
                 )
             else:
-                print(f"• pull: git pull --ff-only ({source_checkout})")
-                rc, out = cli._run_git_pull(source_checkout)
+                # The fetch happened once, for the checks above; the pull
+                # merges exactly the commit they judged and fetches nothing,
+                # so an upstream that moved since cannot land a revision no
+                # check has seen (#3832). Also when the checks found nothing
+                # to pull: the merge is then a no-op, or refuses.
+                try:
+                    pull_target = incoming_revision.target()
+                except _GitFailedError as exc:
+                    print(
+                        f"• pull: FAILED — {exc}. Aborting before "
+                        "install/sync/restart.",
+                        file=sys.stderr,
+                    )
+                    return 1
+                if pull_target.upstream is None:
+                    print(
+                        "• pull: FAILED — the checkout has no upstream branch "
+                        "to pull from. Aborting before install/sync/restart.",
+                        file=sys.stderr,
+                    )
+                    return 1
+                print(
+                    f"• pull: git merge --ff-only {pull_target.upstream[:12]} "
+                    f"({source_checkout})"
+                )
+                rc, out = cli._run_git_fast_forward(
+                    source_checkout, pull_target.upstream
+                )
                 if rc != 0:
                     # A sibling worktree's `gh pr merge --delete-branch` can flip
-                    # this checkout into detached HEAD, which makes `git pull
-                    # --ff-only` refuse. The failed pull already fetched, so try
-                    # a no-loss reattach to the default branch and retry once.
-                    reattached = cli._git_reattach_if_safely_detached(source_checkout)
+                    # this checkout into detached HEAD, which the fast-forward
+                    # refuses. The checks' fetch already ran, so try a no-loss
+                    # reattach to the default branch, at the commit the pull
+                    # merges, and retry once.
+                    reattached = cli._git_reattach_if_safely_detached(
+                        source_checkout, pull_target.upstream
+                    )
                     if reattached:
                         print(
                             f"    detached HEAD detected — reattached to "
-                            f"'{reattached}' (no commits lost); retrying pull"
+                            f"'{reattached}' at {pull_target.upstream[:12]} "
+                            "(no commits lost); retrying pull"
                         )
-                        rc, out = cli._run_git_pull(source_checkout)
+                        rc, out = cli._run_git_fast_forward(
+                            source_checkout, pull_target.upstream
+                        )
                     if rc != 0:
                         print(out.rstrip(), file=sys.stderr)
                         print(
@@ -2001,6 +2500,19 @@ def cmd_update(args) -> int:
                 if out.strip():
                     for line in out.rstrip().splitlines():
                         print(f"    {line}")
+                # The install installs whatever HEAD names, so HEAD must be
+                # the commit the checks judged, however the pull got there.
+                landed = cli._git_head(source_checkout)
+                if landed != pull_target.landing:
+                    print(
+                        f"• pull: FAILED — the checkout is at "
+                        f"{(landed or 'an unreadable HEAD')[:12]}, not "
+                        f"{pull_target.landing[:12]}, the revision the checks "
+                        "judged. Aborting before install/sync/restart.",
+                        file=sys.stderr,
+                    )
+                    return 1
+                judged_core_revision = landed
     else:
         print("• pull: skipped (--no-pull)")
 
@@ -2103,7 +2615,11 @@ def cmd_update(args) -> int:
     # The install replaced packages this process imported, and every step
     # below imports more of them.
     if installed:
-        return _continue_update_in_fresh_interpreter(args)
+        return _continue_update_in_fresh_interpreter(
+            argparse.Namespace(
+                **{**vars(args), "judged_core_revision": judged_core_revision}
+            )
+        )
 
     # Step 2.5: kestrel feature sync — restore the host's out-of-tree feature
     # packages that `uv sync` just pruned (anything not in sovereign's lock).
@@ -2150,6 +2666,17 @@ def cmd_update(args) -> int:
                 # advertised on THIS command silently not reaching the step that
                 # honours it.
                 allow_dirty=allow_dirty,
+                # The core the checks above judged (#3832): the sync links it
+                # where it is, and refuses rather than pull it or move core.
+                # With no source checkout, that is the core installed now,
+                # which the sync holds every install to.
+                core_checkout=(
+                    None
+                    if judged_core.installed_release
+                    else str(judged_core.checkout)
+                ),
+                core_revision=judged_core_revision,
+                core_installed=judged_core.installed_release,
             )
             rc = cli.cmd_feature_sync(sync_args)
             # A core state is a safety failure, not an optional-package
@@ -2194,6 +2721,7 @@ def cmd_update(args) -> int:
             allow_dirty=allow_dirty,
             continue_on_error=continue_on_error,
             prefer=prefer,
+            judged=judged_core,
         )
         # Not continuable, by design: restarting here would bring every agent
         # up on a core the manifest does not declare — or one it cannot load —
@@ -2239,14 +2767,19 @@ def cmd_update(args) -> int:
                 force=bool(getattr(args, "force", False)),
                 startup_timeout=_startup_timeout(args),
                 allow_constitution_safe_mode=allow_safe_mode,
+                allow_pending_offline_migration=allow_pending_migration,
                 # The restart judges what was just installed, in a fresh
                 # interpreter, for every agent the package change reaches.
                 constitution_check_all_agents=package_changing,
             )
             rc = cli.cmd_restart(restart_args)
-            if rc == CONSTITUTION_ADOPTION_REQUIRED:
+            refused_by = {
+                CONSTITUTION_ADOPTION_REQUIRED: "constitution",
+                OFFLINE_MIGRATION_REQUIRED: "offline migration",
+            }.get(rc)
+            if refused_by:
                 print(
-                    "• restart: REFUSED by the constitution check above; no "
+                    f"• restart: REFUSED by the {refused_by} check above; no "
                     "agent was stopped"
                     + (
                         ", but the update itself is installed."
@@ -2413,6 +2946,7 @@ def add_lifecycle_subparsers(subparsers) -> None:
         help="Force-kill existing processes during the termination phase",
     )
     _add_constitution_override_argument(restart_p)
+    _add_offline_migration_override_argument(restart_p)
     _add_startup_timeout_argument(restart_p)
 
     # kestrel update [agent]
@@ -2519,7 +3053,14 @@ def add_lifecycle_subparsers(subparsers) -> None:
     update_p.add_argument(
         "--after-install", action="store_true", help=argparse.SUPPRESS,
     )
+    # Internal, beside --after-install: the commit of the source checkout the
+    # install phase's checks judged and installed (#3832). The continuation's
+    # feature sync links core at that commit and does not pull it again.
+    update_p.add_argument(
+        "--judged-core-revision", metavar="REV", help=argparse.SUPPRESS,
+    )
     _add_constitution_override_argument(update_p)
+    _add_offline_migration_override_argument(update_p)
     _add_startup_timeout_argument(update_p)
 
     # kestrel status

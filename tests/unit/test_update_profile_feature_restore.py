@@ -6,6 +6,7 @@ import pytest
 
 from kestrel_sovereign import paths
 from kestrel_sovereign.features.restart_coordinator.update_profiles import (
+    FETCHED_COMMIT,
     UPDATE_PROFILES,
 )
 
@@ -52,6 +53,12 @@ def test_feature_sync_step_added_when_manifest_present(tmp_path):
     # Absolute manifest passed so discovery doesn't depend on the step cwd.
     assert "--manifest" in fs.argv
     assert str(manifest.resolve()) in fs.argv
+    # The sync links core at the commit the checks judged and never pulls the
+    # checkout again: a pull fetches anew and lands an unjudged commit (#3832).
+    assert fs.argv[-4:] == [
+        "--core-checkout", "/repo", "--core-revision", FETCHED_COMMIT,
+    ]
+    assert fs.bound("f" * 40).argv[-1] == "f" * 40
 
 
 def test_the_manifest_is_checked_against_the_fetched_lock_before_anything_lands(
@@ -76,12 +83,17 @@ def test_the_manifest_is_checked_against_the_fetched_lock_before_anything_lands(
 
     assert names[:3] == ["fetch", "feature_preflight", "checkout"]
     preflight = next(s for s in steps if s.name == "feature_preflight")
-    # The lock FETCH_HEAD records: what the checkout and `uv sync` will install.
+    # The lock the fetched commit records: what the checkout and `uv sync`
+    # will install. The commit pinned after the fetch, never FETCH_HEAD,
+    # which another fetch can rewrite (#3832).
     assert preflight.argv == [
         sys.executable, "-m", "kestrel_sovereign.cli", "feature", "sync",
         "--manifest", str(manifest), "--preflight",
-        "--lock-revision", "FETCH_HEAD", "--lock-checkout", "/repo",
+        "--lock-revision", FETCHED_COMMIT, "--lock-checkout", "/repo",
+        # A manifest moving core off this checkout refuses here (#3832).
+        "--core-checkout", "/repo",
     ]
+    assert preflight.bound("f" * 40).argv[-5] == "f" * 40
     assert preflight.cwd == "/repo"
     # Fatal on failure: a refusal must stop the update before the install.
     assert preflight.read_only is False
@@ -140,10 +152,11 @@ def test_reattach_branch_step_shape():
     reattach = next(s for s in steps if s.name == "reattach_branch")
     # argv documents the mutating command the native routine may run.
     assert reattach.argv == [
-        "git", "-C", "/repo", "checkout", "-B", "main", "FETCH_HEAD",
+        "git", "-C", "/repo", "checkout", "-B", "main", FETCHED_COMMIT,
     ]
     assert reattach.native == "reattach_branch"
-    assert reattach.native_args == ("/repo", "main")
+    assert reattach.native_args == ("/repo", "main", FETCHED_COMMIT)
+    assert reattach.bound("f" * 40).native_args == ("/repo", "main", "f" * 40)
     assert reattach.allow_failure is True
     assert reattach.read_only is False
     # The mutating steps stay fatal-on-failure and non-native.

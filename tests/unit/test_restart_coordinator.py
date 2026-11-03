@@ -3840,6 +3840,21 @@ async def test_failed_update_emits_each_lifecycle_transition_once(tmp_path):
     ] == ["pending", "updating", "pending"]
 
 
+#: The commit a faked fetch "lands", for tests that fake every step.
+_FAKE_FETCHED = "c" * 40
+
+
+async def _fake_pin(self, repo_path):
+    return {
+        "step": "pin_fetched_commit",
+        "argv": ["git", "-C", repo_path, "rev-parse", "--verify", "FETCH_HEAD^{commit}"],
+        "returncode": 0,
+        "ok": True,
+        "stdout_tail": _FAKE_FETCHED,
+        "stderr_tail": "",
+    }
+
+
 @pytest.mark.asyncio
 async def test_run_update_records_steps_and_resolved_ref(tmp_path):
     feat, backend = await _make_feature(tmp_path)
@@ -3869,14 +3884,17 @@ async def test_run_update_records_steps_and_resolved_ref(tmp_path):
 
     with patch.object(
         RestartCoordinatorFeature, "_run_update_step", _fake_step,
-    ):
+    ), patch.object(RestartCoordinatorFeature, "_pin_fetched_commit", _fake_pin):
         update = await feat._run_update(req, profile)
 
     assert update["ok"] is True
     assert update["resolved_ref"] == "deadbeef"
     assert {s["step"] for s in update["steps"]} >= {
-        "fetch", "checkout", "install", "resolve_ref",
+        "fetch", "pin_fetched_commit", "checkout", "install", "resolve_ref",
     }
+    # Every step after the fetch lands the pinned commit, never FETCH_HEAD.
+    checkout = next(s for s in update["steps"] if s["step"] == "checkout")
+    assert checkout["argv"][-2:] == ["--detach", _FAKE_FETCHED]
     assert update["migration"]["ran"] is False
 
 
@@ -3911,14 +3929,14 @@ async def test_run_update_stops_at_first_failing_step(tmp_path):
 
     with patch.object(
         RestartCoordinatorFeature, "_run_update_step", _fake_step,
-    ):
+    ), patch.object(RestartCoordinatorFeature, "_pin_fetched_commit", _fake_pin):
         update = await feat._run_update(req, profile)
 
     assert update["ok"] is False
     assert update["failed_step"] == "checkout"
     # Stopped before install/resolve_ref ran.
     assert [s["step"] for s in update["steps"]] == [
-        "fetch", "feature_preflight", "checkout",
+        "fetch", "pin_fetched_commit", "feature_preflight", "checkout",
     ]
 
 
@@ -3953,12 +3971,14 @@ async def test_a_refused_manifest_preflight_stops_the_update_before_the_checkout
 
     with patch.object(
         RestartCoordinatorFeature, "_run_update_step", _fake_step,
-    ):
+    ), patch.object(RestartCoordinatorFeature, "_pin_fetched_commit", _fake_pin):
         update = await feat._run_update(req, profile)
 
     assert update["ok"] is False
     assert update["failed_step"] == "feature_preflight"
-    assert [s["step"] for s in update["steps"]] == ["fetch", "feature_preflight"]
+    assert [s["step"] for s in update["steps"]] == [
+        "fetch", "pin_fetched_commit", "feature_preflight",
+    ]
 
 
 @pytest.mark.asyncio
@@ -4074,14 +4094,12 @@ async def test_profile_checkout_lands_on_fetched_branch_commit(tmp_path):
     steps = profile.build_steps(
         repo_path=str(work), target_ref="main", allow_migrations=False,
     )
-    for step in steps:
-        if step.name in ("install", "feature_sync"):
-            # Do not run `uv sync` or a real `kestrel feature sync` in a unit
-            # test. The suite's project directory carries a host manifest, so
-            # the profile includes the sync step.
-            continue
-        outcome = await feat._run_update_step(step)
-        assert outcome["ok"], f"step {step.name!r} failed: {outcome}"
+    # Not `uv sync` or a real `kestrel feature sync` in a unit test. The
+    # suite's project directory carries a host manifest, so the profile
+    # includes the sync step.
+    outcomes = await _run_profile_git_steps(feat, steps, work)
+    for name, outcome in outcomes.items():
+        assert outcome["ok"], f"step {name!r} failed: {outcome}"
 
     head_after = _head(work)
     assert head_after == remote_head, (
@@ -5448,6 +5466,27 @@ def _git_out(repo, *args):
     ).stdout.strip()
 
 
+async def _run_profile_git_steps(feat, steps, repo):
+    """Run *steps* as the coordinator does, skipping install/feature_sync.
+
+    The commit the fetch landed is pinned right after it, and every later
+    step that names it runs against that commit (#3832).
+    """
+    outcomes = {}
+    fetched = ""
+    for step in steps:
+        if step.name in ("install", "feature_sync"):
+            continue
+        if step.names_fetched_commit:
+            step = step.bound(fetched)
+        outcomes[step.name] = await feat._run_update_step(step)
+        if step.name == "fetch":
+            pinned = await feat._pin_fetched_commit(str(repo))
+            assert pinned["ok"], pinned
+            fetched = pinned["stdout_tail"]
+    return outcomes
+
+
 async def _run_git_steps(feat, repo, target_ref):
     """Run the profile's git steps (fetch/checkout/reattach) for real,
     skipping install/feature_sync which need a real project."""
@@ -5455,12 +5494,7 @@ async def _run_git_steps(feat, repo, target_ref):
     steps = profile.build_steps(
         repo_path=str(repo), target_ref=target_ref, allow_migrations=False
     )
-    outcomes = {}
-    for step in steps:
-        if step.name in ("install", "feature_sync"):
-            continue
-        outcomes[step.name] = await feat._run_update_step(step)
-    return outcomes
+    return await _run_profile_git_steps(feat, steps, repo)
 
 
 @pytest.mark.asyncio
@@ -8591,7 +8625,12 @@ async def test_an_update_records_both_adoption_checks(
     spawn.assert_called_once()
     fetched, installed = row.constitution_checks_list()
     assert fetched["stage"] == "fetched_revision"
-    assert fetched["code"].startswith("FETCH_HEAD of ")
+    # The commit pinned after the fetch, never the movable FETCH_HEAD (#3832).
+    [pin] = [
+        s for s in row.update_log_dict()["steps"]
+        if s["step"] == "pin_fetched_commit"
+    ]
+    assert fetched["code"].startswith(f"{pin['stdout_tail']} of ")
     assert installed["stage"] == "installed_code"
     anchored = sha256(_ANCHORED_TEXT)
     for check in (fetched, installed):
@@ -9022,3 +9061,265 @@ async def test_restart_onto_installed_code_that_renders_differently_is_refused(
     row = await get_request(backend, request_id)
     assert row.status == "refused"
     assert sha256(_ANCHORED_TEXT + _RENDERED) in row.status_reason
+
+
+# ---------------------------------------------------------------------------
+# Offline migration gate (#3832): an agent must never deploy itself onto code
+# that requires an offline migration an agent database has not had. The 2026
+# native A2A release refused to start on draft A2A data and the fleet was down
+# 31 hours. The fetched revision's declarations are read before checkout; the
+# installed code judges its own before any restart. Refusal is terminal.
+# ---------------------------------------------------------------------------
+
+_OFFLINE_RUNBOOK = "docs/architecture/a2a/OFFLINE_CUTOVER.md"
+
+
+def _leave_draft_a2a_data(project, name="emma"):
+    db = project / "agent_data" / name / "kestrel_prime.db"
+    with sqlite3.connect(str(db)) as conn:
+        conn.execute("CREATE TABLE a2a_outbound_tasks (id TEXT PRIMARY KEY)")
+        conn.execute("INSERT INTO a2a_outbound_tasks VALUES ('draft-1')")
+    conn.close()
+
+
+@pytest.mark.asyncio
+async def test_update_onto_a_pending_offline_migration_is_refused_before_checkout(
+    tmp_path, monkeypatch, adoption_project,
+):
+    from kestrel_sovereign.offline_migrations import (
+        MANIFEST_RELPATH,
+        packaged_manifest,
+    )
+    from tests.utils.constitution_anchor import (
+        PACKAGED_CONSTITUTION_RELPATH,
+        git,
+        origin_and_clone,
+        seed_anchored_agents,
+    )
+
+    project, sha256 = adoption_project
+    origin, checkout = origin_and_clone(tmp_path, _ANCHORED_TEXT)
+    manifest = origin / MANIFEST_RELPATH
+    manifest.write_bytes(packaged_manifest())
+    git(origin, "add", MANIFEST_RELPATH)
+    git(origin, "commit", "-q", "-m", "merge the native A2A release")
+    monkeypatch.setattr(
+        "kestrel_sovereign.config.CONSTITUTION_PATH",
+        str(checkout / PACKAGED_CONSTITUTION_RELPATH),
+    )
+    seed_anchored_agents(project, {"Emma": sha256(_ANCHORED_TEXT)})
+    _leave_draft_a2a_data(project)
+    head = git(checkout, "rev-parse", "HEAD").strip()
+    feat, backend = await _make_feature(tmp_path)
+    created = await feat.request_restart(
+        reason="ship the native A2A release",
+        operation="update_then_restart",
+        update_profile="sovereign_local_uv_sync",
+        target_ref="main",
+        repo_path=str(checkout),
+    )
+    assert created.status is ToolResultStatus.OK, created.error
+    request_id = created.data["request"]["id"]
+
+    ran = []
+    real_step = RestartCoordinatorFeature._run_update_step
+
+    async def _step(self, step):
+        ran.append(step.name)
+        if step.name == "fetch":
+            return await real_step(self, step)
+        return {
+            "step": step.name, "argv": list(step.argv), "returncode": 0,
+            "ok": True, "stdout_tail": "", "stderr_tail": "",
+        }
+
+    with patch.object(RestartCoordinatorFeature, "_run_update_step", _step), \
+            patch.object(
+                RestartCoordinatorFeature, "_spawn_restart_subprocess",
+            ) as spawn:
+        result = await feat.restart_coordinator()
+        again = await feat.restart_coordinator()
+
+    assert ran == ["fetch"]
+    spawn.assert_not_called()
+    assert git(checkout, "rev-parse", "HEAD").strip() == head
+    assert not (checkout / MANIFEST_RELPATH).exists()
+    row = await get_request(backend, request_id)
+    assert row.status == "refused"
+    assert row.completed_at
+    for text in (
+        "offline migration required",
+        "Emma",
+        "native-a2a-cutover",
+        "Draft A2A data remains",
+        _OFFLINE_RUNBOOK,
+        "an agent cannot",
+    ):
+        assert text in row.status_reason
+    log = row.update_log_dict()
+    assert log["failed_step"] == "offline_migration"
+    [check] = log["offline_migration_checks"]
+    assert check["stage"] == "fetched_revision"
+    assert check["result"] == "refused"
+    assert check["code"] == f"{git(origin, 'rev-parse', 'HEAD').strip()} of {checkout}"
+    assert result.data["refused"] == [
+        {"request_id": request_id, "reason": row.status_reason}
+    ]
+    # Terminal: polling again cannot run the migration.
+    assert again.data["pending"] == 0
+    events = await list_events_for_request(backend, request_id)
+    assert [event.state for event in events][-1] == "refused"
+
+
+@pytest.mark.asyncio
+async def test_update_whose_installed_code_requires_a_pending_migration_is_refused(
+    tmp_path, monkeypatch, adoption_project,
+):
+    """The fetched revision declared nothing; the code it installed does."""
+    feat, backend, request_id, ran, step = (
+        await _request_update_onto_unchanged_text(
+            tmp_path, monkeypatch, adoption_project, install=lambda package: None,
+        )
+    )
+    project, _ = adoption_project
+    _leave_draft_a2a_data(project)
+
+    with patch.object(RestartCoordinatorFeature, "_run_update_step", step), \
+            patch.object(
+                RestartCoordinatorFeature, "_spawn_restart_subprocess",
+            ) as spawn:
+        result = await feat.restart_coordinator()
+
+    assert "install" in ran and ran[-1] == "resolve_ref"
+    spawn.assert_not_called()
+    row = await get_request(backend, request_id)
+    assert row.status == "refused"
+    for text in (
+        "Emma",
+        "the installed code",
+        _OFFLINE_RUNBOOK,
+        "The update itself is installed; only the restart was refused.",
+    ):
+        assert text in row.status_reason
+    log = row.update_log_dict()
+    assert log["failed_step"] == "offline_migration"
+    fetched, installed = log["offline_migration_checks"]
+    assert (fetched["stage"], fetched["result"]) == ("fetched_revision", "passed")
+    assert fetched["findings"] == []
+    assert (installed["stage"], installed["result"]) == ("installed_code", "refused")
+    assert result.data["refused"] == [
+        {"request_id": request_id, "reason": row.status_reason}
+    ]
+
+
+@pytest.mark.asyncio
+async def test_restart_onto_code_requiring_a_pending_migration_is_refused(
+    tmp_path, monkeypatch, adoption_project,
+):
+    from tests.utils.constitution_anchor import seed_anchored_agents
+
+    project, sha256 = adoption_project
+    _install_constitution(tmp_path, monkeypatch, _ANCHORED_TEXT)
+    seed_anchored_agents(project, {"Emma": sha256(_ANCHORED_TEXT)})
+    _leave_draft_a2a_data(project)
+    feat, backend = await _make_feature(tmp_path)
+    created = await feat.request_restart(reason="pick up the installed release")
+    request_id = created.data["request"]["id"]
+
+    with patch.object(
+        RestartCoordinatorFeature, "_spawn_restart_subprocess",
+    ) as spawn:
+        result = await feat.restart_coordinator()
+
+    spawn.assert_not_called()
+    row = await get_request(backend, request_id)
+    assert row.status == "refused"
+    for text in ("offline migration required", "Emma", _OFFLINE_RUNBOOK):
+        assert text in row.status_reason
+    assert result.data["refused"] == [
+        {"request_id": request_id, "reason": row.status_reason}
+    ]
+    assert result.data["executed"] == []
+
+
+@pytest.mark.asyncio
+async def test_a_fetch_after_the_checks_cannot_retarget_the_checkout(
+    tmp_path, monkeypatch, adoption_project,
+):
+    """The reviewer's reproduction (#3832): the checks passed commit A, then
+    another fetch rewrote FETCH_HEAD to B, which requires the cutover Emma
+    still needs, and the profile checked out FETCH_HEAD. Every step after the
+    fetch now lands the commit pinned right after it."""
+    from kestrel_sovereign.offline_migrations import (
+        MANIFEST_RELPATH,
+        packaged_manifest,
+    )
+    from tests.utils.constitution_anchor import (
+        PACKAGED_CONSTITUTION_RELPATH,
+        git,
+        origin_and_clone,
+        seed_anchored_agents,
+    )
+
+    project, sha256 = adoption_project
+    origin, checkout = origin_and_clone(tmp_path, _ANCHORED_TEXT)
+    (origin / "README.md").write_text("a release that declares nothing\n")
+    git(origin, "add", "README.md")
+    git(origin, "commit", "-q", "-m", "a release that declares nothing")
+    judged = git(origin, "rev-parse", "HEAD").strip()
+    monkeypatch.setattr(
+        "kestrel_sovereign.config.CONSTITUTION_PATH",
+        str(checkout / PACKAGED_CONSTITUTION_RELPATH),
+    )
+    seed_anchored_agents(project, {"Emma": sha256(_ANCHORED_TEXT)})
+    _leave_draft_a2a_data(project)
+    feat, backend = await _make_feature(tmp_path)
+    profile = get_update_profile("sovereign_local_uv_sync")
+    row = await insert_request(
+        backend, requested_by_agent="did:test:agent", reason="update",
+    )
+    req = SimpleNamespace(
+        id=row.id,
+        update_repo_path=str(checkout),
+        update_target_ref="main",
+        update_allow_migrations=False,
+    )
+    real_step = RestartCoordinatorFeature._run_update_step
+
+    async def _step(self, step):
+        if step.name == "checkout":
+            # Another fetch lands B on FETCH_HEAD after the checks judged A.
+            manifest = origin / MANIFEST_RELPATH
+            manifest.parent.mkdir(parents=True, exist_ok=True)
+            manifest.write_bytes(packaged_manifest())
+            git(origin, "add", MANIFEST_RELPATH)
+            git(origin, "commit", "-q", "-m", "merge the native A2A release")
+            git(checkout, "fetch", "-q", "origin", "main")
+        if step.name in ("fetch", "checkout", "reattach_branch"):
+            return await real_step(self, step)
+        ok = step.name != "install"
+        return {
+            "step": step.name, "argv": list(step.argv),
+            "returncode": 0 if ok else 1, "ok": ok,
+            "stdout_tail": "", "stderr_tail": "" if ok else "stop here",
+        }
+
+    with patch.object(RestartCoordinatorFeature, "_run_update_step", _step), \
+            patch.object(
+                RestartCoordinatorFeature, "_spawn_restart_subprocess",
+            ) as spawn:
+        update = await feat._run_update(req, profile)
+
+    spawn.assert_not_called()
+    assert git(checkout, "rev-parse", "FETCH_HEAD").strip() != judged
+    assert git(checkout, "rev-parse", "HEAD").strip() == judged
+    assert not (checkout / MANIFEST_RELPATH).exists()
+    steps = {s["step"]: s for s in update["steps"]}
+    assert steps["pin_fetched_commit"]["stdout_tail"] == judged
+    assert steps["checkout"]["argv"][-1] == judged
+    assert "staying detached" in steps["reattach_branch"]["stdout_tail"]
+    [migration] = update["offline_migration_checks"]
+    assert (migration["result"], migration["code"]) == (
+        "passed", f"{judged} of {checkout}",
+    )
+    assert update["failed_step"] == "install"

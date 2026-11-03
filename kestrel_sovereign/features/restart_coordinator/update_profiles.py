@@ -19,7 +19,7 @@ import re
 import subprocess
 import sys
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Callable, List, Optional
 
@@ -27,6 +27,15 @@ from typing import Callable, List, Optional
 # characters git refs legitimately use and forbid a leading dash so a
 # crafted ref can never be parsed by git as an option (e.g. ``--upload-pack``).
 _REF_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/\-]*$")
+
+
+#: Stands, in a step after the fetch, for the commit the fetch landed (#3832).
+#: The coordinator resolves ``FETCH_HEAD`` to one commit immediately after the
+#: fetch, judges that commit, and runs every later step against it
+#: (:meth:`UpdateStep.bound`). A step naming ``FETCH_HEAD`` itself would read
+#: whatever the last fetch in the checkout wrote, which a concurrent fetch can
+#: change after the commit was judged and before it is checked out.
+FETCHED_COMMIT = "<fetched-commit>"
 
 
 def is_valid_target_ref(ref: str) -> bool:
@@ -216,6 +225,21 @@ class UpdateStep:
     # sync writes, rather than only in its output's tail (#3324).
     reports_lock_findings: bool = False
 
+    def bound(self, commit: str) -> UpdateStep:
+        """This step with every :data:`FETCHED_COMMIT` replaced by ``commit``."""
+        return replace(
+            self,
+            argv=[commit if arg == FETCHED_COMMIT else arg for arg in self.argv],
+            native_args=tuple(
+                commit if arg == FETCHED_COMMIT else arg for arg in self.native_args
+            ),
+        )
+
+    @property
+    def names_fetched_commit(self) -> bool:
+        """Whether the step runs against the commit the fetch landed."""
+        return FETCHED_COMMIT in self.argv or FETCHED_COMMIT in self.native_args
+
 
 @dataclass(frozen=True)
 class UpdateProfile:
@@ -278,7 +302,10 @@ def _sovereign_local_uv_sync(
     steps = [
         # Fetch the *specific* requested ref so FETCH_HEAD points at the
         # commit we want to land on (``--tags`` keeps tag refs current for
-        # tag targets, ``--prune`` drops deleted upstream refs).
+        # tag targets, ``--prune`` drops deleted upstream refs). The
+        # coordinator resolves FETCH_HEAD to one commit right after this
+        # step; every later step names that commit (FETCHED_COMMIT), the one
+        # its checks judged, never FETCH_HEAD (#3832).
         UpdateStep(
             "fetch",
             git + ["fetch", "--tags", "--prune", "origin", target_ref],
@@ -288,10 +315,10 @@ def _sovereign_local_uv_sync(
         # its OLD commit — ``git fetch`` updates remote-tracking refs, not
         # the local branch — so the freshly-fetched commits would never
         # land and ``uv sync`` would re-install stale code (the headline
-        # bug this feature exists to prevent). Checking out FETCH_HEAD
-        # lands on the fetched commit regardless of whether the ref is a
-        # branch, tag, or sha.
-        UpdateStep("checkout", git + ["checkout", "--detach", "FETCH_HEAD"]),
+        # bug this feature exists to prevent). Checking out the fetched
+        # commit lands on it regardless of whether the ref is a branch,
+        # tag, or sha.
+        UpdateStep("checkout", git + ["checkout", "--detach", FETCHED_COMMIT]),
         # Reattach the local branch for branch targets. The detach above
         # guarantees we run the fetched commit, but left as-is it strands
         # the checkout on a detached HEAD after every update, breaking the
@@ -304,16 +331,16 @@ def _sovereign_local_uv_sync(
         # coordinator-native routine mirrors the fetch's own precedence:
         # skip when the name is a tag (stay detached on the tag commit),
         # skip when origin has no such branch (sha targets), verify the
-        # branch tip equals FETCH_HEAD, then `checkout -B` — forcing the
-        # local branch onto the fetched commit (a deploy checkout must
+        # branch tip equals the fetched commit, then `checkout -B` — forcing
+        # the local branch onto the fetched commit (a deploy checkout must
         # land on origin's tip; stray local commits stay recoverable via
         # the reflog).
         UpdateStep(
             "reattach_branch",
-            git + ["checkout", "-B", target_ref, "FETCH_HEAD"],
+            git + ["checkout", "-B", target_ref, FETCHED_COMMIT],
             allow_failure=True,
             native="reattach_branch",
-            native_args=(repo_path, target_ref),
+            native_args=(repo_path, target_ref, FETCHED_COMMIT),
         ),
         UpdateStep("install", ["uv", "sync"], cwd=repo_path),
     ]
@@ -321,24 +348,34 @@ def _sovereign_local_uv_sync(
         # Before the checkout, as ``kestrel update`` does before its pull
         # (#3702): a manifest window the fetched lock contradicts fails every
         # restore, and finding that after ``uv sync`` leaves the host without
-        # its features. Read from FETCH_HEAD while the code on disk is still
-        # the code this venv was installed for: the fetched code need not
-        # import against these packages until the install has run.
+        # its features. Read from the fetched commit while the code on disk
+        # is still the code this venv was installed for: the fetched code
+        # need not import against these packages until the install has run.
+        # ``--core-checkout`` also refuses, before the checkout, a manifest
+        # that declares core from anywhere but this checkout: the sync would
+        # pull and link a core no check judged (#3832).
         steps.insert(
             1,
             UpdateStep(
                 "feature_preflight",
                 [
                     *feature_sync, "--preflight",
-                    "--lock-revision", "FETCH_HEAD", "--lock-checkout", repo_path,
+                    "--lock-revision", FETCHED_COMMIT, "--lock-checkout", repo_path,
+                    "--core-checkout", repo_path,
                 ],
                 cwd=repo_path,
             ),
         )
+        # The sync links core at the fetched commit, the one the checks
+        # judged, and never pulls this checkout: a pull fetches again and
+        # lands whatever the upstream names by then (#3832).
         steps.append(
             UpdateStep(
                 "feature_sync",
-                feature_sync,
+                [
+                    *feature_sync,
+                    "--core-checkout", repo_path, "--core-revision", FETCHED_COMMIT,
+                ],
                 cwd=repo_path,
                 reports_lock_findings=True,
             )

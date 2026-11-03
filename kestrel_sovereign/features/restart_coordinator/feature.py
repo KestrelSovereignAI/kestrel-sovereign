@@ -23,6 +23,7 @@ import glob
 import json
 import logging
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -99,6 +100,7 @@ from .store import (
 )
 from .update_profiles import (
     KNOWN_UPDATE_PROFILES,
+    UpdateStep,
     default_sovereign_repo_path,
     get_update_profile,
     is_valid_target_ref,
@@ -108,6 +110,13 @@ from .update_profiles import (
 
 # Cap on captured stdout/stderr per update step kept in the durable log.
 _OUTPUT_TAIL_CHARS = 2000
+
+# The update-log step that resolves what the fetch landed to one commit, the
+# one every later step and check names (#3832).
+_PIN_FETCHED_COMMIT_STEP = "pin_fetched_commit"
+
+# What ``git rev-parse`` prints for a commit: a SHA-1 or SHA-256 object id.
+_COMMIT_ID = re.compile(r"[0-9a-f]{40}(?:[0-9a-f]{24})?")
 
 # Active request ids older than this are treated as abandoned markers
 # (endpoint cleanup never ran — client disconnect, crashed generator)
@@ -1180,7 +1189,9 @@ class RestartCoordinatorFeature(Feature):
             "statuses: pending|approved|updating|executing|completed|"
             "rejected|refused|canceled (omit status for all). refused means "
             "the restart would have booted agents into constitution Safe "
-            "Mode; status_reason names them. constitution_checks records "
+            "Mode, or onto code that requires an offline migration an agent "
+            "database has not had (only an operator can run it); "
+            "status_reason names them. constitution_checks records "
             "each check the gate ran, passed or refused, with every agent's "
             "anchored and governing hash. An unknown status is "
             "rejected with the valid set rather than silently returning no "
@@ -1562,6 +1573,16 @@ class RestartCoordinatorFeature(Feature):
                     if await self._refuse_restart(req, refusal):
                         refused.append({"request_id": req.id, "reason": refusal})
                     continue
+                # Nor may it boot code that requires an offline migration an
+                # agent database has not had (#3832): that agent would refuse
+                # to start, and only an operator can migrate it.
+                _, refusal = await self._check_offline_migrations(
+                    stage=_INSTALLED_CODE_CHECK,
+                )
+                if refusal is not None:
+                    if await self._refuse_restart(req, refusal):
+                        refused.append({"request_id": req.id, "reason": refusal})
+                    continue
 
             # Safety checks can await fleet state. Re-verify immediately before
             # crossing into update/execution so key rotation during that wait
@@ -1921,6 +1942,61 @@ class RestartCoordinatorFeature(Feature):
             return record, None
         return record, refusal_reason(check)
 
+    async def _check_offline_migrations(
+        self, *, stage: str, repo_path: str = "", revision: str = "",
+    ) -> tuple[Dict[str, Any], Optional[str]]:
+        """Whether restarting now would boot code an agent database cannot start under.
+
+        The offline migration gate ``kestrel update`` and ``kestrel restart``
+        run (#3832), for every local agent: the code to boot declares the
+        offline migrations it requires, and each agent database is asked,
+        read-only, whether they are done. Returns the check as the update log
+        records it (``stage`` names it), and the terminal refusal reason, or
+        None when the restart is safe.
+
+        With ``revision``, nothing is installed yet: the declarations are read
+        from ``revision`` of ``repo_path`` with git. Without it, the installed
+        code is judged. Either way the probes run in a fresh interpreter.
+
+        A gate that cannot establish what the code requires refuses too, and
+        an agent cannot override it: an agent must never deploy itself into a
+        state only an operator's migration can recover.
+        """
+        from kestrel_sovereign.offline_migrations import (
+            OfflineMigrationError,
+            check_offline_migrations,
+            check_record,
+            check_revision_offline_migrations,
+            refusal_reason,
+        )
+        from kestrel_sovereign.paths import project_dir
+
+        def _check():
+            if not revision:
+                return check_offline_migrations(project_dir())
+            return check_revision_offline_migrations(
+                project_dir(),
+                repo_path,
+                revision,
+                code_label=f"{revision} of {repo_path}",
+            )
+
+        checked = {
+            "stage": stage,
+            "checked_at": datetime.now(timezone.utc).isoformat(),
+        }
+        try:
+            check = await asyncio.to_thread(_check)
+        except OfflineMigrationError as exc:
+            return {**checked, **check_record(None, error=str(exc))}, (
+                "offline migrations could not be verified, so the restart is "
+                f"refused: {exc}"
+            )
+        record = {**checked, **check_record(check)}
+        if check.safe:
+            return record, None
+        return record, refusal_reason(check)
+
     async def _record_constitution_checks(
         self, req, checks: List[Dict[str, Any]],
     ) -> None:
@@ -1987,7 +2063,11 @@ class RestartCoordinatorFeature(Feature):
         )
 
     async def _refuse_restart(self, req, reason: str) -> bool:
-        """Terminally refuse a pending request the adoption gate stopped."""
+        """Terminally refuse a pending request a deploy gate stopped.
+
+        The constitution adoption gate (#3517) or the offline migration gate
+        (#3832).
+        """
         refused = await update_status(
             self._db, req.id,
             status="refused",
@@ -2954,12 +3034,16 @@ class RestartCoordinatorFeature(Feature):
                 "%s: %s", req.id, e,
             )
 
-        if update.get("constitution_refusal"):
+        refusal = update.get("constitution_refusal") or update.get(
+            "offline_migration_refusal"
+        )
+        if refusal:
             # Not retryable: the fetched revision, or the code the update
             # installed, governs by a constitution an agent is not anchored
-            # to, and polling again cannot change that. Only a Sovereign
-            # reanchor can (#3517).
-            reason = update["constitution_refusal"]
+            # to (only a Sovereign reanchor can change that, #3517), or
+            # requires an offline migration an agent database has not had
+            # (only an operator can run it, #3832). Polling again cannot.
+            reason = refusal
             await update_status(
                 self._db, req.id,
                 status="refused",
@@ -3093,11 +3177,35 @@ class RestartCoordinatorFeature(Feature):
         checks_unrecorded: Optional[str] = None
         installed = False
         constitution_checks: List[Dict[str, Any]] = []
+        # What the offline migration gate decided at each stage (#3832); its
+        # refusal is terminal, like the adoption gate's.
+        migration_checks: List[Dict[str, Any]] = []
+        migration_refusal: Optional[str] = None
+        # The one commit the fetch landed, pinned right after it: what the
+        # checks judge and what every later step checks out (#3832).
+        fetched_commit = ""
         try:
             # Clear the previous attempt's checks before this one runs, so the
             # row never presents them as this attempt's.
             await self._record_constitution_checks(req, constitution_checks)
             for step in steps:
+                if step.names_fetched_commit:
+                    if not fetched_commit:
+                        # A profile step names the fetched commit, but no
+                        # fetch pinned one: it would run against nothing.
+                        results.append({
+                            "step": step.name,
+                            "argv": list(step.argv),
+                            "returncode": None,
+                            "ok": False,
+                            "error": "no fetched commit was pinned before this step",
+                            "stdout_tail": "",
+                            "stderr_tail": "",
+                        })
+                        ok = False
+                        failed_step = step.name
+                        break
+                    step = step.bound(fetched_commit)
                 outcome = await self._run_update_step(step)
                 results.append(outcome)
                 if step.name == "resolve_ref" and outcome.get("ok"):
@@ -3109,6 +3217,18 @@ class RestartCoordinatorFeature(Feature):
                     failed_step = step.name
                     break
                 if step.name == "fetch":
+                    # FETCH_HEAD names whatever the last fetch in this checkout
+                    # wrote, and another fetch can rewrite it. Resolve it to
+                    # one commit now: the checks judge that commit and every
+                    # later step lands it, so a revision nothing judged cannot
+                    # be checked out (#3832).
+                    pinned = await self._pin_fetched_commit(req.update_repo_path)
+                    results.append(pinned)
+                    if not pinned["ok"]:
+                        ok = False
+                        failed_step = _PIN_FETCHED_COMMIT_STEP
+                        break
+                    fetched_commit = pinned["stdout_tail"]
                     # The fetch only moved remote-tracking refs. Judge the
                     # revision it fetched before checkout lands it: an agent
                     # not anchored to that revision's constitution would boot
@@ -3118,7 +3238,7 @@ class RestartCoordinatorFeature(Feature):
                         await self._check_constitution_adoption(
                             stage=_FETCHED_REVISION_CHECK,
                             repo_path=req.update_repo_path,
-                            revision="FETCH_HEAD",
+                            revision=fetched_commit,
                         )
                     )
                     constitution_checks.append(check)
@@ -3128,6 +3248,21 @@ class RestartCoordinatorFeature(Feature):
                     if constitution_refusal is not None:
                         ok = False
                         failed_step = "constitution_adoption"
+                        break
+                    # Nor may checkout land a revision that requires an offline
+                    # migration an agent database has not had: that agent
+                    # would refuse to start on it, and only an operator can
+                    # migrate it (#3832). Its declarations are read from the
+                    # fetched revision; the checkout is still as it was.
+                    check, migration_refusal = await self._check_offline_migrations(
+                        stage=_FETCHED_REVISION_CHECK,
+                        repo_path=req.update_repo_path,
+                        revision=fetched_commit,
+                    )
+                    migration_checks.append(check)
+                    if migration_refusal is not None:
+                        ok = False
+                        failed_step = "offline_migration"
                         break
 
             if ok:
@@ -3150,6 +3285,23 @@ class RestartCoordinatorFeature(Feature):
                         f"{installed_refusal} The update itself is installed; "
                         "only the restart was refused."
                     )
+                else:
+                    # The fetched revision's declarations were judged by this
+                    # host's probes; the installed code now judges its own,
+                    # with its own probes, before anything restarts.
+                    check, installed_migration_refusal = (
+                        await self._check_offline_migrations(
+                            stage=_INSTALLED_CODE_CHECK,
+                        )
+                    )
+                    migration_checks.append(check)
+                    if installed_migration_refusal is not None:
+                        ok = False
+                        failed_step = "offline_migration"
+                        migration_refusal = (
+                            f"{installed_migration_refusal} The update itself "
+                            "is installed; only the restart was refused."
+                        )
         except _ConstitutionChecksUnrecorded as exc:
             ok = False
             failed_step = "constitution_checks"
@@ -3190,7 +3342,34 @@ class RestartCoordinatorFeature(Feature):
             "failed_step": failed_step,
             "constitution_refusal": constitution_refusal,
             "constitution_checks_unrecorded": checks_unrecorded,
+            "offline_migration_checks": migration_checks,
+            "offline_migration_refusal": migration_refusal,
         }
+
+    async def _pin_fetched_commit(self, repo_path: str) -> Dict[str, Any]:
+        """Resolve what the fetch landed to one commit, as an update-log outcome.
+
+        ``stdout_tail`` is the commit id when ``ok``. Anything git prints that
+        is not a commit id fails the outcome: nothing could then be judged
+        (#3832).
+        """
+        outcome = await self._exec_update_step(
+            UpdateStep(
+                _PIN_FETCHED_COMMIT_STEP,
+                [
+                    "git", "-C", repo_path,
+                    "rev-parse", "--verify", "FETCH_HEAD^{commit}",
+                ],
+            )
+        )
+        commit = (outcome.get("stdout_tail") or "").strip()
+        if outcome.get("ok") and not _COMMIT_ID.fullmatch(commit):
+            return {
+                **outcome,
+                "ok": False,
+                "error": f"FETCH_HEAD resolved to {commit!r}, not a commit id",
+            }
+        return {**outcome, "stdout_tail": commit}
 
     async def _run_update_step(self, step) -> Dict[str, Any]:
         """Run one allowlisted argv step; capture rc + truncated output.
@@ -3252,7 +3431,9 @@ class RestartCoordinatorFeature(Feature):
     async def _reattach_branch_step(self, step) -> Dict[str, Any]:
         """Native reattach: land the local branch on the fetched commit.
 
-        Runs after the profile's ``checkout --detach FETCH_HEAD``. A single
+        Runs after the profile's ``checkout --detach`` of the commit the
+        coordinator pinned after the fetch, which arrives as the step's third
+        native argument (#3832). A single
         argv command cannot express the required guard — a name can exist
         as BOTH a tag and a branch, and ``git fetch <name>`` lands on the
         TAG commit, so attaching to ``origin/<name>`` could install a
@@ -3266,17 +3447,20 @@ class RestartCoordinatorFeature(Feature):
 
         1. fetch selected ``tag '<ref>'``    → skip, stay detached.
         2. fetch selected no ``branch '<ref>'`` (sha target) → skip.
-        3. ``origin/<ref>`` != FETCH_HEAD    → skip (defensive).
-        4. otherwise ``checkout -B <ref> FETCH_HEAD`` and set the branch
+        3. ``origin/<ref>`` != the pinned commit → skip (defensive).
+        4. otherwise ``checkout -B <ref> <pinned commit>`` and set the branch
            upstream to ``origin/<ref>`` — a NEW local branch without
-           ``@{u}`` would fail the next ``kestrel update``'s bare
-           ``git pull --ff-only`` (codex round-2).
+           ``@{u}`` would fail the next ``kestrel update``'s pull, which
+           merges ``@{u}`` (codex round-2).
+
+        Never ``FETCH_HEAD^{commit}``: another fetch may have rewritten it
+        since the commit was judged and checked out.
 
         Skips report ``ok=True`` with the reason in ``stdout_tail``; the
         step is additionally ``allow_failure`` so even unexpected git
         errors never abort the update.
         """
-        repo, ref = step.native_args
+        repo, ref, fetched = step.native_args
         # A caller may pass the fully-qualified form (refs/heads/main —
         # accepted by is_valid_target_ref); FETCH_HEAD records the SHORT
         # name ("branch 'main'"), and checkout/upstream want it too
@@ -3354,15 +3538,12 @@ class RestartCoordinatorFeature(Feature):
                     True, 0,
                     f"skip: no origin branch {ref!r}; staying detached",
                 )
-            rc, fetch_sha, _err = await _git(
-                "rev-parse", "--verify", "FETCH_HEAD^{commit}"
-            )
-            if rc != 0 or branch_sha.strip() != fetch_sha.strip():
+            if branch_sha.strip() != fetched:
                 return _outcome(
                     True, 0,
-                    f"skip: origin/{ref} != FETCH_HEAD; staying detached",
+                    f"skip: origin/{ref} != the fetched commit; staying detached",
                 )
-            rc, out, err = await _git("checkout", "-B", ref, fetch_sha.strip())
+            rc, out, err = await _git("checkout", "-B", ref, fetched)
             if rc != 0:
                 return _outcome(False, rc, out, err)
             rc, up_out, up_err = await _git(

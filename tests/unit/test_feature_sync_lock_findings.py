@@ -589,6 +589,10 @@ def _fake_host_sync_step(
     ]
     # The profile, not this test, asks the coordinator to keep the findings.
     assert profile_step.reports_lock_findings is True
+    # The step names the commit the coordinator's fetch pinned, which it binds
+    # before running it (#3832). This fake host has no fetch to pin one.
+    assert profile_step.names_fetched_commit
+    profile_step = profile_step.bound("f" * 40)
     return dataclasses.replace(
         profile_step,
         argv=[sys.executable, str(bootstrap), *profile_step.argv[3:]],

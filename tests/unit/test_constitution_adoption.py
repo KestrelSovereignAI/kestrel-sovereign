@@ -270,7 +270,9 @@ def test_agent_names_limit_the_check(project, installed):
 
     assert check_constitution_adoption(project, agent_names=["Kite"]).safe
     assert not check_constitution_adoption(project, agent_names=["Emma"]).safe
-    assert check_constitution_adoption(project, agent_names=["nobody"]).verdicts == ()
+    # Not an empty pass: the launcher may resolve the name elsewhere (#3832).
+    with pytest.raises(ConstitutionAdoptionError, match="no local agent named nobody"):
+        check_constitution_adoption(project, agent_names=["nobody"])
 
 
 def _govern_by_external_source(
@@ -577,9 +579,11 @@ def test_no_selected_agent_starts_no_interpreter(project, installed, monkeypatch
     monkeypatch.setattr(constitution_adoption.subprocess, "run", no_child)
 
     assert check_installed_constitution_adoption(project).verdicts == ()
-    assert check_installed_constitution_adoption(
-        project / "elsewhere", agent_names=["nobody"]
-    ).verdicts == ()
+    # A named agent the registry lacks refuses, still before any child (#3832).
+    with pytest.raises(ConstitutionAdoptionError, match="no local agent named nobody"):
+        check_installed_constitution_adoption(
+            project / "elsewhere", agent_names=["nobody"]
+        )
 
 
 def test_installed_code_that_cannot_answer_is_refused(project, installed_package):
@@ -970,9 +974,11 @@ def upstream(tmp_path, project, monkeypatch):
     monkeypatch.setattr(cli, "_get_project_dir", lambda: project)
     monkeypatch.setattr(cli, "_resolve_source_checkout", lambda: clone)
     steps = []
-    real_pull = cli._run_git_pull
+    real_pull = cli._run_git_fast_forward
     monkeypatch.setattr(
-        cli, "_run_git_pull", lambda c: steps.append("pull") or real_pull(c)
+        cli,
+        "_run_git_fast_forward",
+        lambda c, revision: steps.append("pull") or real_pull(c, revision),
     )
     monkeypatch.setattr(
         cli,
@@ -1083,12 +1089,23 @@ def test_update_without_a_restart_refuses_an_unverifiable_revision_under_running
 
     _, steps = upstream
     seed_anchored_agents(project, {"Emma": sha256(OLD)})
-    monkeypatch.setattr(cli, "_run_git_fetch", lambda _: (1, "network is down"))
+    real_fetch = cli._run_git_fetch
+    fetches = []
+
+    def network_down_for_the_checks(checkout):
+        # Down when the checks fetch, back when the pull fetches again: the
+        # pull lands what it fetched, as nothing could be judged (#3832).
+        fetches.append(checkout)
+        return (1, "network is down") if len(fetches) == 1 else real_fetch(checkout)
+
+    monkeypatch.setattr(cli, "_run_git_fetch", network_down_for_the_checks)
 
     # Nothing running: nothing reads what the install changes.
     assert cli.cmd_update(_update_args(restart=False)) == 0
     assert steps == ["pull", "install"]
+    assert len(fetches) == 2
     steps.clear()
+    monkeypatch.setattr(cli, "_run_git_fetch", lambda _: (1, "network is down"))
 
     host_pid = project / "logs" / ".host.pid"
     host_pid.parent.mkdir()
@@ -1197,7 +1214,7 @@ def test_update_refuses_a_revision_replacing_a_tracked_external_source(
     monkeypatch.setattr(cli, "_resolve_source_checkout", lambda: clone)
     steps = []
     monkeypatch.setattr(
-        cli, "_run_git_pull", lambda _: steps.append("pull") or (0, "")
+        cli, "_run_git_fast_forward", lambda *_: steps.append("pull") or (0, "")
     )
     monkeypatch.setattr(
         cli,
@@ -1297,8 +1314,10 @@ def test_an_update_that_installs_nothing_judges_only_its_target(project, upstrea
 def unchanged_upstream(tmp_path, project, monkeypatch):
     """A checkout whose upstream brings a release that leaves the text alone.
 
-    Pull and terminate/start are recorded; ``kestrel restart`` and its gate
-    run for real. A test installs with :func:`_installing`.
+    The pull, which moves only this test's clone, and terminate/start are
+    recorded; ``kestrel restart`` and its gate run for real. The update
+    installs only once the pull has landed the revision its checks judged
+    (#3832). A test installs with :func:`_installing`.
     """
     origin, clone = origin_and_clone(tmp_path, OLD)
     (origin / "README.md").write_text("a release\n")
@@ -1310,8 +1329,11 @@ def unchanged_upstream(tmp_path, project, monkeypatch):
     monkeypatch.setattr(cli, "_get_project_dir", lambda: project)
     monkeypatch.setattr(cli, "_resolve_source_checkout", lambda: clone)
     steps = []
+    real_pull = cli._run_git_fast_forward
     monkeypatch.setattr(
-        cli, "_run_git_pull", lambda _: steps.append("pull") or (0, "")
+        cli,
+        "_run_git_fast_forward",
+        lambda c, revision: steps.append("pull") or real_pull(c, revision),
     )
     monkeypatch.setattr(
         cli, "cmd_terminate", lambda args: steps.append("terminate") or 0
