@@ -12,6 +12,7 @@ Works with both SQLite and PostgreSQL backends.
 
 import logging
 import sys
+import threading
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Callable, Optional
@@ -71,11 +72,42 @@ _SECRET_KEYS = {
     "token",
 }
 
-# Placeholder written into content-bearing JSON columns (args/metadata) when
-# the active privacy config forbids persisting user content (EPHEMERAL /
-# ISOLATED). The row itself still persists so counts/latency/status keep
-# metering — only the payload is elided (F076).
+# Placeholder written into content-bearing columns when the active privacy
+# config forbids persisting user content (EPHEMERAL / ISOLATED / DEIDENTIFIED),
+# or when the gate cannot apply it (#3920). The row itself still persists so
+# counts/latency/status keep metering — only the payload is elided (F076).
 _CONTENT_GATED_MARKER = "_privacy_gated"
+
+# Returned by ``_current_privacy_config`` when the bound provider raises or
+# returns no config. The active mode is then unknown, so every content gate
+# elides. ``None`` stays reserved for "no provider bound", the legacy
+# redact-and-cap path (#3920).
+_POLICY_UNREADABLE = object()
+
+# Set once the first unreadable policy has been logged at WARNING, so a
+# provider that keeps failing does not log on every write (#3920).
+_policy_unreadable_logged = threading.Event()
+
+
+def _log_policy_unreadable(cause: str) -> None:
+    """Log an unreadable privacy policy: once per process at WARNING."""
+    if _policy_unreadable_logged.is_set():
+        logger.debug("privacy_config_provider %s; eliding payload", cause)
+        return
+    _policy_unreadable_logged.set()
+    logger.warning(
+        "privacy_config_provider %s; eliding observability content until "
+        "the privacy policy is readable",
+        cause,
+    )
+
+
+@dataclass(frozen=True)
+class _Elided:
+    """A content field the privacy gate refused to persist; ``reason`` says why."""
+
+    reason: str
+
 
 # Lazy import of the PII redactor to avoid importing the privacy feature at
 # module load time (mirrors storage.privacy_wrapper.get_anonymize_text).
@@ -126,7 +158,9 @@ class LLMCallEvent(BaseModel):
     duration_ms: int
     success: bool
     error_message: Optional[str]
-    tool_calls: Optional[list[dict]]  # If tools were called
+    # If tools were called. A stored elision or truncation marker reads back
+    # as the only entry (see ``_tool_calls_from_column``).
+    tool_calls: Optional[list[dict]]
     metadata: dict[str, Any]
 
 
@@ -186,40 +220,75 @@ class ObservabilityStore(UnifiedStoreBase):
         """
         self._privacy_config_provider = provider
 
-    def _current_privacy_config(self) -> Optional[Any]:
-        """Read the live privacy config, tolerating a missing/faulty provider."""
+    def _current_privacy_config(self) -> Any:
+        """Read the live privacy config.
+
+        ``None`` means no provider is bound. A bound provider that raises, or
+        returns no config, yields :data:`_POLICY_UNREADABLE`, never ``None``:
+        a policy that cannot be read is not permission to keep content (#3920).
+        """
         if self._privacy_config_provider is None:
             return None
         try:
-            return self._privacy_config_provider()
+            config = self._privacy_config_provider()
         except Exception as exc:  # noqa: BLE001 - never break logging on this
-            logger.debug("privacy_config_provider raised %s; treating as ungated", exc)
-            return None
+            # The exception text may echo content, so only its type is logged.
+            _log_policy_unreadable(f"raised {type(exc).__name__}")
+            return _POLICY_UNREADABLE
+        if config is None:
+            _log_policy_unreadable("returned no privacy config")
+            return _POLICY_UNREADABLE
+        return config
+
+    def _privacy_gate(self, value: Any) -> Any:
+        """Return ``value`` as the privacy mode lets it persist, or :class:`_Elided`.
+
+        The one decision every content gate shares, so no field picks its own
+        fallback (F076, #3920):
+
+        - no provider bound: ``value`` unchanged (legacy redact-and-cap);
+        - provider raised: elided, because the mode is unknown;
+        - EPHEMERAL / ISOLATED / DEIDENTIFIED: elided; no raw content
+          persists in these modes;
+        - ANONYMOUS (``pii_redacted``): every string anonymized;
+        - NORMAL / PUBLIC: ``value`` unchanged;
+        - any other storage tier, or a failure while deciding or
+          anonymizing: elided.
+        """
+        config = self._current_privacy_config()
+        if config is None:
+            return value
+        if config is _POLICY_UNREADABLE:
+            return _Elided("error")
+        try:
+            if (
+                config.is_ephemeral()
+                or config.uses_temp_storage()
+                or config.requires_deidentification()
+            ):
+                return _Elided(config.storage)
+            if config.requires_anonymization():
+                return _anonymize_deep(value, _get_anonymize_text())
+            if config.allows_persistent_storage():
+                return value
+            return _Elided(config.storage)
+        except Exception as exc:  # noqa: BLE001 - fail closed to gated
+            logger.debug(
+                "privacy gate failed (%s); eliding payload", type(exc).__name__
+            )
+            return _Elided("error")
 
     def _privacy_gate_args_json(self, args: Any) -> str:
         """Serialize tool-call args for storage, honouring privacy mode (F076).
 
-        - EPHEMERAL / ISOLATED: elide the payload entirely (no user content
-          persists); the row still records counts/latency/status.
-        - ANONYMOUS (``pii_redacted``): anonymize string content before the
-          usual secret-key redaction + size cap.
-        - NORMAL / PUBLIC / no provider: legacy redact-and-cap behaviour.
+        An elided payload becomes ``{_CONTENT_GATED_MARKER: <reason>}``; the
+        row still records counts/latency/status. Anything kept, anonymized or
+        not, gets the usual secret-key redaction and size cap.
         """
-        config = self._current_privacy_config()
-        if config is not None:
-            try:
-                if config.is_ephemeral() or config.uses_temp_storage():
-                    return json_dumps({_CONTENT_GATED_MARKER: config.storage})
-                if config.requires_anonymization():
-                    return redact_tool_args_json(
-                        _anonymize_deep(args, _get_anonymize_text())
-                    )
-            except Exception as exc:  # noqa: BLE001 - fail closed to gated
-                logger.debug(
-                    "privacy gate for tool args failed (%s); eliding payload", exc
-                )
-                return json_dumps({_CONTENT_GATED_MARKER: "error"})
-        return redact_tool_args_json(args)
+        gated = self._privacy_gate(args)
+        if isinstance(gated, _Elided):
+            return json_dumps({_CONTENT_GATED_MARKER: gated.reason})
+        return redact_tool_args_json(gated)
 
     def _privacy_gate_metadata(
         self, metadata: Optional[dict[str, Any]]
@@ -229,48 +298,28 @@ class ObservabilityStore(UnifiedStoreBase):
         Same policy as :meth:`_privacy_gate_args_json` but returns a dict for
         the ``metadata`` JSON columns. Operational keys the caller injects for
         forensics (e.g. ``metric_name``) are added by the caller *after* this
-        gate, so they are never elided.
+        gate, so they are never elided. The result is always a new dict, so
+        stamping those keys never changes the dict the caller passed in.
         """
-        meta = metadata or {}
-        config = self._current_privacy_config()
-        if config is None:
-            return meta
-        try:
-            if config.is_ephemeral() or config.uses_temp_storage():
-                return {_CONTENT_GATED_MARKER: config.storage}
-            if config.requires_anonymization():
-                return _anonymize_deep(meta, _get_anonymize_text())
-        except Exception as exc:  # noqa: BLE001 - fail closed to gated
-            logger.debug("privacy gate for metadata failed (%s); eliding payload", exc)
-            return {_CONTENT_GATED_MARKER: "error"}
-        return meta
+        gated = self._privacy_gate(metadata or {})
+        if isinstance(gated, _Elided):
+            return {_CONTENT_GATED_MARKER: gated.reason}
+        return dict(gated)
 
     def _privacy_gate_text(self, text: Optional[str]) -> Optional[str]:
         """Gate a free-form text field (e.g. ``error_message``) by privacy mode.
 
         Error/response text can echo user or tool input verbatim, so it is
-        content-bearing just like args/metadata (F076):
-
-        - EPHEMERAL / ISOLATED: elide to the gated marker (the row still
-          records status/latency so metering and the honesty-layer's read of
-          ``result_status`` are unaffected).
-        - ANONYMOUS (``pii_redacted``): anonymize the text in place.
-        - NORMAL / PUBLIC / no provider: pass through unchanged.
+        content-bearing just like args/metadata (F076). An elided text becomes
+        the gated marker; the row still records status/latency, so metering and
+        the honesty-layer's read of ``result_status`` are unaffected.
         """
         if text is None:
             return None
-        config = self._current_privacy_config()
-        if config is None:
-            return text
-        try:
-            if config.is_ephemeral() or config.uses_temp_storage():
-                return _CONTENT_GATED_MARKER
-            if config.requires_anonymization():
-                return _anonymize_deep(text, _get_anonymize_text())
-        except Exception as exc:  # noqa: BLE001 - fail closed to gated
-            logger.debug("privacy gate for text failed (%s); eliding payload", exc)
+        gated = self._privacy_gate(text)
+        if isinstance(gated, _Elided):
             return _CONTENT_GATED_MARKER
-        return text
+        return gated
 
     async def initialize(self) -> None:
         """Create tables if not exists."""
@@ -1314,9 +1363,26 @@ class ObservabilityStore(UnifiedStoreBase):
             duration_ms=row[13],
             success=self.from_bool_field(row[14]),
             error_message=row[15],
-            tool_calls=json_loads(row[16]) if row[16] else None,
+            tool_calls=_tool_calls_from_column(row[16]),
             metadata=json_loads(row[17]) if row[17] else {},
         )
+
+
+def _tool_calls_from_column(raw: Any) -> Optional[list[dict]]:
+    """Read ``a2a_llm_calls.tool_calls`` back as the list ``LLMCallEvent`` holds.
+
+    The writer stores the call list itself unless it cannot: a payload the
+    privacy gate elided is ``{_CONTENT_GATED_MARKER: <reason>}`` (F076, #3920)
+    and an oversized one is ``{"_truncated": True, "preview": ...}``. Such a
+    marker reads back as the list's only entry, so the row stays readable and
+    still says why its calls are missing.
+    """
+    if not raw:
+        return None
+    value = json_loads(raw)
+    if isinstance(value, dict):
+        return [value]
+    return value
 
 
 def redact_tool_args_json(value: Any) -> str:
@@ -1337,21 +1403,29 @@ def _anonymize_deep(value: Any, anonymize: Callable[[str], str], depth: int = 0)
     Structure (dict/list nesting) is preserved so downstream redaction and size
     capping still see a normal payload; only the human-readable string content
     is scrubbed. Secret-key redaction runs afterwards in ``redact_tool_args_json``.
+
+    It fails closed (#3920): an anonymizer error propagates to the privacy
+    gate, which elides the whole field; anything nested past the depth cap
+    becomes :data:`_CONTENT_GATED_MARKER`; and no leaf reaches storage without
+    passing through the anonymizer. Dict keys are not anonymized.
     """
     if depth > 8:
-        return value
+        return _CONTENT_GATED_MARKER
     if isinstance(value, dict):
         return {
             str(k): _anonymize_deep(v, anonymize, depth + 1) for k, v in value.items()
         }
-    if isinstance(value, (list, tuple)):
+    if isinstance(value, (list, tuple, set, frozenset)):
         return [_anonymize_deep(item, anonymize, depth + 1) for item in value]
     if isinstance(value, str):
-        try:
-            return anonymize(value)
-        except Exception:  # noqa: BLE001 - never break logging on anonymizer error
-            return value
-    return value
+        return anonymize(value)
+    if value is None or isinstance(value, (bool, int, float)):
+        return value
+    if isinstance(value, (bytes, bytearray)):
+        return f"<bytes:{len(value)}>"
+    # Any other leaf is persisted as its ``str()`` (``json_dumps(default=str)``),
+    # so that text is anonymized too.
+    return anonymize(str(value))
 
 
 def infer_tool_result_status(result: Any, status_hint: Optional[str] = None) -> str:
