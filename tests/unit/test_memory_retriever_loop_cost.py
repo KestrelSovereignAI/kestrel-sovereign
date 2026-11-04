@@ -8,6 +8,7 @@ lease every agent on the host shares.
 
 import asyncio
 import random
+import threading
 from unittest.mock import AsyncMock
 
 import pytest
@@ -169,6 +170,15 @@ async def test_long_query_retrieval_never_blocks_the_event_loop(
             )
         query = _words(rng, query_vocabulary, 26_238)
         retriever = MemoryRetriever(store, answerability_enabled=False)
+        loop_thread = threading.get_ident()
+        decrypt_threads = []
+        decrypt = store._decrypt_with_fallback
+
+        def observed_decrypt(content, metadata):
+            decrypt_threads.append(threading.get_ident())
+            return decrypt(content, metadata)
+
+        monkeypatch.setattr(store, "_decrypt_with_fallback", observed_decrypt)
 
         results, block = await _max_event_loop_block(
             retriever.retrieve(query, agent_id="agent-3745", read_only=True)
@@ -180,6 +190,10 @@ async def test_long_query_retrieval_never_blocks_the_event_loop(
         assert bridge["fallback_reason"] == "query_token_budget"
         assert bridge["fallback_rows_scanned"] == 702
         assert results
+        assert decrypt_threads
+        assert loop_thread not in decrypt_threads, (
+            "Encrypted retrieval rows were decrypted on the event-loop thread"
+        )
         assert block < _MAX_EVENT_LOOP_BLOCK_SECONDS, (
             f"retrieval held the event loop for {block:.3f} s"
         )
