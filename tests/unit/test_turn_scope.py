@@ -694,6 +694,9 @@ _ALLOWED_DIRECT_BINDS = {
     ("agent/invocation.py", "caller_context_binding_scope"),
     # A subagent binds its LOCAL parts sink, not a captured turn collector.
     ("features/base.py", "bind_part_collector"),
+    # A deferred publication runs its synchronous factory, on the same task,
+    # under the collector of its chosen destination, or none when headless.
+    ("agent/orchestrator_engine.py", "bind_part_collector"),
 }
 
 

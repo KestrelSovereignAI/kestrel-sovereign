@@ -89,6 +89,7 @@ from kestrel_sovereign.agent.invocation import (
 # (codex P1 on PR #1346: follow-up pre-tool prose was streamed without
 # the honesty-layer clear).
 from kestrel_sovereign.agent.parts import (
+    bind_part_collector,
     build_part_sentinel,
     current_part_collector,
     current_tool_publication_context,
@@ -958,9 +959,29 @@ async def _record_inline_tool_dispatch(host, entry, *, session_id, features_by_t
     )
 
 
+# Where ``_complete_post_tool_result`` publishes. The default is the live chat
+# turn the call runs in. A feature subagent names the collector its parent turn
+# dispatched it with, since its own plain buffer is no chat destination. A
+# headless call (an A2A skill) has none: the factory runs with no context and
+# no collector, and nothing it returns is emitted into a chat.
+_CURRENT_TURN = object()
+HEADLESS_PUBLICATION = object()
+
+
+def _publication_scope(destination):
+    if destination is _CURRENT_TURN:
+        return nullcontext()
+    return bind_part_collector(None if destination is HEADLESS_PUBLICATION else destination)
+
+
 async def _complete_post_tool_result(host, result, post_input, *, adapter,
-                                     dispatch_start, on_audited=None):
-    """Complete policy and required audit before invoking a private UI factory."""
+                                     dispatch_start, on_audited=None,
+                                     destination=_CURRENT_TURN):
+    """Complete policy and required audit before invoking a private UI factory.
+
+    Every Core route that can receive a ``DeferredToolResult`` completes it
+    here; ``destination`` (see ``_CURRENT_TURN``) is the only difference.
+    """
     deferred = isinstance(result, DeferredToolResult)
     post_outputs = await host.hooks_manager.execute_hooks_parallel(
         HookEvent.POST_TOOL_USE, post_input,
@@ -1008,10 +1029,13 @@ async def _complete_post_tool_result(host, result, post_input, *, adapter,
         ) from error
     try:
         changed_during_audit = dict(post_result) != reviewed
-        completed = result.finalize(
-            post_result, allowed=allowed and not changed_during_audit,
-            context=current_tool_publication_context(host, post_input.session_id),
-        )
+        # The destination is resolved, and the factory runs, under the
+        # destination's collector: a publisher may consult that turn too.
+        with _publication_scope(destination):
+            completed = result.finalize(
+                post_result, allowed=allowed and not changed_during_audit,
+                context=current_tool_publication_context(host, post_input.session_id),
+            )
     except Exception as error:
         if is_execution_control_error(error):
             raise
@@ -1034,7 +1058,8 @@ async def _complete_post_tool_result(host, result, post_input, *, adapter,
     from kestrel_sovereign.features.base import _attach_envelope_parts
     _attach_envelope_parts(payload, payload.pop("parts", None), None,
                            appended_parts=appended_parts)
-    host._reemit_envelope_parts({"parts": added})
+    if destination is not HEADLESS_PUBLICATION:
+        host._reemit_envelope_parts({"parts": added})
     return _AuditedDeferredResult(payload, host=host, tool_name=post_input.tool_name,
                                   session_id=post_input.session_id)
 
