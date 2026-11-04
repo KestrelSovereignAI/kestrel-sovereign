@@ -321,10 +321,11 @@ async def _close_partial_host_resources(
                 record.error = execution_terminal_error(
                     error, debt, retain_originals=True, isolate_control_originals=True,
                 )
-        if record.task is not None:
-            outcome = await await_owned_task(record.task)
+        task = record.task
+        if task is not None:
+            outcome = await await_owned_task(task)
             from kestrel_sovereign._async_ownership import owned_task_error
-            physical = owned_task_error(record.task)
+            physical = owned_task_error(task)
             record.error = execution_terminal_error(
                 record.error, execution_native_source_error(physical) or physical,
                 retain_originals=True,

@@ -1026,3 +1026,99 @@ async def test_context_observer_joins_physical_close_without_adopting_its_caller
         if observer is not None:
             await await_owned_task(observer)
         await original_close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("grouped", [False, True])
+async def test_ordinary_prefix_failure_preserves_its_actual_caller_withdrawal(
+    prepared_tail, monkeypatch, grouped
+):
+    from kestrel_sovereign import kestrel_agent as agent_module
+
+    agent, case = prepared_tail
+    state, release_close, tasks = case[-2], case[5], case[-1]
+    state["close_error"] = None
+    original_close = agent.llm_service.close
+    entered = asyncio.Event()
+    source = OSError("original prefix close report failed after native provider close")
+    failure = (
+        ExceptionGroup(
+            "original ordinary prefix failures",
+            [source, ValueError("original prefix cleanup report invalid")],
+        )
+        if grouped
+        else source
+    )
+
+    async def close():
+        await original_close()
+        entered.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            raise failure
+
+    monkeypatch.setattr(agent.llm_service, "close", close)
+    monkeypatch.setattr(agent_module, "KESTREL_AGENT_SHUTDOWN_TIMEOUT_S", 2.0)
+    monkeypatch.setattr(agent_module, "KESTREL_SHUTDOWN_DURABLE_RESERVE_S", 0.2)
+    caller = create_owned_task(agent.shutdown(), retain_originals=True)
+    tasks.append(caller)
+    try:
+        await asyncio.wait_for(entered.wait(), 3)
+        caller.cancel("original ordinary-prefix caller withdrew")
+        done, _ = await asyncio.wait({caller}, timeout=1)
+        assert caller in done, (
+            "An ordinary prefix failure consumed the caller withdrawal before the retained native tail join"
+        )
+        result = await await_owned_task(caller)
+        chain = tuple(_explicit_control_chain(result.error))
+        assert source in chain
+        assert any(
+            isinstance(error, asyncio.CancelledError)
+            and error.args == ("original ordinary-prefix caller withdrew",)
+            for error in chain
+        )
+    finally:
+        state["release_server"].set()
+        release_close.set()
+        await await_owned_task(caller)
+        await await_owned_task(
+            create_owned_task(
+                agent.wait_for_shutdown_completion(), retain_originals=True
+            )
+        )
+
+
+@pytest.mark.asyncio
+async def test_two_context_callers_retain_the_same_task_after_successful_physical_close(
+    monkeypatch,
+):
+    backend = SQLiteBackend(":memory:")
+    await backend.connect()
+    context = SovereignHostContext(db=backend)
+    original_close = backend.close
+    entered, release = asyncio.Event(), asyncio.Event()
+
+    async def close():
+        entered.set()
+        await release.wait()
+        await original_close()
+
+    monkeypatch.setattr(backend, "close", close)
+    first = create_owned_task(close_bound_host_context(context), retain_originals=True)
+    second = create_owned_task(close_bound_host_context(context), retain_originals=True)
+    try:
+        await asyncio.wait_for(entered.wait(), 3)
+        release.set()
+        outcomes = [await await_owned_task(owner) for owner in (first, second)]
+        assert backend._connection is None
+        assert all(
+            result.error is None and result.cancellation is None for result in outcomes
+        ), (
+            "Concurrent context observer reread the retired mutable task slot instead of the original close owner"
+        )
+    finally:
+        release.set()
+        await await_owned_task(first)
+        await await_owned_task(second)
+        await original_close()

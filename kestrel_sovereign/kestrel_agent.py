@@ -10288,8 +10288,12 @@ Expected Duration: {expected_duration}
         finite_outcomes: list[BaseException] = []
         shutdown_cancelled = False
 
-        def remember_finite(error, *, retain_ordinary=False):
+        def remember_finite(error, *, retain_ordinary=False, withdrawal=None):
             nonlocal shutdown_cancelled
+            if withdrawal is not None:
+                shutdown_cancelled = True
+                if all(withdrawal is not prior for prior in finite_outcomes):
+                    finite_outcomes.append(withdrawal)
             if execution_observer_cancellations(error):
                 shutdown_cancelled = True
             # Shared agent state owns source-only facts. This invocation still
@@ -10505,6 +10509,13 @@ Expected Duration: {expected_duration}
                     if (requested and isinstance(child_error, asyncio.CancelledError)
                         and not is_execution_control_error(child_error)):
                         child_error = None
+                    # Capture the exact delivered caller withdrawal before
+                    # ordinary terminal selection can turn it into a cause.
+                    remember_finite(
+                        child_error,
+                        retain_ordinary=outcome.cancellation is not None,
+                        withdrawal=outcome.cancellation,
+                    )
                     terminal = execution_terminal_error(
                         child_error, outcome.cancellation,
                         retain_originals=True, isolate_control_originals=True,
@@ -10531,6 +10542,13 @@ Expected Duration: {expected_duration}
                         # This is the deadline's own cooperative interrupt,
                         # not another independent native control receipt.
                         child_error = None
+                    # Capture the exact delivered caller withdrawal before
+                    # ordinary terminal selection can turn it into a cause.
+                    remember_finite(
+                        child_error,
+                        retain_ordinary=outcome.cancellation is not None,
+                        withdrawal=outcome.cancellation,
+                    )
                     terminal = execution_terminal_error(
                         opening, child_error, outcome.cancellation,
                         retain_originals=True, isolate_control_originals=True,
