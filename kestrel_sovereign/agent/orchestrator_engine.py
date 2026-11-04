@@ -111,6 +111,11 @@ from kestrel_sovereign.execution_custody import (
     require_execution_work,
 )
 from kestrel_sovereign.hooks.decision_gate import evaluate_blocking_decision
+from kestrel_sovereign.logging_config import (
+    content_log_summary,
+    exception_frames,
+    exception_log_summary,
+)
 from kestrel_sovereign.agent.tool_allowlist import (
     ToolCallContext,
     allowlist_evidence,
@@ -1247,8 +1252,9 @@ class OrchestratorEngineMixin:
         blocked = evaluate_blocking_decision(hook_output)
         if blocked is not None:
             logging.info(
-                "[HOOKS] Tool blocked (%s): %s.%s - %s",
-                blocked.decision.value, feature_name, tool_name, blocked.reason,
+                "[HOOKS] Tool blocked (%s): %s.%s - reason %s",
+                blocked.decision.value, feature_name, tool_name,
+                content_log_summary(str(blocked.reason)),
             )
             return blocked.envelope
 
@@ -1854,8 +1860,9 @@ class OrchestratorEngineMixin:
         blocked = evaluate_blocking_decision(pre_output)
         if blocked is not None:
             logging.info(
-                "[GOVERNED-DISPATCH] blocked (%s) source=%s tool=%s reason=%s",
-                blocked.decision.value, source, tool_name, blocked.reason,
+                "[GOVERNED-DISPATCH] blocked (%s) source=%s tool=%s reason %s",
+                blocked.decision.value, source, tool_name,
+                content_log_summary(str(blocked.reason)),
             )
             return blocked.envelope
 
@@ -2040,8 +2047,9 @@ class OrchestratorEngineMixin:
         blocked = evaluate_blocking_decision(pre_output)
         if blocked is not None:
             logging.info(
-                "[GOVERNED-DISPATCH] subagent blocked (%s) source=%s feature=%s reason=%s",
-                blocked.decision.value, source, feature_name, blocked.reason,
+                "[GOVERNED-DISPATCH] subagent blocked (%s) source=%s feature=%s reason %s",
+                blocked.decision.value, source, feature_name,
+                content_log_summary(str(blocked.reason)),
             )
             return blocked.envelope
 
@@ -2139,8 +2147,8 @@ class OrchestratorEngineMixin:
             if is_execution_control_error(e):
                 raise
             logging.warning(
-                "[GOVERNED-DISPATCH] subagent execute raised source=%s feature=%s err=%s",
-                source, feature_name, e, exc_info=True,
+                "[GOVERNED-DISPATCH] subagent execute raised source=%s feature=%s err=%s\n%s",
+                source, feature_name, exception_log_summary(e), exception_frames(e),
             )
             exec_duration_ms = int((time.time() - exec_start) * 1000)
             err_result = {
@@ -2691,7 +2699,11 @@ class OrchestratorEngineMixin:
         except Exception as exc:
             if required or is_execution_control_error(exc):
                 raise
-            print(f"a2a_tool_dispatches dispatch wrapper failed: {exc}", file=sys.stderr)
+            print(
+                "a2a_tool_dispatches dispatch wrapper failed: "
+                f"{exception_log_summary(exc)}",
+                file=sys.stderr,
+            )
 
     async def _dispatch_feature_tool(
         self, tool_call, feature, args, dispatch_start, dispatch_event_id,
@@ -2727,8 +2739,9 @@ class OrchestratorEngineMixin:
         if blocked is not None:
             reason = blocked.reason
             logging.warning(
-                "[HOOKS] Subagent blocked (%s): %s.%s - %s",
-                blocked.decision.value, hook_feature_name, tool_name, reason,
+                "[HOOKS] Subagent blocked (%s): %s.%s - reason %s",
+                blocked.decision.value, hook_feature_name, tool_name,
+                content_log_summary(str(reason)),
             )
             result = blocked.envelope
             if dispatch_meta is not None:
@@ -2923,9 +2936,15 @@ class OrchestratorEngineMixin:
     ):
         """Handle feature execution error with logging and hooks."""
         if log_traceback:
-            logging.error(f"Feature {tool_name} execution failed: {error}", exc_info=True)
+            logging.error(
+                "Feature %s execution failed: %s\n%s",
+                tool_name, exception_log_summary(error), exception_frames(error),
+            )
         else:
-            logging.error(f"Feature {tool_name} execution failed: {error}")
+            logging.error(
+                "Feature %s execution failed: %s",
+                tool_name, exception_log_summary(error),
+            )
         result = {"success": False, "error": str(error)}
         if dispatch_meta is not None:
             status = "timeout" if isinstance(error, TimeoutError) else "error"
@@ -3074,7 +3093,9 @@ class OrchestratorEngineMixin:
             return result
         except Exception as e:
             _raise_terminal_tool_error(e, dispatch_meta)
-            logging.error(f"[DIRECT-TOOL] {tool_name} failed: {e}")
+            logging.error(
+                "[DIRECT-TOOL] %s failed: %s", tool_name, exception_log_summary(e),
+            )
             if bound_execution is not None and (
                 bound_execution.returned
                 or (bound_execution.started and not isinstance(e, ResourceConflict))

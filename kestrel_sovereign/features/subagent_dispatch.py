@@ -22,11 +22,27 @@ methods mixed in. In-tree features (which already subclass the sovereign base)
 are returned unchanged. Borrowed methods keep ``base.py`` as their
 ``__globals__``, so the module-level A2A imports they rely on resolve correctly
 regardless of which class they are attached to.
+
+An adopted feature keeps the SDK's own ``get_tools()`` wrapper, whose log
+records carry a tool's exception message and part of a rejected argument.
+Adoption also installs :class:`SdkToolLogSummary`, which gives those records
+the content-free shape Core's own wrapper logs (#3919).
 """
 
 from __future__ import annotations
 
+import logging
+import re
+import sys
 from typing import Type
+
+from kestrel_sdk.features import base as _sdk_feature_base
+
+from kestrel_sovereign.logging_config import (
+    content_log_summary,
+    exception_frames,
+    exception_log_summary,
+)
 
 # The complete transitive closure of methods the subagent-dispatch loop needs
 # that the lean SDK Feature base does NOT provide. (``to_orchestrator_tool``,
@@ -67,11 +83,16 @@ def ensure_subagent_dispatch(feature_class: Type) -> Type:
 
     Injection never overrides a method the feature already defines, so a feature
     is free to supply its own ``execute_as_subagent`` / ``handle_task``.
+
+    Adopting an external feature also installs :class:`SdkToolLogSummary`,
+    because its tools still run through the SDK's ``get_tools()`` wrapper.
     """
     from kestrel_sovereign.features.base import Feature as _SovereignFeature
 
     if issubclass(feature_class, _SovereignFeature):
         return feature_class
+
+    summarize_sdk_tool_logs()
 
     mixin_ns: dict[str, object] = {}
     for name in _DISPATCH_METHODS:
@@ -104,3 +125,104 @@ def ensure_subagent_dispatch(feature_class: Type) -> Type:
             "__doc__": feature_class.__doc__,
         },
     )
+
+
+# The SDK wrapper is ``DynamicTool.execute`` inside
+# ``kestrel_sdk.features.base.Feature.get_tools``; it logs through that
+# module's logger. The two record shapes it writes (SDK 0.46):
+#   "Error executing tool {name}: {error}"                (f-string, no args)
+#   "Rejected tool call — %s" % "{name}: parameter '{p}' expects type '{t}',
+#       but received {repr(value)[:120]} ({type}), which is not a valid {t}"
+_SDK_TOOL_WRAPPER_FUNCTION = "execute"
+_SDK_TOOL_ERROR = re.compile(r"Error executing tool (?P<tool>[\w.\-]+): ")
+_SDK_REJECTED_CALL = "Rejected tool call — %s"
+_SDK_REJECTED_ARGUMENT = re.compile(
+    r"(?P<head>[\w.\-]+: parameter '\w+' expects type '\w+'), "
+    r"but received (?P<value>.*)",
+    re.DOTALL,
+)
+_TOOL_ERROR_SUMMARY = "Error executing tool %s: %s"
+_REJECTED_ARGUMENT_SUMMARY = "Rejected tool call — %s, but received %s"
+_WITHHELD_SUMMARY = "SDK tool wrapper record withheld: %s"
+_WITH_FRAMES = "{}\n%s"
+# Every template this filter writes, so a record it already rewrote (a second
+# install, a handler that filters again) passes unchanged.
+_SUMMARIES = frozenset(
+    template
+    for summary in (_TOOL_ERROR_SUMMARY, _REJECTED_ARGUMENT_SUMMARY, _WITHHELD_SUMMARY)
+    for template in (summary, _WITH_FRAMES.format(summary))
+)
+
+
+class SdkToolLogSummary(logging.Filter):
+    """Keep tool content out of the SDK tool wrapper's log records (#3919).
+
+    The SDK wrapper logs a tool's exception message, and up to 120 characters
+    of an argument that failed its declared type. A tool's exception can quote
+    what it read from the store, which keeps it encrypted, and the host log is
+    plaintext at every level. Core's own wrapper logs the exception's class and
+    :func:`content_log_summary` instead; this gives the SDK wrapper's records
+    the same shape, so an extracted feature's tools log what an in-tree
+    feature's tools log.
+
+    Only log records change; what the wrapper returns to the model is the
+    SDK's. A record from the wrapper that has neither known shape is withheld
+    whole, its summary kept, rather than passed through: a reworded SDK record
+    must not start leaking again.
+    """
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        if record.funcName != _SDK_TOOL_WRAPPER_FUNCTION or (
+            isinstance(record.msg, str) and record.msg in _SUMMARIES
+        ):
+            return True
+        # Read before the record changes: the wrapper logs from inside its
+        # ``except``, so the tool's exception is the one being handled.
+        error = sys.exception()
+        record.msg, record.args = _summary(record, error)
+        if record.exc_info:
+            # Rendering ``exc_info`` ends with ``Type: message``. Keep where
+            # it failed, not what it said.
+            logged = record.exc_info[1]
+            record.msg = _WITH_FRAMES.format(record.msg)
+            record.args = (*record.args, exception_frames(logged) if logged else "")
+            record.exc_info = None
+            record.exc_text = None
+        return True
+
+
+def _summary(record: logging.LogRecord, error: BaseException | None):
+    """The content-free ``(msg, args)`` for one SDK wrapper record."""
+    if (
+        record.msg == _SDK_REJECTED_CALL
+        and isinstance(record.args, tuple)
+        and len(record.args) == 1
+    ):
+        match = _SDK_REJECTED_ARGUMENT.fullmatch(str(record.args[0]))
+        if match:
+            return _REJECTED_ARGUMENT_SUMMARY, (
+                match["head"], content_log_summary(match["value"]),
+            )
+    try:
+        rendered = record.getMessage()
+    except (TypeError, ValueError):
+        # A record whose arguments do not fit its format; raising here would
+        # escape into the wrapper's own ``except`` and fail the tool call.
+        rendered = repr((record.msg, record.args))
+    if error is not None:
+        match = _SDK_TOOL_ERROR.match(rendered)
+        if match and rendered[match.end():] == str(error):
+            return _TOOL_ERROR_SUMMARY, (match["tool"], exception_log_summary(error))
+    return _WITHHELD_SUMMARY, (content_log_summary(rendered),)
+
+
+_SDK_TOOL_LOG_SUMMARY = SdkToolLogSummary()
+
+
+def summarize_sdk_tool_logs() -> None:
+    """Install :class:`SdkToolLogSummary` on the SDK feature logger, once.
+
+    A logger's own filter sees every record that logger creates, whichever
+    handlers (the host log, the launch log, a test's capture) receive it.
+    """
+    _sdk_feature_base.logger.addFilter(_SDK_TOOL_LOG_SUMMARY)
