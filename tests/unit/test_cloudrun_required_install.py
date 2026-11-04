@@ -48,27 +48,34 @@ def _probe_wheel(directory: Path, module: str) -> Path:
     return wheel
 
 
-def _installation_command() -> str:
+def _installation_command(dockerfile_name: str) -> str:
     """Use the actual RUN program; substitute only owned dependency targets."""
-    dockerfile = Path(__file__).resolve().parents[2] / "docker/Dockerfile.multi_agent"
+    dockerfile = Path(__file__).resolve().parents[2] / "docker" / dockerfile_name
     text = dockerfile.read_text()
-    command = text.split("RUN --mount=type=secret,id=github_token \\\n", 1)[1]
-    command = command.split("\n\n", 1)[0].replace("\\\n", " ")
+    if dockerfile_name == "Dockerfile.cloudrun":
+        command = text.split("RUN --mount=type=secret,id=github_token <<'EOF'\n", 1)[1]
+        command = command.split("\nEOF", 1)[0]
+    else:
+        command = text.split("RUN --mount=type=secret,id=github_token \\\n", 1)[1]
+        command = command.split("\n\n", 1)[0].replace("\\\n", " ")
     command = command.replace("/app/.venv/bin/python", '"$INSTALL_TEST_PYTHON"')
     command = command.replace("/app/.venv", '"$INSTALL_TEST_VENV"')
     command = command.replace("/run/secrets/github_token", '"$INSTALL_TEST_TOKEN_FILE"')
-    core = 'uv pip install --python "$INSTALL_TEST_PYTHON" .'
-    feature = (
-        '"kestrel-feature-github-app @ '
-        'git+https://github.com/KestrelSovereignAI/kestrel-feature-github-app.git"'
-    )
-    assert command.count(core) == command.count(feature) == 1
-    return command.replace(core, core[:-1] + '"$INSTALL_TEST_CORE"').replace(
-        feature, '"$INSTALL_TEST_FEATURE"'
-    )
+    core_prefix = 'uv pip install --python "$INSTALL_TEST_PYTHON" '
+    core = core_prefix + "'.[mcp-integration]'"
+    assert command.count(core) == 1, "The image must install Core's MCP integration extra"
+    command = command.replace(core, core_prefix + '"$INSTALL_TEST_CORE"')
+    if dockerfile_name == "Dockerfile.multi_agent":
+        feature = (
+            '"kestrel-feature-github-app @ '
+            'git+https://github.com/KestrelSovereignAI/kestrel-feature-github-app.git"'
+        )
+        assert command.count(feature) == 1
+        command = command.replace(feature, '"$INSTALL_TEST_FEATURE"')
+    return command
 
 
-def _run_install(tmp_path: Path, *, failure: str | None, authenticated: bool):
+def _run_install(tmp_path: Path, *, dockerfile_name: str, failure: str | None, authenticated: bool):
     assert shutil.which("uv") is not None, "The image installation contract requires uv"
     shell = shutil.which("sh")
     assert shell is not None, "The Linux image installation contract requires a POSIX shell"
@@ -104,7 +111,7 @@ def _run_install(tmp_path: Path, *, failure: str | None, authenticated: bool):
     elif failure == "feature":
         env["INSTALL_TEST_FEATURE"] = "git+" + (tmp_path / "missing-feature-repository").as_uri()
     result = subprocess.run(
-        [shell, "-c", _installation_command()],
+        [shell, "-c", _installation_command(dockerfile_name)],
         cwd=tmp_path,
         env=env,
         capture_output=True,
@@ -115,9 +122,17 @@ def _run_install(tmp_path: Path, *, failure: str | None, authenticated: bool):
 
 
 @pytest.mark.parametrize("authenticated", [False, True])
-@pytest.mark.parametrize("failure", ["venv", "core", "feature"])
-def test_required_installation_failure_fails_the_image(tmp_path, failure, authenticated):
-    result, _, _ = _run_install(tmp_path, failure=failure, authenticated=authenticated)
+@pytest.mark.parametrize("dockerfile_name,failure", [
+    (dockerfile_name, failure)
+    for dockerfile_name, failures in [
+        ("Dockerfile.cloudrun", ["venv", "core"]),
+        ("Dockerfile.multi_agent", ["venv", "core", "feature"]),
+    ]
+    for failure in failures
+])
+def test_required_installation_failure_fails_the_image(tmp_path, dockerfile_name, failure, authenticated):
+    result, _, _ = _run_install(tmp_path, dockerfile_name=dockerfile_name,
+                              failure=failure, authenticated=authenticated)
     assert result.returncode != 0, (
         f"Required {failure} installation failed but Docker RUN reported success:\n"
         f"{result.stdout}\n{result.stderr}"
@@ -127,11 +142,16 @@ def test_required_installation_failure_fails_the_image(tmp_path, failure, authen
 
 
 @pytest.mark.parametrize("authenticated", [False, True])
-def test_successful_image_installs_both_packages_and_clears_build_auth(tmp_path, authenticated):
-    result, venv, gitconfig = _run_install(tmp_path, failure=None, authenticated=authenticated)
+@pytest.mark.parametrize("dockerfile_name", ["Dockerfile.cloudrun", "Dockerfile.multi_agent"])
+def test_successful_image_installs_required_packages_and_clears_build_auth(
+    tmp_path, dockerfile_name, authenticated,
+):
+    result, venv, gitconfig = _run_install(tmp_path, dockerfile_name=dockerfile_name,
+                                        failure=None, authenticated=authenticated)
     assert result.returncode == 0, result.stdout + result.stderr
     installed = subprocess.run(
-        [str(venv / "bin/python"), "-I", "-c", "import docker_core_probe, docker_feature_probe"],
+        [str(venv / "bin/python"), "-I", "-c", "import docker_core_probe" +
+         (", docker_feature_probe" if dockerfile_name == "Dockerfile.multi_agent" else "")],
         capture_output=True,
         text=True,
         timeout=10,
