@@ -2028,6 +2028,7 @@ class KestrelAgent(
         # race the continuation exists to prevent.
         self._durable_shutdown_continuation: Optional[asyncio.Task] = None
         self._durable_shutdown_continuation_lock = asyncio.Lock()
+        self._durable_shutdown_tail_tasks: set[asyncio.Task] = set()
 
         # Cancellation tracking for stop button functionality
         self._current_request_id: Optional[str] = None
@@ -9892,6 +9893,14 @@ Expected Duration: {expected_duration}
                 if isinstance(owner, asyncio.Future) and not owner.done()
                 and owner is not current and owner not in ancestors
             }
+            # A finite observation deadline is not a native retirement failure.
+            # Join the exact accepted tail tasks, including completed tasks
+            # whose terminal callback has not yet run. Only their original
+            # outcomes enter the shared native-control inventory.
+            pending.update(
+                owner for owner in self._durable_shutdown_tail_tasks
+                if owner is not current and owner not in ancestors
+            )
             if pending:
                 for owner in pending:
                     outcome = await await_owned_task(owner)
@@ -9900,6 +9909,8 @@ Expected Duration: {expected_duration}
                     if outcome.cancellation is not None:
                         finite_outcomes.append(outcome.cancellation)
                     self._remember_shutdown_control(outcome.error)
+                    if owner.done():
+                        self._durable_shutdown_tail_tasks.discard(owner)
                 continue  # Harvest any native child debt published by that owner.
             continuation = self._durable_shutdown_continuation
             if continuation is None:
@@ -11026,27 +11037,30 @@ Expected Duration: {expected_duration}
             cannot stand in for joining an accepted physical closer. A done
             callback harvests the legacy task's eventual exception too.
             """
-            task.cancel()  # cooperative first; unblocks well-behaved steps
             if retirement_resource is not None:
                 from kestrel_sovereign._async_ownership import (
                     owned_task_error,
-                    pending_owned_retirement_error,
                 )
-
-                retained = pending_owned_retirement_error(
-                    retirement_resource, (task,),
-                    message="original native shutdown owner exceeded its observer guard",
-                )
-                self._remember_shutdown_control(retained, retain_originals=True)
+                # The observer spent its budget; the admitted native operation
+                # still owns its work and eventual physical retirement. Do not
+                # cancel it or turn this observer timeout into permanent native
+                # failure evidence. The lifecycle/reaper joins the same task.
+                self._durable_shutdown_tail_tasks.add(task)
 
                 def retain_native_terminal(completed):
-                    self._remember_shutdown_control(execution_terminal_error(
-                        vars(self).get("_shutdown_control"), retained,
+                    self._remember_shutdown_control(
                         owned_task_error(completed), retain_originals=True,
-                    ))
+                    )
 
-                task.add_done_callback(retain_native_terminal)
+                try:
+                    task.add_done_callback(retain_native_terminal)
+                except BaseException as publication:
+                    # Keep the accepted owner even if publishing its observer
+                    # fails; report that finite fault after independent cleanup.
+                    self._remember_shutdown_control(publication)
+                    admission_failures.append(publication)
                 return  # NEVER close the coroutine joining its native closer.
+            task.cancel()  # cooperative first for legacy, non-native steps
             coro = task.get_coro()
             if coro is not None:
                 try:
@@ -11160,8 +11174,9 @@ Expected Duration: {expected_duration}
                 return "cancelled"
 
             if task not in done:
-                # Exceeded the guard. Hard-terminate but do NOT await — the step
-                # may suppress cancellation and would otherwise hang us.
+                # This observation spent its guard. Retain accepted native
+                # work for the lifecycle join; legacy steps keep their bounded
+                # unwind rather than extending this observer indefinitely.
                 _abandon(task, retirement_resource=retirement_resource)
                 if not defer_failure_report:
                     logging.warning(
