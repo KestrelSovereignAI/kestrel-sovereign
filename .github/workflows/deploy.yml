@@ -111,7 +111,7 @@ jobs:
       # configure-docker`` to push to gcr.io. The ``auth`` action above
       # writes a short-lived federation configuration and points
       # GOOGLE_APPLICATION_CREDENTIALS at it; gcloud picks that up here.
-      # Build/upload ignore rules exclude that file from image contexts.
+      # Rollout requires the build/upload credential exclusions from #3929.
       - name: Set up Cloud SDK
         uses: google-github-actions/setup-gcloud@e427ad8a34f8676edf47cf7d7925499adf3eb74f # v2.2.1
 

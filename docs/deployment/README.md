@@ -77,8 +77,9 @@ Do not broaden another repository's existing provider. See Google's
 
 The authentication action still writes a temporary `gha-creds-*.json`
 federation configuration in the checkout for gcloud and Docker credential
-refresh. Keep root and nested files excluded from Docker and gcloud contexts;
-short-lived credentials must not enter an image either. Verify a real OIDC
+refresh. Rollout requires the root and nested credential exclusions in
+[PR #3929](https://github.com/KestrelSovereignAI/kestrel-sovereign/pull/3929)
+first; short-lived credentials must not enter an image either. Verify a real OIDC
 build/deployment before removing the old repository key secret. Retire an old
 key only after identifying and migrating its other consumers; a key embedded
 in a historical image remains usable until disabled or deleted.
