@@ -13,7 +13,7 @@ import re
 import time
 from copy import deepcopy
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, List
+from typing import Any, Callable, Collection, Dict, List
 from uuid import uuid4
 
 from kestrel_sdk.resources import ResourceConflict, ResourceOutcomeUnknown
@@ -224,7 +224,9 @@ class ToolRegistryMixin:
     # list request, so every dynamically-generated name is bounded here.
     MAX_TOOL_NAME_LEN = 64
 
-    def _bounded_unique_tool_name(self, candidate: str) -> str:
+    def _bounded_unique_tool_name(
+        self, candidate: str, reserved: Collection[str] = (),
+    ) -> str:
         """Return a provider-safe (<=64 char), registry-unique tool name.
 
         Provider function names must match ``^[a-zA-Z0-9_-]+$``; MCP tool names
@@ -238,20 +240,22 @@ class ToolRegistryMixin:
         or URLs once prefixed) are then truncated and suffixed with a short
         stable hash of the full candidate. Any residual collision (including
         ones created by sanitisation, e.g. ``fetch.raw`` and ``fetch/raw``) gets
-        a numeric suffix. Uniqueness is checked against ``_direct_tools`` so two
-        owners can never end up writing the same schema name.
+        a numeric suffix. Uniqueness is checked against ``_direct_tools`` and
+        ``reserved`` (the names a batch not yet committed has claimed) so two
+        owners, or two tools of one batch, can never end up writing the same
+        schema name.
         """
         candidate = re.sub(r"[^a-zA-Z0-9_-]", "_", str(candidate))
         limit = self.MAX_TOOL_NAME_LEN
         if len(candidate) > limit:
             digest = hashlib.sha1(candidate.encode()).hexdigest()[:8]
             candidate = f"{candidate[: limit - 9]}_{digest}"
-        if candidate not in self._direct_tools:
+        if candidate not in self._direct_tools and candidate not in reserved:
             return candidate
         base = candidate[: limit - 4]
         suffix = 2
         name = f"{base}_{suffix}"
-        while name in self._direct_tools:
+        while name in self._direct_tools or name in reserved:
             suffix += 1
             name = f"{base}_{suffix}"
         return name
@@ -459,6 +463,16 @@ class ToolRegistryMixin:
         when this owner is registered again, unmounted, or evicted, even when
         the same tool object is reused. Callbacks must not mutate the registry.
 
+        A batch is mounted whole or not at all (#3923). If iterating ``tools``,
+        reading a tool's ``name`` or ``schema``, or converting its schema
+        raises, the exception propagates and the registry is exactly as it was:
+        no handle, definition, ownership, owner epoch (so the owner's retained
+        bindings stay valid), pin or generation changes. Eviction and the
+        callbacks run after the batch has committed, so an exception from
+        ``on_registered`` propagates with the batch still mounted: the later
+        callbacks are not called, and :meth:`unregister_dynamic_tools` retires
+        the whole batch.
+
         Permissions: a tool not present in the security permission store
         resolves to ``PermissionLevel.ASK`` (the safe default — never a silent
         ALLOW), so dynamically-mounted tools are always gated. Letting an
@@ -469,33 +483,47 @@ class ToolRegistryMixin:
         if on_registered is not None and not callable(on_registered):
             raise TypeError("on_registered must be callable")
         safe_owner = re.sub(r"\W+", "_", str(owner))
+        # Prepare the whole batch without touching the registry: iterating
+        # ``tools``, a tool's ``name``/``schema`` and its schema conversion are
+        # plugin code, and any of it can raise.
+        prepared = []
+        claimed: set[str] = set()
+        for tool in list(tools):
+            name = tool.name
+            if name in self._direct_tools or name in claimed:
+                name = f"{safe_owner}__{name}"
+            # Bound to the provider name cap AND guarantee uniqueness — covers
+            # long MCP owner/tool identifiers and the case where two owners
+            # sanitise to the same prefix and expose a colliding tool name.
+            name = self._bounded_unique_tool_name(name, claimed)
+            schema = tool.schema
+            # A copy: a schema may hand back the dict it caches, which can
+            # already be advertised (this tool remounted, or mounted by another
+            # owner), and the rename must not reach it before the commit.
+            tool_def = deepcopy(schema.to_openai_format())
+            tool_def["function"]["name"] = name
+            visible = getattr(schema, "model_visible", True) is not False
+            claimed.add(name)
+            prepared.append((name, tool, tool_def, visible))
+        # Commit, with nothing that can raise in between. The epoch insert goes
+        # first because it is the first to hash ``owner`` (an unhashable owner
+        # is the one failure left), and a dict insert that fails changes nothing.
         registration = object()
         self._explored_features[owner] = registration
         if pin:
             self._pinned_features.add(owner)
-        mounted = []
-        for tool in tools:
-            name = tool.name
-            if name in self._direct_tools:
-                name = f"{safe_owner}__{tool.name}"
-            # Bound to the provider name cap AND guarantee uniqueness — covers
-            # long MCP owner/tool identifiers and the case where two owners
-            # sanitise to the same prefix and expose a colliding tool name.
-            name = self._bounded_unique_tool_name(name)
+        for name, tool, tool_def, visible in prepared:
             self._direct_tools[name] = tool
-            tool_def = tool.schema.to_openai_format()
-            tool_def["function"]["name"] = name
-            if getattr(tool.schema, "model_visible", True) is not False:
+            if visible:
                 self._direct_tool_defs.append(tool_def)
             self._tool_to_feature[name] = owner
-            mounted.append((name, tool))
         bump_registry_generation(self)
         self._maybe_evict_direct_tools()
-        retained = [(name, tool) for name, tool in mounted
+        retained = [(name, tool) for name, tool, _, _ in prepared
                     if self._direct_tools.get(name) is tool]
         registered = len(retained)
         logging.info(
-            f"[DYNAMIC-TOOLS] Registered {registered} of {len(mounted)} direct "
+            f"[DYNAMIC-TOOLS] Registered {registered} of {len(prepared)} direct "
             f"tools for '{owner}'. Total: {len(self._direct_tools)}"
         )
         if on_registered is not None:
