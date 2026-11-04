@@ -3,12 +3,17 @@
 import asyncio
 import json
 import sqlite3
+from contextlib import closing
 from types import SimpleNamespace
 
 import httpx
 import httpx2
 import openai
 import pytest
+
+from tests.shared.sqlite_retirement import (
+    owned_sqlite_observers as owned_sqlite_observers,
+)
 
 from kestrel_sovereign._async_ownership import await_owned_task, owned_task_join_ancestors
 from kestrel_sovereign.execution_custody import (
@@ -21,6 +26,8 @@ from kestrel_sovereign.llm.openrouter_adapter import OpenRouterAdapter
 from tests.unit.test_execution_custody_review29 import native_owner, retire
 from tests.unit.test_execution_custody_review32 import receipt
 from tests.unit.test_host_context_native_cleanup import _actual_operation
+
+pytestmark = pytest.mark.usefixtures("owned_sqlite_observers")
 
 
 class Body(httpx.AsyncByteStream, httpx2.AsyncByteStream):
@@ -242,7 +249,7 @@ async def test_cancellation_harvests_original_native_child_receipt(tmp_path, kin
             parent.cancel()
         outcome = await await_owned_task(parent)
         assert outcome.error is original, "caller cancellation replaced the child native receipt"
-        with sqlite3.connect(tmp_path / "native.db") as observer:
+        with closing(sqlite3.connect(tmp_path / "native.db")) as observer, observer:
             assert observer.execute("SELECT COUNT(*) FROM effects").fetchone()[0] == 1
     finally:
         await await_owned_task(parent)
@@ -356,7 +363,7 @@ async def test_restart_wake_consumers_preserve_native_receipts(tmp_path, monkeyp
     try:
         outcome = await await_owned_task(asyncio.create_task(operation))
         assert outcome.error is original
-        with sqlite3.connect(tmp_path / "native.db") as observer:
+        with closing(sqlite3.connect(tmp_path / "native.db")) as observer, observer:
             assert observer.execute("SELECT COUNT(*) FROM effects").fetchone()[0] == 1
     finally:
         await retire(agent)

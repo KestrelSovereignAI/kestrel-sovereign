@@ -2,9 +2,14 @@
 
 import asyncio
 import sqlite3
+from contextlib import closing
 from types import SimpleNamespace
 
 import pytest
+
+from tests.shared.sqlite_retirement import (
+    owned_sqlite_observers as owned_sqlite_observers,
+)
 
 from kestrel_sovereign._async_ownership import await_owned_task
 from kestrel_sovereign.agent.boot import BootContext, BootPhase, BootPhaseState, run_boot_sequence
@@ -17,6 +22,8 @@ from tests.unit.test_execution_custody_review29 import native_owner, retire
 from tests.unit.test_execution_custody_review30 import service_owner
 from tests.unit.test_execution_custody_review32 import receipt
 from tests.unit.test_inference_lease_coordinator import _Provider, _LLMService
+
+pytestmark = pytest.mark.usefixtures("owned_sqlite_observers")
 
 
 KINDS = ["unknown", "cancel_unknown", "group"]
@@ -45,7 +52,7 @@ async def test_boot_unwinds_independent_native_effects_and_publishes_failed(tmp_
         outcome = await await_owned_task(asyncio.create_task(run_boot_sequence([BootPhase("late", phase)], ctx, states.append)))
         assert outcome.error is error, "boot replaced the original native rollback receipt"
         assert states[-1] is BootPhaseState.FAILED
-        with sqlite3.connect(tmp_path / "native.db") as observer:
+        with closing(sqlite3.connect(tmp_path / "native.db")) as observer, observer:
             assert observer.execute("SELECT id FROM effects ORDER BY id").fetchall() == [(1,), (2,)]
         assert ctx.custody.is_held("failed-native")
         assert not ctx.custody.is_held("independent")
@@ -154,7 +161,7 @@ async def test_late_boot_failure_joins_actual_llm_writer_before_borrowed_db(tmp_
         assert isinstance(outcome.error, ValueError)
         assert task.done() and closed.is_set()
         assert not service.has_pending_close_owners()
-        with sqlite3.connect(tmp_path / "native.db") as observer:
+        with closing(sqlite3.connect(tmp_path / "native.db")) as observer, observer:
             assert observer.execute("SELECT COUNT(*) FROM effects").fetchone()[0] == 1
     finally:
         release.set()
@@ -194,7 +201,7 @@ async def test_inference_tools_preserve_native_persistence_receipts(tmp_path, mo
         # The coordinator now classifies before ordinary provisioning wraps.
         # Preserve the original receipt itself, not merely an explicit cause.
         assert outcome.error is error
-        with sqlite3.connect(tmp_path / "native.db") as observer:
+        with closing(sqlite3.connect(tmp_path / "native.db")) as observer, observer:
             assert observer.execute("SELECT COUNT(*) FROM agent_metadata").fetchone()[0] == 1
         if route == "acquire":
             assert provider.acquire_calls == 0
@@ -262,7 +269,7 @@ async def test_optional_enablement_ddl_original_receipt_reaches_boot(tmp_path, m
             await agent._boot_phase_storage_privacy(BootContext(custody=agent._resource_custody()))
             outcome = await await_owned_task(asyncio.create_task(agent._boot_phase_a2a_observability_signals(BootContext(custody=agent._resource_custody()))))
             assert outcome.error is error, "optional boot initialization discarded its DDL receipt"
-            with sqlite3.connect(tmp_path / "boot.db") as observer:
+            with closing(sqlite3.connect(tmp_path / "boot.db")) as observer, observer:
                 assert observer.execute("SELECT COUNT(*) FROM sqlite_master WHERE name='feature_enablement'").fetchone()[0] == 1
     finally:
         await _cleanup(agent)

@@ -2,11 +2,16 @@
 
 import asyncio
 import sqlite3
+from contextlib import closing
 from types import SimpleNamespace
 
 import httpx
 import openai
 import pytest
+
+from tests.shared.sqlite_retirement import (
+    owned_sqlite_observers as owned_sqlite_observers,
+)
 
 from kestrel_sovereign._async_ownership import await_owned_task
 from kestrel_sovereign.execution_custody import (
@@ -19,9 +24,10 @@ from kestrel_sovereign.llm.modality_recording import ModalityCall
 from kestrel_sovereign.multi_agent.agent_manager import AgentManager
 from kestrel_sovereign.storage.async_database import AsyncDatabase
 from kestrel_sovereign.storage.db.sqlite import SQLiteBackend
-from tests.unit.test_execution_custody_review29 import native_owner, retire
 from tests.unit.test_execution_custody_review30 import service_owner
 from tests.unit.test_execution_custody_review32 import receipt
+
+pytestmark = pytest.mark.usefixtures("owned_sqlite_observers")
 
 
 @pytest.mark.asyncio
@@ -62,7 +68,7 @@ async def test_local_anchor_native_commit_preserves_original_scopes(
         try:
             outcome = await await_owned_task(asyncio.create_task(invoke()))
             expected = "committed" if boundary == "post_ack_retirement" else "unknown"
-            with sqlite3.connect(path) as observer:
+            with closing(sqlite3.connect(path)) as observer, observer:
                 assert observer.execute("SELECT COUNT(*) FROM effects").fetchone()[0] == 1
             assert execution_commit_outcome(outcome.error) == expected, "native anchor commit lost its outcome"
             for scope in scopes:
@@ -190,7 +196,7 @@ async def test_native_vector_commit_receipt_cannot_authorize_fallback_replay(tmp
     try:
         outcome = await await_owned_task(asyncio.create_task(invoke()))
         assert outcome.error is failure, "native vector receipt authorized legacy replay"
-        with sqlite3.connect(path) as observer:
+        with closing(sqlite3.connect(path)) as observer, observer:
             table = "effects" if surface == "rag_vector" else "conversation_history"
             assert observer.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0] == 1
     finally:
@@ -246,7 +252,7 @@ async def test_embedding_fallback_never_suppresses_native_control(tmp_path, monk
         await db.execute("INSERT INTO effects VALUES(1)")
         raise failure
     def resolver(*_args):
-        with sqlite3.connect(tmp_path / "embedding.db") as native:
+        with closing(sqlite3.connect(tmp_path / "embedding.db")) as native, native:
             native.execute("INSERT INTO effects VALUES(1)")
         raise failure
     rag = AsyncRAGStore(db)
