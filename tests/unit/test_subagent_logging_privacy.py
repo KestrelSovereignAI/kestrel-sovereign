@@ -6,9 +6,11 @@ encrypted. Their results, the subagent's final answer, the task it was handed,
 a hook's refusal reason and an exception's message were all logged as text or
 as a 100-500 character prefix, at INFO, into a plaintext host log. Each now
 logs only its length and a process-keyed digest (``content_log_summary``),
-plus names, decisions and timing. An extracted feature's tools run through the
-SDK's own wrapper, whose records Core summarizes the same way when it adopts
-the feature.
+plus names, decisions and timing. A refused call's argument error names the
+arguments the caller sent, so its log lines get the same summary while the
+model still gets the whole error. These are Core's log sites; an extracted
+feature's tools run through the SDK's own wrapper, whose records the SDK owns
+(kestrel-sovereign-sdk#105).
 
 Every test captures at DEBUG, because DEBUG is a supported operator level and
 its records persist as well, and looks for the markers in every field of every
@@ -24,8 +26,6 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from kestrel_sdk.features import base as sdk_feature_base
-from kestrel_sdk.features.base import Feature as SdkFeature, tool as sdk_tool
 from kestrel_sdk.hooks.base import (
     Hook,
     HookEvent,
@@ -40,10 +40,6 @@ from kestrel_sdk.tools.base import ToolCategory, ToolSchema
 
 from kestrel_sovereign.agent.orchestrator_engine import OrchestratorEngineMixin
 from kestrel_sovereign.features.base import Feature, tool
-from kestrel_sovereign.features.subagent_dispatch import (
-    SdkToolLogSummary,
-    ensure_subagent_dispatch,
-)
 from kestrel_sovereign.hooks.manager import HooksManager
 from kestrel_sovereign.logging_config import (
     exception_frames,
@@ -56,6 +52,13 @@ from tests.unit.test_execute_named_tool import (
     _MinimalOrchestrator,
     _SubagentFeature,
 )
+from tests.unit.test_tool_allowlist_registry import (  # noqa: F401
+    _make_feature,
+    _make_tool,
+    _tool_call,
+    agent,
+    dispatch_agent,
+)
 from tests.utils.log_records import records_containing
 
 # None of these letters is a hex digit, so no digest can spell one by chance.
@@ -64,12 +67,12 @@ ANSWER_MARKER = "ANSWER-MARKER-ruKpYt"
 TASK_MARKER = "TASK-MARKER-wLmQzs"
 REASON_MARKER = "REASON-MARKER-yRtNvk"
 ERROR_MARKER = "ERROR-MARKER-hJxWqp"
-ARGUMENT_MARKER = "ARGUMENT-MARKER-sGtLnz"
+# An argument name the caller made up, as a model does (#3396).
+ARGUMENT_MARKER = "PRIVATE_ARGUMENT_sGtLnz"
 MARKERS = (
     TOOL_MARKER, ANSWER_MARKER, TASK_MARKER, REASON_MARKER, ERROR_MARKER,
     ARGUMENT_MARKER,
 )
-SDK_FEATURE_LOGGER = sdk_feature_base.logger
 
 SUMMARY = re.compile(r"chars=\d+ digest=[0-9a-f]+")
 
@@ -161,13 +164,13 @@ def _feature(llm, tool_, hooks=()):
     manager = HooksManager()
     for hook in hooks:
         manager.register(hook)
-    agent = SimpleNamespace(
+    host = SimpleNamespace(
         llm_service=llm,
         did="did:test:probe",
         hooks_manager=manager,
         get_turn_bound_session_id=lambda: "sess-3919",
     )
-    feature = _ProbeFeature(agent)
+    feature = _ProbeFeature(host)
     feature._fake_tools = [tool_]
     return feature
 
@@ -429,8 +432,8 @@ def _subagent_feature(side_effect=None):
     return feature
 
 
-async def _dispatch_feature(agent, feature):
-    return await agent._dispatch_feature_tool(
+async def _dispatch_feature(host, feature):
+    return await host._dispatch_feature_tool(
         tool_call=SimpleNamespace(name=feature.tool_name),
         feature=feature,
         args={"task": "find it"},
@@ -441,12 +444,12 @@ async def _dispatch_feature(agent, feature):
     )
 
 
-async def _dispatch_direct(agent, tool_):
-    agent._direct_tools["send_email"] = tool_
-    return await agent._dispatch_direct_tool(
-        tool_call=SimpleNamespace(name="send_email"),
-        tool_name="send_email",
-        args={},
+async def _dispatch_direct(host, tool_, name="send_email", args=None):
+    host._direct_tools[name] = tool_
+    return await host._dispatch_direct_tool(
+        tool_call=SimpleNamespace(name=name),
+        tool_name=name,
+        args=args or {},
         dispatch_start=0.0,
         dispatch_event_id="evt-direct",
         session_id="sess-3919",
@@ -517,7 +520,7 @@ async def test_chat_path_subagent_failure_keeps_frames_without_the_message(debug
 
 @pytest.mark.asyncio
 async def test_governed_refusal_reasons_are_logged_as_summaries(debug_caplog):
-    agent = _MinimalOrchestrator(
+    host = _MinimalOrchestrator(
         features={
             "email": _FakeFeature("email", [_FakeTool("send_email", returns={"ok": 1})]),
             "memory": _SubagentFeature("memory_feature", returns={"ok": 1}),
@@ -528,10 +531,10 @@ async def test_governed_refusal_reasons_are_logged_as_summaries(debug_caplog):
         ),
     )
 
-    tool_result = await agent.execute_named_tool(
+    tool_result = await host.execute_named_tool(
         "send_email", {}, session_id="s", source="codex_app_server",
     )
-    subagent_result = await agent.execute_named_tool(
+    subagent_result = await host.execute_named_tool(
         "memory_feature", {"task": "x"}, session_id="s", source="codex_app_server",
     )
 
@@ -547,7 +550,7 @@ async def test_governed_refusal_reasons_are_logged_as_summaries(debug_caplog):
 
 @pytest.mark.asyncio
 async def test_governed_subagent_failure_is_logged_by_class(debug_caplog):
-    agent = _MinimalOrchestrator(
+    host = _MinimalOrchestrator(
         features={
             "memory": _SubagentFeature(
                 "memory_feature", side_effect=RuntimeError(f"echoed {ERROR_MARKER}"),
@@ -556,7 +559,7 @@ async def test_governed_subagent_failure_is_logged_by_class(debug_caplog):
         hooks_manager=_FakeHooksManager(),
     )
 
-    result = await agent.execute_named_tool(
+    result = await host.execute_named_tool(
         "memory_feature", {"task": "x"}, session_id="s", source="codex_app_server",
     )
 
@@ -568,163 +571,193 @@ async def test_governed_subagent_failure_is_logged_by_class(debug_caplog):
 
 
 # ---------------------------------------------------------------------------
-# Extracted features: the SDK's own tool wrapper
+# Refused arguments: the error names what the caller sent
 # ---------------------------------------------------------------------------
 
 
-class _SdkRaisingFeature(SdkFeature):
-    """Built on the public SDK base, as a pip-installed feature is."""
-
-    tool_name = "sdk_probe"
+class _NotesFeature(Feature):
+    """A real ``@tool``: its schema lists the parameters it accepts."""
 
     @property
     def tool_description(self) -> str:
-        return "sdk probe"
+        return "notes"
 
-    async def initialize(self) -> None:
+    async def initialize(self):
         return None
 
-    @sdk_tool(name="fs_read", description="Raise with the content it read")
-    async def fs_read(self, q: str = "", limit: int = 10) -> dict:
-        raise OSError(f"could not parse {ERROR_MARKER}")
+    @tool(name="search_notes", description="Search the notes")
+    async def search_notes(self, query: str, limit: int = 5) -> dict:
+        return {"success": True, "query": query, "limit": limit}
 
 
-@pytest.fixture
-def bare_sdk_logger():
-    """The SDK feature logger as a fresh process has it: no summary filter.
-
-    The filter is process-wide once installed, so without this an earlier test
-    could install it and hide a door that never does.
-    """
-    ours = [f for f in SDK_FEATURE_LOGGER.filters if isinstance(f, SdkToolLogSummary)]
-    for installed in ours:
-        SDK_FEATURE_LOGGER.removeFilter(installed)
-    yield SDK_FEATURE_LOGGER
-    for installed in [
-        f for f in SDK_FEATURE_LOGGER.filters if isinstance(f, SdkToolLogSummary)
-    ]:
-        SDK_FEATURE_LOGGER.removeFilter(installed)
-    for installed in ours:
-        SDK_FEATURE_LOGGER.addFilter(installed)
+# What ``normalize_direct_tool_arguments`` tells the model, unchanged (#3396).
+ARGUMENT_REFUSAL = (
+    f"search_notes does not accept argument '{ARGUMENT_MARKER}'. "
+    "Valid parameters: query, limit."
+)
+REFUSED_ARGS = {"query": "heron", ARGUMENT_MARKER: "x"}
 
 
-def _sdk_feature(llm):
-    cls = ensure_subagent_dispatch(_SdkRaisingFeature)
-    return cls(SimpleNamespace(
-        llm_service=llm,
-        did="did:test:probe",
-        hooks_manager=HooksManager(),
-        get_turn_bound_session_id=lambda: "sess-3919",
-    ))
+class _AuditStore:
+    def __init__(self, error=None):
+        self.rows = []
+        self._error = error
+
+    async def log_decision(self, **row):
+        if self._error is not None:
+            raise self._error
+        self.rows.append(row)
+
+
+def _notes_orchestrator(store=None):
+    features = {"notes": _NotesFeature(SimpleNamespace())}
+    if store is not None:
+        features["SecurityFeature"] = SimpleNamespace(
+            permission_store=store, get_tools=lambda: [],
+        )
+    return _MinimalOrchestrator(features=features, hooks_manager=_FakeHooksManager())
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("door", sorted(DOORS))
-async def test_sdk_feature_tool_exception_is_logged_by_class_and_summary(
-    door, bare_sdk_logger, debug_caplog,
+async def test_governed_argument_refusal_names_the_argument_to_the_model_only(
+    debug_caplog,
 ):
-    """An extracted feature keeps the SDK's ``get_tools()`` wrapper, which
-    catches the tool's exception and logs it itself, before Core sees it."""
-    feature = _sdk_feature(DOORS[door]("fs_read"))
+    """``execute_named_tool`` logged the argument error itself and again
+    through ``record_tool_rejection``."""
+    store = _AuditStore()
+    host = _notes_orchestrator(store)
 
-    await feature.execute_as_subagent(task="read it")
-
-    leaks = _leaks(debug_caplog.records)
-    assert not leaks, leaks
-    [line] = _lines(debug_caplog.records, "Error executing tool fs_read")
-    assert re.fullmatch(
-        r"Error executing tool fs_read: OSError chars=\d+ digest=[0-9a-f]+", line,
-    ), line
-
-
-@pytest.mark.asyncio
-async def test_sdk_feature_tool_results_are_the_sdks(bare_sdk_logger, debug_caplog):
-    """Only the log records change: the model still gets the SDK's envelopes."""
-    [wrapped] = _sdk_feature(None).get_tools()
-
-    failed = await wrapped.execute()
-    rejected = await wrapped.execute(limit=f"{ARGUMENT_MARKER} the heron")
-
-    assert failed == {
-        "success": False,
-        "error": f"could not parse {ERROR_MARKER}",
-        "tool": "fs_read",
-    }
-    assert rejected["tool"] == "fs_read" and ARGUMENT_MARKER in rejected["error"]
-    leaks = _leaks(debug_caplog.records)
-    assert not leaks, leaks
-    [line] = _lines(debug_caplog.records, "Rejected tool call")
-    assert re.fullmatch(
-        r"Rejected tool call — fs_read: parameter 'limit' expects type 'integer', "
-        r"but received chars=\d+ digest=[0-9a-f]+",
-        line,
-    ), line
-
-
-def _sdk_wrapper_record(msg, args=()):
-    return logging.LogRecord(
-        SDK_FEATURE_LOGGER.name, logging.ERROR, "base.py", 1, msg, args, None,
-        func="execute",
+    result = await host.execute_named_tool(
+        "search_notes", dict(REFUSED_ARGS), session_id="s", source="codex_app_server",
     )
 
-
-@pytest.mark.parametrize(
-    "msg, args",
-    [
-        # No active exception, so nothing says where the tool name ends.
-        (f"Error executing tool fs_read: {ERROR_MARKER}", ()),
-        # A rejection the SDK words differently than the filter expects.
-        ("Rejected tool call — %s", (f"fs_read: {ARGUMENT_MARKER} is not a list",)),
-        # Any other record from the wrapper.
-        ("Coerced %s", (ARGUMENT_MARKER,)),
-    ],
-    ids=["error-without-exception", "rejection-reworded", "unknown"],
-)
-def test_sdk_wrapper_record_of_unknown_shape_is_withheld(msg, args):
-    record = _sdk_wrapper_record(msg, args)
-
-    SdkToolLogSummary().filter(record)
-
-    assert not _leaks([record])
+    assert result == {
+        "success": False, "error": f"Invalid tool arguments: {ARGUMENT_REFUSAL}",
+    }
+    assert host.hooks_manager.pre_calls == [], "refused before PRE_TOOL_USE"
+    # The audit row is unchanged: it records the refusal as the model got it.
+    [row] = store.rows
+    assert row["args_summary"].startswith(ARGUMENT_REFUSAL), row
+    leaks = _leaks(debug_caplog.records)
+    assert not leaks, leaks
+    [check] = _lines(debug_caplog.records, "[GOVERNED-DISPATCH] argument check failed")
     assert re.fullmatch(
-        r"SDK tool wrapper record withheld: chars=\d+ digest=[0-9a-f]+",
-        record.getMessage(),
-    ), record.getMessage()
+        r"\[GOVERNED-DISPATCH\] argument check failed source=codex_app_server "
+        r"tool=search_notes err=ToolArgumentError chars=\d+ digest=[0-9a-f]+",
+        check,
+    ), check
+    [refused] = _lines(debug_caplog.records, "[TOOL-GUARDRAIL] tool_validation refused")
+    assert re.fullmatch(
+        r"\[TOOL-GUARDRAIL\] tool_validation refused tool 'search_notes': "
+        r"reason chars=\d+ digest=[0-9a-f]+ \| allowlist .*",
+        refused,
+    ), refused
+    # One summary of one error: the two lines correlate without its text.
+    assert SUMMARY.search(check).group() == SUMMARY.search(refused).group()
 
 
-def test_sdk_wrapper_summary_is_idempotent():
-    """Filtering twice (two installs, or a handler copy) keeps the summary."""
-    summary = SdkToolLogSummary()
-    try:
-        raise ValueError(f"{ERROR_MARKER} the heron")
-    except ValueError as error:
-        record = _sdk_wrapper_record(f"Error executing tool fs_read: {error}")
-        summary.filter(record)
-        once = record.getMessage()
-        summary.filter(record)
+@pytest.mark.asyncio
+async def test_failed_refusal_audit_is_logged_as_summaries(debug_caplog):
+    host = _notes_orchestrator(_AuditStore(error=RuntimeError(f"row {ERROR_MARKER}")))
 
-    assert record.getMessage() == once
-    assert once.startswith("Error executing tool fs_read: ValueError chars=")
+    result = await host.execute_named_tool(
+        "search_notes", dict(REFUSED_ARGS), session_id="s", source="codex_app_server",
+    )
 
-
-def test_sdk_wrapper_exception_text_leaves_record_frames():
-    """A wrapper that logged with ``exc_info`` would render ``Type: message``."""
-    try:
-        raise ValueError(f"{ERROR_MARKER} the heron")
-    except ValueError as error:
-        record = _sdk_wrapper_record(f"Error executing tool fs_read: {error}")
-        record.exc_info = (type(error), error, error.__traceback__)
-        SdkToolLogSummary().filter(record)
-
-    assert record.exc_info is None and record.exc_text is None
-    assert not _leaks([record])
-    assert "test_sdk_wrapper_exception_text_leaves_record_frames" in record.getMessage()
+    assert ARGUMENT_MARKER in result["error"]
+    leaks = _leaks(debug_caplog.records)
+    assert not leaks, leaks
+    [failed] = _lines(debug_caplog.records, "[TOOL-GUARDRAIL] failed to record refusal")
+    assert re.fullmatch(
+        r"\[TOOL-GUARDRAIL\] failed to record refusal of 'search_notes' "
+        r"\(RuntimeError chars=\d+ digest=[0-9a-f]+\); reason chars=\d+ digest=[0-9a-f]+",
+        failed,
+    ), failed
 
 
-def test_adopting_sdk_features_installs_one_summary_filter(bare_sdk_logger):
-    ensure_subagent_dispatch(_SdkRaisingFeature)
-    ensure_subagent_dispatch(_SdkRaisingFeature)
+@pytest.mark.asyncio
+async def test_chat_path_argument_refusal_names_the_argument_to_the_model_only(
+    debug_caplog,
+):
+    [search_notes] = _NotesFeature(SimpleNamespace()).get_tools()
 
-    assert [
-        type(f) for f in bare_sdk_logger.filters if isinstance(f, SdkToolLogSummary)
-    ] == [SdkToolLogSummary]
+    result = await _dispatch_direct(
+        _ChatPathAgent(_DecidingHooks()), search_notes,
+        name="search_notes", args=dict(REFUSED_ARGS),
+    )
+
+    assert result == {"success": False, "error": ARGUMENT_REFUSAL}
+    leaks = _leaks(debug_caplog.records)
+    assert not leaks, leaks
+    [refused] = _lines(debug_caplog.records, "[DIRECT-TOOL] search_notes refused")
+    assert re.fullmatch(
+        r"\[DIRECT-TOOL\] search_notes refused: ToolArgumentError "
+        r"chars=\d+ digest=[0-9a-f]+",
+        refused,
+    ), refused
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "name, args",
+    [
+        ("search_notes", {"query": "heron", ARGUMENT_MARKER: {1}}),
+        ("memory_feature", {"task": "x", ARGUMENT_MARKER: {1}}),
+    ],
+    ids=["tool", "subagent"],
+)
+async def test_governed_argument_validation_is_logged_as_summary(
+    name, args, debug_caplog,
+):
+    """The input guardrail's error names an argument of the wrong type."""
+    host = _notes_orchestrator()
+    host.features["memory"] = _SubagentFeature("memory_feature", returns={"ok": 1})
+
+    result = await host.execute_named_tool(
+        name, args, session_id="s", source="codex_app_server",
+    )
+
+    assert result["success"] is False
+    assert f"argument '{ARGUMENT_MARKER}' has invalid type set" in result["error"]
+    # ``validate_tool_arguments`` also logs the error at its own site, outside
+    # this change; this checks every record the dispatcher itself writes.
+    dispatcher = [
+        r for r in debug_caplog.records
+        if r.name != "kestrel_sovereign.security.input_guardrails"
+    ]
+    leaks = _leaks(dispatcher)
+    assert not leaks, leaks
+    [failed] = [m for m in _lines(dispatcher, "[GOVERNED-DISPATCH] ") if "validation" in m]
+    assert "err=ToolValidationError chars=" in failed, failed
+
+
+@pytest.mark.asyncio
+async def test_chat_path_argument_validation_is_logged_as_summary(
+    dispatch_agent, debug_caplog,  # noqa: F811 - the imported fixture
+):
+    dispatch_agent.features = {
+        "MemoryFeature": _make_feature("memory_feature", [_make_tool("recall_a")]),
+    }
+
+    result = await dispatch_agent._dispatch_tool_call(
+        _tool_call("recall_a", {"query": "q", ARGUMENT_MARKER: {1}}),
+        dispatch_agent._visible_features_by_tool_name(),
+        dispatch_agent._known_tool_names(),
+        [],
+        0,
+        None,
+    )
+
+    assert f"argument '{ARGUMENT_MARKER}' has invalid type set" in str(result), result
+    dispatcher = [
+        r for r in debug_caplog.records
+        if r.name != "kestrel_sovereign.security.input_guardrails"
+    ]
+    leaks = _leaks(dispatcher)
+    assert not leaks, leaks
+    [failed] = [m for m in (r.getMessage() for r in dispatcher) if "Tool validation failed" in m]
+    assert re.search(
+        r"Tool validation failed: tool='recall_a' err=ToolValidationError "
+        r"chars=\d+ digest=[0-9a-f]+$",
+        failed,
+    ), failed
