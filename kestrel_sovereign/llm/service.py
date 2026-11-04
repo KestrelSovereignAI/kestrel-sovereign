@@ -17,6 +17,7 @@ from collections import deque
 from contextlib import asynccontextmanager, contextmanager
 from contextvars import ContextVar
 from dataclasses import replace
+from datetime import datetime, timezone
 from kestrel_sovereign._async_ownership import await_owned_task, raise_owned_outcome
 from kestrel_sovereign.security.access_log import redact_private_capability_tool_calls
 from kestrel_sovereign.llm.retry import state_aggregate_verdicts
@@ -72,6 +73,7 @@ from .invocation_context import (
 )
 from .constitutional_awareness import ConstitutionalAwarenessMixin
 from .remote_backend import REMOTE_ROUTE_NAME, BackendType, RemoteBackendMixin
+from .route_coverage import RouteCoverage, RouteOutcome, RouteState
 from .lifecycle import harvest_llm_close_task, llm_close_observation_control, start_llm_close_task
 from .decision_service import DecisionServiceMixin
 from .modality_recording import ModalityRecordingMixin
@@ -764,6 +766,11 @@ class LLMService(DecisionServiceMixin, ModalityRecordingMixin, ModelDiscoveryMix
         # Cleared by restarting the service (picks up rotated keys). Keys
         # are provider route names (matches provider["name"]).
         self._disabled_routes: dict[str, str] = {}
+
+        # How the most recent real attempt on each route ended, by route name:
+        # the health checks' evidence for the routes in use, so they never
+        # send a paid completion of their own to probe one (#3912).
+        self._route_outcomes: dict[str, RouteOutcome] = {}
 
         # Schema modules are imported while FastAPI builds its routes, before a
         # real agent-scoped LLM service exists. Freeze the conversation vector
@@ -1989,6 +1996,20 @@ class LLMService(DecisionServiceMixin, ModalityRecordingMixin, ModelDiscoveryMix
             "Route %s disabled for the rest of this session after permanent "
             "auth failure: %s. Rotate the key and restart to re-enable.",
             name, reason,
+        )
+
+    def _record_route_outcome(self, route: str, *, answered: bool) -> None:
+        """Record how one real attempt on ``route`` ended (#3912).
+
+        The evidence :meth:`route_coverage` reports for each route. Only the
+        outcome and its time are kept, never an error message.
+        """
+        outcomes = getattr(self, "_route_outcomes", None)
+        if outcomes is None:
+            # A service built without the constructor (a test double).
+            outcomes = self._route_outcomes = {}
+        outcomes[route] = RouteOutcome(
+            answered=answered, at=datetime.now(timezone.utc)
         )
 
     def _available_providers(
@@ -3349,6 +3370,107 @@ class LLMService(DecisionServiceMixin, ModalityRecordingMixin, ModelDiscoveryMix
             providers_to_use, target_model, meta, mandate_pin=mandate_pin
         )
 
+    def route_coverage(self) -> RouteCoverage:
+        """The routes the agent's next turn would try, and every other one (#3912).
+
+        Sends nothing. Each route carries only passive evidence: the outcome
+        of the most recent real call on it this session and, for a local
+        route, the startup reachability probe.
+
+        The routes in use are the dispatch's own decisions for a turn with no
+        per-call override, under the live privacy state:
+
+        - An active private inference lease the call would take
+          (:meth:`_remote_route_selected`, the predicate
+          ``_remote_route_attempt`` dispatches on) is the only route in use.
+          It takes precedence over every configured route and has no cloud
+          fallback, so every configured route is standby while it serves.
+        - Otherwise the chain :meth:`resolve_provider_routing` returns, less
+          the routes the dispatch loops skip before dispatch: a refused
+          plan-to-paid downgrade and an unauthorized vendor's route. Routing's
+          refusal (no usable route) is reported as ``routing_error``.
+
+        A route a permanent auth failure disabled this session is reported as
+        disabled, never as standby: a real call on it failed, and routing
+        skips it until the service restarts. Every other configured route is
+        standby: no turn tries it until routing changes.
+        """
+        outcomes = getattr(self, "_route_outcomes", None) or {}
+        probes = {
+            entry.get("name"): entry.get("status")
+            for entry in getattr(self, "reachability", None) or []
+            if isinstance(entry, dict)
+        }
+
+        def route_state(name: str, vendor: Optional[str], **extra: Any) -> RouteState:
+            return RouteState(
+                name=name,
+                vendor=vendor,
+                last_call=outcomes.get(name),
+                startup_probe=probes.get(name),
+                **extra,
+            )
+
+        configured = [
+            provider for provider in self.providers or []
+            if isinstance(provider, dict) and provider.get("name")
+        ]
+        disabled_reasons = dict(self._disabled_routes)
+        disabled = tuple(
+            route_state(
+                provider["name"],
+                provider.get("vendor"),
+                disabled_reason=disabled_reasons[provider["name"]],
+            )
+            for provider in configured
+            if provider["name"] in disabled_reasons
+        )
+
+        if self._remote_route_selected(
+            force_local_only=self._effective_force_local_only(False),
+            model_override=None,
+        ):
+            in_use = (
+                route_state(
+                    REMOTE_ROUTE_NAME,
+                    None,
+                    refusing_calls=not self._remote_route_accepting(),
+                ),
+            )
+        else:
+            try:
+                resolution = self.resolve_provider_routing()
+            except Exception as error:
+                if is_execution_control_error(error):
+                    raise
+                return RouteCoverage(
+                    in_use=None,
+                    disabled=disabled,
+                    routing_error=str(error) or type(error).__name__,
+                )
+            explicit_selection, authorized_vendors = resolution.meta
+            chain = resolution.providers
+            in_use_routes: Dict[str, RouteState] = {}
+            for index, provider in enumerate(chain):
+                if not explicit_selection and (
+                    self._skip_paid_fallback(provider, chain, index)
+                    or self._skip_unconfigured_route(provider, authorized_vendors)
+                ):
+                    continue
+                in_use_routes.setdefault(
+                    provider["name"],
+                    route_state(provider["name"], provider.get("vendor")),
+                )
+            in_use = tuple(in_use_routes.values())
+
+        not_standby = {route.name for route in in_use} | set(disabled_reasons)
+        standby = tuple(
+            route_state(provider["name"], provider.get("vendor"))
+            for provider in configured
+            if provider["name"] not in not_standby
+        )
+        return RouteCoverage(in_use=in_use, disabled=disabled, standby=standby)
+
     @staticmethod
     def _provider_supports_embeddings(provider: Dict[str, Any]) -> bool:
         capabilities = provider.get("capabilities") or {}
@@ -4591,6 +4713,12 @@ class LLMService(DecisionServiceMixin, ModalityRecordingMixin, ModelDiscoveryMix
         suppress the billing callback, and an observability-store outage cannot
         suppress Prometheus or the structured usage line.  Cancellation is
         deliberately never swallowed.
+
+        ``success`` is the telemetry and billing verdict, not how the route
+        did: a streamed attempt flushing partial usage is recorded as a
+        success even when its stream failed. Each dispatch leaf records the
+        route's outcome for the health checks itself, from the attempt's own
+        result (#3912).
         """
 
         if publish_identity and success:
@@ -4829,6 +4957,10 @@ class LLMService(DecisionServiceMixin, ModalityRecordingMixin, ModelDiscoveryMix
         recorded as a failed attempt, and a fallback loop moves on from it as
         from any other failure, except on a route whose harness owns its
         transport (:func:`~kestrel_sovereign.llm.streaming.is_harness_owned_stall`).
+
+        How the attempt ended is recorded for the health checks (#3912): a
+        failed call and a rejected generation as failed, an accepted response
+        as answered. A cancelled call ended in no outcome and records none.
         """
 
         def recorded_error(error: Exception) -> Exception:
@@ -4862,6 +4994,7 @@ class LLMService(DecisionServiceMixin, ModalityRecordingMixin, ModelDiscoveryMix
                 if is_execution_control_error(exc):
                     raise
                 await require_native_execution_admission(self)
+                self._record_route_outcome(provider_name, answered=False)
                 reported = reported_usage(exc)
                 usage_available = response_usage_available(reported)
                 await self._finalize_failed_invocation(
@@ -4894,6 +5027,7 @@ class LLMService(DecisionServiceMixin, ModalityRecordingMixin, ModelDiscoveryMix
                         response, provider_name=provider_name, model=model,
                     )
                 except IncompleteGenerationError as rejected:
+                    self._record_route_outcome(provider_name, answered=False)
                     usage_available = response_usage_available(response)
                     await self._finalize_failed_invocation(
                         provider_name,
@@ -4918,6 +5052,7 @@ class LLMService(DecisionServiceMixin, ModalityRecordingMixin, ModelDiscoveryMix
                     )
                     raise
 
+            self._record_route_outcome(provider_name, answered=True)
             await self._finalize_successful_invocation(
                 response,
                 provider_name,

@@ -28,6 +28,7 @@ from .lifecycle import harvest_llm_close_task, llm_close_observation_control, st
 from kestrel_sovereign.execution_custody import (
     await_execution_work, bind_execution_custody_snapshot,
     current_execution_custody, execution_terminal_error,
+    is_execution_control_error,
 )
 
 from kestrel_sovereign.kestrel_config.constants import (
@@ -362,6 +363,41 @@ class RemoteBackendMixin:
 
         logger.info("Deactivated private inference lease %s", lease_id)
 
+    def _remote_route_selected(
+        self,
+        *,
+        force_local_only: bool,
+        model_override: str | None,
+    ) -> bool:
+        """Whether a call with these routing inputs takes the lease route.
+
+        The lease route takes precedence over every configured route and has
+        no cloud fallback, so while it is selected it is the only route a call
+        tries. :meth:`_remote_route_attempt` dispatches on this, and
+        ``LLMService.route_coverage`` reports the routes in use from it
+        (#3912).
+        """
+
+        return (
+            self._remote_lease is not None
+            and not force_local_only
+            and self._remote_first_allowed(model_override)
+        )
+
+    def _remote_route_accepting(self) -> bool:
+        """Whether the active lease route accepts a new call now.
+
+        Not while it drains for a release or a credential refresh, nor once a
+        call has seen its lease expire: a call the route is selected for then
+        fails closed, with no cloud fallback.
+        """
+
+        return (
+            self._backend is BackendType.REMOTE_GPU
+            and self._remote_accepting
+            and self._remote_client is not None
+        )
+
     @asynccontextmanager
     async def _remote_route_attempt(
         self,
@@ -376,11 +412,50 @@ class RemoteBackendMixin:
         first, before the lease is read, so every entry point that may take the
         lease route refuses a refused override before any adapter runs, lease
         or none (#2652).
+
+        A call the selected lease route refuses before any adapter runs is a
+        failed attempt on that route. It is recorded for the health checks
+        (the host's ``_record_route_outcome``) like any attempt an adapter
+        ran (#3912).
+        """
+
+        self._admit_call_override(model_override)
+
+        try:
+            snapshot = await self._pin_remote_route(
+                force_local_only=force_local_only,
+                model_override=model_override,
+                required_capabilities=required_capabilities,
+            )
+        except Exception as exc:
+            # ``_pin_remote_route`` raises only once the lease route has been
+            # selected for this call.
+            if not is_execution_control_error(exc):
+                self._record_route_outcome(REMOTE_ROUTE_NAME, answered=False)
+            raise
+        try:
+            yield snapshot
+        finally:
+            if snapshot is not None:
+                async with self._remote_route_condition:
+                    self._remote_inflight -= 1
+                    if self._remote_inflight == 0:
+                        self._remote_route_condition.notify_all()
+
+    async def _pin_remote_route(
+        self,
+        *,
+        force_local_only: bool,
+        model_override: str | None,
+        required_capabilities: Sequence[str],
+    ) -> RemoteRouteSnapshot | None:
+        """Pin the lease route for one call; ``None`` when it is not selected.
+
+        Raises only once the lease route is selected for the call: a call it
+        is not selected for only reads the route state.
         """
 
         from .service import LLMServiceError
-
-        self._admit_call_override(model_override)
 
         snapshot: RemoteRouteSnapshot | None = None
         selected_lease_id: str | None = None
@@ -390,17 +465,12 @@ class RemoteBackendMixin:
         async with self._remote_route_condition:
             lease = self._remote_lease
             client = self._remote_client
-            route_selected = (
-                lease is not None
-                and not force_local_only
-                and self._remote_first_allowed(model_override)
+            route_selected = self._remote_route_selected(
+                force_local_only=force_local_only,
+                model_override=model_override,
             )
             if route_selected:
-                if (
-                    self._backend is not BackendType.REMOTE_GPU
-                    or not self._remote_accepting
-                    or client is None
-                ):
+                if not self._remote_route_accepting():
                     raise LLMServiceError(
                         "private inference route is draining or unavailable; no "
                         "cloud fallback was attempted"
@@ -470,9 +540,7 @@ class RemoteBackendMixin:
                 if (
                     lease is None
                     or lease.lease_id != selected_lease_id
-                    or self._backend is not BackendType.REMOTE_GPU
-                    or not self._remote_accepting
-                    or client is None
+                    or not self._remote_route_accepting()
                 ):
                     raise LLMServiceError(
                         "private inference route is draining or unavailable; no "
@@ -492,14 +560,7 @@ class RemoteBackendMixin:
                     adapter=self._remote_adapter,
                     capabilities=self._remote_capabilities,
                 )
-        try:
-            yield snapshot
-        finally:
-            if snapshot is not None:
-                async with self._remote_route_condition:
-                    self._remote_inflight -= 1
-                    if self._remote_inflight == 0:
-                        self._remote_route_condition.notify_all()
+        return snapshot
 
     def _raise_managed_remote_failure(self, exc: BaseException) -> None:
         """Record a safe category and fail closed without provider fallback."""

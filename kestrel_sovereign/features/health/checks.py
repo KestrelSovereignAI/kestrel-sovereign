@@ -16,7 +16,7 @@ import asyncio
 import logging
 import shutil
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Awaitable, Dict, List, Optional, Tuple
 
 from kestrel_sdk.signals import ResourceLock
@@ -25,6 +25,7 @@ from kestrel_sovereign.features.storage_access import (
     resolve_conversation_store,
     resolve_feature_database,
 )
+from kestrel_sovereign.llm.route_coverage import RouteCoverage, RouteState
 from kestrel_sovereign.signals import lock_manager as resource_lock_manager
 from kestrel_sovereign.storage.consolidation_drain import (
     DRAIN_STATE_ISOLATED,
@@ -215,11 +216,173 @@ async def check_database(db) -> Dict[str, Any]:
         }
 
 
-async def check_llm_service(agent) -> Dict[str, Any]:
-    """Verify that an LLM provider is configured and accessible.
+def _route_coverage(llm_service) -> Optional[RouteCoverage]:
+    """The service's routes in use and every other route, or ``None``.
 
-    This does NOT make an LLM call -- it only checks that the
-    service object exists and has a provider configured.
+    Read from ``LLMService.route_coverage``, which takes them from the
+    dispatch's own routing decisions. ``None`` for a service that cannot
+    report them (a stand-in without the method); its checks then judge every
+    configured route, as they did before routes in use were told apart from
+    standby ones (#3912).
+    """
+    reader = getattr(llm_service, "route_coverage", None)
+    if not callable(reader):
+        return None
+    coverage = reader()
+    return coverage if isinstance(coverage, RouteCoverage) else None
+
+
+def _describe_age(seconds: float) -> str:
+    if seconds < 120:
+        return f"{seconds:.0f}s"
+    if seconds < 2 * 3600:
+        return f"{seconds / 60:.0f}m"
+    if seconds < 2 * 86400:
+        return f"{seconds / 3600:.0f}h"
+    return f"{seconds / 86400:.0f}d"
+
+
+def _last_call_details(route: RouteState, now: datetime) -> Optional[Dict[str, Any]]:
+    call = route.last_call
+    if call is None:
+        return None
+    return {
+        "status": "ok" if call.answered else "failed",
+        "at": call.at.isoformat(),
+        "age_seconds": round(max(0.0, (now - call.at).total_seconds()), 1),
+    }
+
+
+def _name_routes(routes: Tuple[RouteState, ...]) -> str:
+    names = ", ".join(route.name for route in routes[:5])
+    if len(routes) > 5:
+        names += f" (+{len(routes) - 5} more)"
+    return names
+
+
+def _judge_route_coverage(
+    coverage: RouteCoverage,
+) -> Tuple[str, Dict[str, Any], List[str]]:
+    """Judge the routes in use and the disabled ones; report the rest (#3912).
+
+    A route in use is judged on passive evidence, newest first: how the last
+    real call on it ended, then the startup reachability probe (local routes
+    only). One with neither is reported ``unprobed``, by name, and passes:
+    this check sends no completion to find out, since that would bill a paid
+    route on every tick. A failed last call or an unreachable probe warns. A
+    private inference route that refuses every call fails, as does routing
+    that can serve no turn at all.
+
+    A route disabled this session after a permanent auth failure warns: a
+    real call on it failed, and routing skips it until restart. Standby
+    routes, which no turn tries until routing changes, are listed and never
+    judged, so a provider kept configured and idle on purpose does not
+    degrade the agent.
+
+    Returns ``(status, details, notes)``.
+    """
+    now = datetime.now(timezone.utc)
+    status = "pass"
+    notes: List[str] = []
+    in_use_details: List[Dict[str, Any]] = []
+
+    if coverage.in_use is None:
+        status = worst_status(status, "fail")
+        notes.append(f"no route can serve the next turn: {coverage.routing_error}")
+    elif not coverage.in_use:
+        status = worst_status(status, "fail")
+        notes.append("routing selects no route the next turn would try")
+
+    for index, route in enumerate(coverage.in_use or ()):
+        role = "primary" if index == 0 else "fallback"
+        label = f"{'active' if role == 'primary' else 'fallback'} route {route.name}"
+        last_call = _last_call_details(route, now)
+        entry: Dict[str, Any] = {
+            "name": route.name,
+            "vendor": route.vendor,
+            "role": role,
+            "last_call": last_call,
+            "startup_probe": route.startup_probe,
+        }
+        if route.refusing_calls:
+            entry["status"] = "refusing"
+            status = worst_status(status, "fail")
+            notes.append(
+                f"{label} refuses every call: the private inference lease is "
+                "draining or expired, and there is no cloud fallback"
+            )
+        elif last_call is not None:
+            entry["status"] = last_call["status"]
+            age = _describe_age(last_call["age_seconds"])
+            if last_call["status"] == "ok":
+                notes.append(f"{label}: last call answered {age} ago")
+            else:
+                status = worst_status(status, "warn")
+                notes.append(f"{label}: last call failed {age} ago")
+        elif route.startup_probe == "unreachable":
+            entry["status"] = "unreachable"
+            status = worst_status(status, "warn")
+            notes.append(
+                f"{label} was unreachable at startup and has had no call since"
+            )
+        elif route.startup_probe == "reachable":
+            entry["status"] = "reachable"
+            notes.append(f"{label} reachable at startup, no call since")
+        else:
+            entry["status"] = "unprobed"
+            notes.append(
+                f"{label} unprobed: no call on it since startup, and this "
+                "check sends none"
+            )
+        in_use_details.append(entry)
+
+    disabled_details: List[Dict[str, Any]] = []
+    for route in coverage.disabled:
+        status = worst_status(status, "warn")
+        disabled_details.append({
+            "name": route.name,
+            "vendor": route.vendor,
+            "status": "disabled",
+            "reason": route.disabled_reason,
+            "last_call": _last_call_details(route, now),
+        })
+        notes.append(
+            f"route {route.name} disabled this session after a permanent auth "
+            f"failure ({route.disabled_reason}); routing skips it until its "
+            "key is rotated and the service restarted"
+        )
+
+    if coverage.standby:
+        notes.append(
+            f"{len(coverage.standby)} standby route(s) not in use, not judged: "
+            f"{_name_routes(coverage.standby)}"
+        )
+
+    details: Dict[str, Any] = {
+        "routes_in_use": in_use_details,
+        "disabled_routes": disabled_details,
+        "standby_routes": [
+            {
+                "name": route.name,
+                "vendor": route.vendor,
+                "status": "standby",
+                "startup_probe": route.startup_probe,
+            }
+            for route in coverage.standby
+        ],
+    }
+    if coverage.routing_error is not None:
+        details["routing_error"] = coverage.routing_error
+    return status, details, notes
+
+
+async def check_llm_service(agent) -> Dict[str, Any]:
+    """Verify that an LLM provider is configured and the routes in use work.
+
+    This does NOT make an LLM call. The routes the agent's next turn would
+    try are judged on passive evidence (:func:`_judge_route_coverage`); a
+    configured route no turn tries (standby) is reported and never degrades
+    the check (#3912).
 
     Args:
         agent: KestrelAgent instance
@@ -239,7 +402,6 @@ async def check_llm_service(agent) -> Dict[str, Any]:
         }
 
     try:
-        # Check that at least one provider is available
         providers = getattr(llm_service, "providers", None) or []
 
         # Resolve the active model via the canonical routing source so the
@@ -259,65 +421,83 @@ async def check_llm_service(agent) -> Dict[str, Any]:
             active_vendor = pref.get("vendor")
             active_route = pref.get("route")
 
+        # A private inference route can serve every call with no configured
+        # provider at all, so coverage runs whether or not there are any.
+        coverage = _route_coverage(llm_service)
+        if not providers and not (coverage is not None and coverage.in_use):
+            return {
+                "name": "llm_service",
+                "status": "warn",
+                "message": "LLM service exists but no providers initialized",
+                "duration_ms": _elapsed(start),
+            }
+
         if providers:
             names = [p.get("name", p.get("vendor", "?")) for p in providers[:3]]
             msg = f"LLM providers available: {', '.join(names)}"
             if len(providers) > 3:
                 msg += f" (+{len(providers) - 3} more)"
-            if active_model:
-                if active_vendor and active_route:
-                    model_label = f"{active_vendor}:{active_route}/{active_model}"
-                elif active_vendor:
-                    model_label = f"{active_vendor}/{active_model}"
-                else:
-                    model_label = active_model
-                msg += f" (active: {model_label})"
-            reachability = getattr(llm_service, "reachability", None)
-            if not isinstance(reachability, list):
-                reachability = None
+        else:
+            msg = "No configured LLM provider"
+        if active_model:
+            if active_vendor and active_route:
+                model_label = f"{active_vendor}:{active_route}/{active_model}"
+            elif active_vendor:
+                model_label = f"{active_vendor}/{active_model}"
+            else:
+                model_label = active_model
+            msg += f" (active: {model_label})"
+        reachability = getattr(llm_service, "reachability", None)
+        if not isinstance(reachability, list):
+            reachability = None
 
-            # Severity is written by more than one condition below, so each
-            # verdict is combined through worst_status() rather than assigned —
-            # a plain assignment lets a later, milder condition downgrade an
-            # earlier severe one.
-            status = "pass"
+        # Severity is written by more than one condition below, so each
+        # verdict is combined through worst_status() rather than assigned —
+        # a plain assignment lets a later, milder condition downgrade an
+        # earlier severe one.
+        status = "pass"
 
-            details: Dict[str, Any] = {}
-            if reachability:
-                details["reachability"] = reachability
-                if any(r.get("status") == "unreachable" for r in reachability):
-                    status = worst_status(status, "warn")
-
-            # A persisted mandate that failed to apply (#3190): the operator set
-            # a model and it is NOT in effect, so this agent is running on
-            # whatever route_priority picks. Previously this state existed only
-            # as one WARNING line at boot.
-            # Require a real string: ``getattr`` on a test double returns a
-            # truthy stub, which would report every mocked service as UNPINNED
-            # and then fail to JSON-serialise when the heartbeat is persisted.
-            mandate_load_error = getattr(llm_service, "_mandate_load_error", None)
-            if not isinstance(mandate_load_error, str):
-                mandate_load_error = None
-            if mandate_load_error:
+        details: Dict[str, Any] = {}
+        if reachability:
+            details["reachability"] = reachability
+        if coverage is None:
+            # A service that cannot name its routes in use: every startup
+            # probe is judged, as before #3912.
+            if reachability and any(
+                r.get("status") == "unreachable" for r in reachability
+            ):
                 status = worst_status(status, "warn")
-                details["mandate_load_error"] = mandate_load_error
-                msg += (
-                    " — a persisted model preference failed to apply; this "
-                    f"agent is running UNPINNED ({mandate_load_error})"
-                )
+        else:
+            coverage_status, coverage_details, notes = _judge_route_coverage(
+                coverage
+            )
+            status = worst_status(status, coverage_status)
+            details.update(coverage_details)
+            msg += " — " + "; ".join(notes)
 
-            return {
-                "name": "llm_service",
-                "status": status,
-                "message": msg,
-                "details": details,
-                "duration_ms": _elapsed(start),
-            }
+        # A persisted mandate that failed to apply (#3190): the operator set
+        # a model and it is NOT in effect, so this agent is running on
+        # whatever route_priority picks. Previously this state existed only
+        # as one WARNING line at boot.
+        # Require a real string: ``getattr`` on a test double returns a
+        # truthy stub, which would report every mocked service as UNPINNED
+        # and then fail to JSON-serialise when the heartbeat is persisted.
+        mandate_load_error = getattr(llm_service, "_mandate_load_error", None)
+        if not isinstance(mandate_load_error, str):
+            mandate_load_error = None
+        if mandate_load_error:
+            status = worst_status(status, "warn")
+            details["mandate_load_error"] = mandate_load_error
+            msg += (
+                " — a persisted model preference failed to apply; this "
+                f"agent is running UNPINNED ({mandate_load_error})"
+            )
 
         return {
             "name": "llm_service",
-            "status": "warn",
-            "message": "LLM service exists but no providers initialized",
+            "status": status,
+            "message": msg,
+            "details": details,
             "duration_ms": _elapsed(start),
         }
     except Exception as e:
@@ -1403,11 +1583,15 @@ async def check_model_discovery(agent) -> Dict[str, Any]:
     a WARNING line — dropping the whole fleet onto a 1B local model with no
     health signal anywhere.
 
-    ``warn`` when any vendor's discovery failed. ``fail`` when the failing
-    vendor is the one THIS agent's mandate points at, since that is the pin
-    actually at risk. Neither is critical in
+    ``warn`` when discovery failed for a vendor the agent uses: one a route
+    in use selects, or one whose route a permanent auth failure disabled.
+    ``fail`` when the failing vendor is the one THIS agent's mandate points
+    at, since that is the pin actually at risk. Neither is critical in
     :func:`derive_overall_status`, so this reports ``degraded`` rather than
-    taking the host to ``unhealthy`` for a catalog problem.
+    taking the host to ``unhealthy`` for a catalog problem. A failure for any
+    other vendor is a standby vendor's: it is reported and passes, since an
+    operator may keep a local or rented provider configured and idle on
+    purpose (#3912).
 
     The outcome is read from the process-wide catalog snapshot, not from the
     service that happened to run discovery (#3197): every agent on a host reads
@@ -1470,6 +1654,31 @@ async def check_model_discovery(agent) -> Dict[str, Any]:
     vendors = sorted(failures)
     pinned_at_risk = pinned_vendor in failures if pinned_vendor else False
 
+    # Only a vendor the agent uses is judged: one a route in use selects, one
+    # with a route a permanent auth failure disabled (never standby), and the
+    # pinned vendor. Any other is standby, configured and idle, possibly on
+    # purpose (#3912). When the routes in use are unknown, every vendor is.
+    try:
+        coverage = _route_coverage(llm_service)
+    except Exception as error:
+        if is_execution_control_error(error):
+            raise
+        # The llm_service check reads the same coverage and reports this.
+        coverage = None
+    judged_vendors: Optional[List[str]] = None
+    standby_vendors: List[str] = []
+    if coverage is not None and coverage.in_use is not None:
+        judged = {
+            route.vendor
+            for route in (*coverage.in_use, *coverage.disabled)
+            if route.vendor
+        }
+        if pinned_vendor:
+            judged.add(pinned_vendor)
+        judged_vendors = sorted(judged)
+        standby_vendors = [v for v in vendors if v not in judged]
+    failing = [v for v in vendors if v not in standby_vendors]
+
     if pinned_at_risk:
         # Say what is true: the catalog needed to VALIDATE the pin is missing.
         # Whether the pin would actually be dropped on restart depends on
@@ -1483,20 +1692,29 @@ async def check_model_discovery(agent) -> Dict[str, Any]:
             f"against a live catalog while this persists. "
             f"{failures[pinned_vendor]}"
         )
-    else:
+    elif failing:
         message = (
-            f"Model discovery failed for {len(vendors)} vendor(s): "
-            f"{', '.join(vendors)}. Pinned models for these vendors cannot be "
+            f"Model discovery failed for {len(failing)} vendor(s): "
+            f"{', '.join(failing)}. Pinned models for these vendors cannot be "
             f"validated. Check the vendor API credentials."
+        )
+    else:
+        message = "Model discovery healthy for every vendor a route in use selects."
+    if standby_vendors:
+        message += (
+            " Discovery failed for standby vendor(s) no route in use selects, "
+            f"not judged: {', '.join(standby_vendors)}."
         )
 
     return {
         "name": "model_discovery",
-        "status": "fail" if pinned_at_risk else "warn",
+        "status": "fail" if pinned_at_risk else ("warn" if failing else "pass"),
         "message": message,
         "details": {
             "catalog_version": snapshot.catalog_version,
             "failed_vendors": {v: failures[v] for v in vendors},
+            "judged_vendors": judged_vendors,
+            "standby_vendors": standby_vendors,
             # The publication of this snapshot issued no request for these
             # vendors; the failure is the last one observed for each.
             "not_reattempted_vendors": [

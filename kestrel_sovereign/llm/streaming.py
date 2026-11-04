@@ -1207,6 +1207,12 @@ class StreamingMixin:
         #1968). A candidate that goes its bound without progress raises
         :class:`~kestrel_sovereign.llm.call_progress.AttemptInactivityTimeout`
         here, and is recorded as a failed attempt like any other failure.
+
+        How the attempt ended is recorded for the health checks, on a host
+        that keeps route outcomes (``_record_route_outcome``, #3912): a stream
+        that failed or that the gate rejected as failed, one that finished or
+        delivered its terminal response as answered. That is independent of
+        the usage accounting, which bills a failed stream's partial usage.
         """
 
         self._guard_stream_dispatch(
@@ -1349,6 +1355,21 @@ class StreamingMixin:
                 aborted = isinstance(failure, (asyncio.CancelledError, GeneratorExit)) or (
                     failure is not None and is_execution_control_error(failure)
                 )
+                # How the route did, for the health checks (#3912): from how
+                # the stream itself ended, never from the accounting
+                # ``success`` below, which records a partial-usage flush as a
+                # success even when the stream failed. A stream its consumer
+                # abandoned before the terminal response says nothing of the
+                # route, and records nothing.
+                if rejected is not None or (failure is not None and not aborted):
+                    route_answered: Optional[bool] = False
+                elif completed or final_response is not None:
+                    route_answered = True
+                else:
+                    route_answered = None
+                record_route_outcome = getattr(self, "_record_route_outcome", None)
+                if record_route_outcome is not None and route_answered is not None:
+                    record_route_outcome(provider_name, answered=route_answered)
                 # An ordinary provider failure does not revoke a live turn's
                 # usage/attempt accounting. Actual cancellation, explicit
                 # close or authority control retains cleanup-only custody;

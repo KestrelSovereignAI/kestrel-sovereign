@@ -46,6 +46,10 @@ class _Host(RemoteBackendMixin):
         self._remote_route_epoch = 0
         self._remote_route_closed = False
         self._mandate_preference = {"model": None, "vendor": None, "route": None}
+        self.route_outcomes: list[tuple[str, bool]] = []
+
+    def _record_route_outcome(self, route, *, answered):
+        self.route_outcomes.append((route, answered))
 
     def _remote_first_allowed(self, model_override):
         return model_override is None or "/" not in model_override
