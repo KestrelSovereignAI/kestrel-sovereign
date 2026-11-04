@@ -78,26 +78,82 @@ class AuthenticatedSessionMiddleware(SessionMiddleware):
         super().__init__(retain_session, **settings)
 
 
+class RetainedCredentialProof:
+    """Finite, revocable proof of the original credential lane, never a service grant.
+
+    Only trusted host composition retains this proof from an active request.
+    Capability owners must independently check their original agent, principal,
+    boundary, current grant and privacy policy at every use.
+    """
+
+    def __init__(self, caller: CallerContext, expires_at: datetime,
+                 check: Callable[[], None], clock: Callable[[], datetime]):
+        self._caller, self._expires_at = caller, expires_at
+        self._check: Callable[[], None] | None = check
+        self._clock = clock
+
+    @property
+    def caller(self) -> CallerContext:
+        return self._caller
+
+    @property
+    def expires_at(self) -> datetime:
+        return self._expires_at
+
+    def require_current(self) -> None:
+        check = self._check
+        if check is None:
+            raise HostCapabilityAccessDenied("retained credential proof revoked")
+        if self._clock() >= self._expires_at:
+            raise HostCapabilityAccessDenied("retained credential proof expired")
+        check()
+
+    def revoke(self) -> None:
+        """Release the original credential checker and refuse further use."""
+        self._check = None
+
+
 @dataclass
 class InteractiveRequestAuthentication:
     caller: CallerContext
     expires_at: datetime | None
     _check: Callable[[], None] = field(repr=False)
     _active: bool = field(default=True, repr=False)
+    _clock: Callable[[], datetime] = field(default=lambda: datetime.now(UTC), repr=False)
 
     def require_current(self) -> None:
         if not self._active:
             raise HostCapabilityAccessDenied("interactive request ended")
-        if self.expires_at is not None and datetime.now(UTC) >= self.expires_at:
+        if self.expires_at is not None and self._clock() >= self.expires_at:
             raise HostCapabilityAccessDenied("interactive credential expired")
         self._check()
+
+    def retain_credential_proof(self, *, expires_at: datetime) -> RetainedCredentialProof:
+        """Retain current credential checks under an explicit host-owned deadline.
+
+        The ended request remains unusable. This separate proof continues to
+        revalidate its credential lane, including rotation and realm withdrawal.
+
+        Raises:
+            HostCapabilityAccessDenied: The request or requested lifetime expired.
+            ValueError: The requested deadline is not timezone-aware.
+        """
+        self.require_current()
+        if not isinstance(expires_at, datetime) or expires_at.utcoffset() is None:
+            raise ValueError("retained credential deadline must be timezone-aware")
+        deadline = min(expires_at, self.expires_at) if self.expires_at is not None else expires_at
+        if deadline <= self._clock():
+            raise HostCapabilityAccessDenied("retained credential deadline expired")
+        return RetainedCredentialProof(self.caller, deadline, self._check, self._clock)
 
 
 class RequestAuthenticationService:
     """Revalidate an actual middleware-authenticated interactive request."""
 
-    def __init__(self, *, api_key: Callable[[], str | None]):
+    def __init__(self, *, api_key: Callable[[], str | None],
+                 clock: Callable[[], datetime] | None = None):
         self._api_key = api_key
+        self._clock = clock or (lambda: datetime.now(UTC))
 
     @contextmanager
     def bind(self, request, *, require_csrf: bool = True):
@@ -160,7 +216,7 @@ class RequestAuthenticationService:
                 raise HostCapabilityAccessDenied("original request authentication changed")
             credential_current()
 
-        binding = InteractiveRequestAuthentication(caller, expires_at, check)
+        binding = InteractiveRequestAuthentication(caller, expires_at, check, _clock=self._clock)
         binding.require_current()
         try:
             yield binding

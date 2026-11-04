@@ -4,7 +4,7 @@ from base64 import b64encode
 import asyncio
 from contextvars import Context
 from dataclasses import replace
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 import json
 import os
 
@@ -41,8 +41,13 @@ def authenticated_app(monkeypatch):
     monkeypatch.setenv("KESTREL_ALLOWED_EMAILS", ALICE)
     monkeypatch.setenv("KESTREL_A2A_TRANSPORT_KEY", "owned-peer-directory-key")
     app = FastAPI()
+    credential_clock = [datetime.now(UTC)]
+    app.state.credential_clock = credential_clock
+    app.state.retained_credentials = []
+    app.state.retained_issuers = []
     app.state.request_authentication = RequestAuthenticationService(
-        api_key=lambda: server.get_api_key(generate_if_missing=False))
+        api_key=lambda: server.get_api_key(generate_if_missing=False),
+        clock=lambda: credential_clock[0])
     app.add_middleware(InteractiveAuthenticationLifetimeMiddleware)
     app.middleware("http")(server.auth_middleware)
     app.add_middleware(AuthenticatedSessionMiddleware, secret_key=SESSION_KEY,
@@ -50,6 +55,19 @@ def authenticated_app(monkeypatch):
     bindings = []
     producers = []
     carried_scopes = []
+
+    @app.get("/api/owned-retained")
+    async def retained(request: Request):
+        authentication = current_request_authentication()
+        deadline = credential_clock[0] + timedelta(hours=1)
+        if request.query_params.get("deadline") == "expired":
+            deadline = credential_clock[0]
+        elif request.query_params.get("deadline") == "naive":
+            deadline = deadline.replace(tzinfo=None)
+        proof = authentication.retain_credential_proof(expires_at=deadline)
+        app.state.retained_credentials.append(proof)
+        app.state.retained_issuers.append(authentication)
+        return {"retained": True}
 
     @app.get("/api/owned-normal")
     async def normal():
@@ -279,3 +297,67 @@ def test_unexpected_endpoint_capability_failure_is_not_rewritten_as_authenticati
     client, _ = authenticated_app
     with pytest.raises(HostCapabilityAccessDenied, match="unexpected capability refusal"):
         client.get("/api/owned-unexpected-denial", headers={"X-API-Key": API_KEY})
+
+
+@pytest.mark.parametrize("lane", ["header", "bearer", "jwt", "cookie"])
+def test_explicit_retained_proof_rechecks_native_credentials_after_request_end(authenticated_app, lane):
+    client, _ = authenticated_app
+    response = client.get("/api/owned-retained", headers=credentials(client, lane))
+    assert response.status_code == 200 and response.json() == {"retained": True}
+    proof = client.app.state.retained_credentials[0]
+    issuer = client.app.state.retained_issuers[0]
+    with pytest.raises(HostCapabilityAccessDenied, match="ended"):
+        issuer.require_current()
+    with pytest.raises(HostCapabilityAccessDenied, match="ended"):
+        issuer.retain_credential_proof(expires_at=datetime.now(UTC) + timedelta(hours=1))
+    proof.require_current()
+    assert proof.caller is issuer.caller
+    if issuer.expires_at is not None:
+        assert proof.expires_at <= issuer.expires_at
+    proof.revoke()
+    with pytest.raises(HostCapabilityAccessDenied, match="revoked"):
+        proof.require_current()
+
+
+@pytest.mark.parametrize("lane,withdrawal", [
+    ("header", "api-key"), ("jwt", "jwt-key"), ("jwt", "email"),
+    ("cookie", "email"), ("header", "service"),
+])
+def test_retained_proof_does_not_outlive_current_credential_authorization(
+        authenticated_app, monkeypatch, lane, withdrawal):
+    client, _ = authenticated_app
+    assert client.get("/api/owned-retained", headers=credentials(client, lane)).status_code == 200
+    proof = client.app.state.retained_credentials[0]
+    proof.require_current()
+    if withdrawal == "api-key":
+        monkeypatch.setenv("KESTREL_API_KEY", "rotated-owned-key")
+    elif withdrawal == "jwt-key":
+        monkeypatch.setenv("JWT_SECRET_KEY", "rotated-owned-jwt-key-with-enough-entropy")
+    elif withdrawal == "email":
+        monkeypatch.setenv("KESTREL_ALLOWED_EMAILS", "another@example.test")
+    else:
+        client.app.state.request_authentication = RequestAuthenticationService(api_key=lambda: API_KEY)
+    with pytest.raises(HostCapabilityAccessDenied):
+        proof.require_current()
+
+
+def test_retained_proof_has_a_finite_host_deadline(authenticated_app):
+    client, _ = authenticated_app
+    assert client.get("/api/owned-retained", headers={"X-API-Key": API_KEY}).status_code == 200
+    proof = client.app.state.retained_credentials[0]
+    proof.require_current()
+    client.app.state.credential_clock[0] = proof.expires_at
+    with pytest.raises(HostCapabilityAccessDenied, match="expired"):
+        proof.require_current()
+
+
+@pytest.mark.parametrize("deadline,error,reason", [
+    ("expired", HostCapabilityAccessDenied, "deadline expired"),
+    ("naive", ValueError, "timezone-aware"),
+])
+def test_credential_retention_requires_an_explicit_future_aware_deadline(
+        authenticated_app, deadline, error, reason):
+    client, _ = authenticated_app
+    with pytest.raises(error, match=reason):
+        client.get("/api/owned-retained", params={"deadline": deadline}, headers={"X-API-Key": API_KEY})
+    assert client.app.state.retained_credentials == []
