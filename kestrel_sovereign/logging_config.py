@@ -13,17 +13,22 @@ Environment variables:
 """
 
 import contextvars
-import hashlib
-import hmac
 import json
 import logging
 import os
 import re
-import secrets
 import traceback
 import uuid
 from datetime import datetime, timezone
 from typing import Optional
+
+# The SDK's own function and key, not a copy: a second implementation would
+# key its digest differently, so Core and SDK log lines for the same text could
+# not be matched, and the two would drift (#3952).
+from kestrel_sdk.logging_summary import (
+    CONTENT_DIGEST_HEX_CHARS as CONTENT_DIGEST_HEX_CHARS,
+    content_log_summary as content_log_summary,
+)
 
 # --- Context variables for request-scoped fields ---
 
@@ -88,29 +93,6 @@ def get_correlation_id() -> str:
     if cid != correlation_id_var.get():
         correlation_id_var.set(cid)
     return cid
-
-
-# Keys ``content_log_summary``'s digest. Random per process and never written
-# anywhere: an unkeyed hash of a short message ("yes", a name) is an offline
-# oracle for guessing what it said, while a keyed one still lets two log lines
-# of one run be matched to the same text.
-_CONTENT_DIGEST_KEY = secrets.token_bytes(32)
-CONTENT_DIGEST_HEX_CHARS = 12
-
-
-def content_log_summary(text: str) -> str:
-    """Describe caller content for a log line without any of its text.
-
-    Host logs are plaintext files with no retention bound, while the content
-    they would quote (a turn's user message, a generation prompt) is encrypted
-    in the store. A log line therefore gets non-content facts only: the length
-    and a short process-keyed digest, never the text or a prefix of it (#3318).
-    """
-    # ``surrogatepass``: JSON admits lone surrogates, and a log line must not
-    # be the thing that fails the turn.
-    encoded = text.encode("utf-8", errors="surrogatepass")
-    digest = hmac.new(_CONTENT_DIGEST_KEY, encoded, hashlib.sha256)
-    return f"chars={len(text)} digest={digest.hexdigest()[:CONTENT_DIGEST_HEX_CHARS]}"
 
 
 def exception_log_summary(error: BaseException) -> str:
