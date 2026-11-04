@@ -303,6 +303,8 @@ async def test_oauth_host_resolves_the_original_backend_from_real_initialized_ag
         semantic_capabilities=b.agent.semantic_capabilities)
     b.agent._raw_storage = storage
     try:
+        with pytest.raises(TypeError, match='original native feature database'):
+            _ = b.host.database
         await storage.initialize()
         assert isinstance(storage.db.backend, DatabaseBackend)
         assert b.host.database is storage.db.backend
@@ -311,4 +313,21 @@ async def test_oauth_host_resolves_the_original_backend_from_real_initialized_ag
         assert (await storage.db.backend.fetch_one("SELECT value FROM original_oauth_owner"))[0] == "original"
     finally:
         await storage.close()
+        b.agent._raw_storage = None
+
+
+@pytest.mark.parametrize('description', ['missing', 'object', 'duck', 'invalid-native-wrapper'])
+async def test_oauth_host_refuses_untyped_database_descriptions(oauth_boundary, description):
+    from kestrel_sovereign.storage.async_database import AsyncDatabase
+    from kestrel_sovereign.storage.db.sqlite import SQLiteBackend
+
+    b = oauth_boundary
+    database = {'missing': None, 'object': object(),
+        'duck': SimpleNamespace(backend=SQLiteBackend(':memory:')),
+        'invalid-native-wrapper': AsyncDatabase(object())}[description]
+    b.agent._raw_storage = SimpleNamespace(db=database)
+    try:
+        with pytest.raises(TypeError, match='original native feature database'):
+            _ = b.host.database
+    finally:
         b.agent._raw_storage = None

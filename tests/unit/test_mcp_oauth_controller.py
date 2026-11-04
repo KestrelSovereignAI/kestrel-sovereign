@@ -18,7 +18,7 @@ import pytest_asyncio
 from kestrel_sovereign.endpoints.auth_oauth import _create_jwt
 from kestrel_sovereign.mcp_oauth import MCPOAuthHostPolicy
 from kestrel_sovereign.security.capability_authority import HostCapabilityAccessDenied
-from tests.unit.test_mcp_oauth_host import ALICE, API_KEY, oauth_boundary  # noqa: F401
+from tests.unit.test_mcp_oauth_host import ALICE, API_KEY, oauth_boundary as oauth_boundary
 
 
 class HostContractConsumer:
