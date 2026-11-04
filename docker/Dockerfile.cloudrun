@@ -41,7 +41,7 @@ GIT_AUTH="$(cat /run/secrets/github_token 2>/dev/null || true)"
 if [ -n "$GIT_AUTH" ]; then
     git config --global url."https://${GIT_AUTH}@github.com/".insteadOf "https://github.com/"
 fi
-uv pip install --python /app/.venv/bin/python .
+uv pip install --python /app/.venv/bin/python '.[mcp-integration]'
 uv pip uninstall --python /app/.venv/bin/python ollama || true
 git config --global --unset-all url."https://${GIT_AUTH}@github.com/".insteadOf 2>/dev/null || true
 EOF
