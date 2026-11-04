@@ -12,10 +12,17 @@ Prometheus series and the metering callback. A rejected attempt is
 ``success=False`` and keeps the usage its provider reported; its provider
 billed that usage, so it is still metered, as it was before. A natural end is
 the control: the same harness records it as a success.
+
+#3938: a stream that fails after its adapter flushed partial usage, for
+example when its connection drops, is a failed attempt too. It used to be
+recorded as a success because only the gate's rejection made the partial
+attempt fail. A cancelled stream keeps the record it had.
 """
 
 from __future__ import annotations
 
+import asyncio
+from contextlib import aclosing
 from typing import Any, Dict, List, Optional
 from unittest.mock import AsyncMock
 
@@ -32,7 +39,7 @@ from kestrel_sovereign.llm.output_ceiling import (
     IncompleteGenerationError,
     attach_stop_reason,
 )
-from kestrel_sovereign.llm.streaming import StreamingMixin
+from kestrel_sovereign.llm.streaming import LLMStreamingError, StreamingMixin
 from kestrel_sovereign.storage.db import SQLiteBackend
 
 ROUTE = "ollama:local"
@@ -108,6 +115,34 @@ class _FlushedUsageRoute(_Route):
         usage_sink["input_tokens"] = INPUT_TOKENS
         usage_sink["output_tokens"] = OUTPUT_TOKENS
         yield TEXT
+
+
+#: What a dropped connection raises inside the adapter's stream.
+DROPPED = "connection reset by peer"
+
+
+class _InterruptedRoute(_Route):
+    """A usage stream that flushes its usage into the service's sink and
+    streams part of its answer, then ends as ``ending`` says (#3938)."""
+
+    supports_partial_usage_flush = True
+
+    def __init__(self, ending: str) -> None:
+        super().__init__("stop")
+        self.ending = ending
+
+    async def get_streaming_response_with_tools(self, *, usage_sink, **kwargs: Any):
+        self.calls += 1
+        usage_sink["input_tokens"] = INPUT_TOKENS
+        usage_sink["output_tokens"] = OUTPUT_TOKENS
+        yield TEXT
+        if self.ending == "dropped":
+            raise ConnectionError(DROPPED)
+        if self.ending == "cancelled":
+            raise asyncio.CancelledError()
+        if self.ending == "natural":
+            yield _response(self.stop_reason)
+        # "unfinished": the stream ends without a terminal response.
 
 
 class _Metric:
@@ -358,3 +393,118 @@ async def test_a_fallback_attempt_without_the_service_runner_records_the_verdict
         host._track_model_usage.await_args.kwargs["tokens"]
         == INPUT_TOKENS + OUTPUT_TOKENS
     )
+
+
+#: How a stream that flushed partial usage ended: what its caller is raised
+#: (``None`` for nothing), whether its attempt is recorded as a success, and
+#: the error message it is recorded with.
+INTERRUPTIONS = {
+    "dropped": (LLMStreamingError, False, DROPPED),
+    "unfinished": (
+        LLMStreamingError, False,
+        str(NoCompletionEvidenceError(provider=ROUTE, model=MODEL)),
+    ),
+    "natural": (None, True, None),
+    # A cancelled stream is not a failed attempt; its record is unchanged.
+    "cancelled": (asyncio.CancelledError, True, None),
+}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("ending", sorted(INTERRUPTIONS))
+async def test_a_stream_that_fails_after_partial_usage_is_a_failed_attempt(
+    service, store, prometheus, ending,
+):
+    raised, succeeded, error_message = INTERRUPTIONS[ending]
+    route = _InterruptedRoute(ending)
+    service.install_route(route)
+
+    if raised is None:
+        await _call(service, "stream_with_tool_detection")
+    else:
+        with pytest.raises(raised):
+            await _call(service, "stream_with_tool_detection")
+    assert route.calls == 1
+
+    call = await _only_call(store)
+    assert call.success is succeeded
+    assert call.error_message == error_message
+    assert call.metadata["path"] == "stream_with_tool_detection"
+    assert call.metadata.get("partial_abort", False) is (ending != "natural")
+
+    # The partial usage is kept and billed, whether or not the stream failed.
+    assert (call.input_tokens, call.output_tokens) == (INPUT_TOKENS, OUTPUT_TOKENS)
+    service._record_model_usage.assert_awaited_once()
+    assert (
+        service._record_model_usage.await_args.kwargs["tokens"]
+        == INPUT_TOKENS + OUTPUT_TOKENS
+    )
+    stats = await store.get_llm_stats()
+    assert stats["success_rate"] == (100 if succeeded else 0)
+    assert prometheus["calls"] == [
+        ({"provider": ROUTE, "model": MODEL, "success": str(succeeded)}, 1)
+    ]
+    _assert_billed_once(service)
+
+
+@pytest.mark.asyncio
+async def test_a_stream_closed_after_partial_usage_is_not_a_failed_attempt(
+    service, store, prometheus,
+):
+    """A caller that stops reading early has not seen its route fail: the
+    attempt keeps the record it had before #3938."""
+    route = _InterruptedRoute("natural")
+    service.install_route(route)
+
+    async with aclosing(service.stream_with_tool_detection(
+        messages=[{"role": "user", "content": "where do I work?"}],
+        tools=TOOLS, invocation_context=CONTEXT,
+    )) as stream:
+        async for item in stream:
+            assert item == TEXT
+            break
+
+    call = await _only_call(store)
+    assert call.success is True
+    assert call.error_message is None
+    assert call.metadata["partial_abort"] is True
+    assert (call.input_tokens, call.output_tokens) == (INPUT_TOKENS, OUTPUT_TOKENS)
+    assert prometheus["calls"] == [
+        ({"provider": ROUTE, "model": MODEL, "success": "True"}, 1)
+    ]
+    _assert_billed_once(service)
+
+
+@pytest.mark.asyncio
+async def test_a_failed_partial_stream_records_the_routes_failure_message():
+    """A route's own failure message replaces the provider's error text in
+    the failed attempt it records, as it does without partial usage (#3938)."""
+    host = _StreamingOnlyHost()
+    route = _InterruptedRoute("dropped")
+    message = "the managed route failed"
+
+    with pytest.raises(ConnectionError):
+        async for _ in host._stream_adapter_with_usage(
+            adapter=route,
+            client=AsyncMock(),
+            model=MODEL,
+            messages=[{"role": "user", "content": "where do I work?"}],
+            provider_name=ROUTE,
+            path="stream_with_tool_detection",
+            invocation_context=None,
+            expose_protocol_events=True,
+            tools=TOOLS,
+            error_message_override=message,
+        ):
+            pass
+
+    host._log_llm_call.assert_awaited_once()
+    logged = host._log_llm_call.await_args.kwargs
+    assert logged["success"] is False
+    assert logged["error_message"] == message
+    assert logged["meter_usage"] is True
+    assert logged["metadata"]["partial_abort"] is True
+    assert (logged["input_tokens"], logged["output_tokens"]) == (
+        INPUT_TOKENS, OUTPUT_TOKENS,
+    )
+    host._track_model_usage.assert_awaited_once()

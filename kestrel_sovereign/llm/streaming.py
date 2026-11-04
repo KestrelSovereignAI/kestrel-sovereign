@@ -1385,6 +1385,13 @@ class StreamingMixin:
                     elif usage_sink:
                         # Preserve the existing partial-usage billing behavior.  The
                         # metadata makes clear that the stream itself did not finish.
+                        # A rejected or failed stream is a failed attempt; a
+                        # cancelled or closed one is not (#3938).
+                        partial_failure = (
+                            rejected if rejected is not None
+                            else None if aborted
+                            else failure
+                        )
                         await self._record_streamed_usage(
                             LLMResponse(
                                 input_tokens=usage_sink.get("input_tokens"),
@@ -1401,8 +1408,11 @@ class StreamingMixin:
                             duration_ms=duration_ms,
                             partial=True,
                             path=path,
-                            success=rejected is None,
-                            error_message=rejection_message,
+                            success=partial_failure is None,
+                            error_message=(
+                                None if partial_failure is None
+                                else recorded_message(partial_failure)
+                            ),
                             publish_identity=False,
                             invocation_context=invocation_context,
                             meter_usage=True,
