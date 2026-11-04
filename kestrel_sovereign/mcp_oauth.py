@@ -427,7 +427,11 @@ class MCPOAuthHost:
 
     @property
     def database(self) -> DatabaseBackend:
+        from kestrel_sovereign.storage.async_database import AsyncDatabase
+
         database = resolve_feature_database(self.agent)
+        if isinstance(database, AsyncDatabase):
+            database = database.backend
         if not isinstance(database, DatabaseBackend):
             raise TypeError("MCP OAuth requires the original native feature database")
         return database
@@ -632,7 +636,8 @@ class MCPOAuthHost:
         """Attempt every original retirement, retaining native errors and control.
 
         The original cancellation object remains recognizable to its enclosing
-        asyncio or anyio scope. Every independent cleanup error is retained.
+        asyncio or anyio scope. Other failures are attached as its cause; a
+        consuming scope can discard that cause. Failed owners stay registered.
         Eligibility is checked inside each original retirement lock.
         """
         task = asyncio.current_task()

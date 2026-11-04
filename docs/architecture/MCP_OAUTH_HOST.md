@@ -161,10 +161,13 @@ writes and owns/join its authorization tasks. Foreground Begin does not wait on
 unrelated maintenance: a failed retirement remains owned and counts toward the
 finite quotas while the independent maintenance owner reports/reconciles it.
 Each sweep rechecks eligibility under each original retirement lock, retaining
-failed originals and attempting independent cleanup. Every error object is retained in an aggregate; actual cancellation remains the
-original cancellation object, with other failures attached as its cause. Native
-asyncio and anyio timeout scopes therefore keep their own control semantics
-after the independent finite feature-owned joins.
+failed originals and attempting independent cleanup. Ordinary errors are raised
+as themselves or an aggregate. Actual cancellation remains the original object,
+with other failures attached as its cause. A scope that consumes cancellation
+(such as anyio timeout scopes or an asyncio TaskGroup) can discard that cause.
+Owners must reconcile and report failed registrations retained for the next
+sweep; the exception observed outside such a scope is not a complete failure
+inventory. Each native feature-owned join has its own finite budget.
 Every failed `begin` must retain
 and retire its own workers, including before it can return a valid handle.
 

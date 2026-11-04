@@ -292,3 +292,23 @@ async def test_fresh_current_principal_can_enter_a_credential_storage_operation(
     response = await b.client.get("/api/owned-use", params={"mode": "credential"},
                                   headers={"X-API-Key": API_KEY})
     assert response.status_code == 200, response.text
+
+
+async def test_oauth_host_resolves_the_original_backend_from_real_initialized_agent_storage(oauth_boundary, tmp_path):
+    from kestrel_sovereign.storage.async_storage import AsyncStorage
+    from kestrel_sdk.storage.database import DatabaseBackend
+
+    b = oauth_boundary
+    storage = AsyncStorage(str(tmp_path / "original-agent-storage.db"), agent_id=b.agent.did,
+        semantic_capabilities=b.agent.semantic_capabilities)
+    b.agent._raw_storage = storage
+    try:
+        await storage.initialize()
+        assert isinstance(storage.db.backend, DatabaseBackend)
+        assert b.host.database is storage.db.backend
+        await b.host.database.execute("CREATE TABLE original_oauth_owner (value TEXT)")
+        await b.host.database.execute("INSERT INTO original_oauth_owner VALUES (?)", ("original",))
+        assert (await storage.db.backend.fetch_one("SELECT value FROM original_oauth_owner"))[0] == "original"
+    finally:
+        await storage.close()
+        b.agent._raw_storage = None

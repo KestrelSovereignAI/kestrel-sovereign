@@ -785,12 +785,13 @@ async def test_anyio_timeout_preserves_its_original_cancellation_during_sweep(co
         attempted.append(handle)
         if handle is pending[0].handle or last_retirement == 'await':
             await anyio.sleep_forever()
-        raise TimeoutError('independent original closer remains unacknowledged')
+        raise RuntimeError('independent original closer remains unacknowledged')
     monkeypatch.setattr(b.runtime, 'retire_authorization', unacknowledged)
     b.host.withdraw()
     with pytest.raises(TimeoutError):
-        with anyio.fail_after(0.025):
+        with anyio.fail_after(0.025) as scope:
             await b.host.maintain()
+    assert scope.cancelled_caught
     assert attempted == [item.handle for item in pending]
     assert list(b.host._pending.values()) == pending
 
@@ -827,11 +828,43 @@ async def test_anyio_control_survives_a_consumer_that_suppresses_its_first_cance
                 await anyio.sleep_forever()
             except asyncio.CancelledError:
                 return
-        raise TimeoutError('independent original closer remains unacknowledged')
+        raise RuntimeError('independent original closer remains unacknowledged')
     monkeypatch.setattr(b.runtime, 'retire_authorization', unacknowledged)
     b.host.withdraw()
     with pytest.raises(TimeoutError):
-        with anyio.fail_after(0.025):
+        with anyio.fail_after(0.025) as scope:
             await b.host.maintain()
+    assert scope.cancelled_caught
+    assert attempted == [item.handle for item in pending]
+    assert list(b.host._pending.values()) == [pending[1]]
+
+
+@pytest.mark.asyncio
+async def test_plain_asyncio_control_survives_a_consumer_that_suppresses_its_first_cancellation(controller, monkeypatch):
+    b = controller
+    await begin(b)
+    await begin(b, headers={'Authorization': 'Bearer ' + _create_jwt(ALICE)})
+    pending = list(b.host._pending.values())
+    entered = asyncio.Event()
+    failures = [RuntimeError('independent original closer remains unacknowledged')]
+    attempted = []
+    async def unacknowledged(handle):
+        attempted.append(handle)
+        if handle is pending[0].handle:
+            entered.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                return
+        raise failures[0]
+    monkeypatch.setattr(b.runtime, 'retire_authorization', unacknowledged)
+    b.host.withdraw()
+    sweep = asyncio.create_task(b.host.maintain())
+    await entered.wait()
+    sweep.cancel('owned original sweep cancellation')
+    with pytest.raises(asyncio.CancelledError) as caught:
+        await sweep
+    assert sweep.cancelled()
+    assert caught.value.__cause__.exceptions == tuple(failures)
     assert attempted == [item.handle for item in pending]
     assert list(b.host._pending.values()) == [pending[1]]
