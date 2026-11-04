@@ -280,7 +280,6 @@ async def test_tail_captures_original_cause_bearing_native_callback_cancellation
                 break
             await asyncio.sleep(0.01)
         assert tail.done() and not close_tasks[0].done()
-        debts = execution_cleanup_debts(vars(agent).get("_shutdown_control"))
         owners = set(agent_shutdown_completion_owners(agent))
         assert owners
         release_close.set()
@@ -578,7 +577,6 @@ async def test_agent_retains_exact_original_tail_observer_cancellation(
             await asyncio.sleep(0.01)
         assert tail.done() and not close_tasks[0].done()
         assert len(observed) == (2 if repeat else 1)
-        debts = execution_cleanup_debts(vars(agent).get("_shutdown_control"))
         owners = set(agent_shutdown_completion_owners(agent))
         assert owners
         release_close.set()

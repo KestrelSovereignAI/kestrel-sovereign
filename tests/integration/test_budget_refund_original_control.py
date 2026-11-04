@@ -180,13 +180,13 @@ async def test_original_native_refund_survives_join_callback_and_terminal_drain(
         loop.set_task_factory(observe_shutdown)
         actual_completion = child.wait_for_shutdown_completion
 
-        async def held_completion():
+        async def held_completion(**kwargs):
             if asyncio.current_task() not in shutdown_tasks:
                 # Delay only the manager's separate completion observer, not
                 # the real shutdown's own internal native completion join.
                 completion_entered.set()
                 await completion_release.wait()
-            return await actual_completion()
+            return await actual_completion(**kwargs)
 
         monkeypatch.setattr(child, "wait_for_shutdown_completion", held_completion)
 
