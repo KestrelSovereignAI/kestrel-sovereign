@@ -30,6 +30,7 @@ from .retry import with_retry
 from .image_utils import process_images
 from .genai_custody import close_genai_client, genai_operation, genai_stream, joined_iterator, prepare_genai_client
 from .google_adapter import _finish_reason, _normalized_google_genai_usage
+from .gemini_schema import gemini_parameters
 from .gemini_contents import (
     SYSTEM_MARKER_ROLE,
     to_gemini_contents,
@@ -308,6 +309,10 @@ class VertexAIAdapter(LLMAdapter):
             "description": "...",
             "parameters": {...}
         }
+
+        ``parameters`` is the JSON Schema as a google-genai ``Schema``
+        (:func:`~kestrel_sovereign.llm.gemini_schema.gemini_parameters`), the
+        one place a keyword Gemini cannot express is weakened (#3925).
         """
         function_declarations = []
         for tool in tools:
@@ -316,7 +321,9 @@ class VertexAIAdapter(LLMAdapter):
                 function_declarations.append({
                     "name": func["name"],
                     "description": func.get("description", ""),
-                    "parameters": func.get("parameters", {"type": "object", "properties": {}})
+                    "parameters": gemini_parameters(
+                        func.get("parameters", {"type": "object", "properties": {}})
+                    ),
                 })
         return function_declarations
 

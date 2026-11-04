@@ -18,6 +18,7 @@ are verified at the exact path later launched; callables do not use a wrapper.
 
 import asyncio
 import base64
+import copy
 import errno
 import hashlib
 import hmac
@@ -47,7 +48,7 @@ from importlib import metadata as importlib_metadata
 from pathlib import Path
 from queue import Empty, Full, Queue
 from types import MappingProxyType, TracebackType
-from typing import Any, Awaitable, Callable, Dict, List, Mapping, NoReturn, Optional
+from typing import Any, Awaitable, Callable, Dict, Iterator, List, Mapping, NoReturn, Optional
 from uuid import uuid4
 
 import psutil
@@ -3117,6 +3118,42 @@ class IsolatedRuntimeConfigGenerationChanged(IsolatedRuntimePreparationError):
     """A config ingress lease lost its exact client or gate generation."""
 
 
+class IsolatedToolSchemaError(IsolatedRuntimePreparationError):
+    """An isolated service advertised a tool schema Core will not expose.
+
+    Core treats an advertised ``input_schema`` as data (#3925), and refuses
+    two schemas when their tool is registered:
+
+    * :attr:`NON_LOCAL_REFERENCE`: a ``$ref``, ``$dynamicRef`` or
+      ``$recursiveRef`` not starting with ``#``, whose target Core would have
+      to fetch. It never does;
+    * :attr:`TOO_DEEP`: an object or array nested more than
+      :data:`MAX_ISOLATED_TOOL_SCHEMA_DEPTH` deep. Copying the schema for the
+      model, and each provider SDK encoding it, recurse through every level,
+      so one service could otherwise exhaust the stack on every turn the tool
+      is offered on.
+
+    The message names the tool, the problem and where it sits in the schema,
+    never the schema's value: a service controls that, and a URL can carry
+    credentials.
+    """
+
+    NON_LOCAL_REFERENCE = "non_local_reference"
+    TOO_DEEP = "too_deep"
+
+    def __init__(self, tool_name: str, location: str, problem: str) -> None:
+        if problem not in _SCHEMA_REFUSALS:
+            raise ValueError(f"unknown isolated tool schema problem: {problem!r}")
+        self.tool_name = tool_name
+        self.location = location
+        self.problem = problem
+        found, consequence = _SCHEMA_REFUSALS[problem]
+        super().__init__(
+            f"Isolated tool {tool_name[:_SCHEMA_ERROR_TEXT_LIMIT]!r} advertises "
+            f"{found} at {location[:_SCHEMA_ERROR_TEXT_LIMIT]!r}; {consequence}."
+        )
+
+
 class _IsolatedRuntimeLaunchTargetPreparationError(
     IsolatedRuntimePreparationError
 ):
@@ -3291,6 +3328,12 @@ def safe_isolated_runtime_preparation_diagnostic(
         return (
             "the host could not complete isolated feature callable verification; "
             "inspect the sanitized traceback and host process health"
+        )
+    if type(error) is IsolatedToolSchemaError:
+        found, consequence = _SCHEMA_REFUSALS[error.problem]
+        return (
+            f"an isolated feature tool advertises an input schema with {found}; "
+            f"{consequence}; update the feature package"
         )
 
     current: BaseException | None = error
@@ -6937,14 +6980,15 @@ def _meta_get(metadata: Any, key: str, default: Any = None) -> Any:
 
 
 def _input_schema_to_parameters(input_schema: Any) -> List[ToolParameter]:
-    """Convert an isolated service's advertised JSON-Schema ``input_schema``
-    (the SDK wire contract, ``ToolMetadata.input_schema``) into the
-    ``List[ToolParameter]`` a host ``ToolSchema`` expects.
+    """The flat ``List[ToolParameter]`` of an isolated service's advertised
+    JSON-Schema ``input_schema`` (the SDK wire contract,
+    ``ToolMetadata.input_schema``).
 
-    Without this the proxied tool reaches the LLM with an empty parameter list,
-    so the model cannot supply arguments (F004). Passing the raw dict through is
-    also wrong: ``ToolSchema.to_openai_format`` iterates ``ToolParameter``
-    objects and would crash on a dict/string.
+    It serves command help and argument-name checks. The model is offered
+    the schema itself (:class:`_ServiceInputToolSchema`, #3925): this list
+    keeps only each top-level property's type, description, default, enum
+    and items, so nested ``properties`` and ``required``,
+    ``additionalProperties`` and composed shapes are not in it.
     """
     if not isinstance(input_schema, dict):
         return []
@@ -6958,9 +7002,11 @@ def _input_schema_to_parameters(input_schema: Any) -> List[ToolParameter]:
     for pname, pdef in properties.items():
         pdef = pdef if isinstance(pdef, dict) else {}
         ptype = pdef.get("type")
+        nullable = False
         if isinstance(ptype, (list, tuple)):
             # JSON-Schema union, e.g. ["string", "null"] for an Optional — take
             # the first non-null member.
+            nullable = "null" in ptype
             ptype = next((t for t in ptype if t != "null"), None)
         params.append(
             ToolParameter(
@@ -6971,9 +7017,136 @@ def _input_schema_to_parameters(input_schema: Any) -> List[ToolParameter]:
                 default=pdef.get("default"),
                 enum=pdef.get("enum"),
                 items=pdef.get("items"),
+                nullable=nullable,
             )
         )
     return params
+
+
+#: How much of a service-chosen tool name or schema location a refusal quotes.
+_SCHEMA_ERROR_TEXT_LIMIT = 200
+
+#: How deep an object or array in an isolated tool's ``input_schema`` may
+#: nest; the schema object itself is 1. Data under ``default`` or
+#: ``examples`` counts: copying the schema recurses through it as well.
+MAX_ISOLATED_TOOL_SCHEMA_DEPTH = 64
+
+#: What an :class:`IsolatedToolSchemaError` found, and why Core refuses it.
+#: Core's own text, so a diagnostic may show it.
+_SCHEMA_REFUSALS = {
+    IsolatedToolSchemaError.NON_LOCAL_REFERENCE: (
+        "a non-local schema reference ($ref)",
+        "Core does not resolve remote schema references",
+    ),
+    IsolatedToolSchemaError.TOO_DEEP: (
+        f"a value nested more than {MAX_ISOLATED_TOOL_SCHEMA_DEPTH} levels deep",
+        "Core does not expose a schema it cannot copy and encode",
+    ),
+}
+
+#: JSON Schema keywords whose value is a reference to another schema.
+_SCHEMA_REFERENCE_KEYWORDS = ("$ref", "$dynamicRef", "$recursiveRef")
+#: Keywords whose value is one subschema, a list of them, or a map of names to
+#: them. A ``$ref`` key anywhere else (under ``default``, ``enum``,
+#: ``examples``, an unknown keyword, or naming a property) is data.
+_SUBSCHEMA_KEYWORDS = frozenset({
+    "additionalItems", "additionalProperties", "contains", "else", "if", "items",
+    "not", "propertyNames", "then", "unevaluatedItems", "unevaluatedProperties",
+})
+_SUBSCHEMA_LIST_KEYWORDS = frozenset({"allOf", "anyOf", "items", "oneOf", "prefixItems"})
+_SUBSCHEMA_MAP_KEYWORDS = frozenset({
+    "$defs", "definitions", "dependencies", "dependentSchemas", "patternProperties",
+    "properties",
+})
+
+
+def _json_pointer_token(name: Any) -> str:
+    return str(name).replace("~", "~0").replace("/", "~1")
+
+
+def _json_members(value: Any) -> Iterator[tuple[str, Any]]:
+    if isinstance(value, dict):
+        return ((_json_pointer_token(key), item) for key, item in value.items())
+    return ((str(index), item) for index, item in enumerate(value))
+
+
+def _over_deep_schema_location(schema: Dict[str, Any]) -> Optional[str]:
+    """The JSON pointer of the first object or array in ``schema`` nested
+    more than :data:`MAX_ISOLATED_TOOL_SCHEMA_DEPTH` deep, if any.
+
+    Iterative, and holding one member iterator per level, so the check
+    neither recurses nor builds a pointer for each node it passes.
+    """
+    path: List[str] = []
+    members: List[Iterator[tuple[str, Any]]] = [_json_members(schema)]
+    while members:
+        member = next(members[-1], None)
+        if member is None:
+            members.pop()
+            if path:
+                path.pop()
+            continue
+        token, value = member
+        if not isinstance(value, (dict, list)):
+            continue
+        path.append(token)
+        if len(members) + 1 > MAX_ISOLATED_TOOL_SCHEMA_DEPTH:
+            return "#/" + "/".join(path)
+        members.append(_json_members(value))
+    return None
+
+
+def _non_local_schema_reference(schema: Dict[str, Any]) -> Optional[str]:
+    """The JSON pointer of the first non-local reference in ``schema``, if any.
+
+    A local reference is a fragment of this schema (``#``, ``#/$defs/x``,
+    ``#anchor``). Nothing is resolved or fetched. Iterative, so a deeply
+    nested schema cannot exhaust the interpreter stack.
+    """
+    pending: List[tuple[Any, str]] = [(schema, "#")]
+    while pending:
+        node, location = pending.pop()
+        if not isinstance(node, dict):
+            continue
+        for reference_keyword in _SCHEMA_REFERENCE_KEYWORDS:
+            if reference_keyword in node:
+                reference = node[reference_keyword]
+                if not (isinstance(reference, str) and reference.startswith("#")):
+                    return f"{location}/{reference_keyword}"
+        children: List[tuple[Any, str]] = []
+        for schema_keyword, value in node.items():
+            at = f"{location}/{_json_pointer_token(schema_keyword)}"
+            if schema_keyword in _SUBSCHEMA_KEYWORDS and isinstance(value, dict):
+                children.append((value, at))
+            elif schema_keyword in _SUBSCHEMA_LIST_KEYWORDS and isinstance(value, list):
+                children.extend((item, f"{at}/{index}") for index, item in enumerate(value))
+            elif schema_keyword in _SUBSCHEMA_MAP_KEYWORDS and isinstance(value, dict):
+                children.extend(
+                    (item, f"{at}/{_json_pointer_token(name)}") for name, item in value.items()
+                )
+        pending.extend(reversed(children))
+    return None
+
+
+@dataclass
+class _ServiceInputToolSchema(ToolSchema):
+    """A ``ToolSchema`` that offers the model its service's own JSON Schema.
+
+    The SDK's ``to_openai_format`` rebuilds ``function.parameters`` from the
+    flat ``parameters`` list, which lost nested ``properties`` and
+    ``required``, ``additionalProperties``, nullable unions, ``anyOf`` and
+    ``$ref`` before the model saw the tool (#3925). This advertises a deep
+    copy of the schema the service advertised instead; ``parameters`` stays
+    for command help and argument-name checks. A provider that cannot express
+    a keyword weakens it in its own adapter, nowhere else.
+    """
+
+    input_schema: Dict[str, Any] = field(default_factory=dict)
+
+    def to_openai_format(self) -> Dict[str, Any]:
+        definition = super().to_openai_format()
+        definition["function"]["parameters"] = copy.deepcopy(self.input_schema)
+        return definition
 
 
 def _maybe_await(value: Any) -> Awaitable[Any]:
@@ -6990,8 +7163,24 @@ class IsolatedFeatureTool(AgentTool):
     """Tool wrapper that forwards execution to an isolated feature service."""
 
     def __init__(self, feature: "ProxyFeature", metadata: Any):
+        """Raises :class:`IsolatedToolSchemaError` for a schema Core will not
+        expose, so a service advertising one never registers the tool."""
         self._feature = feature
         self._metadata = metadata
+        input_schema = self.input_schema
+        if input_schema is None:
+            return
+        # Depth first: the reference walk keeps a pointer per pending node.
+        location = _over_deep_schema_location(input_schema)
+        if location is not None:
+            raise IsolatedToolSchemaError(
+                self.name, location, IsolatedToolSchemaError.TOO_DEEP
+            )
+        location = _non_local_schema_reference(input_schema)
+        if location is not None:
+            raise IsolatedToolSchemaError(
+                self.name, location, IsolatedToolSchemaError.NON_LOCAL_REFERENCE
+            )
 
     @property
     def name(self) -> str:
@@ -7014,13 +7203,17 @@ class IsolatedFeatureTool(AgentTool):
 
     @property
     def schema(self) -> ToolSchema:
-        return ToolSchema(
+        input_schema = self.input_schema
+        fields = dict(
             name=self.name,
             description=str(_meta_get(self._metadata, "description", "")),
             category=_coerce_category(_meta_get(self._metadata, "category")),
-            parameters=_input_schema_to_parameters(self.input_schema),
+            parameters=_input_schema_to_parameters(input_schema),
             command_prefix=_meta_get(self._metadata, "command_prefix"),
         )
+        if input_schema is None:
+            return ToolSchema(**fields)
+        return _ServiceInputToolSchema(**fields, input_schema=input_schema)
 
     async def execute(self, **kwargs) -> Dict[str, Any]:
         return await self._feature.call_isolated_tool(self.name, kwargs)
@@ -8979,6 +9172,11 @@ class ProxyFeature(Feature):
             self._capture_process_identity(client)
             advertised_tools = await _maybe_await(client.list_tools())
             self._assert_child_start_allowed()
+            # Inside the guard: a refused schema (IsolatedToolSchemaError)
+            # must retire this child, which nothing else would reach.
+            tools: List[AgentTool] = [
+                IsolatedFeatureTool(self, meta) for meta in advertised_tools
+            ]
             self._last_cold_start_seconds = asyncio.get_running_loop().time() - started
         except BaseException as exc:
             try:
@@ -9007,7 +9205,7 @@ class ProxyFeature(Feature):
                     "its runtime contract."
                 ) from exc
             raise
-        return client, [IsolatedFeatureTool(self, meta) for meta in advertised_tools]
+        return client, tools
 
     def _publish_client(
         self,
