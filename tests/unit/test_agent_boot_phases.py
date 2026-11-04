@@ -1328,31 +1328,59 @@ async def test_a_storage_preclose_that_reports_retained_keeps_storage_held(
 async def test_a_standalone_hold_context_is_held_until_its_close_is_confirmed(
     tmp_path, monkeypatch, close_fails
 ):
-    """``python -m kestrel_sovereign.main`` hands the agent its Hold context."""
-    _trust(monkeypatch, {*_BOOT_OWNERS, custody_module.STANDALONE_HOLD_CONTEXT})
-    close = AsyncMock(
-        side_effect=RuntimeError("injected Hold close failure") if close_fails else None
+    """The original native close receipt owns custody, including a lost ACK."""
+    from kestrel_sovereign._async_ownership import await_owned_task, create_owned_task
+    from kestrel_sovereign.execution_custody import (
+        _explicit_control_chain, is_execution_control_error,
     )
+    from kestrel_sovereign.host_features.context import SovereignHostContext
+    from kestrel_sovereign.storage.db.sqlite import SQLiteBackend
+
+    _trust(monkeypatch, {*_BOOT_OWNERS, custody_module.STANDALONE_HOLD_CONTEXT})
+    backend = SQLiteBackend(":memory:")
+    await backend.connect()
+    actual_close = backend.close
+    close_owners = []
+    failure = RuntimeError("original Hold SQLite close acknowledgement lost")
+
+    async def close():
+        close_owners.append(asyncio.current_task())
+        await actual_close()
+        if close_fails:
+            raise failure
+
+    monkeypatch.setattr(backend, "close", close)
     agent = _make_agent(tmp_path)
     try:
-        with _boot_holding_every_resource(), patch(
-            "kestrel_sovereign.hold.close_bound_host_context", close
-        ):
+        with _boot_holding_every_resource():
             await agent.initialize()
-            agent._standalone_hold_context = SimpleNamespace()
-            await _stop(agent)
-
-            close.assert_awaited_once()
+            agent._standalone_hold_context = SovereignHostContext(db=backend)
+            outcome = await await_owned_task(
+                create_owned_task(_stop(agent), retain_originals=True)
+            )
+            assert len(close_owners) == 1 and close_owners[0].done()
+            assert backend._connection is None
+            assert outcome.cancellation is None
             if close_fails:
+                assert is_execution_control_error(outcome.error)
+                assert failure in tuple(_explicit_control_chain(outcome.error))
                 assert agent._resource_custody().held == (
                     custody_module.STANDALONE_HOLD_CONTEXT,
                 )
                 _assert_guards_report_this_process(tmp_path)
+                later = await await_owned_task(create_owned_task(
+                    agent.wait_for_shutdown_completion(), retain_originals=True,
+                ))
+                assert is_execution_control_error(later.error)
+                assert failure in tuple(_explicit_control_chain(later.error))
+                assert len(close_owners) == 1
             else:
+                assert outcome.error is None
                 assert agent._resource_custody().held == ()
                 assert _guard_holder(tmp_path) is None
     finally:
         agent._standalone_hold_context = None
+        await actual_close()
         await _cleanup(agent)
 
 
