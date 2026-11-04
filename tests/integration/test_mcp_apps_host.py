@@ -29,6 +29,7 @@ from kestrel_sovereign.features.security.hooks import SecurityHook
 from kestrel_sovereign.features.security.permissions import PermissionLevel, PermissionStore
 from kestrel_sovereign.kestrel_agent import KestrelAgent
 from kestrel_sovereign.security.private_delivery import PrivateDeliveryMiddleware
+from kestrel_sovereign.security.capability_authority import HostCapabilityAccessDenied
 from kestrel_sovereign.security import private_delivery
 from kestrel_sovereign.security.request_auth import (
     AuthenticatedSessionMiddleware, InteractiveAuthenticationLifetimeMiddleware,
@@ -137,8 +138,9 @@ async def apps_boundary(tmp_path, monkeypatch):
         cleanup.callback(queue.cancel_all)
         agent.hooks_manager.register(SecurityHook(permissions, queue))
         feature = MCPAgent(agent)
-        feature.enabled = True
-        agent.features[feature.name] = feature
+        await agent._register_feature(feature)
+        cleanup.push_async_callback(agent._unregister_feature_runtime, feature, unload=True)
+        assert not hasattr(feature, "enabled")
         host = agent.create_mcp_apps_host(feature, configuration={"sandbox_url": "https://sandbox.apps.test/",
                                         "host_origin": "https://host.apps.test"},
                                            is_current=lambda: agent.features.get(feature.name) is feature)
@@ -157,7 +159,8 @@ async def apps_boundary(tmp_path, monkeypatch):
         agent.register_dynamic_tools("mcp:owned-apps", [MCPToolWrapper(handle_name="app__" + tool.name,
             tool=tool, caller=caller, app_executor=publications.executor) for tool in native_tools],
             on_registered=lambda tool, binding: tools.append(RegisteredAppTool(tool, binding)))
-        publications.register("mcp:owned-apps", tools, is_current=lambda: feature.enabled)
+        publications.register("mcp:owned-apps", tools,
+            is_current=lambda: agent.feature_contribution_runtime.is_active(feature))
         initial = next(item for item in tools if item.tool.native_tool.name == "open_marker")
         await permissions.set_permission("mcp:owned-apps", initial.binding.name, PermissionLevel.ALLOW)
         app = FastAPI()
@@ -205,6 +208,29 @@ async def test_initial_result_is_private_and_reopens_without_replaying_native_to
     assert b.markers == ["once"]
     rows = await b.backend.fetch_all("SELECT session_id,result_status FROM a2a_tool_dispatches")
     assert [tuple(row) for row in rows] == [("original-chat", "success")]
+
+
+@pytest.mark.parametrize("retirement", ["deactivate", "missing-runtime", "host-disabled"])
+async def test_apps_require_original_native_feature_activation(apps_boundary, retirement):
+    b = apps_boundary
+    b.host._require_live()
+    reference = await b.publish()
+    runtime = b.agent.feature_contribution_runtime
+    # A product-owned flag cannot keep a retired SDK contribution alive.
+    b.feature.enabled = True
+    if retirement == "deactivate":
+        assert runtime.deactivate(b.feature)
+    elif retirement == "missing-runtime":
+        b.agent.feature_contribution_runtime = None
+    else:
+        b.feature.enabled = False
+    try:
+        with pytest.raises(HostCapabilityAccessDenied):
+            b.host._require_live()
+        assert (await b.open(reference)).status_code == 403
+        assert b.markers == ["once"]
+    finally:
+        b.agent.feature_contribution_runtime = runtime
 
 
 async def test_fixed_routes_resolve_the_current_optional_host_without_retargeting_views(apps_boundary):
