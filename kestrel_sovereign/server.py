@@ -73,6 +73,7 @@ from kestrel_sovereign.llm.service import LLMService
 from kestrel_sovereign.main import get_agent_did_async
 from kestrel_sovereign.paths import SKIP_DOTENV_ENV
 from kestrel_sovereign.rate_limit import limiter
+from kestrel_sovereign.router_inclusion import atomic_router_inclusion
 from kestrel_sovereign.security.bootstrap_access import (
     forwarding_header_names,
     is_bootstrap_host_allowed,
@@ -1090,8 +1091,6 @@ def _mount_feature_routers(app: FastAPI, *, agents=None) -> None:
             # dispatching without a stale startup snapshot (#2089/#2522).
             if _is_webhook_receiver(getattr(feature, "receiver", None)):
                 continue
-            routes_before_include: Optional[int] = None
-            native_registration_before: Optional[tuple] = None
             try:
                 router = feature.get_router()
                 if router is None:
@@ -1099,29 +1098,18 @@ def _mount_feature_routers(app: FastAPI, *, agents=None) -> None:
                 router_key = _feature_router_signature(name, router)
                 if router_key in mounted_keys:
                     continue
-                routes_before_include = len(app.routes)
-                lifecycle = _LiveFeatureRouter(app, router, name, agent)
-                native_registration_before = (
-                    list(app.router.on_startup), list(app.router.on_shutdown),
-                    app.router.lifespan_context,
-                )
-                app.include_router(lifecycle)
-                contexts = list(iter_route_contexts(app.routes[routes_before_include:]))
-                app.routes[routes_before_include:] = [
-                    _LiveFeatureRoute.bind(context, lifecycle) for context in contexts
-                ]
+                # Treat router validation/inclusion as an atomic mount: never
+                # retain a partial, ungated feature contribution.
+                with atomic_router_inclusion(app) as routes_before_include:
+                    lifecycle = _LiveFeatureRouter(app, router, name, agent)
+                    app.include_router(lifecycle)
+                    contexts = list(iter_route_contexts(app.routes[routes_before_include:]))
+                    app.routes[routes_before_include:] = [
+                        _LiveFeatureRoute.bind(context, lifecycle) for context in contexts
+                    ]
                 mounted_keys.add(router_key)
                 mounted.append(name)
             except Exception as exc:
-                if routes_before_include is not None:
-                    # Treat router validation/inclusion as an atomic mount:
-                    # never retain a partial, ungated feature contribution.
-                    del app.routes[routes_before_include:]
-                if native_registration_before is not None:
-                    startup, shutdown, lifespan = native_registration_before
-                    app.router.on_startup[:] = startup
-                    app.router.on_shutdown[:] = shutdown
-                    app.router.lifespan_context = lifespan
                 logger.warning("Failed to mount router from feature %s: %s", name, exc)
 
     if agents is None:
@@ -4186,9 +4174,13 @@ async def _lifespan_startup(app: FastAPI):
             # or UI. The actual bind still revalidates the original lifecycle.
             if replacing_host_state:
                 _hf.unmount_host_features(app)
-            _hf.mount_host_feature_routers(app, candidate_started)
+            # A feature whose router does not mount is stopped and recorded
+            # as not loaded, so it is neither published nor reported healthy.
+            candidate_started = await _hf.mount_started_host_feature_routers(
+                app, candidate_started, ctx
+            )
             _hf.mount_host_feature_ui(app, candidate_started)
-            app.state.host_features = list(started_features)
+            app.state.host_features = list(candidate_started)
             app.state.host_context = ctx
             if runtime is not None:
                 app.state.host_operator_registry = runtime.operator_registry
@@ -4208,7 +4200,7 @@ async def _lifespan_startup(app: FastAPI):
                         host_context_registry
                     )
                 _bind_host_services(app, runtime.operator_registry)
-            logger.info("Host features initialized: %d", len(started_features))
+            logger.info("Host features initialized: %d", len(candidate_started))
         else:
             # The fleet control store is host infrastructure, not an optional
             # feature side effect. Hold authority must therefore exist on the

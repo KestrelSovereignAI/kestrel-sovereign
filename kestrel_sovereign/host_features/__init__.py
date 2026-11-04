@@ -11,6 +11,8 @@ per-agent features, adding a host scope without touching per-agent behavior:
   fleet tenant-scoped entities session factory).
 * :func:`mount_host_feature_routers` — mount each router at the host root
   (``/api/<name>/…``, no agent dependency → 200, not 503).
+* :func:`mount_started_host_feature_routers` — the same mount for started
+  features; one whose router does not mount is stopped and reported not loaded.
 * :func:`mount_host_feature_ui` — a distinct host-scoped console UI surface.
 * :func:`start_host_features` / :func:`stop_host_features` — host lifecycle.
 """
@@ -40,6 +42,7 @@ from .runtime import (
     is_host_feature_path,
     mount_host_feature_routers,
     mount_host_feature_ui,
+    mount_started_host_feature_routers,
     start_host_features,
     stop_host_features,
     unmount_host_features,
@@ -72,6 +75,7 @@ __all__ = [
     "is_host_feature_path",
     "mount_host_feature_routers",
     "mount_host_feature_ui",
+    "mount_started_host_feature_routers",
     "start_host_features",
     "stop_host_features",
     "unmount_host_features",
