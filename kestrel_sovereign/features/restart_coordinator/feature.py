@@ -41,9 +41,14 @@ from kestrel_sovereign.core_lock import (
     LockReportError,
     read_lock_findings_report,
 )
+from kestrel_sovereign.execution_custody import require_execution_work
 from kestrel_sovereign.features.base import Feature, tool
 from kestrel_sovereign.features.enum_coerce import normalize_choice as _normalize_choice
-from kestrel_sovereign.features.scheduler.runner import get_current_scheduler_occurrence_task
+from kestrel_sovereign.features.scheduler.runner import (
+    SCHEDULER_OCCURRENCE_TASK_PREFIX,
+    get_current_scheduler_occurrence_task,
+    scheduler_occurrence_awaiting_slot,
+)
 from kestrel_sovereign.features.storage_access import (
     AgentIdentityUnavailable,
     resolve_feature_database,
@@ -132,6 +137,18 @@ STALE_ACTIVE_REQUEST_SECONDS = 900
 # busy marker or continuously-active requester from starving the only
 # coordinator capable of applying its restart forever.
 MAX_IDLE_ONLY_DEFERRAL_SECONDS = 1800
+
+# Schedules that fire every minute are admitted in the same scheduler tick as
+# ``restart_coordinator``, so the idle check finds them in flight at 0 s every
+# time: the requester's own ``wait_reconcile`` held every ``idle_agents_only``
+# restart off until ``MAX_IDLE_ONLY_DEFERRAL_SECONDS`` (#3928). When every
+# blocker is a scheduler occurrence younger than this, the check waits up to
+# this long, once per tick, for them to finish and then evaluates again. An
+# occurrence is never exempt: one still running defers the restart as before.
+IDLE_SETTLE_SECONDS = 10
+
+# How often that wait looks again.
+IDLE_SETTLE_POLL_SECONDS = 0.5
 
 # How often the dispatch watchdog checks the restart child (see
 # ``RESTART_DISPATCH_GRACE_SECONDS``).
@@ -427,6 +444,38 @@ def _task_age_seconds(task, now: float) -> Optional[float]:
     if not isinstance(started, (int, float)):
         return None
     return max(0.0, now - started)
+
+
+def _is_settleable_occurrence(task, now: float) -> bool:
+    """A blocking task the idle check may wait out before deferring (#3928).
+
+    Only a running scheduler occurrence admitted less than
+    ``IDLE_SETTLE_SECONDS`` ago. One still queued behind its runner's
+    concurrency cap has not started, and the slot it needs may be the one
+    the inspecting ``restart_coordinator`` occurrence holds. One without a
+    start stamp cannot be shown to be young.
+    """
+    try:
+        name = task.get_name() or ""
+    except AttributeError:
+        return False
+    if not name.startswith(SCHEDULER_OCCURRENCE_TASK_PREFIX):
+        return False
+    if scheduler_occurrence_awaiting_slot(task):
+        return False
+    age = _task_age_seconds(task, now)
+    return age is not None and age < IDLE_SETTLE_SECONDS
+
+
+class _IdleSettleBudget:
+    """The one settle wait a coordinator tick may spend (#3928).
+
+    Spent by the first evaluation that waits, so a tick evaluating several
+    requests still waits at most ``IDLE_SETTLE_SECONDS`` before deferring.
+    """
+
+    def __init__(self) -> None:
+        self.spent = False
 
 
 def _format_age(seconds: Optional[float]) -> str:
@@ -1503,6 +1552,8 @@ class RestartCoordinatorFeature(Feature):
         executed: List[Dict[str, Any]] = []
         deferred: List[Dict[str, Any]] = []
         refused: List[Dict[str, Any]] = []
+        # Shared by every request below, so the tick waits at most once.
+        settle = _IdleSettleBudget()
         for req in candidates:
             # Reject unsigned legacy, forged, tampered, or key-revoked rows
             # before policy/safety can defer them indefinitely. This is the
@@ -1514,7 +1565,9 @@ class RestartCoordinatorFeature(Feature):
                 expected_current_status=req.status,
             ):
                 continue
-            req, decision = await self._evaluate_and_track_safety(req)
+            req, decision = await self._evaluate_and_track_safety(
+                req, settle=settle,
+            )
             if not decision["safe"]:
                 if decision.get("deferable", True):
                     deferred.append({
@@ -1735,8 +1788,12 @@ class RestartCoordinatorFeature(Feature):
                 ):
                     continue
                 # Re-run the safety gate before the restart now that the
-                # (possibly slow) update has completed.
-                req, decision = await self._evaluate_and_track_safety(req)
+                # (possibly slow) update has completed. The update has
+                # outlasted any settle bound, and this is the check that
+                # decides the restart, so it gets a wait of its own.
+                req, decision = await self._evaluate_and_track_safety(
+                    req, settle=_IdleSettleBudget(),
+                )
                 if not decision["safe"]:
                     if decision.get("lost_race"):
                         deferred.append({
@@ -2376,11 +2433,30 @@ class RestartCoordinatorFeature(Feature):
                 return name
         return ""
 
-    async def _evaluate_and_track_safety(self, req):
-        """Evaluate safety while maintaining the durable busy interval."""
+    async def _evaluate_and_track_safety(
+        self, req, *, settle: Optional[_IdleSettleBudget] = None,
+    ):
+        """Evaluate safety while maintaining the durable busy interval.
+
+        With an unspent ``settle`` budget, a busy check whose every blocker
+        is a young scheduler occurrence waits for them once and evaluates
+        again before deferring (#3928).
+        """
 
         database_now = await database_clock(self._db)
         decision = self._evaluate_safety(req, database_now=database_now)
+        if (
+            settle is not None
+            and not settle.spent
+            and not decision["safe"]
+            # Only a busy idle check reports a blocker; ``manual_only`` and an
+            # unknown policy never consult idleness, so waiting cannot help.
+            and decision.get("blocker") is not None
+            and await self._settle_scheduler_occurrences(req)
+        ):
+            settle.spent = True
+            database_now = await database_clock(self._db)
+            decision = self._evaluate_safety(req, database_now=database_now)
         if (
             not decision["safe"]
             and decision.get("deferable", True)
@@ -2514,12 +2590,7 @@ class RestartCoordinatorFeature(Feature):
         # it stops every agent in this host process. Normal dispatch therefore
         # requires whole-fleet quiescence (#F235). The requesting turn's own
         # marker is still excluded only on its owning agent (#1561).
-        idle = self._fleet_idle(
-            ignore_request_id=getattr(req, "requester_request_id", "") or "",
-            ignore_scheduled_task=get_current_scheduler_occurrence_task(
-                agent_id=getattr(self.agent, "did", ""), task_name="restart_coordinator",
-            ),
-        )
+        idle = self._fleet_idle(**self._idle_exclusions(req))
         request_age = self._request_age_seconds(req, database_now)
         deferral_age = self._deferral_age_seconds(req, database_now)
         if idle["idle"]:
@@ -2598,6 +2669,76 @@ class RestartCoordinatorFeature(Feature):
             "escalated": False,
         }
 
+    def _idle_exclusions(self, req) -> Dict[str, Any]:
+        """The requester's own work an idle check for ``req`` does not count.
+
+        The turn that filed the restart (#1561) and this coordinator's own
+        scheduler occurrence. Both are excluded only on the requesting agent.
+        """
+        return {
+            "ignore_request_id": getattr(req, "requester_request_id", "") or "",
+            "ignore_scheduled_task": get_current_scheduler_occurrence_task(
+                agent_id=getattr(self.agent, "did", ""), task_name="restart_coordinator",
+            ),
+        }
+
+    def _settleable_occurrences(
+        self, ignore_request_id: str = "", *, ignore_scheduled_task=None,
+    ) -> List[Any]:
+        """The blocking tasks a busy idle check may wait out (#3928).
+
+        Empty unless EVERY blocker on every agent is a settleable scheduler
+        occurrence (``_is_settleable_occurrence``). An active request,
+        dispatcher load, unknown idleness or any other task means the check
+        defers without waiting, exactly as before.
+        """
+        now = time.monotonic()
+        pending: List[Any] = []
+        for _agent, state, _cohosted in self._fleet_agent_states(
+            ignore_request_id, ignore_scheduled_task=ignore_scheduled_task,
+        ):
+            if state["idle"]:
+                continue
+            tasks = state.get("blocking_tasks") or ()
+            if not tasks or not all(
+                _is_settleable_occurrence(task, now) for task in tasks
+            ):
+                return []
+            pending.extend(tasks)
+        return pending
+
+    async def _settle_scheduler_occurrences(self, req) -> bool:
+        """Wait for young scheduler occurrences blocking ``req`` (#3928).
+
+        Returns True after waiting, so the caller evaluates once more: the
+        occurrences are not exempt, and one still running then defers the
+        restart with the usual reason. Returns False at once, without
+        waiting, when any blocker is something else.
+
+        The wait polls every ``IDLE_SETTLE_POLL_SECONDS`` for at most
+        ``IDLE_SETTLE_SECONDS``. It holds nothing an occurrence needs: no
+        lock or database transaction of this feature is open here, and the
+        cron source declares no resource lock. The one shared resource is
+        the scheduler slot this coordinator's own occurrence occupies, which
+        is why an occurrence still queued for a slot is never waited on.
+        Execution custody is checked on every wake, so an occurrence whose
+        authority was revoked stops waiting there.
+        """
+        pending = self._settleable_occurrences(**self._idle_exclusions(req))
+        if not pending:
+            return False
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + IDLE_SETTLE_SECONDS
+        while True:
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                break
+            await asyncio.sleep(min(IDLE_SETTLE_POLL_SECONDS, remaining))
+            require_execution_work(self.agent)
+            if all(task.done() for task in pending):
+                break
+        return True
+
     def _resolve_cohosted_agents(self) -> Optional[List[Any]]:
         """Every agent sharing this host process, or None for a single-agent host.
 
@@ -2640,23 +2781,26 @@ class RestartCoordinatorFeature(Feature):
                 return f"{name} ({did})" if did else name
         return did or "?"
 
-    def _fleet_idle(self, ignore_request_id: str = "", *, ignore_scheduled_task=None) -> Dict[str, Any]:
-        """Idleness across all agents before a whole-host restart (#F235).
+    def _fleet_agent_states(
+        self, ignore_request_id: str = "", *, ignore_scheduled_task=None,
+    ):
+        """Each agent a whole-host restart stops, with its idle state (#F235).
 
-        The multi-agent host installs ``agent._cohosted_agents_provider`` (a
-        callable returning every co-hosted agent) at load time. When absent
-        (single-agent host, or unwired), this degrades to the requester-only
-        check — behaviour-preserving for the single-agent case. Only the
-        REQUESTING agent excludes its own requester marker; a sibling defers
-        the restart on ANY active request.
+        Yields ``(agent, state, cohosted)``, lazily, so a caller that stops
+        at the first busy agent inspects no further. ``cohosted`` is False
+        only for a genuine single-agent host, whose one state is the
+        requester-only check. Only the REQUESTING agent excludes its own
+        requester marker and its own scheduler occurrence; a sibling defers
+        the restart on ANY of them.
         """
         agents = self._resolve_cohosted_agents()
         if agents is None:
             # No fleet view — genuine single-agent host. Requester-only check
             # (behaviour-preserving).
-            return self._agent_appears_idle(
+            yield self.agent, self._agent_appears_idle(
                 ignore_request_id=ignore_request_id, ignore_scheduled_task=ignore_scheduled_task,
-            )
+            ), False
+            return
         for other in agents:
             excl = ignore_request_id if other is self.agent else ""
             # Name individual tasks only for OUR agent. This reason is
@@ -2668,13 +2812,29 @@ class RestartCoordinatorFeature(Feature):
             # "busy" alone left a permanent task on one agent holding every
             # host restart off with nobody able to see what it was. A
             # sibling's request ids and dispatcher load stay hidden.
-            state = self._agent_appears_idle(
+            yield other, self._agent_appears_idle(
                 ignore_request_id=excl,
                 agent=other,
                 name_tasks=(other is self.agent),
                 ignore_scheduled_task=ignore_scheduled_task if other is self.agent else None,
-            )
+            ), True
+
+    def _fleet_idle(self, ignore_request_id: str = "", *, ignore_scheduled_task=None) -> Dict[str, Any]:
+        """Idleness across all agents before a whole-host restart (#F235).
+
+        The multi-agent host installs ``agent._cohosted_agents_provider`` (a
+        callable returning every co-hosted agent) at load time. When absent
+        (single-agent host, or unwired), this degrades to the requester-only
+        check — behaviour-preserving for the single-agent case. Only the
+        REQUESTING agent excludes its own requester marker; a sibling defers
+        the restart on ANY active request.
+        """
+        for other, state, cohosted in self._fleet_agent_states(
+            ignore_request_id, ignore_scheduled_task=ignore_scheduled_task,
+        ):
             if not state["idle"]:
+                if not cohosted:
+                    return state
                 name = self._fleet_agent_label(other)
                 blocker = dict(state.get("blocker") or {})
                 blocker["scope"] = (
@@ -2872,6 +3032,9 @@ class RestartCoordinatorFeature(Feature):
                         "oldest_age_seconds": max(ages) if ages else None,
                         "summary": summary,
                     },
+                    # In memory only, for the settle wait (#3928); the
+                    # blocker above is what a deferral records.
+                    "blocking_tasks": tuple(alive),
                 }
 
         if not any_surface_seen:
