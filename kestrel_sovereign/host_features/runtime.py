@@ -29,6 +29,7 @@ from kestrel_sovereign.features.contribution_runtime import (
     FeatureContributionRuntimeError,
 )
 from kestrel_sovereign.operator import OperatorRuntimeRegistry
+from kestrel_sovereign.router_inclusion import atomic_router_inclusion
 from kestrel_sovereign.signals import SourceRegistry
 from kestrel_sovereign.waits import WaitRegistry
 
@@ -76,34 +77,38 @@ def is_host_feature_path(app: FastAPI, path: str) -> bool:
     return prefix in host_feature_path_prefixes(app)
 
 
-def mount_host_feature_routers(app: FastAPI, features: List[HostFeature]) -> List[Any]:
-    """Mount each host feature's router at the host root; return added routes.
+def _mount_host_feature_router(app: FastAPI, feature: HostFeature) -> List[Any] | None:
+    """Include one feature's router whole; ``None`` when it contributes none.
 
-    A host feature serving ``/api/<name>/…`` mounts with NO prefix and NO
-    ``get_agent`` dependency, so those paths resolve at host scope and return
-    200 (given valid host auth), never 503.
+    A router whose inclusion raises leaves nothing behind: the routes and
+    native registrations it added before failing are rolled back.
     """
+    router = feature.get_router()
+    if router is None:
+        return None
+    with atomic_router_inclusion(app) as before:
+        app.include_router(router)
+    return list(app.routes[before:])
+
+
+def _mount_host_feature_routers(
+    app: FastAPI, features: List[HostFeature]
+) -> tuple[List[Any], List[tuple[HostFeature, Exception]]]:
+    """Mount every router that mounts; return its routes and what did not."""
     added: List[Any] = []
     prefixes: set = set()
     mounted_names: List[str] = []
+    failures: List[tuple[HostFeature, Exception]] = []
     for feature in features:
-        getter = getattr(feature, "get_router", None)
-        if not callable(getter):
+        if not callable(getattr(feature, "get_router", None)):
             continue
         try:
-            router = getter()
+            new_routes = _mount_host_feature_router(app, feature)
         except Exception as exc:  # noqa: BLE001 - one bad feature must not break the host
-            logger.warning("Host feature %s get_router() failed: %s", feature, exc)
+            failures.append((feature, exc))
             continue
-        if router is None:
+        if new_routes is None:
             continue
-        before = len(app.routes)
-        try:
-            app.include_router(router)
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("Failed to mount host feature router %s: %s", feature, exc)
-            continue
-        new_routes = app.routes[before:]
         added.extend(new_routes)
         for route in iter_route_contexts(new_routes):
             route_path = getattr(route, "path", None)
@@ -115,7 +120,68 @@ def mount_host_feature_routers(app: FastAPI, features: List[HostFeature]) -> Lis
     app.state._host_feature_prefixes = prefixes
     if mounted_names:
         logger.info("Mounted host feature routers: %s", ", ".join(mounted_names))
+    return added, failures
+
+
+def mount_host_feature_routers(app: FastAPI, features: List[HostFeature]) -> List[Any]:
+    """Mount each host feature's router at the host root; return added routes.
+
+    A host feature serving ``/api/<name>/…`` mounts with NO prefix and NO
+    ``get_agent`` dependency, so those paths resolve at host scope and return
+    200 (given valid host auth), never 503.
+
+    This is the mount alone. A router that does not mount is left out whole
+    and only logged here; the host lifecycle mounts started features through
+    :func:`mount_started_host_feature_routers`, which also unloads them.
+    """
+    added, failures = _mount_host_feature_routers(app, features)
+    for feature, exc in failures:
+        logger.warning("Host feature %s router did not mount: %s", feature, exc)
     return added
+
+
+async def mount_started_host_feature_routers(
+    app: FastAPI, features: List[HostFeature], ctx: Any
+) -> List[HostFeature]:
+    """Mount started features' routers; return the features still loaded.
+
+    A ``get_router()`` or ``include_router()`` failure is the same fact as a
+    start-hook failure: the feature is not loaded (#3926). It used to be one
+    WARNING while the feature stayed started, listed and healthy without its
+    HTTP capability. So it goes through the same door -- the feature is
+    stopped like any started one, which removes it from
+    ``ctx.started_host_features``, and its verdict is recorded where
+    ``/health/detailed`` reads it. The reason names the exception type only.
+
+    The other features keep their routers. An execution control failure, from
+    the mount or from the stop, propagates after the failed features retire.
+    """
+    _, failures = _mount_host_feature_routers(app, features)
+    if not failures:
+        return list(features)
+    failed = [feature for feature, _ in failures]
+    errors = [exc for _, exc in failures]
+    try:
+        await stop_host_features(failed, ctx)
+    except BaseException as cleanup:
+        raise execution_terminal_error(
+            *errors, cleanup, retain_originals=True, isolate_control_originals=True
+        )
+    if _host_control_failure(*errors):
+        raise execution_terminal_error(
+            *errors, retain_originals=True, isolate_control_originals=True
+        )
+    for feature, exc in failures:
+        reason = f"router_mount_failed: {type(exc).__name__}"
+        logger.error(
+            "Host feature %s did not load — %s",
+            _host_feature_name(feature),
+            reason,
+            exc_info=exc,
+        )
+        _record_host_feature_rejection(ctx, feature, reason)
+    failed_ids = {id(feature) for feature in failed}
+    return [feature for feature in features if id(feature) not in failed_ids]
 
 
 def mount_host_feature_ui(app: FastAPI, features: List[HostFeature]) -> List[Any]:
@@ -432,6 +498,7 @@ async def stop_host_features(features: List[HostFeature], ctx: Any) -> None:
 __all__ = [
     "HOST_FEATURE_STATIC_ASSET_RE",
     "mount_host_feature_routers",
+    "mount_started_host_feature_routers",
     "mount_host_feature_ui",
     "unmount_host_features",
     "start_host_features",
