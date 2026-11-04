@@ -631,6 +631,7 @@ async def await_lifecycle_task_completion(
 
 def agent_shutdown_completion_owners(
     agent: object, *, include_continuation: bool = True,
+    observed_errors: tuple[BaseException, ...] = (),
 ) -> tuple[asyncio.Future, ...]:
     """Original cleanup owners, never an authority or retirement ACK."""
     from kestrel_sovereign.execution_custody import execution_cleanup_debts
@@ -640,9 +641,8 @@ def agent_shutdown_completion_owners(
     if include_continuation:
         candidates.append(state.get("_durable_shutdown_continuation"))
     candidates.append(state.get("_standalone_hold_context_close_task"))
-    candidates.extend(owner for _resource, owner in execution_cleanup_debts(
-        state.get("_shutdown_control")
-    ))
+    for error in (state.get("_shutdown_control"), *observed_errors):
+        candidates.extend(owner for _resource, owner in execution_cleanup_debts(error))
     owners = []
     for owner in candidates:
         if isinstance(owner, asyncio.Future) and all(owner is not prior for prior in owners):
@@ -704,15 +704,23 @@ async def await_agent_shutdown_completion(
             # The receipt's gate can refuse the new waiter before entry. That
             # does not retire existing native work. Join each original owner
             # directly, never allocate a replacement cleanup attempt.
-            for owner in agent_shutdown_completion_owners(agent):
-                if owner is task:
-                    continue
-                if owner is asyncio.current_task() or owner in owned_task_join_ancestors():
-                    debt = pending_owned_retirement_error(agent, (owner,), message="original shutdown owner still owns reentrant cleanup")
-                    if debt is not None:
-                        errors.append(debt)
-                else:
-                    await join_original(owner)
+            joined = set()
+            while True:
+                owners = tuple(owner for owner in agent_shutdown_completion_owners(
+                    agent, observed_errors=tuple(errors),
+                ) if owner is not task and owner not in joined)
+                if not owners:
+                    break
+                for owner in owners:
+                    joined.add(owner)
+                    if owner is asyncio.current_task() or owner in owned_task_join_ancestors():
+                        debt = pending_owned_retirement_error(agent, (owner,), message="original shutdown owner still owns reentrant cleanup")
+                        if debt is not None:
+                            errors.append(debt)
+                    else:
+                        await join_original(owner)
+                # Joining can publish original child debts even when the
+                # parent's terminal observer could not publish its callback.
     if finite_errors is not None:
         finite_errors.extend(errors)
         finite_errors.extend(value for value in observed if all(value is not old for old in finite_errors))
@@ -9887,6 +9895,7 @@ Expected Duration: {expected_duration}
         """
         retried_failure = False
         finite_outcomes: list[BaseException] = []
+        observed_owners: set[asyncio.Future] = set()
 
         def raise_finite_control(*, control_only=False):
             terminal = execution_terminal_error(
@@ -9913,7 +9922,7 @@ Expected Duration: {expected_duration}
             # waiting on this caller or its actual must-join ancestors.
             from kestrel_sovereign._async_ownership import (
                 await_owned_task,
-                owned_task_join_ancestors,
+                owned_task_join_ancestors, owned_task_error,
             )
             current = asyncio.current_task()
             ancestors = owned_task_join_ancestors(current)
@@ -9923,6 +9932,7 @@ Expected Duration: {expected_duration}
                 )
                 if (not owner.done() or owner in self._durable_shutdown_tail_tasks)
                 and owner is not current and owner not in ancestors
+                and owner not in observed_owners
             }
             # A finite observation deadline is not a native retirement failure.
             # Join the exact accepted tail tasks, including completed tasks
@@ -9930,7 +9940,13 @@ Expected Duration: {expected_duration}
             # outcomes enter the shared native-control inventory.
             if pending:
                 for owner in pending:
-                    outcome = await await_owned_task(owner, defer_cancellation=defer_cancellation)
+                    try:
+                        outcome = await await_owned_task(owner, defer_cancellation=defer_cancellation)
+                    except BaseException as observation:
+                        finite_outcomes.append(observation)
+                        raise_finite_control()
+                        raise
+                    observed_owners.add(owner)
                     if outcome.error is not None:
                         finite_outcomes.append(outcome.error)
                     if outcome.cancellation is not None:
@@ -9939,8 +9955,13 @@ Expected Duration: {expected_duration}
                         outcome.error,
                         retain_cancellation=owner in self._durable_shutdown_tail_tasks,
                     )
-                    if owner.done():
+                    physical = owned_task_error(owner)
+                    if (physical is None or is_execution_control_error(physical)
+                            or isinstance(physical, asyncio.CancelledError)):
                         self._durable_shutdown_tail_tasks.discard(owner)
+                    # An ordinary original failure has no native-control latch.
+                    # Keep its exact completed Task for subsequent lifecycle
+                    # observers; this invocation observes each owner only once.
                 continue  # Harvest any native child debt published by that owner.
             continuation = self._durable_shutdown_continuation
             if continuation is None:
@@ -9952,15 +9973,15 @@ Expected Duration: {expected_duration}
             except asyncio.CancelledError as cancellation:
                 finite_outcomes.append(cancellation)
                 self._remember_shutdown_control(cancellation)
-                raise_finite_control(control_only=True)
-                # A continuation can itself be cancelled (for example while
-                # releasing the runtime owner).  That is a retryable cleanup
-                # failure.  A cancellation of *this* waiter, on the other
-                # hand, must remain visible to the outer lifecycle owner,
-                # which keeps the continuation alive with ``shield``.
                 if not continuation.done() or not continuation.cancelled():
+                    # Preserve earlier original outcomes with this actual
+                    # caller withdrawal. The continuation remains retained.
+                    raise_finite_control()
                     raise
-                failure: BaseException = asyncio.CancelledError()
+                raise_finite_control(control_only=True)
+                # An original continuation cancellation retains the existing
+                # single cleanup retry, with that same owner's native outcome.
+                failure: BaseException = owned_task_error(continuation) or cancellation
             except Exception as exc:
                 # The one existing retry can resolve an ordinary observer
                 # failure. Do not turn that repaired availability error into
@@ -10761,7 +10782,15 @@ Expected Duration: {expected_duration}
                 )
             except BaseException as tail_failure:
                 remember_finite(tail_failure, retain_ordinary=True)
-                tail_cancelled, tail_degraded = False, True
+                tail_cancelled = (
+                    isinstance(tail_failure, asyncio.CancelledError)
+                    or bool(execution_observer_cancellations(tail_failure))
+                    # A consumed group can retain the original withdrawal as
+                    # an unmarked source. It does not undo actual delivery to
+                    # this lifecycle Task or grant a fresh cancellation budget.
+                    or asyncio.current_task().cancelling() > 0
+                )
+                tail_degraded = True
             if tail_cancelled:
                 shutdown_cancelled = True
 
