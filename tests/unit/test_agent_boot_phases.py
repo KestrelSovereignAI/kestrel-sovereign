@@ -1337,8 +1337,8 @@ async def test_a_standalone_hold_context_is_held_until_its_close_is_confirmed(
     from kestrel_sovereign.storage.db.sqlite import SQLiteBackend
 
     _trust(monkeypatch, {*_BOOT_OWNERS, custody_module.STANDALONE_HOLD_CONTEXT})
+    agent = _make_agent(tmp_path)
     backend = SQLiteBackend(":memory:")
-    await backend.connect()
     actual_close = backend.close
     close_owners = []
     failure = RuntimeError("original Hold SQLite close acknowledgement lost")
@@ -1349,9 +1349,9 @@ async def test_a_standalone_hold_context_is_held_until_its_close_is_confirmed(
         if close_fails:
             raise failure
 
-    monkeypatch.setattr(backend, "close", close)
-    agent = _make_agent(tmp_path)
     try:
+        await backend.connect()
+        monkeypatch.setattr(backend, "close", close)
         with _boot_holding_every_resource():
             await agent.initialize()
             agent._standalone_hold_context = SovereignHostContext(db=backend)
