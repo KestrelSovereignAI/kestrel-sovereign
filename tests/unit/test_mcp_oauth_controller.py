@@ -673,3 +673,29 @@ async def test_identity_snapshot_refusal_precedes_original_handle_handoff(contro
     assert result.status_code == 403
     assert b.runtime.calls == [] and b.runtime.states == {} and b.runtime.retired == []
     assert b.host._pending == {}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("retirement_error", [TimeoutError, asyncio.CancelledError])
+async def test_failed_original_retirement_cannot_skip_an_independent_eligible_handle(controller, monkeypatch, retirement_error):
+    b = controller
+    await begin(b)
+    await begin(b, headers={'Authorization': 'Bearer ' + _create_jwt(ALICE)})
+    pending = list(b.host._pending.values())
+    original = b.runtime.retire_authorization
+    attempted = []
+    async def failing_first(handle):
+        attempted.append(handle)
+        if handle is pending[0].handle:
+            raise retirement_error('first original handle remains retained')
+        await original(handle)
+    monkeypatch.setattr(b.runtime, 'retire_authorization', failing_first)
+    b.host.withdraw()
+    with pytest.raises(retirement_error):
+        await b.host.maintain()
+    assert attempted == [item.handle for item in pending]
+    assert list(b.host._pending.values()) == [pending[0]]
+    assert b.runtime.retired == [pending[1].handle]
+    monkeypatch.setattr(b.runtime, 'retire_authorization', original)
+    await b.host.maintain()
+    assert b.host._pending == {}

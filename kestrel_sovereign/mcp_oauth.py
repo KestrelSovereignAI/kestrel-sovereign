@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Callable, Mapping
-from contextlib import asynccontextmanager
+from contextlib import AsyncExitStack, asynccontextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
@@ -627,9 +627,14 @@ class MCPOAuthHost:
     async def maintain(self) -> None:
         """Retire expired original provider frames without writing credential state."""
         now = self.authority.clock()
-        for identifier, pending in tuple(self._pending.items()):
-            if not pending.in_flight and (pending.withdrawn or pending.expires_at <= now):
-                await self._retire_pending(identifier, pending)
+        eligible = [(identifier, pending) for identifier, pending in tuple(self._pending.items())
+            if not pending.in_flight and (pending.withdrawn or pending.expires_at <= now)]
+        # Structured cleanup attempts every independent owner, including when
+        # another callback fails or raises cancellation. Failed originals stay
+        # registered, and AsyncExitStack preserves the exception chain.
+        async with AsyncExitStack() as retirements:
+            for identifier, pending in reversed(eligible):
+                retirements.push_async_callback(self._retire_pending, identifier, pending)
 
     def _pending_for(self, context, identifier: str) -> _PendingAuthorization:
         pending = self._pending.get(identifier)

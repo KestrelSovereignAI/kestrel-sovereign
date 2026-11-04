@@ -160,6 +160,8 @@ permission to use a grant. The feature schedules `maintain()` without durable
 writes and owns/join its authorization tasks. Foreground Begin does not wait on
 unrelated maintenance: a failed retirement remains owned and counts toward the
 finite quotas while the independent maintenance owner reports/reconciles it.
+Each sweep attempts every eligible handle, retaining failed originals and
+propagating their errors after independent cleanup has run.
 Every failed `begin` must retain
 and retire its own workers, including before it can return a valid handle.
 
