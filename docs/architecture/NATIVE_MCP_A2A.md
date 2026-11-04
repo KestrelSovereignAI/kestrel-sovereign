@@ -304,7 +304,12 @@ SDK 0.46's publication context binds an initial private result to its actual
 streaming chat destination. Core carries that metadata on the existing turn
 part collector, matches the exact host and session, and expires it when the
 owning turn exits. Foreign inline tasks borrow the same collector; headless
-calls and subagent buffers supply no destination. Copying or serializing the
+calls and subagent buffers supply no destination. A feature subagent's tool
+result and an A2A skill's are completed at the same boundary as a chat call.
+The subagent's publishes to the turn that dispatched the subagent. The A2A
+skill's is headless: its factory runs with no context, and nothing it returns
+reaches a chat. Core refuses to serialize a deferred result that has not been
+completed, so a route that skips this boundary fails. Copying or serializing the
 collector carries only part data. The original factory can
 read the context during publication even after tool-wrapper transfers. Features
 that need this association require `supports_tool_publication_context is True`.

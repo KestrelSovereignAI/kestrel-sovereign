@@ -1,17 +1,20 @@
 """Real dispatch and post-tool hooks gate private render delivery."""
 
 import asyncio
+import json
 from dataclasses import dataclass
 
 import pytest
 import pytest_asyncio
 
 from kestrel_sdk.hooks.base import Hook, HookEvent, HookOutput
-from kestrel_sdk.llm.response import ToolCall
+from kestrel_sdk.llm.response import LLMResponse, ToolCall
+from kestrel_sdk.native_a2a.types import TaskState
 from kestrel_sdk.tools import (
     DeferredToolResult, ToolCategory, ToolPublicationContext, ToolResult, ToolSchema,
 )
 from kestrel_sdk.features.base import Feature as SDKFeature, tool as feature_tool
+from kestrel_sovereign.a2a.projections import embedded_json_value
 from kestrel_sovereign.a2a.stores.unified.observability_store import ObservabilityStore
 from kestrel_sovereign.agent.orchestrator_engine import OrchestratorEngineMixin
 from kestrel_sovereign.agent.parts import drain_parts, emit_part, part_collector
@@ -20,6 +23,9 @@ from kestrel_sovereign.hooks.manager import HooksManager
 from kestrel_sovereign.features.base import Feature as CoreFeature
 from kestrel_sovereign.execution_custody import ExecutionAuthorityError
 from kestrel_sovereign.storage.db.sqlite import SQLiteBackend
+
+# Native data a factory retains privately; it must never reach a public result.
+PRIVATE_NATIVE_SENTINEL = "private-native-retained-sentinel"
 
 
 class CompletionHost(OrchestratorEngineMixin, ToolRegistryMixin):
@@ -45,8 +51,13 @@ class PostPolicy(Hook):
         self.completed_response = None
         self.failure = None
         self.output = HookOutput.allow()
+        # A feature route also fires POST_TOOL_USE for the subagent dispatch
+        # or the A2A task status; this policy reviews the deferred result.
+        self.deferred_only = False
 
     async def execute(self, value):
+        if self.deferred_only and not isinstance(value.tool_response, DeferredToolResult):
+            return HookOutput.allow()
         self.started.set()
         if self.observe_result is not None:
             self.observe_result(value.tool_response)
@@ -89,8 +100,10 @@ class DeferredTool:
 
     async def execute(self, **arguments):
         self.executions.append(arguments)
+        native = {"retained": PRIVATE_NATIVE_SENTINEL}
 
         def publish():
+            assert native["retained"] == PRIVATE_NATIVE_SENTINEL
             self.publications.append("published-once")
             self.publication_contexts.append(self.last_result.publication_context)
             if self.publication_error is not None:
@@ -859,3 +872,338 @@ async def test_custom_feature_deferred_dispatch_uses_the_same_audit_completion(b
         rows = await peer.backend.fetch_all("SELECT result_status FROM a2a_tool_dispatches")
         assert [tuple(row) for row in rows] == [("success",)]
         assert peer.tool.publications == ["published-once"]
+
+
+# ---------------------------------------------------------------------------
+# Feature-subagent and A2A skill routes (#3922). Both run a feature's tool
+# outside the chat dispatch; each completes a deferred result through the same
+# post-policy, required-audit and publication boundary as the routes above.
+# ---------------------------------------------------------------------------
+
+SESSION = "deferred-owned-session"
+PROVIDER = "deferred-route-feature"
+
+
+class ScriptedSubagentModel:
+    """The subagent's own model: call the deferred tool once, then answer.
+
+    ``inline`` runs the call through the subagent's tool executor, as the
+    codex app-server does; otherwise the subagent's own tool loop runs it.
+    ``seen`` is each tool result exactly as the model received it.
+    """
+
+    def __init__(self, tool_name, *, inline):
+        self.tool_name, self.inline = tool_name, inline
+        self.seen = []
+
+    async def generate(self, *, tool_executor=None, **kwargs):
+        if self.inline:
+            _, result = await tool_executor(self.tool_name, {})
+            self.seen.append(json.loads(json.dumps(result)))
+            return "Subagent finished."
+        return LLMResponse(content="", tool_calls=[
+            ToolCall(id="subagent-call", name=self.tool_name, arguments={})])
+
+    async def generate_with_messages(self, *, messages, **kwargs):
+        self.seen.extend(json.loads(m["content"]) for m in messages if m["role"] == "tool")
+        return "Subagent finished."
+
+
+@dataclass
+class Route:
+    kind: str
+    host: CompletionHost
+    tool: DeferredTool
+    feature: object
+    policy: PostPolicy
+    backend: object
+    model: object = None
+    manager: object = None
+
+    async def invoke(self):
+        if self.kind == "a2a":
+            return await self.manager.execute_skill(PROVIDER, DeferredTool.name, {}, sync=True)
+        return await self.host._dispatch_tool_call(
+            ToolCall(id="parent-call", name=self.feature.tool_name,
+                     arguments={"task": "Render the owned view"}),
+            features_by_tool_name={self.feature.tool_name: self.feature},
+            known_tools=self.host._known_tool_names(), messages=[], iteration=0,
+            user_message=None, session_id=SESSION,
+        )
+
+    def seen(self, outcome):
+        """The public result the subagent's model or the A2A caller received."""
+        if self.kind == "a2a":
+            recognized, value = embedded_json_value(outcome.artifacts[0].parts[0])
+            assert recognized
+            return value
+        [result] = self.model.seen
+        return result
+
+    @property
+    def adapter(self):
+        prefix = "a2a" if self.kind == "a2a" else "subagent"
+        return f"{prefix}:{type(self.feature).__name__}.{DeferredTool.name}"
+
+    async def deferred_dispatch_rows(self):
+        rows = await self.backend.fetch_all(
+            "SELECT adapter, result_status, session_id FROM a2a_tool_dispatches WHERE tool_name = ?",
+            (DeferredTool.name,),
+        )
+        return [tuple(row) for row in rows]
+
+
+@pytest_asyncio.fixture(params=[
+    (kind, base) for kind in ("subagent-loop", "subagent-inline", "a2a")
+    for base in ("core-feature", "sdk-feature")
+], ids=lambda param: "-".join(param))
+async def route(tmp_path, request):
+    from kestrel_sdk.native_a2a.types import AgentSkill
+    from kestrel_sovereign.a2a.scope import NativeRecipientScope
+    from kestrel_sovereign.features.subagent_dispatch import ensure_subagent_dispatch
+    from tests.utils.native_a2a import manager_for
+
+    kind, base_name = request.param
+    db = SQLiteBackend(str(tmp_path / "deferred-route-audit.db"))
+    await db.connect()
+    store = ObservabilityStore(db)
+    await store.initialize()
+    host = CompletionHost(store)
+    host.get_turn_bound_session_id = lambda: SESSION
+    tool, policy = DeferredTool(), PostPolicy()
+    policy.deferred_only = True
+    policy.observe_result = lambda result: setattr(tool, "active_result", result)
+    base = CoreFeature if base_name == "core-feature" else SDKFeature
+
+    class RouteSource(base):
+        tool_description = "Owned deferred route fixture"
+
+        async def initialize(self):
+            pass
+
+        @feature_tool(name="deferred_result", description="Owned deferred result", category=ToolCategory.UTILITY)
+        async def deferred_result(self):
+            return await tool.execute()
+
+    feature = ensure_subagent_dispatch(RouteSource)(host)
+    host.features[type(feature).__name__] = feature
+    host.hooks_manager.register(policy)
+    model = manager = None
+    if kind == "a2a":
+        tasks_db = SQLiteBackend(str(tmp_path / "deferred-route-tasks.db"))
+        await tasks_db.connect()
+        manager = manager_for(tasks_db, NativeRecipientScope(host.did, "tenant"),
+                              hooks_manager=host.hooks_manager)
+        await manager.initialize()
+        manager.register_provider(PROVIDER, [AgentSkill(
+            id=DeferredTool.name, name="Deferred result",
+            description="Owned deferred skill", tags=["test"])], feature)
+    else:
+        model = host.llm_service = ScriptedSubagentModel(DeferredTool.name,
+                                                         inline=kind == "subagent-inline")
+    try:
+        yield Route(kind, host, tool, feature, policy, db, model, manager)
+    finally:
+        policy.release.set()
+        if manager is not None:
+            await manager.close()
+        await store.close()
+
+
+def _assert_spent(tool):
+    with pytest.raises(RuntimeError, match="already finalized or transferred"):
+        tool.active_result.finalize(tool.active_result, allowed=True)
+
+
+@pytest.mark.parametrize("redact", [False, True])
+async def test_route_publishes_once_only_after_completed_post_policy(route, redact):
+    route.policy.redact = redact
+    with part_collector(host=route.host, session_id=SESSION):
+        call = asyncio.create_task(route.invoke())
+        try:
+            await asyncio.wait_for(route.policy.started.wait(), 5)
+            assert route.tool.executions == [{}] and not route.tool.publications
+            route.policy.release.set()
+            outcome = await call
+        finally:
+            route.policy.release.set()
+            if not call.done():
+                call.cancel()
+            await asyncio.gather(call, return_exceptions=True)
+        chat = drain_parts()
+    seen = route.seen(outcome)
+    assert seen["status"] == "ok"
+    assert seen["data"]["value"] == ("redacted" if redact else "original")
+    assert route.tool.executions == [{}]
+    assert route.tool.publications == ([] if redact else ["published-once"])
+    assert PRIVATE_NATIVE_SENTINEL not in json.dumps(seen) + json.dumps(chat)
+    _assert_spent(route.tool)
+
+
+async def test_route_publishes_to_its_own_destination(route):
+    route.policy.release.set()
+    with part_collector(host=route.host, session_id=SESSION):
+        outcome = await route.invoke()
+        chat = [part["type"] for part in drain_parts()]
+    assert route.tool.executions == [{}] and route.tool.publications == ["published-once"]
+    assert route.tool.last_result.publication_context is None
+    if route.kind == "a2a":
+        # An A2A task has no chat: the factory runs headless even inside a
+        # live turn, and nothing it returns reaches that turn's chat.
+        assert route.tool.publication_contexts == [None]
+        assert chat == ["post_policy"]
+        assert outcome.status.state == TaskState.TASK_STATE_COMPLETED
+    else:
+        # The subagent's own buffer is no destination; its parent turn is.
+        assert route.tool.publication_contexts == [ToolPublicationContext(route.host.did, SESSION)]
+        assert chat == ["original_part", "post_policy", "private_view"]
+        assert outcome["success"] is True
+
+
+async def test_route_without_a_chat_turn_publishes_headless(route):
+    route.policy.release.set()
+    await route.invoke()
+    assert route.tool.executions == [{}] and route.tool.publications == ["published-once"]
+    assert route.tool.publication_contexts == [None]
+
+
+@pytest.mark.parametrize("decision", ["deny", "ask", "stop"])
+async def test_route_post_policy_decision_withholds_without_replaying(route, decision):
+    route.policy.output = {
+        "deny": HookOutput.deny("Private delivery denied"),
+        "ask": HookOutput.ask("not-an-automatic-retry", "Private delivery requires approval"),
+        "stop": HookOutput(continue_execution=False, stop_reason="Private delivery stopped"),
+    }[decision]
+    route.policy.release.set()
+    with part_collector(host=route.host, session_id=SESSION):
+        outcome = await route.invoke()
+        assert "private_view" not in [part["type"] for part in drain_parts()]
+    seen = route.seen(outcome)
+    assert seen["data"]["value"] == "original"
+    assert [part["type"] for part in seen["parts"]] == ["original_part"]
+    assert route.tool.executions == [{}] and route.tool.publications == []
+    _assert_spent(route.tool)
+
+
+async def test_route_cancellation_while_post_policy_is_pending_never_publishes(route):
+    with part_collector(host=route.host, session_id=SESSION):
+        call = asyncio.create_task(route.invoke())
+        try:
+            await asyncio.wait_for(route.policy.started.wait(), 5)
+            call.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await call
+        finally:
+            route.policy.release.set()
+            await asyncio.gather(call, return_exceptions=True)
+        assert "private_view" not in [part["type"] for part in drain_parts()]
+    assert route.tool.executions == [{}] and not route.tool.publications
+    assert await route.deferred_dispatch_rows() == []
+
+
+async def test_route_publication_waits_for_its_required_dispatch_row(route, monkeypatch):
+    route.policy.release.set()
+    entered, release = asyncio.Event(), asyncio.Event()
+    write = route.host.observability_store.log_tool_dispatch
+
+    async def persist(entry, **kwargs):
+        if entry.tool_name == DeferredTool.name:
+            assert kwargs == {"required": True}
+            entered.set()
+            await release.wait()
+            assert route.tool.publications == []
+        await write(entry, **kwargs)
+
+    monkeypatch.setattr(route.host.observability_store, "log_tool_dispatch", persist)
+    call = asyncio.create_task(route.invoke())
+    try:
+        await asyncio.wait_for(entered.wait(), 5)
+        assert route.tool.executions == [{}] and route.tool.publications == []
+        release.set()
+        await call
+    finally:
+        release.set()
+        if not call.done():
+            call.cancel()
+        await asyncio.gather(call, return_exceptions=True)
+    assert route.tool.publications == ["published-once"]
+    expected_session = None if route.kind == "a2a" else SESSION
+    assert await route.deferred_dispatch_rows() == [(route.adapter, "success", expected_session)]
+
+
+async def test_route_audit_failure_withholds_the_ui_and_is_not_replayable(route):
+    from kestrel_sdk.resources import ResourceOutcomeUnknown
+    from kestrel_sovereign.a2a.projections import message_text
+
+    route.policy.release.set()
+    await route.backend.execute("DROP TABLE a2a_tool_dispatches")
+    with part_collector(host=route.host, session_id=SESSION):
+        if route.kind == "a2a":
+            task = await route.invoke()
+            assert task.status.state == TaskState.TASK_STATE_FAILED
+            assert "Do not replay" in message_text(task.status.message)
+            assert not task.artifacts
+        else:
+            # Like the chat route, a confirmed tool effect with an unconfirmed
+            # audit ends the dispatch; a failure envelope would invite a rerun.
+            with pytest.raises(ResourceOutcomeUnknown, match="Do not replay"):
+                await route.invoke()
+        assert "private_view" not in [part["type"] for part in drain_parts()]
+    assert route.tool.executions == [{}] and route.tool.publications == []
+    _assert_spent(route.tool)
+
+
+async def test_route_publication_failure_reports_without_failing_or_replaying(route):
+    route.tool.publication_error = RuntimeError("private-factory-sentinel")
+    route.policy.release.set()
+    outcome = await route.invoke()
+    seen = route.seen(outcome)
+    assert seen["status"] == "ok" and seen["data"] == {"value": "original"}
+    assert seen["parts"][-1]["type"] == "notice"
+    assert "Do not run it again" in seen["parts"][-1]["data"]["body"]
+    assert "private-factory-sentinel" not in json.dumps(seen)
+    assert route.tool.executions == [{}] and route.tool.publications == ["published-once"]
+
+
+async def test_route_host_without_audited_completion_withholds_the_ui(route, monkeypatch):
+    from kestrel_sovereign.a2a.projections import message_text
+
+    # No policy runs here, so take the wrapper's transferred result directly.
+    transfer = DeferredToolResult.for_tool
+
+    def record(result, *args, **kwargs):
+        route.tool.active_result = transfer(result, *args, **kwargs)
+        return route.tool.active_result
+
+    monkeypatch.setattr(DeferredToolResult, "for_tool", record)
+    route.host.supports_audited_deferred_tool_results = False
+    route.policy.release.set()
+    outcome = await route.invoke()
+    if route.kind == "a2a":
+        assert outcome.status.state == TaskState.TASK_STATE_FAILED
+        detail = message_text(outcome.status.message)
+    else:
+        detail = outcome["error"]
+    assert "Do not replay" in detail
+    assert route.tool.executions == [{}] and route.tool.publications == []
+    assert not route.policy.started.is_set()
+    _assert_spent(route.tool)
+
+
+def test_serializer_refuses_a_deferred_result_at_any_depth():
+    from kestrel_sovereign.features.base import _serialize_tool_result
+
+    published = []
+
+    def publish():
+        published.append("published")
+        return []
+
+    deferred = DeferredToolResult(ToolResult.ok("done").to_dict(), publish=publish)
+    for value in (deferred, {"result": deferred}, [deferred]):
+        with pytest.raises(TypeError, match="deferred tool result must be completed"):
+            _serialize_tool_result(value)
+    # The refusal neither publishes nor spends the one-shot factory.
+    assert published == []
+    assert deferred.finalize(deferred, allowed=True).withheld is False
+    assert published == ["published"]

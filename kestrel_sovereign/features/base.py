@@ -245,7 +245,15 @@ def _serialize_tool_result(result: Any) -> Any:
     """Convert a tool result to a JSON-serializable format.
 
     Handles dataclasses with to_dict(), lists, enums, and nested structures.
+
+    A ``DeferredToolResult`` is refused: rebuilding it as a plain dict drops
+    its private publication. A route must complete it first, through
+    ``_complete_post_tool_result``, then serialize the public result.
     """
+    if isinstance(result, DeferredToolResult):
+        raise TypeError(
+            "A deferred tool result must be completed before it is serialized"
+        )
     if result is None or isinstance(result, (str, int, float, bool)):
         return result
     if isinstance(result, dict):
@@ -303,6 +311,52 @@ def _attach_envelope_parts(
     response.pop("parts", None)
     if clean:
         response["parts"] = clean
+
+
+async def _complete_feature_deferred_result(
+    feature: Any,
+    result: DeferredToolResult,
+    *,
+    tool_name: str,
+    tool_input: Dict[str, Any],
+    session_id: str,
+    exec_start: float,
+    adapter: str,
+    destination: Any,
+) -> Dict[str, Any]:
+    """Complete a feature route's deferred result at the main boundary.
+
+    The feature-subagent and A2A skill routes run a tool outside the chat
+    dispatch, so they complete its deferred result here: post-tool policy,
+    the required dispatch row, then ``finalize`` at ``destination``, all in
+    ``_complete_post_tool_result``. Only the public result is returned. A host
+    without that completion withholds the UI, and the tool is not replayed.
+    """
+    from kestrel_sdk.hooks.base import HookEvent, HookInput
+    from kestrel_sdk.resources import ResourceUnsupported
+    from kestrel_sovereign.agent.orchestrator_engine import _complete_post_tool_result
+
+    host = feature.agent
+    if getattr(host, "supports_audited_deferred_tool_results", False) is not True:
+        result.finalize(result, allowed=False)
+        raise ResourceUnsupported(
+            "Tool completed, but this host cannot complete its deferred result; "
+            "UI withheld. Do not replay to recover the UI",
+        )
+    post_input = HookInput(
+        session_id=session_id,
+        hook_event_name=HookEvent.POST_TOOL_USE.value,
+        tool_name=tool_name,
+        tool_input=tool_input,
+        feature_name=type(feature).__name__,
+        tool_response=result,
+        execution_time_ms=int((time.time() - exec_start) * 1000),
+    )
+    completed = await _complete_post_tool_result(
+        host, result, post_input, adapter=adapter,
+        dispatch_start=exec_start, destination=destination,
+    )
+    return dict(completed)
 
 
 def _subagent_turn_identity(session_id: Optional[str]):
@@ -1380,7 +1434,21 @@ class Feature(_SdkFeature):
             return task
         task.status.CopyFrom(TaskStatus(state=TaskState.TASK_STATE_WORKING))
         try:
+            exec_start = time.time()
             result = await selected.execute(**args)
+            if isinstance(result, DeferredToolResult):
+                # An A2A task has no chat, so its publication is headless. The
+                # artifact carries only the completed public result.
+                from kestrel_sovereign.agent.orchestrator_engine import (
+                    HEADLESS_PUBLICATION,
+                )
+
+                result = await _complete_feature_deferred_result(
+                    self, result, tool_name=skill_name, tool_input=args,
+                    session_id="", exec_start=exec_start,
+                    adapter=f"a2a:{type(self).__name__}.{skill_name}",
+                    destination=HEADLESS_PUBLICATION,
+                )
             result = _serialize_tool_result(result)
             # Inline standard JSON preserves integer types and identifiers
             # beyond binary64 precision. Encoding must succeed before the
@@ -1407,6 +1475,14 @@ class Feature(_SdkFeature):
                     ),
                 )
             )
+            from kestrel_sdk.resources import ResourceOutcomeUnknown
+
+            if isinstance(error, ResourceOutcomeUnknown):
+                # The skill may already have acted (a completed tool whose
+                # audit is unconfirmed is one): its caller must not rerun it.
+                from kestrel_sovereign.a2a.lifecycle import mark_outcome_unknown
+
+                mark_outcome_unknown(task)
             return task
         task.artifacts.append(artifact)
         failed = (
@@ -1737,6 +1813,11 @@ class Feature(_SdkFeature):
         except Exception as e:
             if is_execution_control_error(e):
                 raise
+            from kestrel_sovereign.llm.error_handling import TerminalToolError
+            if isinstance(e, TerminalToolError):
+                # A tool acted but its completion is unconfirmed. A failure
+                # envelope would invite the parent to run the subagent again.
+                raise
             logger.error(
                 "Feature %s subagent execution failed: %s",
                 self.name, exception_log_summary(e),
@@ -1913,6 +1994,12 @@ class Feature(_SdkFeature):
         # hooks manager in production), so draining it from subagent code
         # steals the outer PRE_TOOL_USE gate's parts and reorders them
         # behind tool-body parts (#2641 review P1, both rounds).
+        #
+        # The parent's collector is read, never drained: a deferred result
+        # publishes to the parent turn's chat destination (#3922), and this
+        # subagent's own buffer is no destination.
+        from kestrel_sovereign.agent.parts import current_part_collector
+        parent_collector = current_part_collector()
         if parts_sink is None:
             sink_scope = contextlib.nullcontext()
         else:
@@ -2019,7 +2106,8 @@ class Feature(_SdkFeature):
                 )
                 serialized = {"success": False, "error": f"{type(e).__name__}: {e}"}
             else:
-                serialized = _serialize_tool_result(result)
+                deferred = isinstance(result, DeferredToolResult)
+                serialized = result if deferred else _serialize_tool_result(result)
                 # Harvest envelope-carried parts (``ToolResult.parts`` / a result
                 # dict's ``parts`` field) into the sink too — the explicit,
                 # ContextVar-free half of the #2641 contract. The envelope keeps
@@ -2031,6 +2119,18 @@ class Feature(_SdkFeature):
                     envelope_parts = serialized.get("parts")
                     if isinstance(envelope_parts, list) and envelope_parts:
                         parts_sink.extend(envelope_parts)
+                if deferred:
+                    # Its POST_TOOL_USE, required dispatch row and publication
+                    # all run at the main completion boundary. The subagent's
+                    # model sees only the completed public result.
+                    completed = await _complete_feature_deferred_result(
+                        self, result, tool_name=tool_name, tool_input=effective_args,
+                        session_id=hook_session_id, exec_start=exec_start,
+                        adapter=f"subagent:{type(self).__name__}.{tool_name}",
+                        destination=parent_collector,
+                    )
+                    require_execution_work(self.agent)
+                    return _shape(effective_args, completed)
             exec_duration_ms = int((time.time() - exec_start) * 1000)
 
             if hooks_manager is not None:

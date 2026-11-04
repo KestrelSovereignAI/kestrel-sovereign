@@ -12,6 +12,7 @@ from functools import wraps
 
 import openai
 import httpx
+from kestrel_sdk.resources import ResourceOutcomeUnknown
 from kestrel_sovereign.execution_custody import ExecutionAuthorityError, is_execution_control_error
 
 logger = logging.getLogger(__name__)
@@ -64,6 +65,18 @@ class LLMProviderUnavailableError(LLMError):
         )
 
 
+class TerminalToolError(ResourceOutcomeUnknown):
+    """A ``tool_executor`` failure after its tool's effect completed.
+
+    A route that runs tools inside its call (the Codex app-server) hands the
+    model an ordinary tool failure as a result it can act on. This failure is
+    not one: the effect already happened, so the model, a retry and another
+    route must not run the tool again. It ends the call unchanged: no route
+    renders it to the model, it is never a provider failure, and the route
+    walk does not fall back. It is the host's error, not the provider's.
+    """
+
+
 class LLMAllProvidersFailedError(LLMError):
     """All configured providers have failed."""
     def __init__(self, errors: Dict[str, Exception]):
@@ -95,7 +108,7 @@ def handle_llm_errors(
             provider = provider_name or kwargs.get('provider_name', 'unknown')
             try:
                 return await func(*args, **kwargs)
-            except ExecutionAuthorityError:
+            except (ExecutionAuthorityError, TerminalToolError):
                 raise
             except asyncio.TimeoutError as e:
                 if is_execution_control_error(e):
@@ -183,7 +196,7 @@ def handle_llm_errors(
             provider = provider_name or kwargs.get('provider_name', 'unknown')
             try:
                 return func(*args, **kwargs)
-            except ExecutionAuthorityError:
+            except (ExecutionAuthorityError, TerminalToolError):
                 raise
             except openai.AuthenticationError as e:
                 if is_execution_control_error(e):

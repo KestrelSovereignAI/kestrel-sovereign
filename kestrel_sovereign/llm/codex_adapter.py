@@ -78,6 +78,7 @@ from kestrel_sovereign.execution_custody import (
 from .adapter import LLMAdapter, LLMResponse, ThinkingDelta, ToolCall
 from .call_progress import report_call_progress
 from .cancellation import CancelToken, await_or_cancelled, raise_if_cancelled
+from .error_handling import TerminalToolError
 from .codex_app_server import (
     _CODEX_DISABLED_NATIVE_FEATURES,
     CodexAppServerClient,
@@ -2087,7 +2088,8 @@ class CodexAdapter(LLMAdapter):
                 from kestrel_sovereign.execution_custody import (
                     is_execution_control_error,
                 )
-                if is_execution_control_error(e):
+                if is_execution_control_error(e) or isinstance(e, TerminalToolError):
+                    # Never a model-facing tool failure: the turn ends with it.
                     raise
                 logger.warning("tool_executor(%s) raised: %s", name, e)
                 err_result = {"success": False, "error": f"{e}"}
@@ -2164,23 +2166,26 @@ class CodexAdapter(LLMAdapter):
                 ),
             )
 
-        control_error: BaseException | None = None
+        terminal_error: BaseException | None = None
 
         async def handler(params: Dict[str, Any]) -> Dict[str, Any]:
-            nonlocal control_error
+            nonlocal terminal_error
             task = asyncio.current_task()
             if active_handlers is not None and task is not None:
                 active_handlers.add(task)
             try:
-                if control_error is not None:
-                    raise control_error
+                if terminal_error is not None:
+                    raise terminal_error
                 return await _handle(params)
             except BaseException as error:
                 from kestrel_sovereign.execution_custody import (
                     is_execution_control_error,
                 )
-                if is_execution_control_error(error):
-                    control_error = error
+                if (is_execution_control_error(error)
+                        or isinstance(error, TerminalToolError)):
+                    # Execution control, or a tool whose effect completed and
+                    # must not run again: no later call of this turn executes.
+                    terminal_error = error
                     # Reader dispatch deliberately turns this into a protocol
                     # error reply and a normal task return. The turn owner
                     # therefore needs evidence independent of its event sink.
@@ -3424,8 +3429,17 @@ class CodexAdapter(LLMAdapter):
                     app.close_turn_sink(thread_id)
                 finally:
                     lock.release()
+            ordered = (unwind_error, *inline_terminal_errors)
+            if isinstance(unwind_error, Exception) and any(
+                isinstance(error, TerminalToolError) for error in inline_terminal_errors
+            ):
+                # An ordinary failure after a tool acted cannot replace that
+                # tool's outcome: as a route error, the route walk would ask
+                # another route, which could run it again. Control evidence
+                # and cancellation keep their precedence.
+                ordered = (*inline_terminal_errors, unwind_error)
             terminal_error = execution_terminal_error(
-                unwind_error, *inline_terminal_errors,
+                *ordered,
                 pending_cleanup_cancellation, checkpoint_error,
                 retain_originals=True, isolate_control_originals=True,
             )

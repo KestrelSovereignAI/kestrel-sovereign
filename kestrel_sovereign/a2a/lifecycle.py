@@ -5,7 +5,7 @@ from __future__ import annotations
 from datetime import datetime
 
 from google.protobuf.timestamp_pb2 import Timestamp
-from kestrel_sdk.native_a2a.types import Message, TaskState, TaskStatus
+from kestrel_sdk.native_a2a.types import Message, Task, TaskState, TaskStatus
 
 TERMINAL_STATES = frozenset(
     {
@@ -20,6 +20,26 @@ TERMINAL_STATES = frozenset(
 STREAM_STOP_STATES = TERMINAL_STATES | frozenset(
     {TaskState.TASK_STATE_INPUT_REQUIRED, TaskState.TASK_STATE_AUTH_REQUIRED}
 )
+
+# Task metadata naming a FAILED local execution whose effect may already have
+# happened (its skill raised ``ResourceOutcomeUnknown``). It is reconciled,
+# never run again automatically.
+OUTCOME_UNKNOWN_METADATA_KEY = "outcome_unknown"
+
+
+def mark_outcome_unknown(task: Task) -> None:
+    """Record on ``task`` that its execution may already have acted."""
+    task.metadata.update({OUTCOME_UNKNOWN_METADATA_KEY: True})
+
+
+def task_outcome_unknown(task: Task) -> bool:
+    """Whether ``task`` records an execution that may already have acted."""
+    value = task.metadata.fields.get(OUTCOME_UNKNOWN_METADATA_KEY)
+    return (
+        value is not None
+        and value.WhichOneof("kind") == "bool_value"
+        and value.bool_value
+    )
 
 
 def task_state_label(state: int) -> str:
