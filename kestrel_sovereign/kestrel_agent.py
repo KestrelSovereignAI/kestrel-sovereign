@@ -10782,13 +10782,13 @@ Expected Duration: {expected_duration}
                 )
             except BaseException as tail_failure:
                 remember_finite(tail_failure, retain_ordinary=True)
-                tail_cancelled = (
-                    isinstance(tail_failure, asyncio.CancelledError)
-                    or bool(execution_observer_cancellations(tail_failure))
-                    # A consumed group can retain the original withdrawal as
-                    # an unmarked source. It does not undo actual delivery to
-                    # this lifecycle Task or grant a fresh cancellation budget.
-                    or asyncio.current_task().cancelling() > 0
+                # This phase can report cancellation inside an original group.
+                # Preserve the entire error unchanged; this flag only defers
+                # its remaining owners to completion. A withdrawal handled
+                # before this call is not a new outcome of this tail.
+                tail_cancelled = any(
+                    isinstance(error, asyncio.CancelledError)
+                    for error in _explicit_control_chain(tail_failure)
                 )
                 tail_degraded = True
             if tail_cancelled:

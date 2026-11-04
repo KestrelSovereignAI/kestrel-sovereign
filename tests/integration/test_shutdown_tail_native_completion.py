@@ -433,8 +433,9 @@ async def test_public_shutdown_observer_stays_bounded_while_native_work_is_pendi
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("previously_handled_withdrawal", [False, True])
 async def test_ordinary_tail_fault_still_retires_the_owned_context_after_native_join(
-    prepared_tail, monkeypatch
+    prepared_tail, monkeypatch, previously_handled_withdrawal
 ):
     from kestrel_sovereign import kestrel_agent as agent_module
 
@@ -481,11 +482,26 @@ async def test_ordinary_tail_fault_still_retires_the_owned_context_after_native_
     monkeypatch.setattr(agent_module, "KESTREL_AGENT_SHUTDOWN_TIMEOUT_S", 0.2)
     monkeypatch.setattr(agent_module, "KESTREL_SHUTDOWN_DURABLE_RESERVE_S", 0.15)
     loop.set_task_factory(factory)
-    caller = create_owned_task(agent.shutdown(), retain_originals=True)
+
+    async def invoke_shutdown():
+        if previously_handled_withdrawal:
+            asyncio.current_task().cancel("previously handled before this shutdown")
+            try:
+                await asyncio.sleep(0)
+            except asyncio.CancelledError:
+                pass
+            assert asyncio.current_task().cancelling() == 1
+        await agent.shutdown()
+
+    caller = create_owned_task(invoke_shutdown(), retain_originals=True)
     tasks.append(caller)
     try:
         await asyncio.wait_for(published.wait(), 3)
         assert backend._connection is not None
+        done, _ = await asyncio.wait({caller}, timeout=0.3)
+        assert caller not in done, (
+            "A previously handled withdrawal or ordinary fault skipped the original cleanup join"
+        )
         state["release_server"].set()
         release_close.set()
         result = await await_owned_task(caller)
@@ -497,16 +513,13 @@ async def test_ordinary_tail_fault_still_retires_the_owned_context_after_native_
         loop.set_task_factory(previous)
         state["release_server"].set()
         release_close.set()
-    try:
-        waiter = create_owned_task(
-            agent.wait_for_shutdown_completion(), retain_originals=True
+        await await_owned_task(caller)
+        await await_owned_task(
+            create_owned_task(
+                agent.wait_for_shutdown_completion(),
+                retain_originals=True,
+            )
         )
-        tasks.append(waiter)
-        await await_owned_task(waiter)
-        assert backend._connection is None, (
-            "Ordinary native tail fault skipped the owned standalone context retirement"
-        )
-    finally:
         await backend.close()
 
 
