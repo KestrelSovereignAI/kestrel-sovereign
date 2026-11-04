@@ -70,12 +70,15 @@ class MCPOAuthHostPolicy(BaseModel):
     def public_console_origin(cls, value: str) -> str:
         if value != value.strip() or any(ord(char) < 32 or ord(char) == 127 for char in value):
             raise ValueError("MCP OAuth console origin must be a control-free HTTPS origin")
-        url = AnyHttpUrl(value)
+        try:
+            url = AnyHttpUrl(value)
+        except ValidationError:
+            raise ValueError("MCP OAuth console origin must be a valid HTTPS origin") from None
         if ("@" in urlsplit(value).netloc or url.scheme != "https"
                 or url.username is not None or url.password is not None
                 or url.query is not None or url.fragment is not None or url.path not in (None, "/")):
             raise ValueError("MCP OAuth console origin must be an exact credential-free HTTPS origin")
-        hostname = url.host.strip("[]")
+        hostname = url.host.strip("[]").rstrip(".")
         if hostname == "localhost" or hostname.endswith(".localhost"):
             raise ValueError("MCP OAuth web client identity requires a public origin")
         try:
@@ -180,6 +183,7 @@ class _PendingAuthorization:
     finished: bool = False
     withdrawn: bool = False
     in_flight: bool = True
+    handed_off: bool = False
     retirement_lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False)
 
 
@@ -559,6 +563,15 @@ class MCPOAuthHost:
         self._leases.add(lease)
         return lease
 
+    def client_identity(self, context: OperatorContext) -> dict:
+        """Read this request's current public identity and budgets, including on restore."""
+        issuer = self._issuer.get()
+        if (issuer is None or issuer[0] is not asyncio.current_task()
+                or issuer[1] is not context):
+            raise HostCapabilityAccessDenied("MCP OAuth identity requires its original host operation")
+        issuer[3]()
+        return self._policy.model_dump(mode="json") | {"client_document": self._policy.client_document()}
+
     def withdraw(self) -> None:
         """Fence existing leases before a host privacy or lifecycle transition."""
         for lease in tuple(self._leases):
@@ -607,7 +620,8 @@ class MCPOAuthHost:
             if current is not pending:
                 raise HostCapabilityAccessDenied("original MCP OAuth authorization changed")
             pending.withdrawn = True
-            await self._runtime.retire_authorization(pending.handle)
+            if pending.handed_off:
+                await self._runtime.retire_authorization(pending.handle)
             self._pending.pop(identifier, None)
 
     async def maintain(self) -> None:
@@ -658,7 +672,6 @@ class MCPOAuthHost:
             raise ValueError("MCP OAuth authorization changed its scope or PKCE binding")
 
     async def _begin(self, context, check, value: MCPOAuthAuthorizationRequest):
-        await self.maintain()
         active = [pending for pending in self._pending.values() if not pending.finished]
         if (len(active) >= self._policy.max_operations
                 or sum(pending.principal_id == context.principal_id for pending in active)
@@ -678,8 +691,11 @@ class MCPOAuthHost:
         self._pending[identifier] = pending
         try:
             check()
-            raw = await self._runtime.begin(context, check, value.model_dump(mode="json"),
-                self._policy.model_dump(mode="json") | {"client_document": self._policy.client_document()},
+            begin = self._runtime.begin
+            request_value = value.model_dump(mode="json")
+            identity = self.client_identity(context)
+            pending.handed_off = True
+            raw = await begin(context, check, request_value, identity,
                 authorization_handle=pending.handle)
             started = _runtime_message(_AuthorizationStarted, raw)
             if started.handle is not pending.handle:
@@ -803,6 +819,9 @@ class MCPOAuthHost:
                     pending.finished = True
                     check()
                     return JSONResponse({"cancelled": True})
+                except BaseException:
+                    pending.withdrawn = True
+                    raise
                 finally:
                     pending.in_flight = False
             return respond(host, request, MCPOAuthAction.CANCEL, build)

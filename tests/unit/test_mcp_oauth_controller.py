@@ -611,3 +611,65 @@ async def test_failed_retirement_is_retained_for_immediate_original_handle_recon
     monkeypatch.setattr(b.runtime, 'retire_authorization', original)
     await b.host.maintain()
     assert b.host._pending == {} and len(b.runtime.retired) == 1
+
+
+@pytest.mark.asyncio
+async def test_failed_cancel_is_immediately_eligible_for_original_handle_retirement(controller, monkeypatch):
+    b = controller
+    initial = await begin(b)
+    original = b.runtime.cancel
+    async def unacknowledged(handle, check):
+        raise TimeoutError('original cancellation not physically acknowledged')
+    monkeypatch.setattr(b.runtime, 'cancel', unacknowledged)
+    response = await b.client.delete('/api/mcp/oauth/authorizations/' + initial.json()['operation_id'], headers={'X-API-Key': API_KEY})
+    assert response.status_code == 503
+    assert next(iter(b.host._pending.values())).withdrawn
+    monkeypatch.setattr(b.runtime, 'cancel', original)
+    await b.host.maintain()
+    assert b.host._pending == {} and len(b.runtime.retired) == 1
+
+
+@pytest.mark.asyncio
+async def test_begin_refused_before_handoff_never_retires_a_handle_feature_did_not_receive(controller, monkeypatch):
+    b = controller
+    original = b.host._begin
+    async def refused(context, check, value):
+        def withdrawn():
+            raise HostCapabilityAccessDenied('authority withdrawn before feature admission')
+        return await original(context, withdrawn, value)
+    monkeypatch.setattr(b.host, '_begin', refused)
+    response = await begin(b)
+    assert response.status_code == 403
+    assert b.runtime.calls == [] and b.runtime.states == {} and b.runtime.retired == []
+    assert b.host._pending == {}
+
+
+@pytest.mark.asyncio
+async def test_foreground_begin_does_not_join_unrelated_failed_maintenance(controller, monkeypatch):
+    b = controller
+    await begin(b)
+    b.host.withdraw()
+    original = b.runtime.retire_authorization
+    async def failed(handle):
+        raise TimeoutError('original worker still retained')
+    monkeypatch.setattr(b.runtime, 'retire_authorization', failed)
+    try:
+        with pytest.raises(TimeoutError):
+            await b.host.maintain()
+        result = await begin(b, headers={'Authorization': 'Bearer ' + _create_jwt(ALICE)})
+        assert result.status_code == 200, result.text
+        assert len(b.host._pending) == 2
+    finally:
+        monkeypatch.setattr(b.runtime, 'retire_authorization', original)
+
+
+@pytest.mark.asyncio
+async def test_identity_snapshot_refusal_precedes_original_handle_handoff(controller, monkeypatch):
+    b = controller
+    def refused(context):
+        raise HostCapabilityAccessDenied('identity snapshot authority ended before feature admission')
+    monkeypatch.setattr(b.host, 'client_identity', refused)
+    result = await begin(b)
+    assert result.status_code == 403
+    assert b.runtime.calls == [] and b.runtime.states == {} and b.runtime.retired == []
+    assert b.host._pending == {}

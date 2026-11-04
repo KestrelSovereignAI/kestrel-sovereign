@@ -153,3 +153,21 @@ def test_connection_status_cannot_accidentally_publish_credential_fields(secret_
 def test_connection_status_requires_an_exact_known_disposition(changes):
     with pytest.raises(ValidationError):
         MCPOAuthConnectionStatus.model_validate(connection_status() | changes)
+
+
+@pytest.mark.parametrize('origin', ['https://localhost.', 'https://x.localhost.'])
+def test_trailing_dot_loopback_origin_is_not_a_public_web_identity(origin):
+    with pytest.raises(ValidationError):
+        MCPOAuthHostPolicy(console_origin=origin)
+
+
+def test_nested_url_validation_never_echoes_malformed_origin_input():
+    with pytest.raises(ValidationError) as caught:
+        MCPOAuthHostPolicy(console_origin='https://[owned-private-origin-marker')
+    assert 'owned-private-origin-marker' not in str(caught.value)
+
+
+def test_direct_origin_validator_has_content_free_parse_errors():
+    with pytest.raises(ValueError) as caught:
+        MCPOAuthHostPolicy.public_console_origin('https://[owned-private-validator-marker')
+    assert 'owned-private-validator-marker' not in str(caught.value)

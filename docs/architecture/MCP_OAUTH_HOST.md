@@ -92,6 +92,12 @@ authority and must be called at each feature effect boundary. Invalid feature
 receipts are service failures; failures after a mutating feature call return an
 unknown-outcome code that explicitly prohibits replay.
 
+The runtime calls `host.client_identity(context)` inside the original host
+operation to obtain the same current identity and budgets during List or Connect
+after a restart. It returns a fresh copy and requires that exact context and
+task; no prior Begin, private Core fields, or duplicated environment parser is
+needed. A connection retains its approved budget snapshot for its own lifetime.
+
 All private routes retain native request authentication, owner/privacy checks,
 and transport custody through the final ASGI send:
 
@@ -125,7 +131,11 @@ retires expired or withdrawn handles only when their request is no longer in
 flight; a browser deadline never interrupts an admitted token exchange. Concurrent
 retirement observers serialize on the original handle and retain the record
 until the feature acknowledges physical closure. The feature's retirement method
-must safely reenter the same original worker after a failed observation.
+must safely reenter the same original worker after a failed observation and
+acknowledge an unknown handle idempotently when no work was registered. Core
+records whether the handle was handed to `begin`; a refused pre-handoff check
+requires no feature retirement. Failed Cancel immediately withdraws its entry
+for maintenance rather than waiting for the browser deadline.
 
 Only the original task inside Connect or Complete may issue a connection lease.
 The lease binds the original agent, feature incarnation, privacy epoch, principal,
@@ -147,7 +157,10 @@ exchange/refresh claims, per-principal status filtering, dispatch checks, and
 physical MCP/tool/App retirement. Status reads must not decrypt credentials.
 The host supplies the original native database handle; database identity is not
 permission to use a grant. The feature schedules `maintain()` without durable
-writes and owns/join its authorization tasks. Every failed `begin` must retain
+writes and owns/join its authorization tasks. Foreground Begin does not wait on
+unrelated maintenance: a failed retirement remains owned and counts toward the
+finite quotas while the independent maintenance owner reports/reconciles it.
+Every failed `begin` must retain
 and retire its own workers, including before it can return a valid handle.
 
 Privacy transitions synchronously withdraw OAuth leases before installing another

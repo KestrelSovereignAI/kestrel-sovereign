@@ -71,6 +71,22 @@ async def oauth_boundary(tmp_path, monkeypatch):
     app.add_middleware(PrivateDeliveryMiddleware)
     leases, contexts, issue_errors, writers = [], [], [], []
 
+    @app.get("/api/owned-identity")
+    async def identity(request: Request):
+        try:
+            async with host._resolve_context(request) as context:
+                async with host._operation(context, MCPOAuthAction.READ):
+                    if request.query_params.get('mode') == 'copied-task':
+                        return await asyncio.create_task(async_identity(context))
+                    value = host.client_identity(context)
+                    value['client_document']['redirect_uris'].append('https://unrelated.example/callback')
+                    return host.client_identity(context)
+        except HostCapabilityAccessDenied:
+            return JSONResponse({'error': 'access_denied'}, status_code=403)
+
+    async def async_identity(context):
+        return host.client_identity(context)
+
     @app.get("/api/owned-issue")
     async def issue(request: Request):
         action = MCPOAuthAction.READ if request.query_params.get("action") == "read" else MCPOAuthAction.CONNECT
@@ -232,6 +248,31 @@ async def test_host_withdrawal_releases_every_original_credential_checker(oauth_
     for lease in b.leases:
         with pytest.raises(HostCapabilityAccessDenied):
             lease.require_background()
+
+
+@pytest.mark.asyncio
+async def test_fresh_restore_request_reads_one_immutable_host_identity_and_budget(oauth_boundary):
+    b = oauth_boundary
+    result = await b.client.get('/api/owned-identity', headers={'X-API-Key': API_KEY})
+    assert result.status_code == 200, result.text
+    assert result.json() == b.app.state.mcp_oauth_policy.model_dump(mode='json') | {
+        'client_document': b.app.state.mcp_oauth_policy.client_document()}
+    assert b.host._pending == {} and b.host._leases == set()
+
+
+@pytest.mark.asyncio
+async def test_copied_task_cannot_read_original_host_operation_identity(oauth_boundary):
+    b = oauth_boundary
+    result = await b.client.get('/api/owned-identity?mode=copied-task', headers={'X-API-Key': API_KEY})
+    assert result.status_code == 403
+
+
+@pytest.mark.asyncio
+async def test_ended_context_cannot_reconstruct_host_identity(oauth_boundary):
+    b = oauth_boundary
+    await issue(b)
+    with pytest.raises(HostCapabilityAccessDenied):
+        b.host.client_identity(b.contexts[0])
 
 
 @pytest.mark.asyncio
