@@ -60,6 +60,11 @@ from kestrel_sovereign.execution_custody import (
     is_execution_control_error,
     require_execution_work,
 )
+from kestrel_sovereign.logging_config import (
+    content_log_summary,
+    exception_frames,
+    exception_log_summary,
+)
 from kestrel_sovereign.turn_completion import (
     confirm_unfinished,
     settle_repaired_content,
@@ -1389,8 +1394,10 @@ class Feature(_SdkFeature):
         except Exception as error:
             if is_execution_control_error(error):
                 raise
-            logger.exception(
-                "Feature %s task handling failed for %s", self.name, skill_name
+            logger.error(
+                "Feature %s task handling failed for %s: %s\n%s",
+                self.name, skill_name, exception_log_summary(error),
+                exception_frames(error),
             )
             task.status.CopyFrom(
                 TaskStatus(
@@ -1638,7 +1645,10 @@ class Feature(_SdkFeature):
             if context:
                 user_prompt += f"\n\nConversation context: {context}"
 
-            logger.info(f"Feature {self.name} executing subagent task: {task[:100]}...")
+            logger.info(
+                "Feature %s executing subagent task: %s",
+                self.name, content_log_summary(str(task)),
+            )
 
             # ``llm_service.generate`` accepts ``tool_executor`` and
             # delegates to ``get_response`` which calls
@@ -1686,8 +1696,11 @@ class Feature(_SdkFeature):
                 tool_names = [tc.name for tc in response.tool_calls]
                 logger.info(f"Feature {self.name} LLM called tools: {tool_names}")
             else:
-                content_preview = str(response)[:100] if response else "None"
-                logger.debug(f"Feature {self.name} LLM returned text (no tool calls): {content_preview}...")
+                logger.debug(
+                    "Feature %s LLM returned text (no tool calls): %s",
+                    self.name,
+                    content_log_summary(str(response)) if response else "None",
+                )
 
             # Handle tool calls within this feature's context. Thread
             # ``tool_executor`` through so every nested generate_with_
@@ -1707,9 +1720,11 @@ class Feature(_SdkFeature):
                 runtime_tools=available_tools,
             )
 
-            # Debug: Log what we're returning to the orchestrator
-            result_preview = str(result)[:500] if result else "None"
-            logger.info(f"[SUBAGENT-RESULT] Feature {self.name} returning to orchestrator: {result_preview}")
+            logger.info(
+                "[SUBAGENT-RESULT] Feature %s returning to orchestrator: %s",
+                self.name,
+                content_log_summary(str(result)) if result else "None",
+            )
 
             envelope: Dict[str, Any] = {"success": True, "result": result}
             if subagent_parts:
@@ -1722,7 +1737,10 @@ class Feature(_SdkFeature):
         except Exception as e:
             if is_execution_control_error(e):
                 raise
-            logger.error(f"Feature {self.name} subagent execution failed: {e}")
+            logger.error(
+                "Feature %s subagent execution failed: %s",
+                self.name, exception_log_summary(e),
+            )
             err_envelope: Dict[str, Any] = {"success": False, "error": str(e)}
             # Parts emitted before the failure (e.g. a *_pending card) still
             # travel — matching the direct path, where emit_part delivers
@@ -1958,8 +1976,8 @@ class Feature(_SdkFeature):
                         else "APPROVAL REQUIRED"
                     )
                     logger.info(
-                        "[SUBAGENT-TOOL] %s blocked (%s): %s",
-                        tool_name, decision_label, reason,
+                        "[SUBAGENT-TOOL] %s blocked (%s): reason %s",
+                        tool_name, decision_label, content_log_summary(str(reason)),
                     )
                     # Surface the POST-hook args even on the block path —
                     # an upstream redaction hook may have run before the
@@ -1997,7 +2015,7 @@ class Feature(_SdkFeature):
                     raise
                 logger.warning(
                     "[SUBAGENT-TOOL] %s raised %s",
-                    tool_name, e,
+                    tool_name, exception_log_summary(e),
                 )
                 serialized = {"success": False, "error": f"{type(e).__name__}: {e}"}
             else:
@@ -2329,6 +2347,7 @@ ABSOLUTE PROHIBITION - NEVER FABRICATE:
                 # codex app-server inline path would bypass security
                 # hooks the orchestrator-driven path enforces (codex
                 # round 1 P1 on #1461 follow-up).
+                call_start = time.monotonic()
                 result = await self._execute_subagent_tool(
                     tool_name=tool_name,
                     args=args,
@@ -2336,9 +2355,13 @@ ABSOLUTE PROHIBITION - NEVER FABRICATE:
                     parts_sink=parts_sink,
                     session_id=session_id,
                 )
+                call_ms = int((time.monotonic() - call_start) * 1000)
                 result_str = json.dumps(result) if isinstance(result, dict) else str(result)
+                # Non-content facts only: the result is often a decrypted read
+                # from the store, and the host log is plaintext (#3919).
                 logger.info(
-                    f"[SUBAGENT-TOOL] {tool_name} result ({len(result_str)} chars): {result_str[:300]}..."
+                    "[SUBAGENT-TOOL] %s result (%dms): %s",
+                    tool_name, call_ms, content_log_summary(result_str),
                 )
 
                 # Add tool result to messages
@@ -2488,7 +2511,10 @@ ABSOLUTE PROHIBITION - NEVER FABRICATE:
                             except Exception as e:
                                 if is_execution_control_error(e):
                                     raise
-                                logger.error(f"Error executing tool {self.name}: {e}")
+                                logger.error(
+                                    "Error executing tool %s: %s",
+                                    self.name, exception_log_summary(e),
+                                )
                                 response: Dict[str, Any] = {
                                     "success": False,
                                     "error": str(e),

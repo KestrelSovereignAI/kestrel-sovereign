@@ -111,6 +111,11 @@ from kestrel_sovereign.execution_custody import (
     require_execution_work,
 )
 from kestrel_sovereign.hooks.decision_gate import evaluate_blocking_decision
+from kestrel_sovereign.logging_config import (
+    content_log_summary,
+    exception_frames,
+    exception_log_summary,
+)
 from kestrel_sovereign.agent.tool_allowlist import (
     ToolCallContext,
     allowlist_evidence,
@@ -154,6 +159,14 @@ MAX_TOOL_CONCURRENCY = int(os.environ.get("KESTREL_MAX_TOOL_CONCURRENCY", "10"))
 # service nor the model catalogue can name one. Only reached after an explicit
 # warning naming the model that failed to resolve — never as a silent default.
 _DEFAULT_ORCHESTRATOR_CONTEXT_LIMIT = 131072
+
+# Error classes for a call its arguments refused: the input guardrail's
+# (``validate_tool_arguments``) and the direct-tool argument check's
+# (``normalize_direct_tool_arguments``). Both errors name the caller's
+# arguments, so the model gets the error and a log line gets this class and
+# its ``content_log_summary`` (#3919).
+_TOOL_VALIDATION_ERROR = "ToolValidationError"
+_TOOL_ARGUMENT_ERROR = "ToolArgumentError"
 
 # Inactivity watchdog for every streamed orchestrator LLM call: the turn's
 # first ``stream_with_tool_detection`` (#3552) and each tool-loop follow-up, so
@@ -1247,8 +1260,9 @@ class OrchestratorEngineMixin:
         blocked = evaluate_blocking_decision(hook_output)
         if blocked is not None:
             logging.info(
-                "[HOOKS] Tool blocked (%s): %s.%s - %s",
-                blocked.decision.value, feature_name, tool_name, blocked.reason,
+                "[HOOKS] Tool blocked (%s): %s.%s - reason %s",
+                blocked.decision.value, feature_name, tool_name,
+                content_log_summary(str(blocked.reason)),
             )
             return blocked.envelope
 
@@ -1779,8 +1793,9 @@ class OrchestratorEngineMixin:
         is_valid, validation_error = validate_tool_arguments(tool_name, args)
         if not is_valid:
             logging.warning(
-                "[GOVERNED-DISPATCH] arg validation failed source=%s tool=%s err=%s",
-                source, tool_name, validation_error,
+                "[GOVERNED-DISPATCH] arg validation failed source=%s tool=%s err=%s %s",
+                source, tool_name, _TOOL_VALIDATION_ERROR,
+                content_log_summary(str(validation_error)),
             )
             return {"success": False, "error": f"Invalid tool arguments: {validation_error}"}
 
@@ -1791,8 +1806,9 @@ class OrchestratorEngineMixin:
         )
         if argument_error is not None:
             logging.warning(
-                "[GOVERNED-DISPATCH] argument check failed source=%s tool=%s err=%s",
-                source, tool_name, argument_error,
+                "[GOVERNED-DISPATCH] argument check failed source=%s tool=%s err=%s %s",
+                source, tool_name, _TOOL_ARGUMENT_ERROR,
+                content_log_summary(argument_error),
             )
             await record_tool_rejection(
                 self,
@@ -1854,8 +1870,9 @@ class OrchestratorEngineMixin:
         blocked = evaluate_blocking_decision(pre_output)
         if blocked is not None:
             logging.info(
-                "[GOVERNED-DISPATCH] blocked (%s) source=%s tool=%s reason=%s",
-                blocked.decision.value, source, tool_name, blocked.reason,
+                "[GOVERNED-DISPATCH] blocked (%s) source=%s tool=%s reason %s",
+                blocked.decision.value, source, tool_name,
+                content_log_summary(str(blocked.reason)),
             )
             return blocked.envelope
 
@@ -2007,8 +2024,10 @@ class OrchestratorEngineMixin:
         is_valid, validation_error = validate_tool_arguments(tool_name, args)
         if not is_valid:
             logging.warning(
-                "[GOVERNED-DISPATCH] subagent arg validation failed source=%s feature=%s err=%s",
-                source, feature_name, validation_error,
+                "[GOVERNED-DISPATCH] subagent arg validation failed source=%s feature=%s "
+                "err=%s %s",
+                source, feature_name, _TOOL_VALIDATION_ERROR,
+                content_log_summary(str(validation_error)),
             )
             return {"success": False, "error": f"Invalid tool arguments: {validation_error}"}
         record_tool_acceptance(self, call_context, tool_name)
@@ -2040,8 +2059,9 @@ class OrchestratorEngineMixin:
         blocked = evaluate_blocking_decision(pre_output)
         if blocked is not None:
             logging.info(
-                "[GOVERNED-DISPATCH] subagent blocked (%s) source=%s feature=%s reason=%s",
-                blocked.decision.value, source, feature_name, blocked.reason,
+                "[GOVERNED-DISPATCH] subagent blocked (%s) source=%s feature=%s reason %s",
+                blocked.decision.value, source, feature_name,
+                content_log_summary(str(blocked.reason)),
             )
             return blocked.envelope
 
@@ -2139,8 +2159,8 @@ class OrchestratorEngineMixin:
             if is_execution_control_error(e):
                 raise
             logging.warning(
-                "[GOVERNED-DISPATCH] subagent execute raised source=%s feature=%s err=%s",
-                source, feature_name, e, exc_info=True,
+                "[GOVERNED-DISPATCH] subagent execute raised source=%s feature=%s err=%s\n%s",
+                source, feature_name, exception_log_summary(e), exception_frames(e),
             )
             exec_duration_ms = int((time.time() - exec_start) * 1000)
             err_result = {
@@ -2390,7 +2410,11 @@ class OrchestratorEngineMixin:
             tool_name, args, known_tools=known_tools
         )
         if not is_valid:
-            logging.warning(f"{log_prefix} Tool validation failed: {validation_error}")
+            logging.warning(
+                "%s Tool validation failed: tool=%r err=%s %s",
+                log_prefix, tool_name, _TOOL_VALIDATION_ERROR,
+                content_log_summary(str(validation_error)),
+            )
             # #2929: this refusal happens BEFORE PRE_TOOL_USE, so nothing else
             # in the stack will record it. Write the security-audit row here or
             # the call vanishes with no evidence it was ever attempted.
@@ -2442,7 +2466,7 @@ class OrchestratorEngineMixin:
                 session_id=session_id,
                 dispatch_start=dispatch_start,
                 status_hint="error",
-                error_class="ToolValidationError",
+                error_class=_TOOL_VALIDATION_ERROR,
                 error_message=f"Tool validation failed: {validation_error}",
                 **({"required": True} if bound_tool is not None else {}),
             )
@@ -2691,7 +2715,11 @@ class OrchestratorEngineMixin:
         except Exception as exc:
             if required or is_execution_control_error(exc):
                 raise
-            print(f"a2a_tool_dispatches dispatch wrapper failed: {exc}", file=sys.stderr)
+            print(
+                "a2a_tool_dispatches dispatch wrapper failed: "
+                f"{exception_log_summary(exc)}",
+                file=sys.stderr,
+            )
 
     async def _dispatch_feature_tool(
         self, tool_call, feature, args, dispatch_start, dispatch_event_id,
@@ -2727,8 +2755,9 @@ class OrchestratorEngineMixin:
         if blocked is not None:
             reason = blocked.reason
             logging.warning(
-                "[HOOKS] Subagent blocked (%s): %s.%s - %s",
-                blocked.decision.value, hook_feature_name, tool_name, reason,
+                "[HOOKS] Subagent blocked (%s): %s.%s - reason %s",
+                blocked.decision.value, hook_feature_name, tool_name,
+                content_log_summary(str(reason)),
             )
             result = blocked.envelope
             if dispatch_meta is not None:
@@ -2923,9 +2952,15 @@ class OrchestratorEngineMixin:
     ):
         """Handle feature execution error with logging and hooks."""
         if log_traceback:
-            logging.error(f"Feature {tool_name} execution failed: {error}", exc_info=True)
+            logging.error(
+                "Feature %s execution failed: %s\n%s",
+                tool_name, exception_log_summary(error), exception_frames(error),
+            )
         else:
-            logging.error(f"Feature {tool_name} execution failed: {error}")
+            logging.error(
+                "Feature %s execution failed: %s",
+                tool_name, exception_log_summary(error),
+            )
         result = {"success": False, "error": str(error)}
         if dispatch_meta is not None:
             status = "timeout" if isinstance(error, TimeoutError) else "error"
@@ -3008,7 +3043,10 @@ class OrchestratorEngineMixin:
         # exactly the arguments the tool will run with.
         args, argument_error = normalize_direct_tool_arguments(tool_name, tool, args)
         if argument_error is not None:
-            logging.warning(f"[DIRECT-TOOL] {tool_name} refused: {argument_error}")
+            logging.warning(
+                "[DIRECT-TOOL] %s refused: %s %s",
+                tool_name, _TOOL_ARGUMENT_ERROR, content_log_summary(argument_error),
+            )
             await record_tool_rejection(
                 self,
                 tool_name=tool_name,
@@ -3017,7 +3055,7 @@ class OrchestratorEngineMixin:
                 args=args,
                 evidence=allowlist_evidence(self, call_context, tool_name),
             )
-            return await _failed(argument_error, error_class="ToolArgumentError")
+            return await _failed(argument_error, error_class=_TOOL_ARGUMENT_ERROR)
         record_tool_acceptance(self, call_context, tool_name)
 
         def _prepare_bound_arguments(effective_args):
@@ -3074,7 +3112,9 @@ class OrchestratorEngineMixin:
             return result
         except Exception as e:
             _raise_terminal_tool_error(e, dispatch_meta)
-            logging.error(f"[DIRECT-TOOL] {tool_name} failed: {e}")
+            logging.error(
+                "[DIRECT-TOOL] %s failed: %s", tool_name, exception_log_summary(e),
+            )
             if bound_execution is not None and (
                 bound_execution.returned
                 or (bound_execution.started and not isinstance(e, ResourceConflict))

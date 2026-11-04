@@ -27,6 +27,11 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING, Any, Optional
 
+from kestrel_sovereign.logging_config import (
+    content_log_summary,
+    exception_log_summary,
+)
+
 if TYPE_CHECKING:
     from kestrel_sovereign.agent.tool_allowlist import AllowlistEvidence
 
@@ -103,9 +108,11 @@ async def record_tool_rejection(
     if args_summary:
         summary = f"{summary} | args={args_summary}"
 
+    # The reason names what the caller sent (an unknown argument's name), so
+    # the log gets its summary. The audit row written below keeps it (#3919).
     logger.warning(
-        "[TOOL-GUARDRAIL] %s refused tool %r: %s%s",
-        action, tool_name, reason,
+        "[TOOL-GUARDRAIL] %s refused tool %r: reason %s%s",
+        action, tool_name, content_log_summary(str(reason)),
         f" | {evidence_text}" if evidence_text else "",
     )
 
@@ -128,7 +135,7 @@ async def record_tool_rejection(
         return True
     except Exception as e:  # noqa: BLE001 — a failed audit must not wedge a turn
         logger.warning(
-            "[TOOL-GUARDRAIL] failed to record refusal of %r (%s); reason=%s",
-            tool_name, e, reason,
+            "[TOOL-GUARDRAIL] failed to record refusal of %r (%s); reason %s",
+            tool_name, exception_log_summary(e), content_log_summary(str(reason)),
         )
         return False

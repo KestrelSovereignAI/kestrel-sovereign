@@ -20,6 +20,7 @@ import logging
 import os
 import re
 import secrets
+import traceback
 import uuid
 from datetime import datetime, timezone
 from typing import Optional
@@ -110,6 +111,27 @@ def content_log_summary(text: str) -> str:
     encoded = text.encode("utf-8", errors="surrogatepass")
     digest = hmac.new(_CONTENT_DIGEST_KEY, encoded, hashlib.sha256)
     return f"chars={len(text)} digest={digest.hexdigest()[:CONTENT_DIGEST_HEX_CHARS]}"
+
+
+def exception_log_summary(error: BaseException) -> str:
+    """Describe an exception for a log line without its message text.
+
+    A tool's or a subagent's exception can quote what it failed on (its
+    arguments, a stored message it read), so a log line gets the class and the
+    :func:`content_log_summary` of the message, never the message (#3919).
+    """
+    return f"{type(error).__name__} {content_log_summary(str(error))}"
+
+
+def exception_frames(error: BaseException) -> str:
+    """The traceback frames of ``error``, without its message.
+
+    ``exc_info=True`` ends the logged traceback with ``Type: message``, which
+    carries the message text :func:`exception_log_summary` withholds. The
+    frames alone (file, line, function, source line) still say where it
+    failed.
+    """
+    return "".join(traceback.format_tb(error.__traceback__))
 
 
 class JSONFormatter(logging.Formatter):
