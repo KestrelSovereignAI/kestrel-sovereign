@@ -105,6 +105,8 @@ SECRET_PATHS = (
     # Cloud credential shapes.
     "my-credentials.json",
     "deploy/my-credentials.json",
+    "gha-creds-synthetic.json",
+    "deploy/gha-creds-synthetic.json",
     "sa-service-account.json",
     "deploy/gcp-service-account.json",
     "deploy/signing-key.json",
