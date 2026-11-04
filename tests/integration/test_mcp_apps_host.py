@@ -29,6 +29,7 @@ from kestrel_sovereign.features.security.hooks import SecurityHook
 from kestrel_sovereign.features.security.permissions import PermissionLevel, PermissionStore
 from kestrel_sovereign.kestrel_agent import KestrelAgent
 from kestrel_sovereign.security.private_delivery import PrivateDeliveryMiddleware
+from kestrel_sovereign.security.capability_authority import HostCapabilityAccessDenied
 from kestrel_sovereign.security import private_delivery
 from kestrel_sovereign.security.request_auth import (
     AuthenticatedSessionMiddleware, InteractiveAuthenticationLifetimeMiddleware,
@@ -91,10 +92,7 @@ class Boundary:
 
 @pytest_asyncio.fixture
 async def apps_boundary(tmp_path, monkeypatch):
-    from kestrel_feature_mcp.apps_execution import RegisteredAppTool
-    from kestrel_feature_mcp.apps_publication import AppPublications
-    from kestrel_feature_mcp.connection import MCPConnection, bind_tool_caller
-    from kestrel_feature_mcp.dynamic_tools import MCPToolWrapper
+    from kestrel_feature_mcp.connection import bind_tool_caller
     from kestrel_feature_mcp.feature import MCPAgent
     from tests.integration.mcp_permission_peer import create_server
 
@@ -137,27 +135,23 @@ async def apps_boundary(tmp_path, monkeypatch):
         cleanup.callback(queue.cancel_all)
         agent.hooks_manager.register(SecurityHook(permissions, queue))
         feature = MCPAgent(agent)
-        feature.enabled = True
-        agent.features[feature.name] = feature
-        host = agent.create_mcp_apps_host(feature, configuration={"sandbox_url": "https://sandbox.apps.test/",
-                                        "host_origin": "https://host.apps.test"},
-                                           is_current=lambda: agent.features.get(feature.name) is feature)
-        connection = MCPConnection(f"http://127.0.0.1:{listener.getsockname()[1]}/mcp")
+        await agent._register_feature(feature)
+        cleanup.push_async_callback(agent._unregister_feature_runtime, feature, unload=True)
+        assert not hasattr(feature, "enabled")
+        await feature.set_config({"apps": {"enabled": True,
+            "host": {"sandbox_url": "https://sandbox.apps.test/", "host_origin": "https://host.apps.test"},
+            "max_pending_calls": 4, "max_publications": 8, "max_views": 8,
+            "max_payload_bytes": 8192, "max_publications_per_owner": 4,
+            "max_views_per_owner": 4, "retention_seconds": 60.0}})
+        host, publications = feature._apps_host, feature._apps_publications
+        connection = feature._new_mcp_connection(f"http://127.0.0.1:{listener.getsockname()[1]}/mcp")
         native_tools = await connection.connect()
         cleanup.push_async_callback(connection.close)
         caller = bind_tool_caller(connection, lambda: True, "owned-apps-peer",
                                   tool_names=[tool.name for tool in native_tools])
-        publications = AppPublications(host=agent, agent_id=agent.did, max_pending_calls=4,
-            publication_owner=host.publication_owner, require_reader=host.require_reader,
-            max_publications=8, max_views=8, max_payload_bytes=8192,
-            max_publications_per_owner=4, max_views_per_owner=4, retention_seconds=60)
-        host.attach(publications)
-        cleanup.push_async_callback(host.close)
-        tools = []
-        agent.register_dynamic_tools("mcp:owned-apps", [MCPToolWrapper(handle_name="app__" + tool.name,
-            tool=tool, caller=caller, app_executor=publications.executor) for tool in native_tools],
-            on_registered=lambda tool, binding: tools.append(RegisteredAppTool(tool, binding)))
-        publications.register("mcp:owned-apps", tools, is_current=lambda: feature.enabled)
+        feature._mount_tools("mcp:owned-apps", "app",
+            [tool.model_dump(mode="json", by_alias=True) for tool in native_tools], caller)
+        tools = list(publications._batches["mcp:owned-apps"].tools)
         initial = next(item for item in tools if item.tool.native_tool.name == "open_marker")
         await permissions.set_permission("mcp:owned-apps", initial.binding.name, PermissionLevel.ALLOW)
         app = FastAPI()
@@ -169,8 +163,7 @@ async def apps_boundary(tmp_path, monkeypatch):
         app.add_middleware(AuthenticatedSessionMiddleware, secret_key="owned-apps-session-signing-key",
                            session_cookie="kestrel_session", max_age=600)
         app.add_middleware(PrivateDeliveryMiddleware)
-        feature.apps_host = host
-        app.include_router(agent.create_mcp_apps_router(feature, resolve_host=lambda: feature.apps_host))
+        app.include_router(feature.get_router())
 
         @app.post("/api/owned-initial")
         async def initial_call(request: Request):
@@ -207,12 +200,35 @@ async def test_initial_result_is_private_and_reopens_without_replaying_native_to
     assert [tuple(row) for row in rows] == [("original-chat", "success")]
 
 
+@pytest.mark.parametrize("retirement", ["deactivate", "missing-runtime", "host-disabled"])
+async def test_apps_require_original_native_feature_activation(apps_boundary, retirement):
+    b = apps_boundary
+    b.host._require_live()
+    reference = await b.publish()
+    runtime = b.agent.feature_contribution_runtime
+    # A product-owned flag cannot keep a retired SDK contribution alive.
+    b.feature.enabled = True
+    if retirement == "deactivate":
+        assert runtime.deactivate(b.feature)
+    elif retirement == "missing-runtime":
+        b.agent.feature_contribution_runtime = None
+    else:
+        b.feature.enabled = False
+    try:
+        with pytest.raises(HostCapabilityAccessDenied):
+            b.host._require_live()
+        assert (await b.open(reference)).status_code == 403
+        assert b.markers == ["once"]
+    finally:
+        b.agent.feature_contribution_runtime = runtime
+
+
 async def test_fixed_routes_resolve_the_current_optional_host_without_retargeting_views(apps_boundary):
     b = apps_boundary
     reference = await b.publish()
-    b.feature.apps_host = None
+    b.feature._apps_host = None
     assert (await b.open(reference)).status_code == 404
-    b.feature.apps_host = b.host
+    b.feature._apps_host = b.host
     opened = await b.open(reference)
     assert opened.status_code == 200 and opened.json()["result"]["_meta"]["private-witness"] == "once"
     assert b.markers == ["once"]

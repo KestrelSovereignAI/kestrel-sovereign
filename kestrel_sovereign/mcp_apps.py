@@ -164,9 +164,15 @@ class MCPAppsHost:
         self._accepting, self.retired = True, False
 
     def _require_live(self, request=None):
+        runtime = self.agent.feature_contribution_runtime
+        # SDK features need no enabled attribute at initial registration.
+        # Native activation grants availability; an explicit host restriction
+        # can still revoke it before contribution cleanup has settled.
         if (not self._accepting or self.retired or self.agent.did != self._agent_id
                 or self.agent.features.get(self.feature.name) is not self.feature
-                or self.feature.enabled is not True or self._is_current() is not True):
+                or runtime is None or runtime.is_active(self.feature) is not True
+                or getattr(self.feature, "enabled", True) is not True
+                or self._is_current() is not True):
             raise HostCapabilityAccessDenied("original MCP Apps feature is unavailable")
         if request is None:
             return

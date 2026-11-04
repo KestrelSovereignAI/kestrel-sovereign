@@ -161,13 +161,14 @@ def test_installed_remote_mcp_campaign_requires_the_public_feature_contract():
     assert not requirement.specifier.contains("0.9.0")
     assert not requirement.specifier.contains("0.10.0")
     assert not requirement.specifier.contains("0.10.1")
-    _assert_requirement_floor(requirement, Version("0.11.0"))
-    assert requirement.specifier.contains("0.11.0")
+    assert not requirement.specifier.contains("0.11.0")
+    _assert_requirement_floor(requirement, Version("0.11.1"))
+    assert requirement.specifier.contains("0.11.1")
     assert requirement.specifier.contains("0.12.0")
     (package,) = [
         item for item in _lock()["package"] if item["name"] == "kestrel-feature-mcp"
     ]
-    assert Version(package["version"]) >= Version("0.11.0")
+    assert Version(package["version"]) >= Version("0.11.1")
     assert package["source"] == {"registry": "https://pypi.org/simple"}
 
 
