@@ -68,7 +68,6 @@ from kestrel_sovereign.llm.call_progress import (
     AttemptInactivityTimeout,
     call_progress_listener,
 )
-from kestrel_sovereign.llm.error_handling import TerminalToolError
 from kestrel_sovereign.llm.generation_gate import failure_summary, judge_generation
 from kestrel_sovereign.llm.output_ceiling import IncompleteGenerationError
 from kestrel_sovereign.turn_completion import (
@@ -885,7 +884,7 @@ def _extract_inline_error_fields(result: Any) -> tuple[Optional[str], Optional[s
     return None, None
 
 
-class _DeferredToolAuditError(TerminalToolError):
+class _DeferredToolAuditError(ResourceOutcomeUnknown):
     """Execution completed but its required audit could not be confirmed."""
 
 
@@ -934,7 +933,7 @@ def _mark_tool_dispatch_audited(dispatch_meta, bound_execution=None):
 
 def _raise_terminal_tool_error(error, dispatch_meta):
     """An observer failure cannot relabel an already-confirmed tool effect."""
-    if is_execution_control_error(error) or isinstance(error, TerminalToolError):
+    if is_execution_control_error(error) or isinstance(error, _DeferredToolAuditError):
         raise error
     if dispatch_meta is not None and dispatch_meta.get("audit_recorded"):
         raise ResourceOutcomeUnknown(

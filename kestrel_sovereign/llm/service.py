@@ -45,8 +45,7 @@ from .error_handling import (
     LLMError,
     LLMProviderError,
     LLMProviderUnavailableError,
-    LLMAllProvidersFailedError,
-    TerminalToolError,
+    LLMAllProvidersFailedError
 )
 from .openai_adapter import OpenAIAdapter
 from .adapter import (
@@ -7013,8 +7012,7 @@ No other text or formatting.
                 diagnostic = type(e).__name__ if _redact else str(e)
                 logger.error(f"Provider {provider['name']} rejected request (400): {diagnostic}")
                 raise LLMServiceError(f"Request rejected by {provider['name']}: {diagnostic}") from e
-            except (ExecutionAuthorityError, TerminalToolError):
-                # A tool this route ran has acted: no other route is asked.
+            except ExecutionAuthorityError:
                 raise
             except Exception as e:
                 if is_execution_control_error(e):

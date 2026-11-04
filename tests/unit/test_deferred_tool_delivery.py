@@ -17,7 +17,9 @@ from kestrel_sdk.features.base import Feature as SDKFeature, tool as feature_too
 from kestrel_sovereign.a2a.projections import embedded_json_value
 from kestrel_sovereign.a2a.stores.unified.observability_store import ObservabilityStore
 from kestrel_sovereign.agent.orchestrator_engine import OrchestratorEngineMixin
-from kestrel_sovereign.agent.parts import drain_parts, emit_part, part_collector
+from kestrel_sovereign.agent.parts import (
+    current_part_collector, drain_parts, emit_part, part_collector,
+)
 from kestrel_sovereign.agent.tool_registry import ToolRegistryMixin
 from kestrel_sovereign.hooks.manager import HooksManager
 from kestrel_sovereign.features.base import Feature as CoreFeature
@@ -92,6 +94,8 @@ class DeferredTool:
         self.executions = []
         self.publications = []
         self.publication_contexts = []
+        # The part collector each publication ran under.
+        self.publication_collectors = []
         self.publication_error = None
         self.publication_parts = None
         self.mutate_before_error = False
@@ -106,6 +110,7 @@ class DeferredTool:
             assert native["retained"] == PRIVATE_NATIVE_SENTINEL
             self.publications.append("published-once")
             self.publication_contexts.append(self.last_result.publication_context)
+            self.publication_collectors.append(current_part_collector())
             if self.publication_error is not None:
                 if self.mutate_before_error:
                     self.active_result["data"]["value"] = "private-mutated-factory-sentinel"
@@ -1043,19 +1048,24 @@ async def test_route_publishes_once_only_after_completed_post_policy(route, reda
 async def test_route_publishes_to_its_own_destination(route):
     route.policy.release.set()
     with part_collector(host=route.host, session_id=SESSION):
+        turn = current_part_collector()
         outcome = await route.invoke()
         chat = [part["type"] for part in drain_parts()]
     assert route.tool.executions == [{}] and route.tool.publications == ["published-once"]
     assert route.tool.last_result.publication_context is None
     if route.kind == "a2a":
         # An A2A task has no chat: the factory runs headless even inside a
-        # live turn, and nothing it returns reaches that turn's chat.
+        # live turn, with no collector, and nothing it returns reaches that
+        # turn's chat.
         assert route.tool.publication_contexts == [None]
+        assert route.tool.publication_collectors == [None]
         assert chat == ["post_policy"]
         assert outcome.status.state == TaskState.TASK_STATE_COMPLETED
     else:
         # The subagent's own buffer is no destination; its parent turn is.
         assert route.tool.publication_contexts == [ToolPublicationContext(route.host.did, SESSION)]
+        [collector] = route.tool.publication_collectors
+        assert collector is turn
         assert chat == ["original_part", "post_policy", "private_view"]
         assert outcome["success"] is True
 
@@ -1131,24 +1141,38 @@ async def test_route_publication_waits_for_its_required_dispatch_row(route, monk
     assert await route.deferred_dispatch_rows() == [(route.adapter, "success", expected_session)]
 
 
-async def test_route_audit_failure_withholds_the_ui_and_is_not_replayable(route):
-    from kestrel_sdk.resources import ResourceOutcomeUnknown
+async def test_route_audit_failure_withholds_the_ui_and_is_not_replayable(route, monkeypatch):
     from kestrel_sovereign.a2a.projections import message_text
+    from kestrel_sovereign.agent.orchestrator_engine import _DeferredToolAuditError
 
+    step_errors = []
+    if route.kind != "a2a":
+        # Observe the subagent's tool step itself. What its callers make of
+        # the error afterwards is their own contract, the same as for chat.
+        step = route.feature._execute_subagent_tool
+
+        async def observed_step(**kwargs):
+            try:
+                return await step(**kwargs)
+            except Exception as error:
+                step_errors.append(error)
+                raise
+
+        monkeypatch.setattr(route.feature, "_execute_subagent_tool", observed_step)
     route.policy.release.set()
     await route.backend.execute("DROP TABLE a2a_tool_dispatches")
     with part_collector(host=route.host, session_id=SESSION):
-        if route.kind == "a2a":
-            task = await route.invoke()
-            assert task.status.state == TaskState.TASK_STATE_FAILED
-            assert "Do not replay" in message_text(task.status.message)
-            assert not task.artifacts
-        else:
-            # Like the chat route, a confirmed tool effect with an unconfirmed
-            # audit ends the dispatch; a failure envelope would invite a rerun.
-            with pytest.raises(ResourceOutcomeUnknown, match="Do not replay"):
-                await route.invoke()
+        outcome = await route.invoke()
         assert "private_view" not in [part["type"] for part in drain_parts()]
+    if route.kind == "a2a":
+        assert outcome.status.state == TaskState.TASK_STATE_FAILED
+        assert "Do not replay" in message_text(outcome.status.message)
+        assert not outcome.artifacts
+    else:
+        # The step raises exactly what the chat boundary raises.
+        [error] = step_errors
+        assert type(error) is _DeferredToolAuditError
+        assert "Do not replay" in str(error)
     assert route.tool.executions == [{}] and route.tool.publications == []
     _assert_spent(route.tool)
 

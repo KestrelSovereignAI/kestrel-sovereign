@@ -1475,14 +1475,6 @@ class Feature(_SdkFeature):
                     ),
                 )
             )
-            from kestrel_sdk.resources import ResourceOutcomeUnknown
-
-            if isinstance(error, ResourceOutcomeUnknown):
-                # The skill may already have acted (a completed tool whose
-                # audit is unconfirmed is one): its caller must not rerun it.
-                from kestrel_sovereign.a2a.lifecycle import mark_outcome_unknown
-
-                mark_outcome_unknown(task)
             return task
         task.artifacts.append(artifact)
         failed = (
@@ -1812,11 +1804,6 @@ class Feature(_SdkFeature):
             raise
         except Exception as e:
             if is_execution_control_error(e):
-                raise
-            from kestrel_sovereign.llm.error_handling import TerminalToolError
-            if isinstance(e, TerminalToolError):
-                # A tool acted but its completion is unconfirmed. A failure
-                # envelope would invite the parent to run the subagent again.
                 raise
             logger.error(
                 "Feature %s subagent execution failed: %s",

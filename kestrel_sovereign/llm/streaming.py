@@ -110,7 +110,7 @@ from .call_progress import (
 from .cancellation import CancelToken
 from .codex_adapter import CodexAdapter
 from .codex_app_server import CodexAppServerTransportError
-from .error_handling import LLMError, TerminalToolError
+from .error_handling import LLMError
 from .generation_gate import (
     UnfinishedAfterInlineToolsError,
     judge_generation,
@@ -2432,8 +2432,7 @@ class StreamingMixin:
                                 yield chunk
                         return
 
-            except (ExecutionAuthorityError, TerminalToolError):
-                # A tool this route ran has acted: no other route is asked.
+            except ExecutionAuthorityError:
                 raise
             except Exception as e:
                 if is_execution_control_error(e):
