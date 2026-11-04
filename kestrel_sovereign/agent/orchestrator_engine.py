@@ -924,11 +924,28 @@ def _discard_tool_supplied_receipt(result):
     return dict(result) if isinstance(result, _AuditedDeferredResult) else result
 
 
-def _mark_tool_dispatch_audited(dispatch_meta, bound_execution=None):
+def _mark_tool_dispatch_audited(dispatch_meta, bound_execution=None, *, status):
     if dispatch_meta is not None:
         dispatch_meta["audit_recorded"] = True
+        dispatch_meta["status"] = status
     if bound_execution is not None:
         bound_execution.audit_recorded = True
+
+
+def _returned_tool_status(result, dispatch_meta) -> str:
+    """The one outcome both audit tables record for a tool that returned (#3924).
+
+    ``a2a_observability.success`` and ``a2a_tool_dispatches.result_status``
+    are both written from this value: it is kept in ``dispatch_meta`` as the
+    dispatch row's ``status_hint``. A deferred result's dispatch row was
+    written before it returned, from the status recorded there.
+    """
+    status = dispatch_meta.get("status") if dispatch_meta else None
+    if status is None:
+        status = infer_tool_result_status(result)
+        if dispatch_meta is not None:
+            dispatch_meta["status"] = status
+    return status
 
 
 def _raise_terminal_tool_error(error, dispatch_meta):
@@ -1000,14 +1017,16 @@ async def _complete_post_tool_result(host, result, post_input, *, adapter,
     reviewed = deepcopy(dict(post_result))
     try:
         error_message, error_class = _extract_inline_error_fields(post_result)
+        status = infer_tool_result_status(reviewed)
         await OrchestratorEngineMixin._log_tool_dispatch(
             host, tool_name=post_input.tool_name, adapter=adapter,
             args=post_input.tool_input, result=reviewed,
             session_id=post_input.session_id, dispatch_start=dispatch_start,
+            status_hint=status,
             error_message=error_message, error_class=error_class, required=True,
         )
         if on_audited is not None:
-            on_audited()
+            on_audited(status)
         require_execution_work(host)
     except BaseException as error:
         # Consume the factory when storage or Stop prevents publication.
@@ -2844,7 +2863,9 @@ class OrchestratorEngineMixin:
                 session_id=session_id,
                 execute_fn=_exec_feature,
                 audit_adapter=f"{type(feature).__name__}.execute_as_subagent",
-                on_audited=lambda: _mark_tool_dispatch_audited(dispatch_meta),
+                on_audited=lambda status: _mark_tool_dispatch_audited(
+                    dispatch_meta, status=status,
+                ),
             )
             # #2641: parts the subagent's tools produced ride the result
             # envelope; ``_execute_tool_with_hooks`` re-emitted them into this
@@ -2852,10 +2873,11 @@ class OrchestratorEngineMixin:
             # loop drains them right after this dispatch's card and ahead of
             # any POST-hook-emitted parts.
 
+            status = _returned_tool_status(result, dispatch_meta)
             dispatch_duration = int((time.time() - dispatch_start) * 1000)
             await self.observability_store.log_tool_response(
                 event_id=dispatch_event_id,
-                success=True,
+                success=status == "success",
                 duration_ms=dispatch_duration,
             )
 
@@ -3114,7 +3136,9 @@ class OrchestratorEngineMixin:
                 execute_fn=_exec_direct,
                 audit_adapter=(f"{bound_tool.owner}.{tool_name}" if bound_tool is not None
                                else OrchestratorEngineMixin._tool_call_adapter(self, tool_name, {})),
-                on_audited=lambda: _mark_tool_dispatch_audited(dispatch_meta, bound_execution),
+                on_audited=lambda status: _mark_tool_dispatch_audited(
+                    dispatch_meta, bound_execution, status=status,
+                ),
                 **({"prepare_args": _prepare_bound_arguments} if bound_tool is not None else {}),
             )
             # #2641: direct tools carry the same envelope contract as
@@ -3124,10 +3148,11 @@ class OrchestratorEngineMixin:
             # in ``_dispatch_feature_tool``). ``_execute_tool_with_hooks``
             # re-emitted the envelope parts before POST_TOOL_USE fired.
 
+            status = _returned_tool_status(result, dispatch_meta)
             dispatch_duration = int((time.time() - dispatch_start) * 1000)
             await self.observability_store.log_tool_response(
                 event_id=dispatch_event_id,
-                success=True,
+                success=status == "success",
                 duration_ms=dispatch_duration,
             )
             if not streaming:
