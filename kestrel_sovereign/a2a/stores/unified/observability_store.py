@@ -1445,7 +1445,10 @@ def infer_tool_result_status(result: Any, status_hint: Optional[str] = None) -> 
             or result.get("error")
         ):
             return "error"
-    if getattr(result, "failed", False):
+    # ``failed`` is a flag on some result objects. On a ``ToolResult`` it is
+    # the ``failed`` constructor, which would read every result as an error.
+    failed = getattr(result, "failed", False)
+    if failed and not callable(failed):
         return "error"
     error = getattr(result, "error", None)
     if error:
