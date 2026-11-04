@@ -51,6 +51,7 @@ from kestrel_sdk.features.ui import UIContributions
 from kestrel_sdk.tools.base import AgentTool, ToolSchema
 from kestrel_sdk.tools.base import ToolCategory as ToolCategory
 from kestrel_sdk.tools.base import ToolParameter as ToolParameter
+from kestrel_sdk.tools import coerce_tool_arguments
 from kestrel_sdk.tools.result import ToolResult, ToolResultStatus
 from kestrel_sdk.tools.deferred import DeferredToolResult
 
@@ -1965,6 +1966,21 @@ class Feature(_SdkFeature):
                 ),
             })
 
+        # #3921: coerce before PRE_TOOL_USE, as the direct and named paths do,
+        # so the hooks authorize and the audit records the binding the tool
+        # runs with. A value that cannot be coerced fails as the tool's own
+        # wrapper fails it.
+        from kestrel_sovereign.agent.direct_tool_arguments import (
+            coerce_declared_tool_arguments,
+            hook_rewrite_argument_error,
+            refused_tool_result,
+        )
+        args, coercion_error = coerce_declared_tool_arguments(
+            tool_name, selected_tool, args,
+        )
+        if coercion_error is not None:
+            return _shape(args, refused_tool_result(tool_name, coercion_error))
+
         # #2641: bind the subagent-local parts sink as the active collector
         # for the WHOLE gated call — PRE_TOOL_USE hooks included, not just the
         # tool body — so ``emit_part`` lands deterministically on THIS
@@ -2071,6 +2087,21 @@ class Feature(_SdkFeature):
                 # post-hook state (mutated ``tool_input`` first, then any
                 # ``updated_input`` override) — see the comment block
                 # before the DENY/ASK branch.
+                #
+                # #3921: those are the arguments the hooks authorized. A
+                # rewrite the tool's wrapper would still coerce is not what
+                # it would run with, so it does not run.
+                rewrite_error = hook_rewrite_argument_error(
+                    tool_name, selected_tool, effective_args,
+                )
+                if rewrite_error is not None:
+                    logger.info(
+                        "[SUBAGENT-TOOL] %s hook rewrite refused: %s",
+                        tool_name, content_log_summary(rewrite_error),
+                    )
+                    return _shape(
+                        effective_args, refused_tool_result(tool_name, rewrite_error),
+                    )
 
             require_execution_work(self.agent)
             exec_start = time.time()
@@ -2569,6 +2600,23 @@ ABSOLUTE PROHIBITION - NEVER FABRICATE:
 
                     @execution_work_operation
                     async def execute(self, **kwargs) -> Dict[str, Any]:
+                        # The SDK wrapper's argument coercion, by the SDK's
+                        # own function, so a built-in feature gets ``"30"``
+                        # as ``30`` exactly as an SDK feature does (#3921).
+                        # Dispatch paths coerce before PRE_TOOL_USE too
+                        # (``coerce_declared_tool_arguments``) and refuse a
+                        # hook rewrite this would still change, so this
+                        # leaves an authorized binding unchanged.
+                        kwargs, coercion_error = coerce_tool_arguments(
+                            self.name, self._schema_data["parameters"], kwargs
+                        )
+                        if coercion_error is not None:
+                            from kestrel_sovereign.agent.direct_tool_arguments import (
+                                refused_tool_result,
+                            )
+
+                            return refused_tool_result(self.name, coercion_error)
+
                         # #2641: bind a "tool result under construction"
                         # buffer for the duration of the wrapped call.
                         # ``emit_part`` calls that find no turn collector

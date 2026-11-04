@@ -54,6 +54,8 @@ from kestrel_sovereign.a2a.stores.unified.observability_store import (
     tool_result_size_bytes,
 )
 from kestrel_sovereign.agent.direct_tool_arguments import (
+    ToolArgumentRewriteError,
+    hook_rewrite_argument_error,
     normalize_direct_tool_arguments,
 )
 from kestrel_sovereign.llm.adapter import (
@@ -1920,6 +1922,17 @@ class OrchestratorEngineMixin:
             )
             return blocked.envelope
 
+        # #3921: the hooks authorized ``post_hook_args``; a rewrite the tool's
+        # wrapper would still coerce is not what it runs with.
+        rewrite_error = hook_rewrite_argument_error(tool_name, found_tool, post_hook_args)
+        if rewrite_error is not None:
+            logging.warning(
+                "[GOVERNED-DISPATCH] hook rewrite refused source=%s tool=%s err=%s %s",
+                source, tool_name, ToolArgumentRewriteError.__name__,
+                content_log_summary(rewrite_error),
+            )
+            return {"success": False, "error": f"Invalid tool arguments: {rewrite_error}"}
+
         # Honor hook-rewritten args at execution time.  Use explicit
         # ``is not None`` checks rather than truthiness — a hook may
         # legitimately rewrite args to ``{}`` (a constraint hook
@@ -3104,12 +3117,26 @@ class OrchestratorEngineMixin:
             )
             return await _failed(argument_error, error_class=_TOOL_ARGUMENT_ERROR)
         record_tool_acceptance(self, call_context, tool_name)
+        if dispatch_meta is not None:
+            # The dispatch row records the binding the hooks authorize (and,
+            # once it runs, the one that ran), not the raw call: normalization
+            # may have coerced ``"30"`` to ``30`` (#3921).
+            dispatch_meta["arguments"] = args
 
         def _prepare_bound_arguments(effective_args):
-            effective_args, error = normalize_direct_tool_arguments(tool_name, tool, effective_args)
+            # A rewrite the hooks authorized must already be the binding that
+            # runs; normalizing it would coerce it after authorization (#3921).
+            rewrite_error = hook_rewrite_argument_error(tool_name, tool, effective_args)
+            error = None
+            if rewrite_error is None:
+                effective_args, error = normalize_direct_tool_arguments(
+                    tool_name, tool, effective_args,
+                )
             snapshot = deepcopy(effective_args)
             bound_execution.arguments = snapshot
             dispatch_meta["arguments"] = snapshot
+            if rewrite_error is not None:
+                raise ToolArgumentRewriteError(rewrite_error)
             if error is not None:
                 raise ValueError(error)
             valid, error = validate_tool_arguments(tool_name, snapshot)
@@ -3122,6 +3149,12 @@ class OrchestratorEngineMixin:
                 dispatch_meta["binding_expired"] = not bound_tool.is_current
                 bound_tool.require_current()
                 bound_execution.started = True
+            else:
+                if dispatch_meta is not None:
+                    dispatch_meta["arguments"] = effective_args
+                rewrite_error = hook_rewrite_argument_error(tool_name, t, effective_args)
+                if rewrite_error is not None:
+                    raise ToolArgumentRewriteError(rewrite_error)
             result = await t.execute(**effective_args)
             if bound_execution is not None:
                 bound_execution.returned = True

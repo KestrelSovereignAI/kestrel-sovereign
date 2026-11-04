@@ -592,8 +592,19 @@ class TaskManager:
         hook_feature_name = getattr(handler, "name", None) or agent_id
 
         session_id = session_id or uuid4().hex
+        # #3921: coerce before PRE_TOOL_USE, so the hooks authorize the binding
+        # the tool runs with (a workflow step's ``"30"`` arrives as ``30``). A
+        # value that cannot be coerced fails the call before its hooks run, with
+        # the message the tool's wrapper would give, as every other path does.
+        from kestrel_sovereign.agent.direct_tool_arguments import (
+            coerce_declared_tool_arguments,
+            hook_rewrite_argument_error,
+        )
+        get_tool = getattr(handler, "_get_tool_by_name", None)
+        tool = get_tool(skill_id) if callable(get_tool) else None
+        args, argument_error = coerce_declared_tool_arguments(skill_id, tool, args)
         denied_reason = None
-        if self.hooks_manager:
+        if self.hooks_manager and argument_error is None:
             from kestrel_sdk.hooks.base import HookEvent, HookInput, PermissionDecision
 
             hook_input = HookInput(
@@ -610,8 +621,16 @@ class TaskManager:
                 denied_reason = (
                     hook_output.permission_reason or "Blocked by security policy"
                 )
-            elif hook_output.updated_input is not None:
-                args = hook_output.updated_input
+            else:
+                # The arguments the hooks authorized: a MODIFY rewrite, else
+                # the threaded input, which a hook may have mutated in place.
+                if hook_output.updated_input is not None:
+                    args = hook_output.updated_input
+                elif isinstance(hook_input.tool_input, dict):
+                    args = hook_input.tool_input
+                # A rewrite the tool's wrapper would still coerce is not what
+                # the tool would run with (#3921).
+                argument_error = hook_rewrite_argument_error(skill_id, tool, args)
         # Local arguments are passed explicitly to the handler. Their durable
         # input representation must also retain exact JSON types and strings.
         argument_part = Part(
@@ -647,6 +666,25 @@ class TaskManager:
                     state=TaskState.TASK_STATE_REJECTED,
                     message=new_text_message(
                         f"Permission denied: {denied_reason}",
+                        task_id=task.id,
+                        context_id=task.context_id,
+                    ),
+                )
+            )
+            task, _ = await self._persist_execution_outcome(
+                task,
+                baseline=baseline,
+                authority_agent_id=authority_agent_id,
+                expected_state=TaskState.TASK_STATE_SUBMITTED,
+            )
+            return task
+        if argument_error is not None:
+            task.status.CopyFrom(
+                new_task_status(
+                    at=self.task_store.now_utc(),
+                    state=TaskState.TASK_STATE_FAILED,
+                    message=new_text_message(
+                        argument_error,
                         task_id=task.id,
                         context_id=task.context_id,
                     ),

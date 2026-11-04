@@ -1285,7 +1285,26 @@ class SchedulerFeature(Feature):
         actually passed to the tool. A DENY the hook manager produced because
         an enforcing hook failed is not a decision: it becomes a non-pausing
         ``hook_failed`` outcome instead (#3749).
+
+        The arguments are coerced to the tool's declared types before the
+        hooks see them, and a MODIFY rewrite the tool's wrapper would still
+        coerce does not run, so the hooks authorize the binding the tool runs
+        with (#3921).
         """
+        from kestrel_sovereign.agent.direct_tool_arguments import (
+            coerce_declared_tool_arguments,
+            hook_rewrite_argument_error,
+            refused_tool_result,
+        )
+
+        # #3921: coerce before PRE_TOOL_USE, as every dispatch path does, so
+        # the hooks authorize the binding the tool runs with. A value that
+        # cannot be coerced fails as the tool's own wrapper would fail it.
+        args, argument_error = coerce_declared_tool_arguments(
+            agent_tool.name, agent_tool, args,
+        )
+        if argument_error is not None:
+            return refused_tool_result(agent_tool.name, argument_error)
         hooks_manager = getattr(self.agent, "hooks_manager", None)
         effective_args = args
         if hooks_manager is not None:
@@ -1354,6 +1373,19 @@ class SchedulerFeature(Feature):
                     decision=blocked.decision.value,
                     hook=blocked.deciding_hook,
                 )
+
+            # The hooks authorized ``effective_args``: a rewrite the tool's
+            # wrapper would still coerce is not what it would run with.
+            rewrite_error = hook_rewrite_argument_error(
+                agent_tool.name, agent_tool, effective_args,
+            )
+            if rewrite_error is not None:
+                logger.warning(
+                    "Scheduler: tool %r not run on this tick: a PRE_TOOL_USE "
+                    "hook rewrote its arguments to another type",
+                    agent_tool.name,
+                )
+                return refused_tool_result(agent_tool.name, rewrite_error)
 
             result = await agent_tool.execute(**effective_args)
 
