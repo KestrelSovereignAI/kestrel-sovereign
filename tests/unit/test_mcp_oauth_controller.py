@@ -699,3 +699,74 @@ async def test_failed_original_retirement_cannot_skip_an_independent_eligible_ha
     monkeypatch.setattr(b.runtime, 'retire_authorization', original)
     await b.host.maintain()
     assert b.host._pending == {}
+
+
+@pytest.mark.asyncio
+async def test_real_maintenance_cancellation_survives_later_independent_join_failure(controller, monkeypatch):
+    b = controller
+    await begin(b)
+    await begin(b, headers={'Authorization': 'Bearer ' + _create_jwt(ALICE)})
+    pending = list(b.host._pending.values())
+    entered = asyncio.Event()
+    attempted = []
+    async def unacknowledged(handle):
+        attempted.append(handle)
+        if handle is pending[0].handle:
+            entered.set()
+            await asyncio.Event().wait()
+        raise TimeoutError('independent original join has not acknowledged closure')
+    monkeypatch.setattr(b.runtime, 'retire_authorization', unacknowledged)
+    b.host.withdraw()
+    sweep = asyncio.create_task(b.host.maintain())
+    await entered.wait()
+    sweep.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await sweep
+    assert sweep.cancelled() and attempted == [item.handle for item in pending]
+    assert list(b.host._pending.values()) == pending
+
+
+@pytest.mark.asyncio
+async def test_clock_rollback_cannot_retire_a_newly_admitted_original_exchange(controller, monkeypatch):
+    b = controller
+    await begin(b)
+    second = await begin(b, headers={'Authorization': 'Bearer ' + _create_jwt(ALICE)})
+    pending = list(b.host._pending.values())
+    retire_entered, retire_release = asyncio.Event(), asyncio.Event()
+    exchange_entered, exchange_release = asyncio.Event(), asyncio.Event()
+    original_retire, original_complete = b.runtime.retire_authorization, b.runtime.complete
+    async def retire(handle):
+        if handle is pending[0].handle:
+            retire_entered.set()
+            await retire_release.wait()
+        await original_retire(handle)
+    async def complete(handle, context, check, value):
+        exchange_entered.set()
+        await exchange_release.wait()
+        return await original_complete(handle, context, check, value)
+    monkeypatch.setattr(b.runtime, 'retire_authorization', retire)
+    monkeypatch.setattr(b.runtime, 'complete', complete)
+    b.clock[0] += timedelta(seconds=601)
+    sweep = asyncio.create_task(b.host.maintain())
+    callback = None
+    try:
+        await retire_entered.wait()
+        b.clock[0] -= timedelta(seconds=601)
+        callback = asyncio.create_task(b.client.post('/api/mcp/oauth/authorizations/'
+            + second.json()['operation_id'] + '/callback',
+            headers={'Authorization': 'Bearer ' + _create_jwt(ALICE)},
+            json={'state': b.runtime.states[pending[1].handle], 'code': 'owned-clock-rollback-code',
+                  'iss': 'https://issuer.example'}))
+        await exchange_entered.wait()
+        retire_release.set()
+        await sweep
+        assert b.runtime.retired == [pending[0].handle]
+        assert pending[1].in_flight and pending[1] in b.host._pending.values()
+    finally:
+        retire_release.set()
+        exchange_release.set()
+        if not sweep.done():
+            await sweep
+        if callback is not None:
+            response = await callback
+            assert response.status_code == 200, response.text

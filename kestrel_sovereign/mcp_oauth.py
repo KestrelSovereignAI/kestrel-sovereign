@@ -564,7 +564,7 @@ class MCPOAuthHost:
         return lease
 
     def client_identity(self, context: OperatorContext) -> dict:
-        """Read this request's current public identity and budgets, including on restore."""
+        """Read current public identity and budgets in the original host operation."""
         issuer = self._issuer.get()
         if (issuer is None or issuer[0] is not asyncio.current_task()
                 or issuer[1] is not context):
@@ -612,29 +612,41 @@ class MCPOAuthHost:
             content.extend(chunk)
         return model.model_validate_json(bytes(content))
 
-    async def _retire_pending(self, identifier: str, pending: _PendingAuthorization) -> None:
+    async def _retire_pending(self, identifier: str, pending: _PendingAuthorization, *, eligible_only=False) -> None:
         async with pending.retirement_lock:
             current = self._pending.get(identifier)
             if current is None:
                 return
             if current is not pending:
                 raise HostCapabilityAccessDenied("original MCP OAuth authorization changed")
+            if eligible_only and (pending.in_flight or (not pending.withdrawn
+                    and pending.expires_at > self.authority.clock())):
+                return
             pending.withdrawn = True
             if pending.handed_off:
                 await self._runtime.retire_authorization(pending.handle)
             self._pending.pop(identifier, None)
 
     async def maintain(self) -> None:
-        """Retire expired original provider frames without writing credential state."""
-        now = self.authority.clock()
-        eligible = [(identifier, pending) for identifier, pending in tuple(self._pending.items())
-            if not pending.in_flight and (pending.withdrawn or pending.expires_at <= now)]
-        # Structured cleanup attempts every independent owner, including when
-        # another callback fails or raises cancellation. Failed originals stay
-        # registered, and AsyncExitStack preserves the exception chain.
+        """Reconcile expired/withdrawn original handles, attempting every owner.
+
+        Each native retirement has its feature-owned finite join budget. A
+        cancelled sweep still attempts independent owners, then preserves the
+        actual task cancellation with later cleanup failures as its cause.
+        """
+        task = asyncio.current_task()
+        if task is None:
+            raise RuntimeError("MCP OAuth maintenance requires its original asyncio task")
+        cancelling = task.cancelling()
+
+        async def preserve_cancellation(error_type, error, traceback):
+            if task.cancelling() > cancelling:
+                raise asyncio.CancelledError from error
+
         async with AsyncExitStack() as retirements:
-            for identifier, pending in reversed(eligible):
-                retirements.push_async_callback(self._retire_pending, identifier, pending)
+            retirements.push_async_exit(preserve_cancellation)
+            for identifier, pending in reversed(tuple(self._pending.items())):
+                retirements.push_async_callback(self._retire_pending, identifier, pending, eligible_only=True)
 
     def _pending_for(self, context, identifier: str) -> _PendingAuthorization:
         pending = self._pending.get(identifier)
