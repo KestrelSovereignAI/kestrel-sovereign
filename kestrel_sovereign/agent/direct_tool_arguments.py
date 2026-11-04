@@ -10,8 +10,9 @@ method that does not declare them raised ``TypeError`` before it ran
 else the call asked for, such as ``capture_output``.
 
 Every direct-tool dispatch path applies these rules, here and nowhere else.
-An argument the tool's schema accepts always passes through unchanged. For
-an argument it does not accept:
+An argument the tool's schema accepts always passes through, coerced to its
+declared type when the tool's wrapper coerces it (see below). For an argument
+it does not accept:
 
 * ``task`` and ``context`` are dropped when the call also carries what the
   tool needs. They are orchestration arguments, not data.
@@ -58,6 +59,19 @@ optionally anchored with ``^`` and ``$`` (``^x-``, ``^context$``), is
 evaluated, by string comparison. A generic name that any other pattern might
 match passes through, and so does any other name a closed schema leaves to
 its patterns. The tool validates them.
+
+A tool wrapping a native ``@tool`` method has its accepted arguments coerced
+to the types the method declares, by the SDK's ``coerce_tool_arguments``: the
+same function and parameters its wrapper applies when it runs (#3921). A model
+may send an integer as ``"30"``. Coercing it here, before PRE_TOOL_USE, means
+the hooks authorize, and the audit records, the binding the tool runs with. A
+value that cannot be coerced refuses the call with the wrapper's message,
+naming the parameter and the type it expects. Any other tool's ``execute``
+receives its arguments as sent, so they are not coerced here either: doing so
+would change what it runs with, not only when. A PRE_TOOL_USE hook that
+rewrites an argument to a value the wrapper would still coerce has the call
+refused (``hook_rewrite_argument_error``): the hooks after it authorized a
+binding the tool would not run with.
 """
 
 from __future__ import annotations
@@ -65,7 +79,10 @@ from __future__ import annotations
 import difflib
 import logging
 from dataclasses import dataclass, field
-from typing import Any, Dict, FrozenSet, Optional, Sequence, Tuple
+from typing import Any, Dict, FrozenSet, List, Optional, Sequence, Tuple
+
+from kestrel_sdk.tools import ToolParameter, coerce_tool_arguments
+from kestrel_sdk.tools.result import ToolResult
 
 logger = logging.getLogger(__name__)
 
@@ -230,6 +247,110 @@ def _declared_parameters(tool: Any) -> Optional[_DeclaredParameters]:
     return None
 
 
+def _wrapper_coerced_parameters(tool: Any) -> Optional[List[ToolParameter]]:
+    """The parameters ``tool``'s own wrapper coerces against, or ``None``.
+
+    A tool wrapping a native ``@tool`` method (Core's ``DynamicTool`` or the
+    SDK's) coerces its arguments to the method's ``_tool_schema`` parameters
+    when it runs. ``None`` for any other tool: its ``execute`` receives the
+    arguments as they are, so coercing them here would change what it runs
+    with rather than only when the coercion happens.
+    """
+    schema = getattr(getattr(tool, "func", None), "_tool_schema", None)
+    if not isinstance(schema, dict):
+        return None
+    parameters = schema.get("parameters")
+    if not isinstance(parameters, list):
+        return None
+    if not all(isinstance(parameter, ToolParameter) for parameter in parameters):
+        return None
+    return parameters
+
+
+def coerce_declared_tool_arguments(
+    tool_name: str,
+    tool: Any,
+    arguments: Dict[str, Any],
+) -> Tuple[Dict[str, Any], Optional[str]]:
+    """Coerce ``arguments`` as ``tool``'s own wrapper will, before it runs.
+
+    Only for a tool wrapping a native ``@tool`` method (see the module
+    docstring); any other tool gets its arguments back unchanged.
+
+    Returns:
+        ``(arguments, error)`` as :func:`kestrel_sdk.tools.coerce_tool_arguments`
+        does. ``error`` names the parameter and the type it expects, and a
+        refused call gets back the arguments it supplied, as does a call
+        whose arguments already had their declared types.
+    """
+    parameters = _wrapper_coerced_parameters(tool)
+    if parameters is None or not isinstance(arguments, dict):
+        return arguments, None
+    coerced, error = coerce_tool_arguments(tool_name, parameters, arguments)
+    if error is None and all(coerced[name] is value for name, value in arguments.items()):
+        return arguments, None
+    return coerced, error
+
+
+def refused_tool_result(tool_name: str, error: str) -> Dict[str, Any]:
+    """The result a native ``@tool`` wrapper returns for arguments it refuses.
+
+    ``ToolResult.failed(error)`` naming the tool, as the SDK's wrapper builds
+    it, so a call refused before it reaches the wrapper fails exactly as one
+    the wrapper refused.
+    """
+    refused = ToolResult.failed(error).to_dict()
+    refused["tool"] = tool_name
+    return refused
+
+
+class ToolArgumentRewriteError(ValueError):
+    """A PRE_TOOL_USE hook rewrote a call's arguments to another binding."""
+
+
+def hook_rewrite_argument_error(
+    tool_name: str,
+    tool: Any,
+    arguments: Dict[str, Any],
+) -> Optional[str]:
+    """Refuse a PRE_TOOL_USE rewrite the tool's own wrapper would coerce.
+
+    A dispatch path coerces a call before its PRE_TOOL_USE hooks run (see the
+    module docstring), so a hook that leaves the arguments alone leaves them
+    in their declared types. A MODIFY hook may still rewrite ``limit`` to
+    ``"7"``: every hook after it authorizes ``"7"``, the audit records it,
+    and the wrapper would run the tool with ``7``. Coercing the rewrite here
+    would not help, since those hooks have already decided on the string. So
+    such a call must not run (#3921). ``arguments`` are the call's arguments
+    once its hooks have run.
+
+    Returns:
+        ``None`` when the tool runs with exactly ``arguments`` (always for a
+        tool whose wrapper does not coerce); otherwise why the call must not
+        run, naming the parameters and their declared types but not their
+        rewritten values.
+    """
+    coerced, error = coerce_declared_tool_arguments(tool_name, tool, arguments)
+    if error is not None:
+        return f"{error}. A PRE_TOOL_USE hook rewrote the arguments; the call did not run"
+    if coerced is arguments:
+        return None
+    declared = {
+        parameter.name: parameter.type
+        for parameter in _wrapper_coerced_parameters(tool)
+    }
+    retyped = ", ".join(
+        f"{name!r} (declared {declared[name]!r})"
+        for name, value in arguments.items()
+        if coerced[name] is not value
+    )
+    return (
+        f"{tool_name}: a PRE_TOOL_USE hook rewrote {retyped} to a value of "
+        "another type. The call did not run: the hooks authorized arguments "
+        "other than the ones it would run with"
+    )
+
+
 def _render_name(name: Any) -> str:
     rendered = repr(name)
     if len(rendered) > _ARGUMENT_NAME_REPR_LIMIT:
@@ -326,17 +447,18 @@ def normalize_direct_tool_arguments(
 
     Returns:
         ``(arguments, error)``. ``error`` is ``None`` when the call may run
-        with the returned arguments; otherwise it names the arguments the
-        schema does not accept or the call is missing, and the tool's
-        parameters, and the call must not run. A refused call gets back the
-        arguments it supplied.
+        with the returned arguments, coerced to their declared types;
+        otherwise it names the arguments the schema does not accept or the
+        call is missing, and the tool's parameters, or the parameter whose
+        value is not of its declared type, and the call must not run. A
+        refused call gets back the arguments it supplied.
     """
     declared = _declared_parameters(tool)
     if declared is None or not isinstance(arguments, dict):
         return arguments, None
     rejected = [name for name in arguments if not declared.accepts(name)]
     if not rejected:
-        return arguments, None
+        return coerce_declared_tool_arguments(tool_name, tool, arguments)
 
     unknown = [
         name for name in rejected if name not in GENERIC_ORCHESTRATION_ARGUMENTS
@@ -351,9 +473,12 @@ def normalize_direct_tool_arguments(
     if incomplete is not None:
         return arguments, incomplete
 
+    coerced, error = coerce_declared_tool_arguments(tool_name, tool, kept)
+    if error is not None:
+        return arguments, error
     logger.info(
         "[DIRECT-TOOL] %s: dropped undeclared orchestration argument(s) %s",
         tool_name,
         ", ".join(sorted(rejected)),
     )
-    return kept, None
+    return coerced, None

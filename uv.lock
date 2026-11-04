@@ -3415,7 +3415,7 @@ requires-dist = [
     { name = "kestrel-sovereign", extras = ["search"], marker = "extra == 'all-features'" },
     { name = "kestrel-sovereign", extras = ["test"], marker = "extra == 'full'" },
     { name = "kestrel-sovereign", extras = ["wallet"], marker = "extra == 'all-features'" },
-    { name = "kestrel-sovereign-sdk", extras = ["a2a", "httpx", "tracing"], specifier = ">=0.46.0,<1" },
+    { name = "kestrel-sovereign-sdk", extras = ["a2a", "httpx", "tracing"], specifier = ">=0.48.0,<1" },
     { name = "kestrel-sovereign-sdk", extras = ["metrics"], marker = "extra == 'observability'" },
     { name = "networkx", specifier = "==3.6.1" },
     { name = "numpy", specifier = ">=2.3.1" },
@@ -3503,15 +3503,15 @@ test = [
 
 [[package]]
 name = "kestrel-sovereign-sdk"
-version = "0.46.0"
+version = "0.48.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "idna" },
     { name = "pydantic" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/0c/fd/7d5e752835918be43188da1e511fc0968d15de9f1c1cc2e5a095440f2113/kestrel_sovereign_sdk-0.46.0.tar.gz", hash = "sha256:9e48d4f787e9632e431e0cc490e91c40fd7929bffc43e411f67a89547ec677c9", size = 554192, upload-time = "2026-11-02T19:20:51Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/d2/ca/f465953025681ee105e42a9da2ba59fae09d596f69a30e0349f0f2684d33/kestrel_sovereign_sdk-0.48.0.tar.gz", hash = "sha256:282adfbda8c6e9f34fd158d2e20ca7dc7953d742bc562166da9c485e23236b90", size = 560799, upload-time = "2026-11-04T16:16:44.231Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/27/6c/0b47b41b971a3c45af4c3c519d4719d66ed4ce1c875250651cfe88d9d797/kestrel_sovereign_sdk-0.46.0-py3-none-any.whl", hash = "sha256:2c8f411dcad09810aa92ecce248c02d780cda1153bf24a8dbcc2e6755b4f21a9", size = 662186, upload-time = "2026-11-02T19:20:49.379Z" },
+    { url = "https://files.pythonhosted.org/packages/ad/0e/ced5b5f5f03d05c2276900f45be87d897e01142b11877b545d35eed8da30/kestrel_sovereign_sdk-0.48.0-py3-none-any.whl", hash = "sha256:898b00c0d21b742618e2a358deef643730dd378f675a20acae63e69014a9d960", size = 668167, upload-time = "2026-11-04T16:16:45.639Z" },
 ]
 
 [package.optional-dependencies]

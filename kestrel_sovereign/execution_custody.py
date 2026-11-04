@@ -29,6 +29,7 @@ from httpx import Response as _NativeHTTPXResponse
 from httpx2 import AsyncByteStream as _NativeHTTPX2AsyncByteStream
 from httpx2 import AsyncClient as _NativeHTTPX2AsyncClient
 from httpx2 import Response as _NativeHTTPX2Response
+from kestrel_sdk.features.host_errors import register_control_error_predicate
 from kestrel_sdk.storage.database import TransactionError
 
 from kestrel_sovereign.turn_scope import capture_turn_scope, turn_scoped
@@ -1896,3 +1897,10 @@ turn_scoped(
     capture=lambda owner: _STREAM_CLEANUP.get(),
     bind=_bind_stream_cleanup,
 )
+
+
+# The SDK's tool wrapper re-raises an exception this predicate calls control
+# instead of turning it into a failed result, so an SDK feature's tool
+# propagates the same control errors Core's wrapper does (#3921). Registering
+# the same function again is a no-op.
+register_control_error_predicate(is_execution_control_error)

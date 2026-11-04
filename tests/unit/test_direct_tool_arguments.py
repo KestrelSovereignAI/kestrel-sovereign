@@ -839,6 +839,7 @@ async def test_chat_path_still_reports_a_tool_that_raises():
 
     assert result == {"success": False, "error": "took too long"}
     assert dispatch_meta == {
+        "arguments": {"n": "1"},
         "status": "timeout",
         "error_class": "TimeoutError",
         "error_message": "took too long",
