@@ -114,6 +114,8 @@ _scheduler_database_backend_type = scheduler_database_backend_type
 
 POLL_INTERVAL = 30
 DEFAULT_MAX_CONCURRENT_TASKS = 4
+# Every admitted occurrence runs on a task named this plus its schedule id.
+SCHEDULER_OCCURRENCE_TASK_PREFIX = "scheduler-occurrence:"
 SUPERVISOR_MIN_BACKOFF_SECONDS = 1.0
 SUPERVISOR_MAX_BACKOFF_SECONDS = 30.0
 RUNTIME_STATUS_MIN_HEARTBEAT_SECONDS = 1.0
@@ -752,6 +754,17 @@ def get_current_scheduler_occurrence_task(
     scope = _current_execution.get()
     task = scope.occurrence_task
     return task if task is not None and not task.done() else None
+
+
+def scheduler_occurrence_awaiting_slot(task: Any) -> bool:
+    """True while ``task`` is an admitted occurrence queued behind its cap.
+
+    Such an occurrence has not started its work, and the concurrency slot it
+    waits for may be the one an inspecting occurrence holds (#3928). Any
+    other task, and an occurrence holding a slot, is False.
+    """
+    admitted = getattr(task, "_kestrel_admitted_occurrence", None)
+    return isinstance(admitted, _AdmittedOccurrence) and admitted.awaiting_slot
 
 
 @contextlib.contextmanager
@@ -2284,14 +2297,18 @@ class SchedulerRunner:
         """Start one due row on its own task and record it as in flight."""
 
         occurrence = self._occurrence_task_factory(
-            self._run_occurrence(task), name=f"scheduler-occurrence:{task.id}"
+            self._run_occurrence(task),
+            name=f"{SCHEDULER_OCCURRENCE_TASK_PREFIX}{task.id}",
         )
-        self._occurrences[task.id] = _AdmittedOccurrence(
+        admitted = _AdmittedOccurrence(
             agent_id=task.agent_id,
             task=occurrence,
             admitted_monotonic=time.monotonic(),
             admitted_at=self._tick_started_at,
         )
+        self._occurrences[task.id] = admitted
+        # Read by ``scheduler_occurrence_awaiting_slot``.
+        occurrence._kestrel_admitted_occurrence = admitted
         self._refresh_unclaimed_admission_snapshot()
         # A done callback, not ``finally``: a task cancelled before its first
         # step never runs its body, and its row must still leave the registry.
