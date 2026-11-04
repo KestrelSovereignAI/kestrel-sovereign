@@ -7,6 +7,7 @@ agent membership, private delivery and the public web client identity.
 from __future__ import annotations
 
 import asyncio
+from anyio.lowlevel import checkpoint_if_cancelled
 from collections.abc import Callable, Mapping
 from contextlib import AsyncExitStack, asynccontextmanager
 from contextvars import ContextVar
@@ -628,25 +629,49 @@ class MCPOAuthHost:
             self._pending.pop(identifier, None)
 
     async def maintain(self) -> None:
-        """Reconcile expired/withdrawn original handles, attempting every owner.
+        """Attempt every original retirement, retaining native errors and control.
 
-        Each native retirement has its feature-owned finite join budget. A
-        cancelled sweep still attempts independent owners, then preserves the
-        actual task cancellation with later cleanup failures as its cause.
+        The original cancellation object remains recognizable to its enclosing
+        asyncio or anyio scope. Every independent cleanup error is retained.
+        Eligibility is checked inside each original retirement lock.
         """
         task = asyncio.current_task()
         if task is None:
             raise RuntimeError("MCP OAuth maintenance requires its original asyncio task")
         cancelling = task.cancelling()
+        failures = []
 
-        async def preserve_cancellation(error_type, error, traceback):
-            if task.cancelling() > cancelling:
-                raise asyncio.CancelledError from error
+        def retain_failure(_kind, error, _traceback):
+            if error is not None:
+                failures.append(error)
+                return True
+            return False
 
         async with AsyncExitStack() as retirements:
-            retirements.push_async_exit(preserve_cancellation)
             for identifier, pending in reversed(tuple(self._pending.items())):
+                retirements.push(retain_failure)
                 retirements.push_async_callback(self._retire_pending, identifier, pending, eligible_only=True)
+
+        cancellation = next((error for error in failures if isinstance(error, asyncio.CancelledError)), None)
+        if cancellation is None and task.cancelling() > cancelling:
+            # A consumer may suppress its observer's cancellation. Ask the
+            # active anyio scope for its native marker before recovering plain
+            # asyncio control from the original task's cancellation count.
+            try:
+                await checkpoint_if_cancelled()
+            except asyncio.CancelledError as error:
+                cancellation = error
+            if cancellation is None:
+                cancellation = asyncio.CancelledError()
+        if cancellation is not None:
+            others = [error for error in failures if error is not cancellation]
+            if others:
+                raise cancellation from BaseExceptionGroup("Independent MCP OAuth retirements failed", others)
+            raise cancellation
+        if len(failures) == 1:
+            raise failures[0]
+        if failures:
+            raise BaseExceptionGroup("Independent MCP OAuth retirements failed", failures)
 
     def _pending_for(self, context, identifier: str) -> _PendingAuthorization:
         pending = self._pending.get(identifier)

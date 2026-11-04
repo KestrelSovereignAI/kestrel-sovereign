@@ -770,3 +770,68 @@ async def test_clock_rollback_cannot_retire_a_newly_admitted_original_exchange(c
         if callback is not None:
             response = await callback
             assert response.status_code == 200, response.text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('last_retirement', ['await', 'ordinary-error'])
+async def test_anyio_timeout_preserves_its_original_cancellation_during_sweep(controller, monkeypatch, last_retirement):
+    import anyio
+    b = controller
+    await begin(b)
+    await begin(b, headers={'Authorization': 'Bearer ' + _create_jwt(ALICE)})
+    pending = list(b.host._pending.values())
+    attempted = []
+    async def unacknowledged(handle):
+        attempted.append(handle)
+        if handle is pending[0].handle or last_retirement == 'await':
+            await anyio.sleep_forever()
+        raise TimeoutError('independent original closer remains unacknowledged')
+    monkeypatch.setattr(b.runtime, 'retire_authorization', unacknowledged)
+    b.host.withdraw()
+    with pytest.raises(TimeoutError):
+        with anyio.fail_after(0.025):
+            await b.host.maintain()
+    assert attempted == [item.handle for item in pending]
+    assert list(b.host._pending.values()) == pending
+
+
+@pytest.mark.asyncio
+async def test_maintenance_preserves_every_independent_native_error(controller, monkeypatch):
+    b = controller
+    await begin(b)
+    await begin(b, headers={'Authorization': 'Bearer ' + _create_jwt(ALICE)})
+    pending = list(b.host._pending.values())
+    failures = [TimeoutError('first original closer'), ValueError('second original closer')]
+    async def unacknowledged(handle):
+        raise failures[0 if handle is pending[0].handle else 1]
+    monkeypatch.setattr(b.runtime, 'retire_authorization', unacknowledged)
+    b.host.withdraw()
+    with pytest.raises(ExceptionGroup) as caught:
+        await b.host.maintain()
+    assert caught.value.exceptions == tuple(failures)
+    assert list(b.host._pending.values()) == pending
+
+
+@pytest.mark.asyncio
+async def test_anyio_control_survives_a_consumer_that_suppresses_its_first_cancellation(controller, monkeypatch):
+    import anyio
+    b = controller
+    await begin(b)
+    await begin(b, headers={'Authorization': 'Bearer ' + _create_jwt(ALICE)})
+    pending = list(b.host._pending.values())
+    attempted = []
+    async def unacknowledged(handle):
+        attempted.append(handle)
+        if handle is pending[0].handle:
+            try:
+                await anyio.sleep_forever()
+            except asyncio.CancelledError:
+                return
+        raise TimeoutError('independent original closer remains unacknowledged')
+    monkeypatch.setattr(b.runtime, 'retire_authorization', unacknowledged)
+    b.host.withdraw()
+    with pytest.raises(TimeoutError):
+        with anyio.fail_after(0.025):
+            await b.host.maintain()
+    assert attempted == [item.handle for item in pending]
+    assert list(b.host._pending.values()) == [pending[1]]
