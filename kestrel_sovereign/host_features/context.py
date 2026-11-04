@@ -241,6 +241,18 @@ def _host_close_owners(context: Any) -> dict[object, _HostCloseOwner]:
     return owners
 
 
+def host_context_cleanup_owners(context: Any) -> tuple[asyncio.Future, ...]:
+    """Exact resource-close owners and retained native children of this context."""
+    if context is None:
+        return ()
+    return tuple(
+        owner
+        for record in _host_close_owners(context).values()
+        for owner in (record.task, *(task for _resource, task in execution_cleanup_debts(record.error)))
+        if isinstance(owner, asyncio.Future)
+    )
+
+
 def _retain_host_cleanup_failure(
     context: Any, resource: Any, error: BaseException, *, operation: str,
 ) -> None:
@@ -604,5 +616,6 @@ __all__ = [
     "SovereignHostContext",
     "build_host_context",
     "close_host_context_resources",
+    "host_context_cleanup_owners",
     "close_host_context",
 ]

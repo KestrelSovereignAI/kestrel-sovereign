@@ -640,7 +640,9 @@ def agent_shutdown_completion_owners(
     candidates = list(state.get("_durable_shutdown_tail_tasks", ()))
     if include_continuation:
         candidates.append(state.get("_durable_shutdown_continuation"))
-    candidates.append(state.get("_standalone_hold_context_close_task"))
+    from kestrel_sovereign.host_features.context import host_context_cleanup_owners
+
+    candidates.extend(host_context_cleanup_owners(state.get("_standalone_hold_context")))
     for error in (state.get("_shutdown_control"), *observed_errors):
         candidates.extend(owner for _resource, owner in execution_cleanup_debts(error))
     owners = []
@@ -1267,7 +1269,6 @@ class KestrelAgent(
         # explicit binding activates the durable turn-start admission seam.
         self._hold_store = None
         self._standalone_hold_context = None
-        self._standalone_hold_context_close_task = None
         self._privacy_mode = privacy_mode
         self.storage_path = storage_path
         # This process's record that it serves the agent (#3522): written as
@@ -10215,56 +10216,38 @@ Expected Duration: {expected_duration}
         self,
         *, withdrawals: list[BaseException] | None = None,
     ) -> tuple[bool, BaseException | None]:
-        """Join closure of a standalone helper's agent-owned Hold context."""
-
-        state = vars(self)
-        context = state.get("_standalone_hold_context")
-        task = state.get("_standalone_hold_context_close_task")
-        if context is None and task is None:
+        """Join the context's original resource closers, independently of callers."""
+        context = vars(self).get("_standalone_hold_context")
+        if context is None:
             return False, None
+        from kestrel_sovereign._async_ownership import owned_task_join_ancestors
+        from kestrel_sovereign.host_features.context import host_context_cleanup_owners
+        from kestrel_sovereign.hold import close_bound_host_context
+
         custody = self._resource_custody()
         custody.acquire(STANDALONE_HOLD_CONTEXT)
-        from kestrel_sovereign._async_ownership import owned_task_join_ancestors
-
-        current = asyncio.current_task()
-        if task is current or task in owned_task_join_ancestors(current):
+        current, ancestors = asyncio.current_task(), owned_task_join_ancestors()
+        context_owners = host_context_cleanup_owners(context)
+        if any(owner is current or owner in ancestors for owner in context_owners):
             return False, None
-        if any(not owner.done() and owner is not task
+        if any(not owner.done() and owner not in context_owners
                for owner in agent_shutdown_completion_owners(self)):
-            # Completion will retry after every original borrower settles.
             custody.settle(STANDALONE_HOLD_CONTEXT, ReleaseOutcome.RETAINED)
             return False, None
-        if task is None:
-            from kestrel_sovereign.hold import close_bound_host_context
-
-            # The context already registers and joins each original resource
-            # closer through cancellation. A second all-resource Task adds a
-            # refusal point before that inventory can even be entered.
-            cancelled, failure = False, None
-            self._standalone_hold_context_close_task = current
-            try:
-                await close_bound_host_context(context)
-            except BaseException as error:
-                if isinstance(error, asyncio.CancelledError) and not is_execution_control_error(error):
-                    cancelled = True
-                    if withdrawals is not None:
-                        withdrawals.append(error)
-                else:
-                    failure = execution_terminal_error(error, retain_originals=True)
-            finally:
-                self._standalone_hold_context_close_task = None
-        else:
-            # Join an already accepted owner from a previous lifecycle call;
-            # never replace it with a fresh observer or cancel its native work.
-            cancelled, failure = await await_lifecycle_task_completion(
-                task, withdrawals=withdrawals,
-            )
+        # Concurrent callers share the same context-owned resource inventory.
+        # Join those exact closers without adopting another caller's later work.
+        cancelled, failure = False, None
+        try:
+            await close_bound_host_context(context)
+        except BaseException as error:
+            if isinstance(error, asyncio.CancelledError) and not is_execution_control_error(error):
+                cancelled = True
+                if withdrawals is not None:
+                    withdrawals.append(error)
+            else:
+                failure = execution_terminal_error(error, retain_originals=True)
         if failure is None:
             self._standalone_hold_context = None
-        # A failed close remains retryable on a later shutdown call; a terminal
-        # success is idempotent and no longer needs a task reference.
-        self._standalone_hold_context_close_task = None
-        # ``cancelled`` is this joiner's; the close itself ran to completion.
         custody.settle(
             STANDALONE_HOLD_CONTEXT,
             ReleaseOutcome.RELEASED if failure is None else ReleaseOutcome.RETAINED,
@@ -10303,8 +10286,12 @@ Expected Duration: {expected_duration}
         only once custody holds nothing.
         """
         finite_outcomes: list[BaseException] = []
+        shutdown_cancelled = False
 
         def remember_finite(error, *, retain_ordinary=False):
+            nonlocal shutdown_cancelled
+            if execution_observer_cancellations(error):
+                shutdown_cancelled = True
             # Shared agent state owns source-only facts. This invocation still
             # owes its finite caller every actual delivered withdrawal.
             if error is not None and (
@@ -10647,7 +10634,6 @@ Expected Duration: {expected_duration}
             request = getattr(type(worker), "request_stop", None)
             return worker.request_stop if callable(request) else None
 
-        shutdown_cancelled = False
         try:
             # EPHEMERAL hard-purge defense-in-depth (#767 / #2673). If the agent
             # process is exiting while still in EPHEMERAL, the session is

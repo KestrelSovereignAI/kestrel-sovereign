@@ -9,9 +9,14 @@ import pytest_asyncio
 
 from kestrel_sovereign import _async_ownership as ownership
 from kestrel_sovereign.hold.enforcement import complete_bound_agent_shutdown
-from kestrel_sovereign.host_features.context import SovereignHostContext
+from kestrel_sovereign.host_features.context import (
+    SovereignHostContext,
+    host_context_cleanup_owners,
+)
 from kestrel_sovereign.storage.db.sqlite import SQLiteBackend
 from tests.unit.test_cleanup_task_admission import _operation_name
+from tests.unit.test_host_context_native_cleanup import _actual_operation
+from kestrel_sovereign.hold.enforcement import close_bound_host_context
 from kestrel_sovereign._async_ownership import (
     await_owned_task,
     create_owned_task,
@@ -21,8 +26,12 @@ from kestrel_sovereign.execution_custody import (
     _explicit_control_chain,
     execution_cleanup_debts,
     execution_terminal_error,
+    is_execution_control_error,
 )
-from kestrel_sovereign.kestrel_agent import KestrelAgent
+from kestrel_sovereign.kestrel_agent import (
+    KestrelAgent,
+    await_agent_shutdown_completion,
+)
 from tests.integration.test_lighthouse_snapshot_original_control import native_snapshot  # noqa: F401
 
 
@@ -537,9 +546,8 @@ async def test_owned_context_native_closer_can_observe_its_waiting_parent(
 
     async def close():
         entries.append(asyncio.current_task())
-        assert (
-            agent._standalone_hold_context_close_task
-            in ownership.owned_task_join_ancestors()
+        assert asyncio.current_task() in host_context_cleanup_owners(
+            agent._standalone_hold_context
         )
         await agent.wait_for_shutdown_completion()
         await original_close()
@@ -555,7 +563,7 @@ async def test_owned_context_native_closer_can_observe_its_waiting_parent(
         assert len(entries) == 1
         assert backend._connection is None
         assert agent._standalone_hold_context is None
-        assert agent._standalone_hold_context_close_task is None
+        assert not host_context_cleanup_owners(agent._standalone_hold_context)
     finally:
         await original_close()
 
@@ -840,4 +848,181 @@ async def test_refused_completion_fallback_resnapshots_a_new_original_native_chi
         await await_owned_task(caller)
         for child in children:
             await await_owned_task(child)
+        await original_close()
+
+
+@pytest.mark.asyncio
+async def test_prefix_grouped_withdrawal_does_not_reenter_borrowed_completion(
+    prepared_tail, monkeypatch
+):
+    from kestrel_sovereign import kestrel_agent as agent_module
+
+    agent, case = prepared_tail
+    state, release_close, tasks = case[-2], case[5], case[-1]
+    state["close_error"] = None
+    backend = SQLiteBackend(":memory:")
+    await backend.connect()
+    context = SovereignHostContext(db=backend)
+    original_llm_close = agent.llm_service.close
+    entered = asyncio.Event()
+    sources = []
+    refused = []
+    original_refusal = OSError("original native prefix SQLite close admission refused")
+    loop = asyncio.get_running_loop()
+    previous = loop.get_task_factory()
+
+    def factory(owner_loop, coroutine, **kwargs):
+        operation = _actual_operation(coroutine)
+        frame = getattr(operation, "cr_frame", None)
+        code = getattr(operation, "cr_code", None)
+        if (
+            not refused
+            and code is not None
+            and code.co_qualname == "SQLiteBackend.close"
+            and frame.f_locals.get("self") is backend
+        ):
+            refused.append(coroutine)
+            raise original_refusal
+        return (
+            previous(owner_loop, coroutine, **kwargs)
+            if previous
+            else asyncio.Task(coroutine, loop=owner_loop, **kwargs)
+        )
+
+    async def close():
+        await original_llm_close()
+        try:
+            await close_bound_host_context(context)
+        except BaseException as source:
+            assert is_execution_control_error(source) and refused
+            sources.append(source)
+            entered.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                # The original native failed-close receipt is still owed.
+                # The prefix owns composition with its outer caller withdrawal.
+                raise source
+
+    monkeypatch.setattr(agent.llm_service, "close", close)
+    monkeypatch.setattr(agent_module, "KESTREL_AGENT_SHUTDOWN_TIMEOUT_S", 2.0)
+    monkeypatch.setattr(agent_module, "KESTREL_SHUTDOWN_DURABLE_RESERVE_S", 0.2)
+    loop.set_task_factory(factory)
+    caller = create_owned_task(agent.shutdown(), retain_originals=True)
+    tasks.append(caller)
+    try:
+        await asyncio.wait_for(entered.wait(), 3)
+        caller.cancel("original prefix caller withdrew")
+        done, _ = await asyncio.wait({caller}, timeout=1)
+        assert caller in done, (
+            "A prefix control group consumed the caller withdrawal before a new native completion wait"
+        )
+        result = await await_owned_task(caller)
+        chain = tuple(_explicit_control_chain(result.error))
+        assert sources[0] in chain and original_refusal in chain
+        assert any(
+            isinstance(error, asyncio.CancelledError)
+            and error.args == ("original prefix caller withdrew",)
+            for error in chain
+        )
+        assert backend._connection is not None
+    finally:
+        loop.set_task_factory(previous)
+        state["release_server"].set()
+        release_close.set()
+        await await_owned_task(caller)
+        await await_owned_task(
+            create_owned_task(
+                agent.wait_for_shutdown_completion(), retain_originals=True
+            )
+        )
+        await backend.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("refuse_waiter", [False, True])
+async def test_context_observer_joins_physical_close_without_adopting_its_callers_later_work(
+    prepared_tail, monkeypatch, refuse_waiter
+):
+    agent, case = prepared_tail
+    tasks = case[-1]
+    backend = SQLiteBackend(":memory:")
+    await backend.connect()
+    agent._standalone_hold_context = SovereignHostContext(db=backend)
+    original_close = backend.close
+    entered, release = asyncio.Event(), asyncio.Event()
+    observers = []
+
+    async def close():
+        entered.set()
+        await release.wait()
+        await original_close()
+
+    monkeypatch.setattr(backend, "close", close)
+
+    async def owner():
+        await agent.wait_for_shutdown_completion()
+        await asyncio.shield(observers[0])
+
+    caller = create_owned_task(owner(), retain_originals=True)
+    tasks.append(caller)
+    observer = None
+    loop, previous = (
+        asyncio.get_running_loop(),
+        asyncio.get_running_loop().get_task_factory(),
+    )
+    refused = []
+    observation_errors = []
+    refusal = OSError("original context completion waiter allocation refused")
+
+    def factory(owner_loop, coroutine, **kwargs):
+        if (
+            refuse_waiter
+            and _operation_name(coroutine)
+            == "KestrelAgent.wait_for_shutdown_completion"
+        ):
+            refused.append(coroutine)
+            raise refusal
+        return (
+            previous(owner_loop, coroutine, **kwargs)
+            if previous
+            else asyncio.Task(coroutine, loop=owner_loop, **kwargs)
+        )
+
+    try:
+        await asyncio.wait_for(entered.wait(), 3)
+        loop.set_task_factory(factory)
+        observer = create_owned_task(
+            await_agent_shutdown_completion(agent, finite_errors=observation_errors),
+            retain_originals=True,
+        )
+        observers.append(observer)
+        tasks.append(observer)
+        await asyncio.sleep(0)
+        assert not observer.done(), (
+            "completion returned before the original physical close"
+        )
+        if refuse_waiter:
+            assert refused
+        release.set()
+        done, _ = await asyncio.wait({caller, observer}, timeout=1)
+        assert done == {caller, observer}, (
+            "Context observer adopted the close callers later work and formed a native join cycle"
+        )
+        assert backend._connection is None
+        assert (await await_owned_task(caller)).error is None
+        assert (await await_owned_task(observer)).error is None
+        if refuse_waiter:
+            assert any(
+                refusal in tuple(_explicit_control_chain(error))
+                for error in observation_errors
+            )
+    finally:
+        loop.set_task_factory(previous)
+        release.set()
+        if not caller.done():
+            caller.cancel("owned test retires only the post-close caller frame")
+        await await_owned_task(caller)
+        if observer is not None:
+            await await_owned_task(observer)
         await original_close()
