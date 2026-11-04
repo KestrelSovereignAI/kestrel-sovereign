@@ -286,7 +286,9 @@ async def complete_bound_agent_shutdown(
     Neither case authorizes a replacement Agent or native closer.
     """
     from kestrel_sovereign.execution_custody import execution_cleanup_debts, execution_finite_error, is_execution_control_error
-    from kestrel_sovereign.kestrel_agent import await_agent_shutdown_completion
+    from kestrel_sovereign.kestrel_agent import (
+        agent_shutdown_completion_owners, await_agent_shutdown_completion,
+    )
 
     prior, errors = list(prior_errors), []
     observed = [] if withdrawals is None else withdrawals
@@ -301,9 +303,9 @@ async def complete_bound_agent_shutdown(
         for _, task in execution_cleanup_debts(error):
             if isinstance(task, asyncio.Future) and not task.done() and task not in pending:
                 pending.append(task)
-    continuation = vars(agent).get("_durable_shutdown_continuation")
-    if isinstance(continuation, asyncio.Future) and not continuation.done() and continuation not in pending:
-        pending.append(continuation)
+    for owner in agent_shutdown_completion_owners(agent):
+        if not owner.done() and owner not in pending:
+            pending.append(owner)
     if pending:
         debt = RuntimeError("standalone Hold context remains owned by original pending Agent cleanup")
         debt._kestrel_native_retirement_debts = tuple((context, task) for task in pending)

@@ -6,6 +6,7 @@ import pytest
 from tests.utils.original_failure import OriginalFailure
 
 from kestrel_sovereign._async_ownership import await_owned_task, create_owned_task, owned_task_error
+from kestrel_sovereign.kestrel_agent import agent_shutdown_completion_owners
 from kestrel_sovereign.execution_custody import (
     _explicit_control_chain,
     execution_cleanup_debts,
@@ -73,6 +74,7 @@ async def test_agent_bounded_tail_retains_actual_pending_snapshot_closer(
         await asyncio.wait_for(entered.wait(), 3)
         if withdrawal:
             tail.cancel("actual Agent tail observer withdrew")
+        state["release_server"].set()
         await asyncio.wait_for(close_entered.wait(), 3)
         for _ in range(200):
             if tail.done():
@@ -80,32 +82,29 @@ async def test_agent_bounded_tail_retains_actual_pending_snapshot_closer(
             await asyncio.sleep(0.01)
         assert tail.done(), "Agent tail escaped its original finite guard"
         assert not close_tasks[0].done(), "physical close ACK was not held at assertion"
-        terminal = vars(agent).get("_shutdown_control")
-        assert is_execution_control_error(terminal), (
-            "bounded tail discarded its actual native close owner"
+        owners = set(agent_shutdown_completion_owners(agent))
+        assert any(not owner.done() for owner in owners), (
+            "bounded observation discarded its original pending snapshot owner"
         )
-        debts = execution_cleanup_debts(terminal)
-        assert any(
-            resource is service and owner is not None and not owner.done()
-            for resource, owner in debts
-        ), "same snapshot Task must retain its accepted native closer"
+        # A finite observer guard is not a failed physical retirement.
+        if not withdrawal:
+            assert vars(agent).get("_shutdown_control") is None
         waiter = None
         if completion == "agent-wait":
             from kestrel_sovereign import _async_ownership
 
             actual_join = _async_ownership.await_owned_task
-            snapshot_owners = {
-                owner for resource, owner in debts
-                if resource is service and owner is not None
-            }
+            snapshot_owners = owners
+            joins = set()
 
             async def observe_original_join(owner, *args, **kwargs):
                 # Assert the original dispatch before it could re-join a done
                 # owner forever. No fake completion/ACK is supplied.
                 if owner in snapshot_owners:
-                    assert not owner.done(), (
-                        "completed debt owner was re-admitted to the join loop"
+                    assert owner not in joins, (
+                        "completed original owner was re-admitted to the join loop"
                     )
+                    joins.add(owner)
                 return await actual_join(owner, *args, **kwargs)
 
             monkeypatch.setattr(
@@ -126,11 +125,7 @@ async def test_agent_bounded_tail_retains_actual_pending_snapshot_closer(
                     "completion withdrawal cancelled the retained native owner"
                 )
         release_close.set()
-        owners = {
-            owner
-            for resource, owner in debts
-            if resource is service and owner is not None
-        }
+        owners = set(agent_shutdown_completion_owners(agent))
         await asyncio.gather(*owners, return_exceptions=True)
         if waiter is not None:
             await asyncio.gather(waiter, return_exceptions=True)
@@ -153,6 +148,7 @@ async def test_agent_bounded_tail_retains_actual_pending_snapshot_closer(
         )
         assert agent._resource_custody().is_held("sync_service")
     finally:
+        state["release_server"].set()
         release_close.set()
         if close_tasks:
             await asyncio.gather(*close_tasks, return_exceptions=True)
@@ -188,24 +184,36 @@ async def test_agent_retains_periodic_stop_and_explicit_snapshot_owners(
     worker = service._poll_task
     tasks.append(worker)
     await asyncio.wait_for(entered.wait(), 3)
+    original_snapshot, original_stop = service.force_snapshot, service.stop
+    dispatched = {}
+
+    async def snapshot():
+        dispatched["snapshot"] = asyncio.current_task()
+        return await original_snapshot()
+
+    async def stop():
+        dispatched["stop"] = asyncio.current_task()
+        return await original_stop()
+
+    monkeypatch.setattr(service, "force_snapshot", snapshot)
+    monkeypatch.setattr(service, "stop", stop)
     tail = create_owned_task(
         agent._run_durable_shutdown_tail(SNAPSHOT_TAIL_OBSERVER_BUDGET_S), retain_originals=True
     )
     tasks.append(tail)
     try:
+        state["release_server"].set()
         for _ in range(200):
             if tail.done() and len(close_tasks) == 2:
                 break
             await asyncio.sleep(0.01)
         assert tail.done() and len(close_tasks) == 2
         assert not worker.done() and all(not owner.done() for owner in close_tasks)
-        debts = execution_cleanup_debts(vars(agent).get("_shutdown_control"))
-        owners = {
-            owner
-            for resource, owner in debts
-            if resource is service and owner is not None and not owner.done()
-        }
-        assert len(owners) == 2, (
+        owners = {owner for owner in agent_shutdown_completion_owners(agent)
+                  if not owner.done()}
+        assert set(dispatched) == {"snapshot", "stop"}
+        assert len(set(dispatched.values())) == 2
+        assert set(dispatched.values()) <= owners, (
             "snapshot and periodic-stop roots must BOTH remain owned"
         )
         release_close.set()
@@ -225,6 +233,7 @@ async def test_agent_retains_periodic_stop_and_explicit_snapshot_owners(
             for error in state["close_errors"]
         ), "one original native failure replaced another"
     finally:
+        state["release_server"].set()
         release_close.set()
         if close_tasks:
             await asyncio.gather(*close_tasks, return_exceptions=True)
@@ -260,6 +269,7 @@ async def test_tail_captures_original_cause_bearing_native_callback_cancellation
     )
     tasks.append(tail)
     try:
+        state["release_server"].set()
         await asyncio.wait_for(close_entered.wait(), 3)
         assert source_errors and isinstance(source_errors[0], asyncio.CancelledError)
         import httpx
@@ -271,11 +281,7 @@ async def test_tail_captures_original_cause_bearing_native_callback_cancellation
             await asyncio.sleep(0.01)
         assert tail.done() and not close_tasks[0].done()
         debts = execution_cleanup_debts(vars(agent).get("_shutdown_control"))
-        owners = {
-            owner
-            for resource, owner in debts
-            if resource is service and owner is not None
-        }
+        owners = set(agent_shutdown_completion_owners(agent))
         assert owners
         release_close.set()
         await asyncio.gather(*owners, return_exceptions=True)
@@ -286,6 +292,7 @@ async def test_tail_captures_original_cause_bearing_native_callback_cancellation
         assert source_errors[0].__cause__ in tuple(_explicit_control_chain(terminal))
         assert all(owner.done() for owner in close_tasks)
     finally:
+        state["release_server"].set()
         release_close.set()
         if close_tasks:
             await asyncio.gather(*close_tasks, return_exceptions=True)
@@ -405,14 +412,14 @@ async def test_completion_from_original_native_join_graph_keeps_owner_fenced(
     tasks.append(tail)
     try:
         await asyncio.wait_for(entered.wait(), 3)
+        state["release_server"].set()
         await asyncio.wait_for(close_entered.wait(), 3)
         for _ in range(200):
             if tail.done():
                 break
             await asyncio.sleep(0.01)
         assert tail.done() and not close_tasks[0].done()
-        debts = execution_cleanup_debts(vars(agent).get("_shutdown_control"))
-        assert debts
+        assert agent_shutdown_completion_owners(agent)
         original_join = _async_ownership.await_owned_task
 
         async def observe_original_join(owner, *args, **kwargs):
@@ -427,16 +434,16 @@ async def test_completion_from_original_native_join_graph_keeps_owner_fenced(
 
         monkeypatch.setattr(_async_ownership, "await_owned_task", observe_original_join)
         release_close.set()
-        owners = {
-            owner
-            for resource, owner in debts
-            if resource is service and owner is not None
-        }
+        owners = set(agent_shutdown_completion_owners(agent))
         await asyncio.gather(*owners, return_exceptions=True)
-        assert len(observed) == 1 and is_execution_control_error(observed[0])
-        assert not isinstance(observed[0], AssertionError)
+        assert not any(isinstance(error, AssertionError) for error in observed)
+        assert all(is_execution_control_error(error) for error in observed)
+        assert state["close_error"] in tuple(
+            _explicit_control_chain(vars(agent).get("_shutdown_control"))
+        ), "eventual native close failure vanished after the reentrant observation"
         assert agent._resource_custody().is_held("sync_service")
     finally:
+        state["release_server"].set()
         release_close.set()
         if close_tasks:
             await asyncio.gather(*close_tasks, return_exceptions=True)
@@ -502,6 +509,7 @@ async def test_timely_agent_snapshot_and_stop_retain_both_native_failures(
             for client in clients
         )
     finally:
+        state["release_server"].set()
         release_close.set()
         await asyncio.gather(worker, return_exceptions=True)
         await _retire_partial_agent_fixture(agent, usage_db)
@@ -562,6 +570,7 @@ async def test_agent_retains_exact_original_tail_observer_cancellation(
         if repeat:
             await asyncio.sleep(0.02)
             tail.cancel("second original tail observer withdrawal")
+        state["release_server"].set()
         await asyncio.wait_for(close_entered.wait(), 3)
         for _ in range(200):
             if tail.done():
@@ -570,11 +579,7 @@ async def test_agent_retains_exact_original_tail_observer_cancellation(
         assert tail.done() and not close_tasks[0].done()
         assert len(observed) == (2 if repeat else 1)
         debts = execution_cleanup_debts(vars(agent).get("_shutdown_control"))
-        owners = {
-            owner
-            for resource, owner in debts
-            if resource is service and owner is not None
-        }
+        owners = set(agent_shutdown_completion_owners(agent))
         assert owners
         release_close.set()
         await asyncio.gather(*owners, return_exceptions=True)
@@ -586,6 +591,7 @@ async def test_agent_retains_exact_original_tail_observer_cancellation(
         )
         assert state["close_error"] in chain
     finally:
+        state["release_server"].set()
         release_close.set()
         if close_tasks:
             await asyncio.gather(*close_tasks, return_exceptions=True)

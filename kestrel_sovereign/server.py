@@ -59,6 +59,7 @@ from kestrel_sovereign.execution_custody import (
 )
 from kestrel_sovereign.kestrel_agent import (
     KestrelAgent,
+    agent_shutdown_completion_owners,
     await_agent_shutdown_completion,
     await_lifecycle_task_completion,
 )
@@ -2105,7 +2106,7 @@ async def _shutdown_single_agent(agent: KestrelAgent, *, finite_errors: list[Bas
     failures, withdrawals = [], []
     # Failed initialization may already have handed native cleanup to the
     # Agent. Join that exact owner before a fresh shutdown can touch providers.
-    if isinstance(getattr(agent, "_durable_shutdown_continuation", None), asyncio.Future):
+    if agent_shutdown_completion_owners(agent):
         try:
             cancelled = await await_agent_shutdown_completion(agent, withdrawals=withdrawals, finite_errors=failures)
         except BaseException as error:
