@@ -141,12 +141,12 @@ async def test_startup_rejection_keeps_original_mount_and_later_hook_sources(
             raise independent.error
     feature = FailingStop()
     monkeypatch.setattr(host_features, "instantiate_host_features", lambda **kwargs: [feature])
-    actual_mount = host_features.mount_host_feature_routers
-    def mount(*args, **kwargs):
-        actual_mount(*args, **kwargs)
+    actual_mount = host_features.mount_started_host_feature_routers
+    async def mount(*args, **kwargs):
+        await actual_mount(*args, **kwargs)
         calls.append("mount")
         raise source.error
-    monkeypatch.setattr(host_features, "mount_host_feature_routers", mount)
+    monkeypatch.setattr(host_features, "mount_started_host_feature_routers", mount)
     app = FastAPI()
     async def invoke():
         async with server._lifespan_startup(app):

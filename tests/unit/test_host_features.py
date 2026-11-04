@@ -501,11 +501,12 @@ async def test_server_lifespan_wires_and_closes_host_features(
     monkeypatch.setattr(server, "setup_tracing", lambda app: None)
     monkeypatch.setattr(hf, "instantiate_host_features", lambda **k: [feature])
     monkeypatch.setattr(hf, "build_host_context", build_context)
-    monkeypatch.setattr(
-        hf,
-        "mount_host_feature_routers",
-        lambda app, features: events.append("host-router-mount"),
-    )
+    async def mount_routers(app, features, supplied_ctx):
+        assert supplied_ctx is ctx
+        events.append("host-router-mount")
+        return features
+
+    monkeypatch.setattr(hf, "mount_started_host_feature_routers", mount_routers)
     monkeypatch.setattr(
         hf,
         "mount_host_feature_ui",
@@ -656,13 +657,10 @@ async def test_server_retains_control_context_after_optional_mount_failure(
     monkeypatch.setattr(hf, "build_host_context", build_context)
     monkeypatch.setattr(hf, "start_host_features", start_features)
     monkeypatch.setattr(hf, "stop_host_features", AsyncMock())
-    monkeypatch.setattr(
-        hf,
-        "mount_host_feature_routers",
-        lambda _app, _features: (_ for _ in ()).throw(
-            RuntimeError("router mount failed")
-        ),
-    )
+    async def failing_mount(_app, _features, _ctx):
+        raise RuntimeError("router mount failed")
+
+    monkeypatch.setattr(hf, "mount_started_host_feature_routers", failing_mount)
     monkeypatch.setattr(hf, "mount_host_feature_ui", lambda _app, _features: None)
     monkeypatch.setattr(hf, "unmount_host_features", lambda _app: None)
 
@@ -676,6 +674,190 @@ async def test_server_retains_control_context_after_optional_mount_failure(
     session_factory.close.assert_awaited_once()
     hold_db.close.assert_awaited_once()
     host_db.close.assert_awaited_once()
+
+
+class _UnreadableHandlers(list):
+    """Handlers FastAPI reads only after it has appended the router's routes."""
+
+    def __iter__(self):
+        raise RuntimeError("startup handlers could not be read")
+
+
+class _RouterRaisesHostFeature(_UIHostFeature):
+    name = "router-raises"
+
+    def get_router(self):
+        raise RuntimeError("router construction failed: secret-token")
+
+
+class _IncludeFailsHostFeature(_UIHostFeature):
+    name = "include-fails"
+
+    def get_router(self):
+        router = APIRouter()
+
+        @router.get("/api/include-fails/ping")
+        async def ping():
+            return {"ok": True}
+
+        router.on_startup = _UnreadableHandlers()
+        return router
+
+
+def test_a_partially_included_router_is_the_premise():
+    """``include_router`` really does leave routes behind when it raises late.
+
+    Without this the include-failure case below could pass by never having
+    added a route to remove.
+    """
+    app = FastAPI()
+    before = len(app.routes)
+
+    with pytest.raises(RuntimeError, match="startup handlers could not be read"):
+        app.include_router(_IncludeFailsHostFeature().get_router())
+
+    assert len(app.routes) > before
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("_local_host_auth")
+async def test_a_router_that_does_not_mount_unloads_its_host_feature(
+    monkeypatch,
+    tmp_path: Path,
+):
+    """A router mount failure is a contribution rejection, not a WARNING (#3926).
+
+    It used to be logged and skipped while the feature stayed started, listed
+    and healthy without its HTTP capability. Startup must instead stop it, keep
+    it out of the published set, report it not loaded, and leave none of its
+    routes mounted, while a healthy sibling still serves.
+    """
+    from fastapi.routing import iter_route_contexts
+
+    from kestrel_sovereign import server
+    from kestrel_sovereign.a2a import did_registry
+    from kestrel_sovereign.multi_agent import agent_manager
+    from kestrel_sovereign.multi_agent import config as ma_config
+    from kestrel_sovereign.security import demo_isolation
+
+    config_path = tmp_path / "multi_agent.toml"
+    config_path.write_text("[host]\nport = 8888\n")
+    fake_config = SimpleNamespace(
+        host=SimpleNamespace(bind="127.0.0.1", port=8888),
+        agents={"Kite": object()},
+    )
+    fake_agent = SimpleNamespace(is_test_instance=True)
+
+    class FakeManager:
+        init_failures = []
+
+        def reconcile_spawn_authority_restart_roster(self, config):
+            return config
+
+        def set_agent_registration_hook(self, _hook) -> None:
+            return None
+
+        async def load_from_config(
+            self,
+            config,
+            *,
+            restart_roster_reconciled,
+            before_initialize,
+        ):
+            before_initialize(tuple(config.agents))
+            return 1
+
+        def validate_host_context_clause_registry(self, _registry) -> None:
+            return None
+
+        def validate_host_service_resolver(self, _resolver) -> None:
+            return None
+
+        def bind_host_context_clause_registry(self, _registry) -> None:
+            return None
+
+        def list_agents(self):
+            return ["Kite"]
+
+        def get_agent(self, _name):
+            return fake_agent
+
+        async def shutdown_all(self):
+            return None
+
+    healthy = _UIHostFeature()
+    router_raises = _RouterRaisesHostFeature()
+    include_fails = _IncludeFailsHostFeature()
+    ctx = SovereignHostContext(
+        db=SimpleNamespace(close=AsyncMock()),
+        session_factory=SimpleNamespace(close=AsyncMock()),
+        hold_store=object(),
+    )
+
+    async def build_context(*, config):
+        return ctx
+
+    monkeypatch.delenv("PORT", raising=False)
+    monkeypatch.setattr(server, "resolve_multi_agent_path", lambda _env: config_path)
+    monkeypatch.setattr(ma_config.MultiAgentConfig, "load", lambda *a, **k: fake_config)
+    monkeypatch.setattr(agent_manager, "AgentManager", lambda **_kwargs: FakeManager())
+    monkeypatch.setattr(did_registry, "install_a2a_did_resolver", lambda *a, **k: None)
+    monkeypatch.setattr(demo_isolation, "classify_server_mode", lambda _agents: True)
+    monkeypatch.setattr(server, "_mount_feature_ui_assets", lambda _app: None)
+    monkeypatch.setattr(server, "_mount_feature_routers", lambda _app: None)
+    monkeypatch.setattr(server, "_unmount_feature_ui_assets", lambda _app: None)
+    monkeypatch.setattr(server, "_unmount_feature_routers", lambda _app: None)
+    monkeypatch.setattr(server, "setup_tracing", lambda _app: None)
+    monkeypatch.setattr(
+        hf,
+        "instantiate_host_features",
+        lambda **_kwargs: [router_raises, healthy, include_fails],
+    )
+    monkeypatch.setattr(hf, "build_host_context", build_context)
+
+    test_app = FastAPI()
+    async with server.lifespan(test_app):
+        assert test_app.state.host_context is ctx
+        assert test_app.state.host_features == [healthy]
+        assert ctx.started_host_features == (healthy,)
+        assert router_raises.stopped and include_fails.stopped
+        assert not healthy.stopped
+        assert [entry["feature"] for entry in test_app.state.host_ui_manifest] == [
+            "demo-host"
+        ]
+
+        rejections = {
+            rejection.feature_name: rejection.reason
+            for rejection in ctx.rejected_host_feature_contributions
+        }
+        assert rejections == {
+            "router-raises": "router_mount_failed: RuntimeError",
+            "include-fails": "router_mount_failed: RuntimeError",
+        }
+
+        health = server._with_host_feature_rejections(
+            test_app.state, {"status": "healthy", "overall_healthy": True}
+        )
+        assert health["status"] == "degraded"
+        assert health["overall_healthy"] is False
+        assert {entry["feature"] for entry in health["host_features_not_loaded"]} == {
+            "router-raises",
+            "include-fails",
+        }
+        assert "secret-token" not in str(health)
+
+        paths = {context.path for context in iter_route_contexts(test_app.routes)}
+        assert "/api/demo-host/ping" in paths
+        assert not any(path.startswith("/api/include-fails") for path in paths)
+        assert not hf.is_host_feature_path(test_app, "/api/include-fails/ping")
+
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=test_app), base_url="http://t"
+        ) as client:
+            assert (await client.get("/api/demo-host/ping")).status_code == 200
+            assert (await client.get("/api/include-fails/ping")).status_code == 404
+
+    assert healthy.stopped
 
 
 @pytest.mark.asyncio

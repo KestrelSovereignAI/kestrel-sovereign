@@ -16,8 +16,10 @@ from kestrel_sovereign.features.contribution_runtime import (
 )
 from kestrel_sovereign.host_features import (
     SovereignHostContext,
+    is_host_feature_path,
     mount_host_feature_routers,
     mount_host_feature_ui,
+    mount_started_host_feature_routers,
     start_host_features,
     stop_host_features,
     unmount_host_features,
@@ -686,3 +688,171 @@ def test_a_whitespace_backend_error_is_not_an_outage():
     payload = _with_host_feature_rejections(_State(), {"status": "healthy"})
 
     assert payload == {"status": "healthy"}
+
+
+# ---------------------------------------------------------------------------
+# #3926 — a router that does not mount is a feature that did not load
+# ---------------------------------------------------------------------------
+
+
+class _RouterlessHostFixture(SDKFixtureHostFeature):
+    contribution_prefix = "routerless-host-fixture"
+    name = "routerless-host-fixture"
+
+    def get_router(self):
+        raise RuntimeError("router needs host-token=must-stay-private")
+
+
+@pytest.mark.asyncio
+async def test_a_router_that_does_not_mount_is_retired_like_a_failed_start():
+    """Started, then unloaded whole: hook stopped and every declaration removed.
+
+    A feature listed as started while its HTTP surface is missing is the
+    silent-healthy report #3058 ended for start hooks. The verdict names the
+    exception type only, so no message text reaches health.
+    """
+    ctx = SovereignHostContext()
+    feature = _RouterlessHostFixture()
+    app = FastAPI()
+    started = await start_host_features([feature], ctx)
+    assert started == [feature]
+    _assert_live(ctx, feature, True)
+
+    loaded = await mount_started_host_feature_routers(app, started, ctx)
+
+    assert loaded == []
+    assert feature.stopped
+    _assert_live(ctx, feature, False)
+    assert tuple(ctx.started_host_features) == ()
+    rejections = tuple(ctx.rejected_host_feature_contributions)
+    assert [(r.feature_name, r.reason) for r in rejections] == [
+        ("routerless-host-fixture", "router_mount_failed: RuntimeError")
+    ]
+    assert "host-token" not in rejections[0].reason
+
+
+@pytest.mark.asyncio
+async def test_a_healthy_router_keeps_serving_beside_one_that_did_not_mount():
+    ctx = SovereignHostContext()
+    healthy = SDKFixtureHostFeature()
+    broken = _RouterlessHostFixture()
+    app = FastAPI()
+    started = await start_host_features([broken, healthy], ctx)
+
+    loaded = await mount_started_host_feature_routers(app, started, ctx)
+
+    assert loaded == [healthy]
+    assert tuple(ctx.started_host_features) == (healthy,)
+    _assert_live(ctx, healthy, True)
+    with TestClient(app) as client:
+        assert client.get("/api/host-fixture/fixture").status_code == 200
+    await stop_host_features([healthy], ctx)
+
+
+def test_a_router_whose_inclusion_fails_leaves_no_native_registration():
+    """No partial router stays mounted, and nothing it registered stays either.
+
+    FastAPI appends a router's routes before it copies its handlers and merges
+    its lifespan, so a late failure leaves routes and handlers behind.
+    """
+    async def handler():
+        pass
+
+    class _Unreadable(list):
+        def __iter__(self):
+            raise RuntimeError("handlers could not be read")
+
+    class _PartialHostFixture(SDKFixtureHostFeature):
+        contribution_prefix = "partial-host-fixture"
+        name = "partial-host-fixture"
+
+        def get_router(self):
+            router = super().get_router()
+            # Startup handlers are copied, then the next read fails.
+            router.on_startup = [handler]
+            router.on_shutdown = _Unreadable()
+            return router
+
+    app = FastAPI()
+    routes = list(app.routes)
+    on_start = list(app.router.on_startup)
+    on_stop = list(app.router.on_shutdown)
+    lifespan = app.router.lifespan_context
+    feature = _PartialHostFixture()
+    # The premise: a bare inclusion fails after it has registered something.
+    probe = FastAPI()
+    with pytest.raises(RuntimeError, match="handlers could not be read"):
+        probe.include_router(feature.get_router())
+    assert len(probe.routes) > len(FastAPI().routes)
+    assert probe.router.on_startup == [handler]
+
+    mount_host_feature_routers(app, [feature])
+
+    assert app.routes == routes
+    assert app.router.on_startup == on_start
+    assert app.router.on_shutdown == on_stop
+    assert app.router.lifespan_context is lifespan
+    assert not is_host_feature_path(app, "/api/partial-host-fixture/fixture")
+
+
+@pytest.mark.asyncio
+async def test_a_feature_whose_router_mounts_on_retry_stops_being_reported():
+    """The mount verdict is superseded by NAME, like a start-hook verdict."""
+    class Flaky(SDKFixtureHostFeature):
+        contribution_prefix = "flaky-router-fixture"
+        name = "flaky-router-fixture"
+        fail = True
+
+        def get_router(self):
+            if type(self).fail:
+                raise RuntimeError("not yet")
+            return super().get_router()
+
+    ctx = SovereignHostContext()
+    app = FastAPI()
+    await mount_started_host_feature_routers(
+        app, await start_host_features([Flaky()], ctx), ctx
+    )
+    assert [r.feature_name for r in ctx.rejected_host_feature_contributions] == [
+        "flaky-router-fixture"
+    ]
+
+    Flaky.fail = False
+    try:
+        retried = Flaky()
+        loaded = await mount_started_host_feature_routers(
+            app, await start_host_features([retried], ctx), ctx
+        )
+    finally:
+        Flaky.fail = True
+
+    assert loaded == [retried]
+    assert tuple(ctx.rejected_host_feature_contributions) == ()
+    await stop_host_features([retried], ctx)
+
+
+@pytest.mark.asyncio
+async def test_an_execution_control_failure_from_get_router_propagates():
+    """Original control evidence is never consumed as an optional rejection."""
+    from kestrel_sovereign.execution_custody import ExecutionAuthorityError
+
+    authority = ExecutionAuthorityError("original authority withdrawn")
+
+    class ControlRouter(SDKFixtureHostFeature):
+        contribution_prefix = "control-router-fixture"
+        name = "control-router-fixture"
+
+        def get_router(self):
+            raise authority
+
+    ctx = SovereignHostContext()
+    feature = ControlRouter()
+    started = await start_host_features([feature], ctx)
+
+    with pytest.raises(ExecutionAuthorityError) as exc_info:
+        await mount_started_host_feature_routers(FastAPI(), started, ctx)
+
+    assert exc_info.value is authority
+    assert feature.stopped
+    _assert_live(ctx, feature, False)
+    assert tuple(ctx.rejected_host_feature_contributions) == ()
