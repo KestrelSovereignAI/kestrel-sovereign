@@ -331,7 +331,7 @@ async def test_remote_feature_restore_reads_the_real_enablement_rows(mcp_boundar
     try:
         await restored.initialize()
         peer.agent.features[restored.name] = restored
-        await restored.post_all_features_loaded()
+        await restored.on_agent_ready()
         assert set(restored._remote_connections) == {peer.container}
         assert restored.manager is None
         result = await peer.result_with_witness(peer.invoke("denied-after-feature-restore"), [])
@@ -377,7 +377,7 @@ async def test_restore_database_read_failure_does_not_block_another_remote(mcp_b
     try:
         await restored.initialize()
         peer.agent.features[restored.name] = restored
-        await restored.post_all_features_loaded()
+        await restored.on_agent_ready()
         assert set(restored._remote_connections) == {healthy_name}
         assert "Failed to restore remote MCP " + failed_name in caplog.text
         assert "no such table: feature_enablement" in caplog.text

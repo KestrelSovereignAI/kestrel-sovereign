@@ -2554,7 +2554,9 @@ class AsyncConversationStore:
         rendered_content: Optional[str] = None
         if rendered_raw is not None:
             try:
-                rendered_content, _ = self._decrypt_with_fallback(rendered_raw, meta)
+                rendered_content, _ = await run_blocking_operation(
+                    self._decrypt_with_fallback, rendered_raw, meta
+                )
             except DecryptionError as e:
                 logger.error(
                     "Failed to decrypt rendered_content for message %s: %s",
@@ -2667,7 +2669,9 @@ class AsyncConversationStore:
             if meta and meta.get("excluded_from_context"):
                 continue
 
-            content, needs_migration = self._decrypt_with_fallback(row[2], meta)
+            content, needs_migration = await run_blocking_operation(
+                self._decrypt_with_fallback, row[2], meta
+            )
 
             # Opportunistic migration to per-agent key
             if needs_migration and self._migrate_on_read:
@@ -3326,7 +3330,9 @@ class AsyncConversationStore:
         for row in rows:
             row_id = row[0]
             meta = json.loads(row[3]) if row[3] else None
-            content, needs_migration = self._decrypt_with_fallback(row[2], meta)
+            content, needs_migration = await run_blocking_operation(
+                self._decrypt_with_fallback, row[2], meta
+            )
 
             # Opportunistic per-agent key migration
             if needs_migration and self._migrate_on_read:
@@ -3450,7 +3456,9 @@ class AsyncConversationStore:
         for row in rows:
             row_id = row[0]
             meta = json.loads(row[3]) if row[3] else None
-            content, needs_migration = self._decrypt_with_fallback(row[2], meta)
+            content, needs_migration = await run_blocking_operation(
+                self._decrypt_with_fallback, row[2], meta
+            )
 
             # Opportunistic per-agent key migration
             if needs_migration and self._migrate_on_read:
@@ -3943,7 +3951,9 @@ class AsyncConversationStore:
         """
         row_id, role = row[0], row[1]
         meta = parse_message_metadata(row[3])
-        content, _needs_migration = self._decrypt_with_fallback(row[2], meta)
+        content, _needs_migration = await run_blocking_operation(
+            self._decrypt_with_fallback, row[2], meta
+        )
 
         # Canonical/transport split (#1402): match and snippet against the
         # raw user turn, never the rendered transport bytes.
@@ -5188,7 +5198,9 @@ class AsyncConversationStore:
         for row in rows:
             row_id = row[0]
             meta = json.loads(row[3]) if row[3] else {}
-            content, needs_migration = self._decrypt_with_fallback(row[2], meta)
+            content, needs_migration = await run_blocking_operation(
+                self._decrypt_with_fallback, row[2], meta
+            )
 
             # Filter out excluded messages unless requested
             if not include_excluded and meta.get("excluded_from_context"):
@@ -5704,7 +5716,9 @@ class AsyncConversationStore:
         for row in rows:
             row_id = row[0]
             meta = json.loads(row[3]) if row[3] else {}
-            content, _ = self._decrypt_with_fallback(row[2], meta)
+            content, _ = await run_blocking_operation(
+                self._decrypt_with_fallback, row[2], meta
+            )
             content, _ = await self._resolve_canonical(
                 row_id, row[1], meta, content, row[5]
             )
@@ -5830,7 +5844,9 @@ class AsyncConversationStore:
                 meta = json.loads(raw_meta) if raw_meta else {}
             except (json.JSONDecodeError, TypeError):
                 meta = {}
-            content, _ = self._decrypt_with_fallback(encrypted_content, meta)
+            content, _ = await run_blocking_operation(
+                self._decrypt_with_fallback, encrypted_content, meta
+            )
             content, _ = await self._resolve_canonical(
                 row_id, role, meta, content, rendered
             )
@@ -5958,7 +5974,9 @@ class AsyncConversationStore:
                     meta = json.loads(raw_meta) if raw_meta else {}
                 except (json.JSONDecodeError, TypeError):
                     meta = {}
-                content, _ = self._decrypt_with_fallback(encrypted_content, meta)
+                content, _ = await run_blocking_operation(
+                    self._decrypt_with_fallback, encrypted_content, meta
+                )
                 content, _ = await self._resolve_canonical(
                     row_id, role, meta, content, rendered
                 )
@@ -6220,7 +6238,9 @@ class AsyncConversationStore:
         for row in rows:
             row_id = row[0]
             meta = json.loads(row[3]) if row[3] else {}
-            content, _ = self._decrypt_with_fallback(row[2], meta)
+            content, _ = await run_blocking_operation(
+                self._decrypt_with_fallback, row[2], meta
+            )
 
             cleaned_meta = remove_enc_flag(meta)
             if cleaned_meta:
@@ -6276,7 +6296,9 @@ class AsyncConversationStore:
         for row in rows:
             row_id = row[0]
             meta = json.loads(row[3]) if row[3] else {}
-            content, _ = self._decrypt_with_fallback(row[2], meta)
+            content, _ = await run_blocking_operation(
+                self._decrypt_with_fallback, row[2], meta
+            )
 
             cleaned_meta = remove_enc_flag(meta)
             if cleaned_meta:
@@ -6348,7 +6370,9 @@ class AsyncConversationStore:
                 continue
             row_id = row[0]
             meta = json.loads(row[3])
-            content, needs_migration = self._decrypt_with_fallback(row[2], meta)
+            content, needs_migration = await run_blocking_operation(
+                self._decrypt_with_fallback, row[2], meta
+            )
 
             # Opportunistic migration
             if needs_migration and self._migrate_on_read:
