@@ -100,15 +100,18 @@ jobs:
         run: uv sync --extra cloud
 
       - name: Authenticate to Google Cloud
-        uses: google-github-actions/auth@c200f3691d83b41bf9bbd8638997a462592937ed # v2.1.13
+        uses: ./.github/actions/gcp-deploy-auth
         with:
-          credentials_json: ${{ secrets.GCP_SA_KEY }}
+          project_id: ${{ env.PROJECT_ID }}
+          workload_identity_provider: ${{ vars.GCP_WIF_PROVIDER }}
+          service_account: ${{ vars.GCP_DEPLOY_SERVICE_ACCOUNT }}
 
       # ``setup-gcloud`` is still needed because ``kestrel deploy build``
       # shells out to ``docker buildx``, and docker needs ``gcloud auth
       # configure-docker`` to push to gcr.io. The ``auth`` action above
-      # writes credentials_json to a temp file and points
+      # writes a short-lived federation configuration and points
       # GOOGLE_APPLICATION_CREDENTIALS at it; gcloud picks that up here.
+      # Rollout requires the build/upload credential exclusions from #3929.
       - name: Set up Cloud SDK
         uses: google-github-actions/setup-gcloud@e427ad8a34f8676edf47cf7d7925499adf3eb74f # v2.2.1
 
@@ -184,9 +187,11 @@ jobs:
         run: uv sync --extra cloud
 
       - name: Authenticate to Google Cloud
-        uses: google-github-actions/auth@c200f3691d83b41bf9bbd8638997a462592937ed # v2.1.13
+        uses: ./.github/actions/gcp-deploy-auth
         with:
-          credentials_json: ${{ secrets.GCP_SA_KEY }}
+          project_id: ${{ env.PROJECT_ID }}
+          workload_identity_provider: ${{ vars.GCP_WIF_PROVIDER }}
+          service_account: ${{ vars.GCP_DEPLOY_SERVICE_ACCOUNT }}
 
       - name: Set up Cloud SDK
         uses: google-github-actions/setup-gcloud@e427ad8a34f8676edf47cf7d7925499adf3eb74f # v2.2.1
@@ -250,9 +255,11 @@ jobs:
         run: uv sync --extra cloud
 
       - name: Authenticate to Google Cloud
-        uses: google-github-actions/auth@c200f3691d83b41bf9bbd8638997a462592937ed # v2.1.13
+        uses: ./.github/actions/gcp-deploy-auth
         with:
-          credentials_json: ${{ secrets.GCP_SA_KEY }}
+          project_id: ${{ env.PROJECT_ID }}
+          workload_identity_provider: ${{ vars.GCP_WIF_PROVIDER }}
+          service_account: ${{ vars.GCP_DEPLOY_SERVICE_ACCOUNT }}
 
       - name: Set up Cloud SDK
         uses: google-github-actions/setup-gcloud@e427ad8a34f8676edf47cf7d7925499adf3eb74f # v2.2.1

@@ -11,7 +11,9 @@ Checks performed:
   - For each cloud route in ``route_priority``, one of its accepted
     credential env vars is set in ``.env`` (e.g. OpenRouter accepts
     either ``OPENROUTER_API_KEY`` or ``OPENROUTER_MANAGEMENT_API_KEY``)
-  - At least one agent registered in ``multi_agent.toml``
+  - At least one agent registered in the registry the host loads:
+    ``KESTREL_MULTI_AGENT_CONFIG`` when that file exists, else
+    ``multi_agent.toml`` (#3878)
   - For each registered agent, ``kestrel_prime.db`` exists
   - For each registered agent, the anchored ``constitution_hash``
     matches the SHA256 of its governing constitution: the packaged
@@ -32,6 +34,11 @@ Checks performed:
   - Legacy local identity exports are inspected by metadata only. Unsafe
     directory/file modes, links, and non-regular entries are reported without
     opening or parsing package contents.
+  - A host that starts two or more agents sets ``KESTREL_BASE_URL``; without
+    it no agent publishes a native A2A interface and every co-hosted A2A send
+    fails. Reported as the host's own startup warning, counted from the roster
+    the host's startup would load — see ``_check_native_a2a_publication``
+    (#3872, #3878).
   - Every pinned semantic resource still matches its manifest digest. One
     mismatch refuses agent boot wholesale, and a CRLF-smudged checkout breaks
     all of them at once — see ``_check_semantic_registry`` (#2924).
@@ -45,6 +52,7 @@ This is deliberately minimal. We avoid reaching out to Ollama / OpenAI
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import os
@@ -53,6 +61,7 @@ import sqlite3
 import subprocess
 import sys
 from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing
 from dataclasses import dataclass, field, replace
 from pathlib import Path
@@ -80,8 +89,8 @@ from kestrel_sovereign.lifecycle_checks import (
 )
 from kestrel_sovereign.llm.route_credentials import accepted_credential_envs
 from kestrel_sovereign.multi_agent.config import (
-    MULTI_AGENT_CONFIG_FILENAME,
     MultiAgentConfig,
+    host_registry_path,
 )
 from kestrel_sovereign.paths import (
     AGENT_DB_PATH_ENV,
@@ -117,7 +126,6 @@ def diagnose(project_dir: Path) -> DoctorReport:
     report = DoctorReport()
     env_path = project_dir / ".env"
     toml_path = project_dir / "kestrel.toml"
-    multi_agent_path = project_dir / MULTI_AGENT_CONFIG_FILENAME
 
     env = read_env(env_path)
     config = read_toml(toml_path)
@@ -131,12 +139,7 @@ def diagnose(project_dir: Path) -> DoctorReport:
 
     _check_data_key(env, env_path, report)
     _check_llm(config, env, toml_path, report)
-    multi_agent = _check_multi_agent(
-        multi_agent_path,
-        project_dir,
-        resolved,
-        report,
-    )
+    multi_agent = _check_multi_agent(project_dir, resolved, report)
 
     # Read each agent's governance ONCE and give the same reading to both
     # checks. They used to resolve and read independently, which on an
@@ -155,10 +158,83 @@ def diagnose(project_dir: Path) -> DoctorReport:
     _check_sqlite_hold_readiness(resolved, project_dir, report)
     _check_postgres_hold_readiness(resolved, project_dir, readings, report)
     _check_legacy_identity_exports(project_dir, report)
+    _check_native_a2a_publication(multi_agent, project_dir, resolved, report)
     _check_semantic_registry(report)
     _check_core_lock(report)
 
     return report
+
+
+def _check_native_a2a_publication(
+    multi_agent: MultiAgentConfig | None,
+    project_dir: Path,
+    env: dict,
+    report: DoctorReport,
+) -> None:
+    """Report the warning host startup logs when co-hosts cannot reach each other.
+
+    A host without a public base URL starts healthy, and each co-hosted A2A
+    send fails only when it is attempted (#3872). The verdict and its text are
+    the startup warning's own (``unpublished_cohost_warning``), judged from
+    ``env``, the environment ``kestrel start`` hands the host. A listen address
+    is never a public URL, here or at startup.
+
+    The agents counted are those the host's startup would start, chosen by
+    the selection startup itself uses (``read_startup_roster``, #3878): the
+    registry reconciled against durable spawn authority, its ``autostart``
+    rows and any cold parent an active signed child needs. When that selection
+    waits on a repair only startup can make, or startup would refuse the
+    roster, this says it could not check rather than guess a count.
+    """
+    if multi_agent is None or not multi_agent.get_local_agents():
+        return
+    from kestrel_sovereign.a2a.native_publication import (
+        host_publishes_native_a2a,
+        unpublished_cohost_warning,
+    )
+
+    if host_publishes_native_a2a(env):
+        return
+    from kestrel_sovereign.multi_agent.agent_manager import (
+        StartupRosterError,
+        StartupRosterRepairPending,
+        read_startup_roster,
+    )
+
+    try:
+        # ``diagnose`` is synchronous but may run inside an event loop, where
+        # ``asyncio.run`` refuses; a loop of its own on its own thread works
+        # in both.
+        with ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="kestrel-doctor-roster"
+        ) as pool:
+            started = pool.submit(
+                asyncio.run,
+                read_startup_roster(
+                    multi_agent,
+                    base_data_dir=project_dir,
+                    runtime_env=env,
+                ),
+            ).result()
+    except (
+        StartupRosterRepairPending,
+        StartupRosterError,
+        OSError,
+        ValueError,
+        TypeError,
+    ) as exc:
+        report.warn.append(
+            "Could not check native A2A publication: which agents this host "
+            f"starts is not known: {exc}"
+        )
+        return
+    warning = unpublished_cohost_warning(
+        env,
+        agents=len(started),
+        host_port=multi_agent.host.port,
+    )
+    if warning is not None:
+        report.warn.append(warning)
 
 
 def _check_core_lock(report: DoctorReport) -> None:
@@ -297,16 +373,25 @@ def _check_llm(config: dict, env: dict, toml_path: Path, report: DoctorReport) -
 
 
 def _check_multi_agent(
-    multi_agent_path: Path,
     project_dir: Path,
     env: dict,
     report: DoctorReport,
 ) -> MultiAgentConfig | None:
+    """Load the registry the host ``kestrel start`` launches reads (#3878).
+
+    The file :func:`host_registry_path` selects: ``KESTREL_MULTI_AGENT_CONFIG``
+    when it exists, else the project's ``multi_agent.toml``, with relative
+    agent paths resolved against the project as the host resolves them. Unlike
+    the host, doctor does not fall back to auto-discovering ``agent_data``:
+    it requires a registry.
+    """
+    multi_agent_path = host_registry_path(env, project_dir)
     try:
         multi_agent = MultiAgentConfig.load(
             multi_agent_path,
             auto_discover_fallback=False,
             runtime_env=env,
+            runtime_base=project_dir,
         )
     except (OSError, ValueError) as exc:
         report.fail.append(f"multi-agent configuration is invalid: {exc}")
@@ -334,8 +419,8 @@ def runtime_env(project_dir: Path) -> dict:
     """The environment the agents would boot with — without becoming it.
 
     Delegates to ``paths.spawned_agent_env``, the body of the launcher's own
-    ``ProcessManager._load_env``. Doctor iterates the local agents in
-    ``multi_agent.toml``, and those are precisely the processes that launcher
+    ``ProcessManager._load_env``. Doctor iterates the local agents in the
+    host's registry, and those are precisely the processes that launcher
     spawns, so its answer is the authoritative one — including its precedence,
     where the project ``.env`` overwrites a conflicting export. Reimplementing
     that here (this function first used ``load_project_env``'s opposite

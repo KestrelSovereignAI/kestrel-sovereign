@@ -184,8 +184,10 @@ overrides an exported value for `kestrel start`, so a stale entry there wins.
 Co-hosted sends poll their peer tasks. Push delivery additionally needs
 `KESTREL_DATA_KEY` and a process identity. A host that starts two or more
 agents without `KESTREL_BASE_URL` logs one startup warning naming it, before
-any agent initializes. A public deployment sets its stable public origin and
-`KESTREL_A2A_DISCOVERY_AGENT` instead (#3819).
+any agent initializes. `kestrel doctor` reports the same warning beforehand,
+counting the agents that host's startup would start from the registry it
+loads, `KESTREL_MULTI_AGENT_CONFIG` included. A public deployment sets its
+stable public origin and `KESTREL_A2A_DISCOVERY_AGENT` instead (#3819).
 
 Start the native host only after its release gates pass. Verify historical task
 reads, context ownership, a fresh native exchange, and the absence of new wakes

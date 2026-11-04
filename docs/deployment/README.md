@@ -52,6 +52,38 @@ names the revision, URL, and failed gate, and is left in place for
 inspection — nothing is rolled back automatically. `unknown` means no probe
 could run (for example, the provider returned no URL) and is also a failure.
 
+## GitHub deployment identity
+
+The deployment workflow uses the shared `.github/actions/gcp-deploy-auth`
+composite action with GitHub OIDC and Google Workload Identity Federation.
+Set the repository variables `GCP_WIF_PROVIDER` (the full provider resource
+name) and `GCP_DEPLOY_SERVICE_ACCOUNT` (the deployment account email).
+The workflow passes its configured `PROJECT_ID` to the action and exports
+`GCP_PROJECT_ID` for the deployment CLI. Missing or empty identity configuration
+stops the job before authentication; there is no service-account JSON key
+authentication path.
+
+The local action is loaded from the checked-out deployment ref. Deploy current
+main or a release that includes that action; older tags without it cannot be
+redeployed through this workflow. This prevents returning to the old key-based
+authentication path.
+
+The provider must restrict GitHub's issuer to this repository and owner using
+the immutable `repository_id` and `repository_owner_id` claims, and to the
+`deploy.yml` workflow on the intended main/tag refs. Grant that restricted
+principal `roles/iam.workloadIdentityUser` on the deployment service account.
+Do not broaden another repository's existing provider. See Google's
+[deployment pipeline federation guide](https://docs.cloud.google.com/iam/docs/workload-identity-federation-with-deployment-pipelines).
+
+The authentication action still writes a temporary `gha-creds-*.json`
+federation configuration in the checkout for gcloud and Docker credential
+refresh. Rollout requires the root and nested credential exclusions in
+[PR #3929](https://github.com/KestrelSovereignAI/kestrel-sovereign/pull/3929)
+first; short-lived credentials must not enter an image either. Verify a real OIDC
+build/deployment before removing the old repository key secret. Retire an old
+key only after identifying and migrating its other consumers; a key embedded
+in a historical image remains usable until disabled or deleted.
+
 ## Environment variables
 
 The CLI reads from your shell env (or `.env` if you `set -a && source .env`).

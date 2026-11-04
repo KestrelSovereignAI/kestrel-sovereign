@@ -927,13 +927,31 @@ def resolve_multi_agent_path(
     return multi_agent_path
 
 
+def host_registry_path(env: Mapping[str, str], base: Path) -> Path:
+    """The registry file a multi-agent host running in ``base`` with ``env`` reads.
+
+    The file :func:`resolve_multi_agent_path` selects when it exists, else
+    ``multi_agent.toml`` in ``base``. Either may be absent, in which case
+    :func:`load_host_registry` auto-discovers agents below ``base``.
+    """
+    base = Path(base)
+    selected = resolve_multi_agent_path(env, base=base)
+    if not selected.exists():
+        # The server asks ``load`` for its default here: ``multi_agent.toml``
+        # in its working directory, which is ``base``.
+        selected = guard_storage_path(
+            base / MULTI_AGENT_CONFIG_FILENAME,
+            source=f"{MULTI_AGENT_CONFIG_FILENAME} in the host's directory",
+        )
+    return selected
+
+
 def load_host_registry(env: Mapping[str, str], base: Path) -> MultiAgentConfig:
     """The registry a multi-agent host running in ``base`` with ``env`` loads.
 
     The server lifespan's load, for a host whose working directory is
     ``base`` (``kestrel start`` launches it in the project directory): the
-    registry :func:`resolve_multi_agent_path` selects when that file exists,
-    else ``multi_agent.toml`` in ``base``, else the agents auto-discovered
+    file :func:`host_registry_path` selects, else the agents auto-discovered
     below ``base``. Relative agent paths resolve against ``base`` whichever
     file names them, so a registry kept outside the project
     (``KESTREL_MULTI_AGENT_CONFIG``) still places agent data in the project.
@@ -946,16 +964,8 @@ def load_host_registry(env: Mapping[str, str], base: Path) -> MultiAgentConfig:
         OSError, ValueError: As :meth:`MultiAgentConfig.load`.
     """
     base = Path(base)
-    selected = resolve_multi_agent_path(env, base=base)
-    if not selected.exists():
-        # The server asks ``load`` for its default here: ``multi_agent.toml``
-        # in its working directory, which is ``base``.
-        selected = guard_storage_path(
-            base / MULTI_AGENT_CONFIG_FILENAME,
-            source=f"{MULTI_AGENT_CONFIG_FILENAME} in the host's directory",
-        )
     return MultiAgentConfig.load(
-        selected,
+        host_registry_path(env, base),
         auto_discover_fallback=True,
         runtime_env=env,
         runtime_base=base,
