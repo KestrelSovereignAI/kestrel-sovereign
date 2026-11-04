@@ -38,9 +38,9 @@ class HostContractConsumer:
             issuer="https://issuer.example", resource="https://resource.example",
             scopes=["read"], state="connected" if connected else "authorized", connected=connected)
 
-    async def begin(self, context, check, request, identity):
+    async def begin(self, context, check, request, identity, *, authorization_handle):
         check()
-        handle = object()
+        handle = authorization_handle
         state = f"owned-state-{len(self.states):032d}"
         self.states[handle] = state
         self.calls.append(("begin", context.principal_id, handle))
@@ -216,7 +216,7 @@ async def test_host_binding_validation_retires_original_returned_handle(controll
     b = controller
     b.runtime.modify_url = lambda url: url.replace(*replacement)
     response = await begin(b)
-    assert response.status_code == 400, response.text
+    assert response.status_code == 500, response.text
     assert b.host._pending == {} and len(b.runtime.retired) == 1
 
 
@@ -367,3 +367,247 @@ async def test_real_privacy_transition_withdraws_leases_before_installing_new_mo
         assert b.agent.privacy_mode == PrivacyMode.PUBLIC
     finally:
         await raw.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("malformation", ["extra", "missing-handle", "null-handle", "other-handle"])
+async def test_malformed_begin_result_never_loses_original_authorization_owner(controller, monkeypatch, malformation):
+    b = controller
+    original = b.runtime.begin
+    async def malformed(*args, **kwargs):
+        result = await original(*args, **kwargs)
+        if malformation == 'extra':
+            result['unexpected'] = True
+        elif malformation == 'missing-handle':
+            result.pop('handle')
+        elif malformation == 'null-handle':
+            result['handle'] = None
+        else:
+            result['handle'] = object()
+        return result
+    monkeypatch.setattr(b.runtime, 'begin', malformed)
+    response = await begin(b)
+    assert response.status_code == 500, response.text
+    assert b.runtime.retired == list(b.runtime.states), 'Malformed metadata lost original authorization worker custody'
+    assert b.host._pending == {}
+
+
+@pytest.mark.asyncio
+async def test_cancel_consumes_before_awaiting_feature_join(controller, monkeypatch):
+    b = controller
+    initial = await begin(b)
+    path = '/api/mcp/oauth/authorizations/' + initial.json()['operation_id']
+    entered, release = asyncio.Event(), asyncio.Event()
+    original = b.runtime.cancel
+    async def paused(handle, check):
+        entered.set()
+        await release.wait()
+        await original(handle, check)
+    monkeypatch.setattr(b.runtime, 'cancel', paused)
+    first = asyncio.create_task(b.client.delete(path, headers={'X-API-Key': API_KEY}))
+    try:
+        await entered.wait()
+        callback = await b.client.post(path + '/callback', json=callback_body(b), headers={'X-API-Key': API_KEY})
+        assert callback.status_code == 409, callback.text
+        repeated = await b.client.delete(path, headers={'X-API-Key': API_KEY})
+        assert repeated.status_code == 409
+    finally:
+        release.set()
+        assert (await first).status_code == 200
+    assert [call[0] for call in b.runtime.calls] == ['begin', 'cancel']
+
+
+@pytest.mark.asyncio
+async def test_maintenance_cannot_retire_an_admitted_exchange_at_browser_deadline(controller, monkeypatch):
+    b = controller
+    b.app.state.mcp_oauth_policy = MCPOAuthHostPolicy(console_origin='https://console.example', authorization_seconds=1.0)
+    initial = await begin(b)
+    entered, release = asyncio.Event(), asyncio.Event()
+    original = b.runtime.complete
+    async def paused(*args):
+        entered.set()
+        await release.wait()
+        return await original(*args)
+    monkeypatch.setattr(b.runtime, 'complete', paused)
+    callback = asyncio.create_task(b.client.post('/api/mcp/oauth/authorizations/' + initial.json()['operation_id'] + '/callback',
+        json=callback_body(b), headers={'X-API-Key': API_KEY}))
+    try:
+        await entered.wait()
+        b.clock[0] += timedelta(seconds=2)
+        await b.host.maintain()
+        assert b.runtime.retired == [] and b.host._pending
+    finally:
+        release.set()
+        assert (await callback).status_code == 200
+    await b.host.maintain()
+    assert b.host._pending == {} and len(b.runtime.retired) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('condition,expected', [('expired', 410), ('withdrawn', 403)])
+async def test_maintenance_preserves_inflight_begin_then_retires_original_before_delivery(controller, condition, expected):
+    b = controller
+    b.app.state.mcp_oauth_policy = MCPOAuthHostPolicy(console_origin='https://console.example', authorization_seconds=1.0)
+    b.runtime.release = asyncio.Event()
+    first = asyncio.create_task(begin(b))
+    try:
+        await b.runtime.started.wait()
+        if condition == 'expired':
+            b.clock[0] += timedelta(seconds=2)
+        else:
+            b.host.withdraw()
+        await b.host.maintain()
+        assert b.runtime.retired == [] and b.host._pending
+    finally:
+        b.runtime.release.set()
+        response = await first
+    assert response.status_code == expected, response.text
+    assert b.host._pending == {} and len(b.runtime.retired) == 1
+
+
+@pytest.mark.asyncio
+async def test_concurrent_maintenance_retires_one_original_handle_once(controller, monkeypatch):
+    b = controller
+    await begin(b)
+    b.clock[0] += timedelta(seconds=601)
+    entered, release, second_started = asyncio.Event(), asyncio.Event(), asyncio.Event()
+    calls = []
+    original = b.runtime.retire_authorization
+    async def paused(handle):
+        calls.append(handle)
+        entered.set()
+        await release.wait()
+        await original(handle)
+    monkeypatch.setattr(b.runtime, 'retire_authorization', paused)
+    first = asyncio.create_task(b.host.maintain())
+    second = None
+    async def another():
+        second_started.set()
+        await b.host.maintain()
+    try:
+        await entered.wait()
+        second = asyncio.create_task(another())
+        await second_started.wait()
+        await asyncio.sleep(0)
+        assert len(calls) == 1
+    finally:
+        release.set()
+        await first
+        if second is not None:
+            await second
+    assert len(b.runtime.retired) == 1 and b.host._pending == {}
+
+
+@pytest.mark.asyncio
+async def test_async_withdraw_callback_is_refused_before_attaching(oauth_boundary):
+    b = oauth_boundary
+    runtime = HostContractConsumer(b.host)
+    async def asynchronous_withdraw():
+        raise AssertionError('Async withdrawal must never be admitted')
+    runtime.withdraw_authorizations = asynchronous_withdraw
+    with pytest.raises(TypeError, match='synchronous'):
+        b.host.attach(runtime)
+    assert b.host._runtime is None
+
+
+@pytest.mark.asyncio
+async def test_nonempty_withdraw_result_is_an_explicit_contract_failure(controller, monkeypatch):
+    b = controller
+    original = b.runtime.withdraw_authorizations
+    monkeypatch.setattr(b.runtime, 'withdraw_authorizations', lambda: 'not-a-withdrawal-ack')
+    try:
+        with pytest.raises(TypeError, match='return None'):
+            b.host.withdraw()
+    finally:
+        monkeypatch.setattr(b.runtime, 'withdraw_authorizations', original)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('policy', ['missing', 'changed'])
+async def test_original_route_refuses_unconfigured_or_retargeted_policy_with_safe_status(controller, policy):
+    b = controller
+    if policy == 'changed':
+        assert (await begin(b)).status_code == 200
+    b.app.state.mcp_oauth_policy = (None if policy == 'missing' else
+        MCPOAuthHostPolicy(console_origin='https://another-console.example'))
+    result = await b.client.get('/api/mcp/oauth/connections', headers={'X-API-Key': API_KEY})
+    assert result.status_code == 403, result.text
+    assert all(call[0] != 'list' for call in b.runtime.calls)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('operation', ['complete', 'connect', 'disconnect'])
+async def test_feature_acted_but_invalid_receipt_reports_unknown_without_suggesting_replay(controller, monkeypatch, operation):
+    b = controller
+    original = getattr(b.runtime, operation)
+    async def invalid(*args, **kwargs):
+        result = await original(*args, **kwargs)
+        return result | {'unexpected_secret': 'private-feature-receipt'}
+    monkeypatch.setattr(b.runtime, operation, invalid)
+    if operation == 'complete':
+        initial = await begin(b)
+        path = '/api/mcp/oauth/authorizations/' + initial.json()['operation_id'] + '/callback'
+        result = await b.client.post(path, json=callback_body(b), headers={'X-API-Key': API_KEY})
+    elif operation == 'connect':
+        result = await b.client.post('/api/mcp/oauth/connections/owned/connect', json={}, headers={'X-API-Key': API_KEY})
+    else:
+        result = await b.client.delete('/api/mcp/oauth/connections/owned', headers={'X-API-Key': API_KEY})
+    assert result.status_code == 503, result.text
+    assert result.json()['error']['code'] == 'mcp_oauth_outcome_unknown_do_not_replay'
+    assert 'private-feature-receipt' not in result.text
+    assert sum(call[0] == operation for call in b.runtime.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_invalid_read_receipt_is_a_service_failure_without_private_diagnostics(controller, monkeypatch):
+    b = controller
+    original = b.runtime.list
+    async def invalid(context):
+        return [row | {'unexpected_secret': 'private-read-value'} for row in await original(context)]
+    monkeypatch.setattr(b.runtime, 'list', invalid)
+    result = await b.client.get('/api/mcp/oauth/connections', headers={'X-API-Key': API_KEY})
+    assert result.status_code == 500, result.text
+    assert result.json()['error']['code'] == 'mcp_oauth_service_error'
+    assert 'private-read-value' not in result.text
+
+
+@pytest.mark.asyncio
+async def test_retirement_fences_callback_before_awaiting_original_worker(controller, monkeypatch):
+    b = controller
+    initial = await begin(b)
+    path = '/api/mcp/oauth/authorizations/' + initial.json()['operation_id'] + '/callback'
+    entered, release = asyncio.Event(), asyncio.Event()
+    original = b.runtime.retire_authorization
+    async def paused(handle):
+        entered.set()
+        await release.wait()
+        await original(handle)
+    monkeypatch.setattr(b.runtime, 'retire_authorization', paused)
+    first = asyncio.create_task(b.client.post(path, json=callback_body(b) | {'state': 'incorrect-state-with-sufficient-length'},
+        headers={'X-API-Key': API_KEY}))
+    try:
+        await entered.wait()
+        competing = await b.client.post(path, json=callback_body(b), headers={'X-API-Key': API_KEY})
+        assert competing.status_code == 403, competing.text
+    finally:
+        release.set()
+        assert (await first).status_code == 400
+    assert [call[0] for call in b.runtime.calls] == ['begin']
+    assert b.host._pending == {} and len(b.runtime.retired) == 1
+
+
+@pytest.mark.asyncio
+async def test_failed_retirement_is_retained_for_immediate_original_handle_reconciliation(controller, monkeypatch):
+    b = controller
+    original = b.runtime.retire_authorization
+    async def failed_observer(handle):
+        raise TimeoutError('owned physical retirement has not acknowledged')
+    monkeypatch.setattr(b.runtime, 'retire_authorization', failed_observer)
+    b.runtime.modify_url = lambda url: url.replace('S256', 'plain')
+    response = await begin(b)
+    assert response.status_code == 503
+    assert len(b.host._pending) == 1
+    assert next(iter(b.host._pending.values())).withdrawn
+    monkeypatch.setattr(b.runtime, 'retire_authorization', original)
+    await b.host.maintain()
+    assert b.host._pending == {} and len(b.runtime.retired) == 1

@@ -24,7 +24,8 @@ export function takeCallback(browser) {
         throw new Error('Invalid Console authorization');
     }
     if (query.has('code') === query.has('error')) throw new Error('Invalid callback');
-    if ([...query.keys()].some(key => !['state', 'code', 'error', 'iss'].includes(key))) {
+    // RFC 6749 requires ignoring extensions, while parameters remain unique.
+    if ([...query.keys()].some(key => query.getAll(key).length !== 1)) {
         throw new Error('Invalid callback');
     }
     const payload = { state, iss: one('iss') };
@@ -43,7 +44,7 @@ export async function completeCallback(browser, loadApi) {
         await api.requestHost(`${hint.agentPrefix}/api/mcp/oauth/authorizations/${hint.operationId}/callback`, {
             method: 'POST', body: JSON.stringify(payload),
         }, true);
-        status.textContent = 'Authorization completed. Return to Console to view the connection.';
+        status.textContent = 'Authorization response received. Return to Console to check the connection status.';
         const link = browser.document.getElementById('oauth-return');
         link.href = hint.returnTo;
         link.hidden = false;

@@ -29,8 +29,10 @@ KESTREL_MCP_OAUTH_CONSOLE_ORIGIN=https://console.example.com
 KESTREL_SERVE_UI=true
 ```
 
-An unconfigured host has no MCP OAuth identity. Invalid configuration fails at
-startup, including a configured web identity with Console assets disabled.
+An unconfigured host has no MCP OAuth identity. Invalid identity or budget
+configuration fails at startup. The public Console origin must serve callback
+assets. A host-managed child may have `KESTREL_SERVE_UI=false` while inheriting
+the public parent's identity; the parent serves the callback page and assets.
 `KESTREL_MCP_OAUTH_POLICY` optionally supplies a strict JSON object of budgets
 and `client_name`. The origin belongs only in its dedicated variable. Unknown
 fields, secrets, replacement client IDs, and conflicting origins are rejected.
@@ -65,6 +67,31 @@ implementing `begin`, `complete`, `cancel`, `connect`, `disconnect`, `list`,
 `retire_authorization`, `withdraw_authorizations`, and `close_authorizations`.
 The feature composes the returned router with its existing router.
 
+The runtime signatures are:
+
+```python
+async def begin(context, check, request, identity, *, authorization_handle): ...
+async def complete(handle, context, check, callback): ...
+async def cancel(handle, check): ...
+async def connect(context, check, connection_id, *, refresh): ...
+async def disconnect(context, check, connection_id): ...
+async def list(context): ...
+async def retire_authorization(handle): ...
+async def close_authorizations(): ...
+def withdraw_authorizations(): ...  # synchronous, returns None
+```
+
+`identity` contains the host policy fields and `client_document`. `begin` returns
+exactly `{handle, authorization_url, state, issuer, resource, scopes}`, echoing the
+original handle. Core owns expiry; the runtime does not return `expires_at`.
+Complete and Connect return `{connection_id, server_url, issuer, resource, scopes,
+state, connected}`; List returns a list of those same status dictionaries. The
+canonical strict schemas and state vocabulary live in `mcp_oauth.py`. Disconnect
+returns the local-only receipt described below. `check()` raises on withdrawn
+authority and must be called at each feature effect boundary. Invalid feature
+receipts are service failures; failures after a mutating feature call return an
+unknown-outcome code that explicitly prohibits replay.
+
 All private routes retain native request authentication, owner/privacy checks,
 and transport custody through the final ASGI send:
 
@@ -84,11 +111,21 @@ anonymous callers, and peer identity do not provide interactive authority.
 
 Pending authorization keeps the original caller, agent privacy epoch, deadline,
 opaque feature handle, and a state digest in memory. Quotas reserve before the
-feature is awaited. Returned URLs must preserve host identity, issuer origin,
+feature is awaited. Core allocates that original handle before awaiting `begin`
+and passes it as the keyword-only `authorization_handle`. The runtime registers
+its operation under that exact object before spawning or awaiting owned work,
+and echoes it in its result. Core can therefore retire the original worker even
+when returned metadata is invalid or omits/substitutes the handle. Returned URLs
+must preserve host identity, issuer origin,
 resource, actual requested scopes, and S256 PKCE. Another principal is refused
 without consuming or cancelling the owner's operation. A bad state retires
 the original handle. Consumption precedes exchange; a failed exchange cannot be
-replayed. Expired or withdrawn handles are joined through `maintain()`.
+replayed. Cancel consumes before awaiting the feature's join. `maintain()`
+retires expired or withdrawn handles only when their request is no longer in
+flight; a browser deadline never interrupts an admitted token exchange. Concurrent
+retirement observers serialize on the original handle and retain the record
+until the feature acknowledges physical closure. The feature's retirement method
+must safely reenter the same original worker after a failed observation.
 
 Only the original task inside Connect or Complete may issue a connection lease.
 The lease binds the original agent, feature incarnation, privacy epoch, principal,

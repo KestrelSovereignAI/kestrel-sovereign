@@ -47,9 +47,10 @@ def test_native_server_wires_public_identity_and_callback_routes():
 
 
 @pytest.mark.asyncio
-async def test_callback_access_log_redacts_all_parameters_at_actual_send_seam():
+@pytest.mark.parametrize("suffix", ["", "/", "/unrouted"])
+async def test_callback_access_log_redacts_all_parameters_at_actual_send_seam(suffix):
     import re
-    path = "/oauth/mcp/callback"
+    path = "/oauth/mcp/callback" + suffix
     query = b"code=private-owned-code&state=private-owned-state&iss=https%3A%2F%2Fissuer.example"
     scope = dict(type="http", path=path, raw_path=path.encode(), query_string=query)
     observed = []
@@ -60,7 +61,7 @@ async def test_callback_access_log_redacts_all_parameters_at_actual_send_seam():
     async def send(message):
         observed.append(get_path_with_query_string(scope))
     await SensitiveQueryStringRedactionMiddleware(app)(scope, None, send)
-    assert observed == [path]
+    assert observed == ["/oauth/mcp/callback"]
     assert scope["query_string"] == query
     assert re.search(PRIVATE_CAPABILITY_URL_PATTERN, path + "?" + query.decode())
 
@@ -79,7 +80,7 @@ def test_native_sdk_oauth_logger_drops_secrets_and_exception_traceback(caplog):
     assert caplog.records[-1].exc_info is None and caplog.records[-1].stack_info is None
 
 
-def test_configured_web_client_refuses_to_start_without_callback_assets():
+def test_host_managed_child_can_use_identity_with_console_assets_served_by_parent():
     import os
     import subprocess
     import sys
@@ -87,5 +88,4 @@ def test_configured_web_client_refuses_to_start_without_callback_assets():
                KESTREL_MCP_OAUTH_CONSOLE_ORIGIN="https://console.example")
     result = subprocess.run([sys.executable, "-B", "-c", "import kestrel_sovereign.server"],
                             env=env, capture_output=True, text=True, timeout=20)
-    assert result.returncode != 0
-    assert "MCP OAuth web client identity requires KESTREL_SERVE_UI=true" in result.stderr
+    assert result.returncode == 0, result.stderr

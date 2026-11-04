@@ -68,8 +68,8 @@ def private_capability_path(path: str) -> str | None:
     # escaped '?', '#' or newline in a malformed run ID is still path data;
     # do not parse it as a query/fragment separator or normalize handler input.
     # Only the legacy artifact metadata family is private here, not all runs.
-    if path == "/oauth/mcp/callback":
-        return path
+    if path == "/oauth/mcp/callback" or path.startswith("/oauth/mcp/callback/"):
+        return "/oauth/mcp/callback"
     if _PRIVATE_LEGACY_WORKFLOW_TARGET.search(path):
         return _LEGACY_WORKFLOW_ARTIFACT_MARKER
     match = _PRIVATE_TARGET.search(path)

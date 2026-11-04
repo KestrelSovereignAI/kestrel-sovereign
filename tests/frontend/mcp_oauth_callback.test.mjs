@@ -48,7 +48,7 @@ for (const [name, options] of [
     ['external return', { hint: { agentPrefix: '', operationId, returnTo: '//evil.example' } }],
     ['duplicate state', { query: `?state=${state}&state=other&code=private-code&iss=https://issuer.example` }],
     ['ambiguous result', { query: `?state=${state}&code=private-code&error=private-error&iss=https://issuer.example` }],
-    ['unrecognized parameter', { query: `?state=${state}&code=private-code&iss=https://issuer.example&access_token=secret` }],
+    ['duplicate extension parameter', { query: `?state=${state}&code=private-code&iss=https://issuer.example&extension=a&extension=b` }],
 ]) {
     test(`${name}: remove query and make no authenticated request`, async () => {
         const b = boundary(options);
@@ -67,3 +67,21 @@ test('never show upstream exception text or replay a failed callback', async () 
     assert.equal(b.nodes['oauth-status'].textContent.includes('private-code'), false);
     assert.equal(b.nodes['oauth-return'].hidden, true);
 });
+
+for (const [name, query, expected] of [
+    ['authorization extension', `?state=${state}&code=private-code&iss=https://issuer.example&session_state=private-extension`,
+        { state, code: 'private-code', iss: 'https://issuer.example' }],
+    ['denial details', `?state=${state}&error=access_denied&iss=https://issuer.example&error_description=private-description&error_uri=https://issuer.example/private`,
+        { state, error: 'access_denied', iss: 'https://issuer.example' }],
+    ['ignored credential-shaped extension', `?state=${state}&code=private-code&iss=https://issuer.example&access_token=private-unrecognized-token`,
+        { state, code: 'private-code', iss: 'https://issuer.example' }],
+]) {
+    test(`OAuth response ${name}: ignore extras and forward only recognized fields`, async () => {
+        const b = boundary({ query });
+        await completeCallback(b.browser, b.load);
+        const post = b.events.find(event => event[0] === 'post');
+        assert.ok(post, 'A standard OAuth extension blocked the callback');
+        assert.deepEqual(JSON.parse(post[2].body), expected);
+        assert.equal(b.nodes['oauth-status'].textContent.includes('private-'), false);
+    });
+}

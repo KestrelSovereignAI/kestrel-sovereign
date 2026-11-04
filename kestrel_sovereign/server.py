@@ -4504,8 +4504,6 @@ class CanonicalCORSMiddleware(CORSMiddleware):
 
 # Mount static files (disabled when running behind Kestrel Host)
 SERVE_UI = os.environ.get("KESTREL_SERVE_UI", "true").lower() == "true"
-if app.state.mcp_oauth_policy is not None and not SERVE_UI:
-    raise ValueError("MCP OAuth web client identity requires KESTREL_SERVE_UI=true for its callback assets")
 # server.py now lives inside the package (kestrel_sovereign/server.py), so
 # the static dir is a sibling — not under another kestrel_sovereign/ subdir.
 STATIC_DIR = Path(__file__).parent / "static"

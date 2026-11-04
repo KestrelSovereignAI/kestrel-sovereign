@@ -10,11 +10,12 @@ import asyncio
 from collections.abc import Callable, Mapping
 from contextlib import asynccontextmanager
 from contextvars import ContextVar
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from enum import StrEnum
 import hashlib
 import ipaddress
+import inspect
 import json
 import hmac
 import re
@@ -164,6 +165,7 @@ class _RequestOwner:
     active: bool = True
     opened_operation: str | None = None
     delivered: bool = False
+    feature_acted: bool = False
 
 
 @dataclass
@@ -172,11 +174,13 @@ class _PendingAuthorization:
     principal_id: str
     epoch: str
     expires_at: datetime
-    handle: object | None = None
+    handle: object = field(default_factory=object)
     state_hash: bytes | None = None
     consumed: bool = False
     finished: bool = False
     withdrawn: bool = False
+    in_flight: bool = True
+    retirement_lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False)
 
 
 class _StrictMessage(BaseModel):
@@ -275,6 +279,17 @@ class MCPOAuthRequestError(ValueError):
     def __init__(self, status: int, code: str):
         super().__init__(code)
         self.status, self.code = status, code
+
+
+class MCPOAuthRuntimeError(RuntimeError):
+    """The trusted feature returned an invalid contract message, never bad user input."""
+
+
+def _runtime_message(model, value):
+    try:
+        return model.model_validate(value)
+    except ValidationError:
+        raise MCPOAuthRuntimeError("invalid MCP OAuth feature response") from None
 
 
 def _https_endpoint(value: str) -> str:
@@ -552,7 +567,11 @@ class MCPOAuthHost:
         for pending in self._pending.values():
             pending.withdrawn = True
         if self._runtime is not None:
-            self._runtime.withdraw_authorizations()
+            result = self._runtime.withdraw_authorizations()
+            if result is not None:
+                if inspect.iscoroutine(result):
+                    result.close()
+                raise TypeError("MCP OAuth withdrawal must be synchronous and return None")
 
     def attach(self, runtime) -> None:
         """Attach the original feature runtime; its methods receive host authority explicitly."""
@@ -560,6 +579,9 @@ class MCPOAuthHost:
                    "retire_authorization", "close_authorizations", "withdraw_authorizations")
         if self._runtime is not None or not all(callable(getattr(runtime, name, None)) for name in methods):
             raise TypeError("original complete MCP OAuth runtime must attach exactly once")
+        if (inspect.iscoroutinefunction(runtime.withdraw_authorizations)
+                or inspect.isasyncgenfunction(runtime.withdraw_authorizations)):
+            raise TypeError("MCP OAuth withdrawal must be synchronous")
         self._runtime = runtime
 
     @asynccontextmanager
@@ -578,20 +600,21 @@ class MCPOAuthHost:
         return model.model_validate_json(bytes(content))
 
     async def _retire_pending(self, identifier: str, pending: _PendingAuthorization) -> None:
-        current = self._pending.get(identifier)
-        if current is None:
-            return
-        if current is not pending:
-            raise HostCapabilityAccessDenied("original MCP OAuth authorization changed")
-        if pending.handle is not None:
+        async with pending.retirement_lock:
+            current = self._pending.get(identifier)
+            if current is None:
+                return
+            if current is not pending:
+                raise HostCapabilityAccessDenied("original MCP OAuth authorization changed")
+            pending.withdrawn = True
             await self._runtime.retire_authorization(pending.handle)
-        self._pending.pop(identifier, None)
+            self._pending.pop(identifier, None)
 
     async def maintain(self) -> None:
         """Retire expired original provider frames without writing credential state."""
         now = self.authority.clock()
         for identifier, pending in tuple(self._pending.items()):
-            if pending.withdrawn or pending.expires_at <= now:
+            if not pending.in_flight and (pending.withdrawn or pending.expires_at <= now):
                 await self._retire_pending(identifier, pending)
 
     def _pending_for(self, context, identifier: str) -> _PendingAuthorization:
@@ -656,11 +679,20 @@ class MCPOAuthHost:
         try:
             check()
             raw = await self._runtime.begin(context, check, value.model_dump(mode="json"),
-                self._policy.model_dump(mode="json") | {"client_document": self._policy.client_document()})
-            started = _AuthorizationStarted.model_validate(raw)
-            pending.handle = started.handle
-            self._validate_started(started, value)
+                self._policy.model_dump(mode="json") | {"client_document": self._policy.client_document()},
+                authorization_handle=pending.handle)
+            started = _runtime_message(_AuthorizationStarted, raw)
+            if started.handle is not pending.handle:
+                raise MCPOAuthRuntimeError("MCP OAuth authorization changed its original host owner")
+            try:
+                self._validate_started(started, value)
+            except ValueError:
+                raise MCPOAuthRuntimeError("invalid MCP OAuth feature authorization binding") from None
             check()
+            if pending.withdrawn:
+                raise HostCapabilityAccessDenied("original MCP OAuth authorization was withdrawn")
+            if pending.expires_at <= self.authority.clock():
+                raise MCPOAuthRequestError(410, "mcp_oauth_operation_expired")
             pending.state_hash = hashlib.sha256(started.state.encode("utf-8")).digest()
             reader.opened_operation = identifier
             return JSONResponse({"operation_id": identifier, "authorization_url": started.authorization_url,
@@ -669,6 +701,8 @@ class MCPOAuthHost:
         except BaseException:
             await self._retire_pending(identifier, pending)
             raise
+        finally:
+            pending.in_flight = False
 
     async def _complete(self, context, check, identifier: str, value: MCPOAuthCallback):
         pending = self._pending_for(context, identifier)
@@ -676,12 +710,17 @@ class MCPOAuthHost:
             await self._retire_pending(identifier, pending)
             raise MCPOAuthRequestError(400, "mcp_oauth_state_mismatch")
         pending.consumed = True
-        check()
-        raw = await self._runtime.complete(pending.handle, context, check, value.model_dump(mode="json"))
-        status = MCPOAuthConnectionStatus.model_validate(raw)
-        check()
-        pending.finished = True
-        return JSONResponse(status.model_dump(mode="json"))
+        pending.in_flight = True
+        try:
+            check()
+            self._reader.get().feature_acted = True
+            raw = await self._runtime.complete(pending.handle, context, check, value.model_dump(mode="json"))
+            status = _runtime_message(MCPOAuthConnectionStatus, raw)
+            check()
+            pending.finished = True
+            return JSONResponse(status.model_dump(mode="json"))
+        finally:
+            pending.in_flight = False
 
     async def close(self) -> None:
         """Retire original authorization workers before releasing their host incarnation."""
@@ -702,14 +741,27 @@ class MCPOAuthHost:
                 raise HTTPException(status_code=404, detail="mcp_oauth_unavailable")
             if not isinstance(host, MCPOAuthHost) or host._runtime is None:
                 raise TypeError("original attached MCP OAuth host required")
-            host._policy_for(request)
+            try:
+                host._policy_for(request)
+            except HostCapabilityAccessDenied:
+                raise HTTPException(status_code=403, detail="mcp_oauth_host_identity_unavailable") from None
             return host
 
         def respond(host, request, action, build, model=None):
+            original_owner = None
+            @asynccontextmanager
+            async def resolve(original_request):
+                nonlocal original_owner
+                async with host._resolve_context(original_request) as context:
+                    original_owner = host._reader.get()
+                    yield context
+            def error_response(error, prepared):
+                acted = original_owner is not None and original_owner.feature_acted
+                return _response_error(error, prepared or acted)
             return AuthorizedCapabilityResponse(request, authority=host.authority,
-                resolve_context=host._resolve_context,
+                resolve_context=resolve,
                 operation=lambda context, _value: host._operation(context, action),
-                build=build, error_response=_response_error, timeout_seconds=host._policy.operation_seconds,
+                build=build, error_response=error_response, timeout_seconds=host._policy.operation_seconds,
                 prepare=(lambda: host._body(request, model)) if model is not None else None,
                 transport_operation=host._transport_operation)
 
@@ -718,7 +770,7 @@ class MCPOAuthHost:
             host = original(request)
             async def build(context):
                 rows = await host._runtime.list(context)
-                values = [MCPOAuthConnectionStatus.model_validate(row).model_dump(mode="json") for row in rows]
+                values = [_runtime_message(MCPOAuthConnectionStatus, row).model_dump(mode="json") for row in rows]
                 return JSONResponse({"connections": values})
             return respond(host, request, MCPOAuthAction.READ, build)
 
@@ -743,26 +795,34 @@ class MCPOAuthHost:
             async def build(context):
                 pending = host._pending_for(context, identifier)
                 check = host._issuer.get()[3]
-                await host._runtime.cancel(pending.handle, check)
-                pending.consumed = pending.finished = True
-                check()
-                return JSONResponse({"cancelled": True})
+                pending.consumed = True
+                pending.in_flight = True
+                try:
+                    host._reader.get().feature_acted = True
+                    await host._runtime.cancel(pending.handle, check)
+                    pending.finished = True
+                    check()
+                    return JSONResponse({"cancelled": True})
+                finally:
+                    pending.in_flight = False
             return respond(host, request, MCPOAuthAction.CANCEL, build)
 
         @router.post("/connections/{identifier}/connect")
         async def connect(identifier: str, request: Request):
             host = original(request)
             async def build(context, value):
+                host._reader.get().feature_acted = True
                 raw = await host._runtime.connect(context, host._issuer.get()[3], identifier, refresh=value.refresh)
-                return JSONResponse(MCPOAuthConnectionStatus.model_validate(raw).model_dump(mode="json"))
+                return JSONResponse(_runtime_message(MCPOAuthConnectionStatus, raw).model_dump(mode="json"))
             return respond(host, request, MCPOAuthAction.CONNECT, build, MCPOAuthConnectRequest)
 
         @router.delete("/connections/{identifier}")
         async def disconnect(identifier: str, request: Request):
             host = original(request)
             async def build(context):
+                host._reader.get().feature_acted = True
                 raw = await host._runtime.disconnect(context, host._issuer.get()[3], identifier)
-                return JSONResponse(_DisconnectStatus.model_validate(raw).model_dump(mode="json"))
+                return JSONResponse(_runtime_message(_DisconnectStatus, raw).model_dump(mode="json"))
             return respond(host, request, MCPOAuthAction.DISCONNECT, build)
         return router
 
