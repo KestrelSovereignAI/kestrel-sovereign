@@ -16,12 +16,13 @@ import stat
 import sys
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterable, Iterator
-from contextlib import asynccontextmanager, contextmanager
+from contextlib import AbstractAsyncContextManager, asynccontextmanager, contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 from functools import wraps
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Protocol, TypeVar
+from types import TracebackType
+from typing import TYPE_CHECKING, Any, Literal, Protocol, TypeVar, overload
 
 from httpx import AsyncByteStream as _NativeHTTPXAsyncByteStream
 from httpx import AsyncClient as _NativeHTTPXAsyncClient
@@ -1501,13 +1502,77 @@ def native_sdk_operation(function: Callable) -> Callable:
     return guarded
 
 
-@asynccontextmanager
-async def owned_native_http_client(client: Any):
+_HTTPXClient = TypeVar("_HTTPXClient", bound=_NativeHTTPXAsyncClient)
+_HTTPX2Client = TypeVar("_HTTPX2Client", bound=_NativeHTTPX2AsyncClient)
+_EnteredClient = TypeVar("_EnteredClient", covariant=True)
+
+
+class _OwnedClientContext(Protocol[_EnteredClient]):
+    async def __aenter__(self) -> _EnteredClient: ...
+
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_value: BaseException | None,
+        traceback: TracebackType | None,
+        /,
+    ) -> bool | None: ...
+
+
+class _NativeClientContext(_OwnedClientContext[_EnteredClient], Protocol[_EnteredClient]):
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_value: BaseException | None,
+        traceback: TracebackType | None,
+        /,
+    ) -> Literal[False] | None: ...
+
+
+class _DelegatedClientContext(_OwnedClientContext[_EnteredClient], Protocol[_EnteredClient]):
+    # Keep this declared bool: Pyright's suppression flow check does not
+    # specialize a generic exit TypeVar, even when its argument is bool.
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_value: BaseException | None,
+        traceback: TracebackType | None,
+        /,
+    ) -> bool: ...
+
+
+@overload
+def owned_native_http_client(
+    client: _HTTPXClient,
+) -> _NativeClientContext[_HTTPXClient]: ...
+
+
+@overload
+def owned_native_http_client(
+    client: _HTTPX2Client,
+) -> _NativeClientContext[_HTTPX2Client]: ...
+
+
+@overload
+def owned_native_http_client(
+    client: AbstractAsyncContextManager[_EnteredClient],
+) -> _DelegatedClientContext[_EnteredClient]: ...
+
+
+def owned_native_http_client(client: Any) -> _OwnedClientContext[Any]:
     """Own a temporary client through physical pool/transport retirement.
 
     HTTPX's context exit is separate from response closure. Retain the whole
     client close, so interrupted pool cleanup cannot erase a request receipt.
+    Native exits cannot suppress; generic delegation retains suppressibility.
+    The generator context manager normalizes delegated exits to actual bools,
+    including when the delegated __aexit__ itself returns None.
     """
+    return _owned_native_http_client(client)
+
+
+@asynccontextmanager
+async def _owned_native_http_client(client: Any) -> AsyncIterator[Any]:
     if not isinstance(client, (_NativeHTTPXAsyncClient, _NativeHTTPX2AsyncClient)):
         async with client as entered:
             yield entered
