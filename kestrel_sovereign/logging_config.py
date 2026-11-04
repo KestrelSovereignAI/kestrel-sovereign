@@ -176,6 +176,33 @@ TEXT_LOG_FORMAT = (
 UVICORN_LOGGERS = ("uvicorn", "uvicorn.error", "uvicorn.access")
 
 
+class MCPOAuthDiagnosticFilter(logging.Filter):
+    """Native OAuth exceptions may embed state, codes or entire token models.
+
+    Preserve severity and logger identity, never format third-party content.
+    The feature reports typed safe outcome codes at its own boundary.
+    """
+
+    def filter(self, record):
+        if record.name == "mcp.client.auth" or record.name.startswith("mcp.client.auth."):
+            record.msg = "MCP OAuth diagnostic redacted; inspect the connection status"
+            record.args = ()
+            record.exc_info = record.exc_text = record.stack_info = None
+        return True
+
+
+def _install_mcp_oauth_diagnostic_filter(handler):
+    handler.addFilter(MCPOAuthDiagnosticFilter())
+    # Logger filters run before any additional handler (including diagnostic
+    # collectors). Python does not apply ancestor logger filters to children.
+    # These are the native SDK's auth loggers; the canonical handler also
+    # guards every descendant namespace, including future SDK modules.
+    for name in ("mcp.client.auth", "mcp.client.auth.oauth2"):
+        logger = logging.getLogger(name)
+        if not any(isinstance(item, MCPOAuthDiagnosticFilter) for item in logger.filters):
+            logger.addFilter(MCPOAuthDiagnosticFilter())
+
+
 def _route_uvicorn_loggers_to_root() -> None:
     """Send uvicorn's records through the root handler and its formatter.
 
@@ -217,6 +244,7 @@ def setup_logging(
 
     handler = logging.StreamHandler()
     handler.addFilter(CorrelationContextFilter())
+    _install_mcp_oauth_diagnostic_filter(handler)
 
     if log_format == "json":
         handler.setFormatter(JSONFormatter())

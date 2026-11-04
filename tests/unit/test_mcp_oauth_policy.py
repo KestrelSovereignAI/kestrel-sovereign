@@ -5,7 +5,9 @@ import json
 import pytest
 from pydantic import ValidationError
 
-from kestrel_sovereign.mcp_oauth import MCPOAuthHostPolicy
+from kestrel_sovereign.mcp_oauth import (
+    MCPOAuthAuthorizationRequest, MCPOAuthCallback, MCPOAuthConnectionStatus, MCPOAuthHostPolicy,
+)
 
 
 @pytest.mark.parametrize("origin,canonical", [
@@ -97,3 +99,57 @@ def test_rejected_secret_settings_are_not_rendered_in_configuration_errors():
         MCPOAuthHostPolicy(console_origin="https://console.example",
                            client_secret="synthetic-private-value-not-for-logs")
     assert "synthetic-private-value-not-for-logs" not in str(failure.value)
+
+
+@pytest.mark.parametrize("scopes", [[], [""], ["read", "read"], ["read write"],
+    ['read"write'], [r"read\write"], ["read\twrite"], ["é"], ["x" * 257]])
+def test_authorization_requires_bounded_distinct_rfc_scope_tokens(scopes):
+    with pytest.raises(ValidationError):
+        MCPOAuthAuthorizationRequest(server_url="https://remote.example/mcp", scopes=scopes)
+
+
+@pytest.mark.parametrize("endpoint", ["http://remote.example/mcp", "https://@remote.example/mcp",
+    "https://user:secret@remote.example/mcp", "https://remote.example/mcp#", "https://remote.example/mcp#part"])
+def test_authorization_refuses_credentials_and_fragments_before_runtime_io(endpoint):
+    with pytest.raises(ValidationError):
+        MCPOAuthAuthorizationRequest(server_url=endpoint, scopes=["read"])
+
+
+def test_valid_scope_and_resource_query_are_preserved_without_a_private_protocol_mapping():
+    value = MCPOAuthAuthorizationRequest(server_url="https://remote.example/mcp?workspace=one",
+                                        scopes=["read:documents", "write:notes"])
+    assert value.server_url == "https://remote.example/mcp?workspace=one"
+    assert value.scopes == ["read:documents", "write:notes"]
+
+
+@pytest.mark.parametrize("extra", [{}, {"code": "owned-code", "error": "access_denied"},
+    {"code": ""}, {"code": "owned-code", "unexpected": "value"}])
+def test_callback_has_exactly_one_bound_outcome(extra):
+    with pytest.raises(ValidationError):
+        MCPOAuthCallback(state="owned-state-with-entropy", iss="https://issuer.example", **extra)
+
+
+def test_callback_repr_does_not_render_code_or_state():
+    value = MCPOAuthCallback(state="owned-state-with-entropy", code="owned-one-use-code",
+                            iss="https://issuer.example")
+    assert value.state == "owned-state-with-entropy" and value.code == "owned-one-use-code"
+    assert value.code not in repr(value) and value.state not in repr(value)
+
+
+def connection_status():
+    return {"connection_id": "owned-connection", "server_url": "https://remote.example/mcp",
+        "issuer": "https://issuer.example", "resource": "https://remote.example/mcp",
+        "scopes": ["read"], "state": "authorized", "connected": False}
+
+
+@pytest.mark.parametrize("secret_field", ["access_token", "refresh_token", "client_secret"])
+def test_connection_status_cannot_accidentally_publish_credential_fields(secret_field):
+    with pytest.raises(ValidationError) as failure:
+        MCPOAuthConnectionStatus.model_validate(connection_status() | {secret_field: "owned-private-value"})
+    assert "owned-private-value" not in str(failure.value)
+
+
+@pytest.mark.parametrize("changes", [{"state": "connected"}, {"connected": True}, {"state": "invented"}])
+def test_connection_status_requires_an_exact_known_disposition(changes):
+    with pytest.raises(ValidationError):
+        MCPOAuthConnectionStatus.model_validate(connection_status() | changes)

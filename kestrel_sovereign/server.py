@@ -4322,6 +4322,9 @@ async def lifespan(app: FastAPI):
 app = FastAPI(lifespan=lifespan)
 from kestrel_sovereign.security.request_auth import RequestAuthenticationService
 
+from kestrel_sovereign.mcp_oauth import MCPOAuthHostPolicy
+
+app.state.mcp_oauth_policy = MCPOAuthHostPolicy.from_environment(os.environ)
 app.state.request_authentication = RequestAuthenticationService(
     api_key=lambda: get_api_key(generate_if_missing=False),
 )
@@ -4501,6 +4504,8 @@ class CanonicalCORSMiddleware(CORSMiddleware):
 
 # Mount static files (disabled when running behind Kestrel Host)
 SERVE_UI = os.environ.get("KESTREL_SERVE_UI", "true").lower() == "true"
+if app.state.mcp_oauth_policy is not None and not SERVE_UI:
+    raise ValueError("MCP OAuth web client identity requires KESTREL_SERVE_UI=true for its callback assets")
 # server.py now lives inside the package (kestrel_sovereign/server.py), so
 # the static dir is a sibling — not under another kestrel_sovereign/ subdir.
 STATIC_DIR = Path(__file__).parent / "static"
@@ -4521,6 +4526,7 @@ from kestrel_sovereign.endpoints import (
     github_router,
     hold_router,
     host_stop_router,
+    mcp_oauth_public_router,
     memories_router,
     metrics_router,
     models_router,
@@ -4559,6 +4565,7 @@ app.include_router(ui_router)
 app.include_router(rasa_shim_router)
 app.include_router(github_router)
 app.include_router(host_stop_router)
+app.include_router(mcp_oauth_public_router)
 app.include_router(hold_router)
 
 
@@ -4679,6 +4686,8 @@ async def auth_middleware(request: Request, call_next):
         "/api/auth/key",
         "/metrics",
         "/webhooks/github-app",
+        "/oauth/mcp/callback",
+        "/oauth/mcp/client-metadata.json",
     ]
     auth_paths = ["/auth/login", "/auth/callback", "/auth/logout", "/auth/token"]
     # `/api/github/` was previously here — that exempted the GitHub-API

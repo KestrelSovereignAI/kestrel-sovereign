@@ -20,6 +20,7 @@ from .ui import router as ui_router
 from .github import router as github_router
 from .hold import router as hold_router
 from .host_stop import router as host_stop_router
+from .mcp_oauth import router as mcp_oauth_public_router
 
 # Feature-contributed routers (voice, spawn) are no longer
 # imported here. They are mounted dynamically via Feature.get_router()
@@ -44,4 +45,5 @@ __all__ = [
     "github_router",
     "hold_router",
     "host_stop_router",
+    "mcp_oauth_public_router",
 ]

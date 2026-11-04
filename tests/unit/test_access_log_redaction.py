@@ -211,7 +211,7 @@ async def test_multi_agent_request_is_redacted_only_during_response_start_send()
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("capability", ["artifacts", "visual-computer"])
+@pytest.mark.parametrize("capability", ["artifacts", "visual-computer", "mcp/oauth"])
 @pytest.mark.parametrize("prefix", ["", "/agent", "/api/agents/Kite", "/api/agent-routes/a2l0ZQ"])
 @pytest.mark.parametrize("query", [b"", b"path=private%2Ffile.md&cursor=private-cursor"])
 async def test_artifact_identifiers_are_redacted_without_changing_handler_semantics(capability, prefix, query):

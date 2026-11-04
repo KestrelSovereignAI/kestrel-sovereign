@@ -40,10 +40,11 @@ _LEGACY_WORKFLOW_ARTIFACT_TARGET = (
 _PRIVATE_LEGACY_WORKFLOW_TARGET = re.compile(_LEGACY_WORKFLOW_ARTIFACT_TARGET)
 # Also used before optional auto-instrumentation creates a URL-bearing span.
 PRIVATE_CAPABILITY_URL_PATTERN = (
-    r"/api/(?:artifacts|visual-computer)(?:[/?#]|$)|"
+    r"/api/(?:artifacts|visual-computer|mcp/oauth)(?:[/?#]|$)|"
+    r"/oauth/mcp/callback(?:[/?#]|$)|"
     + _LEGACY_WORKFLOW_ARTIFACT_TARGET
 )
-_PRIVATE_TARGET = re.compile(r"/api/(artifacts|visual-computer)(?:/|$)")
+_PRIVATE_TARGET = re.compile(r"/api/(artifacts|visual-computer|mcp/oauth)(?:/|$)")
 _PRIVATE_TOOL = re.compile(r"(?:^|__|:)(?:artifact_|visual_)")
 _SENSITIVE_QUERY_NAMES = frozenset(
     {
@@ -67,6 +68,8 @@ def private_capability_path(path: str) -> str | None:
     # escaped '?', '#' or newline in a malformed run ID is still path data;
     # do not parse it as a query/fragment separator or normalize handler input.
     # Only the legacy artifact metadata family is private here, not all runs.
+    if path == "/oauth/mcp/callback":
+        return path
     if _PRIVATE_LEGACY_WORKFLOW_TARGET.search(path):
         return _LEGACY_WORKFLOW_ARTIFACT_MARKER
     match = _PRIVATE_TARGET.search(path)
