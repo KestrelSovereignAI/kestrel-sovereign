@@ -25,6 +25,24 @@ from kestrel_sovereign.storage.sync.targets import (
 
 logger = logging.getLogger(__name__)
 
+SNAPSHOT_CONTENT_TYPE = "application/x-sqlite3"
+
+# A snapshot is 2+ GB, uploaded in resumable chunks. The library defaults
+# (100 MiB chunks, 60 s per request, a 120 s retry deadline) failed a backup
+# whenever the uplink was shared and slow (#3944). Smaller chunks with longer
+# limits make a slow link slow the backup rather than fail it.
+GCS_UPLOAD_CHUNK_BYTES = 16 * 1024 * 1024  # a multiple of 256 KiB, as GCS requires
+GCS_REQUEST_TIMEOUT_SECONDS = 300.0
+GCS_RETRY_DEADLINE_SECONDS = 600.0
+
+
+def _gcs_retry():
+    """The library's retry predicate, with a deadline that covers one chunk on
+    a slow link."""
+    from google.cloud.storage.retry import DEFAULT_RETRY
+
+    return DEFAULT_RETRY.with_timeout(GCS_RETRY_DEADLINE_SECONDS)
+
 
 class GCSTarget(ManifestManagerMixin, SyncTarget):
     """
@@ -110,11 +128,28 @@ class GCSTarget(ManifestManagerMixin, SyncTarget):
 
             def _upload():
                 bucket = self._get_bucket()
-                blob = bucket.blob(blob_name)
-                blob.upload_from_string(content, content_type="application/x-sqlite3")
-                # Also update "latest" pointer
+                retry = _gcs_retry()
+                blob = bucket.blob(blob_name, chunk_size=GCS_UPLOAD_CHUNK_BYTES)
+                blob.upload_from_string(
+                    content,
+                    content_type=SNAPSHOT_CONTENT_TYPE,
+                    timeout=GCS_REQUEST_TIMEOUT_SECONDS,
+                    retry=retry,
+                )
+                # The "latest" pointer is a server-side copy of the blob just
+                # uploaded: the bytes are sent once.
                 latest = bucket.blob(f"{self.prefix}{self.agent_id}/latest.db")
-                latest.upload_from_string(content, content_type="application/x-sqlite3")
+                latest.content_type = SNAPSHOT_CONTENT_TYPE
+                token = None
+                while True:
+                    token, _rewritten, _total = latest.rewrite(
+                        blob,
+                        token=token,
+                        timeout=GCS_REQUEST_TIMEOUT_SECONDS,
+                        retry=retry,
+                    )
+                    if token is None:
+                        break
                 return blob_name
 
             result_name = await asyncio.to_thread(_upload)

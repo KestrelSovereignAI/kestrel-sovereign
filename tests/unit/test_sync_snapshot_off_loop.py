@@ -68,14 +68,16 @@ def _gcs(tmp_path, monkeypatch, upload_error=None):
     uploads: list[bytes] = []  # the raw SQLite bytes each upload received
 
     class Blob:
-        def __init__(self, name):
+        def __init__(self, name, chunk_size=None):
             self.name = name
 
-        def upload_from_string(self, content, content_type=None):
+        def upload_from_string(self, content, **kwargs):
             if upload_error is not None:
                 raise upload_error
-            if not self.name.endswith("/latest.db"):
-                uploads.append(content)
+            uploads.append(content)
+
+        def rewrite(self, source, **kwargs):
+            return None, 0, 0
 
     bucket = SimpleNamespace(blob=Blob)
     target = GCSTarget("unit-test-bucket", agent_id="agent", state_dir=tmp_path)
