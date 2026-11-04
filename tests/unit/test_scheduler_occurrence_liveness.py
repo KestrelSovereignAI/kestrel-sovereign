@@ -15,8 +15,10 @@ from typing import Optional
 import pytest
 
 from kestrel_sovereign.features.scheduler.runner import (
+    SCHEDULER_OCCURRENCE_TASK_PREFIX,
     SCHEDULER_PROTOCOL_VERSION,
     SchedulerRunner,
+    scheduler_occurrence_awaiting_slot,
 )
 from kestrel_sovereign.storage.async_database import AsyncDatabase
 from kestrel_sovereign.storage.db.sqlite import SQLiteBackend
@@ -534,6 +536,48 @@ async def test_rows_waiting_for_a_slot_keep_the_reported_tick_open(tmp_path):
             message="reported tick never closed after the queue drained",
         )
         assert executor.calls == ["slow", "queued"]
+    finally:
+        executor.release_slow.set()
+        await runner.stop()
+        await db.close()
+
+
+@pytest.mark.asyncio
+async def test_occurrence_task_says_whether_it_is_queued_for_a_slot(tmp_path):
+    """#3928: an inspector holding only the task can tell a queued occurrence
+    from a running one; the restart coordinator never waits on a queued one,
+    because the slot it needs may be the coordinator's own."""
+
+    db = await _database(tmp_path / "queued-slot.db")
+    executor = _SlowExecutor()
+    runner = SchedulerRunner(
+        db,
+        "agent-1",
+        executor,
+        owner_id="queued-slot",
+        poll_interval=0.01,
+        max_concurrent_tasks=1,
+    )
+    try:
+        await runner.start(polling=False)
+        await _seed_due(db, "slow-task", "slow", late_seconds=3)
+        await _seed_due(db, "queued-task", "queued")
+        await runner.arm()
+        await asyncio.wait_for(
+            executor.slow_started.wait(), timeout=_HANG_GUARD_SECONDS
+        )
+        running = runner._occurrences["slow-task"].task
+        queued = runner._occurrences["queued-task"].task
+        assert running.get_name() == f"{SCHEDULER_OCCURRENCE_TASK_PREFIX}slow-task"
+        assert scheduler_occurrence_awaiting_slot(running) is False
+        assert scheduler_occurrence_awaiting_slot(queued) is True
+        assert scheduler_occurrence_awaiting_slot(asyncio.current_task()) is False
+
+        executor.release_slow.set()
+        await asyncio.wait_for(
+            executor.ran_event("queued").wait(), timeout=_HANG_GUARD_SECONDS
+        )
+        assert scheduler_occurrence_awaiting_slot(queued) is False
     finally:
         executor.release_slow.set()
         await runner.stop()

@@ -9,9 +9,11 @@ and the post-restart sweep that wakes the requesting agent).
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 import os
+import re
 import shutil
 import sqlite3
 import subprocess
@@ -31,6 +33,11 @@ from kestrel_sdk.tools.result import ToolResultStatus
 from kestrel_sovereign.agent.orchestrator_engine import OrchestratorEngineMixin
 from kestrel_sovereign.agent.turn_lifecycle import TurnLifecycleMixin
 from kestrel_sovereign.auth import CallerContext, caller_context_scope
+from kestrel_sovereign.execution_custody import (
+    ExecutionAuthorityError,
+    ExecutionCustody,
+    ProcessRuntimeExecutionFence,
+)
 from kestrel_sovereign.features.base import Feature, tool
 from kestrel_sovereign.features.restart_coordinator import (
     RestartCoordinatorFeature,
@@ -44,6 +51,8 @@ from kestrel_sovereign.features.restart_coordinator.event_store import (
 )
 from kestrel_sovereign.features.restart_coordinator.feature import (
     _MAX_NAMED_BUSY_KINDS,
+    IDLE_SETTLE_POLL_SECONDS,
+    IDLE_SETTLE_SECONDS,
     MAX_IDLE_ONLY_DEFERRAL_SECONDS,
     _describe_background_tasks,
     _is_infra_background_task,
@@ -66,11 +75,16 @@ from kestrel_sovereign.features.restart_coordinator.update_profiles import (
     get_update_profile,
     is_valid_target_ref,
 )
+from kestrel_sovereign.features.scheduler.runner import (
+    SchedulerRunner,
+    scheduler_occurrence_awaiting_slot,
+)
 from kestrel_sovereign.security.sovereign_key import _EPHEMERAL_KEY_FINGERPRINT_ENV
 from kestrel_sovereign.storage.async_database import AsyncDatabase
 from kestrel_sovereign.storage.db import SQLiteBackend
 from kestrel_sovereign.storage.session_id_column import is_stampable_session_id
 from tests.shared.environment_guard import unset_environment
+from tests.utils.virtual_clock import await_within_hang_guard, pinned_loop_clock
 
 
 # ---------------------------------------------------------------------------
@@ -542,6 +556,385 @@ async def test_fleet_blocker_does_not_disclose_sibling_dispatcher_load(tmp_path)
     assert state["blocker"]["count"] is None
     assert "in_flight_signals" not in state["reason"]
     assert "7" not in state["reason"]
+
+
+# ---------------------------------------------------------------------------
+# #3928 — a young scheduler occurrence is waited out once before deferring
+# ---------------------------------------------------------------------------
+
+
+def _occurrence(work, *, name="scheduler-occurrence:x", age_seconds=0.0):
+    """A running background task named and stamped like an admitted occurrence."""
+    task = asyncio.create_task(work, name=name)
+    if age_seconds is not None:
+        task._kestrel_started_at = time.monotonic() - age_seconds
+    return task
+
+
+async def _cancel_all(*tasks):
+    for task in tasks:
+        task.cancel()
+    await asyncio.gather(*tasks, return_exceptions=True)
+
+
+def _hold_blockers(feat, topology, *tasks):
+    """Put ``tasks`` on the agent ``topology`` names, as the live host does."""
+    requester = feat.agent
+    if topology == "single_agent":
+        requester._background_tasks = set(tasks)
+        return
+    sibling = _idle_sibling("did:test:sibling")
+    if topology == "requester_in_fleet":
+        requester._background_tasks = set(tasks)
+    else:
+        sibling._background_tasks = set(tasks)
+    requester._cohosted_agents_provider = lambda: [requester, sibling]
+
+
+@contextlib.contextmanager
+def _settle_on_virtual_time(monkeypatch, *, on_sleep=None):
+    """Run the coordinator's settle polls on a pinned loop clock.
+
+    Every ``asyncio.sleep`` the feature module awaits advances the pinned
+    clock by its delay instead of waiting, so a full settle finishes at once
+    and its length reads off the clock. Nothing else is patched: a task the
+    test starts still sleeps on the loop clock, so one sleeping 30 s is still
+    running after a 10 s settle.
+    """
+    from kestrel_sovereign.features.restart_coordinator import (
+        feature as feature_module,
+    )
+
+    real_sleep = asyncio.sleep
+    sleeps: list[float] = []
+    with pinned_loop_clock() as clock:
+
+        async def virtual_sleep(delay, result=None):
+            sleeps.append(delay)
+            clock.advance(delay)
+            if on_sleep is not None:
+                on_sleep()
+            await real_sleep(0)
+            return result
+
+        monkeypatch.setattr(
+            feature_module,
+            "asyncio",
+            SimpleNamespace(**{**vars(asyncio), "sleep": virtual_sleep}),
+        )
+        try:
+            yield clock, sleeps
+        finally:
+            monkeypatch.setattr(feature_module, "asyncio", asyncio)
+
+
+def test_idle_settle_is_ten_seconds_polled_every_half_second():
+    assert IDLE_SETTLE_SECONDS == 10
+    assert IDLE_SETTLE_POLL_SECONDS == 0.5
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "topology", ["single_agent", "requester_in_fleet", "cohosted_sibling"],
+)
+async def test_young_occurrence_that_finishes_restarts_in_the_same_tick(
+    tmp_path, topology,
+):
+    """#3928: the requester's every-minute ``wait_reconcile`` occurrence was
+    admitted in the coordinator's scheduler tick and in flight at 0 s on every
+    check, so every ``idle_agents_only`` restart waited out the 30-minute
+    escalation. One that finishes inside the settle wait no longer defers it.
+    """
+    feat, backend = await _make_feature(tmp_path)
+    created = await feat.request_restart(reason="deploy")
+    request_id = created.data["request"]["id"]
+    blocker = _occurrence(asyncio.sleep(0.3))
+    _hold_blockers(feat, topology, blocker)
+    try:
+        with patch.object(
+            RestartCoordinatorFeature, "_spawn_restart_subprocess",
+        ) as spawn:
+            result = await await_within_hang_guard(
+                feat.restart_coordinator(), step="coordinator tick",
+            )
+        assert blocker.done() and not blocker.cancelled()
+    finally:
+        await _cancel_all(blocker)
+
+    spawn.assert_called_once()
+    assert result.data["executed"] == [{"request_id": request_id}]
+    assert result.data["deferred"] == []
+    row = await get_request(backend, request_id)
+    assert row.status == "executing"
+    assert row.first_blocked_at == ""
+    events = await list_events_for_request(backend, request_id)
+    assert not [
+        event for event in events
+        if event.to_public_dict()["payload"].get("deferral_reason")
+    ]
+    assert events[-1].state == "executing"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("topology", "expected_reason"),
+    [
+        (
+            "single_agent",
+            r"host busy \(1 background task\(s\) in flight: "
+            r"scheduler-occurrence:x \(\d+s\)\)",
+        ),
+        (
+            "requester_in_fleet",
+            r"host busy \(co-hosted agent Test Agent \(did:test:agent\) busy "
+            r"\(1 background task\(s\) in flight: scheduler-occurrence:x "
+            r"\(\d+s\)\)\)",
+        ),
+        (
+            "cohosted_sibling",
+            r"host busy \(co-hosted agent did:test:sibling busy \(1 background "
+            r"task\(s\) in flight: scheduler-occurrence \(\d+s\)\)\)",
+        ),
+    ],
+)
+async def test_occurrence_still_running_after_the_settle_defers_as_before(
+    tmp_path, monkeypatch, topology, expected_reason,
+):
+    """An occurrence is never exempt: one running 30 s defers the restart with
+    the reason a deferral gave before #3928, after one bounded wait."""
+    feat, backend = await _make_feature(tmp_path)
+    created = await feat.request_restart(reason="deploy")
+    request_id = created.data["request"]["id"]
+    with _settle_on_virtual_time(monkeypatch) as (clock, sleeps):
+        blocker = _occurrence(asyncio.sleep(30))
+        _hold_blockers(feat, topology, blocker)
+        started = clock.time()
+        try:
+            with patch.object(
+                RestartCoordinatorFeature, "_spawn_restart_subprocess",
+            ) as spawn:
+                result = await await_within_hang_guard(
+                    feat.restart_coordinator(), step="coordinator tick",
+                )
+            elapsed = clock.time() - started
+            assert not blocker.done()
+        finally:
+            await _cancel_all(blocker)
+
+    spawn.assert_not_called()
+    assert elapsed == pytest.approx(IDLE_SETTLE_SECONDS)
+    assert sleeps and max(sleeps) <= IDLE_SETTLE_POLL_SECONDS
+    [deferred] = result.data["deferred"]
+    assert re.fullmatch(expected_reason, deferred["reason"]), deferred["reason"]
+    assert deferred["blocker"]["kind"] == "background_tasks"
+    row = await get_request(backend, request_id)
+    assert row.status == "pending"
+    assert row.first_blocked_at
+    events = await list_events_for_request(backend, request_id)
+    assert events[-1].state == "pending"
+    assert (
+        events[-1].to_public_dict()["payload"]["deferral_reason"]
+        == deferred["reason"]
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "blockers",
+    [
+        pytest.param([("signal_dispatch:talon:sig_1", 0.0)], id="signal-dispatch"),
+        pytest.param(
+            [("scheduler-occurrence:x", 0.0), ("signal_dispatch:talon:sig_1", 0.0)],
+            id="occurrence-and-signal-dispatch",
+        ),
+        pytest.param(
+            [("scheduler-occurrence:x", IDLE_SETTLE_SECONDS + 1)],
+            id="occurrence-older-than-the-settle",
+        ),
+        pytest.param([("scheduler-occurrence:x", None)], id="unstamped-occurrence"),
+    ],
+)
+async def test_any_other_blocker_defers_without_a_settle_wait(
+    tmp_path, monkeypatch, blockers,
+):
+    feat, _ = await _make_feature(tmp_path)
+    created = await feat.request_restart(reason="deploy")
+    request_id = created.data["request"]["id"]
+    with _settle_on_virtual_time(monkeypatch) as (_clock, sleeps):
+        tasks = [
+            _occurrence(asyncio.Event().wait(), name=name, age_seconds=age)
+            for name, age in blockers
+        ]
+        _hold_blockers(feat, "requester_in_fleet", *tasks)
+        try:
+            with patch.object(
+                RestartCoordinatorFeature, "_spawn_restart_subprocess",
+            ) as spawn:
+                result = await await_within_hang_guard(
+                    feat.restart_coordinator(), step="coordinator tick",
+                )
+        finally:
+            await _cancel_all(*tasks)
+
+    assert sleeps == []
+    spawn.assert_not_called()
+    [deferred] = result.data["deferred"]
+    assert deferred["request_id"] == request_id
+    assert deferred["reason"].startswith("host busy (")
+
+
+@pytest.mark.asyncio
+async def test_a_busy_sibling_means_no_settle_wait_for_the_requesters_occurrence(
+    tmp_path, monkeypatch,
+):
+    """Every blocker on every agent must be a young occurrence, not just the
+    first busy agent's: a sibling mid-turn defers the restart at once."""
+    feat, _ = await _make_feature(tmp_path)
+    await feat.request_restart(reason="deploy")
+    requester = feat.agent
+    with _settle_on_virtual_time(monkeypatch) as (_clock, sleeps):
+        blocker = _occurrence(asyncio.Event().wait())
+        requester._background_tasks = {blocker}
+        sibling = _idle_sibling("did:test:sibling", busy=True)
+        requester._cohosted_agents_provider = lambda: [requester, sibling]
+        try:
+            with patch.object(
+                RestartCoordinatorFeature, "_spawn_restart_subprocess",
+            ) as spawn:
+                result = await await_within_hang_guard(
+                    feat.restart_coordinator(), step="coordinator tick",
+                )
+        finally:
+            await _cancel_all(blocker)
+
+    assert sleeps == []
+    spawn.assert_not_called()
+    assert len(result.data["deferred"]) == 1
+
+
+@pytest.mark.asyncio
+async def test_settle_wait_is_bounded_once_per_tick(tmp_path, monkeypatch):
+    """An occurrence that never finishes costs a tick at most
+    ``IDLE_SETTLE_SECONDS``, however many requests the tick evaluates."""
+    feat, _ = await _make_feature(tmp_path)
+    first = await feat.request_restart(reason="first")
+    second = await feat.request_restart(reason="second")
+    with _settle_on_virtual_time(monkeypatch) as (clock, sleeps):
+        blocker = _occurrence(asyncio.Event().wait())
+        _hold_blockers(feat, "requester_in_fleet", blocker)
+        started = clock.time()
+        try:
+            with patch.object(
+                RestartCoordinatorFeature, "_spawn_restart_subprocess",
+            ) as spawn:
+                result = await await_within_hang_guard(
+                    feat.restart_coordinator(), step="coordinator tick",
+                )
+            elapsed = clock.time() - started
+            assert not blocker.done()
+        finally:
+            await _cancel_all(blocker)
+
+    spawn.assert_not_called()
+    assert (
+        IDLE_SETTLE_SECONDS
+        <= elapsed
+        <= IDLE_SETTLE_SECONDS + IDLE_SETTLE_POLL_SECONDS
+    )
+    assert max(sleeps) <= IDLE_SETTLE_POLL_SECONDS
+    assert {entry["request_id"] for entry in result.data["deferred"]} == {
+        first.data["request"]["id"], second.data["request"]["id"],
+    }
+
+
+@pytest.mark.asyncio
+async def test_occurrence_queued_for_a_scheduler_slot_is_not_waited_on(
+    tmp_path, monkeypatch,
+):
+    """The coordinator's own occurrence holds a scheduler slot while it waits.
+    An occurrence still queued for one may need exactly that slot, so the
+    check defers at once; once it holds a slot it is waited on."""
+    feat, _ = await _make_feature(tmp_path)
+    await feat.request_restart(reason="deploy")
+    runner = SchedulerRunner.__new__(SchedulerRunner)
+    runner._occurrence_task_factory = asyncio.create_task
+    runner._occurrences = {}
+    runner._tick_started_at = None
+    runner._refresh_unclaimed_admission_snapshot = MagicMock()
+    runner._occurrence_finished = (
+        lambda task_id, _done: runner._occurrences.pop(task_id, None)
+    )
+    release = asyncio.Event()
+
+    async def occurrence(_task):
+        await release.wait()
+
+    runner._run_occurrence = occurrence
+    runner._admit_occurrence(SimpleNamespace(id="queued", agent_id=feat.agent.did))
+    queued = runner._occurrences["queued"].task
+    queued._kestrel_started_at = time.monotonic()
+    feat.agent._background_tasks = {queued}
+    try:
+        assert scheduler_occurrence_awaiting_slot(queued) is True
+        with _settle_on_virtual_time(monkeypatch) as (_clock, sleeps):
+            with patch.object(
+                RestartCoordinatorFeature, "_spawn_restart_subprocess",
+            ) as spawn:
+                result = await await_within_hang_guard(
+                    feat.restart_coordinator(), step="queued tick",
+                )
+        assert sleeps == []
+        spawn.assert_not_called()
+        assert len(result.data["deferred"]) == 1
+
+        runner._slot_acquired("queued")
+        assert scheduler_occurrence_awaiting_slot(queued) is False
+        with _settle_on_virtual_time(monkeypatch) as (_clock, sleeps):
+            with patch.object(
+                RestartCoordinatorFeature, "_spawn_restart_subprocess",
+            ) as spawn:
+                await await_within_hang_guard(
+                    feat.restart_coordinator(), step="running tick",
+                )
+        assert sum(sleeps) == pytest.approx(IDLE_SETTLE_SECONDS)
+        spawn.assert_not_called()
+    finally:
+        release.set()
+        await queued
+
+
+@pytest.mark.asyncio
+async def test_settle_wait_observes_execution_custody_on_waking(
+    tmp_path, monkeypatch,
+):
+    """Authority revoked while the coordinator waits ends the wait at the next
+    wake; the tick neither restarts nor records a deferral."""
+    feat, backend = await _make_feature(tmp_path)
+    created = await feat.request_restart(reason="deploy")
+    request_id = created.data["request"]["id"]
+    fence = ProcessRuntimeExecutionFence(agent_id=feat.agent.did)
+    feat.agent._execution_custody = ExecutionCustody(fence)
+    with _settle_on_virtual_time(monkeypatch, on_sleep=fence.retire) as (
+        _clock, sleeps,
+    ):
+        blocker = _occurrence(asyncio.Event().wait())
+        _hold_blockers(feat, "requester_in_fleet", blocker)
+        try:
+            with patch.object(
+                RestartCoordinatorFeature, "_spawn_restart_subprocess",
+            ) as spawn:
+                with pytest.raises(ExecutionAuthorityError):
+                    await await_within_hang_guard(
+                        feat.restart_coordinator(), step="coordinator tick",
+                    )
+        finally:
+            await _cancel_all(blocker)
+
+    assert sleeps == [IDLE_SETTLE_POLL_SECONDS]
+    spawn.assert_not_called()
+    row = await get_request(backend, request_id)
+    assert row.status == "pending"
+    assert row.first_blocked_at == ""
 
 
 # ---------------------------------------------------------------------------
@@ -2640,7 +3033,7 @@ async def test_executor_reverifies_after_awaited_safety_check(
     created = await feat.request_restart(reason="rotate during safety")
     request_id = created.data["request"]["id"]
 
-    async def rotate_key_during_safety(req):
+    async def rotate_key_during_safety(req, *, settle=None):
         monkeypatch.setenv("KESTREL_API_KEY", "rotated-during-safety")
         return req, {"safe": True, "reason": "fleet idle"}
 
@@ -2672,7 +3065,7 @@ async def test_executor_defers_when_safety_state_is_resealed_during_check(
     created = await feat.request_restart(reason="reseal during safety")
     request_id = created.data["request"]["id"]
 
-    async def reseal_during_safety(req):
+    async def reseal_during_safety(req, *, settle=None):
         refreshed = await mark_deferral_started(
             backend,
             req.id,
@@ -2890,7 +3283,7 @@ async def test_post_update_deferral_recovers_when_authority_rotates_during_safet
 
     safety_checks = 0
 
-    async def rotate_during_post_update_safety(req):
+    async def rotate_during_post_update_safety(req, *, settle=None):
         nonlocal safety_checks
         safety_checks += 1
         if safety_checks == 1:
