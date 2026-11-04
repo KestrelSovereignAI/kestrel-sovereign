@@ -41,9 +41,12 @@ def test_all_cloud_deployment_jobs_use_the_shared_federated_identity():
     assert "GCP_SA_KEY" not in str(workflow) + str(action)
 
 
-@pytest.mark.parametrize("missing", [None, "GCP_WIF_PROVIDER",
-                                    "GCP_DEPLOY_SERVICE_ACCOUNT", "GCP_DEPLOY_PROJECT_ID"])
-def test_federation_configuration_fails_before_authentication_when_incomplete(missing):
+@pytest.mark.parametrize("missing,value", [(None, None)] + [
+    (field, value)
+    for field in ("GCP_WIF_PROVIDER", "GCP_DEPLOY_SERVICE_ACCOUNT", "GCP_DEPLOY_PROJECT_ID")
+    for value in (None, "")
+])
+def test_federation_configuration_fails_before_authentication_when_incomplete(missing, value):
     _, action = _documents()
     guard, authentication = action["runs"]["steps"]
     assert authentication["uses"].startswith("google-github-actions/auth@")
@@ -52,7 +55,10 @@ def test_federation_configuration_fails_before_authentication_when_incomplete(mi
            "GCP_DEPLOY_SERVICE_ACCOUNT": "test-service-account",
            "GCP_DEPLOY_PROJECT_ID": "test-project"}
     if missing:
-        del env[missing]
+        if value is None:
+            del env[missing]
+        else:
+            env[missing] = value
     result = subprocess.run(["bash", "--noprofile", "--norc", "-e", "-c", guard["run"]],
                             env=env, capture_output=True, text=True)
     if missing:

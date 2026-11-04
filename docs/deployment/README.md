@@ -58,9 +58,15 @@ The deployment workflow uses the shared `.github/actions/gcp-deploy-auth`
 composite action with GitHub OIDC and Google Workload Identity Federation.
 Set the repository variables `GCP_WIF_PROVIDER` (the full provider resource
 name) and `GCP_DEPLOY_SERVICE_ACCOUNT` (the deployment account email).
-`PROJECT_ID` remains the workflow's deployment project configuration. Missing
-identity configuration stops the job before authentication; there is no
-service-account JSON key authentication path.
+The workflow passes its configured `PROJECT_ID` to the action and exports
+`GCP_PROJECT_ID` for the deployment CLI. Missing or empty identity configuration
+stops the job before authentication; there is no service-account JSON key
+authentication path.
+
+The local action is loaded from the checked-out deployment ref. Deploy current
+main or a release that includes that action; older tags without it cannot be
+redeployed through this workflow. This prevents returning to the old key-based
+authentication path.
 
 The provider must restrict GitHub's issuer to this repository and owner using
 the immutable `repository_id` and `repository_owner_id` claims, and to the
