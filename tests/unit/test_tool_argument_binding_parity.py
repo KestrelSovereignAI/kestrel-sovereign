@@ -466,13 +466,31 @@ class _Rewrite(Hook):
         return self.decision
 
 
-def _rewritten_before_the_spy(rewrite: dict):
-    """``_hooks`` with a MODIFY hook that runs before the authorization spy,
-    so the spy authorizes the rewrite, as any later hook in a chain would."""
+class _MutateInPlace(Hook):
+    """A PRE_TOOL_USE hook that rewrites the threaded arguments in place and
+    allows the call, returning no ``updated_input``."""
+
+    def __init__(self, rewrite: dict):
+        super().__init__(name="mutate-in-place", events=[HookEvent.PRE_TOOL_USE], priority=10)
+        self.rewrite = rewrite
+
+    async def execute(self, input: HookInput) -> HookOutput:
+        input.tool_input.update(self.rewrite)
+        return HookOutput.allow()
+
+
+def _rewritten_before_the_spy(rewrite: dict, *, in_place: bool = False):
+    """``_hooks`` with a hook that rewrites the arguments before the
+    authorization spy runs, so the spy authorizes the rewrite, as any later
+    hook in a chain would. A MODIFY hook, or with ``in_place`` one that
+    mutates ``tool_input`` and returns ALLOW."""
 
     def hooks():
         manager = HooksManager()
-        manager.register(_Rewrite(HookOutput.modify(rewrite), priority=10))
+        if in_place:
+            manager.register(_MutateInPlace(rewrite))
+        else:
+            manager.register(_Rewrite(HookOutput.modify(rewrite), priority=10))
         recorder = _Recorder()
         manager.register(recorder)
         return manager, recorder
@@ -489,14 +507,17 @@ def _refusal_text(result) -> str:
 @pytest.mark.asyncio
 @pytest.mark.parametrize("kind", sorted(KINDS))
 @pytest.mark.parametrize("path", sorted(PATHS))
-async def test_a_hook_rewrite_to_another_type_does_not_run(make_path, path, kind):
+@pytest.mark.parametrize("in_place", [False, True], ids=["modify", "in-place"])
+async def test_a_hook_rewrite_to_another_type_does_not_run(
+    make_path, path, kind, in_place,
+):
     """``limit: "7"`` from a MODIFY hook is what every later hook authorizes;
     the wrapper would run the method with ``7``. So it does not run, and the
     records name the binding the hooks authorized."""
     probe = make_path(path, kind)
     rewrite = {"limit": "7", "exact": "false"}
 
-    with _rewritten_before_the_spy(rewrite):
+    with _rewritten_before_the_spy(rewrite, in_place=in_place):
         result = await probe.call("probe", {"limit": "30", "exact": "true"}, "!probe 30 true")
 
     assert (
@@ -509,26 +530,35 @@ async def test_a_hook_rewrite_to_another_type_does_not_run(make_path, path, kind
 @pytest.mark.asyncio
 @pytest.mark.parametrize("kind", sorted(KINDS))
 @pytest.mark.parametrize("path", sorted(PATHS))
-async def test_a_hook_rewrite_its_type_refuses_fails_with_the_named_error(make_path, path, kind):
+@pytest.mark.parametrize("in_place", [False, True], ids=["modify", "in-place"])
+async def test_a_hook_rewrite_its_type_refuses_fails_with_the_named_error(
+    make_path, path, kind, in_place,
+):
     probe = make_path(path, kind)
 
-    with _rewritten_before_the_spy({"limit": "abc"}):
+    with _rewritten_before_the_spy({"limit": "abc"}, in_place=in_place):
         result = await probe.call("probe", {"limit": "30", "exact": "true"}, "!probe 30 true")
 
     assert f"{UNCOERCIBLE_ERROR}. A PRE_TOOL_USE hook rewrote the arguments" in _refusal_text(
         result
     )
-    await _assert_one_binding(probe, [_typed({"limit": "abc"})], ran=False)
+    # A MODIFY hook replaces the arguments; one mutating them in place keeps
+    # the coerced ``exact`` it did not touch.
+    authorized = {"limit": "abc", **({"exact": True} if in_place else {})}
+    await _assert_one_binding(probe, [_typed(authorized)], ran=False)
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("kind", sorted(KINDS))
 @pytest.mark.parametrize("path", sorted(PATHS))
-async def test_a_hook_rewrite_in_the_declared_types_runs_as_authorized(make_path, path, kind):
+@pytest.mark.parametrize("in_place", [False, True], ids=["modify", "in-place"])
+async def test_a_hook_rewrite_in_the_declared_types_runs_as_authorized(
+    make_path, path, kind, in_place,
+):
     probe = make_path(path, kind)
     rewrite = {"limit": 7, "exact": False}
 
-    with _rewritten_before_the_spy(rewrite):
+    with _rewritten_before_the_spy(rewrite, in_place=in_place):
         result = await probe.call("probe", {"limit": "30", "exact": "true"}, "!probe 30 true")
 
     assert result == _success_envelope(7, False)

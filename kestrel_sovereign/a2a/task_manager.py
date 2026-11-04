@@ -621,10 +621,15 @@ class TaskManager:
                 denied_reason = (
                     hook_output.permission_reason or "Blocked by security policy"
                 )
-            elif hook_output.updated_input is not None:
-                args = hook_output.updated_input
-                # The hooks authorized this rewrite: one the tool's wrapper
-                # would still coerce is not what the tool would run with.
+            else:
+                # The arguments the hooks authorized: a MODIFY rewrite, else
+                # the threaded input, which a hook may have mutated in place.
+                if hook_output.updated_input is not None:
+                    args = hook_output.updated_input
+                elif isinstance(hook_input.tool_input, dict):
+                    args = hook_input.tool_input
+                # A rewrite the tool's wrapper would still coerce is not what
+                # the tool would run with (#3921).
                 argument_error = hook_rewrite_argument_error(skill_id, tool, args)
         # Local arguments are passed explicitly to the handler. Their durable
         # input representation must also retain exact JSON types and strings.

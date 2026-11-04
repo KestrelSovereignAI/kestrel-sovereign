@@ -241,6 +241,18 @@ def _host_close_owners(context: Any) -> dict[object, _HostCloseOwner]:
     return owners
 
 
+def host_context_cleanup_owners(context: Any) -> tuple[asyncio.Future, ...]:
+    """Exact resource-close owners and retained native children of this context."""
+    if context is None:
+        return ()
+    return tuple(
+        owner
+        for record in _host_close_owners(context).values()
+        for owner in (record.task, *(task for _resource, task in execution_cleanup_debts(record.error)))
+        if isinstance(owner, asyncio.Future)
+    )
+
+
 def _retain_host_cleanup_failure(
     context: Any, resource: Any, error: BaseException, *, operation: str,
 ) -> None:
@@ -309,10 +321,11 @@ async def _close_partial_host_resources(
                 record.error = execution_terminal_error(
                     error, debt, retain_originals=True, isolate_control_originals=True,
                 )
-        if record.task is not None:
-            outcome = await await_owned_task(record.task)
+        task = record.task
+        if task is not None:
+            outcome = await await_owned_task(task)
             from kestrel_sovereign._async_ownership import owned_task_error
-            physical = owned_task_error(record.task)
+            physical = owned_task_error(task)
             record.error = execution_terminal_error(
                 record.error, execution_native_source_error(physical) or physical,
                 retain_originals=True,
@@ -604,5 +617,6 @@ __all__ = [
     "SovereignHostContext",
     "build_host_context",
     "close_host_context_resources",
+    "host_context_cleanup_owners",
     "close_host_context",
 ]

@@ -317,12 +317,14 @@ def hook_rewrite_argument_error(
 
     A dispatch path coerces a call before its PRE_TOOL_USE hooks run (see the
     module docstring), so a hook that leaves the arguments alone leaves them
-    in their declared types. A MODIFY hook may still rewrite ``limit`` to
-    ``"7"``: every hook after it authorizes ``"7"``, the audit records it,
-    and the wrapper would run the tool with ``7``. Coercing the rewrite here
-    would not help, since those hooks have already decided on the string. So
-    such a call must not run (#3921). ``arguments`` are the call's arguments
-    once its hooks have run.
+    in their declared types. A hook may still rewrite ``limit`` to ``"7"``,
+    by MODIFY or by mutating ``tool_input`` in place: every hook after it
+    authorizes ``"7"``, the audit records it, and the wrapper would run the
+    tool with ``7``. Coercing the rewrite here would not help, since those
+    hooks have already decided on the string. So such a call must not run
+    (#3921). ``arguments`` are the call's arguments once its hooks have run:
+    the MODIFY rewrite, else the threaded ``tool_input``, checked whether or
+    not a hook returned a rewrite.
 
     Returns:
         ``None`` when the tool runs with exactly ``arguments`` (always for a
