@@ -32,7 +32,9 @@ from kestrel_sovereign.kestrel_agent import (
     KestrelAgent,
     await_agent_shutdown_completion,
 )
-from tests.integration.test_lighthouse_snapshot_original_control import native_snapshot  # noqa: F401
+from tests.integration.test_lighthouse_snapshot_original_control import (
+    native_snapshot as native_snapshot,
+)
 
 
 @pytest_asyncio.fixture
