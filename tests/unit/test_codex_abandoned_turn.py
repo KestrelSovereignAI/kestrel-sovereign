@@ -23,6 +23,7 @@ from __future__ import annotations
 import asyncio
 from typing import Any, Dict, List, Optional
 
+import aiosqlite
 import pytest
 
 from kestrel_sovereign.agent import orchestrator_engine as oe
@@ -367,27 +368,76 @@ async def _invoked_turns(agent, monkeypatch) -> List[str]:
 
 @pytest.mark.asyncio
 @pytest.mark.usefixtures("isolated_process_rate_limiter")
+@pytest.mark.parametrize("delayed_commit_ack", [False, True],
+                         ids=["normal-commit", "delayed-commit-ack"])
 @pytest.mark.parametrize("turns", [_streamed_turns, _invoked_turns],
                          ids=["streamed", "invoke"])
 async def test_a_stalled_plan_turn_times_out_and_the_next_starts_a_new_thread(
-    turns, tmp_path, monkeypatch,
+    turns, delayed_commit_ack, tmp_path, monkeypatch,
 ):
     """The review's reproduction, on a real agent. The session's first turn
     carries a one-time briefing, so the second starts its own thread; the
     third has the second's settings and would reuse its thread, where the
     abandoned turn is still running."""
-    # A short deadline belongs to the deliberately silent turn only. A normal
-    # first call may include lazy local setup and is not a 200ms performance
-    # contract. The stall remains bounded and must invalidate its exact thread.
+    # The short bound tests provider silence. Bookkeeping outside an attempt
+    # needs its ordinary budget too: a slow SQLite COMMIT acknowledgement must
+    # not turn the expected provider timeout into an uncertain commit outcome.
+    # Keep the real factory's per-attempt rule, configured by each turn below,
+    # and configure only its independent whole-call bookkeeping window.
+    original_for_call = LLMCallWatchdog.for_call.__func__
+    watchdogs = []
+
+    def provider_bound_with_bookkeeping_budget(cls, *args, **kwargs):
+        watchdog = original_for_call(cls, *args, **kwargs)
+        watchdog.timeout = 30
+        watchdogs.append(watchdog)
+        return watchdog
+
+    monkeypatch.setattr(
+        LLMCallWatchdog, "for_call",
+        classmethod(provider_bound_with_bookkeeping_budget),
+    )
     monkeypatch.setattr(oe, "ORCHESTRATOR_TURN_TIMEOUT_SECS", 30)
     app = FakeCodexAppServer("answer", "stall", "answer")
     async with booted_agent(
         tmp_path, name="Codex", provenance="test:codex_abandoned_turn",
         features=frozenset(),
     ) as agent:
-        _plan_route(agent, app, monkeypatch, tmp_path)
+        provider = _plan_route(agent, app, monkeypatch, tmp_path)
+        committed_acknowledgements = []
+        if delayed_commit_ack:
+            store = agent.llm_service._observability_store
+            original_log = store.log_llm_call
+
+            async def log_with_delayed_failure_commit_ack(*args, **kwargs):
+                if kwargs["success"]:
+                    return await original_log(*args, **kwargs)
+                original_commit = aiosqlite.Connection.commit
+
+                async def delayed_ack(connection):
+                    # Execute the real commit, then delay its acknowledgement.
+                    # This exceeds the provider bound without faking a result.
+                    await original_commit(connection)
+                    await asyncio.sleep(BOUND * 2)
+                    committed_acknowledgements.append(connection)
+
+                with monkeypatch.context() as patch:
+                    patch.setattr(aiosqlite.Connection, "commit", delayed_ack)
+                    return await original_log(*args, **kwargs)
+
+            monkeypatch.setattr(
+                store, "log_llm_call", log_with_delayed_failure_commit_ack,
+            )
 
         assert await turns(agent, monkeypatch) == ["Noted.", "Noted."]
 
         assert app.turns == ["thread-1", "thread-2", "thread-3"]
         assert app.rejected == []
+        assert any(w.attempt_timeout(provider) == BOUND for w in watchdogs)
+        assert all(w.timeout == 30 for w in watchdogs)
+        if delayed_commit_ack:
+            assert committed_acknowledgements
+        failed_calls = await agent.llm_service._observability_store.query_llm_calls(
+            success=False,
+        )
+        assert len(failed_calls) == 1
