@@ -439,9 +439,10 @@ def test_the_real_telegram_tools_are_advertised_as_before(monkeypatch):
     loop = asyncio.new_event_loop()
     try:
         attempts = _forbid_network(monkeypatch)
-        # Constructed only: never started, so it opens no connection.
+        # Constructed only: never started, so it opens no connection. The
+        # explicit empty token keeps it from reading one from the environment.
         advertised = loop.run_until_complete(
-            service_module.TelegramService().get_tools()
+            service_module.TelegramService({"token": ""}).get_tools()
         )
     finally:
         loop.close()

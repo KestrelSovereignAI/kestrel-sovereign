@@ -322,7 +322,8 @@ class VertexAIAdapter(LLMAdapter):
                     "name": func["name"],
                     "description": func.get("description", ""),
                     "parameters": gemini_parameters(
-                        func.get("parameters", {"type": "object", "properties": {}})
+                        func.get("parameters", {"type": "object", "properties": {}}),
+                        tool_name=func["name"],
                     ),
                 })
         return function_declarations

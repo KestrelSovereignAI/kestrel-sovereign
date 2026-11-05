@@ -14,7 +14,10 @@ adapter puts on its request:
 * the Google and Vertex adapters project it into google-genai's ``Schema``
   (:func:`kestrel_sovereign.llm.gemini_schema.gemini_parameters`), which the
   SDK refuses the whole request without: a ``type`` list becomes ``nullable``
-  and a local ``$ref`` is inlined.
+  and a local ``$ref`` is inlined, read in the schema resource it sits in.
+  That projection never raises on a schema registration accepts, a
+  recursive, over-deep, ambiguous or unresolved reference included, and logs
+  one warning naming the tool when one costs the model a constraint.
 
 Nothing leaves the process: every SDK runs over a fake client or a mock
 transport.
@@ -24,6 +27,7 @@ from __future__ import annotations
 
 import copy
 import json
+import logging
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
@@ -36,8 +40,14 @@ from kestrel_sovereign.llm.anthropic_adapter import AnthropicAdapter
 from kestrel_sovereign.llm.claude_max_adapter import ClaudeMaxAdapter
 from kestrel_sovereign.llm.codex_adapter import _convert_tools_to_codex_dynamic_tools
 from kestrel_sovereign.llm.gemini_schema import (
+    AMBIGUOUS_REFERENCE,
     MAX_PROJECTION_DEPTH,
     MAX_REFERENCE_EXPANSIONS,
+    RECURSIVE_REFERENCE,
+    REFERENCE_PAST_BUDGET,
+    SUBSCHEMA_PAST_DEPTH,
+    UNRESOLVED_REFERENCE,
+    VALUE_PAST_DEPTH,
     gemini_parameters,
 )
 from kestrel_sovereign.llm.google_adapter import GoogleAdapter
@@ -293,7 +303,7 @@ def _validate_declaration(parameters: dict) -> None:
 
 @pytest.mark.parametrize("case", CASES)
 def test_google_genai_accepts_every_projected_schema(case):
-    _validate_declaration(gemini_parameters(SCHEMA_CORPUS[case]))
+    _validate_declaration(gemini_parameters(SCHEMA_CORPUS[case], tool_name=TOOL_NAME))
 
 
 @pytest.mark.parametrize("case", ["nullable type", "local $ref", "issue #3925 reproduction"])
@@ -388,7 +398,7 @@ def test_a_schema_inside_the_dialect_comes_back_equal_and_unshared():
         "required": ["q"],
     }
 
-    projected = gemini_parameters(schema)
+    projected = gemini_parameters(schema, tool_name=TOOL_NAME)
 
     assert projected == schema
     projected["properties"]["tags"]["items"]["enum"].append("c")
@@ -401,7 +411,7 @@ def test_a_type_list_naming_several_types_becomes_an_any_of():
     schema = {"type": ["string", "array", "null"], "description": "One or many",
               "items": {"type": "string"}, "maxLength": 9}
 
-    assert gemini_parameters(schema) == {
+    assert gemini_parameters(schema, tool_name=TOOL_NAME) == {
         "description": "One or many",
         "anyOf": [
             {"type": "string", "maxLength": 9},
@@ -409,6 +419,45 @@ def test_a_type_list_naming_several_types_becomes_an_any_of():
         ],
         "nullable": True,
     }
+
+
+@pytest.mark.parametrize(
+    "members, expected",
+    [
+        (["string", "string"], {"type": "string"}),
+        (["string", "null", "string"], {"type": "string", "nullable": True}),
+        (["integer", "string", "integer"], {"anyOf": [{"type": "integer"}, {"type": "string"}]}),
+    ],
+)
+def test_a_repeated_type_is_one_type(members, expected):
+    assert gemini_parameters({"type": members}, tool_name=TOOL_NAME) == expected
+
+
+def test_a_repeated_type_at_every_level_projects_linearly():
+    """A branch per repeat copied the level below into each, doubling the
+    result at every level: 40 levels, which registration accepts, made 2**40
+    dicts. Twelve make the difference plain while staying fast."""
+    schema: dict = {}
+    for _ in range(12):
+        schema = {"type": ["array", "array"], "items": schema}
+    expected: dict = {}
+    for _ in range(12):
+        expected = {"type": "array", "items": expected}
+
+    assert gemini_parameters(schema, tool_name=TOOL_NAME) == expected
+
+
+def test_the_any_of_branches_share_no_value():
+    """``number`` and ``integer`` both take ``enum``: each branch has its own."""
+    projected = gemini_parameters(
+        {"type": ["number", "integer"], "enum": ["1", "2"]}, tool_name=TOOL_NAME
+    )
+
+    first, second = projected["anyOf"]
+    assert first == {"type": "number", "enum": ["1", "2"]}
+    assert second == {"type": "integer", "enum": ["1", "2"]}
+    first["enum"].append("3")
+    assert second["enum"] == ["1", "2"]
 
 
 def test_the_keywords_gemini_cannot_express_are_weakened():
@@ -428,7 +477,7 @@ def test_the_keywords_gemini_cannot_express_are_weakened():
         "examples": [{"kind": "record"}],
     }
 
-    assert gemini_parameters(schema) == {
+    assert gemini_parameters(schema, tool_name=TOOL_NAME) == {
         "type": "object",
         "properties": {
             "kind": {"enum": ["record"]},
@@ -440,7 +489,7 @@ def test_the_keywords_gemini_cannot_express_are_weakened():
             "map": {"type": "object"},
         },
     }
-    _validate_declaration(gemini_parameters(schema))
+    _validate_declaration(gemini_parameters(schema, tool_name=TOOL_NAME))
 
 
 def test_a_reference_that_cannot_be_inlined_becomes_any_value(monkeypatch):
@@ -462,7 +511,7 @@ def test_a_reference_that_cannot_be_inlined_becomes_any_value(monkeypatch):
         },
     }
 
-    assert gemini_parameters(schema) == {
+    assert gemini_parameters(schema, tool_name=TOOL_NAME) == {
         "type": "object",
         "properties": {
             "remote": {"description": "Remote"},
@@ -483,7 +532,7 @@ def test_reference_expansion_is_bounded():
     defs[f"L{depth}"] = {"type": "string"}
     schema = {"type": "object", "$defs": defs, "properties": {"root": {"$ref": "#/$defs/L0"}}}
 
-    projected = gemini_parameters(schema)
+    projected = gemini_parameters(schema, tool_name=TOOL_NAME)
 
     expansions = json.dumps(projected).count('"properties"') - 1
     assert expansions <= MAX_REFERENCE_EXPANSIONS
@@ -501,7 +550,7 @@ def test_a_json_pointer_is_unescaped():
         },
     }
 
-    assert gemini_parameters(schema)["properties"] == {
+    assert gemini_parameters(schema, tool_name=TOOL_NAME)["properties"] == {
         "slash": {"type": "string"}, "tilde": {"type": "integer"}, "space": {"type": "boolean"},
     }
 
@@ -529,7 +578,7 @@ def test_the_whole_fragment_is_percent_decoded_before_it_is_split():
         },
     }
 
-    assert gemini_parameters(schema)["properties"] == {
+    assert gemini_parameters(schema, tool_name=TOOL_NAME)["properties"] == {
         "encoded separators": {"type": "integer"},
         "fully encoded": {"type": "boolean"},
         "encoded escape": {"type": "number"},
@@ -549,17 +598,50 @@ def test_a_pointer_that_names_nothing_is_any_value():
             "leading zero": {"$ref": "#/$defs/list/00"},
             # ``"²".isdigit()``, but ``int("²")`` raises.
             "superscript digit": {"$ref": "#/$defs/list/²"},
+            "past the end": {"$ref": "#/$defs/list/1"},
             "plain-name anchor": {"$ref": "#%41"},
         },
     }
 
-    assert gemini_parameters(schema)["properties"] == {
+    assert gemini_parameters(schema, tool_name=TOOL_NAME)["properties"] == {
         "invalid utf-8": {},
         "index": {"type": "integer"},
         "leading zero": {},
         "superscript digit": {},
+        "past the end": {},
         "plain-name anchor": {},
     }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("run", [_google, _vertex], ids=["google", "vertex"])
+async def test_an_index_too_long_to_convert_names_nothing(run):
+    """``int`` refuses a string of more than 4300 digits with ``ValueError``,
+    which failed every Gemini turn the tool was offered on."""
+    schema = {
+        "type": "object",
+        "required": ["a"],
+        "properties": {"a": {"$ref": "#/required/" + "1" * 4301, "description": "A"}},
+    }
+
+    sent = await run(schema)
+
+    assert sent == {"type": "object", "required": ["a"], "properties": {"a": {"description": "A"}}}
+    _validate_declaration(sent)
+
+
+def test_a_reference_to_the_true_schema_is_any_value_and_loses_nothing(caplog):
+    schema = {
+        "type": "object",
+        "$defs": {"Anything": True},
+        "properties": {"x": {"$ref": "#/$defs/Anything", "description": "Any"}},
+    }
+
+    with caplog.at_level(logging.WARNING, logger=GEMINI_SCHEMA_LOGGER):
+        projected = gemini_parameters(schema, tool_name=TOOL_NAME)
+
+    assert projected["properties"] == {"x": {"description": "Any"}}
+    assert _weakening_warnings(caplog) == []
 
 
 def test_a_cycle_is_caught_however_its_reference_is_spelled():
@@ -569,8 +651,144 @@ def test_a_cycle_is_caught_however_its_reference_is_spelled():
         "properties": {"list": {"$ref": "#/$defs/Node"}},
     }
 
-    assert gemini_parameters(schema)["properties"] == {
+    assert gemini_parameters(schema, tool_name=TOOL_NAME)["properties"] == {
         "list": {"type": "object", "properties": {"next": {}}},
+    }
+
+
+# --- a local reference is read in its own schema resource ---------------------
+
+
+def _embedded_resource(identifier: str) -> dict:
+    """The review's reproduction: the document and a subschema with its own
+    ``$id`` each define ``Value``, as different types."""
+    return {
+        "type": "object",
+        "$defs": {"Value": {"type": "string"}},
+        "properties": {
+            "outer": {"$ref": "#/$defs/Value"},
+            "embedded": {
+                "$id": identifier,
+                "type": "object",
+                "$defs": {"Value": {"type": "integer"}},
+                "properties": {"inner": {"$ref": "#/$defs/Value"}},
+            },
+        },
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("identifier", [
+    "https://example.com/schemas/embedded",
+    "embedded.json",
+    "embedded.json#",
+])
+@pytest.mark.parametrize("run", [_google, _vertex], ids=["google", "vertex"])
+async def test_a_reference_inside_an_embedded_resource_names_its_own_definitions(
+    run, identifier, caplog,
+):
+    """Resolving every fragment against the document root sent ``inner`` as
+    the outer ``string``, and warned of nothing."""
+    with caplog.at_level(logging.WARNING, logger=GEMINI_SCHEMA_LOGGER):
+        sent = await run(_embedded_resource(identifier))
+
+    assert sent["properties"] == {
+        "outer": {"type": "string"},
+        "embedded": {"type": "object", "properties": {"inner": {"type": "integer"}}},
+    }
+    _validate_declaration(sent)
+    assert _weakening_warnings(caplog) == []
+
+
+def test_a_resource_id_beside_a_reference_sets_the_base_that_reads_it():
+    """JSON Schema 2020-12 reads ``$id`` before the ``$ref`` beside it."""
+    schema = {
+        "type": "object",
+        "$defs": {"Value": {"type": "string"}},
+        "properties": {"x": {
+            "$id": "item.json",
+            "$defs": {"Value": {"type": "integer"}},
+            "$ref": "#/$defs/Value",
+        }},
+    }
+
+    assert gemini_parameters(schema, tool_name=TOOL_NAME)["properties"] == {
+        "x": {"type": "integer"},
+    }
+
+
+def test_a_referenced_schema_carries_its_resource_along():
+    """A pointer may pass into an embedded resource on its way: a reference
+    inside the schema it lands on is read in that resource, and one inside a
+    schema the embedded resource points back out of stays in the document."""
+    schema = {
+        "type": "object",
+        "$defs": {
+            "Value": {"type": "string"},
+            "Embedded": {
+                "$id": "https://example.com/embedded",
+                "$defs": {
+                    "Value": {"type": "integer"},
+                    "Holder": {"type": "object", "properties": {"v": {"$ref": "#/$defs/Value"}}},
+                },
+            },
+        },
+        "properties": {
+            "crossing": {"$ref": "#/$defs/Embedded/$defs/Holder"},
+            "into the resource root": {"$ref": "#/$defs/Embedded/$defs/Value"},
+        },
+    }
+
+    assert gemini_parameters(schema, tool_name=TOOL_NAME)["properties"] == {
+        "crossing": {"type": "object", "properties": {"v": {"type": "integer"}}},
+        "into the resource root": {"type": "integer"},
+    }
+
+
+@pytest.mark.parametrize("identifier", ["#anchor", "#", "", 7])
+def test_an_id_that_names_no_other_resource_keeps_the_enclosing_one(identifier, caplog):
+    """A plain-name fragment (draft-07's anchor) and a ``$id`` that is not a
+    string keep the document's ``Value``; ``""`` and ``"#"`` name the
+    document's own URI, so ``inner`` names no one schema and becomes any
+    value, with a warning."""
+    schema = _embedded_resource(identifier)
+
+    with caplog.at_level(logging.WARNING, logger=GEMINI_SCHEMA_LOGGER):
+        projected = gemini_parameters(schema, tool_name=TOOL_NAME)
+
+    ambiguous = identifier in ("", "#")
+    inner = {} if ambiguous else {"type": "string"}
+    assert projected["properties"]["embedded"]["properties"] == {"inner": inner}
+    assert projected["properties"]["outer"] == {"type": "string"}
+    warnings = _weakening_warnings(caplog)
+    if ambiguous:
+        (warning,) = warnings
+        assert warning.endswith(f": {AMBIGUOUS_REFERENCE}: 1")
+    else:
+        assert warnings == []
+
+
+def test_a_member_named_id_is_not_a_resource():
+    """``$defs`` and ``properties`` members hold schemas: one named ``$id``
+    does not make its map a resource the pointer passes into."""
+    schema = {
+        "type": "object",
+        "$defs": {
+            "$id": {"type": "boolean"},
+            "Leaf": {"type": "number"},
+            "Value": {"type": "object", "properties": {"v": {"$ref": "#/$defs/Leaf"}}},
+        },
+        "properties": {
+            "$id": {"type": "string"},
+            "value": {"$ref": "#/$defs/Value"},
+            "id property": {"$ref": "#/properties/$id"},
+        },
+    }
+
+    assert gemini_parameters(schema, tool_name=TOOL_NAME)["properties"] == {
+        "$id": {"type": "string"},
+        "value": {"type": "object", "properties": {"v": {"type": "number"}}},
+        "id property": {"type": "string"},
     }
 
 
@@ -614,17 +832,196 @@ def _schema_depth(schema: dict) -> int:
     return deepest
 
 
+GEMINI_SCHEMA_LOGGER = "kestrel_sovereign.llm.gemini_schema"
+
+
+def _weakening_warnings(caplog) -> list:
+    return [
+        record.getMessage() for record in caplog.records
+        if record.name == GEMINI_SCHEMA_LOGGER and record.levelno == logging.WARNING
+    ]
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("run", [_google, _vertex], ids=["google", "vertex"])
-async def test_a_long_reference_chain_reaches_the_request_bounded(run):
+async def test_a_long_reference_chain_reaches_the_request_bounded(run, caplog):
     """Without a depth bound this raised RecursionError before the SDK call,
     failing every turn the tool was offered on."""
-    sent = await run(_reference_chain(MAX_REFERENCE_EXPANSIONS))
+    with caplog.at_level(logging.WARNING, logger=GEMINI_SCHEMA_LOGGER):
+        sent = await run(_reference_chain(MAX_REFERENCE_EXPANSIONS))
 
     assert _schema_depth(sent) <= MAX_PROJECTION_DEPTH
     # Truncated, not collapsed: the chain is inlined until the bound.
     assert _chain_links(sent) == (MAX_PROJECTION_DEPTH - 1) // 2
     _validate_declaration(sent)
+    (warning,) = _weakening_warnings(caplog)
+    assert repr(TOOL_NAME) in warning
+    assert warning.endswith(f": {SUBSCHEMA_PAST_DEPTH}: 1")
+
+
+@pytest.mark.parametrize("last, warned", [({}, False), ({"type": "string"}, True)])
+def test_the_depth_bound_warns_only_when_it_cuts_a_constraint(last, warned, caplog):
+    """Chain link ``D31`` is inlined one level past the bound: ``{}`` there
+    loses nothing, a ``string`` does."""
+    schema = _reference_chain(31)
+    schema["$defs"]["D31"] = last
+
+    with caplog.at_level(logging.WARNING, logger=GEMINI_SCHEMA_LOGGER):
+        projected = gemini_parameters(schema, tool_name=TOOL_NAME)
+
+    assert _chain_links(projected) == 31
+    assert len(_weakening_warnings(caplog)) == (1 if warned else 0)
+
+
+_TREE = {
+    "type": "object",
+    "properties": {
+        "name": {"type": "string"},
+        "children": {"type": "array", "items": {"$ref": "#"}},
+    },
+    "required": ["name"],
+}
+
+#: Schemas whose ``$ref`` re-enters itself, and what Gemini is sent: each is
+#: inlined until the reference recurs, which becomes any value.
+SELF_RECURSIVE = {
+    "a tree whose items are the root": (
+        _TREE,
+        {
+            **_TREE,
+            "properties": {
+                **_TREE["properties"],
+                "children": {"type": "array", "items": {
+                    **_TREE,
+                    "properties": {
+                        **_TREE["properties"],
+                        "children": {"type": "array", "items": {}},
+                    },
+                }},
+            },
+        },
+    ),
+    "a definition that is its own reference": (
+        {
+            "type": "object",
+            "$defs": {"Loop": {"$ref": "#/$defs/Loop"}},
+            "properties": {"x": {"$ref": "#/$defs/Loop", "description": "Loops"}},
+        },
+        {"type": "object", "properties": {"x": {"description": "Loops"}}},
+    ),
+    "a root that references itself": (
+        {"$ref": "#", "type": "object", "properties": {"q": {"type": "string"}}},
+        {"type": "object", "properties": {"q": {"type": "string"}}},
+    ),
+}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("case", list(SELF_RECURSIVE))
+@pytest.mark.parametrize("run", [_google, _vertex], ids=["google", "vertex"])
+async def test_a_self_recursive_reference_reaches_the_request_weakened(run, case, caplog):
+    """Registration accepts these (``_definition`` registers the tool), so
+    projecting one must not raise: it would fail every Gemini turn the tool
+    is offered on, whichever tool the turn uses."""
+    schema, expected = SELF_RECURSIVE[case]
+
+    with caplog.at_level(logging.WARNING, logger=GEMINI_SCHEMA_LOGGER):
+        sent = await run(copy.deepcopy(schema))
+
+    assert sent == expected
+    _validate_declaration(sent)
+    (warning,) = _weakening_warnings(caplog)
+    assert repr(TOOL_NAME) in warning
+    assert warning.endswith(f": {RECURSIVE_REFERENCE}: 1")
+
+
+#: ``type`` lists registration accepts, which the projection raised
+#: ``TypeError`` on (an unhashable member) or turned into an ``anyOf`` the SDK
+#: refuses (a number member).
+MALFORMED_TYPE_LISTS = {
+    "a list member": [["string"], "null"],
+    "an object member": [{"type": "string"}, "string"],
+    "a number member": [1, "string"],
+}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("run", [_google, _vertex], ids=["google", "vertex"])
+async def test_a_type_list_with_a_member_that_is_not_a_string_is_dropped(run):
+    schema = {"type": "object", "properties": {
+        name: {"type": members, "description": name}
+        for name, members in MALFORMED_TYPE_LISTS.items()
+    }}
+
+    sent = await run(schema)
+
+    assert sent == {"type": "object", "properties": {
+        name: {"description": name} for name in MALFORMED_TYPE_LISTS
+    }}
+    _validate_declaration(sent)
+
+
+def test_a_schema_the_dialect_can_take_whole_logs_nothing(caplog):
+    with caplog.at_level(logging.WARNING, logger=GEMINI_SCHEMA_LOGGER):
+        for schema in SCHEMA_CORPUS.values():
+            gemini_parameters(schema, tool_name=TOOL_NAME)
+
+    assert _weakening_warnings(caplog) == []
+
+
+def test_one_warning_counts_every_weakening_and_quotes_no_schema_text(monkeypatch, caplog):
+    from kestrel_sovereign.llm import gemini_schema
+
+    monkeypatch.setattr(gemini_schema, "MAX_REFERENCE_EXPANSIONS", 3)
+    deep_value: list = []
+    for _ in range(100):
+        deep_value = [deep_value]
+    schema = {
+        "type": "object",
+        "description": "private-text",
+        "$defs": {
+            "Node": {"type": "object", "properties": {"next": {"$ref": "#/$defs/Node"}}},
+            "Leaf": {"type": "string", "description": "private-text"},
+        },
+        "properties": {
+            "recursive": {"$ref": "#/$defs/Node"},
+            "missing": {"$ref": "#/$defs/private-text"},
+            "first": {"$ref": "#/$defs/Leaf"},
+            "second": {"$ref": "#/$defs/Leaf"},
+            "past the budget": {"$ref": "#/$defs/Leaf"},
+            "ambiguous": {"$id": "", "$ref": "#/$defs/Leaf"},
+            "deep": _nested_items(MAX_PROJECTION_DEPTH + 5),
+            "deep default": {"type": "array", "default": deep_value},
+        },
+    }
+
+    with caplog.at_level(logging.WARNING, logger=GEMINI_SCHEMA_LOGGER):
+        gemini_parameters(schema, tool_name=TOOL_NAME)
+
+    (warning,) = _weakening_warnings(caplog)
+    assert warning == (
+        f"Gemini is offered weaker parameters for tool {TOOL_NAME!r} than it declares: "
+        f"{RECURSIVE_REFERENCE}: 1; {UNRESOLVED_REFERENCE}: 1; {AMBIGUOUS_REFERENCE}: 1; "
+        f"{REFERENCE_PAST_BUDGET}: 1; {SUBSCHEMA_PAST_DEPTH}: 1; {VALUE_PAST_DEPTH}: 1"
+    )
+    assert "private-text" not in warning
+
+
+def test_the_warning_quotes_at_most_200_characters_of_the_tool_name(caplog):
+    with caplog.at_level(logging.WARNING, logger=GEMINI_SCHEMA_LOGGER):
+        gemini_parameters({"$ref": "#/$defs/Absent"}, tool_name="n" * 500)
+
+    (warning,) = _weakening_warnings(caplog)
+    assert repr("n" * 200) in warning
+    assert "n" * 201 not in warning
+
+
+def _nested_items(depth: int) -> dict:
+    """A schema whose subschemas nest ``depth`` deep, the root being 1."""
+    node: dict = {}
+    for _ in range(depth - 1):
+        node = {"type": "array", "items": node}
+    return node
 
 
 @pytest.mark.asyncio
@@ -662,7 +1059,7 @@ def test_a_deep_schema_is_cut_off_at_the_bound():
     for _ in range(1000):
         schema = {"type": "array", "items": schema}
 
-    projected = gemini_parameters(schema)
+    projected = gemini_parameters(schema, tool_name=TOOL_NAME)
 
     node, depth = projected, 1
     while node != {}:
@@ -686,7 +1083,7 @@ def test_data_nested_deeper_than_the_depth_left_is_dropped():
         "required": ["deep"],
     }
 
-    assert gemini_parameters(schema) == {
+    assert gemini_parameters(schema, tool_name=TOOL_NAME) == {
         "type": "object",
         "properties": {
             "deep": {"type": "array", "description": "kept"},
@@ -698,4 +1095,4 @@ def test_data_nested_deeper_than_the_depth_left_is_dropped():
 
 @pytest.mark.parametrize("value", [None, "not a schema", []])
 def test_parameters_that_are_not_an_object_are_left_for_the_sdk(value):
-    assert gemini_parameters(value) is value
+    assert gemini_parameters(value, tool_name=TOOL_NAME) is value
