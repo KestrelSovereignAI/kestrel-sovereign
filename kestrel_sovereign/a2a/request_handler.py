@@ -135,7 +135,9 @@ def _push_after(token, scope, principal_id, task_id):
                 token + "=" * (-len(token) % 4), altchars=b"-_", validate=True
             )
         )
-    except (ValueError, UnicodeError, binascii.Error) as error:
+    except (ValueError, UnicodeError, binascii.Error, RecursionError) as error:
+        if is_execution_control_error(error):
+            raise
         raise InvalidParamsError(
             message="Invalid push configuration page token"
         ) from error
