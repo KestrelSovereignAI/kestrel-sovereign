@@ -9,9 +9,7 @@ from kestrel_sdk.native_a2a.types import (
     AgentProvider,
     AgentSkill,
     APIKeySecurityScheme,
-    SecurityRequirement,
     SecurityScheme,
-    StringList,
 )
 from kestrel_sdk.native_a2a.utils.proto_utils import validate_proto_required_fields
 from kestrel_sdk.native_a2a.utils.signing import create_agent_card_signer, create_signature_verifier
@@ -150,6 +148,9 @@ def create_native_agent_card(
                 if uri != PEER_STOP_URI or peer_stop
             ],
         ),
+        # The required signed-sender extension states the requirement. An apiKey
+        # requirement has no scopes, and SDKs disagree on whether that empty
+        # entry is signed, so the card carries no security_requirements.
         security_schemes={
             "signedSender": SecurityScheme(
                 api_key_security_scheme=APIKeySecurityScheme(
@@ -157,9 +158,6 @@ def create_native_agent_card(
                 )
             )
         },
-        security_requirements=[
-            SecurityRequirement(schemes={"signedSender": StringList()})
-        ],
         default_input_modes=DEFAULT_NATIVE_MEDIA_TYPES,
         default_output_modes=DEFAULT_NATIVE_MEDIA_TYPES,
         skills=skills,
