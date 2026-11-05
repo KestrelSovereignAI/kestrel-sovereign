@@ -109,7 +109,9 @@ async def host_campaign(tmp_path, monkeypatch, request):
     (home / '.kestrel-host-features.toml').write_text('[host_features]\ndefault_enabled=false\n')
     peer_root = home / 'peer'
     peer_root.mkdir()
-    async with https_peer(peer_root, monkeypatch, provider_model='owned-permission-model') as peer:
+    settings = getattr(request, 'param', {})
+    async with https_peer(peer_root, monkeypatch, provider_model='owned-permission-model',
+            drop_first_tool_reply=settings.get('drop_first_tool_reply', False)) as peer:
         (home / 'kestrel.toml').write_text(
             '[llm]\nroute_priority=["deepseek:api"]\n'
             '[llm.vendors.deepseek.routes.api]\napi_key="owned-synthetic-provider-key"\n'
