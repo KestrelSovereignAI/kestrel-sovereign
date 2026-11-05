@@ -537,7 +537,10 @@ async def test_a_cache_hits_overrun_reaches_the_health_check_with_the_catalog_it
 
     health = await check_model_discovery(SimpleNamespace(llm_service=service))
     assert health["status"] == "warn"
-    assert health["details"]["failed_vendors"] == {"silent": failure}
+    # Reported by its class, never its text (#3912).
+    assert health["details"]["failed_vendors"] == {
+        "silent": {"status": "failed", "error": "DiscoveryStepTimeout"},
+    }
     assert health["details"]["catalog_version"] == served.catalog_version
 
     # Another service's hit finds the failure already reported: nothing new.
@@ -668,7 +671,10 @@ async def test_two_services_failures_against_one_catalog_both_reach_the_health_c
     assert amended.discovery_failures == failures
     for service in (first, second):
         health = await check_model_discovery(SimpleNamespace(llm_service=service))
-        assert health["details"]["failed_vendors"] == failures
+        assert health["details"]["failed_vendors"] == {
+            name: {"status": "failed", "error": "DiscoveryStepTimeout"}
+            for name in failures
+        }
         assert health["details"]["catalog_version"] == served.catalog_version
 
 

@@ -602,6 +602,93 @@ async def test_normal_persists_llm_call_content(tmp_path):
         await store.close()
 
 
+# The private inference lease that served a call (#3912) is an opaque
+# generated identifier health attributes lease-route rows by. It is stamped
+# after the gate, like ``metric_name``; nothing else the caller passed is.
+# Its five-digit run is one the anonymizer would rewrite.
+LEASE_ID = "lease-12345-abc"
+
+
+async def _log_lease_llm_call(store, metadata):
+    await store.log_llm_call(
+        provider="remote_gpu",
+        model="llama-3",
+        duration_ms=5,
+        success=False,
+        agent_did="did:test:emma",
+        metadata=metadata,
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("provider", "marker"),
+    [
+        (lambda: get_privacy_preset("ephemeral"), "none"),
+        (lambda: get_privacy_preset("isolated"), "temp"),
+        (lambda: get_privacy_preset("deidentified"), "deidentified"),
+        (lambda: _raising_provider(), "error"),
+    ],
+    ids=["ephemeral", "isolated", "deidentified", "provider-raises"],
+)
+async def test_llm_call_lease_id_survives_an_eliding_gate(tmp_path, provider, marker):
+    backend, store = await _store(tmp_path, "llm-lease-elided.db")
+    try:
+        store.set_privacy_config_provider(provider)
+        metadata = {"note": "email me at alice@example.com", "inference_lease_id": LEASE_ID}
+        await _log_lease_llm_call(store, metadata)
+
+        row = await _llm_row(backend)
+        assert json.loads(row[5]) == {
+            _CONTENT_GATED_MARKER: marker,
+            "inference_lease_id": LEASE_ID,
+        }
+        # The caller's dict is not changed.
+        assert metadata == {
+            "note": "email me at alice@example.com",
+            "inference_lease_id": LEASE_ID,
+        }
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_llm_call_lease_id_is_kept_verbatim_where_metadata_is_anonymized(tmp_path):
+    backend, store = await _store(tmp_path, "llm-lease-anon.db")
+    try:
+        store.set_privacy_config_provider(lambda: get_privacy_preset("anonymous"))
+        await _log_lease_llm_call(
+            store,
+            {"note": "email me at alice@example.com", "inference_lease_id": LEASE_ID},
+        )
+
+        row = await _llm_row(backend)
+        meta = json.loads(row[5])
+        assert "alice@example.com" not in row[5]
+        assert "note" in meta
+        assert meta["inference_lease_id"] == LEASE_ID
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "lease_id",
+    [{"note": "alice@example.com"}, ["alice@example.com"], 12345, ""],
+    ids=["dict", "list", "int", "empty"],
+)
+async def test_llm_call_stamps_only_a_string_lease_id(tmp_path, lease_id):
+    backend, store = await _store(tmp_path, "llm-lease-shape.db")
+    try:
+        store.set_privacy_config_provider(lambda: get_privacy_preset("ephemeral"))
+        await _log_lease_llm_call(store, {"inference_lease_id": lease_id})
+
+        row = await _llm_row(backend)
+        assert json.loads(row[5]) == {_CONTENT_GATED_MARKER: "none"}
+    finally:
+        await store.close()
+
+
 # ---------------------------------------------------------------------------
 # Fail-closed gates (#3920). The gates used to fail OPEN in two inner
 # helpers: a privacy provider that raised read as "no policy configured", and

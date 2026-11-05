@@ -2484,6 +2484,8 @@ class TestInvocationBoundary:
         assert logged["metadata"] == {
             "path": "generate.remote_gpu",
             "force_local_only": False,
+            # #3912: lease-route rows name the lease that served them.
+            "inference_lease_id": "lease-test",
             "correlation_id": "correlation-remote",
             "provider_reported_cost_usd": 0.0125,
         }
@@ -2601,6 +2603,7 @@ class TestInvocationBoundary:
         assert logged["metadata"] == {
             "streamed": True,
             "path": "stream_with_tool_detection",
+            "inference_lease_id": "lease-test",
             "correlation_id": "stream-correlation",
             "stop_reason": "stop",
         }

@@ -39,6 +39,9 @@ from kestrel_sovereign.llm.model_metadata import ModelCategory, ModelInfo
 from tests.utils.process_local_llm_service import process_local_service
 
 AUTH_FAILURE = "RuntimeError: 401 Unauthorized"
+# What the health check reports for it: the status and the exception class,
+# never the recorded text (#3912).
+AUTH_FAILURE_REPORTED = {"status": "failed", "error": "RuntimeError"}
 
 
 class _CatalogEndpoint:
@@ -142,7 +145,7 @@ class TestSiblingsReportTheSameSnapshot:
         )
         reading_b = await _reading(host.b.agent)
         assert reading_b["status"] == "warn"
-        assert reading_b["details"]["failed_vendors"] == {"anthropic": AUTH_FAILURE}
+        assert reading_b["details"]["failed_vendors"] == {"anthropic": AUTH_FAILURE_REPORTED}
         assert reading_b == await _reading(host.a.agent), (
             "every service reads the same snapshot, so reports the same state"
         )
@@ -252,7 +255,7 @@ class TestPublicationIsAtomic:
         assert new.discovery_failures == {"anthropic": AUTH_FAILURE}
         reading = await _reading(host.b.agent)
         assert reading["details"]["catalog_version"] == new.version
-        assert reading["details"]["failed_vendors"] == {"anthropic": AUTH_FAILURE}
+        assert reading["details"]["failed_vendors"] == {"anthropic": AUTH_FAILURE_REPORTED}
 
     def test_a_held_snapshot_is_unchanged_by_a_later_publication(self):
         cache = SharedModelCache()
@@ -407,8 +410,9 @@ class TestFailuresAreScopedToTheirVendor:
         reading = await _reading(host.a.agent)
 
         assert reading["details"]["failed_vendors"] == {
-            "anthropic": AUTH_FAILURE,
-            "openai": "503 overloaded",
+            "anthropic": {"status": "not_attempted", "error": "RuntimeError"},
+            # A record naming no exception class is reported by a fixed code.
+            "openai": {"status": "failed", "error": "discovery_failed"},
         }
         assert reading["details"]["not_reattempted_vendors"] == ["anthropic"]
 
@@ -497,7 +501,9 @@ class TestTheCarryOutlivesCatalogInvalidation:
 
         for reading in (invalidated, restored):
             assert reading["status"] == "warn"
-            assert reading["details"]["failed_vendors"] == {"anthropic": AUTH_FAILURE}
+            assert reading["details"]["failed_vendors"] == {
+                "anthropic": {**AUTH_FAILURE_REPORTED, "status": "not_attempted"},
+            }
             assert reading["details"]["not_reattempted_vendors"] == ["anthropic"]
         assert before["details"]["not_reattempted_vendors"] == []
 

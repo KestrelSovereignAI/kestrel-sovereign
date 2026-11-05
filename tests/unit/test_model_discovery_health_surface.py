@@ -90,7 +90,12 @@ class TestModelDiscoveryCheck:
         )
         assert result["status"] == "warn"
         assert "anthropic" in result["message"]
-        assert result["details"]["failed_vendors"]["anthropic"].endswith("401 Unauthorized")
+        # The status and exception class; the recorded text is provider
+        # content and never reaches health output (#3912).
+        assert result["details"]["failed_vendors"] == {
+            "anthropic": {"status": "failed", "error": "AuthenticationError"},
+        }
+        assert "401 Unauthorized" not in str(result)
 
     @pytest.mark.asyncio
     async def test_fails_when_the_agents_own_pinned_vendor_is_the_broken_one(self):
@@ -104,6 +109,8 @@ class TestModelDiscoveryCheck:
         assert result["status"] == "fail"
         assert result["details"]["pinned_vendor_at_risk"] is True
         assert "cannot be validated" in result["message"]
+        assert "(AuthenticationError)" in result["message"]
+        assert "401 Unauthorized" not in str(result)
         # The fix in this same change is designed to PRESERVE the pin, so the
         # message must not promise an outage it prevents. Asserting the
         # accurate wording is present is not enough — the overclaim was
@@ -137,7 +144,10 @@ class TestLlmServiceSurfacesDroppedMandate:
         )
         assert result["status"] == "warn"
         assert "UNPINNED" in result["message"]
-        assert "claude-opus-5" in result["details"]["mandate_load_error"]
+        # The recorded string is the exception's text, so only the fact is
+        # reported (#3912).
+        assert result["details"]["mandate_load_error"] == "preference_not_applied"
+        assert "on 'anthropic:plan'" not in str(result)
 
     @pytest.mark.asyncio
     async def test_no_error_reports_pass(self):

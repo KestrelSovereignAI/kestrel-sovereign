@@ -4650,6 +4650,14 @@ class LLMService(DecisionServiceMixin, ModalityRecordingMixin, ModelDiscoveryMix
         record_metadata.setdefault("path", path)
         if force_local_only is not None:
             record_metadata.setdefault("force_local_only", force_local_only)
+        if provider_name == REMOTE_ROUTE_NAME:
+            # #3912: health counts lease-route rows only for the lease that
+            # served them, so a replacement lease never inherits them. The
+            # attempt being finalized still pins the route: no other lease can
+            # be activated, nor this one released, until it is drained.
+            lease = getattr(self, "_remote_lease", None)
+            if lease is not None:
+                record_metadata.setdefault("inference_lease_id", lease.lease_id)
         if invocation_context.correlation_id:
             record_metadata.setdefault(
                 "correlation_id", invocation_context.correlation_id
