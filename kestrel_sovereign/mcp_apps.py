@@ -28,7 +28,7 @@ from kestrel_sovereign.agent.parts import current_tool_publication_epoch
 from kestrel_sovereign.auth import CallerContext, caller_context_scope, current_caller_context
 from kestrel_sovereign.security.capability_authority import (
     AsyncReaderWriterLock, HostCapabilityAccessDenied, HostCapabilityAuthority,
-    require_raw_capability_disclosure,
+    require_raw_capability_disclosure, require_current_feature_host,
 )
 from kestrel_sovereign.security.csrf import CSRFError
 from kestrel_sovereign.security.private_delivery import (
@@ -164,27 +164,9 @@ class MCPAppsHost:
         self._accepting, self.retired = True, False
 
     def _require_live(self, request=None):
-        runtime = self.agent.feature_contribution_runtime
-        # SDK features need no enabled attribute at initial registration.
-        # Native activation grants availability; an explicit host restriction
-        # can still revoke it before contribution cleanup has settled.
-        if (not self._accepting or self.retired or self.agent.did != self._agent_id
-                or self.agent.features.get(self.feature.name) is not self.feature
-                or runtime is None or runtime.is_active(self.feature) is not True
-                or getattr(self.feature, "enabled", True) is not True
-                or self._is_current() is not True):
-            raise HostCapabilityAccessDenied("original MCP Apps feature is unavailable")
-        if request is None:
-            return
-        routed = getattr(request.state, "agent", None)
-        if routed is not None and routed is not self.agent:
-            raise HostCapabilityAccessDenied("original MCP Apps agent does not match route")
-        manager = getattr(request.app.state, "agent_manager", None)
-        if manager is not None:
-            if not any(candidate is self.agent for candidate in manager.list_agents().values()):
-                raise HostCapabilityAccessDenied("original MCP Apps agent was withdrawn")
-        elif getattr(request.app.state, "agent", None) is not self.agent:
-            raise HostCapabilityAccessDenied("original MCP Apps agent was replaced")
+        require_current_feature_host(self.agent, self.feature, self._agent_id,
+            available=self._accepting and not self.retired, is_current=self._is_current,
+            label="MCP Apps", request=request)
 
     def publication_owner(self, destination: ToolPublicationContext):
         """Resolve the real initial HTTP publisher after governed native audit."""

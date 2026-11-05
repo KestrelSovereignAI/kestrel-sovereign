@@ -19,6 +19,8 @@ privacy: public
 # Native MCP and A2A interoperability
 
 Implementation contract for [#3679](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/3679).
+The optional [MCP OAuth host boundary](MCP_OAUTH_HOST.md) defines Core's web
+identity, interactive authority, callback, and connection-lease contract.
 This is a design, not a claim that the migration has shipped. Phase 0 evidence
 and open gates are recorded in [the spike report](NATIVE_PROTOCOL_SPIKES.md).
 

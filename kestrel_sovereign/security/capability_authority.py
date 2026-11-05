@@ -34,6 +34,7 @@ __all__ = [
     "HostCapabilityAccessDenied",
     "HostCapabilityAuthority",
     "require_raw_capability_disclosure",
+    "require_current_feature_host",
 ]
 
 
@@ -172,3 +173,26 @@ class HostCapabilityAuthority:
                     yield check
                 finally:
                     self._operations.pop(task, None)
+
+
+def require_current_feature_host(agent, feature, agent_id: str, *,
+                                 available: bool, is_current: Callable[[], bool],
+                                 label: str, request=None) -> None:
+    """Check the original native feature and its routed agent without issuing authority."""
+    runtime = agent.feature_contribution_runtime
+    if (available is not True or agent.did != agent_id
+            or agent.features.get(feature.name) is not feature
+            or runtime is None or runtime.is_active(feature) is not True
+            or getattr(feature, "enabled", True) is not True or is_current() is not True):
+        raise HostCapabilityAccessDenied(f"original {label} feature is unavailable")
+    if request is None:
+        return
+    routed = getattr(request.state, "agent", None)
+    if routed is not None and routed is not agent:
+        raise HostCapabilityAccessDenied(f"original {label} agent does not match route")
+    manager = getattr(request.app.state, "agent_manager", None)
+    if manager is not None:
+        if not any(candidate is agent for candidate in manager.list_agents().values()):
+            raise HostCapabilityAccessDenied(f"original {label} agent was withdrawn")
+    elif getattr(request.app.state, "agent", None) is not agent:
+        raise HostCapabilityAccessDenied(f"original {label} agent was replaced")

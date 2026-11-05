@@ -1,6 +1,6 @@
 [project]
 name = "kestrel_sovereign"
-version = "0.61.3"
+version = "0.62.0"
 description = "Kestrel Sovereign AI Agent Framework - Constitutional AI with cryptographic identity"
 readme = "README.md"
 requires-python = ">=3.11,<3.15"
@@ -117,6 +117,8 @@ dependencies = [
     # RFC 8785 for the Kestrel sender extension's complete native request digest.
     "rfc8785>=0.1.4,<1",
     # Core web framework
+    # Public cancellation checkpoint used by MCP OAuth cleanup.
+    "anyio>=4.7,<5",
     # Pre-1.0 router internals changed in a minor release. Advance this tested
     # current line with the native router/CSRF/frontend acceptance checks.
     "fastapi>=0.143.3,<0.144",
@@ -269,7 +271,7 @@ Discussions = "https://github.com/KestrelSovereignAI/kestrel-sovereign/discussio
 
 [project.optional-dependencies]
 # Installed native MCP seam tests remain separate from core-only boot tests.
-mcp-integration = ["kestrel-feature-mcp>=0.11.2,<1"]
+mcp-integration = ["kestrel-feature-mcp>=0.12.0,<1"]
 # Test dependencies (not needed in production)
 test = [
     "pyright==1.1.403",

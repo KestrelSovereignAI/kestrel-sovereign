@@ -4322,6 +4322,9 @@ async def lifespan(app: FastAPI):
 app = FastAPI(lifespan=lifespan)
 from kestrel_sovereign.security.request_auth import RequestAuthenticationService
 
+from kestrel_sovereign.mcp_oauth import MCPOAuthHostPolicy
+
+app.state.mcp_oauth_policy = MCPOAuthHostPolicy.from_environment(os.environ)
 app.state.request_authentication = RequestAuthenticationService(
     api_key=lambda: get_api_key(generate_if_missing=False),
 )
@@ -4521,6 +4524,7 @@ from kestrel_sovereign.endpoints import (
     github_router,
     hold_router,
     host_stop_router,
+    mcp_oauth_public_router,
     memories_router,
     metrics_router,
     models_router,
@@ -4559,6 +4563,7 @@ app.include_router(ui_router)
 app.include_router(rasa_shim_router)
 app.include_router(github_router)
 app.include_router(host_stop_router)
+app.include_router(mcp_oauth_public_router)
 app.include_router(hold_router)
 
 
@@ -4679,6 +4684,8 @@ async def auth_middleware(request: Request, call_next):
         "/api/auth/key",
         "/metrics",
         "/webhooks/github-app",
+        "/oauth/mcp/callback",
+        "/oauth/mcp/client-metadata.json",
     ]
     auth_paths = ["/auth/login", "/auth/callback", "/auth/logout", "/auth/token"]
     # `/api/github/` was previously here — that exempted the GitHub-API
