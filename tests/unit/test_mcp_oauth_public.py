@@ -66,18 +66,22 @@ async def test_callback_access_log_redacts_all_parameters_at_actual_send_seam(su
     assert re.search(PRIVATE_CAPABILITY_URL_PATTERN, path + "?" + query.decode())
 
 
-def test_native_sdk_oauth_logger_drops_secrets_and_exception_traceback(caplog):
+def _assert_oauth_diagnostic_redaction(logger, caplog):
     import logging
-    from mcp.client.auth import oauth2
-    with caplog.at_level(logging.WARNING, logger=oauth2.logger.name):
+    with caplog.at_level(logging.WARNING, logger=logger.name):
         try:
             raise ValueError("private-state-value private-code-value private-token-value")
         except ValueError:
-            oauth2.logger.exception("private-state-value %s", "private-code-value", stack_info=True)
+            logger.exception("private-state-value %s", "private-code-value", stack_info=True)
     assert "private-state-value" not in caplog.text
     assert "private-code-value" not in caplog.text and "private-token-value" not in caplog.text
     assert "MCP OAuth diagnostic redacted" in caplog.text
     assert caplog.records[-1].exc_info is None and caplog.records[-1].stack_info is None
+
+
+def test_oauth_diagnostic_logger_drops_secrets_and_exception_traceback(caplog):
+    import logging
+    _assert_oauth_diagnostic_redaction(logging.getLogger("mcp.client.auth.oauth2"), caplog)
 
 
 def test_host_managed_child_can_use_identity_with_console_assets_served_by_parent():
