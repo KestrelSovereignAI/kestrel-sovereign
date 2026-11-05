@@ -223,7 +223,7 @@ async def test_named_original_terminal_evidence_is_never_a_normal_tool_reply(hos
 
 
 @pytest.mark.asyncio
-async def test_known_inline_conflict_preserves_redaction_without_raw_error_or_stale_denial(host):
+async def test_known_inline_conflict_preserves_redaction_without_raw_error_or_stale_denial(host, caplog):
     from unittest.mock import AsyncMock
     from kestrel_sdk.resources import ResourceConflict
     from kestrel_sovereign.llm.codex_adapter import CodexAdapter
@@ -248,6 +248,8 @@ async def test_known_inline_conflict_preserves_redaction_without_raw_error_or_st
                               'arguments': {'count': 3}})
     assert executed[0]['arguments'] == {'count': 7}
     assert secret not in json.dumps(response) + json.dumps(executed)
+    assert 'ResourceConflict' in caplog.text
+    assert secret not in caplog.text
     assert 'precondition_failed' in response['contentItems'][0]['text']
     assert 'user_denied' not in response['contentItems'][0]['text']
     await agent._append_executed_tool_breadcrumbs([], executed, session_id='conflict-session')

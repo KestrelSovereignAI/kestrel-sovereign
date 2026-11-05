@@ -152,6 +152,7 @@ from kestrel_sovereign.tools.execution_outcome import (
     TOOL_PRECONDITION_CHANGED,
     _HostToolFailure,
     _PreconditionFailedToolResult,
+    _PrivateToolResult,
     _UnconfirmedToolResult,
 )
 from kestrel_sovereign.turn_scope import capture_turn_scope
@@ -894,7 +895,7 @@ def _extract_inline_error_fields(result: Any) -> tuple[Optional[str], Optional[s
     return None, None
 
 
-class _AuditedDeferredResult(dict):
+class _AuditedDeferredResult(_PrivateToolResult):
     """Single-use dispatch receipt; serialization carries only result data.
 
     An inline adapter's history recorder must not write a second dispatch for
@@ -914,16 +915,6 @@ class _AuditedDeferredResult(dict):
             return False
         self._claimed = True
         return True
-
-    def __copy__(self):
-        return dict(self)
-
-    def __deepcopy__(self, memo):
-        return deepcopy(dict(self), memo)
-
-    def __reduce_ex__(self, protocol):
-        return dict, (dict(self),)
-
 
 class _AuditedUnconfirmedToolResult(_AuditedDeferredResult, _UnconfirmedToolResult):
     """Unconfirmed delivery after the host acknowledged the original audit."""
@@ -1782,6 +1773,10 @@ class OrchestratorEngineMixin:
             if not unknown:
                 if (_capture is not None and execution.started
                         and isinstance(error, ResourceConflict)):
+                    logging.warning(
+                        "[GOVERNED-DISPATCH] %s precondition refused: %s\n%s",
+                        tool_name, exception_log_summary(error), exception_frames(error),
+                    )
                     return _PreconditionFailedToolResult({
                         "success": False, "error": TOOL_PRECONDITION_CHANGED,
                     })

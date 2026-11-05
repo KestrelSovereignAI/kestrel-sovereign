@@ -13,12 +13,8 @@ TOOL_PRECONDITION_CHANGED = (
 )
 
 
-class _HostToolFailure(dict):
-    """An in-process host marker; wire data alone cannot create this fact.
-
-    It does not prove persistence. Copies lose the marker just as copies of
-    an audited receipt lose their ability to suppress another dispatch row.
-    """
+class _PrivateToolResult(dict):
+    """Host-owned facts never survive copying or public serialization."""
 
     def __copy__(self):
         return dict(self)
@@ -28,6 +24,10 @@ class _HostToolFailure(dict):
 
     def __reduce_ex__(self, protocol):
         return dict, (dict(self),)
+
+
+class _HostToolFailure(_PrivateToolResult):
+    """A host-generated failure marker, carrying no audit authority."""
 
 
 class _UnconfirmedToolResult(_HostToolFailure):
