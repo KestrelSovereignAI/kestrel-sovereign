@@ -9,15 +9,21 @@ adapter puts on its request:
 
 * OpenAI (and OpenRouter, its subclass), Anthropic (and Claude Max) and Codex
   send the schema verbatim;
-* Ollama's SDK models keep only what they declare, so nested ``properties``,
+* the Ollama adapter projects it into what the Ollama SDK's models accept,
+  which then keep only what they declare, so nested ``properties``,
   ``additionalProperties``, ``anyOf`` and ``$ref`` do not reach Ollama;
 * the Google and Vertex adapters project it into google-genai's ``Schema``
   (:func:`kestrel_sovereign.llm.gemini_schema.gemini_parameters`), which the
   SDK refuses the whole request without: a ``type`` list becomes ``nullable``
-  and a local ``$ref`` is inlined, read in the schema resource it sits in.
-  That projection never raises on a schema registration accepts, a
-  recursive, over-deep, ambiguous or unresolved reference included, and logs
-  one warning naming the tool when one costs the model a constraint.
+  and a local ``$ref`` is inlined, but only in a schema that is one
+  resource. That projection never raises on a schema registration accepts,
+  a recursive or over-deep reference or a value of the wrong shape
+  included, never tells Gemini a type or constraint the schema does not,
+  and logs one warning naming the tool when a reference or the depth bound
+  costs the model a constraint.
+
+Every projection these tests pin keeps what the schema says or admits more
+than it does.
 
 Nothing leaves the process: every SDK runs over a fake client or a mock
 transport.
@@ -40,9 +46,9 @@ from kestrel_sovereign.llm.anthropic_adapter import AnthropicAdapter
 from kestrel_sovereign.llm.claude_max_adapter import ClaudeMaxAdapter
 from kestrel_sovereign.llm.codex_adapter import _convert_tools_to_codex_dynamic_tools
 from kestrel_sovereign.llm.gemini_schema import (
-    AMBIGUOUS_REFERENCE,
     MAX_PROJECTION_DEPTH,
     MAX_REFERENCE_EXPANSIONS,
+    MULTI_RESOURCE_REFERENCE,
     RECURSIVE_REFERENCE,
     REFERENCE_PAST_BUDGET,
     SUBSCHEMA_PAST_DEPTH,
@@ -289,6 +295,113 @@ async def test_each_adapter_sends_the_pinned_parameters(adapter, case):
 
     assert sent == (SCHEMA_CORPUS[case] if pinned is VERBATIM else pinned)
     assert schema == SCHEMA_CORPUS[case], "the adapter edited the tool definition"
+
+
+# --- the Ollama projection is what the Ollama SDK accepts ---------------------
+
+
+def _one_property(schema) -> dict:
+    return {"type": "object", "properties": {"q": schema}}
+
+
+#: Schemas registration accepts that the Ollama SDK's models refuse, failing
+#: every Ollama turn the tool is offered on, and the parameters Ollama is sent.
+OLLAMA_PROJECTED = {
+    "a property that admits anything": (
+        {"type": "object", "properties": {"anything": True, "q": {"type": "string"}}},
+        {"type": "object", "properties": {"anything": {}, "q": {"type": "string"}}},
+    ),
+    "a property that admits nothing": (
+        {"type": "object", "properties": {"never": False, "q": {"type": "string"}}},
+        {"type": "object", "properties": {"q": {"type": "string"}}},
+    ),
+    "a property schema that is a list": (_one_property([]), _one_property({})),
+    "a nullable root": (
+        {"type": ["object", "null"], "properties": {"q": {"type": "string"}}},
+        {"type": "object", "properties": {"q": {"type": "string"}}},
+    ),
+    "a root that is not an object": (
+        {"type": "string", "properties": {"q": {"type": "string"}}},
+        {"type": "object", "properties": {"q": {"type": "string"}}},
+    ),
+    "a required that is a string": (
+        {"type": "object", "required": "q", "properties": {"q": {"type": "string"}}},
+        {"type": "object", "properties": {"q": {"type": "string"}}},
+    ),
+    "a required naming a number": (
+        {"type": "object", "required": ["q", 1], "properties": {"q": {"type": "string"}}},
+        {"type": "object", "properties": {"q": {"type": "string"}}},
+    ),
+    "properties that are a list": (
+        {"type": "object", "properties": ["q"]},
+        {"type": "object"},
+    ),
+    "a property type that is a number": (
+        _one_property({"type": 5, "description": "Q"}), _one_property({"description": "Q"}),
+    ),
+    "a property type list naming a number": (
+        _one_property({"type": ["string", 1]}), _one_property({}),
+    ),
+    "a property description that is a number": (
+        _one_property({"type": "string", "description": 5}), _one_property({"type": "string"}),
+    ),
+    "a property enum that is not a list": (
+        _one_property({"type": "string", "enum": 5}), _one_property({"type": "string"}),
+    ),
+}
+
+#: Schemas the Ollama SDK accepts but would tighten: it drops a keyword
+#: whose partner it keeps.
+OLLAMA_PARTNERS = {
+    # ``items`` applies only past ``prefixItems``: alone it would refuse
+    # ``["a", 1]``.
+    "items beside prefixItems": (
+        _one_property({"type": "array", "prefixItems": [{"type": "string"}],
+                       "items": {"type": "integer"}}),
+        _one_property({"type": "array"}),
+    ),
+    # In draft-07 nothing beside a ``$ref`` applies: ``type`` alone would
+    # refuse the referenced number.
+    "constraints beside a property's $ref": (
+        {"type": "object", "definitions": {"n": {"type": "number"}}, "properties": {"q": {
+            "$ref": "#/definitions/n", "type": "string", "enum": ["a"], "items": {},
+            "description": "Q",
+        }}},
+        {"type": "object", "properties": {"q": {"description": "Q"}}},
+    ),
+    "constraints beside the root's $ref": (
+        {"$ref": "#/$defs/Args", "$defs": {"Args": {"type": "object"}}, "type": "object",
+         "properties": {"q": {"type": "string"}}, "required": ["q"]},
+        {"$defs": {"Args": {"type": "object"}}, "type": "object"},
+    ),
+}
+
+
+@pytest.mark.parametrize(
+    "case", list(OLLAMA_PROJECTED), ids=list(OLLAMA_PROJECTED),
+)
+def test_the_ollama_sdk_refuses_those_schemas_unprojected(case):
+    """Why the Ollama adapter projects: sent as given, each fails the request."""
+    pydantic = pytest.importorskip("pydantic")
+    ollama_types = pytest.importorskip("ollama._types")
+    schema, _ = OLLAMA_PROJECTED[case]
+
+    with pytest.raises(pydantic.ValidationError):
+        ollama_types.Tool.model_validate(_definition(schema))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "case", list({**OLLAMA_PROJECTED, **OLLAMA_PARTNERS}),
+)
+async def test_the_ollama_adapter_sends_a_schema_its_sdk_refuses_or_tightens_weakened(case):
+    schema, expected = {**OLLAMA_PROJECTED, **OLLAMA_PARTNERS}[case]
+    given = copy.deepcopy(schema)
+
+    sent = await _ollama(given)
+
+    assert sent == expected
+    assert given == schema, "the adapter edited the tool definition"
 
 
 # --- the Gemini projection is what google-genai accepts -----------------------
@@ -656,10 +769,10 @@ def test_a_cycle_is_caught_however_its_reference_is_spelled():
     }
 
 
-# --- a local reference is read in its own schema resource ---------------------
+# --- a local reference is resolved only in a one-resource schema -------------
 
 
-def _embedded_resource(identifier: str) -> dict:
+def _embedded_resource(identifier) -> dict:
     """The review's reproduction: the document and a subschema with its own
     ``$id`` each define ``Value``, as different types."""
     return {
@@ -677,118 +790,163 @@ def _embedded_resource(identifier: str) -> dict:
     }
 
 
+#: Every reference in a schema with more than one resource is any value.
+_EMBEDDED_RESOURCE_SENT = {
+    "outer": {},
+    "embedded": {"type": "object", "properties": {"inner": {}}},
+}
+
+
 @pytest.mark.asyncio
-@pytest.mark.parametrize("identifier", [
-    "https://example.com/schemas/embedded",
-    "embedded.json",
-    "embedded.json#",
-])
 @pytest.mark.parametrize("run", [_google, _vertex], ids=["google", "vertex"])
-async def test_a_reference_inside_an_embedded_resource_names_its_own_definitions(
-    run, identifier, caplog,
+async def test_conflicting_outer_and_embedded_definitions_reach_the_request_unconstrained(
+    run, caplog,
 ):
     """Resolving every fragment against the document root sent ``inner`` as
-    the outer ``string``, and warned of nothing."""
+    the outer ``string``, and warned of nothing. No reference in a schema
+    with an embedded resource is resolved: each is any value, with a
+    warning."""
     with caplog.at_level(logging.WARNING, logger=GEMINI_SCHEMA_LOGGER):
-        sent = await run(_embedded_resource(identifier))
+        sent = await run(_embedded_resource("https://example.com/schemas/embedded"))
 
-    assert sent["properties"] == {
-        "outer": {"type": "string"},
-        "embedded": {"type": "object", "properties": {"inner": {"type": "integer"}}},
-    }
+    assert sent["properties"] == _EMBEDDED_RESOURCE_SENT
     _validate_declaration(sent)
-    assert _weakening_warnings(caplog) == []
+    (warning,) = _weakening_warnings(caplog)
+    assert repr(TOOL_NAME) in warning
+    assert warning.endswith(f": {MULTI_RESOURCE_REFERENCE}: 2")
 
 
-def test_a_resource_id_beside_a_reference_sets_the_base_that_reads_it():
-    """JSON Schema 2020-12 reads ``$id`` before the ``$ref`` beside it."""
-    schema = {
+def _resolvable() -> dict:
+    """A schema whose one reference resolves, to which each case adds."""
+    return {
         "type": "object",
         "$defs": {"Value": {"type": "string"}},
-        "properties": {"x": {
-            "$id": "item.json",
-            "$defs": {"Value": {"type": "integer"}},
-            "$ref": "#/$defs/Value",
-        }},
-    }
-
-    assert gemini_parameters(schema, tool_name=TOOL_NAME)["properties"] == {
-        "x": {"type": "integer"},
+        "properties": {"value": {"$ref": "#/$defs/Value"}},
     }
 
 
-def test_a_referenced_schema_carries_its_resource_along():
-    """A pointer may pass into an embedded resource on its way: a reference
-    inside the schema it lands on is read in that resource, and one inside a
-    schema the embedded resource points back out of stays in the document."""
-    schema = {
-        "type": "object",
-        "$defs": {
-            "Value": {"type": "string"},
-            "Embedded": {
-                "$id": "https://example.com/embedded",
-                "$defs": {
-                    "Value": {"type": "integer"},
-                    "Holder": {"type": "object", "properties": {"v": {"$ref": "#/$defs/Value"}}},
-                },
-            },
-        },
-        "properties": {
-            "crossing": {"$ref": "#/$defs/Embedded/$defs/Holder"},
-            "into the resource root": {"$ref": "#/$defs/Embedded/$defs/Value"},
-        },
-    }
-
-    assert gemini_parameters(schema, tool_name=TOOL_NAME)["properties"] == {
-        "crossing": {"type": "object", "properties": {"v": {"type": "integer"}}},
-        "into the resource root": {"type": "integer"},
-    }
+def _adding(path: tuple, key: str, value) -> dict:
+    schema = _resolvable()
+    node = schema
+    for step in path:
+        node = node.setdefault(step, {})
+    node[key] = value
+    return schema
 
 
-@pytest.mark.parametrize("identifier", ["#anchor", "#", "", 7])
-def test_an_id_that_names_no_other_resource_keeps_the_enclosing_one(identifier, caplog):
-    """A plain-name fragment (draft-07's anchor) and a ``$id`` that is not a
-    string keep the document's ``Value``; ``""`` and ``"#"`` name the
-    document's own URI, so ``inner`` names no one schema and becomes any
-    value, with a warning."""
-    schema = _embedded_resource(identifier)
+#: What makes a schema more than one resource, wherever it sits.
+MORE_THAN_ONE_RESOURCE = {
+    "a $id below the root": _adding(("properties", "other"), "$id", "other.json"),
+    "a $id that is a fragment": _adding(("properties", "other"), "$id", "#other"),
+    "an empty $id": _adding(("properties", "other"), "$id", ""),
+    "a $id in a definition": _adding(("$defs", "Value"), "$id", "value.json"),
+    "a $id under a default": _adding(("properties", "other", "default"), "$id", "x"),
+    "draft-04's id": _adding(("properties", "other"), "id", "other.json"),
+    "an $anchor": _adding(("properties", "other"), "$anchor", "other"),
+    "an $anchor at the root": _adding((), "$anchor", "root"),
+    "a $dynamicAnchor": _adding((), "$dynamicAnchor", "meta"),
+    "a $dynamicRef": _adding(("properties", "other"), "$dynamicRef", "#meta"),
+    "a $recursiveAnchor": _adding((), "$recursiveAnchor", True),
+    "a $recursiveRef": _adding(("properties", "other"), "$recursiveRef", "#"),
+}
 
+
+@pytest.mark.parametrize(
+    "schema", list(MORE_THAN_ONE_RESOURCE.values()), ids=list(MORE_THAN_ONE_RESOURCE)
+)
+def test_no_reference_is_resolved_in_a_schema_of_more_than_one_resource(schema, caplog):
     with caplog.at_level(logging.WARNING, logger=GEMINI_SCHEMA_LOGGER):
         projected = gemini_parameters(schema, tool_name=TOOL_NAME)
 
-    ambiguous = identifier in ("", "#")
-    inner = {} if ambiguous else {"type": "string"}
-    assert projected["properties"]["embedded"]["properties"] == {"inner": inner}
-    assert projected["properties"]["outer"] == {"type": "string"}
-    warnings = _weakening_warnings(caplog)
-    if ambiguous:
-        (warning,) = warnings
-        assert warning.endswith(f": {AMBIGUOUS_REFERENCE}: 1")
-    else:
-        assert warnings == []
+    assert projected["properties"]["value"] == {}
+    (warning,) = _weakening_warnings(caplog)
+    assert warning.endswith(f": {MULTI_RESOURCE_REFERENCE}: 1")
 
 
-def test_a_member_named_id_is_not_a_resource():
-    """``$defs`` and ``properties`` members hold schemas: one named ``$id``
-    does not make its map a resource the pointer passes into."""
+#: Schemas that stay one resource.
+ONE_RESOURCE = {
+    "a $id at the root": _adding((), "$id", "https://example.com/root.json"),
+    "draft-04's id at the root": _adding((), "id", "https://example.com/root.json"),
+    "a property named $id": _adding(("properties",), "$id", {"type": "boolean"}),
+    "a property named id": _adding(("properties",), "id", {"type": "string"}),
+    "a definition named $id": _adding(("$defs",), "$id", {"type": "boolean"}),
+    "a $id that is not a string": _adding(("properties", "other"), "$id", 7),
+}
+
+
+@pytest.mark.parametrize("schema", list(ONE_RESOURCE.values()), ids=list(ONE_RESOURCE))
+def test_a_reference_in_a_one_resource_schema_is_resolved(schema, caplog):
+    with caplog.at_level(logging.WARNING, logger=GEMINI_SCHEMA_LOGGER):
+        projected = gemini_parameters(schema, tool_name=TOOL_NAME)
+
+    assert projected["properties"]["value"] == {"type": "string"}
+    assert _weakening_warnings(caplog) == []
+
+
+def test_a_pointer_may_name_a_property_called_id():
     schema = {
         "type": "object",
-        "$defs": {
-            "$id": {"type": "boolean"},
-            "Leaf": {"type": "number"},
-            "Value": {"type": "object", "properties": {"v": {"$ref": "#/$defs/Leaf"}}},
-        },
+        "$defs": {"Leaf": {"type": "number"}},
         "properties": {
             "$id": {"type": "string"},
-            "value": {"$ref": "#/$defs/Value"},
+            "id": {"$ref": "#/$defs/Leaf"},
             "id property": {"$ref": "#/properties/$id"},
         },
     }
 
     assert gemini_parameters(schema, tool_name=TOOL_NAME)["properties"] == {
         "$id": {"type": "string"},
-        "value": {"type": "object", "properties": {"v": {"type": "number"}}},
+        "id": {"type": "number"},
         "id property": {"type": "string"},
+    }
+
+
+# --- beside a reference, only annotations are kept ---------------------------
+
+
+_CLOSED = {
+    "type": "object",
+    "properties": {"a": {"type": "string"}},
+    "additionalProperties": False,
+}
+
+
+def test_constraints_beside_a_reference_are_dropped():
+    """Laid over the referenced schema, the sibling ``properties`` replaced
+    the referenced ones and left ``additionalProperties: false``: ``{"a":
+    "x"}``, which the schema admits, would have been refused. Annotations
+    describe the value and stay."""
+    schema = {
+        "type": "object",
+        "$defs": {"Closed": _CLOSED},
+        "properties": {"x": {
+            "$ref": "#/$defs/Closed",
+            "properties": {"b": {"type": "integer"}},
+            "required": ["b"],
+            "type": "string",
+            "title": "X",
+            "description": "An x",
+            "default": {"a": "y"},
+            "example": {"a": "z"},
+        }},
+    }
+
+    assert gemini_parameters(schema, tool_name=TOOL_NAME)["properties"]["x"] == {
+        **_CLOSED,
+        "title": "X",
+        "description": "An x",
+        "default": {"a": "y"},
+        "example": {"a": "z"},
+    }
+
+
+def test_constraints_beside_an_unresolved_reference_are_dropped():
+    schema = {"type": "object", "properties": {
+        "x": {"$ref": "#/$defs/Absent", "type": "string", "description": "An x"},
+    }}
+
+    assert gemini_parameters(schema, tool_name=TOOL_NAME)["properties"]["x"] == {
+        "description": "An x",
     }
 
 
@@ -909,9 +1067,12 @@ SELF_RECURSIVE = {
         },
         {"type": "object", "properties": {"x": {"description": "Loops"}}},
     ),
+    # Beside a ``$ref`` only annotations are kept: the root's own
+    # ``properties`` are a constraint laid beside its reference to itself.
     "a root that references itself": (
-        {"$ref": "#", "type": "object", "properties": {"q": {"type": "string"}}},
-        {"type": "object", "properties": {"q": {"type": "string"}}},
+        {"$ref": "#", "type": "object", "description": "Loops",
+         "properties": {"q": {"type": "string"}}},
+        {"description": "Loops"},
     ),
 }
 
@@ -942,6 +1103,8 @@ MALFORMED_TYPE_LISTS = {
     "a list member": [["string"], "null"],
     "an object member": [{"type": "string"}, "string"],
     "a number member": [1, "string"],
+    "a name that is not a JSON type": ["string", "text"],
+    "an empty list": [],
 }
 
 
@@ -959,6 +1122,197 @@ async def test_a_type_list_with_a_member_that_is_not_a_string_is_dropped(run):
         name: {"description": name} for name in MALFORMED_TYPE_LISTS
     }}
     _validate_declaration(sent)
+
+
+#: Values registration accepts (they are JSON) for a keyword ``Schema``
+#: copies, which google-genai refuses, failing every Gemini turn the tool is
+#: offered on, or which no JSON Schema allows (a count past int64, an empty
+#: ``enum``). Each is dropped.
+MALFORMED_VALUES = {
+    "a description that is a number": {"description": 5},
+    "a title that is a list": {"title": ["x"]},
+    "a pattern that is a number": {"type": "string", "pattern": 5},
+    "a format that is an object": {"type": "string", "format": {"x": 1}},
+    "a nullable that is a string": {"type": "string", "nullable": "x"},
+    "a minimum that is a string": {"type": "number", "minimum": "x"},
+    "a maximum too large for a float": {"type": "number", "maximum": 10**400},
+    "a minimum that is a flag": {"type": "number", "minimum": True},
+    "a fractional minLength": {"type": "string", "minLength": 2.5},
+    "a negative minLength": {"type": "string", "minLength": -1},
+    "a minLength that is a flag": {"type": "string", "minLength": True},
+    "a maxItems past int64": {"type": "array", "maxItems": 2**63},
+    "a maxProperties that is a string": {"type": "object", "maxProperties": "3"},
+    "a required that is a string": {"type": "object", "required": "a"},
+    "a required naming a number": {"type": "object", "required": [1]},
+    "a propertyOrdering that is a string": {"type": "object", "propertyOrdering": "a"},
+    "a type that is a number": {"type": 5},
+    "a type that is not a JSON type": {"type": "text"},
+    "an empty enum": {"type": "string", "enum": []},
+    "an empty anyOf": {"anyOf": []},
+    "an empty oneOf": {"oneOf": []},
+}
+
+#: Where only a native call can make a value JSON cannot spell: an isolated
+#: tool's is refused at registration.
+NOT_JSON_VALUES = {
+    "a NaN minimum": {"type": "number", "minimum": float("nan")},
+    "an infinite maximum": {"type": "number", "maximum": float("inf")},
+    "a NaN default": {"type": "number", "default": float("nan")},
+    "an infinity inside an example": {"type": "array", "example": [1, [float("-inf")]]},
+}
+
+
+def _with_each(values: dict) -> dict:
+    return {"type": "object", "properties": {
+        name: {**value, "title": name} if "title" not in value else value
+        for name, value in values.items()
+    }}
+
+
+def test_google_genai_refuses_values_of_the_wrong_shape_unprojected():
+    """Why the projection checks them: sent as given, each fails the request."""
+    pydantic = pytest.importorskip("pydantic")
+    for name in (
+        "a description that is a number", "a fractional minLength",
+        "a required that is a string", "a type that is a number",
+        "a maximum too large for a float",
+    ):
+        with pytest.raises(pydantic.ValidationError):
+            _validate_declaration({"type": "object", "properties": {"x": MALFORMED_VALUES[name]}})
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("run", [_google, _vertex], ids=["google", "vertex"])
+async def test_a_value_of_the_wrong_shape_is_dropped(run):
+    sent = await run(_with_each(MALFORMED_VALUES))
+
+    expected = {}
+    for name, value in MALFORMED_VALUES.items():
+        kept = {"title": name}
+        if value.get("type") in ("string", "number", "array", "object"):
+            kept["type"] = value["type"]
+        expected[name] = kept
+    expected["a title that is a list"] = {}
+    assert sent == {"type": "object", "properties": expected}
+    _validate_declaration(sent)
+
+
+def test_an_integer_bound_a_float_cannot_hold_is_dropped():
+    """google-genai's bound fields are floats: ``2**53 + 1`` arrives as
+    ``2**53``, refusing a value the schema admits."""
+    schema = {"type": "object", "properties": {
+        "rounded maximum": {"type": "integer", "maximum": 2**53 + 1},
+        "rounded minimum": {"type": "integer", "minimum": -(2**53) - 1},
+        "exact": {"type": "integer", "minimum": 2**53, "maximum": 2**60},
+    }}
+
+    assert gemini_parameters(schema, tool_name=TOOL_NAME)["properties"] == {
+        "rounded maximum": {"type": "integer"},
+        "rounded minimum": {"type": "integer"},
+        "exact": {"type": "integer", "minimum": 2**53, "maximum": 2**60},
+    }
+
+
+def test_a_number_json_cannot_spell_is_dropped():
+    projected = gemini_parameters(_with_each(NOT_JSON_VALUES), tool_name=TOOL_NAME)
+
+    assert projected == {"type": "object", "properties": {
+        name: {"type": value["type"], "title": name}
+        for name, value in NOT_JSON_VALUES.items()
+    }}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("adapter_type", [GoogleAdapter, VertexAIAdapter])
+async def test_the_real_sdk_sends_values_of_the_wrong_shape_as_valid_json(adapter_type):
+    """The real google-genai validates and encodes the request: nothing it
+    refuses reaches it, and its body is JSON a server can read."""
+    sent = []
+
+    def refuse_constant(constant):
+        raise AssertionError(f"the request carries {constant}, which JSON cannot spell")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        sent.append(json.loads(request.content, parse_constant=refuse_constant))
+        return httpx.Response(200, json={"candidates": [{
+            "content": {"role": "model", "parts": [{"text": "ok"}]},
+            "finishReason": "STOP",
+        }]})
+
+    parameters = _with_each({**MALFORMED_VALUES, **NOT_JSON_VALUES})
+    client = _real_genai_client(adapter_type is VertexAIAdapter, handler)
+
+    await adapter_type().get_response(
+        client=client, model="gemini-2.5-flash", messages=MESSAGES, max_tokens=256,
+        tools=[{"type": "function", "function": {
+            "name": TOOL_NAME, "description": "Store a record", "parameters": parameters,
+        }}],
+    )
+
+    (body,) = sent
+    ((declaration,),) = [t["functionDeclarations"] for t in body["tools"]]
+    assert set(declaration["parameters"]["properties"]) == set(parameters["properties"])
+
+
+# --- keywords whose meaning depends on a partner Gemini drops -----------------
+
+
+def test_additional_properties_beside_pattern_properties_is_dropped():
+    """``patternProperties`` admits ``x-a``; ``additionalProperties: false``
+    alone would refuse it."""
+    schema = {"type": "object", "properties": {
+        "map": {
+            "type": "object",
+            "properties": {"id": {"type": "string"}},
+            "patternProperties": {"^x-": {"type": "string"}},
+            "additionalProperties": False,
+        },
+        "closed": {"type": "object", "additionalProperties": False},
+        "malformed": {"type": "object", "properties": ["id"], "additionalProperties": False},
+    }}
+
+    assert gemini_parameters(schema, tool_name=TOOL_NAME)["properties"] == {
+        "map": {"type": "object", "properties": {"id": {"type": "string"}}},
+        "closed": {"type": "object", "additionalProperties": False},
+        "malformed": {"type": "object"},
+    }
+
+
+def test_items_beside_prefix_items_is_dropped():
+    """``items`` applies only past ``prefixItems``: alone, it would refuse
+    ``["a", 1]``, which the schema admits."""
+    schema = {"type": "object", "properties": {
+        "pair": {
+            "type": "array",
+            "prefixItems": [{"type": "string"}],
+            "items": {"type": "integer"},
+            "maxItems": 2,
+        },
+        "list": {"type": "array", "items": {"type": "integer"}},
+    }}
+
+    assert gemini_parameters(schema, tool_name=TOOL_NAME)["properties"] == {
+        "pair": {"type": "array", "maxItems": 2},
+        "list": {"type": "array", "items": {"type": "integer"}},
+    }
+
+
+def test_a_keyword_that_applies_to_none_of_the_listed_types_is_dropped():
+    """Left beside the branches, an object's ``properties`` could read as
+    making a string-or-integer value an object."""
+    schema = {
+        "type": ["string", "integer"],
+        "properties": {"a": {"type": "string"}},
+        "required": ["a"],
+        "items": {"type": "string"},
+        "maxLength": 3,
+        "description": "A code",
+    }
+
+    assert gemini_parameters(schema, tool_name=TOOL_NAME) == {
+        "description": "A code",
+        "anyOf": [{"type": "string", "maxLength": 3}, {"type": "integer"}],
+    }
 
 
 def test_a_schema_the_dialect_can_take_whole_logs_nothing(caplog):
@@ -989,7 +1343,6 @@ def test_one_warning_counts_every_weakening_and_quotes_no_schema_text(monkeypatc
             "first": {"$ref": "#/$defs/Leaf"},
             "second": {"$ref": "#/$defs/Leaf"},
             "past the budget": {"$ref": "#/$defs/Leaf"},
-            "ambiguous": {"$id": "", "$ref": "#/$defs/Leaf"},
             "deep": _nested_items(MAX_PROJECTION_DEPTH + 5),
             "deep default": {"type": "array", "default": deep_value},
         },
@@ -1001,7 +1354,7 @@ def test_one_warning_counts_every_weakening_and_quotes_no_schema_text(monkeypatc
     (warning,) = _weakening_warnings(caplog)
     assert warning == (
         f"Gemini is offered weaker parameters for tool {TOOL_NAME!r} than it declares: "
-        f"{RECURSIVE_REFERENCE}: 1; {UNRESOLVED_REFERENCE}: 1; {AMBIGUOUS_REFERENCE}: 1; "
+        f"{RECURSIVE_REFERENCE}: 1; {UNRESOLVED_REFERENCE}: 1; "
         f"{REFERENCE_PAST_BUDGET}: 1; {SUBSCHEMA_PAST_DEPTH}: 1; {VALUE_PAST_DEPTH}: 1"
     )
     assert "private-text" not in warning

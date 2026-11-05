@@ -48,7 +48,7 @@ from importlib import metadata as importlib_metadata
 from pathlib import Path
 from queue import Empty, Full, Queue
 from types import MappingProxyType, TracebackType
-from typing import Any, Awaitable, Callable, Dict, Iterator, List, Mapping, NoReturn, Optional
+from typing import Any, Awaitable, Callable, Dict, List, Mapping, NoReturn, Optional
 from uuid import uuid4
 
 import psutil
@@ -97,6 +97,7 @@ from kestrel_sovereign.features.channels.route_ownership import (
     ChannelRouteClaim,
     ChannelRouteOwnershipStore,
 )
+from kestrel_sovereign.json_walk import json_containers, json_members, json_pointer_token
 
 logger = logging.getLogger(__name__)
 _CORE_PACKAGE_ROOT = Path(__file__).resolve().parents[1]
@@ -3122,16 +3123,23 @@ class IsolatedToolSchemaError(IsolatedRuntimePreparationError):
     """An isolated service advertised a tool schema Core will not expose.
 
     Core treats an advertised ``input_schema`` as data (#3925), and refuses
-    two schemas when their tool is registered:
+    three kinds of schema when their tool is registered, checked in this
+    order:
 
-    * :attr:`NON_LOCAL_REFERENCE`: a ``$ref``, ``$dynamicRef`` or
-      ``$recursiveRef`` not starting with ``#``, whose target Core would have
-      to fetch. It never does;
     * :attr:`TOO_DEEP`: an object or array nested more than
       :data:`MAX_ISOLATED_TOOL_SCHEMA_DEPTH` deep. Copying the schema for the
       model, and each provider SDK encoding it, recurse through every level,
       so one service could otherwise exhaust the stack on every turn the tool
-      is offered on.
+      is offered on;
+    * :attr:`NOT_JSON`: a number JSON cannot spell (``NaN`` or an
+      infinity), or a string or member name holding an unpaired surrogate,
+      which UTF-8 cannot encode. The isolated transport's decoder admits
+      both, and the provider SDKs that encode a request refuse them, again
+      on every turn;
+    * :attr:`NON_LOCAL_REFERENCE`: a ``$ref``, ``$dynamicRef`` or
+      ``$recursiveRef`` key, under any keyword, whose value is a string not
+      starting with ``#``: its target Core would have to fetch. It never
+      does.
 
     The message names the tool, the problem and where it sits in the schema,
     never the schema's value: a service controls that, and a URL can carry
@@ -3140,6 +3148,7 @@ class IsolatedToolSchemaError(IsolatedRuntimePreparationError):
 
     NON_LOCAL_REFERENCE = "non_local_reference"
     TOO_DEEP = "too_deep"
+    NOT_JSON = "not_json"
 
     def __init__(self, tool_name: str, location: str, problem: str) -> None:
         if problem not in _SCHEMA_REFUSALS:
@@ -7042,89 +7051,76 @@ _SCHEMA_REFUSALS = {
         f"a value nested more than {MAX_ISOLATED_TOOL_SCHEMA_DEPTH} levels deep",
         "Core does not expose a schema it cannot copy and encode",
     ),
+    IsolatedToolSchemaError.NOT_JSON: (
+        "a value JSON cannot carry (a NaN or infinite number, or an unpaired surrogate)",
+        "Core does not expose a schema it cannot encode as JSON",
+    ),
 }
 
-#: JSON Schema keywords whose value is a reference to another schema.
+#: The JSON Schema keywords whose value is a reference to another schema.
 _SCHEMA_REFERENCE_KEYWORDS = ("$ref", "$dynamicRef", "$recursiveRef")
-#: Keywords whose value is one subschema, a list of them, or a map of names to
-#: them. A ``$ref`` key anywhere else (under ``default``, ``enum``,
-#: ``examples``, an unknown keyword, or naming a property) is data.
-_SUBSCHEMA_KEYWORDS = frozenset({
-    "additionalItems", "additionalProperties", "contains", "else", "if", "items",
-    "not", "propertyNames", "then", "unevaluatedItems", "unevaluatedProperties",
-})
-_SUBSCHEMA_LIST_KEYWORDS = frozenset({"allOf", "anyOf", "items", "oneOf", "prefixItems"})
-_SUBSCHEMA_MAP_KEYWORDS = frozenset({
-    "$defs", "definitions", "dependencies", "dependentSchemas", "patternProperties",
-    "properties",
-})
-
-
-def _json_pointer_token(name: Any) -> str:
-    return str(name).replace("~", "~0").replace("/", "~1")
-
-
-def _json_members(value: Any) -> Iterator[tuple[str, Any]]:
-    if isinstance(value, dict):
-        return ((_json_pointer_token(key), item) for key, item in value.items())
-    return ((str(index), item) for index, item in enumerate(value))
 
 
 def _over_deep_schema_location(schema: Dict[str, Any]) -> Optional[str]:
     """The JSON pointer of the first object or array in ``schema`` nested
     more than :data:`MAX_ISOLATED_TOOL_SCHEMA_DEPTH` deep, if any.
 
-    Iterative, and holding one member iterator per level, so the check
-    neither recurses nor builds a pointer for each node it passes.
+    The walk stops at that container, so it never descends past the bound.
     """
-    path: List[str] = []
-    members: List[Iterator[tuple[str, Any]]] = [_json_members(schema)]
-    while members:
-        member = next(members[-1], None)
-        if member is None:
-            members.pop()
-            if path:
-                path.pop()
-            continue
-        token, value = member
-        if not isinstance(value, (dict, list)):
-            continue
-        path.append(token)
-        if len(members) + 1 > MAX_ISOLATED_TOOL_SCHEMA_DEPTH:
+    for path, _ in json_containers(schema):
+        if len(path) + 1 > MAX_ISOLATED_TOOL_SCHEMA_DEPTH:
             return "#/" + "/".join(path)
-        members.append(_json_members(value))
+    return None
+
+
+def _is_utf8_text(text: str) -> bool:
+    try:
+        text.encode("utf-8")
+    except UnicodeEncodeError:
+        return False
+    return True
+
+
+def _non_json_value_location(schema: Dict[str, Any]) -> Optional[str]:
+    """The JSON pointer of the first value in ``schema`` a provider request
+    cannot carry, if any: a number JSON cannot spell (``NaN``, ``Infinity``
+    or ``-Infinity``), or a string or member name holding an unpaired
+    surrogate, which UTF-8 cannot encode. The transport's decoder admits
+    both (``"\\ud800"`` decodes to one)."""
+    for path, container in json_containers(schema):
+        if isinstance(container, dict):
+            for name in container:
+                if isinstance(name, str) and not _is_utf8_text(name):
+                    return "#/" + "/".join([*path, json_pointer_token(name)])
+        for token, member in json_members(container):
+            if isinstance(member, float) and not math.isfinite(member):
+                return "#/" + "/".join([*path, token])
+            if isinstance(member, str) and not _is_utf8_text(member):
+                return "#/" + "/".join([*path, token])
     return None
 
 
 def _non_local_schema_reference(schema: Dict[str, Any]) -> Optional[str]:
     """The JSON pointer of the first non-local reference in ``schema``, if any.
 
-    A local reference is a fragment of this schema (``#``, ``#/$defs/x``,
-    ``#anchor``). Nothing is resolved or fetched. Iterative, so a deeply
-    nested schema cannot exhaust the interpreter stack.
+    Every object in the schema is looked at, whatever keyword holds it: a
+    list of the keywords whose values are subschemas is never complete
+    (``contentSchema``, a vendor's ``x-`` keyword). A reference is a
+    ``$ref``, ``$dynamicRef`` or ``$recursiveRef`` key with a string value;
+    a local one is a fragment of this schema (``#``, ``#/$defs/x``,
+    ``#anchor``). Under ``default`` or ``enum`` such a key is refused too,
+    though it is data there: Core cannot tell it apart without that list.
+    A key with another value names nothing to fetch, so a property named
+    ``$ref`` (whose value is its schema) is not a reference. Nothing is
+    resolved or fetched.
     """
-    pending: List[tuple[Any, str]] = [(schema, "#")]
-    while pending:
-        node, location = pending.pop()
-        if not isinstance(node, dict):
+    for path, container in json_containers(schema):
+        if not isinstance(container, dict):
             continue
-        for reference_keyword in _SCHEMA_REFERENCE_KEYWORDS:
-            if reference_keyword in node:
-                reference = node[reference_keyword]
-                if not (isinstance(reference, str) and reference.startswith("#")):
-                    return f"{location}/{reference_keyword}"
-        children: List[tuple[Any, str]] = []
-        for schema_keyword, value in node.items():
-            at = f"{location}/{_json_pointer_token(schema_keyword)}"
-            if schema_keyword in _SUBSCHEMA_KEYWORDS and isinstance(value, dict):
-                children.append((value, at))
-            elif schema_keyword in _SUBSCHEMA_LIST_KEYWORDS and isinstance(value, list):
-                children.extend((item, f"{at}/{index}") for index, item in enumerate(value))
-            elif schema_keyword in _SUBSCHEMA_MAP_KEYWORDS and isinstance(value, dict):
-                children.extend(
-                    (item, f"{at}/{_json_pointer_token(name)}") for name, item in value.items()
-                )
-        pending.extend(reversed(children))
+        for keyword in _SCHEMA_REFERENCE_KEYWORDS:
+            reference = container.get(keyword)
+            if isinstance(reference, str) and not reference.startswith("#"):
+                return "#/" + "/".join([*path, keyword])
     return None
 
 
@@ -7170,11 +7166,16 @@ class IsolatedFeatureTool(AgentTool):
         input_schema = self.input_schema
         if input_schema is None:
             return
-        # Depth first: the reference walk keeps a pointer per pending node.
+        # Depth first: it bounds how deep the other walks descend.
         location = _over_deep_schema_location(input_schema)
         if location is not None:
             raise IsolatedToolSchemaError(
                 self.name, location, IsolatedToolSchemaError.TOO_DEEP
+            )
+        location = _non_json_value_location(input_schema)
+        if location is not None:
+            raise IsolatedToolSchemaError(
+                self.name, location, IsolatedToolSchemaError.NOT_JSON
             )
         location = _non_local_schema_reference(input_schema)
         if location is not None:

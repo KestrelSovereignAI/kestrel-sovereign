@@ -14,10 +14,12 @@ These tests pin:
 * ``schema.parameters`` stays flat for command help and name checks, and
   marks a ``[T, "null"]`` property nullable;
 * a schema with a non-local ``$ref`` is refused at registration with
-  :class:`IsolatedToolSchemaError`, opening no connection, while ``$ref``
-  keys that are data are advertised unchanged;
+  :class:`IsolatedToolSchemaError`, opening no connection, under whichever
+  keyword holds it, while a ``$ref`` key that names nothing remote is
+  advertised unchanged;
 * so is a schema nested more than ``MAX_ISOLATED_TOOL_SCHEMA_DEPTH`` deep,
-  which copying it for the model would recurse through;
+  which copying it for the model would recurse through, and one holding a
+  number JSON cannot spell;
 * the real Telegram package's tools are advertised as before.
 """
 
@@ -141,7 +143,7 @@ def test_a_direct_tool_mount_advertises_the_service_schema():
     assert definition["function"]["parameters"] == ISSUE_3925_SCHEMA
 
 
-# --- references are data ------------------------------------------------------
+# --- references are never resolved remotely ---------------------------------
 
 
 def _forbid_network(monkeypatch) -> list:
@@ -162,37 +164,73 @@ def _with(reference_holder: dict) -> dict:
     return {"type": "object", "properties": {"record": reference_holder}}
 
 
+#: Every reference names a ``secret`` host or document: a refusal must not
+#: quote it, since the service chose it and a URL can carry credentials.
 NON_LOCAL_REFERENCES = {
     "remote URL": (
-        _with({"$ref": "https://schemas.example.com/record.json"}),
+        _with({"$ref": "https://secret.example.invalid/record.json"}),
         "#/properties/record/$ref",
     ),
     "remote URL with fragment": (
-        _with({"$ref": "https://schemas.example.com/defs.json#/$defs/Record"}),
+        _with({"$ref": "https://secret.example.invalid/defs.json#/$defs/Record"}),
         "#/properties/record/$ref",
     ),
-    "relative document": (_with({"$ref": "record.json"}), "#/properties/record/$ref"),
-    "URN": (_with({"$ref": "urn:example:record"}), "#/properties/record/$ref"),
-    "not a string": (_with({"$ref": {"url": "x"}}), "#/properties/record/$ref"),
+    "relative document": (_with({"$ref": "secret-record.json"}), "#/properties/record/$ref"),
+    "URN": (_with({"$ref": "urn:secret:record"}), "#/properties/record/$ref"),
     "under items": (
         {"type": "object", "properties": {"lines": {
-            "type": "array", "items": {"$ref": "https://example.com/line.json"},
+            "type": "array", "items": {"$ref": "https://secret.example.invalid/line.json"},
         }}},
         "#/properties/lines/items/$ref",
     ),
     "under anyOf": (
-        _with({"anyOf": [{"type": "null"}, {"$ref": "https://example.com/r.json"}]}),
+        _with({"anyOf": [{"type": "null"}, {"$ref": "https://secret.example.invalid/r.json"}]}),
         "#/properties/record/anyOf/1/$ref",
     ),
     "under $defs": (
-        {"type": "object", "$defs": {"R": {"$ref": "https://example.com/r.json"}},
+        {"type": "object", "$defs": {"R": {"$ref": "https://secret.example.invalid/r.json"}},
          "properties": {"record": {"$ref": "#/$defs/R"}}},
         "#/$defs/R/$ref",
     ),
-    "root": ({"$ref": "https://example.com/schema.json"}, "#/$ref"),
+    "root": ({"$ref": "https://secret.example.invalid/schema.json"}, "#/$ref"),
     "dynamic reference": (
-        _with({"$dynamicRef": "https://example.com/meta#node"}),
+        _with({"$dynamicRef": "https://secret.example.invalid/meta#node"}),
         "#/properties/record/$dynamicRef",
+    ),
+    "recursive reference": (
+        _with({"$recursiveRef": "https://secret.example.invalid/meta"}),
+        "#/properties/record/$recursiveRef",
+    ),
+    # The keyword walk missed these: no list of subschema keywords is
+    # complete, so every object is looked at, whatever keyword holds it.
+    "under contentSchema": (
+        _with({
+            "type": "string",
+            "contentMediaType": "application/json",
+            "contentSchema": {"$ref": "https://secret.example.invalid/payload.json"},
+        }),
+        "#/properties/record/contentSchema/$ref",
+    ),
+    "under a vendor keyword": (
+        {"type": "object", "x-payload": {"$ref": "https://secret.example.invalid/p.json"}},
+        "#/x-payload/$ref",
+    ),
+    # Data there, but telling it apart would need that list back.
+    "under a default": (
+        _with({"type": "object", "default": {"$ref": "https://secret.example.invalid"}}),
+        "#/properties/record/default/$ref",
+    ),
+    "under an enum member": (
+        _with({"enum": [{"$ref": "https://secret.example.invalid"}]}),
+        "#/properties/record/enum/0/$ref",
+    ),
+    "under examples": (
+        _with({"type": "object", "examples": [{"$ref": "https://secret.example.invalid"}]}),
+        "#/properties/record/examples/0/$ref",
+    ),
+    "under a name that needs escaping": (
+        {"type": "object", "properties": {"a/b~c": {"$ref": "https://secret.example.invalid"}}},
+        "#/properties/a~1b~0c/$ref",
     ),
 }
 
@@ -212,8 +250,7 @@ def test_a_non_local_reference_is_refused_at_registration(monkeypatch, schema, l
     assert isinstance(refused.value, IsolatedRuntimePreparationError)
     assert (refused.value.tool_name, refused.value.location) == (TOOL_NAME, location)
     assert refused.value.problem == IsolatedToolSchemaError.NON_LOCAL_REFERENCE
-    # The service chose the reference, and a URL can carry credentials.
-    assert "example" not in str(refused.value)
+    assert "secret" not in str(refused.value)
     assert TOOL_NAME in str(refused.value)
 
 
@@ -227,23 +264,30 @@ def test_the_camel_case_schema_spelling_is_checked_too(monkeypatch):
         })
 
 
-REFERENCES_AS_DATA = {
-    "a default": _with({"type": "object", "default": {"$ref": "https://example.com"}}),
-    "an enum member": _with({"enum": [{"$ref": "https://example.com"}]}),
-    "examples": _with({"type": "object", "examples": [{"$ref": "https://example.com"}]}),
-    "an unknown keyword": _with({"x-origin": {"$ref": "https://example.com"}}),
+#: ``$ref`` keys whose value names nothing to fetch.
+REFERENCE_KEYS_NAMING_NOTHING_REMOTE = {
+    # Its value is the property's schema.
     "a property named $ref": {
         "type": "object",
         "properties": {"$ref": {"type": "string", "format": "uri"}},
     },
+    "a definition named $dynamicRef": {
+        "type": "object",
+        "$defs": {"$dynamicRef": {"type": "string"}},
+        "properties": {"record": {"$ref": "#/$defs/$dynamicRef"}},
+    },
     "a local anchor": _with({"$ref": "#record"}),
+    "a local pointer under a default": _with({"type": "object", "default": {"$ref": "#/x"}}),
+    "a value that is not a string": _with({"$ref": {"url": "x"}}),
 }
 
 
 @pytest.mark.parametrize(
-    "schema", list(REFERENCES_AS_DATA.values()), ids=list(REFERENCES_AS_DATA)
+    "schema",
+    list(REFERENCE_KEYS_NAMING_NOTHING_REMOTE.values()),
+    ids=list(REFERENCE_KEYS_NAMING_NOTHING_REMOTE),
 )
-def test_a_reference_key_that_is_data_is_advertised_unchanged(monkeypatch, schema):
+def test_a_reference_key_naming_nothing_remote_is_advertised_unchanged(monkeypatch, schema):
     attempts = _forbid_network(monkeypatch)
 
     assert _advertised(_tool(schema)) == schema
@@ -321,6 +365,79 @@ def test_nesting_is_checked_before_references():
     assert refused.value.problem == IsolatedToolSchemaError.TOO_DEEP
 
 
+# --- every number is one JSON can spell --------------------------------------
+
+
+def _from_the_wire(text: str) -> dict:
+    """``text`` decoded as the isolated transport decodes a frame: Python's
+    ``json.loads``, which admits ``NaN`` and the infinities."""
+    return json.loads(text)
+
+
+NOT_JSON = {
+    "NaN as a bound": (
+        '{"type": "object", "properties": {"q": {"type": "number", "minimum": NaN}}}',
+        "#/properties/q/minimum",
+    ),
+    "infinity in a default": (
+        '{"type": "object", "properties": {"q": {"type": "array", "default": [1, Infinity]}}}',
+        "#/properties/q/default/1",
+    ),
+    "negative infinity under a vendor keyword": (
+        '{"type": "object", "x-limits": {"a/b": -Infinity}}',
+        "#/x-limits/a~1b",
+    ),
+    # UTF-8 cannot encode a lone surrogate: httpx and the OpenAI SDK raise
+    # UnicodeEncodeError building the request.
+    "an unpaired surrogate in a description": (
+        '{"type": "object", "properties": {"q": {"type": "string", "description": "a\\ud800"}}}',
+        "#/properties/q/description",
+    ),
+    "an unpaired surrogate in an enum member": (
+        '{"type": "object", "properties": {"q": {"enum": ["ok", "\\udfff"]}}}',
+        "#/properties/q/enum/1",
+    ),
+    "an unpaired surrogate in a property name": (
+        '{"type": "object", "properties": {"\\ud800": {"type": "string"}}}',
+        "#/properties/\ud800",
+    ),
+}
+
+
+@pytest.mark.parametrize("text, location", list(NOT_JSON.values()), ids=list(NOT_JSON))
+def test_a_number_json_cannot_spell_is_refused_at_registration(text, location):
+    """Every provider SDK that encodes a request refuses it (OpenAI's and
+    httpx's ``allow_nan=False``), so offering the tool would fail every turn."""
+    with pytest.raises(IsolatedToolSchemaError) as refused:
+        _tool(_from_the_wire(text))
+
+    assert isinstance(refused.value, IsolatedRuntimePreparationError)
+    assert refused.value.problem == IsolatedToolSchemaError.NOT_JSON
+    assert (refused.value.tool_name, refused.value.location) == (TOOL_NAME, location)
+
+
+def test_an_unspellable_number_is_checked_after_nesting_and_before_references():
+    nan_and_reference = _with({"$ref": "https://example.com/r.json", "minimum": float("nan")})
+    with pytest.raises(IsolatedToolSchemaError) as refused:
+        _tool(nan_and_reference)
+    assert refused.value.problem == IsolatedToolSchemaError.NOT_JSON
+
+    nan_and_deep = _with({"minimum": float("nan"), "default": _deep_value(200)})
+    with pytest.raises(IsolatedToolSchemaError) as refused:
+        _tool(nan_and_deep)
+    assert refused.value.problem == IsolatedToolSchemaError.TOO_DEEP
+
+
+def test_large_and_finite_numbers_and_paired_surrogates_are_json():
+    schema = _with({
+        "type": "number", "minimum": -1e308, "maximum": 10**400, "default": 0.5,
+        # A surrogate pair is one character, which UTF-8 encodes.
+        "description": json.loads('"\\ud83d\\ude00"'),
+    })
+
+    assert _advertised(_tool(schema)) == schema
+
+
 def test_an_unknown_refusal_problem_is_a_core_bug():
     with pytest.raises(ValueError):
         IsolatedToolSchemaError(TOOL_NAME, "#", "surprise")
@@ -331,6 +448,7 @@ def test_an_unknown_refusal_problem_is_a_core_bug():
     [
         (IsolatedToolSchemaError.NON_LOCAL_REFERENCE, "non-local schema reference"),
         (IsolatedToolSchemaError.TOO_DEEP, "levels deep"),
+        (IsolatedToolSchemaError.NOT_JSON, "unpaired surrogate"),
     ],
 )
 def test_the_startup_diagnostic_names_the_refusal_without_service_text(problem, named):
