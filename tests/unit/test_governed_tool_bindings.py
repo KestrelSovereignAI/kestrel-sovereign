@@ -769,6 +769,7 @@ async def test_every_direct_tool_lane_preserves_unconfirmed_effects_after_unexpe
     from kestrel_sovereign.tools.execution_outcome import TOOL_OUTCOME_UNCONFIRMED
 
     agent, backend = host
+    assert agent.supports_unconfirmed_tool_outcomes is True
     class FailedAfterEffect(_Tool):
         async def execute(self, **args):
             self.calls.append(args)

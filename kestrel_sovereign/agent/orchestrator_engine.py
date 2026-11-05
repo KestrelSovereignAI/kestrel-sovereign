@@ -1114,6 +1114,11 @@ class OrchestratorEngineMixin:
     supports_deferred_tool_results: bool = True
     supports_audited_deferred_tool_results: bool = True
     supports_tool_publication_context: bool = True
+    # Consumers must require this exact-True contract before exposing remote
+    # tools. Model, named, inline and bound dispatch preserve uncertainty after
+    # execution starts; an unconfirmed required audit terminates delivery and
+    # route fallback. Registration alone does not establish these guarantees.
+    supports_unconfirmed_tool_outcomes: bool = True
 
     @staticmethod
     def _signals_unfinished_tool_work(content: Optional[str]) -> bool:
