@@ -426,6 +426,20 @@
       "type": "Architecture Spec"
     },
     {
+      "existing_code_refs": [
+        "kestrel_sovereign/mcp_oauth.py"
+      ],
+      "findings": [],
+      "missing_code_refs": [],
+      "missing_links": [],
+      "path": "docs/architecture/MCP_OAUTH_HOST.md",
+      "privacy": "public",
+      "render": "public",
+      "status": "draft",
+      "title": "MCP OAuth host boundary",
+      "type": "Architecture Spec"
+    },
+    {
       "existing_code_refs": [],
       "findings": [],
       "missing_code_refs": [],

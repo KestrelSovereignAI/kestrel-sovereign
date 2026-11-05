@@ -131,6 +131,18 @@ audience-specific derivative:
   `docs/architecture/CONTEXT_C_DURABLE_SALVAGE.md` page is a design record.
 <!-- END PROTECTED CONTEXT HONESTY CONTRACT -->
 
+### Optional native MCP OAuth host
+
+- `kestrel_sovereign/endpoints/mcp_oauth.py` serves the public web client
+  metadata document and the callback shell; neither endpoint grants authority.
+- `kestrel_sovereign/mcp_oauth.py` binds the private feature routes to the
+  original authenticated principal, agent, operation and finite connection
+  lease, with privacy withdrawal and private response custody.
+- The separately installed MCP feature owns native connector consent,
+  credential custody and connections. Installing Core alone does not enable
+  that feature runtime. The contract is documented in
+  `docs/architecture/MCP_OAUTH_HOST.md`.
+
 ### Multi-LLM platform
 
 - Unified service and routing:
