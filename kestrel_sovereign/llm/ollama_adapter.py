@@ -187,6 +187,99 @@ def _extract_message_fields(payload: Any) -> tuple[Optional[str], Optional[str]]
     return (thinking or None), (content or None)
 
 
+def _is_names(value: Any) -> bool:
+    return isinstance(value, list) and all(isinstance(member, str) for member in value)
+
+
+def _without_orphans(projected: Dict[str, Any], kept_beside_ref: tuple) -> Dict[str, Any]:
+    """``projected`` less the fields that would constrain more once the SDK
+    drops their partner.
+
+    The SDK drops a ``$ref``, and in drafts before 2019-09 nothing beside
+    one applies, so only ``kept_beside_ref`` stays beside it. It drops
+    ``prefixItems`` too, and ``items`` beside them applies only past them.
+    """
+    if "$ref" in projected:
+        projected = {key: projected[key] for key in ("$ref", *kept_beside_ref) if key in projected}
+    if "prefixItems" in projected:
+        projected.pop("items", None)
+    return projected
+
+
+def _ollama_property(schema: Any) -> Any:
+    """One property's schema as the SDK's ``Parameters.Property`` takes it:
+    a ``type`` that is not a string or list of strings, a ``description``
+    that is not a string, or an ``enum`` that is not a list is dropped, and
+    a schema that is not an object (``true``) becomes ``{}``. Beside a
+    ``$ref`` only its ``description`` stays."""
+    if not isinstance(schema, dict):
+        return {}
+    projected = _without_orphans(dict(schema), ("description",))
+    member_type = projected.get("type")
+    if "type" in projected and not (isinstance(member_type, str) or _is_names(member_type)):
+        del projected["type"]
+    if "description" in projected and not isinstance(projected["description"], str):
+        del projected["description"]
+    if "enum" in projected and not isinstance(projected["enum"], list):
+        del projected["enum"]
+    return projected
+
+
+def _ollama_parameters(parameters: Any) -> Any:
+    """A tool's JSON Schema as the Ollama SDK's ``Tool.Function.Parameters``
+    takes it.
+
+    The SDK validates each tool with pydantic models, keeping only the
+    fields they declare (a property's ``type``, ``items``, ``description``
+    and ``enum``) and refusing the whole request over a value outside them.
+    An isolated service's schema reaches the adapter whole (#3925), so one
+    tool advertising ``{"anything": true}`` or a root ``["object", "null"]``
+    would otherwise fail every Ollama turn it is offered on. This is the
+    one place such a schema is weakened for Ollama.
+
+    A tool's arguments are always an object, and the SDK can send no other
+    root ``type``: one that says anything else is dropped, and the SDK sends
+    ``"object"``. Below the root every rule keeps what the schema says or
+    admits more than it does: a ``required`` that is not a list of names is
+    dropped, a property whose schema is ``false`` is omitted, each property
+    is projected by :func:`_ollama_property`, and beside a root ``$ref``
+    only ``type`` and ``$defs`` stay. The tool definition itself is not
+    edited.
+    """
+    if not isinstance(parameters, dict):
+        return parameters
+    projected = _without_orphans(dict(parameters), ("type", "$defs"))
+    if "type" in projected and projected["type"] not in (None, "object"):
+        del projected["type"]
+    if "required" in projected and not _is_names(projected["required"]):
+        del projected["required"]
+    properties = projected.get("properties")
+    if isinstance(properties, dict):
+        projected["properties"] = {
+            name: _ollama_property(schema)
+            for name, schema in properties.items()
+            if schema is not False
+        }
+    elif properties is not None:
+        del projected["properties"]
+    return projected
+
+
+def _ollama_tools(tools: List[Dict[str, Any]]) -> List[Any]:
+    """OpenAI-format tool definitions with their parameters projected by
+    :func:`_ollama_parameters`; anything else is passed on for the SDK to
+    judge."""
+    projected = []
+    for tool in tools:
+        function = tool.get("function") if isinstance(tool, dict) else None
+        if isinstance(function, dict) and "parameters" in function:
+            tool = {**tool, "function": {
+                **function, "parameters": _ollama_parameters(function["parameters"]),
+            }}
+        projected.append(tool)
+    return projected
+
+
 class OllamaAdapter(LLMAdapter):
     """
     Adapter for interacting with a local Ollama instance.
@@ -820,7 +913,7 @@ class OllamaAdapter(LLMAdapter):
 
             # Ollama tool calling (Ollama 0.4+)
             if tools:
-                extra_kwargs["tools"] = tools
+                extra_kwargs["tools"] = _ollama_tools(tools)
 
             extra_kwargs, budget = self._chat_kwargs(extra_kwargs, kwargs, model)
 

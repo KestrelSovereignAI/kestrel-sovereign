@@ -370,6 +370,37 @@ Regression coverage: `tests.unit.test_tool_allowlist_turn_evidence`.
 - Only a tool with no original schema, a native `@tool` method, is judged by its `ToolSchema` parameter list, which accepts exactly its parameters. A tool with no schema of either shape leaves the arguments unchanged.
 - A server's pattern is never run as a regular expression: `(?:x?){4000000000}` exhausts memory matching even `task`, and `^(a+)+$` backtracks for minutes on a long model-chosen name, all on the event loop. Patterns are compared with `task` and `context` only, and only a literal one, optionally anchored with `^`/`$` (`^x-`, `^context$`), is evaluated, by string comparison. A generic name that any other pattern might match passes through, as does any other name a closed schema leaves to its patterns; the server validates them.
 
+### Isolated tool schemas reach the model whole (#3925)
+
+**Risk**: An isolated tool's model-facing `function.parameters` was rebuilt from the flat `ToolParameter` list derived from its service's `input_schema`. That list keeps each top-level property's type, description, default, enum and items, so nested `properties` and `required`, `additionalProperties`, nullable unions (`["string", "null"]` became `string`), `anyOf` and `$ref` never reached the model.
+
+**Mitigation**:
+
+- An `IsolatedFeatureTool` whose service advertised a schema object offers a deep copy of that schema, verbatim, as `function.parameters`, on the direct-tool mount and the feature-subagent path alike. `schema.parameters` stays flat for command help and argument-name checks, and marks a `[T, "null"]` property `nullable`.
+
+**Contract.** A schema is data. Core never fetches anything it names. What it does with a schema is decided by closed rules, so a JSON Schema keyword no rule names cannot change the outcome. Every schema is either rejected at registration, sent as it is, or sent weakened: a weakened schema admits everything the original admits, and more. No rule tells a provider a type or constraint the schema does not, except that a tool's arguments, which are always an object, are sent to Ollama as one.
+
+*Rejected at registration.* Registration raises `IsolatedToolSchemaError`, a preparation error, so the feature is unavailable and its child is retired. Its `problem` is one of:
+
+- `TOO_DEEP`: an object or array is nested more than `MAX_ISOLATED_TOOL_SCHEMA_DEPTH` (64) levels deep, data under `default` or `examples` included. Copying the schema for the model, and every provider SDK encoding it, recurse through each level, while the isolated transport's JSON decoder admits documents far deeper than the interpreter stack.
+- `NOT_JSON`: a value a request cannot carry: a number JSON cannot spell (`NaN`, `Infinity` or `-Infinity`), or a string or member name holding an unpaired surrogate, which UTF-8 cannot encode. The transport's decoder admits both, and the OpenAI SDK and httpx refuse to encode them.
+- `NON_LOCAL_REFERENCE`: a `$ref`, `$dynamicRef` or `$recursiveRef` key whose value is a string not starting with `#`. Every object in the schema is checked, whatever keyword holds it: `contentSchema`, a vendor's `x-` keyword, `default`, `enum` and `examples` alike. A key whose value is not a string names nothing to fetch, so a property named `$ref` is not a reference.
+
+The checks run in that order. Nothing else is rejected.
+
+*Sent as it is.* OpenAI, OpenRouter, Anthropic, Claude Max and Codex receive the schema verbatim.
+
+*Resolved.* Only the Google and Vertex adapters resolve references, because google-genai's `Schema` has no `$ref`. They resolve a local JSON pointer (`#` or `#/...`) only when the whole schema is one resource: no object below the root declares a string `$id` (or draft-04's `id`), and no object anywhere uses `$anchor`, `$dynamicAnchor`, `$dynamicRef`, `$recursiveAnchor` or `$recursiveRef`. The fragment is percent-decoded whole before it is read as a JSON pointer (RFC 6901 §6), so `#/$defs/a%2F$defs%2Fb` names `b` under `$defs` under `a`, and each token then unescapes `~1` and `~0`. The pointer is read against the document root. The target is inlined, with only the annotations `title`, `description`, `default` and `example` from beside the `$ref`.
+
+*Weakened.* Each adapter's own conversion is the one place a keyword its provider cannot express is weakened:
+
+- Ollama's SDK keeps only a property's `type`, `items`, `description` and `enum`. The adapter (`_ollama_parameters`) first makes the schema fit the SDK's models, which otherwise refuse the whole request: a `required` that is not a list of names, a property's `type`, `description` or `enum` of the wrong shape, and properties that are not an object are dropped; a property whose schema is `false` is omitted, and one that is not an object becomes `{}`. The SDK drops `$ref` and `prefixItems` but keeps fields beside them, so beside a `$ref` only a property's `description` (the root's `type` and `$defs`) stays, and `items` beside `prefixItems` is dropped. The SDK can send no root `type` but `"object"`, which a tool's arguments always are, so a root `type` that says anything else is dropped and sent as `"object"`.
+- The Google and Vertex adapters project the schema into google-genai's `Schema` (`kestrel_sovereign.llm.gemini_schema.gemini_parameters`), which otherwise refuses the whole request: a `type` list becomes `nullable` or an `anyOf` (each type once, and a keyword that applies to none of the types dropped); a `type` that is not a JSON type name, and a keyword value of the wrong shape for its `Schema` field (a `description` that is not a string, a negative `minLength`, a `minimum` that is not finite or that a float cannot hold exactly, ...), are dropped; `oneOf` becomes `anyOf`; `additionalProperties` beside `patternProperties`, and `items` beside `prefixItems`, are dropped; and keywords outside `Schema` are dropped. Every reference that is not resolved becomes `{}` (any value): a non-local one, one in a schema of more than one resource, one that recurs into itself, one past the expansion budget (`MAX_REFERENCE_EXPANSIONS`, 256), and one whose pointer names no schema object. So does every constraint beside a `$ref`, which drafts disagree on and which, laid over the target, could close an object the schema leaves open. Inlining is bounded in depth separately from count (`MAX_PROJECTION_DEPTH`, 64, each inlined reference counting a level): a shallow schema whose references chain through object properties would otherwise recurse as deep as the chain is long. Past the depth a subschema becomes `{}`, and a keyword value nested deeper than the depth left is dropped.
+
+The projections never raise: one tool's schema must not fail every turn it is offered on. When a reference or the depth bound costs Gemini a constraint, one warning from `kestrel_sovereign.llm.gemini_schema` names the tool (at most 200 characters) and counts each kind of weakening, never quoting the schema's own text.
+
+Regression coverage: `tests.unit.test_isolated_tool_schema_exposure` and `tests.unit.test_tool_schema_provider_dialects`.
+
 ### Session persistence
 
 **Risk**: If explored tools persist across sessions, the tool list could be stale after feature code changes or restarts.

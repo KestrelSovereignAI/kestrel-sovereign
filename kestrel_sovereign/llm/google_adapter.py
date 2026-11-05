@@ -22,6 +22,7 @@ from kestrel_sdk.llm import (
 from .model_metadata import ModelInfo, ModelCategory
 from .image_utils import process_images
 from .genai_custody import close_genai_client, genai_operation, genai_stream, joined_iterator, prepare_genai_client
+from .gemini_schema import gemini_parameters
 from .gemini_contents import (
     to_gemini_contents,
     tool_call_from_part,
@@ -349,6 +350,10 @@ class GoogleAdapter(LLMAdapter):
             "description": "...",
             "parameters": {...}
         }
+
+        ``parameters`` is the JSON Schema as a google-genai ``Schema``
+        (:func:`~kestrel_sovereign.llm.gemini_schema.gemini_parameters`), the
+        one place a keyword Gemini cannot express is weakened (#3925).
         """
         function_declarations = []
         for tool in tools:
@@ -357,7 +362,10 @@ class GoogleAdapter(LLMAdapter):
                 function_declarations.append({
                     "name": func["name"],
                     "description": func.get("description", ""),
-                    "parameters": func.get("parameters", {"type": "object", "properties": {}})
+                    "parameters": gemini_parameters(
+                        func.get("parameters", {"type": "object", "properties": {}}),
+                        tool_name=func["name"],
+                    ),
                 })
         return function_declarations
 
