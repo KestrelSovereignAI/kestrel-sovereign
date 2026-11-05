@@ -344,8 +344,9 @@ to it too.
 The flag depends only on what the execution observed, at any depth, never on
 the task's state, which keeps its own message and artifacts: a workflow with
 one uncertain step and one that succeeded completes with a partial result and
-is still flagged. A skill that runs another skill as a task carries that
-task's flag too, whatever it returns. `run_workflow` never retries a step
+is still flagged. A skill that runs another skill as a task, itself or through
+its deferred result's completion hooks, carries that task's flag too, whatever
+it returns. `run_workflow` never retries a step
 whose task carries the flag, whatever its `max_retries`, and passes it to its
 own task whatever the step's status, so an enclosing workflow never reruns it.
 If a flagged task cannot be recorded, or another writer's terminal state wins,

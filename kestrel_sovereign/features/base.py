@@ -1540,31 +1540,35 @@ class Feature(_SdkFeature):
 
         try:
             exec_start = time.time()
+            # Bound until the result is settled, not only while the skill
+            # runs: a deferred result's POST_TOOL_USE hooks run after the
+            # skill returns, and a skill they run as a task is part of this
+            # task's execution like one the skill ran itself.
             with _bind_flattened_outcome_unknown(flattened):
                 result = await selected.execute(**args)
-            if isinstance(result, DeferredToolResult):
-                # An A2A task has no chat, so its publication is headless. The
-                # artifact carries only the completed public result.
-                from kestrel_sovereign.agent.orchestrator_engine import (
-                    HEADLESS_PUBLICATION,
-                )
+                if isinstance(result, DeferredToolResult):
+                    # An A2A task has no chat, so its publication is headless.
+                    # The artifact carries only the completed public result.
+                    from kestrel_sovereign.agent.orchestrator_engine import (
+                        HEADLESS_PUBLICATION,
+                    )
 
-                result = await _complete_feature_deferred_result(
-                    self, result, tool_name=skill_name, tool_input=args,
-                    session_id="", exec_start=exec_start,
-                    adapter=f"a2a:{type(self).__name__}.{skill_name}",
-                    destination=HEADLESS_PUBLICATION,
-                )
-            result = _serialize_tool_result(result)
-            # Inline standard JSON preserves integer types and identifiers
-            # beyond binary64 precision. Encoding must succeed before the
-            # task may claim completion after its tool effect.
-            from kestrel_sovereign.a2a.media import encode_inline_json
+                    result = await _complete_feature_deferred_result(
+                        self, result, tool_name=skill_name, tool_input=args,
+                        session_id="", exec_start=exec_start,
+                        adapter=f"a2a:{type(self).__name__}.{skill_name}",
+                        destination=HEADLESS_PUBLICATION,
+                    )
+                result = _serialize_tool_result(result)
+                # Inline standard JSON preserves integer types and identifiers
+                # beyond binary64 precision. Encoding must succeed before the
+                # task may claim completion after its tool effect.
+                from kestrel_sovereign.a2a.media import encode_inline_json
 
-            payload = encode_inline_json(result)
-            artifact = new_raw_artifact(
-                f"{skill_name}_result", payload, media_type="application/json"
-            )
+                payload = encode_inline_json(result)
+                artifact = new_raw_artifact(
+                    f"{skill_name}_result", payload, media_type="application/json"
+                )
         except Exception as error:
             if is_execution_control_error(error):
                 raise

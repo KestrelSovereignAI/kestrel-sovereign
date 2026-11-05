@@ -1,14 +1,17 @@
 """Workflows execute real decorated tools through native primary task storage."""
 
 import asyncio
+import contextlib
 import inspect
 import json
 from types import SimpleNamespace
 
 import pytest
 from kestrel_sdk.features.base import Feature as SDKFeature
+from kestrel_sdk.hooks.base import Hook, HookEvent, HookOutput
 from kestrel_sdk.native_a2a.types import Task, TaskState, TaskStatus
 from kestrel_sdk.resources import ResourceOutcomeUnknown
+from kestrel_sdk.tools import DeferredToolResult
 from kestrel_sdk.tools.base import AgentTool, ToolCategory, ToolSchema
 from kestrel_sdk.tools.result import ToolResult, ToolResultStatus
 
@@ -18,12 +21,15 @@ from kestrel_sovereign.a2a.lifecycle import (
     task_state_label,
 )
 from kestrel_sovereign.a2a.projections import embedded_json_value, message_text
+from kestrel_sovereign.a2a.stores.unified.observability_store import ObservabilityStore
 from kestrel_sovereign.execution_custody import ExecutionAuthorityError
 from kestrel_sovereign.features.base import Feature, observed_outcome_unknown, tool
 from kestrel_sovereign.features.subagent_dispatch import ensure_subagent_dispatch
 from kestrel_sovereign.features.tasks.feature import TaskFeature
 from kestrel_sovereign.storage.db.interface import QueryError
+from kestrel_sovereign.storage.db.sqlite import SQLiteBackend
 from tests.unit.test_a2a_native_task_manager import manager as manager  # noqa: PLC0414
+from tests.unit.test_deferred_tool_delivery import CompletionHost
 from tests.utils.codex_inline import PreTurnReader
 
 
@@ -1180,6 +1186,105 @@ async def test_a_skill_that_ran_an_ordinarily_failing_skill_is_still_rerun(
 ):
     effect.supplier = raise_unavailable
     result = await task_feature.run_workflow([coordinator_step(max_retries=2)])
+    assert effect.calls == 3
+    [record] = result.data["results"]
+    assert record["status"] == "failed" and record["attempts"] == 3
+    assert "outcome_unknown" not in record
+    assert not any(task_outcome_unknown(task) for task in await stored_tasks(manager))
+
+
+class RunsTheEffectOnCompletion(Hook):
+    """A deferred result's completion policy that runs the effect skill."""
+
+    def __init__(self, manager):
+        super().__init__("runs-the-effect-on-completion", [HookEvent.POST_TOOL_USE])
+        self.manager = manager
+
+    async def execute(self, value):
+        if isinstance(value.tool_response, DeferredToolResult):
+            # It allows the result whatever the child did: nothing the
+            # completed result says is that the effect is unknown.
+            with contextlib.suppress(ResourceOutcomeUnknown):
+                await self.manager.execute_skill(
+                    "effect_feature", "apply_effect", {}, sync=True
+                )
+        return HookOutput.allow()
+
+
+def deferring_provider(base):
+    class DeferringProvider(base):
+        tool_description = "Returns a failure completed after the skill returns"
+
+        async def initialize(self):
+            pass
+
+        @tool(name="defer", description="Return a deferred failure")
+        async def defer(self) -> dict:
+            return DeferredToolResult(
+                ToolResult.failed("Deferred step failed").to_dict(),
+                publish=lambda: [],
+            )
+
+    return DeferringProvider
+
+
+@pytest.fixture(params=["core-feature", "sdk-feature"])
+async def deferring(request, manager, tmp_path):
+    """A skill whose deferred result's completion runs the effect skill."""
+    db = SQLiteBackend(str(tmp_path / "deferring-audit.db"))
+    await db.connect()
+    store = ObservabilityStore(db)
+    await store.initialize()
+    host = CompletionHost(store)
+    host.hooks_manager.register(RunsTheEffectOnCompletion(manager))
+    base = Feature if request.param == "core-feature" else SDKFeature
+    provider = ensure_subagent_dispatch(deferring_provider(base))(host)
+    provider.name = "deferring_feature"
+    host.features[type(provider).__name__] = provider
+    manager.register_provider("deferring_feature", provider.get_agent_skills(), provider)
+    try:
+        yield provider
+    finally:
+        await store.close()
+
+
+def deferring_step(max_retries):
+    return {
+        "feature": "deferring_feature",
+        "skill": "defer",
+        "max_retries": max_retries,
+        "retry_delay_ms": 0,
+    }
+
+
+@pytest.mark.parametrize("effect", EVERY_SKILL_FORM, ids=skill_form_id, indirect=True)
+@pytest.mark.parametrize("persisted", [True, False], ids=["recorded", "write-failed"])
+async def test_a_skill_whose_completion_ran_an_uncertain_skill_is_never_rerun(
+    task_feature, effect, deferring, manager, monkeypatch, persisted
+):
+    effect.supplier = raise_unknown
+    if not persisted:
+        reject_task_writes(manager, monkeypatch, is_effect_task)
+    result = await task_feature.run_workflow([deferring_step(max_retries=2)])
+    assert effect.calls == 1
+    [record] = result.data["results"]
+    assert record["status"] == "failed" and record["outcome_unknown"] is True
+    assert record["attempts"] == 1
+    [deferred] = [
+        task for task in await stored_tasks(manager)
+        if task.metadata["skill"] == "defer"
+    ]
+    assert deferred.status.state == TaskState.TASK_STATE_FAILED
+    assert message_text(deferred.status.message) == "Deferred step failed"
+    assert task_outcome_unknown(deferred)
+
+
+@pytest.mark.parametrize("effect", EVERY_SKILL_FORM, ids=skill_form_id, indirect=True)
+async def test_a_skill_whose_completion_ran_an_ordinarily_failing_skill_is_still_rerun(
+    task_feature, effect, deferring, manager
+):
+    effect.supplier = raise_unavailable
+    result = await task_feature.run_workflow([deferring_step(max_retries=2)])
     assert effect.calls == 3
     [record] = result.data["results"]
     assert record["status"] == "failed" and record["attempts"] == 3
