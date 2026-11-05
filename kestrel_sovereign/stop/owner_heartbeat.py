@@ -20,6 +20,12 @@ heartbeat also stops once the thread that started it (the registry's loop
 thread) has ended, closing its connection, so an interpreter that exits without
 closing the registry is not kept alive by the connection's worker thread.
 
+A heartbeat thread that exits without being stopped records why. The registry
+reports the exit within one relay interval, whether or not any work is in
+flight, and restarts the thread only for new work: an admission that finds it
+exited starts a new one and admits nothing until that thread has renewed the
+owner, so it never admits work that would be self-fenced one lease later.
+
 The heartbeat only publishes renewals. The registry folds each one into its
 lease on its own loop, where its generations live, so the thread never touches
 the loop's objects. Every renewal names the owner it renewed, and a renewal of
@@ -58,6 +64,12 @@ from kestrel_sovereign.execution_custody import is_execution_control_error
 logger = logging.getLogger(__name__)
 
 THREAD_NAME = "kestrel-stop-owner-heartbeat"
+
+# How often ``stop()`` looks whether the thread has exited. It looks from the
+# registry's loop rather than joining in that loop's default executor: a join
+# queued there starts its timeout only once a worker is free, so blocking work
+# occupying every worker held close past its budget.
+_EXIT_POLL_SECONDS = 0.01
 
 DatabaseOpener = Callable[[], AsyncContextManager[Any]]
 Renewal = Callable[[Any, str], Awaitable[Any]]
@@ -181,6 +193,11 @@ class OwnerHeartbeat:
         # The type name of an exception a heartbeat connection's close
         # raised: that connection may still be open, so it stays owned.
         self._connection_failure: str | None = None
+        # How many threads were started, when the newest one was, and why
+        # the newest one exited without being stopped.
+        self._launches = 0
+        self._launched_at: float | None = None
+        self._exit_cause: str | None = None
         self._loop: asyncio.AbstractEventLoop | None = None
         self._wake: asyncio.Event | None = None
 
@@ -198,8 +215,54 @@ class OwnerHeartbeat:
 
     def _launch(self) -> None:
         thread = threading.Thread(target=self._run, name=THREAD_NAME, daemon=True)
+        with self._lock:
+            # Anything the previous thread left in flight ended with it.
+            self._in_flight = None
+            self._exit_cause = None
+            self._launches += 1
+            self._launched_at = time.monotonic()
         thread.start()
         self._thread = thread
+
+    @property
+    def launches(self) -> int:
+        """How many heartbeat threads were started: one, until a restart."""
+
+        with self._lock:
+            return self._launches
+
+    @property
+    def launched_at(self) -> float | None:
+        """``time.monotonic()`` just before the newest thread was started."""
+
+        with self._lock:
+            return self._launched_at
+
+    def exit_cause(self) -> str | None:
+        """Why the heartbeat thread exited without being stopped.
+
+        ``None`` while it runs, before it was started, and once it was
+        stopped.
+        """
+
+        if self._thread is None or self._stopping.is_set() or self.alive:
+            return None
+        with self._lock:
+            cause = self._exit_cause
+        return cause or "it exited without recording why"
+
+    def renewed_since_launch(self, owner_id: str) -> bool:
+        """Whether the newest thread has renewed ``owner_id`` since it started."""
+
+        with self._lock:
+            renewed = self._latest_renewed
+            launched_at = self._launched_at
+        return (
+            renewed is not None
+            and launched_at is not None
+            and renewed.owner_id == owner_id
+            and renewed.started >= launched_at
+        )
 
     def ensure_running(self) -> None:
         """Start a new thread if the previous one exited without being stopped."""
@@ -244,10 +307,14 @@ class OwnerHeartbeat:
             in_flight = self._in_flight
             latest = self._latest
             renewed = self._latest_renewed
+            launched_at = self._launched_at
         if self._thread is None:
             return "the heartbeat thread was never started"
         if not self.alive:
-            return "the heartbeat thread has exited"
+            cause = self.exit_cause()
+            if cause is None:
+                return "the heartbeat thread has exited"
+            return f"the heartbeat thread has exited ({cause})"
         if in_flight is not None:
             return f"its renewal has been in flight for {now - in_flight[1]:.1f} s"
         if latest is None:
@@ -256,6 +323,11 @@ class OwnerHeartbeat:
             return (
                 f"its last renewal raised execution control ({latest.failure}), "
                 "which is never retried"
+            )
+        if launched_at is not None and latest.started < launched_at:
+            return (
+                f"it was restarted {now - launched_at:.1f} s ago and has not "
+                "finished a renewal since"
             )
         if latest.failure is not None:
             if renewed is None:
@@ -305,7 +377,8 @@ class OwnerHeartbeat:
         before it exits. Returns whether it retired: its thread exited in
         time and every connection it opened closed. When it did not, the
         caller still owns both; :meth:`retirement_error` names them, and a
-        later ``stop`` waits again.
+        later ``stop`` waits again. The wait takes no worker from the loop's
+        default executor, so blocking work occupying them cannot extend it.
         """
 
         thread = self._thread
@@ -319,7 +392,7 @@ class OwnerHeartbeat:
                 loop.call_soon_threadsafe(wake.set)
             except RuntimeError:
                 pass  # its loop already closed: the thread is exiting
-        await asyncio.to_thread(thread.join, max(timeout, 0.0))
+        await _wait_for_exit(thread, timeout)
         unretired = self.unretired()
         if unretired is not None:
             logger.warning(
@@ -336,7 +409,7 @@ class OwnerHeartbeat:
     def _run(self) -> None:
         try:
             asyncio.run(self._beat_until_stopped())
-        except BaseException:
+        except BaseException as error:
             if self._stopping.is_set():
                 # stop() reports this through unretired().
                 logger.error(
@@ -344,13 +417,19 @@ class OwnerHeartbeat:
                     exc_info=True,
                 )
                 return
+            with self._lock:
+                self._exit_cause = f"it raised {type(error).__name__}"
             # A thread's death is otherwise only printed to stderr. The
-            # registry notices it as a lease that stopped being renewed.
+            # registry reports it too, and restarts it for new work.
             logger.critical(
-                "Distributed Stop owner heartbeat thread died; the owner lease "
-                "lapses within one lease and the registry fences",
+                "Distributed Stop owner heartbeat thread died; nothing renews "
+                "the owner lease until it is restarted",
                 exc_info=True,
             )
+        else:
+            if not self._stopping.is_set():
+                with self._lock:
+                    self._exit_cause = "the thread that started it has ended"
 
     async def _beat_until_stopped(self) -> None:
         wake = asyncio.Event()
@@ -436,6 +515,18 @@ class OwnerHeartbeat:
                 with self._lock:
                     self._loop = None
                     self._wake = None
+
+
+async def _wait_for_exit(thread: threading.Thread, timeout: float) -> None:
+    """Wait up to ``timeout`` seconds for ``thread`` to exit, on this loop."""
+
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + max(timeout, 0.0)
+    while thread.is_alive():
+        remaining = deadline - loop.time()
+        if remaining <= 0:
+            return
+        await asyncio.sleep(min(_EXIT_POLL_SECONDS, remaining))
 
 
 __all__ = [

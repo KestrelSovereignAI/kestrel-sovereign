@@ -625,10 +625,10 @@ The `FENCED` line names what the owner saw:
 
 - `owner lease not renewed for N s (lease is L s): ...`: the heartbeat did not
   renew the lease within it. The rest says why: the heartbeat thread exited,
-  a renewal has been in flight for `N` s (the database answered slowly), or
-  the last renewal failed, naming the exception and how long ago the last
-  successful renewal started. A failed attempt alone never fences: renewals
-  that succeeded while the loop was blocked still hold the lease.
+  naming why, a renewal has been in flight for `N` s (the database answered
+  slowly), or the last renewal failed, naming the exception and how long ago
+  the last successful renewal started. A failed attempt alone never fences:
+  renewals that succeeded while the loop was blocked still hold the lease.
 - `durable generation was lost: the owner heartbeat's renewal found it expired
   or removed`: a renewal found an in-flight row gone, so another replica may
   already have reaped it.
@@ -648,6 +648,17 @@ The `FENCED` line names what the owner saw:
 The heartbeat thread is a daemon, and it also stops once the thread that runs
 the server's loop has ended, so it never keeps a process alive. A process that
 dies or hangs entirely stops renewing, and its lease expires on schedule.
+
+If the heartbeat thread itself dies in a running process, the host logs
+`Distributed Stop owner heartbeat thread has exited (<cause>)` within one relay
+interval, whether or not a turn is running. Turns in flight fence once their
+lease lapses, as above, and ownership is then re-established under a restarted
+heartbeat. Otherwise the next new turn restarts it, and is admitted only once
+the restarted thread has renewed the owner lease. If that has not happened
+within one lease of the restart, the turn is refused with
+`distributed Stop owner heartbeat was restarted and has not renewed the owner
+lease`, followed by the heartbeat's state; it is never admitted only to be
+fenced a lease later.
 
 Server shutdown stops the heartbeat and waits for its thread to exit and close
 its connection. If it has not by the end of the Stop close budget, shutdown

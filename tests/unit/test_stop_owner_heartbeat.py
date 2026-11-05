@@ -7,12 +7,15 @@ acceptance checks, plus the heartbeat's own lifecycle.
 """
 
 import asyncio
+import logging
 import os
 import subprocess
 import sys
 import textwrap
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import asynccontextmanager
 from pathlib import Path
 from uuid import uuid4
 
@@ -217,6 +220,219 @@ async def test_a_dead_heartbeat_lets_the_lease_expire_and_fences_within_it(
         await asyncio.gather(turn, return_exceptions=True)
         await registry.close()
         await peer_db.close()
+        await db.close()
+
+
+def _killable_heartbeat(monkeypatch, *, kill_restarted: bool = False):
+    """Let a test kill the heartbeat thread from inside its next renewal.
+
+    Returns ``(kill, failing)``. Setting ``kill`` ends the thread that next
+    renews; with ``kill_restarted`` it also ends every thread started after
+    it. While ``failing`` is set, renewals fail with an ordinary error.
+    """
+
+    kill, failing = threading.Event(), threading.Event()
+
+    async def renewal(original, store, owner_id, **kwargs):
+        if kill.is_set():
+            if not kill_restarted:
+                kill.clear()
+            raise _HeartbeatKilled()
+        if failing.is_set():
+            raise ConnectionError("renewal store unavailable")
+        return await original(store, owner_id, **kwargs)
+
+    _patch_heartbeat_renewal(monkeypatch, renewal)
+    return kill, failing
+
+
+def _exit_reports(caplog) -> list[str]:
+    return [
+        record.getMessage()
+        for record in caplog.records
+        if record.name == "kestrel_sovereign.stop.invocation"
+        and "owner heartbeat thread has exited" in record.getMessage()
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(60)
+async def test_a_heartbeat_that_died_while_idle_is_restarted_before_the_next_turn(
+    tmp_path, monkeypatch, caplog
+):
+    """An idle owner's heartbeat thread dies. The exit is reported at once,
+    with nothing in flight to age, and the next turn is admitted only under a
+    restarted heartbeat that has renewed: never admitted, then self-fenced."""
+
+    caplog.set_level(logging.ERROR, logger="kestrel_sovereign.stop.invocation")
+    db, store, registry = await _owner_registry(
+        tmp_path / "idle-death.db",
+        poll_seconds=0.01,
+        owner_lease_seconds=_HEALTHY_LEASE_SECONDS,
+    )
+    agent = _SelfFencingReplicaAgent("did:test:idle-death")
+    registry.attach(agent)
+    kill, _failing = _killable_heartbeat(monkeypatch)
+    registry.start()
+    heartbeat = registry._heartbeat
+    turn = None
+    try:
+        await _wait_for(lambda: heartbeat.latest_renewed() is not None)
+        kill.set()
+        await _wait_for(lambda: not heartbeat.alive)
+        died_at = time.monotonic()
+        await _wait_for(lambda: _exit_reports(caplog))
+        assert time.monotonic() - died_at < _HEALTHY_LEASE_SECONDS
+        assert "(it raised _HeartbeatKilled)" in _exit_reports(caplog)[0]
+        assert "the heartbeat thread has exited (it raised _HeartbeatKilled)" == (
+            heartbeat.describe(time.monotonic(), _HEALTHY_LEASE_SECONDS)
+        )
+
+        await asyncio.sleep(_HEALTHY_LEASE_SECONDS + 0.2)
+        # Reported once; only new work restarts it, and nothing was held.
+        assert len(_exit_reports(caplog)) == 1
+        assert not heartbeat.alive
+        assert heartbeat.launches == 1
+        assert registry.owner_lifecycle_status == "healthy"
+
+        turn = asyncio.create_task(agent.run_turn("next-turn"))
+        await asyncio.wait_for(agent.operation_started.wait(), timeout=10)
+        assert heartbeat.alive
+        assert heartbeat.launches == 2
+        assert heartbeat.renewed_since_launch(registry._owner_id)
+        generation_id = _generation_of(registry, agent, "next-turn")
+
+        # Past one lease from admission, the turn still holds its lease.
+        await asyncio.sleep(_HEALTHY_LEASE_SECONDS + 0.3)
+        assert not turn.done()
+        assert registry.owner_lifecycle_status == "healthy"
+        assert registry.owner_epoch == 1
+        inventory = await store.read_owner(
+            registry._owner_id, lease_seconds=_HEALTHY_LEASE_SECONDS
+        )
+        assert generation_id in inventory.live_generation_ids
+
+        agent.release_operation.set()
+        assert await turn == "next-turn"
+    finally:
+        agent.release_operation.set()
+        if turn is not None:
+            await asyncio.gather(turn, return_exceptions=True)
+        await registry.close()
+        await db.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(60)
+@pytest.mark.parametrize("restarted", ["cannot_renew", "dies_again"])
+async def test_a_restarted_heartbeat_that_does_not_renew_refuses_the_turn_by_name(
+    tmp_path, monkeypatch, restarted
+):
+    """No cognition is admitted under a heartbeat that cannot renew it."""
+
+    db, _store, registry = await _owner_registry(
+        tmp_path / f"restart-{restarted}.db",
+        poll_seconds=0.01,
+        owner_lease_seconds=_HEALTHY_LEASE_SECONDS,
+    )
+    agent = _SelfFencingReplicaAgent(f"did:test:restart-{restarted}")
+    registry.attach(agent)
+    kill, failing = _killable_heartbeat(
+        monkeypatch, kill_restarted=restarted == "dies_again"
+    )
+    registry.start()
+    heartbeat = registry._heartbeat
+    try:
+        await _wait_for(lambda: heartbeat.latest_renewed() is not None)
+        kill.set()
+        await _wait_for(lambda: not heartbeat.alive)
+        if restarted == "cannot_renew":
+            failing.set()
+
+        asked_at = time.monotonic()
+        with pytest.raises(InvocationSelfFencedError) as refused:
+            await agent.run_turn("refused-turn")
+        # Within one lease of the restart, and before any cognition ran.
+        assert time.monotonic() - asked_at < _HEALTHY_LEASE_SECONDS + 0.25
+        assert not agent.operation_started.is_set()
+        assert heartbeat.launches == 2
+        message = str(refused.value)
+        if restarted == "cannot_renew":
+            assert heartbeat.alive
+            assert (
+                "heartbeat was restarted and has not renewed the owner lease"
+                in message
+            )
+        else:
+            assert not heartbeat.alive
+            assert "the heartbeat thread has exited (it raised _HeartbeatKilled)" in (
+                message
+            )
+        assert registry._active == {}
+        rows = await db.fetchall("SELECT generation_id FROM stop_active_invocations")
+        assert rows == []
+    finally:
+        kill.clear()
+        failing.clear()
+        await registry.close()
+        await db.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(60)
+async def test_an_admission_never_restarts_the_heartbeat_for_a_lapsed_owner(
+    tmp_path, monkeypatch
+):
+    """With work in flight, a dead heartbeat lets the lease lapse as before.
+    An admission that reads the lapse first fences that owner and is refused
+    by name; it does not restart the heartbeat under the lapsed owner."""
+
+    db, _store, registry = await _owner_registry(
+        tmp_path / "lapsed-owner.db",
+        poll_seconds=0.01,
+        owner_lease_seconds=_HEALTHY_LEASE_SECONDS,
+    )
+    in_flight = _SelfFencingReplicaAgent("did:test:lapsed-in-flight")
+    newcomer = _SelfFencingReplicaAgent("did:test:lapsed-newcomer")
+    registry.attach(in_flight)
+    registry.attach(newcomer)
+    kill, _failing = _killable_heartbeat(monkeypatch)
+    registry.start()
+    heartbeat = registry._heartbeat
+    # Without the relay, the admission is the first to read the lapse.
+    relay = registry._relay_task
+    relay.cancel()
+    await asyncio.gather(relay, return_exceptions=True)
+    registry._relay_task = None
+    turn = asyncio.create_task(in_flight.run_turn("in-flight-turn"))
+    try:
+        await asyncio.wait_for(in_flight.operation_started.wait(), timeout=10)
+        await _wait_for(lambda: heartbeat.latest_renewed() is not None)
+        kill.set()
+        await _wait_for(lambda: not heartbeat.alive)
+        await asyncio.sleep(_HEALTHY_LEASE_SECONDS + 0.1)
+
+        with pytest.raises(InvocationSelfFencedError) as refused:
+            await newcomer.run_turn("newcomer-turn")
+        message = str(refused.value)
+        assert "expired before admission" in message
+        assert "the heartbeat thread has exited (it raised _HeartbeatKilled)" in (
+            message
+        )
+        assert not newcomer.operation_started.is_set()
+        assert heartbeat.launches == 1
+        with pytest.raises(InvocationSelfFencedError):
+            await asyncio.wait_for(turn, timeout=10)
+
+        # Ownership is then re-established under a restarted heartbeat.
+        assert await registry.register(newcomer, "later-turn", 1)
+        assert heartbeat.launches == 2
+        assert registry.owner_epoch == 2
+        assert heartbeat.renewed_since_launch(registry._owner_id)
+    finally:
+        in_flight.release_operation.set()
+        await asyncio.gather(turn, return_exceptions=True)
+        await registry.close()
         await db.close()
 
 
@@ -1518,13 +1734,96 @@ async def test_server_shutdown_keeps_the_stop_database_while_the_heartbeat_runs(
             await db.close()
 
 
+@asynccontextmanager
+async def _saturated_default_executor():
+    """Occupy the only worker of this loop's default executor until exit."""
+
+    loop = asyncio.get_running_loop()
+    prior = getattr(loop, "_default_executor", None)
+    executor = ThreadPoolExecutor(max_workers=1)
+    occupied, release = threading.Event(), threading.Event()
+
+    def occupy() -> None:
+        occupied.set()
+        release.wait(30)
+
+    loop.set_default_executor(executor)
+    blocker = loop.run_in_executor(None, occupy)
+    try:
+        await _wait_for(occupied.is_set)
+        yield
+    finally:
+        release.set()
+        await asyncio.wait_for(blocker, timeout=10)
+        if prior is None:
+            loop._default_executor = None
+        else:
+            loop.set_default_executor(prior)
+        executor.shutdown(wait=True)
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(60)
+@pytest.mark.parametrize("heartbeat_state", ["exits", "is held"])
+async def test_close_waits_for_the_heartbeat_without_a_default_executor_worker(
+    tmp_path, monkeypatch, heartbeat_state
+):
+    """Blocking work occupying the loop's default executor cannot hold close
+    past its budget: it waits for the heartbeat thread from the loop."""
+
+    from kestrel_sovereign.stop import invocation
+
+    monkeypatch.setattr(invocation, "_DEFAULT_CLOSE_DRAIN_SECONDS", 0.02)
+    db, _store, registry = await _owner_registry(tmp_path / "busy-executor.db")
+    hold, entered, release = _hold_heartbeat_renewal(monkeypatch)
+    closing = None
+    try:
+        registry.start()
+        heartbeat = registry._heartbeat
+        if heartbeat_state == "is held":
+            hold.set()
+            await _wait_for(entered.is_set)
+        else:
+            await _wait_for(lambda: heartbeat.latest() is not None)
+
+        async with _saturated_default_executor():
+            started = time.monotonic()
+            closing = asyncio.create_task(registry.close())
+            done, _ = await asyncio.wait({closing}, timeout=5)
+            assert closing in done, (
+                "registry close waited for a worker of the loop's default executor"
+            )
+            took = time.monotonic() - started
+            if heartbeat_state == "exits":
+                await closing
+                assert not heartbeat.alive
+                assert heartbeat.retirement_error() is None
+            else:
+                with pytest.raises(TimeoutError) as caught:
+                    await closing
+                assert "heartbeat has not retired: its thread has not exited" in (
+                    str(caught.value)
+                )
+                assert heartbeat.alive
+            # Its own budget: the heartbeat join waits at most about 1 s.
+            assert took < 3.0
+    finally:
+        release.set()
+        if closing is not None:
+            await asyncio.wait({closing}, timeout=10)
+            if closing.done() and not closing.cancelled():
+                closing.exception()  # reported by the assertions above
+        try:
+            await registry.close()
+        finally:
+            await db.close()
+
+
 def test_a_connection_that_did_not_close_stays_owned(tmp_path):
     """A heartbeat whose connection's close failed has not retired."""
 
     class _CloseFailed(Exception):
         pass
-
-    from contextlib import asynccontextmanager
 
     @asynccontextmanager
     async def opener():
@@ -1621,6 +1920,7 @@ def test_the_heartbeat_stops_once_the_thread_that_started_it_ends(tmp_path):
     while heartbeat.alive and time.monotonic() < deadline:
         time.sleep(0.01)
     assert not heartbeat.alive
+    assert heartbeat.exit_cause() == "the thread that started it has ended"
 
 
 def test_the_heartbeat_thread_exits_with_its_process(tmp_path):

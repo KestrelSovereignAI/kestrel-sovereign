@@ -1074,6 +1074,8 @@ class DistributedInvocationRegistry:
         self._renewed_at: dict[str, float] = {}
         self._heartbeat: OwnerHeartbeat | None = None
         self._observed_renewal: OwnerRenewal | None = None
+        # The heartbeat thread (by launch count) whose exit was reported.
+        self._reported_heartbeat_exit = 0
         # The identity a fenced registry will adopt once the heartbeat has
         # renewed it in time, and when the heartbeat was pointed at it.
         self._candidate_owner_id: str | None = None
@@ -1276,6 +1278,88 @@ class DistributedInvocationRegistry:
             )
         return renewal
 
+    def _note_heartbeat_exit(self) -> None:
+        """Report, once per thread, a heartbeat thread that has exited.
+
+        The relay calls this every poll interval whatever the registry holds,
+        so an exit is reported within one interval, naming why the thread
+        exited, rather than once some generation's lease has aged.
+        """
+
+        heartbeat = self._heartbeat
+        if heartbeat is None or self._closing:
+            return
+        cause = heartbeat.exit_cause()
+        launches = heartbeat.launches
+        if cause is None or self._reported_heartbeat_exit == launches:
+            return
+        self._reported_heartbeat_exit = launches
+        in_flight = (
+            0 if self._lease_lost else len(self._lease_owned_generation_ids())
+        )
+        logger.error(
+            "Distributed Stop owner heartbeat thread has exited (%s): nothing "
+            "renews the owner lease (epoch %d) until it is restarted. %d "
+            "in-flight generation(s) fence once their lease lapses, and "
+            "re-establishing ownership restarts it; otherwise the next "
+            "admission restarts it and admits nothing until it has renewed "
+            "the owner.",
+            cause,
+            self._owner_epoch,
+            in_flight,
+        )
+
+    async def _require_renewing_heartbeat(self) -> None:
+        """Admit only under a heartbeat that renews the current owner.
+
+        Callers hold ``_registration_lock``. Work admitted while the heartbeat
+        thread has exited is never renewed, so it would be self-fenced one
+        lease later. An exited heartbeat is restarted once, and admission
+        waits, for at most one lease from that start, until the new thread has
+        renewed the current owner; otherwise it is refused, naming the
+        heartbeat's state. The thread :meth:`start` launched with the registry
+        is not waited for: its renewals keep the lease of what it admits, as
+        before. A lease that lapsed meanwhile is left to the caller's check.
+        """
+
+        heartbeat = self._heartbeat
+        if heartbeat is None:
+            return
+        if not heartbeat.alive:
+            self._note_heartbeat_exit()
+            # Work already in flight whose lease lapsed fences first: a new
+            # thread must not renew an owner whose lease has expired.
+            self._observe_owner_heartbeat()
+            self._require_terminal_control()
+            if self._lease_lost:
+                return
+            launches = heartbeat.launches
+            heartbeat.ensure_running()
+            if heartbeat.launches == launches:
+                raise InvocationSelfFencedError(
+                    "distributed Stop owner heartbeat could not be restarted, "
+                    "so admission was refused: "
+                    + heartbeat.describe(time.monotonic(), self._owner_lease_seconds)
+                )
+        if heartbeat.launches < 2:
+            return
+        owner_id = self._owner_id
+        deadline = heartbeat.launched_at + self._owner_lease_seconds
+        while not heartbeat.renewed_since_launch(owner_id):
+            self._heartbeat_attempt()
+            self._require_terminal_control()
+            if self._lease_lost:
+                return
+            now = time.monotonic()
+            if not heartbeat.alive or now >= deadline:
+                self._note_heartbeat_exit()
+                raise InvocationSelfFencedError(
+                    "distributed Stop owner heartbeat was restarted and has not "
+                    "renewed the owner lease, so admission was refused: "
+                    + heartbeat.describe(now, self._owner_lease_seconds)
+                )
+            await asyncio.sleep(self._poll_seconds)
+
     def _renewal_raised_control(self) -> bool:
         """Whether a heartbeat renewal has raised execution control.
 
@@ -1372,13 +1456,15 @@ class DistributedInvocationRegistry:
                         "distributed Stop owner lease was lost and could not "
                         f"be re-established ({self.owner_fence_reason})"
                     )
+                await self._require_renewing_heartbeat()
                 self._observe_owner_heartbeat()
                 # Control this observation held refuses the admission, as
                 # it would have had the relay held it first.
                 self._require_terminal_control()
                 if self._lease_lost:
                     raise InvocationSelfFencedError(
-                        "distributed Stop owner lease expired before admission"
+                        "distributed Stop owner lease expired before admission "
+                        f"({self.owner_fence_reason})"
                     )
                 existing_generation_id = self._by_local_generation.get(key)
                 if existing_generation_id is not None:
@@ -1804,6 +1890,7 @@ class DistributedInvocationRegistry:
         renewal = self._heartbeat_attempt()
         # Held control is raised, never read as an unavailable store.
         self._require_terminal_control()
+        self._note_heartbeat_exit()
         heartbeat.ensure_running()
         candidate = self._candidate_owner_id
         since = self._candidate_since
@@ -1879,6 +1966,7 @@ class DistributedInvocationRegistry:
     async def _relay(self) -> None:
         while not self._closing:
             try:
+                self._note_heartbeat_exit()
                 if self._lease_lost:
                     await self._relay_reacquire_owner_lease()
                 else:
