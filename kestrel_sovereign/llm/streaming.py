@@ -109,6 +109,7 @@ from .call_progress import (
     report_call_attempt,
 )
 from .cancellation import CancelToken
+from .completion_protocol import adapter_call, adapter_stream, response_usage_only
 from .codex_adapter import CodexAdapter
 from .codex_app_server import CodexAppServerTransportError
 from .error_handling import LLMError
@@ -1182,9 +1183,9 @@ class StreamingMixin:
         In-tree adapters expose token usage on their tool-aware stream even for
         text-only turns.  Public plain-stream APIs consume the same stream but
         hide its terminal protocol response, preserving their historical return
-        shape.  A third-party basic stream remains supported; it records an
-        explicit ``usage_available=false`` attempt instead of inventing zero
-        tokens or silently skipping telemetry.
+        shape. A third-party basic stream must also end in one terminal
+        response. An unknown usage count stays unknown; a missing terminal
+        is a protocol failure, never an invented successful response.
 
         ``require_completion`` holds the attempt to the generation gate
         (:func:`~kestrel_sovereign.llm.generation_gate.judge_generation`,
@@ -1264,7 +1265,12 @@ class StreamingMixin:
 
         async def forward(stream: AsyncIterator[Any]) -> AsyncIterator[Any]:
             nonlocal emitted, final_response
-            async with _owned_stream(self, stream) as iterator:
+
+            def retain_terminal(response: LLMResponse) -> None:
+                nonlocal final_response
+                final_response = response_usage_only(response)
+
+            async with _owned_stream(self, adapter_stream(stream, on_terminal=retain_terminal)) as iterator:
                 while True:
                     with bind_execution_custody_snapshot(admitted_custody):
                         require_execution_work(self)
@@ -1356,7 +1362,11 @@ class StreamingMixin:
                 # binding the original snapshot also rejects a lost runtime.
                 with (bind_execution_cleanup(self, admitted_custody) if aborted else bind_execution_custody_snapshot(admitted_custody)):
                     duration_ms = int((time.monotonic() - started) * 1000)
-                    rejection_message = None if rejected is None else recorded_message(rejected)
+                    rejection_message = (
+                        recorded_message(rejected) if rejected is not None
+                        else recorded_message(failure) if failure is not None and not aborted
+                        else None
+                    )
                     refused_usage = None if failure is None else reported_usage(failure)
                     if final_response is not None:
                         await self._record_streamed_usage(
@@ -1365,7 +1375,7 @@ class StreamingMixin:
                             provider_name,
                             duration_ms=duration_ms,
                             path=path,
-                            success=rejected is None,
+                            success=rejected is None and failure is None,
                             error_message=rejection_message,
                             # The terminal response was stamped before it was exposed.
                             publish_identity=False,
@@ -1514,7 +1524,7 @@ class StreamingMixin:
 
         report_call_attempt(provider_name, model)
         started = time.monotonic()
-        response = await bound_attempt_call(route, provider_name, model, attempt)
+        response = await adapter_call(bound_attempt_call(route, provider_name, model, attempt))
         rejected: Optional[IncompleteGenerationError] = None
         if require_completion:
             try:

@@ -35,6 +35,8 @@ host actions only through Kestrel's hooked executor (#1965).
 """
 from __future__ import annotations
 
+from contextlib import aclosing
+
 import asyncio
 import base64
 import binascii
@@ -3646,23 +3648,15 @@ class CodexAdapter(LLMAdapter):
         tools: Optional[List[Dict[str, Any]]] = None,
         response_format: Optional[Type[BaseModel]] = None,
         **kwargs,
-    ) -> AsyncIterator[Union[str, ThinkingDelta]]:
-        session_id = kwargs.get("session_id")
-        cancel_token = kwargs.get("cancel_token")
-        keep_trailing_system = bool(kwargs.get("keep_trailing_system"))
-        # Tools intentionally not passed: text-only streaming surface.
-        # Uses ``_run_turn_with_retry`` so a transient codex idle stall
-        # gets one chance to recover before the error surfaces. See #1411.
-        async with owned_execution_stream(self, self._run_turn_with_retry(
-            model, messages, None, session_id, None,
-            cancel_token=cancel_token,
-            keep_trailing_system=keep_trailing_system,
-        )) as _owned_forwarder_3542:
-            async for ev in _owned_forwarder_3542:
-                if "text" in ev:
-                    yield ev["text"]
-                elif "thinking" in ev:
-                    yield ThinkingDelta(ev["thinking"], provider="codex")
+    ) -> AsyncIterator[Union[str, LLMResponse]]:
+        """Yield plain text and one terminal response from the canonical stream."""
+        kwargs = {**kwargs, "tool_executor": None}
+        async with aclosing(self._plain_stream(
+            client=client, model=model, messages=messages, tools=tools,
+            response_format=response_format, **kwargs,
+        )) as stream:
+            async for item in stream:
+                yield item
 
     async def get_streaming_response_with_tools(
         self,

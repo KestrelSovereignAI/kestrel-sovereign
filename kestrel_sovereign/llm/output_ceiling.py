@@ -53,10 +53,8 @@ from kestrel_sdk.llm import LLMResponse
 
 logger = logging.getLogger(__name__)
 
-#: Runtime attribute carrying the provider's stop reason on an
-#: ``LLMResponse``. The SDK dataclass has no field for it; adapter-supplied
-#: extras ride as attributes (see ``executed_tool_calls``), and every reader
-#: goes through :func:`response_stop_reason`.
+#: Public SDK field carrying the provider's native stop reason. Completion
+#: policy reads it through :func:`response_stop_reason`.
 STOP_REASON_ATTR = "stop_reason"
 
 

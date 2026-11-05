@@ -5,7 +5,7 @@ OAuth. The dedicated MCP CI job installs the optional feature explicitly.
 """
 
 import asyncio
-from contextlib import AsyncExitStack
+from contextlib import AsyncExitStack, contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 import uuid
@@ -26,6 +26,183 @@ from kestrel_sovereign.kestrel_agent import KestrelAgent
 
 pytestmark = [pytest.mark.mcp_integration, pytest.mark.timeout(120)]
 
+
+@contextmanager
+def owned_provider_network(monkeypatch, peer):
+    """Permit only the exact owned TLS listener for provider and MCP traffic."""
+    import socket
+    from urllib.parse import urlsplit
+
+    endpoint = urlsplit(peer.provider_url)
+    with monkeypatch.context() as network:
+        network.setenv("NO_PROXY", endpoint.hostname)
+        original_connect = socket.socket.connect
+        original_connect_ex = socket.socket.connect_ex
+        dials = []
+
+        def require_owned(address):
+            assert isinstance(address, tuple) and address[:2] == ("127.0.0.1", endpoint.port)
+            dials.append(address)
+
+        def connect(sock, address):
+            require_owned(address)
+            return original_connect(sock, address)
+
+        def connect_ex(sock, address):
+            require_owned(address)
+            return original_connect_ex(sock, address)
+
+        network.setattr(socket.socket, "connect", connect)
+        network.setattr(socket.socket, "connect_ex", connect_ex)
+        yield dials
+
+
+async def test_owned_native_provider_wire_has_no_remote_tool_effect(tmp_path, monkeypatch):
+    """Use the installed provider and native SDK; never a metered vendor."""
+    from kestrel_llm_deepseek import DeepSeekAdapter
+
+    async with https_peer(tmp_path, monkeypatch, provider_model="owned-permission-model") as peer:
+        with owned_provider_network(monkeypatch, peer) as dials:
+            provider = DeepSeekAdapter.create_provider({
+                "api_key": "owned-synthetic-provider-key", "base_url": peer.provider_url,
+                "model": "owned-permission-model",
+            })
+            try:
+                models = await provider.adapter.list_models(provider.client)
+                assert [model.id for model in models] == ["owned-permission-model"]
+                response = await provider.adapter.get_response(provider.client, provider.model,
+                    [{"role": "user", "content": "Record the owned marker"}], tools=[{
+                        "type": "function", "function": {"name": "record_marker", "parameters": {
+                            "type": "object", "properties": {"marker": {"type": "string"}},
+                            "required": ["marker"],
+                        }},
+                    }])
+                call, = response.tool_calls
+                assert call.name == "record_marker" and call.arguments == {"marker": "owned-provider-effect"}
+                assert await peer.witness(None, None) == [], "Provider tool selection must not execute the MCP tool"
+                assert dials
+            finally:
+                await provider.client.close()
+
+
+@pytest.mark.parametrize("permission,decision,witness,fault", [
+    (PermissionLevel.DENY, "auto_denied", [], None),
+    (PermissionLevel.ALLOW, "auto_allowed", ["owned-provider-effect"], None),
+    (PermissionLevel.ALLOW, None, [], "wrong_choice"),
+])
+@pytest.mark.parametrize("streaming", [False, True])
+async def test_full_boot_http_invoke_governs_external_mcp_effect(tmp_path, monkeypatch, permission, decision, witness, fault, streaming):
+    """Drive actual agent boot, HTTP invoke, provider SDK and native MCP."""
+    import json
+    import httpx2
+    from cryptography.fernet import Fernet
+    from fastapi import FastAPI
+    from kestrel_sovereign import server
+    from kestrel_sovereign.api_errors import register_api_error_handlers
+    from kestrel_sovereign.endpoints.agent import router
+    from kestrel_sovereign.inception_service import create_kestrel_identity_async
+    from kestrel_sovereign.llm.service import LLMService
+    from kestrel_sovereign.multi_agent.config import MANDATORY_FEATURES
+    from kestrel_sovereign.rate_limit import limiter
+    from kestrel_sovereign.security.private_delivery import PrivateDeliveryMiddleware
+    from kestrel_sovereign.security.request_auth import (
+        AuthenticatedSessionMiddleware, InteractiveAuthenticationLifetimeMiddleware,
+        RequestAuthenticationService,
+    )
+    from tests.shared.genesis_audit import deterministic_safe_genesis_auditor
+
+    async with AsyncExitStack() as cleanup:
+        runtime = cleanup.enter_context(monkeypatch.context())
+        runtime.chdir(tmp_path)
+        runtime.setenv("KESTREL_HOME", str(tmp_path))
+        runtime.setenv("KESTREL_DB_PATH", str(tmp_path))
+        runtime.setenv("KESTREL_API_KEY", "owned-native-invoke-key")
+        runtime.setenv("AWS_EC2_METADATA_DISABLED", "true")
+        data_key = tmp_path / "owned-data-key"
+        data_key.write_bytes(Fernet.generate_key())
+        data_key.chmod(0o600)
+        runtime.setenv("KESTREL_DATA_KEY_FILE", str(data_key))
+        runtime.setenv("KESTREL_DATA_KEY", data_key.read_text().strip())
+        peer = await cleanup.enter_async_context(https_peer(
+            tmp_path, runtime, provider_model="owned-permission-model", provider_fault=fault))
+        dials = cleanup.enter_context(owned_provider_network(runtime, peer))
+        (tmp_path / "kestrel.toml").write_text(
+            '[llm]\nroute_priority=["deepseek:api"]\n'
+            '[llm.vendors.deepseek.routes.api]\n'
+            'api_key="owned-synthetic-provider-key"\n'
+            f'base_url={json.dumps(peer.provider_url)}\nmodel="owned-permission-model"\n')
+        identity = await create_kestrel_identity_async(output_dir=str(tmp_path), is_test_instance=True,
+            agent_name="OwnedNativeInvoke", did_web_domain="owned-native-invoke.invalid",
+            genesis_auditor=deterministic_safe_genesis_auditor,
+            genesis_audit_provenance="test:3679-owned-native-invoke")
+        service = LLMService(agent_data_dir=tmp_path)
+        cleanup.push_async_callback(service.close)
+        agent = KestrelAgent(did=identity.agent_did, storage_path=str(tmp_path / "kestrel_prime.db"),
+            llm_service=service, allowed_features={"MCPAgent", "BootstrapFeature"}, sync_enabled=False)
+
+        async def shutdown():
+            await asyncio.wait_for(agent.shutdown(), 30)
+
+        cleanup.push_async_callback(shutdown)
+        await asyncio.wait_for(agent.initialize(), 30)
+        assert {type(feature).__name__ for feature in agent.features.values()} == MANDATORY_FEATURES | {"MCPAgent", "BootstrapFeature"}
+        feature = next(feature for feature in agent.features.values() if type(feature).__name__ == "MCPAgent")
+        security = next(feature for feature in agent.features.values() if type(feature).__name__ == "SecurityFeature")
+        loaded = await feature.load_tool(peer.selector)
+        assert loaded.status.value == "ok", loaded.to_dict()
+        owner = "mcp:remote:" + loaded.data["connection"]
+        handle, = [name for name, tool_owner in agent._tool_to_feature.items() if tool_owner == owner]
+        await security.permission_store.set_permission(owner, handle, permission)
+        app = FastAPI()
+        app.state.agent = agent
+        app.state.limiter = limiter
+        app.state.request_authentication = RequestAuthenticationService(
+            api_key=lambda: server.get_api_key(generate_if_missing=False))
+        app.add_middleware(InteractiveAuthenticationLifetimeMiddleware)
+        app.middleware("http")(server.auth_middleware)
+        app.add_middleware(AuthenticatedSessionMiddleware,
+            secret_key="owned-native-invoke-session-signing-key", session_cookie="kestrel_session", max_age=600)
+        app.add_middleware(PrivateDeliveryMiddleware)
+        register_api_error_handlers(app)
+        app.include_router(router)
+        client = await cleanup.enter_async_context(httpx2.AsyncClient(
+            transport=httpx2.ASGITransport(app=app), base_url="https://owned-console.invalid",
+            headers={"X-API-Key": "owned-native-invoke-key"}))
+        greeting = await asyncio.wait_for(client.post("/api/agent/invoke", json={
+            "input": "Hello", "session_id": "owned-native-permission",
+        }), 30)
+        assert greeting.status_code == 200, greeting.text
+        assert await peer.witness(feature, loaded.data["connection"]) == []
+        onboarding = await asyncio.wait_for(client.post("/api/agent/invoke", json={
+            "input": "!skip-discovery", "session_id": "owned-native-permission",
+        }), 30)
+        assert onboarding.status_code == 200, onboarding.text
+        assert await agent.bootstrap_service.is_bootstrap_needed() is False
+        before_calls = len([r for r in peer.provider_requests() if r["path"].endswith("/chat/completions")])
+        result = await asyncio.wait_for(client.post("/api/agent/stream" if streaming else "/api/agent/invoke", json={
+            "input": "Record the owned marker using the connected MCP tool.",
+            "provider": "deepseek:api", "model": "owned-permission-model",
+            "session_id": "owned-native-permission",
+        }), 30)
+        assert await peer.witness(feature, loaded.data["connection"]) == witness
+        decisions = [row["decision"] for row in await security.permission_store.get_audit_log()
+            if row["feature"] == owner and row["tool"] == handle]
+        if fault is None:
+            assert result.status_code == 200, result.text
+            assert decisions == [decision], {"response": result.text, "provider_requests": peer.provider_requests()}
+        else:
+            if streaming:
+                from kestrel_sovereign.llm.completion_protocol import GenerationProtocolError
+                from kestrel_sovereign.llm.streaming_errors import agent_stream_error_block
+                assert result.status_code == 200, result.text
+                assert agent_stream_error_block(GenerationProtocolError()) in result.text, result.text
+            else:
+                assert result.status_code == 502, result.text
+                assert "generation_incomplete" in result.text, result.text
+            assert decisions == []
+            after_calls = len([r for r in peer.provider_requests() if r["path"].endswith("/chat/completions")])
+            assert after_calls - before_calls == 1, "The malformed pinned route was retried"
+        assert dials
 
 @dataclass
 class MCPBoundary:

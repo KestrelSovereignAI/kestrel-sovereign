@@ -7,6 +7,10 @@ Adapter for Anthropic's Claude API with support for:
 - Streaming responses
 - API-based model discovery
 """
+
+from contextlib import aclosing
+
+from kestrel_sovereign.execution_custody import owned_execution_stream
 import json
 import logging
 import os
@@ -1560,122 +1564,14 @@ class AnthropicAdapter(LLMAdapter):
         response_format: Optional[Type[BaseModel]] = None,
         system_prompt: Optional[str] = None,
         **kwargs
-    ) -> AsyncIterator[Union[str, ThinkingDelta]]:
-        """
-        Get streaming response from Anthropic Claude.
-
-        Args:
-            client: Anthropic AsyncClient
-            model: Model name
-            messages: Chat messages
-            tools: Optional tools
-            response_format: Optional Pydantic model (not fully supported in streaming)
-            system_prompt: System prompt
-            **kwargs: Additional parameters
-
-        Yields:
-            Text chunks as they arrive
-
-        Note:
-            Structured output with response_format is not well-supported in streaming mode
-            for Anthropic. Use non-streaming get_response for structured output.
-        """
-        _validate_sampling_parameters(kwargs)
-        cancel_token: Optional[CancelToken] = kwargs.pop("cancel_token", None)
-        try:
-            raise_if_cancelled(cancel_token)
-            filtered_messages, combined_system = self._convert_messages_to_anthropic(
-                messages,
-                system_prompt,
-                keep_trailing_system=kwargs.get("keep_trailing_system", False),
-                model=model,
-            )
-            
-            api_params = {
-                "model": self._resolve_wire_model_id(model),
-                "messages": filtered_messages,
-            }
-
-            if combined_system:
-                api_params["system"] = combined_system
-
-            if tools:
-                api_params["tools"] = self._convert_tools_to_anthropic_format(tools)
-
-            # Note: response_format is not applied on this text-only stream;
-            # structured output goes through get_response or
-            # get_streaming_response_with_tools.
-
-            # Attach cache_control markers — see issue #705 and _apply_cache_control.
-            api_params = self._apply_cache_control(api_params)
-            api_params = self._maybe_apply_request_options(api_params, kwargs, model)
-            _ensure_anthropic_beta_header(api_params, _EXTENDED_CACHE_TTL_BETA)
-            # OAuth/plan route only: shape the request like Claude Code and
-            # refresh the access token if it is near expiry. No-ops on the
-            # API-key route. See _apply_oauth_request_shaping / CLAUDE_CODE_IDENTITY.
-            api_params = self._apply_oauth_request_shaping(api_params)
-            await self._ensure_fresh_oauth_token(client)
-            model_ceiling = await self._apply_output_ceiling(
-                client, model, api_params, kwargs, cancel_token,
-            )
-            splitter = ThinkingContentSplitter(provider="anthropic")
-            stop_reason = None
-            text_yielded = False
-
-            async with _anthropic_stream_with_retry(client, api_params) as stream:
-                stream_iter = stream.__aiter__()
-                while True:
-                    try:
-                        event = await _next_stream_event(
-                            stream_iter, cancel_token
-                        )
-                    except StopAsyncIteration:
-                        break
-                    event_type = getattr(event, 'type', None)
-                    if event_type == 'message_delta':
-                        # #3300: the terminal stop_reason rides on the
-                        # message_delta's ``delta``.
-                        stop_reason = getattr(
-                            getattr(event, 'delta', None), 'stop_reason', None,
-                        ) or stop_reason
-                        continue
-                    if event_type != 'content_block_delta' or not hasattr(event, 'delta'):
-                        logger.debug("Ignoring unsupported Anthropic stream event: %s", event_type)
-                        continue
-                    delta = event.delta
-                    delta_type = getattr(delta, 'type', None)
-                    if delta_type == 'text_delta':
-                        text = getattr(delta, 'text', '')
-                        if text:
-                            for item in splitter.feed(text):
-                                text_yielded = text_yielded or (
-                                    isinstance(item, str) and bool(item)
-                                )
-                                yield item
-                    elif delta_type == 'thinking_delta':
-                        thinking = getattr(delta, 'thinking', None)
-                        if thinking is None:
-                            thinking = getattr(delta, 'text', None)
-                        if thinking:
-                            yield ThinkingDelta(thinking, provider="anthropic")
-                    elif delta_type:
-                        logger.debug("Ignoring unsupported Anthropic delta type: %s", delta_type)
-                for item in splitter.flush():
-                    text_yielded = text_yielded or (isinstance(item, str) and bool(item))
-                    yield item
-
-            # #3300: the streamed text is already on screen, so a cut at the
-            # model's ceiling is marked by a final chunk rather than hidden.
-            notice = self._output_ceiling_notice(model, stop_reason, model_ceiling)
-            if notice is not None:
-                yield output_ceiling_notice_chunk(notice, follows_text=text_yielded)
-
-        except Exception as e:
-            logger.error(
-                "Anthropic streaming error [credential=%s]: %s",
-                self._credential_identity(), type(e).__name__,
-            )
-            raise
+    ) -> AsyncIterator[Union[str, LLMResponse]]:
+        """Yield plain text and one terminal response from the canonical stream."""
+        async with aclosing(self._plain_stream(
+            client=client, model=model, messages=messages, tools=tools,
+            response_format=response_format, system_prompt=system_prompt, **kwargs,
+        )) as stream:
+            async for item in stream:
+                yield item
 
     async def get_streaming_response_with_tools(
         self,
@@ -1965,8 +1861,7 @@ class AnthropicAdapter(LLMAdapter):
             parsed_tool_calls = None
             if tool_calls_accumulator:
                 parsed_tool_calls = []
-                for idx in sorted(tool_calls_accumulator.keys()):
-                    tc_data = tool_calls_accumulator[idx]
+                for tc_data in tool_calls_accumulator.values():
                     try:
                         args = json.loads(tc_data["arguments"]) if tc_data["arguments"] else {}
                     except json.JSONDecodeError:

@@ -4839,6 +4839,8 @@ class LLMService(DecisionServiceMixin, ModalityRecordingMixin, ModelDiscoveryMix
         transport (:func:`~kestrel_sovereign.llm.streaming.is_harness_owned_stall`).
         """
 
+        from .completion_protocol import adapter_call
+
         def recorded_error(error: Exception) -> Exception:
             if error_message_override is not None:
                 return LLMServiceError(error_message_override)
@@ -4858,7 +4860,7 @@ class LLMService(DecisionServiceMixin, ModalityRecordingMixin, ModelDiscoveryMix
             report_call_attempt(provider_name, model)
             started = time.monotonic()
             try:
-                response = await bound_attempt_call(route, provider_name, model, attempt)
+                response = await adapter_call(bound_attempt_call(route, provider_name, model, attempt))
                 await require_native_execution_admission(self)
             except ExecutionAuthorityError:
                 raise

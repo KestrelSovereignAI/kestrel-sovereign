@@ -188,14 +188,14 @@ class _Wire:
 
 
 async def _request(route: _Route, path: str, wire: _Wire, messages, **kwargs) -> Any:
-    """Send ``messages`` through ``route`` on the plain or the streamed request."""
+    """Exercise the native request builder through generation or its canonical stream."""
     adapter = route.adapter()
     client = route.client(wire)
     if path == "generate":
         return await adapter.get_response(
             client=client, model=MODEL, messages=messages, **kwargs,
         )
-    return [item async for item in adapter.get_streaming_response(
+    return [item async for item in adapter._stream_with_usage(
         client=client, model=MODEL, messages=messages, **kwargs,
     )]
 

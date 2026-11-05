@@ -2043,7 +2043,7 @@ class TestToolExecutorBridge:
         ]
         a = _adapter_with(events)
         out = [
-            c async for c in a.get_streaming_response(
+            c async for c in a.get_streaming_response_with_tools(
                 client="x", model="auto",
                 messages=[{"role": "user", "content": "hi"}],
                 session_id="s",
@@ -2051,6 +2051,13 @@ class TestToolExecutorBridge:
         ]
         deltas = [c for c in out if isinstance(c, ThinkingDelta)]
         assert [d.content for d in deltas] == ["thinking-one", "summary-two"]
+
+        plain_adapter = _adapter_with(events)
+        plain = [item async for item in plain_adapter.get_streaming_response(
+            client="x", model="auto", messages=[{"role": "user", "content": "hi"}], session_id="plain",
+        )]
+        assert not any(isinstance(item, ThinkingDelta) for item in plain)
+        assert isinstance(plain[-1], LLMResponse)
 
     @pytest.mark.asyncio
     async def test_executed_tool_calls_attached_with_app_server_callid(self):

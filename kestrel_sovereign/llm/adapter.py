@@ -26,9 +26,9 @@ from dataclasses import dataclass
 import json
 import math
 import re
-from typing import Any, Dict, List, Optional, TYPE_CHECKING, Union
+from typing import Any, AsyncIterator, Dict, List, Optional, TYPE_CHECKING, Union
 
-from kestrel_sdk.llm import LLMResponse, ToolCall
+from kestrel_sdk.llm import LLMProtocolError, LLMResponse, ToolCall, ToolCallStarted
 from kestrel_sdk.llm import LLMAdapter as _SDKLLMAdapter
 
 from .cancellation import CancelToken
@@ -400,6 +400,34 @@ class LLMAdapter(_SDKLLMAdapter):
     #: providers only surface usage on the final chunk, where the terminal
     #: ``LLMResponse`` already carries it.
     supports_partial_usage_flush: bool = False
+
+    async def _plain_stream(
+        self, client: Any, model: str, messages: List[Dict[str, Any]],
+        tools: Optional[List[Dict[str, Any]]] = None, **kwargs: Any,
+    ) -> AsyncIterator[Union[str, LLMResponse]]:
+        """One projection of the canonical provider stream for all plain facades."""
+        from contextlib import aclosing
+        from .completion_protocol import adapter_stream
+
+        if tools:
+            raise LLMProtocolError("Plain streaming does not accept tools.")
+        async with aclosing(adapter_stream(
+            self.get_streaming_response_with_tools(
+                client=client, model=model, messages=messages, tools=None, **kwargs,
+            ),
+        )) as stream:
+            async for item in stream:
+                if isinstance(item, ThinkingDelta):
+                    continue
+                if isinstance(item, ToolCallStarted) or (
+                    isinstance(item, LLMResponse) and (
+                        item.has_tool_calls or item.stop_reason in {"tool_calls", "function_call", "tool_use"}
+                    )
+                ):
+                    raise LLMProtocolError("Plain streaming received unexpected tool evidence.")
+                if not isinstance(item, (str, LLMResponse)):
+                    raise LLMProtocolError("Plain streaming received an invalid response item.")
+                yield item
 
     async def probe_reachable(
         self,

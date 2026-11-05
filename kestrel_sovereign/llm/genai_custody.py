@@ -2,8 +2,9 @@
 
 The maintained SDK returns several generators whose bare ``async for`` does
 not close its child. Record each acquired handle in a request-local lexical
-owner, including the HTTP response before any read. Retirement joins every
-layer and the native body; async-generator finalization is never the owner.
+owner, including the HTTP response before any read. Retirement joins retained
+layers and the native body. New SDK forwarding layers can remain suspended
+after that physical response closes; their eventual finalizers own no I/O.
 """
 
 import inspect

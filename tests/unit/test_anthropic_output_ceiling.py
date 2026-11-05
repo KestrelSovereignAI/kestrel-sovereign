@@ -591,7 +591,9 @@ async def test_text_stream_cut_at_model_ceiling_ends_with_the_notice():
         client=_streaming_client(_text_events("Question 1: yes", stop_reason="max_tokens")),
         model="claude-opus-5", messages=USER,
     ))
-    assert items == ["Question 1: yes", f"\n\n{NOTICE}"]
+    assert items[:-1] == ["Question 1: yes", f"\n\n{NOTICE}"]
+    assert isinstance(items[-1], LLMResponse)
+    assert items[-1].stop_reason == "max_tokens"
 
 
 @pytest.mark.asyncio
@@ -605,7 +607,9 @@ async def test_text_stream_cut_with_no_text_yields_only_the_notice():
     items = await _collect(AnthropicAdapter().get_streaming_response(
         client=_streaming_client(events), model="claude-opus-5", messages=USER,
     ))
-    assert items == [NOTICE]
+    assert items[:-1] == [NOTICE]
+    assert isinstance(items[-1], LLMResponse)
+    assert items[-1].stop_reason == "max_tokens"
 
 
 @pytest.mark.asyncio
@@ -614,7 +618,9 @@ async def test_text_stream_finished_has_no_notice():
         client=_streaming_client(_text_events("All done.", stop_reason="end_turn")),
         model="claude-opus-5", messages=USER,
     ))
-    assert items == ["All done."]
+    assert items[:-1] == ["All done."]
+    assert isinstance(items[-1], LLMResponse)
+    assert items[-1].stop_reason == "end_turn"
 
 
 # ---------------------------------------------------------------------------

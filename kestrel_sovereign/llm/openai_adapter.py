@@ -7,6 +7,10 @@ Adapter for OpenAI's chat completion API with full support for:
 - Vision (image inputs)
 - API-based model discovery
 """
+
+from contextlib import aclosing
+
+from kestrel_sovereign.execution_custody import owned_execution_stream
 import json
 import os
 import re
@@ -661,128 +665,14 @@ class OpenAIAdapter(LLMAdapter):
         tools: Optional[List[Dict[str, Any]]] = None,
         response_format: Optional[Type[BaseModel]] = None,
         **kwargs
-    ) -> AsyncIterator[Union[str, ThinkingDelta]]:
-        """
-        Gets a streaming response from the OpenAI model.
-
-        Note: Streaming with tools is complex as tool calls arrive in chunks.
-        This implementation yields text content only. For tool calls during
-        streaming, use the non-streaming get_response method.
-
-        Args:
-            client: OpenAI async client
-            model: Model name to use
-            messages: Chat messages
-            tools: Optional tools
-            response_format: Optional Pydantic model (streaming will yield JSON chunks)
-            **kwargs: Additional parameters
-
-        Yields:
-            Text chunks as they arrive
-        """
-        retain_native_execution_http_client_close(getattr(client, "_client", None))
-        try:
-            # Apply provider/model-specific system-prompt contributions (e.g. the
-            # GPT-5 behavior contract). #807 / #806.
-            messages = self._apply_system_prompt_contribution(messages, model)
-            # Normalize messages for OpenAI compatibility
-            normalized_messages = self._normalize_messages(messages)
-
-            extra_kwargs = {}
-            if tools:
-                extra_kwargs["tools"] = tools
-                extra_kwargs["tool_choice"] = "auto"
-
-            # Handle structured output in streaming mode
-            if response_format is not None and issubclass(response_format, BaseModel):
-                extra_kwargs["response_format"] = _structured_response_format(response_format)
-
-            # Pass through additional kwargs
-            if "max_tokens" in kwargs:
-                extra_kwargs["max_completion_tokens"] = kwargs["max_tokens"]
-            for key in ["temperature", "top_p", "frequency_penalty", "presence_penalty"]:
-                if key in kwargs:
-                    extra_kwargs[key] = kwargs[key]
-
-            # Provider-specific body extensions (issue #704).  See get_response().
-            if "extra_body" in kwargs and kwargs["extra_body"]:
-                extra_kwargs["extra_body"] = kwargs["extra_body"]
-
-            extra_kwargs = self._prepare_chat_completion_request(
-                extra_kwargs,
-                model=model,
-                options=kwargs.get("request_options"),
-            )
-
-            logger.info(f"Starting OpenAI stream for model: {model}")
-            async def acquire_stream(**request):
-                async with native_execution_response_owner(getattr(client, "_client", None)) as responses:
-                    acquired = await client.chat.completions.create(**request)
-                    # The returned SDK stream now owns the same response;
-                    # failed SDK entry instead retires every hidden handle.
-                    responses.handles.clear()
-                    return acquired
-
-            stream = await with_retry(
-                acquire_stream,
-                model=model,
-                messages=normalized_messages,
-                stream=True,
-                acquired_result_cleanup=close_native_execution_stream,
-                **extra_kwargs
-            )
-
-            from kestrel_sovereign.execution_custody import retain_native_execution_stream_close
-            retain_native_execution_stream_close(stream, self)
-
-            splitter = _ThinkingContentSplitter(provider=self.name)
-            chunk_count = 0
-            finish_reason = None
-            try:
-                async for chunk in stream:
-                    report_call_progress()
-                    # #3355: the finish reason rides on the last choice chunk.
-                    finish_reason = _finish_reason(chunk.choices[0]) or finish_reason
-                    delta = chunk.choices[0].delta
-                    reasoning_content = getattr(delta, "reasoning_content", None)
-                    if isinstance(reasoning_content, str) and reasoning_content:
-                        yield ThinkingDelta(reasoning_content, provider=self.name)
-                    content_delta = getattr(delta, "content", None)
-                    if isinstance(content_delta, str) and content_delta:
-                        for item in splitter.feed(content_delta):
-                            if isinstance(item, str):
-                                chunk_count += 1
-                            yield item
-            finally:
-                await close_native_execution_stream(stream, self)
-
-            for item in splitter.flush():
-                if isinstance(item, str):
-                    chunk_count += 1
+    ) -> AsyncIterator[Union[str, LLMResponse]]:
+        """Yield plain text and one terminal response from the canonical stream."""
+        async with aclosing(self._plain_stream(
+            client=client, model=model, messages=messages, tools=tools,
+            response_format=response_format, **kwargs,
+        )) as stream:
+            async for item in stream:
                 yield item
-
-            # #3355: the streamed text is already on screen, so a cut at the
-            # provider's output limit is marked by a final chunk.
-            notice = self._output_limit_notice(
-                model, finish_reason, _caller_output_budget(extra_kwargs),
-            )
-            if notice is not None:
-                yield output_ceiling_notice_chunk(notice, follows_text=chunk_count > 0)
-
-            logger.info(f"Stream completed. Total chunks: {chunk_count}")
-
-        except openai.RateLimitError as e:
-            logger.error("OpenAI rate limit exceeded during streaming: %s", type(e).__name__)
-            raise
-        except openai.APIConnectionError as e:
-            logger.error("OpenAI connection error during streaming: %s", type(e).__name__)
-            raise
-        except openai.APIError as e:
-            logger.error("OpenAI API error during streaming: %s", type(e).__name__)
-            raise
-        except Exception as e:
-            logger.error("OpenAI streaming failed: %s", type(e).__name__)
-            raise
 
     async def get_streaming_response_with_tools(
         self,
@@ -1017,8 +907,7 @@ class OpenAIAdapter(LLMAdapter):
             parsed_tool_calls = None
             if tool_calls_accumulator:
                 parsed_tool_calls = []
-                for idx in sorted(tool_calls_accumulator.keys()):
-                    tc_data = tool_calls_accumulator[idx]
+                for tc_data in tool_calls_accumulator.values():
                     try:
                         args = json.loads(tc_data["arguments"]) if tc_data["arguments"] else {}
                     except json.JSONDecodeError:

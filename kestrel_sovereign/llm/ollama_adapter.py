@@ -8,6 +8,8 @@ Adapter for local Ollama instance with support for:
 - Structured output via JSON schema (Pydantic models)
 - API-based model discovery
 """
+
+from contextlib import aclosing
 import asyncio
 import json
 import logging
@@ -1208,31 +1210,14 @@ class OllamaAdapter(LLMAdapter):
         tools: Optional[List[Dict[str, Any]]] = None,
         response_format: Optional[Type[BaseModel]] = None,
         **kwargs
-    ) -> AsyncIterator[Union[str, ThinkingDelta]]:
-        """
-        Gets a streaming response from Ollama (text/thinking contract).
-
-        Tool calls remain buffered through get_response until the native
-        generation has supplied its terminal evidence.
-
-        Delegates to :meth:`_stream_with_usage` and drops the terminal
-        usage-bearing :class:`LLMResponse` so existing callers keep their
-        ``AsyncIterator[Union[str, ThinkingDelta]]`` contract.
-
-        Yields:
-            Text chunks as they arrive. For structured output, yields JSON chunks.
-        """
-        async with owned_execution_stream(self, self._stream_with_usage(
-            client=client,
-            model=model,
-            messages=messages,
-            tools=tools,
-            response_format=response_format,
-            **kwargs
-        )) as owned_stream:
-            async for item in owned_stream:
-                if not isinstance(item, LLMResponse):
-                    yield item
+    ) -> AsyncIterator[Union[str, LLMResponse]]:
+        """Yield plain text and one terminal response from the canonical stream."""
+        async with aclosing(self._plain_stream(
+            client=client, model=model, messages=messages, tools=tools,
+            response_format=response_format, **kwargs,
+        )) as stream:
+            async for item in stream:
+                yield item
 
     async def get_streaming_response_with_tools(
         self,

@@ -11,6 +11,9 @@ Adapter for Google Cloud Vertex AI using the google-genai SDK with support for:
 Uses the new google-genai SDK (not deprecated google-generativeai or google-cloud-aiplatform).
 Authentication via Application Default Credentials (ADC).
 """
+
+from contextlib import aclosing
+
 import logging
 import os
 from dataclasses import dataclass
@@ -19,6 +22,8 @@ from typing import Any, Dict, List, Optional, Union, AsyncIterator, Type
 from pydantic import BaseModel
 
 from .adapter import LLMAdapter, LLMResponse, ToolCall
+from kestrel_sdk.llm import ToolCallStarted
+
 from kestrel_sdk.llm import (
     ProviderCapabilities,
     StructuredOutputMode,
@@ -568,37 +573,14 @@ class VertexAIAdapter(LLMAdapter):
         tools: Optional[List[Dict[str, Any]]] = None,
         response_format: Optional[Type[BaseModel]] = None,
         **kwargs
-    ) -> AsyncIterator[str]:
-        """
-        Get streaming response from Vertex AI (text-only contract).
-
-        Delegates to :meth:`_stream_with_usage` and drops the terminal
-        usage-bearing :class:`LLMResponse` so existing callers keep their
-        ``AsyncIterator[str]`` contract. A function call on that response
-        cannot travel on a text stream; its drop is logged, never silent.
-
-        Yields:
-            Text chunks as they arrive
-        """
-        async with joined_iterator(self._stream_with_usage(
-            client=client,
-            model=model,
-            messages=messages,
-            tools=tools,
-            response_format=response_format,
-            **kwargs
+    ) -> AsyncIterator[Union[str, LLMResponse]]:
+        """Yield plain text and one terminal response from the canonical stream."""
+        async with aclosing(self._plain_stream(
+            client=client, model=model, messages=messages, tools=tools,
+            response_format=response_format, **kwargs,
         )) as stream:
             async for item in stream:
-                if isinstance(item, str):
-                    yield item
-                elif item.tool_calls:
-                    logger.warning(
-                        "Vertex AI returned %d function call(s) (%s) on the "
-                        "text-only stream, which cannot carry them; use "
-                        "get_streaming_response_with_tools to receive tool calls",
-                        len(item.tool_calls),
-                        ", ".join(call.name for call in item.tool_calls),
-                    )
+                yield item
 
     async def get_streaming_response_with_tools(
         self,
@@ -649,6 +631,8 @@ class VertexAIAdapter(LLMAdapter):
                 # If tool calls detected, yield the response immediately
                 if response.has_tool_calls:
                     logger.info(f"Vertex AI detected {len(response.tool_calls)} tool calls")
+                    for index, call in enumerate(response.tool_calls):
+                        yield ToolCallStarted(index=index, id=call.id or None, name=call.name or None)
                     yield response
                     return
 
