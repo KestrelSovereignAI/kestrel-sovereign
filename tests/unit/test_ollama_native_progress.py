@@ -257,7 +257,13 @@ async def test_logical_raw_stream_options_keep_final_shape(peer, stream):
 @pytest.mark.asyncio
 @pytest.mark.parametrize('mode', ['silent', 'partial-record'])
 async def test_unparsed_or_absent_wire_bytes_do_not_report_progress(peer, mode):
-    peer.mode = mode
+    # The unfinished record goes out in one burst once the request is read.
+    # Trickled at the default cadence it raced the watchdog, whose window
+    # also covers connecting and sending the request: under CI load only two
+    # of its five pieces were written before the call was abandoned. Whether
+    # bytes count as progress is judged by the reports and rearms observed
+    # below, not by when the bytes arrived.
+    peer.mode, peer.cadence = mode, 0
     async with peer.client() as client:
         with _observed_progress_calls() as observed:
             with pytest.raises(LLMCallInactivityTimeout):
@@ -267,7 +273,7 @@ async def test_unparsed_or_absent_wire_bytes_do_not_report_progress(peer, mode):
         assert observed['watchdog_rearms'] == []
         assert len(peer.requests) == 1
         if mode == 'partial-record':
-            assert len(peer.writes) >= 3
+            assert [write['part'] for write in peer.writes] == [0, 1, 2, 3, 4]
 
 
 @pytest.mark.asyncio
