@@ -16,6 +16,7 @@ changed, which is the one thing a reader can already see.
 from __future__ import annotations
 
 import re
+import shlex
 
 import pytest
 import yaml
@@ -170,3 +171,9 @@ def test_pytest_reaches_its_own_deadline_before_the_runner_kills_the_step(
         f"The runner would win the race and report a timeout with no "
         f"traceback."
     )
+
+
+def test_mcp_lane_runs_the_actual_host_process_restart_campaign():
+    """Installed MCP CI must not omit host/auth/restore and approval restart."""
+    step = _suite_step('mcp-permission-seam', 'tests/integration/test_mcp_permission_boundary.py')
+    assert 'tests/integration/test_mcp_permission_host_restart.py' in shlex.split(step['run'])

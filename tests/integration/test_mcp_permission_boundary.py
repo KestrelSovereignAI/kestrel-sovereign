@@ -5,7 +5,7 @@ OAuth. The dedicated MCP CI job installs the optional feature explicitly.
 """
 
 import asyncio
-from contextlib import AsyncExitStack, contextmanager
+from contextlib import AsyncExitStack
 from dataclasses import dataclass
 from pathlib import Path
 import uuid
@@ -13,7 +13,9 @@ import uuid
 import pytest
 import pytest_asyncio
 
-from tests.integration.mcp_permission_peers import MCPTestPeer, docker_peer, https_peer
+from tests.integration.mcp_permission_peers import (
+    MCPTestPeer, docker_peer, https_peer, owned_provider_network,
+)
 from kestrel_sovereign.a2a.stores.unified.feature_enablement_store import FeatureEnablementStore
 from kestrel_sovereign.storage.db.sqlite import SQLiteBackend
 
@@ -25,36 +27,6 @@ from kestrel_sovereign.kestrel_agent import KestrelAgent
 
 
 pytestmark = [pytest.mark.mcp_integration, pytest.mark.timeout(120)]
-
-
-@contextmanager
-def owned_provider_network(monkeypatch, peer):
-    """Permit only the exact owned TLS listener for provider and MCP traffic."""
-    import socket
-    from urllib.parse import urlsplit
-
-    endpoint = urlsplit(peer.provider_url)
-    with monkeypatch.context() as network:
-        network.setenv("NO_PROXY", endpoint.hostname)
-        original_connect = socket.socket.connect
-        original_connect_ex = socket.socket.connect_ex
-        dials = []
-
-        def require_owned(address):
-            assert isinstance(address, tuple) and address[:2] == ("127.0.0.1", endpoint.port)
-            dials.append(address)
-
-        def connect(sock, address):
-            require_owned(address)
-            return original_connect(sock, address)
-
-        def connect_ex(sock, address):
-            require_owned(address)
-            return original_connect_ex(sock, address)
-
-        network.setattr(socket.socket, "connect", connect)
-        network.setattr(socket.socket, "connect_ex", connect_ex)
-        yield dials
 
 
 async def test_owned_native_provider_wire_has_no_remote_tool_effect(tmp_path, monkeypatch):

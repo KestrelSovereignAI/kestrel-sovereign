@@ -467,6 +467,7 @@ jobs:
         run: >-
           uv run --no-sync python -m pytest tests/integration/test_mcp_permission_boundary.py
           tests/integration/test_mcp_apps_host.py
+          tests/integration/test_mcp_permission_host_restart.py
           -q --timeout=120 --session-timeout=480
         timeout-minutes: 12
 
