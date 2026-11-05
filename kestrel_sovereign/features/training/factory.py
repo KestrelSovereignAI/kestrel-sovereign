@@ -418,22 +418,13 @@ class TrainingProviderFactory:
         backend that happens to declare ``uncensored=True`` (e.g. an
         entry-point provider) would fail when generation code calls it, so it
         is skipped here.
-        Priority follows PROVIDER_PRIORITY order.
+        Uses the canonical generation selector, including its explicit-provider
+        refusal and native execution controls.
 
         Returns:
             First available uncensored generation provider, or None if none available
         """
-        require_execution_work()
-        for name in cls._effective_priority():
-            caps = cls.get_capabilities(name)
-            if caps and caps.generation and caps.uncensored:
-                provider = cls.get_provider(name, purpose="generation")
-                if provider:
-                    logger.info(f"Using uncensored provider: {name}")
-                    return provider
-
-        logger.warning("No uncensored providers available")
-        return None
+        return cls.get_generation_provider(uncensored=True)
 
     @classmethod
     def get_generation_provider(cls, uncensored: bool = False) -> Optional[TrainingProvider]:

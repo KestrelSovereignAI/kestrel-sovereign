@@ -61,7 +61,7 @@ def test_default_selection_does_not_try_retired_runpod(monkeypatch, selection):
     assert getattr(TrainingProviderFactory, selection)() is None
 
 
-@pytest.mark.parametrize("selection", ["get_default_provider", "get_generation_provider"])
+@pytest.mark.parametrize("selection", ["get_default_provider", "get_generation_provider", "get_uncensored_provider"])
 def test_forced_retired_runpod_cannot_fall_through_to_another_model(monkeypatch, selection):
     monkeypatch.setenv("GENERATION_PROVIDER", "runpod")
     monkeypatch.setattr(TrainingProviderFactory, "_create_provider", _unexpected)
