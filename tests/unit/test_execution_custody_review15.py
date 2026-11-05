@@ -228,7 +228,7 @@ async def test_actual_first_admission_control_preserves_durable_unresolved_gener
 
     store.register = capture_register
     error = control_error(control, carrier)
-    store.poll_owner = AsyncMock(side_effect=error)
+    store.read_owner = AsyncMock(side_effect=error)
     registry = DistributedInvocationRegistry(store)
     agent = Agent("original-agent")
     registry.attach(agent)

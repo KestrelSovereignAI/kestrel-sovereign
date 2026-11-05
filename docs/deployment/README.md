@@ -120,7 +120,9 @@ The checked-in `prod` profile nonetheless caps `max_instances` at 1, because the
 contract permitting horizontal scale is not the same thing as a substrate able
 to serve it. Each instance opens up to 10 pooled plus 4 advisory runtime
 PostgreSQL connections plus Hold's one-connection operational pool and
-separately bounded one-connection advisory pool on the primary database.
+separately bounded one-connection advisory pool on the primary database, plus
+the Distributed Stop store's one connection and its owner heartbeat's own
+connection.
 Hold's independent evidence database has the same operational-plus-advisory
 pair. The cap must therefore be raised together with the database tier (or a
 connection
@@ -595,13 +597,14 @@ Check the webhook delivery page on GitHub. Response body includes diagnostic inf
 - LLM error → check Cloud Run logs for the actual exception
 
 ### Long gaps in the log, or `Distributed Stop owner FENCED`
-Something held the server's event loop, which every agent turn and the Stop
-owner's lease renewal share. The event-loop stall watchdog
-(`kestrel_sovereign.event_loop_watchdog`) logs one `WARNING` once the loop's
-heartbeat is more than `stall_threshold_seconds` overdue (default 1.0 s), with
-the loop thread's Python stack at that moment; the frame holding the loop is
-the last one. An `INFO` line follows when the loop resumes: the block lasted at
-least as long as the heartbeat ran late and at most the time since the previous
+Something held the server's event loop, which every agent turn shares. The
+event-loop stall watchdog (`kestrel_sovereign.event_loop_watchdog`) logs one
+`WARNING` once the loop's heartbeat is more than `stall_threshold_seconds`
+overdue (default 1.0 s), naming the task that holds the loop and, when that
+task is an agent's turn, the agent (on Python 3.12 and later), with the loop
+thread's Python stack at that moment; the frame holding the loop is the last
+one. An `INFO` line follows when the loop resumes: the block lasted at least as
+long as the heartbeat ran late and at most the time since the previous
 heartbeat. If the `WARNING` says the watchdog thread itself woke late
 (something held the GIL), its stack was sampled after the fact and may show the
 frame just past the blocking call; with no stack at all, the loop resumed before
@@ -609,16 +612,37 @@ the watchdog thread could look. The `[event_loop_watchdog]` section of
 `kestrel.toml` sets the threshold, the heartbeat interval and `enabled`; see
 `kestrel.toml.example`.
 
-The `FENCED` line from the Stop relay names what it saw (#3745):
+A stall delays every agent, including the delivery of a Stop, until the loop
+runs again. It no longer fences the Distributed Stop owner (#3889): the owner
+lease is renewed by a heartbeat thread with its own event loop and its own
+connection to the Stop database, so it keeps renewing while the loop is
+blocked. That heartbeat proves the process is alive, not that the loop is
+responsive. One coupling remains: a Stop-database write transaction left open
+across a stall (SQLite's write lock, or a PostgreSQL lock on one of the owner's
+rows) holds the renewal back until it ends.
 
-- `event loop stalled N s; lease is L s`: the loop held the relay past the
-  lease between renewals. `N` is the time since the last successful renewal,
-  which exceeds the stall by at most one poll interval and one renewal.
-- `owner lease renewal was late in the relay (took N s; lease is L s)`: one
-  renewal outlasted the lease, because the database answered slowly or the
-  loop stalled while it waited.
-- `durable generation was lost in the relay`: a renewal found a row gone
-  although this process's renewals were current.
+The `FENCED` line names what the owner saw:
+
+- `owner lease not renewed for N s (lease is L s): ...`: the heartbeat did not
+  renew the lease within it. The rest says why: the heartbeat thread exited,
+  a renewal has been in flight for `N` s (the database answered slowly), or
+  the last renewal failed, naming the exception and how long ago the last
+  successful renewal started. A failed attempt alone never fences: renewals
+  that succeeded while the loop was blocked still hold the lease.
+- `durable generation was lost: the owner heartbeat's renewal found it expired
+  or removed`: a renewal found an in-flight row gone, so another replica may
+  already have reaped it.
+
+### Process exit and the heartbeat thread
+The heartbeat thread is a daemon, and it also stops once the thread that runs
+the server's loop has ended, so it never keeps a process alive. A process that
+dies or hangs entirely stops renewing, and its lease expires on schedule.
+
+Server shutdown stops the heartbeat and waits for its thread to exit and close
+its connection. If it has not by the end of the Stop close budget, shutdown
+fails with `Distributed Stop owner heartbeat has not retired`, naming the
+thread or the connection, and keeps the Stop registry and its database open
+rather than closing them under a renewal that may still hold a transaction.
 
 ### Logs not appearing in Cloud Run
 Python `logging.info()` calls from request handlers don't always reach Cloud Run's structured log pipeline. Use `print(json.dumps({"severity": "WARNING", "message": "..."}), flush=True)` for debugging.

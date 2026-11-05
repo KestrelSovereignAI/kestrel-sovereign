@@ -951,6 +951,39 @@ class PostgresBackend(DatabaseBackend):
             raise ConnectionError("Not connected to database. Call connect() first.")
         return self._pool
 
+    def independent_connection_recipe(self) -> tuple[tuple[Any, ...], dict[str, Any]]:
+        """``asyncpg`` arguments for a connection of this database's own.
+
+        A connection opened from these shares nothing with this backend's
+        pools: the dedicated advisory pool uses them, and so does the
+        Distributed Stop owner heartbeat, which must keep renewing while the
+        server's event loop is blocked (#3889). They are this backend's DSN or
+        connection parameters, or for a wrapped pool the settings it was built
+        with, such as a non-default ``search_path``. Raises ``ConnectionError``
+        when no such recipe is known.
+        """
+
+        if self._advisory_backend is not None:
+            return self._advisory_backend.independent_connection_recipe()
+        if self._advisory_recipe_available:
+            return (
+                tuple(self._advisory_connect_args),
+                dict(self._advisory_connect_kwargs),
+            )
+        if not self._host or not self._database:
+            raise ConnectionError(
+                "Dedicated PostgreSQL connections require connection "
+                "parameters, advisory_dsn, or a valid wrapped-pool recipe"
+            )
+        return (), {
+            **self._advisory_connect_kwargs,
+            "host": self._host,
+            "port": self._port,
+            "database": self._database,
+            "user": self._user,
+            "password": self._password,
+        }
+
     async def _ensure_advisory_pool(
         self, *, terminal_lifetime: _TerminalAdvisoryLifetime | None = None,
     ) -> "asyncpg.Pool":
@@ -973,31 +1006,14 @@ class PostgresBackend(DatabaseBackend):
                 terminal_lifetime.require_backend(self)
             if self._advisory_pool is not None:
                 return self._advisory_pool
-            kwargs = dict(self._advisory_connect_kwargs)
             try:
-                if self._advisory_recipe_available:
-                    pool = await asyncpg.create_pool(
-                        *self._advisory_connect_args,
-                        min_size=0,
-                        max_size=self._advisory_max_pool_size,
-                        **kwargs,
-                    )
-                else:
-                    if not self._host or not self._database:
-                        raise ConnectionError(
-                            "Dedicated PostgreSQL advisory locks require connection "
-                            "parameters, advisory_dsn, or a valid wrapped-pool recipe"
-                        )
-                    pool = await asyncpg.create_pool(
-                        host=self._host,
-                        port=self._port,
-                        database=self._database,
-                        user=self._user,
-                        password=self._password,
-                        min_size=0,
-                        max_size=self._advisory_max_pool_size,
-                        **kwargs,
-                    )
+                args, kwargs = self.independent_connection_recipe()
+                pool = await asyncpg.create_pool(
+                    *args,
+                    min_size=0,
+                    max_size=self._advisory_max_pool_size,
+                    **kwargs,
+                )
             except ConnectionError:
                 raise
             except Exception as exc:

@@ -3,6 +3,7 @@
 import asyncio
 import logging
 import re
+import threading
 import time
 from unittest.mock import MagicMock
 from uuid import uuid4
@@ -53,6 +54,23 @@ from kestrel_sovereign.stop import (
 # healthy path is faster than the one they are trying to outlast.
 _HEALTHY_LEASE_SECONDS = 0.5
 _PAST_HEALTHY_LEASE_SECONDS = _HEALTHY_LEASE_SECONDS + 0.1
+
+
+def _patch_heartbeat_renewal(monkeypatch, replacement):
+    """Route every owner heartbeat's renewal through ``replacement``.
+
+    Only the owner heartbeat renews, on its own thread and event loop
+    (#3889), so ``replacement(original, store, owner_id, **kwargs)`` runs
+    there. Coordinate with it through ``threading.Event``: an
+    ``asyncio.Event`` belongs to the test's loop, not the heartbeat's.
+    """
+
+    original = DistributedInvocationStore.poll_owner
+
+    async def renewal(store, owner_id, **kwargs):
+        return await replacement(original, store, owner_id, **kwargs)
+
+    monkeypatch.setattr(DistributedInvocationStore, "poll_owner", renewal)
 
 
 class _ReplicaAgent(RequestLifecycleMixin):
@@ -636,7 +654,9 @@ async def test_expired_owner_cannot_revive_its_heartbeat(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_owner_that_cannot_renew_self_fences_and_refuses_new_work(tmp_path):
+async def test_owner_that_cannot_renew_self_fences_and_refuses_new_work(
+    tmp_path, monkeypatch
+):
     first_db, second_db, store, replica_a, replica_b = await _shared_registries(
         tmp_path
     )
@@ -655,9 +675,11 @@ async def test_owner_that_cannot_renew_self_fences_and_refuses_new_work(tmp_path
             agent._cleanup_cancelled_request("partitioned-turn")
 
     operation = asyncio.create_task(cognition())
-    original_poll = store.poll_owner
+    healthy_owner_id = replica_b._owner_id
 
-    async def unavailable_poll(*args, **kwargs):
+    async def partition_replica_a(original, store, owner_id, **kwargs):
+        if owner_id == healthy_owner_id:
+            return await original(store, owner_id, **kwargs)
         raise RuntimeError("database partition")
 
     try:
@@ -671,15 +693,19 @@ async def test_owner_that_cannot_renew_self_fences_and_refuses_new_work(tmp_path
         entering.cancel()
         if operation.done():
             operation.result()
-        store.poll_owner = unavailable_poll
+        _patch_heartbeat_renewal(monkeypatch, partition_replica_a)
         with pytest.raises(asyncio.CancelledError):
             await asyncio.wait_for(operation, timeout=10)
         assert replica_a._lease_lost is True
         assert replica_a.owner_lifecycle_status == "self_fenced"
         with pytest.raises(InvocationSelfFencedError):
             await replica_a.register(agent, "later-turn", 2)
+        assert "owner lease store unavailable (RuntimeError)" in (
+            replica_a.owner_fence_reason
+        )
+        assert replica_b.owner_lifecycle_status == "healthy"
     finally:
-        store.poll_owner = original_poll
+        monkeypatch.undo()
         if not operation.done():
             operation.cancel()
             await asyncio.gather(operation, return_exceptions=True)
@@ -699,7 +725,7 @@ async def _wait_for(predicate, *, timeout: float = 10.0) -> None:
 
 @pytest.mark.asyncio
 async def test_missed_renewal_fences_in_flight_then_admits_under_new_epoch(
-    tmp_path,
+    tmp_path, monkeypatch
 ):
     """One missed renewal must not fence every later turn (#3337)."""
 
@@ -715,9 +741,8 @@ async def test_missed_renewal_fences_in_flight_then_admits_under_new_epoch(
     )
     agent = _SelfFencingReplicaAgent("did:test:owner-reacquisition")
     registry.attach(agent)
-    original_poll = store.poll_owner
     original_settle = store.settle
-    faulted = asyncio.Event()
+    faulted = threading.Event()
     settle_entered = asyncio.Event()
     release_settle = asyncio.Event()
 
@@ -731,12 +756,12 @@ async def test_missed_renewal_fences_in_flight_then_admits_under_new_epoch(
             raise RuntimeError("transient settlement failure")
         await original_settle(generation_id, owner_id, disposition)
 
-    async def one_missed_renewal(*args, **kwargs):
+    async def one_missed_renewal(original, store, owner_id, **kwargs):
         if not faulted.is_set():
             # One renewal answers after the lease it was renewing expired.
             faulted.set()
             await asyncio.sleep(_PAST_HEALTHY_LEASE_SECONDS)
-        return await original_poll(*args, **kwargs)
+        return await original(store, owner_id, **kwargs)
 
     in_flight = asyncio.create_task(agent.run_turn("in-flight-turn"))
     try:
@@ -745,7 +770,7 @@ async def test_missed_renewal_fences_in_flight_then_admits_under_new_epoch(
         fenced_generation_id = next(iter(registry._active))
         assert registry.owner_epoch == 1
 
-        store.poll_owner = one_missed_renewal
+        _patch_heartbeat_renewal(monkeypatch, one_missed_renewal)
         store.settle = settle_after_successor
         registry.start()
 
@@ -771,7 +796,7 @@ async def test_missed_renewal_fences_in_flight_then_admits_under_new_epoch(
         )
         assert row == (registry._owner_id,)
 
-        # The successor's relay renews only its own rows: the fenced
+        # The successor's heartbeat renews only its own rows: the fenced
         # generation, still awaiting settlement, cannot read as its loss.
         await asyncio.sleep(0.1)
         assert registry.owner_lifecycle_status == "healthy"
@@ -783,14 +808,14 @@ async def test_missed_renewal_fences_in_flight_then_admits_under_new_epoch(
         await _wait_for(lambda: fenced_generation_id not in registry._active)
         assert await store.remaining((fenced_generation_id,)) == ()
         assert (
-            await store.poll_owner(
+            await store.read_owner(
                 fenced_owner_id, lease_seconds=_HEALTHY_LEASE_SECONDS
             )
         ).live_generation_ids == ()
     finally:
         agent.release_operation.set()
         release_settle.set()
-        store.poll_owner = original_poll
+        monkeypatch.undo()
         store.settle = original_settle
         await asyncio.gather(in_flight, return_exceptions=True)
         await registry.close()
@@ -798,7 +823,9 @@ async def test_missed_renewal_fences_in_flight_then_admits_under_new_epoch(
 
 
 @pytest.mark.asyncio
-async def test_failed_reacquisition_stays_fenced_and_names_its_reason(tmp_path):
+async def test_failed_reacquisition_stays_fenced_and_names_its_reason(
+    tmp_path, monkeypatch
+):
     """No new owner without a proven lease clock; the relay heals later."""
 
     from kestrel_sovereign.storage.async_database import AsyncDatabase
@@ -811,15 +838,19 @@ async def test_failed_reacquisition_stays_fenced_and_names_its_reason(tmp_path):
         poll_seconds=0.01,
     )
     agent = _ReplicaAgent("did:test:failed-reacquisition")
-    original_poll = store.poll_owner
+    partitioned = threading.Event()
 
-    async def partitioned_poll(*args, **kwargs):
-        raise RuntimeError("database partition")
+    async def partitionable(original, store, owner_id, **kwargs):
+        if partitioned.is_set():
+            raise RuntimeError("database partition")
+        return await original(store, owner_id, **kwargs)
 
+    _patch_heartbeat_renewal(monkeypatch, partitionable)
     try:
+        registry.start()
         fenced_owner_id = registry._owner_id
+        partitioned.set()
         registry._fail_closed_owner("owner lease renewal was late in the relay")
-        store.poll_owner = partitioned_poll
 
         with pytest.raises(InvocationSelfFencedError):
             await registry.register(agent, "refused-turn", 1)
@@ -836,21 +867,27 @@ async def test_failed_reacquisition_stays_fenced_and_names_its_reason(tmp_path):
 
         # Once the store answers again the relay converges on its own: a
         # fenced replica is out of rotation and may receive no admissions.
-        store.poll_owner = original_poll
-        registry.start()
+        partitioned.clear()
         await _wait_for(lambda: registry.owner_lifecycle_status == "healthy")
         assert registry.owner_epoch == 2
         assert registry._owner_id != fenced_owner_id
         assert await registry.register(agent, "admitted-turn", 2)
     finally:
-        store.poll_owner = original_poll
+        partitioned.clear()
         await registry.close()
         await db.close()
 
 
 @pytest.mark.asyncio
-async def test_stale_relay_observation_cannot_fence_successor_owner(tmp_path):
-    """A poll about a replaced owner describes nothing its successor owns."""
+async def test_stale_relay_observation_cannot_fence_successor_owner(
+    tmp_path, monkeypatch
+):
+    """A renewal of a replaced owner describes nothing its successor owns.
+
+    The renewal was in flight when its owner was fenced. It lands during
+    re-establishment, with every row missing; the successor is adopted from
+    its own renewal regardless, and the stale one fences nothing.
+    """
 
     from kestrel_sovereign.storage.async_database import AsyncDatabase
 
@@ -863,42 +900,50 @@ async def test_stale_relay_observation_cannot_fence_successor_owner(tmp_path):
         owner_lease_seconds=_HEALTHY_LEASE_SECONDS,
     )
     agent = _ReplicaAgent("did:test:stale-relay-owner")
-    original_poll = store.poll_owner
     fenced_owner_id = registry._owner_id
-    stale_poll_entered = asyncio.Event()
-    release_stale_poll = asyncio.Event()
+    stale_poll_entered = threading.Event()
+    release_stale_poll = threading.Event()
 
-    async def pause_fenced_owner_poll(owner_id, **kwargs):
+    async def pause_fenced_owner_poll(original, store, owner_id, **kwargs):
         if owner_id == fenced_owner_id:
             stale_poll_entered.set()
-            await release_stale_poll.wait()
+            # Holds the heartbeat thread, as a hung database call would.
+            release_stale_poll.wait()
             # Every row the fenced owner held reads as lost.
-            return type(await original_poll(owner_id, **kwargs))((), ())
-        return await original_poll(owner_id, **kwargs)
+            return type(await original(store, owner_id, **kwargs))((), ())
+        return await original(store, owner_id, **kwargs)
 
+    _patch_heartbeat_renewal(monkeypatch, pause_fenced_owner_poll)
+    reacquisition = None
     try:
         assert await registry.register(agent, "fenced-turn", 1)
-        store.poll_owner = pause_fenced_owner_poll
         registry.start()
-        await asyncio.wait_for(stale_poll_entered.wait(), timeout=30)
+        assert await asyncio.to_thread(stale_poll_entered.wait, 30)
 
         registry._fail_closed_owner("owner lease renewal was late in the relay")
-        async with registry._registration_lock:
-            await registry._reacquire_owner_lease()
-        assert registry.owner_epoch == 2
 
-        # The stale reply arrives after a full lease: late, and missing every
-        # row. Both describe the fenced owner, never its idle successor.
-        await asyncio.sleep(_PAST_HEALTHY_LEASE_SECONDS)
+        async def reacquire():
+            async with registry._registration_lock:
+                await registry._reacquire_owner_lease()
+
+        reacquisition = asyncio.create_task(reacquire())
+        await asyncio.sleep(0.1)
+        assert not reacquisition.done()
         release_stale_poll.set()
-        await asyncio.sleep(0.05)
+        await reacquisition
+        assert registry.owner_epoch == 2
+        successor_owner_id = registry._owner_id
+        assert successor_owner_id != fenced_owner_id
 
+        await asyncio.sleep(0.1)
         assert registry.owner_lifecycle_status == "healthy"
         assert registry.owner_epoch == 2
+        assert registry._observed_renewal.owner_id == successor_owner_id
         assert await registry.register(agent, "successor-turn", 2)
     finally:
         release_stale_poll.set()
-        store.poll_owner = original_poll
+        if reacquisition is not None:
+            await asyncio.gather(reacquisition, return_exceptions=True)
         await registry.close()
         await db.close()
 
@@ -918,6 +963,8 @@ async def test_fenced_generation_cannot_be_readmitted_by_successor(tmp_path):
     registry = DistributedInvocationRegistry(store, poll_seconds=0.01)
     agent = _ReplicaAgent("did:test:fenced-readmission")
     try:
+        # Re-establishment adopts the identity the heartbeat renewed.
+        registry.start()
         assert await registry.register(agent, "fenced-turn", 1)
         fenced_owner_id = registry._owner_id
         fenced_generation_id = registry._by_local_generation[
@@ -1088,6 +1135,8 @@ async def test_registry_close_abandons_each_owner_epoch_independently(
     agent = _ReplicaAgent("did:test:independent-abandon")
     original_abandon_owner = store.abandon_owner
     try:
+        # Re-establishment adopts the identity the heartbeat renewed.
+        registry.start()
         assert await registry.register(agent, "fenced-turn", 1)
         fenced_owner_id = registry._owner_id
         fenced_generation_id = registry._by_local_generation[
@@ -1163,6 +1212,8 @@ async def test_registry_close_hung_current_owner_cannot_starve_fenced_owner(
     agent = _ReplicaAgent("did:test:hung-abandon")
     original_abandon_owner = store.abandon_owner
     try:
+        # Re-establishment adopts the identity the heartbeat renewed.
+        registry.start()
         assert await registry.register(agent, "fenced-turn", 1)
         fenced_owner_id = registry._owner_id
         fenced_generation_id = registry._by_local_generation[
@@ -1231,7 +1282,7 @@ async def test_idle_registry_starts_a_fresh_owner_lease_for_later_work(tmp_path)
                 break
             await asyncio.sleep(0.01)
         assert registry._active == {}
-        assert registry._last_heartbeat_monotonic is None
+        assert registry._renewed_at == {}
 
         await asyncio.sleep(_PAST_HEALTHY_LEASE_SECONDS)
 
@@ -1259,10 +1310,13 @@ async def test_single_row_admission_does_not_refresh_owner_wide_lease(tmp_path):
     agent = _ReplicaAgent("did:test:owner-wide-lease")
     try:
         assert await registry.register(agent, "older-turn", 1)
-        # Leave exactly one healthy lease of the owner-wide lease: enough for
+        older_generation_id = registry._by_local_generation[
+            (id(agent), "older-turn", 1)
+        ]
+        # Leave exactly one healthy lease of the older row's lease: enough for
         # the newer admission's insert, which must not refresh it.
-        registry._last_heartbeat_monotonic = (
-            asyncio.get_running_loop().time() - _HEALTHY_LEASE_SECONDS
+        registry._renewed_at[older_generation_id] = (
+            time.monotonic() - _HEALTHY_LEASE_SECONDS
         )
 
         assert await registry.register(agent, "newer-turn", 2)
@@ -1481,8 +1535,10 @@ async def test_public_turn_binding_rejects_lease_expiring_during_sql(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_relay_compares_only_inventory_captured_before_poll(tmp_path):
-    """A row admitted after the SQL snapshot cannot look lease-lost."""
+async def test_relay_compares_only_inventory_captured_before_poll(
+    tmp_path, monkeypatch
+):
+    """A row admitted after a renewal's snapshot cannot look lease-lost."""
 
     from kestrel_sovereign.storage.async_database import AsyncDatabase
 
@@ -1495,52 +1551,48 @@ async def test_relay_compares_only_inventory_captured_before_poll(tmp_path):
         owner_lease_seconds=1.0,
     )
     agent = _ReplicaAgent("did:test:relay-admission-race")
-    original_poll = store.poll_owner
-    snapshot_taken = asyncio.Event()
-    release_snapshot = asyncio.Event()
-    park_relay = False
-    parked = asyncio.Event()
-    park = asyncio.Event()
+    pause = threading.Event()
+    snapshot_taken = threading.Event()
+    release_snapshot = threading.Event()
 
-    async def pause_after_snapshot(*args, **kwargs):
-        result = await original_poll(*args, **kwargs)
-        if park_relay:
-            # This inventory test does not inject COMMIT uncertainty during
-            # shutdown. Retire the relay at a proven post-native-poll barrier;
-            # native cancellation/unknown receipts have separate coverage.
-            parked.set()
-            await park.wait()
-        snapshot_taken.set()
-        await release_snapshot.wait()
+    async def pause_after_snapshot(original, store, owner_id, **kwargs):
+        result = await original(store, owner_id, **kwargs)
+        if pause.is_set():
+            pause.clear()
+            snapshot_taken.set()
+            release_snapshot.wait()
         return result
 
+    _patch_heartbeat_renewal(monkeypatch, pause_after_snapshot)
     try:
         assert await registry.register(agent, "older-turn", 1)
-        store.poll_owner = pause_after_snapshot
         registry.start()
-        # Generous on purpose: this waits for a real task to reach a barrier,
-        # and under `-n auto` a one-second budget times out on scheduling delay
-        # rather than on the behavior under test. A genuine failure never sets
-        # the event at all, so a larger ceiling costs nothing but patience.
-        await asyncio.wait_for(snapshot_taken.wait(), timeout=30)
+        pause.set()
+        # Generous on purpose: this waits for a real thread to reach a
+        # barrier, and under `-n auto` scheduling delay is the only thing a
+        # short budget would measure. A genuine failure never sets it at all.
+        assert await asyncio.to_thread(snapshot_taken.wait, 30)
 
         assert await registry.register(agent, "newer-turn", 2)
+        newer_generation_id = registry._by_local_generation[
+            (id(agent), "newer-turn", 2)
+        ]
         release_snapshot.set()
         await asyncio.sleep(0.05)
 
         assert registry._lease_lost is False
-        park_relay = True
-        await asyncio.wait_for(parked.wait(), timeout=30)
+        assert newer_generation_id in registry._lease_owned_generation_ids()
     finally:
         release_snapshot.set()
-        store.poll_owner = original_poll
         await registry.close()
         await db.close()
 
 
 @pytest.mark.asyncio
-async def test_relay_excludes_rows_completed_before_poll_snapshot(tmp_path):
-    """A captured row that completes before SQL polling is not lease-lost."""
+async def test_relay_excludes_rows_completed_before_poll_snapshot(
+    tmp_path, monkeypatch
+):
+    """A captured row that completes before a renewal is not lease-lost."""
 
     from kestrel_sovereign.storage.async_database import AsyncDatabase
 
@@ -1553,15 +1605,18 @@ async def test_relay_excludes_rows_completed_before_poll_snapshot(tmp_path):
         owner_lease_seconds=1.0,
     )
     agent = _ReplicaAgent("did:test:relay-completion-race")
-    original_poll = store.poll_owner
-    poll_entered = asyncio.Event()
-    release_poll = asyncio.Event()
+    pause = threading.Event()
+    poll_entered = threading.Event()
+    release_poll = threading.Event()
 
-    async def pause_before_snapshot(*args, **kwargs):
-        poll_entered.set()
-        await release_poll.wait()
-        return await original_poll(*args, **kwargs)
+    async def pause_before_snapshot(original, store, owner_id, **kwargs):
+        if pause.is_set():
+            pause.clear()
+            poll_entered.set()
+            release_poll.wait()
+        return await original(store, owner_id, **kwargs)
 
+    _patch_heartbeat_renewal(monkeypatch, pause_before_snapshot)
     try:
         assert await registry.register(agent, "completing-turn", 1)
         assert await registry.register(agent, "unrelated-turn", 2)
@@ -1571,9 +1626,9 @@ async def test_relay_excludes_rows_completed_before_poll_snapshot(tmp_path):
         unrelated_generation_id = registry._by_local_generation[
             (id(agent), "unrelated-turn", 2)
         ]
-        store.poll_owner = pause_before_snapshot
         registry.start()
-        await asyncio.wait_for(poll_entered.wait(), timeout=1)
+        pause.set()
+        assert await asyncio.to_thread(poll_entered.wait, 30)
 
         registry.complete_soon(agent, "completing-turn", 1)
         for _ in range(100):
@@ -1589,7 +1644,6 @@ async def test_relay_excludes_rows_completed_before_poll_snapshot(tmp_path):
         assert unrelated_generation_id in registry._active
     finally:
         release_poll.set()
-        store.poll_owner = original_poll
         await registry.close()
         await db.close()
 
@@ -1606,62 +1660,8 @@ async def _first_owner_fence(caplog) -> str:
 
 
 @pytest.mark.asyncio
-async def test_relay_names_an_event_loop_stall_that_outlasts_the_lease(
-    tmp_path, caplog
-):
-    """A stall between renewals is logged as a stall, with its length (#3745).
-
-    The renewal poll after the stall is fast, so it is not late; it finds the
-    durable lease already expired. That was logged as "durable generation was
-    lost in the relay", which names no cause.
-    """
-    from kestrel_sovereign.storage.async_database import AsyncDatabase
-
-    caplog.set_level(logging.ERROR, logger="kestrel_sovereign.stop.invocation")
-    db = await AsyncDatabase.sqlite(str(tmp_path / "relay-loop-stall.db"))
-    store = DistributedInvocationStore(db)
-    await store.ensure_schema()
-    registry = DistributedInvocationRegistry(
-        store,
-        poll_seconds=0.05,
-        owner_lease_seconds=_HEALTHY_LEASE_SECONDS,
-    )
-    agent = _ReplicaAgent("did:test:relay-loop-stall")
-    original_poll = store.poll_owner
-    renewed = asyncio.Event()
-
-    async def report_renewal(*args, **kwargs):
-        polled = await original_poll(*args, **kwargs)
-        renewed.set()
-        return polled
-
-    try:
-        assert await registry.register(agent, "stalled-turn", 1)
-        store.poll_owner = report_renewal
-        registry.start()
-        # The relay sets this and runs on to its poll-interval sleep before
-        # this task can resume, so the stall below lands between polls.
-        await asyncio.wait_for(renewed.wait(), timeout=30)
-        time.sleep(_PAST_HEALTHY_LEASE_SECONDS)
-
-        message = await _first_owner_fence(caplog)
-
-        assert "durable generation was lost" not in message
-        assert f"lease is {_HEALTHY_LEASE_SECONDS:.1f} s" in message
-        stalled = re.search(r"event loop stalled ([0-9.]+) s", message)
-        assert stalled is not None, message
-        assert float(stalled.group(1)) >= _PAST_HEALTHY_LEASE_SECONDS
-    finally:
-        store.poll_owner = original_poll
-        await registry.close()
-        await db.close()
-
-
-@pytest.mark.asyncio
-async def test_relay_reports_a_lost_generation_that_no_stall_explains(
-    tmp_path, caplog
-):
-    """A durable row lost while renewals are current is not called a stall."""
+async def test_heartbeat_reports_a_lost_generation_by_name(tmp_path, caplog):
+    """A durable row lost while renewals are current is named as lost."""
     from kestrel_sovereign.storage.async_database import AsyncDatabase
 
     caplog.set_level(logging.ERROR, logger="kestrel_sovereign.stop.invocation")
@@ -1683,15 +1683,17 @@ async def test_relay_reports_a_lost_generation_that_no_stall_explains(
 
         message = await _first_owner_fence(caplog)
 
-        assert "durable generation was lost in the relay" in message
-        assert "event loop stalled" not in message
+        assert "durable generation was lost" in message
+        assert "not renewed" not in message
     finally:
         await registry.close()
         await db.close()
 
 
 @pytest.mark.asyncio
-async def test_late_relay_renewal_names_how_long_it_took(tmp_path, caplog):
+async def test_late_heartbeat_renewal_names_how_long_it_has_taken(
+    tmp_path, caplog, monkeypatch
+):
     from kestrel_sovereign.storage.async_database import AsyncDatabase
 
     caplog.set_level(logging.ERROR, logger="kestrel_sovereign.stop.invocation")
@@ -1704,29 +1706,29 @@ async def test_late_relay_renewal_names_how_long_it_took(tmp_path, caplog):
         owner_lease_seconds=_HEALTHY_LEASE_SECONDS,
     )
     agent = _ReplicaAgent("did:test:relay-late-renewal")
-    original_poll = store.poll_owner
+    release = threading.Event()
 
-    async def late_poll(*args, **kwargs):
-        await asyncio.sleep(_PAST_HEALTHY_LEASE_SECONDS)
-        return await original_poll(*args, **kwargs)
+    async def late_poll(original, store, owner_id, **kwargs):
+        release.wait(timeout=30)
+        return await original(store, owner_id, **kwargs)
 
+    _patch_heartbeat_renewal(monkeypatch, late_poll)
     try:
         assert await registry.register(agent, "late-turn", 1)
-        store.poll_owner = late_poll
         registry.start()
 
         message = await _first_owner_fence(caplog)
 
-        took = re.search(
-            r"owner lease renewal was late in the relay \(took ([0-9.]+) s; "
-            r"lease is ([0-9.]+) s\)",
+        lapsed = re.search(
+            r"owner lease not renewed for ([0-9.]+) s \(lease is ([0-9.]+) s\): "
+            r"its renewal has been in flight for ([0-9.]+) s",
             message,
         )
-        assert took is not None, message
-        assert float(took.group(1)) >= _PAST_HEALTHY_LEASE_SECONDS
-        assert float(took.group(2)) == _HEALTHY_LEASE_SECONDS
+        assert lapsed is not None, message
+        assert float(lapsed.group(1)) >= _HEALTHY_LEASE_SECONDS
+        assert float(lapsed.group(2)) == _HEALTHY_LEASE_SECONDS
     finally:
-        store.poll_owner = original_poll
+        release.set()
         await registry.close()
         await db.close()
 
