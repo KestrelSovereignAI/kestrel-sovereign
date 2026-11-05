@@ -3076,6 +3076,13 @@ class OrchestratorEngineMixin:
         check below is the last guardrail, so the name is recorded as accepted
         only once it passes, and its refusal carries the allowlist evidence.
         """
+        from kestrel_sovereign.agent.tool_registry import _ToolExecution
+
+        # Model and externally bound calls share the same execution facts.
+        # A caller that did not supply a witness still needs to distinguish
+        # pre-execution refusal from a failure after effects became possible.
+        execution = bound_execution if bound_execution is not None else _ToolExecution()
+        dispatch_meta = {} if dispatch_meta is None else dispatch_meta
         tool = tool if tool is not None else self._direct_tools[tool_name]
         hook_feature_name = (
             feature_name or self._security_feature_name_for_tool(tool_name)
@@ -3133,7 +3140,7 @@ class OrchestratorEngineMixin:
                     tool_name, tool, effective_args,
                 )
             snapshot = deepcopy(effective_args)
-            bound_execution.arguments = snapshot
+            execution.arguments = snapshot
             dispatch_meta["arguments"] = snapshot
             if rewrite_error is not None:
                 raise ToolArgumentRewriteError(rewrite_error)
@@ -3148,16 +3155,15 @@ class OrchestratorEngineMixin:
             if bound_tool is not None:
                 dispatch_meta["binding_expired"] = not bound_tool.is_current
                 bound_tool.require_current()
-                bound_execution.started = True
             else:
                 if dispatch_meta is not None:
                     dispatch_meta["arguments"] = effective_args
                 rewrite_error = hook_rewrite_argument_error(tool_name, t, effective_args)
                 if rewrite_error is not None:
                     raise ToolArgumentRewriteError(rewrite_error)
+            execution.started = True
             result = await t.execute(**effective_args)
-            if bound_execution is not None:
-                bound_execution.returned = True
+            execution.returned = True
             return result
 
         try:
@@ -3170,7 +3176,7 @@ class OrchestratorEngineMixin:
                 audit_adapter=(f"{bound_tool.owner}.{tool_name}" if bound_tool is not None
                                else OrchestratorEngineMixin._tool_call_adapter(self, tool_name, {})),
                 on_audited=lambda status: _mark_tool_dispatch_audited(
-                    dispatch_meta, bound_execution, status=status,
+                    dispatch_meta, execution, status=status,
                 ),
                 **({"prepare_args": _prepare_bound_arguments} if bound_tool is not None else {}),
             )
@@ -3198,9 +3204,9 @@ class OrchestratorEngineMixin:
             logging.error(
                 "[DIRECT-TOOL] %s failed: %s", tool_name, exception_log_summary(e),
             )
-            if bound_execution is not None and (
-                bound_execution.returned
-                or (bound_execution.started and not isinstance(e, ResourceConflict))
+            if (
+                execution.returned
+                or (execution.started and not isinstance(e, ResourceConflict))
             ):
                 dispatch_meta["outcome_unknown"] = True
                 dispatch_meta["outcome_error"] = e
