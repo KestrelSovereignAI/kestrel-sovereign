@@ -507,7 +507,7 @@ class TestOpenAIEmitsToolCallStarted:
             ),
             # Stream ends mid-JSON — final accumulated args are invalid.
         ]
-        with pytest.raises(LLMProtocolError, match="valid JSON"):
+        with pytest.raises(LLMProtocolError, match="invalid generation protocol"):
             _drive_openai(OpenAIAdapter(), chunks)
 
 

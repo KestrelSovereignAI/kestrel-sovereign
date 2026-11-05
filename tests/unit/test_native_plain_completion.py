@@ -176,7 +176,7 @@ async def test_native_openai_sparse_tool_calls_keep_marker_order(adapter_type):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("adapter_type", [OpenAIAdapter, OpenRouterAdapter])
-@pytest.mark.parametrize("second_id,second_name", [("owned", "write"), ("other", "write"), ("owned", "other")])
+@pytest.mark.parametrize("second_id,second_name", [("owned", "write"), ("other", "write"), ("owned", "other"), ("", "write"), ("owned", "")])
 async def test_core_native_repeated_tool_identity_is_preserved_or_refused(adapter_type, second_id, second_name):
     frames = [{"id": "owned", "object": "chat.completion.chunk", "created": 0, "model": "owned",
         "choices": [{"index": 0, "finish_reason": reason, "delta": {"tool_calls": [{"index": 0,
