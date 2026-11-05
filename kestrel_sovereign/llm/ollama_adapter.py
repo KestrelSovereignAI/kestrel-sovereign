@@ -1044,10 +1044,9 @@ class OllamaAdapter(LLMAdapter):
     ) -> AsyncIterator[Union[str, ThinkingDelta, LLMResponse]]:
         """Stream text/thinking chunks then emit one terminal LLMResponse.
 
-        Shared by :meth:`get_streaming_response` (which filters the terminal
-        response out to preserve its text/thinking contract) and the no-tools
-        branch of :meth:`get_streaming_response_with_tools` (which forwards it
-        so the service layer can meter streamed turns — #1684). Ollama reports
+        Shared by both streaming methods. The plain facade retains the
+        terminal response, omits thinking deltas, and refuses tool evidence.
+        The with-tools facade also carries reasoning and tools. Ollama reports
         ``prompt_eval_count`` / ``eval_count`` on the final (``done``) chunk.
 
         A fired ``cancel_token`` ends the stream with ``CancelledError`` even

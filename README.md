@@ -342,7 +342,10 @@ the with-tools method to consume separate reasoning events.
 
 Core validates the SDK response and tool-call shapes at its adapter boundary.
 Malformed JSON and non-object tool arguments fail without fabricated argument
-data. A streamed zero-argument call carries `{}`. Native stop reasons remain
+data. A streamed zero-argument call with no argument fragments carries `{}`.
+A completed non-streaming or batch call must supply a JSON object; missing
+arguments or an empty string fail. Non-empty stream fragments must also form
+a valid JSON object. Native stop reasons remain
 unchanged, including unknown values; absent evidence stays `None`, which Core
 rejects as incomplete. Protocol and cleanup failures cannot expose a successful
 terminal response or trigger a retry of that generation.
