@@ -38,6 +38,7 @@ from kestrel_sdk.tools.result import ToolResult
 from kestrel_sovereign.agent.orchestrator_engine import ToolNotRegisteredError
 from kestrel_sovereign.execution_custody import is_execution_control_error
 from kestrel_sovereign.features.base import Feature, tool
+from kestrel_sovereign.logging_config import exception_log_summary, exception_frames
 from kestrel_sovereign.features.enum_coerce import normalize_choice as _normalize_choice
 
 from .atomic_file import (
@@ -112,6 +113,13 @@ from .session_log import collect_session_log
 from .workflow_runs import assess_workflow_runs
 from .workspace_readiness import TalonWorkspaceProviderOutdated, talon_workspaces
 
+
+@dataclass(frozen=True)
+class _WorkOrderWakeFailure:
+    detail: str
+    unknown: bool = False
+
+
 logger = logging.getLogger(__name__)
 
 
@@ -163,7 +171,7 @@ SIGNAL_DISPATCH_REASON_CODES = frozenset(
         "DISPATCH_CAPABILITY_UNAVAILABLE",
         "GOVERNED_DISPATCH_UNAVAILABLE",
         "WORKFLOW_RUNNER_UNAVAILABLE",
-        "WORKFLOW_RUNNER_FAILED",
+        "WORKFLOW_RUNNER_UNCONFIRMED",
         "WORKFLOW_RUN_REJECTED",
         # Every blocker selection tried to confirm came back unreadable; not
         # the same claim as "nothing is actionable" (#3280).
@@ -194,6 +202,8 @@ SIGNAL_DISPATCH_REASON_CODES = frozenset(
         # The work order was sent, but the wait that wakes this agent when
         # the executor reports was not armed (#3838).
         "WORK_ORDER_WAKE_UNARMED",
+        # The wake may exist; inspect the named watch before another arm.
+        "WORK_ORDER_WAKE_UNCONFIRMED",
     }
 )
 #: The ``reason_code`` a failed ``strategy_reconcile_blockers`` result can
@@ -2450,22 +2460,24 @@ class StrategicMemoryFeature(Feature):
                     "reason_code": "WORKFLOW_RUNNER_UNAVAILABLE",
                 },
             )
-        except Exception:  # noqa: BLE001 - sanitize the tool boundary
-            logger.exception(
-                "Strategic Memory dispatch runner failed for workflow %r",
-                workflow_name,
+        except Exception as exc:  # noqa: BLE001 - existing tool boundary
+            if is_execution_control_error(exc):
+                raise
+            logger.error(
+                "Strategic Memory dispatch runner failed for workflow %r: %s\n%s",
+                workflow_name, exception_log_summary(exc), exception_frames(exc),
             )
             return ToolResult.failed(
-                "The governed workflow runner failed before accepting the "
-                "selected issue. Inspect workflow diagnostics and retry; no "
-                "dispatch was confirmed.",
+                "The governed workflow runner did not confirm acceptance of "
+                "the selected issue; it may have started. Reconcile workflow "
+                "state before retrying.",
                 data={
                     "mode": "execute",
                     "issue": issue,
                     "workflow": workflow_name,
-                    "dispatched": False,
+                    "dispatched": None,
                     "skipped": skipped,
-                    "reason_code": "WORKFLOW_RUNNER_FAILED",
+                    "reason_code": "WORKFLOW_RUNNER_UNCONFIRMED",
                 },
             )
 
@@ -2968,9 +2980,9 @@ class StrategicMemoryFeature(Feature):
         except Exception as exc:  # noqa: BLE001 - sanitize the tool boundary
             if is_execution_control_error(exc):
                 raise
-            logger.exception(
-                "Strategic Memory could not send work order %s to %s",
-                order_id, executor,
+            logger.error(
+                "Strategic Memory could not send work order %s to %s: %s\n%s",
+                order_id, executor, exception_log_summary(exc), exception_frames(exc),
             )
             return ToolResult.failed(
                 f"Sending work order {order_id} for {repo}#{number} to "
@@ -3027,14 +3039,25 @@ class StrategicMemoryFeature(Feature):
         # this agent.
         wake = f"a2a:{dispatch_id}"
         wake_error = await self._arm_work_order_wake(call, wake, executor, order_id)
-        data["wake"] = None if wake_error else wake
+        data["wake"] = (
+            wake if wake_error is None or wake_error.unknown else None
+        )
+        data["wake_confirmed"] = (
+            True if wake_error is None else None if wake_error.unknown else False
+        )
         unarmed = (
             ""
             if wake_error is None
-            else f" The wait that wakes this agent when {executor} reports was "
-            f"not armed ({wake_error}); arm wait(target='{wake}', "
-            "mode='signal'), because nothing else wakes the sender of an A2A "
-            "task when it is answered (#3755)."
+            else (
+                f" The wait on {wake} that wakes this agent when {executor} reports may "
+                f"have been armed ({wake_error.detail}). Reconcile the current "
+                "watch before attempting to arm it again."
+                if wake_error.unknown else
+                f" The wait that wakes this agent when {executor} reports was "
+                f"not armed ({wake_error.detail}); arm wait(target='{wake}', "
+                "mode='signal'), because nothing else wakes the sender of an A2A "
+                "task when it is answered (#3755)."
+            )
         )
         if not delivered:
             # ``sent`` is True when the executor acknowledged the order and a
@@ -3070,13 +3093,23 @@ class StrategicMemoryFeature(Feature):
             + skipped_text
         )
         if wake_error is not None:
+            failure_reason = (
+                {"reason_code": "WORK_ORDER_WAKE_UNCONFIRMED"}
+                if wake_error.unknown else
+                {"reason_code": "WORK_ORDER_WAKE_UNARMED"}
+            )
             return ToolResult.partial(
                 confirmation=body,
-                error=f"The wake for work order {order_id} was not armed: {wake_error}",
+                error=(
+                    f"The wake {wake} for work order {order_id} may have been armed; "
+                    f"reconcile before retrying: {wake_error.detail}"
+                    if wake_error.unknown else
+                    f"The wake for work order {order_id} was not armed: {wake_error.detail}"
+                ),
                 data={
                     **data,
                     "dispatched": True,
-                    "reason_code": "WORK_ORDER_WAKE_UNARMED",
+                    **failure_reason,
                 },
             )
         return ToolResult.ok(confirmation=body, data={**data, "dispatched": True})
@@ -3084,8 +3117,8 @@ class StrategicMemoryFeature(Feature):
     @staticmethod
     async def _arm_work_order_wake(
         call: NamedToolCall, wake: str, executor: str, order_id: str
-    ) -> Optional[str]:
-        """Arm ``wait(wake, mode='signal')``; why it was not armed, or ``None``.
+    ) -> Optional[_WorkOrderWakeFailure]:
+        """Arm the wake; return refusal/uncertainty evidence, or ``None``.
 
         Through the ``wait`` tool, so the watch records this turn's session
         exactly as an agent's own call would (#3663).
@@ -3100,15 +3133,18 @@ class StrategicMemoryFeature(Feature):
                 },
             )
         except ToolNotRegisteredError:
-            return f"no enabled feature exposes '{_WAIT_TOOL}'"
+            return _WorkOrderWakeFailure(f"no enabled feature exposes '{_WAIT_TOOL}'")
         except Exception as exc:  # noqa: BLE001 - sanitize the tool boundary
             if is_execution_control_error(exc):
                 raise
-            logger.exception("Strategic Memory could not arm %s", wake)
-            return f"'{_WAIT_TOOL}' raised {type(exc).__name__}"
+            logger.error(
+                "Strategic Memory could not confirm wake %s: %s\n%s",
+                wake, exception_log_summary(exc), exception_frames(exc),
+            )
+            return _WorkOrderWakeFailure("the wait outcome is unconfirmed", unknown=True)
         payload = tool_payload(armed)
         if not tool_succeeded(payload):
-            return payload.get("error") or "the wait did not confirm the watch"
+            return _WorkOrderWakeFailure(payload.get("error") or "the wait did not confirm the watch")
         return None
 
     @tool(

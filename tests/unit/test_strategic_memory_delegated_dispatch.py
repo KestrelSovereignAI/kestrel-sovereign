@@ -600,6 +600,27 @@ async def test_an_unarmed_wake_is_reported_with_the_order_it_belongs_to(monkeypa
 
 
 @pytest.mark.asyncio
+async def test_an_uncertain_wake_requires_reconciliation_before_arming_again(monkeypatch, caplog):
+    from kestrel_sdk.resources import ResourceOutcomeUnknown
+
+    _github(monkeypatch)
+    claw = _Claw()
+    claw.raises["wait"] = ResourceOutcomeUnknown("private-wake-state")
+    result = await _feature(_agent(claw)).signal_dispatch(mode="execute")
+
+    assert result.status is ToolResultStatus.PARTIAL
+    assert result.data["dispatched"] is True
+    assert result.data["reason_code"] == "WORK_ORDER_WAKE_UNCONFIRMED"
+    assert "may" in result.error.lower() and "reconcile" in result.error.lower()
+    assert result.data["wake"] == f"a2a:{result.data['dispatch_id']}"
+    assert result.data["wake_confirmed"] is None
+    assert result.data["wake"] in result.error + result.confirmation
+    assert "was not armed" not in result.error + result.confirmation
+    assert "arm wait(" not in result.confirmation
+    assert "private-wake-state" not in caplog.text
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("tool", [LIST_OUTBOUND_TOOL, "send_a2a_task"])
 async def test_without_the_peers_tools_no_order_is_sent(tool, monkeypatch):
     _github(monkeypatch)
@@ -1119,3 +1140,33 @@ async def _call(claw, name, args):
     return await claw.execute_named_tool(
         name, args, session_id="chat-7", source="strategic_memory.signal_dispatch"
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('tool', ['wait', 'send_a2a_task'])
+async def test_original_dispatch_authority_loss_is_never_an_uncertain_tool_reply(tool, monkeypatch):
+    from kestrel_sovereign.execution_custody import ExecutionAuthorityError
+    _github(monkeypatch)
+    claw = _Claw()
+    original = ExecutionAuthorityError('original dispatch custody lost')
+    claw.raises[tool] = original
+    with pytest.raises(ExecutionAuthorityError) as caught:
+        await _feature(_agent(claw)).signal_dispatch(mode='execute')
+    assert caught.value is original
+
+
+@pytest.mark.asyncio
+async def test_raised_send_uncertainty_preserves_unknown_delivery_and_private_cause(monkeypatch, caplog):
+    from kestrel_sdk.resources import ResourceOutcomeUnknown
+    _github(monkeypatch)
+    claw = _Claw()
+    original = KeyError('private-send-state')
+    unknown = ResourceOutcomeUnknown('Tool outcome is unconfirmed')
+    unknown.__cause__ = original
+    claw.raises['send_a2a_task'] = unknown
+    result = await _feature(_agent(claw)).signal_dispatch(mode='execute')
+    assert result.data['reason_code'] == 'WORK_ORDER_UNCONFIRMED'
+    assert result.data['dispatched'] is None
+    assert 'may have arrived' in result.error
+    assert 'private-send-state' not in caplog.text
+    assert 'wait' not in claw.names()

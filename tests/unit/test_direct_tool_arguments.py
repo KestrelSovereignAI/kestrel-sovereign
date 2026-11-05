@@ -837,7 +837,7 @@ async def test_chat_path_still_reports_a_tool_that_raises():
 
     result = await _dispatch_direct(agent, tool.name, {"n": "1"}, dispatch_meta=dispatch_meta)
 
-    unknown = "Tool outcome is unconfirmed; reconcile before retrying"
+    unknown = "Tool outcome is unconfirmed; reconcile before retrying. Do not replay"
     assert result == {"success": False, "error": unknown}
     original = dispatch_meta.pop("outcome_error")
     assert isinstance(original, TimeoutError) and str(original) == "took too long"

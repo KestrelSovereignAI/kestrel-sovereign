@@ -89,6 +89,7 @@ from kestrel_sdk.llm import (
 
 from kestrel_sovereign.llm.retry import state_aggregate_verdicts
 from kestrel_sovereign.execution_custody import (
+    is_tool_execution_terminal_error,
     ExecutionAuthorityError, bind_execution_custody_snapshot,
     current_execution_custody, require_execution_work,
     bind_execution_cleanup, execution_work_stream, is_execution_control_error,
@@ -2435,7 +2436,7 @@ class StreamingMixin:
             except ExecutionAuthorityError:
                 raise
             except Exception as e:
-                if is_execution_control_error(e):
+                if is_tool_execution_terminal_error(e):
                     raise
                 require_execution_work(self)
                 logger.error(f"Provider {provider['name']} failed: {e}")

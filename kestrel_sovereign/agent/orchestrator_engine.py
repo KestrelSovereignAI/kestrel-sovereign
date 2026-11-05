@@ -109,6 +109,8 @@ from kestrel_sovereign.agent.streaming import (
 )
 from kestrel_sovereign.execution_custody import (
     ExecutionAuthorityError,
+    ToolAuditUnconfirmedError,
+    is_tool_execution_terminal_error,
     execution_terminal_error,
     is_execution_control_error,
     require_execution_work,
@@ -144,6 +146,14 @@ from kestrel_sovereign.telemetry import (
     # One definition of "is this an actual session?", shared with the LLM and
     # signal-dispatch spans that stamp the same value (#2940).
     real_session_id,
+)
+from kestrel_sovereign.tools.execution_outcome import (
+    TOOL_OUTCOME_UNCONFIRMED,
+    TOOL_PRECONDITION_CHANGED,
+    _HostToolFailure,
+    _PreconditionFailedToolResult,
+    _PrivateToolResult,
+    _UnconfirmedToolResult,
 )
 from kestrel_sovereign.turn_scope import capture_turn_scope
 
@@ -848,16 +858,13 @@ class ContextStats:
 
 
 class ToolNotRegisteredError(ValueError):
-    """Raised by ``execute_named_tool`` when the named tool isn't exposed
-    by any of the agent's currently-enabled features.
+    """A named tool is absent from the agent's enabled registry.
 
-    Subclasses ``ValueError`` so the prior contract ("ValueError on
-    unknown tool") still holds for callers that don't import this name,
-    but external transports (voice realtime, MCP, A2A) can catch the
-    subclass specifically to distinguish "tool doesn't exist" from a
-    ``ValueError`` raised by the tool's own validation logic.
-    Conflating the two leads to the realtime model retrying with a
-    different *tool name* when it should have corrected its *args*.
+    This pre-execution lookup refusal is distinct from a tool-body failure.
+    Once execution starts, ordinary exceptions, including ValueError, become
+    ResourceOutcomeUnknown unless they carry a known resource precondition
+    refusal or original terminal evidence. Reconcile unknown outcomes before
+    retrying rather than assuming an argument correction is safe.
     """
 
 
@@ -875,6 +882,8 @@ def _extract_inline_error_fields(result: Any) -> tuple[Optional[str], Optional[s
     ``(None, None)`` so ``result_status`` inference at the SDK layer
     still drives the status column accurately.
     """
+    if isinstance(result, _HostToolFailure):
+        return result.message, result.error_class
     if not isinstance(result, dict):
         return None, None
     if result.get("success") is False:
@@ -886,11 +895,7 @@ def _extract_inline_error_fields(result: Any) -> tuple[Optional[str], Optional[s
     return None, None
 
 
-class _DeferredToolAuditError(ResourceOutcomeUnknown):
-    """Execution completed but its required audit could not be confirmed."""
-
-
-class _AuditedDeferredResult(dict):
+class _AuditedDeferredResult(_PrivateToolResult):
     """Single-use dispatch receipt; serialization carries only result data.
 
     An inline adapter's history recorder must not write a second dispatch for
@@ -911,19 +916,16 @@ class _AuditedDeferredResult(dict):
         self._claimed = True
         return True
 
-    def __copy__(self):
-        return dict(self)
 
-    def __deepcopy__(self, memo):
-        return deepcopy(dict(self), memo)
-
-    def __reduce_ex__(self, protocol):
-        return dict, (dict(self),)
+class _AuditedUnconfirmedToolResult(_AuditedDeferredResult, _UnconfirmedToolResult):
+    """Unconfirmed delivery after the host acknowledged the original audit."""
 
 
 def _discard_tool_supplied_receipt(result):
-    """A nested or fabricated receipt does not audit the enclosing execution."""
-    return dict(result) if isinstance(result, _AuditedDeferredResult) else result
+    """A tool-supplied marker cannot attest to its own enclosing execution."""
+    if isinstance(result, (_AuditedDeferredResult, _HostToolFailure)):
+        return dict(result)
+    return result
 
 
 def _mark_tool_dispatch_audited(dispatch_meta, bound_execution=None, *, status):
@@ -952,12 +954,33 @@ def _returned_tool_status(result, dispatch_meta) -> str:
 
 def _raise_terminal_tool_error(error, dispatch_meta):
     """An observer failure cannot relabel an already-confirmed tool effect."""
-    if is_execution_control_error(error) or isinstance(error, _DeferredToolAuditError):
+    if is_tool_execution_terminal_error(error):
         raise error
     if dispatch_meta is not None and dispatch_meta.get("audit_recorded"):
         raise ResourceOutcomeUnknown(
             "Tool completed and its dispatch was recorded, but final delivery failed. Do not replay",
         ) from error
+
+
+async def _run_tool_execution(host, operation, *, execution, dispatch_meta,
+                             session_id, on_failure, recover_audited=False):
+    """One execution boundary for model, bound and ordinary named tools."""
+    try:
+        return await operation()
+    except Exception as error:
+        if is_tool_execution_terminal_error(error):
+            raise
+        if not recover_audited:
+            _raise_terminal_tool_error(error, dispatch_meta)
+        unknown = execution.returned or (
+            execution.started and not isinstance(error, ResourceConflict)
+        )
+        if unknown:
+            # Anti-repeat evidence must reach the owning turn before Stop can
+            # prevent delivery of this failure. This is not business success.
+            mark_current_invocation_effect_completed(session_id)
+            require_execution_work(host)
+        return await on_failure(error, unknown)
 
 
 async def _record_inline_tool_dispatch(host, entry, *, session_id, features_by_tool_name):
@@ -1044,7 +1067,7 @@ async def _complete_post_tool_result(host, result, post_input, *, adapter,
             )
         if not isinstance(error, Exception) or is_execution_control_error(error):
             raise error
-        raise _DeferredToolAuditError(
+        raise ToolAuditUnconfirmedError(
             "Tool completed, but its audit could not be confirmed; UI withheld. "
             "Reconcile before retrying. Do not replay to recover the UI",
         ) from error
@@ -1705,12 +1728,13 @@ class OrchestratorEngineMixin:
 
         Raises:
             ToolNotRegisteredError: ``tool_name`` is not registered with
-                any enabled feature.  A ``ValueError`` subclass — callers
-                that ``except ValueError`` still catch it for backwards
-                compatibility, but external transports should
-                ``except ToolNotRegisteredError`` specifically so a
-                ``ValueError`` raised by a tool's own argument validation
-                isn't misreported as "tool not found".
+                any enabled feature. Catch this type specifically for an
+                optional-tool probe.
+            ResourceOutcomeUnknown: execution started but its result or final
+                delivery could not be confirmed. Reconcile before retrying;
+                the private cause retains the original exception. Tool-local
+                ValueError is not evidence that execution never happened; do
+                not automatically correct and retry it.
         """
         from kestrel_sovereign.signals.constitution_canary import (
             PHANTOM_RECEIPT_TOOL_NAME,
@@ -1736,10 +1760,46 @@ class OrchestratorEngineMixin:
                 )
             return await handler(**(args or {}))
 
-        with tool_call_scope(self, call_context):
-            result = await self._dispatch_named_tool(
+        from kestrel_sovereign.agent.tool_registry import _ToolExecution
+        execution, dispatch_meta = _ToolExecution(), {}
+
+        async def run():
+            return await self._dispatch_named_tool(
                 tool_name, args, session_id=session_id, source=source,
                 _capture=_capture, call_context=call_context,
+                execution=execution, dispatch_meta=dispatch_meta,
+            )
+
+        async def failed(error, unknown):
+            if not unknown:
+                if (_capture is not None and execution.started
+                        and isinstance(error, ResourceConflict)):
+                    logging.warning(
+                        "[GOVERNED-DISPATCH] %s precondition refused: %s\n%s",
+                        tool_name, exception_log_summary(error), exception_frames(error),
+                    )
+                    return _PreconditionFailedToolResult({
+                        "success": False, "error": TOOL_PRECONDITION_CHANGED,
+                    })
+                raise error
+            logging.error(
+                "[GOVERNED-DISPATCH] %s failed: %s\n%s",
+                tool_name, exception_log_summary(error), exception_frames(error),
+            )
+            if _capture is None:
+                raise ResourceOutcomeUnknown(TOOL_OUTCOME_UNCONFIRMED) from error
+            payload = {"success": False, "error": TOOL_OUTCOME_UNCONFIRMED}
+            if dispatch_meta.get("audit_recorded"):
+                return _AuditedUnconfirmedToolResult(
+                    payload, host=self, tool_name=tool_name, session_id=session_id,
+                )
+            return _UnconfirmedToolResult(payload)
+
+        with tool_call_scope(self, call_context):
+            result = await _run_tool_execution(
+                self, run, execution=execution, dispatch_meta=dispatch_meta,
+                session_id=session_id, on_failure=failed,
+                recover_audited=_capture is not None,
             )
             if isinstance(result, _AuditedDeferredResult) and _capture is None:
                 return dict(result)
@@ -1754,6 +1814,8 @@ class OrchestratorEngineMixin:
         source: str,
         _capture: Optional[Dict[str, Any]],
         call_context: ToolCallContext,
+        execution,
+        dispatch_meta,
     ) -> Any:
         """Resolve and run one :meth:`execute_named_tool` call.
 
@@ -1949,7 +2011,9 @@ class OrchestratorEngineMixin:
         # executions.
         exec_start = time.time()
         require_execution_work(self)
+        execution.started = True
         result = await found_tool.execute(**effective_args)
+        execution.returned = True
         mark_current_invocation_effect_completed(session_id)
         require_execution_work(self)
         exec_duration_ms = int((time.time() - exec_start) * 1000)
@@ -1974,6 +2038,9 @@ class OrchestratorEngineMixin:
         return await _complete_post_tool_result(
             self, result, post_input, adapter=f"named:{source}:{feature_name}.{tool_name}",
             dispatch_start=exec_start,
+            on_audited=lambda status: _mark_tool_dispatch_audited(
+                dispatch_meta, execution, status=status,
+            ),
         )
 
     def _resolve_named_tool(self, tool_name: str) -> tuple[Any, Any]:
@@ -3166,7 +3233,7 @@ class OrchestratorEngineMixin:
             execution.returned = True
             return result
 
-        try:
+        async def run():
             result = await self._execute_tool_with_hooks(
                 tool_name=tool_name,
                 feature_name=hook_feature_name,
@@ -3199,19 +3266,16 @@ class OrchestratorEngineMixin:
             if streaming and tool_events is not None:
                 tool_events.append({'type': 'complete', 'tool': tool_name, 'ms': dispatch_duration})
             return result
-        except Exception as e:
-            _raise_terminal_tool_error(e, dispatch_meta)
+
+        async def failed(e, unknown):
             logging.error(
                 "[DIRECT-TOOL] %s failed: %s", tool_name, exception_log_summary(e),
             )
-            if (
-                execution.returned
-                or (execution.started and not isinstance(e, ResourceConflict))
-            ):
+            if unknown:
                 dispatch_meta["outcome_unknown"] = True
                 dispatch_meta["outcome_error"] = e
                 return await _failed(
-                    "Tool outcome is unconfirmed; reconcile before retrying",
+                    TOOL_OUTCOME_UNCONFIRMED,
                     error_class="ResourceOutcomeUnknown", status="error",
                 )
             return await _failed(
@@ -3219,6 +3283,11 @@ class OrchestratorEngineMixin:
                 error_class=type(e).__name__,
                 status="timeout" if isinstance(e, TimeoutError) else "error",
             )
+
+        return await _run_tool_execution(
+            self, run, execution=execution, dispatch_meta=dispatch_meta,
+            session_id=session_id, on_failure=failed,
+        )
 
     # ------------------------------------------------------------------
     # Tool concurrency batching
