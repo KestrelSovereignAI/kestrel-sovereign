@@ -660,6 +660,20 @@ within one lease of the restart, the turn is refused with
 lease`, followed by the heartbeat's state; it is never admitted only to be
 fenced a lease later.
 
+From then until the heartbeat renews the owner, health says so (#3987):
+`/health` fails readiness, and the `distributed_invocation_owner` check in
+`/health/detailed` names `the owner heartbeat was restarted and has not renewed
+the owner lease`, followed by the heartbeat's state (for example `its last
+renewal failed (ConnectionError)`, or `a new heartbeat thread could not be
+started (RuntimeError: can't start new thread)` when the runtime cannot create
+a thread). A restarted thread that exits before renewing, or never started, is
+reported at once, and the host starts another one a lease after that one
+started, without waiting for a turn. Health keeps reporting the failure while
+that next thread has not renewed, naming it and then `the next restart has not
+renewed it yet` with the new thread's state; a turn arriving then waits up to
+one lease for the new thread, as above. The first renewal of the owner clears
+it, under the same owner and epoch.
+
 Server shutdown stops the heartbeat and waits for its thread to exit and close
 its connection. If it has not by the end of the Stop close budget, shutdown
 fails with `Distributed Stop owner heartbeat has not retired`, naming the

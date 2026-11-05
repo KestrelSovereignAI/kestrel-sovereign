@@ -24,7 +24,12 @@ A heartbeat thread that exits without being stopped records why. The registry
 reports the exit within one relay interval, whether or not any work is in
 flight, and restarts the thread only for new work: an admission that finds it
 exited starts a new one and admits nothing until that thread has renewed the
-owner, so it never admits work that would be self-fenced one lease later.
+owner, so it never admits work that would be self-fenced one lease later. A
+restarted thread that has not renewed the owner once it exited, or once a lease
+has passed since it started, makes the owner's health unavailable, naming why.
+That stands through every later restart, until the heartbeat renews the owner
+(#3987). A thread that cannot be started at all counts as a launch whose thread
+never ran, and is named the same way.
 
 The heartbeat only publishes renewals. The registry folds each one into its
 lease on its own loop, where its generations live, so the thread never touches
@@ -194,10 +199,11 @@ class OwnerHeartbeat:
         # raised: that connection may still be open, so it stays owned.
         self._connection_failure: str | None = None
         # How many threads were started, when the newest one was, and why
-        # the newest one exited without being stopped.
+        # the newest one exited without being stopped, or could not start.
         self._launches = 0
         self._launched_at: float | None = None
         self._exit_cause: str | None = None
+        self._start_failure: str | None = None
         self._loop: asyncio.AbstractEventLoop | None = None
         self._wake: asyncio.Event | None = None
 
@@ -214,14 +220,28 @@ class OwnerHeartbeat:
         self._launch()
 
     def _launch(self) -> None:
+        """Start a new thread; a start that raises still counts as a launch.
+
+        The launch is counted, and timed, before ``Thread.start()``, so a
+        thread that could not be started is a launch whose thread never ran:
+        :meth:`describe` and :meth:`exit_cause` name why until the next
+        launch. The exception is raised to the caller.
+        """
+
         thread = threading.Thread(target=self._run, name=THREAD_NAME, daemon=True)
         with self._lock:
             # Anything the previous thread left in flight ended with it.
             self._in_flight = None
             self._exit_cause = None
+            self._start_failure = None
             self._launches += 1
             self._launched_at = time.monotonic()
-        thread.start()
+        try:
+            thread.start()
+        except BaseException as error:
+            with self._lock:
+                self._start_failure = f"{type(error).__name__}: {error}"
+            raise
         self._thread = thread
 
     @property
@@ -249,6 +269,9 @@ class OwnerHeartbeat:
             return None
         with self._lock:
             cause = self._exit_cause
+            start_failure = self._start_failure
+        if start_failure is not None:
+            return f"a new thread could not be started ({start_failure})"
         return cause or "it exited without recording why"
 
     def renewed_since_launch(self, owner_id: str) -> bool:
@@ -264,15 +287,31 @@ class OwnerHeartbeat:
             and renewed.started >= launched_at
         )
 
-    def ensure_running(self) -> None:
-        """Start a new thread if the previous one exited without being stopped."""
+    def ensure_running(self) -> bool:
+        """Start a new thread if the previous one exited without being stopped.
+
+        Returns whether a new thread was started. ``False`` when there was
+        nothing to restart (never started, stopped, or still running), and
+        when ``Thread.start()`` raised ``RuntimeError`` (the runtime could not
+        create a thread): that launch is logged and named by
+        :meth:`describe` until the next one.
+        """
 
         if self._thread is None or self._stopping.is_set() or self.alive:
-            return
+            return False
         logger.warning(
             "Distributed Stop owner heartbeat thread had exited; starting a new one"
         )
-        self._launch()
+        try:
+            self._launch()
+        except RuntimeError:
+            logger.error(
+                "Distributed Stop owner heartbeat thread could not be started; "
+                "nothing renews the owner lease until one is",
+                exc_info=True,
+            )
+            return False
+        return True
 
     def retarget(self, owner_id: str) -> None:
         """Renew ``owner_id`` from the next renewal on; never the previous one."""
@@ -308,15 +347,29 @@ class OwnerHeartbeat:
             latest = self._latest
             renewed = self._latest_renewed
             launched_at = self._launched_at
+            start_failure = self._start_failure
         if self._thread is None:
             return "the heartbeat thread was never started"
         if not self.alive:
+            if start_failure is not None and not self._stopping.is_set():
+                return f"a new heartbeat thread could not be started ({start_failure})"
             cause = self.exit_cause()
             if cause is None:
                 return "the heartbeat thread has exited"
             return f"the heartbeat thread has exited ({cause})"
         if in_flight is not None:
-            return f"its renewal has been in flight for {now - in_flight[1]:.1f} s"
+            flight = now - in_flight[1]
+            if (
+                latest is not None
+                and latest.failure is not None
+                and (launched_at is None or latest.started >= launched_at)
+            ):
+                # A retry: name the failure it retries, which may recur.
+                return (
+                    f"its last renewal failed ({latest.failure}); its retry "
+                    f"has been in flight for {flight:.1f} s"
+                )
+            return f"its renewal has been in flight for {flight:.1f} s"
         if latest is None:
             return "it has not finished a renewal"
         if latest.control is not None:
