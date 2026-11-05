@@ -916,6 +916,7 @@ class _AuditedDeferredResult(_PrivateToolResult):
         self._claimed = True
         return True
 
+
 class _AuditedUnconfirmedToolResult(_AuditedDeferredResult, _UnconfirmedToolResult):
     """Unconfirmed delivery after the host acknowledged the original audit."""
 

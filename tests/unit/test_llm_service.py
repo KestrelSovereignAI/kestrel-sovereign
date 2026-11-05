@@ -3558,7 +3558,7 @@ from tests.unit.test_deferred_tool_delivery import boundary as deferred_boundary
     ('stream_with_tool_detection', 'public'),
 ])
 async def test_inline_audit_failure_never_rotates_to_another_route(
-    llm_service, mock_adapter, deferred_boundary, entry, delivery,
+    llm_service, mock_adapter, deferred_boundary, entry, delivery,  # noqa: F811 - imported pytest fixture
 ):
     """A failed audit after a real tool effect is not provider unavailability."""
     from kestrel_sdk.resources import ResourceOutcomeUnknown

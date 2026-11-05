@@ -61,7 +61,7 @@ from kestrel_sovereign.agent.parts import part_collector
 
 @pytest.mark.asyncio
 async def test_inline_delivery_failure_after_real_audit_keeps_one_original_receipt(
-    deferred_boundary, monkeypatch,
+    deferred_boundary, monkeypatch,  # noqa: F811 - imported pytest fixture
 ):
     b = deferred_boundary
     b.policy.release.set()
@@ -116,7 +116,7 @@ async def test_codex_uses_host_uncertainty_before_stale_user_denial(host, audite
 
 
 @pytest.mark.asyncio
-async def test_codex_audit_uncertainty_latches_without_becoming_authority_loss(deferred_boundary):
+async def test_codex_audit_uncertainty_latches_without_becoming_authority_loss(deferred_boundary):  # noqa: F811 - imported pytest fixture
     from kestrel_sovereign.execution_custody import ToolAuditUnconfirmedError, is_execution_control_error
     from kestrel_sovereign.llm.codex_adapter import CodexAdapter
 
@@ -228,6 +228,7 @@ async def test_known_inline_conflict_preserves_redaction_without_raw_error_or_st
     from kestrel_sdk.resources import ResourceConflict
     from kestrel_sovereign.llm.codex_adapter import CodexAdapter
 
+    caplog.set_level(logging.DEBUG)
     agent, backend = host
     secret = 'private-conflict-detail'
     class Rejected(_Tool):
