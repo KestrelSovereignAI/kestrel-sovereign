@@ -73,6 +73,11 @@ async def test_standalone_hold_physical_drain_keeps_original_shutdown_c(
     source = OriginalFailure.capture(await _original_control(native_pg[0], monkeypatch)) if native_opening else None
     if source is not None:
         agent._remember_shutdown_control(source.error)
+    # Retire the fixture's unused LLM owner before targeting Hold close.
+    # Otherwise a degraded service stop may defer this context to completion.
+    await agent.llm_service.close()
+    await agent.llm_service.wait_for_close_completion()
+    agent.llm_service = None
     backend = SQLiteBackend(":memory:")
     await backend.connect()
     connection = backend._connection
@@ -96,11 +101,6 @@ async def test_standalone_hold_physical_drain_keeps_original_shutdown_c(
 
     monkeypatch.setattr(connection, "close", close)
     monkeypatch.setattr(context_module, "await_owned_task", join)
-    # Retire the fixture's unused LLM owner before targeting Hold close.
-    # Otherwise a degraded service stop may defer this context to completion.
-    await agent.llm_service.close()
-    await agent.llm_service.wait_for_close_completion()
-    agent.llm_service = None
     owner = create_owned_task(agent.shutdown(), retain_originals=True)
     entered_waiter = create_owned_task(entered.wait(), retain_originals=True)
     try:
