@@ -759,3 +759,68 @@ async def test_external_results_do_not_change_model_context_accounting(host):
     assert analysis["total_tool_calls"] == before["total_tool_calls"] + 1
     assert analysis["duplicate_tool_calls"] == 0
     assert tool.calls == [{"count": 3}] * 3
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('lane', ['model', 'bound', 'direct'])
+@pytest.mark.parametrize('failure', ['key', 'type', 'mixed-group'])
+async def test_every_direct_tool_lane_preserves_unconfirmed_effects_after_unexpected_failure(host, lane, failure):
+    from kestrel_sovereign.llm.adapter import ToolCall
+
+    agent, backend = host
+    class FailedAfterEffect(_Tool):
+        async def execute(self, **args):
+            self.calls.append(args)
+            if failure == 'mixed-group':
+                raise ExceptionGroup('unexpected operation failure', [
+                    ValueError('private-invalid-state'), KeyError('private-bug-detail')])
+            raise (KeyError if failure == 'key' else TypeError)('private-bug-detail')
+
+    tool = FailedAfterEffect(visible=True)
+    binding = _mount(agent, tool)
+    messages = []
+    if lane == 'bound':
+        with pytest.raises(ResourceOutcomeUnknown, match='unconfirmed'):
+            await binding.invoke({'count': 3}, session_id='original-effect')
+    else:
+        call = ToolCall(id='model-original-effect', name=binding.name, arguments={'count': 3})
+        if lane == 'direct':
+            result = await agent._dispatch_direct_tool(call, binding.name, {'count': 3}, 0,
+                'internal-original-effect', session_id='original-effect')
+        else:
+            result = await agent._dispatch_tool_call(call, {}, {binding.name}, messages, 0, None,
+                session_id='original-effect')
+        assert result['success'] is False
+        assert 'unconfirmed' in result['error'] and 'reconcile before retrying' in result['error']
+        assert 'private-bug-detail' not in json.dumps(messages)
+    assert tool.calls == [{'count': 3}]
+    rows = await backend.fetch_all('SELECT result_status, error_class, error_message FROM a2a_tool_dispatches')
+    if lane == 'direct':
+        # The internal executor does not own the outer dispatch receipt.
+        assert rows == []
+    else:
+        assert len(rows) == 1
+        assert tuple(rows[0][:2]) == ('error', 'ResourceOutcomeUnknown')
+        assert 'private-bug-detail' not in rows[0][2]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('lane', ['model', 'bound'])
+async def test_direct_tool_policy_refusal_before_execution_is_not_unknown(host, lane):
+    from kestrel_sovereign.llm.adapter import ToolCall
+
+    agent, backend = host
+    tool = _Tool(visible=True)
+    binding = _mount(agent, tool)
+    agent.hooks_manager.register(_Policy(HookOutput.deny('denied-before-execution')))
+    if lane == 'bound':
+        result = await binding.invoke({'count': 3}, session_id='pre-execution')
+    else:
+        result = await agent._dispatch_tool_call(
+            ToolCall(id='model-refused', name=binding.name, arguments={'count': 3}),
+            {}, {binding.name}, [], 0, None, session_id='pre-execution')
+    assert result['success'] is False
+    assert 'unconfirmed' not in result['error']
+    assert not tool.calls
+    row = await backend.fetch_one('SELECT result_status, error_class FROM a2a_tool_dispatches')
+    assert row[0] == 'policy_denied' and row[1] != 'ResourceOutcomeUnknown'

@@ -825,7 +825,7 @@ async def test_chat_path_refuses_an_unknown_argument_before_anything_runs():
 
 @pytest.mark.asyncio
 async def test_chat_path_still_reports_a_tool_that_raises():
-    """The failure bookkeeping the refusal shares with the exception path."""
+    """A tool-local timeout cannot establish that execution had no effects."""
 
     class _Raises(_SchemaTool):
         async def execute(self, **kwargs):
@@ -837,12 +837,16 @@ async def test_chat_path_still_reports_a_tool_that_raises():
 
     result = await _dispatch_direct(agent, tool.name, {"n": "1"}, dispatch_meta=dispatch_meta)
 
-    assert result == {"success": False, "error": "took too long"}
+    unknown = "Tool outcome is unconfirmed; reconcile before retrying"
+    assert result == {"success": False, "error": unknown}
+    original = dispatch_meta.pop("outcome_error")
+    assert isinstance(original, TimeoutError) and str(original) == "took too long"
     assert dispatch_meta == {
         "arguments": {"n": "1"},
-        "status": "timeout",
-        "error_class": "TimeoutError",
-        "error_message": "took too long",
+        "status": "error",
+        "error_class": "ResourceOutcomeUnknown",
+        "error_message": unknown,
+        "outcome_unknown": True,
     }
     assert agent.audit.rows == []
 

@@ -30,7 +30,7 @@ from kestrel_sovereign.tools.result_contract import enforce_tool_result_contract
 
 
 @dataclass
-class _BoundToolExecution:
+class _ToolExecution:
     """Caller-local execution facts, independent of a tool's business result."""
 
     started: bool = False
@@ -80,7 +80,7 @@ class _GovernedToolBinding:
         if not isinstance(source, str) or not source.strip():
             raise ValueError("A tool invocation requires a source")
         call = ToolCall(id=str(uuid4()), name=self.name, arguments=deepcopy(arguments))
-        execution = _BoundToolExecution()
+        execution = _ToolExecution()
         dispatch_start = time.time()
         from kestrel_sovereign._async_ownership import OwnedTaskOutcome, raise_owned_outcome
         from kestrel_sovereign.execution_custody import is_execution_control_error

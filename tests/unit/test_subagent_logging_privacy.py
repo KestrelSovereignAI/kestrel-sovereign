@@ -498,7 +498,8 @@ async def test_chat_path_direct_tool_failure_is_logged_by_class(debug_caplog):
 
     result = await _dispatch_direct(_ChatPathAgent(_DecidingHooks()), tool_)
 
-    assert result["success"] is False and ERROR_MARKER in result["error"]
+    assert result["success"] is False and "unconfirmed" in result["error"]
+    assert ERROR_MARKER not in result["error"]
     leaks = _leaks(debug_caplog.records)
     assert not leaks, leaks
     [line] = _lines(debug_caplog.records, "[DIRECT-TOOL] send_email failed")

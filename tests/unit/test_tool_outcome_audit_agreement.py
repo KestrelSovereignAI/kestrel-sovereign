@@ -222,7 +222,8 @@ async def test_raising_direct_tool_still_records_failure(host):
 
     result = await _dispatch(agent, tool.name)
 
-    assert result == {"success": False, "error": "broken on purpose"}
+    assert result == {"success": False,
+        "error": "Tool outcome is unconfirmed; reconcile before retrying"}
     await _assert_one_outcome(backend, "error")
 
 
