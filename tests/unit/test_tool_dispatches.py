@@ -184,9 +184,10 @@ async def test_broken_direct_tool_dispatch_writes_failure_row(tmp_path):
         assert row[5] == "TestFeature.broken_tool"
         assert json.loads(row[6])["api_key"] == "<redacted>"
         assert row[7] == "error"
-        assert row[8] == "ValueError"
-        assert row[9] == "broken on purpose"
-        assert messages and "broken on purpose" in messages[0]["content"]
+        assert row[8] == "ResourceOutcomeUnknown"
+        assert row[9] == "Tool outcome is unconfirmed; reconcile before retrying"
+        assert messages and row[9] in messages[0]["content"]
+        assert "broken on purpose" not in messages[0]["content"]
     finally:
         await store.close()
 
