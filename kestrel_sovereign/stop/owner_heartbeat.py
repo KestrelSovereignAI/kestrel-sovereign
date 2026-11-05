@@ -28,6 +28,15 @@ successful renewal is kept apart from the newest attempt: a stalled loop may
 next look after a failed attempt, and the renewals made during the stall still
 hold the lease.
 
+The heartbeat changes where a renewal runs, not what its failure means. A
+renewal error that carries execution control (``is_execution_control_error``),
+such as a lost COMMIT acknowledgement, is never retried: the heartbeat keeps
+the original exception on that attempt and renews nothing more. The registry
+retains it on its own loop as terminal control, which fences the owner, refuses
+new work and raises it at close, as when the relay renewed. Any other error is
+retried, and the lease is judged only against the last successful renewal, so
+a run of them fences once one lease has passed since it.
+
 One coupling remains, in the database rather than the loop. A renewal is a
 write, so a Stop-store write transaction that the server's loop holds open
 across a stall (SQLite's database write lock, or a PostgreSQL row lock on one
@@ -43,6 +52,8 @@ import time
 from contextlib import AsyncExitStack, asynccontextmanager
 from dataclasses import dataclass
 from typing import Any, AsyncContextManager, AsyncIterator, Awaitable, Callable
+
+from kestrel_sovereign.execution_custody import is_execution_control_error
 
 logger = logging.getLogger(__name__)
 
@@ -126,7 +137,9 @@ class OwnerRenewal:
     ``started`` is ``time.monotonic()`` before the renewal's transaction
     began, so it is no later than the heartbeat it wrote. ``poll`` is the
     owner's renewed inventory, or ``None`` when the attempt failed with
-    ``failure`` (the exception's type name).
+    ``failure`` (the exception's type name). ``control`` is the original
+    exception when it carried execution control; the heartbeat attempts no
+    renewal after such an attempt.
     """
 
     owner_id: str
@@ -134,6 +147,7 @@ class OwnerRenewal:
     finished: float
     poll: Any | None
     failure: str | None
+    control: BaseException | None = None
 
 
 class OwnerHeartbeat:
@@ -204,7 +218,10 @@ class OwnerHeartbeat:
             self._owner_id = owner_id
 
     def latest(self) -> OwnerRenewal | None:
-        """The most recent finished renewal attempt, of whichever owner."""
+        """The most recent finished renewal attempt, of whichever owner.
+
+        Once an attempt carries ``control``, it stays the most recent one.
+        """
 
         with self._lock:
             return self._latest
@@ -235,6 +252,11 @@ class OwnerHeartbeat:
             return f"its renewal has been in flight for {now - in_flight[1]:.1f} s"
         if latest is None:
             return "it has not finished a renewal"
+        if latest.control is not None:
+            return (
+                f"its last renewal raised execution control ({latest.failure}), "
+                "which is never retried"
+            )
         if latest.failure is not None:
             if renewed is None:
                 return f"its last renewal failed ({latest.failure})"
@@ -342,42 +364,63 @@ class OwnerHeartbeat:
             database = None
             while not self._stopping.is_set() and host.is_alive():
                 with self._lock:
+                    latest = self._latest
+                    # A control-bearing failure is never retried, by this
+                    # thread or one ensure_running() starts after it.
+                    halted = latest is not None and latest.control is not None
                     owner_id = self._owner_id
                     started = time.monotonic()
-                    self._in_flight = (owner_id, started)
-                poll = failure = None
-                try:
-                    if database is None:
-                        database = await connection.enter_async_context(
-                            self._open_database()
-                        )
-                    poll = await self._renew(database, owner_id)
-                except Exception as error:
-                    failure = type(error).__name__
-                    if not failing:
-                        logger.warning(
-                            "Distributed Stop owner heartbeat could not renew "
-                            "the owner lease (%s); retrying every %.2f s",
-                            failure,
-                            self._interval,
-                            exc_info=(type(error), error, error.__traceback__),
-                        )
-                    failing = True
-                else:
-                    if failing:
-                        logger.warning(
-                            "Distributed Stop owner heartbeat renews the owner "
-                            "lease again"
-                        )
-                    failing = False
-                renewal = OwnerRenewal(
-                    owner_id, started, time.monotonic(), poll, failure
-                )
-                with self._lock:
-                    self._in_flight = None
-                    self._latest = renewal
-                    if failure is None:
-                        self._latest_renewed = renewal
+                    if not halted:
+                        self._in_flight = (owner_id, started)
+                if not halted:
+                    poll = failure = control = None
+                    try:
+                        if database is None:
+                            database = await connection.enter_async_context(
+                                self._open_database()
+                            )
+                        poll = await self._renew(database, owner_id)
+                    except BaseException as error:
+                        if is_execution_control_error(error):
+                            control = error
+                        elif not isinstance(error, Exception):
+                            raise
+                        failure = type(error).__name__
+                        if control is not None:
+                            logger.error(
+                                "Distributed Stop owner heartbeat renewal raised "
+                                "execution control (%s); it is never retried, and "
+                                "the registry fences on it",
+                                failure,
+                                exc_info=(type(error), error, error.__traceback__),
+                            )
+                        elif not failing:
+                            logger.warning(
+                                "Distributed Stop owner heartbeat could not renew "
+                                "the owner lease (%s); retrying every %.2f s",
+                                failure,
+                                self._interval,
+                                exc_info=(type(error), error, error.__traceback__),
+                            )
+                        failing = True
+                    else:
+                        if failing:
+                            logger.warning(
+                                "Distributed Stop owner heartbeat renews the "
+                                "owner lease again"
+                            )
+                        failing = False
+                    renewal = OwnerRenewal(
+                        owner_id, started, time.monotonic(), poll, failure, control
+                    )
+                    with self._lock:
+                        self._in_flight = None
+                        self._latest = renewal
+                        if failure is None:
+                            self._latest_renewed = renewal
+                    if control is not None and not isinstance(control, Exception):
+                        # Published first, so the registry still retains it.
+                        raise control
                 try:
                     await asyncio.wait_for(wake.wait(), timeout=self._interval)
                 except TimeoutError:

@@ -632,6 +632,14 @@ The `FENCED` line names what the owner saw:
 - `durable generation was lost: the owner heartbeat's renewal found it expired
   or removed`: a renewal found an in-flight row gone, so another replica may
   already have reaped it.
+- `original execution control retained by Stop settlement`: a renewal raised
+  execution control, such as a lost COMMIT acknowledgement
+  (`ExecutionCommitOutcomeError`), logged just before by the heartbeat as
+  `renewal raised execution control`. Unlike an ordinary error it is never
+  retried: the heartbeat renews nothing more, every later admission is refused
+  with that error, and shutdown raises it, as before the heartbeat had a
+  thread of its own. Ownership is not re-established in that process; it
+  admits work again only after a restart.
 
 ### Process exit and the heartbeat thread
 The heartbeat thread is a daemon, and it also stops once the thread that runs

@@ -1167,18 +1167,23 @@ class DistributedInvocationRegistry:
         its durable row expired or was removed. A generation in the inventory
         was renewed no earlier than the renewal started. Then every generation
         the current owner holds must have been renewed within one lease.
+        Before any of that, a renewal's execution control is held and fences.
+
+        Those inventory facts are applied on every observation, including to
+        a renewal already observed: a generation whose admission was waiting
+        for its insert's reply when that renewal was folded in is published
+        afterwards, and the renewal still renewed its row. Only the renewal's
+        Stop marks are delivered once.
         """
 
+        self._heartbeat_attempt()
         if self._lease_lost:
             return
         owner_id = self._owner_id
         heartbeat = self._heartbeat
         renewal = heartbeat.latest_renewed() if heartbeat is not None else None
-        if (
-            renewal is not None
-            and renewal is not self._observed_renewal
-            and renewal.owner_id == owner_id
-        ):
+        if renewal is not None and renewal.owner_id == owner_id:
+            unobserved = renewal is not self._observed_renewal
             self._observed_renewal = renewal
             live = set(renewal.poll.live_generation_ids)
             lease_owned = self._lease_owned_generation_ids()
@@ -1198,7 +1203,9 @@ class DistributedInvocationRegistry:
                     and self._renewed_at[generation_id] < renewal.started
                 ):
                     self._renewed_at[generation_id] = renewal.started
-            for generation_id in renewal.poll.stop_generation_ids:
+            for generation_id in (
+                renewal.poll.stop_generation_ids if unobserved else ()
+            ):
                 target = self._active.get(generation_id)
                 if target is None or target.owner_id != owner_id:
                     continue
@@ -1218,6 +1225,27 @@ class DistributedInvocationRegistry:
         )
         if oldest is not None and now - oldest >= self._owner_lease_seconds:
             self._fail_closed_owner(self._lease_lapse_reason(now, oldest))
+
+    def _heartbeat_attempt(self) -> OwnerRenewal | None:
+        """The heartbeat's newest renewal attempt, once its control is held.
+
+        A renewal error carrying execution control is never retried (#3889):
+        the heartbeat stops renewing and keeps the original exception on that
+        attempt. Here, on the registry's loop, the same exception is retained
+        as terminal control and the owner fences, as when the relay renewed:
+        work past its durable write sees a fenced owner, a call that has not
+        written yet is refused with that exception, and close raises it.
+        """
+
+        heartbeat = self._heartbeat
+        renewal = heartbeat.latest() if heartbeat is not None else None
+        if renewal is not None and renewal.control is not None:
+            self._retain_terminal_control(renewal.control)
+            self._fail_closed_owner(
+                "owner heartbeat renewal raised original execution control "
+                f"({renewal.failure})"
+            )
+        return renewal
 
     def _lease_lapse_reason(self, now: float, renewed_at: float) -> str:
         heartbeat = self._heartbeat
@@ -1299,6 +1327,9 @@ class DistributedInvocationRegistry:
                         f"be re-established ({self.owner_fence_reason})"
                     )
                 self._observe_owner_heartbeat()
+                # Control this observation held refuses the admission, as
+                # it would have had the relay held it first.
+                self._require_terminal_control()
                 if self._lease_lost:
                     raise InvocationSelfFencedError(
                         "distributed Stop owner lease expired before admission"
@@ -1413,6 +1444,7 @@ class DistributedInvocationRegistry:
                     "distributed Stop owner lease was lost before turn binding"
                 )
             self._observe_owner_heartbeat()
+            self._require_terminal_control()
             if self._lease_lost:
                 raise InvocationSelfFencedError(
                     "distributed Stop owner lease expired before turn binding"
@@ -1708,11 +1740,13 @@ class DistributedInvocationRegistry:
                 "the owner heartbeat is not running (the registry was not started)"
             )
             return
+        renewal = self._heartbeat_attempt()
+        # Held control is raised, never read as an unavailable store.
+        self._require_terminal_control()
         heartbeat.ensure_running()
         candidate = self._candidate_owner_id
         since = self._candidate_since
         deadline = time.monotonic() + self._owner_lease_seconds
-        renewal = heartbeat.latest()
         while (
             renewal is None
             or renewal.owner_id != candidate
@@ -1728,7 +1762,8 @@ class DistributedInvocationRegistry:
             await asyncio.sleep(self._poll_seconds)
             if not self._lease_lost or self._closing:
                 return
-            renewal = heartbeat.latest()
+            renewal = self._heartbeat_attempt()
+            self._require_terminal_control()
         failure = None
         if renewal.poll is None:
             failure = f"owner lease store unavailable ({renewal.failure})"
@@ -1892,6 +1927,10 @@ class DistributedInvocationRegistry:
             withdrawal = execution_terminal_error(
                 withdrawal, stopped.cancellation, retain_originals=True,
             )
+            last_attempt = heartbeat.latest()
+            if last_attempt is not None and last_attempt.control is not None:
+                # Possibly raised by the renewal that stop() let finish.
+                self._retain_terminal_control(last_attempt.control)
             if stopped.error is not None:
                 failure = execution_terminal_error(
                     failure, stopped.error, retain_originals=True,

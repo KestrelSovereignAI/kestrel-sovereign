@@ -16,6 +16,7 @@ import time
 from pathlib import Path
 from uuid import uuid4
 
+import aiosqlite
 import pytest
 from fastapi import FastAPI
 
@@ -26,7 +27,9 @@ from kestrel_sovereign.agent.invocation import (
     bind_async_invocation,
 )
 from kestrel_sovereign.execution_custody import (
+    ExecutionCommitOutcomeError,
     execution_cleanup_debts,
+    execution_commit_outcome,
     is_execution_control_error,
 )
 from kestrel_sovereign.stop import (
@@ -35,6 +38,7 @@ from kestrel_sovereign.stop import (
     StopDisposition,
 )
 from kestrel_sovereign.stop.owner_heartbeat import (
+    THREAD_NAME,
     OwnerHeartbeat,
     independent_database_opener,
 )
@@ -383,6 +387,539 @@ async def test_a_failed_attempt_after_a_stall_keeps_the_renewals_made_during_it(
         agent.release_operation.set()
         assert await turn == "held-turn"
         assert registry.owner_epoch == 1
+    finally:
+        failing.clear()
+        agent.release_operation.set()
+        await asyncio.gather(turn, return_exceptions=True)
+        await registry.close()
+        await db.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(60)
+async def test_an_admission_whose_reply_is_late_keeps_the_renewal_the_relay_already_read(
+    tmp_path, monkeypatch
+):
+    """An insert's reply can arrive after the relay folded in the renewal that
+    renewed the new row. That renewal still holds the row's lease: neither
+    the admission nor another agent's turn is fenced."""
+
+    db, store, registry = await _owner_registry(
+        tmp_path / "late-admission-reply.db",
+        poll_seconds=0.02,
+        owner_lease_seconds=_HEALTHY_LEASE_SECONDS,
+    )
+    bystander = _SelfFencingReplicaAgent("did:test:late-reply-bystander")
+    late = _SelfFencingReplicaAgent("did:test:late-reply-admission")
+    registry.attach(bystander)
+    registry.attach(late)
+    holding = threading.Event()
+    parked = threading.Event()
+    released = threading.Event()
+
+    async def holdable(original, store, owner_id, **kwargs):
+        if holding.is_set():
+            parked.set()
+            released.wait(30)
+        return await original(store, owner_id, **kwargs)
+
+    _patch_heartbeat_renewal(monkeypatch, holdable)
+    original_register = store.register
+    late_reply: dict = {}
+
+    async def register_with_a_late_reply(**kwargs):
+        sent = time.monotonic()
+        admitted = await original_register(**kwargs)
+        if kwargs["agent_id"] != late.agent_id:
+            return admitted
+        # The row has committed; its reply arrives more than a lease later,
+        # while the heartbeat renews the row and the relay folds that in.
+        await asyncio.sleep(_HEALTHY_LEASE_SECONDS + 0.1)
+        # No renewal finishes before the admission resumes, and the relay
+        # has already observed the newest one.
+        holding.set()
+        await _wait_for(parked.is_set)
+        renewal = registry._heartbeat.latest_renewed()
+        await _wait_for(lambda: registry._observed_renewal is renewal)
+        late_reply.update(
+            sent=sent, renewal=renewal, generation_id=kwargs["generation_id"]
+        )
+        return admitted
+
+    store.register = register_with_a_late_reply
+    registry.start()
+    bystander_turn = asyncio.create_task(bystander.run_turn("bystander-turn"))
+    try:
+        await asyncio.wait_for(bystander.operation_started.wait(), timeout=10)
+
+        assert await registry.register(late, "late-turn", 1)
+
+        renewal, generation_id = late_reply["renewal"], late_reply["generation_id"]
+        # The situation the fix is for: the renewal renewed the new row after
+        # it committed, the relay read it before the admission published the
+        # row, and the admission began more than a lease ago.
+        assert renewal.started > late_reply["sent"]
+        assert generation_id in renewal.poll.live_generation_ids
+        assert time.monotonic() - late_reply["sent"] >= _HEALTHY_LEASE_SECONDS
+        assert registry._renewed_at[generation_id] == renewal.started
+        assert not registry._lease_lost, registry.owner_fence_reason
+        assert registry.owner_lifecycle_status == "healthy"
+        assert registry.owner_epoch == 1
+        assert not bystander_turn.done()
+
+        holding.clear()
+        released.set()
+        # Let the relay act on everything it can now see.
+        await asyncio.sleep(10 * registry._poll_seconds)
+        assert registry.owner_lifecycle_status == "healthy"
+        assert not bystander_turn.done()
+        bystander.release_operation.set()
+        assert await bystander_turn == "bystander-turn"
+        registry.complete_soon(late, "late-turn", 1)
+        await _wait_for(lambda: generation_id not in registry._active)
+    finally:
+        holding.clear()
+        released.set()
+        bystander.release_operation.set()
+        await asyncio.gather(bystander_turn, return_exceptions=True)
+        await registry.close()
+        await db.close()
+
+
+def _count_heartbeat_renewals(monkeypatch, failure=None):
+    """Record every renewal attempt; raise ``failure()`` while it returns one.
+
+    Returns the list of ``(time.monotonic(), succeeded)`` per attempt.
+    """
+
+    attempts: list[tuple[float, bool]] = []
+
+    async def counted(original, store, owner_id, **kwargs):
+        started = time.monotonic()
+        error = None if failure is None else failure()
+        if error is not None:
+            attempts.append((started, False))
+            raise error
+        try:
+            polled = await original(store, owner_id, **kwargs)
+        except BaseException:
+            attempts.append((started, False))
+            raise
+        attempts.append((started, True))
+        return polled
+
+    _patch_heartbeat_renewal(monkeypatch, counted)
+    return attempts
+
+
+_RENEWAL_TASK = "distributed-stop-owner-poll:"
+
+
+class _LostRenewalAcknowledgement:
+    """Once armed, drop the reply to the heartbeat's next renewal COMMIT, on
+    its own connection, after SQLite has run the COMMIT.
+
+    The backend cannot tell whether that renewal committed, so it raises
+    ``ExecutionCommitOutcomeError("unknown")`` from the error appended to
+    ``lost``. ``sparing`` exempts one owner identity's renewals; ``hold``
+    keeps the renewal waiting for ``release`` before its reply is lost.
+    """
+
+    def __init__(self, monkeypatch):
+        self.lost: list[BaseException] = []
+        self.entered = threading.Event()
+        self.release = threading.Event()
+        self._lock = threading.Lock()
+        self._armed = False
+        self._sparing: str | None = None
+        self._hold = False
+        native_commit = aiosqlite.Connection.commit
+
+        async def commit(connection):
+            await native_commit(connection)
+            name = asyncio.current_task().get_name()
+            if threading.current_thread().name != THREAD_NAME or not (
+                name.startswith(_RENEWAL_TASK)
+            ):
+                return
+            with self._lock:
+                if not self._armed or name == f"{_RENEWAL_TASK}{self._sparing}":
+                    return
+                self._armed = False
+                hold = self._hold
+            if hold:
+                self.entered.set()
+                self.release.wait(30)
+            self.lost.append(
+                ConnectionResetError("renewal COMMIT acknowledgement lost")
+            )
+            raise self.lost[-1]
+
+        monkeypatch.setattr(aiosqlite.Connection, "commit", commit)
+
+    def arm(self, *, sparing: str | None = None, hold: bool = False) -> None:
+        with self._lock:
+            self._armed, self._sparing, self._hold = True, sparing, hold
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(60)
+async def test_a_lost_renewal_commit_acknowledgement_fences_and_is_never_retried(
+    tmp_path, monkeypatch
+):
+    """A renewal error carrying execution control means what it meant when
+    the relay renewed on the server's loop: it is never retried, the owner
+    fences, new work is refused with the original error, and close raises
+    it. Each outcome asserted here is main's for the same injection."""
+
+    db, _store, registry = await _owner_registry(
+        tmp_path / "lost-renewal-ack.db",
+        poll_seconds=0.02,
+        owner_lease_seconds=_HEALTHY_LEASE_SECONDS,
+    )
+    agent = _SelfFencingReplicaAgent("did:test:lost-renewal-ack")
+    registry.attach(agent)
+    attempts = _count_heartbeat_renewals(monkeypatch)
+    lost_ack = _LostRenewalAcknowledgement(monkeypatch)
+    registry.start()
+    heartbeat = registry._heartbeat
+    turn = asyncio.create_task(agent.run_turn("in-flight-turn"))
+    closed = False
+    try:
+        await asyncio.wait_for(agent.operation_started.wait(), timeout=10)
+        await _wait_for(lambda: heartbeat.latest_renewed() is not None)
+        lost_ack.arm()
+        await _wait_for(lambda: registry._lease_lost)
+
+        control = heartbeat.latest().control
+        assert isinstance(control, ExecutionCommitOutcomeError)
+        assert execution_commit_outcome(control) == "unknown"
+        assert control.__cause__ is lost_ack.lost[0]
+        # The registry holds that exact exception, and fenced on it.
+        assert registry._terminal_control is control
+        assert registry.owner_lifecycle_status == "self_fenced"
+        assert registry.owner_fence_reason == (
+            "epoch 1: original execution control retained by Stop settlement"
+        )
+        with pytest.raises(InvocationSelfFencedError):
+            await asyncio.wait_for(turn, timeout=10)
+
+        # Never retried: no further attempt, for that owner or a successor.
+        made = len(attempts)
+        assert not attempts[-1][1]
+        await asyncio.sleep(25 * registry._poll_seconds)
+        assert len(attempts) == made
+        assert heartbeat.latest().control is control
+
+        later = _SelfFencingReplicaAgent("did:test:lost-renewal-ack")
+        with pytest.raises(ExecutionCommitOutcomeError) as refused:
+            await registry.register(later, "later-turn", 1)
+        assert refused.value is control
+
+        closed = True
+        with pytest.raises(ExecutionCommitOutcomeError) as raised:
+            await registry.close()
+        assert raised.value is control
+        assert not heartbeat.alive
+        assert len(attempts) == made
+    finally:
+        agent.release_operation.set()
+        await asyncio.gather(turn, return_exceptions=True)
+        if not closed:
+            try:
+                await registry.close()
+            except ExecutionCommitOutcomeError:
+                pass
+        await db.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(60)
+@pytest.mark.parametrize("entry", ["admission", "turn binding"])
+async def test_the_call_that_first_reads_a_lost_acknowledgement_is_refused_with_it(
+    tmp_path, monkeypatch, entry
+):
+    """On main the relay held the control the moment the renewal failed, so a
+    call that started later was refused with it. Here the call itself may be
+    the first to read it from the heartbeat; it is refused with it too."""
+
+    db, _store, registry = await _owner_registry(
+        tmp_path / "lost-ack-first-reader.db",
+        poll_seconds=0.02,
+        owner_lease_seconds=_HEALTHY_LEASE_SECONDS,
+    )
+    lost_ack = _LostRenewalAcknowledgement(monkeypatch)
+    agent = _SelfFencingReplicaAgent("did:test:lost-ack-first-reader")
+    registry.attach(agent)
+    registry.start()
+    heartbeat = registry._heartbeat
+    # Without the relay, only the call below reads what the heartbeat holds.
+    relay = registry._relay_task
+    relay.cancel()
+    await asyncio.gather(relay, return_exceptions=True)
+    registry._relay_task = None
+    closed = False
+    try:
+        if entry == "turn binding":
+            assert await registry.register(agent, "private-request", 1)
+        rows = await db.fetchall("SELECT generation_id FROM stop_active_invocations")
+        await _wait_for(lambda: heartbeat.latest_renewed() is not None)
+        lost_ack.arm()
+        await _wait_for(lambda: heartbeat.latest().control is not None)
+        control = heartbeat.latest().control
+        assert registry._terminal_control is None and not registry._lease_lost
+
+        with pytest.raises(ExecutionCommitOutcomeError) as refused:
+            if entry == "admission":
+                await registry.register(agent, "refused-request", 1)
+            else:
+                await registry.bind_public_turn(
+                    agent, "public-turn", "private-request", 1
+                )
+        assert refused.value is control
+        assert registry._terminal_control is control
+        assert registry.owner_lifecycle_status == "self_fenced"
+        # Refused before it wrote anything.
+        assert await db.fetchall(
+            "SELECT generation_id FROM stop_active_invocations"
+        ) == rows
+        assert await db.fetchall(
+            "SELECT generation_id FROM stop_active_invocations "
+            "WHERE public_turn_digest IS NOT NULL"
+        ) == []
+
+        closed = True
+        with pytest.raises(ExecutionCommitOutcomeError) as raised:
+            await registry.close()
+        assert raised.value is control
+    finally:
+        if not closed:
+            try:
+                await registry.close()
+            except ExecutionCommitOutcomeError:
+                pass
+        await db.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(60)
+async def test_a_lost_acknowledgement_while_reacquiring_is_held_not_retried(
+    tmp_path, monkeypatch
+):
+    """A fenced registry re-establishing ownership holds a control-bearing
+    renewal of its candidate identity; it is not an unavailable store."""
+
+    db, _store, registry = await _owner_registry(
+        tmp_path / "lost-ack-reacquiring.db",
+        poll_seconds=0.02,
+        owner_lease_seconds=_HEALTHY_LEASE_SECONDS,
+    )
+    attempts = _count_heartbeat_renewals(monkeypatch)
+    lost_ack = _LostRenewalAcknowledgement(monkeypatch)
+    registry.start()
+    heartbeat = registry._heartbeat
+    closed = False
+    try:
+        await _wait_for(lambda: heartbeat.latest_renewed() is not None)
+        lost_ack.arm(sparing=registry._owner_id)
+        registry._fail_closed_owner("owner fenced for review")
+        candidate = registry._candidate_owner_id
+
+        await _wait_for(lambda: registry._terminal_control is not None)
+        control = heartbeat.latest().control
+        assert heartbeat.latest().owner_id == candidate
+        assert control.__cause__ is lost_ack.lost[0]
+        assert registry._terminal_control is control
+        assert registry._reacquisition_failure is None
+        assert registry.owner_epoch == 1
+        made = len(attempts)
+        await asyncio.sleep(25 * registry._poll_seconds)
+        assert len(attempts) == made
+
+        with pytest.raises(ExecutionCommitOutcomeError) as refused:
+            await registry.register(
+                _SelfFencingReplicaAgent("did:test:lost-ack-reacquiring"),
+                "refused-turn",
+                1,
+            )
+        assert refused.value is control
+        closed = True
+        with pytest.raises(ExecutionCommitOutcomeError) as raised:
+            await registry.close()
+        assert raised.value is control
+    finally:
+        if not closed:
+            try:
+                await registry.close()
+            except ExecutionCommitOutcomeError:
+                pass
+        await db.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(60)
+async def test_close_raises_a_lost_acknowledgement_of_the_renewal_it_waited_for(
+    tmp_path, monkeypatch
+):
+    """A renewal in flight when close begins finishes before the heartbeat
+    exits; close raises the control that renewal raised."""
+
+    db, _store, registry = await _owner_registry(
+        tmp_path / "lost-ack-at-close.db",
+        poll_seconds=0.02,
+        owner_lease_seconds=_HEALTHY_LEASE_SECONDS,
+    )
+    lost_ack = _LostRenewalAcknowledgement(monkeypatch)
+    registry.start()
+    heartbeat = registry._heartbeat
+    closing = None
+    try:
+        await _wait_for(lambda: heartbeat.latest_renewed() is not None)
+        lost_ack.arm(hold=True)
+        assert await asyncio.to_thread(lost_ack.entered.wait, 10)
+
+        closing = asyncio.create_task(registry.close())
+        done, _ = await asyncio.wait({closing}, timeout=0.1)
+        assert not done, "close did not wait for the renewal in flight"
+        assert registry._terminal_control is None
+        lost_ack.release.set()
+
+        with pytest.raises(ExecutionCommitOutcomeError) as raised:
+            await closing
+        control = heartbeat.latest().control
+        assert raised.value is control
+        assert control.__cause__ is lost_ack.lost[0]
+        assert registry._terminal_control is control
+        assert registry.owner_lifecycle_status == "self_fenced"
+        assert not heartbeat.alive
+    finally:
+        lost_ack.release.set()
+        if closing is None:
+            await registry.close()
+        else:
+            await asyncio.gather(closing, return_exceptions=True)
+        await db.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(60)
+async def test_a_transient_renewal_error_then_a_renewal_within_the_lease_changes_nothing(
+    tmp_path, monkeypatch
+):
+    """An ordinary error is retried; the next renewal inside the lease keeps
+    the owner and every turn as they were."""
+
+    db, _store, registry = await _owner_registry(
+        tmp_path / "transient-renewal-error.db",
+        poll_seconds=0.02,
+        owner_lease_seconds=_HEALTHY_LEASE_SECONDS,
+    )
+    agent = _SelfFencingReplicaAgent("did:test:transient-renewal-error")
+    registry.attach(agent)
+    to_fail = [0]
+    to_fail_lock = threading.Lock()
+
+    def transient_failure():
+        with to_fail_lock:
+            if to_fail[0] == 0:
+                return None
+            to_fail[0] -= 1
+        return ConnectionError("transient renewal failure")
+
+    attempts = _count_heartbeat_renewals(monkeypatch, transient_failure)
+    registry.start()
+    heartbeat = registry._heartbeat
+    turn = asyncio.create_task(agent.run_turn("in-flight-turn"))
+    try:
+        await asyncio.wait_for(agent.operation_started.wait(), timeout=10)
+        await _wait_for(lambda: heartbeat.latest_renewed() is not None)
+        with to_fail_lock:
+            to_fail[0] = 2
+
+        def failed_indices() -> list[int]:
+            return [index for index, (_, ok) in enumerate(attempts) if not ok]
+
+        await _wait_for(
+            lambda: len(failed_indices()) == 2
+            and len(attempts) > failed_indices()[-1] + 1
+        )
+        failed = failed_indices()
+        assert failed[1] == failed[0] + 1
+        before, after = attempts[failed[0] - 1], attempts[failed[1] + 1]
+        assert before[1] and after[1]
+        assert after[0] - before[0] < _HEALTHY_LEASE_SECONDS
+
+        # Let the relay act on everything it can now see.
+        await asyncio.sleep(10 * registry._poll_seconds)
+        assert registry.owner_lifecycle_status == "healthy"
+        assert registry.owner_epoch == 1
+        assert registry._terminal_control is None
+        assert heartbeat.latest().control is None
+        assert not turn.done()
+
+        agent.release_operation.set()
+        assert await turn == "in-flight-turn"
+    finally:
+        agent.release_operation.set()
+        await asyncio.gather(turn, return_exceptions=True)
+        await registry.close()
+        await db.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(60)
+async def test_ordinary_renewal_errors_past_the_lease_fence_within_it(
+    tmp_path, monkeypatch
+):
+    """Retried errors never extend the lease: it is judged against the last
+    successful renewal, so the owner fences once one lease has passed."""
+
+    db, _store, registry = await _owner_registry(
+        tmp_path / "renewal-errors-past-lease.db",
+        poll_seconds=0.02,
+        owner_lease_seconds=_HEALTHY_LEASE_SECONDS,
+    )
+    agent = _SelfFencingReplicaAgent("did:test:renewal-errors-past-lease")
+    registry.attach(agent)
+    failing = threading.Event()
+    attempts = _count_heartbeat_renewals(
+        monkeypatch,
+        lambda: (
+            ConnectionError("renewal store unavailable") if failing.is_set() else None
+        ),
+    )
+    registry.start()
+    heartbeat = registry._heartbeat
+    turn = asyncio.create_task(agent.run_turn("in-flight-turn"))
+    try:
+        await asyncio.wait_for(agent.operation_started.wait(), timeout=10)
+        await _wait_for(lambda: heartbeat.latest_renewed() is not None)
+        failing.set()
+        await _wait_for(lambda: registry._lease_lost, timeout=10)
+        fenced_at = time.monotonic()
+
+        last_renewed = heartbeat.latest_renewed()
+        failures = [started for started, ok in attempts if not ok]
+        # Retried every interval, and none of it renewed the lease.
+        assert len(failures) >= 2
+        assert min(failures) >= last_renewed.started
+        fenced_after = fenced_at - last_renewed.started
+        assert fenced_after >= _HEALTHY_LEASE_SECONDS
+        assert fenced_after < _HEALTHY_LEASE_SECONDS + 0.25
+        reason = registry.owner_fence_reason
+        assert "owner lease not renewed for" in reason
+        assert "its last renewal failed (ConnectionError)" in reason
+        assert registry._terminal_control is None
+        with pytest.raises(InvocationSelfFencedError):
+            await asyncio.wait_for(turn, timeout=10)
+
+        # The errors were not control: once renewals succeed again, the
+        # relay re-establishes ownership and new work is admitted.
+        failing.clear()
+        await _wait_for(lambda: registry.owner_lifecycle_status == "healthy")
+        assert registry.owner_epoch == 2
+        later = _SelfFencingReplicaAgent("did:test:renewal-errors-past-lease")
+        assert await registry.register(later, "later-turn", 1)
     finally:
         failing.clear()
         agent.release_operation.set()
