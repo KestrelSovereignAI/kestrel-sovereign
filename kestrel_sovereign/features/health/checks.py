@@ -16,6 +16,7 @@ import asyncio
 import logging
 import shutil
 import time
+import weakref
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any, Awaitable, Dict, FrozenSet, List, Optional, Tuple
@@ -222,54 +223,127 @@ async def check_database(db) -> Dict[str, Any]:
 # rather than re-deriving routing, and never sends a completion to probe a
 # route. A (provider, model) pair with a row in the window is active, and its
 # health is its newest outcome.
+#
+# A route is reported ok or standby, and a startup failure set aside, only on
+# positive evidence. A lease-route row naming no lease or another lease, a
+# capped read, a selected route with no rows, and a call that cannot be placed
+# after the startup probe each leave a route unprobed or warning, never
+# passing. An installed lease that refuses calls now warns whatever its rows
+# say: it refuses some calls before they are recorded.
 LLM_ROUTE_EVIDENCE_WINDOW = timedelta(hours=24)
-# The newest rows read per check. A pair whose rows all fall outside them
-# reads as having none; ``row_limit_reached`` in the details says so.
+# The newest rows read for each route, and for its failures when that first
+# read is full (see :func:`_read_route_rows`).
 LLM_ROUTE_EVIDENCE_ROW_LIMIT = 200
 
-# What one configured route's evidence says. FAILING, DISABLED and
-# UNATTRIBUTED_FAILING degrade.
+# What one route's evidence says.
 ROUTE_OK = "ok"
 ROUTE_FAILING = "failing"
 ROUTE_DISABLED = "disabled"
+# The installed lease route refuses calls now: its lease expired, or the
+# route is not accepting calls. Such a refusal happens before the call is
+# recorded, so no row shows it.
+ROUTE_UNAVAILABLE = "unavailable"
+# The installed lease route's newest call on a model names no lease, and
+# failed: it may be this lease's. The store keeps the lease id past the
+# privacy gate, so only a row written before it did names none.
+ROUTE_UNATTRIBUTED_FAILING = "unattributed_failing"
+# The route failed more calls in the window than were read, so a model whose
+# newest call failed may lie beyond them.
+ROUTE_TRUNCATED = "truncated"
+# Failed its startup reachability probe, with no call known to have been made
+# after that probe (see :func:`_startup_probe_seen_at`).
+ROUTE_UNREACHABLE = "unreachable"
 ROUTE_UNPROBED = "unprobed"
 ROUTE_STANDBY = "standby"
 ROUTE_UNKNOWN = "unknown"
-# The installed lease route's only recent calls name no lease, so health
-# cannot tell whether they were this lease's or a predecessor's. The privacy
-# gate elides the whole metadata column in some storage modes, lease id
-# included. The newest such call failing still warns: it is this lease's
-# whenever this lease has served at all.
-ROUTE_UNATTRIBUTED_FAILING = "unattributed_failing"
-ROUTE_UNATTRIBUTED_OK = "unattributed_ok"
 
 _ROUTE_STATE_LABELS = (
     (ROUTE_DISABLED, "disabled after a failure"),
+    (ROUTE_UNAVAILABLE, "refusing calls now"),
     (ROUTE_FAILING, "failing (newest call failed)"),
     (
         ROUTE_UNATTRIBUTED_FAILING,
         "failing, lease unattributed (newest call failed and names no lease)",
     ),
-    (ROUTE_OK, "ok"),
     (
-        ROUTE_UNATTRIBUTED_OK,
-        "ok, lease unattributed (newest call names no lease)",
+        ROUTE_TRUNCATED,
+        f"failures beyond the {LLM_ROUTE_EVIDENCE_ROW_LIMIT} rows read",
     ),
+    (ROUTE_UNREACHABLE, "unreachable at startup, no call known since"),
+    (ROUTE_OK, "ok"),
     (ROUTE_UNPROBED, "active route unprobed"),
     (ROUTE_STANDBY, "standby"),
     (ROUTE_UNKNOWN, "unclassified"),
 )
-_DEGRADING_ROUTE_STATES = frozenset(
-    {ROUTE_FAILING, ROUTE_DISABLED, ROUTE_UNATTRIBUTED_FAILING}
+_DEGRADING_ROUTE_STATES = frozenset({
+    ROUTE_FAILING,
+    ROUTE_DISABLED,
+    ROUTE_UNAVAILABLE,
+    ROUTE_UNATTRIBUTED_FAILING,
+    ROUTE_TRUNCATED,
+    ROUTE_UNREACHABLE,
+})
+
+
+# When a health check first saw each LLM service's startup probe result,
+# with that result (see :func:`_startup_probe_seen_at`). Keyed weakly by the
+# service: an agent reloaded in this process brings a new service, and so
+# starts over, and a retired one is forgotten with it.
+_STARTUP_PROBES_SEEN: "weakref.WeakKeyDictionary[Any, Tuple[list, datetime]]" = (
+    weakref.WeakKeyDictionary()
 )
-# A route's failed startup reachability probe speaks for it only while the
-# route has no call in the window to judge it by, and is not standby.
-_STARTUP_PROBE_STATES = frozenset({ROUTE_UNPROBED, ROUTE_UNKNOWN})
+
+
+def _startup_probe_seen_at(llm_service, reachability) -> Optional[datetime]:
+    """When a health check first saw ``reachability``, ``llm_service``'s
+    current startup probe result. ``None`` when that cannot be tracked.
+
+    The probe stamps no time, and neither the process nor the agent records
+    when it ran: an agent can be loaded, and so probed, long after this
+    process started. Each run assigns a new list, so the first time a check
+    sees a list, the probe that built it has finished. A call stamped after
+    that was made after the probe; an earlier call, even one this same
+    service made, cannot be placed after it.
+    """
+    if not isinstance(reachability, list):
+        return None
+    try:
+        seen = _STARTUP_PROBES_SEEN.get(llm_service)
+        if seen is None or seen[0] is not reachability:
+            seen = (reachability, datetime.now(timezone.utc))
+            _STARTUP_PROBES_SEEN[llm_service] = seen
+    except TypeError:
+        # The service cannot be held weakly, or hashed: the probe cannot be
+        # placed, so it stands.
+        return None
+    return seen[1]
+
+
+def _utc(timestamp: Any) -> Optional[datetime]:
+    if not isinstance(timestamp, datetime):
+        return None
+    if timestamp.tzinfo is None:
+        return timestamp.replace(tzinfo=timezone.utc)
+    return timestamp
+
+
+@dataclass(frozen=True)
+class _RouteRows:
+    """One route's rows in the window, newest first, as read."""
+
+    rows: Tuple[Any, ...]
+    capped: bool
+    # Only when ``rows`` is capped: the route's newest failures, whether that
+    # read was capped too, and the newest call of each model they name that
+    # ``rows`` does not hold.
+    failures: Tuple[Any, ...] = ()
+    failures_capped: bool = False
+    late: Tuple[Any, ...] = ()
 
 
 @dataclass(frozen=True)
 class _CallEvidence:
-    """The ledger rows read for one agent, reduced to content-free facts."""
+    """The ledger rows read for one agent's routes."""
 
     available: bool
     # Why there is no evidence: a fixed phrase or an exception class name,
@@ -277,111 +351,90 @@ class _CallEvidence:
     unavailable_reason: Optional[str] = None
     # The read was attempted and failed, as opposed to there being no ledger.
     unreadable: bool = False
-    rows_read: int = 0
-    # (provider, model) -> calls, failures, newest outcome; newest pair first.
-    # The lease route's rows are not here: see the lease fields below.
-    pairs: Optional[Dict[Tuple[str, str], Dict[str, Any]]] = None
-    # The installed lease's calls, by model (see :func:`_attribute_lease_rows`).
-    lease_models: Optional[Dict[str, Dict[str, Any]]] = None
-    # Lease-route calls naming no lease that could not be attributed, by
-    # model, and whether the newest of them succeeded.
-    unattributed_lease_models: Optional[Dict[str, Dict[str, Any]]] = None
-    newest_unattributed_lease_call_succeeded: Optional[bool] = None
+    by_route: Optional[Dict[str, _RouteRows]] = None
 
     def evidence_details(self) -> Dict[str, Any]:
+        by_route = self.by_route or {}
         return {
             "source": "a2a_llm_calls",
             "window_seconds": int(LLM_ROUTE_EVIDENCE_WINDOW.total_seconds()),
             "row_limit": LLM_ROUTE_EVIDENCE_ROW_LIMIT,
             "available": self.available,
             "unavailable_reason": self.unavailable_reason,
-            "rows_read": self.rows_read,
-            "row_limit_reached": self.rows_read >= LLM_ROUTE_EVIDENCE_ROW_LIMIT,
+            "rows_read": sum(len(read.rows) for read in by_route.values()),
+            "row_limit_reached": sorted(
+                name for name, read in by_route.items() if read.capped
+            ),
         }
 
 
-@dataclass(frozen=True)
-class LlmRouteAssessment:
-    """Each configured route's state, read from the call ledger (#3912)."""
+async def _read_route_rows(store, agent_did: str, provider: str, since, *, relevant):
+    """Read one route's newest rows; when they fill the limit, its failures too.
 
-    routes: Tuple[Dict[str, Any], ...]
-    evidence: Dict[str, Any]
-    ledger_unreadable: bool
-    private_route_installed: bool
-
-    def state_of(self, name: Any) -> Optional[str]:
-        for route in self.routes:
-            if route["name"] == name:
-                return route["state"]
-        return None
-
-    @property
-    def degraded_routes(self) -> List[str]:
-        return [
-            route["name"]
-            for route in self.routes
-            if route["state"] in _DEGRADING_ROUTE_STATES
-        ]
-
-    def startup_probe_failures(self, reachability: List[Any]) -> List[str]:
-        """Routes whose failed startup reachability probe still stands.
-
-        The probe runs once, when the service starts, and is never repeated,
-        so a route that recovered would warn until the next restart. A route
-        with a call in the window is judged by its newest call instead. The
-        probe records no time, so a call made before the probe also
-        supersedes it, until the route's next call or until that call leaves
-        the window. A standby route is selected by nothing, and a probed route
-        this assessment does not know has no call evidence.
-        """
-        return [
-            entry["name"]
-            for entry in reachability
-            if isinstance(entry, dict)
-            and entry.get("status") == "unreachable"
-            and isinstance(entry.get("name"), str)
-            and self.state_of(entry["name"]) in (_STARTUP_PROBE_STATES | {None})
-        ]
-
-    def standby_vendors(self) -> FrozenSet[str]:
-        """Vendors every configured route of which is standby."""
-        states: Dict[str, List[str]] = {}
-        for route in self.routes:
-            if route.get("private_inference_lease"):
-                continue
-            states.setdefault(route["vendor"], []).append(route["state"])
-        return frozenset(
-            vendor
-            for vendor, vendor_states in states.items()
-            if vendor_states and all(s == ROUTE_STANDBY for s in vendor_states)
-        )
-
-    def summary(self) -> str:
-        groups = []
-        for state, label in _ROUTE_STATE_LABELS:
-            names = [r["name"] for r in self.routes if r["state"] == state]
-            if names:
-                groups.append(f"{label}: {', '.join(names)}")
-        text = f" — routes: {'; '.join(groups)}" if groups else ""
-        reason = self.evidence.get("unavailable_reason")
-        if self.ledger_unreadable:
-            text += f" (call ledger unreadable: {reason})"
-        elif not self.evidence.get("available"):
-            text += f" (no call evidence: {reason})"
-        return text
+    A full read says nothing of the rows beyond it. A model whose newest call
+    failed may be among them, so the route's newest failures are read as
+    well, and for each model they name that the first read does not hold,
+    that model's newest call. ``relevant`` picks the failures that can speak
+    for the route (the lease route ignores another lease's).
+    """
+    limit = LLM_ROUTE_EVIDENCE_ROW_LIMIT
+    rows = await store.query_llm_calls(
+        agent_did=agent_did, provider=provider, since=since, limit=limit
+    )
+    if len(rows) < limit:
+        return _RouteRows(rows=tuple(rows), capped=False)
+    failures = await store.query_llm_calls(
+        agent_did=agent_did, provider=provider, success=False, since=since,
+        limit=limit,
+    )
+    read_models = {row.model for row in rows}
+    late: List[Any] = []
+    for model in dict.fromkeys(f.model for f in failures if relevant(f)):
+        # The store drops an empty model filter, so such a failure is judged
+        # as the model's newest call.
+        if model in read_models or not model:
+            continue
+        late.extend(await store.query_llm_calls(
+            agent_did=agent_did, provider=provider, model=model, since=since,
+            limit=1,
+        ))
+    return _RouteRows(
+        rows=tuple(rows),
+        capped=True,
+        failures=tuple(failures),
+        failures_capped=len(failures) >= limit,
+        late=tuple(late),
+    )
 
 
-async def _read_call_evidence(
-    agent, private_lease_id: Optional[str]
-) -> _CallEvidence:
-    """Read this agent's recent ledger rows, keeping only content-free fields.
+def _lease_named_by(call) -> Optional[str]:
+    metadata = call.metadata if isinstance(call.metadata, dict) else {}
+    lease_id = metadata.get("inference_lease_id")
+    return lease_id if isinstance(lease_id, str) and lease_id else None
 
-    Only ``provider``, ``model``, ``success``, ``timestamp`` and
-    ``metadata.inference_lease_id`` are read off a row; prompt, response and
-    error text never leave this function. ``remote_gpu`` rows count for the
-    installed lease only as :func:`_attribute_lease_rows` allows: a row naming
-    a predecessor is never counted, and a row naming no lease that cannot be
-    placed is reported as unattributed, not credited to this lease.
+
+def _row_owner(private_lease_id: Optional[str]):
+    """``(owns, unattributed)`` predicates over one route's rows.
+
+    A provider's rows are all its own. The lease route's rows are the
+    installed lease's only when they name it exactly; a row naming another
+    lease is never counted, and a row naming no lease is unattributed.
+    """
+    if private_lease_id is None:
+        return (lambda call: True), (lambda call: False)
+    return (
+        lambda call: _lease_named_by(call) == private_lease_id,
+        lambda call: _lease_named_by(call) is None,
+    )
+
+
+async def _read_call_evidence(agent, route_names, private_lease_id) -> _CallEvidence:
+    """Read each route's recent ledger rows (see :func:`_read_route_rows`).
+
+    Each route is read on its own, so one busy route's rows never crowd
+    another's out of a shared limit. Only ``provider``, ``model``,
+    ``success``, ``timestamp`` and ``metadata.inference_lease_id`` are judged
+    off a row; prompt, response and error text never leave this module.
     """
     from kestrel_sovereign.a2a.stores.unified.observability_store import (
         ObservabilityStore,
@@ -403,14 +456,18 @@ async def _read_call_evidence(
         )
 
     since = datetime.now(timezone.utc) - LLM_ROUTE_EVIDENCE_WINDOW
+    by_route: Dict[str, _RouteRows] = {}
     deadline: asyncio.Timeout | None = None
     try:
         async with asyncio.timeout(DATABASE_HEALTH_CHECK_TIMEOUT_S) as deadline:
-            calls = await store.query_llm_calls(
-                agent_did=agent_did,
-                since=since,
-                limit=LLM_ROUTE_EVIDENCE_ROW_LIMIT,
-            )
+            for name in route_names:
+                owns, unattributed = _row_owner(
+                    private_lease_id if name == REMOTE_ROUTE_NAME else None
+                )
+                by_route[name] = await _read_route_rows(
+                    store, agent_did, name, since,
+                    relevant=lambda call: owns(call) or unattributed(call),
+                )
     except Exception as error:
         if is_execution_control_error(error):
             raise
@@ -428,81 +485,155 @@ async def _read_call_evidence(
             ),
             unreadable=True,
         )
+    return _CallEvidence(available=True, by_route=by_route)
 
-    # Rows arrive newest first, so a pair's first row is its newest outcome.
-    lease_rows = [call for call in calls if call.provider == REMOTE_ROUTE_NAME]
-    attributed, unattributed = _attribute_lease_rows(lease_rows, private_lease_id)
-    return _CallEvidence(
-        available=True,
-        rows_read=len(calls),
-        pairs=_aggregate_by_model(
-            call for call in calls if call.provider != REMOTE_ROUTE_NAME
-        ),
-        # Every lease row has the one provider, so its model is the key.
-        lease_models={
-            model: stats
-            for (_provider, model), stats in _aggregate_by_model(attributed).items()
-        },
-        unattributed_lease_models={
-            model: stats
-            for (_provider, model), stats in _aggregate_by_model(unattributed).items()
-        },
-        newest_unattributed_lease_call_succeeded=(
-            bool(unattributed[0].success) if unattributed else None
-        ),
+
+def _model_stats(newest: Dict[str, Any], rows) -> List[Dict[str, Any]]:
+    """Each model's newest outcome, with its calls and failures among ``rows``."""
+    stats = []
+    for model, call in newest.items():
+        timestamp = _utc(call.timestamp)
+        counted = [row for row in rows if row.model == model]
+        stats.append({
+            "model": model,
+            "calls": len(counted),
+            "failures": sum(1 for row in counted if not row.success),
+            "last_call_at": timestamp.isoformat() if timestamp else None,
+            "last_call_succeeded": bool(call.success),
+        })
+    return stats
+
+
+@dataclass(frozen=True)
+class _RouteJudgement:
+    """What one route's rows say, before configuration and the probe."""
+
+    state: Optional[str]  # None: no row of the route's own speaks for it
+    models: List[Dict[str, Any]]
+    unattributed_models: List[Dict[str, Any]]
+    newest_call_at: Optional[datetime]
+
+
+def _supersedes(call, current) -> bool:
+    """Whether ``call`` is newer than ``current``, the same model's call.
+
+    By timestamp, not by the order the reads returned them: a call written
+    between two reads is newer than every row the first one holds. A tie, or
+    a call with no timestamp, goes to the failure: neither can show the
+    success came after it.
+    """
+    call_at, current_at = _utc(call.timestamp), _utc(current.timestamp)
+    if call_at is not None and current_at is not None and call_at != current_at:
+        return call_at > current_at
+    return not call.success and bool(current.success)
+
+
+def _keep_newest(newest: Dict[str, Any], call) -> None:
+    current = newest.get(call.model)
+    if current is None or _supersedes(call, current):
+        newest[call.model] = call
+
+
+def _judge_route_rows(read: _RouteRows, private_lease_id: Optional[str]) -> _RouteJudgement:
+    """Judge each model by its newest own call, and the route by its models.
+
+    Each model's newest call is chosen by timestamp across every read (see
+    :func:`_supersedes`). A model the first read does not hold is judged by
+    its newest call when that is the route's own, else by its newest own
+    failure: no newer own call can be placed after it. For the lease route,
+    an unattributed failure stands unless a newer call names the installed
+    lease (ties stand); an unattributed success never sets it aside, nor
+    speaks for the lease.
+    """
+    owns, unattributed = _row_owner(private_lease_id)
+    newest_own: Dict[str, Any] = {}
+    newest_unattributed: Dict[str, Any] = {}
+    unattributed_failure: Dict[str, Any] = {}
+    for call in (*read.rows, *read.failures, *read.late):
+        if owns(call):
+            _keep_newest(newest_own, call)
+        elif unattributed(call):
+            _keep_newest(newest_unattributed, call)
+            if not call.success:
+                _keep_newest(unattributed_failure, call)
+
+    def stands(model: str, failure) -> bool:
+        own = newest_own.get(model)
+        if own is None:
+            return True
+        failed_at, own_at = _utc(failure.timestamp), _utc(own.timestamp)
+        return failed_at is None or own_at is None or failed_at >= own_at
+
+    seen = {row.event_id: row for row in (*read.rows, *read.failures, *read.late)}
+    own_rows = [row for row in seen.values() if owns(row)]
+    unattributed_rows = [row for row in seen.values() if unattributed(row)]
+    own_times = [t for t in (_utc(c.timestamp) for c in newest_own.values()) if t]
+
+    if any(not call.success for call in newest_own.values()):
+        state = ROUTE_FAILING
+    elif any(stands(model, f) for model, f in unattributed_failure.items()):
+        state = ROUTE_UNATTRIBUTED_FAILING
+    elif read.failures_capped:
+        state = ROUTE_TRUNCATED
+    elif newest_own:
+        state = ROUTE_OK
+    else:
+        state = None
+    return _RouteJudgement(
+        state=state,
+        models=_model_stats(newest_own, own_rows),
+        unattributed_models=_model_stats(newest_unattributed, unattributed_rows),
+        newest_call_at=max(own_times) if own_times else None,
     )
 
 
-def _aggregate_by_model(calls) -> Dict[Tuple[str, str], Dict[str, Any]]:
-    """Calls, failures and newest outcome per (provider, model); newest first."""
-    pairs: Dict[Tuple[str, str], Dict[str, Any]] = {}
-    for call in calls:
-        stats = pairs.get((call.provider, call.model))
-        if stats is None:
-            timestamp = call.timestamp
-            stats = pairs[(call.provider, call.model)] = {
-                "model": call.model,
-                "calls": 0,
-                "failures": 0,
-                "last_call_at": (
-                    timestamp.isoformat()
-                    if isinstance(timestamp, datetime)
-                    else None
-                ),
-                "last_call_succeeded": bool(call.success),
-            }
-        stats["calls"] += 1
-        if not call.success:
-            stats["failures"] += 1
-    return pairs
+@dataclass(frozen=True)
+class LlmRouteAssessment:
+    """Each configured route's state, read from the call ledger (#3912)."""
 
+    routes: Tuple[Dict[str, Any], ...]
+    evidence: Dict[str, Any]
+    ledger_unreadable: bool
+    private_route_installed: bool
 
-def _lease_named_by(call) -> Optional[str]:
-    metadata = call.metadata if isinstance(call.metadata, dict) else {}
-    lease_id = metadata.get("inference_lease_id")
-    return lease_id if isinstance(lease_id, str) and lease_id else None
+    @property
+    def degraded_routes(self) -> List[str]:
+        return [
+            route["name"]
+            for route in self.routes
+            if route["state"] in _DEGRADING_ROUTE_STATES
+        ]
 
+    def standby_vendors(self) -> FrozenSet[str]:
+        """Vendors every configured route of which is standby."""
+        states: Dict[str, List[str]] = {}
+        for route in self.routes:
+            if route.get("private_inference_lease"):
+                continue
+            states.setdefault(route["vendor"], []).append(route["state"])
+        return frozenset(
+            vendor
+            for vendor, vendor_states in states.items()
+            if vendor_states and all(s == ROUTE_STANDBY for s in vendor_states)
+        )
 
-def _attribute_lease_rows(lease_rows, private_lease_id: Optional[str]):
-    """Split newest-first lease-route rows into the installed lease's calls
-    and the calls naming no lease that cannot be attributed.
-
-    A lease's rows are written inside its attempts, and a lease is released
-    only after its attempts drain, so every row of the installed lease is
-    newer than every row of each lease before it. Every row from the
-    installed lease's oldest call naming it onward is therefore that lease's,
-    whatever its metadata says: the privacy gate can strip or rewrite the id.
-    Before that point, a row naming another lease is that lease's and never
-    counted, and a row naming no lease may be either. Rows naming no lease
-    are returned as unattributed only when no row names this lease.
-    """
-    if private_lease_id is None:
-        return [], []
-    named = [_lease_named_by(call) for call in lease_rows]
-    matches = [i for i, lease in enumerate(named) if lease == private_lease_id]
-    if matches:
-        return lease_rows[: matches[-1] + 1], []
-    return [], [call for call, lease in zip(lease_rows, named) if lease is None]
+    def summary(self) -> str:
+        groups = []
+        for state, label in _ROUTE_STATE_LABELS:
+            names = [
+                f"{r['name']} ({r['refusal']})" if r.get("refusal") else r["name"]
+                for r in self.routes
+                if r["state"] == state
+            ]
+            if names:
+                groups.append(f"{label}: {', '.join(names)}")
+        text = f" — routes: {'; '.join(groups)}" if groups else ""
+        reason = self.evidence.get("unavailable_reason")
+        if self.ledger_unreadable:
+            text += f" (call ledger unreadable: {reason})"
+        elif not self.evidence.get("available"):
+            text += f" (no call evidence: {reason})"
+        return text
 
 
 def _installed_private_lease_id(llm_service) -> Optional[str]:
@@ -510,6 +641,36 @@ def _installed_private_lease_id(llm_service) -> Optional[str]:
     lease = getattr(llm_service, "_remote_lease", None)
     lease_id = getattr(lease, "lease_id", None) if lease is not None else None
     return lease_id if isinstance(lease_id, str) and lease_id else None
+
+
+def _private_route_refusal(llm_service) -> Optional[str]:
+    """Why the installed lease route refuses every call now, or ``None``.
+
+    The lease route refuses an expired lease, and a route that is not
+    accepting calls (draining, released, or latched off after expiry),
+    before the call is recorded, so the ledger never shows those refusals.
+    This reads the same state: the service's backend status and the lease's
+    expiry. A fixed phrase, never provider text. Availability that cannot be
+    read is not shown, so it is a refusal too.
+    """
+    lease = getattr(llm_service, "_remote_lease", None)
+    expires_at = _utc(getattr(lease, "expires_at", None))
+    if expires_at is None:
+        return "lease expiry unknown"
+    if datetime.now(timezone.utc) >= expires_at:
+        return "lease expired"
+    backend_status = getattr(llm_service, "get_backend_status", None)
+    try:
+        status = backend_status() if callable(backend_status) else None
+    except Exception as error:
+        if is_execution_control_error(error):
+            raise
+        status = None
+    if not isinstance(status, dict):
+        return "route status unreadable"
+    if status.get("remote_active") is not True:
+        return "not accepting calls"
+    return None
 
 
 def _provider_vendor_and_route(provider: Dict[str, Any]) -> Tuple[str, Optional[str]]:
@@ -523,61 +684,131 @@ def _provider_vendor_and_route(provider: Dict[str, Any]) -> Tuple[str, Optional[
     )
 
 
-def _configured_route_names(llm_service, providers: List[Dict[str, Any]]) -> set:
-    """The configured routes the agent's current selection names.
+def _named_selections(llm_service) -> Tuple[List[Dict[str, Optional[str]]], bool]:
+    """Every provider selection the agent's model configuration names, and
+    whether that is all of them.
 
-    This is the canonical current selection (the mandate, else the default
-    route), not a routing resolution: which route a call actually took is
-    the ledger's to say.
+    The current selection (the mandate, else the default route), every
+    selector ``model_mandate.toml`` names (``defaults.preferred``, each
+    mandate, an explicit cheap model), the cheap model its hints pick, and
+    each mandate fallback naming a provider. Each is read and parsed by the
+    service's own helpers; nothing here resolves routing. Not complete when
+    the configuration cannot be read, or a selector names no provider (a bare
+    model id is tried on every route): then no route can be shown standby.
     """
+    from kestrel_sovereign.llm.provider_policy import fallback_selection
     from kestrel_sovereign.llm.service import resolve_active_model_selection
 
+    selections: List[Dict[str, Optional[str]]] = []
     try:
-        selection = resolve_active_model_selection(llm_service)
+        current = resolve_active_model_selection(llm_service)
+        if isinstance(current.get("vendor"), str) and current["vendor"]:
+            selections.append({"vendor": current["vendor"], "route": current.get("route")})
+        config_selectors = getattr(llm_service, "_config_selectors", None)
+        select = getattr(llm_service, "_call_override_selection", None)
+        resolve = getattr(llm_service, "_resolve_model_selector", None)
+        if not (callable(config_selectors) and callable(select) and callable(resolve)):
+            return selections, False
+        complete = True
+        selectors = list(config_selectors())
+        cheap = getattr(llm_service, "get_cheap_model_selector", None)
+        cheap_selector = cheap() if callable(cheap) else None
+        if isinstance(cheap_selector, str) and cheap_selector:
+            selectors.append(cheap_selector)
+        for selector in selectors:
+            selection = select(selector)
+            if selection is None:
+                resolved = resolve(selector).get("selector")
+                selection = select(resolved) if resolved != selector else None
+            if selection is None:
+                complete = False
+            else:
+                selections.append(selection)
+        for fallback in getattr(llm_service, "_mandate_fallbacks", None) or []:
+            # A fallback naming no provider is never followed.
+            selection = fallback_selection(fallback)
+            if selection is not None:
+                selections.append(selection)
     except Exception as error:
         if is_execution_control_error(error):
             raise
-        return set()
-    vendor = selection.get("vendor")
-    route = selection.get("route")
-    if not isinstance(vendor, str) or not vendor:
-        return set()
+        return selections, False
+    return selections, complete
+
+
+def _selected_route_names(
+    llm_service, providers: List[Dict[str, Any]]
+) -> Tuple[set, bool]:
+    """The configured routes the agent's model configuration names, and
+    whether every other route is known to be named by nothing (see
+    :func:`_named_selections`).
+    """
+    from kestrel_sovereign.llm.provider_policy import selection_covers
+
+    selections, complete = _named_selections(llm_service)
     named = set()
     for provider in providers:
-        provider_vendor, provider_route = _provider_vendor_and_route(provider)
-        if provider_vendor != vendor:
-            continue
-        if isinstance(route, str) and route and provider_route != route:
-            continue
-        named.add(provider["name"])
-    return named
+        vendor, route = _provider_vendor_and_route(provider)
+        if any(selection_covers(s, vendor, route) for s in selections):
+            named.add(provider["name"])
+    return named, complete
+
+
+def _startup_unreachable(llm_service) -> set:
+    """Routes whose startup reachability probe failed."""
+    reachability = getattr(llm_service, "reachability", None)
+    if not isinstance(reachability, list):
+        return set()
+    return {
+        entry["name"]
+        for entry in reachability
+        if isinstance(entry, dict)
+        and entry.get("status") == "unreachable"
+        and isinstance(entry.get("name"), str)
+    }
 
 
 def _route_state(
     *,
+    judgement: Optional[_RouteJudgement],
     disabled: bool,
-    configured: bool,
-    models: List[Dict[str, Any]],
-    evidence: _CallEvidence,
-    newest_unattributed_succeeded: Optional[bool] = None,
+    selected: Optional[bool],
+    evidence_available: bool,
+    unreachable_at_startup: bool,
+    probe_seen_at: Optional[datetime],
+    refusing_calls: bool,
 ) -> str:
+    """One route's state. ``selected`` is ``None`` when selection is unknown.
+
+    ``probe_seen_at`` is when the startup probe result was first seen (see
+    :func:`_startup_probe_seen_at`); ``refusing_calls`` is an installed lease
+    route's current refusal (see :func:`_private_route_refusal`).
+    """
     if disabled:
         # A route disabled after a failure is failing whatever its rows say.
         return ROUTE_DISABLED
-    if not evidence.available:
-        return ROUTE_UNPROBED if configured else ROUTE_UNKNOWN
-    if models:
-        if any(not m["last_call_succeeded"] for m in models):
-            return ROUTE_FAILING
-        return ROUTE_OK
-    if newest_unattributed_succeeded is not None:
-        # Unattributed calls mix leases, so only the newest one is judged.
-        return (
-            ROUTE_UNATTRIBUTED_OK
-            if newest_unattributed_succeeded
-            else ROUTE_UNATTRIBUTED_FAILING
-        )
-    return ROUTE_UNPROBED if configured else ROUTE_STANDBY
+    if refusing_calls:
+        # So is a route refusing calls now: those refusals leave no row.
+        return ROUTE_UNAVAILABLE
+    state = judgement.state if judgement is not None else None
+    if state in _DEGRADING_ROUTE_STATES:
+        return state
+    if state is None:
+        if selected:
+            state = ROUTE_UNPROBED
+        elif not evidence_available or selected is None:
+            state = ROUTE_UNKNOWN
+        else:
+            # Nothing selects it and it served nothing: its startup probe
+            # speaks for no route this agent uses.
+            return ROUTE_STANDBY
+    if unreachable_at_startup:
+        # Only a call stamped after the probe result was first seen is known
+        # to be newer than the probe.
+        newest = judgement.newest_call_at if judgement is not None else None
+        if probe_seen_at is None or newest is None or newest <= probe_seen_at:
+            return ROUTE_UNREACHABLE
+    return state
 
 
 async def assess_llm_routes(agent) -> Optional[LlmRouteAssessment]:
@@ -586,15 +817,20 @@ async def assess_llm_routes(agent) -> Optional[LlmRouteAssessment]:
 
     - ``disabled``: disabled after a permanent failure; degrades.
     - ``failing``: a model's newest call in the window failed; degrades.
+    - ``unattributed_failing``: the installed lease route's newest call on a
+      model names no lease and failed, with no newer call of its own; degrades.
+    - ``truncated``: more failures than were read; degrades.
+    - ``unavailable``: the installed lease route refuses calls now (its lease
+      expired, or it is not accepting calls); degrades.
+    - ``unreachable``: failed its startup probe, with no call known to have
+      been made after it (see :func:`_startup_probe_seen_at`), and is not
+      standby; degrades.
     - ``ok``: every model's newest call in the window succeeded.
-    - ``unattributed_failing`` / ``unattributed_ok``: the installed lease's
-      route, when its only recent calls name no lease (see
-      :data:`ROUTE_UNATTRIBUTED_FAILING`); the newest one's outcome decides,
-      and a failure degrades.
-    - ``unprobed``: the agent's current selection, or the installed private
-      lease, with no call in the window ("active route unprobed").
-    - ``standby``: configured, selected by nothing, no call in the window.
-    - ``unknown``: no evidence could be read, so standby cannot be claimed.
+    - ``unprobed``: named by the agent's model configuration, or the installed
+      private lease, with no call in the window ("active route unprobed").
+    - ``standby``: configured, named by nothing, no call in the window.
+    - ``unknown``: no evidence could be read, or the configuration could not
+      be placed on routes, so standby cannot be claimed.
     """
     llm_service = getattr(agent, "llm_service", None)
     if llm_service is None:
@@ -616,48 +852,73 @@ async def assess_llm_routes(agent) -> Optional[LlmRouteAssessment]:
         else set()
     )
     lease_id = _installed_private_lease_id(llm_service)
-    configured = _configured_route_names(llm_service, providers)
-    evidence = await _read_call_evidence(agent, lease_id)
-    pairs = evidence.pairs or {}
+    # Read with the lease id, before any await, so both describe one lease.
+    lease_refusal = (
+        _private_route_refusal(llm_service) if lease_id is not None else None
+    )
+    selected, selection_complete = _selected_route_names(llm_service, providers)
+    unreachable = _startup_unreachable(llm_service)
+    # Before the ledger read: every row stamped after this was written after
+    # the probe finished.
+    probe_seen_at = _startup_probe_seen_at(
+        llm_service, getattr(llm_service, "reachability", None)
+    )
+    route_names = [provider["name"] for provider in providers]
+    if lease_id is not None:
+        route_names.append(REMOTE_ROUTE_NAME)
+    evidence = await _read_call_evidence(agent, route_names, lease_id)
+    by_route = evidence.by_route or {}
 
     routes: List[Dict[str, Any]] = []
     for provider in providers:
         name = provider["name"]
         vendor, _route = _provider_vendor_and_route(provider)
-        models = [stats for (p, _m), stats in pairs.items() if p == name]
+        read = by_route.get(name)
+        judgement = _judge_route_rows(read, None) if read is not None else None
+        # Named, named by nothing, or not known to be named by nothing.
+        named = True if name in selected else (False if selection_complete else None)
         routes.append({
             "name": name,
             "vendor": vendor,
             "state": _route_state(
+                judgement=judgement,
                 disabled=name in disabled,
-                configured=name in configured,
-                models=models,
-                evidence=evidence,
+                selected=named,
+                evidence_available=evidence.available,
+                unreachable_at_startup=name in unreachable,
+                probe_seen_at=probe_seen_at,
+                refusing_calls=False,
             ),
-            "configured_route": name in configured,
-            "models": [dict(m) for m in models],
+            "configured_route": named,
+            "models": judgement.models if judgement is not None else [],
+            "row_limit_reached": bool(read is not None and read.capped),
         })
     if lease_id is not None:
         # An installed lease is a configured route by definition: it is never
-        # standby. Its rows were already attributed by _attribute_lease_rows.
-        models = list((evidence.lease_models or {}).values())
-        unattributed = list((evidence.unattributed_lease_models or {}).values())
+        # standby, and it has no startup probe.
+        read = by_route.get(REMOTE_ROUTE_NAME)
+        judgement = _judge_route_rows(read, lease_id) if read is not None else None
         routes.append({
             "name": REMOTE_ROUTE_NAME,
             "vendor": REMOTE_ROUTE_NAME,
             "state": _route_state(
+                judgement=judgement,
                 disabled=REMOTE_ROUTE_NAME in disabled,
-                configured=True,
-                models=models,
-                evidence=evidence,
-                newest_unattributed_succeeded=(
-                    evidence.newest_unattributed_lease_call_succeeded
-                ),
+                selected=True,
+                evidence_available=evidence.available,
+                unreachable_at_startup=False,
+                probe_seen_at=None,
+                refusing_calls=lease_refusal is not None,
             ),
             "configured_route": True,
             "private_inference_lease": True,
-            "models": [dict(m) for m in models],
-            "unattributed_models": [dict(m) for m in unattributed],
+            # A fixed phrase (see _private_route_refusal), or None.
+            "refusal": lease_refusal,
+            "models": judgement.models if judgement is not None else [],
+            "unattributed_models": (
+                judgement.unattributed_models if judgement is not None else []
+            ),
+            "row_limit_reached": bool(read is not None and read.capped),
         })
     return LlmRouteAssessment(
         routes=tuple(routes),
@@ -674,9 +935,10 @@ async def check_llm_service(agent) -> Dict[str, Any]:
     This does NOT make an LLM call. Route health is read from the per-call
     ledger (see :func:`assess_llm_routes`): a route whose newest call failed,
     or that was disabled after a failure, warns; a configured route nothing
-    selects is ``standby`` and does not degrade the check, nor does its
-    startup reachability. A failed startup reachability probe warns only
-    while its route has no call in the window to judge it by.
+    names is ``standby`` and does not degrade the check, nor does its startup
+    reachability. A failed startup reachability probe warns until its route
+    serves a call known to be newer than the probe. An installed private
+    lease that refuses calls now warns, whatever its rows say.
 
     Args:
         agent: KestrelAgent instance
@@ -765,24 +1027,15 @@ async def check_llm_service(agent) -> Dict[str, Any]:
             "routes": list(routes.routes),
             "route_evidence": routes.evidence,
         }
-        probe_failures: List[str] = []
         if reachability:
             details["reachability"] = reachability
-            # A startup probe failure stands only for a route with no call in
-            # the window that something selects (#3912): see
-            # LlmRouteAssessment.startup_probe_failures.
-            probe_failures = routes.startup_probe_failures(reachability)
-            if probe_failures:
-                status = worst_status(status, "warn")
 
+        # A failed startup probe is part of its route's state (#3912): it
+        # stands until a call known to be newer than the probe, unless the
+        # route is standby. See assess_llm_routes.
         if routes.degraded_routes or routes.ledger_unreadable:
             status = worst_status(status, "warn")
         msg += routes.summary()
-        if probe_failures:
-            msg += (
-                " — unreachable at startup, no call since: "
-                f"{', '.join(probe_failures)}"
-            )
 
         # A persisted mandate that failed to apply (#3190): the operator set
         # a model and it is NOT in effect, so this agent is running on

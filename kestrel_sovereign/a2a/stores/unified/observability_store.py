@@ -1120,7 +1120,16 @@ class ObservabilityStore(UnifiedStoreBase):
         user_prompt = self._privacy_gate_text(user_prompt)
         response = self._privacy_gate_text(response)
         error_message = self._privacy_gate_text(error_message)
+        # The private inference lease that served the call (#3912) is an
+        # opaque generated identifier, not content: health attributes the
+        # lease route's rows by it, so it is stamped after the gate, like
+        # ``metric_name``. Nothing else is carried past the gate.
+        lease_id = (
+            metadata.get("inference_lease_id") if isinstance(metadata, dict) else None
+        )
         metadata = self._privacy_gate_metadata(metadata)
+        if isinstance(lease_id, str) and lease_id:
+            metadata["inference_lease_id"] = lease_id
         tool_calls_json = (
             self._privacy_gate_args_json(redact_private_capability_tool_calls(tool_calls))
             if tool_calls else None

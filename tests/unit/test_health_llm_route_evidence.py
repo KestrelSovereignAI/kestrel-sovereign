@@ -1,17 +1,27 @@
 """``llm_service`` and ``model_discovery`` read route health from the call ledger (#3912).
 
 Health reads what dispatch did: the ``a2a_llm_calls`` rows LLMService writes
-for every attempt. A configured route with no rows and nothing selecting it is
-``standby`` and degrades nothing; the route the agent's selection names, with
-no rows, is reported "active route unprobed"; a route whose newest call failed,
-or that was disabled after a failure, warns. A failed startup reachability
-probe stands only while its route has no call to judge it by. Lease-route rows
-count for the installed lease by its id, or by position once it has named
-itself; rows the privacy gate stripped of their lease id are reported, never
-silently dropped.
+for every attempt. A route is reported ok or standby, and a startup failure
+set aside, only on positive evidence:
 
-Every ledger here is a real ``ObservabilityStore`` on a temp SQLite database.
-Providers are mocked: no network, no key, no paid completion.
+- a route whose newest call failed, or that was disabled after a failure,
+  warns;
+- a configured route nothing in the agent's model configuration names, with
+  no rows, is ``standby`` and degrades nothing;
+- a route the configuration names, with no rows, is "active route unprobed";
+- a failed startup reachability probe stands until a call known to be newer
+  than it: one stamped after a health check first saw the probe's result;
+- each route is read on its own, so one route's rows never crowd another's
+  out of the read, and a capped read is followed by its failures. Each
+  model's newest call is chosen by timestamp across the reads;
+- lease-route rows count for the installed lease only when they name it.
+  A failure naming no lease warns until a newer call names the lease. An
+  installed lease that refuses calls now (expired, or not accepting) warns
+  whatever its rows say.
+
+Every ledger here is a real ``ObservabilityStore`` on a temp SQLite database,
+and every service a real ``LLMService`` over mocked routes: no network, no
+key, no paid completion.
 """
 
 from __future__ import annotations
@@ -34,11 +44,15 @@ from kestrel_sdk.llm import (
 from pydantic import SecretStr
 
 from kestrel_sovereign.a2a.stores.unified.observability_store import (
+    _CONTENT_GATED_MARKER,
     ObservabilityStore,
 )
 from kestrel_sovereign.features.health import checks as health_checks
 from kestrel_sovereign.features.health.checks import (
+    LLM_ROUTE_EVIDENCE_ROW_LIMIT,
     LLM_ROUTE_EVIDENCE_WINDOW,
+    _private_route_refusal,
+    _startup_probe_seen_at,
     check_llm_service,
     check_model_discovery,
     derive_overall_status,
@@ -67,6 +81,7 @@ LLAMA = {"name": "llama_cpp:local", "vendor": "llama_cpp", "route": "local",
          "model": "qwen3-8b", "is_local": True}
 RUNPOD = {"name": "runpod:vllm", "vendor": "runpod", "route": "vllm",
           "model": "vllm-2f8vdgn"}
+PINNED_ANTHROPIC = {"vendor": "anthropic", "route": "plan", "model": "claude-opus-5"}
 
 
 # ---------------------------------------------------------------------------
@@ -95,64 +110,23 @@ async def ledger(tmp_path):
 
 
 @pytest.fixture
-async def owned_services():
-    async with AsyncExitStack() as stack:
-        yield stack
+async def stack():
+    async with AsyncExitStack() as owned:
+        yield owned
 
 
-def _fake_service(
-    providers,
-    *,
-    preference=None,
-    disabled=None,
-    reachability=None,
-):
-    """What health reads off an LLM service, and nothing else."""
-    preference = preference or {"vendor": None, "route": None, "model": None}
-    return SimpleNamespace(
-        providers=[dict(p) for p in providers],
-        get_model_preference=lambda: dict(preference),
-        get_active_model_id=lambda: preference.get("model") or "auto",
-        reachability=reachability,
-        _disabled_routes=dict(disabled or {}),
-        _mandate_load_error=None,
-        _remote_lease=None,
+@pytest.fixture
+def lease_clients(monkeypatch):
+    monkeypatch.setattr(
+        "kestrel_sovereign.llm.remote_backend.openai.AsyncOpenAI",
+        lambda **_kwargs: _LeaseClient(),
     )
-
-
-def _agent(service, store, did=DID):
-    return SimpleNamespace(did=did, llm_service=service, observability_store=store)
-
-
-async def _log(store, provider, model, *, success, did=DID, **extra):
-    await store.log_llm_call(
-        provider=provider,
-        model=model,
-        duration_ms=5,
-        success=success,
-        agent_did=did,
-        **extra,
-    )
-
-
-def _route(result, name):
-    [route] = [r for r in result["details"]["routes"] if r["name"] == name]
-    return route
-
-
-def _discovery(failures):
-    outcomes = {"anthropic": VendorDiscoveryOutcome.ok()}
-    outcomes.update({
-        vendor: VendorDiscoveryOutcome.failed(error)
-        for vendor, error in failures.items()
-    })
-    get_shared_model_cache().set([], outcomes=outcomes)
 
 
 class _ScriptedRoute:
     """A mocked provider route that answers or raises, one outcome per call."""
 
-    def __init__(self, provider, outcomes):
+    def __init__(self, provider, outcomes=()):
         self.provider = provider
         self.outcomes = list(outcomes)
         self.calls = 0
@@ -182,17 +156,17 @@ class _ScriptedRoute:
         }
 
 
-def _real_service(stack, routes, store):
+def _real_service(stack, routes, store, *, mandate_config=None):
     """A real LLMService over mocked routes, writing to ``store``."""
     registry = Mock()
     registry.initialize_providers = Mock(return_value=[])
     registry.get_providers_with_pattern = Mock(return_value=[])
     registry.get_local_providers = Mock(return_value=[])
+    mandate_config = mandate_config or {"defaults": {}, "mandates": {}}
     with patch(
         "kestrel_sovereign.llm.service.load_section", return_value={}
     ), patch(
-        "kestrel_sovereign.llm.service.load_config",
-        return_value={"defaults": {}, "mandates": {}},
+        "kestrel_sovereign.llm.service.load_config", return_value=mandate_config,
     ), patch("kestrel_sovereign.llm.service.ProviderRegistry", return_value=registry):
         service = LLMService()
     stack.push_async_callback(service.close)
@@ -204,6 +178,72 @@ def _real_service(stack, routes, store):
     service.attach_to_agent(DID)
     service.set_observability_store(store)
     return service
+
+
+def _service(
+    stack,
+    providers,
+    store,
+    *,
+    preference=None,
+    disabled=None,
+    reachability=None,
+    mandate_config=None,
+):
+    """A real LLMService whose routes are configured but never called here:
+    health reads its configuration, and the ledger rows a test writes."""
+    service = _real_service(
+        stack,
+        [_ScriptedRoute(p) for p in providers],
+        store,
+        mandate_config=mandate_config,
+    )
+    if preference:
+        service._mandate_preference = dict(preference)
+    service._disabled_routes = dict(disabled or {})
+    service.reachability = reachability
+    return service
+
+
+async def _install_lease(service, lease_id):
+    """Activate a lease that serves no call here (ledger tests). The
+    service's close releases it."""
+    await _activate(service, lease_id, [])
+
+
+def _agent(service, store, did=DID):
+    return SimpleNamespace(did=did, llm_service=service, observability_store=store)
+
+
+async def _log(store, provider, model, *, success, did=DID, **extra):
+    await store.log_llm_call(
+        provider=provider,
+        model=model,
+        duration_ms=5,
+        success=success,
+        agent_did=did,
+        **extra,
+    )
+
+
+async def _log_at(store, monkeypatch, when, provider, model, **kwargs):
+    with monkeypatch.context() as patched:
+        patched.setattr(store, "now_utc", lambda: when)
+        await _log(store, provider, model, **kwargs)
+
+
+def _route(result, name):
+    [route] = [r for r in result["details"]["routes"] if r["name"] == name]
+    return route
+
+
+def _discovery(failures):
+    outcomes = {"anthropic": VendorDiscoveryOutcome.ok()}
+    outcomes.update({
+        vendor: VendorDiscoveryOutcome.failed(error)
+        for vendor, error in failures.items()
+    })
+    get_shared_model_cache().set([], outcomes=outcomes)
 
 
 class _LeaseAdapter:
@@ -229,8 +269,11 @@ class _LeaseClient:
         pass
 
 
-def _lease(lease_id):
+def _lease(lease_id, *, expires_in=timedelta(minutes=10)):
+    """A ready lease. A negative ``expires_in`` is one that was ready when
+    last updated and has since run past its expiry."""
     now = datetime.now(UTC)
+    updated = min(now, now + expires_in - timedelta(minutes=1))
     return InferenceLease(
         lease_id=lease_id,
         quote_id=f"quote-{lease_id}",
@@ -241,9 +284,9 @@ def _lease(lease_id):
         model="llama-3",
         runtime="ollama",
         privacy=InferencePrivacy.AUTHENTICATED_ENDPOINT,
-        created_at=now,
-        updated_at=now,
-        expires_at=now + timedelta(minutes=10),
+        created_at=updated,
+        updated_at=updated,
+        expires_at=now + expires_in,
         hourly_cost_usd=Decimal("0.50"),
         estimated_total_cost_usd=Decimal("0.20"),
         route=InferenceRoute(
@@ -254,22 +297,24 @@ def _lease(lease_id):
     )
 
 
-async def _activate(service, lease_id, outcomes):
+async def _activate(service, lease_id, outcomes, *, expires_in=timedelta(minutes=10)):
     async def touch(requested):
         assert requested == lease_id
         return service._remote_lease
 
     await service.activate_inference_lease(
-        _lease(lease_id), capabilities=("chat",), touch_lease=touch
+        _lease(lease_id, expires_in=expires_in),
+        capabilities=("chat",),
+        touch_lease=touch,
     )
     service._remote_adapter = _LeaseAdapter(outcomes)
 
 
-@pytest.fixture
-def lease_clients(monkeypatch):
-    monkeypatch.setattr(
-        "kestrel_sovereign.llm.remote_backend.openai.AsyncOpenAI",
-        lambda **_kwargs: _LeaseClient(),
+def _bind_privacy(store, service, privacy):
+    """Both production privacy hooks, bound as KestrelAgent binds them."""
+    store.set_privacy_config_provider(lambda: privacy.config)
+    service.set_force_local_only_provider(
+        lambda: not privacy.config.allows_cloud_llm()
     )
 
 
@@ -278,16 +323,14 @@ def lease_clients(monkeypatch):
 # ---------------------------------------------------------------------------
 
 
-async def test_a_failed_newest_call_warns_and_a_later_success_passes(
-    ledger, owned_services
-):
+async def test_a_failed_newest_call_warns_and_a_later_success_passes(ledger, stack):
     """Rows written by real dispatch, not by hand."""
     anthropic = _ScriptedRoute(ANTHROPIC, [
         "first answer",
         LLMProviderError("anthropic", "overloaded"),
         "recovered",
     ])
-    service = _real_service(owned_services, [anthropic], ledger)
+    service = _real_service(stack, [anthropic], ledger)
     agent = _agent(service, ledger)
 
     assert await service.generate_with_messages(messages=list(MESSAGES)) == "first answer"
@@ -313,8 +356,8 @@ async def test_a_failed_newest_call_warns_and_a_later_success_passes(
     assert derive_overall_status([passing]) == "healthy"
 
 
-async def test_each_model_on_a_route_is_judged_by_its_own_newest_call(ledger):
-    service = _fake_service([ANTHROPIC])
+async def test_each_model_on_a_route_is_judged_by_its_own_newest_call(ledger, stack):
+    service = _service(stack, [ANTHROPIC], ledger)
     await _log(ledger, "anthropic:plan", "claude-haiku", success=True)
     await _log(ledger, "anthropic:plan", "claude-opus-5", success=False)
     await _log(ledger, "anthropic:plan", "claude-haiku", success=True)
@@ -328,18 +371,13 @@ async def test_each_model_on_a_route_is_judged_by_its_own_newest_call(ledger):
     assert by_model == {"claude-haiku": True, "claude-opus-5": False}
 
 
-async def test_only_this_agents_rows_and_the_window_count(ledger, monkeypatch):
-    service = _fake_service(
-        [ANTHROPIC, LLAMA],
-        preference={"vendor": "anthropic", "route": "plan", "model": "claude-opus-5"},
-    )
+async def test_only_this_agents_rows_and_the_window_count(ledger, stack, monkeypatch):
+    service = _service(stack, [ANTHROPIC, LLAMA], ledger, preference=PINNED_ANTHROPIC)
     # Another agent's failure on the same shared table is not this agent's.
     await _log(ledger, "anthropic:plan", "claude-opus-5", success=False, did=OTHER_DID)
     # A failure older than the window is not evidence of the route now.
     stale = datetime.now(UTC) - LLM_ROUTE_EVIDENCE_WINDOW - timedelta(minutes=5)
-    monkeypatch.setattr(ledger, "now_utc", lambda: stale)
-    await _log(ledger, "llama_cpp:local", "qwen3-8b", success=False)
-    monkeypatch.undo()
+    await _log_at(ledger, monkeypatch, stale, "llama_cpp:local", "qwen3-8b", success=False)
 
     result = await check_llm_service(_agent(service, ledger))
 
@@ -354,12 +392,14 @@ async def test_only_this_agents_rows_and_the_window_count(ledger, monkeypatch):
 # ---------------------------------------------------------------------------
 
 
-async def test_standby_providers_do_not_degrade_tick_status(ledger):
+async def test_standby_providers_do_not_degrade_tick_status(ledger, stack):
     """The #3873 host: llama_cpp refuses connections and runpod 404s discovery,
     while anthropic:plan, the selected route, serves every call."""
-    service = _fake_service(
+    service = _service(
+        stack,
         [ANTHROPIC, LLAMA, RUNPOD],
-        preference={"vendor": "anthropic", "route": "plan", "model": "claude-opus-5"},
+        ledger,
+        preference=PINNED_ANTHROPIC,
         reachability=[
             {"name": "anthropic:plan", "status": "skipped"},
             {"name": "llama_cpp:local", "status": "unreachable"},
@@ -385,11 +425,13 @@ async def test_standby_providers_do_not_degrade_tick_status(ledger):
     assert derive_overall_status([llm, discovery]) == "healthy"
 
 
-async def test_a_failing_provider_that_served_traffic_still_degrades(ledger):
+async def test_a_failing_provider_that_served_traffic_still_degrades(ledger, stack):
     """The same standby route, once dispatch actually used it and it failed."""
-    service = _fake_service(
+    service = _service(
+        stack,
         [ANTHROPIC, LLAMA],
-        preference={"vendor": "anthropic", "route": "plan", "model": "claude-opus-5"},
+        ledger,
+        preference=PINNED_ANTHROPIC,
         reachability=[{"name": "llama_cpp:local", "status": "unreachable"}],
     )
     await _log(ledger, "anthropic:plan", "claude-opus-5", success=True)
@@ -410,38 +452,179 @@ async def test_a_failing_provider_that_served_traffic_still_degrades(ledger):
     assert derive_overall_status([llm, discovery]) == "degraded"
 
 
-async def test_an_unreachable_selected_route_still_warns(ledger):
-    service = _fake_service(
+async def test_a_configured_route_with_no_rows_is_active_route_unprobed(ledger, stack):
+    service = _service(stack, [ANTHROPIC, LLAMA], ledger, preference=PINNED_ANTHROPIC)
+    result = await check_llm_service(_agent(service, ledger))
+
+    assert result["status"] == "pass"
+    route = _route(result, "anthropic:plan")
+    assert route["state"] == "unprobed"
+    assert route["configured_route"] is True
+    assert "active route unprobed: anthropic:plan" in result["message"]
+    assert _route(result, "llama_cpp:local")["state"] == "standby"
+
+
+async def test_with_no_mandate_the_default_route_is_the_configured_one(ledger, stack):
+    service = _service(stack, [ANTHROPIC, LLAMA], ledger)
+    result = await check_llm_service(_agent(service, ledger))
+
+    assert _route(result, "anthropic:plan")["state"] == "unprobed"
+    assert _route(result, "llama_cpp:local")["state"] == "standby"
+
+
+async def test_the_pinned_vendor_is_never_standby_for_discovery(ledger, stack):
+    service = _service(stack, [ANTHROPIC, LLAMA], ledger, preference=PINNED_ANTHROPIC)
+    _discovery({"anthropic": "AuthenticationError: 401", "llama_cpp": "refused"})
+
+    discovery = await check_model_discovery(_agent(service, ledger))
+
+    assert discovery["status"] == "fail"
+    assert discovery["details"]["pinned_vendor_at_risk"] is True
+    assert list(discovery["details"]["failed_vendors"]) == ["anthropic"]
+    assert list(discovery["details"]["standby_failed_vendors"]) == ["llama_cpp"]
+
+
+# ---------------------------------------------------------------------------
+# Standby needs the whole model configuration
+# ---------------------------------------------------------------------------
+
+
+async def test_a_route_defaults_preferred_names_is_not_standby(ledger, stack):
+    """The round-2 repro: anthropic first, ``defaults.preferred`` selecting
+    llama_cpp, whose startup probe failed, on a cold ledger."""
+    llama = _ScriptedRoute(LLAMA, ["local answer"])
+    anthropic = _ScriptedRoute(ANTHROPIC, [])
+    service = _real_service(
+        stack,
+        [anthropic, llama],
+        ledger,
+        mandate_config={"defaults": {"preferred": "llama_cpp"}, "mandates": {}},
+    )
+    service.reachability = [
+        {"name": "anthropic:plan", "status": "skipped"},
+        {"name": "llama_cpp:local", "status": "unreachable"},
+    ]
+    _discovery({"llama_cpp": "ConnectError: connection refused"})
+    agent = _agent(service, ledger)
+
+    llm = await check_llm_service(agent)
+    discovery = await check_model_discovery(agent)
+
+    assert llm["status"] == "warn"
+    route = _route(llm, "llama_cpp:local")
+    assert route["configured_route"] is True
+    assert route["state"] == "unreachable"
+    assert "unreachable at startup, no call known since: llama_cpp:local" in llm["message"]
+    assert discovery["status"] == "warn"
+    assert list(discovery["details"]["failed_vendors"]) == ["llama_cpp"]
+    assert discovery["details"]["standby_failed_vendors"] == {}
+    assert derive_overall_status([llm, discovery]) == "degraded"
+
+    # Public dispatch agrees: the configured default is the route it takes.
+    assert await service.get_response(system_prompt="", user_prompt="hello") == "local answer"
+    assert (llama.calls, anthropic.calls) == (1, 0)
+
+
+@pytest.mark.parametrize(
+    ("mandate_config", "fallbacks"),
+    [
+        ({"defaults": {}, "mandates": {"code": "llama_cpp/qwen3-8b"}}, []),
+        ({"defaults": {"cheap_model": "llama_cpp/qwen3-8b"}, "mandates": {}}, []),
+        ({"defaults": {}, "mandates": {}}, [{"model": "qwen3-8b", "provider": "llama_cpp"}]),
+        # A bare model id naming a route's default model.
+        ({"defaults": {"preferred": "qwen3-8b"}, "mandates": {}}, []),
+    ],
+    ids=["mandate", "cheap-model", "fallback", "bare-default-model"],
+)
+async def test_a_route_any_mandate_selector_names_is_not_standby(
+    ledger, stack, mandate_config, fallbacks
+):
+    service = _service(
+        stack,
+        [ANTHROPIC, LLAMA, RUNPOD],
+        ledger,
+        preference=PINNED_ANTHROPIC,
+        mandate_config=mandate_config,
+    )
+    service._mandate_fallbacks = list(fallbacks)
+
+    result = await check_llm_service(_agent(service, ledger))
+
+    assert _route(result, "llama_cpp:local")["state"] == "unprobed"
+    assert _route(result, "runpod:vllm")["state"] == "standby"
+
+
+async def test_a_selector_naming_no_route_leaves_nothing_standby(ledger, stack):
+    """A selector naming no configured vendor is tried as a model on every
+    route, so no route can be shown to be selected by nothing."""
+    service = _service(
+        stack,
+        [ANTHROPIC, LLAMA],
+        ledger,
+        preference=PINNED_ANTHROPIC,
+        mandate_config={"defaults": {}, "mandates": {"truth": "xai"}},
+        reachability=[{"name": "llama_cpp:local", "status": "unreachable"}],
+    )
+    _discovery({"llama_cpp": "refused"})
+    agent = _agent(service, ledger)
+
+    llm = await check_llm_service(agent)
+    discovery = await check_model_discovery(agent)
+
+    assert _route(llm, "anthropic:plan")["state"] == "unprobed"
+    route = _route(llm, "llama_cpp:local")
+    assert route["configured_route"] is None
+    assert route["state"] == "unreachable"
+    assert llm["status"] == "warn"
+    assert discovery["status"] == "warn"
+    assert discovery["details"]["standby_failed_vendors"] == {}
+
+
+# ---------------------------------------------------------------------------
+# The startup reachability probe
+# ---------------------------------------------------------------------------
+
+
+async def test_an_unreachable_selected_route_warns(ledger, stack):
+    service = _service(
+        stack,
         [LLAMA],
+        ledger,
         preference={"vendor": "llama_cpp", "route": "local", "model": "qwen3-8b"},
         reachability=[{"name": "llama_cpp:local", "status": "unreachable"}],
     )
     result = await check_llm_service(_agent(service, ledger))
 
     assert result["status"] == "warn"
-    assert _route(result, "llama_cpp:local")["state"] == "unprobed"
+    assert _route(result, "llama_cpp:local")["state"] == "unreachable"
 
 
-async def test_a_call_after_a_failed_startup_probe_supersedes_it(
-    ledger, owned_services
-):
-    """The startup probe runs once. A route that recovered must not warn
-    until the next restart."""
-    llama = _ScriptedRoute(LLAMA, ["local answer", LLMProviderError("llama_cpp", "refused")])
+def _probed_local_service(stack, ledger, local_outcomes, *, cloud_outcomes=()):
+    """A real service whose local route failed its real startup probe. The
+    cloud route keeps startup from refusing, and is the local route's
+    fallback."""
+    llama = _ScriptedRoute(LLAMA, local_outcomes)
     llama.adapter.probe_reachable = AsyncMock(return_value=False)
-    # The cloud route keeps startup from refusing, and is the fallback when
-    # the local route fails at the end.
-    anthropic = _ScriptedRoute(ANTHROPIC, [LLMProviderError("anthropic", "overloaded")])
-    service = _real_service(owned_services, [llama, anthropic], ledger)
+    anthropic = _ScriptedRoute(ANTHROPIC, cloud_outcomes)
+    return _real_service(stack, [llama, anthropic], ledger)
+
+
+async def test_a_call_after_the_failed_probe_was_seen_supersedes_it(ledger, stack):
+    """The round-1 repro, ordered: the probe fails, a check sees it, then a
+    call succeeds. The probe runs once; a recovered route must not warn until
+    the next restart."""
+    service = _probed_local_service(
+        stack, ledger,
+        ["local answer", LLMProviderError("llama_cpp", "refused")],
+        cloud_outcomes=[LLMProviderError("anthropic", "overloaded")],
+    )
     agent = _agent(service, ledger)
 
     await verify_llm_providers_reachable(service, env={})
     assert [r["status"] for r in service.reachability] == ["unreachable", "skipped"]
-
-    down = await check_llm_service(agent)
-    assert down["status"] == "warn"
-    assert _route(down, "llama_cpp:local")["state"] == "unprobed"
-    assert "unreachable at startup, no call since: llama_cpp:local" in down["message"]
+    unreachable = await check_llm_service(agent)
+    assert unreachable["status"] == "warn"
+    assert _route(unreachable, "llama_cpp:local")["state"] == "unreachable"
 
     assert await service.generate_with_messages(messages=list(MESSAGES)) == "local answer"
 
@@ -461,9 +644,97 @@ async def test_a_call_after_a_failed_startup_probe_supersedes_it(
     assert _route(failing, "llama_cpp:local")["state"] == "failing"
 
 
-async def test_a_failed_startup_probe_stands_while_its_route_has_no_call(ledger):
-    service = _fake_service(
+async def test_a_call_not_known_to_follow_the_probe_does_not_supersede_it(ledger, stack):
+    """Nothing checked between the probe and the call. The probe records no
+    time, so that call cannot be placed after it: the probe stands until a
+    call that can."""
+    service = _probed_local_service(stack, ledger, ["unplaced", "placed"])
+    agent = _agent(service, ledger)
+
+    await verify_llm_providers_reachable(service, env={})
+    assert await service.generate_with_messages(messages=list(MESSAGES)) == "unplaced"
+
+    unplaced = await check_llm_service(agent)
+    assert unplaced["status"] == "warn"
+    route = _route(unplaced, "llama_cpp:local")
+    assert route["state"] == "unreachable"
+    assert [m["last_call_succeeded"] for m in route["models"]] == [True]
+
+    assert await service.generate_with_messages(messages=list(MESSAGES)) == "placed"
+    placed = await check_llm_service(agent)
+    assert placed["status"] == "pass"
+    assert _route(placed, "llama_cpp:local")["state"] == "ok"
+
+
+async def test_a_reloaded_agents_failed_probe_outlasts_its_predecessors_success(
+    ledger, stack
+):
+    """The round-3 repro: an agent reloaded in this process. Its first
+    service's success came after the process started, but before the
+    replacement's probe, which failed; it says nothing about that probe."""
+    first = _real_service(stack, [_ScriptedRoute(LLAMA, ["first answer"])], ledger)
+    assert await first.generate_with_messages(messages=list(MESSAGES)) == "first answer"
+    first_agent = _agent(first, ledger)
+    assert (await check_llm_service(first_agent))["status"] == "pass"
+
+    second = _probed_local_service(stack, ledger, ["second answer"])
+    await verify_llm_providers_reachable(second, env={})
+    agent = _agent(second, ledger)
+
+    reloaded = await check_llm_service(agent)
+    assert reloaded["status"] == "warn"
+    route = _route(reloaded, "llama_cpp:local")
+    assert route["state"] == "unreachable"
+    # The predecessor's success is read; it is not newer than the probe.
+    assert [m["last_call_succeeded"] for m in route["models"]] == [True]
+    assert derive_overall_status([reloaded]) == "degraded"
+
+    assert await second.generate_with_messages(messages=list(MESSAGES)) == "second answer"
+    recovered = await check_llm_service(agent)
+    assert recovered["status"] == "pass"
+    assert _route(recovered, "llama_cpp:local")["state"] == "ok"
+
+
+async def test_a_probe_that_cannot_be_placed_stands(ledger, stack, monkeypatch):
+    monkeypatch.setattr(health_checks, "_startup_probe_seen_at", lambda *_: None)
+    service = _service(
+        stack,
+        [LLAMA],
+        ledger,
+        reachability=[{"name": "llama_cpp:local", "status": "unreachable"}],
+    )
+    agent = _agent(service, ledger)
+    await check_llm_service(agent)
+    await _log(ledger, "llama_cpp:local", "qwen3-8b", success=True)
+
+    result = await check_llm_service(agent)
+
+    assert result["status"] == "warn"
+    assert _route(result, "llama_cpp:local")["state"] == "unreachable"
+
+
+def test_each_probe_result_is_placed_when_a_check_first_sees_it():
+    service = Mock()
+    first = [{"name": "llama_cpp:local", "status": "unreachable"}]
+    seen = _startup_probe_seen_at(service, first)
+    assert seen is not None and seen <= datetime.now(UTC)
+    # The same result keeps the time it was first seen.
+    assert _startup_probe_seen_at(service, first) == seen
+    # A re-probe assigns a new list, even an equal one: placed afresh.
+    again = _startup_probe_seen_at(service, [dict(first[0])])
+    assert again is not None and again >= seen
+    # Another service's probe is its own.
+    assert _startup_probe_seen_at(Mock(), first) >= seen
+    # No result, or a service that cannot be tracked: nothing is placed.
+    assert _startup_probe_seen_at(service, None) is None
+    assert _startup_probe_seen_at(SimpleNamespace(), first) is None
+
+
+async def test_a_failed_startup_probe_stands_while_its_route_has_no_call(ledger, stack):
+    service = _service(
+        stack,
         [ANTHROPIC, LLAMA],
+        ledger,
         preference={"vendor": "llama_cpp", "route": "local", "model": "qwen3-8b"},
         reachability=[
             {"name": "anthropic:plan", "status": "skipped"},
@@ -476,46 +747,8 @@ async def test_a_failed_startup_probe_stands_while_its_route_has_no_call(ledger)
     result = await check_llm_service(_agent(service, ledger))
 
     assert result["status"] == "warn"
-    assert _route(result, "llama_cpp:local")["state"] == "unprobed"
-    assert "unreachable at startup, no call since: llama_cpp:local" in result["message"]
-
-
-async def test_a_configured_route_with_no_rows_is_active_route_unprobed(ledger):
-    service = _fake_service(
-        [ANTHROPIC, LLAMA],
-        preference={"vendor": "anthropic", "route": "plan", "model": "claude-opus-5"},
-    )
-    result = await check_llm_service(_agent(service, ledger))
-
-    assert result["status"] == "pass"
-    route = _route(result, "anthropic:plan")
-    assert route["state"] == "unprobed"
-    assert route["configured_route"] is True
-    assert "active route unprobed: anthropic:plan" in result["message"]
-    assert _route(result, "llama_cpp:local")["state"] == "standby"
-
-
-async def test_with_no_mandate_the_default_route_is_the_configured_one(ledger):
-    service = _fake_service([ANTHROPIC, LLAMA])
-    result = await check_llm_service(_agent(service, ledger))
-
-    assert _route(result, "anthropic:plan")["state"] == "unprobed"
-    assert _route(result, "llama_cpp:local")["state"] == "standby"
-
-
-async def test_the_pinned_vendor_is_never_standby_for_discovery(ledger):
-    service = _fake_service(
-        [ANTHROPIC, LLAMA],
-        preference={"vendor": "anthropic", "route": "plan", "model": "claude-opus-5"},
-    )
-    _discovery({"anthropic": "AuthenticationError: 401", "llama_cpp": "refused"})
-
-    discovery = await check_model_discovery(_agent(service, ledger))
-
-    assert discovery["status"] == "fail"
-    assert discovery["details"]["pinned_vendor_at_risk"] is True
-    assert list(discovery["details"]["failed_vendors"]) == ["anthropic"]
-    assert list(discovery["details"]["standby_failed_vendors"]) == ["llama_cpp"]
+    assert _route(result, "llama_cpp:local")["state"] == "unreachable"
+    assert "unreachable at startup, no call known since: llama_cpp:local" in result["message"]
 
 
 # ---------------------------------------------------------------------------
@@ -523,10 +756,12 @@ async def test_the_pinned_vendor_is_never_standby_for_discovery(ledger):
 # ---------------------------------------------------------------------------
 
 
-async def test_a_failure_disabled_route_is_failing_despite_older_successes(ledger):
-    service = _fake_service(
+async def test_a_failure_disabled_route_is_failing_despite_older_successes(ledger, stack):
+    service = _service(
+        stack,
         [ANTHROPIC, LLAMA],
-        preference={"vendor": "anthropic", "route": "plan", "model": "claude-opus-5"},
+        ledger,
+        preference=PINNED_ANTHROPIC,
         disabled={"anthropic:plan": f"401 Unauthorized {SENTINEL}"},
     )
     await _log(ledger, "anthropic:plan", "claude-opus-5", success=True)
@@ -540,10 +775,12 @@ async def test_a_failure_disabled_route_is_failing_despite_older_successes(ledge
     assert SENTINEL not in json.dumps(result)
 
 
-async def test_a_disabled_route_with_no_rows_is_not_standby(ledger):
-    service = _fake_service(
+async def test_a_disabled_route_with_no_rows_is_not_standby(ledger, stack):
+    service = _service(
+        stack,
         [ANTHROPIC, LLAMA],
-        preference={"vendor": "anthropic", "route": "plan", "model": "claude-opus-5"},
+        ledger,
+        preference=PINNED_ANTHROPIC,
         disabled={"llama_cpp:local": "invalid api key"},
     )
     _discovery({"llama_cpp": "401"})
@@ -558,9 +795,7 @@ async def test_a_disabled_route_with_no_rows_is_not_standby(ledger):
     assert discovery["details"]["standby_failed_vendors"] == {}
 
 
-async def test_a_route_dispatch_disabled_after_an_auth_failure_is_failing(
-    ledger, owned_services
-):
+async def test_a_route_dispatch_disabled_after_an_auth_failure_is_failing(ledger, stack):
     """The real ``_maybe_disable_route``: fallback answered, the route is dead."""
     anthropic = _ScriptedRoute(ANTHROPIC, [
         "first answer",
@@ -570,7 +805,7 @@ async def test_a_route_dispatch_disabled_after_an_auth_failure_is_failing(
         {"name": "openai:api", "vendor": "openai", "route": "api", "model": "gpt-5"},
         ["fallback answer"],
     )
-    service = _real_service(owned_services, [anthropic, openai_route], ledger)
+    service = _real_service(stack, [anthropic, openai_route], ledger)
 
     assert await service.generate_with_messages(messages=list(MESSAGES)) == "first answer"
     assert await service.generate_with_messages(messages=list(MESSAGES)) == "fallback answer"
@@ -584,15 +819,159 @@ async def test_a_route_dispatch_disabled_after_an_auth_failure_is_failing(
 
 
 # ---------------------------------------------------------------------------
+# A capped read proves nothing about what lies beyond it
+# ---------------------------------------------------------------------------
+
+
+async def test_a_busy_route_does_not_hide_another_routes_failure(ledger, stack):
+    """The round-2 repro: one llama_cpp failure, then a full read's worth of
+    anthropic successes. Each route is read on its own."""
+    service = _service(
+        stack,
+        [ANTHROPIC, LLAMA],
+        ledger,
+        preference=PINNED_ANTHROPIC,
+        reachability=[{"name": "llama_cpp:local", "status": "unreachable"}],
+    )
+    await _log(ledger, "llama_cpp:local", "qwen3-8b", success=False)
+    for _ in range(LLM_ROUTE_EVIDENCE_ROW_LIMIT):
+        await _log(ledger, "anthropic:plan", "claude-opus-5", success=True)
+    _discovery({"llama_cpp": "ConnectError: connection refused"})
+    agent = _agent(service, ledger)
+
+    llm = await check_llm_service(agent)
+    discovery = await check_model_discovery(agent)
+
+    assert llm["status"] == "warn"
+    assert _route(llm, "llama_cpp:local")["state"] == "failing"
+    anthropic = _route(llm, "anthropic:plan")
+    assert anthropic["state"] == "ok"
+    assert anthropic["row_limit_reached"] is True
+    assert llm["details"]["route_evidence"]["row_limit_reached"] == ["anthropic:plan"]
+    assert discovery["status"] == "warn"
+    assert list(discovery["details"]["failed_vendors"]) == ["llama_cpp"]
+    assert discovery["details"]["standby_failed_vendors"] == {}
+
+
+async def test_a_capped_route_still_sees_a_model_whose_newest_call_failed(ledger, stack):
+    service = _service(stack, [ANTHROPIC], ledger, preference=PINNED_ANTHROPIC)
+    await _log(ledger, "anthropic:plan", "claude-opus-5", success=False)
+    for _ in range(LLM_ROUTE_EVIDENCE_ROW_LIMIT):
+        await _log(ledger, "anthropic:plan", "claude-haiku", success=True)
+
+    result = await check_llm_service(_agent(service, ledger))
+
+    assert result["status"] == "warn"
+    route = _route(result, "anthropic:plan")
+    assert route["state"] == "failing"
+    by_model = {m["model"]: m["last_call_succeeded"] for m in route["models"]}
+    assert by_model == {"claude-haiku": True, "claude-opus-5": False}
+
+
+async def test_a_capped_route_judges_a_recovered_model_by_its_newest_call(
+    ledger, stack, monkeypatch
+):
+    monkeypatch.setattr(health_checks, "LLM_ROUTE_EVIDENCE_ROW_LIMIT", 3)
+    service = _service(stack, [ANTHROPIC], ledger, preference=PINNED_ANTHROPIC)
+    await _log(ledger, "anthropic:plan", "claude-opus-5", success=False)
+    await _log(ledger, "anthropic:plan", "claude-opus-5", success=True)
+    for _ in range(3):
+        await _log(ledger, "anthropic:plan", "claude-haiku", success=True)
+
+    result = await check_llm_service(_agent(service, ledger))
+
+    assert result["status"] == "pass"
+    route = _route(result, "anthropic:plan")
+    assert route["state"] == "ok"
+    by_model = {m["model"]: m["last_call_succeeded"] for m in route["models"]}
+    assert by_model == {"claude-haiku": True, "claude-opus-5": True}
+
+
+async def test_more_failures_than_can_be_read_warns(ledger, stack, monkeypatch):
+    """Every model read has recovered, but failures beyond the read may
+    belong to a model that has not."""
+    monkeypatch.setattr(health_checks, "LLM_ROUTE_EVIDENCE_ROW_LIMIT", 3)
+    service = _service(stack, [ANTHROPIC], ledger, preference=PINNED_ANTHROPIC)
+    for _ in range(3):
+        await _log(ledger, "anthropic:plan", "claude-opus-5", success=False)
+    await _log(ledger, "anthropic:plan", "claude-opus-5", success=True)
+    for _ in range(3):
+        await _log(ledger, "anthropic:plan", "claude-haiku", success=True)
+
+    result = await check_llm_service(_agent(service, ledger))
+
+    assert result["status"] == "warn"
+    assert _route(result, "anthropic:plan")["state"] == "truncated"
+    assert "failures beyond the 200 rows read: anthropic:plan" in result["message"]
+
+
+async def test_a_call_failing_between_the_reads_is_the_models_newest(
+    ledger, stack, monkeypatch
+):
+    """The round-3 repro: the route's first read is full and holds the
+    model's success; a public call then fails before the failure read. That
+    read returns the failure after the older success, but it is newer."""
+    monkeypatch.setattr(health_checks, "LLM_ROUTE_EVIDENCE_ROW_LIMIT", 3)
+    anthropic = _ScriptedRoute(ANTHROPIC, [
+        "one", "two", "three", LLMProviderError("anthropic", "overloaded"),
+    ])
+    service = _real_service(stack, [anthropic], ledger)
+    for _ in range(3):
+        await service.generate_with_messages(messages=list(MESSAGES))
+    read = ledger.query_llm_calls
+    interleaved = []
+
+    async def failure_between_reads(**kwargs):
+        rows = await read(**kwargs)
+        if not interleaved and kwargs.get("success") is None and len(rows) == 3:
+            interleaved.append(rows[0].success)
+            with pytest.raises(LLMServiceError):
+                await service.generate_with_messages(messages=list(MESSAGES))
+        return rows
+
+    monkeypatch.setattr(ledger, "query_llm_calls", failure_between_reads)
+    result = await check_llm_service(_agent(service, ledger))
+
+    assert interleaved == [True]
+    newest = (await read(agent_did=DID, limit=1))[0]
+    assert newest.success is False
+    assert result["status"] == "warn"
+    route = _route(result, "anthropic:plan")
+    assert route["state"] == "failing"
+    [model] = route["models"]
+    assert (model["model"], model["last_call_succeeded"]) == ("claude-opus-5", False)
+
+
+@pytest.mark.parametrize(
+    "outcomes", [(False, True), (True, False)], ids=["failure-first", "success-first"]
+)
+async def test_a_success_and_a_failure_at_one_instant_is_failing(
+    ledger, stack, monkeypatch, outcomes
+):
+    """Neither can be shown to follow the other, so the success cannot set
+    the failure aside, in whichever order the read returns them."""
+    service = _service(stack, [ANTHROPIC], ledger, preference=PINNED_ANTHROPIC)
+    instant = datetime.now(UTC) - timedelta(minutes=5)
+    for success in outcomes:
+        await _log_at(ledger, monkeypatch, instant, "anthropic:plan",
+                      "claude-opus-5", success=success)
+
+    result = await check_llm_service(_agent(service, ledger))
+
+    assert result["status"] == "warn"
+    assert _route(result, "anthropic:plan")["state"] == "failing"
+
+
+# ---------------------------------------------------------------------------
 # The private inference lease route
 # ---------------------------------------------------------------------------
 
 
 async def test_a_replacement_lease_does_not_inherit_the_old_leases_failures(
-    ledger, owned_services, lease_clients
+    ledger, stack, lease_clients
 ):
     """Private-only service: no configured providers, the lease is the route."""
-    service = _real_service(owned_services, [], ledger)
+    service = _real_service(stack, [], ledger)
     agent = _agent(service, ledger)
 
     await _activate(service, "lease-A", [RuntimeError("pod gone")])
@@ -634,11 +1013,11 @@ async def test_a_replacement_lease_does_not_inherit_the_old_leases_failures(
 
 
 async def test_a_failing_lease_route_beside_healthy_providers_warns(
-    ledger, owned_services, lease_clients
+    ledger, stack, lease_clients
 ):
     """The lease takes precedence over the providers, so its failure counts."""
     anthropic = _ScriptedRoute(ANTHROPIC, [])
-    service = _real_service(owned_services, [anthropic], ledger)
+    service = _real_service(stack, [anthropic], ledger)
     await _activate(service, "lease-A", [RuntimeError("pod gone")])
     try:
         with pytest.raises(LLMServiceError):
@@ -653,12 +1032,161 @@ async def test_a_failing_lease_route_beside_healthy_providers_warns(
     assert _route(result, "anthropic:plan")["state"] == "unprobed"
 
 
-async def test_lease_rows_naming_another_lease_are_ignored(ledger):
-    service = _fake_service([ANTHROPIC])
-    service._remote_lease = SimpleNamespace(lease_id="lease-B")
+async def test_an_expired_lease_warns_although_its_newest_call_succeeded(
+    ledger, stack, lease_clients
+):
+    """The round-3 repro: the lease answered, then ran past its expiry. The
+    route refuses every call before it is recorded, so its newest row is
+    still the success."""
+    service = _real_service(stack, [], ledger)
+    agent = _agent(service, ledger)
+    await _activate(service, "lease-A", ["answered"])
+    assert await service.generate_with_messages(messages=list(MESSAGES)) == "answered"
+    assert (await check_llm_service(agent))["status"] == "pass"
+
+    # The same ready lease, as reconciliation would hand it over once its
+    # expiry has passed. Its route is unchanged, so it replaces the installed
+    # lease in place.
+    await _activate(service, "lease-A", [], expires_in=timedelta(minutes=-1))
+    expired = await check_llm_service(agent)
+    assert expired["status"] == "warn"
+    route = _route(expired, REMOTE_ROUTE_NAME)
+    assert (route["state"], route["refusal"]) == ("unavailable", "lease expired")
+    assert [m["last_call_succeeded"] for m in route["models"]] == [True]
+    assert "refusing calls now: remote_gpu (lease expired)" in expired["message"]
+    assert derive_overall_status([expired]) == "degraded"
+
+    with pytest.raises(LLMServiceError, match="lease expired"):
+        await service.generate_with_messages(messages=list(MESSAGES))
+    # The refusal wrote no row: only the route's state shows it.
+    [row] = await ledger.query_llm_calls(agent_did=DID)
+    assert row.success is True
+    refused = await check_llm_service(agent)
+    assert refused["status"] == "warn"
+    assert _route(refused, REMOTE_ROUTE_NAME)["state"] == "unavailable"
+
+
+class _HeldLeaseAdapter(_LeaseAdapter):
+    """Holds one call in flight until released."""
+
+    def __init__(self):
+        super().__init__([])
+        self.started = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def get_response(self, **kwargs):
+        self.started.set()
+        await self.release.wait()
+        return attach_stop_reason(
+            LLMResponse(content="late", input_tokens=1, output_tokens=1), "stop"
+        )
+
+
+async def test_a_draining_lease_route_warns(ledger, stack, lease_clients):
+    """Release stops new calls and waits for the one in flight: meanwhile
+    the route refuses every call, and has written no failure."""
+    service = _real_service(stack, [], ledger)
+    agent = _agent(service, ledger)
+    await _activate(service, "lease-A", ["answered"])
+    assert await service.generate_with_messages(messages=list(MESSAGES)) == "answered"
+
+    held = _HeldLeaseAdapter()
+    service._remote_adapter = held
+    in_flight = asyncio.create_task(
+        service.generate_with_messages(messages=list(MESSAGES))
+    )
+    await asyncio.wait_for(held.started.wait(), 5)
+    releasing = asyncio.create_task(service.deactivate_inference_lease("lease-A"))
+    try:
+        async with asyncio.timeout(5):
+            while service.get_backend_status()["remote_active"]:
+                await asyncio.sleep(0)
+        draining = await check_llm_service(agent)
+    finally:
+        held.release.set()
+        assert await asyncio.wait_for(in_flight, 5) == "late"
+        await asyncio.wait_for(releasing, 5)
+
+    assert draining["status"] == "warn"
+    route = _route(draining, REMOTE_ROUTE_NAME)
+    assert (route["state"], route["refusal"]) == ("unavailable", "not accepting calls")
+    assert [m["last_call_succeeded"] for m in route["models"]] == [True]
+
+
+def test_lease_availability_that_cannot_be_read_is_a_refusal():
+    future = datetime.now(UTC) + timedelta(minutes=5)
+    lease = SimpleNamespace(lease_id="lease-A", expires_at=future)
+
+    def raises():
+        raise RuntimeError(f"status {SENTINEL}")
+
+    assert _private_route_refusal(
+        SimpleNamespace(_remote_lease=SimpleNamespace(lease_id="lease-A"))
+    ) == "lease expiry unknown"
+    assert _private_route_refusal(
+        SimpleNamespace(_remote_lease=lease)
+    ) == "route status unreadable"
+    assert _private_route_refusal(
+        SimpleNamespace(_remote_lease=lease, get_backend_status=raises)
+    ) == "route status unreadable"
+    assert _private_route_refusal(SimpleNamespace(
+        _remote_lease=lease, get_backend_status=lambda: {"remote_active": True},
+    )) is None
+
+
+@pytest.mark.parametrize(
+    "installed_fails", [True, False], ids=["B-fails-A-succeeds", "B-succeeds-A-fails"]
+)
+async def test_interleaved_leases_on_one_ledger_judge_only_their_own_rows(
+    ledger, stack, lease_clients, installed_fails
+):
+    """Two services share one ledger, each with its own lease. The installed
+    lease's health is its own calls; the other lease's newer call, success or
+    failure, never decides it."""
+    service_a = _real_service(stack, [], ledger)
+    service_b = _real_service(stack, [], ledger)
+    if installed_fails:
+        await _activate(service_b, "lease-B", [RuntimeError("pod gone")])
+        await _activate(service_a, "lease-A", ["from lease A"])
+    else:
+        await _activate(service_b, "lease-B", ["from lease B"])
+        await _activate(service_a, "lease-A", [RuntimeError("pod gone")])
+    try:
+        # The installed lease B calls first; the other lease A's call is newer.
+        if installed_fails:
+            with pytest.raises(LLMServiceError):
+                await service_b.generate_with_messages(messages=list(MESSAGES))
+            assert await service_a.generate_with_messages(messages=list(MESSAGES)) == "from lease A"
+        else:
+            assert await service_b.generate_with_messages(messages=list(MESSAGES)) == "from lease B"
+            with pytest.raises(LLMServiceError):
+                await service_a.generate_with_messages(messages=list(MESSAGES))
+        newest, older = await ledger.query_llm_calls(agent_did=DID)
+        assert newest.metadata["inference_lease_id"] == "lease-A"
+        assert older.metadata["inference_lease_id"] == "lease-B"
+
+        result = await check_llm_service(_agent(service_b, ledger))
+    finally:
+        await service_a.deactivate_inference_lease("lease-A")
+        await service_b.deactivate_inference_lease("lease-B")
+
+    route = _route(result, REMOTE_ROUTE_NAME)
+    [model] = route["models"]
+    assert (model["calls"], model["last_call_succeeded"]) == (1, not installed_fails)
+    if installed_fails:
+        assert result["status"] == "warn"
+        assert route["state"] == "failing"
+    else:
+        assert result["status"] == "pass"
+        assert route["state"] == "ok"
+
+
+async def test_lease_rows_naming_another_lease_are_ignored(ledger, stack, lease_clients):
+    service = _service(stack, [ANTHROPIC], ledger)
+    await _install_lease(service, "lease-B")
     await _log(ledger, REMOTE_ROUTE_NAME, "llama-3", success=False,
                metadata={"inference_lease_id": "lease-A"})
-    await _log(ledger, REMOTE_ROUTE_NAME, "llama-3", success=False,
+    await _log(ledger, REMOTE_ROUTE_NAME, "llama-3", success=True,
                metadata={"inference_lease_id": "lease-A"})
 
     result = await check_llm_service(_agent(service, ledger))
@@ -669,80 +1197,72 @@ async def test_lease_rows_naming_another_lease_are_ignored(ledger):
     assert route["models"] == [] and route["unattributed_models"] == []
 
 
-async def test_lease_rows_naming_no_lease_are_reported_not_dropped(ledger):
-    """A row with no lease id may be this lease's: its failure warns."""
-    service = _fake_service([ANTHROPIC])
-    service._remote_lease = SimpleNamespace(lease_id="lease-B")
+async def test_an_unattributed_lease_failure_warns_until_the_lease_names_a_newer_call(
+    ledger, stack, lease_clients
+):
+    """A row naming no lease may be this lease's. Its failure warns, and an
+    unattributed success never sets it aside: only a newer call naming the
+    installed lease does."""
+    service = _service(stack, [ANTHROPIC], ledger)
+    await _install_lease(service, "lease-B")
+    agent = _agent(service, ledger)
     await _log(ledger, REMOTE_ROUTE_NAME, "llama-3", success=True)
     await _log(ledger, REMOTE_ROUTE_NAME, "llama-3", success=False)
+
+    failing = await check_llm_service(agent)
+    assert failing["status"] == "warn"
+    route = _route(failing, REMOTE_ROUTE_NAME)
+    assert route["state"] == "unattributed_failing"
+    assert route["models"] == []
+    [model] = route["unattributed_models"]
+    assert (model["calls"], model["failures"]) == (2, 1)
+    assert "failing, lease unattributed" in failing["message"]
+    assert derive_overall_status([failing]) == "degraded"
+
+    await _log(ledger, REMOTE_ROUTE_NAME, "llama-3", success=True)
+    still = await check_llm_service(agent)
+    assert still["status"] == "warn"
+    assert _route(still, REMOTE_ROUTE_NAME)["state"] == "unattributed_failing"
+
+    await _log(ledger, REMOTE_ROUTE_NAME, "llama-3", success=True,
+               metadata={"inference_lease_id": "lease-B"})
+    recovered = await check_llm_service(agent)
+    assert recovered["status"] == "pass"
+    assert _route(recovered, REMOTE_ROUTE_NAME)["state"] == "ok"
+
+
+async def test_an_unattributed_failure_newer_than_the_leases_success_warns(
+    ledger, stack, monkeypatch, lease_clients
+):
+    """Position never attributes a row: an unnamed failure after the lease's
+    own success is not counted as the lease's, and still warns."""
+    service = _service(stack, [ANTHROPIC], ledger)
+    await _install_lease(service, "lease-B")
+    base = datetime.now(UTC) - timedelta(minutes=30)
+    await _log_at(ledger, monkeypatch, base, REMOTE_ROUTE_NAME, "llama-3",
+                  success=True, metadata={"inference_lease_id": "lease-B"})
+    await _log_at(ledger, monkeypatch, base + timedelta(minutes=1),
+                  REMOTE_ROUTE_NAME, "llama-3", success=False)
 
     result = await check_llm_service(_agent(service, ledger))
 
     assert result["status"] == "warn"
     route = _route(result, REMOTE_ROUTE_NAME)
     assert route["state"] == "unattributed_failing"
-    assert route["models"] == []
-    [model] = route["unattributed_models"]
-    assert (model["calls"], model["failures"]) == (2, 1)
-    assert "failing, lease unattributed" in result["message"]
-    assert derive_overall_status([result]) == "degraded"
-
-    await _log(ledger, REMOTE_ROUTE_NAME, "llama-3", success=True)
-    recovered = await check_llm_service(_agent(service, ledger))
-    assert recovered["status"] == "pass"
-    assert _route(recovered, REMOTE_ROUTE_NAME)["state"] == "unattributed_ok"
-
-
-async def test_every_lease_row_after_the_lease_first_named_itself_is_its_own(
-    ledger, monkeypatch
-):
-    """A lease is released only after its calls drain, so no other lease can
-    write a row after this lease's first one: an unnamed row then is its own."""
-    service = _fake_service([ANTHROPIC])
-    service._remote_lease = SimpleNamespace(lease_id="lease-B")
-    base = datetime.now(UTC) - timedelta(minutes=30)
-
-    async def log_at(minutes, **kwargs):
-        monkeypatch.setattr(ledger, "now_utc", lambda: base + timedelta(minutes=minutes))
-        await _log(ledger, REMOTE_ROUTE_NAME, "llama-3", **kwargs)
-        monkeypatch.undo()
-
-    # Older than lease B's first named call: may be lease A's. Not counted.
-    await log_at(1, success=False)
-    await log_at(2, success=True, metadata={"inference_lease_id": "lease-B"})
-    # Newer: lease B's, though its lease id did not survive.
-    await log_at(3, success=False)
-
-    result = await check_llm_service(_agent(service, ledger))
-
-    assert result["status"] == "warn"
-    route = _route(result, REMOTE_ROUTE_NAME)
-    assert route["state"] == "failing"
     [model] = route["models"]
-    assert (model["calls"], model["failures"]) == (2, 1)
-    assert route["unattributed_models"] == []
-
-    await log_at(4, success=True, metadata={"inference_lease_id": "lease-B"})
-    recovered = await check_llm_service(_agent(service, ledger))
-    assert recovered["status"] == "pass"
-    assert _route(recovered, REMOTE_ROUTE_NAME)["state"] == "ok"
+    assert (model["calls"], model["failures"]) == (1, 0)
 
 
-async def test_a_failed_lease_call_the_privacy_gate_stripped_still_warns(
-    ledger, owned_services, lease_clients
+async def test_a_failed_private_call_warns_through_the_real_privacy_gate(
+    ledger, stack, lease_clients
 ):
-    """The production privacy gate elides the whole metadata column, lease id
-    included, in temporary storage. Health must not read the failure as no
-    call at all."""
+    """The round-1 repro: temporary storage elides the whole metadata column.
+    The lease id is stamped after the gate, so the failure is the lease's."""
     privacy = SimpleNamespace(
         config=PrivacyConfig(storage="temp", processing="cloud")
     )
-    service = _real_service(owned_services, [], ledger)
-    # Both production privacy hooks, bound as KestrelAgent binds them.
-    ledger.set_privacy_config_provider(lambda: privacy.config)
-    service.set_force_local_only_provider(
-        lambda: not privacy.config.allows_cloud_llm()
-    )
+    service = _real_service(stack, [], ledger)
+    _bind_privacy(ledger, service, privacy)
     agent = _agent(service, ledger)
 
     await _activate(service, "lease-A", [RuntimeError("pod gone"), "recovered"])
@@ -751,32 +1271,31 @@ async def test_a_failed_lease_call_the_privacy_gate_stripped_still_warns(
             await service.generate_with_messages(messages=list(MESSAGES))
         [row] = await ledger.query_llm_calls(agent_did=DID)
         assert row.provider == REMOTE_ROUTE_NAME and row.success is False
-        assert "inference_lease_id" not in row.metadata  # the gate took it
+        # The gate elided everything else the call carried.
+        assert row.metadata == {
+            _CONTENT_GATED_MARKER: "temp",
+            "inference_lease_id": "lease-A",
+        }
 
         failing = await check_llm_service(agent)
         assert failing["status"] == "warn"
-        assert _route(failing, REMOTE_ROUTE_NAME)["state"] == "unattributed_failing"
+        assert _route(failing, REMOTE_ROUTE_NAME)["state"] == "failing"
         assert derive_overall_status([failing]) == "degraded"
 
         assert await service.generate_with_messages(messages=list(MESSAGES)) == "recovered"
         recovered = await check_llm_service(agent)
         assert recovered["status"] == "pass"
-        assert _route(recovered, REMOTE_ROUTE_NAME)["state"] == "unattributed_ok"
+        assert _route(recovered, REMOTE_ROUTE_NAME)["state"] == "ok"
     finally:
         await service.deactivate_inference_lease("lease-A")
 
 
 async def test_a_lease_failing_after_privacy_tightens_mid_lease_is_failing(
-    ledger, owned_services, lease_clients
+    ledger, stack, lease_clients
 ):
-    """The lease named itself before the gate began stripping its id, so the
-    stripped failure that followed is attributed to it."""
     privacy = SimpleNamespace(config=get_privacy_preset("normal"))
-    service = _real_service(owned_services, [], ledger)
-    ledger.set_privacy_config_provider(lambda: privacy.config)
-    service.set_force_local_only_provider(
-        lambda: not privacy.config.allows_cloud_llm()
-    )
+    service = _real_service(stack, [], ledger)
+    _bind_privacy(ledger, service, privacy)
     agent = _agent(service, ledger)
 
     await _activate(service, "lease-A", ["named", RuntimeError("pod gone")])
@@ -785,9 +1304,10 @@ async def test_a_lease_failing_after_privacy_tightens_mid_lease_is_failing(
         privacy.config = PrivacyConfig(storage="temp", processing="cloud")
         with pytest.raises(LLMServiceError):
             await service.generate_with_messages(messages=list(MESSAGES))
-        stripped, named = await ledger.query_llm_calls(agent_did=DID)
-        assert "inference_lease_id" not in stripped.metadata
-        assert named.metadata["inference_lease_id"] == "lease-A"
+        gated, plain = await ledger.query_llm_calls(agent_did=DID)
+        assert _CONTENT_GATED_MARKER in gated.metadata
+        assert gated.metadata["inference_lease_id"] == "lease-A"
+        assert plain.metadata["inference_lease_id"] == "lease-A"
 
         result = await check_llm_service(agent)
     finally:
@@ -802,19 +1322,14 @@ async def test_a_lease_failing_after_privacy_tightens_mid_lease_is_failing(
     )
 
 
-async def test_a_replacement_lease_is_judged_by_its_own_first_unnamed_call(
-    ledger, owned_services, lease_clients
+async def test_a_replacement_lease_under_temp_storage_is_not_judged_by_its_predecessor(
+    ledger, stack, lease_clients
 ):
-    """Where the gate strips every lease id, the newest lease-route call is
-    the replacement's as soon as it has served one."""
     privacy = SimpleNamespace(
         config=PrivacyConfig(storage="temp", processing="cloud")
     )
-    service = _real_service(owned_services, [], ledger)
-    ledger.set_privacy_config_provider(lambda: privacy.config)
-    service.set_force_local_only_provider(
-        lambda: not privacy.config.allows_cloud_llm()
-    )
+    service = _real_service(stack, [], ledger)
+    _bind_privacy(ledger, service, privacy)
     agent = _agent(service, ledger)
 
     await _activate(service, "lease-A", [RuntimeError("pod gone")])
@@ -824,11 +1339,9 @@ async def test_a_replacement_lease_is_judged_by_its_own_first_unnamed_call(
 
     await _activate(service, "lease-B", ["from lease B"])
     try:
-        # Until lease B serves, lease A's stripped failure cannot be told
-        # apart from lease B's, so it warns: failing closed, not open. Rows
-        # that keep their lease id are never mistaken this way.
         before = await check_llm_service(agent)
-        assert _route(before, REMOTE_ROUTE_NAME)["state"] == "unattributed_failing"
+        assert before["status"] == "pass"
+        assert _route(before, REMOTE_ROUTE_NAME)["state"] == "unprobed"
 
         assert await service.generate_with_messages(messages=list(MESSAGES)) == "from lease B"
         after = await check_llm_service(agent)
@@ -836,7 +1349,7 @@ async def test_a_replacement_lease_is_judged_by_its_own_first_unnamed_call(
         await service.deactivate_inference_lease("lease-B")
 
     assert after["status"] == "pass"
-    assert _route(after, REMOTE_ROUTE_NAME)["state"] == "unattributed_ok"
+    assert _route(after, REMOTE_ROUTE_NAME)["state"] == "ok"
 
 
 # ---------------------------------------------------------------------------
@@ -844,11 +1357,8 @@ async def test_a_replacement_lease_is_judged_by_its_own_first_unnamed_call(
 # ---------------------------------------------------------------------------
 
 
-async def test_an_unreadable_ledger_warns_without_its_error_text(ledger, monkeypatch):
-    service = _fake_service(
-        [ANTHROPIC, LLAMA],
-        preference={"vendor": "anthropic", "route": "plan", "model": "claude-opus-5"},
-    )
+async def test_an_unreadable_ledger_warns_without_its_error_text(ledger, stack, monkeypatch):
+    service = _service(stack, [ANTHROPIC, LLAMA], ledger, preference=PINNED_ANTHROPIC)
 
     async def broken(**_kwargs):
         raise RuntimeError(f"database said {SENTINEL}")
@@ -865,8 +1375,8 @@ async def test_an_unreadable_ledger_warns_without_its_error_text(ledger, monkeyp
     assert SENTINEL not in json.dumps(result)
 
 
-async def test_a_wedged_ledger_read_is_bounded(ledger, monkeypatch):
-    service = _fake_service([ANTHROPIC])
+async def test_a_wedged_ledger_read_is_bounded(ledger, stack, monkeypatch):
+    service = _service(stack, [ANTHROPIC], ledger)
 
     async def wedged(**_kwargs):
         await asyncio.Event().wait()
@@ -880,10 +1390,12 @@ async def test_a_wedged_ledger_read_is_bounded(ledger, monkeypatch):
     assert "read timed out" in result["message"]
 
 
-async def test_without_a_ledger_a_standby_route_is_not_claimed(ledger):
-    service = _fake_service(
+async def test_without_a_ledger_a_standby_route_is_not_claimed(ledger, stack):
+    service = _service(
+        stack,
         [ANTHROPIC, LLAMA],
-        preference={"vendor": "anthropic", "route": "plan", "model": "claude-opus-5"},
+        ledger,
+        preference=PINNED_ANTHROPIC,
         reachability=[{"name": "llama_cpp:local", "status": "unreachable"}],
     )
     _discovery({"llama_cpp": "refused"})
@@ -893,7 +1405,8 @@ async def test_without_a_ledger_a_standby_route_is_not_claimed(ledger):
     discovery = await check_model_discovery(agent)
 
     assert llm["status"] == "warn"
-    assert _route(llm, "llama_cpp:local")["state"] == "unknown"
+    # Not shown standby, so its startup failure stands.
+    assert _route(llm, "llama_cpp:local")["state"] == "unreachable"
     assert "no call evidence: no call ledger" in llm["message"]
     assert discovery["status"] == "warn"
 
@@ -903,13 +1416,17 @@ async def test_without_a_ledger_a_standby_route_is_not_claimed(ledger):
 # ---------------------------------------------------------------------------
 
 
-async def test_no_health_output_carries_prompt_response_or_error_text(ledger):
-    service = _fake_service(
+async def test_no_health_output_carries_prompt_response_or_error_text(
+    ledger, stack, lease_clients
+):
+    service = _service(
+        stack,
         [ANTHROPIC, LLAMA, RUNPOD],
-        preference={"vendor": "anthropic", "route": "plan", "model": "claude-opus-5"},
+        ledger,
+        preference=PINNED_ANTHROPIC,
         disabled={"runpod:vllm": f"unauthorized {SENTINEL}"},
     )
-    service._remote_lease = SimpleNamespace(lease_id="lease-A")
+    await _install_lease(service, "lease-A")
     content = {
         "system_prompt": f"system {SENTINEL}",
         "user_prompt": f"user {SENTINEL}",
@@ -922,6 +1439,8 @@ async def test_no_health_output_carries_prompt_response_or_error_text(ledger):
     await _log(ledger, "llama_cpp:local", "qwen3-8b", success=True, **content)
     await _log(ledger, REMOTE_ROUTE_NAME, "llama-3", success=False, **content,
                metadata={"inference_lease_id": "lease-A", "note": SENTINEL})
+    await _log(ledger, REMOTE_ROUTE_NAME, "llama-3", success=False, **content,
+               metadata={"note": SENTINEL})
     [stored, *_] = await ledger.query_llm_calls(agent_did=DID)
     assert SENTINEL in (stored.user_prompt_preview or "")  # the rows do carry it
     _discovery({"runpod": "404"})
