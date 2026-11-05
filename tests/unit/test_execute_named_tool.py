@@ -557,38 +557,21 @@ class TestExecuteNamedToolGovernance:
             )
 
     @pytest.mark.asyncio
-    async def test_tool_value_error_propagates_unwrapped(self):
-        """A ``ValueError`` raised by the tool's own validation logic
-        propagates out of ``execute_named_tool`` as a plain
-        ``ValueError`` — NOT as ``ToolNotRegisteredError``.  Callers can
-        ``except ToolNotRegisteredError`` to handle "tool doesn't exist"
-        and ``except ValueError`` for tool-side validation errors.
-        Codex round-2 caught the prior version of this — without the
-        distinction, a tool raising ``ValueError("invalid recipient")``
-        would be misreported as "tool not found" and the realtime model
-        would correct the wrong problem.
-        """
-        bad_tool = _FakeTool("send_email", side_effect=ValueError("invalid recipient: not an email"))
-        feature = _FakeFeature("email", [bad_tool])
+    async def test_tool_value_error_preserves_public_uncertainty(self):
+        from kestrel_sdk.resources import ResourceOutcomeUnknown
+
+        original = ValueError("private-invalid-recipient")
+        bad_tool = _FakeTool("send_email", side_effect=original)
         agent = _MinimalOrchestrator(
-            features={"email": feature},
+            features={"email": _FakeFeature("email", [bad_tool])},
             hooks_manager=_FakeHooksManager(),
         )
-
-        with pytest.raises(ValueError, match="invalid recipient"):
+        with pytest.raises(ResourceOutcomeUnknown, match="unconfirmed") as caught:
             await agent.execute_named_tool(
-                "send_email", {"to": "bad"},
-                session_id="s", source="voice_realtime",
+                "send_email", {"to": "bad"}, session_id="s", source="voice_realtime",
             )
-        # And critically — that ValueError is NOT a ToolNotRegisteredError.
-        # We verify by re-running and confirming the exception type.
-        try:
-            await agent.execute_named_tool(
-                "send_email", {"to": "bad"},
-                session_id="s", source="voice_realtime",
-            )
-        except ValueError as exc:
-            assert not isinstance(exc, ToolNotRegisteredError)
+        assert caught.value.__cause__ is original
+        assert "private-invalid-recipient" not in str(caught.value)
 
     @pytest.mark.asyncio
     async def test_resolver_walks_features_not_explored_cache(self, fake_tool):

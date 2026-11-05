@@ -1143,7 +1143,7 @@ async def test_route_publication_waits_for_its_required_dispatch_row(route, monk
 
 async def test_route_audit_failure_withholds_the_ui_and_is_not_replayable(route, monkeypatch):
     from kestrel_sovereign.a2a.projections import message_text
-    from kestrel_sovereign.agent.orchestrator_engine import _DeferredToolAuditError
+    from kestrel_sovereign.execution_custody import ToolAuditUnconfirmedError
 
     step_errors = []
     if route.kind != "a2a":
@@ -1171,7 +1171,7 @@ async def test_route_audit_failure_withholds_the_ui_and_is_not_replayable(route,
     else:
         # The step raises exactly what the chat boundary raises.
         [error] = step_errors
-        assert type(error) is _DeferredToolAuditError
+        assert type(error) is ToolAuditUnconfirmedError
         assert "Do not replay" in str(error)
     assert route.tool.executions == [{}] and route.tool.publications == []
     _assert_spent(route.tool)

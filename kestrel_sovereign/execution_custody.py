@@ -32,11 +32,16 @@ from httpx2 import AsyncClient as _NativeHTTPX2AsyncClient
 from httpx2 import Response as _NativeHTTPX2Response
 from kestrel_sdk.features.host_errors import register_control_error_predicate
 from kestrel_sdk.storage.database import TransactionError
+from kestrel_sdk.resources import ResourceOutcomeUnknown
 
 from kestrel_sovereign.turn_scope import capture_turn_scope, turn_scoped
 
 if TYPE_CHECKING:
     from kestrel_sovereign.storage.db.postgres import AdvisoryLease
+
+
+class ToolAuditUnconfirmedError(ResourceOutcomeUnknown):
+    """Execution completed but its required audit could not be confirmed."""
 
 
 class ExecutionAuthorityError(RuntimeError):
@@ -263,6 +268,18 @@ def is_execution_control_error(
     nodes = (_explicit_control_chain(error) if recursive
              else () if error is None else (error,))
     return any(_is_execution_control_node(current) for current in nodes)
+
+
+def is_tool_execution_terminal_error(error: BaseException | None) -> bool:
+    """Tool delivery must propagate control and mandatory audit uncertainty.
+
+    An audit error alone is not authority loss or retirement debt. Keep this
+    local delivery rule separate from the SDK-registered control predicate.
+    """
+    return is_execution_control_error(error) or any(
+        isinstance(current, ToolAuditUnconfirmedError)
+        for current in _explicit_control_chain(error)
+    )
 
 
 def retained_execution_error(error: BaseException) -> BaseException:

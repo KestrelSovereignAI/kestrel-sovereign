@@ -109,7 +109,7 @@ from kestrel_sovereign.kestrel_config.constants import (
 )
 from kestrel_sovereign.config import load_config, load_section
 from kestrel_sovereign import telemetry
-from kestrel_sovereign.execution_custody import ExecutionAuthorityError, ExecutionCustody, bind_execution_runtime, require_execution_work, execution_work_operation, is_execution_control_error, execution_terminal_error, require_native_execution_admission
+from kestrel_sovereign.execution_custody import is_tool_execution_terminal_error, ExecutionAuthorityError, ExecutionCustody, bind_execution_runtime, require_execution_work, execution_work_operation, is_execution_control_error, execution_terminal_error, require_native_execution_admission
 from kestrel_sovereign._async_ownership import owned_task_error
 
 logger = logging.getLogger(__name__)
@@ -6082,7 +6082,7 @@ No other text or formatting.
                 continue
 
             except LLMProviderError as e:
-                if is_execution_control_error(e):
+                if is_tool_execution_terminal_error(e):
                     raise
                 logger.warning(f"Provider {provider['name']} failed: {e}")
                 errors[provider['name']] = e
@@ -7023,7 +7023,7 @@ No other text or formatting.
             except ExecutionAuthorityError:
                 raise
             except Exception as e:
-                if is_execution_control_error(e):
+                if is_tool_execution_terminal_error(e):
                     raise
                 diagnostic = type(e).__name__ if _redact else str(e)
                 logger.error(f"Provider {provider['name']} failed: {diagnostic}")
