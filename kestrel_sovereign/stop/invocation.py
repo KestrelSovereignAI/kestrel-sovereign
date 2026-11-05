@@ -15,6 +15,7 @@ import asyncio
 import hashlib
 import logging
 import time
+from collections.abc import Callable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from functools import wraps
@@ -223,14 +224,18 @@ class _TerminalStopDatabase:
         return tuple(row.values()) if row is not None else None
 
 
-async def _settle_stop_on_connection(connection, generation_id, owner_id, disposition):
+async def _settle_stop_on_connection(
+    connection, generation_id, owner_id, disposition, abandon_if=None,
+):
     """Reuse canonical settlement SQL, with no ordinary work admission."""
     generation_id = _required_identity(generation_id, "generation identity")
     owner_id = _required_identity(owner_id, "owner identity")
     if not isinstance(disposition, RequestCompletionDisposition):
         raise TypeError("distributed Stop settlement disposition must be typed")
     store = DistributedInvocationStore(_TerminalStopDatabase(connection))
-    await store._settle_rows(generation_id, owner_id, disposition)
+    await store._settle_rows(
+        generation_id, owner_id, disposition, abandon_if=abandon_if
+    )
 
 
 class DistributedInvocationStore:
@@ -542,6 +547,8 @@ class DistributedInvocationStore:
         generation_id: str,
         owner_id: str,
         disposition: RequestCompletionDisposition,
+        *,
+        abandon_if: Callable[[], bool] | None = None,
     ) -> None:
         """Apply the only valid terminal transition for one generation.
 
@@ -549,6 +556,13 @@ class DistributedInvocationStore:
         observed completion.  ``ABANDONED`` means the terminal state is
         unknown, so it is moved to the unresolved ledger instead.  This is the
         lifecycle invariant used by local cleanup and remote Stop results.
+
+        ``abandon_if`` is asked once the settlement holds its transaction's
+        database custody, immediately before any row is deleted. When it
+        answers true, a ``COMPLETED`` settlement is recorded ``ABANDONED``:
+        a settlement that queued behind another writer then reflects what
+        became true while it waited, not what was true when it was decided.
+        It must not await or touch the database.
         """
 
         generation_id = _required_identity(generation_id, "generation identity")
@@ -560,12 +574,21 @@ class DistributedInvocationStore:
 
         backend = getattr(self._db, "backend", None)
         if isinstance(backend, PostgresBackend) and current_execution_custody(backend):
-            await backend.settle_stop_invocation(generation_id, owner_id, disposition)
+            await backend.settle_stop_invocation(
+                generation_id, owner_id, disposition, abandon_if=abandon_if
+            )
             return
-        await self._settle_rows(generation_id, owner_id, disposition)
+        await self._settle_rows(
+            generation_id, owner_id, disposition, abandon_if=abandon_if
+        )
 
     async def _settle_rows(
-        self, generation_id: str, owner_id: str, disposition: RequestCompletionDisposition,
+        self,
+        generation_id: str,
+        owner_id: str,
+        disposition: RequestCompletionDisposition,
+        *,
+        abandon_if: Callable[[], bool] | None = None,
     ) -> None:
         async with self._db.transaction(immediate=True):
             row = await self._db.fetchone(
@@ -594,6 +617,12 @@ class DistributedInvocationStore:
                 raise RuntimeError(
                     "distributed Stop generation exists in multiple lifecycle states"
                 )
+            if (
+                disposition is RequestCompletionDisposition.COMPLETED
+                and abandon_if is not None
+                and abandon_if()
+            ):
+                disposition = RequestCompletionDisposition.ABANDONED
             if disposition is RequestCompletionDisposition.ABANDONED:
                 if unresolved is not None:
                     return
@@ -1247,6 +1276,18 @@ class DistributedInvocationRegistry:
             )
         return renewal
 
+    def _renewal_raised_control(self) -> bool:
+        """Whether a heartbeat renewal has raised execution control.
+
+        A pure read of the heartbeat, so a settlement can ask it inside its
+        transaction; holding the control and fencing are left to the next
+        observation (:meth:`_heartbeat_attempt`).
+        """
+
+        heartbeat = self._heartbeat
+        renewal = heartbeat.latest() if heartbeat is not None else None
+        return renewal is not None and renewal.control is not None
+
     def _lease_lapse_reason(self, now: float, renewed_at: float) -> str:
         heartbeat = self._heartbeat
         state = (
@@ -1269,7 +1310,9 @@ class DistributedInvocationRegistry:
         """Re-read one generation's durable row before cognition.
 
         The read renews nothing: it shows whether a peer marked or reaped the
-        row while it was being admitted or bound.
+        row while it was being admitted or bound. Execution control a renewal
+        raised while the read awaited outranks every lease-loss outcome here:
+        the caller receives that original exception, never a self-fence.
         """
 
         owner_id = self._owner_id
@@ -1281,6 +1324,8 @@ class DistributedInvocationRegistry:
         except Exception as error:
             if is_execution_control_error(error):
                 raise
+            self._heartbeat_attempt()
+            self._require_terminal_control()
             self._fail_closed_owner(
                 f"owner inventory could not be read {operation} "
                 f"({type(error).__name__})",
@@ -1289,6 +1334,8 @@ class DistributedInvocationRegistry:
             raise InvocationSelfFencedError(
                 f"distributed Stop owner inventory could not be read {operation}"
             ) from error
+        self._observe_owner_heartbeat()
+        self._require_terminal_control()
         if generation_id not in polled.live_generation_ids:
             self._fail_closed_owner(
                 f"durable generation was lost {operation}", owner_id=owner_id
@@ -1296,7 +1343,6 @@ class DistributedInvocationRegistry:
             raise InvocationSelfFencedError(
                 f"distributed Stop durable generation was lost {operation}"
             )
-        self._observe_owner_heartbeat()
         if self._lease_lost:
             raise InvocationSelfFencedError(
                 f"distributed Stop owner lease expired {operation}"
@@ -1376,6 +1422,9 @@ class DistributedInvocationRegistry:
                 # authority to revive an owner whose lease lapsed meanwhile.
                 self._observe_owner_heartbeat()
                 if self._lease_lost:
+                    # Held execution control is raised as itself, and the row
+                    # is left to the caller's abandonment, never completed.
+                    self._require_terminal_control()
                     self.complete_soon(agent, turn_id, generation)
                     raise InvocationSelfFencedError(
                         "distributed Stop owner lease was lost during admission"
@@ -1426,6 +1475,7 @@ class DistributedInvocationRegistry:
             raise RuntimeError("distributed Stop registry is closing")
         async with self._registration_lock:
             if self._lease_lost:
+                self._require_terminal_control()
                 raise InvocationSelfFencedError(
                     "distributed Stop owner lease was lost before turn binding"
                 )
@@ -1462,6 +1512,7 @@ class DistributedInvocationRegistry:
                 turn_id=turn_id,
             )
             self._observe_owner_heartbeat()
+            self._require_terminal_control()
             if self._lease_lost:
                 raise InvocationSelfFencedError(
                     "distributed Stop owner lease expired during turn binding"
@@ -1499,11 +1550,21 @@ class DistributedInvocationRegistry:
         async def complete() -> None:
             try:
                 while True:
+                    # Once a renewal has raised execution control, including
+                    # one no observation has read yet, no generation is
+                    # recorded completed: it is preserved as unresolved, so
+                    # a Stop for it reports it unreachable. The settlement
+                    # asks again once it holds the database, because a
+                    # renewal can raise control while it waits for a writer.
+                    renewal = self._heartbeat_attempt()
                     try:
                         await self._store.settle(
                             generation_id,
                             owner_id,
-                            disposition,
+                            RequestCompletionDisposition.ABANDONED
+                            if renewal is not None and renewal.control is not None
+                            else disposition,
+                            abandon_if=self._renewal_raised_control,
                         )
                     except BaseException as error:
                         if is_execution_control_error(error):

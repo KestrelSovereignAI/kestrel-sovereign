@@ -638,8 +638,11 @@ The `FENCED` line names what the owner saw:
   `renewal raised execution control`. Unlike an ordinary error it is never
   retried: the heartbeat renews nothing more, every later admission is refused
   with that error, and shutdown raises it, as before the heartbeat had a
-  thread of its own. Ownership is not re-established in that process; it
-  admits work again only after a restart.
+  thread of its own. An admission in progress receives that error too, not a
+  self-fence. No turn is recorded as completed after it, even one whose
+  completion was already waiting for the database: each turn's row is kept as
+  unresolved, so a Stop for it returns `unreachable`. Ownership is not
+  re-established in that process; it admits work again only after a restart.
 
 ### Process exit and the heartbeat thread
 The heartbeat thread is a daemon, and it also stops once the thread that runs

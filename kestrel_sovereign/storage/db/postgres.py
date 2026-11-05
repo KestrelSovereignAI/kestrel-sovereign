@@ -2185,12 +2185,17 @@ class PostgresBackend(DatabaseBackend):
             (table_name,),
         ))
 
-    async def settle_stop_invocation(self, generation_id: str, owner_id: str, disposition: Any) -> None:
+    async def settle_stop_invocation(
+        self, generation_id: str, owner_id: str, disposition: Any, *,
+        abandon_if: Callable[[], bool] | None = None,
+    ) -> None:
         """Only an existing exact Stop generation/owner may terminalize.
 
         This fixed native operation is available after work-custody denial.
         It neither clears the caller's denial nor exposes a connection or
         generic SQL executor. Ordinary storage/tools remain denied throughout.
+        ``abandon_if`` is the settlement's in-transaction recheck: see
+        ``DistributedInvocationStore.settle``.
         """
         from kestrel_sovereign.stop.invocation import _settle_stop_on_connection
 
@@ -2203,6 +2208,7 @@ class PostgresBackend(DatabaseBackend):
                 async with self._tracked_native_transaction(connection, state.scopes, state):
                     await _settle_stop_on_connection(
                         connection, generation_id, owner_id, disposition,
+                        abandon_if,
                     )
 
     async def release_initial_reservations(

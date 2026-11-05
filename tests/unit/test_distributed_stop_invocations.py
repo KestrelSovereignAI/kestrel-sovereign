@@ -746,7 +746,7 @@ async def test_missed_renewal_fences_in_flight_then_admits_under_new_epoch(
     settle_entered = asyncio.Event()
     release_settle = asyncio.Event()
 
-    async def settle_after_successor(generation_id, owner_id, disposition):
+    async def settle_after_successor(generation_id, owner_id, disposition, **kwargs):
         # Keep the fenced generation locally owned until a successor owner
         # exists, then fail that attempt, so the settlement that finally
         # lands is a retry issued under the successor's epoch.
@@ -754,7 +754,7 @@ async def test_missed_renewal_fences_in_flight_then_admits_under_new_epoch(
             settle_entered.set()
             await release_settle.wait()
             raise RuntimeError("transient settlement failure")
-        await original_settle(generation_id, owner_id, disposition)
+        await original_settle(generation_id, owner_id, disposition, **kwargs)
 
     async def one_missed_renewal(original, store, owner_id, **kwargs):
         if not faulted.is_set():
@@ -1746,8 +1746,8 @@ async def test_durable_completion_is_excluded_from_relay_inventory(tmp_path):
     deletion_committed = asyncio.Event()
     release_completion = asyncio.Event()
 
-    async def pause_after_durable_delete(generation_id, owner_id, disposition):
-        await original_settle(generation_id, owner_id, disposition)
+    async def pause_after_durable_delete(generation_id, owner_id, disposition, **kwargs):
+        await original_settle(generation_id, owner_id, disposition, **kwargs)
         deletion_committed.set()
         await release_completion.wait()
 
@@ -1788,12 +1788,12 @@ async def test_transient_completion_failure_is_retried_until_row_is_removed(
     original_settle = store.settle
     attempts = 0
 
-    async def flaky_complete(generation_id, owner_id, disposition):
+    async def flaky_complete(generation_id, owner_id, disposition, **kwargs):
         nonlocal attempts
         attempts += 1
         if attempts == 1:
             raise RuntimeError("transient database outage")
-        await original_settle(generation_id, owner_id, disposition)
+        await original_settle(generation_id, owner_id, disposition, **kwargs)
 
     store.settle = flaky_complete
     try:
@@ -1840,12 +1840,12 @@ async def test_lease_loss_after_insert_retries_provisional_generation_cleanup(
         registry._lease_lost = True
         return admitted
 
-    async def flaky_complete(generation_id, owner_id, disposition):
+    async def flaky_complete(generation_id, owner_id, disposition, **kwargs):
         nonlocal attempts
         attempts += 1
         if attempts == 1:
             raise RuntimeError("transient database outage")
-        await original_settle(generation_id, owner_id, disposition)
+        await original_settle(generation_id, owner_id, disposition, **kwargs)
 
     store.register = lose_lease_after_insert
     store.settle = flaky_complete
@@ -2198,10 +2198,10 @@ async def test_close_is_bounded_when_a_completion_never_settles(tmp_path):
     settle_release = asyncio.Event()
     completion = None
 
-    async def never_settles(generation_id, owner_id, disposition):
+    async def never_settles(generation_id, owner_id, disposition, **kwargs):
         settle_entered.set()
         await settle_release.wait()
-        return await original_settle(generation_id, owner_id, disposition)
+        return await original_settle(generation_id, owner_id, disposition, **kwargs)
 
     store.settle = never_settles
     try:

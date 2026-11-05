@@ -26,6 +26,7 @@ from kestrel_sovereign.agent.invocation import (
     InvocationSelfFencedError,
     bind_async_invocation,
 )
+from kestrel_sovereign.agent.request_lifecycle import RequestCompletionDisposition
 from kestrel_sovereign.execution_custody import (
     ExecutionCommitOutcomeError,
     execution_cleanup_debts,
@@ -799,6 +800,476 @@ async def test_close_raises_a_lost_acknowledgement_of_the_renewal_it_waited_for(
         else:
             await asyncio.gather(closing, return_exceptions=True)
         await db.close()
+
+
+async def _peer_stop(path: Path, agent_id: str, turn_id: str) -> StopDisposition:
+    """A Stop for one turn, issued by another replica over its own connection."""
+
+    peer_db = await AsyncDatabase.sqlite(str(path), schema_initializer=_no_schema)
+    try:
+        peer = DistributedInvocationRegistry(
+            DistributedInvocationStore(peer_db),
+            poll_seconds=0.02,
+            owner_lease_seconds=_HEALTHY_LEASE_SECONDS,
+        )
+        ticket = await peer.request_turn(agent_id, turn_id)
+        return await peer.wait_for_stop(
+            ticket, timeout_seconds=2 * _HEALTHY_LEASE_SECONDS
+        )
+    finally:
+        await peer_db.close()
+
+
+async def _rows_by_agent(db, table: str) -> list[str]:
+    rows = await db.fetchall(f"SELECT agent_id FROM {table} ORDER BY agent_id")
+    return [str(row[0]) for row in rows]
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(60)
+@pytest.mark.parametrize("point", ["insert", "confirmation read", "relay"])
+async def test_a_lost_renewal_acknowledgement_during_admission_stays_unresolved(
+    tmp_path, monkeypatch, point
+):
+    """Held execution control outranks lease loss wherever admission meets it.
+
+    A renewal loses its COMMIT acknowledgement while an admission awaits its
+    insert, or its confirmation read, or its insert while the relay, not the
+    admission, first reads the control with another agent's turn running.
+    The caller receives that original exception, never a self-fence. No
+    generation is recorded completed: each row stays unresolved, a peer's
+    Stop for it returns UNREACHABLE, and close raises the original. These
+    are main's outcomes when the admission's own renewal lost its
+    acknowledgement.
+    """
+
+    path = tmp_path / "lost-ack-during-admission.db"
+    db, store, registry = await _owner_registry(
+        path, poll_seconds=0.02, owner_lease_seconds=_HEALTHY_LEASE_SECONDS
+    )
+    lost_ack = _LostRenewalAcknowledgement(monkeypatch)
+    admitted = _SelfFencingReplicaAgent("did:test:lost-ack-admitted")
+    running = _SelfFencingReplicaAgent("did:test:lost-ack-running")
+    registry.attach(admitted)
+    registry.attach(running)
+    registry.start()
+    heartbeat = registry._heartbeat
+    if point != "relay":
+        # Without the relay, the admission is the first to read the control.
+        relay = registry._relay_task
+        relay.cancel()
+        await asyncio.gather(relay, return_exceptions=True)
+        registry._relay_task = None
+
+    async def lose_a_renewal_acknowledgement() -> None:
+        lost_ack.arm()
+        if point == "relay":
+            await _wait_for(lambda: registry._terminal_control is not None)
+        else:
+            await _wait_for(
+                lambda: heartbeat.latest() is not None
+                and heartbeat.latest().control is not None
+            )
+            assert registry._terminal_control is None
+
+    if point == "confirmation read":
+        original_read = store.read_owner
+
+        async def read_while_a_renewal_loses_its_ack(*args, **kwargs):
+            await lose_a_renewal_acknowledgement()
+            return await original_read(*args, **kwargs)
+
+        store.read_owner = read_while_a_renewal_loses_its_ack
+    else:
+        original_register = store.register
+
+        async def insert_while_a_renewal_loses_its_ack(**kwargs):
+            inserted = await original_register(**kwargs)
+            if kwargs["agent_id"] == admitted.agent_id:
+                await lose_a_renewal_acknowledgement()
+            return inserted
+
+        store.register = insert_while_a_renewal_loses_its_ack
+    running_turn = None
+    if point == "relay":
+        running_turn = asyncio.create_task(running.run_turn("running-turn"))
+        await asyncio.wait_for(running.operation_started.wait(), timeout=10)
+    closed = False
+    try:
+        with pytest.raises(ExecutionCommitOutcomeError) as refused:
+            await asyncio.wait_for(admitted.run_turn("admitted-turn"), timeout=10)
+        control = heartbeat.latest().control
+        assert control.__cause__ is lost_ack.lost[0]
+        assert refused.value is control
+        assert registry._terminal_control is control
+        assert registry.owner_lifecycle_status == "self_fenced"
+
+        unresolved = [admitted.agent_id]
+        if running_turn is not None:
+            with pytest.raises(InvocationSelfFencedError):
+                await asyncio.wait_for(running_turn, timeout=10)
+            unresolved.append(running.agent_id)
+        await _wait_for(lambda: not registry._active)
+        assert await _rows_by_agent(db, "stop_active_invocations") == []
+        assert await _rows_by_agent(db, "stop_unresolved_invocations") == sorted(
+            unresolved
+        )
+        assert await _peer_stop(
+            path, admitted.agent_id, "admitted-turn"
+        ) is StopDisposition.UNREACHABLE
+        if running_turn is not None:
+            assert await _peer_stop(
+                path, running.agent_id, "running-turn"
+            ) is StopDisposition.UNREACHABLE
+
+        closed = True
+        with pytest.raises(ExecutionCommitOutcomeError) as raised:
+            await registry.close()
+        assert raised.value is control
+        assert await _rows_by_agent(db, "stop_unresolved_invocations") == sorted(
+            unresolved
+        )
+    finally:
+        running.release_operation.set()
+        admitted.release_operation.set()
+        if running_turn is not None:
+            await asyncio.gather(running_turn, return_exceptions=True)
+        if not closed:
+            try:
+                await registry.close()
+            except ExecutionCommitOutcomeError:
+                pass
+        await db.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(60)
+@pytest.mark.parametrize(
+    "point",
+    ["confirmation read fails", "binding waits for its lock", "binding writes the turn"],
+)
+async def test_held_control_outranks_lease_loss_at_the_other_admission_steps(
+    tmp_path, monkeypatch, point
+):
+    """The remaining places a call can find the owner fenced while a renewal's
+    control is held each raise that original exception, not a self-fence."""
+
+    db, store, registry = await _owner_registry(
+        tmp_path / "held-control-precedence.db",
+        poll_seconds=0.02,
+        owner_lease_seconds=_HEALTHY_LEASE_SECONDS,
+    )
+    lost_ack = _LostRenewalAcknowledgement(monkeypatch)
+    agent = _SelfFencingReplicaAgent("did:test:held-control-precedence")
+    registry.attach(agent)
+    registry.start()
+    heartbeat = registry._heartbeat
+    if point != "binding waits for its lock":
+        # Without the relay, the call itself is the first to read the control.
+        relay = registry._relay_task
+        relay.cancel()
+        await asyncio.gather(relay, return_exceptions=True)
+        registry._relay_task = None
+
+    async def lose_a_renewal_acknowledgement() -> None:
+        lost_ack.arm()
+        await _wait_for(
+            lambda: heartbeat.latest() is not None
+            and heartbeat.latest().control is not None
+        )
+
+    closed = False
+    try:
+        if point == "confirmation read fails":
+            original_read = store.read_owner
+
+            async def read_failing_while_a_renewal_loses_its_ack(*args, **kwargs):
+                await lose_a_renewal_acknowledgement()
+                raise ConnectionError("confirmation read failed")
+
+            store.read_owner = read_failing_while_a_renewal_loses_its_ack
+            with pytest.raises(ExecutionCommitOutcomeError) as refused:
+                await asyncio.wait_for(agent.run_turn("admitted-turn"), timeout=10)
+            store.read_owner = original_read
+        else:
+            assert await registry.register(agent, "private-request", 1)
+            if point == "binding writes the turn":
+                original_bind = store.bind_public_turn
+
+                async def bind_while_a_renewal_loses_its_ack(**kwargs):
+                    bound = await original_bind(**kwargs)
+                    await lose_a_renewal_acknowledgement()
+                    return bound
+
+                store.bind_public_turn = bind_while_a_renewal_loses_its_ack
+                binding = asyncio.create_task(
+                    registry.bind_public_turn(agent, "public-turn", "private-request", 1)
+                )
+            else:
+                async with registry._registration_lock:
+                    binding = asyncio.create_task(
+                        registry.bind_public_turn(
+                            agent, "public-turn", "private-request", 1
+                        )
+                    )
+                    for _ in range(5):
+                        await asyncio.sleep(0)
+                    assert not binding.done()
+                    await lose_a_renewal_acknowledgement()
+                    # The relay holds it, and fences, while binding waits.
+                    await _wait_for(lambda: registry._terminal_control is not None)
+            with pytest.raises(ExecutionCommitOutcomeError) as refused:
+                await asyncio.wait_for(binding, timeout=10)
+
+        control = heartbeat.latest().control
+        assert control.__cause__ is lost_ack.lost[0]
+        assert refused.value is control
+        assert registry._terminal_control is control
+        closed = True
+        with pytest.raises(ExecutionCommitOutcomeError) as raised:
+            await registry.close()
+        assert raised.value is control
+    finally:
+        agent.release_operation.set()
+        if not closed:
+            try:
+                await registry.close()
+            except ExecutionCommitOutcomeError:
+                pass
+        await db.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(60)
+async def test_a_turn_finishing_before_any_observation_of_a_lost_acknowledgement_stays_unresolved(
+    tmp_path, monkeypatch
+):
+    """The relay held a renewal's control the moment it was raised. Here the
+    heartbeat holds it until something reads it, and a turn that finishes in
+    that window is still not recorded completed."""
+
+    path = tmp_path / "finished-before-observation.db"
+    db, _store, registry = await _owner_registry(
+        path, poll_seconds=0.02, owner_lease_seconds=_HEALTHY_LEASE_SECONDS
+    )
+    lost_ack = _LostRenewalAcknowledgement(monkeypatch)
+    agent = _SelfFencingReplicaAgent("did:test:finished-before-observation")
+    registry.attach(agent)
+    registry.start()
+    heartbeat = registry._heartbeat
+    relay = registry._relay_task
+    relay.cancel()
+    await asyncio.gather(relay, return_exceptions=True)
+    registry._relay_task = None
+    turn = asyncio.create_task(agent.run_turn("finished-turn"))
+    try:
+        await asyncio.wait_for(agent.operation_started.wait(), timeout=10)
+        lost_ack.arm()
+        await _wait_for(
+            lambda: heartbeat.latest() is not None
+            and heartbeat.latest().control is not None
+        )
+        assert registry._terminal_control is None
+
+        agent.release_operation.set()
+        assert await turn == "finished-turn"
+        await _wait_for(lambda: not registry._active)
+        control = heartbeat.latest().control
+        assert registry._terminal_control is control
+        assert await _rows_by_agent(db, "stop_unresolved_invocations") == [
+            agent.agent_id
+        ]
+        assert await _peer_stop(
+            path, agent.agent_id, "finished-turn"
+        ) is StopDisposition.UNREACHABLE
+    finally:
+        agent.release_operation.set()
+        await asyncio.gather(turn, return_exceptions=True)
+        try:
+            await registry.close()
+        except ExecutionCommitOutcomeError:
+            pass
+        await db.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(60)
+async def test_a_completion_queued_behind_a_writer_when_control_is_held_stays_unresolved(
+    tmp_path, monkeypatch
+):
+    """A completion decided before a renewal raised control, but settled
+    after, is not recorded completed.
+
+    The turn finishes while another task holds the server connection's
+    writer, so its settlement, already decided ``COMPLETED``, queues behind
+    it. A renewal then loses its COMMIT acknowledgement and the registry
+    holds the original exception before the writer is released. The
+    settlement asks again once it holds the database: the row stays
+    unresolved, a peer's Stop for the turn returns UNREACHABLE, and close
+    raises the original.
+    """
+
+    path = tmp_path / "completion-behind-a-writer.db"
+    # A lease long enough that holding the renewal never lapses it here.
+    db, store, registry = await _owner_registry(
+        path, poll_seconds=0.02, owner_lease_seconds=10 * _HEALTHY_LEASE_SECONDS
+    )
+    lost_ack = _LostRenewalAcknowledgement(monkeypatch)
+    agent = _SelfFencingReplicaAgent("did:test:completion-behind-a-writer")
+    registry.attach(agent)
+    registry.start()
+    heartbeat = registry._heartbeat
+
+    decided: list[RequestCompletionDisposition] = []
+    settling = asyncio.Event()
+    original_settle = store.settle
+
+    async def recorded_settle(generation_id, owner_id, disposition, **kwargs):
+        decided.append(disposition)
+        settling.set()
+        return await original_settle(generation_id, owner_id, disposition, **kwargs)
+
+    store.settle = recorded_settle
+    writer_held = asyncio.Event()
+    release_writer = asyncio.Event()
+
+    async def hold_the_writer() -> None:
+        async with db.transaction(immediate=True):
+            writer_held.set()
+            await release_writer.wait()
+
+    turn = asyncio.create_task(agent.run_turn("contended-turn"))
+    writer = None
+    closed = False
+    try:
+        await asyncio.wait_for(agent.operation_started.wait(), timeout=10)
+        await _wait_for(lambda: heartbeat.latest_renewed() is not None)
+        # The renewal commits, then waits before its reply is lost: SQLite's
+        # write lock is free, and no control has been raised yet.
+        lost_ack.arm(hold=True)
+        assert await asyncio.to_thread(lost_ack.entered.wait, 10)
+        writer = asyncio.create_task(hold_the_writer())
+        await asyncio.wait_for(writer_held.wait(), timeout=10)
+
+        agent.release_operation.set()
+        assert await asyncio.wait_for(turn, timeout=10) == "contended-turn"
+        await asyncio.wait_for(settling.wait(), timeout=10)
+        assert decided == [RequestCompletionDisposition.COMPLETED]
+        assert registry._terminal_control is None
+
+        lost_ack.release.set()
+        await _wait_for(lambda: registry._terminal_control is not None)
+        control = heartbeat.latest().control
+        assert control.__cause__ is lost_ack.lost[0]
+        assert registry._terminal_control is control
+        assert registry._active
+
+        release_writer.set()
+        await asyncio.wait_for(writer, timeout=10)
+        await _wait_for(lambda: not registry._active)
+        assert decided == [RequestCompletionDisposition.COMPLETED]
+        assert await _rows_by_agent(db, "stop_active_invocations") == []
+        assert await _rows_by_agent(db, "stop_unresolved_invocations") == [
+            agent.agent_id
+        ]
+        assert await _peer_stop(
+            path, agent.agent_id, "contended-turn"
+        ) is StopDisposition.UNREACHABLE
+
+        closed = True
+        with pytest.raises(ExecutionCommitOutcomeError) as raised:
+            await registry.close()
+        assert raised.value is control
+    finally:
+        lost_ack.release.set()
+        release_writer.set()
+        agent.release_operation.set()
+        await asyncio.gather(turn, return_exceptions=True)
+        if writer is not None:
+            await asyncio.gather(writer, return_exceptions=True)
+        if not closed:
+            try:
+                await registry.close()
+            except ExecutionCommitOutcomeError:
+                pass
+        await db.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.dual_backend
+@pytest.mark.parametrize("abandon", [True, False])
+async def test_a_completed_settlement_asks_again_under_database_custody(
+    db_backend, abandon
+):
+    """``abandon_if`` is asked inside the settlement's transaction, after its
+    agent lock, and turns ``COMPLETED`` into ``ABANDONED`` only when true."""
+
+    store = DistributedInvocationStore(AsyncDatabase(db_backend))
+    await store.ensure_schema()
+    suffix = uuid4().hex
+    agent_id = f"did:test:settle-recheck-{suffix}"
+    owner_id = f"owner-{suffix}"
+    asked: list[bool] = []
+
+    def abandon_if() -> bool:
+        asked.append(True)
+        return abandon
+
+    async def registered(label: str) -> str:
+        generation_id = f"{label}-{suffix}"
+        assert await store.register(
+            generation_id=generation_id,
+            agent_id=agent_id,
+            turn_id=f"turn-{label}-{suffix}",
+            owner_id=owner_id,
+            request_generation=1,
+        )
+        return generation_id
+
+    async def lifecycle(generation_id: str) -> tuple[bool, bool]:
+        active = await store._db.fetchone(
+            "SELECT 1 FROM stop_active_invocations WHERE generation_id = ?",
+            (generation_id,),
+        )
+        unresolved = await store._db.fetchone(
+            "SELECT 1 FROM stop_unresolved_invocations WHERE generation_id = ?",
+            (generation_id,),
+        )
+        return active is not None, unresolved is not None
+
+    completed = await registered("completed")
+    await store.settle(
+        completed,
+        owner_id,
+        RequestCompletionDisposition.COMPLETED,
+        abandon_if=abandon_if,
+    )
+    assert asked == [True]
+    assert await lifecycle(completed) == (False, abandon)
+
+    abandoned = await registered("abandoned")
+    await store.settle(
+        abandoned,
+        owner_id,
+        RequestCompletionDisposition.ABANDONED,
+        abandon_if=abandon_if,
+    )
+    # An abandonment is already the conservative outcome: nothing to ask.
+    assert asked == [True]
+    assert await lifecycle(abandoned) == (False, True)
+
+    backend = store._db.backend
+    if getattr(backend, "backend_type", "") == "postgres":
+        # The native settlement forwards the same recheck to the same SQL.
+        native = await registered("native")
+        await backend.settle_stop_invocation(
+            native,
+            owner_id,
+            RequestCompletionDisposition.COMPLETED,
+            abandon_if=abandon_if,
+        )
+        assert asked == [True, True]
+        assert await lifecycle(native) == (False, abandon)
 
 
 @pytest.mark.asyncio
