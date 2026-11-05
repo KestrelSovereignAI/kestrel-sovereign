@@ -21,16 +21,12 @@ Usage:
     caps = TrainingProviderFactory.get_capabilities("replicate")
 """
 
-import asyncio
 import logging
 import os
 from typing import Dict, List, Literal, Optional
 
-from kestrel_sovereign.execution_custody import (
-    execution_terminal_error,
-    is_execution_control_error,
-    require_execution_work,
-)
+from kestrel_sovereign._async_ownership import gather_owned
+from kestrel_sovereign.execution_custody import is_execution_control_error, require_execution_work
 
 from .protocol import DEFAULT_PROVIDER_PRIORITY, ProviderNotAvailableError, TrainingProvider
 from .types import ProviderCapabilities
@@ -567,24 +563,23 @@ class TrainingProviderFactory:
         ]
         if not closable:
             return
-        results = await asyncio.gather(
-            *(provider.close() for _name, provider in closable),
-            return_exceptions=True,
-        )
-        failures: List[BaseException] = []
-        for (name, provider), result in zip(closable, results):
-            if isinstance(result, BaseException):
-                logger.error(f"Failed to close training provider {name}: {result}")
-                failures.append(result)
-            elif cls._instances.get(name) is provider:
+        async def close_provider(name: str, provider: TrainingProvider) -> None:
+            await provider.close()
+            if cls._instances.get(name) is provider:
                 del cls._instances[name]
-        if failures:
-            terminal = execution_terminal_error(
-                *failures, retain_originals=True, isolate_control_originals=True
-            )
-            if terminal is None:
-                raise RuntimeError("native composition omitted provider close failures") from failures[0]
-            raise terminal
+
+        # The canonical owner retains cancellation-shaped originals and joins
+        # independent cleanup even if a sibling or the observer withdraws.
+        # Raw gather(return_exceptions=True) replaces a cancelled child's
+        # original carrier, losing its native receipt before composition.
+        await gather_owned(
+            (close_provider(name, provider) for name, provider in closable),
+            cancel_siblings_on_error=False,
+            retirement_resource=cls,
+            retain_originals=True,
+            isolate_control_originals=True,
+            name_prefix="training-provider-close",
+        )
 
     @classmethod
     def clear_cache(cls) -> None:

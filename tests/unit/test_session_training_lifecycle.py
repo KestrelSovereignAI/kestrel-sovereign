@@ -53,6 +53,7 @@ from kestrel_sovereign.features.training.protocol import (
     TrainingSubmissionError,
 )
 from kestrel_sovereign.features.training.types import TrainingConfig, TrainingState
+from tests.utils.training_history import start_original_runpod_tail
 
 
 _UNSET = object()
@@ -541,15 +542,13 @@ async def _start(adapter, companion_id: str = "companion-1"):
         # acquisition/submission races already admitted before the cutover.
         # It is not fresh provider-admission evidence or a production bypass:
         # the public Runpod door's zero-effects refusal has separate tests.
-        config = TrainingConfig()
-        record = await adapter._lifecycle.start(
+        return await start_original_runpod_tail(
+            adapter,
             job_id=f"retained-runpod-{next(_ids)}",
             companion_id=companion_id,
-            trigger_word=f"TOK{companion_id[:8]}",
-            config=config,
+            config=TrainingConfig(),
             avatar_data=b"avatar",
         )
-        return adapter._lifecycle.training_job(record)
     return await adapter.start_training(companion_id, b"avatar", TrainingConfig())
 
 

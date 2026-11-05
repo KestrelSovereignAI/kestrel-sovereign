@@ -269,12 +269,17 @@ async def test_factory_does_not_normalize_original_control_into_unavailability(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("outcome", ["denied", "unknown", "group", "retirement"])
+@pytest.mark.parametrize("carrier", ["exception", "cancellation"])
 async def test_all_provider_closes_join_without_discarding_later_original_control(
-    monkeypatch, outcome
+    monkeypatch, outcome, carrier
 ):
     from kestrel_sovereign.execution_custody import _explicit_control_chain, is_execution_control_error
 
     failure = await _original_control(outcome)
+    if carrier == "cancellation":
+        cancellation = asyncio.CancelledError("original provider close withdrew")
+        cancellation.__cause__ = failure
+        failure = cancellation
     ordinary = ValueError("ordinary earlier close failure")
     joined = []
 
@@ -303,6 +308,37 @@ async def test_all_provider_closes_join_without_discarding_later_original_contro
     assert TrainingProviderFactory._instances == {
         "ordinary": retained["ordinary"], "control": retained["control"],
     }
+
+
+@pytest.mark.asyncio
+async def test_factory_close_caller_withdrawal_still_joins_original_provider(monkeypatch):
+    from kestrel_sovereign.async_ownership import await_owned_task, create_owned_task
+
+    entered, finish = asyncio.Event(), asyncio.Event()
+    completed = []
+
+    class Provider:
+        async def close(self):
+            entered.set()
+            await finish.wait()
+            completed.append(self)
+
+    provider = Provider()
+    monkeypatch.setattr(TrainingProviderFactory, "_instances", {"owned": provider})
+    closer = create_owned_task(TrainingProviderFactory.close_providers(), retain_originals=True)
+    try:
+        await entered.wait()
+        closer.cancel("original close observer withdrew")
+        await asyncio.sleep(0)
+        assert not completed and not closer.done()
+        finish.set()
+        outcome = await await_owned_task(closer)
+        assert isinstance(outcome.error, asyncio.CancelledError)
+        assert completed == [provider]
+        assert not TrainingProviderFactory._instances
+    finally:
+        finish.set()
+        await await_owned_task(closer)
 
 
 @pytest.mark.asyncio
