@@ -1068,8 +1068,15 @@ Repeated retries retain bounded diagnostic notes rather than
 manufacturing another owner or acknowledgement. Operator reconciliation is
 required when the original lease can no longer establish terminal state.
 
-The first distributed Stop admission settles control-bearing renewal failures
-as `ABANDONED` before asynchronous cleanup can claim `COMPLETED`. Both native
+The first distributed Stop admission settles control-bearing failures of its
+confirmation read as `ABANDONED` before asynchronous cleanup can claim
+`COMPLETED`. (Only the owner heartbeat, on its own thread and connection,
+renews the owner lease; #3889.) Control a heartbeat renewal raised outranks
+every lease-loss outcome of admission and turn binding: the caller receives
+that original exception, and from then on the registry settles no generation
+as `COMPLETED`, only as `ABANDONED`. A settlement decides again once its
+transaction holds the database, before it deletes anything, so one that was
+queued behind another writer when the renewal failed is `ABANDONED` too. Both native
 HTTP and bridge invocation/streaming routes classify explicit control causes
 before ordinary Stop, retry, refusal or provider-error normalization. Source
 closure and transport cleanup select original terminal evidence before later

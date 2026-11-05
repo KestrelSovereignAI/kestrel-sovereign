@@ -14,6 +14,8 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import logging
+import time
+from collections.abc import Callable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from functools import wraps
@@ -44,6 +46,11 @@ from kestrel_sovereign.storage.database_clock import (
     database_now_sql,
 )
 
+from .owner_heartbeat import (
+    OwnerHeartbeat,
+    OwnerRenewal,
+    independent_database_opener,
+)
 from .receipt import (
     STOP_OWNER_LEASE_SECONDS,
     StopReceiptStore,
@@ -186,6 +193,9 @@ class _LocalGeneration:
     turn_id: str
     generation: int
     owner_id: str
+    # ``time.monotonic()`` once the durable insert had committed: an owner
+    # renewal that started later must have found this row.
+    admitted_at: float
 
 
 class _TerminalStopDatabase:
@@ -214,14 +224,18 @@ class _TerminalStopDatabase:
         return tuple(row.values()) if row is not None else None
 
 
-async def _settle_stop_on_connection(connection, generation_id, owner_id, disposition):
+async def _settle_stop_on_connection(
+    connection, generation_id, owner_id, disposition, abandon_if=None,
+):
     """Reuse canonical settlement SQL, with no ordinary work admission."""
     generation_id = _required_identity(generation_id, "generation identity")
     owner_id = _required_identity(owner_id, "owner identity")
     if not isinstance(disposition, RequestCompletionDisposition):
         raise TypeError("distributed Stop settlement disposition must be typed")
     store = DistributedInvocationStore(_TerminalStopDatabase(connection))
-    await store._settle_rows(generation_id, owner_id, disposition)
+    await store._settle_rows(
+        generation_id, owner_id, disposition, abandon_if=abandon_if
+    )
 
 
 class DistributedInvocationStore:
@@ -533,6 +547,8 @@ class DistributedInvocationStore:
         generation_id: str,
         owner_id: str,
         disposition: RequestCompletionDisposition,
+        *,
+        abandon_if: Callable[[], bool] | None = None,
     ) -> None:
         """Apply the only valid terminal transition for one generation.
 
@@ -540,6 +556,13 @@ class DistributedInvocationStore:
         observed completion.  ``ABANDONED`` means the terminal state is
         unknown, so it is moved to the unresolved ledger instead.  This is the
         lifecycle invariant used by local cleanup and remote Stop results.
+
+        ``abandon_if`` is asked once the settlement holds its transaction's
+        database custody, immediately before any row is deleted. When it
+        answers true, a ``COMPLETED`` settlement is recorded ``ABANDONED``:
+        a settlement that queued behind another writer then reflects what
+        became true while it waited, not what was true when it was decided.
+        It must not await or touch the database.
         """
 
         generation_id = _required_identity(generation_id, "generation identity")
@@ -551,12 +574,21 @@ class DistributedInvocationStore:
 
         backend = getattr(self._db, "backend", None)
         if isinstance(backend, PostgresBackend) and current_execution_custody(backend):
-            await backend.settle_stop_invocation(generation_id, owner_id, disposition)
+            await backend.settle_stop_invocation(
+                generation_id, owner_id, disposition, abandon_if=abandon_if
+            )
             return
-        await self._settle_rows(generation_id, owner_id, disposition)
+        await self._settle_rows(
+            generation_id, owner_id, disposition, abandon_if=abandon_if
+        )
 
     async def _settle_rows(
-        self, generation_id: str, owner_id: str, disposition: RequestCompletionDisposition,
+        self,
+        generation_id: str,
+        owner_id: str,
+        disposition: RequestCompletionDisposition,
+        *,
+        abandon_if: Callable[[], bool] | None = None,
     ) -> None:
         async with self._db.transaction(immediate=True):
             row = await self._db.fetchone(
@@ -585,6 +617,12 @@ class DistributedInvocationStore:
                 raise RuntimeError(
                     "distributed Stop generation exists in multiple lifecycle states"
                 )
+            if (
+                disposition is RequestCompletionDisposition.COMPLETED
+                and abandon_if is not None
+                and abandon_if()
+            ):
+                disposition = RequestCompletionDisposition.ABANDONED
             if disposition is RequestCompletionDisposition.ABANDONED:
                 if unresolved is not None:
                     return
@@ -788,12 +826,15 @@ class DistributedInvocationStore:
         crossed the lease boundary must self-fence and start a new registry
         owner rather than silently reclaiming work another replica may already
         have reaped.
+
+        The registry calls this only from its owner heartbeat, on that
+        heartbeat's own thread and connection (#3889).
         """
 
         owner_id = _required_identity(owner_id, "owner identity")
         if lease_seconds <= 0:
             raise ValueError("distributed Stop owner lease must be positive")
-        # The relay is cancellable between polls, not inside an accepted
+        # The heartbeat is stoppable between renewals, not inside an accepted
         # renewal's native COMMIT acknowledgement. Retain this finite original
         # transaction until physical settlement, then propagate caller Stop.
         task = create_owned_task(
@@ -815,13 +856,38 @@ class DistributedInvocationStore:
                 f"AND heartbeat_at > {cutoff_sql}",
                 (owner_id, *cutoff_args),
             )
-            rows = await self._db.fetchall(
-                "SELECT generation_id, stop_requested "
-                "FROM stop_active_invocations WHERE owner_id = ? "
-                f"AND heartbeat_at > {cutoff_sql} "
-                "ORDER BY generation_id",
-                (owner_id, *cutoff_args),
-            )
+            return await self._owner_inventory(owner_id, lease_seconds=lease_seconds)
+
+    async def read_owner(
+        self,
+        owner_id: str,
+        *,
+        lease_seconds: float,
+    ) -> _OwnerPoll:
+        """Return an owner's live inventory without renewing its lease.
+
+        Only the owner heartbeat renews (#3889). A read on the server's loop
+        can confirm a generation before cognition, never extend its lease.
+        """
+
+        owner_id = _required_identity(owner_id, "owner identity")
+        if lease_seconds <= 0:
+            raise ValueError("distributed Stop owner lease must be positive")
+        return await self._owner_inventory(owner_id, lease_seconds=lease_seconds)
+
+    async def _owner_inventory(
+        self, owner_id: str, *, lease_seconds: float
+    ) -> _OwnerPoll:
+        cutoff_sql, cutoff_args = database_lease_cutoff_sql(
+            self._db, float(lease_seconds)
+        )
+        rows = await self._db.fetchall(
+            "SELECT generation_id, stop_requested "
+            "FROM stop_active_invocations WHERE owner_id = ? "
+            f"AND heartbeat_at > {cutoff_sql} "
+            "ORDER BY generation_id",
+            (owner_id, *cutoff_args),
+        )
         return _OwnerPoll(
             live_generation_ids=tuple(str(row[0]) for row in rows),
             stop_generation_ids=tuple(
@@ -950,6 +1016,15 @@ def _registry_control_boundary(function):
 class DistributedInvocationRegistry:
     """One process's live map and relay for shared Stop requests.
 
+    The owner lease is renewed only by :class:`OwnerHeartbeat`, on a thread
+    and connection of its own, never by this registry's event loop (#3889).
+    The relay folds each renewal into the lease on the loop and delivers the
+    Stop marks it carried. So a synchronous stall in one agent's turn delays
+    Stop delivery until the loop runs again, but it does not let the lease
+    lapse or cancel another agent's turn. Each generation's lease is tracked
+    from the earliest instant its durable heartbeat is known to cover: its own
+    insert, then every renewal that found it live.
+
     Owner lease loss fences the owner's in-flight generations immediately; it
     is never a permanent state of the process (#3337). The fenced owner
     identity is retired, and ownership for new work is re-established under a
@@ -994,7 +1069,17 @@ class DistributedInvocationRegistry:
         self._fence_reason: str | None = None
         self._reacquisition_failure: str | None = None
         self._next_relay_reacquisition_at: float | None = None
-        self._last_heartbeat_monotonic: float | None = None
+        # Per generation, a ``time.monotonic()`` instant no later than its
+        # durable heartbeat: the lease covers it for one lease after this.
+        self._renewed_at: dict[str, float] = {}
+        self._heartbeat: OwnerHeartbeat | None = None
+        self._observed_renewal: OwnerRenewal | None = None
+        # The heartbeat thread (by launch count) whose exit was reported.
+        self._reported_heartbeat_exit = 0
+        # The identity a fenced registry will adopt once the heartbeat has
+        # renewed it in time, and when the heartbeat was pointed at it.
+        self._candidate_owner_id: str | None = None
+        self._candidate_since: float | None = None
         self._terminal_control: BaseException | None = None
 
     def _retain_terminal_control(self, error: BaseException) -> None:
@@ -1017,6 +1102,23 @@ class DistributedInvocationRegistry:
 
     def start(self) -> None:
         self._require_terminal_control()
+        if self._heartbeat is None:
+            lease_seconds = self._owner_lease_seconds
+
+            async def renew(database, owner_id: str) -> _OwnerPoll:
+                return await DistributedInvocationStore(database).poll_owner(
+                    owner_id, lease_seconds=lease_seconds
+                )
+
+            heartbeat = OwnerHeartbeat(
+                independent_database_opener(self._store._db),
+                renew,
+                interval_seconds=self._poll_seconds,
+            )
+            heartbeat.start(
+                self._candidate_owner_id if self._lease_lost else self._owner_id
+            )
+            self._heartbeat = heartbeat
         if self._relay_task is None:
             self._relay_task = asyncio.create_task(
                 self._relay(), name="distributed-stop-relay"
@@ -1080,47 +1182,255 @@ class DistributedInvocationRegistry:
             else "local-agent"
         )
 
+    def _observe_owner_heartbeat(self) -> None:
+        """Fold the heartbeat's newest successful renewal into the lease, or fence.
+
+        Runs on the registry's loop: from the relay every poll interval, and
+        before each admission decision, so the first decision after a stall
+        reads the renewals the heartbeat made while the loop was blocked
+        rather than a lease that only looks expired. It reads the newest
+        successful renewal, never merely the newest attempt: a failed attempt
+        just before the loop resumed does not hide the renewals made during
+        the stall.
+
+        A generation committed before a renewal started must be in that
+        renewal's inventory, unless it has since begun completion; otherwise
+        its durable row expired or was removed. A generation in the inventory
+        was renewed no earlier than the renewal started. Then every generation
+        the current owner holds must have been renewed within one lease.
+        Before any of that, a renewal's execution control is held and fences.
+
+        Those inventory facts are applied on every observation, including to
+        a renewal already observed: a generation whose admission was waiting
+        for its insert's reply when that renewal was folded in is published
+        afterwards, and the renewal still renewed its row. Only the renewal's
+        Stop marks are delivered once.
+        """
+
+        self._heartbeat_attempt()
+        if self._lease_lost:
+            return
+        owner_id = self._owner_id
+        heartbeat = self._heartbeat
+        renewal = heartbeat.latest_renewed() if heartbeat is not None else None
+        if renewal is not None and renewal.owner_id == owner_id:
+            unobserved = renewal is not self._observed_renewal
+            self._observed_renewal = renewal
+            live = set(renewal.poll.live_generation_ids)
+            lease_owned = self._lease_owned_generation_ids()
+            if any(
+                generation_id not in live
+                and self._active[generation_id].admitted_at < renewal.started
+                for generation_id in lease_owned
+            ):
+                self._fail_closed_owner(
+                    "durable generation was lost: the owner heartbeat's "
+                    "renewal found it expired or removed"
+                )
+                return
+            for generation_id in lease_owned:
+                if (
+                    generation_id in live
+                    and self._renewed_at[generation_id] < renewal.started
+                ):
+                    self._renewed_at[generation_id] = renewal.started
+            for generation_id in (
+                renewal.poll.stop_generation_ids if unobserved else ()
+            ):
+                target = self._active.get(generation_id)
+                if target is None or target.owner_id != owner_id:
+                    continue
+                cancel = getattr(target.agent, "cancel_current_request", None)
+                if callable(cancel):
+                    cancel(
+                        request_id=target.turn_id,
+                        generation=target.generation,
+                    )
+        now = time.monotonic()
+        oldest = min(
+            (
+                self._renewed_at[generation_id]
+                for generation_id in self._lease_owned_generation_ids()
+            ),
+            default=None,
+        )
+        if oldest is not None and now - oldest >= self._owner_lease_seconds:
+            self._fail_closed_owner(self._lease_lapse_reason(now, oldest))
+
+    def _heartbeat_attempt(self) -> OwnerRenewal | None:
+        """The heartbeat's newest renewal attempt, once its control is held.
+
+        A renewal error carrying execution control is never retried (#3889):
+        the heartbeat stops renewing and keeps the original exception on that
+        attempt. Here, on the registry's loop, the same exception is retained
+        as terminal control and the owner fences, as when the relay renewed:
+        work past its durable write sees a fenced owner, a call that has not
+        written yet is refused with that exception, and close raises it.
+        """
+
+        heartbeat = self._heartbeat
+        renewal = heartbeat.latest() if heartbeat is not None else None
+        if renewal is not None and renewal.control is not None:
+            self._retain_terminal_control(renewal.control)
+            self._fail_closed_owner(
+                "owner heartbeat renewal raised original execution control "
+                f"({renewal.failure})"
+            )
+        return renewal
+
+    def _note_heartbeat_exit(self) -> None:
+        """Report, once per thread, a heartbeat thread that has exited.
+
+        The relay calls this every poll interval whatever the registry holds,
+        so an exit is reported within one interval, naming why the thread
+        exited, rather than once some generation's lease has aged.
+        """
+
+        heartbeat = self._heartbeat
+        if heartbeat is None or self._closing:
+            return
+        cause = heartbeat.exit_cause()
+        launches = heartbeat.launches
+        if cause is None or self._reported_heartbeat_exit == launches:
+            return
+        self._reported_heartbeat_exit = launches
+        in_flight = (
+            0 if self._lease_lost else len(self._lease_owned_generation_ids())
+        )
+        logger.error(
+            "Distributed Stop owner heartbeat thread has exited (%s): nothing "
+            "renews the owner lease (epoch %d) until it is restarted. %d "
+            "in-flight generation(s) fence once their lease lapses, and "
+            "re-establishing ownership restarts it; otherwise the next "
+            "admission restarts it and admits nothing until it has renewed "
+            "the owner.",
+            cause,
+            self._owner_epoch,
+            in_flight,
+        )
+
+    async def _require_renewing_heartbeat(self) -> None:
+        """Admit only under a heartbeat that renews the current owner.
+
+        Callers hold ``_registration_lock``. Work admitted while the heartbeat
+        thread has exited is never renewed, so it would be self-fenced one
+        lease later. An exited heartbeat is restarted once, and admission
+        waits, for at most one lease from that start, until the new thread has
+        renewed the current owner; otherwise it is refused, naming the
+        heartbeat's state. The thread :meth:`start` launched with the registry
+        is not waited for: its renewals keep the lease of what it admits, as
+        before. A lease that lapsed meanwhile is left to the caller's check.
+        """
+
+        heartbeat = self._heartbeat
+        if heartbeat is None:
+            return
+        if not heartbeat.alive:
+            self._note_heartbeat_exit()
+            # Work already in flight whose lease lapsed fences first: a new
+            # thread must not renew an owner whose lease has expired.
+            self._observe_owner_heartbeat()
+            self._require_terminal_control()
+            if self._lease_lost:
+                return
+            launches = heartbeat.launches
+            heartbeat.ensure_running()
+            if heartbeat.launches == launches:
+                raise InvocationSelfFencedError(
+                    "distributed Stop owner heartbeat could not be restarted, "
+                    "so admission was refused: "
+                    + heartbeat.describe(time.monotonic(), self._owner_lease_seconds)
+                )
+        if heartbeat.launches < 2:
+            return
+        owner_id = self._owner_id
+        deadline = heartbeat.launched_at + self._owner_lease_seconds
+        while not heartbeat.renewed_since_launch(owner_id):
+            self._heartbeat_attempt()
+            self._require_terminal_control()
+            if self._lease_lost:
+                return
+            now = time.monotonic()
+            if not heartbeat.alive or now >= deadline:
+                self._note_heartbeat_exit()
+                raise InvocationSelfFencedError(
+                    "distributed Stop owner heartbeat was restarted and has not "
+                    "renewed the owner lease, so admission was refused: "
+                    + heartbeat.describe(now, self._owner_lease_seconds)
+                )
+            await asyncio.sleep(self._poll_seconds)
+
+    def _renewal_raised_control(self) -> bool:
+        """Whether a heartbeat renewal has raised execution control.
+
+        A pure read of the heartbeat, so a settlement can ask it inside its
+        transaction; holding the control and fencing are left to the next
+        observation (:meth:`_heartbeat_attempt`).
+        """
+
+        heartbeat = self._heartbeat
+        renewal = heartbeat.latest() if heartbeat is not None else None
+        return renewal is not None and renewal.control is not None
+
+    def _lease_lapse_reason(self, now: float, renewed_at: float) -> str:
+        heartbeat = self._heartbeat
+        state = (
+            "the owner heartbeat is not running"
+            if heartbeat is None
+            else heartbeat.describe(now, self._owner_lease_seconds)
+        )
+        return (
+            f"owner lease not renewed for {now - renewed_at:.1f} s "
+            f"(lease is {self._owner_lease_seconds:.1f} s): {state}"
+        )
+
     @_registry_control_boundary
-    async def _renew_owner_lease(
+    async def _confirm_generation(
         self,
         generation_id: str,
         *,
         operation: str,
     ) -> _OwnerPoll:
-        """Renew the whole durable inventory without reviving an old lease."""
+        """Re-read one generation's durable row before cognition.
 
-        loop = asyncio.get_running_loop()
-        poll_started = loop.time()
+        The read renews nothing: it shows whether a peer marked or reaped the
+        row while it was being admitted or bound. Execution control a renewal
+        raised while the read awaited outranks every lease-loss outcome here:
+        the caller receives that original exception, never a self-fence.
+        """
+
+        owner_id = self._owner_id
         try:
-            polled = await self._store.poll_owner(
-                self._owner_id,
+            polled = await self._store.read_owner(
+                owner_id,
                 lease_seconds=self._owner_lease_seconds,
             )
         except Exception as error:
             if is_execution_control_error(error):
                 raise
+            self._heartbeat_attempt()
+            self._require_terminal_control()
             self._fail_closed_owner(
-                f"owner lease could not be renewed {operation} "
-                f"({type(error).__name__})"
+                f"owner inventory could not be read {operation} "
+                f"({type(error).__name__})",
+                owner_id=owner_id,
             )
             raise InvocationSelfFencedError(
-                f"distributed Stop owner lease could not be renewed {operation}"
+                f"distributed Stop owner inventory could not be read {operation}"
             ) from error
-        # The database heartbeat occurs no earlier than ``poll_started``.
-        # Retaining that lower bound (rather than response time) prevents a
-        # delayed database response from making an already-expired lease look
-        # fresh to this process.
-        if loop.time() - poll_started >= self._owner_lease_seconds:
-            self._fail_closed_owner(f"owner lease renewal was late {operation}")
-            raise InvocationSelfFencedError(
-                f"distributed Stop owner lease expired {operation}"
-            )
+        self._observe_owner_heartbeat()
+        self._require_terminal_control()
         if generation_id not in polled.live_generation_ids:
-            self._fail_closed_owner(f"durable generation was lost {operation}")
+            self._fail_closed_owner(
+                f"durable generation was lost {operation}", owner_id=owner_id
+            )
             raise InvocationSelfFencedError(
                 f"distributed Stop durable generation was lost {operation}"
             )
-        self._last_heartbeat_monotonic = poll_started
+        if self._lease_lost:
+            raise InvocationSelfFencedError(
+                f"distributed Stop owner lease expired {operation}"
+            )
         return polled
 
     @_registry_control_boundary
@@ -1146,19 +1456,15 @@ class DistributedInvocationRegistry:
                         "distributed Stop owner lease was lost and could not "
                         f"be re-established ({self.owner_fence_reason})"
                     )
-                last_heartbeat = self._last_heartbeat_monotonic
-                lease_owned_generation_ids = self._lease_owned_generation_ids()
-                if (
-                    lease_owned_generation_ids
-                    and last_heartbeat is not None
-                    and asyncio.get_running_loop().time() - last_heartbeat
-                    >= self._owner_lease_seconds
-                ):
-                    self._fail_closed_owner(
-                        "owner lease expired before admission"
-                    )
+                await self._require_renewing_heartbeat()
+                self._observe_owner_heartbeat()
+                # Control this observation held refuses the admission, as
+                # it would have had the relay held it first.
+                self._require_terminal_control()
+                if self._lease_lost:
                     raise InvocationSelfFencedError(
-                        "distributed Stop owner lease expired before admission"
+                        "distributed Stop owner lease expired before admission "
+                        f"({self.owner_fence_reason})"
                     )
                 existing_generation_id = self._by_local_generation.get(key)
                 if existing_generation_id is not None:
@@ -1174,7 +1480,8 @@ class DistributedInvocationRegistry:
                         )
                     return True
                 generation_id = uuid4().hex
-                admission_started = asyncio.get_running_loop().time()
+                # The insert writes the row's first heartbeat no earlier.
+                admission_started = time.monotonic()
                 owner_id = self._owner_id
                 admitted = await self._store.register(
                     generation_id=generation_id,
@@ -1185,57 +1492,35 @@ class DistributedInvocationRegistry:
                 )
                 if not admitted:
                     return False
-                still_lease_owned = self._lease_owned_generation_ids()
-                had_other_lease_owned_work = bool(still_lease_owned)
+                had_other_lease_owned_work = bool(
+                    self._lease_owned_generation_ids()
+                )
                 # The durable insert establishes cleanup ownership. Publish
                 # that ownership locally before any lease-loss branch can
                 # fail, so complete_soon can retry transient deletion errors.
                 self._by_local_generation[key] = generation_id
                 self._active[generation_id] = _LocalGeneration(
-                    agent, turn_id, generation, owner_id
+                    agent, turn_id, generation, owner_id, time.monotonic()
                 )
-                lease_expired_during_admission = bool(
-                    lease_owned_generation_ids
-                    and last_heartbeat is not None
-                    and any(
-                        owned_generation_id in still_lease_owned
-                        for owned_generation_id in lease_owned_generation_ids
-                    )
-                    and asyncio.get_running_loop().time() - last_heartbeat
-                    >= self._owner_lease_seconds
-                )
-                if lease_expired_during_admission:
-                    # The durable insert awaited outside the process clock's
-                    # lease window. A relay stalled on the same database may
-                    # not have observed this yet, while another replica is
-                    # already entitled to reap the older rows. The new row is
-                    # provisional, never authority to revive that owner.
-                    self._fail_closed_owner(
-                        "owner lease expired during admission"
-                    )
+                self._renewed_at[generation_id] = admission_started
+                # The insert awaited the database; the older rows' leases, and
+                # this one's, must still hold. A new row is provisional, never
+                # authority to revive an owner whose lease lapsed meanwhile.
+                self._observe_owner_heartbeat()
                 if self._lease_lost:
+                    # Held execution control is raised as itself, and the row
+                    # is left to the caller's abandonment, never completed.
+                    self._require_terminal_control()
                     self.complete_soon(agent, turn_id, generation)
                     raise InvocationSelfFencedError(
                         "distributed Stop owner lease was lost during admission"
                     )
                 if not had_other_lease_owned_work:
-                    # The insert starts an idle owner's lease, but its reply
-                    # can be delayed past that lease while a peer marks and
-                    # reaps the row. Never use response time as proof of fresh
-                    # ownership, and re-read the durable row before cognition.
-                    if (
-                        asyncio.get_running_loop().time() - admission_started
-                        >= self._owner_lease_seconds
-                    ):
-                        self._fail_closed_owner(
-                            "first admission reply outlasted the owner lease"
-                        )
-                        self.complete_soon(agent, turn_id, generation)
-                        raise InvocationSelfFencedError(
-                            "distributed Stop owner lease expired during admission"
-                        )
+                    # A peer can mark or reap the row while its insert reply
+                    # is delayed. With other work in flight the relay reads
+                    # every renewal; an idle owner re-reads the row here.
                     try:
-                        polled = await self._renew_owner_lease(
+                        polled = await self._confirm_generation(
                             generation_id,
                             operation="during admission",
                         )
@@ -1276,6 +1561,7 @@ class DistributedInvocationRegistry:
             raise RuntimeError("distributed Stop registry is closing")
         async with self._registration_lock:
             if self._lease_lost:
+                self._require_terminal_control()
                 raise InvocationSelfFencedError(
                     "distributed Stop owner lease was lost before turn binding"
                 )
@@ -1293,19 +1579,13 @@ class DistributedInvocationRegistry:
                 raise InvocationSelfFencedError(
                     "distributed Stop owner lease was lost before turn binding"
                 )
-            last_heartbeat = self._last_heartbeat_monotonic
-            if (
-                last_heartbeat is None
-                or asyncio.get_running_loop().time() - last_heartbeat
-                >= self._owner_lease_seconds
-            ):
-                self._fail_closed_owner(
-                    "owner lease expired before turn binding"
-                )
+            self._observe_owner_heartbeat()
+            self._require_terminal_control()
+            if self._lease_lost:
                 raise InvocationSelfFencedError(
                     "distributed Stop owner lease expired before turn binding"
                 )
-            polled = await self._renew_owner_lease(
+            polled = await self._confirm_generation(
                 generation_id,
                 operation="before turn binding",
             )
@@ -1317,15 +1597,9 @@ class DistributedInvocationRegistry:
                 agent_id=self._agent_id(agent),
                 turn_id=turn_id,
             )
-            last_heartbeat = self._last_heartbeat_monotonic
-            if (
-                last_heartbeat is None
-                or asyncio.get_running_loop().time() - last_heartbeat
-                >= self._owner_lease_seconds
-            ):
-                self._fail_closed_owner(
-                    "owner lease expired during turn binding"
-                )
+            self._observe_owner_heartbeat()
+            self._require_terminal_control()
+            if self._lease_lost:
                 raise InvocationSelfFencedError(
                     "distributed Stop owner lease expired during turn binding"
                 )
@@ -1362,11 +1636,21 @@ class DistributedInvocationRegistry:
         async def complete() -> None:
             try:
                 while True:
+                    # Once a renewal has raised execution control, including
+                    # one no observation has read yet, no generation is
+                    # recorded completed: it is preserved as unresolved, so
+                    # a Stop for it reports it unreachable. The settlement
+                    # asks again once it holds the database, because a
+                    # renewal can raise control while it waits for a writer.
+                    renewal = self._heartbeat_attempt()
                     try:
                         await self._store.settle(
                             generation_id,
                             owner_id,
-                            disposition,
+                            RequestCompletionDisposition.ABANDONED
+                            if renewal is not None and renewal.control is not None
+                            else disposition,
+                            abandon_if=self._renewal_raised_control,
                         )
                     except BaseException as error:
                         if is_execution_control_error(error):
@@ -1390,13 +1674,8 @@ class DistributedInvocationRegistry:
                         continue
                     self._by_local_generation.pop(key, None)
                     self._active.pop(generation_id, None)
+                    self._renewed_at.pop(generation_id, None)
                     self._completing_generation_ids.discard(generation_id)
-                    if not self._lease_owned_generation_ids():
-                        # A lease protects durable owner rows, not an idle
-                        # process identity. The next admission starts a fresh
-                        # lease generation instead of inheriting elapsed idle
-                        # time from work that already completed.
-                        self._last_heartbeat_monotonic = None
                     return
             finally:
                 self._cleanup_keys.discard(key)
@@ -1521,6 +1800,8 @@ class DistributedInvocationRegistry:
         self._fence_reason = reason
         self._reacquisition_failure = None
         self._next_relay_reacquisition_at = None
+        # The fenced identity is never renewed again.
+        self._retarget_candidate()
         live_work = tuple(
             self._active[generation_id]
             for generation_id in self._lease_owned_generation_ids()
@@ -1561,6 +1842,14 @@ class DistributedInvocationRegistry:
                         "Distributed Stop owner self-fence cancellation failed"
                     )
 
+    def _retarget_candidate(self) -> None:
+        """Point the heartbeat at a fresh identity for the next owner epoch."""
+
+        self._candidate_owner_id = uuid4().hex
+        self._candidate_since = time.monotonic()
+        if self._heartbeat is not None:
+            self._heartbeat.retarget(self._candidate_owner_id)
+
     def _record_reacquisition_failure(self, failure: str) -> None:
         if failure != self._reacquisition_failure:
             logger.error(
@@ -1583,38 +1872,56 @@ class DistributedInvocationRegistry:
         Callers hold ``_registration_lock``. The fenced owner identity is
         retired, never renewed: its rows keep that identity, stop being
         heartbeated, and are either settled by their own cleanup or reaped by
-        a peer. The replacement identity must prove the shared lease clock
-        answers inside one lease before it may admit anything. An idle owner
-        holds no durable rows, so that round trip is the whole acquisition;
+        a peer. The replacement identity is the one the heartbeat has renewed
+        since the fence, and it must prove the heartbeat reaches the shared
+        lease clock inside one lease before it may admit anything. An idle
+        owner holds no durable rows, so that renewal is the whole acquisition;
         the first admission then starts the new owner's lease as usual.
         """
 
         if not self._lease_lost or self._closing:
             return
-        loop = asyncio.get_running_loop()
-        candidate = uuid4().hex
-        started = loop.time()
-        try:
-            polled = await self._store.poll_owner(
-                candidate,
-                lease_seconds=self._owner_lease_seconds,
-            )
-        except Exception as error:
-            if is_execution_control_error(error):
-                raise
+        heartbeat = self._heartbeat
+        if heartbeat is None:
             self._record_reacquisition_failure(
-                f"owner lease store unavailable ({type(error).__name__})"
+                "the owner heartbeat is not running (the registry was not started)"
             )
             return
-        if loop.time() - started >= self._owner_lease_seconds:
-            self._record_reacquisition_failure(
-                "owner lease store answered after the lease window"
-            )
-            return
-        if polled.live_generation_ids:
-            self._record_reacquisition_failure(
-                "fresh owner identity already holds durable generations"
-            )
+        renewal = self._heartbeat_attempt()
+        # Held control is raised, never read as an unavailable store.
+        self._require_terminal_control()
+        self._note_heartbeat_exit()
+        heartbeat.ensure_running()
+        candidate = self._candidate_owner_id
+        since = self._candidate_since
+        deadline = time.monotonic() + self._owner_lease_seconds
+        while (
+            renewal is None
+            or renewal.owner_id != candidate
+            or renewal.started < since
+        ):
+            if time.monotonic() >= deadline:
+                self._record_reacquisition_failure(
+                    "the owner heartbeat did not renew the new owner identity "
+                    f"within {self._owner_lease_seconds:.1f} s: "
+                    + heartbeat.describe(time.monotonic(), self._owner_lease_seconds)
+                )
+                return
+            await asyncio.sleep(self._poll_seconds)
+            if not self._lease_lost or self._closing:
+                return
+            renewal = self._heartbeat_attempt()
+            self._require_terminal_control()
+        failure = None
+        if renewal.poll is None:
+            failure = f"owner lease store unavailable ({renewal.failure})"
+        elif renewal.finished - renewal.started >= self._owner_lease_seconds:
+            failure = "owner lease store answered after the lease window"
+        elif renewal.poll.live_generation_ids:
+            failure = "fresh owner identity already holds durable generations"
+        if failure is not None:
+            self._record_reacquisition_failure(failure)
+            self._retarget_candidate()
             return
         if not self._lease_lost or self._closing:
             return
@@ -1622,7 +1929,9 @@ class DistributedInvocationRegistry:
         fenced_reason = self._fence_reason
         self._owner_id = candidate
         self._owner_epoch = fenced_epoch + 1
-        self._last_heartbeat_monotonic = None
+        self._observed_renewal = renewal
+        self._candidate_owner_id = None
+        self._candidate_since = None
         self._lease_lost = False
         self._fence_reason = None
         self._reacquisition_failure = None
@@ -1653,110 +1962,15 @@ class DistributedInvocationRegistry:
                 loop.time() + self._owner_lease_seconds
             )
 
-    def _stall_since_renewal(self, now: float) -> str | None:
-        """Name the stall that let the owner lease lapse before ``now``.
-
-        The relay renews every poll interval, and a renewal that itself
-        outlasts the lease is reported as late. So a gap since the last
-        successful renewal longer than the lease, at the start of a poll, means
-        the event loop held the relay between polls (#3745). The figure is that
-        gap: it exceeds the stall by at most one poll interval plus the
-        previous renewal's round trip.
-        """
-        renewed = self._last_heartbeat_monotonic
-        if renewed is None:
-            return None
-        stalled = now - renewed
-        if stalled < self._owner_lease_seconds:
-            return None
-        return (
-            f"event loop stalled {stalled:.1f} s; "
-            f"lease is {self._owner_lease_seconds:.1f} s"
-        )
-
     @_registry_control_boundary
     async def _relay(self) -> None:
         while not self._closing:
-            if self._lease_lost:
-                try:
-                    await self._relay_reacquire_owner_lease()
-                except asyncio.CancelledError:
-                    raise
-                except Exception as error:
-                    if is_execution_control_error(error):
-                        raise
-                    logger.error(
-                        "Distributed Stop owner re-establishment failed (%s)",
-                        type(error).__name__,
-                        exc_info=(type(error), error, error.__traceback__),
-                    )
-                await asyncio.sleep(self._poll_seconds)
-                continue
-            owner_id = self._owner_id
-            lease_owned_generation_ids = self._lease_owned_generation_ids()
-            if not lease_owned_generation_ids:
-                await asyncio.sleep(self._poll_seconds)
-                continue
             try:
-                poll_started = asyncio.get_running_loop().time()
-                stall = self._stall_since_renewal(poll_started)
-                polled = await self._store.poll_owner(
-                    owner_id,
-                    lease_seconds=self._owner_lease_seconds,
-                )
-                if owner_id != self._owner_id:
-                    # The owner this poll renewed was fenced and replaced
-                    # while it was in flight; its result describes no
-                    # generation the current lease protects.
-                    await asyncio.sleep(self._poll_seconds)
-                    continue
-                renewal_seconds = asyncio.get_running_loop().time() - poll_started
-                if renewal_seconds >= self._owner_lease_seconds:
-                    self._fail_closed_owner(
-                        "owner lease renewal was late in the relay "
-                        f"(took {renewal_seconds:.1f} s; lease is "
-                        f"{self._owner_lease_seconds:.1f} s)",
-                        owner_id=owner_id,
-                    )
+                self._note_heartbeat_exit()
+                if self._lease_lost:
+                    await self._relay_reacquire_owner_lease()
                 else:
-                    self._last_heartbeat_monotonic = poll_started
-                live = set(polled.live_generation_ids)
-                # ``polled`` can describe only the durable snapshot taken for
-                # the inventory captured above. A concurrent admission may be
-                # published locally after that SQL snapshot; comparing it to
-                # this older reply would falsely declare the healthy owner
-                # lease lost. Conversely, an originally captured row can enter
-                # ordinary completion before the database snapshot and be
-                # legitimately absent. Compare the captured inventory only
-                # after subtracting rows that have since completed or begun
-                # completion; fresh admissions are covered by the next poll.
-                still_lease_owned = set(self._lease_owned_generation_ids())
-                lease_owned_generation_ids = tuple(
-                    generation_id
-                    for generation_id in lease_owned_generation_ids
-                    if generation_id in still_lease_owned
-                )
-                if any(
-                    generation_id not in live
-                    for generation_id in lease_owned_generation_ids
-                ):
-                    self._fail_closed_owner(
-                        stall or "durable generation was lost in the relay",
-                        owner_id=owner_id,
-                    )
-                else:
-                    for generation_id in polled.stop_generation_ids:
-                        target = self._active.get(generation_id)
-                        if target is None:
-                            continue
-                        cancel = getattr(
-                            target.agent, "cancel_current_request", None
-                        )
-                        if callable(cancel):
-                            cancel(
-                                request_id=target.turn_id,
-                                generation=target.generation,
-                            )
+                    self._observe_owner_heartbeat()
             except asyncio.CancelledError:
                 raise
             except Exception as error:
@@ -1767,17 +1981,6 @@ class DistributedInvocationRegistry:
                     type(error).__name__,
                     exc_info=(type(error), error, error.__traceback__),
                 )
-                last_heartbeat = self._last_heartbeat_monotonic
-                if (
-                    last_heartbeat is not None
-                    and asyncio.get_running_loop().time() - last_heartbeat
-                    >= self._owner_lease_seconds
-                ):
-                    self._fail_closed_owner(
-                        "owner lease could not be renewed in the relay "
-                        f"({type(error).__name__})",
-                        owner_id=owner_id,
-                    )
             await asyncio.sleep(self._poll_seconds)
 
     async def _abandon_owner_before(self, owner_id: str, deadline: float) -> None:
@@ -1861,17 +2064,45 @@ class DistributedInvocationRegistry:
             )
         except BaseException as error:
             failure = execution_terminal_error(failure, error, retain_originals=True)
+        heartbeat = self._heartbeat
+        unretired_heartbeat = None
+        if heartbeat is not None:
+            # The lease was renewed through the drain and abandonment above.
+            # Stopping only now lets a row left behind expire on schedule.
+            stopped = await await_owned_task(create_owned_task(
+                heartbeat.stop(timeout=max(abandon_deadline - loop.time(), 1.0)),
+                name="distributed-stop-heartbeat-stop",
+            ))
+            withdrawal = execution_terminal_error(
+                withdrawal, stopped.cancellation, retain_originals=True,
+            )
+            last_attempt = heartbeat.latest()
+            if last_attempt is not None and last_attempt.control is not None:
+                # Possibly raised by the renewal that stop() let finish.
+                self._retain_terminal_control(last_attempt.control)
+            if stopped.error is not None:
+                failure = execution_terminal_error(
+                    failure, stopped.error, retain_originals=True,
+                )
+            elif stopped.result is not True:
+                # Its thread is still running, or a connection it opened did
+                # not close: it may still hold that connection and a native
+                # transaction on it. Close is not done until it has retired;
+                # the registry, and its database, stay owned until then.
+                unretired_heartbeat = heartbeat.retirement_error()
         pending = pending_owned_retirement_error(
             self, (*self._registration_tasks, *self._cleanup_tasks),
             message="Distributed Stop close still owns unfinished native settlement",
         )
-        if pending is None and failure is None:
+        if pending is None and unretired_heartbeat is None and failure is None:
             self._active.clear()
             self._by_local_generation.clear()
+            self._renewed_at.clear()
             self._cleanup_keys.clear()
             self._completing_generation_ids.clear()
         terminal = execution_terminal_error(
-            self._terminal_control, pending, failure, withdrawal, retain_originals=True,
+            self._terminal_control, pending, unretired_heartbeat, failure,
+            withdrawal, retain_originals=True,
         )
         if terminal is not None:
             raise terminal

@@ -196,6 +196,18 @@ def publish_turn_ownership(agent: object, turn_id: str) -> Iterator[None]:
         _BOUND_TURN_SESSION.reset(token)
 
 
+def turn_agent_in_context(context: contextvars.Context) -> Optional[object]:
+    """The agent whose turn ``context`` belongs to, or ``None`` (#3889).
+
+    Reads one task's context without entering it, so the event-loop stall
+    watchdog can name, from its own thread, the agent whose turn holds the
+    loop.
+    """
+
+    binding = context.get(_BOUND_TURN_SESSION)
+    return None if binding is None else binding.agent
+
+
 def capture_turn_session_binding(agent: object) -> _TurnSessionBinding:
     """Capture ``agent``'s authoritative live-turn session for later binding.
 

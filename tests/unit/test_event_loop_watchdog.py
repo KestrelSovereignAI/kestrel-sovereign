@@ -484,3 +484,61 @@ async def test_a_malformed_section_refuses_server_startup(stub_server_lifespan_p
             pytest.fail("the server started with a malformed watchdog section")
     assert stub_server_lifespan_phases == []
     assert _watchdog_threads() == []
+
+
+class _NamedAgent:
+    def __init__(self) -> None:
+        self.agent_name = "Stalling Kestrel"
+        self.did = "did:test:stalling-kestrel"
+
+
+@pytest.mark.skipif(
+    sys.version_info < (3, 12), reason="Task.get_context() is Python 3.12+"
+)
+async def test_a_stall_names_the_task_and_the_agent_whose_turn_holds_the_loop(
+    watchdog_log,
+):
+    """A stall is a reported fact naming its agent, not a fencing trigger (#3889)."""
+
+    from kestrel_sovereign.agent.turn_lifecycle import publish_turn_ownership
+
+    async def turn() -> None:
+        with publish_turn_ownership(_NamedAgent(), "stalling-turn"):
+            _block_the_loop(0.8)
+
+    watchdog = EventLoopStallWatchdog(
+        stall_threshold_seconds=0.3, heartbeat_interval_seconds=0.1
+    )
+    watchdog.start()
+    try:
+        await asyncio.sleep(0.3)
+        await asyncio.create_task(turn(), name="turn:stalling-kestrel")
+        await asyncio.sleep(0.3)
+    finally:
+        watchdog.stop()
+
+    [warning] = _warnings(watchdog_log)
+    message = warning.getMessage()
+    assert (
+        "Running task: 'turn:stalling-kestrel', a turn of agent "
+        "Stalling Kestrel (did:test:stalling-kestrel)." in message
+    )
+
+
+async def test_a_stall_outside_any_turn_names_only_its_task(watchdog_log):
+    async def background() -> None:
+        _block_the_loop(0.8)
+
+    watchdog = EventLoopStallWatchdog(
+        stall_threshold_seconds=0.3, heartbeat_interval_seconds=0.1
+    )
+    watchdog.start()
+    try:
+        await asyncio.sleep(0.3)
+        await asyncio.create_task(background(), name="background-sweep")
+        await asyncio.sleep(0.3)
+    finally:
+        watchdog.stop()
+
+    [warning] = _warnings(watchdog_log)
+    assert "Running task: 'background-sweep'." in warning.getMessage()

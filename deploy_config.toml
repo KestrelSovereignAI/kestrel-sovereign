@@ -112,7 +112,9 @@ GITHUB_APP_WEBHOOK_SECRET = "github-app-webhook-secret:latest"
 # capacity. Each instance opens up to 10 pooled plus 4 advisory runtime
 # PostgreSQL connections plus Hold's one-connection operational pool and
 # separately bounded one-connection advisory pool on the primary database
-# (storage/db/postgres.py and host_features/context.py). The provisioned
+# (storage/db/postgres.py and host_features/context.py), plus the Distributed
+# Stop store's one connection and its owner heartbeat's own connection
+# (server.py and stop/owner_heartbeat.py). The provisioned
 # Cloud SQL instance is a ``db-f1-micro`` whose connection ceiling is ~25, so a
 # second instance exhausts it. Hold's independent evidence database has the
 # same one-connection operational plus separately bounded one-connection
