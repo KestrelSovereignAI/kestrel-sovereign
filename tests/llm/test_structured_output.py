@@ -5,7 +5,6 @@ Credentials alone never authorize a paid request.
 """
 
 import json
-import os
 from types import SimpleNamespace
 from typing import Literal
 from unittest.mock import AsyncMock
@@ -14,6 +13,12 @@ import pytest
 from pydantic import BaseModel, Field
 
 from kestrel_sovereign.llm.service import LLMService
+from tests.llm._live import (
+    LIVE_TESTS_ENV,
+    PROVIDER_CREDENTIAL_ENV_VARS,
+    require_live_opt_in,
+    require_live_provider,
+)
 
 
 # =============================================================================
@@ -68,39 +73,10 @@ PROVIDER_MODEL_MATRIX = (
     ("vertex_ai", "gemini-3-flash-preview"),
 )
 
-_LIVE_TESTS_ENV = "KESTREL_LIVE_TESTS"
-_PROVIDER_CREDENTIAL_ENV_VARS = {
-    "openai": ("OPENAI_API_KEY",),
-    "anthropic": ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"),
-    "vertex_ai": ("GOOGLE_API_KEY", "GCP_PROJECT_ID"),
-}
-
-
-def _provider_available(provider_name: str) -> bool:
-    """Return whether credentials for a declared matrix provider exist."""
-    return any(
-        os.environ.get(variable, "").strip()
-        for variable in _PROVIDER_CREDENTIAL_ENV_VARS.get(provider_name, ())
-    )
-
-
-def _require_live_opt_in() -> None:
-    """Skip before external client use unless live tests are explicitly enabled."""
-    if os.environ.get(_LIVE_TESTS_ENV) != "1":
-        pytest.skip(f"live test requires explicit opt-in: set {_LIVE_TESTS_ENV}=1")
-
-
-def _require_live_provider(provider_name: str) -> None:
-    """Require explicit live opt-in and credentials for one provider."""
-    _require_live_opt_in()
-    if not _provider_available(provider_name):
-        credential_names = " or ".join(_PROVIDER_CREDENTIAL_ENV_VARS[provider_name])
-        pytest.skip(f"{provider_name} requires {credential_names}")
-
 
 async def _get_matrix_response(llm_service, provider: str, model: str, **request):
     """Call a declared matrix model only after crossing the live-test gate."""
-    _require_live_provider(provider)
+    require_live_provider(provider)
     return await llm_service.get_response(model_override=model, **request)
 
 
@@ -118,7 +94,7 @@ def llm_service():
 
 def _set_fake_provider_credentials(monkeypatch, provider: str) -> None:
     """Populate inert credentials for hermetic live-gate regressions."""
-    for variable in _PROVIDER_CREDENTIAL_ENV_VARS[provider]:
+    for variable in PROVIDER_CREDENTIAL_ENV_VARS[provider]:
         monkeypatch.setenv(variable, "test-credential-must-never-reach-network")
 
 
@@ -133,14 +109,14 @@ class TestStructuredOutputHermeticity:
         provider,
         model,
     ):
-        monkeypatch.delenv(_LIVE_TESTS_ENV, raising=False)
+        monkeypatch.delenv(LIVE_TESTS_ENV, raising=False)
         _set_fake_provider_credentials(monkeypatch, provider)
         get_response = AsyncMock(
             side_effect=AssertionError("network-capable service call was reached")
         )
         service = SimpleNamespace(get_response=get_response)
 
-        with pytest.raises(pytest.skip.Exception, match=_LIVE_TESTS_ENV):
+        with pytest.raises(pytest.skip.Exception, match=LIVE_TESTS_ENV):
             await _get_matrix_response(
                 service,
                 provider,
@@ -160,7 +136,7 @@ class TestStructuredOutputHermeticity:
         provider,
         model,
     ):
-        monkeypatch.setenv(_LIVE_TESTS_ENV, "1")
+        monkeypatch.setenv(LIVE_TESTS_ENV, "1")
         _set_fake_provider_credentials(monkeypatch, provider)
         expected = object()
         get_response = AsyncMock(return_value=expected)
@@ -309,7 +285,7 @@ class TestAdapterStructuredOutput:
     @pytest.mark.asyncio
     async def test_openai_adapter_structured(self):
         """Test OpenAI adapter structured output directly."""
-        _require_live_provider("openai")
+        require_live_provider("openai")
 
         import openai
         from kestrel_sovereign.llm.openai_adapter import OpenAIAdapter
@@ -336,7 +312,7 @@ class TestAdapterStructuredOutput:
     @pytest.mark.asyncio
     async def test_anthropic_adapter_structured(self):
         """Test Anthropic adapter structured output directly."""
-        _require_live_provider("anthropic")
+        require_live_provider("anthropic")
 
         import anthropic
         from kestrel_sovereign.llm.anthropic_adapter import AnthropicAdapter
@@ -364,7 +340,7 @@ class TestAdapterStructuredOutput:
     @pytest.mark.asyncio
     async def test_vertex_adapter_structured(self):
         """Test Vertex AI adapter structured output directly."""
-        _require_live_provider("vertex_ai")
+        require_live_provider("vertex_ai")
 
         from kestrel_sovereign.llm.vertex_adapter import VertexAIAdapter
 
@@ -389,7 +365,7 @@ class TestAdapterStructuredOutput:
     @pytest.mark.asyncio
     async def test_ollama_adapter_structured(self):
         """Test Ollama adapter structured output directly."""
-        _require_live_opt_in()
+        require_live_opt_in()
 
         try:
             import ollama
@@ -448,7 +424,7 @@ class TestAdapterStructuredOutput:
     @pytest.mark.asyncio
     async def test_ollama_adapter_streaming_structured(self):
         """Test Ollama adapter streaming with structured output."""
-        _require_live_opt_in()
+        require_live_opt_in()
 
         try:
             import ollama
@@ -574,7 +550,7 @@ class TestStreamingStructuredOutput:
     @pytest.mark.asyncio
     async def test_openai_streaming_structured(self):
         """Test OpenAI streaming with structured output."""
-        _require_live_provider("openai")
+        require_live_provider("openai")
 
         import openai
         from kestrel_sovereign.llm.openai_adapter import OpenAIAdapter
@@ -617,7 +593,7 @@ class TestServiceStreamingStructuredOutput:
     @pytest.mark.asyncio
     async def test_service_streaming_structured_openai(self):
         """Test streaming structured output via service layer with OpenAI."""
-        _require_live_provider("openai")
+        require_live_provider("openai")
 
         service = LLMService()
 
@@ -641,7 +617,7 @@ class TestServiceStreamingStructuredOutput:
     @pytest.mark.asyncio
     async def test_service_generate_stream_structured(self):
         """Test generate_stream with structured output."""
-        _require_live_provider("openai")
+        require_live_provider("openai")
 
         service = LLMService()
 
@@ -662,7 +638,7 @@ class TestServiceStreamingStructuredOutput:
     @pytest.mark.asyncio
     async def test_streaming_fallback_for_non_streaming_provider(self):
         """Test that non-streaming providers fall back gracefully."""
-        _require_live_provider("anthropic")
+        require_live_provider("anthropic")
 
         service = LLMService()
 
