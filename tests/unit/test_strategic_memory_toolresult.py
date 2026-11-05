@@ -386,12 +386,15 @@ async def test_signal_dispatch_identifies_missing_governed_runner_by_public_erro
 
 
 @pytest.mark.asyncio
-async def test_signal_dispatch_does_not_misclassify_provider_value_error():
+@pytest.mark.parametrize("failure", ["value", "unknown"])
+async def test_signal_dispatch_does_not_misclassify_provider_value_error(failure, caplog):
     """A registered runner's own validation failure is not tool absence."""
 
     registration = SimpleNamespace(owner="feature:fixture-dispatch")
     agent = _dispatch_agent(registration=registration)
-    agent.execute_named_tool.side_effect = ValueError("invalid workflow params")
+    from kestrel_sdk.resources import ResourceOutcomeUnknown
+    error = (ResourceOutcomeUnknown if failure == "unknown" else ValueError)("private-workflow-state")
+    agent.execute_named_tool.side_effect = error
     feat = _make_feature({}, agent=agent)
     with patch(
         "kestrel_sovereign.features.strategic_memory.feature.pick_top_issue",
@@ -400,8 +403,11 @@ async def test_signal_dispatch_does_not_misclassify_provider_value_error():
         result = await feat.signal_dispatch()
 
     assert result.status is ToolResultStatus.ERROR
-    assert result.data["reason_code"] == "WORKFLOW_RUNNER_FAILED"
-    assert result.data["dispatched"] is False
+    assert result.data["reason_code"] == "WORKFLOW_RUNNER_UNCONFIRMED"
+    assert result.data["dispatched"] is None
+    assert "reconcile" in result.error.lower()
+    assert "before accepting" not in result.error
+    assert "private-workflow-state" not in caplog.text
 
 
 @pytest.mark.asyncio
@@ -1555,3 +1561,16 @@ async def test_signal_dispatch_without_talon_asks_about_no_workspace():
         await feat.signal_dispatch(mode="suggest")
 
     assert pick.await_args.kwargs["talon_workspaces"] is None
+
+
+@pytest.mark.asyncio
+async def test_signal_dispatch_never_relabels_original_workflow_authority_loss():
+    from kestrel_sovereign.execution_custody import ExecutionAuthorityError
+    original = ExecutionAuthorityError('original workflow custody lost')
+    agent = _dispatch_agent(registration=SimpleNamespace(owner='feature:fixture-dispatch'))
+    agent.execute_named_tool.side_effect = original
+    with patch('kestrel_sovereign.features.strategic_memory.feature.pick_top_issue',
+               new=AsyncMock(return_value=_TOP_ISSUE)):
+        with pytest.raises(ExecutionAuthorityError) as caught:
+            await _make_feature({}, agent=agent).signal_dispatch()
+    assert caught.value is original

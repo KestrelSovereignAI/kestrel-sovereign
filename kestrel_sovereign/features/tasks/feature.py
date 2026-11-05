@@ -47,6 +47,7 @@ from kestrel_sovereign.execution_custody import is_execution_control_error
 from kestrel_sovereign.features.base import (
     Feature,
     is_flat_toolresult_envelope,
+    observed_outcome_unknown,
     report_flattened_outcome_unknown,
     tool,
 )
@@ -420,7 +421,9 @@ class TaskFeature(Feature):
                 except Exception as e:
                     if is_execution_control_error(e):
                         raise
-                    unknown = e if isinstance(e, ResourceOutcomeUnknown) else None
+                    # The error itself, a cause or an exception-group member
+                    # may say the step's effect may already have happened.
+                    unknown = e if observed_outcome_unknown(e) else None
                     if unknown is None and task is not None and task_outcome_unknown(task):
                         # The task says its effect may already have happened.
                         # Failing to read its result does not make it safe to

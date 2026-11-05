@@ -109,11 +109,16 @@ from kestrel_sovereign.agent.streaming import (
 )
 from kestrel_sovereign.execution_custody import (
     ExecutionAuthorityError,
+    ToolAuditUnconfirmedError,
+    is_tool_execution_terminal_error,
     execution_terminal_error,
     is_execution_control_error,
     require_execution_work,
 )
-from kestrel_sovereign.hooks.decision_gate import evaluate_blocking_decision
+from kestrel_sovereign.hooks.decision_gate import (
+    decided_tool_input,
+    evaluate_blocking_decision,
+)
 from kestrel_sovereign.logging_config import (
     content_log_summary,
     exception_frames,
@@ -144,6 +149,14 @@ from kestrel_sovereign.telemetry import (
     # One definition of "is this an actual session?", shared with the LLM and
     # signal-dispatch spans that stamp the same value (#2940).
     real_session_id,
+)
+from kestrel_sovereign.tools.execution_outcome import (
+    TOOL_OUTCOME_UNCONFIRMED,
+    TOOL_PRECONDITION_CHANGED,
+    _HostToolFailure,
+    _PreconditionFailedToolResult,
+    _PrivateToolResult,
+    _UnconfirmedToolResult,
 )
 from kestrel_sovereign.turn_scope import capture_turn_scope
 
@@ -848,16 +861,13 @@ class ContextStats:
 
 
 class ToolNotRegisteredError(ValueError):
-    """Raised by ``execute_named_tool`` when the named tool isn't exposed
-    by any of the agent's currently-enabled features.
+    """A named tool is absent from the agent's enabled registry.
 
-    Subclasses ``ValueError`` so the prior contract ("ValueError on
-    unknown tool") still holds for callers that don't import this name,
-    but external transports (voice realtime, MCP, A2A) can catch the
-    subclass specifically to distinguish "tool doesn't exist" from a
-    ``ValueError`` raised by the tool's own validation logic.
-    Conflating the two leads to the realtime model retrying with a
-    different *tool name* when it should have corrected its *args*.
+    This pre-execution lookup refusal is distinct from a tool-body failure.
+    Once execution starts, ordinary exceptions, including ValueError, become
+    ResourceOutcomeUnknown unless they carry a known resource precondition
+    refusal or original terminal evidence. Reconcile unknown outcomes before
+    retrying rather than assuming an argument correction is safe.
     """
 
 
@@ -875,6 +885,8 @@ def _extract_inline_error_fields(result: Any) -> tuple[Optional[str], Optional[s
     ``(None, None)`` so ``result_status`` inference at the SDK layer
     still drives the status column accurately.
     """
+    if isinstance(result, _HostToolFailure):
+        return result.message, result.error_class
     if not isinstance(result, dict):
         return None, None
     if result.get("success") is False:
@@ -886,11 +898,7 @@ def _extract_inline_error_fields(result: Any) -> tuple[Optional[str], Optional[s
     return None, None
 
 
-class _DeferredToolAuditError(ResourceOutcomeUnknown):
-    """Execution completed but its required audit could not be confirmed."""
-
-
-class _AuditedDeferredResult(dict):
+class _AuditedDeferredResult(_PrivateToolResult):
     """Single-use dispatch receipt; serialization carries only result data.
 
     An inline adapter's history recorder must not write a second dispatch for
@@ -911,19 +919,16 @@ class _AuditedDeferredResult(dict):
         self._claimed = True
         return True
 
-    def __copy__(self):
-        return dict(self)
 
-    def __deepcopy__(self, memo):
-        return deepcopy(dict(self), memo)
-
-    def __reduce_ex__(self, protocol):
-        return dict, (dict(self),)
+class _AuditedUnconfirmedToolResult(_AuditedDeferredResult, _UnconfirmedToolResult):
+    """Unconfirmed delivery after the host acknowledged the original audit."""
 
 
 def _discard_tool_supplied_receipt(result):
-    """A nested or fabricated receipt does not audit the enclosing execution."""
-    return dict(result) if isinstance(result, _AuditedDeferredResult) else result
+    """A tool-supplied marker cannot attest to its own enclosing execution."""
+    if isinstance(result, (_AuditedDeferredResult, _HostToolFailure)):
+        return dict(result)
+    return result
 
 
 def _mark_tool_dispatch_audited(dispatch_meta, bound_execution=None, *, status):
@@ -932,6 +937,19 @@ def _mark_tool_dispatch_audited(dispatch_meta, bound_execution=None, *, status):
         dispatch_meta["status"] = status
     if bound_execution is not None:
         bound_execution.audit_recorded = True
+
+
+def _record_refused_tool_arguments(dispatch_meta, arguments, bound_execution=None):
+    """A refused call's dispatch row names the arguments its hooks refused.
+
+    They are the arguments as they stood when the deciding hook ran, not the
+    call's: a rewrite or redaction an earlier hook made stays in the record,
+    as it does for a call that ran with it (#3953).
+    """
+    if dispatch_meta is not None:
+        dispatch_meta["arguments"] = arguments
+    if bound_execution is not None:
+        bound_execution.arguments = arguments
 
 
 def _returned_tool_status(result, dispatch_meta) -> str:
@@ -952,12 +970,33 @@ def _returned_tool_status(result, dispatch_meta) -> str:
 
 def _raise_terminal_tool_error(error, dispatch_meta):
     """An observer failure cannot relabel an already-confirmed tool effect."""
-    if is_execution_control_error(error) or isinstance(error, _DeferredToolAuditError):
+    if is_tool_execution_terminal_error(error):
         raise error
     if dispatch_meta is not None and dispatch_meta.get("audit_recorded"):
         raise ResourceOutcomeUnknown(
             "Tool completed and its dispatch was recorded, but final delivery failed. Do not replay",
         ) from error
+
+
+async def _run_tool_execution(host, operation, *, execution, dispatch_meta,
+                             session_id, on_failure, recover_audited=False):
+    """One execution boundary for model, bound and ordinary named tools."""
+    try:
+        return await operation()
+    except Exception as error:
+        if is_tool_execution_terminal_error(error):
+            raise
+        if not recover_audited:
+            _raise_terminal_tool_error(error, dispatch_meta)
+        unknown = execution.returned or (
+            execution.started and not isinstance(error, ResourceConflict)
+        )
+        if unknown:
+            # Anti-repeat evidence must reach the owning turn before Stop can
+            # prevent delivery of this failure. This is not business success.
+            mark_current_invocation_effect_completed(session_id)
+            require_execution_work(host)
+        return await on_failure(error, unknown)
 
 
 async def _record_inline_tool_dispatch(host, entry, *, session_id, features_by_tool_name):
@@ -1044,7 +1083,7 @@ async def _complete_post_tool_result(host, result, post_input, *, adapter,
             )
         if not isinstance(error, Exception) or is_execution_control_error(error):
             raise error
-        raise _DeferredToolAuditError(
+        raise ToolAuditUnconfirmedError(
             "Tool completed, but its audit could not be confirmed; UI withheld. "
             "Reconcile before retrying. Do not replay to recover the UI",
         ) from error
@@ -1091,6 +1130,11 @@ class OrchestratorEngineMixin:
     supports_deferred_tool_results: bool = True
     supports_audited_deferred_tool_results: bool = True
     supports_tool_publication_context: bool = True
+    # Registry-mounted tools require this exact-True host contract. Their
+    # model, named, inline and bound dispatch preserve uncertainty after
+    # execution starts; an unconfirmed required audit terminates delivery and
+    # route fallback. Registration alone does not establish these guarantees.
+    supports_unconfirmed_tool_outcomes: bool = True
 
     @staticmethod
     def _signals_unfinished_tool_work(content: Optional[str]) -> bool:
@@ -1264,6 +1308,7 @@ class OrchestratorEngineMixin:
         prepare_args=None,
         audit_adapter=None,
         on_audited=None,
+        on_refused=None,
     ) -> dict:
         """
         Execute a tool with PRE_TOOL_USE and POST_TOOL_USE hook enforcement.
@@ -1281,6 +1326,10 @@ class OrchestratorEngineMixin:
             execute_fn: Async callable that performs the actual tool execution.
                         Called with the post-hook args; should return the tool
                         result.
+            on_refused: Called, when the hooks DENY or ASK, with the arguments
+                        as they stood when the deciding hook ran, so the
+                        caller records the refused call with them rather than
+                        with ``args`` (#3953).
 
         Returns:
             Tool result dict, or an error dict if permission was denied.
@@ -1310,13 +1359,11 @@ class OrchestratorEngineMixin:
                 blocked.decision.value, feature_name, tool_name,
                 content_log_summary(str(blocked.reason)),
             )
+            if on_refused is not None:
+                on_refused(decided_tool_input(hook_input, hook_output))
             return blocked.envelope
 
-        args = (
-            hook_output.updated_input
-            if hook_output.updated_input is not None
-            else hook_input.tool_input
-        )
+        args = decided_tool_input(hook_input, hook_output)
         if prepare_args is not None:
             args = prepare_args(args)
 
@@ -1705,12 +1752,13 @@ class OrchestratorEngineMixin:
 
         Raises:
             ToolNotRegisteredError: ``tool_name`` is not registered with
-                any enabled feature.  A ``ValueError`` subclass — callers
-                that ``except ValueError`` still catch it for backwards
-                compatibility, but external transports should
-                ``except ToolNotRegisteredError`` specifically so a
-                ``ValueError`` raised by a tool's own argument validation
-                isn't misreported as "tool not found".
+                any enabled feature. Catch this type specifically for an
+                optional-tool probe.
+            ResourceOutcomeUnknown: execution started but its result or final
+                delivery could not be confirmed. Reconcile before retrying;
+                the private cause retains the original exception. Tool-local
+                ValueError is not evidence that execution never happened; do
+                not automatically correct and retry it.
         """
         from kestrel_sovereign.signals.constitution_canary import (
             PHANTOM_RECEIPT_TOOL_NAME,
@@ -1736,10 +1784,46 @@ class OrchestratorEngineMixin:
                 )
             return await handler(**(args or {}))
 
-        with tool_call_scope(self, call_context):
-            result = await self._dispatch_named_tool(
+        from kestrel_sovereign.agent.tool_registry import _ToolExecution
+        execution, dispatch_meta = _ToolExecution(), {}
+
+        async def run():
+            return await self._dispatch_named_tool(
                 tool_name, args, session_id=session_id, source=source,
                 _capture=_capture, call_context=call_context,
+                execution=execution, dispatch_meta=dispatch_meta,
+            )
+
+        async def failed(error, unknown):
+            if not unknown:
+                if (_capture is not None and execution.started
+                        and isinstance(error, ResourceConflict)):
+                    logging.warning(
+                        "[GOVERNED-DISPATCH] %s precondition refused: %s\n%s",
+                        tool_name, exception_log_summary(error), exception_frames(error),
+                    )
+                    return _PreconditionFailedToolResult({
+                        "success": False, "error": TOOL_PRECONDITION_CHANGED,
+                    })
+                raise error
+            logging.error(
+                "[GOVERNED-DISPATCH] %s failed: %s\n%s",
+                tool_name, exception_log_summary(error), exception_frames(error),
+            )
+            if _capture is None:
+                raise ResourceOutcomeUnknown(TOOL_OUTCOME_UNCONFIRMED) from error
+            payload = {"success": False, "error": TOOL_OUTCOME_UNCONFIRMED}
+            if dispatch_meta.get("audit_recorded"):
+                return _AuditedUnconfirmedToolResult(
+                    payload, host=self, tool_name=tool_name, session_id=session_id,
+                )
+            return _UnconfirmedToolResult(payload)
+
+        with tool_call_scope(self, call_context):
+            result = await _run_tool_execution(
+                self, run, execution=execution, dispatch_meta=dispatch_meta,
+                session_id=session_id, on_failure=failed,
+                recover_audited=_capture is not None,
             )
             if isinstance(result, _AuditedDeferredResult) and _capture is None:
                 return dict(result)
@@ -1754,6 +1838,8 @@ class OrchestratorEngineMixin:
         source: str,
         _capture: Optional[Dict[str, Any]],
         call_context: ToolCallContext,
+        execution,
+        dispatch_meta,
     ) -> Any:
         """Resolve and run one :meth:`execute_named_tool` call.
 
@@ -1899,11 +1985,7 @@ class OrchestratorEngineMixin:
         # the hook-rewritten arguments even when the dispatch is
         # blocked. A PRE_TOOL_USE redactor running before a denial
         # must not be undone by the breadcrumb.
-        post_hook_args = (
-            pre_output.updated_input
-            if pre_output.updated_input is not None
-            else pre_input.tool_input
-        )
+        post_hook_args = decided_tool_input(pre_input, pre_output)
         if _capture is not None:
             _capture["effective_args"] = post_hook_args
 
@@ -1949,7 +2031,9 @@ class OrchestratorEngineMixin:
         # executions.
         exec_start = time.time()
         require_execution_work(self)
+        execution.started = True
         result = await found_tool.execute(**effective_args)
+        execution.returned = True
         mark_current_invocation_effect_completed(session_id)
         require_execution_work(self)
         exec_duration_ms = int((time.time() - exec_start) * 1000)
@@ -1974,6 +2058,9 @@ class OrchestratorEngineMixin:
         return await _complete_post_tool_result(
             self, result, post_input, adapter=f"named:{source}:{feature_name}.{tool_name}",
             dispatch_start=exec_start,
+            on_audited=lambda status: _mark_tool_dispatch_audited(
+                dispatch_meta, execution, status=status,
+            ),
         )
 
     def _resolve_named_tool(self, tool_name: str) -> tuple[Any, Any]:
@@ -2105,11 +2192,7 @@ class OrchestratorEngineMixin:
         pre_output = await self.hooks_manager.execute_hooks(
             HookEvent.PRE_SUBAGENT_CALL, pre_input,
         )
-        post_hook_args = (
-            pre_output.updated_input
-            if pre_output.updated_input is not None
-            else pre_input.tool_input
-        )
+        post_hook_args = decided_tool_input(pre_input, pre_output)
         if _capture is not None:
             _capture["effective_args"] = post_hook_args
 
@@ -2156,9 +2239,15 @@ class OrchestratorEngineMixin:
         # PRE_SUBAGENT_CALL already passed.
         inner_blocked = evaluate_blocking_decision(inner_pre_output)
         if inner_blocked is not None:
+            # The breadcrumb and the completion hook both report what this
+            # chain refused, not what the outer PRE_SUBAGENT_CALL chain
+            # allowed: a redaction made before the refusal stays made (#3953).
+            refused_args = decided_tool_input(inner_pre, inner_pre_output)
+            if _capture is not None:
+                _capture["effective_args"] = refused_args
             await self._fire_post_subagent_hook(
                 session_id=session_id, tool_name=tool_name,
-                feature_name=feature_name, effective_args=effective_args,
+                feature_name=feature_name, effective_args=refused_args,
                 result=inner_blocked.envelope,
                 exec_duration_ms=0,
             )
@@ -2166,11 +2255,7 @@ class OrchestratorEngineMixin:
         # Honor inner-MODIFY rewrites for the same reason the outer
         # hook does — a PRE_TOOL_USE redactor on subagent args must
         # apply to the call that actually runs.
-        inner_effective = (
-            inner_pre_output.updated_input
-            if inner_pre_output.updated_input is not None
-            else inner_pre.tool_input
-        )
+        inner_effective = decided_tool_input(inner_pre, inner_pre_output)
         if isinstance(inner_effective, dict):
             task = inner_effective.get("task", task)
             context = inner_effective.get("context", context)
@@ -2817,11 +2902,17 @@ class OrchestratorEngineMixin:
                 content_log_summary(str(reason)),
             )
             result = blocked.envelope
+            _record_refused_tool_arguments(
+                dispatch_meta,
+                decided_tool_input(subagent_hook_input, subagent_hook_output),
+            )
             if dispatch_meta is not None:
+                # ``a2a_tool_dispatches.result_status`` has no approval
+                # status, and the writer swallows a CHECK failure: an ASK is
+                # a ``policy_denied`` row its ``error_class`` names, or no
+                # row at all (#3953).
                 dispatch_meta.update({
-                    "status": (
-                        "approval_required" if blocked.is_ask else "policy_denied"
-                    ),
+                    "status": "policy_denied",
                     "error_class": (
                         "ApprovalRequired" if blocked.is_ask else "PermissionDenied"
                     ),
@@ -2868,6 +2959,15 @@ class OrchestratorEngineMixin:
             self._register_explored_feature_tools(f)
             return r
 
+        # What the PRE_TOOL_USE chain refused, if it refuses: the dispatch row
+        # and the completion hook report it rather than ``args``, on the error
+        # path too, where a failed response write sends a refused call (#3953).
+        refused: Dict[str, Any] = {}
+
+        def _on_refused(arguments):
+            refused["arguments"] = arguments
+            _record_refused_tool_arguments(dispatch_meta, arguments)
+
         try:
             result = await self._execute_tool_with_hooks(
                 tool_name=tool_name,
@@ -2879,6 +2979,7 @@ class OrchestratorEngineMixin:
                 on_audited=lambda status: _mark_tool_dispatch_audited(
                     dispatch_meta, status=status,
                 ),
+                on_refused=_on_refused,
             )
             # #2641: parts the subagent's tools produced ride the result
             # envelope; ``_execute_tool_with_hooks`` re-emitted them into this
@@ -2899,7 +3000,7 @@ class OrchestratorEngineMixin:
                 session_id=session_id,
                 hook_event_name=HookEvent.POST_SUBAGENT_CALL.value,
                 tool_name=tool_name,
-                tool_input=args,
+                tool_input=refused.get("arguments", args),
                 feature_name=hook_feature_name,
                 tool_response=result if isinstance(result, dict) else {"result": str(result)},
                 execution_time_ms=dispatch_duration,
@@ -2918,16 +3019,17 @@ class OrchestratorEngineMixin:
         except (ConnectionError, TimeoutError, ValueError, KeyError, TypeError, AttributeError) as e:
             _raise_terminal_tool_error(e, dispatch_meta)
             return await self._handle_feature_error(
-                e, tool_name, hook_feature_name, args, dispatch_start,
-                dispatch_event_id, tool_events=tool_events, streaming=streaming,
-                session_id=session_id, dispatch_meta=dispatch_meta,
+                e, tool_name, hook_feature_name, refused.get("arguments", args),
+                dispatch_start, dispatch_event_id, tool_events=tool_events,
+                streaming=streaming, session_id=session_id,
+                dispatch_meta=dispatch_meta,
             )
         except Exception as e:
             _raise_terminal_tool_error(e, dispatch_meta)
             return await self._handle_feature_error(
-                e, tool_name, hook_feature_name, args, dispatch_start,
-                dispatch_event_id, tool_events=tool_events, streaming=streaming,
-                log_traceback=True, session_id=session_id,
+                e, tool_name, hook_feature_name, refused.get("arguments", args),
+                dispatch_start, dispatch_event_id, tool_events=tool_events,
+                streaming=streaming, log_traceback=True, session_id=session_id,
                 dispatch_meta=dispatch_meta,
             )
 
@@ -3166,7 +3268,7 @@ class OrchestratorEngineMixin:
             execution.returned = True
             return result
 
-        try:
+        async def run():
             result = await self._execute_tool_with_hooks(
                 tool_name=tool_name,
                 feature_name=hook_feature_name,
@@ -3177,6 +3279,9 @@ class OrchestratorEngineMixin:
                                else OrchestratorEngineMixin._tool_call_adapter(self, tool_name, {})),
                 on_audited=lambda status: _mark_tool_dispatch_audited(
                     dispatch_meta, execution, status=status,
+                ),
+                on_refused=lambda arguments: _record_refused_tool_arguments(
+                    dispatch_meta, arguments, execution,
                 ),
                 **({"prepare_args": _prepare_bound_arguments} if bound_tool is not None else {}),
             )
@@ -3199,19 +3304,16 @@ class OrchestratorEngineMixin:
             if streaming and tool_events is not None:
                 tool_events.append({'type': 'complete', 'tool': tool_name, 'ms': dispatch_duration})
             return result
-        except Exception as e:
-            _raise_terminal_tool_error(e, dispatch_meta)
+
+        async def failed(e, unknown):
             logging.error(
                 "[DIRECT-TOOL] %s failed: %s", tool_name, exception_log_summary(e),
             )
-            if (
-                execution.returned
-                or (execution.started and not isinstance(e, ResourceConflict))
-            ):
+            if unknown:
                 dispatch_meta["outcome_unknown"] = True
                 dispatch_meta["outcome_error"] = e
                 return await _failed(
-                    "Tool outcome is unconfirmed; reconcile before retrying",
+                    TOOL_OUTCOME_UNCONFIRMED,
                     error_class="ResourceOutcomeUnknown", status="error",
                 )
             return await _failed(
@@ -3219,6 +3321,11 @@ class OrchestratorEngineMixin:
                 error_class=type(e).__name__,
                 status="timeout" if isinstance(e, TimeoutError) else "error",
             )
+
+        return await _run_tool_execution(
+            self, run, execution=execution, dispatch_meta=dispatch_meta,
+            session_id=session_id, on_failure=failed,
+        )
 
     # ------------------------------------------------------------------
     # Tool concurrency batching

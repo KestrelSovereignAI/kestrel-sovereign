@@ -355,7 +355,10 @@ def mark_current_invocation_effect_completed(
     *,
     checkpoint: InvocationEffectCheckpoint | None = None,
 ) -> None:
-    """Record that this turn completed an externally visible tool effect."""
+    """Record anti-repeat evidence for a returned or unconfirmed tool operation.
+
+    This does not assert business success or a known external effect.
+    """
 
     state = checkpoint or _current_effect_checkpoint.get()
     if state is not None:

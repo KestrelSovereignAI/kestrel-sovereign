@@ -319,11 +319,28 @@ The context identifies the destination; authenticated View controllers still
 authorize readers and tool calls independently. It does not confirm delivery:
 later response policy can withhold the rendered parts.
 
+MCP tool hosts additionally require `supports_unconfirmed_tool_outcomes is True`
+(Core 0.62.2 or newer). This declares unknown-outcome handling for registry-mounted
+tools across model, named, inline and bound dispatch. The execution engine supplies
+the contract; registration alone does not establish it. Unexpected failures after
+execution starts preserve uncertainty, and an unconfirmed required audit terminates
+delivery and automatic route fallback. The MCP feature refuses hosts without this
+exact-True capability before connection acquisition or Apps/OAuth enablement.
+Other SDK-only hosts must implement the same contract. It is independent of caller
+authority and permission checks and does not authorize a retry.
+
 A local A2A skill whose execution met a `ResourceOutcomeUnknown` marks its
 task with `outcome_unknown: true` metadata (#3946). That covers a skill raising
 it, a Core or SDK `@tool` wrapper that returns it to a model as an ordinary
 failure, a feature subagent's tool step, failure envelope or inline tool
 executor doing the same, and a required write that fails after the tool ran.
+Each of them reads an error the same way (`observed_outcome_unknown`): the
+error itself, an explicit cause or an exception-group member counts, so a
+skill that runs its effects in an `asyncio.TaskGroup` is flagged too. Implicit
+handling context does not count.
+The skill's capture is carried with the turn's scope, so a tool its transport
+runs on a task that predates the skill (the codex app-server's reader) reports
+to it too.
 The flag depends only on what the execution observed, at any depth, never on
 the task's state, which keeps its own message and artifacts: a workflow with
 one uncertain step and one that succeeded completes with a partial result and

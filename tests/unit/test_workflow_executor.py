@@ -1,5 +1,6 @@
 """Workflows execute real decorated tools through native primary task storage."""
 
+import asyncio
 import inspect
 import json
 from types import SimpleNamespace
@@ -18,11 +19,12 @@ from kestrel_sovereign.a2a.lifecycle import (
 )
 from kestrel_sovereign.a2a.projections import embedded_json_value, message_text
 from kestrel_sovereign.execution_custody import ExecutionAuthorityError
-from kestrel_sovereign.features.base import Feature, tool
+from kestrel_sovereign.features.base import Feature, observed_outcome_unknown, tool
 from kestrel_sovereign.features.subagent_dispatch import ensure_subagent_dispatch
 from kestrel_sovereign.features.tasks.feature import TaskFeature
 from kestrel_sovereign.storage.db.interface import QueryError
 from tests.unit.test_a2a_native_task_manager import manager as manager  # noqa: PLC0414
+from tests.utils.codex_inline import PreTurnReader
 
 
 class WorkflowProvider(Feature):
@@ -602,6 +604,166 @@ async def test_an_unknown_outcome_raised_to_the_workflow_is_not_retried(
     assert record["attempts"] == 2 and record["error"] == UNKNOWN
 
 
+async def raise_unknown_from_a_task_group(_attempt):
+    """Run the effect concurrently, so its unknown outcome arrives grouped."""
+
+    async def uncertain():
+        raise ResourceOutcomeUnknown(UNKNOWN)
+
+    async with asyncio.TaskGroup() as group:
+        group.create_task(uncertain())
+
+
+def raise_unknown_in_a_nested_group(_attempt):
+    raise ExceptionGroup(
+        "Effects failed",
+        [
+            OSError("Other effect unavailable"),
+            ExceptionGroup("Effect failed", [ResourceOutcomeUnknown(UNKNOWN)]),
+        ],
+    )
+
+
+def raise_unknown_as_a_cause(_attempt):
+    raise RuntimeError("Effect publication failed") from ResourceOutcomeUnknown(
+        UNKNOWN
+    )
+
+
+async def raise_unavailable_from_a_task_group(_attempt):
+    async def unavailable():
+        raise OSError("Effect storage unavailable")
+
+    async with asyncio.TaskGroup() as group:
+        group.create_task(unavailable())
+
+
+# An unknown outcome another error carries, and that error's own text.
+CARRIED_UNKNOWN_OUTCOMES = [
+    (raise_unknown_from_a_task_group, "unhandled errors in a TaskGroup (1 sub-exception)"),
+    (raise_unknown_in_a_nested_group, "Effects failed (2 sub-exceptions)"),
+    (raise_unknown_as_a_cause, "Effect publication failed"),
+]
+
+
+@pytest.mark.parametrize("effect", EVERY_SKILL_FORM, ids=skill_form_id, indirect=True)
+@pytest.mark.parametrize(
+    "supplier, text", CARRIED_UNKNOWN_OUTCOMES,
+    ids=["task-group", "nested-group", "cause"],
+)
+async def test_an_unknown_outcome_another_error_carries_is_never_retried(
+    task_feature, effect, manager, supplier, text
+):
+    # A skill running its effects in an asyncio.TaskGroup raises an
+    # ExceptionGroup; one wrapping its effect's error names it as the cause.
+    effect.supplier = supplier
+    result = await task_feature.run_workflow([effect_step(max_retries=2)])
+    assert effect.calls == 1
+    [record] = result.data["results"]
+    assert record["status"] == "failed" and record["outcome_unknown"] is True
+    assert record["attempts"] == 1 and record["error"] == text
+    # The receipt keeps the carrying error's own message.
+    [task] = await stored_tasks(manager)
+    assert task.status.state == TaskState.TASK_STATE_FAILED
+    assert message_text(task.status.message) == text
+    assert task_outcome_unknown(task)
+
+
+@pytest.mark.parametrize("effect", EVERY_SKILL_FORM, ids=skill_form_id, indirect=True)
+async def test_an_ordinary_exception_group_is_still_retried(
+    task_feature, effect, manager
+):
+    effect.supplier = raise_unavailable_from_a_task_group
+    result = await task_feature.run_workflow([effect_step(max_retries=2)])
+    assert effect.calls == 3
+    [record] = result.data["results"]
+    assert record["status"] == "failed" and record["attempts"] == 3
+    assert "outcome_unknown" not in record
+    assert not any(task_outcome_unknown(task) for task in await stored_tasks(manager))
+
+
+@pytest.mark.parametrize(
+    "effect",
+    [
+        (base, form)
+        for base in ("core-feature", "sdk-feature")
+        for form in ("decorated", "plain-decorated")
+    ],
+    ids=skill_form_id,
+    indirect=True,
+)
+async def test_a_grouped_unknown_outcome_reaches_a_model_unchanged(effect):
+    effect.supplier = raise_unknown_in_a_nested_group
+    [skill] = effect.get_tools()
+    assert await skill.execute() == {
+        "success": False,
+        "error": "Effects failed (2 sub-exceptions)",
+        "tool": "apply_effect",
+    }
+    assert effect.calls == 1
+
+
+async def test_a_grouped_unknown_outcome_raised_to_the_workflow_is_not_retried(
+    task_feature, manager, monkeypatch
+):
+    calls = []
+
+    async def execute_skill(**kwargs):
+        calls.append(kwargs)
+        raise ExceptionGroup(
+            "Task execution failed", [ResourceOutcomeUnknown(UNKNOWN)]
+        )
+
+    monkeypatch.setattr(manager, "execute_skill", execute_skill)
+    result = await task_feature.run_workflow(
+        [
+            {
+                "feature": "memory_feature",
+                "skill": "memory_status",
+                "max_retries": 2,
+                "retry_delay_ms": 0,
+            }
+        ]
+    )
+    assert len(calls) == 1
+    [record] = result.data["results"]
+    assert record["status"] == "failed" and record["outcome_unknown"] is True
+    assert record["attempts"] == 1
+    assert record["error"] == "Task execution failed (1 sub-exception)"
+
+
+def test_an_unknown_outcome_is_read_from_the_explicit_error_graph():
+    bare = ResourceOutcomeUnknown(UNKNOWN)
+    assert observed_outcome_unknown(bare) == (bare,)
+
+    member = ResourceOutcomeUnknown(UNKNOWN)
+    grouped = ExceptionGroup(
+        "outer", [OSError("other"), ExceptionGroup("inner", [member])]
+    )
+    assert observed_outcome_unknown(grouped) == (member,)
+
+    cause = ResourceOutcomeUnknown(UNKNOWN)
+    wrapper = RuntimeError("wrapper")
+    wrapper.__cause__ = cause
+    assert observed_outcome_unknown(wrapper) == (cause,)
+
+    # Implicit handling context is not evidence, as for every execution
+    # classifier: only an explicit cause or group member counts.
+    try:
+        try:
+            raise ResourceOutcomeUnknown(UNKNOWN)
+        except ResourceOutcomeUnknown:
+            raise OSError("cleanup failed")
+    except OSError as error:
+        handled = error
+    assert isinstance(handled.__context__, ResourceOutcomeUnknown)
+    assert observed_outcome_unknown(handled) == ()
+
+    assert observed_outcome_unknown(ExceptionGroup("ordinary", [OSError("x")])) == ()
+    assert observed_outcome_unknown(OSError("ordinary")) == ()
+    assert observed_outcome_unknown(None) == ()
+
+
 class PlainValueProvider(SDKFeature):
     tool_description = "Reads a value"
 
@@ -1095,6 +1257,130 @@ async def test_a_subagent_tool_steps_ordinary_failure_is_still_retried(
     assert record["status"] == "failed" and record["attempts"] == 3
     assert "outcome_unknown" not in record
     assert not any(task_outcome_unknown(task) for task in await stored_tasks(manager))
+
+
+async def test_a_subagent_tool_step_carries_a_grouped_unknown_outcome(
+    task_feature, delegating, manager
+):
+    delegating.supplier = raise_unknown_from_a_task_group
+    result = await task_feature.run_workflow([delegating_step(max_retries=2)])
+    assert delegating.calls == 1
+    [record] = result.data["results"]
+    assert record["status"] == "failed" and record["outcome_unknown"] is True
+    assert record["attempts"] == 1
+    [task] = await stored_tasks(manager)
+    assert task_outcome_unknown(task)
+
+
+class CodexSubagentRunner(Feature):
+    """A skill whose feature subagent is a codex turn.
+
+    It builds the effect feature's inline tool executor on its own task, and
+    the codex reader runs it on a task that predates the skill, returning a
+    flattened failure as the subagent's model would see it.
+    """
+
+    tool_description = "Runs the effect tool as a codex subagent turn does"
+
+    async def initialize(self):
+        pass
+
+    @tool(name="run_on_reader", description="Run the effect tool on the codex reader")
+    async def run_on_reader(self) -> dict:
+        executor = self.effect._make_feature_inline_tool_executor(parts_sink=None)
+        return await self.reader.call(executor, "apply_effect")
+
+
+@pytest.fixture
+async def codex_runner(manager, effect):
+    """The runner, with a codex reader started before any skill runs."""
+    agent = SimpleNamespace(
+        did=manager.did, task_manager=manager, _execution_custody=None
+    )
+    runner = CodexSubagentRunner(agent)
+    runner.name = "codex_runner"
+    runner.effect = effect
+    runner.reader = PreTurnReader()
+    await runner.reader.start()
+    manager.register_provider("codex_runner", runner.get_agent_skills(), runner)
+    try:
+        yield runner
+    finally:
+        await runner.reader.stop()
+
+
+def codex_runner_step(max_retries):
+    return {
+        "feature": "codex_runner",
+        "skill": "run_on_reader",
+        "max_retries": max_retries,
+        "retry_delay_ms": 0,
+    }
+
+
+@pytest.mark.parametrize("effect", EVERY_SKILL_FORM, ids=skill_form_id, indirect=True)
+@pytest.mark.parametrize("persisted", [True, False], ids=["recorded", "write-failed"])
+async def test_an_unknown_outcome_flattened_on_a_codex_reader_is_never_rerun(
+    task_feature, effect, codex_runner, manager, monkeypatch, persisted
+):
+    # The effect's tool wrapper or the subagent's tool step flattens the
+    # unknown outcome on the reader's task. Only the turn's scope carries the
+    # runner's capture there.
+    effect.supplier = raise_unknown
+    if not persisted:
+        reject_failed_task_writes(manager, monkeypatch)
+    result = await task_feature.run_workflow([codex_runner_step(max_retries=2)])
+    assert effect.calls == 1
+    [record] = result.data["results"]
+    assert record["status"] == "failed" and record["outcome_unknown"] is True
+    assert record["attempts"] == 1 and UNKNOWN in record["error"]
+
+
+@pytest.mark.parametrize("effect", EVERY_SKILL_FORM, ids=skill_form_id, indirect=True)
+async def test_an_ordinary_failure_flattened_on_a_codex_reader_is_still_retried(
+    task_feature, effect, codex_runner, manager
+):
+    effect.supplier = raise_unavailable
+    result = await task_feature.run_workflow([codex_runner_step(max_retries=2)])
+    assert effect.calls == 3
+    [record] = result.data["results"]
+    assert record["status"] == "failed" and record["attempts"] == 3
+    assert "outcome_unknown" not in record
+    assert not any(task_outcome_unknown(task) for task in await stored_tasks(manager))
+
+
+@pytest.mark.parametrize(
+    "effect",
+    [("core-feature", "decorated"), ("sdk-feature", "decorated")],
+    ids=skill_form_id,
+    indirect=True,
+)
+@pytest.mark.parametrize(
+    "member, retried",
+    [(lambda: ResourceOutcomeUnknown(UNKNOWN), False),
+     (lambda: OSError("Effect storage unavailable"), True)],
+    ids=["unknown", "ordinary"],
+)
+async def test_the_inline_executor_reports_a_grouped_unknown_outcome(
+    task_feature, effect, codex_runner, manager, monkeypatch, member, retried
+):
+    # The subagent's tool step itself raises, grouped, to the executor, and
+    # the codex handler returns that error to the model as an ordinary failure.
+    async def subagent_step(**_kwargs):
+        effect.calls += 1
+        raise ExceptionGroup("Subagent step failed", [member()])
+
+    monkeypatch.setattr(effect, "_execute_subagent_tool", subagent_step)
+    result = await task_feature.run_workflow([codex_runner_step(max_retries=2)])
+    [record] = result.data["results"]
+    assert record["status"] == "failed"
+    assert record["error"] == "Subagent step failed (1 sub-exception)"
+    if retried:
+        assert effect.calls == 3 and record["attempts"] == 3
+        assert "outcome_unknown" not in record
+    else:
+        assert effect.calls == 1 and record["attempts"] == 1
+        assert record["outcome_unknown"] is True
 
 
 @pytest.mark.parametrize(

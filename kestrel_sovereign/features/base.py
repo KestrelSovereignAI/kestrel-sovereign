@@ -59,6 +59,7 @@ from kestrel_sdk.resources import ResourceOutcomeUnknown
 
 from kestrel_sovereign.execution_custody import (
     ExecutionAuthorityError,
+    execution_evidence_carriers,
     execution_work_operation,
     is_execution_control_error,
     require_execution_work,
@@ -73,6 +74,7 @@ from kestrel_sovereign.turn_completion import (
     settle_repaired_content,
     turn_completion_repair_prompt,
 )
+from kestrel_sovereign.turn_scope import capture_turn_scope, turn_scoped
 
 logger = logging.getLogger(__name__)
 
@@ -93,17 +95,64 @@ SUBAGENT_CONTEXT_FRACTION = 0.85
 # Every ResourceOutcomeUnknown turned into an ordinary result while
 # ``handle_task`` runs a skill (#3946). The result stays what a model has always
 # seen; only the task boundary learns the skill may already have acted. Bound
-# by ``handle_task`` alone, unbound (None) everywhere else. Every boundary that
-# flattens one reports it through ``report_flattened_outcome_unknown``.
+# by ``handle_task`` and carried with the turn's scope (below), unbound (None)
+# everywhere else. Every boundary that flattens one reports it through
+# ``report_flattened_outcome_unknown``.
 _flattened_outcome_unknown: ContextVar[list[ResourceOutcomeUnknown] | None] = (
     ContextVar("kestrel_flattened_outcome_unknown", default=None)
 )
 
 
+@contextlib.contextmanager
+def _bind_flattened_outcome_unknown(
+    flattened: list[ResourceOutcomeUnknown] | None,
+):
+    """Report into ``flattened`` for the block (``None``: into no task)."""
+    token = _flattened_outcome_unknown.set(flattened)
+    try:
+        yield
+    finally:
+        _flattened_outcome_unknown.reset(token)
+
+
+# A skill's tools can run on a task that holds none of its context: the codex
+# app-server runs a feature subagent's inline tools on its reader's tasks. The
+# skill's capture follows them there like the rest of the turn's state, so an
+# unknown outcome flattened on that task still reaches its ``handle_task``. An
+# executor built outside one carries None, and reports reach no task.
+turn_scoped(
+    "flattened_outcome_unknown",
+    variables=(_flattened_outcome_unknown,),
+    capture=lambda _agent: _flattened_outcome_unknown.get(),
+    bind=_bind_flattened_outcome_unknown,
+)
+
+
+def observed_outcome_unknown(
+    error: BaseException | None,
+) -> tuple[ResourceOutcomeUnknown, ...]:
+    """Every ``ResourceOutcomeUnknown`` ``error`` carries, each once.
+
+    The error itself, an explicit cause, or a member of an exception group,
+    at any depth: the explicit graph every execution classifier reads
+    (``execution_evidence_carriers``). ``asyncio.TaskGroup`` raises a child's
+    error inside an ``ExceptionGroup``, so a skill that runs its effects
+    concurrently surfaces an unknown outcome only as a member. Implicit
+    handling context is not evidence. The one test every #3946 boundary
+    applies to an error, so a grouped or chained unknown outcome marks its
+    task like a bare one, and an error carrying none is an ordinary failure.
+    """
+    return tuple(
+        carrier for carrier in execution_evidence_carriers(error)
+        if isinstance(carrier, ResourceOutcomeUnknown)
+    )
+
+
 def report_flattened_outcome_unknown(error: BaseException) -> None:
     """Tell the A2A skill running now that it flattened an unknown outcome.
 
-    A tool boundary that returns a ``ResourceOutcomeUnknown`` as an ordinary
+    A tool boundary that returns an error carrying a
+    ``ResourceOutcomeUnknown`` (``observed_outcome_unknown``) as an ordinary
     result calls this with the error, so ``handle_task`` marks its task
     ``outcome_unknown``, whatever state it ends in, and no caller runs the
     skill again (#3946). The reporters are this module's @tool wrapper, the
@@ -113,12 +162,13 @@ def report_flattened_outcome_unknown(error: BaseException) -> None:
     to the model), and a workflow with a step whose task carries the flag,
     whatever that step's status. A skill run as a task inside another skill
     passes what it observed to that skill's task itself, whatever that skill
-    returns. A no-op outside ``handle_task`` and for any other error, so a
-    model-facing call is unchanged.
+    returns. A tool its transport runs on another task reports there through
+    the turn's scope. A no-op outside ``handle_task`` and for an error that
+    carries none, so a model-facing call is unchanged.
     """
     flattened = _flattened_outcome_unknown.get()
-    if flattened is not None and isinstance(error, ResourceOutcomeUnknown):
-        flattened.append(error)
+    if flattened is not None:
+        flattened.extend(observed_outcome_unknown(error))
 
 
 class SubagentContextBudgetExceeded(RuntimeError):
@@ -1481,9 +1531,7 @@ class Feature(_SdkFeature):
         enclosing = _flattened_outcome_unknown.get()
 
         def settle_outcome(raised: BaseException | None = None) -> None:
-            observed = list(flattened)
-            if isinstance(raised, ResourceOutcomeUnknown):
-                observed.append(raised)
+            observed = [*flattened, *observed_outcome_unknown(raised)]
             if not observed:
                 return
             mark_outcome_unknown(task)
@@ -1492,11 +1540,8 @@ class Feature(_SdkFeature):
 
         try:
             exec_start = time.time()
-            witness = _flattened_outcome_unknown.set(flattened)
-            try:
+            with _bind_flattened_outcome_unknown(flattened):
                 result = await selected.execute(**args)
-            finally:
-                _flattened_outcome_unknown.reset(witness)
             if isinstance(result, DeferredToolResult):
                 # An A2A task has no chat, so its publication is headless. The
                 # artifact carries only the completed public result.
@@ -1947,8 +1992,6 @@ class Feature(_SdkFeature):
         built outside a live turn captures an explicit unbound value, so it
         grants nothing to unrelated background work.
         """
-        from kestrel_sovereign.turn_scope import capture_turn_scope
-
         turn_scope = capture_turn_scope(self.agent)
 
         async def _exec(name: str, args: Dict[str, Any]):
@@ -1965,10 +2008,11 @@ class Feature(_SdkFeature):
                         parts_sink=parts_sink,
                         session_id=session_id,
                     )
-                except ResourceOutcomeUnknown as error:
+                except Exception as error:
                     # The adapter running this executor returns what it raises
                     # to the model as an ordinary tool failure (the Codex
-                    # inline handler), so report it first (#3946).
+                    # inline handler), so report an unknown outcome it carries
+                    # first (#3946). Any error propagates unchanged.
                     report_flattened_outcome_unknown(error)
                     raise
                 require_execution_work(self.agent)

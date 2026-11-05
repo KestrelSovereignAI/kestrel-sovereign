@@ -23,10 +23,9 @@ from kestrel_sovereign.agent.parts import (
 from kestrel_sovereign.agent.tool_registry import ToolRegistryMixin
 from kestrel_sovereign.hooks.manager import HooksManager
 from kestrel_sovereign.features.base import Feature as CoreFeature
-from kestrel_sovereign.execution_custody import (
-    ExecutionAuthorityError, is_execution_control_error,
-)
+from kestrel_sovereign.execution_custody import ExecutionAuthorityError
 from kestrel_sovereign.storage.db.sqlite import SQLiteBackend
+from tests.utils.codex_inline import PreTurnReader, codex_inline_failure
 
 # Native data a factory retains privately; it must never reach a public result.
 PRIVATE_NATIVE_SENTINEL = "private-native-retained-sentinel"
@@ -896,24 +895,29 @@ class ScriptedSubagentModel:
 
     ``inline`` runs the call through the subagent's tool executor, as the
     codex app-server does; otherwise the subagent's own tool loop runs it.
-    ``flatten_errors`` returns an error the executor raises to the model as an
-    ordinary tool failure, as the codex inline handler does.
+    ``flatten_errors`` handles an error the executor raises as the codex inline
+    handler does (``codex_inline_failure``). ``reader`` runs the executor on
+    that reader's tasks instead of the calling one.
     ``seen`` is each tool result exactly as the model received it.
     """
 
     def __init__(self, tool_name, *, inline):
         self.tool_name, self.inline = tool_name, inline
         self.flatten_errors = False
+        self.reader = None
         self.seen = []
 
     async def generate(self, *, tool_executor=None, **kwargs):
         if self.inline:
-            try:
-                _, result = await tool_executor(self.tool_name, {})
-            except Exception as error:
-                if not self.flatten_errors or is_execution_control_error(error):
-                    raise
-                result = {"success": False, "error": f"{error}"}
+            if self.reader is not None:
+                result = await self.reader.call(tool_executor, self.tool_name)
+            else:
+                try:
+                    _, result = await tool_executor(self.tool_name, {})
+                except Exception as error:
+                    if not self.flatten_errors:
+                        raise
+                    result = codex_inline_failure(error)
             self.seen.append(json.loads(json.dumps(result)))
             return "Subagent finished."
         return LLMResponse(content="", tool_calls=[
@@ -1153,7 +1157,7 @@ async def test_route_publication_waits_for_its_required_dispatch_row(route, monk
 
 async def test_route_audit_failure_withholds_the_ui_and_is_not_replayable(route, monkeypatch):
     from kestrel_sovereign.a2a.projections import message_text
-    from kestrel_sovereign.agent.orchestrator_engine import _DeferredToolAuditError
+    from kestrel_sovereign.execution_custody import ToolAuditUnconfirmedError
 
     step_errors = []
     if route.kind != "a2a":
@@ -1181,7 +1185,7 @@ async def test_route_audit_failure_withholds_the_ui_and_is_not_replayable(route,
     else:
         # The step raises exactly what the chat boundary raises.
         [error] = step_errors
-        assert type(error) is _DeferredToolAuditError
+        assert type(error) is ToolAuditUnconfirmedError
         assert "Do not replay" in str(error)
     assert route.tool.executions == [{}] and route.tool.publications == []
     _assert_spent(route.tool)
@@ -1216,16 +1220,17 @@ SUBAGENT_RUNNER = "subagent-runner"
 
 
 @pytest.mark.parametrize(
-    "route, transport_flattens",
+    "route, transport",
     [
         pytest.param(
-            (kind, base), flattens,
-            id=f"{kind}-{base}" + ("-flattening-transport" if flattens else ""),
+            (kind, base), transport,
+            id=f"{kind}-{base}" + (f"-{transport}-transport" if transport else ""),
         )
-        for kind, flattens in (
-            ("subagent-loop", False),
-            ("subagent-inline", False),
-            ("subagent-inline", True),
+        for kind, transport in (
+            ("subagent-loop", None),
+            ("subagent-inline", None),
+            ("subagent-inline", "codex"),
+            ("subagent-inline", "codex-pre-turn-reader"),
         )
         for base in ("core-feature", "sdk-feature")
     ],
@@ -1233,12 +1238,13 @@ SUBAGENT_RUNNER = "subagent-runner"
 )
 @pytest.mark.parametrize("persisted", [True, False], ids=["recorded", "write-failed"])
 async def test_workflow_never_reruns_a_skill_whose_subagent_audit_failed(
-    route, tmp_path, monkeypatch, transport_flattens, persisted
+    route, tmp_path, monkeypatch, transport, persisted
 ):
     # #3946: a skill runs a feature's subagent, whose deferred tool completed
-    # but whose required audit failed. Its error reaches the subagent's model
-    # as an ordinary failure, from its executor's transport or from the
-    # subagent's own failure envelope; the skill's task must still carry it.
+    # but whose required audit failed. It reaches the skill as the subagent's
+    # failure envelope, also when the codex transport ends the subagent's turn
+    # with it from a reader task that predates the skill; the skill's task
+    # must carry it either way.
     from types import SimpleNamespace
 
     from kestrel_sdk.native_a2a.types import AgentSkill
@@ -1258,7 +1264,7 @@ async def test_workflow_never_reruns_a_skill_whose_subagent_audit_failed(
         async def run_subagent(self):
             return await route.feature.execute_as_subagent(task="Render the owned view")
 
-    route.model.flatten_errors = transport_flattens
+    route.model.flatten_errors = transport == "codex"
     runner = SubagentRunner(route.host)
     tasks_db = SQLiteBackend(str(tmp_path / "subagent-runner-tasks.db"))
     await tasks_db.connect()
@@ -1276,6 +1282,9 @@ async def test_workflow_never_reruns_a_skill_whose_subagent_audit_failed(
     workflow.set_task_manager(manager)
     route.policy.release.set()
     await route.backend.execute("DROP TABLE a2a_tool_dispatches")
+    if transport == "codex-pre-turn-reader":
+        route.model.reader = PreTurnReader()
+        await route.model.reader.start()
     try:
         result = await workflow.run_workflow([{
             "feature": SUBAGENT_RUNNER, "skill": "run_subagent",
@@ -1283,13 +1292,15 @@ async def test_workflow_never_reruns_a_skill_whose_subagent_audit_failed(
         }])
     finally:
         await manager.close()
+        if route.model.reader is not None:
+            await route.model.reader.stop()
     assert route.tool.executions == [{}] and route.tool.publications == []
     [record] = result.data["results"]
     assert record["outcome_unknown"] is True and record["attempts"] == 1
-    # The subagent's model saw an ordinary failure, unchanged.
-    if transport_flattens:
-        [seen] = route.model.seen
-        assert seen["success"] is False and "Do not replay" in seen["error"]
+    # The codex transport ends the subagent's turn with the failed audit
+    # instead of showing it to the model.
+    if transport is not None:
+        assert route.model.seen == []
 
 
 async def test_route_publication_failure_reports_without_failing_or_replaying(route):

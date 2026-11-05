@@ -69,6 +69,8 @@ from kestrel_sdk.llm import (
 )
 from pydantic import BaseModel
 
+from kestrel_sovereign.logging_config import exception_log_summary
+from kestrel_sovereign.tools.execution_outcome import _HostToolFailure
 from kestrel_sovereign._async_ownership import await_owned_task
 from kestrel_sovereign.execution_custody import (
     execution_terminal_error,
@@ -720,6 +722,15 @@ def _result_to_codex_response(
     rendered block so the LLM still has the original wording for
     debugging context.
     """
+    if isinstance(result, _HostToolFailure):
+        return {
+            "contentItems": [{"type": "inputText", "text": (
+                f"Tool failed.\nOutcome: {result.outcome}\n"
+                "Evidence: host execution boundary\n"
+                "Recovery: " + result.message
+            )}],
+            "success": False,
+        }
     # ToolResult (#1061): kestrel's standard envelope. After PR-E
     # every in-tree @tool returns one — the legacy ``{success: bool}``
     # dict path is the EXCEPTION now, not the rule. Catch ToolResult
@@ -2085,11 +2096,11 @@ class CodexAdapter(LLMAdapter):
                 ret = await executor(name, args)
             except Exception as e:
                 from kestrel_sovereign.execution_custody import (
-                    is_execution_control_error,
+                    is_tool_execution_terminal_error,
                 )
-                if is_execution_control_error(e):
+                if is_tool_execution_terminal_error(e):
                     raise
-                logger.warning("tool_executor(%s) raised: %s", name, e)
+                logger.warning("tool_executor(%s) raised: %s", name, exception_log_summary(e))
                 err_result = {"success": False, "error": f"{e}"}
                 # Failed inline tool calls must remain observable —
                 # mirrors the orchestrator-dispatched path, which
@@ -2159,28 +2170,28 @@ class CodexAdapter(LLMAdapter):
                 tool_name=name,
                 recent_decisions=(
                     await self._recent_security_decisions()
-                    if is_failure
+                    if is_failure and not isinstance(result, _HostToolFailure)
                     else None
                 ),
             )
 
-        control_error: BaseException | None = None
+        terminal_error: BaseException | None = None
 
         async def handler(params: Dict[str, Any]) -> Dict[str, Any]:
-            nonlocal control_error
+            nonlocal terminal_error
             task = asyncio.current_task()
             if active_handlers is not None and task is not None:
                 active_handlers.add(task)
             try:
-                if control_error is not None:
-                    raise control_error
+                if terminal_error is not None:
+                    raise terminal_error
                 return await _handle(params)
             except BaseException as error:
                 from kestrel_sovereign.execution_custody import (
-                    is_execution_control_error,
+                    is_tool_execution_terminal_error,
                 )
-                if is_execution_control_error(error):
-                    control_error = error
+                if is_tool_execution_terminal_error(error):
+                    terminal_error = error
                     # Reader dispatch deliberately turns this into a protocol
                     # error reply and a normal task return. The turn owner
                     # therefore needs evidence independent of its event sink.

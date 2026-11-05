@@ -26,9 +26,11 @@ regardless of which class they are attached to.
 The same subclass guards the feature's ``@tool`` methods. The SDK's @tool
 wrapper returns every non-control error as an ordinary failed result, so an A2A
 task could not tell that a skill raising ``ResourceOutcomeUnknown`` may already
-have acted, and a workflow would run it again (#3946). The guard reports that
-error to the running ``handle_task`` and re-raises it unchanged, so the
-wrapper's result, and everything a model sees, stay the same.
+have acted, and a workflow would run it again (#3946). The guard reports every
+error the method raises to the running ``handle_task``, which keeps one
+carrying an unknown outcome (itself, a cause or an exception-group member), and
+re-raises it unchanged, so the wrapper's result, and everything a model sees,
+stay the same.
 """
 
 from __future__ import annotations
@@ -36,8 +38,6 @@ from __future__ import annotations
 import functools
 import inspect
 from typing import Any, Callable, Type
-
-from kestrel_sdk.resources import ResourceOutcomeUnknown
 
 # The complete transitive closure of methods the subagent-dispatch loop needs
 # that the lean SDK Feature base does NOT provide. (``to_orchestrator_tool``,
@@ -74,14 +74,17 @@ def _outcome_reporting_tool(
     The wrapper keeps the method's name, signature, ``_tool_schema`` and kind
     (a coroutine function stays one, a plain function stays plain), so the
     SDK's ``get_tools`` advertises and coerces exactly as before and a direct
-    caller gets what it always got. An error the SDK wrapper re-raises as
-    control instead never yields a task to mark: ``handle_task`` propagates it.
+    caller gets what it always got. ``report`` keeps only an error that
+    carries an unknown outcome, whether bare, chained or grouped (a method
+    running its effects in an ``asyncio.TaskGroup`` raises an
+    ``ExceptionGroup``). An error the SDK wrapper re-raises as control instead
+    never yields a task to mark: ``handle_task`` propagates it.
     """
 
     async def reported(awaitable: Any) -> Any:
         try:
             return await awaitable
-        except ResourceOutcomeUnknown as error:
+        except Exception as error:
             report(error)
             raise
 
@@ -99,7 +102,7 @@ def _outcome_reporting_tool(
     def reporting(self: Any, *args: Any, **kwargs: Any) -> Any:
         try:
             result = method(self, *args, **kwargs)
-        except ResourceOutcomeUnknown as error:
+        except Exception as error:
             report(error)
             raise
         return reported(result) if inspect.isawaitable(result) else result
