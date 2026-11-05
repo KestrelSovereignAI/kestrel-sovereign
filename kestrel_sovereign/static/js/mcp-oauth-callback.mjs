@@ -45,13 +45,15 @@ export async function completeCallback(browser, loadApi) {
             method: 'POST', body: JSON.stringify(payload),
         }, true);
         status.textContent = 'Authorization response received. Return to Console to check the connection status.';
-        const link = browser.document.getElementById('oauth-return');
-        link.href = hint.returnTo;
-        link.hidden = false;
     } catch {
         // Callback parameters and upstream errors must never reach page text.
-        status.textContent = 'Authorization could not be completed. Restart from your Console tab; do not replay this callback.';
+        status.textContent = 'Authorization could not be completed. Return to Console to check the connection status; do not replay this callback.';
     }
+    // Navigation is always safe, including a missing or invalid routing hint.
+    // Never use callback parameters or an untrusted return target here.
+    const link = browser.document.getElementById('oauth-return');
+    link.href = '/';
+    link.hidden = false;
 }
 
 if (typeof window !== 'undefined') {

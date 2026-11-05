@@ -56,16 +56,25 @@ for (const [name, options] of [
         assert.equal(b.events[0][0], 'strip');
         assert.equal(b.events.some(event => ['import', 'post'].includes(event[0])), false);
         assert.equal(b.nodes['oauth-status'].textContent.includes('private-'), false);
-        assert.equal(b.nodes['oauth-return'].hidden, true);
+        assert.equal(b.nodes['oauth-return'].href, '/');
+        assert.equal(b.nodes['oauth-return'].hidden, false);
     });
 }
 
 test('never show upstream exception text or replay a failed callback', async () => {
     const b = boundary();
-    await completeCallback(b.browser, async () => ({ init: async () => {}, requestHost: async () => { throw Error('private-code'); } }));
+    let attempts = 0;
+    const load = async () => ({ init: async () => {}, requestHost: async () => {
+        attempts++;
+        throw Error('private-code');
+    } });
+    await completeCallback(b.browser, load);
+    await completeCallback(b.browser, load);
+    assert.equal(attempts, 1);
     assert.equal(b.storage.size, 0);
     assert.equal(b.nodes['oauth-status'].textContent.includes('private-code'), false);
-    assert.equal(b.nodes['oauth-return'].hidden, true);
+    assert.equal(b.nodes['oauth-return'].href, '/');
+    assert.equal(b.nodes['oauth-return'].hidden, false);
 });
 
 for (const [name, query, expected] of [
