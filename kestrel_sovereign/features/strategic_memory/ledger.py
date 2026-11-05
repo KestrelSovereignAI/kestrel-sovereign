@@ -76,6 +76,9 @@ LEDGER_POINTER_KEY = "ledger_file"
 _PATTERN_ID_PREFIX = "pat_"
 _BLOCKER_ID_PREFIX = "blk_"
 
+#: The row field naming the session of the turn that recorded the row (#3875).
+SESSION_KEY = "session_id"
+
 
 def _digest(*parts: Any) -> str:
     joined = "\x00".join(str(p or "").strip().lower() for p in parts)
@@ -142,6 +145,25 @@ def assign_row_ids(rows: List[Dict[str, Any]], minter) -> int:
         taken.add(row_id)
         minted += 1
     return minted
+
+
+def recorded_session_id(row: Mapping[str, Any]) -> Optional[str]:
+    """The session the turn that recorded ``row`` filed its rows under, or None.
+
+    Written once, when the row is recorded, and never by a later turn: a row is
+    projected best-effort, possibly by another turn in another session or in
+    none, and only the recording turn's session says where the row came from.
+    The key is returned exactly as recorded. An unquoted digit-only key reads
+    back from YAML as an integer, so an integer names that same key. A row with
+    no recorded session, including every row recorded before this field
+    existed, names none.
+    """
+    value = row.get(SESSION_KEY)
+    if isinstance(value, int) and not isinstance(value, bool):
+        return str(value)
+    if isinstance(value, str) and value.strip():
+        return value
+    return None
 
 
 def is_active_pattern(row: Dict[str, Any]) -> bool:
@@ -733,8 +755,13 @@ class StrategyLedger:
     # ------------------------------------------------------------------
 
     def add_pattern(
-        self, pattern: str, source: str = "", implication: str = ""
+        self,
+        pattern: str,
+        source: str = "",
+        implication: str = "",
+        session_id: Optional[str] = None,
     ) -> Dict[str, Any]:
+        """Append one pattern, naming the recording turn's ``session_id``."""
         rows = self.patterns
         entry = {
             "id": _unique_id(
@@ -746,6 +773,7 @@ class StrategyLedger:
             "implication": implication,
             "recorded_at": str(date.today()),
         }
+        _record_session(entry, session_id)
         self.data.setdefault(PATTERNS_KEY, []).append(entry)
         return entry
 
@@ -757,6 +785,7 @@ class StrategyLedger:
         owner: str,
         notes: str = "",
         repo: str = "",
+        session_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Append one blocker.
 
@@ -764,6 +793,9 @@ class StrategyLedger:
         repository. Without it, reconciliation has to try every configured repo
         and bind to whichever one happens to contain a number 42 — which is how
         a blocker gets resolved against a stranger's closed ticket.
+
+        ``session_id`` is the recording turn's session, as for
+        :meth:`add_pattern`.
         """
         rows = self.blockers
         entry = {
@@ -779,6 +811,7 @@ class StrategyLedger:
             "blocked_since": str(date.today()),
             "notes": notes,
         }
+        _record_session(entry, session_id)
         self.data.setdefault(BLOCKERS_KEY, []).append(entry)
         return entry
 
@@ -890,6 +923,12 @@ class StrategyLedger:
             target.append(copied)
             absorbed += 1
         return absorbed
+
+
+def _record_session(entry: Dict[str, Any], session_id: Optional[str]) -> None:
+    """Name the recording turn's session on a new row; None names none."""
+    if session_id is not None:
+        entry[SESSION_KEY] = session_id
 
 
 def strip_ledger_sections(strategy_data: Dict[str, Any]) -> bool:

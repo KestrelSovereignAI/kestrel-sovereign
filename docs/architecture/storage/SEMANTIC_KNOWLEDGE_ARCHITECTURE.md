@@ -671,10 +671,17 @@ the producer canonicalizes it as the conversation store does before filing a
 row, so the source names the key the turn's rows are filed under; a trimmed
 copy would name a session no row belongs to and slip past its exclusion. Work outside a
 turn, and a turn with no session, names none: the store then derives each row's
-session as it writes it, so no single session is the turn's. A ledger pass
-names the projecting turn's session for every row it writes in that pass. Any
-producer that reads a saved item must name it as `saved-item:<id>` the same
-way. The explicit-fact replay fingerprint ignores session segments, as it
+session as it writes it, so no single session is the turn's. A strategy-ledger
+row records that session in its `session_id` field when the row is written,
+and projection names the row's recorded session, never the projecting turn's:
+projection is best-effort, so a row whose first projection failed is projected
+by whichever turn reindexes next, in another session or in none. A row with no
+recorded session, including every row written before #3875, names none. A
+session key that a locator cannot carry, such as one containing a control
+character, is refused rather than dropped: `save_fact` writes nothing, and the
+ledger row's assertion fails to project while the rest of the pass proceeds.
+Any producer that reads a saved item must name it as `saved-item:<id>` the
+same way. The explicit-fact replay fingerprint ignores session segments, as it
 ignores delivery time, so a retry filed under another session, or of an
 operation recorded before sources named one, still replays idempotently.
 Assertions recorded before #3875 name no session and can be held out only by

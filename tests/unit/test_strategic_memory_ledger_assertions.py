@@ -1171,10 +1171,14 @@ async def test_a_row_recorded_during_a_session_names_that_session(governed, tmp_
         await feature.strategy_add_pattern(
             pattern="Recorded during the exam", source="s", implication="i"
         )
+        blocker = await feature.strategy_add_blocker(
+            issue="#42", title="Blocked during the exam", repo="o/r"
+        )
     await feature.strategy_add_pattern(
         pattern="Recorded off any turn", source="s", implication="i"
     )
 
+    assert blocker.data["blocker"]["session_id"] == "exam-session"
     named = {}
     for held in await active(storage):
         sources = await storage.list_assertion_revision_sources(held.revision_id)
@@ -1183,6 +1187,74 @@ async def test_a_row_recorded_during_a_session_names_that_session(governed, tmp_
     assert sorted(named.values()) == [
         [frozenset()],
         [frozenset({(SourceReferenceKind.SESSION, "exam-session")})],
+        [frozenset({(SourceReferenceKind.SESSION, "exam-session")})],
+    ]
+
+
+@pytest.mark.asyncio
+async def test_a_row_whose_recorded_session_cannot_be_named_fails_alone(
+    governed, ledger
+):
+    """A session a locator cannot carry is refused, never dropped.
+
+    Writing the row's assertion without its session would escape an exclusion
+    of the session it was recorded in. Only that row fails; the rest of the
+    pass projects, and a later pass refuses it again rather than give up.
+    """
+    storage, _, _ = governed
+    ledger.add_pattern(
+        "Recorded in an unnameable session", "s", "i", session_id="\texam\t"
+    )
+    ledger.add_pattern("Recorded in a nameable session", "s", "i", session_id="exam")
+
+    report = await project(storage, ledger)
+    assert (report.projected, report.failed) == (1, 1)
+    (held,) = await every(storage)
+    sources = await storage.list_assertion_revision_sources(held.revision_id)
+    assert [source.references for source in sources] == [
+        frozenset({(SourceReferenceKind.SESSION, "exam")})
+    ]
+
+    again = await project(storage, ledger)
+    assert (again.unchanged, again.failed) == (1, 1)
+    assert len(await every(storage)) == 1
+
+
+@pytest.mark.asyncio
+async def test_a_recorded_session_survives_the_ledger_file(governed, ledger):
+    """A row's session is read back from the file exactly as it was recorded.
+
+    A digit-only key (an older console's session, #2012) is written quoted, so
+    it reads back as the same string. Hand-written unquoted, YAML reads it as
+    an integer, which still names that key.
+    """
+    storage, _, _ = governed
+    ledger.add_pattern("Recorded in session 1314", "s", "i", session_id="1314")
+    assert ledger.save() is None
+    written = ledger.path.read_text(encoding="utf-8")
+    assert "session_id: '1314'" in written
+    ledger.path.write_text(
+        written.replace(
+            "blockers: []",
+            "- id: pat_handwritten\n"
+            "  pattern: Written by hand\n"
+            "  session_id: 2718\n"
+            "blockers: []",
+        ),
+        encoding="utf-8",
+    )
+    reloaded = StrategyLedger(ledger.path)
+    reloaded.load()
+    assert [row.get("session_id") for row in reloaded.patterns] == ["1314", 2718]
+
+    await project(storage, reloaded)
+    named = []
+    for held in await active(storage):
+        sources = await storage.list_assertion_revision_sources(held.revision_id)
+        named.extend(source.references for source in sources)
+    assert sorted(named, key=sorted) == [
+        frozenset({(SourceReferenceKind.SESSION, "1314")}),
+        frozenset({(SourceReferenceKind.SESSION, "2718")}),
     ]
 
 

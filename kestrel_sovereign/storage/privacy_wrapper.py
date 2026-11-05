@@ -2398,7 +2398,7 @@ class PrivacyEnforcingStorage:
 
             invocation_id = ensure_invocation_id(invocation_id)
             binding = fact_binding()
-            source_session_id = await self._filed_session_id(session_id)
+            source_session_id = await self.filed_session_id(session_id)
             mapping = map_legacy_fact(
                 subject,
                 predicate,
@@ -3364,7 +3364,7 @@ class PrivacyEnforcingStorage:
             return provided
         return await self._storage.resolve_session_id(provided)
 
-    async def _filed_session_id(self, session_id: Optional[str]) -> Optional[str]:
+    async def filed_session_id(self, session_id: Optional[str]) -> Optional[str]:
         """The session a turn's conversation rows are filed under, or None.
 
         ``session_id`` is the turn's own session key, which the calling
@@ -3375,6 +3375,9 @@ class PrivacyEnforcingStorage:
         A turn with no session gets None, never a derived one: the store then
         derives each row's session as it writes it, so no single session is
         the turn's, and a source must name none rather than guess (#3875).
+
+        Resolve it while the turn is live, when its rows are filed: a producer
+        that records the session for later projection records this value.
         """
         if not session_id:
             return None
@@ -4289,9 +4292,7 @@ class PrivacyEnforcingStorage:
                 "pipeline; this wrapper will not silently rewrite canonical terms."
             )
 
-    async def project_strategy_ledger_assertions(
-        self, snapshot, *, session_id: Optional[str] = None
-    ):
+    async def project_strategy_ledger_assertions(self, snapshot):
         """Project the canonical strategy ledger into canonical assertions (#3051).
 
         Takes a :class:`LedgerSnapshot` -- a deep copy the ledger captured the
@@ -4312,9 +4313,9 @@ class PrivacyEnforcingStorage:
         fail the ledger mutation. The report says what happened; the next
         projection reconciles.
 
-        ``session_id`` is the session of the turn projecting the ledger, read
-        through the turn lifecycle; each source this pass writes names the
-        session that turn's rows are filed under.
+        Each source names the session its row was recorded in, read off the
+        row (#3875). The projecting turn's session is never used: a row whose
+        first projection failed is projected by whichever turn reindexes next.
         """
         from kestrel_sovereign.features.strategic_memory.ledger_assertions import (
             LedgerAssertionReport,
@@ -4349,7 +4350,7 @@ class PrivacyEnforcingStorage:
         try:
             async with self._ledger_projection_lock(snapshot):
                 return await self._project_strategy_ledger_assertions_leased(
-                    snapshot, binding, report, session_id
+                    snapshot, binding, report
                 )
         finally:
             self._release_ledger_assertion_lease()
@@ -4386,7 +4387,7 @@ class PrivacyEnforcingStorage:
         return lock
 
     async def _project_strategy_ledger_assertions_leased(
-        self, snapshot, binding, report, session_id
+        self, snapshot, binding, report
     ):
         """Run one projection pass while the privacy lease is held."""
         from kestrel_sovereign.features.strategic_memory import ledger_assertions
@@ -4460,7 +4461,6 @@ class PrivacyEnforcingStorage:
         current = await self._read_ledger_assertions(plan, report)
         if current is None:
             return report
-        source_session_id = await self._filed_session_id(session_id)
 
         # Seeded with the rows that are present but unassertable, so
         # reconciliation leaves them alone. "The row is gone" and "the row is
@@ -4469,11 +4469,7 @@ class PrivacyEnforcingStorage:
         for proposal in plan.proposals:
             keep.add(proposal.assertion_id)
             await self._apply_ledger_proposal(
-                proposal,
-                current.get(proposal.assertion_id),
-                binding,
-                report,
-                session_id=source_session_id,
+                proposal, current.get(proposal.assertion_id), binding, report
             )
 
         # Reconcile: an assertion whose row is gone, or retired in place, stops
@@ -4539,12 +4535,13 @@ class PrivacyEnforcingStorage:
                 cursor = page[-1].revision_id
         return current
 
-    async def _apply_ledger_proposal(
-        self, proposal, held, binding, report, *, session_id
-    ):
+    async def _apply_ledger_proposal(self, proposal, held, binding, report):
         """Write, revise, or decline one row's assertion."""
         from kestrel_sovereign.features.strategic_memory import ledger_assertions
-        from kestrel_sovereign.knowledge import AssertionStatus
+        from kestrel_sovereign.knowledge import (
+            AssertionStatus,
+            AssertionValidationError,
+        )
 
         if held is None:
             action = ledger_assertions.ACTION_WRITE
@@ -4604,12 +4601,24 @@ class PrivacyEnforcingStorage:
             predecessor_revision_id=predecessor,
             action=action,
         )
-        source = ledger_assertions.build_source(
-            proposal,
-            transition=transition,
-            owning_agent_id=binding.owning_agent_id,
-            session_id=session_id,
-        )
+        try:
+            source = ledger_assertions.build_source(
+                proposal,
+                transition=transition,
+                owning_agent_id=binding.owning_agent_id,
+            )
+        except AssertionValidationError as error:
+            # The row's provenance cannot be built, notably because its
+            # recorded session cannot be named in a locator. Writing the row
+            # without that session would escape an exclusion of it, so this
+            # row fails and the rest of the pass goes on.
+            logger.warning(
+                "strategy ledger row %s cannot name its provenance: %s",
+                proposal.row_id,
+                error,
+            )
+            report.failed += 1
+            return
         assertion = ledger_assertions.build_assertion(
             binding=binding,
             proposal=proposal,

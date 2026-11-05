@@ -13,6 +13,7 @@ from uuid import uuid4
 import pytest
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+from kestrel_sdk.tools.result import ToolResultStatus
 
 from kestrel_sovereign.identity.runtime_identity import AgentIdentity, load_agent_identity
 from kestrel_sovereign.agent.invocation import invocation_scope, request_provenance
@@ -22,6 +23,7 @@ from kestrel_sovereign.features.memory_agency.semantic_facts import _is_adapter_
 from kestrel_sovereign.inception_service import create_kestrel_identity_async
 from kestrel_sovereign.knowledge import (
     Assertion,
+    AssertionQuery,
     DirectLineage,
     EpistemicState,
     GovernedArtifactError,
@@ -909,6 +911,152 @@ async def test_save_fact_names_the_session_its_turn_rows_are_filed_under(
     assert [source.references for source in sources] == [
         frozenset({(SourceReferenceKind.SESSION, filed.pop())})
     ]
+
+
+async def _semantic_row_counts(storage: AsyncStorage) -> dict[str, int]:
+    """How many rows every semantic table holds."""
+    tables = await storage.db.fetchall(
+        "SELECT name FROM sqlite_master WHERE type = 'table' AND name LIKE 'semantic%'"
+    )
+    assert tables
+    return {
+        name: await storage.db.fetchval(f"SELECT COUNT(*) FROM {name}")
+        for (name,) in tables
+    }
+
+
+@pytest.mark.asyncio
+async def test_save_fact_refuses_a_session_it_cannot_name_and_writes_nothing(
+    storage: AsyncStorage,
+) -> None:
+    """A session key a locator cannot carry is refused, not dropped.
+
+    Dropping the session would write a fact whose source names no session, and
+    excluding the session it was taught in would then miss it. The refusal
+    comes before any write, so nothing is left behind.
+    """
+    feature, agent, governed = _fact_feature(storage)
+    before = await _semantic_row_counts(storage)
+
+    with live_turn(agent, "\texam-session\t"):
+        with invocation_scope("control-character-session-turn"):
+            result = await feature.save_fact(
+                subject="user", predicate="preferred_deploy_region", value="exam-region"
+            )
+
+    assert result.status is ToolResultStatus.ERROR
+    assert "control character" in result.error
+    assert await _semantic_row_counts(storage) == before
+
+
+async def _ledger_feature(storage: AsyncStorage, tmp_path):
+    """The strategy ledger over the real privacy wrapper and turn lifecycle."""
+    from kestrel_sovereign.features.strategic_memory.feature import (
+        StrategicMemoryFeature,
+    )
+
+    governed = PrivacyEnforcingStorage(storage, PrivacyMode.NORMAL)
+    agent = TurnBoundAgent(
+        storage=governed, agent_id=storage.agent_id, agent_data_dir=str(tmp_path)
+    )
+    feature = StrategicMemoryFeature(agent)
+    await feature.initialize()
+    return feature, agent, governed
+
+
+async def _ledger_row_references(governed: PrivacyEnforcingStorage) -> dict:
+    """Each projected ledger row's IRI, mapped to the references its source names."""
+    named = {}
+    for held in await governed.query_assertions(AssertionQuery(limit=50)):
+        sources = await governed.list_assertion_revision_sources(held.revision_id)
+        named[held.object.value] = [source.references for source in sources]
+    return named
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("projecting_session", ["later-session", None])
+async def test_a_ledger_row_names_the_session_that_recorded_it_not_the_one_projecting(
+    storage: AsyncStorage, tmp_path, projecting_session
+) -> None:
+    """#3875: a row's session is the session of the turn that wrote it.
+
+    Projection is best-effort. A row whose first projection failed is projected
+    by whichever turn next reindexes, in another session or in none. Naming
+    that turn's session would misattribute the row, or name none, and either
+    way excluding the session the row was recorded in would not hold it out.
+    """
+    feature, agent, governed = await _ledger_feature(storage, tmp_path)
+    store_put = governed.put_assertion
+
+    async def unavailable(*args, **kwargs):
+        raise RuntimeError("assertion store unavailable")
+
+    governed.put_assertion = unavailable
+    with live_turn(agent, EXAM_SESSION):
+        recorded = await feature.strategy_add_pattern(
+            pattern="Learned during the exam", source="exam", implication="hold out"
+        )
+    assert recorded.data["persisted"] is True
+    assert await governed.query_assertions(AssertionQuery(limit=50)) == []
+    exam_row = recorded.data["pattern_id"]
+
+    governed.put_assertion = store_put
+    with live_turn(agent, projecting_session, turn_id="projecting-turn"):
+        later = await feature.strategy_add_pattern(
+            pattern="Learned later", source="later", implication="keep"
+        )
+    later_row = later.data["pattern_id"]
+
+    named = {
+        iri.rsplit(":", 1)[-1]: references
+        for iri, references in (await _ledger_row_references(governed)).items()
+    }
+    later_references = (
+        frozenset({(SourceReferenceKind.SESSION, projecting_session)})
+        if projecting_session is not None
+        else frozenset()
+    )
+    assert named == {
+        exam_row: [frozenset({(SourceReferenceKind.SESSION, EXAM_SESSION)})],
+        later_row: [later_references],
+    }
+
+    by_row = {
+        held.object.value.rsplit(":", 1)[-1]: held
+        for held in await governed.query_assertions(AssertionQuery(limit=50))
+    }
+    exam_assertion = by_row[exam_row]
+    (exam_source,) = await governed.list_assertion_revision_sources(
+        exam_assertion.revision_id
+    )
+    await storage.run_semantic_maintenance(None)
+    capabilities = await storage.semantic_maintenance_capability_versions(None)
+    policy = GovernedCorpusPolicy(
+        policy_id="exam-holdout",
+        policy_version="1",
+        accepted_epistemic_states=(exam_assertion.epistemic_state,),
+        accepted_visibility=(exam_assertion.visibility,),
+        accepted_privacy_classifications=(exam_assertion.privacy_classification,),
+        accepted_consent_references=(exam_assertion.release_policy_reference,),
+        accepted_grounding_classes=(exam_assertion.confidence_basis,),
+        accepted_source_kinds=(exam_source.source_kind,),
+        accepted_ontology_pins=(exam_assertion.ontology_version,),
+        accepted_semantic_capability_versions=tuple(capabilities.items()),
+    )
+
+    unexcluded = await _corpus_snapshot(storage, policy)
+    held_out = await _corpus_snapshot(
+        storage, replace(policy, excluded_session_ids=(EXAM_SESSION,))
+    )
+
+    assert {item.assertion.revision_id for item in unexcluded.examples} == {
+        exam_assertion.revision_id,
+        by_row[later_row].revision_id,
+    }
+    assert [item.assertion.revision_id for item in held_out.examples] == [
+        by_row[later_row].revision_id
+    ]
+    assert held_out.observability.excluded == {"explicitly_excluded": 1}
 
 
 @pytest.mark.asyncio
