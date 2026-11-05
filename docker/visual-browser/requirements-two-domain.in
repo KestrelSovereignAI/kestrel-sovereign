@@ -3,3 +3,5 @@
 kestrel-sovereign==0.62.2
 kestrel-sovereign-sdk==0.48.0
 playwright==1.63.0
+# GHSA-45c3-73f7-pv4m is fixed in dnspython 2.9.0.
+dnspython>=2.9.0

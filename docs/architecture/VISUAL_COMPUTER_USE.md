@@ -404,12 +404,13 @@ the environment. Export and transfer always select an exact source revision.
 
 ### Manual human channel
 
-This source integration requires published SDK 0.45 human-control contracts.
-Core declares `>=0.45.0,<1`; its normal-index lock and the exact hash-locked
-worker requirements select 0.45.0. The Dockerfile verifies the installed worker
-pin and human contract. This Core 0.58 source successor still requires complete
-review, CI and built-image/host acceptance before release. Published SDK
-installability alone does not establish Core product readiness.
+Manual human control uses the published SDK human-control contracts. The host
+SDK requirement is declared in `pyproject.toml` and resolved through `uv.lock`.
+Each worker image uses its own exact hash-locked requirements; the legacy and
+two-domain worker locks are separate inputs. The Dockerfiles verify the installed
+SDK pin. Published SDK installability alone does not establish Core product
+readiness: source review, CI, built-image/host acceptance and worker registration
+remain separate gates.
 
 Trusted visual configuration explicitly enables `human_control_enabled` and may
 set `human_lease_seconds` from 1 to 120 (default 120). The original session owner
