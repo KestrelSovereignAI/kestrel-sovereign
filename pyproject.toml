@@ -466,3 +466,41 @@ allow-direct-references = true
 [tool.hatch.build]
 packages = ["kestrel_sovereign"]
 exclude = ["kestrel_sovereign/model_discovery_cache.json"]
+
+# Keep one canonical browser/controller program in source. Normal Core wheels
+# install its exact files as private resources; new worker images install the
+# complete wheel dependency closure rather than copying Python module subsets.
+[tool.hatch.build.targets.wheel.force-include]
+"docker/visual-browser/controller.py" = "kestrel_sovereign/visual_computer/_worker_programs/controller.py"
+"docker/visual-browser/wire.py" = "kestrel_sovereign/visual_computer/_worker_programs/wire.py"
+"docker/visual-browser/worker.py" = "kestrel_sovereign/visual_computer/_worker_programs/worker.py"
+"docker/visual-browser/rpc_client.py" = "kestrel_sovereign/visual_computer/_worker_programs/rpc_client.py"
+"docker/visual-browser/sandbox_checks.py" = "kestrel_sovereign/visual_computer/_worker_programs/sandbox_checks.py"
+"docker/visual-browser/sandbox_probe.py" = "kestrel_sovereign/visual_computer/_worker_programs/sandbox_probe.py"
+"docker/visual-browser/workspace.py" = "kestrel_sovereign/visual_computer/_worker_programs/workspace.py"
+"docker/visual-browser/network.py" = "kestrel_sovereign/visual_computer/_worker_programs/network.py"
+"docker/visual-browser/human.py" = "kestrel_sovereign/visual_computer/_worker_programs/human.py"
+"docker/visual-browser/two_domain_worker.py" = "kestrel_sovereign/visual_computer/_worker_programs/two_domain_worker.py"
+"docker/visual-browser/broker_worker.py" = "kestrel_sovereign/visual_computer/_worker_programs/broker_worker.py"
+
+# Preserve the canonical input paths in source archives so rebuilding a normal
+# wheel from the sdist applies the same resource mapping and yields the same code.
+[tool.hatch.build.targets.sdist.force-include]
+"docker/visual-browser/controller.py" = "docker/visual-browser/controller.py"
+"docker/visual-browser/wire.py" = "docker/visual-browser/wire.py"
+"docker/visual-browser/worker.py" = "docker/visual-browser/worker.py"
+"docker/visual-browser/rpc_client.py" = "docker/visual-browser/rpc_client.py"
+"docker/visual-browser/sandbox_checks.py" = "docker/visual-browser/sandbox_checks.py"
+"docker/visual-browser/sandbox_probe.py" = "docker/visual-browser/sandbox_probe.py"
+"docker/visual-browser/workspace.py" = "docker/visual-browser/workspace.py"
+"docker/visual-browser/network.py" = "docker/visual-browser/network.py"
+"docker/visual-browser/human.py" = "docker/visual-browser/human.py"
+"docker/visual-browser/two_domain_worker.py" = "docker/visual-browser/two_domain_worker.py"
+"docker/visual-browser/broker_worker.py" = "docker/visual-browser/broker_worker.py"
+"docker/visual-browser/Dockerfile" = "docker/visual-browser/Dockerfile"
+"docker/visual-browser/requirements.in" = "docker/visual-browser/requirements.in"
+"docker/visual-browser/requirements.txt" = "docker/visual-browser/requirements.txt"
+"docker/visual-browser/Dockerfile.two-domain-browser" = "docker/visual-browser/Dockerfile.two-domain-browser"
+"docker/visual-browser/Dockerfile.two-domain-broker" = "docker/visual-browser/Dockerfile.two-domain-broker"
+"docker/visual-browser/requirements-two-domain.in" = "docker/visual-browser/requirements-two-domain.in"
+"docker/visual-browser/requirements-two-domain.txt" = "docker/visual-browser/requirements-two-domain.txt"

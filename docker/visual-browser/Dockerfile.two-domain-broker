@@ -1,0 +1,15 @@
+FROM mcr.microsoft.com/playwright/python:v1.63.0-noble@sha256:72bd171a9ffc2b4b59532aaa6210e21014d07093120dc25528870c0b840da1f0
+LABEL io.kestrel.local-two-domain.contract="core-sdk046-two-domain-v2"
+COPY wheelhouse/ /opt/kestrel-wheelhouse/
+COPY requirements-two-domain.txt /opt/kestrel-wheelhouse/requirements-two-domain.txt
+RUN cd /opt/kestrel-wheelhouse && sha256sum --strict -c SHA256SUMS \
+    && python -m pip install --no-cache-dir --no-compile --no-index \
+       --find-links=/opt/kestrel-wheelhouse --require-hashes \
+       -r /opt/kestrel-wheelhouse/requirements-two-domain.txt \
+    && python -m pip check \
+    && python -B -c "from pathlib import Path; from kestrel_sovereign.visual_computer import worker_entry; Path('/opt/kestrel-worker-entry.py').symlink_to(Path(worker_entry.__file__).resolve(strict=True))" \
+    && python -B -c "from importlib.metadata import version; assert version('kestrel-sovereign-sdk') == '0.48.0'; assert version('playwright') == '1.63.0'; from importlib.resources import files; assert files('kestrel_sovereign.visual_computer').joinpath('_worker_programs','broker_worker.py').is_file()" \
+    && groupadd --gid 10003 kestrel-ipc && useradd --uid 10001 --gid 10003 --no-create-home --shell /usr/sbin/nologin kestrel-broker \
+    && mkdir -p /run/kestrel-worker-ipc && chown 10002:10003 /run/kestrel-worker-ipc && chmod 0710 /run/kestrel-worker-ipc
+USER 10001:10003
+CMD ["python", "-B", "/opt/kestrel-worker-entry.py", "broker"]

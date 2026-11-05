@@ -1,0 +1,5 @@
+# Normal full Core closure. Resolve on the exact pinned Linux/ARM64 base's
+# measured interpreter, then bind the exact Core wheel and every artifact hash.
+kestrel-sovereign==0.62.2
+kestrel-sovereign-sdk==0.48.0
+playwright==1.63.0

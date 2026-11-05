@@ -25,7 +25,7 @@ from kestrel_sdk.resources import ResourceConflict, ResourceError, ResourceNotFo
 from kestrel_sdk.computer_use.acquisition import CustodiedEnvironmentProvider
 from kestrel_sdk.operator import OperatorAuthorizationError
 
-from .dispatch import original_dispatch, NativeActionNotDispatched
+from .dispatch import original_dispatch, NativeActionNotDispatched, raise_driver_borrow_outcome
 from .repository import CustodyRecord, VisualCustodyRepository
 from .egress import ActiveCallEgress
 
@@ -70,6 +70,9 @@ class VisualPolicy:
             raise ValueError("invalid visual computer policy bounds")
 
 
+_LOCAL_ADMIT_ISSUER = object()
+
+
 class VisualComputerRuntime:
     def __init__(self, repository: VisualCustodyRepository, authority, *, providers, drivers,
                  policy: VisualPolicy | None = None, check_destination=None, egress=None):
@@ -84,6 +87,8 @@ class VisualComputerRuntime:
         self._verified_sessions = set()
         self._inflight = 0
         self.human = None
+        from .local_worker import bind_local_worker_hosts
+        bind_local_worker_hosts(self)
 
     @staticmethod
     def scope(context):
@@ -135,7 +140,7 @@ class VisualComputerRuntime:
         to one native child. No child resolves authority or replaces custody.
         The finite method selection excludes acquisition and provider cleanup.
         """
-        from kestrel_sovereign._async_ownership import await_owned_operation, raise_owned_outcome
+        from kestrel_sovereign._async_ownership import await_owned_operation
         driver, session, scope = self._driver(record), record.session, record.request.scope
         if operation == "observe":
             method, arguments = driver.observe, (session,)
@@ -168,7 +173,7 @@ class VisualComputerRuntime:
             call = self.egress._calls[self.egress._key(session, identifier, "session")]
             outcome = await await_owned_operation(dispatch(), retain_originals=True,
                 cancel_on_caller_cancellation=call.cancel)
-            return raise_owned_outcome(outcome, operation="original visual session call", retain_originals=True)
+            return raise_driver_borrow_outcome(outcome, operation="original visual session call", retain_originals=True)
 
     def _provider(self, record):
         try:
@@ -301,10 +306,13 @@ class VisualComputerRuntime:
                     check()
                     return record.session
                 if record.phase == "retired":
+                    if record.retired_from == "acquiring":
+                        raise ResourceConflict("original request retired after verified setup cleanup; use a new request ID")
                     raise ResourceConflict("original request retired without acquisition; use a new request ID")
                 if record.phase not in {"admitted", "quoted"}:
                     raise ResourceOutcomeUnknown("existing request requires original-ID reconciliation")
                 native_quote = record.remote_environment is not None
+                original_setup = None
                 try:
                     provider = self._provider(record)
                     native_quote = native_quote or (getattr(provider, "native_environment_host_api_version", None) is not None
@@ -339,6 +347,18 @@ class VisualComputerRuntime:
                     self._quote(record, record.quote)
                     if self._custodied_provider(provider) != custodied:
                         raise ResourceUnsupported('provider acquisition custody negotiation changed')
+                    from .local_worker import LocalTwoDomainProvider, _OriginalLocalWorkerAdmission
+                    if type(provider) is LocalTwoDomainProvider:
+                        # SAME original ADMIT check: no nested authority
+                        # operation and no fabricated pre-session SDK object.
+                        admission = _OriginalLocalWorkerAdmission(self, context, record, check,
+                                                                 _issuer=_LOCAL_ADMIT_ISSUER)
+                        try:
+                            original_setup = provider._setup_host._issue_local_setup(admission)
+                            async with self.egress._activate_local_worker_setup(original_setup):
+                                return await original_setup.run_original()
+                        finally:
+                            admission._active = False
                     if custodied:
                         record = await self._acquire_custodied(context, record, check, provider)
                     else:
@@ -346,6 +366,14 @@ class VisualComputerRuntime:
                         await self.repository.save(self.scope(context), record, check)
                     return await self._acquire_open(context, record, check)
                 except BaseException as original:
+                    if original_setup is not None and not original_setup._handed_off:
+                        try:
+                            async with self._lock(record.session_id):
+                                await self._settle_failed_local_setup(self.scope(context), record, check)
+                        except BaseException as settlement:
+                            from kestrel_sovereign.execution_custody import execution_terminal_error
+                            raise execution_terminal_error(original, settlement, retain_originals=True)
+                        raise
                     try:
                         await self.repository.retire_unacquired(self.scope(context), record, at=self._now(),
                             guard=check if native_quote else None)
@@ -402,12 +430,59 @@ class VisualComputerRuntime:
         self._verified_sessions.add(self._key(scope, record.session_id))
         return session
 
+    async def _settle_failed_local_setup(self, scope, record, check):
+        from .local_worker import LocalTwoDomainProvider
+        provider = self.providers.get(record.request.provider_id)
+        if type(provider) is not LocalTwoDomainProvider:
+            return None
+        # Callers hold the existing session lock and fresh current authority.
+        # A stale in-memory lease assignment is never a durable lease receipt.
+        record = await self.repository.get(scope, session_id=record.session_id, guard=check)
+        host = provider._setup_host
+        original = host._retained_setup(record)
+        if original is None:
+            return None
+        await original._join_retirement(record, failed=True)
+        if record.phase in {"admitted", "quoted"}:
+            record = await self.repository.retire_unacquired(scope, record, at=self._now(), guard=check)
+        elif record.phase not in {"retired", "released"}:
+            if record.lease is None:
+                record = await self.repository._retire_failed_local_setup(scope, record, original, at=self._now(), guard=check)
+            else:
+                lease = record.lease.model_copy(update={"state": "released", "released_at": self._now(), "actual_cost_usd": Decimal(0)})
+                self._lease(record, lease, releasing=True)
+                record.lease, record.phase = lease, "released"
+                await self.repository.save(scope, record, check)
+        # Only a durable ACK permits dropping exact completion/connection
+        # custody. Every failed/ambiguous write leaves both retained.
+        host._discard_retired_setup(original, record)
+        return record
+
+    async def _discard_released_local_connection(self, record, check=None):
+        from .local_worker import LocalTwoDomainProvider
+        provider = self.providers.get(record.request.provider_id)
+        if type(provider) is LocalTwoDomainProvider:
+            if check is not None:
+                check()
+            await provider._setup_host._discard_released_connection(record)
+
     async def reconcile_request(self, context, request_id):
         async with self.operation(context, VisualAction.ADMIT) as check:
             scope = self.scope(context)
             async with self._lock((scope.model_dump_json(), request_id)):
                 record = await self.repository.get(scope, request_id=request_id, guard=check)
-                if record.phase in {"admitted", "quoted", "retired"}:
+                async with self._lock(record.session_id):
+                    settled = await self._settle_failed_local_setup(scope, record, check)
+                    if settled is None:
+                        record = await self.repository.get(scope, session_id=record.session_id, guard=check)
+                if settled is not None:
+                    return self._retirement(settled) if settled.phase == "retired" else {"session_id": settled.session_id, "released": True}
+                if record.phase == "retired":
+                    return self._retirement(record)
+                if record.phase == "released":
+                    await self._discard_released_local_connection(record, check)
+                    return {"session_id": record.session_id, "released": True}
+                if record.phase in {"admitted", "quoted"}:
                     record = await self.repository.retire_unacquired(scope, record, at=self._now(), guard=check)
                     return self._retirement(record)
                 self._request(context, record.request)
@@ -750,6 +825,10 @@ class VisualComputerRuntime:
 
     @staticmethod
     def _retirement(record):
+        if record.retired_from == "acquiring":
+            return {"session_id": record.session_id, "request_id": record.request.request_id,
+                    "retired": True, "acquired": None, "released": True,
+                    "setup_cleanup": "verified_original_physical_retirement"}
         return {"session_id":record.session_id, "request_id":record.request.request_id,
                 "retired":True, "acquired":False, "released":False}
 
@@ -773,41 +852,52 @@ class VisualComputerRuntime:
             fence = self._key(scope, session_id)
             self._fence(scope, session_id)
             await self.egress.revoke_session(scope, session_id)
-            try:
-                record = await self.repository.get(scope, session_id=session_id, guard=check)
-            except ResourceNotFound:
-                self._fences.discard(fence)
-                self._control_serials.pop(fence, None)
-                raise
-            if record.phase in {"admitted", "quoted", "retired"}:
-                record = await self.repository.retire_unacquired(scope, record, at=self._now(), guard=check)
-                self._fences.discard(fence)
-                self._control_serials.pop(fence, None)
-                return self._retirement(record)
-            if record.lease is None:
-                raise ResourceOutcomeUnknown("unknown acquisition retains request cleanup custody")
-            if record.phase == "released":
-                return {"session_id": session_id, "released": True}
-            if record.remote_environment is not None:
-                provider = self._provider(record)
-                host = self._native_lifecycle_host(provider)
-                async with host._activate_release(context, record) as original:
-                    lease = await self._call(context, check, provider.release, scope, record.lease)
-                    self._lease(record, lease, releasing=True)
-                    record = await self.repository._accepted_runpod_lifecycle(scope, original, lease)
-                return {"session_id": session_id, "released": False}
-            if self._requires_remote_worker_admission(record):
-                raise ResourceUnsupported("Original private native quote required for foreground release; retained Pod custody is unresolved")
-            await self._begin_release(scope, record, check)
-            # Physical destruction has its own verb and outcome. A timeout
-            # does not erase the original lease/connection or claim release.
-            lease = await self._call(context, check, self._provider(record).release, scope, record.lease)
-            self._lease(record, lease, releasing=True)
-            record.lease = lease
-            if lease.state == "released":
-                record.phase, record.connection = "released", None
-            await self.repository.save(scope, record, check)
-            return {"session_id": session_id, "released": lease.state == "released"}
+            async with self._lock(session_id):
+                try:
+                    record = await self.repository.get(scope, session_id=session_id, guard=check)
+                except ResourceNotFound:
+                    self._fences.discard(fence)
+                    self._control_serials.pop(fence, None)
+                    raise
+                settled = await self._settle_failed_local_setup(scope, record, check)
+                if settled is not None:
+                    return self._retirement(settled) if settled.phase == "retired" else {"session_id": session_id, "released": True}
+                if record.phase == "retired":
+                    self._fences.discard(fence)
+                    self._control_serials.pop(fence, None)
+                    return self._retirement(record)
+                if record.phase in {"admitted", "quoted"}:
+                    record = await self.repository.retire_unacquired(scope, record, at=self._now(), guard=check)
+                    self._fences.discard(fence)
+                    self._control_serials.pop(fence, None)
+                    return self._retirement(record)
+                if record.lease is None:
+                    raise ResourceOutcomeUnknown("unknown acquisition retains request cleanup custody")
+                if record.phase == "released":
+                    await self._discard_released_local_connection(record, check)
+                    return {"session_id": session_id, "released": True}
+                if record.remote_environment is not None:
+                    provider = self._provider(record)
+                    host = self._native_lifecycle_host(provider)
+                    async with host._activate_release(context, record) as original:
+                        lease = await self._call(context, check, provider.release, scope, record.lease)
+                        self._lease(record, lease, releasing=True)
+                        record = await self.repository._accepted_runpod_lifecycle(scope, original, lease)
+                    return {"session_id": session_id, "released": False}
+                if self._requires_remote_worker_admission(record):
+                    raise ResourceUnsupported("Original private native quote required for foreground release; retained Pod custody is unresolved")
+                await self._begin_release(scope, record, check)
+                # Physical destruction has its own verb and outcome. A timeout
+                # does not erase the original lease/connection or claim release.
+                lease = await self._call(context, check, self._provider(record).release, scope, record.lease)
+                self._lease(record, lease, releasing=True)
+                record.lease = lease
+                if lease.state == "released":
+                    record.phase, record.connection = "released", None
+                await self.repository.save(scope, record, check)
+                if record.phase == "released":
+                    await self._discard_released_local_connection(record, check)
+                return {"session_id": session_id, "released": lease.state == "released"}
 
     async def fence_owned_sessions(self, scope):
         """Host lifecycle safety, without minting a user/delegated grant.
@@ -816,6 +906,7 @@ class VisualComputerRuntime:
         acquire, extend a lease, or destroy a process. Unknown control remains
         durable and is reported to lifecycle diagnostics.
         """
+        from kestrel_sovereign._async_ownership import await_owned_operation
         if self.repository._key is None:
             if not await self.repository.db.table_exists("visual_computer_requests"):
                 return []  # An unused capability never acquired a worker.
@@ -823,29 +914,58 @@ class VisualComputerRuntime:
         uncertain = []
         for record in await self.repository.records(scope):
             self._fence(scope, record.session_id)
-            await self.egress.revoke_session(scope, record.session_id)
-            if record.session is None or record.phase == "released":
-                continue
-            if record.phase == "releasing":
-                uncertain.append(record.session_id)
-                continue
-            request = record.pending_control
-            if request is not None and request.operation != "pause":
-                # Never replay an uncertain handback/takeover as lifecycle stop.
-                uncertain.append(record.session_id)
-                continue
-            request = request or ControlRequest(request_id=uuid4().hex, session_id=record.session_id,
-                expected_control_epoch=record.session.control_epoch, operation="pause")
-            record.pending_control, record.phase, record.frame = request, "fenced", None
+            fence = self._key(scope, record.session_id)
+            serial = self._control_serials[fence]  # Capture before the first drain await.
+            def current():
+                if self._control_serials.get(fence) != serial:
+                    raise ResourceConflict("original lifecycle pause was superseded")
             try:
-                await self.repository.save(scope, record)
+                await self.egress.revoke_session(scope, record.session_id)
+                # The sweep snapshot may predate a priority Stop/release.
+                record = await self.repository.get(scope, session_id=record.session_id, guard=current)
+                if record.session is None or record.phase == "released":
+                    continue
+                if record.phase == "releasing":
+                    uncertain.append(record.session_id)
+                    continue
+                request = record.pending_control
+                if request is not None and request.operation != "pause":
+                    # Never replay uncertain handback/takeover as lifecycle stop.
+                    uncertain.append(record.session_id)
+                    continue
+                request = request or ControlRequest(request_id=uuid4().hex, session_id=record.session_id,
+                    expected_control_epoch=record.session.control_epoch, operation="pause")
+                record.pending_control, record.phase, record.frame = request, "fenced", None
+                await self.repository.save(scope, record, current)
+                session, lease, connection, revision = record.session, record.lease, record.connection, record.revision
+                def pause_current():
+                    current()
+                    self._require_native_session(record)
+                    if record.phase != "fenced" or record.pending_control != request or request.operation != "pause":
+                        raise ResourceConflict("original lifecycle pause intent changed")
+                identifier = "lifecycle-pause:" + request.request_id
+                # Only this existing Host-owned pause borrows a session call;
+                # no OperatorContext, input grant or replacement lease is issued.
                 async with asyncio.timeout(self.policy.operation_seconds):
-                    session = await self._driver(record).control(record.session, request)
-                self._session(record, session)
-                if session.controller != "none" or session.control_epoch <= request.expected_control_epoch:
+                    async with self.egress._activate(session, identifier, pause_current,
+                            deadline=self._now()+timedelta(seconds=self.policy.operation_seconds), purpose="session"):
+                        async def dispatch():
+                            async with self.egress._operation(session, identifier, purpose="session") as borrowed:
+                                latest = await self.repository.get(scope, session_id=record.session_id, guard=borrowed)
+                                if (latest.phase != "fenced" or latest.pending_control != request
+                                        or latest.session != session or latest.lease != lease
+                                        or latest.connection != connection or latest.revision != revision):
+                                    raise ResourceConflict("original lifecycle custody changed before SDK entry")
+                                return await self._driver(record).control(session, request)
+                        call = self.egress._calls[self.egress._key(session, identifier, "session")]
+                        outcome = await await_owned_operation(dispatch(), retain_originals=True,
+                            cancel_on_caller_cancellation=call.cancel)
+                        result = raise_driver_borrow_outcome(outcome, operation="original lifecycle pause", retain_originals=True)
+                self._session(record, result)
+                if result.controller != "none" or result.control_epoch <= request.expected_control_epoch:
                     raise ResourceOutcomeUnknown("lifecycle input fence requires reconciliation")
-                record.session, record.pending_control = session, None
-                await self.repository.save(scope, record)
+                record.session, record.pending_control = result, None
+                await self.repository.save(scope, record, current)
             except (ResourceError, TimeoutError, OSError):
                 uncertain.append(record.session_id)
         return uncertain
@@ -883,25 +1003,43 @@ class VisualComputerRuntime:
                         or (self._now()-last).total_seconds() >= record.request.idle_ttl_seconds):
                     if self._key(scope, record.session_id) not in self._fences:
                         self._fence(scope, record.session_id)
-                    await self.egress.revoke_session_use(scope, record.session_id)
+                    try:
+                        await self.egress.revoke_session_use(scope, record.session_id)
+                    except (ResourceError, TimeoutError, OSError):
+                        pass  # This original remains uncertain below; continue other sessions.
                 uncertain.append(record.session_id)
                 continue
             if (record.phase != "releasing" and self._now() < record.lease.expires_at
                     and (self._now()-last).total_seconds() < record.request.idle_ttl_seconds):
                 continue
             self._fence(scope, record.session_id)
-            await self.egress.revoke_session(scope, record.session_id)
             try:
-                await self._begin_release(scope, record)
-                async with asyncio.timeout(self.policy.operation_seconds):
-                    lease = await self._provider(record).release(scope, record.lease)
-                self._lease(record, lease, releasing=True)
-                record.lease = lease
-                if lease.state == "released":
-                    record.phase, record.connection = "released", None
-                else:
-                    uncertain.append(record.session_id)
-                await self.repository.save(scope, record)
+                await self.egress.revoke_session(scope, record.session_id)
+                async with self._lock(record.session_id):
+                    # The earlier sweep snapshot may predate another original
+                    # release. Decide only from this freshly read current row.
+                    record = await self.repository.get(scope, session_id=record.session_id)
+                    if record.phase in {"released", "retired"}:
+                        continue
+                    if record.lease is None or self._requires_remote_worker_admission(record):
+                        uncertain.append(record.session_id)
+                        continue
+                    last = record.last_activity_at or record.request.requested_at
+                    if (record.phase != "releasing" and self._now() < record.lease.expires_at
+                            and (self._now()-last).total_seconds() < record.request.idle_ttl_seconds):
+                        continue
+                    await self._begin_release(scope, record)
+                    async with asyncio.timeout(self.policy.operation_seconds):
+                        lease = await self._provider(record).release(scope, record.lease)
+                    self._lease(record, lease, releasing=True)
+                    record.lease = lease
+                    if lease.state == "released":
+                        record.phase, record.connection = "released", None
+                    else:
+                        uncertain.append(record.session_id)
+                    await self.repository.save(scope, record)
+                    if record.phase == "released":
+                        await self._discard_released_local_connection(record)
             except (ResourceError, TimeoutError, OSError):
                 uncertain.append(record.session_id)
         return uncertain

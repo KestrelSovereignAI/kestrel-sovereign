@@ -162,3 +162,42 @@ def native_dispatch(session, request, driver_id):
 
 def native_trace():
     return _TRACE.get()
+
+
+def raise_driver_borrow_outcome(outcome, *, operation, retain_originals=False):
+    """A revoked native borrower is UNKNOWN, not cancellation of its caller.
+
+    Preserve original caller cancellation and all native control/commit facts.
+    This is the single result boundary shared by the Docker and worker drivers.
+    """
+    import asyncio
+    from kestrel_sovereign._async_ownership import raise_owned_outcome
+    error = outcome.error
+    from types import TracebackType
+
+    from kestrel_sovereign.execution_custody import (
+        execution_commit_outcome,
+        is_execution_control_error,
+    )
+    def descriptive_fields_only(node):
+        # Absence of a recognized control predicate is not proof that an
+        # original carrier has no other admission/native-source facts.
+        fields = vars(node)
+        if any(type(key) is not str or key not in {
+                "__notes__", "_kestrel_retained_traceback"} for key in fields):
+            return False
+        notes = fields.get("__notes__", [])
+        trace = fields.get("_kestrel_retained_traceback")
+        return (type(notes) is list and all(type(note) is str for note in notes)
+                and (trace is None or type(trace) is TracebackType))
+    cause = error.__cause__ if type(error) is asyncio.CancelledError else None
+    ordinary_cause = (cause is None or (type(cause) is ResourceOutcomeUnknown
+                      and cause.__cause__ is None and descriptive_fields_only(cause)))
+    if (outcome.cancellation is None and type(error) is asyncio.CancelledError
+            and ordinary_cause and descriptive_fields_only(error)
+            and not is_execution_control_error(error)
+            and execution_commit_outcome(error) is None):
+        # No receipt or no-effect claim follows from an interrupted driver.
+        # The original ledger/native dispatch owner still decides custody.
+        raise ResourceOutcomeUnknown("original_visual_operation_interrupted") from error
+    return raise_owned_outcome(outcome, operation=operation, retain_originals=retain_originals)
