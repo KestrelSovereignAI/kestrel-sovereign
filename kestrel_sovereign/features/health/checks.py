@@ -14,6 +14,7 @@ and native retirement debt propagate to the lifecycle owner without conversion.
 
 import asyncio
 import logging
+import re
 import shutil
 import time
 import weakref
@@ -928,6 +929,91 @@ async def assess_llm_routes(agent) -> Optional[LlmRouteAssessment]:
     )
 
 
+# What ``llm_service`` and ``model_discovery`` report from other producers is
+# projected into fixed fields first (#3912, #3919, #3920). Those producers
+# record exception or provider text beside their facts; none of that text
+# leaves this module, only an exception class name or a fixed code.
+_EXCEPTION_CLASS_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,99}")
+_REACHABILITY_STATUSES = frozenset({"reachable", "unreachable", "skipped"})
+# The startup probe raised. Its producer records the exception's text only.
+REACHABILITY_PROBE_RAISED = "probe_raised"
+# A persisted model preference failed to apply. Its producer records the
+# exception's text only.
+MANDATE_NOT_APPLIED = "preference_not_applied"
+# A discovery failure whose record names no exception class.
+DISCOVERY_FAILURE_CODE = "discovery_failed"
+
+
+def _config_text(value: Any) -> Optional[str]:
+    return value if isinstance(value, str) else None
+
+
+def _reachability_view(reachability: list) -> List[Dict[str, Any]]:
+    """The startup probe results, without their text.
+
+    ``verify_llm_providers_reachable`` records each route's configured name,
+    vendor and route, a status and a message, and for a probe that raised,
+    the exception's text as ``error``. A message is kept only when it is one
+    of that producer's fixed strings; the exception becomes a fixed code.
+    """
+    from kestrel_sovereign.lifecycle_checks import SKIP_REACHABILITY_PROBE_ENV_VAR
+
+    fixed_messages = {
+        "cloud route not probed at startup",
+        "adapter has no reachability probe",
+        "local route probe succeeded",
+        "local route probe failed",
+        "adapter probe unavailable",
+        f"{SKIP_REACHABILITY_PROBE_ENV_VAR}=1",
+    }
+    view = []
+    for entry in reachability:
+        if not isinstance(entry, dict):
+            continue
+        status = entry.get("status")
+        message = entry.get("message")
+        item: Dict[str, Any] = {
+            "name": _config_text(entry.get("name")),
+            "vendor": _config_text(entry.get("vendor")),
+            "route": _config_text(entry.get("route")),
+            "is_local": entry.get("is_local") is True,
+            "status": (
+                status
+                if isinstance(status, str) and status in _REACHABILITY_STATUSES
+                else "unknown"
+            ),
+        }
+        if isinstance(message, str) and message in fixed_messages:
+            item["message"] = message
+        if entry.get("error") is not None:
+            item["error"] = REACHABILITY_PROBE_RAISED
+        view.append(item)
+    return view
+
+
+def _discovery_failure_class(error: Any) -> str:
+    """The exception class a recorded discovery failure names, else a fixed
+    code. ``_note_discovery_outcome`` records ``"<class>: <message>"``; the
+    message is provider text and is never reported.
+    """
+    if isinstance(error, str):
+        name, separator, _message = error.partition(": ")
+        if separator and _EXCEPTION_CLASS_NAME.fullmatch(name):
+            return name
+    return DISCOVERY_FAILURE_CODE
+
+
+def _discovery_failures_view(snapshot, vendors) -> Dict[str, Dict[str, str]]:
+    """Each vendor's discovery status and failure class, without its text."""
+    return {
+        vendor: {
+            "status": snapshot.outcomes[vendor].status.value,
+            "error": _discovery_failure_class(snapshot.outcomes[vendor].error),
+        }
+        for vendor in vendors
+    }
+
+
 async def check_llm_service(agent) -> Dict[str, Any]:
     """Verify that an LLM provider is configured, and report each route's
     health from the calls it actually served.
@@ -1028,7 +1114,7 @@ async def check_llm_service(agent) -> Dict[str, Any]:
             "route_evidence": routes.evidence,
         }
         if reachability:
-            details["reachability"] = reachability
+            details["reachability"] = _reachability_view(reachability)
 
         # A failed startup probe is part of its route's state (#3912): it
         # stands until a call known to be newer than the probe, unless the
@@ -1044,15 +1130,17 @@ async def check_llm_service(agent) -> Dict[str, Any]:
         # Require a real string: ``getattr`` on a test double returns a
         # truthy stub, which would report every mocked service as UNPINNED
         # and then fail to JSON-serialise when the heartbeat is persisted.
+        # The recorded string is the exception's text, so only the fact that
+        # it was recorded is reported (#3912); the boot log line carries it.
         mandate_load_error = getattr(llm_service, "_mandate_load_error", None)
         if not isinstance(mandate_load_error, str):
             mandate_load_error = None
         if mandate_load_error:
             status = worst_status(status, "warn")
-            details["mandate_load_error"] = mandate_load_error
+            details["mandate_load_error"] = MANDATE_NOT_APPLIED
             msg += (
                 " — a persisted model preference failed to apply; this "
-                f"agent is running UNPINNED ({mandate_load_error})"
+                "agent is running UNPINNED"
             )
 
         return {
@@ -1065,10 +1153,11 @@ async def check_llm_service(agent) -> Dict[str, Any]:
     except Exception as e:
         if is_execution_control_error(e):
             raise
+        # The class only: the exception's text can carry provider content.
         return {
             "name": "llm_service",
             "status": "fail",
-            "message": f"LLM service check failed: {e}",
+            "message": f"LLM service check failed: {type(e).__name__}",
             "duration_ms": _elapsed(start),
         }
 
@@ -2159,6 +2248,8 @@ async def check_model_discovery(agent) -> Dict[str, Any]:
     A failing vendor whose every configured route is ``standby`` for this agent
     (see :func:`assess_llm_routes`) is reported under ``standby_failed_vendors``
     and does not degrade the check (#3912): nothing this agent runs selects it.
+    Each failure is reported as its status and exception class, never its
+    recorded text, which is provider content.
     """
     from kestrel_sovereign.llm.model_cache import (
         DiscoveryStatus,
@@ -2229,7 +2320,7 @@ async def check_model_discovery(agent) -> Dict[str, Any]:
         vendor for vendor in failures
         if vendor in standby and vendor != pinned_vendor
     )
-    standby_failures = {vendor: failures[vendor] for vendor in standby_vendors}
+    standby_failures = _discovery_failures_view(snapshot, standby_vendors)
     failures = {
         vendor: error for vendor, error in failures.items()
         if vendor not in standby_failures
@@ -2253,6 +2344,7 @@ async def check_model_discovery(agent) -> Dict[str, Any]:
         }
 
     vendors = sorted(failures)
+    failed_vendors = _discovery_failures_view(snapshot, vendors)
     pinned_at_risk = pinned_vendor in failures if pinned_vendor else False
 
     if pinned_at_risk:
@@ -2265,8 +2357,8 @@ async def check_model_discovery(agent) -> Dict[str, Any]:
         message = (
             f"Model discovery failed for '{pinned_vendor}', the vendor this "
             f"agent's model is pinned to — the pin cannot be validated "
-            f"against a live catalog while this persists. "
-            f"{failures[pinned_vendor]}"
+            f"against a live catalog while this persists "
+            f"({failed_vendors[pinned_vendor]['error']})."
         )
     else:
         message = (
@@ -2281,7 +2373,7 @@ async def check_model_discovery(agent) -> Dict[str, Any]:
         "message": message,
         "details": {
             "catalog_version": snapshot.catalog_version,
-            "failed_vendors": {v: failures[v] for v in vendors},
+            "failed_vendors": failed_vendors,
             # The publication of this snapshot issued no request for these
             # vendors; the failure is the last one observed for each.
             "not_reattempted_vendors": [

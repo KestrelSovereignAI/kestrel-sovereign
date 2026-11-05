@@ -17,7 +17,10 @@ set aside, only on positive evidence:
 - lease-route rows count for the installed lease only when they name it.
   A failure naming no lease warns until a newer call names the lease. An
   installed lease that refuses calls now (expired, or not accepting) warns
-  whatever its rows say.
+  whatever its rows say;
+- no provider or exception text reaches either check's output: a startup
+  probe's error, a discovery failure, a mandate's load error and an error
+  inside the check are reported by exception class or a fixed code.
 
 Every ledger here is a real ``ObservabilityStore`` on a temp SQLite database,
 and every service a real ``LLMService`` over mocked routes: no network, no
@@ -47,6 +50,8 @@ from kestrel_sovereign.a2a.stores.unified.observability_store import (
     _CONTENT_GATED_MARKER,
     ObservabilityStore,
 )
+from kestrel_sovereign.agent import token_counter
+from kestrel_sovereign.agent.model_preference import apply_persisted_model_preference
 from kestrel_sovereign.features.health import checks as health_checks
 from kestrel_sovereign.features.health.checks import (
     LLM_ROUTE_EVIDENCE_ROW_LIMIT,
@@ -58,12 +63,14 @@ from kestrel_sovereign.features.health.checks import (
     derive_overall_status,
 )
 from kestrel_sovereign.lifecycle_checks import verify_llm_providers_reachable
+from kestrel_sovereign.llm import model_catalog
 from kestrel_sovereign.llm.adapter import LLMResponse
 from kestrel_sovereign.llm.error_handling import LLMProviderError
 from kestrel_sovereign.llm.model_cache import (
     VendorDiscoveryOutcome,
     get_shared_model_cache,
 )
+from kestrel_sovereign.llm.model_catalog import ModelCatalogService
 from kestrel_sovereign.llm.output_ceiling import attach_stop_reason
 from kestrel_sovereign.llm.remote_backend import REMOTE_ROUTE_NAME
 from kestrel_sovereign.llm.service import LLMService, LLMServiceError
@@ -446,7 +453,7 @@ async def test_a_failing_provider_that_served_traffic_still_degrades(ledger, sta
     assert _route(llm, "llama_cpp:local")["state"] == "failing"
     assert discovery["status"] == "warn"
     assert discovery["details"]["failed_vendors"] == {
-        "llama_cpp": "ConnectError: connection refused"
+        "llama_cpp": {"status": "failed", "error": "ConnectError"}
     }
     assert discovery["details"]["standby_failed_vendors"] == {}
     assert derive_overall_status([llm, discovery]) == "degraded"
@@ -1452,3 +1459,199 @@ async def test_no_health_output_carries_prompt_response_or_error_text(
     assert llm["status"] == "warn"
     assert SENTINEL not in json.dumps(llm)
     assert SENTINEL not in json.dumps(discovery)
+
+
+class _Catalog:
+    """A route's catalog endpoint: answers with no models, or raises."""
+
+    def __init__(self, error=None):
+        self.error = error
+
+    async def list_models(self, client=None):
+        if self.error is not None:
+            raise self.error
+        return []
+
+
+@pytest.fixture
+def temp_catalog(tmp_path, monkeypatch):
+    """Real discovery persists its catalog: keep it in the temp dir."""
+    monkeypatch.setattr(
+        model_catalog,
+        "_catalog_service",
+        ModelCatalogService(cache_path=tmp_path / "model_discovery_cache.json"),
+    )
+    monkeypatch.setattr(token_counter, "_discovered_context_limits", {})
+
+
+async def _discover(service, errors):
+    """Run real discovery, each route's catalog raising its ``errors`` entry.
+    The real producer, ``_note_discovery_outcome``, records each failure's
+    class and text; the text is checked to be there before health reads it."""
+    for provider in service.providers:
+        provider["adapter"] = _Catalog(errors.get(provider["name"]))
+    await service.discover_all_models(use_cache=False)
+    recorded = get_shared_model_cache().snapshot().discovery_failures
+    assert sorted(recorded) == sorted(
+        name.partition(":")[0] for name in errors
+    )
+    assert all(SENTINEL in text for text in recorded.values())
+
+
+async def test_a_standby_vendors_discovery_failure_is_reported_without_its_text(
+    ledger, stack, temp_catalog
+):
+    service = _service(stack, [ANTHROPIC, LLAMA], ledger, preference=PINNED_ANTHROPIC)
+    await _log(ledger, "anthropic:plan", "claude-opus-5", success=True)
+    await _discover(
+        service, {"llama_cpp:local": ConnectionError(f"refused {SENTINEL}")}
+    )
+
+    discovery = await check_model_discovery(_agent(service, ledger))
+
+    assert discovery["status"] == "pass"
+    assert discovery["details"]["standby_failed_vendors"] == {
+        "llama_cpp": {"status": "failed", "error": "ConnectionError"},
+    }
+    assert SENTINEL not in json.dumps(discovery)
+
+
+async def test_a_selected_vendors_discovery_failure_is_reported_without_its_text(
+    ledger, stack, temp_catalog
+):
+    """The pinned vendor, and a vendor that served traffic: both count, and
+    both are reported by class, in the details and in the message."""
+    service = _service(stack, [ANTHROPIC, LLAMA], ledger, preference=PINNED_ANTHROPIC)
+    await _log(ledger, "llama_cpp:local", "qwen3-8b", success=True)
+    await _discover(service, {
+        "anthropic:plan": LLMProviderError("anthropic", f"unauthorized {SENTINEL}"),
+        "llama_cpp:local": RuntimeError(f"refused {SENTINEL}"),
+    })
+
+    discovery = await check_model_discovery(_agent(service, ledger))
+
+    assert discovery["status"] == "fail"
+    assert discovery["details"]["pinned_vendor_at_risk"] is True
+    assert discovery["details"]["failed_vendors"] == {
+        "anthropic": {"status": "failed", "error": "LLMProviderError"},
+        "llama_cpp": {"status": "failed", "error": "RuntimeError"},
+    }
+    assert "(LLMProviderError)" in discovery["message"]
+    assert SENTINEL not in json.dumps(discovery)
+
+
+async def test_a_raising_startup_probe_is_reported_without_its_text(ledger, stack):
+    """Through the real producer, which records the exception's text as the
+    probe result's ``error``."""
+    llama = _ScriptedRoute(LLAMA)
+    llama.adapter.probe_reachable = AsyncMock(
+        side_effect=RuntimeError(f"probe said {SENTINEL}")
+    )
+    service = _real_service(stack, [llama, _ScriptedRoute(ANTHROPIC)], ledger)
+    await verify_llm_providers_reachable(service, env={})
+    assert SENTINEL in service.reachability[0]["error"]
+
+    result = await check_llm_service(_agent(service, ledger))
+
+    assert result["status"] == "warn"
+    assert result["details"]["reachability"] == [
+        {
+            "name": "llama_cpp:local",
+            "vendor": "llama_cpp",
+            "route": "local",
+            "is_local": True,
+            "status": "unreachable",
+            "message": "local route probe failed",
+            "error": "probe_raised",
+        },
+        {
+            "name": "anthropic:plan",
+            "vendor": "anthropic",
+            "route": "plan",
+            "is_local": False,
+            "status": "skipped",
+            "message": "cloud route not probed at startup",
+        },
+    ]
+    assert SENTINEL not in json.dumps(result)
+
+
+async def test_a_probe_result_keeps_only_its_fixed_fields(ledger, stack):
+    """Whatever a probe result carries, only its configured identity, a known
+    status and one of the producer's fixed messages are reported."""
+    service = _service(
+        stack,
+        [LLAMA],
+        ledger,
+        reachability=[
+            {
+                "name": "llama_cpp:local",
+                "vendor": "llama_cpp",
+                "route": "local",
+                "is_local": True,
+                "status": "unreachable",
+                "message": f"probe said {SENTINEL}",
+                "error": f"probe said {SENTINEL}",
+                "detail": SENTINEL,
+            },
+            {"name": "runpod:vllm", "status": {"said": SENTINEL}, "message": ["x"]},
+            f"not a result {SENTINEL}",
+        ],
+    )
+
+    result = await check_llm_service(_agent(service, ledger))
+
+    assert result["details"]["reachability"] == [
+        {
+            "name": "llama_cpp:local",
+            "vendor": "llama_cpp",
+            "route": "local",
+            "is_local": True,
+            "status": "unreachable",
+            "error": "probe_raised",
+        },
+        {
+            "name": "runpod:vllm",
+            "vendor": None,
+            "route": None,
+            "is_local": False,
+            "status": "unknown",
+        },
+    ]
+    assert SENTINEL not in json.dumps(result)
+
+
+async def test_a_mandate_that_failed_to_apply_is_reported_without_its_text(
+    ledger, stack
+):
+    """Through the real producer, which records the exception's text."""
+    service = _service(stack, [ANTHROPIC], ledger)
+    database = SimpleNamespace(
+        fetchall=AsyncMock(side_effect=RuntimeError(f"database said {SENTINEL}"))
+    )
+    assert SENTINEL in await apply_persisted_model_preference(service, database, DID)
+    assert SENTINEL in service._mandate_load_error
+
+    result = await check_llm_service(_agent(service, ledger))
+
+    assert result["status"] == "warn"
+    assert result["details"]["mandate_load_error"] == "preference_not_applied"
+    assert "running UNPINNED" in result["message"]
+    assert SENTINEL not in json.dumps(result)
+
+
+async def test_an_exception_inside_the_check_is_reported_by_its_class(
+    ledger, stack, monkeypatch
+):
+    service = _service(stack, [ANTHROPIC], ledger)
+
+    def broken():
+        raise RuntimeError(f"routing said {SENTINEL}")
+
+    monkeypatch.setattr(service, "get_active_model_id", broken)
+
+    result = await check_llm_service(_agent(service, ledger))
+
+    assert result["status"] == "fail"
+    assert result["message"] == "LLM service check failed: RuntimeError"
+    assert SENTINEL not in json.dumps(result)
