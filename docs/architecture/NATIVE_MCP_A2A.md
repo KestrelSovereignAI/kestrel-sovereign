@@ -319,6 +319,16 @@ The context identifies the destination; authenticated View controllers still
 authorize readers and tool calls independently. It does not confirm delivery:
 later response policy can withhold the rendered parts.
 
+MCP tool hosts additionally require `supports_unconfirmed_tool_outcomes is True`
+(Core 0.62.2 or newer). This declares unknown-outcome handling for registry-mounted
+tools across model, named, inline and bound dispatch. The execution engine supplies
+the contract; registration alone does not establish it. Unexpected failures after
+execution starts preserve uncertainty, and an unconfirmed required audit terminates
+delivery and automatic route fallback. The MCP feature refuses hosts without this
+exact-True capability before connection acquisition or Apps/OAuth enablement.
+Other SDK-only hosts must implement the same contract. It is independent of caller
+authority and permission checks and does not authorize a retry.
+
 ### Tasks and operator input
 
 An MCP task is identified by agent, connection and remote task ID. Its durable
