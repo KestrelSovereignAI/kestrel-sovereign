@@ -24,7 +24,7 @@ def current_check(active):
 
 def executable(tmp_path, *, delayed=False):
     path = tmp_path / "owned-stdin-fixture"
-    program = f"#!{sys.executable}\nimport sys,time\nfrom pathlib import Path\n"
+    program = f"#!{sys.executable} -B\nimport sys,time\nfrom pathlib import Path\n"
     program += f"data=sys.stdin.buffer.read(); p=Path({str(tmp_path / 'accepted')!r})\n"
     program += "if data: p.write_bytes(data)\n"
     if delayed:

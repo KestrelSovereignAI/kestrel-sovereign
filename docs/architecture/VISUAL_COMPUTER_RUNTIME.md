@@ -373,10 +373,34 @@ observations cannot refund capacity, prove no cloud effect, or authorize another
 create. This is a conservative recovery limitation, not a new sent=false field or
 automatic cleanup permission.
 
-The same immutable Acquisition acceptance also restricts the logical Runtime
-provider invocation through context inherited by joined child tasks. Changing
-the request row or forwarding the guard cannot create a second acquisition in
-that invocation. The context value only restricts issuance; it grants no host,
-native, or persistence authority. Independently admitted tasks retain their own
-original checks. Physical close and outer retirement still use the same original
-owner, backend hold, and actual native joins.
+The same immutable Acquisition acceptance also restricts the Runtime facade and
+the invocation context inherited by child tasks, including a child that resumes
+after the parent invocation returns. Within that inherited lineage, changing
+the request row or forwarding the guard does not permit fresh issuance. The
+context value only restricts issuance; it grants no host, native, or persistence
+authority. The trusted direct repository/source issuer accepts a caller-supplied
+synchronous checker. A task created before the invocation can use that API with
+another quoted row and a forwarded checker outside the inherited restriction;
+this does not establish an independent authenticated host admission. Physical
+close and outer retirement still use the same original owner, backend hold, and
+actual native joins.
+
+
+### Worker build dependencies and validation scope
+
+The public SDK dependency is >=0.48.0; the worker build input pins SDK 0.48.0.
+The Core pin in both worker requirements files must match the project version.
+Build the ordinary Core wheel and regenerate the target dependency lock with
+that wheel's exact hash before building worker images. The version test checks
+both requirements files so a Core release cannot silently keep an older wheel.
+
+The closed v2 profile and `core-sdk046-two-domain-v2` schema identity refer to
+its original contracts. They do not negotiate an installed SDK version or
+provide a compatibility fallback. Dependency installation requires full package
+namespace and RECORD verification; current and minimum Python versions and the
+native worker must be tested against the same candidate. Earlier validation
+retains its original source, package and environment identities.
+
+A dependency declaration or successful installation does not register the
+worker or establish cgroup-zero, broker outbound isolation, cognitive, cloud or
+end-to-end product readiness.
