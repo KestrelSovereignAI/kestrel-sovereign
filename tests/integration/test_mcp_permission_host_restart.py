@@ -12,6 +12,7 @@ import json
 import os
 from pathlib import Path
 import signal
+import shutil
 import sys
 import uuid
 
@@ -21,6 +22,7 @@ import pytest_asyncio
 from types import SimpleNamespace
 from cryptography.fernet import Fernet
 
+import kestrel_sovereign
 from kestrel_sovereign.inception_service import create_kestrel_identity_async
 from tests.integration.mcp_permission_peers import https_peer, owned_provider_network
 from tests.shared.genesis_audit import deterministic_safe_genesis_auditor
@@ -67,9 +69,10 @@ async def native_host(home, descriptor, environment, peer, generation):
                     await asyncio.sleep(0.01)
             state = json.loads(ready.read_text())
             assert state['pid'] == process.pid
-            expected = Path(__file__).resolve().parents[2] / 'kestrel_sovereign/server.py'
-            assert Path(state['server_source']).resolve() == expected
             running.state = state
+            expected = Path(kestrel_sovereign.__file__).resolve().with_name('server.py')
+            assert Path(state['server_source']).resolve() == expected, (
+                'Owned child Core runtime differs from parent')
             peer.local_ports.add(state['port'])
             yield running
         finally:
@@ -112,7 +115,9 @@ async def host_campaign(tmp_path, monkeypatch):
             KESTREL_MULTI_AGENT_CONFIG=str(home / 'multi_agent.toml'),
             KESTREL_DATA_KEY=key, KESTREL_API_KEY=api_key, KESTREL_SKIP_DOTENV='1',
             PYTHON_DOTENV_DISABLED='1', PYTHONDONTWRITEBYTECODE='1',
-            PYTHONPATH=str(repository), KESTREL_PHOENIX_ENABLED='0', KESTREL_TRACING_ENABLED='0',
+            PYTHONPATH=os.pathsep.join([
+                str(Path(kestrel_sovereign.__file__).resolve().parent.parent), str(repository)]),
+            KESTREL_PHOENIX_ENABLED='0', KESTREL_TRACING_ENABLED='0',
             AWS_EC2_METADATA_DISABLED='true', EMAIL_DRY_RUN='true')
         headers = {'X-API-Key': api_key, 'X-Kestrel-Allow-Destructive': 'true'}
         with owned_provider_network(monkeypatch, peer):
@@ -290,3 +295,17 @@ async def test_owned_host_setup_failure_preserves_original_diagnostic(tmp_path):
             pytest.fail('A missing native host descriptor must never reach readiness')
     assert 'FileNotFoundError' in str(raised.value)
     assert not (home / 'host-failure-ready.json').exists()
+
+
+async def test_owned_host_refuses_a_different_core_runtime(host_campaign):
+    c = host_campaign
+    alternate = c.home / 'alternate-runtime'
+    alternate.mkdir()
+    shutil.copytree(Path(kestrel_sovereign.__file__).resolve().parent,
+        alternate / 'kestrel_sovereign', ignore=shutil.ignore_patterns('__pycache__'))
+    repository = Path(__file__).resolve().parents[2]
+    environment = dict(c.environment, PYTHONPATH=os.pathsep.join([str(alternate), str(repository)]))
+    with pytest.raises(AssertionError, match='Owned child Core runtime differs from parent'):
+        async with native_host(c.home, c.descriptor, environment, c.peer, 'foreign-runtime'):
+            pass
+    assert await c.peer.witness(None, None) == []
