@@ -57,9 +57,10 @@ def reserved_session_id(session_id: object) -> Optional[str]:
     refused with "no interactive approver" and the turn's history filed under
     the reserved label (#3284).
 
-    Surrounding whitespace is ignored because the turn lifecycle strips it
-    from the session it binds (``turn_lifecycle._normalize_session_id``), so a
-    padded value reaches the turn's features as the bare reserved id.
+    Surrounding whitespace is ignored, so a padded reserved id is refused
+    too. The turn lifecycle keeps a session key exactly as given (#3875), but
+    readers that trim one, such as the session span attributes, would still
+    show a padded value as the bare reserved label.
     """
     if not isinstance(session_id, str):
         return None

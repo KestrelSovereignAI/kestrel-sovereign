@@ -95,6 +95,8 @@ from kestrel_sovereign.knowledge import (
     IRI,
     OntologyRef,
     SourceOccurrence,
+    SourceReferenceKind,
+    with_source_reference,
 )
 from kestrel_sovereign.knowledge.registry import get_knowledge_registry
 from kestrel_sovereign.storage.semantic_binding import SemanticAssertionBinding
@@ -526,11 +528,15 @@ def build_source(
     *,
     transition: str,
     owning_agent_id: str,
+    session_id: Optional[str] = None,
 ) -> SourceOccurrence:
     """Build provenance from the trusted turn context, never from row text.
 
     The locator names the canonical file and the row's address, which is a
-    truthful pointer that carries no pattern or blocker prose.
+    truthful pointer that carries no pattern or blocker prose. ``session_id``
+    is the session the projecting turn's conversation rows are filed under, or
+    ``None`` when no turn with a session is projecting; the locator then names
+    no session.
     """
     provenance = current_invocation_provenance()
     stem = f"{_LOCATOR_STEM}{proposal.section_key}:{proposal.row_id}"
@@ -547,7 +553,9 @@ def build_source(
     return SourceOccurrence(
         source_occurrence_id=source_occurrence_id(transition),
         source_kind=source_kind,
-        locator=locator,
+        locator=with_source_reference(
+            locator, SourceReferenceKind.SESSION, session_id
+        ),
         received_at=observed_at,
         content_digest=f"sha256:{proposal.content_digest}",
         actor=actor,

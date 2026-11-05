@@ -659,10 +659,26 @@ so they change its digest and therefore the corpus manifest's `policy_pin`; an
 empty set is omitted from that value, so a policy without exclusions keeps its
 prior digest. A consumer that persists its policy restores it with
 `GovernedCorpusPolicy.from_mapping`, which refuses unknown fields rather than
-dropping them. No producer writes these segments yet (#3875): the existing
-`save_fact` and strategy-ledger sources name their request route and their own
-record, never the session, so material they recorded during an excluded session
-must be excluded by source-occurrence id.
+dropping them.
+
+Producers append the segment after their own locator with
+`with_source_reference`, so a stem a reader matches by prefix still leads it
+(#3875). `save_fact` and the strategy-ledger projection name the session of the
+turn that recorded them, read through the turn lifecycle
+(`get_turn_bound_session_id`) and never from tool arguments. The lifecycle
+reports the session key exactly as the turn was given it, never trimmed, and
+the producer canonicalizes it as the conversation store does before filing a
+row, so the source names the key the turn's rows are filed under; a trimmed
+copy would name a session no row belongs to and slip past its exclusion. Work outside a
+turn, and a turn with no session, names none: the store then derives each row's
+session as it writes it, so no single session is the turn's. A ledger pass
+names the projecting turn's session for every row it writes in that pass. Any
+producer that reads a saved item must name it as `saved-item:<id>` the same
+way. The explicit-fact replay fingerprint ignores session segments, as it
+ignores delivery time, so a retry filed under another session, or of an
+operation recorded before sources named one, still replays idempotently.
+Assertions recorded before #3875 name no session and can be held out only by
+source-occurrence id.
 
 The host admits only current,
 projection-eligible, conformant assertions. Derived assertions recursively

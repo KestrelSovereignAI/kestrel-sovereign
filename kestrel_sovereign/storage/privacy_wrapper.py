@@ -2392,11 +2392,13 @@ class PrivacyEnforcingStorage:
             confidence: float,
             confidence_requested: float | None = None,
             invocation_id: object = None,
+            session_id: str | None = None,
         ) -> FactWriteReceipt:
             from kestrel_sovereign.agent.invocation import ensure_invocation_id
 
             invocation_id = ensure_invocation_id(invocation_id)
             binding = fact_binding()
+            source_session_id = await self._filed_session_id(session_id)
             mapping = map_legacy_fact(
                 subject,
                 predicate,
@@ -2419,6 +2421,7 @@ class PrivacyEnforcingStorage:
                 operation_id,
                 digest,
                 binding.owning_agent_id,
+                session_id=source_session_id,
             )
             assertion = _assertion(
                 binding=binding,
@@ -3361,6 +3364,22 @@ class PrivacyEnforcingStorage:
             return provided
         return await self._storage.resolve_session_id(provided)
 
+    async def _filed_session_id(self, session_id: Optional[str]) -> Optional[str]:
+        """The session a turn's conversation rows are filed under, or None.
+
+        ``session_id`` is the turn's own session key, which the calling
+        feature reads through the turn lifecycle exactly as the turn was given
+        it; it is never trimmed, because the store files rows under that exact
+        key. A named session is canonicalized as the conversation store
+        canonicalizes it before filing a row (#2012).
+        A turn with no session gets None, never a derived one: the store then
+        derives each row's session as it writes it, so no single session is
+        the turn's, and a source must name none rather than guess (#3875).
+        """
+        if not session_id:
+            return None
+        return await self.resolve_session_id(session_id)
+
     async def get_conversation_history(
         self, limit: int = 100, session_id: str = None
     ) -> List[Dict]:
@@ -4270,7 +4289,9 @@ class PrivacyEnforcingStorage:
                 "pipeline; this wrapper will not silently rewrite canonical terms."
             )
 
-    async def project_strategy_ledger_assertions(self, snapshot):
+    async def project_strategy_ledger_assertions(
+        self, snapshot, *, session_id: Optional[str] = None
+    ):
         """Project the canonical strategy ledger into canonical assertions (#3051).
 
         Takes a :class:`LedgerSnapshot` -- a deep copy the ledger captured the
@@ -4290,6 +4311,10 @@ class PrivacyEnforcingStorage:
         has already persisted, so a semantic write that cannot land must not
         fail the ledger mutation. The report says what happened; the next
         projection reconciles.
+
+        ``session_id`` is the session of the turn projecting the ledger, read
+        through the turn lifecycle; each source this pass writes names the
+        session that turn's rows are filed under.
         """
         from kestrel_sovereign.features.strategic_memory.ledger_assertions import (
             LedgerAssertionReport,
@@ -4324,7 +4349,7 @@ class PrivacyEnforcingStorage:
         try:
             async with self._ledger_projection_lock(snapshot):
                 return await self._project_strategy_ledger_assertions_leased(
-                    snapshot, binding, report
+                    snapshot, binding, report, session_id
                 )
         finally:
             self._release_ledger_assertion_lease()
@@ -4361,7 +4386,7 @@ class PrivacyEnforcingStorage:
         return lock
 
     async def _project_strategy_ledger_assertions_leased(
-        self, snapshot, binding, report
+        self, snapshot, binding, report, session_id
     ):
         """Run one projection pass while the privacy lease is held."""
         from kestrel_sovereign.features.strategic_memory import ledger_assertions
@@ -4435,6 +4460,7 @@ class PrivacyEnforcingStorage:
         current = await self._read_ledger_assertions(plan, report)
         if current is None:
             return report
+        source_session_id = await self._filed_session_id(session_id)
 
         # Seeded with the rows that are present but unassertable, so
         # reconciliation leaves them alone. "The row is gone" and "the row is
@@ -4443,7 +4469,11 @@ class PrivacyEnforcingStorage:
         for proposal in plan.proposals:
             keep.add(proposal.assertion_id)
             await self._apply_ledger_proposal(
-                proposal, current.get(proposal.assertion_id), binding, report
+                proposal,
+                current.get(proposal.assertion_id),
+                binding,
+                report,
+                session_id=source_session_id,
             )
 
         # Reconcile: an assertion whose row is gone, or retired in place, stops
@@ -4509,7 +4539,9 @@ class PrivacyEnforcingStorage:
                 cursor = page[-1].revision_id
         return current
 
-    async def _apply_ledger_proposal(self, proposal, held, binding, report):
+    async def _apply_ledger_proposal(
+        self, proposal, held, binding, report, *, session_id
+    ):
         """Write, revise, or decline one row's assertion."""
         from kestrel_sovereign.features.strategic_memory import ledger_assertions
         from kestrel_sovereign.knowledge import AssertionStatus
@@ -4576,6 +4608,7 @@ class PrivacyEnforcingStorage:
             proposal,
             transition=transition,
             owning_agent_id=binding.owning_agent_id,
+            session_id=session_id,
         )
         assertion = ledger_assertions.build_assertion(
             binding=binding,
@@ -4695,8 +4728,14 @@ class PrivacyEnforcingStorage:
         confidence: float,
         confidence_requested: float | None = None,
         invocation_id: object = None,
+        session_id: str | None = None,
     ):
-        """Run explicit teaching through this wrapper's captured authority."""
+        """Run explicit teaching through this wrapper's captured authority.
+
+        ``session_id`` is the calling turn's session, read through the turn
+        lifecycle and never from tool arguments; the fact's source names the
+        session that turn's rows are filed under.
+        """
         return await self.__save_explicit_fact(
             subject=subject,
             predicate=predicate,
@@ -4704,6 +4743,7 @@ class PrivacyEnforcingStorage:
             confidence=confidence,
             confidence_requested=confidence_requested,
             invocation_id=invocation_id,
+            session_id=session_id,
         )
 
     async def forget_explicit_fact(

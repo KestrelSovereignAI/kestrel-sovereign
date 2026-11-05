@@ -818,7 +818,9 @@ class StrategicMemoryFeature(Feature):
             # producer may reconcile against.
             return {"skipped_reason": "ledger_ids_unpersisted"}
         try:
-            report = await project(snapshot)
+            # The projecting turn's session, from the turn lifecycle, so each
+            # row's source names the session it was recorded in (#3875).
+            report = await project(snapshot, session_id=self._turn_session_id())
         except Exception as e:  # noqa: BLE001 - the producer is best-effort
             logger.warning("strategy ledger assertion projection failed: %s", e)
             return {"skipped_reason": "assertion_projection_failed"}
