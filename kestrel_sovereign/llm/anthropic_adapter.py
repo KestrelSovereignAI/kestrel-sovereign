@@ -19,9 +19,9 @@ from typing import Any, Dict, List, Optional, Union, AsyncIterator, Type
 import httpx2
 from pydantic import BaseModel
 
-from kestrel_sdk.llm import ToolCallStarted
+from kestrel_sdk.llm import LLMProtocolError, ToolCallStarted
 
-from .completion_protocol import decode_tool_arguments
+from .completion_protocol import GenerationProtocolError, decode_tool_arguments
 from .adapter import LLMAdapter, LLMResponse, ThinkingContentSplitter, ThinkingDelta, ToolCall
 from .call_progress import report_call_progress
 from .cancellation import (
@@ -1417,6 +1417,9 @@ class AnthropicAdapter(LLMAdapter):
         """
         _validate_sampling_parameters(kwargs)
         cancel_token: Optional[CancelToken] = kwargs.pop("cancel_token", None)
+        input_tokens = output_tokens = total_tokens = None
+        cache_creation_input_tokens = cache_read_input_tokens = None
+        stop_reason = None
         try:
             raise_if_cancelled(cancel_token)
             filtered_messages, combined_system = self._convert_messages_to_anthropic(
@@ -1468,6 +1471,26 @@ class AnthropicAdapter(LLMAdapter):
                 cancel_token,
             )
 
+            # Extract token usage from response
+            input_tokens = None
+            output_tokens = None
+            total_tokens = None
+            cache_creation_input_tokens = None
+            cache_read_input_tokens = None
+            if hasattr(response, 'usage') and response.usage:
+                input_tokens = getattr(response.usage, 'input_tokens', None)
+                output_tokens = getattr(response.usage, 'output_tokens', None)
+                # Anthropic reports cache usage separately; either may be 0
+                # (no write/read on this call) or absent on older API versions.
+                cache_creation_input_tokens = getattr(
+                    response.usage, 'cache_creation_input_tokens', None
+                )
+                cache_read_input_tokens = getattr(
+                    response.usage, 'cache_read_input_tokens', None
+                )
+                if input_tokens is not None and output_tokens is not None:
+                    total_tokens = input_tokens + output_tokens
+
             # #3300: the provider's own verdict on whether the response is
             # finished. A ``max_tokens`` or ``model_context_window_exceeded``
             # stop means generation was cut inside its LAST content block; when that block is a tool call, its
@@ -1509,26 +1532,6 @@ class AnthropicAdapter(LLMAdapter):
                     ))
             content = "".join(text_blocks) if text_blocks else None
 
-            # Extract token usage from response
-            input_tokens = None
-            output_tokens = None
-            total_tokens = None
-            cache_creation_input_tokens = None
-            cache_read_input_tokens = None
-            if hasattr(response, 'usage') and response.usage:
-                input_tokens = getattr(response.usage, 'input_tokens', None)
-                output_tokens = getattr(response.usage, 'output_tokens', None)
-                # Anthropic reports cache usage separately; either may be 0
-                # (no write/read on this call) or absent on older API versions.
-                cache_creation_input_tokens = getattr(
-                    response.usage, 'cache_creation_input_tokens', None
-                )
-                cache_read_input_tokens = getattr(
-                    response.usage, 'cache_read_input_tokens', None
-                )
-                if input_tokens is not None and output_tokens is not None:
-                    total_tokens = input_tokens + output_tokens
-
             notice = self._output_ceiling_notice(model, stop_reason, model_ceiling)
             if notice is not None:
                 content = join_output_ceiling_notice(content, notice)
@@ -1544,6 +1547,19 @@ class AnthropicAdapter(LLMAdapter):
                 cache_read_input_tokens=cache_read_input_tokens,
             ), stop_reason)
 
+        except LLMProtocolError as error:
+            if is_execution_control_error(error) or isinstance(error, GenerationProtocolError):
+                raise
+            raise GenerationProtocolError(LLMResponse(
+                input_tokens=input_tokens, output_tokens=output_tokens,
+                total_tokens=(input_tokens + output_tokens
+                    if input_tokens is not None and output_tokens is not None else None),
+                cache_creation_input_tokens=cache_creation_input_tokens,
+                cache_read_input_tokens=cache_read_input_tokens,
+                stop_reason=stop_reason,
+            ) if any(value is not None for value in (
+                input_tokens, output_tokens, cache_creation_input_tokens, cache_read_input_tokens,
+            )) else None) from error
         except Exception as e:
             logger.error(
                 "Anthropic API error [credential=%s]: %s",
@@ -1614,6 +1630,9 @@ class AnthropicAdapter(LLMAdapter):
         usage_sink = kwargs.pop("usage_sink", None)
         _validate_sampling_parameters(kwargs)
         cancel_token: Optional[CancelToken] = kwargs.pop("cancel_token", None)
+        input_tokens = output_tokens = total_tokens = None
+        cache_creation_input_tokens = cache_read_input_tokens = None
+        stop_reason = None
         try:
             raise_if_cancelled(cancel_token)
             filtered_messages, combined_system = self._convert_messages_to_anthropic(
@@ -1663,10 +1682,6 @@ class AnthropicAdapter(LLMAdapter):
             current_tool_block_index: Optional[int] = None
             text_content = ""
             chunk_count = 0
-            input_tokens = None
-            output_tokens = None
-            cache_creation_input_tokens = None
-            cache_read_input_tokens = None
             # #3300: the terminal stop_reason, and the last content block the
             # stream opened — a ``max_tokens`` stop cuts that block short.
             stop_reason = None
@@ -1699,6 +1714,7 @@ class AnthropicAdapter(LLMAdapter):
                         if hasattr(event, 'message') and hasattr(event.message, 'usage'):
                             usage = event.message.usage
                             input_tokens = getattr(usage, 'input_tokens', None)
+                            output_tokens = getattr(usage, 'output_tokens', None)
                             cache_creation_input_tokens = getattr(
                                 usage, 'cache_creation_input_tokens', None
                             )
@@ -1902,6 +1918,19 @@ class AnthropicAdapter(LLMAdapter):
                 cache_read_input_tokens=cache_read_input_tokens,
             ), stop_reason)
 
+        except LLMProtocolError as error:
+            if is_execution_control_error(error) or isinstance(error, GenerationProtocolError):
+                raise
+            raise GenerationProtocolError(LLMResponse(
+                input_tokens=input_tokens, output_tokens=output_tokens,
+                total_tokens=(input_tokens + output_tokens
+                    if input_tokens is not None and output_tokens is not None else None),
+                cache_creation_input_tokens=cache_creation_input_tokens,
+                cache_read_input_tokens=cache_read_input_tokens,
+                stop_reason=stop_reason,
+            ) if any(value is not None for value in (
+                input_tokens, output_tokens, cache_creation_input_tokens, cache_read_input_tokens,
+            )) else None) from error
         except Exception as e:
             logger.error(
                 "Anthropic streaming with tools failed [credential=%s]: %s",

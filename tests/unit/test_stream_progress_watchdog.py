@@ -513,7 +513,9 @@ def test_the_text_only_stream_counts_hidden_thinking_too(kind):
 
     assert failure is None
     assert _longest_gap_between_items(received, provider) > 2 * BOUND
-    assert _items(received) == ["Done."]
+    items = _items(received)
+    assert len(items) == 2 and items[0] == "Done."
+    assert isinstance(items[1], LLMResponse) and items[1].stop_reason == "end_turn"
 
 
 def test_omitted_thinking_does_not_cut_a_non_streaming_answer():
@@ -684,25 +686,29 @@ def test_openai_tool_call_arguments_that_outlast_the_bound_are_not_cut():
     ]
 
 
-def test_openai_text_stream_counts_chunks_it_does_not_yield():
-    """The text-only stream drops tool-call deltas; they are still the
-    provider answering."""
+def test_openai_plain_stream_counts_hidden_reasoning_progress():
+    """Hidden native reasoning still reports progress while plain output waits."""
     loop = VirtualClockLoop()
-    provider = _ScriptedProvider(loop, _openai_tool_call_script()[:-1])
+    script = [(0, _openai_chunk({"role": "assistant", "content": "Working."}))]
+    script += [(STEP, _openai_chunk({"reasoning_content": "private"})) for _ in range(40)]
+    script.append((STEP, _openai_chunk({}, finish_reason="stop")))
+    provider = _ScriptedProvider(loop, script)
     client = _openai_client(provider)
     adapter = OpenAIAdapter()
 
     received, failure = _drive(
         loop,
         lambda: adapter.get_streaming_response(
-            client=client, model="gpt-5", messages=USER, tools=TOOLS,
+            client=client, model="gpt-5", messages=USER,
         ),
         client,
     )
 
     assert failure is None
     assert _longest_gap_between_items(received, provider) > 2 * BOUND
-    assert _items(received) == ["Writing the notes now."]
+    items = _items(received)
+    assert len(items) == 2 and items[0] == "Working."
+    assert isinstance(items[1], LLMResponse) and items[1].stop_reason == "stop"
 
 
 # --------------------------------------------------------------------------

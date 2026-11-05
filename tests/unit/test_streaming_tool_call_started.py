@@ -241,7 +241,7 @@ class TestAnthropicEmitsToolCallStarted:
             _anthropic_event("content_block_stop", index=0),
         ]
 
-        with pytest.raises(LLMProtocolError, match="valid JSON"):
+        with pytest.raises(LLMProtocolError, match="invalid generation protocol"):
             _drive(AnthropicAdapter(), events)
 
 

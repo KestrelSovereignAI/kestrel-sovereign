@@ -97,12 +97,16 @@ async def test_core_native_anthropic_nonobject_tool_input_is_refused(streaming, 
 
     async with httpx2.AsyncClient(transport=httpx2.MockTransport(respond)) as http:
         async with AsyncAnthropic(api_key="owned-native-key", http_client=http, max_retries=0) as client:
-            with pytest.raises(LLMProtocolError):
+            with pytest.raises(LLMProtocolError) as raised:
                 if streaming:
                     _ = [item async for item in AnthropicAdapter().get_streaming_response_with_tools(
                         client, "claude-owned", [{"role": "user", "content": "owned"}], max_tokens=16)]
                 else:
                     await AnthropicAdapter().get_response(client, "claude-owned", [{"role": "user", "content": "owned"}], max_tokens=16)
+            usage = reported_usage(raised.value)
+            assert usage is not None and usage.input_tokens == 2
+            assert usage.content is None and usage.raw is None and usage.tool_calls is None
+            assert (usage.output_tokens, usage.total_tokens) == ((0, 2) if streaming else (3, 5))
             assert responses and all(response.is_closed for response in responses)
 
 
