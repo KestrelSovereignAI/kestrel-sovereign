@@ -25,6 +25,7 @@ import pytest_asyncio
 from kestrel_sdk.features.base import Feature as SdkFeature
 from kestrel_sdk.hooks.base import Hook, HookEvent, HookInput, HookOutput
 from kestrel_sdk.llm.response import ToolCall
+from kestrel_sdk.storage.database.interface import QueryError
 from kestrel_sdk.tools.base import ToolCategory
 
 from kestrel_sovereign.features.base import Feature, tool
@@ -132,6 +133,20 @@ class _NamedDispatcher(_Dispatcher):
     call = parity._NamedPath.call
 
 
+class _UncapturedNamedDispatcher(_Dispatcher):
+    """``execute_named_tool`` with no ``_capture``, as voice, MCP and A2A call it.
+
+    The named path writes no dispatch row for such a caller, refused or
+    allowed: its transport records the call. Only the completion hook it
+    fires is this path's own audit."""
+
+    async def call(self, tool_name, arguments, command):
+        agent = await self._agent()
+        return await agent.execute_named_tool(
+            tool_name, dict(arguments), session_id=parity.SESSION, source="mcp",
+        )
+
+
 TOOL_PATHS = {
     "bound": _Bound,
     "direct": _Direct,
@@ -140,6 +155,11 @@ TOOL_PATHS = {
     "subagent_inline": _SubagentInline,
 }
 DISPATCHER_PATHS = {"dispatcher": _Dispatcher, "named_dispatcher": _NamedDispatcher}
+#: Paths whose completion hook reports a refused call, with or without a row.
+COMPLETION_PATHS = {
+    **DISPATCHER_PATHS,
+    "uncaptured_named_dispatcher": _UncapturedNamedDispatcher,
+}
 
 DISPATCH = {"task": f"look up {SECRET}", "context": "a note"}
 
@@ -149,7 +169,7 @@ async def make_probe(tmp_path):
     made: list = []
 
     def _make(path: str, kind: str):
-        made.append({**TOOL_PATHS, **DISPATCHER_PATHS}[path](kind, tmp_path))
+        made.append({**TOOL_PATHS, **COMPLETION_PATHS}[path](kind, tmp_path))
         return made[-1]
 
     yield _make
@@ -318,8 +338,31 @@ async def test_a_refused_subagent_dispatch_records_what_its_hooks_refused(
     make_probe, path, kind, in_place, decision,
 ):
     """The same rule for a feature's dispatcher, whose PRE_TOOL_USE chain
-    runs inside its PRE_SUBAGENT_CALL envelope. Its POST_SUBAGENT_CALL
-    completion hook reports the refused arguments too."""
+    runs inside its PRE_SUBAGENT_CALL envelope."""
+    probe = make_probe(path, kind)
+
+    with _chain(
+        _Decide(REFUSALS[decision](), event=HookEvent.PRE_TOOL_USE),
+        before=_Rewrite({"task": REDACTED}, in_place=in_place, event=HookEvent.PRE_TOOL_USE),
+    ):
+        _refused(await probe.call("probe_feature", dict(DISPATCH), ""))
+
+    assert probe.feature.calls == []
+    assert probe.recorder.authorized == [{**DISPATCH, "task": REDACTED}]
+    assert await _recorded(probe) == probe.recorder.authorized
+    assert SECRET not in await _recorded_text(probe)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("decision", sorted(REFUSALS))
+@pytest.mark.parametrize("in_place", [False, True], ids=["modify", "in-place"])
+@pytest.mark.parametrize("kind", sorted(KINDS))
+@pytest.mark.parametrize("path", sorted(COMPLETION_PATHS))
+async def test_a_refused_subagent_dispatch_completes_with_what_its_hooks_refused(
+    make_probe, path, kind, in_place, decision,
+):
+    """Its POST_SUBAGENT_CALL completion hook reports the refused arguments
+    too, whether or not the named path's caller captures them."""
     probe = make_probe(path, kind)
     completion = _Completion()
 
@@ -332,26 +375,24 @@ async def test_a_refused_subagent_dispatch_records_what_its_hooks_refused(
 
     assert probe.feature.calls == []
     assert probe.recorder.authorized == [{**DISPATCH, "task": REDACTED}]
-    assert await _recorded(probe) == probe.recorder.authorized
-    assert SECRET not in await _recorded_text(probe)
     assert completion.reported == probe.recorder.authorized
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("decision", sorted(REFUSALS))
 @pytest.mark.parametrize("in_place", [False, True], ids=["modify", "in-place"])
 @pytest.mark.parametrize("kind", sorted(KINDS))
 @pytest.mark.parametrize("path", sorted(DISPATCHER_PATHS))
-async def test_a_denied_subagent_call_records_what_its_hooks_denied(
-    make_probe, path, kind, in_place,
+async def test_a_refused_subagent_call_records_what_its_hooks_refused(
+    make_probe, path, kind, in_place, decision,
 ):
-    """A PRE_SUBAGENT_CALL denial is recorded by the same rule. (The chat
-    loop writes no dispatch row at all for a PRE_SUBAGENT_CALL ASK: its
-    ``approval_required`` status fails the table's CHECK, a separate defect.)"""
+    """A PRE_SUBAGENT_CALL refusal is recorded by the same rule, in exactly
+    one row."""
     probe = make_probe(path, kind)
     completion = _Completion()
 
     with _chain(
-        _Decide(REFUSALS["deny"](), event=HookEvent.PRE_SUBAGENT_CALL),
+        _Decide(REFUSALS[decision](), event=HookEvent.PRE_SUBAGENT_CALL),
         completion,
         before=_Rewrite(
             {"task": REDACTED}, in_place=in_place, event=HookEvent.PRE_SUBAGENT_CALL,
@@ -365,6 +406,31 @@ async def test_a_denied_subagent_call_records_what_its_hooks_denied(
     assert await _recorded(probe) == probe.recorder.authorized
     assert SECRET not in await _recorded_text(probe)
     assert SECRET not in json.dumps(completion.reported)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("decision", "error_class"), [("ask", "ApprovalRequired"), ("deny", "PermissionDenied")],
+)
+@pytest.mark.parametrize("kind", sorted(KINDS))
+async def test_a_subagent_call_the_chat_loop_refused_is_recorded_as_policy_denied(
+    make_probe, kind, decision, error_class,
+):
+    """The table has no approval status: an ASK is a ``policy_denied`` row
+    that names ``ApprovalRequired``. Recorded as ``approval_required``, the
+    row failed the table's CHECK and was never written (#3953)."""
+    probe = make_probe("dispatcher", kind)
+
+    with _chain(
+        _Decide(REFUSALS[decision](), event=HookEvent.PRE_SUBAGENT_CALL),
+        event=HookEvent.PRE_SUBAGENT_CALL,
+    ):
+        _refused(await probe.call("probe_feature", dict(DISPATCH), ""))
+
+    rows = await probe.backend.fetch_all(
+        "SELECT result_status, error_class FROM a2a_tool_dispatches"
+    )
+    assert [tuple(row) for row in rows] == [("policy_denied", error_class)]
 
 
 ALL_PATHS = sorted({**TOOL_PATHS, **DISPATCHER_PATHS})
@@ -440,6 +506,66 @@ async def test_a_governed_refusal_the_dispatch_could_not_finish_keeps_its_argume
 
         assert probe.feature.calls == []
         assert await _recorded(probe) == [{"note": REDACTED}]
+        assert SECRET not in await _recorded_text(probe)
+    finally:
+        await probe.close()
+
+
+#: A first response write that fails, by the two handlers the chat loop's
+#: dispatcher recovers through: a backend error and a builtin one.
+RESPONSE_WRITE_FAILURES = {
+    "backend": lambda: QueryError("response log unavailable"),
+    "builtin": lambda: ConnectionError("response log unavailable"),
+}
+
+
+class _DispatcherResponseLogFailsOnce(_Dispatcher):
+    """A dispatcher whose first observability response write fails, so the
+    chat loop's error recovery reports the refused call."""
+
+    failure = "backend"
+
+    async def _agent(self):
+        agent = await super()._agent()
+        store = agent.observability_store
+        log_tool_response = store.log_tool_response
+        failures = [RESPONSE_WRITE_FAILURES[self.failure]()]
+
+        async def fails_once(**kwargs):
+            if failures:
+                raise failures.pop()
+            return await log_tool_response(**kwargs)
+
+        store.log_tool_response = fails_once
+        return agent
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", sorted(RESPONSE_WRITE_FAILURES))
+@pytest.mark.parametrize("decision", sorted(REFUSALS))
+@pytest.mark.parametrize("in_place", [False, True], ids=["modify", "in-place"])
+@pytest.mark.parametrize("kind", sorted(KINDS))
+async def test_a_refused_dispatch_whose_response_write_failed_completes_with_what_was_refused(
+    tmp_path, kind, in_place, decision, failure,
+):
+    """The error recovery's completion hook reports the refused arguments,
+    not the call's: the redaction an earlier hook made stays made."""
+    probe = _DispatcherResponseLogFailsOnce(kind, tmp_path)
+    probe.failure = failure
+    completion = _Completion()
+    try:
+        with _chain(
+            _Decide(REFUSALS[decision](), event=HookEvent.PRE_TOOL_USE),
+            completion,
+            before=_Rewrite({"task": REDACTED}, in_place=in_place, event=HookEvent.PRE_TOOL_USE),
+        ):
+            result = await probe.call("probe_feature", dict(DISPATCH), "")
+
+        assert "response log unavailable" in parity._refusal_text(result), result
+        assert probe.feature.calls == []
+        assert probe.recorder.authorized == [{**DISPATCH, "task": REDACTED}]
+        assert completion.reported == probe.recorder.authorized
+        assert await _recorded(probe) == probe.recorder.authorized
         assert SECRET not in await _recorded_text(probe)
     finally:
         await probe.close()

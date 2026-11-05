@@ -2902,10 +2902,12 @@ class OrchestratorEngineMixin:
                 decided_tool_input(subagent_hook_input, subagent_hook_output),
             )
             if dispatch_meta is not None:
+                # ``a2a_tool_dispatches.result_status`` has no approval
+                # status, and the writer swallows a CHECK failure: an ASK is
+                # a ``policy_denied`` row its ``error_class`` names, or no
+                # row at all (#3953).
                 dispatch_meta.update({
-                    "status": (
-                        "approval_required" if blocked.is_ask else "policy_denied"
-                    ),
+                    "status": "policy_denied",
                     "error_class": (
                         "ApprovalRequired" if blocked.is_ask else "PermissionDenied"
                     ),
@@ -2953,7 +2955,8 @@ class OrchestratorEngineMixin:
             return r
 
         # What the PRE_TOOL_USE chain refused, if it refuses: the dispatch row
-        # and the completion hook report it rather than ``args`` (#3953).
+        # and the completion hook report it rather than ``args``, on the error
+        # path too, where a failed response write sends a refused call (#3953).
         refused: Dict[str, Any] = {}
 
         def _on_refused(arguments):
@@ -3011,16 +3014,17 @@ class OrchestratorEngineMixin:
         except (ConnectionError, TimeoutError, ValueError, KeyError, TypeError, AttributeError) as e:
             _raise_terminal_tool_error(e, dispatch_meta)
             return await self._handle_feature_error(
-                e, tool_name, hook_feature_name, args, dispatch_start,
-                dispatch_event_id, tool_events=tool_events, streaming=streaming,
-                session_id=session_id, dispatch_meta=dispatch_meta,
+                e, tool_name, hook_feature_name, refused.get("arguments", args),
+                dispatch_start, dispatch_event_id, tool_events=tool_events,
+                streaming=streaming, session_id=session_id,
+                dispatch_meta=dispatch_meta,
             )
         except Exception as e:
             _raise_terminal_tool_error(e, dispatch_meta)
             return await self._handle_feature_error(
-                e, tool_name, hook_feature_name, args, dispatch_start,
-                dispatch_event_id, tool_events=tool_events, streaming=streaming,
-                log_traceback=True, session_id=session_id,
+                e, tool_name, hook_feature_name, refused.get("arguments", args),
+                dispatch_start, dispatch_event_id, tool_events=tool_events,
+                streaming=streaming, log_traceback=True, session_id=session_id,
                 dispatch_meta=dispatch_meta,
             )
 
