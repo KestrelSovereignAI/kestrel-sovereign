@@ -766,6 +766,7 @@ async def test_external_results_do_not_change_model_context_accounting(host):
 @pytest.mark.parametrize('failure', ['key', 'type', 'mixed-group'])
 async def test_every_direct_tool_lane_preserves_unconfirmed_effects_after_unexpected_failure(host, lane, failure):
     from kestrel_sovereign.llm.adapter import ToolCall
+    from kestrel_sovereign.tools.execution_outcome import TOOL_OUTCOME_UNCONFIRMED
 
     agent, backend = host
     class FailedAfterEffect(_Tool):
@@ -780,12 +781,13 @@ async def test_every_direct_tool_lane_preserves_unconfirmed_effects_after_unexpe
     binding = _mount(agent, tool)
     messages = []
     if lane in {'bound', 'named'}:
-        with pytest.raises(ResourceOutcomeUnknown, match='unconfirmed'):
+        with pytest.raises(ResourceOutcomeUnknown, match='unconfirmed') as caught:
             if lane == 'bound':
                 await binding.invoke({'count': 3}, session_id='original-effect')
             else:
                 await agent.execute_named_tool(binding.name, {'count': 3},
                     session_id='original-effect', source='owned-named-transport')
+        assert str(caught.value) == TOOL_OUTCOME_UNCONFIRMED
     else:
         call = ToolCall(id='model-original-effect', name=binding.name, arguments={'count': 3})
         if lane == 'direct':
@@ -795,7 +797,7 @@ async def test_every_direct_tool_lane_preserves_unconfirmed_effects_after_unexpe
             result = await agent._dispatch_tool_call(call, {}, {binding.name}, messages, 0, None,
                 session_id='original-effect')
         assert result['success'] is False
-        assert 'unconfirmed' in result['error'] and 'reconcile before retrying' in result['error']
+        assert result['error'] == TOOL_OUTCOME_UNCONFIRMED
         assert 'private-bug-detail' not in json.dumps(messages)
     assert tool.calls == [{'count': 3}]
     rows = await backend.fetch_all('SELECT result_status, error_class, error_message FROM a2a_tool_dispatches')

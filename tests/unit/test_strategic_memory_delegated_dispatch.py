@@ -612,6 +612,9 @@ async def test_an_uncertain_wake_requires_reconciliation_before_arming_again(mon
     assert result.data["dispatched"] is True
     assert result.data["reason_code"] == "WORK_ORDER_WAKE_UNCONFIRMED"
     assert "may" in result.error.lower() and "reconcile" in result.error.lower()
+    assert result.data["wake"] == f"a2a:{result.data['dispatch_id']}"
+    assert result.data["wake_confirmed"] is None
+    assert result.data["wake"] in result.error + result.confirmation
     assert "was not armed" not in result.error + result.confirmation
     assert "arm wait(" not in result.confirmation
     assert "private-wake-state" not in caplog.text

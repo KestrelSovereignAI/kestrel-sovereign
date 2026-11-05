@@ -2,13 +2,14 @@
 
 import copy
 import json
+import pickle
 
 import pytest
 from kestrel_sovereign.execution_custody import (
     ExecutionAuthorityError, ToolAuditUnconfirmedError,
     is_execution_control_error, is_tool_execution_terminal_error,
 )
-from kestrel_sovereign.tools.execution_outcome import _UnconfirmedToolResult
+from kestrel_sovereign.tools.execution_outcome import _UnconfirmedToolResult, _PreconditionFailedToolResult
 
 
 def test_audit_terminal_graph_preserves_authority_distinction():
@@ -30,9 +31,10 @@ def test_incidental_audit_context_does_not_become_terminal():
     assert not is_tool_execution_terminal_error(None)
 
 
-@pytest.mark.parametrize('project', [copy.copy, copy.deepcopy, lambda value: json.loads(json.dumps(value))])
-def test_copied_marker_is_ordinary_wire_data(project):
-    result = _UnconfirmedToolResult({'success': False, 'error': 'unconfirmed'})
+@pytest.mark.parametrize('project', [copy.copy, copy.deepcopy, lambda value: json.loads(json.dumps(value)), lambda value: pickle.loads(pickle.dumps(value))])
+@pytest.mark.parametrize('result_type', [_UnconfirmedToolResult, _PreconditionFailedToolResult])
+def test_copied_marker_is_ordinary_wire_data(project, result_type):
+    result = result_type({'success': False, 'error': 'unconfirmed'})
     assert type(project(result)) is dict
 
 

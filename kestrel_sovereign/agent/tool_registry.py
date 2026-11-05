@@ -27,6 +27,7 @@ from kestrel_sovereign.agent.tool_allowlist import (
     registry_generation,
 )
 from kestrel_sovereign.tools.result_contract import enforce_tool_result_contract
+from kestrel_sovereign.tools.execution_outcome import TOOL_OUTCOME_UNCONFIRMED
 
 
 @dataclass
@@ -101,7 +102,7 @@ class _GovernedToolBinding:
                 session_id=session_id, dispatch_start=dispatch_start,
                 status_hint="error", error_class=error_class,
                 error_message=(
-                    "Tool outcome is unconfirmed; reconcile before retrying"
+                    TOOL_OUTCOME_UNCONFIRMED
                     if unknown else "Invocation stopped before tool execution"
                 ),
                 required=True,
@@ -128,7 +129,7 @@ class _GovernedToolBinding:
             message = (
                 "Tool audit could not be confirmed; reconcile before retrying"
                 if isinstance(error, DatabaseError)
-                else "Tool outcome is unconfirmed; reconcile before retrying"
+                else TOOL_OUTCOME_UNCONFIRMED
             )
             unknown = ResourceOutcomeUnknown(message)
             unknown.__cause__ = error

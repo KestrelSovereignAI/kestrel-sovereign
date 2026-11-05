@@ -70,7 +70,7 @@ from kestrel_sdk.llm import (
 from pydantic import BaseModel
 
 from kestrel_sovereign.logging_config import exception_log_summary
-from kestrel_sovereign.tools.execution_outcome import TOOL_OUTCOME_UNCONFIRMED, _UnconfirmedToolResult
+from kestrel_sovereign.tools.execution_outcome import _HostToolFailure
 from kestrel_sovereign._async_ownership import await_owned_task
 from kestrel_sovereign.execution_custody import (
     execution_terminal_error,
@@ -722,12 +722,12 @@ def _result_to_codex_response(
     rendered block so the LLM still has the original wording for
     debugging context.
     """
-    if isinstance(result, _UnconfirmedToolResult):
+    if isinstance(result, _HostToolFailure):
         return {
             "contentItems": [{"type": "inputText", "text": (
-                "Tool failed.\nOutcome: unconfirmed\n"
+                f"Tool failed.\nOutcome: {result.outcome}\n"
                 "Evidence: host execution boundary\n"
-                "Recovery: " + TOOL_OUTCOME_UNCONFIRMED
+                "Recovery: " + result.message
             )}],
             "success": False,
         }
@@ -2170,7 +2170,7 @@ class CodexAdapter(LLMAdapter):
                 tool_name=name,
                 recent_decisions=(
                     await self._recent_security_decisions()
-                    if is_failure and not isinstance(result, _UnconfirmedToolResult)
+                    if is_failure and not isinstance(result, _HostToolFailure)
                     else None
                 ),
             )

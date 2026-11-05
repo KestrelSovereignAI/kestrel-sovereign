@@ -149,6 +149,9 @@ from kestrel_sovereign.telemetry import (
 )
 from kestrel_sovereign.tools.execution_outcome import (
     TOOL_OUTCOME_UNCONFIRMED,
+    TOOL_PRECONDITION_CHANGED,
+    _HostToolFailure,
+    _PreconditionFailedToolResult,
     _UnconfirmedToolResult,
 )
 from kestrel_sovereign.turn_scope import capture_turn_scope
@@ -854,16 +857,13 @@ class ContextStats:
 
 
 class ToolNotRegisteredError(ValueError):
-    """Raised by ``execute_named_tool`` when the named tool isn't exposed
-    by any of the agent's currently-enabled features.
+    """A named tool is absent from the agent's enabled registry.
 
-    Subclasses ``ValueError`` so the prior contract ("ValueError on
-    unknown tool") still holds for callers that don't import this name,
-    but external transports (voice realtime, MCP, A2A) can catch the
-    subclass specifically to distinguish "tool doesn't exist" from a
-    ``ValueError`` raised by the tool's own validation logic.
-    Conflating the two leads to the realtime model retrying with a
-    different *tool name* when it should have corrected its *args*.
+    This pre-execution lookup refusal is distinct from a tool-body failure.
+    Once execution starts, ordinary exceptions, including ValueError, become
+    ResourceOutcomeUnknown unless they carry a known resource precondition
+    refusal or original terminal evidence. Reconcile unknown outcomes before
+    retrying rather than assuming an argument correction is safe.
     """
 
 
@@ -881,8 +881,8 @@ def _extract_inline_error_fields(result: Any) -> tuple[Optional[str], Optional[s
     ``(None, None)`` so ``result_status`` inference at the SDK layer
     still drives the status column accurately.
     """
-    if isinstance(result, _UnconfirmedToolResult):
-        return TOOL_OUTCOME_UNCONFIRMED, "ResourceOutcomeUnknown"
+    if isinstance(result, _HostToolFailure):
+        return result.message, result.error_class
     if not isinstance(result, dict):
         return None, None
     if result.get("success") is False:
@@ -931,7 +931,7 @@ class _AuditedUnconfirmedToolResult(_AuditedDeferredResult, _UnconfirmedToolResu
 
 def _discard_tool_supplied_receipt(result):
     """A tool-supplied marker cannot attest to its own enclosing execution."""
-    if isinstance(result, (_AuditedDeferredResult, _UnconfirmedToolResult)):
+    if isinstance(result, (_AuditedDeferredResult, _HostToolFailure)):
         return dict(result)
     return result
 
@@ -1740,7 +1740,9 @@ class OrchestratorEngineMixin:
                 optional-tool probe.
             ResourceOutcomeUnknown: execution started but its result or final
                 delivery could not be confirmed. Reconcile before retrying;
-                the private cause retains the original exception.
+                the private cause retains the original exception. Tool-local
+                ValueError is not evidence that execution never happened; do
+                not automatically correct and retry it.
         """
         from kestrel_sovereign.signals.constitution_canary import (
             PHANTOM_RECEIPT_TOOL_NAME,
@@ -1778,6 +1780,11 @@ class OrchestratorEngineMixin:
 
         async def failed(error, unknown):
             if not unknown:
+                if (_capture is not None and execution.started
+                        and isinstance(error, ResourceConflict)):
+                    return _PreconditionFailedToolResult({
+                        "success": False, "error": TOOL_PRECONDITION_CHANGED,
+                    })
                 raise error
             logging.error(
                 "[GOVERNED-DISPATCH] %s failed: %s\n%s",
@@ -3272,7 +3279,7 @@ class OrchestratorEngineMixin:
                 dispatch_meta["outcome_unknown"] = True
                 dispatch_meta["outcome_error"] = e
                 return await _failed(
-                    "Tool outcome is unconfirmed; reconcile before retrying",
+                    TOOL_OUTCOME_UNCONFIRMED,
                     error_class="ResourceOutcomeUnknown", status="error",
                 )
             return await _failed(

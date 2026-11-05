@@ -171,7 +171,7 @@ SIGNAL_DISPATCH_REASON_CODES = frozenset(
         "DISPATCH_CAPABILITY_UNAVAILABLE",
         "GOVERNED_DISPATCH_UNAVAILABLE",
         "WORKFLOW_RUNNER_UNAVAILABLE",
-        "WORKFLOW_RUNNER_FAILED",
+        "WORKFLOW_RUNNER_UNCONFIRMED",
         "WORKFLOW_RUN_REJECTED",
         # Every blocker selection tried to confirm came back unreadable; not
         # the same claim as "nothing is actionable" (#3280).
@@ -202,6 +202,8 @@ SIGNAL_DISPATCH_REASON_CODES = frozenset(
         # The work order was sent, but the wait that wakes this agent when
         # the executor reports was not armed (#3838).
         "WORK_ORDER_WAKE_UNARMED",
+        # The wake may exist; inspect the named watch before another arm.
+        "WORK_ORDER_WAKE_UNCONFIRMED",
     }
 )
 #: The ``reason_code`` a failed ``strategy_reconcile_blockers`` result can
@@ -3037,12 +3039,17 @@ class StrategicMemoryFeature(Feature):
         # this agent.
         wake = f"a2a:{dispatch_id}"
         wake_error = await self._arm_work_order_wake(call, wake, executor, order_id)
-        data["wake"] = None if wake_error else wake
+        data["wake"] = (
+            wake if wake_error is None or wake_error.unknown else None
+        )
+        data["wake_confirmed"] = (
+            True if wake_error is None else None if wake_error.unknown else False
+        )
         unarmed = (
             ""
             if wake_error is None
             else (
-                f" The wait that wakes this agent when {executor} reports may "
+                f" The wait on {wake} that wakes this agent when {executor} reports may "
                 f"have been armed ({wake_error.detail}). Reconcile the current "
                 "watch before attempting to arm it again."
                 if wake_error.unknown else
@@ -3086,10 +3093,15 @@ class StrategicMemoryFeature(Feature):
             + skipped_text
         )
         if wake_error is not None:
+            failure_reason = (
+                {"reason_code": "WORK_ORDER_WAKE_UNCONFIRMED"}
+                if wake_error.unknown else
+                {"reason_code": "WORK_ORDER_WAKE_UNARMED"}
+            )
             return ToolResult.partial(
                 confirmation=body,
                 error=(
-                    f"The wake for work order {order_id} may have been armed; "
+                    f"The wake {wake} for work order {order_id} may have been armed; "
                     f"reconcile before retrying: {wake_error.detail}"
                     if wake_error.unknown else
                     f"The wake for work order {order_id} was not armed: {wake_error.detail}"
@@ -3097,10 +3109,7 @@ class StrategicMemoryFeature(Feature):
                 data={
                     **data,
                     "dispatched": True,
-                    "reason_code": (
-                        "WORK_ORDER_WAKE_UNCONFIRMED" if wake_error.unknown
-                        else "WORK_ORDER_WAKE_UNARMED"
-                    ),
+                    **failure_reason,
                 },
             )
         return ToolResult.ok(confirmation=body, data={**data, "dispatched": True})

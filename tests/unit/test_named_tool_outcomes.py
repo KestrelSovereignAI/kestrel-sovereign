@@ -140,15 +140,17 @@ async def test_codex_audit_uncertainty_latches_without_becoming_authority_loss(d
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize('marker', ['plain', 'audited'])
+@pytest.mark.parametrize('marker', ['plain', 'audited', 'precondition'])
 async def test_real_tool_supplied_unknown_marker_does_not_claim_framework_trust(host, marker):
-    from kestrel_sovereign.tools.execution_outcome import _UnconfirmedToolResult
+    from kestrel_sovereign.tools.execution_outcome import _UnconfirmedToolResult, _PreconditionFailedToolResult
     from kestrel_sovereign.agent.orchestrator_engine import _AuditedUnconfirmedToolResult
     agent, backend = host
     payload = {'success': False, 'error': 'supplied-by-tool'}
     class Forged(_Tool):
         async def execute(self, **args):
             self.calls.append(args)
+            if marker == 'precondition':
+                return _PreconditionFailedToolResult(payload)
             return (_UnconfirmedToolResult(payload) if marker == 'plain' else
                     _AuditedUnconfirmedToolResult(payload, host=agent, tool_name=self.name,
                                                  session_id='original-inline'))
@@ -218,3 +220,40 @@ async def test_named_original_terminal_evidence_is_never_a_normal_tool_reply(hos
         await agent._make_inline_tool_executor('owned-terminal')(binding.name, {'count': 3})
     assert caught.value is original
     assert not await backend.fetch_all('SELECT * FROM a2a_tool_dispatches')
+
+
+@pytest.mark.asyncio
+async def test_known_inline_conflict_preserves_redaction_without_raw_error_or_stale_denial(host):
+    from unittest.mock import AsyncMock
+    from kestrel_sdk.resources import ResourceConflict
+    from kestrel_sovereign.llm.codex_adapter import CodexAdapter
+
+    agent, backend = host
+    secret = 'private-conflict-detail'
+    class Rejected(_Tool):
+        async def execute(self, **args):
+            self.calls.append(args)
+            raise ResourceConflict(secret)
+    tool = Rejected(visible=True)
+    binding = _mount(agent, tool)
+    agent.hooks_manager.register(_Policy(HookOutput.modify({'count': 7})))
+    adapter = CodexAdapter()
+    adapter._recent_security_decisions = AsyncMock(return_value=[{
+        'tool': binding.name, 'decision': 'user_denied', 'user_choice': 'user_denied',
+    }])
+    executed = []
+    handler = adapter._make_tool_call_handler(agent._make_inline_tool_executor('conflict-session'),
+        't', frozenset({binding.name}), executed_log=executed)
+    response = await handler({'threadId': 't', 'callId': 'conflict-call', 'name': binding.name,
+                              'arguments': {'count': 3}})
+    assert executed[0]['arguments'] == {'count': 7}
+    assert secret not in json.dumps(response) + json.dumps(executed)
+    assert 'precondition_failed' in response['contentItems'][0]['text']
+    assert 'user_denied' not in response['contentItems'][0]['text']
+    await agent._append_executed_tool_breadcrumbs([], executed, session_id='conflict-session')
+    rows = await backend.fetch_all('SELECT args_redacted,error_class,error_message FROM a2a_tool_dispatches')
+    assert len(rows) == 1 and json.loads(rows[0][0]) == {'count': 7}
+    assert rows[0][1] == 'ResourceConflict' and secret not in rows[0][2]
+    with pytest.raises(ResourceConflict) as caught:
+        await agent.execute_named_tool(binding.name, {'count': 3}, session_id='public-conflict')
+    assert str(caught.value) == secret
