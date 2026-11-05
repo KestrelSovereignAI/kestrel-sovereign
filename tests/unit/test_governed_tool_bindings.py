@@ -762,7 +762,7 @@ async def test_external_results_do_not_change_model_context_accounting(host):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize('lane', ['model', 'bound', 'direct'])
+@pytest.mark.parametrize('lane', ['model', 'bound', 'direct', 'named'])
 @pytest.mark.parametrize('failure', ['key', 'type', 'mixed-group'])
 async def test_every_direct_tool_lane_preserves_unconfirmed_effects_after_unexpected_failure(host, lane, failure):
     from kestrel_sovereign.llm.adapter import ToolCall
@@ -779,9 +779,13 @@ async def test_every_direct_tool_lane_preserves_unconfirmed_effects_after_unexpe
     tool = FailedAfterEffect(visible=True)
     binding = _mount(agent, tool)
     messages = []
-    if lane == 'bound':
+    if lane in {'bound', 'named'}:
         with pytest.raises(ResourceOutcomeUnknown, match='unconfirmed'):
-            await binding.invoke({'count': 3}, session_id='original-effect')
+            if lane == 'bound':
+                await binding.invoke({'count': 3}, session_id='original-effect')
+            else:
+                await agent.execute_named_tool(binding.name, {'count': 3},
+                    session_id='original-effect', source='owned-named-transport')
     else:
         call = ToolCall(id='model-original-effect', name=binding.name, arguments={'count': 3})
         if lane == 'direct':
@@ -795,8 +799,8 @@ async def test_every_direct_tool_lane_preserves_unconfirmed_effects_after_unexpe
         assert 'private-bug-detail' not in json.dumps(messages)
     assert tool.calls == [{'count': 3}]
     rows = await backend.fetch_all('SELECT result_status, error_class, error_message FROM a2a_tool_dispatches')
-    if lane == 'direct':
-        # The internal executor does not own the outer dispatch receipt.
+    if lane in {'direct', 'named'}:
+        # These executors do not own the outer dispatch/inline receipt.
         assert rows == []
     else:
         assert len(rows) == 1
