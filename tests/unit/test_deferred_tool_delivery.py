@@ -1177,6 +1177,31 @@ async def test_route_audit_failure_withholds_the_ui_and_is_not_replayable(route,
     _assert_spent(route.tool)
 
 
+@pytest.mark.parametrize(
+    "route", [("a2a", "core-feature"), ("a2a", "sdk-feature")],
+    ids=["a2a-core-feature", "a2a-sdk-feature"], indirect=True,
+)
+async def test_workflow_never_retries_a_skill_whose_required_audit_failed(route):
+    # #3946: the failed audit is an unknown outcome, so a workflow retry would
+    # run the completed tool again.
+    from types import SimpleNamespace
+
+    from kestrel_sovereign.features.tasks.feature import TaskFeature
+
+    workflow = TaskFeature(SimpleNamespace(did=route.host.did))
+    workflow.set_task_manager(route.manager)
+    route.policy.release.set()
+    await route.backend.execute("DROP TABLE a2a_tool_dispatches")
+    result = await workflow.run_workflow([{
+        "feature": PROVIDER, "skill": DeferredTool.name,
+        "max_retries": 1, "retry_delay_ms": 0,
+    }])
+    assert route.tool.executions == [{}] and route.tool.publications == []
+    [record] = result.data["results"]
+    assert record["status"] == "failed" and record["outcome_unknown"] is True
+    assert record["attempts"] == 1 and "Do not replay" in record["error"]
+
+
 async def test_route_publication_failure_reports_without_failing_or_replaying(route):
     route.tool.publication_error = RuntimeError("private-factory-sentinel")
     route.policy.release.set()

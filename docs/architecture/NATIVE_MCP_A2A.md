@@ -319,6 +319,16 @@ The context identifies the destination; authenticated View controllers still
 authorize readers and tool calls independently. It does not confirm delivery:
 later response policy can withhold the rendered parts.
 
+A local A2A skill that fails after it may already have acted fails its task
+with `outcome_unknown: true` metadata and its own message (#3946). That covers a
+skill raising `ResourceOutcomeUnknown`, also through a Core or SDK `@tool`
+wrapper that returns it to a model as an ordinary failure, and a required write
+that fails after the tool ran. `run_workflow` never retries such a step,
+whatever its `max_retries`, and a workflow run as a skill marks its own task the
+same way. If that failed task cannot be recorded, or another writer's terminal
+state wins, `execute_skill` raises `ResourceOutcomeUnknown` instead, caused by
+any storage failure.
+
 ### Tasks and operator input
 
 An MCP task is identified by agent, connection and remote task ID. Its durable

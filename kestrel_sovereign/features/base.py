@@ -6,6 +6,7 @@ import logging
 import os
 import re
 import time
+from contextvars import ContextVar
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -54,6 +55,7 @@ from kestrel_sdk.tools.base import ToolParameter as ToolParameter
 from kestrel_sdk.tools import coerce_tool_arguments
 from kestrel_sdk.tools.result import ToolResult, ToolResultStatus
 from kestrel_sdk.tools.deferred import DeferredToolResult
+from kestrel_sdk.resources import ResourceOutcomeUnknown
 
 from kestrel_sovereign.execution_custody import (
     ExecutionAuthorityError,
@@ -87,6 +89,31 @@ MAX_TOOL_ITERATIONS = int(os.environ.get("KESTREL_MAX_TOOL_ITERATIONS", "50"))
 # read through ``self`` is not carried across — #3298, where every external
 # feature's subagent died on its first budget check.
 SUBAGENT_CONTEXT_FRACTION = 0.85
+
+# Every ResourceOutcomeUnknown turned into an ordinary failed result while
+# ``handle_task`` runs a skill (#3946). The result stays what a model has always
+# seen; only the task boundary learns the skill may already have acted. Bound
+# by ``handle_task`` alone, unbound (None) everywhere else. Every boundary that
+# flattens one reports it through ``report_flattened_outcome_unknown``.
+_flattened_outcome_unknown: ContextVar[list[ResourceOutcomeUnknown] | None] = (
+    ContextVar("kestrel_flattened_outcome_unknown", default=None)
+)
+
+
+def report_flattened_outcome_unknown(error: BaseException) -> None:
+    """Tell the A2A skill running now that it flattened an unknown outcome.
+
+    A tool boundary that returns a ``ResourceOutcomeUnknown`` as an ordinary
+    failed result calls this with the error, so ``handle_task`` marks its task
+    ``outcome_unknown`` and no caller runs the skill again (#3946). The
+    reporters are this module's @tool wrapper, the method guard an SDK
+    feature's @tool methods get at discovery (``subagent_dispatch``), and a
+    workflow whose step's outcome is unknown. A no-op outside ``handle_task``
+    and for any other error, so a model-facing call is unchanged.
+    """
+    flattened = _flattened_outcome_unknown.get()
+    if flattened is not None and isinstance(error, ResourceOutcomeUnknown):
+        flattened.append(error)
 
 
 class SubagentContextBudgetExceeded(RuntimeError):
@@ -1434,9 +1461,20 @@ class Feature(_SdkFeature):
             )
             return task
         task.status.CopyFrom(TaskStatus(state=TaskState.TASK_STATE_WORKING))
+        from kestrel_sovereign.a2a.lifecycle import mark_outcome_unknown
+
+        # A skill that may already have acted fails with an unknown outcome,
+        # so its caller never runs it again as an ordinary failure (#3946).
+        # A boundary that returns such an error as a plain failed result
+        # reports it here instead (``report_flattened_outcome_unknown``).
+        flattened: list[ResourceOutcomeUnknown] = []
         try:
             exec_start = time.time()
-            result = await selected.execute(**args)
+            witness = _flattened_outcome_unknown.set(flattened)
+            try:
+                result = await selected.execute(**args)
+            finally:
+                _flattened_outcome_unknown.reset(witness)
             if isinstance(result, DeferredToolResult):
                 # An A2A task has no chat, so its publication is headless. The
                 # artifact carries only the completed public result.
@@ -1476,6 +1514,8 @@ class Feature(_SdkFeature):
                     ),
                 )
             )
+            if flattened or isinstance(error, ResourceOutcomeUnknown):
+                mark_outcome_unknown(task)
             return task
         task.artifacts.append(artifact)
         failed = (
@@ -1496,6 +1536,8 @@ class Feature(_SdkFeature):
                 ),
             )
         )
+        if failed and flattened:
+            mark_outcome_unknown(task)
         return task
 
     def _get_tool_by_name(self, name: str) -> Optional[AgentTool]:
@@ -2650,6 +2692,7 @@ ABSOLUTE PROHIBITION - NEVER FABRICATE:
                                     "Error executing tool %s: %s",
                                     self.name, exception_log_summary(e),
                                 )
+                                report_flattened_outcome_unknown(e)
                                 response: Dict[str, Any] = {
                                     "success": False,
                                     "error": str(e),

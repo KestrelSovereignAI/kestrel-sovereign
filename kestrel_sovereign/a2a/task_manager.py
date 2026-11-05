@@ -44,6 +44,7 @@ from kestrel_sdk.native_a2a.utils.errors import (
     PushNotificationNotSupportedError,
 )
 from kestrel_sdk.native_a2a.utils.proto_utils import validate_proto_required_fields
+from kestrel_sdk.resources import ResourceOutcomeUnknown
 
 from kestrel_sovereign._async_ownership import (
     await_owned_task,
@@ -60,6 +61,7 @@ from kestrel_sovereign.a2a.lifecycle import (
     STREAM_STOP_STATES,
     TERMINAL_STATES,
     new_task_status,
+    task_outcome_unknown,
     task_state_label,
 )
 from kestrel_sovereign.a2a.media import encode_inline_json
@@ -67,7 +69,7 @@ from kestrel_sovereign.a2a.native_input import (
     NativeTaskInput,
     prepare_native_task_input,
 )
-from kestrel_sovereign.a2a.projections import embedded_json_value
+from kestrel_sovereign.a2a.projections import embedded_json_value, message_text
 from kestrel_sovereign.a2a.push_outbox import NativePushOutbox, PreparedPushConfig
 from kestrel_sovereign.a2a.push_service import NativePushService
 from kestrel_sovereign.a2a.scope import NativeRecipientScope
@@ -706,7 +708,7 @@ class TaskManager:
                 # The canonical outcome writer owns CAS and uncertain-commit
                 # reconciliation. A persistence failure must reach the caller; an
                 # extra transaction/retry cannot manufacture a completed receipt.
-                task, _ = await self._persist_execution_outcome(
+                task = await self._persist_sync_execution_outcome(
                     task,
                     baseline=baseline,
                     authority_agent_id=authority_agent_id,
@@ -972,6 +974,54 @@ class TaskManager:
                 baseline, authority_agent_id, cancellation
             )
             raise
+
+    async def _persist_sync_execution_outcome(
+        self,
+        task: Task,
+        *,
+        baseline: Task,
+        authority_agent_id: str,
+        expected_state: TaskState,
+    ) -> Task:
+        """Persist a synchronous result without losing an unknown outcome.
+
+        A handler whose skill may already have acted marks its failed task
+        ``outcome_unknown`` so the caller never runs it again (#3946). If that
+        task cannot be recorded, or another writer's terminal state wins, the
+        caller would get a storage error or the other task instead and could
+        retry the skill. It gets ``ResourceOutcomeUnknown``, caused by the
+        storage failure when there is one.
+        """
+        unknown = task_outcome_unknown(task)
+        try:
+            persisted, _ = await self._persist_execution_outcome(
+                task,
+                baseline=baseline,
+                authority_agent_id=authority_agent_id,
+                expected_state=expected_state,
+            )
+        except Exception as persist_error:
+            if not unknown or is_execution_control_error(persist_error):
+                raise
+            raise ResourceOutcomeUnknown(
+                f"{self._outcome_failure_text(task)}; "
+                "its failed task could not be recorded"
+            ) from persist_error
+        if unknown and not task_outcome_unknown(persisted):
+            raise ResourceOutcomeUnknown(
+                f"{self._outcome_failure_text(task)}; another writer recorded "
+                f"the task as {task_state_label(persisted.status.state)}"
+            )
+        return persisted
+
+    @staticmethod
+    def _outcome_failure_text(task: Task) -> str:
+        text = (
+            message_text(task.status.message)
+            if task.status.HasField("message")
+            else None
+        )
+        return text or "The skill's outcome is unknown"
 
     async def _persist_execution_outcome(
         self,

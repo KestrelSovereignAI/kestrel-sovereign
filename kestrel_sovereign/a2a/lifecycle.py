@@ -5,7 +5,7 @@ from __future__ import annotations
 from datetime import datetime
 
 from google.protobuf.timestamp_pb2 import Timestamp
-from kestrel_sdk.native_a2a.types import Message, TaskState, TaskStatus
+from kestrel_sdk.native_a2a.types import Message, Task, TaskState, TaskStatus
 
 TERMINAL_STATES = frozenset(
     {
@@ -20,6 +20,8 @@ TERMINAL_STATES = frozenset(
 STREAM_STOP_STATES = TERMINAL_STATES | frozenset(
     {TaskState.TASK_STATE_INPUT_REQUIRED, TaskState.TASK_STATE_AUTH_REQUIRED}
 )
+
+_OUTCOME_UNKNOWN = "outcome_unknown"
 
 
 def task_state_label(state: int) -> str:
@@ -56,3 +58,24 @@ def new_task_status(
         raise TypeError("A task status timestamp requires datetime or Timestamp")
     stamp.ToJsonString()
     return TaskStatus(state=state, timestamp=stamp, message=message)
+
+
+def mark_outcome_unknown(task: Task) -> None:
+    """Record that a failed task's effect may already have happened.
+
+    The task stays FAILED with its own message. Its caller must reconcile
+    before running the work again; it must never retry it automatically.
+    """
+    if task.status.state != TaskState.TASK_STATE_FAILED:
+        raise ValueError("Only a failed task can carry an unknown outcome")
+    task.metadata.update({_OUTCOME_UNKNOWN: True})
+
+
+def task_outcome_unknown(task: Task) -> bool:
+    """Whether the task failed with an effect that may already have happened."""
+    value = task.metadata.fields.get(_OUTCOME_UNKNOWN)
+    return (
+        value is not None
+        and value.WhichOneof("kind") == "bool_value"
+        and value.bool_value
+    )
