@@ -15,7 +15,7 @@ Usage:
     provider = TrainingProviderFactory.get_default_provider()
 
     # Or get specific provider
-    provider = TrainingProviderFactory.get_provider("vertex_ai")
+    provider = TrainingProviderFactory.get_provider("vertex_ai", purpose="training")
 
     # Start training
     job = await provider.start_training(
@@ -110,10 +110,11 @@ class TrainingProvider(Protocol):
 
     def is_available(self) -> bool:
         """
-        Check if provider is configured and available.
+        Check configured provider access for its declared capabilities.
 
-        Returns True if required environment variables are set and
-        the provider can accept training jobs.
+        Recovery-only providers may remain reachable without admitting fresh
+        work. New selection must also require the training/generation
+        capability; availability is not input, consent or spend authority.
         """
         ...
 

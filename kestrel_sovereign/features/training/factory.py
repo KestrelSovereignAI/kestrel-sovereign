@@ -9,7 +9,7 @@ Usage:
     provider = TrainingProviderFactory.get_default_provider()
 
     # Get specific provider
-    provider = TrainingProviderFactory.get_provider("vertex_ai")
+    provider = TrainingProviderFactory.get_provider("vertex_ai", purpose="training")
 
     # List available providers
     available = TrainingProviderFactory.list_available_providers()
@@ -21,12 +21,14 @@ Usage:
     caps = TrainingProviderFactory.get_capabilities("replicate")
 """
 
-import asyncio
 import logging
 import os
-from typing import Dict, List, Optional
+from typing import Dict, List, Literal, Optional
 
-from .protocol import DEFAULT_PROVIDER_PRIORITY, TrainingProvider
+from kestrel_sovereign._async_ownership import gather_owned
+from kestrel_sovereign.execution_custody import is_execution_control_error, require_execution_work
+
+from .protocol import DEFAULT_PROVIDER_PRIORITY, ProviderNotAvailableError, TrainingProvider
 from .types import ProviderCapabilities
 
 logger = logging.getLogger(__name__)
@@ -57,11 +59,11 @@ class TrainingProviderFactory:
 
     # Provider priority for auto-selection
     # Local MPS first: zero cloud cost, Apple Silicon with MPS backend
-    # RunPod second: persistent pod with FLUX.2, supports both training AND generation
+    # Runpod retains its position/name for historical access, not fresh work.
     # Vertex AI third: serverless, supports both training AND generation (batch mode)
     PROVIDER_PRIORITY = [
         "local_mps",     # Local Apple Silicon (MPS backend), zero cloud cost
-        "runpod",        # Persistent pod, FLUX.2, uncensored, training + generation
+        "runpod",        # Historical status/cancel/download/resource custody only
         "vertex_ai",     # Serverless, FLUX.2, training + generation (batch)
         "replicate",     # Serverless, FLUX.1 only, censored
         "gcp_compute",   # VM-based, good reliability
@@ -89,8 +91,8 @@ class TrainingProviderFactory:
             supports_lora_download=True,
         ),
         "runpod": ProviderCapabilities(
-            training=True,
-            generation=True,
+            training=False,
+            generation=False,
             uncensored=True,
             flux_version="2.x",
             supports_lora_download=True,
@@ -239,6 +241,9 @@ class TrainingProviderFactory:
         try:
             cls._discover_entry_point_providers()
         except Exception as e:  # pragma: no cover - defensive
+            if is_execution_control_error(e):
+                cls._entry_points_loaded = False
+                raise
             logger.warning("Training provider entry-point discovery failed: %s", e)
 
     @classmethod
@@ -263,9 +268,15 @@ class TrainingProviderFactory:
         return [name for _, _, name in entries]
 
     @classmethod
-    def get_provider(cls, name: str) -> Optional[TrainingProvider]:
+    def get_provider(
+        cls, name: str, *, purpose: Optional[Literal["training", "generation"]] = None
+    ) -> Optional[TrainingProvider]:
         """
-        Get a specific provider by name.
+        Get a specific provider, optionally requiring a fresh-work capability.
+
+        Without a purpose this remains the historical provider accessor.
+        Fresh selection must supply a purpose; cached instances cannot bypass
+        a retired/unsupported capability. No private catalog types are imported.
 
         Args:
             name: Provider name ('vertex_ai', 'runpod', 'gcp_compute', 'replicate', 'vastai')
@@ -273,6 +284,18 @@ class TrainingProviderFactory:
         Returns:
             TrainingProvider instance or None if not available
         """
+        if purpose is not None:
+            require_execution_work()
+            if purpose not in {"training", "generation"}:
+                raise ValueError("provider purpose must be training or generation")
+            capabilities = cls.get_capabilities(name)
+            if capabilities is None or not getattr(capabilities, purpose):
+                raise ProviderNotAvailableError(
+                    f"Provider '{name}' does not admit new {purpose}; use an "
+                    "authorized host/catalog provider with that capability. "
+                    "Historical provider access remains separate.",
+                    provider=name,
+                )
         if name in cls._instances:
             return cls._instances[name]
 
@@ -292,6 +315,8 @@ class TrainingProviderFactory:
         try:
             available = provider.is_available()
         except Exception as e:
+            if is_execution_control_error(e):
+                raise
             if is_entry_point:
                 logger.warning(
                     "Entry-point provider '%s' is_available() raised: %s "
@@ -325,22 +350,23 @@ class TrainingProviderFactory:
         Environment:
             GENERATION_PROVIDER: Force a specific provider (e.g., "vertex_ai", "runpod")
         """
+        require_execution_work()
         # Check for forced provider via env var
         forced_provider = os.getenv("GENERATION_PROVIDER")
         if forced_provider:
-            caps = cls.get_capabilities(forced_provider)
-            if caps and caps.training:
-                provider = cls.get_provider(forced_provider)
-                if provider:
-                    logger.info(f"Using forced training provider: {forced_provider} (GENERATION_PROVIDER env)")
-                    return provider
-            logger.warning(f"Forced provider '{forced_provider}' not available or doesn't support training")
+            provider = cls.get_provider(forced_provider, purpose="training")
+            if provider is None:
+                raise ProviderNotAvailableError(
+                    f"Forced training provider '{forced_provider}' is unavailable",
+                    provider=forced_provider,
+                )
+            return provider
 
         for name in cls._effective_priority():
             caps = cls.get_capabilities(name)
             if not (caps and caps.training):
                 continue
-            provider = cls.get_provider(name)
+            provider = cls.get_provider(name, purpose="training")
             if provider:
                 logger.info(f"Using training provider: {name}")
                 return provider
@@ -349,10 +375,15 @@ class TrainingProviderFactory:
         return None
 
     @classmethod
-    def list_available_providers(cls) -> List[str]:
-        """List names of all available providers."""
+    def list_available_providers(cls, *, include_recovery: bool = False) -> List[str]:
+        """List fresh-work providers; opt in to historical-only access."""
         available = []
         for name in cls._effective_priority():
+            capabilities = cls.get_capabilities(name)
+            if not include_recovery and not (
+                capabilities and (capabilities.training or capabilities.generation)
+            ):
+                continue
             if cls._check_provider_available(name):
                 available.append(name)
         return available
@@ -383,21 +414,13 @@ class TrainingProviderFactory:
         backend that happens to declare ``uncensored=True`` (e.g. an
         entry-point provider) would fail when generation code calls it, so it
         is skipped here.
-        Priority follows PROVIDER_PRIORITY order.
+        Uses the canonical generation selector, including its explicit-provider
+        refusal and native execution controls.
 
         Returns:
             First available uncensored generation provider, or None if none available
         """
-        for name in cls._effective_priority():
-            caps = cls.get_capabilities(name)
-            if caps and caps.generation and caps.uncensored:
-                provider = cls.get_provider(name)
-                if provider:
-                    logger.info(f"Using uncensored provider: {name}")
-                    return provider
-
-        logger.warning("No uncensored providers available")
-        return None
+        return cls.get_generation_provider(uncensored=True)
 
     @classmethod
     def get_generation_provider(cls, uncensored: bool = False) -> Optional[TrainingProvider]:
@@ -413,23 +436,30 @@ class TrainingProviderFactory:
         Environment:
             GENERATION_PROVIDER: Force a specific provider (e.g., "vertex_ai", "runpod")
         """
+        require_execution_work()
         # Check for forced provider via env var
         forced_provider = os.getenv("GENERATION_PROVIDER")
         if forced_provider:
             caps = cls.get_capabilities(forced_provider)
-            if caps and caps.generation:
-                provider = cls.get_provider(forced_provider)
-                if provider:
-                    logger.info(f"Using forced generation provider: {forced_provider} (GENERATION_PROVIDER env)")
-                    return provider
-            logger.warning(f"Forced provider '{forced_provider}' not available or doesn't support generation")
+            if uncensored and caps is not None and not caps.uncensored:
+                raise ProviderNotAvailableError(
+                    f"Forced generation provider '{forced_provider}' does not "
+                    "support uncensored generation", provider=forced_provider,
+                )
+            provider = cls.get_provider(forced_provider, purpose="generation")
+            if provider is None:
+                raise ProviderNotAvailableError(
+                    f"Forced generation provider '{forced_provider}' is unavailable",
+                    provider=forced_provider,
+                )
+            return provider
 
         for name in cls._effective_priority():
             caps = cls.get_capabilities(name)
             if caps and caps.generation:
                 if uncensored and not caps.uncensored:
                     continue
-                provider = cls.get_provider(name)
+                provider = cls.get_provider(name, purpose="generation")
                 if provider:
                     logger.info(f"Using generation provider: {name} (uncensored={caps.uncensored})")
                     return provider
@@ -471,6 +501,8 @@ class TrainingProviderFactory:
             try:
                 return cls._ep_provider_classes[name]()
             except Exception as e:
+                if is_execution_control_error(e):
+                    raise
                 logger.error(f"Failed to create entry-point provider {name}: {e}")
                 return None
 
@@ -504,9 +536,13 @@ class TrainingProviderFactory:
                 return None
 
         except ImportError as e:
+            if is_execution_control_error(e):
+                raise
             logger.error(f"Failed to import provider {name}: {e}")
             return None
         except Exception as e:
+            if is_execution_control_error(e):
+                raise
             logger.error(f"Failed to create provider {name}: {e}")
             return None
 
@@ -517,8 +553,8 @@ class TrainingProviderFactory:
         Session-based adapters drain their submission tasks and release their
         billable sessions here. Providers close concurrently; one that closed
         cleanly leaves the cache, while one that failed stays cached so the
-        custody it still holds remains reachable. The first failure is raised
-        after every close has settled; the rest are logged.
+        custody it still holds remains reachable. Original native control and
+        every sibling failure are composed only after all closes have joined.
         """
         closable = [
             (name, provider)
@@ -527,19 +563,23 @@ class TrainingProviderFactory:
         ]
         if not closable:
             return
-        results = await asyncio.gather(
-            *(provider.close() for _name, provider in closable),
-            return_exceptions=True,
-        )
-        failures: List[BaseException] = []
-        for (name, provider), result in zip(closable, results):
-            if isinstance(result, BaseException):
-                logger.error(f"Failed to close training provider {name}: {result}")
-                failures.append(result)
-            elif cls._instances.get(name) is provider:
+        async def close_provider(name: str, provider: TrainingProvider) -> None:
+            await provider.close()
+            if cls._instances.get(name) is provider:
                 del cls._instances[name]
-        if failures:
-            raise failures[0]
+
+        # The canonical owner retains cancellation-shaped originals and joins
+        # independent cleanup even if a sibling or the observer withdraws.
+        # Raw gather(return_exceptions=True) replaces a cancelled child's
+        # original carrier, losing its native receipt before composition.
+        await gather_owned(
+            (close_provider(name, provider) for name, provider in closable),
+            cancel_siblings_on_error=False,
+            retirement_resource=cls,
+            retain_originals=True,
+            isolate_control_originals=True,
+            name_prefix="training-provider-close",
+        )
 
     @classmethod
     def clear_cache(cls) -> None:

@@ -7,8 +7,7 @@ Covers:
 - Missing ``RUNPOD_API_KEY`` → exit code 1 with a clear hint
 - Unknown profile in ``runpod_config.toml`` → exit code 1 listing the
   available profiles
-- ``deploy lora-trainer`` invokes :meth:`RunPodManager.start_session`
-  with the right kwargs
+- ``deploy lora-trainer`` refuses before configuration/provider work
 - ``status`` calls :meth:`get_status` and surfaces both active and
   resumable pods
 - ``stop`` calls :meth:`stop_session`
@@ -19,7 +18,6 @@ Covers:
 from __future__ import annotations
 
 import argparse
-import asyncio
 import os
 from pathlib import Path
 from types import SimpleNamespace
@@ -170,7 +168,7 @@ def test_cmd_runpod_no_subverb_prints_usage(capsys):
 # Missing RUNPOD_API_KEY
 # ---------------------------------------------------------------------------
 
-def test_deploy_without_api_key_errors_with_hint(monkeypatch, capsys):
+def test_deploy_without_api_key_is_still_retired(monkeypatch, capsys):
     monkeypatch.delenv("RUNPOD_API_KEY", raising=False)
     args = _Args(
         runpod_command="deploy", target="lora-trainer",
@@ -179,7 +177,7 @@ def test_deploy_without_api_key_errors_with_hint(monkeypatch, capsys):
     rc = cli_runpod.cmd_runpod(args)
     assert rc == 1
     err = capsys.readouterr().err
-    assert "RUNPOD_API_KEY" in err
+    assert "catalog" in err and "retired" in err
 
 
 def test_status_without_api_key_errors(monkeypatch, capsys):
@@ -216,14 +214,14 @@ def test_kill_without_api_key_errors(monkeypatch, capsys):
 # Unknown profile
 # ---------------------------------------------------------------------------
 
-def test_deploy_unknown_profile_errors_with_available_list(
+def test_status_unknown_profile_errors_with_available_list(
     monkeypatch, capsys,
 ):
     monkeypatch.setenv("RUNPOD_API_KEY", "rp-key")
     mgr = _make_manager(profile_name="training")
     with patch.object(cli_runpod, "_load_manager", return_value=mgr):
         rc = cli_runpod.cmd_runpod(_Args(
-            runpod_command="deploy", target="lora-trainer",
+            runpod_command="status",
             profile="bogus-profile", test=False,
         ))
     assert rc == 1
@@ -232,14 +230,14 @@ def test_deploy_unknown_profile_errors_with_available_list(
     assert "training" in err  # listed as available
 
 
-def test_deploy_no_profiles_at_all_hints_at_config(
+def test_status_no_profiles_at_all_hints_at_config(
     monkeypatch, capsys,
 ):
     monkeypatch.setenv("RUNPOD_API_KEY", "rp-key")
     mgr = _make_manager(with_profile=False)
     with patch.object(cli_runpod, "_load_manager", return_value=mgr):
         rc = cli_runpod.cmd_runpod(_Args(
-            runpod_command="deploy", target="lora-trainer",
+            runpod_command="status",
             profile="training", test=False,
         ))
     assert rc == 1
@@ -263,61 +261,49 @@ def test_deploy_unknown_target_errors(monkeypatch, capsys):
     assert "elephants" in err
 
 
-def test_deploy_invokes_start_session(monkeypatch, capsys):
-    monkeypatch.setenv("RUNPOD_API_KEY", "rp-key")
-    mgr = _make_manager()
-    captured: dict = {}
-    orig = mgr.start_session
-
-    async def spy(**kw):
-        captured.update(kw)
-        return await orig(**kw)
-
-    mgr.start_session = spy
-
-    with patch.object(cli_runpod, "_load_manager", return_value=mgr):
-        rc = cli_runpod.cmd_runpod(_Args(
-            runpod_command="deploy", target="lora-trainer",
-            profile="training", test=False,
-        ))
-    assert rc == 0
-    out = capsys.readouterr().out
-    assert "Pod created successfully" in out
-    assert "pod-abc" in out
-    assert captured.get("task_profile") == "training"
-    assert captured.get("model_name") == "FLUX.1-dev"
-    assert captured.get("ttl_seconds") == 3600
-
-
-def test_deploy_failure_surfaces_error_and_returns_1(
-    monkeypatch, capsys,
+@pytest.mark.parametrize("profile", ["training", "unavailable-profile"])
+@pytest.mark.parametrize("test_after", [False, True])
+def test_deploy_never_loads_manager_or_tries_another_profile(
+    monkeypatch, capsys, profile, test_after
 ):
     monkeypatch.setenv("RUNPOD_API_KEY", "rp-key")
-    mgr = _make_manager(start_session_exc=RuntimeError("boom"))
-    with patch.object(cli_runpod, "_load_manager", return_value=mgr):
+    with patch.object(cli_runpod, "_load_manager") as load:
         rc = cli_runpod.cmd_runpod(_Args(
             runpod_command="deploy", target="lora-trainer",
-            profile="training", test=False,
+            profile=profile, test=test_after,
         ))
     assert rc == 1
-    err = capsys.readouterr().err
-    assert "boom" in err
+    load.assert_not_called()
+    error = capsys.readouterr().err
+    assert "retired" in error and "catalog" in error
+    assert "training-4090" not in error
 
 
-def test_deploy_no_gpu_avail_emits_recovery_hints(monkeypatch, capsys):
+def test_historical_status_failure_preserves_original_error(monkeypatch):
     monkeypatch.setenv("RUNPOD_API_KEY", "rp-key")
-    mgr = _make_manager(start_session_exc=RuntimeError(
-        "There are no longer any instances available with this configuration."
-    ))
-    with patch.object(cli_runpod, "_load_manager", return_value=mgr):
-        rc = cli_runpod.cmd_runpod(_Args(
-            runpod_command="deploy", target="lora-trainer",
-            profile="training", test=False,
-        ))
-    assert rc == 1
-    err = capsys.readouterr().err
-    assert "GPU Availability" in err
-    assert "training-4090" in err  # cross-profile suggestion
+    manager = _make_manager()
+    original = RuntimeError("original historical status is unavailable")
+
+    async def status():
+        raise original
+
+    manager.get_status = status
+    with patch.object(cli_runpod, "_load_manager", return_value=manager):
+        with pytest.raises(RuntimeError) as observed:
+            cli_runpod.cmd_runpod(_Args(runpod_command="status", profile="training"))
+    assert observed.value is original
+
+
+def test_historical_terminate_failure_is_not_reported_as_cleanup(monkeypatch):
+    monkeypatch.setenv("RUNPOD_API_KEY", "rp-key")
+    manager = _make_manager()
+    original = RuntimeError("original resource still needs termination")
+    manager.provider.terminate_pod.side_effect = original
+    with patch.object(cli_runpod, "_load_manager", return_value=manager):
+        with pytest.raises(RuntimeError) as observed:
+            cli_runpod.cmd_runpod(_Args(runpod_command="kill", profile="training"))
+    assert observed.value is original
+    manager.provider.terminate_pod.assert_called_once_with("pod-abc")
 
 
 # ---------------------------------------------------------------------------

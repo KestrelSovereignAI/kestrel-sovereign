@@ -19,10 +19,18 @@ privacy: public
 
 # LoRA Training & Generation - Operational Guide
 
+> **Historical only — superseded by the catalog cutover.** The built-in
+> Runpod adapter and legacy deployment CLI no longer admit fresh training or
+> generation. The FLUX images, model paths, prices and timings below are not
+> current delivery/availability evidence. Preserve original status, Stop,
+> artifact and resource cleanup; do not recreate old work from this runbook.
+> See [Training Provider Architecture](TRAINING_PROVIDER_ARCHITECTURE.md#runpod-catalog-cutover)
+> and [KCR#64](https://github.com/KestrelSovereignAI/kestrel-cloud-runpod/issues/64).
+
 **Status:** Experimental — works on the happy path; not actively developed since Q1 2026.
 **Document last updated:** 2026-01-04 (re-verified 2026-04-25; see banner below)
 **Owner:** Kestrel Team
-**Source of Truth For:** LoRA training and selfie generation operational details
+**Source of Truth For:** Historical Q1 2026 deployment observations only
 
 > **Implementation status (last verified 2026-04-25):**
 > - The training-provider library moved out of this feature: training adapters now live at `features/training/adapters/runpod_adapter.py` and the protocol/factory at `features/training/`. This document predates that split.

@@ -53,6 +53,7 @@ from kestrel_sovereign.features.training.protocol import (
     TrainingSubmissionError,
 )
 from kestrel_sovereign.features.training.types import TrainingConfig, TrainingState
+from tests.utils.training_history import start_original_runpod_tail
 
 
 _UNSET = object()
@@ -536,6 +537,18 @@ async def _assert_no_orphans(adapter, remote: FakeRemote, loop_errors) -> None:
 
 
 async def _start(adapter, companion_id: str = "companion-1"):
+    if isinstance(adapter, RunPodTrainingAdapter):
+        # This suite exercises the SAME original session owner/hooks, including
+        # acquisition/submission races already admitted before the cutover.
+        # It is not fresh provider-admission evidence or a production bypass:
+        # the public Runpod door's zero-effects refusal has separate tests.
+        return await start_original_runpod_tail(
+            adapter,
+            job_id=f"retained-runpod-{next(_ids)}",
+            companion_id=companion_id,
+            config=TrainingConfig(),
+            avatar_data=b"avatar",
+        )
     return await adapter.start_training(companion_id, b"avatar", TrainingConfig())
 
 
@@ -1745,4 +1758,3 @@ def test_released_job_history_has_a_default_bound():
     assert lifecycle._released_history_limit == RELEASED_JOB_HISTORY_LIMIT
     with pytest.raises(ValueError, match="at least 1"):
         SessionTrainingLifecycle(lifecycle._hooks, released_history_limit=0)
-

@@ -1,4 +1,4 @@
-"""Public training adapters preserve actual native receipts, not business text.
+"""Training adapters preserve original native receipts, not business text.
 
 Adapters use declared SQLite-backed local session hooks; no cloud provider,
 credential, billing, inference or remote job acceptance is exercised here.
@@ -21,6 +21,7 @@ from tests.integration.test_execution_authority_postgres import native_pg as nat
 from tests.integration.test_maintenance_original_retirement import _original_control
 from tests.unit.test_host_context_native_cleanup import _actual_operation
 from tests.utils.original_failure import OriginalFailure
+from tests.utils.training_history import start_original_runpod_tail
 
 
 @pytest.mark.asyncio
@@ -92,7 +93,7 @@ async def test_rejected_opening_retains_actual_later_release_observer_withdrawal
 @pytest.mark.parametrize("adapter_type", [RunPodTrainingAdapter, VastAITrainingAdapter, GCPComputeTrainingAdapter])
 @pytest.mark.parametrize("phase", ["acquire", "submission"])
 @pytest.mark.parametrize("source_cancel", [False, True])
-async def test_training_public_start_and_status_retain_native_original(
+async def test_training_original_start_and_status_retain_native_original(
     native_pg, tmp_path, monkeypatch, adapter_type, phase, source_cancel,
 ):
     source = OriginalFailure.capture(await _original_control(native_pg[0], monkeypatch, source_cancel))
@@ -117,8 +118,18 @@ async def test_training_public_start_and_status_retain_native_original(
     adapter = object.__new__(adapter_type)
     adapter._lifecycle = lifecycle
     try:
-        result = await await_owned_task(create_owned_task(adapter.start_training(
-            companion_id="declared", avatar_data=b"local", config=TrainingConfig()), retain_originals=True))
+        # Runpod's public NEW-work door is retired. Preserve all original
+        # acquire/submission/status/release assertions through its SAME owner;
+        # unrelated adapters still exercise their actual public start path.
+        operation = (
+            start_original_runpod_tail(
+                adapter, job_id="retained-runpod-original", companion_id="declared",
+                avatar_data=b"local", config=TrainingConfig(),
+            ) if isinstance(adapter, RunPodTrainingAdapter) else adapter.start_training(
+                companion_id="declared", avatar_data=b"local", config=TrainingConfig(),
+            )
+        )
+        result = await await_owned_task(create_owned_task(operation, retain_originals=True))
         if phase == "acquire":
             source.assert_retained(result.error)
             assert not lifecycle.records

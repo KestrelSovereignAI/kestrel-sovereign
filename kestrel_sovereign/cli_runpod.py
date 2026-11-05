@@ -11,10 +11,9 @@ argparse.
 Subverbs
 --------
 
-- ``kestrel runpod deploy lora-trainer [--profile training|training-4090]
-  [--test]`` - start a LoRA-training pod via
-  :meth:`RunPodManager.start_session`. ``--test`` runs a post-deploy
-  ``/health`` + ``/openapi.json`` probe (matches the bash flag).
+- ``kestrel runpod deploy lora-trainer`` - retained only to explain retired
+  fresh admission. Use the authorized catalog workflow; no provider/config
+  lookup, model mapping, profile fallback or health probe is performed.
 - ``kestrel runpod status [--profile training]`` - print active /
   resumable pod state.
 - ``kestrel runpod stop [--profile training]`` - stop the session
@@ -22,8 +21,8 @@ Subverbs
 - ``kestrel runpod kill [--profile training]`` - terminate the pod
   completely (no resume).
 
-Validation
-----------
+Historical resource access
+--------------------------
 
 - ``RUNPOD_API_KEY`` must be set; we error with a clear message if
   not, matching the bash predecessor.
@@ -175,7 +174,7 @@ async def _action_status(manager, profile_name: str) -> int:
     print("Checking pod status...")
     status = await manager.get_status()
     if status.get("active"):
-        print(f"Pod is ACTIVE")
+        print("Pod is ACTIVE")
         print(f"   Pod ID: {status.get('pod_id')}")
         print(f"   Status: {status.get('status')}")
         print(f"   Base URL: {status.get('base_url')}")
@@ -214,92 +213,12 @@ async def _action_kill(manager) -> int:
     return 0
 
 
-async def _action_deploy(manager, profile_name: str, *,
-                         test_after: bool) -> int:
-    print("Starting training pod...")
-    print("   (Using template_id for GCR private registry auth)")
-    print()
-    try:
-        result = await manager.start_session(
-            task_profile=profile_name,
-            model_name="FLUX.1-dev",
-            ttl_seconds=3600,
-            metadata={
-                "name": "kestrel-lora-trainer",
-                "purpose": "lora_training",
-            },
-        )
-    except Exception as e:  # noqa: BLE001 - bash predecessor is broad here
-        msg = str(e)
-        print(f"Deployment failed: {msg}", file=sys.stderr)
-        if "no longer any instances available" in msg.lower():
-            print("\nGPU Availability Issue:", file=sys.stderr)
-            print(
-                f"   Profile '{profile_name}' GPU unavailable in "
-                "US-KS-2 datacenter.",
-                file=sys.stderr,
-            )
-            print(
-                "   (Network volume requires pods in same datacenter)",
-                file=sys.stderr,
-            )
-            print("\n   Options:", file=sys.stderr)
-            print("   1. Wait and retry later", file=sys.stderr)
-            other = (
-                "training-4090" if profile_name == "training" else "training"
-            )
-            print(
-                f"   2. Try the other profile: "
-                f"kestrel runpod deploy lora-trainer --profile {other}",
-                file=sys.stderr,
-            )
-            print(
-                "   3. Check RunPod dashboard for availability",
-                file=sys.stderr,
-            )
-        return 1
-
-    print(f"Pod created successfully!")
-    print(f"   Pod ID: {result.get('pod_id')}")
-    print(f"   Status: {result.get('status')}")
-    print(f"   Base URL: {result.get('base_url')}")
-    print(f"   TTL: {result.get('ttl_seconds')}s")
-    print()
-
-    if test_after:
-        base_url = result.get("base_url")
-        if base_url:
-            print("Testing endpoints...")
-            try:
-                import httpx
-            except ImportError:
-                print(
-                    "   (httpx not installed - skipping post-deploy probes)"
-                )
-                return 0
-            try:
-                health = httpx.get(f"{base_url}/health", timeout=60)
-                print(f"   /health: {health.status_code}")
-                print(f"   {health.text[:200]}")
-            except Exception as e:  # noqa: BLE001
-                print(f"   /health: {e}")
-            try:
-                openapi = httpx.get(f"{base_url}/openapi.json", timeout=30)
-                if openapi.status_code == 200:
-                    spec = openapi.json()
-                    paths = list(spec.get("paths", {}).keys())
-                    print(f"   Available endpoints: {paths}")
-            except Exception as e:  # noqa: BLE001
-                print(f"   /openapi.json: {e}")
-    return 0
-
-
 # ---------------------------------------------------------------------------
 # Subverb dispatchers
 # ---------------------------------------------------------------------------
 
 def _cmd_deploy(args) -> int:
-    """``kestrel runpod deploy lora-trainer [--profile NAME] [--test]``."""
+    """Reject retired legacy deployment before configuration or provider effects."""
     target: Optional[str] = getattr(args, "target", None)
     if target not in _VALID_TARGETS:
         print(
@@ -309,26 +228,16 @@ def _cmd_deploy(args) -> int:
         )
         return 1
 
-    if not _check_api_key():
-        _print_missing_api_key()
+    from kestrel_sovereign.features.training.adapters.runpod_adapter import (
+        reject_legacy_runpod_new_work,
+    )
+    from kestrel_sovereign.features.training.protocol import TrainingSubmissionError
+
+    try:
+        reject_legacy_runpod_new_work(TrainingSubmissionError)
+    except TrainingSubmissionError as error:
+        print(f"error: {error}", file=sys.stderr)
         return 1
-
-    profile_name: str = getattr(args, "profile", None) or _DEFAULT_PROFILE
-    test_after: bool = getattr(args, "test", False)
-
-    print("Kestrel LoRA Trainer - RunPod Deployment")
-    print()
-    print(f"Profile: {profile_name}")
-
-    manager = _load_manager()
-    if not _validate_profile(manager, profile_name):
-        return 1
-    profile = manager.profiles[profile_name]
-    _print_profile(profile)
-
-    return asyncio.run(_action_deploy(
-        manager, profile_name, test_after=test_after,
-    ))
 
 
 def _cmd_status(args) -> int:
@@ -386,7 +295,7 @@ def add_runpod_subcommand(
 
     deploy_p = runpod_sub.add_parser(
         "deploy",
-        help="Start a RunPod pod for LoRA training",
+        help="Retired legacy deployment; explains authorized catalog migration",
     )
     deploy_p.add_argument(
         "target",
@@ -402,7 +311,7 @@ def add_runpod_subcommand(
     deploy_p.add_argument(
         "--test",
         action="store_true",
-        help="Run /health + /openapi.json probes after deploy",
+        help="Legacy compatibility flag; deployment remains retired",
     )
 
     status_p = runpod_sub.add_parser(

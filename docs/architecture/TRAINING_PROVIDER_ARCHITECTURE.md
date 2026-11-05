@@ -19,6 +19,40 @@ privacy: public
 
 # Training Provider Architecture
 
+## Runpod catalog cutover
+
+The built-in `runpod` adapter is **recovery-only**, not a fresh training or
+generation backend. Its public start/generate methods and the legacy
+`kestrel runpod deploy lora-trainer` command refuse before provider, model,
+task or configuration effects. An old session is not new input/consent
+authority, and legacy FLUX configuration is not automatically an SDXL catalog
+request. Detailed cross-repository requirements remain in
+[KCR#64](https://github.com/KestrelSovereignAI/kestrel-cloud-runpod/issues/64);
+this Core implementation is tracked by
+[Core#3954](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/3954).
+
+`get_provider(name, purpose="training"|"generation")` requires the requested
+fresh capability before creating **or returning a cached** provider. Automatic
+selectors respect that capability. A forced `GENERATION_PROVIDER` that cannot
+serve the request raises clearly instead of switching providers/models.
+`list_available_providers()` lists fresh-work backends; use
+`include_recovery=True` to include configured historical-only providers.
+
+`get_provider("runpod")` remains the historical accessor. Existing status,
+download, cancellation and release retain the SAME session-lifecycle owner.
+Unknown state after restart/eviction must not be reported as confirmed cleanup;
+reconcile the original durable cloud ledger/resource identity. Pausing a
+persistent Pod stops GPU billing, not necessarily disk billing. Original
+execution denial, uncertain COMMIT and native retirement debt are propagated,
+not converted into ordinary provider unavailability. Failed closes remain
+reachable until their custody can be resolved.
+
+New catalog delivery uses the existing external-provider entry-point mechanism
+below, under its own name and actual host admission contract. Core neither
+imports private Frinz/catalog types nor installs a second queue/worker. The
+compatibility release must actually be published before a cloud consumer sets
+its dependency floor; a branch version is not a release.
+
 ## Overview
 
 The Training Provider system provides a unified interface for LoRA training across multiple GPU providers. This enables automatic provider selection, consistent error handling, and seamless switching between providers.
@@ -67,11 +101,11 @@ Require instance lifecycle management:
 
 ## Provider Capabilities Matrix
 
-Each provider has different capabilities. Use `TrainingProviderFactory.get_capabilities()` to query these programmatically.
+Each provider has different capabilities. Use `TrainingProviderFactory.get_capabilities()` to query these programmatically. Model/cost notes below are historical, not current quotes or capacity observations.
 
 | Provider | Training | Generation | Uncensored | FLUX Version | Cost/Train | Notes |
 |----------|----------|------------|------------|--------------|------------|-------|
-| **RunPod** | ✅ | ✅ | ✅ | 2.x | ~$3-5 | Persistent pod, best for iteration |
+| **RunPod (legacy adapter)** | No new work | No new work | Historical metadata | Historical 2.x | Not offered | Status/cancel/download/resource custody only |
 | **Vertex AI** | ✅ | ✅ | ✅ | 2.x | ~$5-10 | Serverless, most reliable |
 | **Replicate** | ✅ | ✅ | ❌ | 1.x | ~$2-5 | Cheapest, but censored |
 | **Vast.ai** | ✅ | ✅ | ✅ | 2.x | ~$2-4 | Cheapest uncensored |
@@ -79,9 +113,9 @@ Each provider has different capabilities. Use `TrainingProviderFactory.get_capab
 
 ### Capability Details
 
-**Training**: All providers support LoRA fine-tuning with avatar images.
+**Training**: Providers declaring training support can accept their supported inputs; the legacy Runpod adapter cannot.
 
-**Generation**: All providers can generate images using trained LoRA weights.
+**Generation**: Requires a declared generation capability and compatible, authorized artifact inputs; availability alone is insufficient.
 
 **Uncensored**: Whether content safety filters are applied:
 - ✅ = No filters, NSFW content allowed
@@ -116,7 +150,7 @@ Replicate's `hf_lora` parameter only accepts:
 The Replicate adapter will return a clear error if IPFS URLs are passed.
 
 **Workarounds:**
-1. **Use a different provider**: RunPod and Vertex AI both support IPFS
+1. **Use a compatible provider**: verify its current artifact input contract. The legacy Runpod adapter does not admit new generation.
 2. **Upload to HuggingFace**: Store LoRA on HuggingFace and use the HF path
 3. **Train on Replicate**: If you train on Replicate, the model is hosted there automatically
 
@@ -128,9 +162,9 @@ job = await replicate_provider.start_training(companion_id, avatar_data)
 # ... wait for completion ...
 weights = await replicate_provider.download_weights(job.job_id)
 
-# Generate on RunPod (uncensored)
-runpod_provider = TrainingProviderFactory.get_uncensored_provider()
-# Upload weights to RunPod and generate
+# Select an available generation backend with the required capability.
+# This does not choose the retired Runpod adapter or authorize artifact use.
+generation_provider = TrainingProviderFactory.get_generation_provider(uncensored=True)
 ```
 
 ### Selecting Providers by Capability
@@ -334,7 +368,7 @@ if status.state == TrainingState.COMPLETED:
 ### Request Specific Provider
 
 ```python
-provider = TrainingProviderFactory.get_provider("vertex_ai")
+provider = TrainingProviderFactory.get_provider("vertex_ai", purpose="training")
 if not provider:
     available = TrainingProviderFactory.list_available_providers()
     raise RuntimeError(f"Vertex AI not available. Available: {available}")
@@ -342,121 +376,15 @@ if not provider:
 
 ## Implementing a New Adapter
 
-To add a new training provider (e.g., RunPod):
-
-### 1. Create the Adapter Class
-
-```python
-# features/training/adapters/runpod_adapter.py
-
-from ..protocol import TrainingProvider, ProviderNotAvailableError
-from ..types import ProviderType, TrainingConfig, TrainingJob, TrainingStatus, TrainingState
-
-class RunPodTrainingAdapter:
-    """Adapter wrapping RunPodManager for TrainingProvider protocol."""
-
-    provider_name = "runpod"
-    provider_type = ProviderType.SESSION_BASED
-
-    def __init__(self, manager=None):
-        self._manager = manager
-        self._active_jobs: dict[str, dict] = {}
-
-    def _get_manager(self):
-        """Lazy load the RunPod manager."""
-        if self._manager is None:
-            from features.runpod.runpod_manager import RunPodManager
-            self._manager = RunPodManager()
-        return self._manager
-
-    def is_available(self) -> bool:
-        """Check for RUNPOD_API_KEY."""
-        try:
-            manager = self._get_manager()
-            return manager is not None and manager._api_key is not None
-        except Exception:
-            return False
-
-    async def start_training(self, companion_id, avatar_data, config=None):
-        # 1. Start/resume pod
-        # 2. Upload avatar via API or SSH
-        # 3. Call training endpoint
-        # 4. Track job internally
-        # 5. Return TrainingJob
-        ...
-
-    async def get_status(self, job_id):
-        # Poll training status from pod API
-        # Map to TrainingState using TrainingState.from_runpod_state()
-        ...
-
-    async def download_weights(self, job_id):
-        # Download from pod or network volume
-        ...
-
-    async def cancel(self, job_id):
-        # Stop training, optionally pause pod
-        ...
-
-    async def cleanup(self, job_id):
-        # Pause or terminate pod to stop billing
-        ...
-```
-
-### 2. Register in Factory
-
-```python
-# features/training/factory.py
-
-# Add to _PROVIDER_CLASSES
-_PROVIDER_CLASSES = {
-    "vertex_ai": ("features.training.adapters.vertex_ai_adapter", "VertexAITrainingAdapter"),
-    "replicate": ("features.training.adapters.replicate_adapter", "ReplicateTrainingAdapter"),
-    "gcp_compute": ("features.training.adapters.gcp_compute_adapter", "GCPComputeTrainingAdapter"),
-    "vastai": ("features.training.adapters.vastai_adapter", "VastAITrainingAdapter"),
-    "runpod": ("features.training.adapters.runpod_adapter", "RunPodTrainingAdapter"),  # Add this
-}
-
-# Add to _PROVIDER_PRIORITY (higher priority = tried first)
-_PROVIDER_PRIORITY = ["vertex_ai", "runpod", "replicate", "gcp_compute", "vastai"]
-```
-
-### 3. Add State Mapping
-
-If RunPod has unique states, add mapping in `types.py`:
-
-```python
-@classmethod
-def from_runpod_state(cls, state: str) -> "TrainingState":
-    """Map RunPod pod state to unified state."""
-    mapping = {
-        "offline": cls.PENDING,
-        "provisioning": cls.PROVISIONING,
-        "loading": cls.PREPARING,
-        "ready": cls.TRAINING,
-        "running": cls.TRAINING,
-        "terminating": cls.CANCELLED,
-        "error": cls.FAILED,
-    }
-    return mapping.get(state.lower(), cls.PENDING)
-```
-
-### 4. Export from `__init__.py`
-
-```python
-# features/training/adapters/__init__.py
-from .runpod_adapter import RunPodTrainingAdapter
-
-__all__ = [
-    # ... existing
-    "RunPodTrainingAdapter",
-]
-```
+Use the existing external-provider registration described below. Do not copy
+the retired Runpod implementation, add another in-tree factory registry, or
+invent a FLUX-to-catalog parameter conversion. Session-backed implementations
+reuse the canonical `SessionTrainingLifecycle` owner for task and resource
+retirement; they still need their own actual host input/admission contract.
 
 ## Writing a Training Provider (External Package, Entry Points)
 
-The steps above add a provider **in-tree** by editing `factory.py`. External
-packages don't have to — they can register a provider through the
+External packages register a provider through the existing
 `kestrel_sovereign.training_providers` entry-point group and Kestrel discovers
 it at runtime, mirroring how LLM adapters register under
 `kestrel_sovereign.llm_providers`.
@@ -539,7 +467,8 @@ entry point, records its class, `capabilities`, and `priority`, then:
 
 - **Instantiates + checks `is_available()`** — an unavailable provider is
   silently skipped (never appears in `list_available_providers()` and
-  `get_provider()` returns `None`).
+  `get_provider()` returns `None`). Original execution-control failures are
+  raised, never normalized into ordinary unavailability.
 - **Merges into the priority order** — `_effective_priority()` interleaves
   entry-point providers with the built-in `PROVIDER_PRIORITY` by their declared
   `priority`, so `get_default_provider()` / `get_generation_provider()` /
