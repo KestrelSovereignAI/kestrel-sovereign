@@ -770,6 +770,7 @@ async def test_every_direct_tool_lane_preserves_unconfirmed_effects_after_unexpe
 
     agent, backend = host
     assert agent.supports_unconfirmed_tool_outcomes is True
+    assert getattr(ToolRegistryMixin, 'supports_unconfirmed_tool_outcomes', None) is not True
     class FailedAfterEffect(_Tool):
         async def execute(self, **args):
             self.calls.append(args)
