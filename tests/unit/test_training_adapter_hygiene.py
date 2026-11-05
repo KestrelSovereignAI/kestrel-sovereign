@@ -15,6 +15,10 @@ from kestrel_sovereign.features.training.adapters.replicate_adapter import (
 from kestrel_sovereign.features.training.adapters.runpod_adapter import (
     RunPodTrainingAdapter,
 )
+from kestrel_sovereign.features.training.adapters._session_training_lifecycle import (
+    SessionJobPhase,
+    SessionTrainingRecord,
+)
 from kestrel_sovereign.features.training.types import (
     TrainingConfig,
     TrainingJob,
@@ -57,13 +61,25 @@ def _runpod_manager(session):
     )
 
 
+def _retained_runpod_job(adapter, session):
+    """Existing custody for cleanup, not a new training/submission shortcut."""
+    now = datetime.now(timezone.utc)
+    record = SessionTrainingRecord(
+        job_id="original-job", companion_id="companion", trigger_word="TOKcompanion",
+        config=TrainingConfig(), session=session, created_at=now, started_at=now,
+        phase=SessionJobPhase.FAILED,
+    )
+    adapter._active_jobs[record.job_id] = record
+    return adapter._lifecycle.training_job(record)
+
+
 @pytest.mark.asyncio
 async def test_runpod_cleanup_pauses_the_managers_current_persistent_pod():
     session = _runpod_session(persistent=True)
     manager = _runpod_manager(session)
     manager._session = session
     adapter = RunPodTrainingAdapter(manager=manager)
-    job = await adapter.start_training("companion", b"avatar")
+    job = _retained_runpod_job(adapter, session)
 
     await adapter.cleanup(job.job_id)
 
@@ -79,7 +95,7 @@ async def test_runpod_cleanup_pauses_a_persistent_pod_the_manager_no_longer_hold
     session = _runpod_session(persistent=True)
     manager = _runpod_manager(session)
     adapter = RunPodTrainingAdapter(manager=manager)
-    job = await adapter.start_training("companion", b"avatar")
+    job = _retained_runpod_job(adapter, session)
 
     await adapter.cleanup(job.job_id)
 
@@ -98,7 +114,7 @@ async def test_runpod_cleanup_terminates_on_demand_pod():
     manager = _runpod_manager(session)
     manager._session = session
     adapter = RunPodTrainingAdapter(manager=manager)
-    job = await adapter.start_training("companion", b"avatar")
+    job = _retained_runpod_job(adapter, session)
 
     await adapter.cleanup(job.job_id)
 

@@ -326,12 +326,14 @@ def test_default_provider_skips_generation_only(register_entry_points, monkeypat
 
 
 def test_forced_generation_only_rejected_for_training(register_entry_points, monkeypatch):
+    from kestrel_sovereign.features.training.protocol import ProviderNotAvailableError
+
     register_entry_points(("gen_only", _GenerationOnlyProvider))
     monkeypatch.setenv("GENERATION_PROVIDER", "gen_only")
 
     # Forcing a generation-only provider for the training default is refused.
-    provider = TrainingProviderFactory.get_default_provider()
-    assert not isinstance(provider, _GenerationOnlyProvider)
+    with pytest.raises(ProviderNotAvailableError, match="does not admit new training"):
+        TrainingProviderFactory.get_default_provider()
 
 
 def test_uncensored_provider_requires_generation(register_entry_points):

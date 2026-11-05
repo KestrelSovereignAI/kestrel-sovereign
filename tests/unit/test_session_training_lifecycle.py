@@ -536,6 +536,20 @@ async def _assert_no_orphans(adapter, remote: FakeRemote, loop_errors) -> None:
 
 
 async def _start(adapter, companion_id: str = "companion-1"):
+    if isinstance(adapter, RunPodTrainingAdapter):
+        # This suite exercises the SAME original session owner/hooks, including
+        # acquisition/submission races already admitted before the cutover.
+        # It is not fresh provider-admission evidence or a production bypass:
+        # the public Runpod door's zero-effects refusal has separate tests.
+        config = TrainingConfig()
+        record = await adapter._lifecycle.start(
+            job_id=f"retained-runpod-{next(_ids)}",
+            companion_id=companion_id,
+            trigger_word=f"TOK{companion_id[:8]}",
+            config=config,
+            avatar_data=b"avatar",
+        )
+        return adapter._lifecycle.training_job(record)
     return await adapter.start_training(companion_id, b"avatar", TrainingConfig())
 
 
@@ -1745,4 +1759,3 @@ def test_released_job_history_has_a_default_bound():
     assert lifecycle._released_history_limit == RELEASED_JOB_HISTORY_LIMIT
     with pytest.raises(ValueError, match="at least 1"):
         SessionTrainingLifecycle(lifecycle._hooks, released_history_limit=0)
-
