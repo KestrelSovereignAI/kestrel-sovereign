@@ -48,7 +48,7 @@ async def test_anthropic_streaming_emits_thinking_delta():
     )
 
     items = []
-    async for item in adapter.get_streaming_response(
+    async for item in adapter.get_streaming_response_with_tools(
         client=client,
         model="claude-haiku-4-5-20251001",
         messages=[{"role": "user", "content": "2+2?"}],
@@ -74,7 +74,7 @@ async def test_anthropic_streaming_splits_think_tags():
     )
 
     items = []
-    async for item in adapter.get_streaming_response(
+    async for item in adapter.get_streaming_response_with_tools(
         client=client,
         model="claude-haiku-4-5-20251001",
         messages=[{"role": "user", "content": "test"}],
@@ -102,7 +102,7 @@ async def test_ollama_streaming_splits_think_tags(monkeypatch):
     client = SimpleNamespace(chat=chat)
 
     items = []
-    async for item in adapter.get_streaming_response(
+    async for item in adapter.get_streaming_response_with_tools(
         client=client,
         model="qwen3",
         messages=[{"role": "user", "content": "2+2?"}],
@@ -134,7 +134,7 @@ async def test_ollama_streaming_emits_native_thinking_field(monkeypatch):
     client = SimpleNamespace(chat=chat)
 
     items = []
-    async for item in adapter.get_streaming_response(
+    async for item in adapter.get_streaming_response_with_tools(
         client=client,
         model="gemma4:31b",
         messages=[{"role": "user", "content": "2+2?"}],
@@ -171,7 +171,7 @@ async def test_ollama_streaming_emits_native_thinking_via_sdk_objects(monkeypatc
     client = SimpleNamespace(chat=chat)
 
     items = []
-    async for item in adapter.get_streaming_response(
+    async for item in adapter.get_streaming_response_with_tools(
         client=client,
         model="gemma4:31b",
         messages=[{"role": "user", "content": "test"}],

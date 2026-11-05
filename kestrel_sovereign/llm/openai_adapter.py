@@ -10,7 +10,6 @@ Adapter for OpenAI's chat completion API with full support for:
 
 from contextlib import aclosing
 
-from kestrel_sovereign.execution_custody import owned_execution_stream
 import json
 import os
 import re
@@ -27,7 +26,7 @@ from pydantic import BaseModel
 
 from kestrel_sdk.llm import LLMProtocolError, ToolCallStarted
 
-from .completion_protocol import decode_tool_arguments
+from .completion_protocol import GenerationProtocolError, decode_tool_arguments
 from .adapter import (
     LLMAdapter,
     LLMResponse,
@@ -252,6 +251,16 @@ async def _maybe_await(value: Any) -> Any:
     if hasattr(value, "__await__"):
         return await value
     return value
+
+
+def _protocol_failure_usage(usage: Any, stop_reason: Optional[str]) -> Optional[LLMResponse]:
+    """Retain only reported token counts when native response parsing fails."""
+    if usage is None:
+        return None
+    inputs, outputs, total, writes, reads = _normalized_openai_usage(usage)
+    return LLMResponse(input_tokens=inputs, output_tokens=outputs, total_tokens=total,
+        cache_creation_input_tokens=writes, cache_read_input_tokens=reads,
+        stop_reason=stop_reason)
 
 
 class OpenAIAdapter(LLMAdapter):
@@ -547,6 +556,8 @@ class OpenAIAdapter(LLMAdapter):
             LLMResponse with content and/or tool calls
         """
         retain_native_execution_http_client_close(getattr(client, "_client", None))
+        reported_native_usage = None
+        finish_reason = None
         try:
             # Apply provider/model-specific system-prompt contributions (e.g. the
             # GPT-5 behavior contract). #807 / #806.
@@ -596,6 +607,7 @@ class OpenAIAdapter(LLMAdapter):
                 **extra_kwargs
             )
 
+            reported_native_usage = getattr(response, "usage", None)
             choice = _single_choice(response.choices)
             message = choice.message
             # #3355: the provider's own verdict on whether the response is
@@ -654,6 +666,12 @@ class OpenAIAdapter(LLMAdapter):
                 cache_read_input_tokens=cache_read_input_tokens,
             ), finish_reason)
 
+        except LLMProtocolError as error:
+            if is_execution_control_error(error) or isinstance(error, GenerationProtocolError):
+                raise
+            raise GenerationProtocolError(
+                _protocol_failure_usage(reported_native_usage, finish_reason)
+            ) from error
         except openai.RateLimitError as e:
             logger.error("OpenAI rate limit exceeded: %s", type(e).__name__)
             raise
@@ -725,6 +743,8 @@ class OpenAIAdapter(LLMAdapter):
                             # Continue conversation with tool results
         """
         retain_native_execution_http_client_close(getattr(client, "_client", None))
+        reported_native_usage = None
+        finish_reason = None
         try:
             # Apply provider/model-specific system-prompt contributions (e.g. the
             # GPT-5 behavior contract). #807 / #806.
@@ -800,6 +820,7 @@ class OpenAIAdapter(LLMAdapter):
                     report_call_progress()
                     # Extract usage from final chunk (OpenAI sends it with stream_options)
                     if hasattr(chunk, 'usage') and chunk.usage:
+                        reported_native_usage = chunk.usage
                         (
                             input_tokens,
                             output_tokens,
@@ -961,6 +982,12 @@ class OpenAIAdapter(LLMAdapter):
                 cache_read_input_tokens=cache_read_input_tokens,
             ), finish_reason)
 
+        except LLMProtocolError as error:
+            if is_execution_control_error(error) or isinstance(error, GenerationProtocolError):
+                raise
+            raise GenerationProtocolError(
+                _protocol_failure_usage(reported_native_usage, finish_reason)
+            ) from error
         except openai.RateLimitError as e:
             logger.error("OpenAI rate limit exceeded during streaming with tools: %s", type(e).__name__)
             raise
@@ -1099,12 +1126,15 @@ class OpenAIAdapter(LLMAdapter):
             custom_id = item.get("custom_id", "")
             error = item.get("error")
             response_body = ((item.get("response") or {}).get("body") or None)
-            response = (
-                self._llm_response_from_chat_completion(response_body)
-                if response_body
-                else None
-            )
+            response = None
             error_text = json.dumps(error) if error is not None else None
+            if response_body:
+                try:
+                    response = self._llm_response_from_chat_completion(response_body)
+                except LLMProtocolError:
+                    # Each native batch item owns its outcome. A refused item
+                    # cannot hide valid neighbors or expose an executable call.
+                    error_text = "Invalid generation protocol in batch result."
             if BatchResult:
                 results.append(
                     BatchResult(

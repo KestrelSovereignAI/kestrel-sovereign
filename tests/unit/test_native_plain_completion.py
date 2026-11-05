@@ -12,6 +12,7 @@ import pytest
 
 from kestrel_sdk.llm import LLMProtocolError, LLMResponse
 from kestrel_sdk.testing import drain_streaming_with_tools
+from kestrel_sovereign.llm.output_ceiling import reported_usage
 from kestrel_sovereign.llm.genai_custody import close_genai_client
 from kestrel_sovereign.llm.google_adapter import GoogleAdapter
 from kestrel_sovereign.llm.vertex_adapter import VertexAIAdapter
@@ -52,14 +53,24 @@ async def test_core_native_malformed_tool_arguments_never_complete(adapter_type,
         payload = {"id": "owned", "object": "chat.completion", "created": 0, "model": "owned",
             "choices": [{"index": 0, "finish_reason": "tool_calls",
             "message": {"role": "assistant", "content": None, "tool_calls": [call]}}]}
+    usage = {"prompt_tokens": 7, "completion_tokens": 3, "total_tokens": 10}
+    if streaming:
+        payload.append({"id": "owned", "object": "chat.completion.chunk", "created": 0,
+            "model": "owned", "choices": [], "usage": usage})
+    else:
+        payload["usage"] = usage
     async with native_openai_client(payload, streaming=streaming) as (client, responses):
         observed = []
-        with pytest.raises(LLMProtocolError):
+        with pytest.raises(LLMProtocolError) as raised:
             if streaming:
                 async for item in adapter_type().get_streaming_response_with_tools(client, "owned", [{"role": "user", "content": "owned"}]):
                     observed.append(item)
             else:
                 await adapter_type().get_response(client, "owned", [{"role": "user", "content": "owned"}])
+        usage = reported_usage(raised.value)
+        assert usage is not None
+        assert (usage.input_tokens, usage.output_tokens, usage.total_tokens) == (7, 3, 10)
+        assert usage.content is None and usage.raw is None and usage.tool_calls is None
         assert not any(isinstance(item, LLMResponse) for item in observed)
         assert responses and all(response.is_closed for response in responses)
 
@@ -192,11 +203,53 @@ async def test_core_native_unselected_choices_are_refused(adapter_type, streamin
     choices = [{"index": index, "finish_reason": "stop",
         ("delta" if streaming else "message"): {"role": "assistant", "content": "unselected"}} for index in indices]
     payload = {"id": "owned", "object": "chat.completion.chunk" if streaming else "chat.completion",
-        "created": 0, "model": "owned", "choices": choices}
+        "created": 0, "model": "owned", "choices": choices,
+        "usage": {"prompt_tokens": 7, "completion_tokens": 3, "total_tokens": 10}}
     async with native_openai_client([payload] if streaming else payload, streaming=streaming) as (client, responses):
-        with pytest.raises(LLMProtocolError):
+        with pytest.raises(LLMProtocolError) as raised:
             if streaming:
                 _ = [item async for item in adapter_type().get_streaming_response_with_tools(client, "owned", [{"role": "user", "content": "owned"}])]
             else:
                 await adapter_type().get_response(client, "owned", [{"role": "user", "content": "owned"}])
+        usage = reported_usage(raised.value)
+        assert usage is not None and (usage.input_tokens, usage.output_tokens, usage.total_tokens) == (7, 3, 10)
+        assert usage.content is None and usage.raw is None and usage.tool_calls is None
         assert responses and all(response.is_closed for response in responses)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["arguments", "choice"])
+async def test_native_batch_malformed_result_keeps_valid_neighbors(failure):
+    from types import SimpleNamespace
+
+    def item(custom_id):
+        return {"custom_id": custom_id, "response": {"body": {
+            "choices": [{"index": 0, "finish_reason": "stop", "message": {
+                "role": "assistant", "content": custom_id}}],
+            "usage": {"prompt_tokens": 7, "completion_tokens": 3, "total_tokens": 10}}}}
+
+    before, bad, after = [item(key) for key in ("before", "bad", "after")]
+    choice = bad["response"]["body"]["choices"][0]
+    if failure == "arguments":
+        choice["message"]["tool_calls"] = [{"id": "owned", "type": "function",
+            "function": {"name": "write", "arguments": "PRIVATE_INVALID_JSON"}}]
+    else:
+        choice["index"] = 1
+    body = "\n".join(json.dumps(line) for line in [before, bad, after])
+    responses = []
+
+    def respond(request):
+        assert request.url.path.endswith("/files/owned/content")
+        response = httpx2.Response(200, content=body)
+        responses.append(response)
+        return response
+
+    async with httpx2.AsyncClient(transport=httpx2.MockTransport(respond)) as http:
+        async with AsyncOpenAI(api_key="owned", http_client=http, max_retries=0) as client:
+            results = await OpenAIAdapter().batch_results(client, SimpleNamespace(output_file_id="owned"))
+            assert [result.custom_id for result in results] == ["before", "bad", "after"]
+            assert [results[i].response.content for i in [0, 2]] == ["before", "after"]
+            assert results[0].error is None and results[2].error is None
+            assert results[1].response is None and results[1].error
+            assert "PRIVATE_INVALID_JSON" not in results[1].error
+            assert responses and all(response.is_closed for response in responses)

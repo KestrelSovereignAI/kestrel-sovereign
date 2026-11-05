@@ -91,6 +91,7 @@ async def _openai_parameters(adapter_type, schema: dict) -> dict:
     client = MagicMock()
     client.chat.completions.create = AsyncMock(return_value=MagicMock(
         choices=[MagicMock(
+            index=0,
             message=MagicMock(content="ok", tool_calls=None, reasoning_content=None),
             finish_reason="stop",
         )],

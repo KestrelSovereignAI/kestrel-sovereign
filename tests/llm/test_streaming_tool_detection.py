@@ -13,7 +13,7 @@ import pytest
 from typing import List, Dict, Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
-from kestrel_sdk.llm import ToolCallStarted
+from kestrel_sdk.llm import LLMProtocolError, ToolCallStarted
 
 from kestrel_sovereign.llm.adapter import LLMResponse, ToolCall
 from kestrel_sovereign.llm.openai_adapter import OpenAIAdapter
@@ -78,7 +78,7 @@ class TestOpenAIStreamingToolDetectionUnit:
             chunks = ["Hello", " ", "world", "!"]
             for i, text in enumerate(chunks):
                 chunk = MagicMock()
-                chunk.choices = [MagicMock()]
+                chunk.choices = [MagicMock(index=0)]
                 chunk.choices[0].delta = MagicMock()
                 chunk.choices[0].delta.content = text
                 chunk.choices[0].delta.tool_calls = None
@@ -127,7 +127,7 @@ class TestOpenAIStreamingToolDetectionUnit:
         async def mock_stream():
             # First chunk: tool call start with id and name
             chunk1 = MagicMock()
-            chunk1.choices = [MagicMock()]
+            chunk1.choices = [MagicMock(index=0)]
             chunk1.choices[0].delta = MagicMock()
             chunk1.choices[0].delta.content = None
             tc1 = MagicMock()
@@ -142,7 +142,7 @@ class TestOpenAIStreamingToolDetectionUnit:
 
             # Second chunk: more arguments
             chunk2 = MagicMock()
-            chunk2.choices = [MagicMock()]
+            chunk2.choices = [MagicMock(index=0)]
             chunk2.choices[0].delta = MagicMock()
             chunk2.choices[0].delta.content = None
             tc2 = MagicMock()
@@ -208,7 +208,7 @@ class TestOpenAIStreamingToolDetectionUnit:
         async def mock_stream():
             # Tool call 1 - get_weather
             chunk1 = MagicMock()
-            chunk1.choices = [MagicMock()]
+            chunk1.choices = [MagicMock(index=0)]
             chunk1.choices[0].delta = MagicMock()
             chunk1.choices[0].delta.content = None
             tc1 = MagicMock()
@@ -223,7 +223,7 @@ class TestOpenAIStreamingToolDetectionUnit:
 
             # Tool call 2 - search_web (different index)
             chunk2 = MagicMock()
-            chunk2.choices = [MagicMock()]
+            chunk2.choices = [MagicMock(index=0)]
             chunk2.choices[0].delta = MagicMock()
             chunk2.choices[0].delta.content = None
             tc2 = MagicMock()
@@ -281,7 +281,7 @@ class TestOpenAIStreamingToolDetectionUnit:
         async def mock_stream():
             # Text chunk first
             chunk1 = MagicMock()
-            chunk1.choices = [MagicMock()]
+            chunk1.choices = [MagicMock(index=0)]
             chunk1.choices[0].delta = MagicMock()
             chunk1.choices[0].delta.content = "Let me check the weather. "
             chunk1.choices[0].delta.tool_calls = None
@@ -290,7 +290,7 @@ class TestOpenAIStreamingToolDetectionUnit:
 
             # Then tool call
             chunk2 = MagicMock()
-            chunk2.choices = [MagicMock()]
+            chunk2.choices = [MagicMock(index=0)]
             chunk2.choices[0].delta = MagicMock()
             chunk2.choices[0].delta.content = None
             tc = MagicMock()
@@ -344,7 +344,7 @@ class TestOpenAIStreamingToolDetectionUnit:
 
         async def mock_stream():
             chunk = MagicMock()
-            chunk.choices = [MagicMock()]
+            chunk.choices = [MagicMock(index=0)]
             chunk.choices[0].delta = MagicMock()
             chunk.choices[0].delta.content = None
             tc = MagicMock()
@@ -367,24 +367,14 @@ class TestOpenAIStreamingToolDetectionUnit:
         mock_client.chat.completions.create = AsyncMock(return_value=mock_response)
 
         results = []
-        async for item in adapter.get_streaming_response_with_tools(
-            client=mock_client,
-            model="gpt-5-mini",
-            messages=[{"role": "user", "content": "test"}],
-            tools=SAMPLE_TOOLS
-        ):
-            results.append(item)
-
-        # SDK 0.7.0+: ToolCallStarted precedes the final LLMResponse.
-        # Malformed JSON sentinel renamed from "raw" to "_raw" in
-        # 0.7.0 to signal "sentinel, not real data".
-        starts = [r for r in results if isinstance(r, ToolCallStarted)]
-        finals = [r for r in results if isinstance(r, LLMResponse)]
-        assert len(starts) == 1
-        assert len(finals) == 1
-        final = finals[0]
-        assert final.has_tool_calls
-        assert final.tool_calls[0].arguments == {"_raw": "not valid json {"}
+        with pytest.raises(LLMProtocolError):
+            async for item in adapter.get_streaming_response_with_tools(
+                client=mock_client, model="gpt-5-mini",
+                messages=[{"role": "user", "content": "test"}], tools=SAMPLE_TOOLS,
+            ):
+                results.append(item)
+        assert len([r for r in results if isinstance(r, ToolCallStarted)]) == 1
+        assert not any(isinstance(r, LLMResponse) for r in results)
 
 
 # =============================================================================
@@ -484,6 +474,7 @@ class TestAnthropicStreamingToolDetectionUnit:
         tool_start.content_block.type = 'tool_use'
         tool_start.content_block.id = 'toolu_abc'
         tool_start.content_block.name = 'get_weather'
+        tool_start.content_block.input = {}
         events.append(tool_start)
 
         # input_json_delta chunks
@@ -695,10 +686,12 @@ class TestVertexStreamingToolDetectionUnit:
             ):
                 results.append(item)
 
-            assert len(results) == 1
-            assert isinstance(results[0], LLMResponse)
-            assert results[0].has_tool_calls
-            assert results[0].tool_calls[0].name == "search_web"
+            assert len(results) == 2
+            assert isinstance(results[0], ToolCallStarted)
+            assert results[0].id == "vertex_call_0"
+            assert isinstance(results[1], LLMResponse)
+            assert results[1].has_tool_calls
+            assert results[1].tool_calls[0].name == "search_web"
 
 
 # =============================================================================
@@ -963,7 +956,7 @@ class TestStreamingToolDetectionEdgeCases:
 
         async def mock_stream():
             chunk = MagicMock()
-            chunk.choices = [MagicMock()]
+            chunk.choices = [MagicMock(index=0)]
             chunk.choices[0].delta = MagicMock()
             chunk.choices[0].delta.content = None
             tc = MagicMock()
@@ -1010,7 +1003,7 @@ class TestStreamingToolDetectionEdgeCases:
         async def mock_stream():
             # First chunk with id and name
             chunk1 = MagicMock()
-            chunk1.choices = [MagicMock()]
+            chunk1.choices = [MagicMock(index=0)]
             chunk1.choices[0].delta = MagicMock()
             chunk1.choices[0].delta.content = None
             tc1 = MagicMock()
@@ -1026,7 +1019,7 @@ class TestStreamingToolDetectionEdgeCases:
             # Arguments arrive in small chunks
             for char in argument_json:
                 chunk = MagicMock()
-                chunk.choices = [MagicMock()]
+                chunk.choices = [MagicMock(index=0)]
                 chunk.choices[0].delta = MagicMock()
                 chunk.choices[0].delta.content = None
                 tc = MagicMock()

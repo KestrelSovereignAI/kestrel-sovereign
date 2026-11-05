@@ -10,7 +10,6 @@ Adapter for Anthropic's Claude API with support for:
 
 from contextlib import aclosing
 
-from kestrel_sovereign.execution_custody import owned_execution_stream
 import json
 import logging
 import os

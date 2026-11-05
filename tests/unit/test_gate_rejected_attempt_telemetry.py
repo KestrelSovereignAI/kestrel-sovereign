@@ -29,9 +29,9 @@ from unittest.mock import AsyncMock
 import pytest
 
 from kestrel_sovereign.a2a.stores import ObservabilityStore
+from kestrel_sovereign.llm.completion_protocol import GenerationProtocolError
 from kestrel_sovereign.llm.adapter import LLMResponse
 from kestrel_sovereign.llm.generation_gate import (
-    NoCompletionEvidenceError,
     judge_generation,
 )
 from kestrel_sovereign.llm.invocation_context import LLMInvocationContext
@@ -314,7 +314,7 @@ def _assert_billed_once(llm) -> None:
 async def test_a_stream_without_a_terminal_response_keeps_its_flushed_usage(
     service, store, prometheus,
 ):
-    """No terminal response is no stop reason: a failed attempt, which still
+    """No terminal response violates the protocol: a failed attempt still
     records the usage its adapter flushed before the stream ended."""
     route = _FlushedUsageRoute(None)
     service.install_route(route)
@@ -324,9 +324,7 @@ async def test_a_stream_without_a_terminal_response_keeps_its_flushed_usage(
 
     call = await _only_call(store)
     assert call.success is False
-    assert call.error_message == str(
-        NoCompletionEvidenceError(provider=ROUTE, model=MODEL)
-    )
+    assert call.error_message == str(GenerationProtocolError())
     assert call.metadata["partial_abort"] is True
     assert (call.input_tokens, call.output_tokens) == (INPUT_TOKENS, OUTPUT_TOKENS)
     service._record_model_usage.assert_awaited_once()
@@ -402,7 +400,7 @@ INTERRUPTIONS = {
     "dropped": (LLMStreamingError, False, DROPPED),
     "unfinished": (
         LLMStreamingError, False,
-        str(NoCompletionEvidenceError(provider=ROUTE, model=MODEL)),
+        str(GenerationProtocolError()),
     ),
     "natural": (None, True, None),
     # A cancelled stream is not a failed attempt; its record is unchanged.
@@ -508,3 +506,21 @@ async def test_a_failed_partial_stream_records_the_routes_failure_message():
         INPUT_TOKENS, OUTPUT_TOKENS,
     )
     host._track_model_usage.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_close_after_delivered_terminal_preserves_success():
+    host = _StreamingOnlyHost()
+    route = _StreamedRoute("stop")
+    stream = host._stream_adapter_with_usage(
+        adapter=route, client=AsyncMock(), model=MODEL, messages=[],
+        provider_name=ROUTE, path="stream_with_tool_detection",
+        invocation_context=None, expose_protocol_events=True, tools=TOOLS,
+    )
+    assert await anext(stream) == TEXT
+    assert isinstance(await anext(stream), LLMResponse)
+    await stream.aclose()
+    host._log_llm_call.assert_awaited_once()
+    logged = host._log_llm_call.await_args.kwargs
+    assert logged["success"] is True and logged["error_message"] is None
+    assert (logged["input_tokens"], logged["output_tokens"]) == (INPUT_TOKENS, OUTPUT_TOKENS)

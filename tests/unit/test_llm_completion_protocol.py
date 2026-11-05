@@ -277,3 +277,30 @@ async def test_protocol_accepts_the_sdk_async_iterator_without_an_optional_close
                 raise StopAsyncIteration
 
     assert [item async for item in adapter_stream(Items())] == [terminal]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("module,class_name", [
+    ("openai", "OpenAIAdapter"), ("anthropic", "AnthropicAdapter"),
+    ("google", "GoogleAdapter"), ("vertex", "VertexAIAdapter"),
+    ("ollama", "OllamaAdapter"), ("openrouter", "OpenRouterAdapter"),
+    ("codex", "CodexAdapter"),
+])
+async def test_plain_facades_omit_reasoning_but_keep_terminal_after_cleanup(monkeypatch, module, class_name):
+    from kestrel_sovereign.llm.adapter import ThinkingDelta
+
+    closed = []
+    terminal = LLMResponse(content="visible", stop_reason="stop", input_tokens=2)
+
+    async def source(**kwargs):
+        try:
+            yield ThinkingDelta("private", provider=module)
+            yield "visible"
+            yield terminal
+        finally:
+            closed.append(True)
+
+    adapter = getattr(importlib.import_module("kestrel_sovereign.llm." + module + "_adapter"), class_name)()
+    monkeypatch.setattr(adapter, "get_streaming_response_with_tools", source)
+    items = [item async for item in adapter.get_streaming_response(client=object(), model="owned", messages=[])]
+    assert items == ["visible", terminal] and closed == [True]

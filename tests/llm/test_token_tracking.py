@@ -20,6 +20,17 @@ from tests.utils.anthropic_client import anthropic_client
 from tests.utils.ollama_client import ollama_client
 
 
+@pytest.fixture
+async def tracking_service():
+    from kestrel_sovereign.llm.service import LLMService
+
+    service = LLMService()
+    try:
+        yield service
+    finally:
+        await service.close()
+
+
 # =============================================================================
 # Unit Tests (Mocked) - Verify Token Extraction Logic
 # =============================================================================
@@ -43,7 +54,7 @@ class TestOpenAITokenExtraction:
         mock_usage.total_tokens = 15
 
         mock_response = MagicMock()
-        mock_response.choices = [MagicMock(message=mock_message)]
+        mock_response.choices = [MagicMock(index=0, message=mock_message)]
         mock_response.usage = mock_usage
 
         mock_client = MagicMock()
@@ -69,7 +80,7 @@ class TestOpenAITokenExtraction:
         mock_message.tool_calls = None
 
         mock_response = MagicMock()
-        mock_response.choices = [MagicMock(message=mock_message)]
+        mock_response.choices = [MagicMock(index=0, message=mock_message)]
         mock_response.usage = None
 
         mock_client = MagicMock()
@@ -346,12 +357,11 @@ class TestUsageTrackingIntegration:
     """Test that _track_model_usage is called with token counts."""
 
     @pytest.mark.asyncio
-    async def test_track_model_usage_receives_tokens(self):
+    async def test_track_model_usage_receives_tokens(self, tracking_service):
         """Verify _track_model_usage is called with non-zero token count."""
-        from kestrel_sovereign.llm.service import LLMService
 
         # Create service and mock the tracking method
-        service = LLMService()
+        service = tracking_service
         tracked_calls = []
         original_track = service._track_model_usage
 
@@ -394,11 +404,10 @@ class TestUsageTrackingIntegration:
             pytest.skip("No providers available")
 
     @pytest.mark.asyncio
-    async def test_track_model_usage_with_model_override(self):
+    async def test_track_model_usage_with_model_override(self, tracking_service):
         """Verify get_response_with_model also tracks tokens."""
-        from kestrel_sovereign.llm.service import LLMService
 
-        service = LLMService()
+        service = tracking_service
         tracked_calls = []
 
         async def mock_track(model_id, provider, tokens=0):

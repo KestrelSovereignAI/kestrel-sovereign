@@ -1263,8 +1263,10 @@ class StreamingMixin:
                 return error_message_override
             return str(error)
 
+        terminal_delivered = False
+
         async def forward(stream: AsyncIterator[Any]) -> AsyncIterator[Any]:
-            nonlocal emitted, final_response
+            nonlocal emitted, final_response, terminal_delivered
 
             def retain_terminal(response: LLMResponse) -> None:
                 nonlocal final_response
@@ -1289,6 +1291,7 @@ class StreamingMixin:
                             item, model=model, provider=provider_name
                         )
                         reject_unfinished(item)
+                        terminal_delivered = True
                         if expose_protocol_events:
                             yield item
                         continue
@@ -1375,7 +1378,7 @@ class StreamingMixin:
                             provider_name,
                             duration_ms=duration_ms,
                             path=path,
-                            success=rejected is None and failure is None,
+                            success=rejected is None and (failure is None or (terminal_delivered and aborted)),
                             error_message=rejection_message,
                             # The terminal response was stamped before it was exposed.
                             publish_identity=False,

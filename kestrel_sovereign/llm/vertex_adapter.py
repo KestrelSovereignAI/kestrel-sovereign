@@ -487,10 +487,9 @@ class VertexAIAdapter(LLMAdapter):
     ) -> AsyncIterator[Union[str, LLMResponse]]:
         """Stream text chunks then emit one terminal LLMResponse with usage.
 
-        Shared by :meth:`get_streaming_response` (which filters the terminal
-        response out to preserve its text-only contract) and the no-tools
-        branch of :meth:`get_streaming_response_with_tools` (which forwards it
-        so the service layer can meter streamed turns — #1684). Vertex sends
+        Shared by both public streaming methods. The plain facade retains
+        the terminal response and refuses tool evidence; the with-tools path
+        carries calls on that response. Vertex sends
         ``usage_metadata`` cumulatively across the stream; the latest non-empty
         value carries the final counts.
         """

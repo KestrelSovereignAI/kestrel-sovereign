@@ -126,6 +126,7 @@ async def _capture_create_kwargs(extra_body_arg) -> Dict[str, Any]:
         return_value=MagicMock(
             choices=[
                 MagicMock(
+                    index=0,
                     message=MagicMock(content="ok", tool_calls=None),
                     finish_reason="stop",
                 )

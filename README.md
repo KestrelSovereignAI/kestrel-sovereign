@@ -337,7 +337,8 @@ Core 0.63 requires public SDK 0.49 or later and provider packages from the
 end with exactly one `LLMResponse`, after EOF and native response cleanup.
 Direct adapter consumers must handle that terminal response separately from
 text chunks. Use the with-tools method for tools; plain streams reject tool
-requests and returned tool evidence.
+requests and returned tool evidence. Plain streams omit `ThinkingDelta`; use
+the with-tools method to consume separate reasoning events.
 
 Core validates the SDK response and tool-call shapes at its adapter boundary.
 Malformed JSON and non-object tool arguments fail without fabricated argument
