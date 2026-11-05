@@ -90,7 +90,7 @@ MAX_TOOL_ITERATIONS = int(os.environ.get("KESTREL_MAX_TOOL_ITERATIONS", "50"))
 # feature's subagent died on its first budget check.
 SUBAGENT_CONTEXT_FRACTION = 0.85
 
-# Every ResourceOutcomeUnknown turned into an ordinary failed result while
+# Every ResourceOutcomeUnknown turned into an ordinary result while
 # ``handle_task`` runs a skill (#3946). The result stays what a model has always
 # seen; only the task boundary learns the skill may already have acted. Bound
 # by ``handle_task`` alone, unbound (None) everywhere else. Every boundary that
@@ -104,12 +104,17 @@ def report_flattened_outcome_unknown(error: BaseException) -> None:
     """Tell the A2A skill running now that it flattened an unknown outcome.
 
     A tool boundary that returns a ``ResourceOutcomeUnknown`` as an ordinary
-    failed result calls this with the error, so ``handle_task`` marks its task
-    ``outcome_unknown`` and no caller runs the skill again (#3946). The
-    reporters are this module's @tool wrapper, the method guard an SDK
-    feature's @tool methods get at discovery (``subagent_dispatch``), and a
-    workflow whose step's outcome is unknown. A no-op outside ``handle_task``
-    and for any other error, so a model-facing call is unchanged.
+    result calls this with the error, so ``handle_task`` marks its task
+    ``outcome_unknown``, whatever state it ends in, and no caller runs the
+    skill again (#3946). The reporters are this module's @tool wrapper, the
+    method guard an SDK feature's @tool methods get at discovery
+    (``subagent_dispatch``), a feature subagent's tool step and its failure
+    envelope, its inline tool executor (whose adapter returns what it raises
+    to the model), and a workflow with a step whose task carries the flag,
+    whatever that step's status. A skill run as a task inside another skill
+    passes what it observed to that skill's task itself, whatever that skill
+    returns. A no-op outside ``handle_task`` and for any other error, so a
+    model-facing call is unchanged.
     """
     flattened = _flattened_outcome_unknown.get()
     if flattened is not None and isinstance(error, ResourceOutcomeUnknown):
@@ -1463,11 +1468,28 @@ class Feature(_SdkFeature):
         task.status.CopyFrom(TaskStatus(state=TaskState.TASK_STATE_WORKING))
         from kestrel_sovereign.a2a.lifecycle import mark_outcome_unknown
 
-        # A skill that may already have acted fails with an unknown outcome,
-        # so its caller never runs it again as an ordinary failure (#3946).
-        # A boundary that returns such an error as a plain failed result
-        # reports it here instead (``report_flattened_outcome_unknown``).
+        # A skill that may already have acted marks its task outcome_unknown,
+        # so its caller never runs it again (#3946). A boundary that returns
+        # such an error as a plain result reports it here instead
+        # (``report_flattened_outcome_unknown``). What was observed decides
+        # the flag, never the task's state: a workflow with one uncertain step
+        # and one that succeeded completes with a partial result.
         flattened: list[ResourceOutcomeUnknown] = []
+        # The capture of a skill whose execution runs this one as a task, if
+        # any. Whatever that skill makes of this task, its own execution
+        # observed what this one did, so it may not run again either.
+        enclosing = _flattened_outcome_unknown.get()
+
+        def settle_outcome(raised: BaseException | None = None) -> None:
+            observed = list(flattened)
+            if isinstance(raised, ResourceOutcomeUnknown):
+                observed.append(raised)
+            if not observed:
+                return
+            mark_outcome_unknown(task)
+            if enclosing is not None:
+                enclosing.extend(observed)
+
         try:
             exec_start = time.time()
             witness = _flattened_outcome_unknown.set(flattened)
@@ -1514,8 +1536,7 @@ class Feature(_SdkFeature):
                     ),
                 )
             )
-            if flattened or isinstance(error, ResourceOutcomeUnknown):
-                mark_outcome_unknown(task)
+            settle_outcome(error)
             return task
         task.artifacts.append(artifact)
         failed = (
@@ -1536,8 +1557,7 @@ class Feature(_SdkFeature):
                 ),
             )
         )
-        if failed and flattened:
-            mark_outcome_unknown(task)
+        settle_outcome()
         return task
 
     def _get_tool_by_name(self, name: str) -> Optional[AgentTool]:
@@ -1852,6 +1872,7 @@ class Feature(_SdkFeature):
                 "Feature %s subagent execution failed: %s",
                 self.name, exception_log_summary(e),
             )
+            report_flattened_outcome_unknown(e)
             err_envelope: Dict[str, Any] = {"success": False, "error": str(e)}
             # Parts emitted before the failure (e.g. a *_pending card) still
             # travel — matching the direct path, where emit_part delivers
@@ -1933,16 +1954,23 @@ class Feature(_SdkFeature):
         async def _exec(name: str, args: Dict[str, Any]):
             with turn_scope.bind():
                 require_execution_work(self.agent)
-                result = await self._execute_subagent_tool(
-                    tool_name=name,
-                    args=args or {},
-                    tools_by_name={
-                        t.name: t for t in (runtime_tools or self.get_tools())
-                    },
-                    return_with_effective_args=True,
-                    parts_sink=parts_sink,
-                    session_id=session_id,
-                )
+                try:
+                    result = await self._execute_subagent_tool(
+                        tool_name=name,
+                        args=args or {},
+                        tools_by_name={
+                            t.name: t for t in (runtime_tools or self.get_tools())
+                        },
+                        return_with_effective_args=True,
+                        parts_sink=parts_sink,
+                        session_id=session_id,
+                    )
+                except ResourceOutcomeUnknown as error:
+                    # The adapter running this executor returns what it raises
+                    # to the model as an ordinary tool failure (the Codex
+                    # inline handler), so report it first (#3946).
+                    report_flattened_outcome_unknown(error)
+                    raise
                 require_execution_work(self.agent)
                 return result
         return _exec
@@ -2164,6 +2192,7 @@ class Feature(_SdkFeature):
                     "[SUBAGENT-TOOL] %s raised %s",
                     tool_name, exception_log_summary(e),
                 )
+                report_flattened_outcome_unknown(e)
                 serialized = {"success": False, "error": f"{type(e).__name__}: {e}"}
             else:
                 deferred = isinstance(result, DeferredToolResult)

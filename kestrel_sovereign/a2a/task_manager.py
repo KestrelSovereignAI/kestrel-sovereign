@@ -985,12 +985,13 @@ class TaskManager:
     ) -> Task:
         """Persist a synchronous result without losing an unknown outcome.
 
-        A handler whose skill may already have acted marks its failed task
-        ``outcome_unknown`` so the caller never runs it again (#3946). If that
-        task cannot be recorded, or another writer's terminal state wins, the
-        caller would get a storage error or the other task instead and could
-        retry the skill. It gets ``ResourceOutcomeUnknown``, caused by the
-        storage failure when there is one.
+        A handler whose skill may already have acted marks its task
+        ``outcome_unknown``, failed or completed, so the caller never runs it
+        again (#3946). If that task cannot be recorded, or another writer's
+        terminal state wins, the caller would get a storage error or the other
+        task instead and could retry the skill. It gets
+        ``ResourceOutcomeUnknown``, caused by the storage failure when there
+        is one.
         """
         unknown = task_outcome_unknown(task)
         try:
@@ -1004,21 +1005,24 @@ class TaskManager:
             if not unknown or is_execution_control_error(persist_error):
                 raise
             raise ResourceOutcomeUnknown(
-                f"{self._outcome_failure_text(task)}; "
-                "its failed task could not be recorded"
+                f"{self._unknown_outcome_text(task)}; "
+                f"its {task_state_label(task.status.state)} task could not "
+                "be recorded"
             ) from persist_error
         if unknown and not task_outcome_unknown(persisted):
             raise ResourceOutcomeUnknown(
-                f"{self._outcome_failure_text(task)}; another writer recorded "
+                f"{self._unknown_outcome_text(task)}; another writer recorded "
                 f"the task as {task_state_label(persisted.status.state)}"
             )
         return persisted
 
     @staticmethod
-    def _outcome_failure_text(task: Task) -> str:
+    def _unknown_outcome_text(task: Task) -> str:
+        """A failed task's own error, never a completed task's success message."""
         text = (
             message_text(task.status.message)
-            if task.status.HasField("message")
+            if task.status.state == TaskState.TASK_STATE_FAILED
+            and task.status.HasField("message")
             else None
         )
         return text or "The skill's outcome is unknown"

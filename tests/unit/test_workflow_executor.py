@@ -11,7 +11,11 @@ from kestrel_sdk.resources import ResourceOutcomeUnknown
 from kestrel_sdk.tools.base import AgentTool, ToolCategory, ToolSchema
 from kestrel_sdk.tools.result import ToolResult, ToolResultStatus
 
-from kestrel_sovereign.a2a.lifecycle import mark_outcome_unknown, task_outcome_unknown
+from kestrel_sovereign.a2a.lifecycle import (
+    mark_outcome_unknown,
+    task_outcome_unknown,
+    task_state_label,
+)
 from kestrel_sovereign.a2a.projections import embedded_json_value, message_text
 from kestrel_sovereign.execution_custody import ExecutionAuthorityError
 from kestrel_sovereign.features.base import Feature, tool
@@ -626,16 +630,63 @@ def test_the_sdk_outcome_guard_returns_a_plain_methods_value_unchanged():
     assert feature.read_value() == {"value": 1}
 
 
-def reject_failed_task_writes(manager, monkeypatch):
-    """Fail every terminal write of a FAILED task, on either engine."""
+def unreadable_step_results(monkeypatch):
+    """Fail reading every step's returned task, after the skill has run."""
+
+    def unreadable(*_args, **_kwargs):
+        raise ValueError("Step result unreadable")
+
+    monkeypatch.setattr(TaskFeature, "_classify_step_result", staticmethod(unreadable))
+
+
+@pytest.mark.parametrize("effect", EVERY_SKILL_FORM, ids=skill_form_id, indirect=True)
+async def test_a_flagged_step_whose_result_cannot_be_read_is_not_retried(
+    task_feature, effect, monkeypatch
+):
+    effect.supplier = raise_unknown
+    unreadable_step_results(monkeypatch)
+    result = await task_feature.run_workflow([effect_step(max_retries=2)])
+    assert effect.calls == 1
+    [record] = result.data["results"]
+    assert record["status"] == "failed" and record["outcome_unknown"] is True
+    assert record["attempts"] == 1
+    assert record["error"] == (
+        "Step 0 outcome is unknown; its result could not be read: "
+        "Step result unreadable"
+    )
+
+
+@pytest.mark.parametrize("effect", EVERY_SKILL_FORM, ids=skill_form_id, indirect=True)
+async def test_an_unflagged_step_whose_result_cannot_be_read_is_still_retried(
+    task_feature, effect, monkeypatch
+):
+    effect.supplier = raise_unavailable
+    unreadable_step_results(monkeypatch)
+    result = await task_feature.run_workflow([effect_step(max_retries=2)])
+    assert effect.calls == 3
+    [record] = result.data["results"]
+    assert record["status"] == "failed" and record["attempts"] == 3
+    assert "outcome_unknown" not in record
+
+
+def reject_task_writes(manager, monkeypatch, rejected):
+    """Fail every terminal write of a task ``rejected`` selects, on either engine."""
     save = manager.task_store.save_recipient_terminal_outcome
 
     async def refuse(task, **kwargs):
-        if task.status.state == TaskState.TASK_STATE_FAILED:
-            raise QueryError("Failed task write rejected")
+        if rejected(task):
+            raise QueryError("Task write rejected")
         return await save(task, **kwargs)
 
     monkeypatch.setattr(manager.task_store, "save_recipient_terminal_outcome", refuse)
+
+
+def reject_failed_task_writes(manager, monkeypatch):
+    """Fail every terminal write of a FAILED task."""
+    reject_task_writes(
+        manager, monkeypatch,
+        lambda task: task.status.state == TaskState.TASK_STATE_FAILED,
+    )
 
 
 @pytest.mark.parametrize("effect", EVERY_SKILL_FORM, ids=skill_form_id, indirect=True)
@@ -761,19 +812,320 @@ async def test_an_enclosing_workflow_still_reruns_an_ordinary_inner_failure(
     assert not any(task_outcome_unknown(task) for task in run_tasks)
 
 
+def is_workflow_task(task):
+    return task.metadata["skill"] == "run_workflow"
+
+
+def mixed_inner_workflow():
+    """An inner workflow whose first step succeeds and whose second is uncertain."""
+    return [
+        {"feature": "wallet_feature", "skill": "check_balance"},
+        effect_step(max_retries=2),
+    ]
+
+
+@pytest.mark.parametrize("effect", EVERY_SKILL_FORM, ids=skill_form_id, indirect=True)
+async def test_a_partial_inner_workflow_carries_its_unknown_outcome(
+    nested_workflow, effect, manager
+):
+    # One step succeeded, so the inner workflow completes with a partial
+    # result. The uncertain step still decides whether it may run again.
+    effect.supplier = raise_unknown
+    result = await nested_workflow.run_workflow(
+        [outer_step(mixed_inner_workflow(), max_retries=2)]
+    )
+    assert effect.calls == 1
+    [record] = result.data["results"]
+    assert record["status"] == "partial" and record["outcome_unknown"] is True
+    assert record["attempts"] == 1
+    [inner] = [task for task in await stored_tasks(manager) if is_workflow_task(task)]
+    assert inner.status.state == TaskState.TASK_STATE_COMPLETED
+    assert task_outcome_unknown(inner)
+    assert message_text(inner.status.message) == "Completed run_workflow"
+
+
+@pytest.mark.parametrize("effect", EVERY_SKILL_FORM, ids=skill_form_id, indirect=True)
+async def test_a_partial_inner_workflow_whose_task_write_fails_is_not_rerun(
+    nested_workflow, effect, manager, monkeypatch
+):
+    effect.supplier = raise_unknown
+    reject_task_writes(manager, monkeypatch, is_workflow_task)
+    result = await nested_workflow.run_workflow(
+        [outer_step(mixed_inner_workflow(), max_retries=2)]
+    )
+    assert effect.calls == 1
+    [record] = result.data["results"]
+    assert record["status"] == "failed" and record["outcome_unknown"] is True
+    assert record["attempts"] == 1
+    assert record["error"] == (
+        "The skill's outcome is unknown; its completed task could not be recorded"
+    )
+
+
+@pytest.mark.parametrize("effect", EVERY_SKILL_FORM, ids=skill_form_id, indirect=True)
+async def test_a_partial_inner_workflow_canceled_meanwhile_is_not_rerun(
+    nested_workflow, effect, manager
+):
+    async def cancel_the_inner_workflow_then_lose_the_outcome(_attempt):
+        [running] = [
+            task for task in await stored_tasks(manager)
+            if is_workflow_task(task)
+            and task.status.state == TaskState.TASK_STATE_SUBMITTED
+        ]
+        await manager.cancel_task(
+            running.id, reason="Canceled while running", agent_name=manager.did
+        )
+        raise ResourceOutcomeUnknown(UNKNOWN)
+
+    effect.supplier = cancel_the_inner_workflow_then_lose_the_outcome
+    result = await nested_workflow.run_workflow(
+        [outer_step(mixed_inner_workflow(), max_retries=2)]
+    )
+    assert effect.calls == 1
+    [record] = result.data["results"]
+    assert record["status"] == "failed" and record["outcome_unknown"] is True
+    assert record["attempts"] == 1
+    assert record["error"] == (
+        "The skill's outcome is unknown; another writer recorded the task as canceled"
+    )
+    [inner] = [task for task in await stored_tasks(manager) if is_workflow_task(task)]
+    assert inner.status.state == TaskState.TASK_STATE_CANCELED
+
+
+def encloses_a_workflow(task):
+    """A workflow task one of whose steps ran another workflow."""
+    if not is_workflow_task(task) or not task.artifacts:
+        return False
+    recognized, value = embedded_json_value(task.artifacts[0].parts[0])
+    return recognized and any(
+        step.get("feature") == "tasks" for step in value["data"]["results"]
+    )
+
+
+@pytest.mark.parametrize("effect", EVERY_SKILL_FORM, ids=skill_form_id, indirect=True)
+@pytest.mark.parametrize("persisted", [True, False], ids=["recorded", "write-failed"])
+async def test_a_workflow_reports_a_partial_steps_unknown_outcome_upward(
+    nested_workflow, effect, manager, monkeypatch, persisted
+):
+    # The middle workflow's only step is a partial inner workflow. It must pass
+    # that step's unknown outcome to its own task even though the step did not
+    # fail, so the outermost workflow never reruns it.
+    effect.supplier = raise_unknown
+    if not persisted:
+        reject_task_writes(manager, monkeypatch, encloses_a_workflow)
+    middle = [outer_step(mixed_inner_workflow(), max_retries=2)]
+    result = await nested_workflow.run_workflow([outer_step(middle, max_retries=2)])
+    assert effect.calls == 1
+    [record] = result.data["results"]
+    assert record["outcome_unknown"] is True and record["attempts"] == 1
+    if persisted:
+        assert record["status"] == "partial"
+        workflow_tasks = [
+            task for task in await stored_tasks(manager) if is_workflow_task(task)
+        ]
+        assert len(workflow_tasks) == 2
+        assert all(
+            task.status.state == TaskState.TASK_STATE_COMPLETED
+            and task_outcome_unknown(task)
+            for task in workflow_tasks
+        )
+    else:
+        assert record["status"] == "failed"
+        assert record["error"].endswith("its completed task could not be recorded")
+
+
+def is_effect_task(task):
+    return task.metadata["skill"] == "apply_effect"
+
+
+def coordinator_provider(base):
+    class CoordinatorProvider(base):
+        tool_description = "Coordinates the effect skill"
+
+        async def initialize(self):
+            pass
+
+        @tool(name="coordinate", description="Run the effect skill and report it")
+        async def coordinate(self) -> dict:
+            # It reads its child task's state, never its flag, and returns an
+            # ordinary failure: nothing it returns says the effect is unknown.
+            try:
+                child = await self.manager.execute_skill(
+                    "effect_feature", "apply_effect", {}, sync=True
+                )
+            except ResourceOutcomeUnknown as error:
+                return ToolResult.failed(f"Effect skill failed: {error}")
+            return ToolResult.failed(
+                f"Effect skill ended {task_state_label(child.status.state)}"
+            )
+
+    return CoordinatorProvider
+
+
+@pytest.fixture(params=["core-feature", "sdk-feature"])
+def coordinator(request, manager):
+    """A skill, other than a workflow, that runs the effect skill as a task."""
+    base = Feature if request.param == "core-feature" else SDKFeature
+    agent = SimpleNamespace(
+        did=manager.did, task_manager=manager, _execution_custody=None
+    )
+    provider = ensure_subagent_dispatch(coordinator_provider(base))(agent)
+    provider.name = "coordinator_feature"
+    provider.manager = manager
+    manager.register_provider(
+        "coordinator_feature", provider.get_agent_skills(), provider
+    )
+    return provider
+
+
+def coordinator_step(max_retries):
+    return {
+        "feature": "coordinator_feature",
+        "skill": "coordinate",
+        "max_retries": max_retries,
+        "retry_delay_ms": 0,
+    }
+
+
+@pytest.mark.parametrize("effect", EVERY_SKILL_FORM, ids=skill_form_id, indirect=True)
+@pytest.mark.parametrize("persisted", [True, False], ids=["recorded", "write-failed"])
+async def test_a_skill_that_ran_an_uncertain_skill_is_never_rerun(
+    task_feature, effect, coordinator, manager, monkeypatch, persisted
+):
+    effect.supplier = raise_unknown
+    if not persisted:
+        # The child's task cannot be recorded, so the coordinator catches the
+        # raised error instead of reading a flagged task.
+        reject_task_writes(manager, monkeypatch, is_effect_task)
+    result = await task_feature.run_workflow([coordinator_step(max_retries=2)])
+    assert effect.calls == 1
+    [record] = result.data["results"]
+    assert record["status"] == "failed" and record["outcome_unknown"] is True
+    assert record["attempts"] == 1
+    [coordinating] = [
+        task for task in await stored_tasks(manager)
+        if task.metadata["skill"] == "coordinate"
+    ]
+    # The coordinator's own failure message is unchanged.
+    assert coordinating.status.state == TaskState.TASK_STATE_FAILED
+    assert message_text(coordinating.status.message).startswith("Effect skill ")
+    assert task_outcome_unknown(coordinating)
+
+
+@pytest.mark.parametrize("effect", EVERY_SKILL_FORM, ids=skill_form_id, indirect=True)
+async def test_a_skill_that_ran_an_ordinarily_failing_skill_is_still_rerun(
+    task_feature, effect, coordinator, manager
+):
+    effect.supplier = raise_unavailable
+    result = await task_feature.run_workflow([coordinator_step(max_retries=2)])
+    assert effect.calls == 3
+    [record] = result.data["results"]
+    assert record["status"] == "failed" and record["attempts"] == 3
+    assert "outcome_unknown" not in record
+    assert not any(task_outcome_unknown(task) for task in await stored_tasks(manager))
+
+
+def delegating_provider(base):
+    class DelegatingProvider(base):
+        tool_description = "Runs its own effect tool as its subagent does"
+
+        async def initialize(self):
+            pass
+
+        @tool(name="delegate", description="Run the effect tool through the subagent step")
+        async def delegate(self) -> dict:
+            # The subagent's tool step returns a raised error to its model as
+            # an ordinary failure, and this skill returns that unchanged.
+            return await self._execute_subagent_tool(
+                tool_name="apply_effect",
+                args={},
+                tools_by_name={"apply_effect": EffectSkill(self)},
+            )
+
+    return DelegatingProvider
+
+
+@pytest.fixture(params=["core-feature", "sdk-feature"])
+def delegating(request, manager):
+    """A skill whose feature-owned tool runs through the subagent tool step."""
+    base = Feature if request.param == "core-feature" else SDKFeature
+    agent = SimpleNamespace(
+        did=manager.did, task_manager=manager, _execution_custody=None
+    )
+    provider = ensure_subagent_dispatch(delegating_provider(base))(agent)
+    provider.name = "delegating_feature"
+    provider.calls = 0
+    manager.register_provider(
+        "delegating_feature", provider.get_agent_skills(), provider
+    )
+    return provider
+
+
+def delegating_step(max_retries):
+    return {
+        "feature": "delegating_feature",
+        "skill": "delegate",
+        "max_retries": max_retries,
+        "retry_delay_ms": 0,
+    }
+
+
+async def test_a_subagent_tool_step_carries_its_unknown_outcome(
+    task_feature, delegating, manager
+):
+    delegating.supplier = raise_unknown
+    result = await task_feature.run_workflow([delegating_step(max_retries=2)])
+    assert delegating.calls == 1
+    [record] = result.data["results"]
+    assert record["status"] == "failed" and record["outcome_unknown"] is True
+    assert record["attempts"] == 1
+    # What the subagent's model would see is unchanged.
+    assert record["error"] == f"ResourceOutcomeUnknown: {UNKNOWN}"
+    [task] = await stored_tasks(manager)
+    assert task_outcome_unknown(task)
+
+
+async def test_a_subagent_tool_steps_ordinary_failure_is_still_retried(
+    task_feature, delegating, manager
+):
+    delegating.supplier = raise_unavailable
+    result = await task_feature.run_workflow([delegating_step(max_retries=2)])
+    assert delegating.calls == 3
+    [record] = result.data["results"]
+    assert record["status"] == "failed" and record["attempts"] == 3
+    assert "outcome_unknown" not in record
+    assert not any(task_outcome_unknown(task) for task in await stored_tasks(manager))
+
+
 @pytest.mark.parametrize(
     "state",
     [
+        TaskState.TASK_STATE_SUBMITTED,
         TaskState.TASK_STATE_WORKING,
+        TaskState.TASK_STATE_INPUT_REQUIRED,
+    ],
+)
+def test_only_a_finished_task_can_carry_an_unknown_outcome(state):
+    task = Task(id="task", context_id="context", status=TaskStatus(state=state))
+    with pytest.raises(ValueError, match="Only a finished task"):
+        mark_outcome_unknown(task)
+    assert not task_outcome_unknown(task)
+
+
+@pytest.mark.parametrize(
+    "state",
+    [
         TaskState.TASK_STATE_COMPLETED,
+        TaskState.TASK_STATE_FAILED,
+        TaskState.TASK_STATE_CANCELED,
         TaskState.TASK_STATE_REJECTED,
     ],
 )
-def test_only_a_failed_task_can_carry_an_unknown_outcome(state):
+def test_a_finished_task_in_any_state_can_carry_an_unknown_outcome(state):
     task = Task(id="task", context_id="context", status=TaskStatus(state=state))
-    with pytest.raises(ValueError, match="Only a failed task"):
-        mark_outcome_unknown(task)
     assert not task_outcome_unknown(task)
+    mark_outcome_unknown(task)
+    assert task_outcome_unknown(task) and task.status.state == state
 
 
 def test_an_unknown_outcome_flag_must_be_a_true_boolean():

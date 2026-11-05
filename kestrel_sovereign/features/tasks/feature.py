@@ -329,6 +329,7 @@ class TaskFeature(Feature):
             attempts = 1 + max_retries
 
             for attempt in range(attempts):
+                task = None
                 try:
                     task = await self.task_manager.execute_skill(
                         agent_id=feature_name,
@@ -371,7 +372,17 @@ class TaskFeature(Feature):
                         step_record["error"] = semantic_error
                     outcome_unknown = task_outcome_unknown(task)
                     if outcome_unknown:
+                        # Some effect this step ran may already have happened.
+                        # A workflow running as a skill tells its own task,
+                        # whatever this step's status, so an enclosing
+                        # workflow never reruns this one (#3946).
                         step_record["outcome_unknown"] = True
+                        report_flattened_outcome_unknown(
+                            ResourceOutcomeUnknown(
+                                semantic_error
+                                or f"Step {i} outcome is unknown"
+                            )
+                        )
                     results.append(step_record)
                     logger.info(
                         f"[WORKFLOW] Step {i}: {feature_name}.{skill_name} "
@@ -382,16 +393,8 @@ class TaskFeature(Feature):
                     if semantic_status != "failed":
                         break
                     if outcome_unknown:
-                        # The skill may already have acted. Running it again
-                        # could repeat its effect, whatever max_retries says.
-                        # A workflow running as a skill tells its own task too,
-                        # so an enclosing workflow does not rerun this one.
-                        report_flattened_outcome_unknown(
-                            ResourceOutcomeUnknown(
-                                semantic_error
-                                or f"Step {i} outcome is unknown"
-                            )
-                        )
+                        # Running it again could repeat its effect, whatever
+                        # max_retries says.
                         logger.warning(
                             f"[WORKFLOW] Step {i}: {feature_name}.{skill_name} "
                             f"outcome is unknown after attempt {attempt + 1}; not retrying"
@@ -417,8 +420,18 @@ class TaskFeature(Feature):
                 except Exception as e:
                     if is_execution_control_error(e):
                         raise
-                    if isinstance(e, ResourceOutcomeUnknown):
-                        report_flattened_outcome_unknown(e)
+                    unknown = e if isinstance(e, ResourceOutcomeUnknown) else None
+                    if unknown is None and task is not None and task_outcome_unknown(task):
+                        # The task says its effect may already have happened.
+                        # Failing to read its result does not make it safe to
+                        # run again.
+                        unknown = ResourceOutcomeUnknown(
+                            f"Step {i} outcome is unknown; its result could "
+                            f"not be read: {e}"
+                        )
+                        unknown.__cause__ = e
+                    if unknown is not None:
+                        report_flattened_outcome_unknown(unknown)
                         last_error = None
                         step_duration = int((time.time() - step_start) * 1000)
                         results.append({
@@ -426,7 +439,7 @@ class TaskFeature(Feature):
                             "feature": feature_name,
                             "skill": skill_name,
                             "status": "failed",
-                            "error": str(e),
+                            "error": str(unknown),
                             "outcome_unknown": True,
                             "duration_ms": step_duration,
                             "attempts": attempt + 1,
@@ -434,7 +447,7 @@ class TaskFeature(Feature):
                         logger.error(
                             f"[WORKFLOW] Step {i}: {feature_name}.{skill_name} "
                             f"outcome is unknown after attempt {attempt + 1}; "
-                            f"not retrying: {e} ({step_duration}ms)"
+                            f"not retrying: {unknown} ({step_duration}ms)"
                         )
                         break
                     last_error = e

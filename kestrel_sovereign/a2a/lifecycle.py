@@ -61,18 +61,22 @@ def new_task_status(
 
 
 def mark_outcome_unknown(task: Task) -> None:
-    """Record that a failed task's effect may already have happened.
+    """Record that a finished task's execution met an unknown outcome.
 
-    The task stays FAILED with its own message. Its caller must reconcile
-    before running the work again; it must never retry it automatically.
+    Some effect it ran, at any depth, may already have happened. That decides
+    whether the task may run again, never its state: a task that completed
+    (a workflow with one uncertain step returns a partial result) carries the
+    flag too. The state, message and artifacts are unchanged. Its caller must
+    reconcile before running the work again; it must never retry it
+    automatically.
     """
-    if task.status.state != TaskState.TASK_STATE_FAILED:
-        raise ValueError("Only a failed task can carry an unknown outcome")
+    if task.status.state not in TERMINAL_STATES:
+        raise ValueError("Only a finished task can carry an unknown outcome")
     task.metadata.update({_OUTCOME_UNKNOWN: True})
 
 
 def task_outcome_unknown(task: Task) -> bool:
-    """Whether the task failed with an effect that may already have happened."""
+    """Whether the task's execution met an effect that may already have happened."""
     value = task.metadata.fields.get(_OUTCOME_UNKNOWN)
     return (
         value is not None

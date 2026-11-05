@@ -23,7 +23,9 @@ from kestrel_sovereign.agent.parts import (
 from kestrel_sovereign.agent.tool_registry import ToolRegistryMixin
 from kestrel_sovereign.hooks.manager import HooksManager
 from kestrel_sovereign.features.base import Feature as CoreFeature
-from kestrel_sovereign.execution_custody import ExecutionAuthorityError
+from kestrel_sovereign.execution_custody import (
+    ExecutionAuthorityError, is_execution_control_error,
+)
 from kestrel_sovereign.storage.db.sqlite import SQLiteBackend
 
 # Native data a factory retains privately; it must never reach a public result.
@@ -894,16 +896,24 @@ class ScriptedSubagentModel:
 
     ``inline`` runs the call through the subagent's tool executor, as the
     codex app-server does; otherwise the subagent's own tool loop runs it.
+    ``flatten_errors`` returns an error the executor raises to the model as an
+    ordinary tool failure, as the codex inline handler does.
     ``seen`` is each tool result exactly as the model received it.
     """
 
     def __init__(self, tool_name, *, inline):
         self.tool_name, self.inline = tool_name, inline
+        self.flatten_errors = False
         self.seen = []
 
     async def generate(self, *, tool_executor=None, **kwargs):
         if self.inline:
-            _, result = await tool_executor(self.tool_name, {})
+            try:
+                _, result = await tool_executor(self.tool_name, {})
+            except Exception as error:
+                if not self.flatten_errors or is_execution_control_error(error):
+                    raise
+                result = {"success": False, "error": f"{error}"}
             self.seen.append(json.loads(json.dumps(result)))
             return "Subagent finished."
         return LLMResponse(content="", tool_calls=[
@@ -1200,6 +1210,86 @@ async def test_workflow_never_retries_a_skill_whose_required_audit_failed(route)
     [record] = result.data["results"]
     assert record["status"] == "failed" and record["outcome_unknown"] is True
     assert record["attempts"] == 1 and "Do not replay" in record["error"]
+
+
+SUBAGENT_RUNNER = "subagent-runner"
+
+
+@pytest.mark.parametrize(
+    "route, transport_flattens",
+    [
+        pytest.param(
+            (kind, base), flattens,
+            id=f"{kind}-{base}" + ("-flattening-transport" if flattens else ""),
+        )
+        for kind, flattens in (
+            ("subagent-loop", False),
+            ("subagent-inline", False),
+            ("subagent-inline", True),
+        )
+        for base in ("core-feature", "sdk-feature")
+    ],
+    indirect=["route"],
+)
+@pytest.mark.parametrize("persisted", [True, False], ids=["recorded", "write-failed"])
+async def test_workflow_never_reruns_a_skill_whose_subagent_audit_failed(
+    route, tmp_path, monkeypatch, transport_flattens, persisted
+):
+    # #3946: a skill runs a feature's subagent, whose deferred tool completed
+    # but whose required audit failed. Its error reaches the subagent's model
+    # as an ordinary failure, from its executor's transport or from the
+    # subagent's own failure envelope; the skill's task must still carry it.
+    from types import SimpleNamespace
+
+    from kestrel_sdk.native_a2a.types import AgentSkill
+    from kestrel_sovereign.a2a.scope import NativeRecipientScope
+    from kestrel_sovereign.features.tasks.feature import TaskFeature
+    from kestrel_sovereign.storage.db.interface import QueryError
+    from tests.utils.native_a2a import manager_for
+
+    class SubagentRunner(CoreFeature):
+        tool_description = "Runs a feature's subagent as a skill"
+
+        async def initialize(self):
+            pass
+
+        @feature_tool(name="run_subagent", description="Run the deferred feature's subagent",
+                      category=ToolCategory.UTILITY)
+        async def run_subagent(self):
+            return await route.feature.execute_as_subagent(task="Render the owned view")
+
+    route.model.flatten_errors = transport_flattens
+    runner = SubagentRunner(route.host)
+    tasks_db = SQLiteBackend(str(tmp_path / "subagent-runner-tasks.db"))
+    await tasks_db.connect()
+    manager = manager_for(tasks_db, NativeRecipientScope(route.host.did, "tenant"))
+    await manager.initialize()
+    manager.register_provider(SUBAGENT_RUNNER, [AgentSkill(
+        id="run_subagent", name="Run subagent",
+        description="Runs a feature's subagent", tags=["test"])], runner)
+    if not persisted:
+        async def refuse(task, **kwargs):
+            raise QueryError("Task write rejected")
+
+        monkeypatch.setattr(manager.task_store, "save_recipient_terminal_outcome", refuse)
+    workflow = TaskFeature(SimpleNamespace(did=route.host.did))
+    workflow.set_task_manager(manager)
+    route.policy.release.set()
+    await route.backend.execute("DROP TABLE a2a_tool_dispatches")
+    try:
+        result = await workflow.run_workflow([{
+            "feature": SUBAGENT_RUNNER, "skill": "run_subagent",
+            "max_retries": 2, "retry_delay_ms": 0,
+        }])
+    finally:
+        await manager.close()
+    assert route.tool.executions == [{}] and route.tool.publications == []
+    [record] = result.data["results"]
+    assert record["outcome_unknown"] is True and record["attempts"] == 1
+    # The subagent's model saw an ordinary failure, unchanged.
+    if transport_flattens:
+        [seen] = route.model.seen
+        assert seen["success"] is False and "Do not replay" in seen["error"]
 
 
 async def test_route_publication_failure_reports_without_failing_or_replaying(route):

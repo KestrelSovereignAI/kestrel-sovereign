@@ -319,15 +319,21 @@ The context identifies the destination; authenticated View controllers still
 authorize readers and tool calls independently. It does not confirm delivery:
 later response policy can withhold the rendered parts.
 
-A local A2A skill that fails after it may already have acted fails its task
-with `outcome_unknown: true` metadata and its own message (#3946). That covers a
-skill raising `ResourceOutcomeUnknown`, also through a Core or SDK `@tool`
-wrapper that returns it to a model as an ordinary failure, and a required write
-that fails after the tool ran. `run_workflow` never retries such a step,
-whatever its `max_retries`, and a workflow run as a skill marks its own task the
-same way. If that failed task cannot be recorded, or another writer's terminal
-state wins, `execute_skill` raises `ResourceOutcomeUnknown` instead, caused by
-any storage failure.
+A local A2A skill whose execution met a `ResourceOutcomeUnknown` marks its
+task with `outcome_unknown: true` metadata (#3946). That covers a skill raising
+it, a Core or SDK `@tool` wrapper that returns it to a model as an ordinary
+failure, a feature subagent's tool step, failure envelope or inline tool
+executor doing the same, and a required write that fails after the tool ran.
+The flag depends only on what the execution observed, at any depth, never on
+the task's state, which keeps its own message and artifacts: a workflow with
+one uncertain step and one that succeeded completes with a partial result and
+is still flagged. A skill that runs another skill as a task carries that
+task's flag too, whatever it returns. `run_workflow` never retries a step
+whose task carries the flag, whatever its `max_retries`, and passes it to its
+own task whatever the step's status, so an enclosing workflow never reruns it.
+If a flagged task cannot be recorded, or another writer's terminal state wins,
+`execute_skill` raises `ResourceOutcomeUnknown` instead, caused by any storage
+failure.
 
 ### Tasks and operator input
 
