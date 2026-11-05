@@ -115,7 +115,10 @@ from kestrel_sovereign.execution_custody import (
     is_execution_control_error,
     require_execution_work,
 )
-from kestrel_sovereign.hooks.decision_gate import evaluate_blocking_decision
+from kestrel_sovereign.hooks.decision_gate import (
+    decided_tool_input,
+    evaluate_blocking_decision,
+)
 from kestrel_sovereign.logging_config import (
     content_log_summary,
     exception_frames,
@@ -936,6 +939,19 @@ def _mark_tool_dispatch_audited(dispatch_meta, bound_execution=None, *, status):
         bound_execution.audit_recorded = True
 
 
+def _record_refused_tool_arguments(dispatch_meta, arguments, bound_execution=None):
+    """A refused call's dispatch row names the arguments its hooks refused.
+
+    They are the arguments as they stood when the deciding hook ran, not the
+    call's: a rewrite or redaction an earlier hook made stays in the record,
+    as it does for a call that ran with it (#3953).
+    """
+    if dispatch_meta is not None:
+        dispatch_meta["arguments"] = arguments
+    if bound_execution is not None:
+        bound_execution.arguments = arguments
+
+
 def _returned_tool_status(result, dispatch_meta) -> str:
     """The one outcome both audit tables record for a tool that returned (#3924).
 
@@ -1287,6 +1303,7 @@ class OrchestratorEngineMixin:
         prepare_args=None,
         audit_adapter=None,
         on_audited=None,
+        on_refused=None,
     ) -> dict:
         """
         Execute a tool with PRE_TOOL_USE and POST_TOOL_USE hook enforcement.
@@ -1304,6 +1321,10 @@ class OrchestratorEngineMixin:
             execute_fn: Async callable that performs the actual tool execution.
                         Called with the post-hook args; should return the tool
                         result.
+            on_refused: Called, when the hooks DENY or ASK, with the arguments
+                        as they stood when the deciding hook ran, so the
+                        caller records the refused call with them rather than
+                        with ``args`` (#3953).
 
         Returns:
             Tool result dict, or an error dict if permission was denied.
@@ -1333,13 +1354,11 @@ class OrchestratorEngineMixin:
                 blocked.decision.value, feature_name, tool_name,
                 content_log_summary(str(blocked.reason)),
             )
+            if on_refused is not None:
+                on_refused(decided_tool_input(hook_input, hook_output))
             return blocked.envelope
 
-        args = (
-            hook_output.updated_input
-            if hook_output.updated_input is not None
-            else hook_input.tool_input
-        )
+        args = decided_tool_input(hook_input, hook_output)
         if prepare_args is not None:
             args = prepare_args(args)
 
@@ -1961,11 +1980,7 @@ class OrchestratorEngineMixin:
         # the hook-rewritten arguments even when the dispatch is
         # blocked. A PRE_TOOL_USE redactor running before a denial
         # must not be undone by the breadcrumb.
-        post_hook_args = (
-            pre_output.updated_input
-            if pre_output.updated_input is not None
-            else pre_input.tool_input
-        )
+        post_hook_args = decided_tool_input(pre_input, pre_output)
         if _capture is not None:
             _capture["effective_args"] = post_hook_args
 
@@ -2172,11 +2187,7 @@ class OrchestratorEngineMixin:
         pre_output = await self.hooks_manager.execute_hooks(
             HookEvent.PRE_SUBAGENT_CALL, pre_input,
         )
-        post_hook_args = (
-            pre_output.updated_input
-            if pre_output.updated_input is not None
-            else pre_input.tool_input
-        )
+        post_hook_args = decided_tool_input(pre_input, pre_output)
         if _capture is not None:
             _capture["effective_args"] = post_hook_args
 
@@ -2223,9 +2234,15 @@ class OrchestratorEngineMixin:
         # PRE_SUBAGENT_CALL already passed.
         inner_blocked = evaluate_blocking_decision(inner_pre_output)
         if inner_blocked is not None:
+            # The breadcrumb and the completion hook both report what this
+            # chain refused, not what the outer PRE_SUBAGENT_CALL chain
+            # allowed: a redaction made before the refusal stays made (#3953).
+            refused_args = decided_tool_input(inner_pre, inner_pre_output)
+            if _capture is not None:
+                _capture["effective_args"] = refused_args
             await self._fire_post_subagent_hook(
                 session_id=session_id, tool_name=tool_name,
-                feature_name=feature_name, effective_args=effective_args,
+                feature_name=feature_name, effective_args=refused_args,
                 result=inner_blocked.envelope,
                 exec_duration_ms=0,
             )
@@ -2233,11 +2250,7 @@ class OrchestratorEngineMixin:
         # Honor inner-MODIFY rewrites for the same reason the outer
         # hook does — a PRE_TOOL_USE redactor on subagent args must
         # apply to the call that actually runs.
-        inner_effective = (
-            inner_pre_output.updated_input
-            if inner_pre_output.updated_input is not None
-            else inner_pre.tool_input
-        )
+        inner_effective = decided_tool_input(inner_pre, inner_pre_output)
         if isinstance(inner_effective, dict):
             task = inner_effective.get("task", task)
             context = inner_effective.get("context", context)
@@ -2884,6 +2897,10 @@ class OrchestratorEngineMixin:
                 content_log_summary(str(reason)),
             )
             result = blocked.envelope
+            _record_refused_tool_arguments(
+                dispatch_meta,
+                decided_tool_input(subagent_hook_input, subagent_hook_output),
+            )
             if dispatch_meta is not None:
                 dispatch_meta.update({
                     "status": (
@@ -2935,6 +2952,14 @@ class OrchestratorEngineMixin:
             self._register_explored_feature_tools(f)
             return r
 
+        # What the PRE_TOOL_USE chain refused, if it refuses: the dispatch row
+        # and the completion hook report it rather than ``args`` (#3953).
+        refused: Dict[str, Any] = {}
+
+        def _on_refused(arguments):
+            refused["arguments"] = arguments
+            _record_refused_tool_arguments(dispatch_meta, arguments)
+
         try:
             result = await self._execute_tool_with_hooks(
                 tool_name=tool_name,
@@ -2946,6 +2971,7 @@ class OrchestratorEngineMixin:
                 on_audited=lambda status: _mark_tool_dispatch_audited(
                     dispatch_meta, status=status,
                 ),
+                on_refused=_on_refused,
             )
             # #2641: parts the subagent's tools produced ride the result
             # envelope; ``_execute_tool_with_hooks`` re-emitted them into this
@@ -2966,7 +2992,7 @@ class OrchestratorEngineMixin:
                 session_id=session_id,
                 hook_event_name=HookEvent.POST_SUBAGENT_CALL.value,
                 tool_name=tool_name,
-                tool_input=args,
+                tool_input=refused.get("arguments", args),
                 feature_name=hook_feature_name,
                 tool_response=result if isinstance(result, dict) else {"result": str(result)},
                 execution_time_ms=dispatch_duration,
@@ -3244,6 +3270,9 @@ class OrchestratorEngineMixin:
                                else OrchestratorEngineMixin._tool_call_adapter(self, tool_name, {})),
                 on_audited=lambda status: _mark_tool_dispatch_audited(
                     dispatch_meta, execution, status=status,
+                ),
+                on_refused=lambda arguments: _record_refused_tool_arguments(
+                    dispatch_meta, arguments, execution,
                 ),
                 **({"prepare_args": _prepare_bound_arguments} if bound_tool is not None else {}),
             )

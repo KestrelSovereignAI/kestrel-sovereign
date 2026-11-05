@@ -25,7 +25,7 @@ from kestrel_sdk.hooks.base import PermissionDecision
 
 from kestrel_sovereign.hooks.manager import FailedHookDenial, deciding_hook
 
-__all__ = ["BlockedDecision", "evaluate_blocking_decision"]
+__all__ = ["BlockedDecision", "decided_tool_input", "evaluate_blocking_decision"]
 
 
 @dataclass(frozen=True)
@@ -126,3 +126,17 @@ def evaluate_blocking_decision(
         )
 
     return None
+
+
+def decided_tool_input(hook_input: Any, hook_output: Any) -> Any:
+    """The arguments a PRE-hook chain decided on, whatever it decided.
+
+    The manager threads a MODIFY rewrite into ``hook_input.tool_input`` for
+    the next hook, and a hook may also mutate that payload in place, so it
+    holds the arguments as they stood when the deciding hook ran. A deciding
+    output's own ``updated_input`` overrides it (#3953). An executed call runs
+    with these and a refused one is recorded with them: a redaction a hook made
+    before a later hook denied is never undone in the record.
+    """
+    updated = getattr(hook_output, "updated_input", None)
+    return updated if updated is not None else hook_input.tool_input
