@@ -5,12 +5,68 @@ import importlib
 
 import pytest
 
-from kestrel_sdk.llm import LLMProtocolError, LLMResponse, ToolCallStarted
+from kestrel_sdk.llm import LLMProtocolError, LLMResponse, ToolCall, ToolCallStarted
 from kestrel_sovereign.execution_custody import ExecutionAuthorityError
-from kestrel_sovereign.llm.completion_protocol import GenerationProtocolError, adapter_call, adapter_stream
+from kestrel_sovereign.llm.completion_protocol import GenerationProtocolError, adapter_call, adapter_stream, decode_tool_arguments
 from kestrel_sovereign.llm.generation_gate import judge_generation
 from kestrel_sovereign.llm.output_ceiling import incomplete_generation, reported_usage
 from kestrel_sovereign.llm.retry import is_retryable_error
+
+
+@pytest.mark.parametrize("arguments", [None, [], 17, True, "", "{", "[]", "null", '"text"'])
+def test_tool_argument_decoder_refuses_invalid_or_nonobject_data(arguments):
+    with pytest.raises(LLMProtocolError):
+        decode_tool_arguments(arguments)
+
+
+@pytest.mark.parametrize("arguments,expected", [({}, {}), ("{}", {}),
+    ({"_raw": "native data"}, {"_raw": "native data"}), ('{"_raw":"native data"}', {"_raw": "native data"})])
+def test_tool_argument_decoder_preserves_real_object_data(arguments, expected):
+    assert decode_tool_arguments(arguments) == expected
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("arguments", ["{", "[]", "null", [], 17, True])
+async def test_codex_malformed_inline_arguments_cannot_reach_execution(arguments):
+    from kestrel_sovereign.llm.codex_adapter import CodexAdapter
+
+    executions = []
+
+    async def execute(name, args):
+        executions.append((name, args))
+        return {"success": True, "result": "must not execute"}
+
+    handler = CodexAdapter()._make_tool_call_handler(execute, "owned-thread", frozenset({"write"}))
+    with pytest.raises(LLMProtocolError):
+        await handler({"threadId": "owned-thread", "tool": "write", "callId": "owned-call", "arguments": arguments})
+    assert executions == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("streaming", [False, True])
+@pytest.mark.parametrize("calls", [
+    "invalid", [{}], [ToolCall(id="", name="write", arguments={})],
+    [ToolCall(id="owned", name="", arguments={})],
+    [ToolCall(id="owned", name="write", arguments=[])],
+    [ToolCall(id="owned", name="write", arguments=None)],
+])
+async def test_adapter_boundary_refuses_invalid_tool_call_shapes(streaming, calls):
+    response = LLMResponse(content="private", raw={"private": "data"}, tool_calls=calls,
+        stop_reason="tool_calls", input_tokens=2)
+
+    async def call():
+        return response
+
+    async def source():
+        yield response
+
+    with pytest.raises(GenerationProtocolError) as raised:
+        if streaming:
+            _ = [item async for item in adapter_stream(source())]
+        else:
+            await adapter_call(call())
+    assert raised.value.usage.input_tokens == 2
+    assert raised.value.usage.content is None and raised.value.usage.raw is None and raised.value.usage.tool_calls is None
 
 
 @pytest.mark.asyncio

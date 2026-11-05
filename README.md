@@ -332,6 +332,20 @@ use the scheduler host's own storage pool, not the agents' advisory pool.
 #### Native SDK release requirements
 
 Core declares its SDK version constraint in [pyproject.toml](https://github.com/KestrelSovereignAI/kestrel-sovereign/blob/main/pyproject.toml).
+Core 0.63 requires public SDK 0.49 or later and provider packages from the
+0.2 family. This release adopts LLM contract 8: both adapter streaming methods
+end with exactly one `LLMResponse`, after EOF and native response cleanup.
+Direct adapter consumers must handle that terminal response separately from
+text chunks. Use the with-tools method for tools; plain streams reject tool
+requests and returned tool evidence.
+
+Core validates the SDK response and tool-call shapes at its adapter boundary.
+Malformed JSON and non-object tool arguments fail without fabricated argument
+data. A streamed zero-argument call carries `{}`. Native stop reasons remain
+unchanged, including unknown values; absent evidence stays `None`, which Core
+rejects as incomplete. Protocol and cleanup failures cannot expose a successful
+terminal response or trigger a retry of that generation.
+
 The base install selects `[a2a,httpx,tracing]`; the `observability` extra adds
 `metrics` under that same base constraint. The 0.40
 release replaces draft A2A contribution types with native `AgentSkill` and

@@ -468,6 +468,7 @@ def test_openai_text_only_stream_emits_terminal_llmresponse_with_usage(monkeypat
     content_chunk = SimpleNamespace(
         usage=None,
         choices=[SimpleNamespace(
+            index=0,
             delta=SimpleNamespace(content="hello world", tool_calls=None),
             finish_reason=None,
         )],

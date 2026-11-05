@@ -1,16 +1,29 @@
 """The adapter boundary: one terminal response after EOF and owned cleanup."""
 
 from contextlib import AsyncExitStack
+import json
 
 from typing import Any, AsyncIterator, Awaitable, Callable, Optional, TypeVar
 
-from kestrel_sdk.llm import LLMProtocolError, LLMResponse
+from kestrel_sdk.llm import LLMProtocolError, LLMResponse, ToolCall
 from kestrel_sovereign.execution_custody import (
     is_execution_control_error,
 )
 from .output_ceiling import IncompleteGenerationError
 
 _T = TypeVar("_T")
+
+
+def decode_tool_arguments(arguments: Any) -> dict[str, Any]:
+    """Decode native object arguments without fabricating an executable payload."""
+    if isinstance(arguments, str):
+        try:
+            arguments = json.loads(arguments)
+        except json.JSONDecodeError as error:
+            raise LLMProtocolError("Native tool arguments must contain valid JSON.") from error
+    if not isinstance(arguments, dict):
+        raise LLMProtocolError("Native tool arguments must contain a JSON object.")
+    return arguments
 
 
 def response_usage_only(response: LLMResponse) -> LLMResponse:
@@ -36,10 +49,28 @@ class GenerationProtocolError(IncompleteGenerationError, LLMProtocolError):
             self.usage = response_usage_only(response)
 
 
+def _validate_response_shape(response: LLMResponse) -> None:
+    if response.stop_reason is not None and (type(response.stop_reason) is not str or not response.stop_reason):
+        raise GenerationProtocolError(response)
+    calls = response.tool_calls
+    if calls is None:
+        return
+    if not isinstance(calls, list):
+        raise GenerationProtocolError(response)
+    for call in calls:
+        if not isinstance(call, ToolCall) or any(type(value) is not str or not value for value in (call.id, call.name)):
+            raise GenerationProtocolError(response)
+        if not isinstance(call.arguments, dict):
+            raise GenerationProtocolError(response)
+
+
 async def adapter_call(pending: Awaitable[_T]) -> _T:
     """Translate an SDK contract failure before route wrapping and retry decisions."""
     try:
-        return await pending
+        result = await pending
+        if isinstance(result, LLMResponse):
+            _validate_response_shape(result)
+        return result
     except LLMProtocolError as error:
         if isinstance(error, GenerationProtocolError) or is_execution_control_error(error):
             raise
@@ -67,8 +98,7 @@ async def adapter_stream(stream: AsyncIterator[Any], *,
                     terminal = item
                     if on_terminal is not None:
                         on_terminal(item)
-                    if item.stop_reason is not None and (type(item.stop_reason) is not str or not item.stop_reason):
-                        raise GenerationProtocolError(terminal)
+                    _validate_response_shape(item)
                 else:
                     yield item
     except LLMProtocolError as error:

@@ -79,6 +79,7 @@ from kestrel_sovereign.execution_custody import (
     owned_execution_stream,
 )
 
+from .completion_protocol import decode_tool_arguments
 from .adapter import LLMAdapter, LLMResponse, ThinkingDelta, ToolCall
 from .call_progress import report_call_progress
 from .cancellation import CancelToken, await_or_cancelled, raise_if_cancelled
@@ -2080,19 +2081,15 @@ class CodexAdapter(LLMAdapter):
             # tool's true ``mcp__...`` name (#2008).
             if tool_aliases:
                 name = tool_aliases.get(name, name)
-            args = params.get("arguments") or {}
-            if isinstance(args, str):
-                try:
-                    args = json.loads(args)
-                except ValueError:
-                    args = {"_raw": args}
+            raw_arguments = params.get("arguments")
+            args = decode_tool_arguments({} if raw_arguments is None else raw_arguments)
             call_id = params.get("callId") or params.get("id") or ""
             # The executor returns (effective_args, result) — effective
             # args are what actually ran after PRE_TOOL_USE hooks, so
             # the breadcrumb reflects the redacted/rewritten payload,
             # not the model's pre-hook arguments.
             effective_args: Dict[str, Any] = (
-                args if isinstance(args, dict) else {}
+                args
             )
             try:
                 ret = await executor(name, args)
@@ -3234,17 +3231,13 @@ class CodexAdapter(LLMAdapter):
                                     continue
                                 if iid:
                                     seen_tool_ids.add(iid)
-                                raw_args = item.get("arguments")
-                                if isinstance(raw_args, str):
-                                    try:
-                                        raw_args = json.loads(raw_args)
-                                    except ValueError:
-                                        raw_args = {"_raw": raw_args}
+                                native_args = item.get("arguments")
+                                raw_args = decode_tool_arguments({} if native_args is None else native_args)
                                 tc = ToolCall(
                                     id=iid,
                                     name=item.get("name") or item.get("tool") or "",
                                     arguments=(
-                                        raw_args if isinstance(raw_args, dict) else {}
+                                        raw_args
                                     ),
                                 )
                                 # Critical: the app-server has ALREADY executed

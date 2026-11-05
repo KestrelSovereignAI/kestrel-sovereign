@@ -22,6 +22,7 @@ from pydantic import BaseModel
 
 from kestrel_sdk.llm import ToolCallStarted
 
+from .completion_protocol import decode_tool_arguments
 from .adapter import LLMAdapter, LLMResponse, ThinkingContentSplitter, ThinkingDelta, ToolCall
 from .call_progress import report_call_progress
 from .cancellation import (
@@ -1082,11 +1083,7 @@ class AnthropicAdapter(LLMAdapter):
                     "function",
                     {},
                 ).get("arguments", tc.get("arguments", {}))
-                if isinstance(tool_input, str):
-                    try:
-                        tool_input = json.loads(tool_input)
-                    except (json.JSONDecodeError, TypeError):
-                        tool_input = {}
+                tool_input = decode_tool_arguments(tool_input)
                 content_blocks.append({
                     "type": "tool_use",
                     "id": tc.get("id", ""),
@@ -1509,7 +1506,7 @@ class AnthropicAdapter(LLMAdapter):
                     parsed_tool_calls.append(ToolCall(
                         id=block.id,
                         name=block.name,
-                        arguments=block.input if isinstance(block.input, dict) else {}
+                        arguments=decode_tool_arguments(block.input)
                     ))
             content = "".join(text_blocks) if text_blocks else None
 
@@ -1757,11 +1754,12 @@ class AnthropicAdapter(LLMAdapter):
                             last_block_type = block.type
 
                             if block.type == 'tool_use':
+                                initial_arguments = decode_tool_arguments(block.input)
                                 # Start accumulating a new tool call
                                 tool_calls_accumulator[block_index] = {
                                     "id": block.id,
                                     "name": block.name,
-                                    "arguments": ""
+                                    "arguments": json.dumps(initial_arguments) if initial_arguments else ""
                                 }
                                 current_tool_block_index = block_index
 
@@ -1862,17 +1860,7 @@ class AnthropicAdapter(LLMAdapter):
             if tool_calls_accumulator:
                 parsed_tool_calls = []
                 for tc_data in tool_calls_accumulator.values():
-                    try:
-                        args = json.loads(tc_data["arguments"]) if tc_data["arguments"] else {}
-                    except json.JSONDecodeError:
-                        # SDK 0.7.0 contract: malformed-JSON fallback
-                        # surfaces the partial string under the
-                        # ``_raw`` sentinel key so the framework can
-                        # report the error to the model as a tool
-                        # result rather than crashing the turn. Was
-                        # ``"raw"`` pre-0.7.0 — renamed to underscore-
-                        # prefixed to signal "sentinel, not real data".
-                        args = {"_raw": tc_data["arguments"]}
+                    args = decode_tool_arguments(tc_data["arguments"] or "{}")
 
                     parsed_tool_calls.append(ToolCall(
                         id=tc_data["id"],

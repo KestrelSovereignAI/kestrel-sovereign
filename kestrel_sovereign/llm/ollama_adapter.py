@@ -31,6 +31,7 @@ from typing import (
 import httpx
 from pydantic import BaseModel
 
+from .completion_protocol import decode_tool_arguments
 from .adapter import (
     LLMAdapter,
     LLMResponse,
@@ -1002,12 +1003,7 @@ class OllamaAdapter(LLMAdapter):
                     else:
                         continue
 
-                    if isinstance(args, str):
-                        try:
-                            args = json.loads(args)
-                        except json.JSONDecodeError:
-                            # SDK 0.7.0 malformed-JSON sentinel.
-                            args = {"_raw": args}
+                    args = decode_tool_arguments(args)
 
                     parsed_tool_calls.append(ToolCall(
                         id=f"ollama_call_{i}",  # Ollama doesn't provide IDs

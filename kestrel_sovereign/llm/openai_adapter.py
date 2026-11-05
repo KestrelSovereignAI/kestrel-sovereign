@@ -25,8 +25,9 @@ if TYPE_CHECKING:
     from .embedding_discovery import EmbeddingModelInfo
 from pydantic import BaseModel
 
-from kestrel_sdk.llm import ToolCallStarted
+from kestrel_sdk.llm import LLMProtocolError, ToolCallStarted
 
+from .completion_protocol import decode_tool_arguments
 from .adapter import (
     LLMAdapter,
     LLMResponse,
@@ -99,9 +100,24 @@ def _structured_response_format(model: Type[BaseModel]) -> Dict[str, Any]:
     }}
 
 
+def _single_choice(choices: Any, *, allow_empty: bool = False) -> Any:
+    """One selected generation; usage-only stream trailers can have none."""
+    if not isinstance(choices, list):
+        raise LLMProtocolError("OpenAI completion choices must be a list.")
+    if not choices and allow_empty:
+        return None
+    if len(choices) != 1:
+        raise LLMProtocolError("OpenAI completion must contain one selected choice.")
+    choice = choices[0]
+    index = choice.get("index") if isinstance(choice, dict) else getattr(choice, "index", None)
+    if type(index) is not int or index != 0:
+        raise LLMProtocolError("OpenAI completion choice must have index zero.")
+    return choice
+
+
 def _finish_reason(choice: Any) -> Optional[str]:
     """A chat-completions choice's ``finish_reason``, if the provider gave one."""
-    reason = getattr(choice, "finish_reason", None)
+    reason = choice.get("finish_reason") if isinstance(choice, dict) else getattr(choice, "finish_reason", None)
     return reason if isinstance(reason, str) and reason else None
 
 
@@ -580,10 +596,11 @@ class OpenAIAdapter(LLMAdapter):
                 **extra_kwargs
             )
 
-            message = response.choices[0].message
+            choice = _single_choice(response.choices)
+            message = choice.message
             # #3355: the provider's own verdict on whether the response is
             # finished; ``length`` means it was cut at an output limit.
-            finish_reason = _finish_reason(response.choices[0])
+            finish_reason = _finish_reason(choice)
 
             # Parse tool calls if present
             # Use getattr to safely access tool_calls (may not exist on mock objects)
@@ -592,12 +609,7 @@ class OpenAIAdapter(LLMAdapter):
             if message_tool_calls:
                 parsed_tool_calls = []
                 for tc in message_tool_calls:
-                    try:
-                        args = json.loads(tc.function.arguments)
-                    except json.JSONDecodeError:
-                        # SDK 0.7.0 malformed-JSON sentinel; same
-                        # convention as the streaming path.
-                        args = {"_raw": tc.function.arguments}
+                    args = decode_tool_arguments(tc.function.arguments)
 
                     parsed_tool_calls.append(ToolCall(
                         id=tc.id,
@@ -810,12 +822,13 @@ class OpenAIAdapter(LLMAdapter):
                                 call_cost = None
 
                     # Skip chunks with no choices (like the final usage-only chunk)
-                    if not chunk.choices:
+                    choice = _single_choice(chunk.choices, allow_empty=True)
+                    if choice is None:
                         continue
 
                     # #3355: the finish reason rides on the last choice chunk.
-                    finish_reason = _finish_reason(chunk.choices[0]) or finish_reason
-                    delta = chunk.choices[0].delta
+                    finish_reason = _finish_reason(choice) or finish_reason
+                    delta = choice.delta
 
                     # Handle text content - yield immediately for real-time streaming
                     delta_reasoning_content = getattr(delta, "reasoning_content", None)
@@ -856,17 +869,24 @@ class OpenAIAdapter(LLMAdapter):
                                     "arguments": ""
                                 }
 
-                            # Accumulate id (usually comes in first chunk)
-                            if tc_delta.id:
-                                tool_calls_accumulator[idx]["id"] += tc_delta.id
+                            # Identity fields repeat whole values; only arguments fragment.
+                            current = tool_calls_accumulator[idx]
+                            for key, value in (("id", tc_delta.id), ("name", getattr(tc_delta.function, "name", None))):
+                                if value is None:
+                                    continue
+                                if type(value) is not str or not value:
+                                    raise LLMProtocolError("Native tool identity must be a non-empty string.")
+                                if current[key] and current[key] != value:
+                                    raise LLMProtocolError("Native tool delta returned conflicting identity.")
+                                current[key] = value
 
-                            # Accumulate function name (usually comes in first chunk)
                             if tc_delta.function:
-                                if tc_delta.function.name:
-                                    tool_calls_accumulator[idx]["name"] += tc_delta.function.name
                                 # Accumulate arguments (comes in multiple chunks)
-                                if tc_delta.function.arguments:
-                                    tool_calls_accumulator[idx]["arguments"] += tc_delta.function.arguments
+                                arguments = tc_delta.function.arguments
+                                if arguments is not None:
+                                    if type(arguments) is not str:
+                                        raise LLMProtocolError("Native tool argument fragments must be strings.")
+                                    current["arguments"] += arguments
 
                             if is_new_call:
                                 # Emit ToolCallStarted only after we've
@@ -908,13 +928,7 @@ class OpenAIAdapter(LLMAdapter):
             if tool_calls_accumulator:
                 parsed_tool_calls = []
                 for tc_data in tool_calls_accumulator.values():
-                    try:
-                        args = json.loads(tc_data["arguments"]) if tc_data["arguments"] else {}
-                    except json.JSONDecodeError:
-                        # SDK 0.7.0 malformed-JSON fallback — see
-                        # contract docstring on
-                        # LLMAdapter.get_streaming_response_with_tools.
-                        args = {"_raw": tc_data["arguments"]}
+                    args = decode_tool_arguments(tc_data["arguments"] or "{}")
 
                     parsed_tool_calls.append(ToolCall(
                         id=tc_data["id"],
@@ -1591,18 +1605,14 @@ class OpenAIAdapter(LLMAdapter):
 
     def _llm_response_from_chat_completion(self, response_body: Any) -> LLMResponse:
         body = response_body if isinstance(response_body, dict) else _object_to_dict(response_body)
-        choices = body.get("choices") or []
-        message = (choices[0].get("message") if choices else {}) or {}
+        choice = _single_choice(body.get("choices"))
+        message = choice.get("message") or {}
         tool_calls = None
         if message.get("tool_calls"):
             tool_calls = []
             for tc in message["tool_calls"]:
                 fn = tc.get("function") or {}
-                args = fn.get("arguments") or "{}"
-                try:
-                    parsed = json.loads(args) if isinstance(args, str) else args
-                except json.JSONDecodeError:
-                    parsed = {"_raw": args}
+                parsed = decode_tool_arguments(fn.get("arguments"))
                 tool_calls.append(
                     ToolCall(
                         id=tc.get("id", ""),
@@ -1622,6 +1632,7 @@ class OpenAIAdapter(LLMAdapter):
             content=message.get("content"),
             tool_calls=tool_calls,
             raw=response_body,
+            stop_reason=_finish_reason(choice),
             input_tokens=input_tokens,
             output_tokens=output_tokens,
             total_tokens=total_tokens,
