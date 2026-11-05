@@ -28,11 +28,13 @@ from kestrel_sdk.native_a2a.helpers.proto_helpers import new_text_artifact, new_
 from kestrel_sdk.native_a2a.types import Role, TaskState
 from kestrel_sdk.native_a2a.utils.errors import InvalidAgentResponseError
 from google.protobuf.json_format import MessageToDict
+from kestrel_sdk.resources import ResourceOutcomeUnknown
 from kestrel_sdk.tools.base import ToolCategory
 from kestrel_sdk.tools.result import ToolResult, ToolResultStatus
 
 from kestrel_sovereign.a2a.lifecycle import (
     TERMINAL_STATES,
+    task_outcome_unknown,
     task_state_from_label,
     task_state_label,
 )
@@ -42,7 +44,13 @@ from kestrel_sovereign.a2a.projections import (
     task_presentation,
 )
 from kestrel_sovereign.execution_custody import is_execution_control_error
-from kestrel_sovereign.features.base import Feature, is_flat_toolresult_envelope, tool
+from kestrel_sovereign.features.base import (
+    Feature,
+    is_flat_toolresult_envelope,
+    observed_outcome_unknown,
+    report_flattened_outcome_unknown,
+    tool,
+)
 from kestrel_sovereign.features.tasks.wait_provider import TaskWaitable
 from kestrel_sovereign.storage.db.interface import DatabaseError
 
@@ -322,6 +330,7 @@ class TaskFeature(Feature):
             attempts = 1 + max_retries
 
             for attempt in range(attempts):
+                task = None
                 try:
                     task = await self.task_manager.execute_skill(
                         agent_id=feature_name,
@@ -362,6 +371,19 @@ class TaskFeature(Feature):
                     }
                     if semantic_error is not None:
                         step_record["error"] = semantic_error
+                    outcome_unknown = task_outcome_unknown(task)
+                    if outcome_unknown:
+                        # Some effect this step ran may already have happened.
+                        # A workflow running as a skill tells its own task,
+                        # whatever this step's status, so an enclosing
+                        # workflow never reruns this one (#3946).
+                        step_record["outcome_unknown"] = True
+                        report_flattened_outcome_unknown(
+                            ResourceOutcomeUnknown(
+                                semantic_error
+                                or f"Step {i} outcome is unknown"
+                            )
+                        )
                     results.append(step_record)
                     logger.info(
                         f"[WORKFLOW] Step {i}: {feature_name}.{skill_name} "
@@ -370,6 +392,14 @@ class TaskFeature(Feature):
                     )
                     last_error = None
                     if semantic_status != "failed":
+                        break
+                    if outcome_unknown:
+                        # Running it again could repeat its effect, whatever
+                        # max_retries says.
+                        logger.warning(
+                            f"[WORKFLOW] Step {i}: {feature_name}.{skill_name} "
+                            f"outcome is unknown after attempt {attempt + 1}; not retrying"
+                        )
                         break
                     # Semantic failure with retries left: fall through
                     # to retry like a transport exception.
@@ -391,6 +421,38 @@ class TaskFeature(Feature):
                 except Exception as e:
                     if is_execution_control_error(e):
                         raise
+                    # The error itself, a cause or an exception-group member
+                    # may say the step's effect may already have happened.
+                    unknown = e if observed_outcome_unknown(e) else None
+                    if unknown is None and task is not None and task_outcome_unknown(task):
+                        # The task says its effect may already have happened.
+                        # Failing to read its result does not make it safe to
+                        # run again.
+                        unknown = ResourceOutcomeUnknown(
+                            f"Step {i} outcome is unknown; its result could "
+                            f"not be read: {e}"
+                        )
+                        unknown.__cause__ = e
+                    if unknown is not None:
+                        report_flattened_outcome_unknown(unknown)
+                        last_error = None
+                        step_duration = int((time.time() - step_start) * 1000)
+                        results.append({
+                            "step": i,
+                            "feature": feature_name,
+                            "skill": skill_name,
+                            "status": "failed",
+                            "error": str(unknown),
+                            "outcome_unknown": True,
+                            "duration_ms": step_duration,
+                            "attempts": attempt + 1,
+                        })
+                        logger.error(
+                            f"[WORKFLOW] Step {i}: {feature_name}.{skill_name} "
+                            f"outcome is unknown after attempt {attempt + 1}; "
+                            f"not retrying: {unknown} ({step_duration}ms)"
+                        )
+                        break
                     last_error = e
                     if attempt < attempts - 1:
                         delay_s = retry_delay_ms / 1000.0

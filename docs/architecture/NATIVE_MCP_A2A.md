@@ -329,6 +329,30 @@ exact-True capability before connection acquisition or Apps/OAuth enablement.
 Other SDK-only hosts must implement the same contract. It is independent of caller
 authority and permission checks and does not authorize a retry.
 
+A local A2A skill whose execution met a `ResourceOutcomeUnknown` marks its
+task with `outcome_unknown: true` metadata (#3946). That covers a skill raising
+it, a Core or SDK `@tool` wrapper that returns it to a model as an ordinary
+failure, a feature subagent's tool step, failure envelope or inline tool
+executor doing the same, and a required write that fails after the tool ran.
+Each of them reads an error the same way (`observed_outcome_unknown`): the
+error itself, an explicit cause or an exception-group member counts, so a
+skill that runs its effects in an `asyncio.TaskGroup` is flagged too. Implicit
+handling context does not count.
+The skill's capture is carried with the turn's scope, so a tool its transport
+runs on a task that predates the skill (the codex app-server's reader) reports
+to it too.
+The flag depends only on what the execution observed, at any depth, never on
+the task's state, which keeps its own message and artifacts: a workflow with
+one uncertain step and one that succeeded completes with a partial result and
+is still flagged. A skill that runs another skill as a task, itself or through
+its deferred result's completion hooks, carries that task's flag too, whatever
+it returns. `run_workflow` never retries a step
+whose task carries the flag, whatever its `max_retries`, and passes it to its
+own task whatever the step's status, so an enclosing workflow never reruns it.
+If a flagged task cannot be recorded, or another writer's terminal state wins,
+`execute_skill` raises `ResourceOutcomeUnknown` instead, caused by any storage
+failure.
+
 ### Tasks and operator input
 
 An MCP task is identified by agent, connection and remote task ID. Its durable
