@@ -8,7 +8,6 @@ This is critical for billing/metering - the vending machine system needs
 real token counts to pass through costs.
 """
 import asyncio
-import os
 import pytest
 from unittest.mock import AsyncMock, MagicMock
 
@@ -16,6 +15,7 @@ from kestrel_sovereign.llm.adapter import LLMResponse, ToolCall
 from kestrel_sovereign.llm.openai_adapter import OpenAIAdapter
 from kestrel_sovereign.llm.anthropic_adapter import AnthropicAdapter
 from kestrel_sovereign.llm.ollama_adapter import OllamaAdapter
+from tests.llm._live import require_live_provider
 from tests.utils.anthropic_client import anthropic_client
 from tests.utils.ollama_client import ollama_client
 
@@ -157,14 +157,14 @@ class TestOllamaTokenExtraction:
 # Integration Tests (Real APIs) - Verify End-to-End Token Tracking
 # =============================================================================
 
+@pytest.mark.live
 class TestRealOpenAITokenTracking:
     """Integration tests with real OpenAI API."""
 
     @pytest.mark.asyncio
     async def test_real_openai_returns_tokens(self):
         """Test that real OpenAI API returns token counts."""
-        if not os.environ.get("OPENAI_API_KEY"):
-            pytest.skip("OPENAI_API_KEY not set")
+        require_live_provider("openai")
 
         import openai
         adapter = OpenAIAdapter()
@@ -189,14 +189,14 @@ class TestRealOpenAITokenTracking:
         assert response.total_tokens == response.input_tokens + response.output_tokens
 
 
+@pytest.mark.live
 class TestRealAnthropicTokenTracking:
     """Integration tests with real Anthropic API."""
 
     @pytest.mark.asyncio
     async def test_real_anthropic_returns_tokens(self):
         """Test that real Anthropic API returns token counts."""
-        if not os.environ.get("ANTHROPIC_API_KEY"):
-            pytest.skip("ANTHROPIC_API_KEY not set")
+        require_live_provider("anthropic")
 
         import anthropic
         adapter = AnthropicAdapter()
@@ -269,6 +269,7 @@ class TestRealOllamaTokenTracking:
 # Service Layer Token Tracking
 # =============================================================================
 
+@pytest.mark.live
 class TestLLMServiceTokenTracking:
     """Test token tracking through the LLM service layer."""
 
@@ -279,8 +280,7 @@ class TestLLMServiceTokenTracking:
         Note: service.generate() returns str by default, but returns LLMResponse
         when tools or response_format is provided.
         """
-        if not os.environ.get("OPENAI_API_KEY"):
-            pytest.skip("OPENAI_API_KEY not set")
+        require_live_provider("openai")
 
         from pydantic import BaseModel, Field
         from kestrel_sovereign.llm.service import LLMService
@@ -307,8 +307,7 @@ class TestLLMServiceTokenTracking:
     @pytest.mark.asyncio
     async def test_service_passes_tokens_through_with_tools(self):
         """Test that LLM service preserves token counts when using tools."""
-        if not os.environ.get("OPENAI_API_KEY"):
-            pytest.skip("OPENAI_API_KEY not set")
+        require_live_provider("openai")
 
         from kestrel_sovereign.llm.service import LLMService
 

@@ -9,7 +9,6 @@ from the stream, and yield an LLMResponse at the end if tools were called.
 """
 import asyncio
 import json
-import os
 import pytest
 from typing import List, Dict, Any
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -21,6 +20,7 @@ from kestrel_sovereign.llm.openai_adapter import OpenAIAdapter
 from kestrel_sovereign.llm.anthropic_adapter import AnthropicAdapter
 from kestrel_sovereign.llm.ollama_adapter import OllamaAdapter
 from kestrel_sovereign.llm.vertex_adapter import VertexAIAdapter
+from tests.llm._live import require_live_provider
 from tests.utils.anthropic_client import install_models_api
 
 
@@ -705,14 +705,14 @@ class TestVertexStreamingToolDetectionUnit:
 # Integration Tests (Real APIs)
 # =============================================================================
 
+@pytest.mark.live
 class TestOpenAIStreamingToolDetectionIntegration:
     """Integration tests with real OpenAI API."""
 
     @pytest.mark.asyncio
     async def test_real_openai_text_streaming(self):
         """Test real OpenAI streaming without tools."""
-        if not os.environ.get("OPENAI_API_KEY"):
-            pytest.skip("OPENAI_API_KEY not set")
+        require_live_provider("openai")
 
         import openai
         adapter = OpenAIAdapter()
@@ -740,8 +740,7 @@ class TestOpenAIStreamingToolDetectionIntegration:
     @pytest.mark.asyncio
     async def test_real_openai_tool_detection(self):
         """Test real OpenAI tool detection from stream."""
-        if not os.environ.get("OPENAI_API_KEY"):
-            pytest.skip("OPENAI_API_KEY not set")
+        require_live_provider("openai")
 
         import openai
         adapter = OpenAIAdapter()
@@ -773,14 +772,14 @@ class TestOpenAIStreamingToolDetectionIntegration:
         assert "tokyo" in str(weather_call.arguments).lower()
 
 
+@pytest.mark.live
 class TestAnthropicStreamingToolDetectionIntegration:
     """Integration tests with real Anthropic API."""
 
     @pytest.mark.asyncio
     async def test_real_anthropic_text_streaming(self):
         """Test real Anthropic streaming without tools."""
-        if not os.environ.get("ANTHROPIC_API_KEY"):
-            pytest.skip("ANTHROPIC_API_KEY not set")
+        require_live_provider("anthropic")
 
         import anthropic
         adapter = AnthropicAdapter()
@@ -808,8 +807,7 @@ class TestAnthropicStreamingToolDetectionIntegration:
     @pytest.mark.asyncio
     async def test_real_anthropic_tool_detection(self):
         """Test real Anthropic tool detection from stream."""
-        if not os.environ.get("ANTHROPIC_API_KEY"):
-            pytest.skip("ANTHROPIC_API_KEY not set")
+        require_live_provider("anthropic")
 
         import anthropic
         adapter = AnthropicAdapter()
@@ -898,14 +896,14 @@ class TestOllamaStreamingToolDetectionIntegration:
 # Service Layer Tests
 # =============================================================================
 
+@pytest.mark.live
 class TestLLMServiceStreamWithToolDetection:
     """Tests for LLM service stream_with_tool_detection method."""
 
     @pytest.mark.asyncio
     async def test_service_streaming_text_only(self):
         """Test service-level streaming without tools."""
-        if not os.environ.get("OPENAI_API_KEY"):
-            pytest.skip("OPENAI_API_KEY not set")
+        require_live_provider("openai")
 
         from kestrel_sovereign.llm.service import LLMService
 
@@ -927,8 +925,7 @@ class TestLLMServiceStreamWithToolDetection:
     @pytest.mark.asyncio
     async def test_service_streaming_with_tools(self):
         """Test service-level streaming with tool detection."""
-        if not os.environ.get("OPENAI_API_KEY"):
-            pytest.skip("OPENAI_API_KEY not set")
+        require_live_provider("openai")
 
         from kestrel_sovereign.llm.service import LLMService
 
