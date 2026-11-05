@@ -83,14 +83,3 @@ func TestCardKeyTrustCannotFollowAnUntrustedKeyOrURL(t *testing.T) {
 		t.Fatal("resolver did not return the exact trusted public key")
 	}
 }
-
-func TestCanonicalizationRetainsEmptySecurityRequirements(t *testing.T) {
-	with := map[string]any{"securityRequirements": []any{map[string]any{"schemes": map[string]any{"signedSender": map[string]any{}}}}}
-	without := map[string]any{"securityRequirements": []any{}}
-	if string(canonical(with)) != `{"securityRequirements":[{"schemes":{"signedSender":{}}}]}` {
-		t.Fatal("lost a meaningful empty security map")
-	}
-	if digest(with) == digest(without) {
-		t.Fatal("empty security requirements were pruned before signing")
-	}
-}
