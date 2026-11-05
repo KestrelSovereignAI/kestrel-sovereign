@@ -154,8 +154,17 @@ _COMMITTED_FEATURE_TRANSITION_AGENT: contextvars.ContextVar[object | None] = (
 
 
 def _normalize_session_id(session_id: object) -> Optional[str]:
+    """The turn's session key exactly as given, or None when it names none.
+
+    The key is returned verbatim, never stripped: the conversation store files
+    a turn's rows under the exact key the turn was handed, so a caller that
+    names "this turn's session" (a wake's origin, a fact's source) must name
+    that same key. A stripped copy names a session no row is filed under, and
+    an exclusion of the real key would then miss it (#3875). A blank key names
+    no session.
+    """
     if isinstance(session_id, str) and session_id.strip():
-        return session_id.strip()
+        return session_id
     return None
 
 

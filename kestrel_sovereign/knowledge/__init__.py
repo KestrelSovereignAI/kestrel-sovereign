@@ -50,6 +50,8 @@ from .assertion import (
     lineage_from_mapping,
     normalize_iri,
     source_reference_segment,
+    with_source_reference,
+    without_source_references,
 )
 if TYPE_CHECKING:
     from .corpus import (
@@ -302,6 +304,8 @@ __all__ = [
     "load_knowledge_registry",
     "normalize_iri",
     "source_reference_segment",
+    "with_source_reference",
+    "without_source_references",
     "maintenance_limits_from_config",
     "maintenance_allows_prior_verified_snapshot",
 ]

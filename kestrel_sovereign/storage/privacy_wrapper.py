@@ -2392,11 +2392,13 @@ class PrivacyEnforcingStorage:
             confidence: float,
             confidence_requested: float | None = None,
             invocation_id: object = None,
+            session_id: str | None = None,
         ) -> FactWriteReceipt:
             from kestrel_sovereign.agent.invocation import ensure_invocation_id
 
             invocation_id = ensure_invocation_id(invocation_id)
             binding = fact_binding()
+            source_session_id = await self.filed_session_id(session_id)
             mapping = map_legacy_fact(
                 subject,
                 predicate,
@@ -2419,6 +2421,7 @@ class PrivacyEnforcingStorage:
                 operation_id,
                 digest,
                 binding.owning_agent_id,
+                session_id=source_session_id,
             )
             assertion = _assertion(
                 binding=binding,
@@ -3361,6 +3364,25 @@ class PrivacyEnforcingStorage:
             return provided
         return await self._storage.resolve_session_id(provided)
 
+    async def filed_session_id(self, session_id: Optional[str]) -> Optional[str]:
+        """The session a turn's conversation rows are filed under, or None.
+
+        ``session_id`` is the turn's own session key, which the calling
+        feature reads through the turn lifecycle exactly as the turn was given
+        it; it is never trimmed, because the store files rows under that exact
+        key. A named session is canonicalized as the conversation store
+        canonicalizes it before filing a row (#2012).
+        A turn with no session gets None, never a derived one: the store then
+        derives each row's session as it writes it, so no single session is
+        the turn's, and a source must name none rather than guess (#3875).
+
+        Resolve it while the turn is live, when its rows are filed: a producer
+        that records the session for later projection records this value.
+        """
+        if not session_id:
+            return None
+        return await self.resolve_session_id(session_id)
+
     async def get_conversation_history(
         self, limit: int = 100, session_id: str = None
     ) -> List[Dict]:
@@ -4290,6 +4312,10 @@ class PrivacyEnforcingStorage:
         has already persisted, so a semantic write that cannot land must not
         fail the ledger mutation. The report says what happened; the next
         projection reconciles.
+
+        Each source names the session its row was recorded in, read off the
+        row (#3875). The projecting turn's session is never used: a row whose
+        first projection failed is projected by whichever turn reindexes next.
         """
         from kestrel_sovereign.features.strategic_memory.ledger_assertions import (
             LedgerAssertionReport,
@@ -4512,7 +4538,10 @@ class PrivacyEnforcingStorage:
     async def _apply_ledger_proposal(self, proposal, held, binding, report):
         """Write, revise, or decline one row's assertion."""
         from kestrel_sovereign.features.strategic_memory import ledger_assertions
-        from kestrel_sovereign.knowledge import AssertionStatus
+        from kestrel_sovereign.knowledge import (
+            AssertionStatus,
+            AssertionValidationError,
+        )
 
         if held is None:
             action = ledger_assertions.ACTION_WRITE
@@ -4572,11 +4601,24 @@ class PrivacyEnforcingStorage:
             predecessor_revision_id=predecessor,
             action=action,
         )
-        source = ledger_assertions.build_source(
-            proposal,
-            transition=transition,
-            owning_agent_id=binding.owning_agent_id,
-        )
+        try:
+            source = ledger_assertions.build_source(
+                proposal,
+                transition=transition,
+                owning_agent_id=binding.owning_agent_id,
+            )
+        except AssertionValidationError as error:
+            # The row's provenance cannot be built, notably because its
+            # recorded session cannot be named in a locator. Writing the row
+            # without that session would escape an exclusion of it, so this
+            # row fails and the rest of the pass goes on.
+            logger.warning(
+                "strategy ledger row %s cannot name its provenance: %s",
+                proposal.row_id,
+                error,
+            )
+            report.failed += 1
+            return
         assertion = ledger_assertions.build_assertion(
             binding=binding,
             proposal=proposal,
@@ -4695,8 +4737,14 @@ class PrivacyEnforcingStorage:
         confidence: float,
         confidence_requested: float | None = None,
         invocation_id: object = None,
+        session_id: str | None = None,
     ):
-        """Run explicit teaching through this wrapper's captured authority."""
+        """Run explicit teaching through this wrapper's captured authority.
+
+        ``session_id`` is the calling turn's session, read through the turn
+        lifecycle and never from tool arguments; the fact's source names the
+        session that turn's rows are filed under.
+        """
         return await self.__save_explicit_fact(
             subject=subject,
             predicate=predicate,
@@ -4704,6 +4752,7 @@ class PrivacyEnforcingStorage:
             confidence=confidence,
             confidence_requested=confidence_requested,
             invocation_id=invocation_id,
+            session_id=session_id,
         )
 
     async def forget_explicit_fact(

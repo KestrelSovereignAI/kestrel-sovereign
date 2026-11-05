@@ -98,8 +98,8 @@ def test_a_reserved_id_names_itself(value):
 
 @pytest.mark.parametrize("value, expected", list(zip(PADDED, RESERVED)))
 def test_surrounding_whitespace_does_not_hide_a_reserved_id(value, expected):
-    """The turn lifecycle strips the session it binds, so a padded value would
-    reach the turn's features as the bare reserved id."""
+    """A padded reserved id is refused too: readers that trim a session id,
+    such as the session span attributes, would show it as the bare label."""
     assert reserved_session_id(value) == expected
 
 

@@ -1682,6 +1682,10 @@ class Feature(_SdkFeature):
         None outside a turn, for a session-less turn, and for any agent double
         that does not implement the accessor — all of which mean "no chat
         window", which callers treat as system-initiated.
+
+        A session is returned exactly as the lifecycle reports it, never
+        stripped: it is the key the turn's conversation rows are filed under,
+        and a trimmed copy would name a session no row belongs to (#3875).
         """
         agent = getattr(self, "agent", None)
         if agent is None:
@@ -1698,7 +1702,7 @@ class Feature(_SdkFeature):
         except Exception:  # pragma: no cover - defensive; stub agents
             return None
         if isinstance(session_id, str) and session_id.strip():
-            return session_id.strip()
+            return session_id
         return None
 
     def _owns_live_turn(self) -> bool:

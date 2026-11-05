@@ -13,12 +13,17 @@ from uuid import uuid4
 import pytest
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+from kestrel_sdk.tools.result import ToolResultStatus
 
 from kestrel_sovereign.identity.runtime_identity import AgentIdentity, load_agent_identity
+from kestrel_sovereign.agent.invocation import invocation_scope, request_provenance
 from kestrel_sovereign.agent.sleep import SleepMixin
+from kestrel_sovereign.features.memory_agency.feature import MemoryAgencyFeature
+from kestrel_sovereign.features.memory_agency.semantic_facts import _is_adapter_source
 from kestrel_sovereign.inception_service import create_kestrel_identity_async
 from kestrel_sovereign.knowledge import (
     Assertion,
+    AssertionQuery,
     DirectLineage,
     EpistemicState,
     GovernedArtifactError,
@@ -47,6 +52,7 @@ from kestrel_sovereign.storage.privacy_wrapper import (
     PrivacyViolationError,
 )
 from kestrel_sovereign.privacy import PrivacyMode
+from tests.utils.live_turn import TurnBoundAgent, live_turn
 
 
 async def _open_storage(db_path: str, tenant_id: str, capability) -> AsyncStorage:
@@ -673,6 +679,22 @@ async def test_tombstone_delta_is_revoked_and_physically_deleted_after_erasure(
     ) == 0
 
 
+_CORPUS_CONSUMER_PUBLIC_KEY = _public_key(Ed25519PrivateKey.generate())
+
+
+async def _corpus_snapshot(storage: AsyncStorage, policy: GovernedCorpusPolicy):
+    """One corpus snapshot for the same consumer key on every call."""
+    return await storage.governed_assertion_corpus_snapshot(
+        policy=policy,
+        inference_profile=None,
+        artifact_id=str(uuid4()),
+        consumer_id="parametric-self-test",
+        consumer_key_id="parametric-self-key-v1",
+        consumer_public_key=_CORPUS_CONSUMER_PUBLIC_KEY,
+        retention_seconds=300,
+    )
+
+
 @pytest.mark.asyncio
 async def test_corpus_holds_out_a_session_named_in_stored_provenance(
     storage: AsyncStorage,
@@ -710,19 +732,10 @@ async def test_corpus_holds_out_a_session_named_in_stored_provenance(
         accepted_ontology_pins=(stored[0].ontology_version,),
         accepted_semantic_capability_versions=tuple(capabilities.items()),
     )
-    producer = {
-        "consumer_id": "parametric-self-test",
-        "consumer_key_id": "parametric-self-key-v1",
-        "consumer_public_key": _public_key(Ed25519PrivateKey.generate()),
-        "retention_seconds": 300,
-    }
 
-    unexcluded = await storage.governed_assertion_corpus_snapshot(
-        policy=policy, inference_profile=None, artifact_id=str(uuid4()), **producer,
-    )
-    held_out = await storage.governed_assertion_corpus_snapshot(
-        policy=replace(policy, excluded_session_ids=(exam_session,)),
-        inference_profile=None, artifact_id=str(uuid4()), **producer,
+    unexcluded = await _corpus_snapshot(storage, policy)
+    held_out = await _corpus_snapshot(
+        storage, replace(policy, excluded_session_ids=(exam_session,))
     )
 
     assert {item.assertion.revision_id for item in unexcluded.examples} == {
@@ -733,6 +746,317 @@ async def test_corpus_holds_out_a_session_named_in_stored_provenance(
     assert all(
         "exam-answer" not in str(item.canonical_mapping()) for item in held_out.examples
     )
+
+
+EXAM_SESSION = "dcd6f767-829d-4a7d-b8c7-d7a722e5de13"
+
+
+def _fact_feature(storage: AsyncStorage):
+    """``save_fact`` over the real privacy wrapper, for an agent with a real turn lifecycle."""
+    governed = PrivacyEnforcingStorage(storage, PrivacyMode.NORMAL)
+    agent = TurnBoundAgent(storage=governed, did=storage.agent_id)
+    feature = MemoryAgencyFeature(agent)
+    feature.storage = governed
+    return feature, agent, governed
+
+
+async def _teach(feature: MemoryAgencyFeature, invocation_id: str, value: str) -> dict:
+    """One ``save_fact`` call on an HTTP turn, as the invoke endpoint binds it."""
+    provenance = request_provenance(
+        actor="owner@example.test",
+        source_kind="http_request",
+        source_locator="POST:/api/agent/invoke",
+    )
+    with invocation_scope(invocation_id, provenance=provenance):
+        result = await feature.save_fact(
+            subject="user", predicate="preferred_deploy_region", value=value
+        )
+    assert result.data["saved"] is True, result
+    return result.data
+
+
+async def _taught_fact_policy(
+    storage: AsyncStorage, saved: dict
+) -> GovernedCorpusPolicy:
+    """A corpus policy every class filter of which accepts a taught fact."""
+    assertion = await storage.get_assertion(saved["assertion_id"])
+    await storage.run_semantic_maintenance(None)
+    capabilities = await storage.semantic_maintenance_capability_versions(None)
+    return GovernedCorpusPolicy(
+        policy_id="exam-holdout",
+        policy_version="1",
+        accepted_epistemic_states=(EpistemicState.REPORTED,),
+        accepted_visibility=(Visibility.PRIVATE,),
+        accepted_privacy_classifications=("normal",),
+        accepted_consent_references=("policy:privacy:normal-v1",),
+        accepted_grounding_classes=("explicit-tool-invocation",),
+        accepted_source_kinds=("http_request",),
+        accepted_ontology_pins=(assertion.ontology_version,),
+        accepted_semantic_capability_versions=tuple(capabilities.items()),
+    )
+
+
+@pytest.mark.asyncio
+async def test_save_fact_during_a_session_is_held_out_by_excluding_that_session(
+    storage: AsyncStorage,
+) -> None:
+    """#3875: a fact taught during the exam session names it, so excluding it holds."""
+    feature, agent, governed = _fact_feature(storage)
+    with live_turn(agent, EXAM_SESSION):
+        saved = await _teach(feature, "exam-turn", "exam-answer-region")
+
+    sources = await governed.list_assertion_revision_sources(saved["revision_id"])
+    assert [source.references for source in sources] == [
+        frozenset({(SourceReferenceKind.SESSION, EXAM_SESSION)})
+    ]
+    # The session segment does not hide the source from the adapter that owns it.
+    assert _is_adapter_source(sources[0])
+
+    policy = await _taught_fact_policy(storage, saved)
+    unexcluded = await _corpus_snapshot(storage, policy)
+    held_out = await _corpus_snapshot(
+        storage, replace(policy, excluded_session_ids=(EXAM_SESSION,))
+    )
+
+    assert [item.assertion.revision_id for item in unexcluded.examples] == [
+        saved["revision_id"]
+    ]
+    assert held_out.examples == ()
+    assert held_out.observability.excluded == {"explicitly_excluded": 1}
+
+
+PADDED_SESSION = " exam-session "
+
+
+@pytest.mark.asyncio
+async def test_save_fact_names_a_padded_session_exactly_as_its_rows_are_filed(
+    storage: AsyncStorage,
+) -> None:
+    """A session key is named as filed, never trimmed.
+
+    HTTP admission and the conversation store keep a caller's session key
+    verbatim, surrounding whitespace included. A source naming a trimmed copy
+    names a session no row is filed under, so excluding the session the rows
+    are filed under would let the fact into the corpus.
+    """
+    feature, agent, governed = _fact_feature(storage)
+    with live_turn(agent, PADDED_SESSION):
+        await governed.add_conversation(
+            "user", "Remember my region.", session_id=PADDED_SESSION
+        )
+        saved = await _teach(feature, "padded-session-turn", "exam-answer-region")
+
+    history = await governed.get_conversation_history(limit=10)
+    assert {entry["metadata"]["session_id"] for entry in history} == {PADDED_SESSION}
+    sources = await governed.list_assertion_revision_sources(saved["revision_id"])
+    assert [source.references for source in sources] == [
+        frozenset({(SourceReferenceKind.SESSION, PADDED_SESSION)})
+    ]
+
+    policy = await _taught_fact_policy(storage, saved)
+    held_out = await _corpus_snapshot(
+        storage, replace(policy, excluded_session_ids=(PADDED_SESSION,))
+    )
+    assert held_out.examples == ()
+    assert held_out.observability.excluded == {"explicitly_excluded": 1}
+
+
+@pytest.mark.asyncio
+async def test_save_fact_names_a_session_only_from_its_own_live_turn(
+    storage: AsyncStorage,
+) -> None:
+    """Off-turn work and a session-less turn name no session.
+
+    The agent-global session belongs to whichever turn is live. A call that is
+    not that turn, such as a scheduled tool, must not borrow it, and a turn
+    without a session has its rows filed under sessions the conversation store
+    derives row by row, so there is no one session to name.
+    """
+    feature, agent, governed = _fact_feature(storage)
+    agent._active_session_id = EXAM_SESSION
+    off_turn = await _teach(feature, "scheduled-call", "us-central1")
+    with live_turn(agent, None):
+        sessionless = await _teach(feature, "sessionless-turn", "europe-west4")
+
+    for saved in (off_turn, sessionless):
+        sources = await governed.list_assertion_revision_sources(saved["revision_id"])
+        assert [source.references for source in sources] == [frozenset()]
+
+
+@pytest.mark.asyncio
+async def test_save_fact_names_the_session_its_turn_rows_are_filed_under(
+    storage: AsyncStorage,
+) -> None:
+    """An older console echoes a session as its marker row id (#2012).
+
+    The conversation store files that turn's rows under the marker's UUID, so
+    the fact's source names the UUID, not the echoed row id.
+    """
+    feature, agent, governed = _fact_feature(storage)
+    await governed.add_conversation(
+        "system", "New conversation", metadata={"new_session": True}
+    )
+    marker_id = await storage.db.fetchval(
+        "SELECT id FROM conversation_history WHERE agent_id = ?", (storage.agent_id,)
+    )
+    echoed = str(marker_id)
+    with live_turn(agent, echoed):
+        await governed.add_conversation("user", "Remember my region.", session_id=echoed)
+        saved = await _teach(feature, "echoed-session-turn", "us-central1")
+
+    history = await governed.get_conversation_history(limit=10)
+    filed = {entry["metadata"]["session_id"] for entry in history}
+    assert len(filed) == 1 and echoed not in filed
+    sources = await governed.list_assertion_revision_sources(saved["revision_id"])
+    assert [source.references for source in sources] == [
+        frozenset({(SourceReferenceKind.SESSION, filed.pop())})
+    ]
+
+
+async def _semantic_row_counts(storage: AsyncStorage) -> dict[str, int]:
+    """How many rows every semantic table holds."""
+    tables = await storage.db.fetchall(
+        "SELECT name FROM sqlite_master WHERE type = 'table' AND name LIKE 'semantic%'"
+    )
+    assert tables
+    return {
+        name: await storage.db.fetchval(f"SELECT COUNT(*) FROM {name}")
+        for (name,) in tables
+    }
+
+
+@pytest.mark.asyncio
+async def test_save_fact_refuses_a_session_it_cannot_name_and_writes_nothing(
+    storage: AsyncStorage,
+) -> None:
+    """A session key a locator cannot carry is refused, not dropped.
+
+    Dropping the session would write a fact whose source names no session, and
+    excluding the session it was taught in would then miss it. The refusal
+    comes before any write, so nothing is left behind.
+    """
+    feature, agent, governed = _fact_feature(storage)
+    before = await _semantic_row_counts(storage)
+
+    with live_turn(agent, "\texam-session\t"):
+        with invocation_scope("control-character-session-turn"):
+            result = await feature.save_fact(
+                subject="user", predicate="preferred_deploy_region", value="exam-region"
+            )
+
+    assert result.status is ToolResultStatus.ERROR
+    assert "control character" in result.error
+    assert await _semantic_row_counts(storage) == before
+
+
+async def _ledger_feature(storage: AsyncStorage, tmp_path):
+    """The strategy ledger over the real privacy wrapper and turn lifecycle."""
+    from kestrel_sovereign.features.strategic_memory.feature import (
+        StrategicMemoryFeature,
+    )
+
+    governed = PrivacyEnforcingStorage(storage, PrivacyMode.NORMAL)
+    agent = TurnBoundAgent(
+        storage=governed, agent_id=storage.agent_id, agent_data_dir=str(tmp_path)
+    )
+    feature = StrategicMemoryFeature(agent)
+    await feature.initialize()
+    return feature, agent, governed
+
+
+async def _ledger_row_references(governed: PrivacyEnforcingStorage) -> dict:
+    """Each projected ledger row's IRI, mapped to the references its source names."""
+    named = {}
+    for held in await governed.query_assertions(AssertionQuery(limit=50)):
+        sources = await governed.list_assertion_revision_sources(held.revision_id)
+        named[held.object.value] = [source.references for source in sources]
+    return named
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("projecting_session", ["later-session", None])
+async def test_a_ledger_row_names_the_session_that_recorded_it_not_the_one_projecting(
+    storage: AsyncStorage, tmp_path, projecting_session
+) -> None:
+    """#3875: a row's session is the session of the turn that wrote it.
+
+    Projection is best-effort. A row whose first projection failed is projected
+    by whichever turn next reindexes, in another session or in none. Naming
+    that turn's session would misattribute the row, or name none, and either
+    way excluding the session the row was recorded in would not hold it out.
+    """
+    feature, agent, governed = await _ledger_feature(storage, tmp_path)
+    store_put = governed.put_assertion
+
+    async def unavailable(*args, **kwargs):
+        raise RuntimeError("assertion store unavailable")
+
+    governed.put_assertion = unavailable
+    with live_turn(agent, EXAM_SESSION):
+        recorded = await feature.strategy_add_pattern(
+            pattern="Learned during the exam", source="exam", implication="hold out"
+        )
+    assert recorded.data["persisted"] is True
+    assert await governed.query_assertions(AssertionQuery(limit=50)) == []
+    exam_row = recorded.data["pattern_id"]
+
+    governed.put_assertion = store_put
+    with live_turn(agent, projecting_session, turn_id="projecting-turn"):
+        later = await feature.strategy_add_pattern(
+            pattern="Learned later", source="later", implication="keep"
+        )
+    later_row = later.data["pattern_id"]
+
+    named = {
+        iri.rsplit(":", 1)[-1]: references
+        for iri, references in (await _ledger_row_references(governed)).items()
+    }
+    later_references = (
+        frozenset({(SourceReferenceKind.SESSION, projecting_session)})
+        if projecting_session is not None
+        else frozenset()
+    )
+    assert named == {
+        exam_row: [frozenset({(SourceReferenceKind.SESSION, EXAM_SESSION)})],
+        later_row: [later_references],
+    }
+
+    by_row = {
+        held.object.value.rsplit(":", 1)[-1]: held
+        for held in await governed.query_assertions(AssertionQuery(limit=50))
+    }
+    exam_assertion = by_row[exam_row]
+    (exam_source,) = await governed.list_assertion_revision_sources(
+        exam_assertion.revision_id
+    )
+    await storage.run_semantic_maintenance(None)
+    capabilities = await storage.semantic_maintenance_capability_versions(None)
+    policy = GovernedCorpusPolicy(
+        policy_id="exam-holdout",
+        policy_version="1",
+        accepted_epistemic_states=(exam_assertion.epistemic_state,),
+        accepted_visibility=(exam_assertion.visibility,),
+        accepted_privacy_classifications=(exam_assertion.privacy_classification,),
+        accepted_consent_references=(exam_assertion.release_policy_reference,),
+        accepted_grounding_classes=(exam_assertion.confidence_basis,),
+        accepted_source_kinds=(exam_source.source_kind,),
+        accepted_ontology_pins=(exam_assertion.ontology_version,),
+        accepted_semantic_capability_versions=tuple(capabilities.items()),
+    )
+
+    unexcluded = await _corpus_snapshot(storage, policy)
+    held_out = await _corpus_snapshot(
+        storage, replace(policy, excluded_session_ids=(EXAM_SESSION,))
+    )
+
+    assert {item.assertion.revision_id for item in unexcluded.examples} == {
+        exam_assertion.revision_id,
+        by_row[later_row].revision_id,
+    }
+    assert [item.assertion.revision_id for item in held_out.examples] == [
+        by_row[later_row].revision_id
+    ]
+    assert held_out.observability.excluded == {"explicitly_excluded": 1}
 
 
 @pytest.mark.asyncio

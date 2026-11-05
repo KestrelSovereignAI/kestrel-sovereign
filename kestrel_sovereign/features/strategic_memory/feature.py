@@ -827,6 +827,26 @@ class StrategicMemoryFeature(Feature):
             logger.info("strategy ledger assertions: %s", data)
         return data
 
+    async def _recording_session_id(self) -> Optional[str]:
+        """The session this turn's conversation rows are filed under, or None.
+
+        Recorded on a row as it is written (#3875), so the row's semantic
+        source names the session it came from even when a later turn, in
+        another session or in none, is the one that projects it. Read through
+        the turn lifecycle, never from tool arguments, and resolved by the
+        privacy wrapper that files the turn's rows. A storage without that
+        resolver also has no assertion producer, so nothing projects the row
+        through it; the turn's key is recorded as given.
+        """
+        session_id = self._turn_session_id()
+        if session_id is None:
+            return None
+        storage = getattr(self.agent, "storage", None)
+        filed_session_id = getattr(storage, "filed_session_id", None)
+        if filed_session_id is None:
+            return session_id
+        return await filed_session_id(session_id)
+
     def _projection_agent_id(self) -> Optional[str]:
         """The identity decisions are indexed under.
 
@@ -1302,6 +1322,7 @@ class StrategicMemoryFeature(Feature):
                 return ToolResult.failed(
                     repo_error, data={"recorded": False, "issue": issue}
                 )
+            session_id = await self._recording_session_id()
             commit = self._ledger.commit(
                 lambda ledger: ledger.add_blocker(
                     issue=issue,
@@ -1310,6 +1331,7 @@ class StrategicMemoryFeature(Feature):
                     owner=owner,
                     notes=notes,
                     repo=resolved_repo,
+                    session_id=session_id,
                 )
             )
             entry = commit.value
@@ -1350,9 +1372,13 @@ class StrategicMemoryFeature(Feature):
                 # ``strategy_view`` would show it as recorded -- a row that
                 # exists nowhere on disk and vanishes on restart.
                 return self._ledger_unreadable_result({"recorded": False})
+            session_id = await self._recording_session_id()
             commit = self._ledger.commit(
                 lambda ledger: ledger.add_pattern(
-                    pattern=pattern, source=source, implication=implication
+                    pattern=pattern,
+                    source=source,
+                    implication=implication,
+                    session_id=session_id,
                 )
             )
             entry = commit.value

@@ -34,6 +34,7 @@ from kestrel_sovereign.knowledge import (
     DirectLineage,
     EpistemicState,
     SourceOccurrence,
+    SourceReferenceKind,
 )
 from kestrel_sovereign.privacy import PrivacyMode
 from kestrel_sovereign.security.assertion_tenant_resolver import (
@@ -44,6 +45,7 @@ from kestrel_sovereign.storage.privacy_wrapper import (
     PrivacyEnforcingStorage,
     PrivacyViolationError,
 )
+from tests.utils.live_turn import TurnBoundAgent, live_turn
 
 
 # --------------------------------------------------------------------------
@@ -1149,6 +1151,150 @@ async def test_adding_a_pattern_through_the_tool_writes_an_assertion(wired):
     assert len(held) == 1
     assert held[0].predicate.value.endswith("strategicPattern")
     assert isinstance(held[0].lineage, DirectLineage)
+
+
+@pytest.mark.asyncio
+async def test_a_row_recorded_during_a_session_names_that_session(governed, tmp_path):
+    """#3875: a corpus can hold out what was recorded in a given session."""
+    from kestrel_sovereign.features.strategic_memory.feature import (
+        StrategicMemoryFeature,
+    )
+
+    storage, _, tenant_id = governed
+    agent = TurnBoundAgent(
+        storage=storage, agent_id=tenant_id, agent_data_dir=str(tmp_path)
+    )
+    feature = StrategicMemoryFeature(agent)
+    await feature.initialize()
+
+    with live_turn(agent, "exam-session"):
+        await feature.strategy_add_pattern(
+            pattern="Recorded during the exam", source="s", implication="i"
+        )
+        blocker = await feature.strategy_add_blocker(
+            issue="#42", title="Blocked during the exam", repo="o/r"
+        )
+    await feature.strategy_add_pattern(
+        pattern="Recorded off any turn", source="s", implication="i"
+    )
+
+    assert blocker.data["blocker"]["session_id"] == "exam-session"
+    named = {}
+    for held in await active(storage):
+        sources = await storage.list_assertion_revision_sources(held.revision_id)
+        assert ledger_assertions.has_adapter_provenance(sources)
+        named[held.object.value] = [source.references for source in sources]
+    assert sorted(named.values()) == [
+        [frozenset()],
+        [frozenset({(SourceReferenceKind.SESSION, "exam-session")})],
+        [frozenset({(SourceReferenceKind.SESSION, "exam-session")})],
+    ]
+
+
+@pytest.mark.asyncio
+async def test_a_row_whose_recorded_session_cannot_be_named_fails_alone(
+    governed, ledger
+):
+    """A session a locator cannot carry is refused, never dropped.
+
+    Writing the row's assertion without its session would escape an exclusion
+    of the session it was recorded in. Only that row fails; the rest of the
+    pass projects, and a later pass refuses it again rather than give up.
+    """
+    storage, _, _ = governed
+    ledger.add_pattern(
+        "Recorded in an unnameable session", "s", "i", session_id="\texam\t"
+    )
+    ledger.add_pattern("Recorded in a nameable session", "s", "i", session_id="exam")
+
+    report = await project(storage, ledger)
+    assert (report.projected, report.failed) == (1, 1)
+    (held,) = await every(storage)
+    sources = await storage.list_assertion_revision_sources(held.revision_id)
+    assert [source.references for source in sources] == [
+        frozenset({(SourceReferenceKind.SESSION, "exam")})
+    ]
+
+    again = await project(storage, ledger)
+    assert (again.unchanged, again.failed) == (1, 1)
+    assert len(await every(storage)) == 1
+
+
+@pytest.mark.asyncio
+async def test_a_recorded_session_survives_the_ledger_file(governed, ledger):
+    """A row's session is read back from the file exactly as it was recorded.
+
+    A digit-only key (an older console's session, #2012) is written quoted, so
+    it reads back as the same string. Hand-written unquoted, YAML reads it as
+    an integer, which still names that key.
+    """
+    storage, _, _ = governed
+    ledger.add_pattern("Recorded in session 1314", "s", "i", session_id="1314")
+    assert ledger.save() is None
+    written = ledger.path.read_text(encoding="utf-8")
+    assert "session_id: '1314'" in written
+    ledger.path.write_text(
+        written.replace(
+            "blockers: []",
+            "- id: pat_handwritten\n"
+            "  pattern: Written by hand\n"
+            "  session_id: 2718\n"
+            "blockers: []",
+        ),
+        encoding="utf-8",
+    )
+    reloaded = StrategyLedger(ledger.path)
+    reloaded.load()
+    assert [row.get("session_id") for row in reloaded.patterns] == ["1314", 2718]
+
+    await project(storage, reloaded)
+    named = []
+    for held in await active(storage):
+        sources = await storage.list_assertion_revision_sources(held.revision_id)
+        named.extend(source.references for source in sources)
+    assert sorted(named, key=sorted) == [
+        frozenset({(SourceReferenceKind.SESSION, "1314")}),
+        frozenset({(SourceReferenceKind.SESSION, "2718")}),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_a_row_names_a_padded_session_exactly_as_its_rows_are_filed(
+    governed, tmp_path
+):
+    """A session key is named as filed, never trimmed.
+
+    The conversation store keeps a caller's session key verbatim, surrounding
+    whitespace included. A source naming a trimmed copy names a session no row
+    is filed under, and excluding the real one would not hold the row out.
+    """
+    from kestrel_sovereign.features.strategic_memory.feature import (
+        StrategicMemoryFeature,
+    )
+
+    storage, _, tenant_id = governed
+    agent = TurnBoundAgent(
+        storage=storage, agent_id=tenant_id, agent_data_dir=str(tmp_path)
+    )
+    feature = StrategicMemoryFeature(agent)
+    await feature.initialize()
+    padded = " exam-session "
+
+    with live_turn(agent, padded):
+        await storage.add_conversation(
+            "user", "Record the exam pattern.", session_id=padded
+        )
+        await feature.strategy_add_pattern(
+            pattern="Recorded during the exam", source="s", implication="i"
+        )
+
+    history = await storage.get_conversation_history(limit=10)
+    assert {entry["metadata"]["session_id"] for entry in history} == {padded}
+    (held,) = await active(storage)
+    sources = await storage.list_assertion_revision_sources(held.revision_id)
+    assert [source.references for source in sources] == [
+        frozenset({(SourceReferenceKind.SESSION, padded)})
+    ]
 
 
 @pytest.mark.asyncio

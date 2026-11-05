@@ -95,11 +95,18 @@ from kestrel_sovereign.knowledge import (
     IRI,
     OntologyRef,
     SourceOccurrence,
+    SourceReferenceKind,
+    with_source_reference,
 )
 from kestrel_sovereign.knowledge.registry import get_knowledge_registry
 from kestrel_sovereign.storage.semantic_binding import SemanticAssertionBinding
 
-from .ledger import BLOCKERS_KEY, LEDGER_FILENAME, PATTERNS_KEY
+from .ledger import (
+    BLOCKERS_KEY,
+    LEDGER_FILENAME,
+    PATTERNS_KEY,
+    recorded_session_id,
+)
 from .ledger_index import BLOCKER_SECTION, PATTERN_SECTION, LedgerSection
 
 #: The closed local-term, identity and provenance grammar owned by this
@@ -342,6 +349,13 @@ class LedgerRowProposal:
     ontology: OntologyRef
     content_digest: str
     assertion_id: str
+    #: The session of the turn that recorded the row, read off the row itself
+    #: (#3875). Never the projecting turn's: projection is best-effort, so a
+    #: row whose first projection failed is projected later by whichever turn
+    #: next reindexes, in another session or in none. ``None`` for a row that
+    #: records no session. Not part of the content digest, so naming a session
+    #: never re-keys a row's revisions.
+    session_id: Optional[str] = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -403,6 +417,7 @@ def map_ledger_row(
             predicate=predicate,
             object=target,
         ),
+        session_id=recorded_session_id(row),
     )
 
 
@@ -530,7 +545,14 @@ def build_source(
     """Build provenance from the trusted turn context, never from row text.
 
     The locator names the canonical file and the row's address, which is a
-    truthful pointer that carries no pattern or blocker prose.
+    truthful pointer that carries no pattern or blocker prose. It names the
+    session the row was recorded in, or none when the row records no session;
+    the projecting turn's own session never enters it.
+
+    Raises :class:`~kestrel_sovereign.knowledge.AssertionValidationError` when
+    the recorded session cannot be named in a locator, rather than dropping
+    it: a source that silently names no session would escape an exclusion of
+    the session the row was recorded in.
     """
     provenance = current_invocation_provenance()
     stem = f"{_LOCATOR_STEM}{proposal.section_key}:{proposal.row_id}"
@@ -547,7 +569,9 @@ def build_source(
     return SourceOccurrence(
         source_occurrence_id=source_occurrence_id(transition),
         source_kind=source_kind,
-        locator=locator,
+        locator=with_source_reference(
+            locator, SourceReferenceKind.SESSION, proposal.session_id
+        ),
         received_at=observed_at,
         content_digest=f"sha256:{proposal.content_digest}",
         actor=actor,

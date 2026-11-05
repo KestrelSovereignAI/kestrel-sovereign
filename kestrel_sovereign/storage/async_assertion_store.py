@@ -33,6 +33,8 @@ from kestrel_sovereign.knowledge import (
     EpistemicState,
     IRI,
     SourceOccurrence,
+    SourceReferenceKind,
+    without_source_references,
 )
 from kestrel_sovereign.knowledge.shacl_validation import (
     ShaclValidationReport,
@@ -522,7 +524,13 @@ def _governed_assertion_replay_binding(
     source: SourceOccurrence,
     adapter_request_digest: str,
 ) -> _GovernedAssertionReplayBinding:
-    """Bind every immutable proposal field while ignoring delivery clocks."""
+    """Bind every immutable proposal field while ignoring delivery context.
+
+    Delivery context is when a retry arrived and which session it was filed
+    under. Neither identifies the operation: a retry may resolve a session
+    the first delivery did not, and an operation recorded before sources
+    named their session (#3875) must still replay idempotently.
+    """
     if not isinstance(assertion, Assertion) or not isinstance(
         source,
         SourceOccurrence,
@@ -541,6 +549,9 @@ def _governed_assertion_replay_binding(
         assertion_mapping.pop(field, None)
     source_mapping = source.to_mapping()
     source_mapping.pop("received_at", None)
+    source_mapping["locator"] = without_source_references(
+        source.locator, SourceReferenceKind.SESSION
+    )
     fingerprint = _operation_digest(
         {
             "namespace": "semantic-explicit-fact-proposal-v1",
