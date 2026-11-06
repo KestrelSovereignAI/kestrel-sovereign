@@ -2217,12 +2217,12 @@
     },
     {
       "existing_code_refs": [
-        "pyproject.toml",
         "tests/frontend/api_client.test.mjs",
         "tests/integration/test_compute_security_integration.py",
         "tests/integration/test_core_only_boot.py",
         "tests/integration/test_identity_export_import.py",
         "tests/integration/test_mcp_permission_boundary.py",
+        "tests/integration/test_mcp_permission_host_restart.py",
         "tests/integration/test_sovereignty_e2e.py",
         "tests/integration/test_storage_backend_parity.py",
         "tests/unit/test_agent_backend_routing_contracts.py",
@@ -2244,8 +2244,7 @@
         "tests/unit/test_security_feature.py",
         "tests/unit/test_sovereignty_export_receipt_contracts.py",
         "tests/unit/test_sse_connection_limits.py",
-        "tests/unit/test_webhooks_feature.py",
-        "uv.lock"
+        "tests/unit/test_webhooks_feature.py"
       ],
       "findings": [
         "missing_code_refs"
