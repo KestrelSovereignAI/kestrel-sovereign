@@ -14,6 +14,8 @@ import pytest
 
 from kestrel_sdk.tools.result import ToolResultStatus
 
+from tests.utils.ledger_storage import without_ledger_row_record
+
 
 # ---------------------------------------------------------------------------
 # save.item_type — synonyms/plurals map onto canonical SavedItemType values
@@ -50,7 +52,9 @@ def _make_strategic():
     from kestrel_sovereign.features.strategic_memory.feature import _SaveOutcome
     from kestrel_sovereign.features.strategic_memory.ledger import StrategyLedger
 
-    feat = StrategicMemoryFeature(agent=MagicMock())
+    agent = MagicMock()
+    without_ledger_row_record(agent.storage)
+    feat = StrategicMemoryFeature(agent=agent)
     feat._data = {}
     feat._strategy_path = Path("/tmp/kestrel-test/STRATEGY.yaml")
     feat._save = MagicMock(return_value=_SaveOutcome(persisted=True))

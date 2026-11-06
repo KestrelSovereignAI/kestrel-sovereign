@@ -2213,6 +2213,29 @@ class AsyncStorage:
         )
         return service.capability_versions()
 
+    async def _require_ledger_row_provenance(self) -> None:
+        """Refuse a corpus while a strategy-ledger row's session is unverified (#3990).
+
+        The last strategy-ledger projection records each row it did not write
+        because the agent's database does not vouch for its session: the
+        row's ``session_id`` in ``STRATEGY_LEDGER.yaml``, which the agent can
+        edit, disagrees with the record, or the row has none. Such a row is
+        never written, but a corpus built meanwhile would be built as though
+        the row's provenance were settled. Nothing is built until a later
+        projection verifies the row or finds it gone.
+        """
+        from kestrel_sovereign.knowledge.corpus import GovernedCorpusUnavailable
+        from kestrel_sovereign.storage.ledger_row_sessions import (
+            unresolved_row_refusals,
+        )
+
+        if not self._initialized:
+            await self.initialize()
+        if await unresolved_row_refusals(self.db, agent_id=self.agent_id):
+            raise GovernedCorpusUnavailable(
+                "strategy_ledger_row_provenance_unverified"
+            )
+
     async def governed_assertion_corpus_snapshot(
         self,
         *,
@@ -2240,6 +2263,7 @@ class AsyncStorage:
             GovernedCorpusLimits,
         )
 
+        await self._require_ledger_row_provenance()
         snapshot = await GovernedAssertionCorpusService(self).snapshot(
             policy=policy,
             inference_profile=inference_profile,
@@ -2292,6 +2316,7 @@ class AsyncStorage:
             GovernedCorpusLimits,
         )
 
+        await self._require_ledger_row_provenance()
         delta = await GovernedAssertionCorpusService(self).changes_since(
             snapshot,
             policy=policy,

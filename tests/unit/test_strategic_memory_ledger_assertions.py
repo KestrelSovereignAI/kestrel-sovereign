@@ -22,9 +22,14 @@ from dataclasses import replace
 from pathlib import Path
 
 import pytest
+from kestrel_sdk.tools.result import ToolResultStatus
 
 from kestrel_sovereign.features.strategic_memory import ledger_assertions
-from kestrel_sovereign.features.strategic_memory.ledger import StrategyLedger
+from kestrel_sovereign.features.strategic_memory.ledger import (
+    BLOCKERS_KEY,
+    PATTERNS_KEY,
+    StrategyLedger,
+)
 from kestrel_sovereign.identity.runtime_identity import load_agent_identity
 from kestrel_sovereign.inception_service import create_kestrel_identity
 from kestrel_sovereign.knowledge import (
@@ -119,6 +124,27 @@ async def every(storage) -> list[Assertion]:
             statuses=ledger_assertions.statuses_for_current_read(), limit=500
         )
     )
+
+
+async def record_sessions(storage, *rows, section_key=PATTERNS_KEY):
+    """Reserve each row's address and session as the strategy-ledger tool does (#3990).
+
+    Projection names a row's session only when the agent's database recorded
+    the one its ``session_id`` field names, and refuses a row it holds no
+    record of, so a test that writes a row straight into the ledger after the
+    first projection records it as the tool would have.
+    """
+    for row in rows:
+        await storage.reserve_strategy_ledger_row(
+            section_key=section_key,
+            session_id=row.get("session_id"),
+            mint=lambda recorded, row_id=row["id"]: row_id,
+        )
+
+
+def inventoried(ledger_data):
+    """The records a first projection makes for rows already in ``ledger_data``."""
+    return {key: None for key in ledger_assertions.inventory_rows(ledger_data)}
 
 
 def seed(book: StrategyLedger):
@@ -240,6 +266,7 @@ async def test_initial_projection_writes_both_row_types(governed, ledger):
         "blocked_terminal": 0,
         "unmappable": 0,
         "failed": 0,
+        "provenance_refused": 0,
     }
     held = await active(storage)
     assert len(held) == 2
@@ -842,7 +869,9 @@ def test_marker_fields_alone_do_not_prove_ownership(tenant_identity, ledger):
     """The unit-level statement of the same rule."""
     tenant_id, _ = tenant_identity
     seed(ledger)
-    plan = ledger_assertions.build_proposal_plan(ledger.data, tenant_id=tenant_id)
+    plan = ledger_assertions.build_proposal_plan(
+        ledger.data, tenant_id=tenant_id, recorded_sessions=inventoried(ledger.data)
+    )
     proposal = plan.proposals[0]
     foreign = SourceOccurrence(
         source_occurrence_id="source:some-other-producer:3",
@@ -1202,10 +1231,13 @@ async def test_a_row_whose_recorded_session_cannot_be_named_fails_alone(
     pass projects, and a later pass refuses it again rather than give up.
     """
     storage, _, _ = governed
-    ledger.add_pattern(
+    unnameable = ledger.add_pattern(
         "Recorded in an unnameable session", "s", "i", session_id="\texam\t"
     )
-    ledger.add_pattern("Recorded in a nameable session", "s", "i", session_id="exam")
+    nameable = ledger.add_pattern(
+        "Recorded in a nameable session", "s", "i", session_id="exam"
+    )
+    await record_sessions(storage, unnameable, nameable)
 
     report = await project(storage, ledger)
     assert (report.projected, report.failed) == (1, 1)
@@ -1226,10 +1258,18 @@ async def test_a_recorded_session_survives_the_ledger_file(governed, ledger):
 
     A digit-only key (an older console's session, #2012) is written quoted, so
     it reads back as the same string. Hand-written unquoted, YAML reads it as
-    an integer, which still names that key.
+    an integer, which still names that key, so it agrees with the string the
+    agent's database recorded.
     """
     storage, _, _ = governed
-    ledger.add_pattern("Recorded in session 1314", "s", "i", session_id="1314")
+    recorded = ledger.add_pattern(
+        "Recorded in session 1314", "s", "i", session_id="1314"
+    )
+    await record_sessions(
+        storage,
+        recorded,
+        {"id": "pat_handwritten", "session_id": "2718"},
+    )
     assert ledger.save() is None
     written = ledger.path.read_text(encoding="utf-8")
     assert "session_id: '1314'" in written
@@ -1294,6 +1334,555 @@ async def test_a_row_names_a_padded_session_exactly_as_its_rows_are_filed(
     sources = await storage.list_assertion_revision_sources(held.revision_id)
     assert [source.references for source in sources] == [
         frozenset({(SourceReferenceKind.SESSION, padded)})
+    ]
+
+
+# --------------------------------------------------------------------------
+# #3990: a row's session comes from the agent's database, not from its file.
+# --------------------------------------------------------------------------
+
+
+def _row(session_id=None, row_id="pat_row"):
+    row = {"id": row_id, "pattern": "p"}
+    if session_id is not None:
+        row["session_id"] = session_id
+    return row
+
+
+_REFUSED = object()
+
+
+@pytest.mark.parametrize(
+    ("row", "recorded", "named"),
+    [
+        pytest.param(_row("exam"), {"exam"}, "exam", id="agree"),
+        pytest.param(_row(), {None}, None, id="agree-on-none"),
+        pytest.param(_row(2718), {"2718"}, "2718", id="agree-unquoted-digits"),
+        pytest.param(_row("edited"), {"exam"}, _REFUSED, id="file-edited"),
+        pytest.param(_row(), {"exam"}, _REFUSED, id="file-session-removed"),
+        pytest.param(_row("added"), {None}, _REFUSED, id="file-session-added"),
+        pytest.param(_row("exam"), set(), _REFUSED, id="no-record-for-a-session"),
+        pytest.param(_row(), set(), _REFUSED, id="no-record-and-no-session"),
+    ],
+)
+def test_a_row_session_is_named_only_when_the_database_agrees(row, recorded, named):
+    """Each way a row's file and the agent's database can relate.
+
+    The file is a hint the agent can edit, so it never decides a session on
+    its own. A row recorded before #3875 has a record naming none, made when
+    the record began; a row with no record at all, whatever its file says,
+    was not written by the tool and is refused. The refusal is content-free:
+    it names no session.
+    """
+    records = {(PATTERNS_KEY, row["id"]): value for value in recorded}
+    session_id, refusal = ledger_assertions.verified_row_session(
+        PATTERNS_KEY, row["id"], row, records
+    )
+    if named is _REFUSED:
+        assert refusal is not None
+        assert "record" in refusal and "exam" not in refusal
+    else:
+        assert (session_id, refusal) == (named, None)
+
+
+def test_a_record_for_another_section_or_row_vouches_for_nothing():
+    """A record names one row at one address, in one section."""
+    row = _row("exam")
+    for key in ((BLOCKERS_KEY, "pat_row"), (PATTERNS_KEY, "pat_other")):
+        _, refusal = ledger_assertions.verified_row_session(
+            PATTERNS_KEY, "pat_row", row, {key: "exam"}
+        )
+        assert refusal is not None
+
+
+@pytest.mark.asyncio
+async def test_a_row_naming_a_session_the_database_never_recorded_is_refused(
+    governed, ledger
+):
+    """A row recorded after #3875 whose record is missing is never projected.
+
+    Writing it under the session its file names would trust a field the agent
+    can edit, and writing it under none would escape an exclusion of that
+    session. It is not taken for a row from before sessions were named either:
+    the first projection records only the rows whose file names no session.
+    The rest of the pass projects, and the row projects once the agent's
+    database vouches for its session.
+    """
+    storage, raw, tenant_id = governed
+    unvouched = ledger.add_pattern("Names an unrecorded session", "s", "i", "exam")
+    ledger.add_pattern("Recorded before sessions were named", "s", "i")
+
+    report = await project(storage, ledger)
+    assert (report.projected, report.provenance_refused, report.failed) == (1, 1, 0)
+    assert report.needs_attention
+    (held,) = await active(storage)
+    assert not held.object.value.endswith(unvouched["id"])
+    assert await _refused_rows(raw, tenant_id) == [(PATTERNS_KEY, unvouched["id"])]
+
+    await record_sessions(storage, unvouched)
+    again = await project(storage, ledger)
+    assert (again.projected, again.unchanged, again.provenance_refused) == (1, 1, 0)
+    assert await _refused_rows(raw, tenant_id) == []
+    named = {}
+    for held in await active(storage):
+        sources = await storage.list_assertion_revision_sources(held.revision_id)
+        named[held.object.value.rsplit(":", 1)[-1]] = [
+            source.references for source in sources
+        ]
+    assert named[unvouched["id"]] == [
+        frozenset({(SourceReferenceKind.SESSION, "exam")})
+    ]
+
+
+@pytest.mark.asyncio
+async def test_a_row_written_into_the_file_after_the_record_began_is_refused(
+    governed, ledger
+):
+    """Only the tool, or the first look at the ledger, gives a row a record.
+
+    A row written into the file by hand once the agent's database has seen the
+    ledger names no session, exactly as a row recorded before #3875 does, but
+    nothing the agent cannot write says it is one: it is refused, and the
+    refusal is resolved once the row is gone again.
+    """
+    storage, raw, tenant_id = governed
+    ledger.add_pattern("Recorded before sessions were named", "s", "i")
+    first = await project(storage, ledger)
+    assert (first.projected, first.provenance_refused) == (1, 0)
+
+    handwritten = ledger.add_pattern("Written in by hand later", "s", "i")
+    report = await project(storage, ledger)
+    assert (report.unchanged, report.provenance_refused) == (1, 1)
+    assert len(await active(storage)) == 1
+    assert await _refused_rows(raw, tenant_id) == [
+        (PATTERNS_KEY, handwritten["id"])
+    ]
+
+    ledger.data[PATTERNS_KEY].remove(handwritten)
+    resolved = await project(storage, ledger)
+    assert (resolved.unchanged, resolved.provenance_refused) == (1, 0)
+    assert await _refused_rows(raw, tenant_id) == []
+
+
+@pytest.mark.asyncio
+async def test_the_rows_present_when_the_record_began_are_recorded_once(
+    governed, ledger
+):
+    """The inventory records rows from before, as written in no session, once.
+
+    A row whose file already names a session is left out: it was recorded
+    after #3875, and only the tool can vouch for its session. A row added
+    after the inventory is not recorded by a later one.
+    """
+    storage, raw, tenant_id = governed
+    before = ledger.add_pattern("Recorded before sessions were named", "s", "i")
+    blocker = ledger.add_blocker("#9", "Recorded before too", "high", "me")
+    retired = ledger.add_pattern("Retired before sessions were named", "s", "i")
+    ledger.supersede_pattern(retired, reason="old")
+    named = ledger.add_pattern("Names a session already", "s", "i", "exam")
+    assert ledger.save() is None
+
+    assert await storage.take_strategy_ledger_row_inventory(
+        ledger.persisted_snapshot
+    )
+    expected = sorted(
+        [
+            (BLOCKERS_KEY, blocker["id"], None, "inventory"),
+            (PATTERNS_KEY, before["id"], None, "inventory"),
+            (PATTERNS_KEY, retired["id"], None, "inventory"),
+        ]
+    )
+    assert await _recorded_rows(raw, tenant_id, attempts=True) == expected
+    assert (PATTERNS_KEY, named["id"]) not in {
+        row[:2] for row in await _recorded_rows(raw, tenant_id)
+    }
+
+    ledger.add_pattern("Written in by hand later", "s", "i")
+    assert ledger.save() is None
+    assert await storage.take_strategy_ledger_row_inventory(
+        ledger.persisted_snapshot
+    )
+    assert await _recorded_rows(raw, tenant_id, attempts=True) == expected
+
+
+@pytest.mark.asyncio
+async def test_no_inventory_is_taken_from_a_ledger_that_was_never_read(
+    governed, tmp_path
+):
+    """A missing or unconfirmed file says nothing about which rows came before."""
+    storage, raw, tenant_id = governed
+    absent = StrategyLedger(tmp_path / "absent" / "STRATEGY_LEDGER.yaml")
+    absent.load()
+    assert not await storage.take_strategy_ledger_row_inventory(
+        absent.persisted_snapshot
+    )
+    assert not await storage.take_strategy_ledger_row_inventory(None)
+
+    report = await storage.project_strategy_ledger_assertions(
+        absent.persisted_snapshot
+    )
+    assert report.skipped_reason == "ledger_absent"
+    assert await raw.db.fetchall(
+        "SELECT agent_id FROM strategy_ledger_row_inventories"
+    ) == []
+
+
+@pytest.mark.asyncio
+async def test_the_inventory_is_taken_while_semantic_writes_are_denied(
+    governed, tmp_path
+):
+    """A row hand-written while nothing projects is not taken for an older one.
+
+    Projection takes the inventory too, but only while semantic writes are
+    allowed. The feature takes it at load in every privacy mode, so a row
+    written into the file by hand in the meantime is refused once projection
+    resumes.
+    """
+    from kestrel_sovereign.features.strategic_memory.feature import (
+        StrategicMemoryFeature,
+    )
+
+    normal, raw, tenant_id = governed
+    book = StrategyLedger(tmp_path / "STRATEGY_LEDGER.yaml")
+    book.load()
+    before = book.add_pattern("Recorded before sessions were named", "s", "i")
+    assert book.save() is None
+
+    denied = PrivacyEnforcingStorage(raw, PrivacyMode.EPHEMERAL)
+    agent = TurnBoundAgent(
+        storage=denied, agent_id=tenant_id, agent_data_dir=str(tmp_path)
+    )
+    feature = StrategicMemoryFeature(agent)
+    await feature.initialize()
+    assert await _recorded_rows(raw, tenant_id) == [
+        (PATTERNS_KEY, before["id"], None)
+    ]
+    assert await every(normal) == []
+
+    handwritten = book.add_pattern("Written in by hand meanwhile", "s", "i")
+    assert book.save() is None
+    report = await normal.project_strategy_ledger_assertions(book.persisted_snapshot)
+    assert (report.projected, report.provenance_refused) == (1, 1)
+    (held,) = await active(normal)
+    assert held.object.value.endswith(before["id"])
+    assert await _refused_rows(raw, tenant_id) == [
+        (PATTERNS_KEY, handwritten["id"])
+    ]
+
+
+@pytest.mark.asyncio
+async def test_an_unreadable_session_record_projects_nothing(
+    governed, ledger, monkeypatch
+):
+    """Without the agent's database record no row's session can be verified."""
+    from kestrel_sovereign.storage import ledger_row_sessions
+
+    storage, _, _ = governed
+    seed(ledger)
+
+    async def unreadable(*args, **kwargs):
+        raise RuntimeError("database unavailable")
+
+    monkeypatch.setattr(ledger_row_sessions, "recorded_row_sessions", unreadable)
+    report = await project(storage, ledger)
+
+    assert report.skipped_reason == "row_sessions_read_failed"
+    assert report.projected == 0
+    assert await every(storage) == []
+
+
+@pytest.mark.asyncio
+async def test_an_inventory_that_cannot_be_taken_projects_nothing(
+    governed, ledger, monkeypatch
+):
+    """Until the rows from before are recorded, no row can be told from a new one."""
+    from kestrel_sovereign.storage import ledger_row_sessions
+
+    storage, raw, tenant_id = governed
+    seed(ledger)
+
+    async def unwritable(*args, **kwargs):
+        raise RuntimeError("database unavailable")
+
+    monkeypatch.setattr(ledger_row_sessions, "take_row_inventory", unwritable)
+    report = await project(storage, ledger)
+
+    assert report.skipped_reason == "row_inventory_unavailable"
+    assert await every(storage) == []
+    assert await _recorded_rows(raw, tenant_id) == []
+
+
+async def _session_feature(governed, tmp_path):
+    from kestrel_sovereign.features.strategic_memory.feature import (
+        StrategicMemoryFeature,
+    )
+
+    storage, raw, tenant_id = governed
+    agent = TurnBoundAgent(
+        storage=storage, agent_id=tenant_id, agent_data_dir=str(tmp_path)
+    )
+    feature = StrategicMemoryFeature(agent)
+    await feature.initialize()
+    return feature, agent, storage, raw, tenant_id
+
+
+async def _recorded_rows(raw, tenant_id, *, attempts=False):
+    columns = "section, row_id, session_id" + (", attempt_id" if attempts else "")
+    return await raw.db.fetchall(
+        f"SELECT {columns} FROM strategy_ledger_row_sessions "
+        "WHERE agent_id = ? ORDER BY section, row_id",
+        (tenant_id,),
+    )
+
+
+async def _refused_rows(raw, tenant_id):
+    return await raw.db.fetchall(
+        "SELECT section, row_id FROM strategy_ledger_row_refusals "
+        "WHERE agent_id = ? ORDER BY section, row_id",
+        (tenant_id,),
+    )
+
+
+@pytest.mark.asyncio
+async def test_the_tool_records_each_row_session_where_the_agent_cannot_write(
+    governed, tmp_path
+):
+    """Every row the tool writes has its session in the agent's database."""
+    feature, agent, storage, raw, tenant_id = await _session_feature(
+        governed, tmp_path
+    )
+    with live_turn(agent, "exam-session"):
+        pattern = await feature.strategy_add_pattern(
+            pattern="Recorded during the exam", source="s", implication="i"
+        )
+        blocker = await feature.strategy_add_blocker(
+            issue="#42", title="Blocked during the exam", repo="o/r"
+        )
+    sessionless = await feature.strategy_add_pattern(
+        pattern="Recorded off any turn", source="s", implication="i"
+    )
+
+    assert sorted(await _recorded_rows(raw, tenant_id)) == sorted(
+        [
+            (BLOCKERS_KEY, blocker.data["blocker_id"], "exam-session"),
+            (PATTERNS_KEY, pattern.data["pattern_id"], "exam-session"),
+            (PATTERNS_KEY, sessionless.data["pattern_id"], None),
+        ]
+    )
+    assert len(await active(storage)) == 3
+    assert await _refused_rows(raw, tenant_id) == []
+
+
+@pytest.mark.asyncio
+async def test_a_row_that_cannot_be_reserved_is_not_written(
+    governed, tmp_path, monkeypatch
+):
+    """Nothing is written when nothing the agent cannot edit would vouch for it.
+
+    A row with no record is never projected, so a row written without one
+    would sit in the file unverifiable. That holds for a row recorded in no
+    session as much as for one recorded in a session.
+    """
+    feature, agent, storage, raw, tenant_id = await _session_feature(
+        governed, tmp_path
+    )
+
+    async def unwritable(**kwargs):
+        raise RuntimeError("database unavailable")
+
+    monkeypatch.setattr(storage, "reserve_strategy_ledger_row", unwritable)
+    assert not feature._ledger.path.exists()
+    with live_turn(agent, "exam-session"):
+        refused = await feature.strategy_add_pattern(
+            pattern="Recorded during the exam", source="s", implication="i"
+        )
+        refused_blocker = await feature.strategy_add_blocker(
+            issue="#42", title="Blocked during the exam", repo="o/r"
+        )
+    refused_sessionless = await feature.strategy_add_pattern(
+        pattern="Recorded off any turn", source="s", implication="i"
+    )
+
+    for result in (refused, refused_blocker, refused_sessionless):
+        assert result.status is ToolResultStatus.ERROR
+        assert "could not reserve this row" in result.error
+        assert result.data == {"recorded": False, "persisted": False}
+    assert not feature._ledger.path.exists()
+    assert feature._ledger.patterns == [] and feature._ledger.blockers == []
+    assert await _recorded_rows(raw, tenant_id) == []
+
+
+def _write_ledger(path, *rows):
+    import yaml
+
+    path.write_text(
+        yaml.safe_dump({"version": 1, PATTERNS_KEY: list(rows)}), encoding="utf-8"
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_row_moved_by_an_edited_file_is_reserved_before_it_is_written(
+    governed, tmp_path
+):
+    """The address a row is written under is reserved before the write (#3990).
+
+    A file edited since it was read is re-read, and an edit can have put a row
+    at the address reserved for this one (#3636). Nothing is written under the
+    taken address: its reservation is released and the next is reserved, so
+    the row reaches the file only under an address whose session is recorded.
+    The row the edit put there is one the record had not seen before, so the
+    inventory taken when the ledger is next projected records it.
+    """
+    feature, agent, storage, raw, tenant_id = await _session_feature(
+        governed, tmp_path
+    )
+    text = "Both of us noticed this"
+    planned = feature._ledger.next_pattern_id(text)
+    _write_ledger(feature._ledger.path, {"id": planned, "pattern": text})
+
+    with live_turn(agent, "exam-session"):
+        result = await feature.strategy_add_pattern(pattern=text)
+
+    written = result.data["pattern_id"]
+    assert result.status is ToolResultStatus.OK
+    assert written == f"{planned}-2"
+    recorded = await _recorded_rows(raw, tenant_id, attempts=True)
+    assert [row[:3] for row in recorded] == [
+        (PATTERNS_KEY, planned, None),
+        (PATTERNS_KEY, written, "exam-session"),
+    ]
+    # The tool's reservation of the taken address was released; the record
+    # there is the inventory's.
+    assert recorded[0][3] == "inventory"
+    named = {}
+    for held in await active(storage):
+        sources = await storage.list_assertion_revision_sources(held.revision_id)
+        named[held.object.value.rsplit(":", 1)[-1]] = [
+            source.references for source in sources
+        ]
+    assert named == {
+        planned: [frozenset()],
+        written: [frozenset({(SourceReferenceKind.SESSION, "exam-session")})],
+    }
+
+
+@pytest.mark.asyncio
+async def test_a_moved_row_whose_reservation_fails_is_never_written(
+    governed, tmp_path
+):
+    """A reservation that fails after an edit moved the row leaves no row behind.
+
+    The row is written only under an address reserved for it, so when the
+    reservation for its new address is refused the file keeps the edit alone,
+    and no record is left at the address the edit took.
+    """
+    feature, agent, storage, raw, tenant_id = await _session_feature(
+        governed, tmp_path
+    )
+    text = "Exam material"
+    planned = feature._ledger.next_pattern_id(text)
+    _write_ledger(
+        feature._ledger.path, {"id": planned, "pattern": "A concurrent row"}
+    )
+    await raw.db.execute(
+        "CREATE TRIGGER refuse_moved_reservation BEFORE INSERT ON "
+        "strategy_ledger_row_sessions "
+        f"WHEN NEW.row_id = '{planned}-2' "
+        "BEGIN SELECT RAISE(ABORT, 'session recorder unavailable'); END"
+    )
+
+    with live_turn(agent, "exam-session"):
+        result = await feature.strategy_add_pattern(pattern=text)
+
+    assert result.status is ToolResultStatus.ERROR
+    assert result.data == {"recorded": False, "persisted": False}
+    assert [row["id"] for row in _file_patterns(feature._ledger.path)] == [planned]
+    assert await _recorded_rows(raw, tenant_id) == []
+
+
+def _file_patterns(path):
+    book = StrategyLedger(path)
+    book.load()
+    return book.patterns
+
+
+@pytest.mark.asyncio
+async def test_a_stale_writer_never_replaces_or_removes_another_writers_record(
+    governed, tmp_path
+):
+    """Two ledgers over one file cannot take each other's addresses (#3990).
+
+    The second was read before the first wrote, so its copy lacks the first
+    writer's row. It reserves an address no record holds, rather than the one
+    its copy shows free, so the first row's session is never replaced, and
+    nothing it releases is the first writer's.
+    """
+    first, first_agent, storage, raw, tenant_id = await _session_feature(
+        governed, tmp_path
+    )
+    second, second_agent, _, _, _ = await _session_feature(governed, tmp_path)
+
+    with live_turn(first_agent, "exam-session"):
+        original = await first.strategy_add_pattern(pattern="Same material")
+    before = await _recorded_rows(raw, tenant_id, attempts=True)
+    with live_turn(second_agent, "later-session"):
+        later = await second.strategy_add_pattern(pattern="Same material")
+
+    original_id = original.data["pattern_id"]
+    assert later.data["pattern_id"] == f"{original_id}-2"
+    assert later.data["reloaded_from_disk"] is True
+    after = await _recorded_rows(raw, tenant_id, attempts=True)
+    assert before[0] in after
+    assert [row[:3] for row in after] == [
+        (PATTERNS_KEY, original_id, "exam-session"),
+        (PATTERNS_KEY, f"{original_id}-2", "later-session"),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_a_reservation_is_released_only_by_the_attempt_that_made_it(
+    governed, monkeypatch
+):
+    """A reservation never replaces a record, and is released only by its own attempt."""
+    from dataclasses import replace as replaced
+
+    from kestrel_sovereign.storage import ledger_row_sessions
+
+    storage, raw, tenant_id = governed
+    first = await storage.reserve_strategy_ledger_row(
+        section_key=PATTERNS_KEY, session_id="exam", mint=lambda recorded: "pat_a"
+    )
+    with pytest.raises(ValueError):
+        await storage.reserve_strategy_ledger_row(
+            section_key=PATTERNS_KEY,
+            session_id="other",
+            mint=lambda recorded: "pat_a",
+        )
+    # A writer that reads ``pat_a`` as free just before it is reserved is
+    # given the next address it names, never ``pat_a``.
+    raced = iter(["pat_a", "pat_b"])
+
+    async def fetch_none(*args, **kwargs):
+        return frozenset()
+
+    with monkeypatch.context() as patched:
+        patched.setattr(ledger_row_sessions, "recorded_row_ids", fetch_none)
+        second = await storage.reserve_strategy_ledger_row(
+            section_key=PATTERNS_KEY,
+            session_id="other",
+            mint=lambda recorded: next(raced),
+        )
+    assert second.row_id == "pat_b"
+
+    stranger = replaced(first, attempt_id="another-attempt")
+    assert not await storage.release_strategy_ledger_row(stranger)
+    assert await _recorded_rows(raw, tenant_id) == [
+        (PATTERNS_KEY, "pat_a", "exam"),
+        (PATTERNS_KEY, "pat_b", "other"),
+    ]
+    assert await storage.release_strategy_ledger_row(first)
+    assert await _recorded_rows(raw, tenant_id) == [
+        (PATTERNS_KEY, "pat_b", "other")
     ]
 
 

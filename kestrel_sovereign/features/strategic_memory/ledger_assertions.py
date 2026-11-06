@@ -85,6 +85,7 @@ import re
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from decimal import Decimal
+from types import MappingProxyType
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 from kestrel_sovereign.agent.invocation import current_invocation_provenance
@@ -106,6 +107,7 @@ from .ledger import (
     LEDGER_FILENAME,
     PATTERNS_KEY,
     recorded_session_id,
+    session_key,
 )
 from .ledger_index import BLOCKER_SECTION, PATTERN_SECTION, LedgerSection
 
@@ -187,6 +189,19 @@ READ_PAGE_SIZE = 200
 
 class LedgerAssertionMappingError(ValueError):
     """A ledger row cannot be represented by this bounded adapter."""
+
+
+class LedgerRowProvenanceError(LedgerAssertionMappingError):
+    """A row's session cannot be verified against the agent's database (#3990)."""
+
+
+#: ``(section key, row id)`` -> the session the agent's database recorded the
+#: row in, ``None`` for a row recorded in no session. A row absent from the
+#: mapping has no record there. Read from host-owned storage, never from the
+#: ledger file.
+RecordedRowSessions = Mapping[Tuple[str, str], Optional[str]]
+
+_NO_RECORDED_SESSIONS: RecordedRowSessions = MappingProxyType({})
 
 
 def sections() -> Tuple[LedgerSection, ...]:
@@ -349,13 +364,16 @@ class LedgerRowProposal:
     ontology: OntologyRef
     content_digest: str
     assertion_id: str
-    #: The session of the turn that recorded the row, read off the row itself
-    #: (#3875). Never the projecting turn's: projection is best-effort, so a
-    #: row whose first projection failed is projected later by whichever turn
-    #: next reindexes, in another session or in none. ``None`` for a row that
-    #: records no session. Not part of the content digest, so naming a session
-    #: never re-keys a row's revisions.
+    #: The session of the turn that recorded the row (#3875), as
+    #: :func:`verified_row_session` settles it. Never the projecting turn's:
+    #: projection is best-effort, so a row whose first projection failed is
+    #: projected later by whichever turn next reindexes, in another session or
+    #: in none. ``None`` for a row that records no session. Not part of the
+    #: content digest, so naming a session never re-keys a row's revisions.
     session_id: Optional[str] = None
+    #: Why the row's session cannot be verified, or ``None`` when it can. A row
+    #: carrying one is never written: :func:`build_source` refuses it.
+    provenance_refusal: Optional[str] = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -389,20 +407,99 @@ class LedgerProposalPlan:
     skipped: int = 0
 
 
+def verified_row_session(
+    section_key: str,
+    row_id: str,
+    row: Mapping[str, Any],
+    recorded_sessions: RecordedRowSessions,
+) -> Tuple[Optional[str], Optional[str]]:
+    """The session a row's source names, and why it cannot name one (#3990).
+
+    Returns ``(session_id, refusal)``. The session comes from the agent's
+    database, which only host code writes, and never from the ledger file
+    alone: the file is in the agent's own data directory, so its
+    ``session_id`` field is a hint the agent can rewrite or delete, and its
+    ``id`` an address the agent can change. Every row the host knows of has a
+    record: the strategy-ledger tool reserves one before it writes a row, and
+    the rows already in the file when the record began were recorded as
+    written in no session (see :func:`inventory_rows`). So:
+
+    * The record and the field agree: the row names that session, or none.
+      Every row recorded before #3875 names none this way.
+    * They disagree, the field edited or removed: refused.
+    * No record: refused, whatever the field says. The row was written into
+      the file by something other than the tool after the record began, or
+      its id was changed; nothing the agent cannot write says where it came
+      from, so no unfamiliar id can make a row pass as one recorded before
+      sessions were named.
+
+    A refused row is never written under some session or under none: either
+    could let it escape an exclusion of the session it was recorded in.
+    """
+    hint = recorded_session_id(row)
+    key = (section_key, row_id)
+    if key not in recorded_sessions:
+        return None, (
+            "the agent's database holds no record of this row: it was not "
+            "written by the strategy-ledger tools, nor in the ledger when the "
+            "record began"
+        )
+    recorded = session_key(recorded_sessions[key])
+    if recorded != hint:
+        return recorded, (
+            "the ledger file names a different session for this row than the "
+            "agent's database recorded"
+        )
+    return recorded, None
+
+
+def inventory_rows(
+    ledger_data: Optional[Mapping[str, Any]],
+) -> List[Tuple[str, str]]:
+    """The rows of a ledger taken as recorded before sessions were named (#3990).
+
+    ``(section key, row id)`` of every row, active or retired, whose file names
+    no session. Recorded once, when the agent's database first sees the
+    ledger, so that :func:`verified_row_session` can tell those rows from rows
+    that appear later. A row whose file names a session is left out: it was
+    recorded after #3875, and only a record the tool made can vouch for it. A
+    row with no id has no address to record.
+    """
+    data = dict(ledger_data or {})
+    rows: List[Tuple[str, str]] = []
+    for section in _SECTIONS:
+        for row in section.rows(data):
+            if not str(row.get("id") or "").strip():
+                continue
+            if recorded_session_id(row) is not None:
+                continue
+            rows.append((section.ledger_key, section.row_id(row)))
+    return rows
+
+
 def map_ledger_row(
     section: LedgerSection,
     row: Mapping[str, Any],
     *,
     tenant_id: str,
     ontology_ref: OntologyRef,
+    recorded_sessions: RecordedRowSessions = _NO_RECORDED_SESSIONS,
 ) -> LedgerRowProposal:
-    """Map one active, projectable ledger row to closed canonical terms."""
+    """Map one active, projectable ledger row to closed canonical terms.
+
+    ``recorded_sessions`` is what the agent's database recorded for each row
+    (see :func:`verified_row_session`). Without it no row has a record, so
+    every row is refused.
+    """
     from kestrel_sovereign.knowledge.assertion import derive_assertion_id
 
     row_id = section.row_id(row)
     subject = ledger_subject(tenant_id)
     predicate = IRI(f"{ontology_ref.namespace}{section_term(section)}")
     target = ledger_row_object(tenant_id, row_id)
+    session_id, provenance_refusal = verified_row_session(
+        section.ledger_key, row_id, row, recorded_sessions
+    )
     return LedgerRowProposal(
         section_key=section.ledger_key,
         row_id=row_id,
@@ -417,7 +514,8 @@ def map_ledger_row(
             predicate=predicate,
             object=target,
         ),
-        session_id=recorded_session_id(row),
+        session_id=session_id,
+        provenance_refusal=provenance_refusal,
     )
 
 
@@ -426,8 +524,13 @@ def build_proposal_plan(
     *,
     tenant_id: str,
     ontology_ref: Optional[OntologyRef] = None,
+    recorded_sessions: RecordedRowSessions = _NO_RECORDED_SESSIONS,
 ) -> LedgerProposalPlan:
     """Read the canonical ledger into proposals, refusing ambiguous sections.
+
+    ``recorded_sessions`` is the agent's database record of each row's session
+    (#3990), which every proposal is verified against; see
+    :func:`verified_row_session`.
 
     Row ids are addresses, and ``StrategyLedger.normalize`` only disambiguates
     the ones it mints — a hand-edited file can hold two rows under one id.
@@ -516,7 +619,11 @@ def build_proposal_plan(
                 # the keep-set, so it is deliberately absent from here.
                 continue
             mapped = map_ledger_row(
-                section, row, tenant_id=tenant_id, ontology_ref=ontology_ref
+                section,
+                row,
+                tenant_id=tenant_id,
+                ontology_ref=ontology_ref,
+                recorded_sessions=recorded_sessions,
             )
             if not section.is_projectable(row):
                 # Present, active, and currently says nothing. Keep it; do not
@@ -546,14 +653,19 @@ def build_source(
 
     The locator names the canonical file and the row's address, which is a
     truthful pointer that carries no pattern or blocker prose. It names the
-    session the row was recorded in, or none when the row records no session;
-    the projecting turn's own session never enters it.
+    session the row was recorded in, as the agent's database recorded it, or
+    none when the row records no session; the projecting turn's own session
+    never enters it.
 
-    Raises :class:`~kestrel_sovereign.knowledge.AssertionValidationError` when
-    the recorded session cannot be named in a locator, rather than dropping
-    it: a source that silently names no session would escape an exclusion of
+    Raises :class:`LedgerRowProvenanceError` when that session cannot be
+    verified (:func:`verified_row_session`), and
+    :class:`~kestrel_sovereign.knowledge.AssertionValidationError` when it
+    cannot be named in a locator, rather than dropping it: a source that
+    silently names no session, or another one, would escape an exclusion of
     the session the row was recorded in.
     """
+    if proposal.provenance_refusal is not None:
+        raise LedgerRowProvenanceError(proposal.provenance_refusal)
     provenance = current_invocation_provenance()
     stem = f"{_LOCATOR_STEM}{proposal.section_key}:{proposal.row_id}"
     if provenance is None:
@@ -682,6 +794,10 @@ class LedgerAssertionReport:
     blocked_terminal: int = 0
     unmappable: int = 0
     failed: int = 0
+    #: Rows not written because the agent's database does not vouch for their
+    #: session (#3990). The governed corpus build refuses until a later pass
+    #: verifies them or finds them gone.
+    provenance_refused: int = 0
     refused_sections: Dict[str, str] = field(default_factory=dict)
     skipped_reason: Optional[str] = None
 
@@ -696,6 +812,7 @@ class LedgerAssertionReport:
             "blocked_terminal": self.blocked_terminal,
             "unmappable": self.unmappable,
             "failed": self.failed,
+            "provenance_refused": self.provenance_refused,
         }
         if self.refused_sections:
             data["refused_sections"] = dict(self.refused_sections)
@@ -707,6 +824,7 @@ class LedgerAssertionReport:
     def needs_attention(self) -> bool:
         return bool(
             self.failed
+            or self.provenance_refused
             or self.foreign
             or self.blocked_terminal
             or self.unmappable

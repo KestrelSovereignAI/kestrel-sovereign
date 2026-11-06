@@ -17,6 +17,7 @@ rows for those shapes.
 import json
 from datetime import date, datetime, timedelta, timezone
 from unittest.mock import AsyncMock, MagicMock, patch
+from tests.utils.ledger_storage import without_ledger_row_record
 
 import pytest
 import yaml as _yaml
@@ -100,7 +101,7 @@ async def _feature(tmp_path, blockers, *, scan_repos=SCAN_REPOS):
     agent = MagicMock()
     agent.agent_id = "did:test:reconcile"
     agent.agent_data_dir = str(tmp_path)
-    agent.storage = MagicMock()
+    agent.storage = without_ledger_row_record(MagicMock())
     agent.storage.graph = None
     (tmp_path / "STRATEGY.yaml").write_text(
         _yaml.dump(

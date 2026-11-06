@@ -4313,9 +4313,14 @@ class PrivacyEnforcingStorage:
         fail the ledger mutation. The report says what happened; the next
         projection reconciles.
 
-        Each source names the session its row was recorded in, read off the
-        row (#3875). The projecting turn's session is never used: a row whose
-        first projection failed is projected by whichever turn reindexes next.
+        Each source names the session its row was recorded in (#3875), as
+        :meth:`reserve_strategy_ledger_row` recorded it in the agent's
+        database; the row's own ``session_id`` field is only checked against
+        that record, and a row with no record is not written (#3990). The
+        rows refused for that reason are recorded, and the governed corpus
+        build refuses until a later pass verifies them or finds them gone. The
+        projecting turn's session is never used: a row whose first projection
+        failed is projected by whichever turn reindexes next.
         """
         from kestrel_sovereign.features.strategic_memory.ledger_assertions import (
             LedgerAssertionReport,
@@ -4354,6 +4359,93 @@ class PrivacyEnforcingStorage:
                 )
         finally:
             self._release_ledger_assertion_lease()
+
+    async def reserve_strategy_ledger_row(
+        self,
+        *,
+        section_key: str,
+        session_id: Optional[str],
+        mint,
+    ):
+        """Reserve, where the agent cannot write, a new ledger row's address and session.
+
+        The strategy-ledger tool calls this before it writes the row, with the
+        session it is about to name in the row's ``session_id`` field, and
+        writes the row under exactly the address returned. ``mint`` is given
+        every address already recorded and names the one the row takes.
+        Projection names a session only when this record agrees with that
+        field (#3990): the ledger file is in the agent's own data directory,
+        so neither the field nor the row's id is provenance on its own.
+
+        Written in every privacy mode, as the ledger file is. The record holds
+        a row address and a session key, never row text, and a row recorded
+        while semantic writes are denied must still be verifiable when they
+        are allowed again. Never replaces another row's record. Raises when
+        nothing can be reserved, so the tool writes no row.
+        """
+        from kestrel_sovereign.storage.ledger_row_sessions import (
+            reserve_row_session,
+        )
+
+        return await reserve_row_session(
+            self._storage.db,
+            agent_id=self.agent_id,
+            section=section_key,
+            session_id=session_id,
+            mint=mint,
+        )
+
+    async def release_strategy_ledger_row(self, reservation) -> bool:
+        """Remove a reservation whose row was not written (#3990).
+
+        Only the attempt that made it can remove it: a record another writer
+        made at the same address is never touched.
+        """
+        from kestrel_sovereign.storage.ledger_row_sessions import (
+            release_row_reservation,
+        )
+
+        return await release_row_reservation(
+            self._storage.db, agent_id=self.agent_id, reservation=reservation
+        )
+
+    async def take_strategy_ledger_row_inventory(self, snapshot) -> bool:
+        """Record the ledger's rows from before this record began, once (#3990).
+
+        Returns whether the inventory is in place, taken now or before. Rows
+        already in the ledger the first time the agent's database sees it are
+        recorded as written in no session, unless their file names one; from
+        then on, a row with no record was not written by the strategy-ledger
+        tools and is never projected. Taken only from a ledger file that
+        exists and that the ledger vouched is on disk: an absent or unread
+        file says nothing about which rows came before.
+
+        Written in every privacy mode, as reservations are, so a row
+        hand-written while semantic writes are denied is not taken for one
+        recorded before sessions were named when they are allowed again.
+        """
+        from kestrel_sovereign.features.strategic_memory import ledger_assertions
+        from kestrel_sovereign.features.strategic_memory.ledger import (
+            LedgerSnapshot,
+        )
+        from kestrel_sovereign.storage import ledger_row_sessions
+
+        db = self._storage.db
+        if await ledger_row_sessions.row_inventory_taken(db, agent_id=self.agent_id):
+            return True
+        if not (
+            isinstance(snapshot, LedgerSnapshot)
+            and snapshot.readable
+            and snapshot.has_canonical_file
+            and snapshot.confirmed_persisted
+        ):
+            return False
+        await ledger_row_sessions.take_row_inventory(
+            db,
+            agent_id=self.agent_id,
+            rows=ledger_assertions.inventory_rows(snapshot.data),
+        )
+        return True
 
     @staticmethod
     def _ledger_projection_key(snapshot) -> str:
@@ -4445,9 +4537,14 @@ class PrivacyEnforcingStorage:
         self._ledger_projected_sequences[key] = snapshot.persisted_sequence
         ledger_data = snapshot.data
 
+        recorded_sessions = await self._read_ledger_row_sessions(snapshot, report)
+        if recorded_sessions is None:
+            return report
         try:
             plan = ledger_assertions.build_proposal_plan(
-                ledger_data, tenant_id=binding.tenant_id
+                ledger_data,
+                tenant_id=binding.tenant_id,
+                recorded_sessions=recorded_sessions,
             )
         except Exception as error:  # noqa: BLE001 - never fail a persisted write
             logger.warning("strategy ledger assertion mapping unavailable: %s", error)
@@ -4466,11 +4563,17 @@ class PrivacyEnforcingStorage:
         # reconciliation leaves them alone. "The row is gone" and "the row is
         # here but currently says nothing" are different facts.
         keep: set[str] = set(plan.protected)
+        unverified: dict = {}
         for proposal in plan.proposals:
             keep.add(proposal.assertion_id)
             await self._apply_ledger_proposal(
-                proposal, current.get(proposal.assertion_id), binding, report
+                proposal,
+                current.get(proposal.assertion_id),
+                binding,
+                report,
+                unverified,
             )
+        await self._record_ledger_row_refusals(plan, unverified, report)
 
         # Reconcile: an assertion whose row is gone, or retired in place, stops
         # being held. Scoped to this adapter's own predicates, its own
@@ -4485,6 +4588,74 @@ class PrivacyEnforcingStorage:
                 continue
             await self._retract_ledger_assertion(held, report)
         return report
+
+    async def _read_ledger_row_sessions(self, snapshot, report):
+        """The agent's database record of each ledger row's session (#3990).
+
+        Takes the inventory of the rows that came before the record first, so
+        that a row with no record can be refused. Returns ``None`` when either
+        cannot be had. Without them no row's session can be verified, and a
+        row whose session went unverified would be written under the session
+        its file names, which the agent can edit.
+        """
+        from kestrel_sovereign.storage.ledger_row_sessions import (
+            recorded_row_sessions,
+        )
+
+        try:
+            in_place = await self.take_strategy_ledger_row_inventory(snapshot)
+        except Exception as error:  # noqa: BLE001
+            if is_execution_control_error(error):
+                raise
+            logger.warning("strategy ledger row inventory unavailable: %s", error)
+            in_place = False
+        if not in_place:
+            report.skipped_reason = "row_inventory_unavailable"
+            return None
+        try:
+            return await recorded_row_sessions(
+                self._storage.db, agent_id=self.agent_id
+            )
+        except Exception as error:  # noqa: BLE001
+            if is_execution_control_error(error):
+                raise
+            logger.warning("strategy ledger row sessions unreadable: %s", error)
+            report.skipped_reason = "row_sessions_read_failed"
+            return None
+
+    async def _record_ledger_row_refusals(self, plan, unverified, report):
+        """Record which rows this pass refused for their provenance (#3990).
+
+        Replaces the record for every section this pass verified in full, so
+        a row refused before and now verified or gone is resolved, and a
+        section the plan refused whole keeps what it had. The governed corpus
+        build refuses while any remain. A failure to record is reported, never
+        raised: the ledger write has already landed.
+        """
+        from kestrel_sovereign.features.strategic_memory import ledger_assertions
+        from kestrel_sovereign.storage.ledger_row_sessions import (
+            replace_row_refusals,
+        )
+
+        sections = [
+            section.ledger_key
+            for section in ledger_assertions.sections()
+            if section.ledger_key not in plan.refused_sections
+        ]
+        try:
+            await replace_row_refusals(
+                self._storage.db,
+                agent_id=self.agent_id,
+                sections=sections,
+                refusals=unverified,
+            )
+        except Exception as error:  # noqa: BLE001
+            if is_execution_control_error(error):
+                raise
+            logger.warning(
+                "strategy ledger row provenance refusals not recorded: %s", error
+            )
+            report.skipped_reason = "row_refusals_unrecorded"
 
     async def _read_ledger_assertions(self, plan, report):
         """Every current assertion on this adapter's predicates, paged in full.
@@ -4535,8 +4706,14 @@ class PrivacyEnforcingStorage:
                 cursor = page[-1].revision_id
         return current
 
-    async def _apply_ledger_proposal(self, proposal, held, binding, report):
-        """Write, revise, or decline one row's assertion."""
+    async def _apply_ledger_proposal(
+        self, proposal, held, binding, report, unverified
+    ):
+        """Write, revise, or decline one row's assertion.
+
+        A row declined because its session cannot be verified (#3990) is added
+        to ``unverified``, keyed by its address, with why.
+        """
         from kestrel_sovereign.features.strategic_memory import ledger_assertions
         from kestrel_sovereign.knowledge import (
             AssertionStatus,
@@ -4607,11 +4784,25 @@ class PrivacyEnforcingStorage:
                 transition=transition,
                 owning_agent_id=binding.owning_agent_id,
             )
+        except ledger_assertions.LedgerRowProvenanceError as error:
+            # The agent's database does not vouch for the session the row's
+            # file names, or holds no record of the row at all (#3990).
+            # Writing it under another session or none would escape an
+            # exclusion of the one it was recorded in, so it is not written,
+            # and it is recorded so the governed corpus build refuses until a
+            # later pass verifies it.
+            logger.warning(
+                "strategy ledger row %s: its session cannot be verified: %s",
+                proposal.row_id,
+                error,
+            )
+            report.provenance_refused += 1
+            unverified[(proposal.section_key, proposal.row_id)] = str(error)
+            return
         except AssertionValidationError as error:
-            # The row's provenance cannot be built, notably because its
-            # recorded session cannot be named in a locator. Writing the row
-            # without that session would escape an exclusion of it, so this
-            # row fails and the rest of the pass goes on.
+            # The row's recorded session cannot be named in a locator. Writing
+            # the row without it would escape an exclusion of that session, so
+            # this row fails and the rest of the pass goes on.
             logger.warning(
                 "strategy ledger row %s cannot name its provenance: %s",
                 proposal.row_id,

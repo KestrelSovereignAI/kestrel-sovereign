@@ -226,6 +226,64 @@ _WAIT_SIGNAL_REKEYS_INDEX = (
     "agent_id, kind, handle",
 )
 
+#: The #3990 record of each strategy-ledger row's session, as host code recorded
+#: it. ``STRATEGY_LEDGER.yaml`` lives in the agent's own data directory and
+#: names the same session in each row's ``session_id`` field, but an agent that
+#: can write that file can rewrite the field or the row's ``id``, so projection
+#: verifies each row against these tables and never trusts the file alone. See
+#: ``kestrel_sovereign.storage.ledger_row_sessions``:
+#:
+#: * ``strategy_ledger_row_sessions`` -- one row per ``(agent_id, section,
+#:   row_id)`` address; a NULL ``session_id`` is a row recorded in no session,
+#:   and ``attempt_id`` names the reservation that owns it.
+#: * ``strategy_ledger_row_inventories`` -- whether the rows already in the
+#:   ledger when the record began have been recorded, per agent.
+#: * ``strategy_ledger_row_refusals`` -- the rows the last projection could not
+#:   verify; the governed corpus build refuses while any remain.
+#:
+#: Kept out of ``CORE_SCHEMA`` for the reason given above
+#: ``_MODEL_USAGE_PERIODS_DDL``: ``_ensure_strategy_ledger_row_sessions``
+#: creates them through probe -> migration lock -> re-probe. Each primary key
+#: is the only index it needs, since every read is one agent's rows.
+_STRATEGY_LEDGER_ROW_SESSION_TABLES = (
+    (
+        "strategy_ledger_row_sessions",
+        """
+CREATE TABLE IF NOT EXISTS strategy_ledger_row_sessions (
+    agent_id TEXT NOT NULL,
+    section TEXT NOT NULL,
+    row_id TEXT NOT NULL,
+    session_id TEXT,
+    attempt_id TEXT NOT NULL,
+    recorded_at TEXT NOT NULL,
+    PRIMARY KEY (agent_id, section, row_id)
+)
+""",
+    ),
+    (
+        "strategy_ledger_row_inventories",
+        """
+CREATE TABLE IF NOT EXISTS strategy_ledger_row_inventories (
+    agent_id TEXT NOT NULL PRIMARY KEY,
+    taken_at TEXT NOT NULL
+)
+""",
+    ),
+    (
+        "strategy_ledger_row_refusals",
+        """
+CREATE TABLE IF NOT EXISTS strategy_ledger_row_refusals (
+    agent_id TEXT NOT NULL,
+    section TEXT NOT NULL,
+    row_id TEXT NOT NULL,
+    reason TEXT NOT NULL,
+    detected_at TEXT NOT NULL,
+    PRIMARY KEY (agent_id, section, row_id)
+)
+""",
+    ),
+)
+
 #: ``(name, table, columns)`` of the index that makes the #2959 staleness probe
 #: the "one indexed ``max(id)`` lookup" it is described as.
 #:
@@ -1648,6 +1706,7 @@ class AsyncDatabase:
             },
         )
         await self._ensure_wait_signal_rekeys()
+        await self._ensure_strategy_ledger_row_sessions()
         # Both indexes go through ``ensure_index`` rather than a bare
         # ``CREATE INDEX IF NOT EXISTS``: that spelling is idempotent in
         # sequence but not safe in parallel, and ``_init_schema`` runs on every
@@ -2455,6 +2514,25 @@ class AsyncDatabase:
                 "cannot be re-keyed without an audit record"
             )
         await self.ensure_index(*_WAIT_SIGNAL_REKEYS_INDEX)
+
+    async def _ensure_strategy_ledger_row_sessions(self) -> None:
+        """Create the #3990 ledger-row session tables safely under concurrent boot.
+
+        New in an upgrade, so the first post-upgrade PostgreSQL boot races
+        exactly as ``_ensure_wait_signal_rekeys`` describes. Same probe ->
+        migration lock -> re-probe, per table.
+        """
+        for table, ddl in _STRATEGY_LEDGER_ROW_SESSION_TABLES:
+            if not await self.table_exists(table):
+                async with self.migration_lock(f"create_{table}"):
+                    if not await self.table_exists(table):
+                        await self.execute(ddl)
+
+            if not await self.table_exists(table):
+                raise RuntimeError(
+                    f"{table} was not created; a strategy-ledger row's session "
+                    "cannot be verified against host-owned state"
+                )
 
     async def ensure_index(
         self, name: str, table: str, columns: str, *, lock_name: str = "",

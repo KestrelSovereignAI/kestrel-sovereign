@@ -147,23 +147,34 @@ def assign_row_ids(rows: List[Dict[str, Any]], minter) -> int:
     return minted
 
 
-def recorded_session_id(row: Mapping[str, Any]) -> Optional[str]:
-    """The session the turn that recorded ``row`` filed its rows under, or None.
+def session_key(value: Any) -> Optional[str]:
+    """A recorded session value as the session key it names, or None.
 
-    Written once, when the row is recorded, and never by a later turn: a row is
-    projected best-effort, possibly by another turn in another session or in
-    none, and only the recording turn's session says where the row came from.
     The key is returned exactly as recorded. An unquoted digit-only key reads
-    back from YAML as an integer, so an integer names that same key. A row with
-    no recorded session, including every row recorded before this field
-    existed, names none.
+    back from YAML as an integer, so an integer names that same key. A blank
+    value names none.
     """
-    value = row.get(SESSION_KEY)
     if isinstance(value, int) and not isinstance(value, bool):
         return str(value)
     if isinstance(value, str) and value.strip():
         return value
     return None
+
+
+def recorded_session_id(row: Mapping[str, Any]) -> Optional[str]:
+    """The session ``row``'s ``session_id`` field names, or None.
+
+    Written once, when the row is recorded, and never by a later turn: a row is
+    projected best-effort, possibly by another turn in another session or in
+    none, and only the recording turn's session says where the row came from.
+    A row with no recorded session, including every row recorded before this
+    field existed, names none.
+
+    The field is a hint, not provenance: the file is in the agent's own data
+    directory, so the agent can rewrite it. Projection names a session only
+    when the agent's database recorded the same one (#3990).
+    """
+    return session_key(row.get(SESSION_KEY))
 
 
 def is_active_pattern(row: Dict[str, Any]) -> bool:
@@ -246,6 +257,14 @@ class LedgerChangeConflict(Exception):
     rows it acts on are gone from the file, or no longer in the state it needs:
     a pattern already superseded, a blocker already resolved by hand. Applying
     it anyway would act on a row the caller never saw.
+    """
+
+
+class LedgerRowIdTaken(LedgerChangeConflict):
+    """The id a new row was given is already a row's in its section.
+
+    Raised when a row is added under an id fixed before the write (#3990): the
+    file, edited since it was read, put another row at that address.
     """
 
 
@@ -754,19 +773,62 @@ class StrategyLedger:
     # Mutation
     # ------------------------------------------------------------------
 
+    def section_row_ids(self, section_key: str) -> set:
+        """The ids of every row in one section, as the ledger now holds them."""
+        return {str(r.get("id") or "") for r in _rows(self.data, section_key)}
+
+    def next_pattern_id(self, pattern: str, also_taken: Iterable[str] = ()) -> str:
+        """The id a new ``pattern`` row takes on the ledger as it stands.
+
+        ``also_taken`` are addresses the row must not take although no row in
+        the file holds them now, such as those reserved for rows of other
+        writers (#3990).
+        """
+        return _unique_id(
+            pattern_row_id({"pattern": pattern}),
+            self.section_row_ids(PATTERNS_KEY) | set(also_taken),
+        )
+
+    def next_blocker_id(
+        self, issue: str, title: str, also_taken: Iterable[str] = ()
+    ) -> str:
+        """The id a new blocker row takes, as :meth:`next_pattern_id`."""
+        return _unique_id(
+            blocker_row_id({"issue": issue, "title": title}),
+            self.section_row_ids(BLOCKERS_KEY) | set(also_taken),
+        )
+
+    def _new_row_id(self, section_key: str, row_id: Optional[str], minted) -> str:
+        """``row_id`` when the caller fixed one, else the id ``minted`` gives.
+
+        A fixed id is the address the caller reserved before the write; a row
+        already at it in this section is refused rather than duplicated.
+        """
+        if row_id is None:
+            return minted()
+        if row_id in self.section_row_ids(section_key):
+            raise LedgerRowIdTaken(
+                f"a row with id {row_id} is already in {section_key}"
+            )
+        return row_id
+
     def add_pattern(
         self,
         pattern: str,
         source: str = "",
         implication: str = "",
         session_id: Optional[str] = None,
+        row_id: Optional[str] = None,
     ) -> Dict[str, Any]:
-        """Append one pattern, naming the recording turn's ``session_id``."""
-        rows = self.patterns
+        """Append one pattern, naming the recording turn's ``session_id``.
+
+        ``row_id``, when given, is the id the row takes; otherwise one is
+        minted from its text. Raises :class:`LedgerRowIdTaken` when a row
+        already holds the given id.
+        """
         entry = {
-            "id": _unique_id(
-                pattern_row_id({"pattern": pattern}),
-                [str(r.get("id") or "") for r in rows],
+            "id": self._new_row_id(
+                PATTERNS_KEY, row_id, lambda: self.next_pattern_id(pattern)
             ),
             "pattern": pattern,
             "source": source,
@@ -786,6 +848,7 @@ class StrategyLedger:
         notes: str = "",
         repo: str = "",
         session_id: Optional[str] = None,
+        row_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Append one blocker.
 
@@ -794,14 +857,12 @@ class StrategyLedger:
         and bind to whichever one happens to contain a number 42 — which is how
         a blocker gets resolved against a stranger's closed ticket.
 
-        ``session_id`` is the recording turn's session, as for
-        :meth:`add_pattern`.
+        ``session_id`` is the recording turn's session, and ``row_id`` the id
+        it takes if given, as for :meth:`add_pattern`.
         """
-        rows = self.blockers
         entry = {
-            "id": _unique_id(
-                blocker_row_id({"issue": issue, "title": title}),
-                [str(r.get("id") or "") for r in rows],
+            "id": self._new_row_id(
+                BLOCKERS_KEY, row_id, lambda: self.next_blocker_id(issue, title)
             ),
             "issue": issue,
             "title": title,
