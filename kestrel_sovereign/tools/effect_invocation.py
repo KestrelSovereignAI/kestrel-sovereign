@@ -8,7 +8,7 @@ import inspect
 from kestrel_sovereign.agent.invocation import (
     current_invocation_id, current_invocation_provenance,
 )
-from kestrel_sovereign.auth import CallerRole, current_caller_context
+from kestrel_sovereign.auth import CallerContext, CallerRole, current_caller_context
 from kestrel_sovereign.execution_custody import execution_terminal_error
 from kestrel_sovereign.tools.effect_journal import (
     ToolEffectJournalUnavailable, ToolEffectTurn, admit_tool_effect_turn, bind_tool_effect_turn,
@@ -46,6 +46,44 @@ class _JournalInvocation:
                 await self.turn.close(error)
             elif error is not None:
                 raise error
+
+
+@dataclass(frozen=True)
+class ToolEffectOperation:
+    """An external intent, independent of transport/physical View lifetimes."""
+
+    operation_id: str
+    owner: str
+    tool_name: str
+    arguments: dict
+    session_id: str
+
+
+@asynccontextmanager
+async def journal_tool_operation(owner, operation: ToolEffectOperation):
+    """Admit inside the existing request lifecycle, before approval or effect."""
+    from kestrel_sovereign.tools.effect_journal import require_persistent_tool_effects
+
+    require_persistent_tool_effects(owner)
+    caller = current_caller_context() or CallerContext.anonymous()
+    turn = await admit_tool_effect_turn(owner,
+        namespace=['mcp_app', caller.role.value, caller.auth_method.value, caller.identity],
+        client_key=operation.operation_id,
+        request=dict(owner=operation.owner, tool=operation.tool_name,
+            arguments=operation.arguments, session_id=operation.session_id),
+        invocation_id=current_invocation_id())
+    if turn is None:
+        require_persistent_tool_effects(owner)
+        raise ToolEffectJournalUnavailable('tool_effect_attempt_unavailable')
+    turn.generation = owner._request_generation_for_current_task(turn.invocation_id)
+    state = _JournalInvocation(turn, None, True)
+    with state.bind():
+        try:
+            yield
+        except BaseException as error:
+            await state.close(error)
+        else:
+            await state.close()
 
 
 async def _open_journal_turn(owner, arguments, route):

@@ -68,8 +68,10 @@ class _GovernedToolBinding:
         if not self.is_current:
             raise ResourceConflict("Tool registration expired; reopen the originating view")
 
-    async def invoke(self, arguments: Dict[str, Any], *, session_id: str,
+    async def invoke(self, arguments: Dict[str, Any], *, session_id: str, operation_id: str,
                      source: str = "external") -> Any:
+        from kestrel_sovereign.agent.invocation import validate_invocation_id
+        from kestrel_sovereign.tools.effect_invocation import ToolEffectOperation
         from kestrel_sovereign.llm.adapter import ToolCall
         from kestrel_sovereign.storage.db.interface import DatabaseError
 
@@ -80,6 +82,7 @@ class _GovernedToolBinding:
             raise ValueError("A tool invocation requires a session_id")
         if not isinstance(source, str) or not source.strip():
             raise ValueError("A tool invocation requires a source")
+        operation_id = validate_invocation_id(operation_id)
         call = ToolCall(id=str(uuid4()), name=self.name, arguments=deepcopy(arguments))
         execution = _ToolExecution()
         dispatch_start = time.time()
@@ -118,6 +121,8 @@ class _GovernedToolBinding:
             ),
             name="bound-tool-invocation", cancel_on_caller_cancellation=True,
             finalize=finalize,
+            tool_operation=ToolEffectOperation(operation_id, self.owner,
+                self.name, deepcopy(call.arguments), session_id),
         )
         error = outcome.error
         if isinstance(error, Exception) and not is_execution_control_error(error) and (

@@ -24,25 +24,15 @@ from kestrel_sovereign.tools.effect_journal import (
 )
 from kestrel_sovereign.turn_scope import capture_turn_scope
 from tests.unit.test_cleanup_task_admission import _partial_native_agent
+from kestrel_sovereign.testing.fixtures import native_tool_effect_agent
 
 
 pytestmark = pytest.mark.timeout(30)
 
 
 @pytest_asyncio.fixture
-async def owner(tmp_path, monkeypatch):
-    monkeypatch.setenv("KESTREL_DATA_KEY", Fernet.generate_key().decode())
-    agent, db = await _partial_native_agent(tmp_path, monkeypatch)
-    agent.privacy_agent = PrivacyAgent(agent.storage)
-    store = ToolEffectStore(db, scope=NativeRecipientScope(agent.did))
-    await store.initialize()
-    agent.tool_effect_store = store
-    try:
-        yield agent
-    finally:
-        await store.close()
-        await agent.llm_service.close()
-        await db.close()
+async def owner(native_tool_effect_agent):
+    yield await native_tool_effect_agent(did='did:test:unpublished-cleanup')
 
 
 async def admit(owner, key="owned-op"):

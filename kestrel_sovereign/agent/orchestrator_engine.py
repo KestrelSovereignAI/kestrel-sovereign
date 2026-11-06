@@ -3694,6 +3694,7 @@ class OrchestratorEngineMixin:
 
     async def _execute_tool_operation_at_stop_boundary(
         self, operation, *, name, cancel_on_caller_cancellation=False, finalize=None,
+        tool_operation=None,
     ):
         """Join a tool operation and its audit under the original turn scope.
 
@@ -3702,41 +3703,61 @@ class OrchestratorEngineMixin:
         cancellation once so an approval or transport can unwind; both paths
         still join the original owner and any required audit before returning.
         """
-        turn_scope = capture_turn_scope(self)
-        task_context = contextvars.copy_context()
-        lock_manager = None
-        get_lock_manager = getattr(type(self), "_get_lock_manager", None)
-        if callable(get_lock_manager):
-            lock_manager = get_lock_manager(self)
-        delegate = getattr(lock_manager, "delegate_current_task_ownership", None)
-        if callable(delegate):
-            delegate(task_context)
+        async def join_original_operation():
+            turn_scope = capture_turn_scope(self)
+            task_context = contextvars.copy_context()
+            lock_manager = None
+            get_lock_manager = getattr(type(self), "_get_lock_manager", None)
+            if callable(get_lock_manager):
+                lock_manager = get_lock_manager(self)
+            delegate = getattr(lock_manager, "delegate_current_task_ownership", None)
+            if callable(delegate):
+                delegate(task_context)
 
-        async def run_scoped(factory):
-            with turn_scope.bind():
-                return await factory()
+            async def run_scoped(factory):
+                with turn_scope.bind():
+                    return await factory()
 
-        owner = create_owned_task(
-            run_scoped(operation), name=name, context=task_context, retain_originals=True,
-        )
-        outcome = await await_owned_task(
-            owner, cancel_on_caller_cancellation=cancel_on_caller_cancellation,
-        )
-        if finalize is not None:
-            audit_owner = create_owned_task(
-                run_scoped(lambda: finalize(outcome)), name=name + "-audit",
-                context=task_context, retain_originals=True,
+            owner = create_owned_task(
+                run_scoped(operation), name=name, context=task_context, retain_originals=True,
             )
-            audit = await await_owned_task(audit_owner, pending_cancellation=outcome.cancellation)
-            outcome = OwnedTaskOutcome(
-                outcome.result,
-                execution_terminal_error(
-                    outcome.error, audit.error, retain_originals=True,
-                    isolate_control_originals=True,
-                ),
-                audit.cancellation,
+            outcome = await await_owned_task(
+                owner, cancel_on_caller_cancellation=cancel_on_caller_cancellation,
             )
-        return outcome
+            if finalize is not None:
+                audit_owner = create_owned_task(
+                    run_scoped(lambda: finalize(outcome)), name=name + "-audit",
+                    context=task_context, retain_originals=True,
+                )
+                audit = await await_owned_task(audit_owner, pending_cancellation=outcome.cancellation)
+                outcome = OwnedTaskOutcome(
+                    outcome.result,
+                    execution_terminal_error(
+                        outcome.error, audit.error, retain_originals=True,
+                        isolate_control_originals=True,
+                    ),
+                    audit.cancellation,
+                )
+            return outcome
+
+        if tool_operation is None:
+            return await join_original_operation()
+
+        from kestrel_sovereign.agent.invocation import bind_async_invocation
+        from kestrel_sovereign.auth import current_caller_context
+        from kestrel_sovereign.tools.effect_invocation import journal_tool_operation
+
+        @bind_async_invocation("invocation_id", track_request_lifecycle=True)
+        async def invoke_external(agent, *, invocation_id, caller, session_id):
+            async with journal_tool_operation(agent, tool_operation):
+                outcome = await join_original_operation()
+                return raise_owned_outcome(outcome, operation=name, retain_originals=True)
+
+        external = create_owned_task(invoke_external(self,
+            invocation_id=tool_operation.operation_id, caller=current_caller_context(),
+            session_id=tool_operation.session_id), name=name + "-lifecycle", retain_originals=True)
+        return await await_owned_task(external,
+            cancel_on_caller_cancellation=cancel_on_caller_cancellation)
 
     async def _execute_tool_batch_at_stop_boundary(
         self,

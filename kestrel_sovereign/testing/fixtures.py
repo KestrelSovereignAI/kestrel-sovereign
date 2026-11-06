@@ -18,8 +18,56 @@ Then use fixtures directly:
 """
 
 import pytest
+import pytest_asyncio
 
 from kestrel_sovereign.testing.mock_agent import MockAgent
+
+
+@pytest_asyncio.fixture
+async def native_tool_effect_agent(tmp_path, monkeypatch):
+    """Create partial native Agents for governed effect component tests.
+
+    SQLite, journal keys, privacy, hooks and request lifecycle are real. No
+    READY publication, model response or provider acceptance is fabricated.
+    Each created Agent owns only its test directory and native resources.
+    """
+    from contextlib import AsyncExitStack
+    from uuid import uuid4
+    from cryptography.fernet import Fernet
+    from kestrel_sovereign.a2a.scope import NativeRecipientScope
+    from kestrel_sovereign.features.privacy.feature import PrivacyAgent
+    from kestrel_sovereign.kestrel_agent import KestrelAgent
+    from kestrel_sovereign.llm import service as service_module
+    from kestrel_sovereign.storage.async_database import AsyncDatabase
+    from kestrel_sovereign.storage.async_storage import AsyncStorage
+    from kestrel_sovereign.tool_effect_store import ToolEffectStore
+
+    monkeypatch.setenv('KESTREL_DATA_KEY', Fernet.generate_key().decode())
+    # Explicitly unconfigured real provider service: no ambient operator
+    # routes or credentials are inputs to this component fixture.
+    monkeypatch.setattr(service_module, 'load_section', lambda _section: {})
+    async with AsyncExitStack() as resources:
+        async def create(*, did):
+            root = tmp_path / ('native-tool-effect-' + uuid4().hex)
+            root.mkdir()
+            database = await AsyncDatabase.sqlite(str(root / 'primary.db'))
+            resources.push_async_callback(database.close)
+            service = service_module.LLMService(usage_db=database, agent_data_dir=root)
+            resources.push_async_callback(service.close)
+            agent = KestrelAgent(did=did, storage_path=str(root / 'agent.db'),
+                llm_service=service, allowed_features=[], sync_enabled=False)
+            storage = AsyncStorage(backend=database.backend)
+            storage.db = database
+            agent.storage = agent._raw_storage = storage
+            agent.privacy_agent = PrivacyAgent(storage)
+            journal = ToolEffectStore(database, scope=NativeRecipientScope(did))
+            await journal.initialize()
+            resources.push_async_callback(journal.close)
+            agent.tool_effect_store = journal
+            assert not agent._runtime_publication_ready.is_set()
+            return agent
+
+        yield create
 
 
 @pytest.fixture

@@ -2859,7 +2859,7 @@ ABSOLUTE PROHIBITION - NEVER FABRICATE:
                                 )
                                 mark_current_invocation_effect_completed(None)
                                 require_execution_work(self.func.__self__.agent)
-                            except ExecutionAuthorityError:
+                            except (ExecutionAuthorityError, ResourceOutcomeUnknown):
                                 raise
                             except Exception as e:
                                 if is_execution_control_error(e):
