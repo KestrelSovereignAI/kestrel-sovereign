@@ -154,7 +154,9 @@ def register_request_delivery(
     return registrar(request_id)
 
 
-async def admit_request_operation(agent, request_id, operation, *, name, context=None):
+async def admit_request_operation(
+    agent, request_id, operation, *, name, context=None, privacy_work_factory=None,
+):
     """Accept and bind one child, or physically retire it before returning.
 
     Registration belongs to the caller. Even canonical callback refusal must
@@ -165,8 +167,18 @@ async def admit_request_operation(agent, request_id, operation, *, name, context
     from .request_lifecycle import bind_request_operation_if_supported
     admission = OwnedTaskAdmission()
     try:
-        task = create_owned_task(operation, name=name, context=context,
-                                 retain_originals=True, admission=admission)
+        if privacy_work_factory is None:
+            task = create_owned_task(operation, name=name, context=context,
+                                     retain_originals=True, admission=admission)
+        else:
+            # Transfer only this explicitly admitted child through the held
+            # native privacy frame. Copying a token cannot transfer a foreign
+            # reentry mutex that the parent must retain until this child ends.
+            # The factory accepts a lazy body, so a refused native start has
+            # no unstarted request coroutine left outside its own inventory.
+            task = privacy_work_factory(operation, context=context)
+            admission.task = task
+            task.set_name(name)
         bind_request_operation_if_supported(agent, request_id, task)
         return task
     except BaseException as opening:
@@ -556,6 +568,16 @@ def bind_async_invocation(
                             )
                         parent_context = copy_context()
                         operation_context = parent_context.copy()
+                        from kestrel_sovereign.storage.privacy_wrapper import (
+                            capture_transition_lock_reentry,
+                        )
+
+                        privacy_work_factory = None
+                        if capture_transition_lock_reentry(lifecycle_owner) is not None:
+                            privacy_work_factory = (
+                                lifecycle_owner._get_privacy_transition_lock()
+                                .capture_native_work_factory()
+                            )
                         dispatcher = getattr(lifecycle_owner, "dispatcher", None)
                         lock_manager = getattr(dispatcher, "lock_manager", None)
                         if lock_manager is None:
@@ -623,12 +645,14 @@ def bind_async_invocation(
                         try:
                             isolated_operation = await admit_request_operation(
                                 lifecycle_owner, invocation_id,
-                                run_isolated_operation(),
+                                (run_isolated_operation if privacy_work_factory is not None
+                                 else run_isolated_operation()),
                                 name=(
                                     "invocation-turn:"
                                     f"{invocation_log_correlation(invocation_id)}"
                                 ),
                                 context=operation_context,
+                                privacy_work_factory=privacy_work_factory,
                             )
                         except BaseException:
                             cleanup_abandoned = True

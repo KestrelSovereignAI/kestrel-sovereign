@@ -63,6 +63,42 @@ async def test_reconnected_backing_cannot_admit_a_claim_for_the_original_attempt
     assert await owner.tool_effect_store.database.fetchone('SELECT COUNT(*) FROM tool_effect_claims') == (0,)
 
 
+async def test_backend_close_fences_new_terminal_writer_admission_before_inventory_snapshot(owner, monkeypatch):
+    first, late = await admit(owner, key='first-original'), await admit(owner, key='late-original')
+    backend = owner.tool_effect_store.backend
+    native_proof = backend._verify_original_signal_outcome
+    entered, resume = asyncio.Event(), asyncio.Event()
+
+    async def hold_first_original(connection, journal):
+        await native_proof(connection, journal)
+        if journal is first.attempt._terminal:
+            entered.set()
+            await resume.wait()
+
+    monkeypatch.setattr(backend, '_verify_original_signal_outcome', hold_first_original)
+    finishing = asyncio.create_task(owner.tool_effect_store.finish(first.attempt))
+    closing = late_finish = None
+    try:
+        await asyncio.wait_for(entered.wait(), 2)
+        closing = asyncio.create_task(backend.close())
+        await asyncio.sleep(0.02)
+        assert backend._original_results_closing and not closing.done()
+        late_finish = asyncio.create_task(owner.tool_effect_store.finish(late.attempt))
+        await asyncio.sleep(0.02)
+        assert late.attempt._terminal._writer is None, 'A terminal writer entered after its inventory closed'
+        assert late.attempt._terminal not in backend._original_result_holds
+        with pytest.raises(ExecutionAuthorityError):
+            await late_finish
+        resume.set()
+        await finishing
+        await closing
+        assert not backend._original_result_holds
+    finally:
+        resume.set()
+        await asyncio.gather(finishing, *([late_finish] if late_finish else []),
+            *([closing] if closing else []), return_exceptions=True)
+
+
 @pytest.mark.parametrize('field,value', [
     ('scope_digest', 'not-a-digest'), ('operation_digest', '0' * 63),
     ('attempt_id', 'not-an-attempt'), ('attempt_id', None),

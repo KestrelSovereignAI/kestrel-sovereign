@@ -27,6 +27,7 @@ from kestrel_sovereign.agent.invocation import (
     InvocationCancelledError,
     InvocationSelfFencedError,
     admit_request_operation,
+    bind_async_invocation,
     invocation_id_response_header,
     invocation_log_correlation,
     new_stream_delivery_id,
@@ -206,6 +207,26 @@ def _kite_verified_runtime_semantic_selection(agent: Any) -> tuple[Any, Any]:
     return profile, capabilities
 
 
+@bind_async_invocation("request_id", track_request_lifecycle=True)
+async def _kite_memory_command(
+    agent: Any, *, request_id: str, nonce: str, operation: str, command: str,
+) -> Any:
+    """Bind the closed Kite intent to the canonical lifecycle and effect journal."""
+    from kestrel_sovereign.tools.effect_invocation import (
+        ToolEffectOperation, journal_tool_operation,
+    )
+
+    task_manager = agent.task_manager
+    if task_manager is None:
+        raise RuntimeError("Kite runtime command dispatcher is unavailable")
+    async with journal_tool_operation(agent, ToolEffectOperation(
+        namespace="kite_evidence", operation_id=nonce,
+        owner="kite_release_evidence", tool_name=operation,
+        arguments={"command": command}, session_id=request_id,
+    )):
+        return await task_manager.execute_command(command)
+
+
 async def _kite_runtime_observation(
     agent: Any, *, request_id: str, provenance: Any, request: object,
 ) -> tuple[str, dict[str, object]]:
@@ -326,10 +347,8 @@ async def _kite_runtime_observation(
                 raise RuntimeError("Kite invalid import probe did not complete")
             return operation, observation
 
-        task_manager = getattr(agent, "task_manager", None)
-        if task_manager is None:
-            raise RuntimeError("Kite runtime command dispatcher is unavailable")
-        raw = await task_manager.execute_command(command)
+        raw = await _kite_memory_command(agent, request_id=request_id,
+            nonce=nonce, operation=operation, command=command)
     from kestrel_sovereign.features.base import is_flat_toolresult_envelope
     if not is_flat_toolresult_envelope(raw) or raw.get("status") != "ok" or not isinstance(raw.get("data"), dict):
         raise RuntimeError("Kite runtime command did not return a successful typed result")

@@ -1,11 +1,13 @@
 """Real Agent generations, native SQL admission and external file effects."""
 
 import asyncio
+import inspect
 import pytest
 
 from kestrel_sdk.resources import ResourceOutcomeUnknown
 from kestrel_sovereign.agent.invocation import (
-    bind_async_generator_invocation, bind_async_invocation, request_provenance,
+    admit_request_operation, bind_async_generator_invocation, bind_async_invocation,
+    request_provenance,
 )
 from kestrel_sovereign.auth import CallerContext
 from kestrel_sovereign.api_errors import tool_effect_api_error
@@ -114,27 +116,96 @@ async def test_retry_namespace_keeps_distinct_authenticated_people_separate(owne
 
 
 @pytest.mark.asyncio
-async def test_nested_invocation_keeps_its_original_parent_effect_claim(owner, tmp_path):
+@pytest.mark.parametrize('depth', [1, 3])
+async def test_nested_invocation_keeps_its_original_parent_effect_claim(owner, tmp_path, depth):
     witness = tmp_path / 'nested-effect'
 
     @governed
-    async def invoke(agent, user_input, *, invocation_id=None, nested=False):
+    async def invoke(agent, user_input, *, invocation_id=None, nested=0):
         async def effect():
-            if not nested:
-                return await invoke(agent, user_input, invocation_id=invocation_id, nested=True)
-            witness.write_text('one physical effect')
+            if nested < depth:
+                return await invoke(agent, user_input, invocation_id=invocation_id, nested=nested + 1)
+            async with agent._get_privacy_transition_lock():
+                witness.write_text('one physical effect')
             return 'done'
 
-        return await execute_tool_effect(agent, registration='child' if nested else 'parent',
+        return await execute_tool_effect(agent, registration=f'child-{nested}' if nested else 'parent',
             arguments={}, execute=effect)
 
     assert await invoke(owner, 'owned input', invocation_id='parent-intent') == 'done'
     claims = await owner.tool_effect_store.database.fetchall('SELECT claim_id, parent_claim_id FROM tool_effect_claims')
     roots = [row[0] for row in claims if row[1] is None]
     children = [row for row in claims if row[1] is not None]
-    assert len(roots) == len(children) == 1, 'Nested invocation detached the original effect claim'
-    assert children[0][1] == roots[0]
+    assert len(roots) == 1 and len(children) == depth, 'Nested invocation detached the original effect claim'
+    parents = {row[0]: row[1] for row in children}
+    for child in parents:
+        ancestor = child
+        while ancestor in parents:
+            ancestor = parents[ancestor]
+        assert ancestor == roots[0]
     assert witness.read_text() == 'one physical effect'
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('failure', ['allocation', 'binding'])
+async def test_privacy_owned_invocation_refusal_never_constructs_its_lazy_body(
+    owner, tmp_path, monkeypatch, failure,
+):
+    from kestrel_sovereign._async_ownership import await_owned_task
+    from kestrel_sovereign.execution_custody import execution_evidence_carriers
+    from tests.unit.test_host_context_native_cleanup import _actual_operation
+
+    witness = tmp_path / 'refused-lazy-effect'
+    constructed, refused = [], []
+    refusal = RuntimeError('Original privacy-owned invocation refused')
+    lock = owner._get_privacy_transition_lock()
+    loop, previous = asyncio.get_running_loop(), asyncio.get_running_loop().get_task_factory()
+    actual_bind = type(owner).bind_request_operation
+    request_id = 'owned-lazy-refusal'
+    owner.register_active_request(request_id)
+
+    async def body():
+        witness.write_text('must not execute')
+
+    def lazy_body():
+        constructed.append(True)
+        return body()
+
+    def bind(self, rid, task):
+        if self is owner and rid == request_id and failure == 'binding':
+            raise refusal
+        return actual_bind(self, rid, task)
+
+    def factory(loop, coroutine, **kwargs):
+        operation = _actual_operation(coroutine)
+        code = getattr(operation, 'cr_code', None)
+        if failure == 'allocation' and code is not None and code.co_qualname.endswith(
+            'ReentrantTransitionLock.start_owned_native_work.<locals>.run'
+        ):
+            refused.extend((coroutine, operation))
+            raise refusal
+        return previous(loop, coroutine, **kwargs) if previous else asyncio.Task(coroutine, loop=loop, **kwargs)
+
+    monkeypatch.setattr(type(owner), 'bind_request_operation', bind)
+    try:
+        async with lock:
+            loop.set_task_factory(factory)
+            try:
+                with pytest.raises(BaseException) as observed:
+                    task = await admit_request_operation(owner, request_id, lazy_body,
+                        name='owned-lazy-request', privacy_work_factory=lock.capture_native_work_factory())
+                    outcome = await await_owned_task(task)
+                    assert outcome.error is not None
+                    raise outcome.error
+            finally:
+                loop.set_task_factory(previous)
+            assert refusal in execution_evidence_carriers(observed.value)
+        assert not constructed and not witness.exists()
+        assert not lock._native_work
+        assert all(inspect.getcoroutinestate(coro) == inspect.CORO_CLOSED for coro in refused)
+    finally:
+        loop.set_task_factory(previous)
+        owner._cleanup_cancelled_request(request_id)
 
 
 @pytest.mark.asyncio

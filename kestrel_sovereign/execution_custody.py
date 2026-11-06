@@ -271,12 +271,14 @@ def is_execution_control_error(
 
 
 def is_tool_execution_terminal_error(error: BaseException | None) -> bool:
-    """Tool delivery must propagate control and mandatory audit uncertainty.
+    """Tool delivery must propagate control, unknown effects and audit uncertainty.
 
     An audit error alone is not authority loss or retirement debt. Keep this
     local delivery rule separate from the SDK-registered control predicate.
     """
-    return is_execution_control_error(error) or any(
+    from kestrel_sdk.resources import observed_outcome_unknown
+
+    return is_execution_control_error(error) or bool(observed_outcome_unknown(error)) or any(
         isinstance(current, ToolAuditUnconfirmedError)
         for current in _explicit_control_chain(error)
     )

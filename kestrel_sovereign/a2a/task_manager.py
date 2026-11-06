@@ -741,7 +741,17 @@ class TaskManager:
                 try:
                     expected_state = task.status.state
                     with execution_registration:
-                        require_original_registration()
+                        try:
+                            require_original_registration()
+                        except ResourceConflict as refusal:
+                            # The original native task was already admitted.
+                            # Settle that same recipient-owned task through the
+                            # canonical failure transition before propagating
+                            # the known no-dispatch registration refusal.
+                            await self.fail_task(task.id, str(refusal),
+                                agent_name=authority_agent_id,
+                                recipient_agent_id=authority_agent_id)
+                            raise
                         task = await handler.handle_task(task, arguments=args)
                     # The canonical outcome writer owns CAS and uncertain-commit
                     # reconciliation. A persistence failure must reach the caller; an

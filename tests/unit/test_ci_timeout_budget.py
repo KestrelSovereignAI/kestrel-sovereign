@@ -177,6 +177,7 @@ def test_mcp_lane_runs_the_actual_host_process_restart_campaign():
     """Installed MCP CI must not omit host/auth/restore and approval restart."""
     step = _suite_step('mcp-permission-seam', 'tests/integration/test_mcp_permission_boundary.py')
     assert 'tests/integration/test_mcp_permission_host_restart.py' in shlex.split(step['run'])
+    assert 'tests/integration/test_mcp_permission_unknown_restart.py' in shlex.split(step['run'])
     assert 'tests/integration/test_tool_effect_host_boot.py' in shlex.split(step['run'])
     assert ('tests/unit/test_async_ownership.py::'
         'test_repeated_withdrawal_does_not_accumulate_completion_callbacks') in shlex.split(step['run'])

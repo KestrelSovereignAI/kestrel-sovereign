@@ -55,13 +55,14 @@ from kestrel_sdk.tools.base import ToolParameter as ToolParameter
 from kestrel_sdk.tools import coerce_tool_arguments
 from kestrel_sdk.tools.result import ToolResult, ToolResultStatus
 from kestrel_sdk.tools.deferred import DeferredToolResult
-from kestrel_sdk.resources import ResourceOutcomeUnknown
+from kestrel_sdk.resources import ResourceOutcomeUnknown, observed_outcome_unknown
 
 from kestrel_sovereign.execution_custody import (
     ExecutionAuthorityError,
     execution_evidence_carriers,
     execution_work_operation,
     is_execution_control_error,
+    is_tool_execution_terminal_error,
     require_execution_work,
 )
 from kestrel_sovereign.logging_config import (
@@ -126,26 +127,6 @@ turn_scoped(
     capture=lambda _agent: _flattened_outcome_unknown.get(),
     bind=_bind_flattened_outcome_unknown,
 )
-
-
-def observed_outcome_unknown(
-    error: BaseException | None,
-) -> tuple[ResourceOutcomeUnknown, ...]:
-    """Every ``ResourceOutcomeUnknown`` ``error`` carries, each once.
-
-    The error itself, an explicit cause, or a member of an exception group,
-    at any depth: the explicit graph every execution classifier reads
-    (``execution_evidence_carriers``). ``asyncio.TaskGroup`` raises a child's
-    error inside an ``ExceptionGroup``, so a skill that runs its effects
-    concurrently surfaces an unknown outcome only as a member. Implicit
-    handling context is not evidence. The one test every #3946 boundary
-    applies to an error, so a grouped or chained unknown outcome marks its
-    task like a bare one, and an error carrying none is an ordinary failure.
-    """
-    return tuple(
-        carrier for carrier in execution_evidence_carriers(error)
-        if isinstance(carrier, ResourceOutcomeUnknown)
-    )
 
 
 def report_flattened_outcome_unknown(error: BaseException) -> None:
@@ -1938,7 +1919,7 @@ class Feature(_SdkFeature):
         except ExecutionAuthorityError:
             raise
         except Exception as e:
-            if is_execution_control_error(e):
+            if is_tool_execution_terminal_error(e):
                 raise
             logger.error(
                 "Feature %s subagent execution failed: %s",
@@ -2323,7 +2304,7 @@ class Feature(_SdkFeature):
             except ExecutionAuthorityError:
                 raise
             except Exception as e:
-                if is_execution_control_error(e):
+                if is_tool_execution_terminal_error(e):
                     raise
                 logger.warning(
                     "[SUBAGENT-TOOL] %s raised %s",
@@ -2866,7 +2847,7 @@ ABSOLUTE PROHIBITION - NEVER FABRICATE:
                             except (ExecutionAuthorityError, ResourceOutcomeUnknown):
                                 raise
                             except Exception as e:
-                                if is_execution_control_error(e):
+                                if is_tool_execution_terminal_error(e):
                                     raise
                                 logger.error(
                                     "Error executing tool %s: %s",

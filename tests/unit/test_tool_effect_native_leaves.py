@@ -19,6 +19,60 @@ from tests.unit.test_tool_effect_invocation import governed
 pytestmark = [pytest.mark.asyncio, pytest.mark.timeout(30)]
 
 
+@pytest.mark.parametrize('feature_base', [Feature, SDKFeature], ids=['core', 'sdk'])
+@pytest.mark.parametrize('shape', ['task-group', 'explicit-cause'])
+async def test_composite_unknown_cannot_be_flattened_by_named_tool_wrappers(owner, tmp_path, feature_base, shape):
+    from kestrel_sovereign.execution_custody import execution_evidence_carriers
+    from kestrel_sovereign.tools.effect_journal import ToolEffectOutcomeUnconfirmed
+
+    witness = tmp_path / 'composite-unknown-effects'
+    unknown = ResourceOutcomeUnknown('Original grouped or chained remote reply was lost')
+    observability = ObservabilityStore(owner.tool_effect_store.backend, owns_backend=False)
+    await observability.initialize()
+    owner.observability_store = observability
+
+    async def lose_reply():
+        raise unknown
+
+    class CompoundFeature(feature_base):
+        @property
+        def tool_description(self):
+            return 'Original composite outcome'
+
+        async def initialize(self):
+            pass
+
+        @tool(name='compound_effect', description='Write once before a composite lost reply')
+        async def compound_effect(self, marker: str) -> dict:
+            with witness.open('a') as stream:
+                stream.write(marker + '\n')
+            if shape == 'task-group':
+                async with asyncio.TaskGroup() as children:
+                    children.create_task(lose_reply())
+            raise ResourceConflict('Original wrapper precondition') from unknown
+
+    feature = CompoundFeature(owner)
+    owner.features[feature.name] = feature
+    wrapped = next(tool for tool in feature.get_tools() if tool.name == 'compound_effect')
+
+    @governed
+    async def invoke(agent, user_input, *, invocation_id=None):
+        with pytest.raises(BaseException) as original:
+            await agent.execute_named_tool(wrapped.name, {'marker': 'first'}, session_id='owned-composite-session')
+        assert any(error is unknown for error in execution_evidence_carriers(original.value))
+        with pytest.raises(ToolEffectOutcomeUnconfirmed):
+            await agent.execute_named_tool(wrapped.name, {'marker': 'unsafe second effect'}, session_id='owned-composite-session')
+
+    try:
+        with pytest.raises((ResourceOutcomeUnknown, BaseExceptionGroup)) as closed:
+            await invoke(owner, 'original composite intent', invocation_id='owned-composite-intent')
+        assert any(error is unknown for error in execution_evidence_carriers(closed.value))
+        assert witness.read_text() == 'first\n'
+        assert await owner.tool_effect_store.database.fetchall('SELECT state FROM tool_effect_claims') == [('UNCONFIRMED',)]
+    finally:
+        await observability.close()
+
+
 async def test_async_registration_refusal_settles_the_native_task_without_dispatch(owner, tmp_path):
     from kestrel_sovereign.a2a.scope import NativeRecipientScope
     from kestrel_sdk.native_a2a.types import AgentSkill
@@ -249,6 +303,15 @@ async def test_task_manager_cannot_execute_a_registration_withdrawn_during_appro
             return HookOutput.allow()
 
     owner.hooks_manager.register(Withdraw())
+    created = []
+    create_native_task = manager.create_task
+
+    async def capture_original_task(*args, **kwargs):
+        task = await create_native_task(*args, **kwargs)
+        created.append(task.id)
+        return task
+
+    monkeypatch.setattr(manager, 'create_task', capture_original_task)
     if withdrawal == 'provider-after-claim':
         original_claim = owner.tool_effect_store.claim
 
@@ -272,6 +335,9 @@ async def test_task_manager_cannot_execute_a_registration_withdrawn_during_appro
         assert not witness.exists(), 'TaskManager executed a provider withdrawn during PRE_TOOL_USE'
         assert all(row == ('NOT_EXECUTED',) for row in
             await owner.tool_effect_store.database.fetchall('SELECT state FROM tool_effect_claims'))
+        assert len(created) == 1
+        persisted = await manager.task_store.get_for_recipient(created[0], manager.did)
+        assert persisted.status.state == TaskState.TASK_STATE_FAILED, 'Synchronous withdrawn provider left a native task SUBMITTED'
     finally:
         await manager.close()
 

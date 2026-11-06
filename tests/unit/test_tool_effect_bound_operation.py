@@ -1,5 +1,6 @@
 """Actual bound-tool dispatch, native lifecycle, SQL claims and file effects."""
 
+import asyncio
 import pytest
 import pytest_asyncio
 from kestrel_sdk.tools.base import ToolCategory, ToolParameter, ToolSchema
@@ -33,8 +34,9 @@ async def bound_operation(owner, tmp_path):
             claims = await owner.tool_effect_store.database.fetchall('SELECT state FROM tool_effect_claims')
             assert claims[-1] == ('STARTED',), 'Native dispatcher bypassed durable effect admission'
             assert owner.tool_effect_store.database.owns_open_transaction is False
-            with witness.open('a') as stream:
-                stream.write(marker + '\n')
+            async with owner._get_privacy_transition_lock():
+                with witness.open('a') as stream:
+                    stream.write(marker + '\n')
             return {'success': True, 'marker': marker}
 
     mounted = []
@@ -79,6 +81,46 @@ async def test_missing_operation_id_is_a_required_interface_failure(bound_operat
     with pytest.raises(TypeError, match='operation_id'):
         await binding.invoke({'marker': 'forbidden'}, session_id='owned-session')
     assert not witness.exists()
+
+
+async def test_external_tool_and_real_privacy_transition_follow_one_lock_order(bound_operation, monkeypatch):
+    owner, binding, witness = bound_operation
+    acknowledged, resume = asyncio.Event(), asyncio.Event()
+    original_claim = owner.tool_effect_store.claim
+
+    async def pause_after_native_ack(*args, **kwargs):
+        claim = await original_claim(*args, **kwargs)
+        acknowledged.set()
+        await resume.wait()
+        return claim
+
+    monkeypatch.setattr(owner.tool_effect_store, 'claim', pause_after_native_ack)
+    transitioned = asyncio.Event()
+
+    async def transition():
+        async with owner.privacy_transition():
+            transitioned.set()
+
+    calling = asyncio.create_task(binding.invoke({'marker': 'ordered'},
+        session_id='owned-lock-order', operation_id='owned-lock-order-intent'))
+    changing = None
+    try:
+        await asyncio.wait_for(acknowledged.wait(), 2)
+        changing = asyncio.create_task(transition())
+        await asyncio.sleep(0.02)
+        resume.set()
+        _done, pending = await asyncio.wait({calling, changing}, timeout=0.3)
+        assert not pending, 'Tool/privacy lock order created a native mutex/gate cycle'
+        assert (await calling)['success'] is True
+        await changing
+        assert transitioned.is_set() and witness.read_text() == 'ordered\n'
+        assert await owner.tool_effect_store.database.fetchone('SELECT state FROM tool_effect_claims') == ('RETURNED_OK',)
+    finally:
+        resume.set()
+        for task in (calling, changing):
+            if task is not None and not task.done():
+                task.cancel()
+        await asyncio.gather(calling, *([changing] if changing is not None else []), return_exceptions=True)
 
 
 async def test_external_named_dispatch_owns_its_explicit_operation_without_a_model_turn(bound_operation):

@@ -171,6 +171,11 @@ class _OriginalToolEffectFinish(_OriginalResultCustody):
             if self._phase != 'accepted' or self._attempt is None or self._attempt() is None:
                 raise ExecutionAuthorityError('Original attempt terminal owner is unavailable')
             self._require_backing()
+            if self._backend._original_results_closing:
+                raise ExecutionAuthorityError('Original result inventory is closing')
+            # No await separates this admission fence from hold enrollment.
+            # Existing writers may retire during close; late writers cannot
+            # enter after its original inventory snapshot.
             self._query, self._match_query = self._fixed_queries()
             self._entry = _FinishEntry(self._identity)
             self._phase = 'bound'

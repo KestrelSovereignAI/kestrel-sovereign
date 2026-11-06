@@ -12,7 +12,7 @@ from typing import Any, Awaitable, Callable, Iterator
 
 import rfc8785
 
-from kestrel_sdk.resources import ResourceConflict, ResourceError, ResourceOutcomeUnknown
+from kestrel_sdk.resources import ResourceConflict, ResourceError, ResourceOutcomeUnknown, observed_outcome_unknown
 from kestrel_sdk.tools.result import ToolResult, ToolResultStatus
 from kestrel_sovereign._async_ownership import await_owned_task
 from kestrel_sovereign.execution_custody import (
@@ -112,7 +112,7 @@ class ToolEffectTurn:
             # A swallowed uncertain effect still needs a typed root failure;
             # adding that synthetic error to an already typed/control failure
             # would replace or wrap the very evidence the caller must retain.
-            protected = (isinstance(terminal, ResourceOutcomeUnknown)
+            protected = (bool(observed_outcome_unknown(terminal))
                 or is_execution_control_error(terminal)
                 or any(isinstance(item, asyncio.CancelledError)
                     for item in execution_evidence_carriers(terminal)))
@@ -238,7 +238,10 @@ async def execute_tool_effect(
     completion = asyncio.get_running_loop().create_future()
     turn.pending.add(completion)
     try:
-        async with owner._get_durable_persistence_gate().shared_lock():
+        # Identity-writing tools reenter the privacy mutex. The transition
+        # takes that mutex before the exclusive gate, so every effect must
+        # preserve the same mutex -> gate order across its complete dispatch.
+        async with owner._get_privacy_transition_lock(), owner._get_durable_persistence_gate().shared_lock():
             turn.require_live(owner)
             store = require_persistent_tool_effects(owner)
             if store is not turn.store:
@@ -278,13 +281,16 @@ async def execute_tool_effect(
                 isinstance(result, dict)
                 and (result.get("success") is False or result.get("status") == "error")
             )
+            known_conflict = (isinstance(error, ResourceConflict)
+                and not observed_outcome_unknown(error)
+                and not is_execution_control_error(error))
             state = (
                 "NOT_EXECUTED" if not started else
-                "RETURNED_ERROR" if isinstance(error, ResourceConflict) else
+                "RETURNED_ERROR" if known_conflict else
                 "UNCONFIRMED" if error is not None else
                 "RETURNED_ERROR" if returned_error else "RETURNED_OK"
             )
-            if started and error is not None and not isinstance(error, ResourceConflict):
+            if started and error is not None and not known_conflict:
                 turn.unconfirmed.append(error)
             try:
                 # Ordinary SQL authority is required. A revoked runtime may
