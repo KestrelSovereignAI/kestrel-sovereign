@@ -802,7 +802,7 @@ class TaskManager:
                     task.id,
                     authority_agent_id,
                     work_factory=(handler.agent._get_privacy_transition_lock()
-                        .capture_native_work_factory(acquire_span=False, inherit_frame=False)
+                        .capture_native_work_factory(acquire_span=False, serialize=True)
                         if original_turn is not None else None),
                 )
                 if original_turn is not None:

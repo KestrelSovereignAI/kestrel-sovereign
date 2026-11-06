@@ -329,6 +329,13 @@ turn_scoped(
 )
 
 
+class _NativeWorkBranch:
+    """Sibling exclusion for one exact native continuation branch."""
+
+    def __init__(self):
+        self.children_lock = asyncio.Lock()
+
+
 class ReentrantTransitionLock:
     """Task-reentrant async lock for the privacy-transition boundary (#2672 P1).
 
@@ -431,8 +438,10 @@ class ReentrantTransitionLock:
         self._foreign_native_dependencies = {}
         self._native_foreign_frames = {}
         self._native_foreign_depths = {}
+        self._native_work_branches = {}
+        self._native_foreign_branches = {}
 
-    def capture_native_work_factory(self, *, acquire_span=True, inherit_frame=True):
+    def capture_native_work_factory(self, *, acquire_span=True, serialize=False):
         """Capture the constructing owner's held frame for one lazy source.
 
         Registration is still deferred until dispatch, and an ended foreign
@@ -440,22 +449,33 @@ class ReentrantTransitionLock:
         Background effect workers may retain an existing foreign frame without
         acquiring a new whole-worker span; their actual effect leaves still
         acquire this mutex and revalidate policy through ordinary admission.
-        Deferred independent workers set inherit_frame=False: they retain the
-        held span token, but must serialize at their actual effect entry. Only
-        bounded child continuations may borrow their joining parent's mutex.
+        Independent asynchronous workers set serialize=True. Siblings share
+        their parent's branch gate; each admitted worker gets its own child
+        branch so joined descendants can progress without joining that gate.
+        Only exact native Tasks inherit a branch, never copied context alone.
         """
         parent = asyncio.current_task()
-        frame = ((parent if parent is not None and self._reentry_owner is parent else self._native_foreign_frames.get(parent))
-                 if inherit_frame else None)
+        frame = parent if parent is not None and self._reentry_owner is parent else self._native_foreign_frames.get(parent)
         token = self.current_reentry_token()
         if token is None and self._token_matches_current_span():
             token = _transition_lock_reentry_token.get()
+        branch = self._native_branch_for(parent, frame) if frame is not None else None
         def start(operation, context=None, *, name="privacy-owned-native-work"):
             return self.start_owned_native_work(operation, context=context, name=name,
-                _captured_frame=frame, _captured_token=token, acquire_span=acquire_span, inherit_frame=inherit_frame)
+                _captured_frame=frame, _captured_token=token, acquire_span=acquire_span,
+                serialize=serialize, _captured_branch=branch)
         return start
 
-    def start_owned_native_work(self, operation, *, context=None, name="privacy-owned-native-work", _captured_frame=None, _captured_token=None, acquire_span=True, inherit_frame=True):
+    def _native_branch_for(self, task, frame):
+        branch = self._native_work_branches.get(task)
+        if branch is None:
+            branch = self._native_foreign_branches.get(frame)
+            if branch is None:
+                branch = _NativeWorkBranch()
+                self._native_foreign_branches[frame] = branch
+        return branch
+
+    def start_owned_native_work(self, operation, *, context=None, name="privacy-owned-native-work", _captured_frame=None, _captured_token=None, acquire_span=True, serialize=False, _captured_branch=None):
         """Retain a fixed native body without lending arbitrary reentry rights.
 
         Only the actual foreign-mutex owner may reserve continuation of that
@@ -463,11 +483,16 @@ class ReentrantTransitionLock:
         Other workers acquire the ordinary lock path and revalidate live policy.
         """
         parent = asyncio.current_task()
-        frame = ((parent if parent is not None and self._reentry_owner is parent else self._native_foreign_frames.get(parent))
-                 if inherit_frame else None)
-        if inherit_frame and frame is None and _captured_frame is self._reentry_owner:
+        frame = parent if parent is not None and self._reentry_owner is parent else self._native_foreign_frames.get(parent)
+        if frame is None and _captured_frame is self._reentry_owner:
             frame = _captured_frame
         foreign = frame is not None and self._reentry_owner is frame
+        parent_branch = None
+        if foreign:
+            parent_branch = self._native_work_branches.get(parent) or _captured_branch
+            if parent_branch is None:
+                parent_branch = self._native_branch_for(parent, frame)
+        branch = _NativeWorkBranch() if foreign and serialize else parent_branch
         token = self.current_reentry_token()
         if token is None and self._token_matches_current_span():
             token = _transition_lock_reentry_token.get()
@@ -482,6 +507,9 @@ class ReentrantTransitionLock:
             if opening is not None:
                 raise opening
             if foreign:
+                if serialize:
+                    async with parent_branch.children_lock:
+                        return await operation()
                 return await operation()
             with bind_transition_lock_reentry(token):
                 if not acquire_span:
@@ -502,11 +530,13 @@ class ReentrantTransitionLock:
             self._native_work.discard(finished)
             self._native_foreign_frames.pop(finished, None)
             self._native_foreign_depths.pop(finished, None)
+            self._native_work_branches.pop(finished, None)
         try:
             self._native_work.add(task)
             task._kestrel_native_privacy_state = state
             if foreign:
                 self._native_foreign_frames[task] = frame
+                self._native_work_branches[task] = branch
                 self._foreign_native_dependencies.setdefault(frame, set()).add(task)
             task.add_done_callback(completed)
         except BaseException as opening:
@@ -514,6 +544,7 @@ class ReentrantTransitionLock:
             self._native_work.discard(task)
             self._native_foreign_frames.pop(task, None)
             self._native_foreign_depths.pop(task, None)
+            self._native_work_branches.pop(task, None)
             dependencies = self._foreign_native_dependencies.get(frame)
             if dependencies is not None:
                 dependencies.discard(task)
@@ -647,6 +678,7 @@ class ReentrantTransitionLock:
                             terminal = execution_terminal_error(terminal, outcome.error)
                         terminal = execution_terminal_error(terminal, outcome.cancellation)
                 self._foreign_native_dependencies.pop(task, None)
+                self._native_foreign_branches.pop(task, None)
                 self._reentry_depth = 0
                 self._reentry_owner = None
                 self._reentry_lock.release()

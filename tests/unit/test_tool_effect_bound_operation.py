@@ -465,7 +465,7 @@ async def test_privacy_revocation_during_external_approval_refuses_the_original_
         await asyncio.gather(calling, *([changing] if changing is not None else []), return_exceptions=True)
 
 
-@pytest.mark.parametrize('lane', ['external', 'normal-turn'])
+@pytest.mark.parametrize('lane', ['external', 'normal-turn', 'nested-normal-turn', 'async-parent'])
 async def test_async_native_sibling_effects_exclude_each_other_without_delaying_acceptance(bound_operation, lane):
     from kestrel_sovereign.a2a.scope import NativeRecipientScope
     from kestrel_sovereign.features.base import Feature, tool
@@ -517,7 +517,58 @@ async def test_async_native_sibling_effects_exclude_each_other_without_delaying_
         on_registered=lambda tool, binding: mounted.append(binding))
     binding, = mounted
 
+    class ParentDispatchFeature(Feature):
+        @property
+        def tool_description(self):
+            return 'Original nested asynchronous workflow'
+
+        async def initialize(self):
+            pass
+
+        @tool(name='owned_nested_sibling_dispatch', description='Join a nested native sibling dispatch')
+        async def owned_nested_sibling_dispatch(self) -> dict:
+            return await binding.invoke({}, session_id='owned-async-parent-session',
+                operation_id='owned-async-parent-child')
+
+    parent_feature = ParentDispatchFeature(owner)
+    owner.features[parent_feature.name] = parent_feature
+    manager.register_provider(parent_feature.name, parent_feature.get_agent_skills(), parent_feature)
+
+    class ParentAsyncTool:
+        name = 'owned.async_parent_dispatch'
+        schema = ToolSchema(name, 'Accept an asynchronous parent', ToolCategory.UTILITY)
+
+        async def execute(self):
+            await manager.execute_skill(parent_feature.name, 'owned_nested_sibling_dispatch', {}, sync=False)
+            return {'success': True}
+
+    parents = []
+    owner.register_dynamic_tools('owned-async-parent', [ParentAsyncTool()],
+        on_registered=lambda tool, binding: parents.append(binding))
+    parent_binding, = parents
+
+    class RelayTool:
+        name = 'owned.sibling_relay'
+        schema = ToolSchema(name, 'Join the original nested native dispatch', ToolCategory.UTILITY)
+
+        async def execute(self):
+            return await binding.invoke({}, session_id='owned-nested-sibling-session',
+                operation_id='owned-nested-sibling-child')
+
+    relays = []
+    owner.register_dynamic_tools('owned-sibling-relay', [RelayTool()],
+        on_registered=lambda tool, binding: relays.append(binding))
+    relay, = relays
+
     async def call():
+        if lane == 'async-parent':
+            async with owner._get_privacy_transition_lock():
+                return await parent_binding.invoke({}, session_id='owned-async-parent-session',
+                    operation_id='owned-async-parent-intent')
+        if lane == 'nested-normal-turn':
+            async with owner._get_privacy_transition_lock():
+                return await relay.invoke({}, session_id='owned-nested-sibling-session',
+                    operation_id='owned-nested-sibling-parent')
         if lane == 'normal-turn':
             async with owner._get_privacy_transition_lock():
                 return await binding.invoke({}, session_id='owned-sibling-session', operation_id='owned-sibling-intent')
@@ -525,8 +576,8 @@ async def test_async_native_sibling_effects_exclude_each_other_without_delaying_
 
     calling = asyncio.create_task(call())
     try:
-        await asyncio.wait_for(first_started.wait(), 2)
-        await asyncio.wait({calling}, timeout=0.2)
+        await asyncio.wait({calling}, timeout=0.5)
+        assert first_started.is_set(), 'Nested background effects waited behind their joining parent privacy mutex'
         assert all_accepted.is_set(), 'Native background acceptance waited for its sibling effect'
         assert entered == ['first'], 'Native sibling effects bypassed their shared privacy mutex'
         release.set()
@@ -536,8 +587,12 @@ async def test_async_native_sibling_effects_exclude_each_other_without_delaying_
             persisted = await manager.task_store.get_for_recipient(task.id, manager.did)
             assert persisted.status.state == TaskState.TASK_STATE_COMPLETED
         states = await owner.tool_effect_store.database.fetchall('SELECT state FROM tool_effect_claims')
-        assert states == [('RETURNED_OK',)] * 5
+        assert states == [('RETURNED_OK',)] * ({'nested-normal-turn': 6, 'async-parent': 8}.get(lane, 5))
     finally:
         release.set()
-        await asyncio.gather(calling, *tuple(manager._execution_tasks), return_exceptions=True)
+        workers = tuple(manager._execution_tasks)
+        if not first_started.is_set():
+            for worker in workers:
+                worker.cancel()
+        await asyncio.gather(calling, *workers, return_exceptions=True)
         await manager.close()
