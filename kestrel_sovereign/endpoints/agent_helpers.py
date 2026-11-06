@@ -6,6 +6,7 @@ from fastapi import HTTPException, Request
 
 from kestrel_sovereign.agent.invocation import (
     InvocationProvenance,
+    InvocationIdentityConflictError,
     invocation_id_response_header,
     request_provenance,
     resolve_transport_invocation_id,
@@ -154,10 +155,11 @@ def reject_reserved_session_id(session_id: object) -> None:
 
 
 def _invalid_request_id(error: ValueError) -> ApiHTTPException:
+    conflict = isinstance(error, InvocationIdentityConflictError)
     return ApiHTTPException(
         status_code=400,
-        code="invalid_request_id",
-        message=(
+        code="conflicting_request_id" if conflict else "invalid_request_id",
+        message=str(error) if conflict else (
             "request_id must be a non-empty valid Unicode string no "
             f"longer than 256 characters: {error}"
         ),

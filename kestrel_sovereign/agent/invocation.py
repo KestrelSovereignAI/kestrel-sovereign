@@ -105,6 +105,10 @@ class InvocationCancelledError(Exception):
     """An isolated turn ended without cancelling its long-lived caller."""
 
 
+class InvocationIdentityConflictError(ValueError):
+    """Present retry identifiers disagree about the intended operation."""
+
+
 class InvocationSelfFencedError(Exception):
     """An invocation stopped because its infrastructure lease became unsafe.
 
@@ -221,7 +225,7 @@ def invocation_id_from_request_header(value: object) -> str:
     transport.  ``X-Request-ID`` therefore always uses RFC 3986 percent
     encoding: a client retries with the response value verbatim, and the
     server decodes it exactly once.  Body ``request_id`` / ``invocation_id`` /
-    ``id`` values remain literal Unicode and retain their existing precedence.
+    ``id`` values remain literal Unicode.
 
     This is deliberately not a best-effort decoder.  A literal percent in a
     header value must be sent as ``%25``; otherwise a value such as ``%E2`` is
@@ -286,23 +290,24 @@ def resolve_transport_invocation_id(
     body: Mapping[str, object] | object | None,
     header_request_id: object = None,
 ) -> str:
-    """Resolve one client retry identity from the shared HTTP contract.
+    """Require every present body alias and decoded header to name one intent.
 
-    Explicit body fields win over the header for backwards compatibility with
-    ``/api/agent``.  ``id`` is accepted for OpenAI-compatible clients, while
-    ``invocation_id`` lets non-Kestrel gateways name the same opaque operation
-    without overloading a provider's response identifier.
+    ``id`` remains the OpenAI-compatible alias. Body values are literal Unicode;
+    the header is decoded once before comparing identities.
     """
+    identities = []
     for field in ("request_id", "invocation_id", "id"):
         if isinstance(body, Mapping):
             value = body.get(field)
         else:
             value = getattr(body, field, None) if body is not None else None
         if value is not None:
-            return ensure_invocation_id(value)
-    if header_request_id is None:
-        return ensure_invocation_id()
-    return invocation_id_from_request_header(header_request_id)
+            identities.append(validate_invocation_id(value))
+    if header_request_id is not None:
+        identities.append(invocation_id_from_request_header(header_request_id))
+    if len(set(identities)) > 1:
+        raise InvocationIdentityConflictError("Request identity aliases identify different operations")
+    return identities[0] if identities else new_invocation_id()
 
 
 def request_provenance(
