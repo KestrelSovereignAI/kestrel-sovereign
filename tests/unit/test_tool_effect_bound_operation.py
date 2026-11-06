@@ -145,7 +145,8 @@ async def test_missing_operation_id_is_a_required_interface_failure(bound_operat
     assert not witness.exists()
 
 
-async def test_external_tool_and_real_privacy_transition_follow_one_lock_order(bound_operation, monkeypatch):
+@pytest.mark.parametrize('lane', ['bound', 'in-turn'])
+async def test_external_tool_and_real_privacy_transition_follow_one_lock_order(bound_operation, monkeypatch, lane):
     owner, binding, witness = bound_operation
     acknowledged, resume = asyncio.Event(), asyncio.Event()
     original_claim = owner.tool_effect_store.claim
@@ -163,8 +164,17 @@ async def test_external_tool_and_real_privacy_transition_follow_one_lock_order(b
         async with owner.privacy_transition():
             transitioned.set()
 
-    calling = asyncio.create_task(binding.invoke({'marker': 'ordered'},
-        session_id='owned-lock-order', operation_id='owned-lock-order-intent'))
+    from tests.unit.test_tool_effect_invocation import governed
+
+    @governed
+    async def invoke(agent, user_input, *, invocation_id=None):
+        return await agent.execute_named_tool(binding.name, {'marker': 'ordered'},
+            session_id='owned-lock-order')
+
+    calling = asyncio.create_task(
+        binding.invoke({'marker': 'ordered'}, session_id='owned-lock-order',
+            operation_id='owned-lock-order-intent') if lane == 'bound' else
+        invoke(owner, 'original in-turn intent', invocation_id='owned-lock-order-intent'))
     changing = None
     try:
         await asyncio.wait_for(acknowledged.wait(), 2)
@@ -177,6 +187,54 @@ async def test_external_tool_and_real_privacy_transition_follow_one_lock_order(b
         await changing
         assert transitioned.is_set() and witness.read_text() == 'ordered\n'
         assert await owner.tool_effect_store.database.fetchone('SELECT state FROM tool_effect_claims') == ('RETURNED_OK',)
+    finally:
+        resume.set()
+        for task in (calling, changing):
+            if task is not None and not task.done():
+                task.cancel()
+        await asyncio.gather(calling, *([changing] if changing is not None else []), return_exceptions=True)
+
+
+async def test_external_lifecycle_holds_privacy_from_native_admission_to_dispatch(bound_operation, monkeypatch):
+    from kestrel_sovereign._async_ownership import await_owned_task
+
+    owner, binding, witness = bound_operation
+    acknowledged, resume, transitioned = asyncio.Event(), asyncio.Event(), asyncio.Event()
+    admit = owner.tool_effect_store.admit
+    tool = owner._direct_tools[binding.name]
+    execute = tool.execute
+
+    async def hold_native_admission(*args, **kwargs):
+        attempt = await admit(*args, **kwargs)
+        assert not owner.tool_effect_store.database.owns_open_transaction
+        acknowledged.set()
+        await resume.wait()
+        return attempt
+
+    async def observe_original_execution(**kwargs):
+        assert not transitioned.is_set(), 'Privacy transition overtook an already admitted lifecycle'
+        return await execute(**kwargs)
+
+    async def transition():
+        async with owner.privacy_transition():
+            transitioned.set()
+
+    monkeypatch.setattr(owner.tool_effect_store, 'admit', hold_native_admission)
+    monkeypatch.setattr(tool, 'execute', observe_original_execution)
+    calling = asyncio.create_task(binding.invoke({'marker': 'ordered'},
+        session_id='owned-lifecycle-span', operation_id='owned-lifecycle-span-intent'))
+    changing = None
+    try:
+        await asyncio.wait_for(acknowledged.wait(), 2)
+        changing = asyncio.create_task(transition())
+        await asyncio.sleep(0.02)
+        resume.set()
+        outcome = await await_owned_task(calling)
+        healthy = outcome.error is None
+        assert healthy, 'External lifecycle lost its privacy span before native dispatch'
+        await changing
+        assert transitioned.is_set() and witness.read_text() == 'ordered\n'
+        assert not owner._active_request_ids
     finally:
         resume.set()
         for task in (calling, changing):
