@@ -177,6 +177,15 @@ def test_mcp_lane_runs_the_actual_host_process_restart_campaign():
     """Installed MCP CI must not omit host/auth/restore and approval restart."""
     step = _suite_step('mcp-permission-seam', 'tests/integration/test_mcp_permission_boundary.py')
     assert 'tests/integration/test_mcp_permission_host_restart.py' in shlex.split(step['run'])
+    assert 'tests/integration/test_tool_effect_host_boot.py' in shlex.split(step['run'])
+    assert ('tests/unit/test_async_ownership.py::'
+        'test_repeated_withdrawal_does_not_accumulate_completion_callbacks') in shlex.split(step['run'])
+    job = yaml.safe_load(CI_WORKFLOW.read_text())['jobs']['mcp-permission-seam']
+    installations = [shlex.split(item['run']) for item in job['steps']
+        if str(item.get('run', '')).startswith('uv sync ')]
+    assert len(installations) == 1
+    installation = installations[0]
+    assert installation[installation.index('--python') + 1] == '3.14'
 
 
 @pytest.mark.asyncio
