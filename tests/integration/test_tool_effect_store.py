@@ -13,10 +13,11 @@ import pytest_asyncio
 from kestrel_sovereign.a2a.scope import NativeRecipientScope
 from kestrel_sovereign.storage.async_database import AsyncDatabase
 from kestrel_sovereign.tool_effect_store import (
-    ToolEffectAttemptSuperseded, ToolEffectOperationConflict,
+    ToolEffectAttemptClosed, ToolEffectAttemptSuperseded, ToolEffectClaimConflict, ToolEffectOperationConflict,
     ToolEffectIntegrityError, ToolEffectReconciliationRequired, ToolEffectStore,
 )
 from kestrel_sdk.storage.database.interface import TransactionError
+from kestrel_sdk.resources import ResourceConflict
 
 
 @pytest_asyncio.fixture(params=["sqlite", pytest.param("postgres", marks=pytest.mark.native_postgres)])
@@ -116,7 +117,7 @@ async def test_not_executed_allows_new_attempt_but_terminal_claim_cannot_be_reop
     first = await admit(store)
     claim = await store.claim(first, registration="owned-tool", arguments={})
     await store.settle(claim, state="NOT_EXECUTED")
-    with pytest.raises(ToolEffectOperationConflict):
+    with pytest.raises(ToolEffectClaimConflict):
         await store.settle(claim, state="RETURNED_OK")
     second = await admit(store)
     with pytest.raises(ToolEffectAttemptSuperseded):
@@ -131,7 +132,7 @@ async def test_unknown_latch_stops_new_claims_while_original_parallel_claim_can_
     first = await store.claim(attempt, registration="owned-first", arguments={})
     second = await store.claim(attempt, registration="owned-second", arguments={})
     await store.settle(first, state="UNCONFIRMED")
-    with pytest.raises(ToolEffectAttemptSuperseded):
+    with pytest.raises(ToolEffectAttemptClosed):
         await store.claim(attempt, registration="owned-third", arguments={})
     await store.settle(second, state="RETURNED_OK")
     with pytest.raises(ToolEffectReconciliationRequired) as error:
@@ -173,7 +174,7 @@ async def test_closed_attempt_cannot_erase_an_unsettled_effect_as_not_executed(j
     attempt = await admit(store)
     claim = await store.claim(attempt, registration="owned-tool", arguments={})
     await store.finish(attempt)
-    with pytest.raises(ToolEffectAttemptSuperseded):
+    with pytest.raises(ToolEffectAttemptClosed):
         await store.settle(claim, state="NOT_EXECUTED")
     with pytest.raises(ToolEffectReconciliationRequired) as error:
         await admit(store)
@@ -186,9 +187,8 @@ async def test_missing_root_with_operations_never_creates_a_replacement(journal)
     await admit(store)
     await store.database.execute("DELETE FROM tool_effect_keys WHERE scope_digest = ?", (store.scope_digest,))
     restarted = ToolEffectStore(store.database, scope=NativeRecipientScope("did:test:owned-journal", "tenant"))
-    with pytest.raises(TransactionError, match="original tool effect envelope key is missing") as error:
+    with pytest.raises(ToolEffectIntegrityError, match="original tool effect envelope key is missing"):
         await restarted.initialize()
-    assert isinstance(error.value.__cause__, ToolEffectIntegrityError)
     assert restarted._root is None
     assert await store.database.fetchone("SELECT COUNT(*) FROM tool_effect_keys") == (0,)
 
@@ -199,9 +199,8 @@ async def test_wrong_wrapping_key_preserves_the_original_envelope(journal, monke
     before = await store.database.fetchone("SELECT wrapped_key FROM tool_effect_keys")
     monkeypatch.setenv("KESTREL_DATA_KEY", Fernet.generate_key().decode())
     restarted = ToolEffectStore(store.database, scope=NativeRecipientScope("did:test:owned-journal", "tenant"))
-    with pytest.raises(TransactionError, match="restore its original KESTREL_DATA_KEY") as error:
+    with pytest.raises(ToolEffectIntegrityError, match="restore its original KESTREL_DATA_KEY"):
         await restarted.initialize()
-    assert isinstance(error.value.__cause__, ToolEffectIntegrityError)
     assert restarted._root is None
     assert await store.database.fetchone("SELECT wrapped_key FROM tool_effect_keys") == before
 
@@ -217,7 +216,7 @@ async def test_agent_scopes_and_authenticated_caller_namespaces_are_distinct(jou
     await other_scope.initialize()
     other_attempt = await admit(other_scope)
     assert original.scope_digest != other_attempt.scope_digest
-    with pytest.raises(ToolEffectAttemptSuperseded):
+    with pytest.raises(ResourceConflict):
         await other_scope.claim(original, registration="owned-tool", arguments={})
     keys = await store.database.fetchall("SELECT key_id FROM tool_effect_keys")
     assert len(keys) == len(set(row[0] for row in keys)) == 2
@@ -267,7 +266,7 @@ async def test_uncommitted_caller_transaction_cannot_receive_claim_admission(jou
     with pytest.raises(TransactionError) as error:
         async with store.database.transaction():
             await admit(store)
-    assert isinstance(error.value.__cause__, ToolEffectOperationConflict)
+    assert isinstance(error.value.__cause__, ResourceConflict)
     assert await store.database.fetchone("SELECT COUNT(*) FROM tool_effect_operations") == (0,)
 
 
@@ -347,8 +346,7 @@ async def test_unknown_schema_revision_is_not_migrated_or_marked_initialized(jou
     store, _, _ = journal
     await store.database.execute("UPDATE tool_effect_schema SET revision = 2 WHERE singleton = 1")
     restarted = ToolEffectStore(store.database, scope=NativeRecipientScope("did:test:owned-journal", "tenant"))
-    with pytest.raises(TransactionError, match="unsupported tool effect schema revision") as error:
+    with pytest.raises(ToolEffectIntegrityError, match="unsupported tool effect schema revision"):
         await restarted.initialize()
-    assert isinstance(error.value.__cause__, ToolEffectIntegrityError)
     assert restarted._root is None
     assert await store.database.fetchone("SELECT revision FROM tool_effect_schema WHERE singleton = 1") == (2,)

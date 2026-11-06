@@ -34,6 +34,7 @@ from kestrel_sdk.security.aead import AEADCipher
 from kestrel_sdk.security.exceptions import DecryptionError
 from kestrel_sdk.storage.database.interface import TransactionError
 from kestrel_sovereign.storage.async_database import AsyncDatabase
+from kestrel_sovereign.storage.initialization_errors import repository_initialization_errors
 from kestrel_sovereign.security.envelope_keys import resolve_envelope_key
 from kestrel_sovereign.execution_custody import execution_commit_outcome
 
@@ -134,14 +135,11 @@ class ArtifactRepository:
         if self._index_key is None:
             async with self._initialization_lock:
                 if self._index_key is None:
-                    try:
+                    with repository_initialization_errors(
+                        integrity_error=ArtifactIntegrityError,
+                        unknown_message="artifact initialization requires reconciliation",
+                    ):
                         await self.initialize()
-                    except TransactionError as error:
-                        if execution_commit_outcome(error) is not None:
-                            raise ResourceOutcomeUnknown("artifact initialization requires reconciliation") from error
-                        if isinstance(error.__cause__, ArtifactIntegrityError):
-                            raise error.__cause__ from None
-                        raise
 
     async def initialize(self) -> None:
         self._require_outermost()

@@ -29,6 +29,7 @@ from kestrel_sdk.storage.database.interface import TransactionError
 
 from kestrel_sovereign.execution_custody import ExecutionAuthorityError, execution_commit_outcome
 from kestrel_sovereign.security.envelope_keys import resolve_envelope_key
+from kestrel_sovereign.storage.initialization_errors import repository_initialization_errors
 from .step import PlanningRecord, StepIntent
 from .runpod_quote_storage import _RunpodEnvironmentEnvelope
 
@@ -126,7 +127,10 @@ class VisualCustodyRepository:
                 raise CustodyIntegrityError("visual custody requires encryption")
             if self.db.owns_open_transaction is not False:
                 raise ResourceConflict("visual custody requires an outermost transaction")
-            try:
+            with repository_initialization_errors(
+                integrity_error=CustodyIntegrityError,
+                unknown_message="visual custody initialization requires reconciliation",
+            ):
                 async with self.db.migration_lock("visual-computer-custody-v1"):
                     binary = "BYTEA" if self.db.backend_type == "postgres" else "BLOB"
                     for sql in (
@@ -190,12 +194,6 @@ class VisualCustodyRepository:
                     await self.db.execute("CREATE INDEX IF NOT EXISTS visual_computer_retired_requests ON visual_computer_requests (owner, retired, released)")
                     await self.db.execute("CREATE INDEX IF NOT EXISTS visual_computer_pending_actions ON visual_computer_actions (owner, session_key, pending)")
                     await self.db.execute("DELETE FROM visual_computer_actions WHERE pending = 0 AND EXISTS (SELECT 1 FROM visual_computer_requests r WHERE r.owner = visual_computer_actions.owner AND r.session_key = visual_computer_actions.session_key AND r.released = 1)")
-            except TransactionError as error:
-                if execution_commit_outcome(error) is not None:
-                    raise ResourceOutcomeUnknown("visual custody initialization requires reconciliation") from error
-                if isinstance(error.__cause__, CustodyIntegrityError):
-                    raise error.__cause__ from None
-                raise
             self._key = key
 
     def _address(self, *parts, key=None):

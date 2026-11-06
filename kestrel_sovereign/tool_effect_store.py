@@ -10,18 +10,19 @@ import asyncio
 from dataclasses import dataclass
 import hashlib
 import hmac
-from typing import Literal
+from typing import Literal, NoReturn
 from uuid import uuid4
 
 import rfc8785
 
 from kestrel_sdk._validation import stable_token
-from kestrel_sdk.resources import ResourceError
+from kestrel_sdk.resources import ResourceConflict, ResourceError
 from kestrel_sdk.security.encryption import get_fernet
 from kestrel_sovereign.a2a.scope import NativeRecipientScope
 from kestrel_sovereign.a2a.stores.unified.base import NativeStoreConflict, UnifiedStoreBase
 from kestrel_sovereign.security.envelope_keys import resolve_envelope_key
 from kestrel_sovereign.storage.async_database import AsyncDatabase
+from kestrel_sovereign.storage.initialization_errors import repository_initialization_errors
 
 
 class ToolEffectIntegrityError(ResourceError):
@@ -34,6 +35,14 @@ class ToolEffectOperationConflict(NativeStoreConflict):
 
 class ToolEffectAttemptSuperseded(NativeStoreConflict):
     """This execution attempt no longer owns admission."""
+
+
+class ToolEffectAttemptClosed(NativeStoreConflict):
+    """The original attempt still exists but no longer admits this work."""
+
+
+class ToolEffectClaimConflict(NativeStoreConflict):
+    """A settlement does not match an original unsettled claim."""
 
 
 class ToolEffectReconciliationRequired(NativeStoreConflict):
@@ -74,7 +83,7 @@ class ToolEffectStore(UnifiedStoreBase):
 
     def _require_outermost(self) -> None:
         if self.database.owns_open_transaction is not False:
-            raise ToolEffectOperationConflict("tool effect journal requires its own durable transaction")
+            raise ResourceConflict("tool effect journal requires its own durable transaction")
 
     async def initialize(self) -> None:
         if self._root is not None:
@@ -88,43 +97,47 @@ class ToolEffectStore(UnifiedStoreBase):
             cipher = get_fernet()
             if cipher is None:
                 raise ToolEffectIntegrityError("tool effect journal requires encryption")
-            async with self.database.migration_lock("kestrel-tool-effect-schema-v1"):
-                await self.database.execute(
-                    "CREATE TABLE IF NOT EXISTS tool_effect_schema (singleton BIGINT PRIMARY KEY, revision BIGINT NOT NULL)"
-                )
-                revision = await self.database.fetchone("SELECT revision FROM tool_effect_schema WHERE singleton = 1")
-                if revision is not None and revision[0] != 1:
-                    raise ToolEffectIntegrityError("unsupported tool effect schema revision")
-                if revision is None:
-                    binary = "BYTEA" if self.is_postgres else "BLOB"
-                    for sql in (
-                        f"CREATE TABLE tool_effect_keys (key_id TEXT PRIMARY KEY, scope_digest TEXT NOT NULL UNIQUE, wrapped_key {binary} NOT NULL)",
-                        "CREATE TABLE tool_effect_operations (scope_digest TEXT NOT NULL, operation_digest TEXT NOT NULL, request_digest TEXT NOT NULL, attempt_id TEXT NOT NULL, revision BIGINT NOT NULL, state TEXT NOT NULL CHECK(state IN ('OPEN', 'CLOSED')), latched BIGINT NOT NULL CHECK(latched IN (0, 1)), PRIMARY KEY(scope_digest, operation_digest))",
-                        "CREATE TABLE tool_effect_claims (scope_digest TEXT NOT NULL, operation_digest TEXT NOT NULL, claim_id TEXT NOT NULL, attempt_id TEXT NOT NULL, parent_claim_id TEXT, registration_digest TEXT NOT NULL, args_digest TEXT NOT NULL, state TEXT NOT NULL CHECK(state IN ('STARTED', 'RETURNED_OK', 'RETURNED_ERROR', 'UNCONFIRMED', 'NOT_EXECUTED')), PRIMARY KEY(scope_digest, operation_digest, claim_id), FOREIGN KEY(scope_digest, operation_digest) REFERENCES tool_effect_operations(scope_digest, operation_digest))",
-                    ):
-                        await self.database.execute(sql)
-                    await self.database.execute("INSERT INTO tool_effect_schema(singleton, revision) VALUES (1, 1)")
-                # A completed revision never silently recreates lost tables.
-                await self.database.fetchone("SELECT request_digest, attempt_id, revision, state, latched FROM tool_effect_operations WHERE 1 = 0")
-                await self.database.fetchone("SELECT claim_id, attempt_id, parent_claim_id, registration_digest, args_digest, state FROM tool_effect_claims WHERE 1 = 0")
-                row = await self.database.fetchone("SELECT wrapped_key FROM tool_effect_keys WHERE scope_digest = ?", (self.scope_digest,))
-                has_dependents = False
-                if row is None:
-                    for table in ("tool_effect_operations", "tool_effect_claims"):
-                        if await self.database.fetchone(f"SELECT 1 FROM {table} WHERE scope_digest = ? LIMIT 1", (self.scope_digest,)):
-                            has_dependents = True
-                root, new_envelope = resolve_envelope_key(
-                    cipher, bytes(row[0]) if row is not None else None,
-                    has_dependents=has_dependents, integrity_error=ToolEffectIntegrityError,
-                    missing_message="original tool effect envelope key is missing",
-                    unavailable_message="tool effect envelope cannot be opened; restore its original KESTREL_DATA_KEY or complete offline key rotation",
-                    invalid_message="invalid tool effect envelope key",
-                )
-                if new_envelope is not None:
+            with repository_initialization_errors(
+                integrity_error=ToolEffectIntegrityError,
+                unknown_message="tool effect initialization requires reconciliation",
+            ):
+                async with self.database.migration_lock("kestrel-tool-effect-schema-v1"):
                     await self.database.execute(
-                        "INSERT INTO tool_effect_keys(key_id, scope_digest, wrapped_key) VALUES (?, ?, ?)",
-                        (self.scope_digest + ":v1", self.scope_digest, new_envelope),
+                        "CREATE TABLE IF NOT EXISTS tool_effect_schema (singleton BIGINT PRIMARY KEY, revision BIGINT NOT NULL)"
                     )
+                    revision = await self.database.fetchone("SELECT revision FROM tool_effect_schema WHERE singleton = 1")
+                    if revision is not None and revision[0] != 1:
+                        raise ToolEffectIntegrityError("unsupported tool effect schema revision")
+                    if revision is None:
+                        binary = "BYTEA" if self.is_postgres else "BLOB"
+                        for sql in (
+                            f"CREATE TABLE tool_effect_keys (key_id TEXT PRIMARY KEY, scope_digest TEXT NOT NULL UNIQUE, wrapped_key {binary} NOT NULL)",
+                            "CREATE TABLE tool_effect_operations (scope_digest TEXT NOT NULL, operation_digest TEXT NOT NULL, request_digest TEXT NOT NULL, attempt_id TEXT NOT NULL, revision BIGINT NOT NULL, state TEXT NOT NULL CHECK(state IN ('OPEN', 'CLOSED')), latched BIGINT NOT NULL CHECK(latched IN (0, 1)), PRIMARY KEY(scope_digest, operation_digest))",
+                            "CREATE TABLE tool_effect_claims (scope_digest TEXT NOT NULL, operation_digest TEXT NOT NULL, claim_id TEXT NOT NULL, attempt_id TEXT NOT NULL, parent_claim_id TEXT, registration_digest TEXT NOT NULL, args_digest TEXT NOT NULL, state TEXT NOT NULL CHECK(state IN ('STARTED', 'RETURNED_OK', 'RETURNED_ERROR', 'UNCONFIRMED', 'NOT_EXECUTED')), PRIMARY KEY(scope_digest, operation_digest, claim_id), FOREIGN KEY(scope_digest, operation_digest) REFERENCES tool_effect_operations(scope_digest, operation_digest))",
+                        ):
+                            await self.database.execute(sql)
+                        await self.database.execute("INSERT INTO tool_effect_schema(singleton, revision) VALUES (1, 1)")
+                    # A completed revision never silently recreates lost tables.
+                    await self.database.fetchone("SELECT request_digest, attempt_id, revision, state, latched FROM tool_effect_operations WHERE 1 = 0")
+                    await self.database.fetchone("SELECT claim_id, attempt_id, parent_claim_id, registration_digest, args_digest, state FROM tool_effect_claims WHERE 1 = 0")
+                    row = await self.database.fetchone("SELECT wrapped_key FROM tool_effect_keys WHERE scope_digest = ?", (self.scope_digest,))
+                    has_dependents = False
+                    if row is None:
+                        for table in ("tool_effect_operations", "tool_effect_claims"):
+                            if await self.database.fetchone(f"SELECT 1 FROM {table} WHERE scope_digest = ? LIMIT 1", (self.scope_digest,)):
+                                has_dependents = True
+                    root, new_envelope = resolve_envelope_key(
+                        cipher, bytes(row[0]) if row is not None else None,
+                        has_dependents=has_dependents, integrity_error=ToolEffectIntegrityError,
+                        missing_message="original tool effect envelope key is missing",
+                        unavailable_message="tool effect envelope cannot be opened; restore its original KESTREL_DATA_KEY or complete offline key rotation",
+                        invalid_message="invalid tool effect envelope key",
+                    )
+                    if new_envelope is not None:
+                        await self.database.execute(
+                            "INSERT INTO tool_effect_keys(key_id, scope_digest, wrapped_key) VALUES (?, ?, ?)",
+                            (self.scope_digest + ":v1", self.scope_digest, new_envelope),
+                        )
             self._root = root
 
     def _digest(self, domain: str, value: object) -> str:
@@ -134,7 +147,7 @@ class ToolEffectStore(UnifiedStoreBase):
 
     def _require_scope(self, attempt: ToolEffectAttempt) -> None:
         if attempt.scope_digest != self.scope_digest:
-            raise ToolEffectAttemptSuperseded("tool effect attempt belongs to another scope")
+            raise ResourceConflict("tool effect attempt belongs to another scope")
         if self._root is None:
             raise RuntimeError("tool effect journal must be initialized")
         self._require_outermost()
@@ -147,6 +160,15 @@ class ToolEffectStore(UnifiedStoreBase):
         ):
             counts["unsettled" if state == "STARTED" else state.lower()] = count
         return counts
+
+    async def _refuse_inactive_attempt(self, attempt: ToolEffectAttempt) -> NoReturn:
+        row = await self.database.fetchone(
+            "SELECT attempt_id FROM tool_effect_operations WHERE scope_digest = ? AND operation_digest = ?",
+            (self.scope_digest, attempt.operation_digest),
+        )
+        if row is not None and row[0] == attempt.attempt_id:
+            raise ToolEffectAttemptClosed("tool effect attempt is closed or stopped")
+        raise ToolEffectAttemptSuperseded("tool effect attempt was superseded or is absent")
 
     async def admit(self, *, namespace: object, client_key: str, request: object) -> ToolEffectAttempt:
         self._require_outermost()
@@ -167,9 +189,12 @@ class ToolEffectStore(UnifiedStoreBase):
             row = await self.database.fetchone("SELECT request_digest FROM tool_effect_operations WHERE scope_digest = ? AND operation_digest = ?", (self.scope_digest, operation))
             if row[0] != request_digest:
                 raise ToolEffectOperationConflict("tool effect operation key has different input")
-            counts = await self._counts(operation)
-            if any(counts[name] for name in ("returned_ok", "returned_error", "unconfirmed", "unsettled")):
-                raise ToolEffectReconciliationRequired(counts)
+            effect = await self.database.fetchone(
+                "SELECT 1 FROM tool_effect_claims WHERE scope_digest = ? AND operation_digest = ? AND state <> 'NOT_EXECUTED' LIMIT 1",
+                (self.scope_digest, operation),
+            )
+            if effect is not None:
+                raise ToolEffectReconciliationRequired(await self._counts(operation))
             await self.database.execute(
                 "UPDATE tool_effect_operations SET attempt_id = ?, state = 'OPEN', latched = 0 WHERE scope_digest = ? AND operation_digest = ?",
                 (attempt.attempt_id, self.scope_digest, operation),
@@ -190,7 +215,7 @@ class ToolEffectStore(UnifiedStoreBase):
                 (self.scope_digest, attempt.operation_digest, attempt.attempt_id),
             )
             if changed != 1:
-                raise ToolEffectAttemptSuperseded("tool effect attempt no longer admits work")
+                await self._refuse_inactive_attempt(attempt)
             await self.database.execute(
                 "INSERT INTO tool_effect_claims(scope_digest, operation_digest, claim_id, attempt_id, parent_claim_id, registration_digest, args_digest, state) VALUES (?, ?, ?, ?, ?, ?, ?, 'STARTED')",
                 (self.scope_digest, attempt.operation_digest, claim.claim_id, attempt.attempt_id,
@@ -211,13 +236,13 @@ class ToolEffectStore(UnifiedStoreBase):
                 (self.scope_digest, attempt.operation_digest, attempt.attempt_id, state),
             )
             if changed != 1:
-                raise ToolEffectAttemptSuperseded("tool effect claim lost its original attempt")
+                await self._refuse_inactive_attempt(attempt)
             changed = await self.database.execute(
                 "UPDATE tool_effect_claims SET state = ? WHERE scope_digest = ? AND operation_digest = ? AND claim_id = ? AND attempt_id = ? AND state = 'STARTED'",
                 (state, self.scope_digest, attempt.operation_digest, claim.claim_id, attempt.attempt_id),
             )
             if changed != 1:
-                raise ToolEffectOperationConflict("tool effect claim is already terminal or absent")
+                raise ToolEffectClaimConflict("tool effect claim is already terminal or absent")
             if state == "UNCONFIRMED":
                 await self.database.execute(
                     "UPDATE tool_effect_operations SET latched = 1 WHERE scope_digest = ? AND operation_digest = ?",
