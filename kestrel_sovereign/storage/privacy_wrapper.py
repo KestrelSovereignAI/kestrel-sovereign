@@ -432,11 +432,14 @@ class ReentrantTransitionLock:
         self._native_foreign_frames = {}
         self._native_foreign_depths = {}
 
-    def capture_native_work_factory(self):
+    def capture_native_work_factory(self, *, acquire_span=True):
         """Capture the constructing owner's held frame for one lazy source.
 
         Registration is still deferred until dispatch, and an ended foreign
         frame cannot be revived. Copied-context children gain no frame rights.
+        Background effect workers may retain an existing foreign frame without
+        acquiring a new whole-worker span; their actual effect leaves still
+        acquire this mutex and revalidate policy through ordinary admission.
         """
         parent = asyncio.current_task()
         frame = parent if parent is not None and self._reentry_owner is parent else self._native_foreign_frames.get(parent)
@@ -445,10 +448,10 @@ class ReentrantTransitionLock:
             token = _transition_lock_reentry_token.get()
         def start(operation, context=None, *, name="privacy-owned-native-work"):
             return self.start_owned_native_work(operation, context=context, name=name,
-                _captured_frame=frame, _captured_token=token)
+                _captured_frame=frame, _captured_token=token, acquire_span=acquire_span)
         return start
 
-    def start_owned_native_work(self, operation, *, context=None, name="privacy-owned-native-work", _captured_frame=None, _captured_token=None):
+    def start_owned_native_work(self, operation, *, context=None, name="privacy-owned-native-work", _captured_frame=None, _captured_token=None, acquire_span=True):
         """Retain a fixed native body without lending arbitrary reentry rights.
 
         Only the actual foreign-mutex owner may reserve continuation of that
@@ -476,6 +479,8 @@ class ReentrantTransitionLock:
             if foreign:
                 return await operation()
             with bind_transition_lock_reentry(token):
+                if not acquire_span:
+                    return await operation()
                 async with self:
                     state["entered"] = True
                     return await operation()

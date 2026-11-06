@@ -3701,16 +3701,15 @@ class OrchestratorEngineMixin:
 
                 await gather_owned(
                     (
-                        _run_one(
-                            tc,
-                            per_tool_messages[i],
-                            per_tool_results[i] if per_tool_results is not None else None,
-                        )
+                        (lambda i=i, tc=tc: _run_one(
+                            tc, per_tool_messages[i],
+                            per_tool_results[i] if per_tool_results is not None else None))
                         for i, tc in enumerate(batch_tcs)
                     ),
                     retain_originals=True,
                     isolate_control_originals=True,
                     name_prefix="orchestrator-parallel-tool",
+                    work_factory=self._get_privacy_transition_lock().capture_native_work_factory(acquire_span=False),
                 )
 
                 # Append results in original request order

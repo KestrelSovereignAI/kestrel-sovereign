@@ -367,7 +367,7 @@ async def gather_owned(operations, *, cancel_siblings_on_error=True,
                        retirement_resource=None, retain_originals=False,
                        name_prefix: str | None = None,
                        isolate_control_originals=False,
-                       return_when=asyncio.ALL_COMPLETED):
+                       return_when=asyncio.ALL_COMPLETED, work_factory=None):
     """Join accepted children even if later admission or observation fails.
 
     Independent native retirement can disable sibling cancellation: all
@@ -377,6 +377,9 @@ async def gather_owned(operations, *, cancel_siblings_on_error=True,
     receipts. Indexed names are diagnostic only, never a second owner.
     FIRST_COMPLETED races are finite observers: after the first outcome, every
     remaining accepted peer is cancelled and physically joined before return.
+    An explicit native work factory receives lazy operation factories instead
+    of coroutines. It owns gated admission and original-error retention; this
+    gather still owns joining every accepted Task, including a failed gate.
     """
     from kestrel_sovereign.execution_custody import (
         execution_terminal_error,
@@ -392,12 +395,16 @@ async def gather_owned(operations, *, cancel_siblings_on_error=True,
         for index, operation in enumerate(operations):
             admission = OwnedTaskAdmission()
             try:
-                children.append(create_owned_task(
-                    operation, retirement_resource=retirement_resource,
-                    retain_originals=retain_originals,
-                    name=f"{name_prefix}:{index}" if name_prefix is not None else None,
-                    admission=admission,
-                ))
+                name = f"{name_prefix}:{index}" if name_prefix is not None else None
+                if work_factory is None:
+                    child = create_owned_task(
+                        operation, retirement_resource=retirement_resource,
+                        retain_originals=retain_originals, name=name, admission=admission,
+                    )
+                else:
+                    child = work_factory(operation, name=name)
+                    admission.task = child
+                children.append(child)
             except BaseException as error:
                 if admission.task is not None:
                     # Publication failed, not acceptance. This exact gated

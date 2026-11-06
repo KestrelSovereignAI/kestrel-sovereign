@@ -20,7 +20,7 @@ pytestmark = [pytest.mark.asyncio, pytest.mark.timeout(30)]
 
 
 @pytest.mark.parametrize('feature_base', [Feature, SDKFeature], ids=['core', 'sdk'])
-@pytest.mark.parametrize('shape', ['task-group', 'explicit-cause', 'attribute-hook'])
+@pytest.mark.parametrize('shape', ['task-group', 'explicit-cause', 'attribute-hook', 'attribute-group-hook'])
 async def test_composite_unknown_cannot_be_flattened_by_named_tool_wrappers(owner, tmp_path, feature_base, shape):
     from kestrel_sovereign.execution_custody import execution_evidence_carriers
     from kestrel_sovereign.tools.effect_journal import ToolEffectOutcomeUnconfirmed
@@ -32,6 +32,11 @@ async def test_composite_unknown_cannot_be_flattened_by_named_tool_wrappers(owne
         @property
         def __class__(self):
             raise RuntimeError('Application class hook replaced the original Core carrier')
+
+    class OpaqueGroup(ExceptionGroup):
+        @property
+        def __class__(self):
+            raise RuntimeError('Application group class hook replaced the original Core carrier')
     observability = ObservabilityStore(owner.tool_effect_store.backend, owns_backend=False)
     await observability.initialize()
     owner.observability_store = observability
@@ -54,6 +59,8 @@ async def test_composite_unknown_cannot_be_flattened_by_named_tool_wrappers(owne
             if shape == 'task-group':
                 async with asyncio.TaskGroup() as children:
                     children.create_task(lose_reply())
+            if shape == 'attribute-group-hook':
+                raise OpaqueGroup('Original opaque group', [unknown])
             carrier = (OpaqueConflict('Original opaque wrapper') if shape == 'attribute-hook'
                        else ResourceConflict('Original wrapper precondition'))
             raise carrier from unknown
@@ -66,7 +73,8 @@ async def test_composite_unknown_cannot_be_flattened_by_named_tool_wrappers(owne
     async def invoke(agent, user_input, *, invocation_id=None):
         with pytest.raises(BaseException) as original:
             await agent.execute_named_tool(wrapped.name, {'marker': 'first'}, session_id='owned-composite-session')
-        assert any(error is unknown for error in execution_evidence_carriers(original.value))
+        assert any(error is unknown for error in execution_evidence_carriers(original.value)), \
+            'Native dispatch erased the original unknown before fencing the live turn'
         with pytest.raises(ToolEffectOutcomeUnconfirmed):
             await agent.execute_named_tool(wrapped.name, {'marker': 'unsafe second effect'}, session_id='owned-composite-session')
 
@@ -168,9 +176,9 @@ async def test_async_feature_task_retains_its_original_journal_until_native_comp
 
     invocation = asyncio.create_task(invoke(owner, 'original async intention', invocation_id='original-async-task-intent'))
     try:
-        await asyncio.wait_for(accepted.wait(), 2)
-        await asyncio.wait_for(entered.wait(), 2)
-        await asyncio.sleep(0.02)
+        await asyncio.wait({invocation}, timeout=0.5)
+        assert accepted.is_set(), 'Native asynchronous acceptance waited for a whole-worker privacy span'
+        assert entered.is_set(), 'Accepted native asynchronous worker never entered its original handler'
         assert not invocation.done(), 'Originating journal retired before its accepted worker'
         assert await owner.tool_effect_store.database.fetchall('SELECT state FROM tool_effect_claims') == [('RETURNED_OK',)]
         resume.set()

@@ -798,9 +798,12 @@ class TaskManager:
                             validate_registration=require_original_registration)
 
                 execution = self._track_execution_task(
-                    execute_original_provider(),
+                    execute_original_provider,
                     task.id,
                     authority_agent_id,
+                    work_factory=(handler.agent._get_privacy_transition_lock()
+                        .capture_native_work_factory(acquire_span=False)
+                        if original_turn is not None else None),
                 )
                 if original_turn is not None:
                     # The local async API returns its accepted native Task now;
@@ -822,12 +825,16 @@ class TaskManager:
 
     def _track_execution_task(
         self,
-        coro: Coroutine[Any, Any, None],
+        operation: Callable[[], Coroutine[Any, Any, None]],
         task_id: str,
         authority_agent_id: str,
+        *,
+        work_factory=None,
     ) -> asyncio.Task[None]:
         """Own background task execution so close() can cancel and await it."""
-        task = create_owned_task(coro, name=f"a2a-task-{task_id}")
+        name = f"a2a-task-{task_id}"
+        task = (create_owned_task(operation(), name=name) if work_factory is None
+            else work_factory(operation, name=name))
         self._execution_tasks.add(task)
         self._execution_authorities[task] = (task_id, authority_agent_id)
 

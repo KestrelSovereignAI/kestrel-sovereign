@@ -27,7 +27,8 @@ async def bound_operation(owner, tmp_path):
     class FileTool:
         name = 'owned.effect'
         schema = ToolSchema(name, 'Append the owned marker', ToolCategory.UTILITY,
-            parameters=[ToolParameter('marker', 'string', 'Owned marker', required=True)])
+            parameters=[ToolParameter('marker', 'string', 'Owned marker', required=True)],
+            is_concurrency_safe=True)
 
         async def execute(self, *, marker):
             assert owner._request_generation_for_current_task(current_invocation_id()) is not None
@@ -45,6 +46,117 @@ async def bound_operation(owner, tmp_path):
     binding, = mounted
     yield owner, binding, witness
     await store.close()
+
+
+async def test_parallel_batch_retains_original_privacy_ownership_for_its_native_leaves(bound_operation):
+    from kestrel_sovereign.llm.adapter import ToolCall
+    from tests.unit.test_tool_effect_invocation import governed
+
+    owner, binding, witness = bound_operation
+    messages, results = [], []
+
+    @governed
+    async def invoke(agent, user_input, *, invocation_id=None):
+        async with agent._get_privacy_transition_lock():
+            await agent._execute_tool_batch_at_stop_boundary(
+                [ToolCall(id=str(index), name=binding.name, arguments={'marker': marker})
+                    for index, marker in enumerate(('first', 'second'))],
+                {}, {binding.name}, messages, 0, user_input,
+                tool_results=results, session_id='owned-parallel-session')
+
+    calling = asyncio.create_task(invoke(owner, 'original parallel intention',
+        invocation_id='owned-parallel-intent'))
+    try:
+        _done, pending = await asyncio.wait({calling}, timeout=0.5)
+        assert not pending, 'Parallel native tools lost the privacy frame held by their joining batch'
+        await calling
+        assert sorted(witness.read_text().splitlines()) == ['first', 'second']
+        assert [row['name'] for row in results] == [binding.name, binding.name]
+        assert [row['tool_call_id'] for row in results] == ['0', '1']
+        assert await owner.tool_effect_store.database.fetchall(
+            'SELECT state FROM tool_effect_claims') == [('RETURNED_OK',), ('RETURNED_OK',)]
+        assert not owner._active_request_ids
+    finally:
+        # Retire the actual batch children first if the regression deadlocks;
+        # their parent deliberately shields admitted effects from caller Stop.
+        children = [task for task in asyncio.all_tasks()
+            if task.get_name().startswith('orchestrator-parallel-tool:')]
+        for task in children:
+            task.cancel()
+        await asyncio.gather(*children, return_exceptions=True)
+        if not calling.done():
+            calling.cancel()
+        await asyncio.gather(calling, return_exceptions=True)
+
+
+async def test_external_async_a2a_worker_retains_original_privacy_ownership(bound_operation):
+    from kestrel_sovereign.a2a.scope import NativeRecipientScope
+    from kestrel_sovereign.features.base import Feature, tool
+    from tests.utils.native_a2a import manager_for
+
+    owner, _binding, witness = bound_operation
+    manager = manager_for(owner.tool_effect_store.backend,
+        NativeRecipientScope(owner.did), owns_backend=False)
+    await manager.initialize()
+    accepted = []
+
+    class BackgroundFeature(Feature):
+        @property
+        def tool_description(self):
+            return 'Native asynchronous file effect'
+
+        async def initialize(self):
+            pass
+
+        @tool(name='owned_background_file', description='Write the accepted task marker')
+        async def owned_background_file(self) -> dict:
+            async with owner._get_privacy_transition_lock():
+                witness.write_text('one accepted background effect')
+            return {'success': True}
+
+    feature = BackgroundFeature(owner)
+    owner.features[feature.name] = feature
+    manager.register_provider(feature.name, feature.get_agent_skills(), feature)
+
+    class DispatchTool:
+        name = 'owned.async_dispatch'
+        schema = ToolSchema(name, 'Accept an asynchronous native task', ToolCategory.UTILITY)
+
+        async def execute(self):
+            task = await manager.execute_skill(feature.name, 'owned_background_file', {}, sync=False)
+            accepted.append(task)
+            return {'success': True, 'task_id': task.id}
+
+    mounted = []
+    owner.register_dynamic_tools('owned-background', [DispatchTool()],
+        on_registered=lambda tool, binding: mounted.append(binding))
+    binding, = mounted
+    calling = asyncio.create_task(binding.invoke({}, session_id='owned-background-session',
+        operation_id='owned-background-intent'))
+    try:
+        _done, pending = await asyncio.wait({calling}, timeout=0.5)
+        assert not pending, 'Asynchronous A2A worker lost its joining external lifecycle privacy frame'
+        assert (await calling)['success'] is True
+        task, = accepted
+        from kestrel_sdk.native_a2a.types import TaskState
+
+        persisted = await manager.task_store.get_for_recipient(task.id, manager.did)
+        assert persisted.status.state == TaskState.TASK_STATE_COMPLETED
+        assert witness.read_text() == 'one accepted background effect'
+        assert await owner.tool_effect_store.database.fetchall(
+            'SELECT state FROM tool_effect_claims') == [('RETURNED_OK',)] * 3
+        assert await owner.tool_effect_store.database.fetchone(
+            'SELECT state FROM tool_effect_operations') == ('CLOSED',)
+        assert not owner._active_request_ids
+    finally:
+        workers = tuple(manager._execution_tasks)
+        for task in workers:
+            task.cancel()
+        await asyncio.gather(*workers, return_exceptions=True)
+        if not calling.done():
+            calling.cancel()
+        await asyncio.gather(calling, return_exceptions=True)
+        await manager.close()
 
 
 @pytest.mark.parametrize('lane', ['bound', 'named', 'audit'])

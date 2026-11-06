@@ -114,7 +114,7 @@ class ToolEffectTurn:
             # would replace or wrap the very evidence the caller must retain.
             protected = (bool(observed_outcome_unknown(terminal))
                 or is_execution_control_error(terminal)
-                or any(isinstance(item, asyncio.CancelledError)
+                or any(issubclass(type(item), asyncio.CancelledError)
                     for item in execution_evidence_carriers(terminal)))
             if self.unconfirmed and protected:
                 terminal = execution_terminal_error(
@@ -281,7 +281,7 @@ async def execute_tool_effect(
                 isinstance(result, dict)
                 and (result.get("success") is False or result.get("status") == "error")
             )
-            known_conflict = (isinstance(error, ResourceConflict)
+            known_conflict = (issubclass(type(error), ResourceConflict)
                 and not observed_outcome_unknown(error)
                 and not is_execution_control_error(error))
             state = (
