@@ -377,7 +377,7 @@ async def test_active_host_sweeps_expired_staging_without_owner_return(host, mon
 async def test_keyless_agent_boots_without_advertising_artifacts(temp_db, monkeypatch):
     from kestrel_sovereign.kestrel_agent import KestrelAgent
     from kestrel_sovereign.llm.service import LLMService
-    from tests.shared.native_shutdown_budget import shutdown_fixture_agent
+    from kestrel_sovereign.testing.native_shutdown_budget import shutdown_fixture_agent
     monkeypatch.delenv("KESTREL_DATA_KEY", raising=False)
     monkeypatch.delenv("KESTREL_DATA_KEY_FILE", raising=False)
     llm = LLMService()
@@ -439,7 +439,7 @@ async def test_keyed_real_boot_omits_subagent_claim_and_survives_wrong_artifact_
     from cryptography.fernet import Fernet
     from kestrel_sovereign.kestrel_agent import KestrelAgent
     from kestrel_sovereign.llm.service import LLMService
-    from tests.shared.native_shutdown_budget import shutdown_fixture_agent
+    from kestrel_sovereign.testing.native_shutdown_budget import shutdown_fixture_agent
     monkeypatch.delenv("KESTREL_DATA_KEY_FILE", raising=False)
     wrapped = None
     for restart in (False, True):

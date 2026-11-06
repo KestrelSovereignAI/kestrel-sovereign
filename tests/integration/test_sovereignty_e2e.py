@@ -8,7 +8,7 @@ Tests use REAL IPFS (if available) or gracefully degrade to local cache.
 NO MOCKS - we test actual sovereignty, not simulations.
 """
 
-from tests.shared.native_shutdown_budget import shutdown_fixture_agent
+from kestrel_sovereign.testing.native_shutdown_budget import shutdown_fixture_agent
 
 import pytest
 import pytest_asyncio

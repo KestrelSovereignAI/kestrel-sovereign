@@ -9,7 +9,7 @@ scripted tool calls, but the features and their tools are real. This
 verifies the full dispatch pipeline.
 """
 
-from tests.shared.native_shutdown_budget import shutdown_fixture_agent
+from kestrel_sovereign.testing.native_shutdown_budget import shutdown_fixture_agent
 
 import logging
 import logging.handlers

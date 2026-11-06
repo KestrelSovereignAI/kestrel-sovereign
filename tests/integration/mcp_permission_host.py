@@ -134,7 +134,7 @@ async def serve(descriptor, ready):
                     prefix_floor = max(float(agent_module.SHUTDOWN_TIMEOUT),
                         agent_module.KESTREL_AGENT_SHUTDOWN_TIMEOUT_S)
                     if 'KESTREL_AIOSQLITE_WORKER_SHUTDOWN_TIMEOUT_S' in os.environ:
-                        from tests.shared.native_shutdown_budget import reserve_native_shutdown_budget
+                        from kestrel_sovereign.testing.native_shutdown_budget import reserve_native_shutdown_budget
                         from kestrel_sovereign.multi_agent import agent_manager
 
                         reserve_native_shutdown_budget(agent, network,

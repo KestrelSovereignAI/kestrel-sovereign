@@ -11,7 +11,7 @@ Tests the !compact command and context compaction:
 Uses REAL services - minimal mocking for LLM only.
 """
 
-from tests.shared.native_shutdown_budget import shutdown_fixture_agent
+from kestrel_sovereign.testing.native_shutdown_budget import shutdown_fixture_agent
 
 import pytest
 import pytest_asyncio

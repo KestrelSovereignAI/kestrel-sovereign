@@ -16,7 +16,7 @@ real offline reanchor writer. What these prove together:
 
 from __future__ import annotations
 
-from tests.shared.native_shutdown_budget import shutdown_fixture_agent
+from kestrel_sovereign.testing.native_shutdown_budget import shutdown_fixture_agent
 
 import hashlib
 import json

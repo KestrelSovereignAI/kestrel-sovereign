@@ -191,7 +191,7 @@ async def test_real_local_visual_product(tmp_path, monkeypatch):
                 if app is not None:
                     server._unmount_feature_routers(app);app.router.lifespan_context=lifespan
                 if agent is not None:
-                    from tests.shared.native_shutdown_budget import shutdown_fixture_agent
+                    from kestrel_sovereign.testing.native_shutdown_budget import shutdown_fixture_agent
                     await shutdown_fixture_agent(agent)
                 if llm is not None:await llm.close()
             finally:

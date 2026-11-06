@@ -633,7 +633,7 @@ async def _booted_agent(tmp_path):
             # native close reservation. Otherwise the larger storage floor
             # consumes the entire default five-second shutdown and gives the
             # LLM/client prefix zero time, cancelling its original closers.
-            from tests.shared.native_shutdown_budget import reserve_native_shutdown_budget
+            from kestrel_sovereign.testing.native_shutdown_budget import reserve_native_shutdown_budget
 
             reserve_native_shutdown_budget(agent, cleanup)
             # Keep cold migrations outside the generation's own watchdog.

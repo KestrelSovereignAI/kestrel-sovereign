@@ -25,7 +25,7 @@ Lighthouse provider then takes the IPFS tier, and serves it back.
 
 from __future__ import annotations
 
-from tests.shared.native_shutdown_budget import shutdown_fixture_agent
+from kestrel_sovereign.testing.native_shutdown_budget import shutdown_fixture_agent
 
 import asyncio
 import base64

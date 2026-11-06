@@ -14,7 +14,7 @@ from kestrel_sovereign.a2a.native_card import verify_native_agent_card
 from kestrel_sovereign.features.peers.directory import PeerRequester
 from kestrel_sovereign.inception_service import create_kestrel_identity_async
 from tests.shared.genesis_audit import deterministic_safe_genesis_auditor
-from tests.shared.native_shutdown_budget import reserve_native_shutdown_budget
+from kestrel_sovereign.testing.native_shutdown_budget import reserve_native_shutdown_budget
 
 
 @pytest.mark.parametrize("push", ["false", "true"])

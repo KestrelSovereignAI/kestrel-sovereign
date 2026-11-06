@@ -9,7 +9,7 @@ All key storage is agent-scoped - each agent has isolated key storage.
 Run with: uv run pytest tests/integration/test_agent_own_key.py -v
 """
 
-from tests.shared.native_shutdown_budget import shutdown_fixture_agent
+from kestrel_sovereign.testing.native_shutdown_budget import shutdown_fixture_agent
 
 import os
 import tempfile

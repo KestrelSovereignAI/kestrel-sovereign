@@ -1,6 +1,6 @@
 """Actual PostgreSQL commit uncertainty cannot become an ordinary health report."""
 
-from tests.shared.native_shutdown_budget import shutdown_fixture_agent
+from kestrel_sovereign.testing.native_shutdown_budget import shutdown_fixture_agent
 
 import pytest
 from fastapi import FastAPI
