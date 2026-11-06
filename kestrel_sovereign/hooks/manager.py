@@ -36,7 +36,7 @@ class FailedHookDenial(HookOutput):
     failed_hook: str = ""
 
 
-#: The attribute naming the hook whose DENY or ASK ended a chain (#3873).
+#: The attribute naming the hook whose blocking decision ended a chain (#3873).
 #: ``HookOutput`` is an SDK type with no field for it, so the manager records
 #: it on the output the deciding hook returned, as it already records the
 #: chain's accumulated warnings there. Read it with :func:`deciding_hook`.
@@ -44,9 +44,9 @@ DECIDING_HOOK_ATTRIBUTE = "deciding_hook"
 
 
 def deciding_hook(output: Any) -> Optional[str]:
-    """The name of the hook that decided ``output``'s DENY or ASK, if known.
+    """The name of the hook that blocked ``output``'s chain, if known.
 
-    ``None`` for an output no chain decided (a caller's double, an ALLOW), and
+    ``None`` for an output no chain decided (such as a caller's double), and
     for a :class:`FailedHookDenial`: a hook that failed decided nothing.
     """
     name = getattr(output, DECIDING_HOOK_ATTRIBUTE, None)
@@ -91,7 +91,7 @@ class HooksManager:
     - Priority-based execution order (lower priority = earlier execution)
     - Per-hook timeout handling
     - Tool name regex matching
-    - Chain interruption on DENY or ASK decisions
+    - Chain interruption on DENY, ASK, or an explicit stop
 
     Example:
         manager = HooksManager()
@@ -234,7 +234,7 @@ class HooksManager:
         Execute matching hooks in priority order.
 
         Hooks are executed sequentially in priority order. The chain is
-        interrupted if a hook returns DENY or ASK decision.
+        interrupted if a hook returns DENY, ASK, or an explicit stop.
 
         Args:
             event: The hook event type
@@ -244,7 +244,7 @@ class HooksManager:
             HookOutput from the chain. Returns ALLOW if no hooks block.
 
         Note:
-            - DENY or ASK stops the chain and returns immediately
+            - DENY, ASK, or an explicit stop returns immediately
             - MODIFY updates the input for subsequent hooks
             - Timeout causes the hook to be skipped with a warning
             - Exceptions cause the hook to be skipped with an error log
@@ -357,14 +357,14 @@ class HooksManager:
 
         Shared core of :meth:`execute_hooks` (live registry) and
         :meth:`execute_hooks_snapshot` (caller-pinned set) so both get identical
-        DENY/ASK short-circuiting, MODIFY propagation, warning accumulation, and
+        DENY/ASK/stop short-circuiting, MODIFY propagation, warning accumulation, and
         fail-closed timeout/exception handling.
 
         ``freeze_response_text`` (#2674 finding 2) drives the post-gate observer
         phase: a hook's ``updated_input['response_text']`` rewrite is DROPPED
         (logged, never applied to the chained input nor carried on the returned
         output) so an unaudited observer cannot alter the gate-reviewed release.
-        Every other behavior — DENY/ASK short-circuit, warning accumulation,
+        Every other behavior — DENY/ASK/stop short-circuit, warning accumulation,
         non-response_text ``updated_input`` propagation, fail handling — is
         unchanged.
 
