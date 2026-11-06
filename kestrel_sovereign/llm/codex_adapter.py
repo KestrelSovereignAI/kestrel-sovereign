@@ -2923,6 +2923,8 @@ class CodexAdapter(LLMAdapter):
         active_inline_tool_handlers: set[asyncio.Task[Any]] = set()
         inline_terminal_errors: list[BaseException] = []
         unregisters: List[Callable[[], None]] = []
+        from kestrel_sovereign._async_ownership import OwnedCallbackScope
+        callback_scope = OwnedCallbackScope()
         if tool_executor is not None and dyn:
             # Only register an item/tool/call handler when tools were
             # actually advertised this turn. A handler on a text-only
@@ -2937,14 +2939,13 @@ class CodexAdapter(LLMAdapter):
             # the dispatcher routes by ``params.threadId``. Without
             # scoping, a second turn's registration would silently
             # overwrite an in-flight turn's handler.
+            inline_handler = self._make_tool_call_handler(
+                tool_executor, thread_id, allowed_tools, executed_log,
+                tool_aliases, active_inline_tool_handlers, inline_terminal_errors,
+            )
+            inline_handler._codex_native_callback_scope = callback_scope
             unregisters.append(app.register_server_request_handler(
-                "item/tool/call",
-                self._make_tool_call_handler(
-                    tool_executor, thread_id, allowed_tools, executed_log,
-                    tool_aliases, active_inline_tool_handlers,
-                    inline_terminal_errors,
-                ),
-                thread_id=thread_id,
+                "item/tool/call", inline_handler, thread_id=thread_id,
             ))
 
         # Defense in depth: explicit native approval handlers always decline,
@@ -3035,7 +3036,8 @@ class CodexAdapter(LLMAdapter):
                 )
             from kestrel_sovereign.execution_custody import require_execution_work
             require_execution_work()
-            await app.request("turn/start", turn_params, timeout=60)
+            async with callback_scope.wait():
+                await app.request("turn/start", turn_params, timeout=60)
 
             text_parts: List[str] = []
             final_text: Optional[str] = None
@@ -3081,7 +3083,12 @@ class CodexAdapter(LLMAdapter):
                 app, sink, est_payload_tokens, thread_id=thread_id,
                 cancel_token=cancel_token,
             )) as _owned_forwarder_2982:
-                async for ev in _owned_forwarder_2982:
+                while True:
+                    try:
+                        async with callback_scope.wait():
+                            ev = await anext(_owned_forwarder_2982)
+                    except StopAsyncIteration:
+                        break
                     raise_if_cancelled(cancel_token)
                     method = ev.get("method")
                     p = ev.get("params") or {}
@@ -3376,6 +3383,7 @@ class CodexAdapter(LLMAdapter):
             raise
         finally:
             unwind_error = sys.exception()
+            callback_scope.close()
             inline_terminal_errors.extend(_cleanup_app_server_data_images(
                 temp_image_paths, retirement_owner=image_retirement_owner,
             ))

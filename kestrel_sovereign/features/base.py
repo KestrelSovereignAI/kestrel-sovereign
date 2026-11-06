@@ -49,6 +49,7 @@ from kestrel_sdk.features.base import Feature as _SdkFeature
 from kestrel_sdk.features.base import parse_docstring_params as parse_docstring_params
 from kestrel_sdk.features.base import tool as tool
 from kestrel_sdk.features.ui import UIContributions
+from kestrel_sdk.features.host_errors import host_owns_tool_error_boundary
 from kestrel_sdk.tools.base import AgentTool, ToolSchema
 from kestrel_sdk.tools.base import ToolCategory as ToolCategory
 from kestrel_sdk.tools.base import ToolParameter as ToolParameter
@@ -2782,10 +2783,11 @@ ABSOLUTE PROHIBITION - NEVER FABRICATE:
 
                 # Create a dynamic AgentTool wrapper
                 class DynamicTool(AgentTool):
-                    def __init__(self, func, schema_data):
+                    def __init__(self, feature, func, schema_data):
+                        self.feature = feature
                         self.func = func
                         self._schema_data = schema_data
-                        self._execution_custody = getattr(func.__self__.agent, "_execution_custody", None)
+                        self._execution_custody = getattr(feature.agent, "_execution_custody", None)
 
                     @property
                     def name(self) -> str:
@@ -2803,6 +2805,7 @@ ABSOLUTE PROHIBITION - NEVER FABRICATE:
 
                     @execution_work_operation
                     async def execute(self, **kwargs) -> Dict[str, Any]:
+                        host_owns_errors = host_owns_tool_error_boundary(self.feature.agent)
                         # The SDK wrapper's argument coercion, by the SDK's
                         # own function, so a built-in feature gets ``"30"``
                         # as ``30`` exactly as an SDK feature does (#3921).
@@ -2833,7 +2836,7 @@ ABSOLUTE PROHIBITION - NEVER FABRICATE:
                             tool_result_parts_buffer,
                         )
                         with tool_result_parts_buffer() as pending_parts:
-                            require_execution_work(self.func.__self__.agent)
+                            require_execution_work(self.feature.agent)
                             try:
                                 result = await self.func(**kwargs)
                                 # Preserve effect evidence at the actual method
@@ -2843,11 +2846,11 @@ ABSOLUTE PROHIBITION - NEVER FABRICATE:
                                     mark_current_invocation_effect_completed,
                                 )
                                 mark_current_invocation_effect_completed(None)
-                                require_execution_work(self.func.__self__.agent)
+                                require_execution_work(self.feature.agent)
                             except (ExecutionAuthorityError, ResourceOutcomeUnknown):
                                 raise
                             except Exception as e:
-                                if is_tool_execution_terminal_error(e):
+                                if host_owns_errors or is_tool_execution_terminal_error(e):
                                     raise
                                 logger.error(
                                     "Error executing tool %s: %s",
@@ -2943,5 +2946,5 @@ ABSOLUTE PROHIBITION - NEVER FABRICATE:
                         _attach_envelope_parts(response, None, pending_parts)
                         return response
 
-                tools.append(DynamicTool(method, schema_data))
+                tools.append(DynamicTool(self, method, schema_data))
         return tools

@@ -205,3 +205,55 @@ async def test_scheduled_tool_withdrawn_during_original_admission_cannot_execute
         assert await case.database.fetchone('SELECT state FROM tool_effect_claims') == ('NOT_EXECUTED',)
     finally:
         await runner.stop()
+
+
+@pytest.mark.parametrize('wrapper', ['native', 'sdk'])
+async def test_native_workflow_does_not_repeat_a_tool_effect_after_its_ordinary_timeout(scheduled_case, wrapper, monkeypatch):
+    from kestrel_sdk.features.base import Feature as SDKFeature
+
+    case = scheduled_case
+    observed = []
+    dispatched = []
+    execute_skill = case.manager.execute_skill
+
+    async def record_dispatch(*args, **kwargs):
+        dispatched.append(True)
+        return await execute_skill(*args, **kwargs)
+
+    monkeypatch.setattr(case.manager, 'execute_skill', record_dispatch)
+
+    class UncertainFeature(Feature):
+        get_tools = SDKFeature.get_tools if wrapper == 'sdk' else Feature.get_tools
+
+        @property
+        def tool_description(self):
+            return 'Native uncertain file effect through the original tool wrapper'
+
+        async def initialize(self):
+            pass
+
+        @tool(name='uncertain_file_effect', description='Write before losing the original acknowledgement')
+        async def uncertain_file_effect(self) -> dict:
+            with case.witness.open('a') as stream:
+                stream.write('original uncertain effect\n')
+            observed.append(True)
+            raise TimeoutError('Original acknowledgement unavailable after the owned file effect')
+
+    feature = UncertainFeature(case.owner)
+    case.owner.features[feature.name] = feature
+    case.manager.register_provider(feature.name, feature.get_agent_skills(), feature)
+    runner = SchedulerRunner(case.database, case.owner.did, case.scheduler._lookup_and_run_tool,
+        owner_id='owned-native-uncertain-workflow')
+    try:
+        await seed_occurrence(case, runner, 'run_workflow', {'steps': [{
+            'feature': feature.name, 'skill': 'uncertain_file_effect',
+            'max_retries': 1, 'retry_delay_ms': 0,
+        }]})
+        await tick_and_settle(runner)
+        assert len(observed) == 1, 'Native tool normalization allowed an uncertain workflow effect to repeat'
+        assert len(dispatched) == 1, 'Workflow retried before consuming the original typed unknown outcome'
+        assert case.witness.read_text() == 'original uncertain effect\n'
+        states = await case.database.fetchall('SELECT state FROM tool_effect_claims')
+        assert states == [('RETURNED_ERROR',), ('UNCONFIRMED',)]
+    finally:
+        await runner.stop()

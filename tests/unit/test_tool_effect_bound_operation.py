@@ -514,7 +514,7 @@ async def test_privacy_revocation_during_external_approval_refuses_the_original_
         await asyncio.gather(calling, *([changing] if changing is not None else []), return_exceptions=True)
 
 
-@pytest.mark.parametrize('lane', ['external', 'normal-turn', 'nested-normal-turn', 'async-parent'])
+@pytest.mark.parametrize('lane', ['external', 'normal-turn', 'nested-normal-turn', 'async-parent', 'parallel-parent'])
 async def test_async_native_sibling_effects_exclude_each_other_without_delaying_acceptance(bound_operation, lane):
     from kestrel_sovereign.a2a.scope import NativeRecipientScope
     from kestrel_sovereign.features.base import Feature, tool
@@ -539,7 +539,7 @@ async def test_async_native_sibling_effects_exclude_each_other_without_delaying_
         async def owned_sibling_effect(self, marker: str) -> dict:
             async with owner._get_privacy_transition_lock():
                 entered.append(marker)
-                if marker == 'first':
+                if len(entered) == 1:
                     first_started.set()
                     await release.wait()
                 with witness.open('a') as stream:
@@ -552,7 +552,8 @@ async def test_async_native_sibling_effects_exclude_each_other_without_delaying_
 
     class DispatchTool:
         name = 'owned.sibling_dispatch'
-        schema = ToolSchema(name, 'Accept two asynchronous native effects', ToolCategory.UTILITY)
+        schema = ToolSchema(name, 'Accept two asynchronous native effects', ToolCategory.UTILITY,
+            is_concurrency_safe=True)
 
         async def execute(self):
             for marker in ('first', 'second'):
@@ -596,11 +597,51 @@ async def test_async_native_sibling_effects_exclude_each_other_without_delaying_
         on_registered=lambda tool, binding: parents.append(binding))
     parent_binding, = parents
 
+    class ObserverTool:
+        name = 'owned.parallel_observer'
+        schema = ToolSchema(name, 'Observe exclusion beneath another parallel parent',
+            ToolCategory.UTILITY, is_concurrency_safe=True)
+
+        async def execute(self):
+            async with owner._get_privacy_transition_lock():
+                entered.append('observer')
+                with witness.open('a') as stream:
+                    stream.write('observer\n')
+            return {'success': True}
+
+    observers = []
+    owner.register_dynamic_tools('owned-parallel-observer', [ObserverTool()],
+        on_registered=lambda tool, binding: observers.append(binding))
+    observer_binding, = observers
+
+    if lane == 'parallel-parent':
+        from kestrel_sdk.hooks.base import Hook, HookEvent, HookOutput
+
+        class ObserveAfterChildStarts(Hook):
+            def __init__(self):
+                super().__init__('native-subtree-observer-order', [HookEvent.PRE_TOOL_USE])
+
+            async def execute(self, value):
+                if value.tool_name == observer_binding.name:
+                    await first_started.wait()
+                return HookOutput.allow()
+
+        owner.hooks_manager.register(ObserveAfterChildStarts())
+
     class RelayTool:
         name = 'owned.sibling_relay'
         schema = ToolSchema(name, 'Join the original nested native dispatch', ToolCategory.UTILITY)
 
         async def execute(self):
+            if lane == 'parallel-parent':
+                from kestrel_sovereign.llm.adapter import ToolCall
+                await owner._execute_tool_batch_at_stop_boundary([
+                    ToolCall(id='parent', name=binding.name, arguments={}),
+                    ToolCall(id='observer', name=observer_binding.name, arguments={}),
+                ], {}, {binding.name, observer_binding.name}, [], 0,
+                    'Original parallel native parent and observer', tool_results=[],
+                    session_id='owned-parallel-parent')
+                return {'success': True}
             return await binding.invoke({}, session_id='owned-nested-sibling-session',
                 operation_id='owned-nested-sibling-child')
 
@@ -614,6 +655,22 @@ async def test_async_native_sibling_effects_exclude_each_other_without_delaying_
             async with owner._get_privacy_transition_lock():
                 return await parent_binding.invoke({}, session_id='owned-async-parent-session',
                     operation_id='owned-async-parent-intent')
+        if lane == 'parallel-parent':
+            from kestrel_sovereign.llm.adapter import ToolCall
+            from tests.unit.test_tool_effect_invocation import governed
+
+            @governed
+            async def invoke_parallel(agent, user_input, *, invocation_id=None):
+                async with agent._get_privacy_transition_lock().policy_span():
+                    await agent._execute_tool_batch_at_stop_boundary([
+                        ToolCall(id='parent', name=binding.name, arguments={}),
+                        ToolCall(id='observer', name=observer_binding.name, arguments={}),
+                    ], {}, {binding.name, observer_binding.name}, [], 0,
+                        user_input, tool_results=[], session_id='owned-parallel-parent')
+                return {'success': True}
+
+            return await invoke_parallel(owner, 'Native parallel subtree exclusion',
+                invocation_id='owned-parallel-parent-intent')
         if lane == 'nested-normal-turn':
             async with owner._get_privacy_transition_lock():
                 return await relay.invoke({}, session_id='owned-nested-sibling-session',
@@ -625,21 +682,37 @@ async def test_async_native_sibling_effects_exclude_each_other_without_delaying_
 
     calling = asyncio.create_task(call())
     try:
-        await asyncio.wait({calling}, timeout=0.5)
-        assert first_started.is_set(), 'Nested background effects waited behind their joining parent privacy mutex'
+        milestone = asyncio.create_task(first_started.wait())
+        try:
+            await asyncio.wait({milestone, calling}, timeout=2.0,
+                return_when=asyncio.FIRST_COMPLETED)
+        finally:
+            milestone.cancel()
+            await asyncio.gather(milestone, return_exceptions=True)
+        lock = owner._get_privacy_transition_lock()
+        diagnostic = {
+            'writer': lock._writer.get_name() if lock._writer is not None else None,
+            'closing': lock._token.closing if lock._token is not None else None,
+            'parked': [(frame.task.get_name(), [getattr(target, 'get_name', lambda: type(target).__name__)() for target in frame.targets]) for frame in lock._parked],
+            'tasks': [(task.get_name(), task.done(), [(frame.f_code.co_name, frame.f_lineno) for frame in task.get_stack()]) for task in lock._admissions],
+        }
+        assert first_started.is_set(), f'Native child has not entered: {diagnostic}'
         assert all_accepted.is_set(), 'Native background acceptance waited for its sibling effect'
-        assert entered == ['first'], 'Native sibling effects bypassed their shared privacy mutex'
+        assert len(entered) == 1 and entered[0] in {'first', 'second'}, 'Native sibling effects bypassed their shared privacy mutex'
         if lane != 'external':
             admitted = sum(worker._kestrel_native_privacy_state['entered'] for worker in manager._execution_tasks)
             assert admitted == (2 if lane == 'async-parent' else 1), 'Queued native worker was classified as already entered'
         release.set()
         assert (await calling)['success'] is True
-        assert witness.read_text() == 'first\nsecond\n'
+        if lane == 'parallel-parent':
+            assert sorted(witness.read_text().splitlines()) == ['first', 'observer', 'second']
+        else:
+            assert sorted(witness.read_text().splitlines()) == ['first', 'second']
         for task in accepted:
             persisted = await manager.task_store.get_for_recipient(task.id, manager.did)
             assert persisted.status.state == TaskState.TASK_STATE_COMPLETED
         states = await owner.tool_effect_store.database.fetchall('SELECT state FROM tool_effect_claims')
-        assert states == [('RETURNED_OK',)] * ({'nested-normal-turn': 6, 'async-parent': 8}.get(lane, 5))
+        assert states == [('RETURNED_OK',)] * ({'nested-normal-turn': 6, 'async-parent': 8, 'parallel-parent': 6}.get(lane, 5))
     finally:
         release.set()
         workers = tuple(manager._execution_tasks)

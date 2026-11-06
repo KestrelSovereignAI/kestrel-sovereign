@@ -38,6 +38,12 @@ class ToolEffectOutcomeUnconfirmed(ResourceOutcomeUnknown):
     """A turn observed an uncertain effect and must not narrate success."""
 
 
+def _requires_original_terminal_error(error: BaseException | None) -> bool:
+    return (bool(observed_outcome_unknown(error)) or is_execution_control_error(error)
+        or any(issubclass(type(item), asyncio.CancelledError)
+            for item in execution_evidence_carriers(error)))
+
+
 def logical_operation_key(value: object) -> str:
     """Encode opaque transport keys once without narrowing their wire domain."""
     try:
@@ -71,12 +77,12 @@ class ToolEffectTurn:
     generation: int | None = None
     live: bool = True
     closing: bool = False
-    pending: set[asyncio.Future] = field(default_factory=set)
+    pending: dict[asyncio.Future, asyncio.Task] = field(default_factory=dict)
     unconfirmed: list[BaseException] = field(default_factory=list)
 
     def require_live(self, owner: Any) -> None:
         if (self.owner is not owner or not self.live
-                or (self.closing and asyncio.current_task() not in self.pending)):
+                or (self.closing and asyncio.current_task() not in self.pending.values())):
             raise ToolEffectJournalUnavailable("tool_effect_attempt_retired")
 
     def require_confirmed(self) -> None:
@@ -90,9 +96,11 @@ class ToolEffectTurn:
         terminal = error
         try:
             while self.pending:
-                for completion in tuple(self.pending):
-                    outcome = await await_owned_task(completion)
-                    self.pending.discard(completion)
+                for completion, executor in tuple(self.pending.items()):
+                    from kestrel_sovereign._async_ownership import owned_native_wait
+                    async with owned_native_wait((executor,)):
+                        outcome = await await_owned_task(completion)
+                    self.pending.pop(completion, None)
                     terminal = execution_terminal_error(
                         terminal, outcome.error, outcome.cancellation,
                         retain_originals=True,
@@ -112,10 +120,7 @@ class ToolEffectTurn:
             # A swallowed uncertain effect still needs a typed root failure;
             # adding that synthetic error to an already typed/control failure
             # would replace or wrap the very evidence the caller must retain.
-            protected = (bool(observed_outcome_unknown(terminal))
-                or is_execution_control_error(terminal)
-                or any(issubclass(type(item), asyncio.CancelledError)
-                    for item in execution_evidence_carriers(terminal)))
+            protected = _requires_original_terminal_error(terminal)
             if self.unconfirmed and protected:
                 terminal = execution_terminal_error(
                     terminal, *self.unconfirmed, retain_originals=True,
@@ -236,7 +241,7 @@ async def execute_tool_effect(
     if generation is None:
         generation = prepared.generation if prepared is not None else registry_generation(owner)
     completion = asyncio.get_running_loop().create_future()
-    turn.pending.add(completion)
+    turn.pending[completion] = asyncio.current_task()
     try:
         # Identity-writing tools reenter the privacy mutex. The transition
         # takes that mutex before the exclusive gate, so every effect must
@@ -291,6 +296,10 @@ async def execute_tool_effect(
                 "RETURNED_ERROR" if returned_error else "RETURNED_OK"
             )
             if started and error is not None and not known_conflict:
+                if not _requires_original_terminal_error(error):
+                    original = error
+                    error = ToolEffectOutcomeUnconfirmed('tool_effect_outcome_unconfirmed')
+                    error.__cause__ = original
                 turn.unconfirmed.append(error)
             try:
                 # Ordinary SQL authority is required. A revoked runtime may
@@ -306,5 +315,5 @@ async def execute_tool_effect(
                 raise error
             return result
     finally:
-        turn.pending.discard(completion)
+        turn.pending.pop(completion, None)
         completion.set_result(None)

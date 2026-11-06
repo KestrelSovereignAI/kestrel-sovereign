@@ -70,7 +70,7 @@ async def test_native_gather_refusal_joins_accepted_task_without_constructing_bo
             try:
                 with pytest.raises(BaseException) as observed:
                     await gather_owned([lazy_body, lazy_body], retain_originals=True,
-                        work_factory=lock.capture_native_work_factory(acquire_span=acquire_span, serialize=False))
+                        work_factory=lock.capture_native_work_factory(acquire_span=acquire_span))
             finally:
                 loop.set_task_factory(previous)
         assert any(error is original for error in execution_evidence_carriers(observed.value))

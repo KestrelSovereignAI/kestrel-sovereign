@@ -332,7 +332,7 @@ use the scheduler host's own storage pool, not the agents' advisory pool.
 #### Native SDK release requirements
 
 Core declares its SDK version constraint in [pyproject.toml](https://github.com/KestrelSovereignAI/kestrel-sovereign/blob/main/pyproject.toml).
-Core 0.64 requires public SDK 0.51.1 or later and provider packages from the
+Core 0.64 requires public SDK 0.51.2 or later and provider packages from the
 0.2 family. This release adopts LLM contract 8: both adapter streaming methods
 end with exactly one `LLMResponse`, after EOF and native response cleanup.
 Direct adapter consumers must handle that terminal response separately from

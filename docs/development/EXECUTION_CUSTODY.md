@@ -15,6 +15,34 @@ tags:
 Core issue #3569 extends existing PostgreSQL advisory and native transaction
 custody. This is a host authority contract, not a causation-derived permission.
 
+Privacy policy retention and exclusive execution have separate lifetimes within
+one `ReentrantTransitionLock`. Turn entry uses `policy_span()`; each effect and
+identity write still acquires the same exclusive writer through classification
+and journal settlement. A captured token identifies the live policy span and
+never grants writer ownership.
+
+The shared native task helpers record exact accepted tasks before dispatch. An
+owned join parks the current writer for those original execution owners and
+restores its full frame before any parent continuation or exception handler
+resumes. Gather retains this barrier through sibling cancellation and physical
+harvesting. Stream producers relinquish the writer at the controlled item
+handshake and reacquire it before advancing. Codex reader callbacks use an
+original callback cohort accepted before their task gate opens. Arbitrary Event
+waits, copied context, and eventual join edges cannot lend a writer.
+
+Span closure closes root factories and drains original accepted work before
+releasing policy retention. Accepted continuations retain their original native
+receipts while closing; stale tokens and factories fail explicitly. Journal
+completion signals retain their exact executor association rather than acting
+as execution identities themselves.
+
+SDK 0.51.2's shared host error policy preserves original decorated-tool errors
+when the host declares durable effect ownership. Core classifies an ordinary
+post-dispatch exception as unconfirmed before task, workflow, or transport
+projection. An explicit returned failure or a nominal known resource conflict
+remains a definite returned error. Existing cancellation, control, and unknown
+outcome carriers retain their original identity and evidence.
+
 Corpus-profile surveys and operator reindexing preserve original native control
 before unreadable-table/zero-count fallbacks, batch splitting, failed-row
 accounting or registry/parity success. Actual localhost SDK outputs, scoped

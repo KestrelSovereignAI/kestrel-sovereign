@@ -1197,15 +1197,16 @@ class CodexAppServerClient:
             handler = self._server_request_handlers.get((method, tid))
             if handler is None:
                 handler = self._server_request_handlers.get((method, None))
-            task = asyncio.create_task(
-                self._handle_server_request(
-                    mid,
-                    method,
-                    params,
-                    selected_handler=handler,
-                    handler_selected=True,
-                )
-            )
+            callback_scope = getattr(handler, "_codex_native_callback_scope", None)
+            if callback_scope is not None:
+                task = callback_scope.start(lambda: self._handle_server_request(
+                    mid, method, params, selected_handler=handler, handler_selected=True,
+                ), name="codex-inline-tool-callback")
+            else:
+                from kestrel_sovereign._async_ownership import create_owned_task
+                task = create_owned_task(self._handle_server_request(
+                    mid, method, params, selected_handler=handler, handler_selected=True,
+                ), name="codex-server-request", retain_originals=True)
             task._kestrel_codex_caller_scopes = getattr(handler, "_codex_caller_scopes", ())
             if not hasattr(self, "_server_request_tasks"):
                 self._server_request_tasks = set()

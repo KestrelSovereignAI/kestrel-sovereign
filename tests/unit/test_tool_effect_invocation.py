@@ -193,7 +193,7 @@ async def test_privacy_owned_invocation_refusal_never_constructs_its_lazy_body(
             try:
                 with pytest.raises(BaseException) as observed:
                     task = await admit_request_operation(owner, request_id, lazy_body,
-                        name='owned-lazy-request', privacy_work_factory=lock.capture_native_work_factory(serialize=False))
+                        name='owned-lazy-request', privacy_work_factory=lock.capture_native_work_factory())
                     outcome = await await_owned_task(task)
                     assert outcome.error is not None
                     raise outcome.error

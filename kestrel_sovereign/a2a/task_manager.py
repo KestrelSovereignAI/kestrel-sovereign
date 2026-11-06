@@ -802,15 +802,17 @@ class TaskManager:
                     task.id,
                     authority_agent_id,
                     work_factory=(handler.agent._get_privacy_transition_lock()
-                        .capture_native_work_factory(acquire_span=False, serialize=True)
+                        .capture_native_work_factory(acquire_span=False)
                         if original_turn is not None else None),
                 )
                 if original_turn is not None:
                     # The local async API returns its accepted native Task now;
                     # its originating turn still owns this exact worker through
                     # journal finalization. A copied/foreign Task is not enrolled.
-                    original_turn.pending.add(execution)
-                    execution.add_done_callback(original_turn.pending.discard)
+                    original_turn.pending[execution] = execution
+                    def retire_execution(finished):
+                        original_turn.pending.pop(finished, None)
+                    execution.add_done_callback(retire_execution)
                 return task
 
         if original_turn is not None:

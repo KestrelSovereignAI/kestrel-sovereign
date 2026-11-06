@@ -156,7 +156,7 @@ async def test_failed_stream_setup_joins_dispatch_gated_original_producer(
         return asyncio.Task(coroutine, loop=loop, **kwargs)
 
     lifecycle = ExecutionStreamLifecycle(
-        lock.capture_native_work_factory(serialize=False), started, lambda: None
+        lock.capture_native_work_factory(), started, lambda: None
     )
     stream = execution_stream(Host(), source(), lifecycle=lifecycle)
     try:

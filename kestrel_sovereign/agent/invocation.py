@@ -576,7 +576,7 @@ def bind_async_invocation(
                         if capture_transition_lock_reentry(lifecycle_owner) is not None:
                             privacy_work_factory = (
                                 lifecycle_owner._get_privacy_transition_lock()
-                                .capture_native_work_factory(acquire_span=False, serialize=False)
+                                .capture_native_work_factory(acquire_span=False)
                             )
                         dispatcher = getattr(lifecycle_owner, "dispatcher", None)
                         lock_manager = getattr(dispatcher, "lock_manager", None)
@@ -658,7 +658,9 @@ def bind_async_invocation(
                             cleanup_abandoned = True
                             raise
                         try:
-                            result = await isolated_operation
+                            from kestrel_sovereign._async_ownership import owned_native_wait
+                            async with owned_native_wait((isolated_operation,)):
+                                result = await isolated_operation
                             require_execution_work(lifecycle_owner)
                             # ``Task.cancel()`` is a no-op once the isolated
                             # child has produced a result.  Stop can linearize

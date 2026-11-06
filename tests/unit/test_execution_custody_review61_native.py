@@ -142,7 +142,7 @@ def test_malformed_peer_control_details_still_cannot_become_retryable_transport(
 async def test_copied_context_sibling_cannot_inherit_native_privacy_lifecycle():
     from kestrel_sovereign.execution_custody import ExecutionStreamLifecycle, execution_stream
     lock = ReentrantTransitionLock()
-    native_factory = lock.capture_native_work_factory(serialize=False)
+    native_factory = lock.capture_native_work_factory()
     registered, children, effects = [], [], []
     attempted = asyncio.Event()
     lifecycle = ExecutionStreamLifecycle(
@@ -202,7 +202,7 @@ async def test_original_owner_cancelled_before_privacy_admission_wakes_reader():
         yield b"must-not-run"
 
     # Capture outside the mutex: this unrelated producer must queue normally.
-    native_factory = lock.capture_native_work_factory(serialize=False)
+    native_factory = lock.capture_native_work_factory()
     locked, release = asyncio.Event(), asyncio.Event()
     async def unrelated_holder():
         async with lock:

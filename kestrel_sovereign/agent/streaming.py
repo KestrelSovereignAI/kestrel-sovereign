@@ -1272,7 +1272,7 @@ class StreamingMixin:
                         yield safe_mode_block
                         return
                     transition_lock = self._get_privacy_transition_lock()
-                    async with transition_lock:
+                    async with transition_lock.policy_span():
                         from kestrel_sovereign.streams.tap import AgentStreamTap
                         AgentStreamTap.get_instance().capture_request_privacy(
                             self, request_id, self._request_generation_for_current_task(request_id))

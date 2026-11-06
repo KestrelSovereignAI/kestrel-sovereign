@@ -8290,7 +8290,7 @@ Expected Duration: {expected_duration}
                     # completes fully before the turn reads any policy, or waits until
                     # the turn has finished consuming its prompt.
                     transition_lock = self._get_privacy_transition_lock()
-                    async with transition_lock:
+                    async with transition_lock.policy_span():
                         # The source's own admission runs HERE, first, and nowhere
                         # else. Placing it one line earlier — outside the mutex — is
                         # what rounds 1-3 each did, and each time a transition landed

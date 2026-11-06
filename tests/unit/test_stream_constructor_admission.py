@@ -89,7 +89,7 @@ async def test_native_constructor_failure_joins_all_original_tasks(tmp_path, fac
         yield b"must never dispatch"
 
     lock = ReentrantTransitionLock()
-    factory = (None if factory_kind == "default" else lock.capture_native_work_factory(serialize=False)
+    factory = (None if factory_kind == "default" else lock.capture_native_work_factory()
         if factory_kind == "privacy" else custom_factory)
     stream = execution_stream(None, source(), lifecycle=ExecutionStreamLifecycle(factory, started, lambda: None))
     loop.set_task_factory(native_factory)
@@ -115,7 +115,7 @@ async def test_native_constructor_failure_joins_all_original_tasks(tmp_path, fac
             assert first in tuple(_explicit_control_chain(owned_task_error(owner)))
         assert execution_commit_outcome(caught.value) == (first_kind if first_kind in {"unknown", "committed"} else None)
         assert second.__cause__ is None and (first is None or first.__cause__ is None)
-        assert not lock._native_work and not lock._foreign_native_dependencies
+        assert not lock._native_work
         assert not bodies and await db.fetchval("SELECT COUNT(*) FROM effects") == 0
     finally:
         loop.set_task_factory(previous)
@@ -248,8 +248,8 @@ async def test_actual_foreign_privacy_frame_retains_failed_native_handoff(tmp_pa
             if getattr(callback, "__name__", "") == publication:
                 if publication == "completed":
                     frame = asyncio.current_task()
-                    assert lock._native_foreign_frames[self] is frame
-                    assert self in lock._foreign_native_dependencies[frame]
+                    assert lock._members[self] is frame
+                    assert lock._admissions[self].task is self
                 raise original
             return super().add_done_callback(callback, context=context)
     def factory(loop, coroutine, **options):
@@ -263,16 +263,16 @@ async def test_actual_foreign_privacy_frame_retains_failed_native_handoff(tmp_pa
         await db.execute_commit("INSERT INTO effects VALUES (1)")
     async def foreign(token):
         with bind_transition_lock_reentry(token):
-            async with lock:
+            async with lock.policy_span():
                 child = lock.start_owned_native_work(effect)
                 outcome = await await_owned_task(child)
                 assert child.done() and original in tuple(_explicit_control_chain(outcome.error))
                 assert execution_commit_outcome(outcome.error) == receipt
-                assert not lock._native_work and not lock._foreign_native_dependencies
+                assert not lock._native_work
     loop, previous = asyncio.get_running_loop(), asyncio.get_running_loop().get_task_factory()
     reader = None
     try:
-        async with lock:
+        async with lock.policy_span():
             loop.set_task_factory(factory)
             reader = create_owned_task(foreign(lock.current_reentry_token()), retain_originals=True)
             try:
