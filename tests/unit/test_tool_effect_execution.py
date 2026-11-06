@@ -26,6 +26,9 @@ from kestrel_sovereign.turn_scope import capture_turn_scope
 from tests.unit.test_cleanup_task_admission import _partial_native_agent
 
 
+pytestmark = pytest.mark.timeout(30)
+
+
 @pytest_asyncio.fixture
 async def owner(tmp_path, monkeypatch):
     monkeypatch.setenv("KESTREL_DATA_KEY", Fernet.generate_key().decode())
@@ -102,12 +105,13 @@ async def test_root_drain_waits_for_original_claimant_before_closing_attempt(own
         leaf = asyncio.create_task(execute_tool_effect(owner, registration="file", arguments={}, execute=effect))
     await entered.wait()
     closer = asyncio.create_task(turn.close())
-    await asyncio.sleep(0)
-    assert not closer.done()
-    assert await owner.tool_effect_store.database.fetchone("SELECT state FROM tool_effect_operations") == ("OPEN",)
-    release.set()
-    await leaf
-    await closer
+    try:
+        await asyncio.sleep(0)
+        assert not closer.done()
+        assert await owner.tool_effect_store.database.fetchone("SELECT state FROM tool_effect_operations") == ("OPEN",)
+    finally:
+        release.set()
+        await asyncio.gather(leaf, closer)
     assert await owner.tool_effect_store.database.fetchone("SELECT state FROM tool_effect_operations") == ("CLOSED",)
     assert await owner.tool_effect_store.database.fetchone("SELECT state FROM tool_effect_claims") == ("RETURNED_OK",)
 
