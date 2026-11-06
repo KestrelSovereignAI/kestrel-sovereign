@@ -77,13 +77,7 @@ from kestrel_sovereign.execution_custody import (
     owned_execution_stream,
 )
 
-from .adapter import (
-    LLMAdapter,
-    LLMResponse,
-    ThinkingDelta,
-    ToolCall,
-    inline_tool_dispatch_id,
-)
+from .adapter import LLMAdapter, LLMResponse, ThinkingDelta, ToolCall
 from .call_progress import report_call_progress
 from .cancellation import CancelToken, await_or_cancelled, raise_if_cancelled
 from .codex_app_server import (
@@ -2151,6 +2145,8 @@ class CodexAdapter(LLMAdapter):
                 }
                 # The dispatch row this call is recorded under, so the
                 # calls a feature subagent made inside it can name it (#3778).
+                from .adapter import inline_tool_dispatch_id
+
                 dispatch_id = inline_tool_dispatch_id(ret)
                 if dispatch_id is not None:
                     executed_entry["dispatch_id"] = dispatch_id

@@ -407,7 +407,6 @@ async def _complete_feature_deferred_result(
     adapter: str,
     destination: Any,
     parent_dispatch_id: Optional[str] = None,
-    on_settled: Optional[Callable[[], None]] = None,
 ) -> Dict[str, Any]:
     """Complete a feature route's deferred result at the main boundary.
 
@@ -416,8 +415,8 @@ async def _complete_feature_deferred_result(
     the required dispatch row, then ``finalize`` at ``destination``, all in
     ``_complete_post_tool_result``. Only the public result is returned. A host
     without that completion withholds the UI, and the tool is not replayed.
-    ``on_settled`` runs once the dispatch row's write ended, whether or not
-    it wrote the row.
+    ``parent_dispatch_id`` names the dispatch a feature subagent's own call
+    ran inside (#3778).
     """
     from kestrel_sdk.hooks.base import HookEvent, HookInput
     from kestrel_sdk.resources import ResourceUnsupported
@@ -442,7 +441,7 @@ async def _complete_feature_deferred_result(
     completed = await _complete_post_tool_result(
         host, result, post_input, adapter=adapter,
         dispatch_start=exec_start, destination=destination,
-        parent_dispatch_id=parent_dispatch_id, on_settled=on_settled,
+        parent_dispatch_id=parent_dispatch_id,
     )
     return dict(completed)
 
@@ -2075,19 +2074,17 @@ class Feature(_SdkFeature):
         ``"subagent"`` was no session: nothing ever ended it, and it lumped
         every subagent call the agent made, across restarts, into one.
 
-        Every call is recorded in ``a2a_tool_dispatches``, whatever its
-        outcome: run, raised, refused by policy, refused before it ran, or
-        interrupted once it started (#3778). The row names
-        ``parent_dispatch_id``, the dispatch that delegated to this subagent,
-        so a call made through a subagent is found where every other call the
-        agent made is, and traced to the envelope that made it. The row is
-        written after POST_TOOL_USE, as the chat path writes its row after its
-        hooks, and as an owned operation: a cancellation arriving meanwhile
-        waits for it. A cancellation or Stop that ends the call after the tool
-        started and before its row writes an interrupted row instead, then is
-        raised as it arrived. A write the ledger refuses (as native storage
-        does once execution authority is revoked) is reported once and is
-        never taken for a row; the call is not attempted a second time.
+        Every call that completes is recorded in ``a2a_tool_dispatches``,
+        whatever its outcome: run, raised, refused by policy, or refused
+        before it ran (#3778). The row names ``parent_dispatch_id``, the
+        dispatch that delegated to this subagent, so a call made through a
+        subagent is found where every other call the agent made is, and
+        traced to the envelope that made it. The row is written in this task
+        after POST_TOOL_USE, as the chat path writes its row after its hooks.
+        A call that a cancellation or Stop ends before then records nothing,
+        as a top-level call does. A write the ledger refuses (as native
+        storage does once execution authority is revoked) is reported once,
+        as a WARNING, and is never taken for a row.
 
         ``return_with_effective_args`` controls the return shape:
 
@@ -2113,19 +2110,11 @@ class Feature(_SdkFeature):
         from kestrel_sovereign.agent.orchestrator_engine import (
             _TOOL_ARGUMENT_ERROR,
             _extract_inline_error_fields,
-            _record_interrupted_dispatch,
             _write_tool_dispatch,
         )
 
         dispatch_start = time.time()
         dispatch_adapter = f"subagent:{type(self).__name__}.{tool_name}"
-        # Whether the row's write ended, written or refused: it is attempted
-        # once, so a refusal is reported once.
-        row_settled = False
-
-        def _row_settled() -> None:
-            nonlocal row_settled
-            row_settled = True
 
         async def _recorded(
             effective_args_value: Dict[str, Any],
@@ -2145,7 +2134,7 @@ class Feature(_SdkFeature):
                 session_id=session_id, dispatch_start=dispatch_start,
                 status_hint=status, error_class=error_class,
                 error_message=error_message,
-                parent_dispatch_id=parent_dispatch_id, on_settled=_row_settled,
+                parent_dispatch_id=parent_dispatch_id,
             )
             return _shape(effective_args_value, result_value)
 
@@ -2288,9 +2277,8 @@ class Feature(_SdkFeature):
                             f"blocked by security policy."
                         ),
                     }, status="policy_denied", error_class=(
-                        "PermissionDenied"
-                        if hook_output.permission_decision == PermissionDecision.DENY
-                        else "ApprovalRequired"
+                        "ApprovalRequired" if decision_label == "APPROVAL REQUIRED"
+                        else "PermissionDenied"
                     ), error_message=reason)
                 # ``effective_args`` was already resolved above to the
                 # post-hook state (mutated ``tool_input`` first, then any
@@ -2317,106 +2305,78 @@ class Feature(_SdkFeature):
 
             require_execution_work(self.agent)
             exec_start = time.time()
-            # From here the tool may take effect. Whatever ends the call
-            # before its row is written -- a cancellation, a Stop -- the row
-            # is still written, saying so, and that error is still raised: a
-            # ``talon_cancel`` that cancelled a job does not vanish from the
-            # log because its turn was cancelled afterwards (#3778).
-            returned, returned_result = False, None
             try:
-                try:
-                    result = await selected_tool.execute(**effective_args)
-                    returned, returned_result = True, result
-                    from kestrel_sovereign.agent.invocation import (
-                        mark_current_invocation_effect_completed,
-                    )
-
-                    mark_current_invocation_effect_completed(None)
-                    require_execution_work(self.agent)
-                except ExecutionAuthorityError:
-                    raise
-                except Exception as e:
-                    if is_execution_control_error(e):
-                        raise
-                    logger.warning(
-                        "[SUBAGENT-TOOL] %s raised %s",
-                        tool_name, exception_log_summary(e),
-                    )
-                    report_flattened_outcome_unknown(e)
-                    serialized = {"success": False, "error": f"{type(e).__name__}: {e}"}
-                    raised_fields = {
-                        "status": "error",
-                        "error_class": type(e).__name__,
-                        "error_message": str(e),
-                    }
-                else:
-                    raised_fields = {}
-                    deferred = isinstance(result, DeferredToolResult)
-                    serialized = result if deferred else _serialize_tool_result(result)
-                    # Harvest envelope-carried parts (``ToolResult.parts`` / a
-                    # result dict's ``parts`` field) into the sink too — the
-                    # explicit, ContextVar-free half of the #2641 contract. The
-                    # envelope keeps its copy; delivery to the outbound stream
-                    # happens once, at the orchestrator's dispatch site.
-                    # Harvested BEFORE POST_TOOL_USE fires, so a part a POST
-                    # hook emits lands after the tool's own, the order the chat
-                    # path keeps.
-                    if parts_sink is not None and isinstance(serialized, dict):
-                        envelope_parts = serialized.get("parts")
-                        if isinstance(envelope_parts, list) and envelope_parts:
-                            parts_sink.extend(envelope_parts)
-                    if deferred:
-                        # Its POST_TOOL_USE, required dispatch row and
-                        # publication all run at the main completion boundary.
-                        # The subagent's model sees only the completed public
-                        # result.
-                        completed = await _complete_feature_deferred_result(
-                            self, result, tool_name=tool_name,
-                            tool_input=effective_args,
-                            session_id=hook_session_id, exec_start=exec_start,
-                            adapter=dispatch_adapter,
-                            destination=parent_collector,
-                            parent_dispatch_id=parent_dispatch_id,
-                            on_settled=_row_settled,
-                        )
-                        require_execution_work(self.agent)
-                        return _shape(effective_args, completed)
-                exec_duration_ms = int((time.time() - exec_start) * 1000)
-
-                if hooks_manager is not None:
-                    post_hook_input = HookInput(
-                        session_id=hook_session_id,
-                        hook_event_name=HookEvent.POST_TOOL_USE.value,
-                        tool_name=tool_name,
-                        tool_input=effective_args,
-                        feature_name=type(self).__name__,
-                        tool_response=(
-                            serialized
-                            if isinstance(serialized, dict)
-                            else {"result": str(serialized)}
-                        ),
-                        execution_time_ms=exec_duration_ms,
-                    )
-                    await hooks_manager.execute_hooks_parallel(
-                        HookEvent.POST_TOOL_USE, post_hook_input,
-                    )
-                recorded = await _recorded(effective_args, serialized, **raised_fields)
-            except BaseException as error:
-                if row_settled:
-                    raise
-                # A deferred result is not serialized into the row: only its
-                # completion may consume it.
-                raise await _record_interrupted_dispatch(
-                    self.agent, error, returned=returned,
-                    result=(
-                        None if isinstance(returned_result, DeferredToolResult)
-                        else returned_result
-                    ),
-                    tool_name=tool_name, adapter=dispatch_adapter,
-                    args=effective_args, session_id=session_id,
-                    dispatch_start=dispatch_start,
-                    parent_dispatch_id=parent_dispatch_id,
+                result = await selected_tool.execute(**effective_args)
+                from kestrel_sovereign.agent.invocation import (
+                    mark_current_invocation_effect_completed,
                 )
+
+                mark_current_invocation_effect_completed(None)
+                require_execution_work(self.agent)
+            except ExecutionAuthorityError:
+                raise
+            except Exception as e:
+                if is_execution_control_error(e):
+                    raise
+                logger.warning(
+                    "[SUBAGENT-TOOL] %s raised %s",
+                    tool_name, exception_log_summary(e),
+                )
+                report_flattened_outcome_unknown(e)
+                serialized = {"success": False, "error": f"{type(e).__name__}: {e}"}
+                raised_fields = {
+                    "status": "error",
+                    "error_class": type(e).__name__,
+                    "error_message": str(e),
+                }
+            else:
+                raised_fields = {}
+                deferred = isinstance(result, DeferredToolResult)
+                serialized = result if deferred else _serialize_tool_result(result)
+                # Harvest envelope-carried parts (``ToolResult.parts`` / a result
+                # dict's ``parts`` field) into the sink too — the explicit,
+                # ContextVar-free half of the #2641 contract. The envelope keeps
+                # its copy; delivery to the outbound stream happens once, at the
+                # orchestrator's dispatch site. Harvested BEFORE POST_TOOL_USE
+                # fires, so a part a POST hook emits lands after the tool's own,
+                # the order the chat path keeps.
+                if parts_sink is not None and isinstance(serialized, dict):
+                    envelope_parts = serialized.get("parts")
+                    if isinstance(envelope_parts, list) and envelope_parts:
+                        parts_sink.extend(envelope_parts)
+                if deferred:
+                    # Its POST_TOOL_USE, required dispatch row and publication
+                    # all run at the main completion boundary. The subagent's
+                    # model sees only the completed public result.
+                    completed = await _complete_feature_deferred_result(
+                        self, result, tool_name=tool_name, tool_input=effective_args,
+                        session_id=hook_session_id, exec_start=exec_start,
+                        adapter=dispatch_adapter,
+                        destination=parent_collector,
+                        parent_dispatch_id=parent_dispatch_id,
+                    )
+                    require_execution_work(self.agent)
+                    return _shape(effective_args, completed)
+            exec_duration_ms = int((time.time() - exec_start) * 1000)
+
+            if hooks_manager is not None:
+                post_hook_input = HookInput(
+                    session_id=hook_session_id,
+                    hook_event_name=HookEvent.POST_TOOL_USE.value,
+                    tool_name=tool_name,
+                    tool_input=effective_args,
+                    feature_name=type(self).__name__,
+                    tool_response=(
+                        serialized
+                        if isinstance(serialized, dict)
+                        else {"result": str(serialized)}
+                    ),
+                    execution_time_ms=exec_duration_ms,
+                )
+                await hooks_manager.execute_hooks_parallel(
+                    HookEvent.POST_TOOL_USE, post_hook_input,
+                )
+            recorded = await _recorded(effective_args, serialized, **raised_fields)
             require_execution_work(self.agent)
             return recorded
 
