@@ -30,9 +30,12 @@ from __future__ import annotations
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import MagicMock
 
 import pytest
+from uuid import uuid4
+from kestrel_sovereign.a2a.stores.unified.observability_store import ObservabilityStore
+from tests.unit.test_tool_effect_invocation import governed
 from kestrel_sdk.features.base import Feature as SdkFeature, tool as sdk_tool
 from kestrel_sdk.hooks.base import HookEvent, HookInput, HookOutput
 from kestrel_sdk.isolated_feature import ToolMetadata
@@ -42,11 +45,9 @@ from kestrel_sovereign.agent.direct_tool_arguments import (
     GENERIC_ORCHESTRATION_ARGUMENTS,
     normalize_direct_tool_arguments,
 )
-from kestrel_sovereign.agent.orchestrator_engine import OrchestratorEngineMixin
 from kestrel_sovereign.features.computer_use.feature import ComputerUseFeature
 from kestrel_sovereign.features.isolated_runtime import IsolatedFeatureTool
 from kestrel_sovereign.kestrel_agent import KestrelAgent
-from kestrel_sovereign.privacy import PrivacyConfig
 from kestrel_sovereign.security.tool_audit import (
     ACTION_TOOL_VALIDATION,
     REJECTION_FEATURE_NAME,
@@ -116,6 +117,16 @@ def test_the_generic_arguments_are_exactly_task_and_context():
     assert GENERIC_ORCHESTRATION_ARGUMENTS == {"task", "context"}
 
 
+@pytest.mark.parametrize("metadata", ["native-schema", "json-schema"])
+def test_argument_normalization_owns_nested_values_without_type_coercion(metadata):
+    tool = (_SchemaTool("owned", "payload") if metadata == "native-schema" else
+        _JsonSchemaTool("owned", {"type": "object", "properties": {"payload": {"type": "object"}}}))
+    supplied = {"payload": {"marker": "original"}}
+    approved, error = normalize_direct_tool_arguments(tool.name, tool, supplied)
+    supplied["payload"]["marker"] = "late mutation"
+    assert error is None and approved == {"payload": {"marker": "original"}}
+
+
 def test_undeclared_task_and_context_are_dropped():
     tool = _SchemaTool("get_github_issue", "owner", "repo", "number")
 
@@ -147,7 +158,7 @@ def test_declared_arguments_pass_through_as_the_same_mapping():
     args, error = normalize_direct_tool_arguments(tool.name, tool, supplied)
 
     assert error is None
-    assert args is supplied
+    assert args == supplied and args is not supplied
 
 
 def test_an_unknown_argument_lists_the_parameters_and_suggests_the_match():
@@ -261,7 +272,7 @@ def test_an_open_json_schema_passes_every_argument_unchanged(schema):
     args, error = normalize_direct_tool_arguments(tool.name, tool, supplied)
 
     assert error is None
-    assert args is supplied
+    assert args == supplied and args is not supplied
 
 
 def test_a_closed_json_schema_refuses_unknown_arguments():
@@ -540,7 +551,7 @@ def test_an_isolated_tool_is_judged_by_its_advertised_schema(schema):
     args, error = normalize_direct_tool_arguments(tool.name, tool, ISOLATED_CALL)
 
     assert error is None
-    assert args is ISOLATED_CALL
+    assert args == ISOLATED_CALL and args is not ISOLATED_CALL
 
 
 def test_an_isolated_tool_whose_patterns_admit_context_receives_it():
@@ -607,7 +618,7 @@ def test_an_isolated_tool_without_a_schema_object_is_left_alone(schema):
     args, error = normalize_direct_tool_arguments(tool.name, tool, ISOLATED_CALL)
 
     assert error is None
-    assert args is ISOLATED_CALL
+    assert args == ISOLATED_CALL and args is not ISOLATED_CALL
 
 
 def test_any_proxy_carrying_its_original_schema_is_judged_by_it():
@@ -617,7 +628,7 @@ def test_any_proxy_carrying_its_original_schema_is_judged_by_it():
     args, error = normalize_direct_tool_arguments(proxy.name, proxy, ISOLATED_CALL)
 
     assert error is None
-    assert args is ISOLATED_CALL
+    assert args == ISOLATED_CALL and args is not ISOLATED_CALL
 
 
 def test_a_test_double_does_not_carry_an_original_schema():
@@ -660,39 +671,59 @@ class _AuditStore:
         self.rows.append(row)
 
 
-class _ObservabilityStore:
-    def __init__(self):
-        self.responses: list[dict] = []
+class _ObservabilityStore(ObservabilityStore):
+    """Observe the actual native SQL response writer without replacing it."""
+
+    def __init__(self, backend):
+        super().__init__(backend, owns_backend=False)
+        self.responses = []
 
     async def log_tool_response(self, **kwargs):
+        await super().log_tool_response(**kwargs)
         self.responses.append(kwargs)
 
 
-class _Orchestrator(OrchestratorEngineMixin):
-    """The orchestrator surface the two direct-tool paths read."""
+@pytest.fixture()
+async def orchestrator(native_tool_effect_agent):
+    """Real partial Agent, SQLite, journal and lifecycle; no model or READY claim."""
+    stores = []
 
-    def __init__(self, *, direct_tools=None, features=None):
-        self._direct_tools = dict(direct_tools or {})
-        self._tool_to_feature: dict = {}
-        self.audit = _AuditStore()
-        self.features = {
-            "SecurityFeature": SimpleNamespace(permission_store=self.audit),
-            **(features or {}),
-        }
-        self.hooks_manager = _AllowAllHooks()
-        self.observability_store = _ObservabilityStore()
+    async def create(*, direct_tools=None, features=None, agent=None):
+        if agent is None:
+            agent = await native_tool_effect_agent(did='did:test:argument-' + uuid4().hex)
+        agent._direct_tools = dict(direct_tools or {})
+        agent._tool_to_feature = {}
+        agent.audit = _AuditStore()
+        agent.features.update({'SecurityFeature': SimpleNamespace(permission_store=agent.audit),
+                               **(features or {})})
+        agent.hooks_manager = _AllowAllHooks()
+        store = _ObservabilityStore(agent.tool_effect_store.backend)
+        await store.initialize()
+        stores.append(store)
+        agent.observability_store = store
+        return agent
+
+    try:
+        yield create
+    finally:
+        for store in stores:
+            await store.close()
 
 
 async def _dispatch_direct(agent, tool_name, args, **kwargs):
-    return await agent._dispatch_direct_tool(
-        SimpleNamespace(id="call-1", name=tool_name),
-        tool_name,
-        args,
-        0.0,
-        "evt-3396",
-        session_id="s-3396",
-        **kwargs,
-    )
+    @governed
+    async def invoke(agent, user_input, *, invocation_id=None):
+        event_id = await agent.observability_store.log_tool_call(agent.did, tool_name)
+        return await agent._dispatch_direct_tool(
+            SimpleNamespace(id="call-1", name=tool_name), tool_name, args,
+            0.0, event_id, session_id="s-3396", **kwargs,
+        )
+    return await invoke(agent, {'tool': tool_name, 'arguments': args})
+
+
+async def _inline_dispatch(agent, tool_name, args, **kwargs):
+    return await agent.execute_named_tool(tool_name, args,
+        operation_id=uuid4().hex, **kwargs)
 
 
 class _ApprovalQueue:
@@ -700,25 +731,14 @@ class _ApprovalQueue:
         return True, "once"
 
 
-class _ComputerUseAgent:
-    def __init__(self):
-        self.privacy_config = PrivacyConfig(computer_access=True)
-        self.granted_capabilities = frozenset(
-            {"shell_execution_sandboxed", "shell_execution_host"}
-        )
-        self.did = "did:test:agent"
-        self.features = {
-            "security": SimpleNamespace(approval_queue=_ApprovalQueue())
-        }
-
-    def get_feature(self, name):
-        return self.features.get(name)
-
-
 @pytest.fixture()
-async def computer_use(tmp_path: Path) -> ComputerUseFeature:
+async def computer_use(orchestrator, tmp_path: Path) -> ComputerUseFeature:
     (tmp_path / "captures").mkdir()
-    feature = ComputerUseFeature(_ComputerUseAgent())
+    agent = await orchestrator()
+    agent.privacy_agent._privacy_config.computer_access = True
+    agent.granted_capabilities = frozenset({'shell_execution_sandboxed', 'shell_execution_host'})
+    agent.features['security'] = SimpleNamespace(approval_queue=_ApprovalQueue())
+    feature = ComputerUseFeature(agent)
     feature._cfg = {
         "enabled": True,
         "backend": "local",
@@ -752,10 +772,10 @@ SHELL_WITH_HABITUAL_KWARGS = {
 
 
 @pytest.mark.asyncio
-async def test_chat_path_shell_with_context_still_writes_the_capture(
+async def test_chat_path_shell_with_context_still_writes_the_capture(orchestrator,
     computer_use, tmp_path: Path
 ):
-    agent = _Orchestrator(direct_tools={"shell": _shell_tool(computer_use)})
+    agent = await orchestrator(direct_tools={"shell": _shell_tool(computer_use)}, agent=computer_use.agent)
 
     result = await _dispatch_direct(agent, "shell", dict(SHELL_WITH_HABITUAL_KWARGS))
 
@@ -768,13 +788,13 @@ async def test_chat_path_shell_with_context_still_writes_the_capture(
 
 
 @pytest.mark.asyncio
-async def test_inline_executor_path_shell_with_context_still_writes_the_capture(
+async def test_inline_executor_path_shell_with_context_still_writes_the_capture(orchestrator,
     computer_use, tmp_path: Path
 ):
     """``execute_named_tool`` is the codex inline executor's door."""
-    agent = _Orchestrator(features={"ComputerUseFeature": computer_use})
+    agent = await orchestrator(features={"ComputerUseFeature": computer_use}, agent=computer_use.agent)
 
-    result = await agent.execute_named_tool(
+    result = await _inline_dispatch(agent,
         "shell", dict(SHELL_WITH_HABITUAL_KWARGS), session_id="s-3396",
         source="codex_app_server",
     )
@@ -786,9 +806,9 @@ async def test_inline_executor_path_shell_with_context_still_writes_the_capture(
 
 
 @pytest.mark.asyncio
-async def test_chat_path_refuses_an_unknown_argument_before_anything_runs():
+async def test_chat_path_refuses_an_unknown_argument_before_anything_runs(orchestrator, ):
     tool = _SchemaTool("get_pull_request", "owner", "repo", "pull_number")
-    agent = _Orchestrator(direct_tools={tool.name: tool})
+    agent = await orchestrator(direct_tools={tool.name: tool})
     dispatch_meta: dict = {}
     tool_events: list = []
 
@@ -824,7 +844,7 @@ async def test_chat_path_refuses_an_unknown_argument_before_anything_runs():
 
 
 @pytest.mark.asyncio
-async def test_chat_path_still_reports_a_tool_that_raises():
+async def test_chat_path_still_reports_a_tool_that_raises(orchestrator, ):
     """A tool-local timeout cannot establish that execution had no effects."""
 
     class _Raises(_SchemaTool):
@@ -832,13 +852,14 @@ async def test_chat_path_still_reports_a_tool_that_raises():
             raise TimeoutError("took too long")
 
     tool = _Raises("slow", "n")
-    agent = _Orchestrator(direct_tools={tool.name: tool})
+    agent = await orchestrator(direct_tools={tool.name: tool})
     dispatch_meta: dict = {}
 
-    result = await _dispatch_direct(agent, tool.name, {"n": "1"}, dispatch_meta=dispatch_meta)
+    from kestrel_sdk.resources import ResourceOutcomeUnknown
+    with pytest.raises(ResourceOutcomeUnknown):
+        await _dispatch_direct(agent, tool.name, {"n": "1"}, dispatch_meta=dispatch_meta)
 
     unknown = "Tool outcome is unconfirmed; reconcile before retrying. Do not replay"
-    assert result == {"success": False, "error": unknown}
     original = dispatch_meta.pop("outcome_error")
     assert isinstance(original, TimeoutError) and str(original) == "took too long"
     assert dispatch_meta == {
@@ -852,12 +873,12 @@ async def test_chat_path_still_reports_a_tool_that_raises():
 
 
 @pytest.mark.asyncio
-async def test_inline_executor_path_refuses_an_unknown_argument():
+async def test_inline_executor_path_refuses_an_unknown_argument(orchestrator, ):
     tool = _SchemaTool("get_pull_request", "owner", "repo", "pull_number")
     feature = SimpleNamespace(name="GitHubFeature", get_tools=lambda: [tool])
-    agent = _Orchestrator(features={"GitHubFeature": feature})
+    agent = await orchestrator(features={"GitHubFeature": feature})
 
-    result = await agent.execute_named_tool(
+    result = await _inline_dispatch(agent,
         tool.name, {"owner": "o", "repo": "r", "pr_number": 12},
         session_id="s-3396", source="codex_app_server",
     )
@@ -882,18 +903,18 @@ async def test_inline_executor_path_refuses_an_unknown_argument():
     ids=list(SCHEMAS_THAT_ACCEPT_CONTEXT),
 )
 @pytest.mark.parametrize("path", ["chat", "inline_executor"])
-async def test_context_a_json_schema_accepts_reaches_the_tool_unchanged(path, schema):
+async def test_context_a_json_schema_accepts_reaches_the_tool_unchanged(orchestrator, path, schema):
     """The review of the first #3396 fix: dropping ``context`` whenever
     ``properties`` omits it silently stripped tool data from an MCP server
     whose schema accepts the name some other way."""
     tool = _JsonSchemaTool("mcp__api__call", schema)
-    agent = _Orchestrator(direct_tools={tool.name: tool})
+    agent = await orchestrator(direct_tools={tool.name: tool})
     supplied = {"url": "u", "context": "the server's own context field"}
 
     if path == "chat":
         result = await _dispatch_direct(agent, tool.name, dict(supplied))
     else:
-        result = await agent.execute_named_tool(
+        result = await _inline_dispatch(agent,
             tool.name, dict(supplied), session_id="s-3396", source="mcp",
         )
 
@@ -903,14 +924,14 @@ async def test_context_a_json_schema_accepts_reaches_the_tool_unchanged(path, sc
     assert agent.audit.rows == []
 
 
-async def _dispatch_isolated(path: str, tool: IsolatedFeatureTool, args: dict):
+async def _dispatch_isolated(orchestrator, path: str, tool: IsolatedFeatureTool, args: dict):
     """Dispatch ``tool`` the way each door finds an isolated feature's tool."""
     if path == "chat":
-        agent = _Orchestrator(direct_tools={tool.name: tool})
+        agent = await orchestrator(direct_tools={tool.name: tool})
         return agent, await _dispatch_direct(agent, tool.name, dict(args))
     feature = SimpleNamespace(name="IsolatedFetchFeature", get_tools=lambda: [tool])
-    agent = _Orchestrator(features={"IsolatedFetchFeature": feature})
-    return agent, await agent.execute_named_tool(
+    agent = await orchestrator(features={"IsolatedFetchFeature": feature})
+    return agent, await _inline_dispatch(agent,
         tool.name, dict(args), session_id="s-3396", source="codex_app_server",
     )
 
@@ -920,11 +941,11 @@ async def _dispatch_isolated(path: str, tool: IsolatedFeatureTool, args: dict):
     "schema", list(OPEN_ISOLATED_SCHEMAS.values()), ids=list(OPEN_ISOLATED_SCHEMAS)
 )
 @pytest.mark.parametrize("path", ["chat", "inline_executor"])
-async def test_an_open_isolated_service_receives_every_argument(path, schema):
+async def test_an_open_isolated_service_receives_every_argument(orchestrator, path, schema):
     service = _IsolatedService()
     tool = _isolated_tool(schema, service)
 
-    agent, result = await _dispatch_isolated(path, tool, ISOLATED_CALL)
+    agent, result = await _dispatch_isolated(orchestrator, path, tool, ISOLATED_CALL)
 
     assert result == {"success": True}
     assert service.calls == [(ISOLATED_TOOL_NAME, ISOLATED_CALL)]
@@ -934,17 +955,17 @@ async def test_an_open_isolated_service_receives_every_argument(path, schema):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("path", ["chat", "inline_executor"])
-async def test_a_closed_isolated_service_gets_neither_extras_nor_typos(path):
+async def test_a_closed_isolated_service_gets_neither_extras_nor_typos(orchestrator, path):
     service = _IsolatedService()
     tool = _isolated_tool(CLOSED_ISOLATED_SCHEMA, service)
 
-    agent, result = await _dispatch_isolated(
+    agent, result = await _dispatch_isolated(orchestrator,
         path, tool, {"url": "u", "task": "t", "context": "c"}
     )
     assert result == {"success": True}
     assert service.calls == [(ISOLATED_TOOL_NAME, {"url": "u"})]
 
-    agent, result = await _dispatch_isolated(path, tool, ISOLATED_CALL)
+    agent, result = await _dispatch_isolated(orchestrator, path, tool, ISOLATED_CALL)
     assert result["success"] is False
     assert "fetch_page does not accept argument 'extra'." in result["error"]
     assert service.calls == [(ISOLATED_TOOL_NAME, {"url": "u"})]
@@ -956,34 +977,20 @@ async def test_a_closed_isolated_service_gets_neither_extras_nor_typos(path):
 
 
 @pytest.fixture()
-def chat_agent():
-    """A real ``KestrelAgent`` wired for ``_dispatch_tool_call``."""
-    with patch("kestrel_sovereign.kestrel_agent.LLMService"):
-        agent = KestrelAgent(did="did:test:3396")
-    agent.observability_store = MagicMock()
-    agent.observability_store.log_tool_call = AsyncMock(return_value="evt-1")
-    agent.observability_store.log_tool_response = AsyncMock()
-    agent.observability_store.log_error = AsyncMock()
-    agent.observability_store.log_tool_dispatch = AsyncMock(return_value="d-1")
-    agent.hooks_manager = _AllowAllHooks()
-    agent.audit = _AuditStore()
-    agent.features = {
-        "SecurityFeature": SimpleNamespace(permission_store=agent.audit),
-    }
-    return agent
+async def chat_agent(orchestrator):
+    return await orchestrator()
 
 
 async def _chat_dispatch(agent, tool_name: str, arguments: dict) -> tuple[Any, list]:
-    messages: list = []
-    result = await agent._dispatch_tool_call(
-        SimpleNamespace(id="tc-3396", name=tool_name, arguments=arguments),
-        {},
-        {tool_name},
-        messages,
-        0,
-        None,
-    )
-    return result, messages
+    @governed
+    async def invoke(agent, user_input, *, invocation_id=None):
+        messages = []
+        result = await agent._dispatch_tool_call(
+            SimpleNamespace(id="tc-3396", name=tool_name, arguments=arguments),
+            {}, {tool_name}, messages, 0, None,
+        )
+        return result, messages
+    return await invoke(agent, {'tool': tool_name, 'arguments': arguments})
 
 
 def _github_feature(*tools):
@@ -1237,11 +1244,11 @@ async def test_emmas_call_reaches_the_model_as_a_correctable_refusal(chat_agent)
 
 
 @pytest.mark.asyncio
-async def test_emmas_call_is_refused_on_the_inline_executor_path():
+async def test_emmas_call_is_refused_on_the_inline_executor_path(orchestrator, ):
     feature = _GitHubIssueFeature()
-    agent = _Orchestrator(features={"GitHubFeature": feature})
+    agent = await orchestrator(features={"GitHubFeature": feature})
 
-    result = await agent.execute_named_tool(
+    result = await _inline_dispatch(agent,
         "get_github_issue_comments",
         dict(EMMA_GET_COMMENTS_CALL),
         session_id="s-3571",

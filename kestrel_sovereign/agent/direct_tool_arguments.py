@@ -78,6 +78,7 @@ from __future__ import annotations
 
 import difflib
 import logging
+from copy import deepcopy
 from dataclasses import dataclass, field
 from typing import Any, Dict, FrozenSet, List, Optional, Sequence, Tuple
 
@@ -274,15 +275,18 @@ def coerce_declared_tool_arguments(
 ) -> Tuple[Dict[str, Any], Optional[str]]:
     """Coerce ``arguments`` as ``tool``'s own wrapper will, before it runs.
 
-    Only for a tool wrapping a native ``@tool`` method (see the module
-    docstring); any other tool gets its arguments back unchanged.
+    Type coercion applies only to native ``@tool`` wrappers. Every dictionary
+    is detached before approval, including tools that need no coercion, so a
+    caller cannot change its nested values while the hook chain is awaiting.
 
     Returns:
         ``(arguments, error)`` as :func:`kestrel_sdk.tools.coerce_tool_arguments`
         does. ``error`` names the parameter and the type it expects, and a
-        refused call gets back the arguments it supplied, as does a call
-        whose arguments already had their declared types.
+        refused call gets the supplied values back. The returned dictionary
+        owns its values even when they already had their declared types.
     """
+    if isinstance(arguments, dict):
+        arguments = deepcopy(arguments)
     parameters = _wrapper_coerced_parameters(tool)
     if parameters is None or not isinstance(arguments, dict):
         return arguments, None
@@ -332,10 +336,16 @@ def hook_rewrite_argument_error(
         run, naming the parameters and their declared types but not their
         rewritten values.
     """
-    coerced, error = coerce_declared_tool_arguments(tool_name, tool, arguments)
+    parameters = _wrapper_coerced_parameters(tool)
+    if parameters is None or not isinstance(arguments, dict):
+        return None
+    # This is validation of the already owned approved binding. Use the
+    # wrapper's coercer directly so ownership copies are not mistaken for
+    # coercion of the values the hooks authorized.
+    coerced, error = coerce_tool_arguments(tool_name, parameters, arguments)
     if error is not None:
         return f"{error}. A PRE_TOOL_USE hook rewrote the arguments; the call did not run"
-    if coerced is arguments:
+    if all(coerced[name] is value for name, value in arguments.items()):
         return None
     declared = {
         parameter.name: parameter.type
@@ -457,7 +467,7 @@ def normalize_direct_tool_arguments(
     """
     declared = _declared_parameters(tool)
     if declared is None or not isinstance(arguments, dict):
-        return arguments, None
+        return coerce_declared_tool_arguments(tool_name, tool, arguments)
     rejected = [name for name in arguments if not declared.accepts(name)]
     if not rejected:
         return coerce_declared_tool_arguments(tool_name, tool, arguments)

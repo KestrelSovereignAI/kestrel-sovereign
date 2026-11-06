@@ -47,6 +47,68 @@ async def bound_operation(owner, tmp_path):
     await store.close()
 
 
+@pytest.mark.parametrize('lane', ['bound', 'named', 'audit'])
+async def test_nested_external_operation_retains_its_original_privacy_frame(bound_operation, lane):
+    from tests.unit.test_tool_effect_invocation import governed
+    from kestrel_sovereign.tools.effect_journal import execute_tool_effect
+
+    owner, binding, witness = bound_operation
+
+    @governed
+    async def invoke(agent, user_input, *, invocation_id=None):
+        async def outer_effect():
+            context = dict(session_id='owned-nested-session', operation_id='owned-nested-intent')
+            if lane == 'bound':
+                return await binding.invoke({'marker': 'nested'}, **context)
+            if lane == 'audit':
+                from kestrel_sovereign._async_ownership import raise_owned_outcome
+                from kestrel_sovereign.tools.effect_invocation import ToolEffectOperation
+
+                async def audit(outcome):
+                    # Bound the native acquisition itself so a broken handoff
+                    # can retire and report a failed audit without hanging its
+                    # original owner during the regression's cleanup.
+                    async with asyncio.timeout(0.2), agent._get_privacy_transition_lock():
+                        with witness.open('a') as stream:
+                            stream.write('audit\n')
+
+                outcome = await agent._execute_tool_operation_at_stop_boundary(
+                    lambda: agent.execute_named_tool(binding.name, {'marker': 'nested'},
+                        session_id='owned-nested-session'),
+                    name='owned-nested-audit', cancel_on_caller_cancellation=True,
+                    finalize=audit,
+                    tool_operation=ToolEffectOperation('native_audit', 'owned-nested-intent',
+                        'owned-registry', binding.name, {'marker': 'nested'}, 'owned-nested-session'))
+                return raise_owned_outcome(outcome, operation='original nested audit', retain_originals=True)
+            return await agent.execute_named_tool(binding.name, {'marker': 'nested'}, **context)
+
+        return await execute_tool_effect(agent, registration='owned-parent-effect',
+            arguments={}, execute=outer_effect)
+
+    calling = asyncio.create_task(invoke(owner, 'original nested intention', invocation_id='owned-parent-intent'))
+    try:
+        _done, pending = await asyncio.wait({calling}, timeout=0.5)
+        assert not pending, 'Nested external tool lost its original held privacy frame'
+        if lane == 'audit':
+            from kestrel_sovereign._async_ownership import await_owned_task
+
+            outcome = await await_owned_task(calling)
+            healthy = outcome.error is None
+            assert healthy, 'Mandatory native audit lost its original held privacy frame'
+            result = outcome.result
+        else:
+            result = await calling
+        assert result['success'] is True
+        assert witness.read_text() == ('nested\naudit\n' if lane == 'audit' else 'nested\n')
+        assert await owner.tool_effect_store.database.fetchall(
+            'SELECT state FROM tool_effect_claims') == [('RETURNED_OK',), ('RETURNED_OK',)]
+        assert not owner._active_request_ids
+    finally:
+        if not calling.done():
+            calling.cancel()
+        await asyncio.gather(calling, return_exceptions=True)
+
+
 async def test_bound_operation_fences_retry_before_another_native_effect(bound_operation):
     owner, binding, witness = bound_operation
     context = dict(session_id='owned-app-session', operation_id='original-intent', source='mcp-app')

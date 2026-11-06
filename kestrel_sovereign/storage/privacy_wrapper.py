@@ -443,12 +443,12 @@ class ReentrantTransitionLock:
         token = self.current_reentry_token()
         if token is None and self._token_matches_current_span():
             token = _transition_lock_reentry_token.get()
-        def start(operation, context=None):
-            return self.start_owned_native_work(operation, context=context,
+        def start(operation, context=None, *, name="privacy-owned-native-work"):
+            return self.start_owned_native_work(operation, context=context, name=name,
                 _captured_frame=frame, _captured_token=token)
         return start
 
-    def start_owned_native_work(self, operation, *, context=None, _captured_frame=None, _captured_token=None):
+    def start_owned_native_work(self, operation, *, context=None, name="privacy-owned-native-work", _captured_frame=None, _captured_token=None):
         """Retain a fixed native body without lending arbitrary reentry rights.
 
         Only the actual foreign-mutex owner may reserve continuation of that
@@ -481,7 +481,7 @@ class ReentrantTransitionLock:
                     return await operation()
         admission = OwnedTaskAdmission()
         try:
-            task = create_owned_task(run(), name="privacy-owned-native-work", context=context,
+            task = create_owned_task(run(), name=name, context=context,
                 admission=admission, retain_originals=True)
         except BaseException:
             if admission.task is None:

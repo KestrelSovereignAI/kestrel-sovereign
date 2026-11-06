@@ -349,6 +349,108 @@ async def test_task_manager_cannot_execute_a_registration_withdrawn_during_appro
         await manager.close()
 
 
+@pytest.mark.parametrize('lane,checkpoint,mutation', [
+    ('task', 'approval', 'caller'), ('task', 'task-ack', 'caller'),
+    ('task', 'claim-ack', 'caller'), ('task', 'task-ack', 'hook'),
+    ('task', 'claim-ack', 'hook'), ('named', 'approval', 'caller'),
+    ('named', 'claim-ack', 'caller'), ('named', 'claim-ack', 'hook'),
+])
+async def test_approved_binding_survives_native_admission_without_borrowed_arguments(
+    owner, tmp_path, monkeypatch, lane, checkpoint, mutation,
+):
+    from kestrel_sovereign.a2a.scope import NativeRecipientScope
+    from tests.utils.native_a2a import manager_for
+
+    witness = tmp_path / 'approved-binding-effect'
+    entered, resume = asyncio.Event(), asyncio.Event()
+    supplied = {'payload': {'marker': 'approved'}}
+    retained = []
+    observability = ObservabilityStore(owner.tool_effect_store.backend, owns_backend=False)
+    await observability.initialize()
+    owner.observability_store = observability
+    manager = manager_for(owner.tool_effect_store.backend,
+        NativeRecipientScope(owner.did), owns_backend=False)
+    await manager.initialize()
+    manager.hooks_manager = owner.hooks_manager
+
+    class SnapshotFeature(Feature):
+        @property
+        def tool_description(self):
+            return 'Original approved binding'
+
+        async def initialize(self):
+            pass
+
+        @tool(name='owned_snapshot_effect', description='Write only the original approved binding')
+        async def owned_snapshot_effect(self, payload: dict) -> dict:
+            witness.write_text(payload['marker'])
+            return {'success': True}
+
+    feature = SnapshotFeature(owner)
+    owner.features[feature.name] = feature
+    manager.register_provider(feature.name, feature.get_agent_skills(), feature)
+
+    class RetainApproval(Hook):
+        def __init__(self):
+            super().__init__('retain-original-approval', [HookEvent.PRE_TOOL_USE])
+
+        async def execute(self, value):
+            if value.tool_name == 'owned_snapshot_effect':
+                retained.append(value.tool_input)
+                if checkpoint == 'approval':
+                    entered.set()
+                    await resume.wait()
+            return HookOutput.allow()
+
+    owner.hooks_manager.register(RetainApproval())
+    if checkpoint == 'task-ack':
+        create_task = manager.create_task
+
+        async def hold_task_ack(*args, **kwargs):
+            task = await create_task(*args, **kwargs)
+            entered.set()
+            await resume.wait()
+            return task
+
+        monkeypatch.setattr(manager, 'create_task', hold_task_ack)
+    elif checkpoint == 'claim-ack':
+        claim = owner.tool_effect_store.claim
+
+        async def hold_claim_ack(*args, **kwargs):
+            accepted = await claim(*args, **kwargs)
+            assert not owner.tool_effect_store.database.owns_open_transaction
+            entered.set()
+            await resume.wait()
+            return accepted
+
+        monkeypatch.setattr(owner.tool_effect_store, 'claim', hold_claim_ack)
+
+    @governed
+    async def invoke(agent, user_input, *, invocation_id=None):
+        if lane == 'task':
+            return await manager.execute_skill(feature.name, 'owned_snapshot_effect', supplied)
+        return await agent.execute_named_tool('owned_snapshot_effect', supplied, session_id='owned-snapshot')
+
+    calling = asyncio.create_task(invoke(owner, 'original approved intent', invocation_id='owned-approved-intent'))
+    try:
+        await asyncio.wait_for(entered.wait(), 2)
+        (supplied if mutation == 'caller' else retained[-1])['payload']['marker'] = 'unapproved mutation'
+        resume.set()
+        result = await calling
+        assert witness.read_text() == 'approved', 'Native effect executed a borrowed binding after approval'
+        if lane == 'task':
+            assert result.status.state == TaskState.TASK_STATE_COMPLETED
+        assert await owner.tool_effect_store.database.fetchall(
+            'SELECT state FROM tool_effect_claims') == [('RETURNED_OK',)]
+    finally:
+        resume.set()
+        if not calling.done():
+            calling.cancel()
+        await asyncio.gather(calling, return_exceptions=True)
+        await manager.close()
+        await observability.close()
+
+
 @pytest.mark.parametrize('lane', ['named', 'direct', 'subagent'])
 async def test_original_registration_withdrawn_during_pre_hook_cannot_execute(owner, tmp_path, lane):
     from kestrel_sovereign.agent.tool_allowlist import bump_registry_generation

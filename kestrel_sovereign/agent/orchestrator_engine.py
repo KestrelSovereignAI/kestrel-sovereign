@@ -3733,6 +3733,11 @@ class OrchestratorEngineMixin:
         cancellation once so an approval or transport can unwind; both paths
         still join the original owner and any required audit before returning.
         """
+        # Capture before the first foreign task is constructed. Both the
+        # lifecycle and operation handoffs must retain this exact held frame;
+        # the later invocation decorator cannot recover an already lost owner.
+        start_privacy_work = self._get_privacy_transition_lock().capture_native_work_factory()
+
         async def join_original_operation():
             turn_scope = capture_turn_scope(self)
             task_context = contextvars.copy_context()
@@ -3748,16 +3753,16 @@ class OrchestratorEngineMixin:
                 with turn_scope.bind():
                     return await factory()
 
-            owner = create_owned_task(
-                run_scoped(operation), name=name, context=task_context, retain_originals=True,
+            owner = start_privacy_work(
+                lambda: run_scoped(operation), name=name, context=task_context,
             )
             outcome = await await_owned_task(
                 owner, cancel_on_caller_cancellation=cancel_on_caller_cancellation,
             )
             if finalize is not None:
-                audit_owner = create_owned_task(
-                    run_scoped(lambda: finalize(outcome)), name=name + "-audit",
-                    context=task_context, retain_originals=True,
+                audit_owner = start_privacy_work(
+                    lambda: run_scoped(lambda: finalize(outcome)), name=name + "-audit",
+                    context=task_context,
                 )
                 audit = await await_owned_task(audit_owner, pending_cancellation=outcome.cancellation)
                 outcome = OwnedTaskOutcome(
@@ -3783,9 +3788,9 @@ class OrchestratorEngineMixin:
                 outcome = await join_original_operation()
                 return raise_owned_outcome(outcome, operation=name, retain_originals=True)
 
-        external = create_owned_task(invoke_external(self,
+        external = start_privacy_work(lambda: invoke_external(self,
             invocation_id=tool_operation.operation_id, caller=current_caller_context(),
-            session_id=tool_operation.session_id), name=name + "-lifecycle", retain_originals=True)
+            session_id=tool_operation.session_id), name=name + "-lifecycle")
         return await await_owned_task(external,
             cancel_on_caller_cancellation=cancel_on_caller_cancellation)
 
