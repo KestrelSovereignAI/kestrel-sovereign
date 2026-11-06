@@ -1104,10 +1104,13 @@ def cmd_tool_log_recent_failures(args) -> int:
         print(json.dumps(result, indent=2, sort_keys=True))
     else:
         for row in result:
+            # A feature subagent's call names the dispatch that made it (#3778).
+            parent = row.get("parent_dispatch_id")
             print(
                 f"#{row['id']} {row['ts']} {row['tool_name']} "
                 f"{row['result_status']} {row['error_class'] or ''}: "
                 f"{row['error_message'] or ''}"
+                + (f" [inside dispatch {parent}]" if parent else "")
             )
     return 0
 

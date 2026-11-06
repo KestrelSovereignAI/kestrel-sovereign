@@ -18,6 +18,7 @@ import os
 import re
 import sys
 import time
+import uuid
 from contextlib import aclosing, contextmanager, nullcontext
 from copy import deepcopy
 from dataclasses import dataclass
@@ -59,6 +60,7 @@ from kestrel_sovereign.agent.direct_tool_arguments import (
     normalize_direct_tool_arguments,
 )
 from kestrel_sovereign.llm.adapter import (
+    InlineToolOutcome,
     LLMResponse,
     ThinkingDelta,
     tool_call_history_entry,
@@ -111,6 +113,8 @@ from kestrel_sovereign.execution_custody import (
     ExecutionAuthorityError,
     ToolAuditUnconfirmedError,
     is_tool_execution_terminal_error,
+    execution_cleanup_debts,
+    execution_commit_outcome,
     execution_terminal_error,
     is_execution_control_error,
     require_execution_work,
@@ -880,16 +884,20 @@ def _extract_inline_error_fields(result: Any) -> tuple[Optional[str], Optional[s
     Inline tools surface failures in a few common shapes — codex's
     inline wrapper writes ``{'success': False, 'error': '<repr>'}``;
     feature subagents return ``{'success': False, 'error': ...}`` too;
-    a ToolResult envelope serializes to a similar shape via
-    ``_serialize_tool_result``. We honour those and otherwise return
-    ``(None, None)`` so ``result_status`` inference at the SDK layer
-    still drives the status column accurately.
+    a failed ToolResult serializes, via ``_serialize_tool_result``, to the
+    flat ``{'status': 'error', 'error': ...}`` envelope. We honour those and
+    otherwise return ``(None, None)`` so ``result_status`` inference at the
+    SDK layer still drives the status column accurately.
     """
+    from kestrel_sovereign.features.base import is_flat_toolresult_envelope
+
     if isinstance(result, _HostToolFailure):
         return result.message, result.error_class
     if not isinstance(result, dict):
         return None, None
-    if result.get("success") is False:
+    if result.get("success") is False or (
+        is_flat_toolresult_envelope(result) and result.get("status") == "error"
+    ):
         err = result.get("error")
         if isinstance(err, str) and err:
             return err, "InlineToolFailure"
@@ -1014,7 +1022,52 @@ async def _record_inline_tool_dispatch(host, entry, *, session_id, features_by_t
         args=args if isinstance(args, dict) else {}, result=result,
         session_id=session_id, dispatch_start=time.time(),
         error_message=error_message, error_class=error_class,
+        dispatch_id=entry.get("dispatch_id"),
     )
+
+
+def _report_unwritten_dispatch(row, error) -> None:
+    """The one report of a dispatch row its write did not confirm (#3778)."""
+    outcome = execution_commit_outcome(error)
+    logging.warning(
+        "[TOOL-DISPATCH] a2a_tool_dispatches row %s: dispatch_id=%s "
+        "tool=%s parent_dispatch_id=%s cause=%s",
+        "not written" if outcome is None else f"write outcome {outcome}",
+        row["dispatch_id"], row.get("tool_name"), row.get("parent_dispatch_id"),
+        exception_log_summary(error),
+    )
+
+
+async def _write_tool_dispatch(host, *, on_written=None, **row) -> None:
+    """Write one best-effort ``a2a_tool_dispatches`` row (#3778).
+
+    The row is written in the calling task, as ``_log_tool_dispatch`` writes
+    every other row, so a write inside the caller's transaction joins it.
+    ``on_written`` runs only once the row is written. The ledger's own writer
+    swallows a failed best-effort write, so this one writes as required and
+    reads the failure itself: a refused write (native storage refuses one
+    once the execution's authority is revoked) or a failed one is reported
+    once, as a WARNING naming the row, and the caller's outcome stands. A
+    write whose COMMIT outcome is unknown or committed, or that left a native
+    resource unretired, may have written the row: it is reported the same
+    way, then raised, so the caller reconciles rather than retries. A host
+    with no ``log_tool_dispatch`` writer is written to as before, and its row
+    is never taken for written: nothing there can say whether it was.
+    """
+    row = {**row, "dispatch_id": row.get("dispatch_id") or uuid.uuid4().hex}
+    store = getattr(host, "observability_store", None)
+    if getattr(store, "log_tool_dispatch", None) is None:
+        await OrchestratorEngineMixin._log_tool_dispatch(host, **row)
+        return
+    try:
+        await OrchestratorEngineMixin._log_tool_dispatch(host, **row, required=True)
+    except Exception as error:
+        _report_unwritten_dispatch(row, error)
+        if execution_commit_outcome(error) is not None or execution_cleanup_debts(error):
+            raise
+        return
+    if on_written is not None:
+        on_written()
 
 
 # Where ``_complete_post_tool_result`` publishes. The default is the live chat
@@ -1034,11 +1087,14 @@ def _publication_scope(destination):
 
 async def _complete_post_tool_result(host, result, post_input, *, adapter,
                                      dispatch_start, on_audited=None,
-                                     destination=_CURRENT_TURN):
+                                     destination=_CURRENT_TURN,
+                                     dispatch_id=None, parent_dispatch_id=None):
     """Complete policy and required audit before invoking a private UI factory.
 
     Every Core route that can receive a ``DeferredToolResult`` completes it
     here; ``destination`` (see ``_CURRENT_TURN``) is the only difference.
+    ``dispatch_id`` names the row, and ``parent_dispatch_id`` the dispatch the
+    call ran inside, for a feature subagent's own call (#3778).
     """
     deferred = isinstance(result, DeferredToolResult)
     post_outputs = await host.hooks_manager.execute_hooks_parallel(
@@ -1065,6 +1121,7 @@ async def _complete_post_tool_result(host, result, post_input, *, adapter,
             session_id=post_input.session_id, dispatch_start=dispatch_start,
             status_hint=status,
             error_message=error_message, error_class=error_class, required=True,
+            dispatch_id=dispatch_id, parent_dispatch_id=parent_dispatch_id,
         )
         if on_audited is not None:
             on_audited(status)
@@ -1309,6 +1366,7 @@ class OrchestratorEngineMixin:
         audit_adapter=None,
         on_audited=None,
         on_refused=None,
+        dispatch_id=None,
     ) -> dict:
         """
         Execute a tool with PRE_TOOL_USE and POST_TOOL_USE hook enforcement.
@@ -1330,6 +1388,9 @@ class OrchestratorEngineMixin:
                         as they stood when the deciding hook ran, so the
                         caller records the refused call with them rather than
                         with ``args`` (#3953).
+            dispatch_id: The ``ledger_id`` of the dispatch, which a deferred
+                        result's row is written under. A feature subagent's
+                        own calls name it as their parent (#3778).
 
         Returns:
             Tool result dict, or an error dict if permission was denied.
@@ -1400,6 +1461,7 @@ class OrchestratorEngineMixin:
             self, result, post_hook_input,
             adapter=audit_adapter or f"{feature_name}.{tool_name}",
             dispatch_start=exec_start, on_audited=on_audited,
+            dispatch_id=dispatch_id,
         )
 
     async def _generate_with_messages_bounded(
@@ -1554,7 +1616,10 @@ class OrchestratorEngineMixin:
                 session_id,
                 checkpoint=effect_checkpoint,
             )
-            return capture.get("effective_args", args), result
+            return InlineToolOutcome(
+                capture.get("effective_args", args), result,
+                capture.get("dispatch_id"),
+            )
 
         async def _persist_completed_effects(executed: list[dict]) -> None:
             """Checkpoint an inline effect before transport cancellation wins."""
@@ -1774,6 +1839,10 @@ class OrchestratorEngineMixin:
         call_context = begin_tool_call(
             self, registered() if callable(registered) else frozenset()
         )
+        if _capture is not None:
+            # The row the inline caller records this call under, which a
+            # feature subagent's own calls name as their parent (#3778).
+            _capture["dispatch_id"] = call_context.ledger_id
 
         if tool_name == PHANTOM_RECEIPT_TOOL_NAME:
             handler = getattr(self, "_handle_constitution_receipt_tool", None)
@@ -1889,7 +1958,8 @@ class OrchestratorEngineMixin:
                 return await self._execute_named_subagent(
                     subagent_feature, tool_name=tool_name, args=args,
                     session_id=session_id, source=source, _capture=_capture,
-                    call_context=call_context,
+                    call_context=call_context, execution=execution,
+                    dispatch_meta=dispatch_meta,
                 )
             evidence = allowlist_evidence(self, call_context, tool_name)
             if evidence is not None:
@@ -2057,7 +2127,7 @@ class OrchestratorEngineMixin:
         )
         return await _complete_post_tool_result(
             self, result, post_input, adapter=f"named:{source}:{feature_name}.{tool_name}",
-            dispatch_start=exec_start,
+            dispatch_start=exec_start, dispatch_id=call_context.ledger_id,
             on_audited=lambda status: _mark_tool_dispatch_audited(
                 dispatch_meta, execution, status=status,
             ),
@@ -2138,17 +2208,33 @@ class OrchestratorEngineMixin:
         source: str,
         _capture: Optional[Dict[str, Any]] = None,
         call_context: Optional[ToolCallContext] = None,
+        execution=None,
+        dispatch_meta: Optional[Dict[str, Any]] = None,
     ) -> Any:
         """Run a feature subagent through the governance stack.
 
         Mirrors ``_dispatch_feature_tool`` (the chat path) but in the
         ``execute_named_tool`` shape: no streaming/event-emit side
-        channels, no dispatch_meta, no observability_store coupling.
-        The hooks (``PRE_SUBAGENT_CALL`` / ``POST_SUBAGENT_CALL``) and
-        denied-tools stripping ARE applied — that's the security
+        channels. The hooks (``PRE_SUBAGENT_CALL`` / ``POST_SUBAGENT_CALL``)
+        and denied-tools stripping ARE applied — that's the security
         envelope subagent dispatch sits inside, separate from the
         ``PRE_TOOL_USE`` / ``POST_TOOL_USE`` envelope individual tools
         sit inside.
+
+        The envelope's ``a2a_tool_dispatches`` row is written here, under
+        ``call_context.ledger_id``, once the dispatch completes: refused,
+        failed or returned (#3778). The subagent's own calls name that id as
+        their parent, so the row is written on every transport, including
+        one with no inline caller to record it, and before a codex turn that
+        ran it could fail ahead of recording its executed calls. The codex
+        inline caller (``_capture``) receives the single-use receipt that the
+        row was written, so its recorder does not write it again. When the
+        write was not confirmed it receives the plain payload instead, and its
+        recorder writes the row under the same id. Either carries the result's
+        serialized form, so a ``ToolResult`` keeps its status. Every other
+        caller receives the result itself. The row and the inline caller name
+        the arguments the subagent ran with, after the inner ``PRE_TOOL_USE``
+        chain's rewrites.
 
         Args:
             feature: The Feature subagent to dispatch to.
@@ -2161,8 +2247,50 @@ class OrchestratorEngineMixin:
             call_context: The call's place in its turn (#2935), recorded as
                 accepted once the argument guardrail passes, before the
                 permission hooks, as the chat path records a subagent call.
+            execution / dispatch_meta: ``execute_named_tool``'s execution
+                facts, marked audited once the envelope's row is written.
         """
         feature_name = type(feature).__name__
+        dispatch_start = time.time()
+        adapter = f"named:{source}:{feature_name}.execute_as_subagent"
+
+        async def _recorded(row_args, result, *, status=None, error_class=None,
+                            error_message=None):
+            """Write the envelope's row, then return what the caller receives."""
+            payload = result
+            if not isinstance(payload, dict):
+                from kestrel_sovereign.features.base import _serialize_tool_result
+
+                payload = _serialize_tool_result(result)
+                if not isinstance(payload, dict):
+                    payload = {"result": payload}
+            if error_class is None and error_message is None:
+                error_message, error_class = _extract_inline_error_fields(payload)
+            status = infer_tool_result_status(payload, status)
+            written = []
+
+            def _on_written():
+                written.append(True)
+                _mark_tool_dispatch_audited(dispatch_meta, execution, status=status)
+
+            await _write_tool_dispatch(
+                self, tool_name=tool_name, adapter=adapter,
+                args=row_args if isinstance(row_args, dict) else {}, result=payload,
+                session_id=session_id, dispatch_start=dispatch_start,
+                status_hint=status, error_class=error_class,
+                error_message=error_message,
+                dispatch_id=None if call_context is None else call_context.ledger_id,
+                on_written=_on_written,
+            )
+            if _capture is None:
+                return result
+            if not written:
+                # No row to vouch for: the inline recorder writes it, under
+                # the same ``dispatch_id``, from the plain payload.
+                return payload
+            return _AuditedDeferredResult(
+                payload, host=self, tool_name=tool_name, session_id=session_id,
+            )
 
         # Same arg-validation guardrail individual tools get.
         is_valid, validation_error = validate_tool_arguments(tool_name, args)
@@ -2173,7 +2301,12 @@ class OrchestratorEngineMixin:
                 source, feature_name, _TOOL_VALIDATION_ERROR,
                 content_log_summary(str(validation_error)),
             )
-            return {"success": False, "error": f"Invalid tool arguments: {validation_error}"}
+            return await _recorded(
+                args,
+                {"success": False, "error": f"Invalid tool arguments: {validation_error}"},
+                status="error", error_class=_TOOL_VALIDATION_ERROR,
+                error_message=f"Tool validation failed: {validation_error}",
+            )
         record_tool_acceptance(self, call_context, tool_name)
 
         logging.info(
@@ -2203,7 +2336,13 @@ class OrchestratorEngineMixin:
                 blocked.decision.value, source, feature_name,
                 content_log_summary(str(blocked.reason)),
             )
-            return blocked.envelope
+            # As the chat path records a refused subagent call (#3953): an
+            # ASK is a ``policy_denied`` row its ``error_class`` names.
+            return await _recorded(
+                post_hook_args, blocked.envelope, status="policy_denied",
+                error_class="ApprovalRequired" if blocked.is_ask else "PermissionDenied",
+                error_message=blocked.reason,
+            )
 
         effective_args = post_hook_args if isinstance(post_hook_args, dict) else args
         task = effective_args.get("task", "")
@@ -2251,7 +2390,13 @@ class OrchestratorEngineMixin:
                 result=inner_blocked.envelope,
                 exec_duration_ms=0,
             )
-            return inner_blocked.envelope
+            return await _recorded(
+                refused_args, inner_blocked.envelope, status="policy_denied",
+                error_class=(
+                    "ApprovalRequired" if inner_blocked.is_ask else "PermissionDenied"
+                ),
+                error_message=inner_blocked.reason,
+            )
         # Honor inner-MODIFY rewrites for the same reason the outer
         # hook does — a PRE_TOOL_USE redactor on subagent args must
         # apply to the call that actually runs.
@@ -2259,6 +2404,12 @@ class OrchestratorEngineMixin:
         if isinstance(inner_effective, dict):
             task = inner_effective.get("task", task)
             context = inner_effective.get("context", context)
+            # The completion hooks, the envelope's row and the inline caller
+            # all report the binding that ran, not one a redactor rewrote
+            # before it ran (#3778).
+            effective_args = inner_effective
+            if _capture is not None:
+                _capture["effective_args"] = effective_args
 
         exec_start = time.time()
         # Codex P2 on PR #1385: chat-path ``_dispatch_feature_tool``
@@ -2314,7 +2465,10 @@ class OrchestratorEngineMixin:
                 feature_name=feature_name, effective_args=effective_args,
                 result=err_result, exec_duration_ms=exec_duration_ms,
             )
-            return err_result
+            return await _recorded(
+                effective_args, err_result, status="error",
+                error_class=type(e).__name__, error_message=str(e),
+            )
         exec_duration_ms = int((time.time() - exec_start) * 1000)
         # #2641: envelope-carried subagent parts → this turn's collector (the
         # codex inline executor re-binds it around this call, so parts emitted
@@ -2347,8 +2501,9 @@ class OrchestratorEngineMixin:
             feature_name=feature_name, effective_args=effective_args,
             result=result, exec_duration_ms=exec_duration_ms,
         )
+        recorded = await _recorded(effective_args, result)
         require_execution_work(self)
-        return result
+        return recorded
 
     async def _fire_post_subagent_hook(
         self,
@@ -2610,6 +2765,7 @@ class OrchestratorEngineMixin:
                 status_hint="error",
                 error_class=_TOOL_VALIDATION_ERROR,
                 error_message=f"Tool validation failed: {validation_error}",
+                dispatch_id=call_context.ledger_id,
                 **({"required": True} if bound_tool is not None else {}),
             )
             if bound_execution is not None:
@@ -2667,6 +2823,7 @@ class OrchestratorEngineMixin:
                     user_message, tool_events=tool_events, streaming=streaming,
                     session_id=session_id, dispatch_meta=dispatch_meta,
                     effective_model=effective_model,
+                    dispatch_id=call_context.ledger_id,
                 )
             elif tool_name in self._direct_tools:
                 result = await self._dispatch_direct_tool(
@@ -2782,6 +2939,8 @@ class OrchestratorEngineMixin:
                 status_hint=dispatch_meta.get("status"),
                 error_class=dispatch_meta.get("error_class"),
                 error_message=dispatch_meta.get("error_message"),
+                # A feature subagent's own calls name this row as their parent.
+                dispatch_id=call_context.ledger_id,
                 **({"required": True} if bound_tool is not None else {}),
             )
 
@@ -2818,8 +2977,15 @@ class OrchestratorEngineMixin:
         error_class: Optional[str] = None,
         error_message: Optional[str] = None,
         required: bool = False,
+        dispatch_id: Optional[str] = None,
+        parent_dispatch_id: Optional[str] = None,
     ) -> None:
-        """Build the canonical dispatch entry, optionally requiring persistence."""
+        """Build the canonical dispatch entry, optionally requiring persistence.
+
+        ``dispatch_id`` names the row (the store assigns one when it is
+        ``None``); ``parent_dispatch_id`` names the dispatch this call ran
+        inside, such as the feature subagent envelope that made it (#3778).
+        """
         observability_store = getattr(self, "observability_store", None)
         if observability_store is None:
             if required:
@@ -2851,6 +3017,8 @@ class OrchestratorEngineMixin:
                     error_message=error_message,
                     latency_ms=int((time.time() - dispatch_start) * 1000),
                     result_size_bytes=tool_result_size_bytes(result),
+                    dispatch_id=dispatch_id,
+                    parent_dispatch_id=parent_dispatch_id,
                 ),
                 **({"required": True} if required else {}),
             )
@@ -2866,13 +3034,17 @@ class OrchestratorEngineMixin:
     async def _dispatch_feature_tool(
         self, tool_call, feature, args, dispatch_start, dispatch_event_id,
         user_message, *, tool_events=None, streaming=False, session_id="orchestrator",
-        dispatch_meta=None, effective_model=None,
+        dispatch_meta=None, effective_model=None, dispatch_id=None,
     ):
         """Dispatch to a feature subagent with hook enforcement.
 
         ``effective_model`` is the route/model the orchestrator resolved for
         this turn; it's forwarded into ``execute_as_subagent`` so the subagent's
         own reasoning call targets the same route the main turn used (#2352).
+
+        ``dispatch_id`` is the dispatch's ``ledger_id``. The subagent's own
+        calls name it as their parent, so a deferred result's row, which its
+        completion writes here, is written under it too (#3778).
         """
         tool_name = tool_call.name
         hook_feature_name = type(feature).__name__
@@ -2980,6 +3152,7 @@ class OrchestratorEngineMixin:
                     dispatch_meta, status=status,
                 ),
                 on_refused=_on_refused,
+                dispatch_id=dispatch_id,
             )
             # #2641: parts the subagent's tools produced ride the result
             # envelope; ``_execute_tool_with_hooks`` re-emitted them into this
@@ -3283,6 +3456,7 @@ class OrchestratorEngineMixin:
                 on_refused=lambda arguments: _record_refused_tool_arguments(
                     dispatch_meta, arguments, execution,
                 ),
+                dispatch_id=None if call_context is None else call_context.ledger_id,
                 **({"prepare_args": _prepare_bound_arguments} if bound_tool is not None else {}),
             )
             # #2641: direct tools carry the same envelope contract as
