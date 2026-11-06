@@ -328,7 +328,9 @@ async def test_close_retains_timed_out_native_resource_and_joins_original_receip
     native_close_entered = asyncio.Event()
     original_wait = asyncio.wait
 
-    async def wait_after_native_setup(awaitable, *, timeout):
+    async def wait_after_native_setup(
+        awaitable, *, timeout=None, return_when=asyncio.ALL_COMPLETED,
+    ):
         # This regression concerns the resource's terminal receipt after
         # a real write, not how quickly a SQLite worker can finish that write.
         # Keep the actual timeout owner, but arm its short test deadline only
@@ -337,7 +339,7 @@ async def test_close_retains_timed_out_native_resource_and_joins_original_receip
             task.get_name().startswith(f"llm-close:('{stage}',") for task in awaitable
         ):
             await asyncio.wait_for(native_close_entered.wait(), timeout=5)
-        return await original_wait(awaitable, timeout=timeout)
+        return await original_wait(awaitable, timeout=timeout, return_when=return_when)
 
     monkeypatch.setattr(service_module, "CLIENT_CLOSE_TIMEOUT", 0.01)
     monkeypatch.setattr(asyncio, "wait", wait_after_native_setup)
