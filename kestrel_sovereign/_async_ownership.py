@@ -86,7 +86,7 @@ async def owned_native_yield():
 
 
 class OwnedCallbackScope:
-    """Exact reader callbacks accepted for one native provider wait."""
+    """Original native work accepted during one provider wait."""
 
     def __init__(self):
         self.tasks = set()
@@ -106,6 +106,12 @@ class OwnedCallbackScope:
             raise RuntimeError("a callback must have one original privacy coordinator")
         task = (self.factories[0](operation, name=name) if self.factories else
                 create_owned_task(operation(), name=name, retain_originals=True))
+        return self.accept(task)
+
+    def accept(self, task):
+        """Retain a producer's exact accepted Task, including failed publication."""
+        if self.closed:
+            raise RuntimeError("native callback admission is closed")
         self.tasks.add(task)
         for observer in tuple(self._join_observers):
             observer(task)
@@ -497,7 +503,9 @@ async def gather_owned(operations, *, cancel_siblings_on_error=True,
     pending = set()
     primary = None
     first_observed = False
+    accepted_scope = OwnedCallbackScope()
     async with AsyncExitStack() as parked:
+        await parked.enter_async_context(accepted_scope.wait())
         try:
             for index, operation in enumerate(operations):
                 admission = OwnedTaskAdmission()
@@ -512,12 +520,21 @@ async def gather_owned(operations, *, cancel_siblings_on_error=True,
                         child = work_factory(operation, name=name)
                         admission.task = child
                     children.append(child)
+                    accepted_scope.accept(child)
                 except BaseException as error:
                     if admission.task is not None:
                         # Publication failed, not acceptance. This exact gated
                         # child must be harvested without cancelling away its
                         # original opening failure.
-                        children.append(admission.task)
+                        if not children or children[-1] is not admission.task:
+                            children.append(admission.task)
+                        if admission.task not in accepted_scope.tasks:
+                            try:
+                                accepted_scope.accept(admission.task)
+                            except BaseException as publication_error:
+                                error = execution_terminal_error(error, publication_error,
+                                    retain_originals=retain_originals,
+                                    isolate_control_originals=isolate_control_originals)
                         outcome = await await_owned_task(admission.task)
                         error = execution_terminal_error(
                             error, outcome.error, outcome.cancellation,
@@ -533,7 +550,6 @@ async def gather_owned(operations, *, cancel_siblings_on_error=True,
                         primary, error, retain_originals=retain_originals,
                         isolate_control_originals=isolate_control_originals,
                     )
-            await parked.enter_async_context(owned_native_wait(children))
             pending = set(children)
             while pending:
                 done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
@@ -549,6 +565,8 @@ async def gather_owned(operations, *, cancel_siblings_on_error=True,
                 primary, error, retain_originals=retain_originals,
                 isolate_control_originals=isolate_control_originals,
             )
+        finally:
+            accepted_scope.close()
         if first_observed or (primary is not None and cancel_siblings_on_error):
             for child in children:
                 if not child.done():

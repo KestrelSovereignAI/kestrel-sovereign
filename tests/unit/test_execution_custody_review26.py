@@ -119,7 +119,21 @@ async def test_actual_a2a_producers_and_projections_propagate_original_control(t
                     if stage == "worker_cancel":
                         raise asyncio.CancelledError("wrapped original custody") from marker
                     fail_sync()
-                await manager._execute_async(SimpleNamespace(handle_task=handler_failure), task, "did:test:recipient")
+                from kestrel_sdk.resources import ResourceConflict
+                provider = SimpleNamespace(handle_task=handler_failure)
+                manager.register_provider('original-control-worker',
+                    [AgentSkill(id='fixture', name='Fixture', description='Original worker control', tags=['test'])],
+                    provider)
+                original_registration = manager._providers['original-control-worker']
+                validated = []
+
+                def validate_original_registration():
+                    if manager._providers.get('original-control-worker') is not original_registration:
+                        raise ResourceConflict('Original worker registration changed')
+                    validated.append(True)
+
+                await manager._execute_async(provider, task, "did:test:recipient",
+                    validate_registration=validate_original_registration)
             elif stage == "command":
                 manager.register_provider(
                     "feature", [AgentSkill(id="fixture", name="Fixture", description="Fixture", tags=["test"])],
@@ -131,6 +145,7 @@ async def test_actual_a2a_producers_and_projections_propagate_original_control(t
         assert execution_commit_outcome(result.value) == "unknown", "A2A producer/projection erased original control"
         assert is_execution_control_error(result.value)
         if stage in {"worker", "worker_cancel"}:
+            assert validated == [True]
             assert (await manager.task_store._get_unscoped(task.id)).status.state == TaskState.TASK_STATE_SUBMITTED, "original control became a fresh FAILED/CANCELED write"
     finally:
         await manager.close()

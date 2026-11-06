@@ -765,3 +765,63 @@ async def test_finished_privacy_writer_is_not_retained_by_empty_binding_stack(ou
     gc.collect()
     assert reference() is None, 'empty privacy binding stack retained a completed writer Task'
     assert not lock.locked()
+
+
+@pytest.mark.asyncio
+async def test_partial_gather_admission_keeps_all_original_cleanup_writers(tmp_path, monkeypatch):
+    import kestrel_sovereign._async_ownership as ownership
+
+    lock = ReentrantTransitionLock()
+    started = [asyncio.Event(), asyncio.Event()]
+    stall = asyncio.Event()
+    witness = tmp_path / 'original-sibling-cleanup'
+    accepted = []
+    publication_error = RuntimeError('original postaccept native publication refusal')
+    create_original = ownership.create_owned_task
+
+    def accept_then_refuse(*args, **kwargs):
+        task = create_original(*args, **kwargs)
+        accepted.append(task)
+        if len(accepted) == 3:
+            raise publication_error
+        return task
+
+    monkeypatch.setattr(ownership, 'create_owned_task', accept_then_refuse)
+
+    async def first():
+        started[0].set()
+        try:
+            await stall.wait()
+        finally:
+            await await_owned_task(accepted[1])
+
+    async def second():
+        started[1].set()
+        try:
+            await stall.wait()
+        finally:
+            async with lock:
+                witness.write_text('original sibling physically retired')
+
+    async def third():
+        await asyncio.gather(*(event.wait() for event in started))
+        return 'original accepted third child'
+
+    async def parent():
+        async with lock:
+            return await gather_owned([first(), second(), third()], retain_originals=True)
+
+    calling = asyncio.create_task(parent())
+    try:
+        done, _ = await asyncio.wait({calling}, timeout=.3)
+        assert calling in done, 'partial gather admission excluded an original sibling needed by cancellation cleanup'
+        result = await await_owned_task(calling)
+        assert result.error is publication_error
+        assert len(accepted) == 3 and all(task.done() for task in accepted)
+        assert witness.read_text() == 'original sibling physically retired'
+        assert not lock.locked()
+    finally:
+        for task in accepted:
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(calling, *accepted, return_exceptions=True)
