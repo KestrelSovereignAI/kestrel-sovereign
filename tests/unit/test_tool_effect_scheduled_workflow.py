@@ -106,6 +106,7 @@ async def test_native_scheduled_workflow_admits_its_original_effect_before_dispa
 
 
 async def test_scheduled_redelivery_retains_its_identity_across_transport_principals(scheduled_case):
+    from kestrel_sovereign.agent.invocation import invocation_scope, request_provenance
     from kestrel_sovereign.auth import CallerContext, caller_context_scope
     from kestrel_sovereign.tool_effect_store import ToolEffectReconciliationRequired
 
@@ -113,9 +114,14 @@ async def test_scheduled_redelivery_retains_its_identity_across_transport_princi
     completed = []
 
     async def execute(name, arguments):
-        with caller_context_scope(CallerContext.sovereign(credential='owned-scheduler-controller')):
+        with invocation_scope(provenance=request_provenance(
+                source_kind='http_request', source_locator='/owned/scheduler/first',
+                actor='owned-first-controller')), caller_context_scope(
+                    CallerContext.sovereign(credential='owned-scheduler-controller')):
             await case.scheduler._lookup_and_run_tool(name, arguments)
-        with caller_context_scope(CallerContext.anonymous()):
+        with invocation_scope(provenance=request_provenance(
+                source_kind='http_request', source_locator='/owned/scheduler/redelivery',
+                actor='owned-second-controller')), caller_context_scope(CallerContext.anonymous()):
             with pytest.raises(ToolEffectReconciliationRequired):
                 await case.scheduler._lookup_and_run_tool(name, arguments)
         completed.append(True)
