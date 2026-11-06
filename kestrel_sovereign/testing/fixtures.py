@@ -29,7 +29,9 @@ async def native_tool_effect_agent(tmp_path, monkeypatch):
 
     SQLite, journal keys, privacy, hooks and request lifecycle are real. No
     READY publication, model response or provider acceptance is fabricated.
-    Each created Agent owns only its test directory and native resources.
+    Each created Agent owns only its test directory and native resources. A
+    supplied connected backend transfers ownership to that Agent, allowing the
+    same primary SQLite/PostgreSQL store to serve journal and task contracts.
     """
     from contextlib import AsyncExitStack
     from uuid import uuid4
@@ -47,10 +49,12 @@ async def native_tool_effect_agent(tmp_path, monkeypatch):
     # routes or credentials are inputs to this component fixture.
     monkeypatch.setattr(service_module, 'load_section', lambda _section: {})
     async with AsyncExitStack() as resources:
-        async def create(*, did):
+        async def create(*, did, connected_backend=None):
             root = tmp_path / ('native-tool-effect-' + uuid4().hex)
             root.mkdir()
-            database = await AsyncDatabase.sqlite(str(root / 'primary.db'))
+            database = (await AsyncDatabase.sqlite(str(root / 'primary.db'))
+                if connected_backend is None else
+                await AsyncDatabase.from_connected_backend(connected_backend))
             resources.push_async_callback(database.close)
             service = service_module.LLMService(usage_db=database, agent_data_dir=root)
             resources.push_async_callback(service.close)

@@ -47,3 +47,15 @@ def test_host_marker_cannot_be_relabelled_by_stale_denial_history():
     assert 'Outcome: unconfirmed' in trusted['contentItems'][0]['text']
     assert 'Do not replay' in trusted['contentItems'][0]['text']
     assert 'Outcome: user_denied' in untrusted['contentItems'][0]['text']
+
+
+@pytest.mark.parametrize('shape', ['cause', 'group'])
+def test_unknown_graph_is_terminal_without_granting_execution_authority(shape):
+    from kestrel_sdk.resources import ResourceOutcomeUnknown
+    unknown = ResourceOutcomeUnknown('original reply unavailable')
+    carrier = ValueError('ordinary carrier')
+    carrier.__cause__ = unknown
+    error = carrier if shape == 'cause' else ExceptionGroup('original group', [carrier])
+    assert is_tool_execution_terminal_error(error), 'original uncertainty was flattened by the Core terminal classifier'
+    assert not is_execution_control_error(error)
+    assert carrier.__cause__ is unknown

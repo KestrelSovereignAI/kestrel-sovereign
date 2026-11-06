@@ -14,6 +14,7 @@ import asyncio
 from typing import Any
 
 from kestrel_sovereign.execution_custody import is_tool_execution_terminal_error
+from kestrel_sovereign._async_ownership import OwnedCallbackScope, await_owned_task
 
 
 def codex_inline_failure(error: Exception) -> dict[str, Any]:
@@ -45,7 +46,8 @@ class PreTurnReader:
 
     async def _read(self) -> None:
         while (call := await self._calls.get()) is not None:
-            handler = asyncio.create_task(self._handle(*call))
+            scope, *request = call
+            handler = scope.start(lambda request=request: self._handle(*request), name='owned-test-codex-callback')
             self._handlers.add(handler)
             handler.add_done_callback(self._handlers.discard)
 
@@ -63,9 +65,18 @@ class PreTurnReader:
 
     async def call(self, executor, name: str, args: dict | None = None) -> Any:
         """Run ``executor(name, args)`` on a reader task; the model's result."""
+        scope = OwnedCallbackScope()
         done = asyncio.get_running_loop().create_future()
-        await self._calls.put((executor, name, args or {}, done))
-        return await done
+        try:
+            await self._calls.put((scope, executor, name, args or {}, done))
+            async with scope.wait():
+                return await done
+        finally:
+            scope.close()
+            for task in tuple(scope.tasks):
+                outcome = await await_owned_task(task)
+                if outcome.error is not None:
+                    raise outcome.error
 
     async def stop(self) -> None:
         await self._calls.put(None)

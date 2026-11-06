@@ -490,3 +490,148 @@ async def test_queued_token_writer_cannot_run_after_its_policy_span_retires(tmp_
     with pytest.raises(RuntimeError, match='retained span|closed or stale'):
         await task
     assert not witness.exists() and not lock.locked()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('dispatch', ['same-task', 'child'])
+async def test_token_writer_does_not_gain_original_effect_admission(owner, tmp_path, dispatch):
+    from kestrel_sovereign.execution_custody import ExecutionAuthorityError
+    from kestrel_sovereign.tools.effect_journal import bind_tool_effect_turn, execute_tool_effect
+    from tests.unit.test_tool_effect_execution import admit
+
+    lock = owner._get_privacy_transition_lock()
+    turn = await admit(owner, key='token-cannot-admit-effect')
+    witness = tmp_path / 'token-forged-effect'
+
+    async def effect():
+        witness.write_text('effect without original native acceptance')
+
+    async def copied(token):
+        with bind_transition_lock_reentry(token):
+            async with lock:
+                pass
+        operation = execute_tool_effect(owner, registration='unadmitted-token-effect',
+            arguments={}, execute=effect)
+        if dispatch == 'child':
+            return await create_owned_task(operation)
+        return await operation
+
+    try:
+        with bind_tool_effect_turn((turn, None)):
+            async with lock.policy_span():
+                task = asyncio.create_task(copied(lock.current_reentry_token()))
+                with pytest.raises(ExecutionAuthorityError, match='original native privacy lifetime'):
+                    await task
+        assert not witness.exists(), 'ordinary token writer acquired original effect admission'
+        assert await owner.tool_effect_store.database.fetchone(
+            'SELECT COUNT(*) FROM tool_effect_claims') == (0,)
+    finally:
+        await turn.close()
+
+
+@pytest.mark.asyncio
+async def test_concurrent_first_activation_joins_one_original_policy_acquisition(tmp_path):
+    from kestrel_sovereign._async_ownership import bind_owned_coordinator
+    lock = ReentrantTransitionLock()
+    held, release = asyncio.Event(), asyncio.Event()
+    attempts = [asyncio.Event(), asyncio.Event()]
+    witness = tmp_path / 'first-activation'
+
+    async def other_scope():
+        async with lock:
+            held.set()
+            await release.wait()
+
+    other = asyncio.create_task(other_scope())
+    await held.wait()
+    scope, owned = lock.begin_native_scope(None)
+    assert owned
+
+    async def effect(index):
+        attempts[index].set()
+        async with lock:
+            with witness.open('a') as output:
+                output.write(str(index))
+
+    with bind_owned_coordinator(lock):
+        children = [create_owned_task(effect(index)) for index in range(2)]
+    try:
+        await asyncio.gather(*(event.wait() for event in attempts))
+        await asyncio.sleep(0)
+        release.set()
+        await other
+        done, _ = await asyncio.wait(children, timeout=.3)
+        assert len(done) == 2, 'two original members queued separate acquisitions of one retained policy lock'
+        assert all(owned_task_error(task) is None for task in children)
+        assert sorted(witness.read_text()) == ['0', '1']
+    finally:
+        release.set()
+        for task in children:
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(other, *children, return_exceptions=True)
+        try:
+            await lock.close_native_scope(scope, None)
+        except asyncio.CancelledError:
+            pass
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('journaled', [False, True])
+async def test_nested_native_privacy_transition_does_not_join_its_waiting_ancestor(owner, tmp_path, journaled):
+    from tests.unit.test_tool_effect_invocation import governed
+    lock = owner._get_privacy_transition_lock()
+    witness = tmp_path / 'nested-native-transition'
+    children = []
+
+    async def child():
+        async with owner.privacy_transition():
+            witness.write_text('transition completed')
+
+    async def parent():
+        from kestrel_sovereign._async_ownership import owned_native_wait, owned_task_join_dependency
+        from kestrel_sovereign.tools.effect_journal import execute_tool_effect
+
+        async def operation():
+            task = lock.capture_native_work_factory()(child)
+            children.append(task)
+            # A bounded original native wait also provides deterministic cleanup
+            # on the broken implementation: the ancestor eventually returns.
+            with owned_task_join_dependency(task):
+                async with owned_native_wait((task,)):
+                    done, _ = await asyncio.wait({task}, timeout=2)
+            if task in done:
+                outcome = await await_owned_task(task)
+                if journaled:
+                    assert isinstance(outcome.error, RuntimeError)
+                    assert 'wait on itself' in str(outcome.error)
+                else:
+                    assert outcome.error is None
+
+        if journaled:
+            return await execute_tool_effect(owner, registration='native-transition-parent',
+                arguments={}, execute=operation)
+        return await operation()
+
+    @governed
+    async def invoke(agent, user_input, *, invocation_id=None):
+        task = lock.capture_native_work_factory(acquire_span=False)(parent)
+        outcome = await await_owned_task(task)
+        assert outcome.error is None
+
+    calling = asyncio.create_task(invoke(owner, 'Native nested privacy transition',
+        invocation_id='nested-native-privacy-transition'))
+    try:
+        done, _ = await asyncio.wait({calling}, timeout=.3)
+        assert calling in done, 'privacy transition joined its native ancestor while that ancestor awaited the caller'
+        await calling
+        if journaled:
+            assert not witness.exists()
+        else:
+            assert witness.read_text() == 'transition completed'
+        assert not lock.locked()
+    finally:
+        for task in children:
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(calling, *children, return_exceptions=True)

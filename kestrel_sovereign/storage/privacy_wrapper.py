@@ -300,6 +300,7 @@ class _PrivacySpan:
         self.lifetime_owner = lifetime_owner
         self.closing = False
         self.active = False
+        self.activation_lock = asyncio.Lock()
         self.members = {root: None}
         self.admissions = {}
 
@@ -356,20 +357,22 @@ class ReentrantTransitionLock:
     def _admissions(self):
         return self._token.admissions if self._token is not None else {}
 
-    def _scope_for(self, task):
+    def _scope_for(self, task, *, original=False):
         for scope in self._native_scopes:
-            if task in scope.members:
+            if task in scope.members and (not original or task is scope.root or task in scope.admissions):
                 return scope
         return None
 
     def current_native_scope(self):
-        return self._scope_for(asyncio.current_task())
+        return self._scope_for(asyncio.current_task(), original=True)
 
     def begin_native_scope(self, lifetime_owner):
         """Record original native lifetime without pinning privacy policy."""
         scope = self.current_native_scope()
         if scope is not None:
             return scope, False
+        if self._scope_for(asyncio.current_task()) is not None:
+            raise ExecutionAuthorityError("native lifetime requires an original root or accepted child")
         scope = _PrivacySpan(self, asyncio.current_task(), lifetime_owner)
         self._native_scopes.add(scope)
         return scope, True
@@ -379,11 +382,11 @@ class ReentrantTransitionLock:
             raise ExecutionAuthorityError("execution requires its original native privacy lifetime")
 
     def _is_member(self, task):
-        return self._scope_for(task) is not None
+        return self._scope_for(task, original=True) is not None
 
     def admit_owned_task(self, parent, task, admission):
         """Enroll the original child before dispatch, even before policy activation."""
-        scope = self._scope_for(parent)
+        scope = self._scope_for(parent, original=True)
         if scope is None:
             return False
         if type(admission) is not OwnedTaskAdmission or admission.task is not task:
@@ -410,13 +413,20 @@ class ReentrantTransitionLock:
             raise RuntimeError("privacy policy span is closed or stale")
         if self._token is scope:
             return
-        await self._lock.acquire()
-        if scope not in self._native_scopes:
-            self._lock.release()
-            raise RuntimeError("privacy policy span is closed or stale")
-        self._token = scope
-        self._owner = scope.root
-        scope.active = True
+        # Exactly one original member acquires the retained base lock. Other
+        # members join that activation and recheck it before trying the base.
+        async with scope.activation_lock:
+            if scope not in self._native_scopes:
+                raise RuntimeError("privacy policy span is closed or stale")
+            if self._token is scope:
+                return
+            await self._lock.acquire()
+            if scope not in self._native_scopes:
+                self._lock.release()
+                raise RuntimeError("privacy policy span is closed or stale")
+            self._token = scope
+            self._owner = scope.root
+            scope.active = True
 
     async def _enter_span(self):
         task = asyncio.current_task()
@@ -644,7 +654,7 @@ class ReentrantTransitionLock:
         parent = asyncio.current_task() if _parent is None else _parent
         captured = self.current_native_scope() if _span is None else _span
         if captured is not None and (
-            captured not in self._native_scopes or self._scope_for(parent) is not captured
+            captured not in self._native_scopes or self._scope_for(parent, original=True) is not captured
             or parent.done() or (captured.closing and parent not in captured.admissions)
         ):
             raise RuntimeError("native work factory belongs to a closed privacy span")
@@ -689,7 +699,8 @@ class ReentrantTransitionLock:
         current = asyncio.current_task()
         terminal = None
         for task in tuple(self._native_work):
-            if task is current or not task._kestrel_native_privacy_state["entered"]:
+            if (task is current or self._descends_from(current, task)
+                    or not task._kestrel_native_privacy_state["entered"]):
                 continue
             outcome = await await_owned_task(task)
             if outcome.error is not None and is_execution_control_error(outcome.error):
@@ -867,7 +878,9 @@ class DurablePersistenceGate:
     normally. A task inside its own shared frame cannot take the gate
     exclusive; that upgrade would wait on itself, so it is refused. A task
     that only inherited a live hold may be detached from its holder, so its
-    transition waits for the lease like any other. Writer preference comes from
+    transition waits for the lease like any other, unless that holder is
+    physically joining the current task. That upgrade is refused as a
+    completion cycle; the join cannot grant an exclusive lease. Writer preference comes from
     :class:`AsyncReaderWriterLock`: once a transition queues, new persists
     wait behind it.
     """
@@ -921,10 +934,17 @@ class DurablePersistenceGate:
         return None
 
     def _held_shared_by_current_task(self) -> bool:
-        """Whether the current task is inside one of its own shared frames."""
+        """Refuse upgrades blocked by this task or a caller joining it.
+
+        Actual join dependencies only detect a completion cycle; they never
+        grant shared/exclusive admission or allow a lease upgrade.
+        """
+        from kestrel_sovereign._async_ownership import owned_task_join_ancestors
+
         task = asyncio.current_task()
+        joining = owned_task_join_ancestors(task)
         return any(
-            hold.gate is self and hold.live and hold.task is task
+            hold.gate is self and hold.live and (hold.task is task or hold.task in joining)
             for hold in _DURABLE_GATE_SHARED_HOLDS.get()
         )
 

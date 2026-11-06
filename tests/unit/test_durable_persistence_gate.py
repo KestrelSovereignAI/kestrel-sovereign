@@ -32,6 +32,7 @@ from kestrel_sdk.signals import ResourceLock, Signal, SignalMode, Status
 
 from kestrel_sovereign.agent.turn_lifecycle import TurnLifecycleMixin
 from kestrel_sovereign.kestrel_agent import KestrelAgent
+from kestrel_sovereign.features.privacy.feature import PrivacyAgent
 from kestrel_sovereign.privacy import get_privacy_preset
 from kestrel_sovereign.signals import (
     DurableAdmissionDisposition,
@@ -115,15 +116,14 @@ class _Rig(SimpleNamespace):
 
 def _privacy(agent: KestrelAgent, preset: str) -> None:
     """Install the privacy config the dispatcher's projection reads."""
-    agent.privacy_agent = SimpleNamespace(privacy_config=get_privacy_preset(preset))
+    agent.privacy_agent = PrivacyAgent(agent.storage, get_privacy_preset(preset))
 
 
 @pytest.fixture
-async def rig(tmp_path):
-    agent = KestrelAgent(did="did:test:3316", storage_path=":memory:")
+async def rig(native_tool_effect_agent):
+    agent = await native_tool_effect_agent(did="did:test:3316")
     # Everything `process_input` touches before its lock span is stubbed, so
     # the turn exercises the real CONVERSATION -> privacy acquisition.
-    agent.storage = object()
     agent.context_manager = object()
     agent.bootstrap_service = None
     agent._safe_mode = False
@@ -132,8 +132,7 @@ async def rig(tmp_path):
     agent._genesis_audit_cognition_block = AsyncMock(return_value=None)
     _privacy(agent, "normal")
 
-    backend = SQLiteBackend(str(tmp_path / "gate.db"))
-    await backend.connect()
+    backend = agent.tool_effect_store.database.backend
     store = SignalLogStore(backend)
     await store.initialize()
     registry = SourceRegistry()
@@ -166,7 +165,7 @@ async def rig(tmp_path):
         )
     finally:
         await dispatcher.shutdown_durable_delivery()
-        await backend.close()
+        # The native Agent fixture owns the shared primary backend.
 
 
 def _cron_signal(agent: KestrelAgent, **payload) -> Signal:

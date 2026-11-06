@@ -46,7 +46,7 @@ from kestrel_sovereign.privacy import PrivacyMode
 from kestrel_sovereign.storage.privacy_wrapper import optional_transition_lock
 
 
-def _turn_agent(did: str) -> KestrelAgent:
+async def _turn_agent(did: str, native_tool_effect_agent) -> KestrelAgent:
     """A real agent stopped just short of the machinery a turn body needs.
 
     Everything `process_input` / `process_input_streaming` touch BEFORE the
@@ -54,8 +54,7 @@ def _turn_agent(did: str) -> KestrelAgent:
     sequence (`_turn_lifecycle` → `_get_privacy_transition_lock`) rather than a
     re-implementation of it.
     """
-    agent = KestrelAgent(did=did, storage_path=":memory:")
-    agent.storage = object()
+    agent = await native_tool_effect_agent(did=did)
     agent.context_manager = object()
     agent.bootstrap_service = None
     agent._safe_mode = False
@@ -66,9 +65,9 @@ def _turn_agent(did: str) -> KestrelAgent:
 
 
 @pytest.mark.asyncio
-async def test_non_streaming_turn_body_holds_the_privacy_transition_lock():
+async def test_non_streaming_turn_body_holds_the_privacy_transition_lock(native_tool_effect_agent):
     """The span exists: the turn body runs with the privacy mutex held."""
-    agent = _turn_agent("did:test:3310-span")
+    agent = await _turn_agent("did:test:3310-span", native_tool_effect_agent)
     observed: list[bool] = []
 
     async def traced(user_input, *args, **kwargs):
@@ -88,7 +87,7 @@ async def test_non_streaming_turn_body_holds_the_privacy_transition_lock():
 
 
 @pytest.mark.asyncio
-async def test_transition_lock_writer_cannot_land_inside_the_turn():
+async def test_transition_lock_writer_cannot_land_inside_the_turn(native_tool_effect_agent):
     """A privacy check inside the turn stays valid until the prompt is used.
 
     The writer here takes ONLY the privacy mutex — the production shape of
@@ -99,7 +98,7 @@ async def test_transition_lock_writer_cannot_land_inside_the_turn():
     `await` gaps: between the turn's own privacy check and the turn consuming
     its prompt.
     """
-    agent = _turn_agent("did:test:3310-writer")
+    agent = await _turn_agent("did:test:3310-writer", native_tool_effect_agent)
     checked = asyncio.Event()
     may_consume = asyncio.Event()
     writer_landed = False
@@ -145,7 +144,7 @@ async def test_transition_lock_writer_cannot_land_inside_the_turn():
 
 
 @pytest.mark.asyncio
-async def test_in_turn_cross_task_tool_re_enters_the_span():
+async def test_in_turn_cross_task_tool_re_enters_the_span(native_tool_effect_agent):
     """The hazard the new span introduces, and the plumbing that answers it.
 
     Holding the mutex across the whole non-streaming turn means a tool that
@@ -163,7 +162,7 @@ async def test_in_turn_cross_task_tool_re_enters_the_span():
         bind_transition_lock_reentry,
     )
 
-    agent = _turn_agent("did:test:3310-reentry")
+    agent = await _turn_agent("did:test:3310-reentry", native_tool_effect_agent)
     reentered = asyncio.Event()
 
     async def traced(user_input, *args, **kwargs):
@@ -194,7 +193,7 @@ async def test_in_turn_cross_task_tool_re_enters_the_span():
 
 
 @pytest.mark.asyncio
-async def test_privacy_transition_waits_for_an_in_flight_non_streaming_turn():
+async def test_privacy_transition_waits_for_an_in_flight_non_streaming_turn(native_tool_effect_agent):
     """The production transition path serializes behind the whole turn.
 
     CONVERSATION alone already gave this much — `privacy_transition()` takes
@@ -203,7 +202,7 @@ async def test_privacy_transition_waits_for_an_in_flight_non_streaming_turn():
     the invariant the privacy mutex adds is for callers that hold ONLY that
     mutex (see the `optional_transition_lock` test above).
     """
-    agent = _turn_agent("did:test:3310-transition")
+    agent = await _turn_agent("did:test:3310-transition", native_tool_effect_agent)
     in_body = asyncio.Event()
     may_finish = asyncio.Event()
     applied = asyncio.Event()
@@ -237,7 +236,7 @@ async def test_privacy_transition_waits_for_an_in_flight_non_streaming_turn():
 
 
 @pytest.mark.asyncio
-async def test_streamed_turn_signal_turn_and_transition_do_not_deadlock():
+async def test_streamed_turn_signal_turn_and_transition_do_not_deadlock(native_tool_effect_agent):
     """The three-way concurrency the new span has to survive.
 
     The signal-driven turn is wrapped in a MEMORY acquisition to mirror the
@@ -247,7 +246,7 @@ async def test_streamed_turn_signal_turn_and_transition_do_not_deadlock():
     CONVERSATION → privacy (streamed turn) and CONVERSATION → privacy
     (transition) — one global order, therefore no cycle.
     """
-    agent = _turn_agent("did:test:3310-deadlock")
+    agent = await _turn_agent("did:test:3310-deadlock", native_tool_effect_agent)
     order: list[str] = []
 
     async def traced(user_input, *args, **kwargs):
@@ -295,7 +294,7 @@ async def test_streamed_turn_signal_turn_and_transition_do_not_deadlock():
 
 
 @pytest.mark.asyncio
-async def test_bootstrap_transition_lock_writers_run_inside_the_span():
+async def test_bootstrap_transition_lock_writers_run_inside_the_span(native_tool_effect_agent):
     """Bootstrap now runs INSIDE the span, and takes the same lock.
 
     `bootstrap/service.py` serializes its own privacy check against the durable
@@ -309,7 +308,7 @@ async def test_bootstrap_transition_lock_writers_run_inside_the_span():
     This drives the real shape: `process_input` → `_handle_bootstrap` →
     `optional_transition_lock(<the agent's lock>)` on the turn task.
     """
-    agent = _turn_agent("did:test:3310-bootstrap")
+    agent = await _turn_agent("did:test:3310-bootstrap", native_tool_effect_agent)
     writes: list[str] = []
 
     async def bootstrap_write() -> None:
@@ -349,7 +348,7 @@ async def test_bootstrap_transition_lock_writers_run_inside_the_span():
 
 
 @pytest.mark.asyncio
-async def test_an_in_turn_privacy_transition_reenters_rather_than_wedging():
+async def test_an_in_turn_privacy_transition_reenters_rather_than_wedging(native_tool_effect_agent):
     """`!privacy` / `confirm_privacy_transition` run inside the span now.
 
     The command handler is inside the span since #3310, and those commands go
@@ -358,7 +357,7 @@ async def test_an_in_turn_privacy_transition_reenters_rather_than_wedging():
     only the (task-reentrant) mutex — re-acquiring CONVERSATION would wedge on
     the lock the turn itself is holding.
     """
-    agent = _turn_agent("did:test:3310-in-turn-transition")
+    agent = await _turn_agent("did:test:3310-in-turn-transition", native_tool_effect_agent)
     entered = asyncio.Event()
 
     class _CommandHandler:

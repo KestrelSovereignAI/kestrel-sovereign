@@ -7,6 +7,7 @@ import json
 from types import SimpleNamespace
 
 import pytest
+import pytest_asyncio
 from kestrel_sdk.features.base import Feature as SDKFeature
 from kestrel_sdk.hooks.base import Hook, HookEvent, HookOutput
 from kestrel_sdk.native_a2a.types import Task, TaskState, TaskStatus
@@ -28,9 +29,67 @@ from kestrel_sovereign.features.subagent_dispatch import ensure_subagent_dispatc
 from kestrel_sovereign.features.tasks.feature import TaskFeature
 from kestrel_sovereign.storage.db.interface import QueryError
 from kestrel_sovereign.storage.db.sqlite import SQLiteBackend
-from tests.unit.test_a2a_native_task_manager import manager as manager  # noqa: PLC0414
-from tests.unit.test_deferred_tool_delivery import CompletionHost
+from kestrel_sovereign.a2a.scope import NativeRecipientScope
+from kestrel_sovereign.tools.effect_journal import (
+    admit_tool_effect_turn, bind_tool_effect_turn, current_tool_effect_turn,
+)
+from tests.utils.native_a2a import manager_for
 from tests.utils.codex_inline import PreTurnReader
+
+
+@pytest_asyncio.fixture
+async def manager(native_a2a_backend_factory, native_tool_effect_agent):
+    """Drive the task component with real native host and journal ownership.
+
+    Each top-level skill call is a new component input. Nested skills share
+    its original journal. The driver may inspect a persisted unknown Task
+    after root retirement refuses completion; it never calls that a successful
+    invocation. A missing unknown Task receipt still propagates the terminal
+    failure. Full invocation delivery is tested by the tool-effect suites.
+    """
+    from uuid import uuid4
+
+    backend = native_a2a_backend_factory()
+    await backend.connect()
+    host = await native_tool_effect_agent(did='did:kestrel:recipient', connected_backend=backend)
+    instance = manager_for(backend, NativeRecipientScope(host.did, 'tenant'), owns_backend=False)
+    await instance.initialize()
+    host.task_manager = instance
+    host.observability_store = instance.observability_store
+    instance._workflow_host = host
+    instance._native_terminal_errors = []
+    execute_skill = instance.execute_skill
+
+    async def drive(agent_id, skill_id, args, sync=True, session_id=None):
+        if current_tool_effect_turn(host) is not None:
+            return await execute_skill(agent_id, skill_id, args, sync=sync, session_id=session_id)
+        operation_id = uuid4().hex
+        turn = await admit_tool_effect_turn(host, namespace=['workflow-component'],
+            client_key=operation_id, request=dict(provider=agent_id, skill=skill_id, arguments=args),
+            invocation_id=operation_id)
+        with bind_tool_effect_turn((turn, None)):
+            try:
+                task = await execute_skill(agent_id, skill_id, args, sync=sync, session_id=session_id)
+            except BaseException as error:
+                await turn.close(error)
+                raise AssertionError('Native root retirement discarded an original error')
+            try:
+                await turn.close()
+            except ResourceOutcomeUnknown as terminal:
+                assert task_outcome_unknown(task), 'Root uncertainty lacked the original native Task receipt'
+                instance._native_terminal_errors.append(terminal)
+            return task
+
+    instance.execute_skill = drive
+    try:
+        yield instance
+    finally:
+        await instance.close()
+
+
+@pytest.fixture
+def workflow_host(manager):
+    return manager._workflow_host
 
 
 class WorkflowProvider(Feature):
@@ -69,10 +128,8 @@ class WalletProvider(WorkflowProvider):
 
 
 @pytest.fixture
-def providers(manager):
-    agent = SimpleNamespace(
-        did=manager.did, task_manager=manager, _execution_custody=None
-    )
+def providers(manager, workflow_host):
+    agent = workflow_host
     model, memory, wallet = (
         ModelProvider(agent),
         MemoryProvider(agent),
@@ -91,8 +148,8 @@ def providers(manager):
 
 
 @pytest.fixture
-def task_feature(manager, providers):
-    feature = TaskFeature(SimpleNamespace(did=manager.did))
+def task_feature(manager, providers, workflow_host):
+    feature = TaskFeature(workflow_host)
     feature.set_task_manager(manager)
     return feature
 
@@ -319,7 +376,8 @@ async def test_raised_tool_error_is_reported_without_stopping_other_steps(
         ]
     )
     assert result.status is ToolResultStatus.PARTIAL
-    assert "Tool storage unavailable" in result.data["results"][0]["error"]
+    assert result.data["results"][0]["outcome_unknown"] is True
+    assert result.data["results"][0]["error"] == "tool_effect_outcome_unconfirmed"
     assert result.data["completed"] == result.data["failed"] == 1
 
 
@@ -461,13 +519,11 @@ def effect_provider(base, form):
 
 
 @pytest.fixture
-def effect(request, manager):
+def effect(request, manager, workflow_host):
     """A skill with a counted effect, in the form ``request.param`` names."""
     base_name, form = request.param
     base = Feature if base_name == "core-feature" else SDKFeature
-    agent = SimpleNamespace(
-        did=manager.did, task_manager=manager, _execution_custody=None
-    )
+    agent = workflow_host
     provider = ensure_subagent_dispatch(effect_provider(base, form))(agent)
     provider.name = "effect_feature"
     provider.calls = 0
@@ -517,17 +573,17 @@ async def test_a_step_whose_outcome_is_unknown_is_never_retried(
 
 
 @pytest.mark.parametrize("effect", EVERY_SKILL_FORM, ids=skill_form_id, indirect=True)
-async def test_an_ordinary_raised_failure_is_still_retried(task_feature, effect, manager):
+async def test_an_ordinary_raised_failure_is_not_retried_after_native_admission(task_feature, effect, manager):
     effect.supplier = raise_unavailable
     result = await task_feature.run_workflow([effect_step(max_retries=2)])
-    assert effect.calls == 3
+    assert effect.calls == 1
     [record] = result.data["results"]
-    assert record["status"] == "failed" and record["attempts"] == 3
-    assert "outcome_unknown" not in record
+    assert record["status"] == "failed" and record["attempts"] == 1
+    assert record["outcome_unknown"] is True
     tasks = await stored_tasks(manager)
-    assert len(tasks) == 3
+    assert len(tasks) == 1
     assert all(task.status.state == TaskState.TASK_STATE_FAILED for task in tasks)
-    assert not any(task_outcome_unknown(task) for task in tasks)
+    assert any(task_outcome_unknown(task) for task in tasks)
 
 
 @pytest.mark.parametrize("effect", EVERY_SKILL_FORM, ids=skill_form_id, indirect=True)
@@ -540,14 +596,16 @@ async def test_an_ordinary_raised_failure_is_still_retried(task_feature, effect,
     ],
     ids=["completed", "returned-failure", "raised-failure"],
 )
-async def test_an_ordinary_outcome_does_not_mark_the_task(
+async def test_only_a_post_admission_exception_marks_the_native_task(
     effect, manager, supplier, state
 ):
     effect.supplier = supplier
     task = await manager.execute_skill("effect_feature", "apply_effect", {}, sync=True)
-    assert task.status.state == state and not task_outcome_unknown(task)
+    assert task.status.state == state
+    assert task_outcome_unknown(task) is (supplier is raise_unavailable)
     [stored] = await stored_tasks(manager)
-    assert stored.status.state == state and not task_outcome_unknown(stored)
+    assert stored.status.state == state
+    assert task_outcome_unknown(stored) is (supplier is raise_unavailable)
 
 
 @pytest.mark.parametrize("effect", EVERY_SKILL_FORM, ids=skill_form_id, indirect=True)
@@ -571,14 +629,12 @@ async def test_an_unknown_outcome_marks_the_stored_task(effect, manager):
     ids=skill_form_id,
     indirect=True,
 )
-async def test_a_wrapped_unknown_outcome_reaches_a_model_unchanged(effect):
-    # The task boundary learns the outcome is unknown; a direct caller of the
-    # wrapper (a model's tool call) still gets the same ordinary failure.
+async def test_a_durable_tool_wrapper_preserves_the_original_unknown(effect):
+    # A durable host owns normalization and must receive original evidence.
     effect.supplier = raise_unknown
     [skill] = effect.get_tools()
-    assert await skill.execute() == {
-        "success": False, "error": UNKNOWN, "tool": "apply_effect",
-    }
+    with pytest.raises(ResourceOutcomeUnknown, match=UNKNOWN):
+        await skill.execute()
     assert effect.calls == 1
 
 
@@ -676,16 +732,16 @@ async def test_an_unknown_outcome_another_error_carries_is_never_retried(
 
 
 @pytest.mark.parametrize("effect", EVERY_SKILL_FORM, ids=skill_form_id, indirect=True)
-async def test_an_ordinary_exception_group_is_still_retried(
+async def test_an_ordinary_exception_group_is_not_retried_after_native_admission(
     task_feature, effect, manager
 ):
     effect.supplier = raise_unavailable_from_a_task_group
     result = await task_feature.run_workflow([effect_step(max_retries=2)])
-    assert effect.calls == 3
+    assert effect.calls == 1
     [record] = result.data["results"]
-    assert record["status"] == "failed" and record["attempts"] == 3
-    assert "outcome_unknown" not in record
-    assert not any(task_outcome_unknown(task) for task in await stored_tasks(manager))
+    assert record["status"] == "failed" and record["attempts"] == 1
+    assert record["outcome_unknown"] is True
+    assert any(task_outcome_unknown(task) for task in await stored_tasks(manager))
 
 
 @pytest.mark.parametrize(
@@ -698,14 +754,12 @@ async def test_an_ordinary_exception_group_is_still_retried(
     ids=skill_form_id,
     indirect=True,
 )
-async def test_a_grouped_unknown_outcome_reaches_a_model_unchanged(effect):
+async def test_a_durable_tool_wrapper_preserves_original_grouped_uncertainty(effect):
     effect.supplier = raise_unknown_in_a_nested_group
     [skill] = effect.get_tools()
-    assert await skill.execute() == {
-        "success": False,
-        "error": "Effects failed (2 sub-exceptions)",
-        "tool": "apply_effect",
-    }
+    with pytest.raises(ExceptionGroup) as raised:
+        await skill.execute()
+    assert len(observed_outcome_unknown(raised.value)) == 1
     assert effect.calls == 1
 
 
@@ -828,7 +882,7 @@ async def test_a_flagged_step_whose_result_cannot_be_read_is_not_retried(
 async def test_an_unflagged_step_whose_result_cannot_be_read_is_still_retried(
     task_feature, effect, monkeypatch
 ):
-    effect.supplier = raise_unavailable
+    effect.supplier = lambda _attempt: ToolResult.failed("Known business failure")
     unreadable_step_results(monkeypatch)
     result = await task_feature.run_workflow([effect_step(max_retries=2)])
     assert effect.calls == 3
@@ -866,7 +920,8 @@ async def test_an_unknown_outcome_survives_a_failed_task_write(
     with pytest.raises(ResourceOutcomeUnknown) as raised:
         await manager.execute_skill("effect_feature", "apply_effect", {}, sync=True)
     # The storage failure stays the evidence for the unrecorded task.
-    assert isinstance(raised.value.__cause__, QueryError)
+    from kestrel_sovereign.execution_custody import execution_evidence_carriers
+    assert any(isinstance(error, QueryError) for error in execution_evidence_carriers(raised.value))
     assert str(raised.value) == f"{UNKNOWN}; its failed task could not be recorded"
 
     result = await task_feature.run_workflow([effect_step(max_retries=2)])
@@ -877,18 +932,18 @@ async def test_an_unknown_outcome_survives_a_failed_task_write(
 
 
 @pytest.mark.parametrize("effect", EVERY_SKILL_FORM, ids=skill_form_id, indirect=True)
-async def test_an_ordinary_failure_whose_task_write_fails_is_still_retried(
+async def test_post_admission_exception_and_failed_task_write_cannot_trigger_retry(
     task_feature, effect, manager, monkeypatch
 ):
     effect.supplier = raise_unavailable
     reject_failed_task_writes(manager, monkeypatch)
-    with pytest.raises(QueryError):
+    with pytest.raises((ResourceOutcomeUnknown, BaseExceptionGroup)):
         await manager.execute_skill("effect_feature", "apply_effect", {}, sync=True)
     result = await task_feature.run_workflow([effect_step(max_retries=2)])
-    assert effect.calls == 4
+    assert effect.calls == 2
     [record] = result.data["results"]
-    assert record["status"] == "failed" and record["attempts"] == 3
-    assert "outcome_unknown" not in record
+    assert record["status"] == "failed" and record["attempts"] == 1
+    assert record["outcome_unknown"] is True
 
 
 @pytest.mark.parametrize("effect", EVERY_SKILL_FORM, ids=skill_form_id, indirect=True)
@@ -919,11 +974,9 @@ async def test_an_unknown_outcome_survives_another_writers_terminal_state(
 
 
 @pytest.fixture
-def nested_workflow(manager, task_feature):
+def nested_workflow(manager, task_feature, workflow_host):
     """The tasks feature registered as a skill provider, as on a real host."""
-    agent = SimpleNamespace(
-        did=manager.did, task_manager=manager, _execution_custody=None
-    )
+    agent = workflow_host
     nested = TaskFeature(agent)
     nested.set_task_manager(manager)
     nested.name = "tasks"
@@ -954,30 +1007,30 @@ async def test_an_enclosing_workflow_never_reruns_an_unknown_inner_outcome(
     # Every inner step fails, so the inner workflow fails as a whole.
     inner = [effect_step(max_retries=2), effect_step(max_retries=2)]
     result = await nested_workflow.run_workflow([outer_step(inner, max_retries=2)])
-    assert effect.calls == 2
+    assert effect.calls == 1
     [record] = result.data["results"]
     assert record["status"] == "failed" and record["outcome_unknown"] is True
     assert record["attempts"] == 1
 
 
 @pytest.mark.parametrize("effect", EVERY_SKILL_FORM, ids=skill_form_id, indirect=True)
-async def test_an_enclosing_workflow_still_reruns_an_ordinary_inner_failure(
+async def test_an_enclosing_workflow_fences_an_ordinary_inner_exception(
     nested_workflow, effect, manager
 ):
     effect.supplier = raise_unavailable
     result = await nested_workflow.run_workflow(
         [outer_step([effect_step(max_retries=0)], max_retries=2)]
     )
-    assert effect.calls == 3
+    assert effect.calls == 1
     [record] = result.data["results"]
-    assert record["status"] == "failed" and record["attempts"] == 3
-    assert "outcome_unknown" not in record
+    assert record["status"] == "failed" and record["attempts"] == 1
+    assert record["outcome_unknown"] is True
     run_tasks = [
         task for task in await stored_tasks(manager)
         if task.metadata["skill"] == "run_workflow"
     ]
-    assert len(run_tasks) == 3
-    assert not any(task_outcome_unknown(task) for task in run_tasks)
+    assert len(run_tasks) == 1
+    assert any(task_outcome_unknown(task) for task in run_tasks)
 
 
 def is_workflow_task(task):
@@ -1131,12 +1184,10 @@ def coordinator_provider(base):
 
 
 @pytest.fixture(params=["core-feature", "sdk-feature"])
-def coordinator(request, manager):
+def coordinator(request, manager, workflow_host):
     """A skill, other than a workflow, that runs the effect skill as a task."""
     base = Feature if request.param == "core-feature" else SDKFeature
-    agent = SimpleNamespace(
-        did=manager.did, task_manager=manager, _execution_custody=None
-    )
+    agent = workflow_host
     provider = ensure_subagent_dispatch(coordinator_provider(base))(agent)
     provider.name = "coordinator_feature"
     provider.manager = manager
@@ -1181,16 +1232,16 @@ async def test_a_skill_that_ran_an_uncertain_skill_is_never_rerun(
 
 
 @pytest.mark.parametrize("effect", EVERY_SKILL_FORM, ids=skill_form_id, indirect=True)
-async def test_a_skill_that_ran_an_ordinarily_failing_skill_is_still_rerun(
+async def test_a_skill_that_ran_an_ordinarily_failing_skill_is_not_rerun_after_native_admission(
     task_feature, effect, coordinator, manager
 ):
     effect.supplier = raise_unavailable
     result = await task_feature.run_workflow([coordinator_step(max_retries=2)])
-    assert effect.calls == 3
+    assert effect.calls == 1
     [record] = result.data["results"]
-    assert record["status"] == "failed" and record["attempts"] == 3
-    assert "outcome_unknown" not in record
-    assert not any(task_outcome_unknown(task) for task in await stored_tasks(manager))
+    assert record["status"] == "failed" and record["attempts"] == 1
+    assert record["outcome_unknown"] is True
+    assert any(task_outcome_unknown(task) for task in await stored_tasks(manager))
 
 
 class RunsTheEffectOnCompletion(Hook):
@@ -1229,23 +1280,16 @@ def deferring_provider(base):
 
 
 @pytest.fixture(params=["core-feature", "sdk-feature"])
-async def deferring(request, manager, tmp_path):
+async def deferring(request, manager, workflow_host):
     """A skill whose deferred result's completion runs the effect skill."""
-    db = SQLiteBackend(str(tmp_path / "deferring-audit.db"))
-    await db.connect()
-    store = ObservabilityStore(db)
-    await store.initialize()
-    host = CompletionHost(store)
+    host = workflow_host
     host.hooks_manager.register(RunsTheEffectOnCompletion(manager))
     base = Feature if request.param == "core-feature" else SDKFeature
     provider = ensure_subagent_dispatch(deferring_provider(base))(host)
     provider.name = "deferring_feature"
     host.features[type(provider).__name__] = provider
     manager.register_provider("deferring_feature", provider.get_agent_skills(), provider)
-    try:
-        yield provider
-    finally:
-        await store.close()
+    return provider
 
 
 def deferring_step(max_retries):
@@ -1280,16 +1324,16 @@ async def test_a_skill_whose_completion_ran_an_uncertain_skill_is_never_rerun(
 
 
 @pytest.mark.parametrize("effect", EVERY_SKILL_FORM, ids=skill_form_id, indirect=True)
-async def test_a_skill_whose_completion_ran_an_ordinarily_failing_skill_is_still_rerun(
+async def test_a_skill_whose_completion_ran_an_ordinarily_failing_skill_is_not_rerun_after_native_admission(
     task_feature, effect, deferring, manager
 ):
     effect.supplier = raise_unavailable
     result = await task_feature.run_workflow([deferring_step(max_retries=2)])
-    assert effect.calls == 3
+    assert effect.calls == 1
     [record] = result.data["results"]
-    assert record["status"] == "failed" and record["attempts"] == 3
-    assert "outcome_unknown" not in record
-    assert not any(task_outcome_unknown(task) for task in await stored_tasks(manager))
+    assert record["status"] == "failed" and record["attempts"] == 1
+    assert record["outcome_unknown"] is True
+    assert any(task_outcome_unknown(task) for task in await stored_tasks(manager))
 
 
 def delegating_provider(base):
@@ -1313,12 +1357,10 @@ def delegating_provider(base):
 
 
 @pytest.fixture(params=["core-feature", "sdk-feature"])
-def delegating(request, manager):
+def delegating(request, manager, workflow_host):
     """A skill whose feature-owned tool runs through the subagent tool step."""
     base = Feature if request.param == "core-feature" else SDKFeature
-    agent = SimpleNamespace(
-        did=manager.did, task_manager=manager, _execution_custody=None
-    )
+    agent = workflow_host
     provider = ensure_subagent_dispatch(delegating_provider(base))(agent)
     provider.name = "delegating_feature"
     provider.calls = 0
@@ -1346,22 +1388,21 @@ async def test_a_subagent_tool_step_carries_its_unknown_outcome(
     [record] = result.data["results"]
     assert record["status"] == "failed" and record["outcome_unknown"] is True
     assert record["attempts"] == 1
-    # What the subagent's model would see is unchanged.
-    assert record["error"] == f"ResourceOutcomeUnknown: {UNKNOWN}"
+    assert record["error"] == UNKNOWN
     [task] = await stored_tasks(manager)
     assert task_outcome_unknown(task)
 
 
-async def test_a_subagent_tool_steps_ordinary_failure_is_still_retried(
+async def test_a_subagent_tool_steps_ordinary_failure_is_not_retried_after_native_admission(
     task_feature, delegating, manager
 ):
     delegating.supplier = raise_unavailable
     result = await task_feature.run_workflow([delegating_step(max_retries=2)])
-    assert delegating.calls == 3
+    assert delegating.calls == 1
     [record] = result.data["results"]
-    assert record["status"] == "failed" and record["attempts"] == 3
-    assert "outcome_unknown" not in record
-    assert not any(task_outcome_unknown(task) for task in await stored_tasks(manager))
+    assert record["status"] == "failed" and record["attempts"] == 1
+    assert record["outcome_unknown"] is True
+    assert any(task_outcome_unknown(task) for task in await stored_tasks(manager))
 
 
 async def test_a_subagent_tool_step_carries_a_grouped_unknown_outcome(
@@ -1397,11 +1438,9 @@ class CodexSubagentRunner(Feature):
 
 
 @pytest.fixture
-async def codex_runner(manager, effect):
+async def codex_runner(manager, effect, workflow_host):
     """The runner, with a codex reader started before any skill runs."""
-    agent = SimpleNamespace(
-        did=manager.did, task_manager=manager, _execution_custody=None
-    )
+    agent = workflow_host
     runner = CodexSubagentRunner(agent)
     runner.name = "codex_runner"
     runner.effect = effect
@@ -1442,16 +1481,16 @@ async def test_an_unknown_outcome_flattened_on_a_codex_reader_is_never_rerun(
 
 
 @pytest.mark.parametrize("effect", EVERY_SKILL_FORM, ids=skill_form_id, indirect=True)
-async def test_an_ordinary_failure_flattened_on_a_codex_reader_is_still_retried(
+async def test_an_ordinary_failure_flattened_on_a_codex_reader_is_not_retried_after_native_admission(
     task_feature, effect, codex_runner, manager
 ):
     effect.supplier = raise_unavailable
     result = await task_feature.run_workflow([codex_runner_step(max_retries=2)])
-    assert effect.calls == 3
+    assert effect.calls == 1
     [record] = result.data["results"]
-    assert record["status"] == "failed" and record["attempts"] == 3
-    assert "outcome_unknown" not in record
-    assert not any(task_outcome_unknown(task) for task in await stored_tasks(manager))
+    assert record["status"] == "failed" and record["attempts"] == 1
+    assert record["outcome_unknown"] is True
+    assert any(task_outcome_unknown(task) for task in await stored_tasks(manager))
 
 
 @pytest.mark.parametrize(

@@ -25,7 +25,12 @@ settlement. Releasing that writer does not delay asynchronous acceptance: the
 original journal lifetime retains accepted workers until journal finalization.
 An explicit resident task context preserves runtime ownership and cannot enroll
 a continuing service as an invocation child. A captured token identifies the live policy span and
-never grants writer ownership.
+never grants writer ownership or original execution admission. Ordinary token
+writers are distinct from the original root and accepted native children;
+neither an effect nor child acceptance can borrow their token membership.
+Concurrent original members join one first activation of their lifetime.
+Privacy draining excludes the caller's actual original ancestors, whose
+completion may depend on that caller, while still joining independent peers.
 
 The shared native task helpers record exact accepted tasks before dispatch. An
 owned join parks the current writer for those original execution owners and
