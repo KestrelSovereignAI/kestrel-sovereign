@@ -101,7 +101,9 @@ async def test_actual_http_retry_preserves_client_input_before_session_resolutio
             with closing(sqlite3.connect(database.as_uri() + '?mode=ro', uri=True)) as db:
                 first, = db.execute('SELECT attempt_id, revision, state FROM tool_effect_operations').fetchall()
                 assert first[2] == 'CLOSED'
-            response = await client.post(endpoint, json=body)
+            response = await client.post(endpoint, json={
+                'input': body['input'], 'invocation_id': body['request_id'], 'user_passphrase': None,
+            })
             assert response.status_code == 200, 'Unchanged client input was mistaken for another operation: ' + response.text
             with closing(sqlite3.connect(database.as_uri() + '?mode=ro', uri=True)) as db:
                 second, = db.execute('SELECT attempt_id, revision, state FROM tool_effect_operations').fetchall()
@@ -112,4 +114,20 @@ async def test_actual_http_retry_preserves_client_input_before_session_resolutio
             with closing(sqlite3.connect(database.as_uri() + '?mode=ro', uri=True)) as db:
                 assert db.execute('SELECT attempt_id, revision, state FROM tool_effect_operations').fetchall() == [second]
                 assert db.execute('SELECT COUNT(*) FROM tool_effect_claims').fetchone() == (0,)
+    assert await c.peer.witness(None, None) == []
+
+
+@pytest.mark.asyncio
+async def test_actual_http_stream_admits_and_closes_its_original_journal_turn(host_campaign):
+    c = host_campaign
+    async with native_host(c.home, c.descriptor, c.environment, c.peer, 'http-stream-root') as host:
+        database = Path(host.state['agent_database']).resolve()
+        async with host_client(c, host.state) as client:
+            response = await client.post('/api/agents/permission-host/api/agent/stream',
+                json={'input': '!help', 'request_id': 'owned-stream-root'})
+            assert response.status_code == 200, response.text
+        with closing(sqlite3.connect(database.as_uri() + '?mode=ro', uri=True)) as db:
+            rows = db.execute('SELECT state FROM tool_effect_operations').fetchall()
+            assert rows == [('CLOSED',)], 'Native streaming producer bypassed its original journal turn'
+            assert db.execute('SELECT COUNT(*) FROM tool_effect_claims').fetchone() == (0,)
     assert await c.peer.witness(None, None) == []
