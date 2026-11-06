@@ -92,6 +92,7 @@ class InvocationProvenance:
     source_locator: str
     received_at: str
     input_digest: str | None = None
+    operation_key: str | None = None
 
 
 _current_invocation_provenance: ContextVar[InvocationProvenance | None] = ContextVar(
@@ -318,6 +319,7 @@ def request_provenance(
     source_locator: str,
     received_at: str | None = None,
     input_digest: str | None = None,
+    operation_key: str | None = None,
 ) -> InvocationProvenance:
     """Create bounded, endpoint-owned provenance for the current request.
 
@@ -339,6 +341,7 @@ def request_provenance(
         source_locator=source_locator,
         received_at=received_at,
         input_digest=input_digest,
+        operation_key=operation_key,
     )
 
 

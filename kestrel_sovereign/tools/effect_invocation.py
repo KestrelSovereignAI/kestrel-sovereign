@@ -18,10 +18,12 @@ from kestrel_sovereign.tool_effect_store import ToolEffectClaim
 
 
 def _operation_namespace():
+    provenance = current_invocation_provenance()
+    if provenance is not None and provenance.source_kind == 'signal':
+        return ['signal', provenance.source_locator]
     caller = current_caller_context()
     if caller is not None and caller.role != CallerRole.ANONYMOUS:
         return ['caller', caller.role.value, caller.auth_method.value, caller.identity]
-    provenance = current_invocation_provenance()
     if provenance is not None:
         if provenance.source_kind == 'http_request':
             return ['service', provenance.actor] if provenance.actor else ['anonymous', 'http_request']
@@ -67,7 +69,9 @@ async def _open_journal_turn(owner, arguments, route):
         if provenance is not None and provenance.input_digest is not None:
             request = dict(route=provenance.source_locator, input_digest=provenance.input_digest)
         turn = await admit_tool_effect_turn(owner, namespace=_operation_namespace(),
-            client_key=invocation_id, request=request, invocation_id=invocation_id)
+            client_key=(provenance.operation_key if provenance is not None
+                        and provenance.operation_key is not None else invocation_id),
+            request=request, invocation_id=invocation_id)
         if turn is not None:
             turn.generation = generation
     elif turn is not None:
