@@ -209,6 +209,32 @@ async def test_completion_allocation_refusal_cannot_abandon_original(monkeypatch
 
 
 @pytest.mark.asyncio
+async def test_bounded_wait_observer_preserves_unbounded_and_first_completed(monkeypatch):
+    from tests.shared.owned_task_observation import observe_bounded_asyncio_wait
+
+    loop = asyncio.get_running_loop()
+    ready, pending = loop.create_future(), loop.create_future()
+    ready.set_result('original result')
+    observations = []
+
+    async def before_wait(owners, timeout):
+        observations.append((set(owners), timeout))
+
+    observe_bounded_asyncio_wait(monkeypatch, before_wait)
+    try:
+        async with asyncio.timeout(1):
+            done, waiting = await asyncio.wait({ready, pending},
+                return_when=asyncio.FIRST_COMPLETED)
+        assert done == {ready} and waiting == {pending}
+        assert ready.result() == 'original result' and observations == []
+        done, waiting = await asyncio.wait({pending}, timeout=0.01)
+        assert done == set() and waiting == {pending} and not pending.cancelled()
+        assert observations == [({pending}, 0.01)]
+    finally:
+        pending.set_result('original pending result')
+
+
+@pytest.mark.asyncio
 async def test_borrowed_observation_returns_original_cancelled_source_not_shield_surrogate():
     original = asyncio.CancelledError("original source cancellation")
     cause = OSError("original source cause")

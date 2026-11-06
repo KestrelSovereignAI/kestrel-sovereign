@@ -326,11 +326,9 @@ async def test_close_retains_timed_out_native_resource_and_joins_original_receip
     resource = Resource()
     service.providers = [{stage: resource}, {"client": SimpleNamespace(close=later)}]
     native_close_entered = asyncio.Event()
-    original_wait = asyncio.wait
+    from tests.shared.owned_task_observation import observe_bounded_asyncio_wait
 
-    async def wait_after_native_setup(
-        awaitable, *, timeout=None, return_when=asyncio.ALL_COMPLETED,
-    ):
+    async def wait_after_native_setup(awaitable, timeout):
         # This regression concerns the resource's terminal receipt after
         # a real write, not how quickly a SQLite worker can finish that write.
         # Keep the actual timeout owner, but arm its short test deadline only
@@ -339,10 +337,9 @@ async def test_close_retains_timed_out_native_resource_and_joins_original_receip
             task.get_name().startswith(f"llm-close:('{stage}',") for task in awaitable
         ):
             await asyncio.wait_for(native_close_entered.wait(), timeout=5)
-        return await original_wait(awaitable, timeout=timeout, return_when=return_when)
 
     monkeypatch.setattr(service_module, "CLIENT_CLOSE_TIMEOUT", 0.01)
-    monkeypatch.setattr(asyncio, "wait", wait_after_native_setup)
+    observe_bounded_asyncio_wait(monkeypatch, wait_after_native_setup)
     try:
         with pytest.raises(RuntimeError, match="retained cleanup owners"):
             await service.close()

@@ -33,3 +33,15 @@ def refuse_owned_observation_allocation(monkeypatch, owner, *, allocation, error
 
     monkeypatch.setattr(loop, 'create_future', allocate)
     return refused
+
+
+def observe_bounded_asyncio_wait(monkeypatch, before_wait):
+    """Observe bounded resource joins while preserving the full wait API."""
+    original = asyncio.wait
+
+    async def wait(owners, *, timeout=None, return_when=asyncio.ALL_COMPLETED):
+        if timeout is not None:
+            await before_wait(owners, timeout)
+        return await original(owners, timeout=timeout, return_when=return_when)
+
+    monkeypatch.setattr(asyncio, 'wait', wait)
