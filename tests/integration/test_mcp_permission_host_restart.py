@@ -48,8 +48,9 @@ class RunningHost:
             await self.process.wait()
             raise
         if self.state:
-            assert self.process.returncode in {0, -signal.SIGTERM}
-            assert 'Application shutdown complete' in self.log_path.read_text()
+            diagnostic = self.log_path.read_text()
+            assert self.process.returncode in {0, -signal.SIGTERM}, diagnostic
+            assert 'Application shutdown complete' in diagnostic, diagnostic
 
 
 @asynccontextmanager

@@ -177,3 +177,23 @@ def test_mcp_lane_runs_the_actual_host_process_restart_campaign():
     """Installed MCP CI must not omit host/auth/restore and approval restart."""
     step = _suite_step('mcp-permission-seam', 'tests/integration/test_mcp_permission_boundary.py')
     assert 'tests/integration/test_mcp_permission_host_restart.py' in shlex.split(step['run'])
+
+
+@pytest.mark.asyncio
+async def test_owned_process_shutdown_preserves_full_original_diagnostic(tmp_path):
+    """A native fixture process proves log retention, not Core shutdown success."""
+    import asyncio
+    import sys
+    from tests.integration.test_mcp_permission_host_restart import RunningHost
+
+    diagnostic = ('owned-prefix-' * 400) + '\nowned original shutdown failure\n' + ('owned-suffix-' * 400)
+    log_path = tmp_path / 'failed-shutdown.log'
+    with log_path.open('wb') as log:
+        process = await asyncio.create_subprocess_exec(sys.executable, '-I', '-c',
+            'import sys; sys.stdout.write(sys.argv[1])', diagnostic,
+            stdout=log, stderr=asyncio.subprocess.STDOUT)
+        await process.wait()
+    host = RunningHost({'pid': process.pid}, process, log_path)
+    with pytest.raises(AssertionError) as raised:
+        await host.stop()
+    assert all(line in str(raised.value) for line in diagnostic.splitlines())
