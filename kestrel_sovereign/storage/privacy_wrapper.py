@@ -441,7 +441,7 @@ class ReentrantTransitionLock:
         self._native_work_branches = {}
         self._native_foreign_branches = {}
 
-    def capture_native_work_factory(self, *, acquire_span=True, serialize=False):
+    def capture_native_work_factory(self, *, serialize: bool, acquire_span=True):
         """Capture the constructing owner's held frame for one lazy source.
 
         Registration is still deferred until dispatch, and an ended foreign
@@ -449,7 +449,8 @@ class ReentrantTransitionLock:
         Background effect workers may retain an existing foreign frame without
         acquiring a new whole-worker span; their actual effect leaves still
         acquire this mutex and revalidate policy through ordinary admission.
-        Independent asynchronous workers set serialize=True. Siblings share
+        Every producer must explicitly distinguish independent workers
+        (serialize=True) from joined continuations (serialize=False). Siblings share
         their parent's branch gate; each admitted worker gets its own child
         branch so joined descendants can progress without joining that gate.
         Only exact native Tasks inherit a branch, never copied context alone.

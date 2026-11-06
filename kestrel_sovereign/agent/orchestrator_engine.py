@@ -3709,7 +3709,7 @@ class OrchestratorEngineMixin:
                     retain_originals=True,
                     isolate_control_originals=True,
                     name_prefix="orchestrator-parallel-tool",
-                    work_factory=self._get_privacy_transition_lock().capture_native_work_factory(acquire_span=False),
+                    work_factory=self._get_privacy_transition_lock().capture_native_work_factory(acquire_span=False, serialize=True),
                 )
 
                 # Append results in original request order
@@ -3735,7 +3735,7 @@ class OrchestratorEngineMixin:
         # Capture before the first foreign task is constructed. Both the
         # lifecycle and operation handoffs must retain this exact held frame;
         # the later invocation decorator cannot recover an already lost owner.
-        start_privacy_work = self._get_privacy_transition_lock().capture_native_work_factory(acquire_span=False)
+        start_privacy_work = self._get_privacy_transition_lock().capture_native_work_factory(acquire_span=False, serialize=False)
 
         async def join_original_operation():
             turn_scope = capture_turn_scope(self)

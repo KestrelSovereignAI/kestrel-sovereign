@@ -67,7 +67,7 @@ import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from collections.abc import Mapping
-from typing import Any, Dict, Optional
+from typing import Any, Callable, Dict, Optional
 
 from kestrel_sdk.tools.base import ToolCategory
 from kestrel_sdk.tools.result import ToolResult, ToolResultStatus
@@ -1272,14 +1272,29 @@ class SchedulerFeature(Feature):
         self, feature_name: str, agent_tool: Any, args: dict
     ) -> Any:
         """Admit the original scheduled intent before hooks or tool effects."""
+        from kestrel_sdk.resources import ResourceConflict
+        from kestrel_sovereign.agent.tool_allowlist import registry_generation
         from kestrel_sovereign.tools.effect_invocation import run_scheduled_tool_operation
 
+        selected_generation = registry_generation(self.agent)
+        selected_function = getattr(agent_tool, 'func', agent_tool.execute)
+
+        def validate_registration():
+            owner, current, _disabled = self._resolve_scheduled_tool(agent_tool.name)
+            same_tool = current is agent_tool or (current is not None
+                and getattr(current, 'func', current.execute) == selected_function)
+            if owner != feature_name or not same_tool:
+                raise ResourceConflict('Scheduled tool registration changed before execution')
+
+        validate_registration()
         return await run_scheduled_tool_operation(self.agent,
             feature_name=feature_name, tool_name=agent_tool.name, arguments=args,
-            operation=lambda owned: self._run_tool_hook_gated_body(feature_name, agent_tool, owned))
+            operation=lambda owned: self._run_tool_hook_gated_body(feature_name, agent_tool, owned,
+                selected_generation=selected_generation, validate_registration=validate_registration))
 
     async def _run_tool_hook_gated_body(
-        self, feature_name: str, agent_tool: Any, args: dict
+        self, feature_name: str, agent_tool: Any, args: dict, *,
+        selected_generation: int, validate_registration: Callable[[], None],
     ) -> Any:
         """Run a feature tool on a scheduler tick through the SAME
         PRE_TOOL_USE / POST_TOOL_USE hook envelope the chat and subagent
@@ -1306,15 +1321,13 @@ class SchedulerFeature(Feature):
             hook_rewrite_argument_error,
             refused_tool_result,
         )
-        from kestrel_sovereign.agent.tool_allowlist import registry_generation
         from kestrel_sovereign.tools.effect_journal import execute_tool_effect
-
-        selected_generation = registry_generation(self.agent)
 
         async def execute_approved(approved):
             return await execute_tool_effect(self.agent,
                 registration=['scheduler', feature_name, agent_tool.name],
                 arguments=approved, expected_generation=selected_generation,
+                validate_registration=validate_registration,
                 execute=lambda: agent_tool.execute(**approved))
 
         # #3921: coerce before PRE_TOOL_USE, as every dispatch path does, so

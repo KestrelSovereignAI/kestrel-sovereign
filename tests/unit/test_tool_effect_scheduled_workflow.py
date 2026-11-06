@@ -174,3 +174,34 @@ async def test_foreign_scheduled_occurrence_cannot_open_this_agents_journal(sche
             'A foreign scheduled occurrence opened this agent\'s journal'
     finally:
         await runner.stop()
+
+
+@pytest.mark.parametrize('withdrawal', ['feature', 'skill'])
+async def test_scheduled_tool_withdrawn_during_original_admission_cannot_execute(scheduled_case, monkeypatch, withdrawal):
+    case = scheduled_case
+    original_admit = case.owner.tool_effect_store.admit
+    disabled = []
+
+    async def admit_then_disable(**kwargs):
+        attempt = await original_admit(**kwargs)
+        if withdrawal == 'feature':
+            await case.owner._unregister_feature_runtime(case.feature, unload=False)
+        else:
+            case.feature.disabled_skills.add('scheduled_file_effect')
+        disabled.append(True)
+        return attempt
+
+    monkeypatch.setattr(case.owner.tool_effect_store, 'admit', admit_then_disable)
+    runner = SchedulerRunner(case.database, case.owner.did, case.scheduler._lookup_and_run_tool,
+        owner_id='owned-native-registration-scheduler')
+    try:
+        await seed_occurrence(case, runner, 'scheduled_file_effect', {})
+        await tick_and_settle(runner)
+        assert disabled
+        if withdrawal == 'feature':
+            assert case.feature.enabled is False
+        assert not case.witness.exists(), 'Scheduled tool executed a registration disabled during admission'
+        assert not case.observed
+        assert await case.database.fetchone('SELECT state FROM tool_effect_claims') == ('NOT_EXECUTED',)
+    finally:
+        await runner.stop()

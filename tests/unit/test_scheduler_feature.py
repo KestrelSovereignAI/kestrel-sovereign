@@ -28,7 +28,7 @@ from kestrel_sdk.signals import (
 )
 from kestrel_sdk.tools.result import ToolResult, ToolResultStatus
 from kestrel_sovereign.agent.sleep import SleepMixin
-from kestrel_sovereign.features.base import Feature
+from kestrel_sovereign.features.base import Feature, tool
 from kestrel_sovereign.features.scheduler.feature import SchedulerFeature
 from kestrel_sovereign.features.scheduler.outcome import ScheduledTaskOutcome
 from kestrel_sovereign.features.scheduler.runner import (
@@ -2027,7 +2027,7 @@ class TestSchedulerRunner:
 
     @pytest.mark.asyncio
     async def test_persisted_schedule_skips_disabled_feature_end_to_end(
-        self, tmp_path,
+        self, tmp_path, native_tool_effect_agent,
     ):
         """E2E (#2522): a schedule persisted BEFORE its feature is disabled must
         not invoke the tool on a tick while the feature is disabled, and must
@@ -2038,24 +2038,35 @@ class TestSchedulerRunner:
         ``_lookup_and_run_tool`` → the feature tool — with only the enablement
         state changing between ticks.
         """
-        raw_db = SQLiteBackend(str(tmp_path / "scheduler.db"))
-        await raw_db.connect()
-        db = AsyncDatabase(raw_db)
-
-        agent = _make_mock_agent(db)
-        agent.did = "did:test:scheduler-agent"
+        agent = await native_tool_effect_agent(did="did:test:scheduler-agent")
+        db = agent.tool_effect_store.database
         # Force the direct tool-execution path (no dispatcher) so the tick runs
         # exactly the production `_lookup_and_run_tool` body under test.
         agent.dispatcher = None
-        job_feature = _StubJobFeature()
-        agent.features = {"JobFeature": job_feature}
+        class JobFeature(Feature):
+            calls = 0
+
+            @property
+            def tool_description(self):
+                return 'Native scheduled enablement contract'
+
+            async def initialize(self):
+                pass
+
+            @tool(name='job', description='Count an original scheduled effect')
+            async def job(self) -> dict:
+                self.calls += 1
+                return {'success': True, 'ran': self.calls}
+
+        job_feature = JobFeature(agent)
+        agent.features = {job_feature.name: job_feature}
         agent.hooks_manager = TestTaskExecutor._passthrough_hooks_manager()
 
         sched = SchedulerFeature(agent)
         sched._db = db
         sched._agent_id = agent.did
 
-        runner = SchedulerRunner(db, agent.did, sched._dispatch_scheduled_task)
+        runner = SchedulerRunner(db, agent.did, sched._lookup_and_run_tool)
 
         async def _make_due():
             """Reset the persisted task so the next tick considers it due."""
@@ -2123,7 +2134,7 @@ class TestSchedulerRunner:
             status, _text = await _latest_log_status()
             assert status == "success"
         finally:
-            await db.close()
+            await runner.stop()
 
 
 # =========================================================================
@@ -3433,29 +3444,34 @@ class TestEcosystemDiscoveryWatchHandler:
         feature.agent.dispatcher.enqueue_signal.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_explicit_discovery_tool_resolves_external_feature(self, feature):
-        external = _StubJobFeature()
-        external._tool.name = "discover_ecosystem"
-        external._tool.execute = AsyncMock(return_value=_discovery_finding())
-        feature.agent.features = {"ExternalDiscoveryFeature": external}
-        feature.agent.hooks_manager = None
-        feature._load_ecosystem_discovery_state = AsyncMock(return_value=(None, None))
-        feature._save_ecosystem_discovery_state = AsyncMock()
-        _wire_watch_dispatcher(feature)
+    async def test_explicit_discovery_tool_resolves_external_feature(self, native_tool_effect_agent):
+        feature = SchedulerFeature(await native_tool_effect_agent(did='did:test:discovery-scheduler'))
+        await feature.initialize()
+        try:
+            external = _StubJobFeature()
+            external._tool.name = "discover_ecosystem"
+            external._tool.execute = AsyncMock(return_value=_discovery_finding())
+            feature.agent.features = {"ExternalDiscoveryFeature": external}
+            feature.agent.hooks_manager = None
+            feature._load_ecosystem_discovery_state = AsyncMock(return_value=(None, None))
+            feature._save_ecosystem_discovery_state = AsyncMock()
+            _wire_watch_dispatcher(feature)
 
-        out = await feature._run_ecosystem_discovery_watch(
-            {"tool": "discover_ecosystem", "repo": "owner/name"}
-        )
+            out = await dispatch_scheduled_tool(feature, 'ecosystem_discovery_watch',
+                {"tool": "discover_ecosystem", "repo": "owner/name"},
+                dispatch=lambda _name, arguments: feature._run_ecosystem_discovery_watch(arguments))
 
-        data = json.loads(out)
-        assert data["signaled"] is True
-        assert data["reason"] == "new_findings"
-        assert data["findings_count"] == 1
-        signal = feature.agent.dispatcher.enqueue_signal.call_args.args[0]
-        findings = json.loads(signal.payload["findings"])
-        assert findings[0]["repo"] == "owner/name"
-        assert findings[0]["kind"] == "red_ci"
-        assert findings[0]["number"] == "2281"
+            data = json.loads(out)
+            assert data["signaled"] is True
+            assert data["reason"] == "new_findings"
+            assert data["findings_count"] == 1
+            signal = feature.agent.dispatcher.enqueue_signal.call_args.args[0]
+            findings = json.loads(signal.payload["findings"])
+            assert findings[0]["repo"] == "owner/name"
+            assert findings[0]["kind"] == "red_ci"
+            assert findings[0]["number"] == "2281"
+        finally:
+            await feature.shutdown()
 
     @pytest.mark.asyncio
     async def test_roster_args_forwarded_to_scan_tool(self, feature):

@@ -89,7 +89,7 @@ async def test_native_constructor_failure_joins_all_original_tasks(tmp_path, fac
         yield b"must never dispatch"
 
     lock = ReentrantTransitionLock()
-    factory = (None if factory_kind == "default" else lock.capture_native_work_factory()
+    factory = (None if factory_kind == "default" else lock.capture_native_work_factory(serialize=False)
         if factory_kind == "privacy" else custom_factory)
     stream = execution_stream(None, source(), lifecycle=ExecutionStreamLifecycle(factory, started, lambda: None))
     loop.set_task_factory(native_factory)

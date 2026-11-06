@@ -39,7 +39,7 @@ async def tick_and_settle(runner: Any) -> None:
     await settle_occurrences(runner)
 
 
-async def dispatch_scheduled_tool(feature: Any, task_name: str, arguments: dict) -> Any:
+async def dispatch_scheduled_tool(feature: Any, task_name: str, arguments: dict, *, dispatch=None) -> Any:
     """Run an explicit test intent under a real, revocable SQLite occurrence.
 
     Retain the target's exact result/error for component assertions; the real
@@ -51,7 +51,8 @@ async def dispatch_scheduled_tool(feature: Any, task_name: str, arguments: dict)
 
     async def execute(name, supplied):
         try:
-            observed['result'] = await feature._lookup_and_run_tool(name, supplied)
+            operation = dispatch if dispatch is not None else feature._lookup_and_run_tool
+            observed['result'] = await operation(name, supplied)
             return observed['result']
         except BaseException as error:
             observed['error'] = error

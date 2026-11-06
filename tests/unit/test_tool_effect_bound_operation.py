@@ -648,3 +648,58 @@ async def test_async_native_sibling_effects_exclude_each_other_without_delaying_
                 worker.cancel()
         await asyncio.gather(calling, *workers, return_exceptions=True)
         await manager.close()
+
+
+async def test_nested_foreign_parallel_effects_exclude_siblings_inside_the_native_mutex(bound_operation):
+    from kestrel_sovereign.llm.adapter import ToolCall
+    from tests.unit.test_tool_effect_invocation import governed
+
+    owner, _binding, witness = bound_operation
+    entered = []
+    first_started, release = asyncio.Event(), asyncio.Event()
+
+    class CriticalTool:
+        name = 'owned.parallel_critical'
+        schema = ToolSchema(name, 'Concurrent tools share the native privacy mutex',
+            ToolCategory.UTILITY, parameters=[ToolParameter('marker', 'string', 'Marker', required=True)],
+            is_concurrency_safe=True)
+
+        async def execute(self, *, marker):
+            async with owner._get_privacy_transition_lock():
+                entered.append(marker)
+                if marker == 'first':
+                    first_started.set()
+                    await release.wait()
+                with witness.open('a') as stream:
+                    stream.write(marker + '\n')
+            return {'success': True}
+
+    mounted = []
+    owner.register_dynamic_tools('owned-parallel-critical', [CriticalTool()],
+        on_registered=lambda tool, binding: mounted.append(binding))
+    binding, = mounted
+
+    @governed
+    async def invoke(agent, user_input, *, invocation_id=None):
+        async def batch():
+            await agent._execute_tool_batch_at_stop_boundary(
+                [ToolCall(id=str(index), name=binding.name, arguments={'marker': marker})
+                 for index, marker in enumerate(('first', 'second'))],
+                {}, {binding.name}, [], 0, user_input, tool_results=[],
+                session_id='owned-parallel-critical-session')
+            return {'success': True}
+        return await _foreign_effect(agent, batch)
+
+    calling = asyncio.create_task(invoke(owner, 'Original parallel critical sections',
+        invocation_id='owned-parallel-critical-intent'))
+    try:
+        await asyncio.wait({calling}, timeout=0.2)
+        assert first_started.is_set(), 'Nested parallel children deadlocked behind their parent frame'
+        assert entered == ['first'], 'Parallel siblings bypassed their original privacy mutex'
+        release.set()
+        assert (await calling)['success'] is True
+        assert witness.read_text() == 'first\nsecond\n'
+    finally:
+        release.set()
+        await _retire_foreign_scenario(calling, (binding.name, 'owned.foreign_relay',
+            'orchestrator-parallel-tool:'))

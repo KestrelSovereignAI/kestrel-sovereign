@@ -33,7 +33,7 @@ async def test_lazy_native_stream_is_registered_before_any_body_step(tmp_path, e
     def started(iterator, task):
         assert iterator._consumer_close.owner is task
         registered.add(task)
-    lifecycle = ExecutionStreamLifecycle(lock.capture_native_work_factory(), started, lambda: None)
+    lifecycle = ExecutionStreamLifecycle(lock.capture_native_work_factory(serialize=False), started, lambda: None)
     stream = execution_stream(host, source(), lifecycle=lifecycle)
     assert not registered and not path.exists()
     loop, previous = asyncio.get_running_loop(), asyncio.get_running_loop().get_task_factory()
