@@ -216,16 +216,19 @@ async def test_bounded_wait_observer_preserves_unbounded_and_first_completed(mon
     ready, pending = loop.create_future(), loop.create_future()
     ready.set_result('original result')
     observations = []
+    entries = []
 
     async def before_wait(owners, timeout):
         observations.append((set(owners), timeout))
 
-    observe_bounded_asyncio_wait(monkeypatch, before_wait)
+    observe_bounded_asyncio_wait(monkeypatch, before_wait,
+        on_enter=lambda owners: entries.append(tuple(owners)))
     try:
         async with asyncio.timeout(1):
-            done, waiting = await asyncio.wait({ready, pending},
+            done, waiting = await asyncio.wait(iter((ready, pending)),
                 return_when=asyncio.FIRST_COMPLETED)
         assert done == {ready} and waiting == {pending}
+        assert entries == [(ready, pending)]
         assert ready.result() == 'original result' and observations == []
         done, waiting = await asyncio.wait({pending}, timeout=0.01)
         assert done == set() and waiting == {pending} and not pending.cancelled()

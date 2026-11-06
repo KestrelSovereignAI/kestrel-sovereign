@@ -1,6 +1,7 @@
 """Close timeout and the earlier native drain retain every delivered caller C."""
 import asyncio
 import sqlite3
+from contextlib import closing
 
 import pytest
 
@@ -113,6 +114,10 @@ async def _assert_close_drain_withdrawals(tmp_path, monkeypatch, *, source=None,
     drain = backend._cancelled_write_drain
     try:
         await asyncio.wait_for(entered.wait(), 5)
+        if source is not None:
+            backend._cancelled_write_drain_error = source.error
+        owner = create_owned_task(backend.close(), retain_originals=True)
+        await asyncio.wait_for(waiting.wait(), 5)
         if foreign_borrower:
             borrower_entered = asyncio.Event()
             async def borrow():
@@ -124,10 +129,6 @@ async def _assert_close_drain_withdrawals(tmp_path, monkeypatch, *, source=None,
             observed = await await_owned_task(borrowed)
             assert isinstance(observed.error, asyncio.CancelledError)
             assert withdrawals == [] and not drain.cancelling()
-        if source is not None:
-            backend._cancelled_write_drain_error = source.error
-        owner = create_owned_task(backend.close(), retain_originals=True)
-        await asyncio.wait_for(waiting.wait(), 5)
         owner.cancel("actual earlier drain waiter C1")
         await asyncio.wait_for(unwinding.wait(), 5)
         await asyncio.wait_for(joining.wait(), 5)
@@ -137,9 +138,11 @@ async def _assert_close_drain_withdrawals(tmp_path, monkeypatch, *, source=None,
         if source is not None:
             source.assert_retained(result.error)
         assert len(withdrawals) == 2 and withdrawals[0] is not withdrawals[1]
+        assert withdrawals[0].args == ('actual earlier drain waiter C1',)
+        assert withdrawals[1].args == ('actual canonical drain join C2',)
         assert all(error in tuple(_explicit_control_chain(result.error)) for error in withdrawals)
         assert drain.done() and backend._connection is None and not worker.is_alive()
-        with sqlite3.connect(f"file:{path}?mode=ro", uri=True) as observer:
+        with closing(sqlite3.connect(f"file:{path}?mode=ro", uri=True)) as observer:
             assert observer.execute("SELECT count(*) FROM effects").fetchone()[0] == 0
     finally:
         release.set()

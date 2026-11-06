@@ -113,7 +113,12 @@ async def test_full_boot_http_invoke_governs_external_mcp_effect(tmp_path, monke
             llm_service=service, allowed_features={"MCPAgent", "BootstrapFeature"}, sync_enabled=False)
 
         async def shutdown():
-            await asyncio.wait_for(agent.shutdown(), 30)
+            from tests.shared.native_shutdown_budget import shutdown_fixture_agent
+
+            async with asyncio.timeout(30):
+                await shutdown_fixture_agent(agent)
+                await agent.wait_for_shutdown_completion()
+                assert not service.has_pending_close_owners()
 
         cleanup.push_async_callback(shutdown)
         await asyncio.wait_for(agent.initialize(), 30)

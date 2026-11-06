@@ -44,6 +44,7 @@ def observe_bounded_asyncio_wait(
     original = asyncio.wait
 
     async def wait(owners, *, timeout=None, return_when=asyncio.ALL_COMPLETED):
+        owners = tuple(owners)
         if on_enter is not None:
             on_enter(owners)
         try:
