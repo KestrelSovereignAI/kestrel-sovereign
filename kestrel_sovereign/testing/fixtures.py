@@ -32,6 +32,7 @@ async def native_tool_effect_agent(tmp_path, monkeypatch):
     Each created Agent owns only its test directory and native resources. A
     supplied connected backend transfers ownership to that Agent, allowing the
     same primary SQLite/PostgreSQL store to serve journal and task contracts.
+    An explicitly borrowed AsyncDatabase retains its caller's ownership.
     """
     from contextlib import AsyncExitStack
     from uuid import uuid4
@@ -49,13 +50,18 @@ async def native_tool_effect_agent(tmp_path, monkeypatch):
     # routes or credentials are inputs to this component fixture.
     monkeypatch.setattr(service_module, 'load_section', lambda _section: {})
     async with AsyncExitStack() as resources:
-        async def create(*, did, connected_backend=None):
+        async def create(*, did, connected_backend=None, borrowed_database=None):
+            if connected_backend is not None and borrowed_database is not None:
+                raise ValueError("A native test Agent must have one primary database owner")
             root = tmp_path / ('native-tool-effect-' + uuid4().hex)
             root.mkdir()
-            database = (await AsyncDatabase.sqlite(str(root / 'primary.db'))
-                if connected_backend is None else
-                await AsyncDatabase.from_connected_backend(connected_backend))
-            resources.push_async_callback(database.close)
+            if borrowed_database is not None:
+                database = borrowed_database
+            else:
+                database = (await AsyncDatabase.sqlite(str(root / 'primary.db'))
+                    if connected_backend is None else
+                    await AsyncDatabase.from_connected_backend(connected_backend))
+                resources.push_async_callback(database.close)
             service = service_module.LLMService(usage_db=database, agent_data_dir=root)
             resources.push_async_callback(service.close)
             agent = KestrelAgent(did=did, storage_path=str(root / 'agent.db'),

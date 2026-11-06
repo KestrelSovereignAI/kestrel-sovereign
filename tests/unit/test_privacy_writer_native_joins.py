@@ -589,7 +589,7 @@ async def test_nested_native_privacy_transition_does_not_join_its_waiting_ancest
             witness.write_text('transition completed')
 
     async def parent():
-        from kestrel_sovereign._async_ownership import owned_native_wait, owned_task_join_dependency
+        from kestrel_sovereign._async_ownership import owned_native_wait
         from kestrel_sovereign.tools.effect_journal import execute_tool_effect
 
         async def operation():
@@ -597,9 +597,8 @@ async def test_nested_native_privacy_transition_does_not_join_its_waiting_ancest
             children.append(task)
             # A bounded original native wait also provides deterministic cleanup
             # on the broken implementation: the ancestor eventually returns.
-            with owned_task_join_dependency(task):
-                async with owned_native_wait((task,)):
-                    done, _ = await asyncio.wait({task}, timeout=2)
+            async with owned_native_wait((task,)):
+                done, _ = await asyncio.wait({task}, timeout=2)
             if task in done:
                 outcome = await await_owned_task(task)
                 if journaled:
@@ -668,3 +667,101 @@ async def test_ordinary_token_writer_cannot_promote_itself_to_an_original_root(o
             'SELECT COUNT(*) FROM tool_effect_claims') == (0,)
     finally:
         await turn.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('producer', ['gather', 'callback'])
+async def test_shared_gate_upgrade_is_refused_during_native_wait(owner, tmp_path, producer):
+    import contextvars
+    from kestrel_sovereign._async_ownership import OwnedCallbackScope
+    from kestrel_sovereign.tools.effect_journal import execute_tool_effect
+    from tests.unit.test_tool_effect_invocation import governed
+
+    lock = owner._get_privacy_transition_lock()
+    witness = tmp_path / 'invalid-native-shared-upgrade'
+    children = []
+
+    async def child():
+        children.append(asyncio.current_task())
+        with pytest.raises(RuntimeError, match='wait on itself'):
+            async with owner.privacy_transition():
+                witness.write_text('invalid lease upgrade')
+        return 'original upgrade refused'
+
+    async def operation():
+        if producer == 'gather':
+            return await gather_owned([child],
+                work_factory=lock.capture_native_work_factory(acquire_span=False),
+                retain_originals=True)
+        scope = OwnedCallbackScope()
+
+        async def reader():
+            task = scope.start(child)
+            outcome = await await_owned_task(task)
+            if outcome.error is not None:
+                raise outcome.error
+            return [outcome.result]
+
+        reading = asyncio.create_task(reader(), context=contextvars.Context())
+        try:
+            async with scope.wait():
+                return await reading
+        finally:
+            scope.close()
+            await asyncio.gather(reading, return_exceptions=True)
+            for task in tuple(scope.tasks):
+                await await_owned_task(task)
+
+    @governed
+    async def invoke(agent, user_input, *, invocation_id=None):
+        return await execute_tool_effect(owner, registration='native-wait-upgrade',
+            arguments={'producer': producer}, execute=operation)
+
+    calling = asyncio.create_task(invoke(owner, 'Original native wait',
+        invocation_id='native-wait-upgrade-' + producer))
+    try:
+        done, _ = await asyncio.wait({calling}, timeout=.3)
+        assert calling in done, 'native wait failed to record the actual parent dependency before its child acquired the writer'
+        assert await calling == ['original upgrade refused']
+        assert not witness.exists()
+        assert not lock.locked() and not owner._get_durable_persistence_gate().locked()
+        assert await owner.tool_effect_store.database.fetchall(
+            'SELECT state FROM tool_effect_claims') == [('RETURNED_OK',)]
+    finally:
+        for task in children:
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(calling, *children, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('outcome', ['success', 'failed-acquisition'])
+async def test_finished_privacy_writer_is_not_retained_by_empty_binding_stack(outcome):
+    import gc
+    import weakref
+    lock = ReentrantTransitionLock()
+    attempted = asyncio.Event()
+
+    async def writer(token=None):
+        try:
+            with bind_transition_lock_reentry(token):
+                attempted.set()
+                async with lock:
+                    pass
+        except RuntimeError as error:
+            assert outcome == 'failed-acquisition' and 'retained span' in str(error)
+        return 'physical writer finished'
+
+    if outcome == 'failed-acquisition':
+        async with lock:
+            task = asyncio.create_task(writer(lock.current_reentry_token()))
+            await attempted.wait()
+    else:
+        task = asyncio.create_task(writer())
+    assert await task == 'physical writer finished'
+    reference = weakref.ref(task)
+    task = None
+    await asyncio.sleep(0)
+    gc.collect()
+    assert reference() is None, 'empty privacy binding stack retained a completed writer Task'
+    assert not lock.locked()

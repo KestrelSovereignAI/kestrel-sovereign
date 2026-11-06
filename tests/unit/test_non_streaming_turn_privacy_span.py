@@ -54,7 +54,11 @@ async def _turn_agent(did: str, native_tool_effect_agent) -> KestrelAgent:
     sequence (`_turn_lifecycle` → `_get_privacy_transition_lock`) rather than a
     re-implementation of it.
     """
-    agent = await native_tool_effect_agent(did=did)
+    return _configure_turn_probe(await native_tool_effect_agent(did=did))
+
+
+def _configure_turn_probe(agent: KestrelAgent) -> KestrelAgent:
+    """Keep native host/storage custody; replace only the probed turn body seams."""
     agent.context_manager = object()
     agent.bootstrap_service = None
     agent._safe_mode = False

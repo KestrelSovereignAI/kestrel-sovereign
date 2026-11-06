@@ -14,10 +14,11 @@ from kestrel_sovereign.storage.async_storage import AsyncStorage
 from kestrel_sovereign.storage.async_graph_store import GraphNode
 from tests.integration.test_constitution_refusal_races import _agent
 from tests.integration.test_constitution_reanchor_e2e import _write_authority_files
-from tests.unit.test_non_streaming_turn_privacy_span import _turn_agent
+from tests.unit.test_non_streaming_turn_privacy_span import _configure_turn_probe
+from kestrel_sovereign.kestrel_agent import KestrelAgent
 
 
-async def _ready_turn(storage, *, is_new_identity=True):
+async def _ready_turn(storage, *, is_new_identity=True, execution_agent=None):
     native = await _agent(storage, is_new_identity=is_new_identity)
     content = resolve_governing_constitution_bytes(None)
     digest = await storage.store_file(content, "constitution.md")
@@ -29,7 +30,8 @@ async def _ready_turn(storage, *, is_new_identity=True):
     await storage.add_node(GraphNode(node_id=storage.agent_id, node_type="agent", label="turn", properties={"constitution_hash": digest, "genesis_audit": receipt}))
     await native._anchor_constitution_governance(digest)
     assert await native._record_successful_constitution_audit(source="native fixture")
-    agent = _turn_agent(storage.agent_id)
+    agent = _configure_turn_probe(KestrelAgent(did=storage.agent_id, storage_path=":memory:")
+        if execution_agent is None else execution_agent)
     agent.extension = None
     agent.storage = agent._raw_storage = storage
     for name, value in vars(native).items():
@@ -45,13 +47,15 @@ async def _ready_turn(storage, *, is_new_identity=True):
 @pytest.mark.dual_backend
 @pytest.mark.parametrize("streaming", [False, True])
 @pytest.mark.parametrize("change", ["queued-restriction", "admitted-signed-repair"])
-async def test_turn_cannot_outrun_native_restriction_or_governing_receipt(db_backend, tmp_path, monkeypatch, streaming, change):
+async def test_turn_cannot_outrun_native_restriction_or_governing_receipt(db_backend, tmp_path, monkeypatch, streaming, change, native_tool_effect_agent):
     storage = AsyncStorage(backend=db_backend, agent_id="did:test:turn-admission:" + uuid4().hex)
     await storage.initialize()
     task = None
     reached, release = asyncio.Event(), asyncio.Event()
     try:
-        agent, content = await _ready_turn(storage)
+        execution_agent = await native_tool_effect_agent(did=storage.agent_id, borrowed_database=storage.db)
+        assert execution_agent.tool_effect_store.database is storage.db
+        agent, content = await _ready_turn(storage, execution_agent=execution_agent)
         cognition = AsyncMock(side_effect=AssertionError("restricted turn reached cognition"))
 
         async def body(user_input, *args, **kwargs):

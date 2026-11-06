@@ -664,3 +664,33 @@ async def test_gate_exclusive_waits_for_shared_and_blocks_new_shared():
         timeout=_HANG_GUARD_SECONDS,
     )
     assert order == ["reader-1", "writer", "reader-2"]
+
+
+@pytest.mark.asyncio
+async def test_copied_retired_shared_frame_cannot_borrow_a_later_exclusive_lease(tmp_path):
+    import contextvars
+
+    gate = DurablePersistenceGate()
+    attempted = asyncio.Event()
+    witness = tmp_path / 'retired-shared-frame-write'
+    async with gate.shared():
+        stale_context = contextvars.copy_context()
+
+    async def writer():
+        attempted.set()
+        async with gate.shared():
+            witness.write_text('fresh original read lease')
+
+    task = None
+    try:
+        async with gate.exclusive():
+            task = asyncio.create_task(writer(), context=stale_context)
+            await attempted.wait()
+            await asyncio.sleep(0)
+            assert not witness.exists(), 'retired shared frame borrowed a different exclusive lease'
+        await task
+        assert witness.read_text() == 'fresh original read lease'
+        assert not gate.locked()
+    finally:
+        if task is not None:
+            await asyncio.gather(task, return_exceptions=True)

@@ -29,11 +29,16 @@ never grants writer ownership or original execution admission. Ordinary token
 writers are distinct from the original root and accepted native children;
 neither an effect nor child acceptance can borrow their token membership.
 Concurrent original members join one first activation of their lifetime.
-Privacy draining excludes the caller's actual original ancestors, whose
-completion may depend on that caller, while still joining independent peers.
+Privacy draining excludes callers actually waiting for the current task,
+whose completion depends on its return, while still joining independent peers.
+Each durable shared frame has one live gate-owned record; copied context routes
+reentry but cannot substitute for the actual frame owner during cycle checks.
 
-The shared native task helpers record exact accepted tasks before dispatch. An
-owned join parks the current writer for those original execution owners and
+The shared native task helpers record exact accepted tasks before dispatch.
+`owned_native_wait` records actual must-join dependencies for every static task
+and each original callback accepted during its wait. Gather, bounded joins and
+callback readers share that observation boundary; creation ancestry cannot
+substitute for an actual wait or grant execution authority. An owned join parks the current writer for those original execution owners and
 restores its full frame before any parent continuation or exception handler
 resumes. Gather retains this barrier through sibling cancellation and physical
 harvesting. Stream producers relinquish the writer at the controlled item

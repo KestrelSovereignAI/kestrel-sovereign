@@ -12,7 +12,7 @@ import asyncio
 import contextvars
 import math
 from collections.abc import AsyncIterator, Callable
-from contextlib import AsyncExitStack, asynccontextmanager, contextmanager
+from contextlib import AsyncExitStack, ExitStack, asynccontextmanager, contextmanager
 from dataclasses import dataclass, field
 from functools import wraps
 from typing import Generic, TypeVar, cast
@@ -54,10 +54,26 @@ async def owned_native_wait(targets):
     Restoration completes before caller code, including cancellation handlers,
     resumes. Eventual join edges and copied context alone cannot lend a writer.
     """
-    async with AsyncExitStack() as stack:
-        for coordinator in _OWNED_COORDINATORS.get():
-            await stack.enter_async_context(coordinator.park_native_wait(tuple(targets)))
-        yield
+    targets = tuple(targets)
+    waiter = asyncio.current_task()
+    with ExitStack() as dependencies:
+        def join_original(task):
+            dependencies.enter_context(owned_task_join_dependency(task, waiter=waiter))
+
+        for target in targets:
+            if type(target) is OwnedCallbackScope:
+                # Future reader callbacks join this exact waiting frame before
+                # their producer returns them. The cohort grants no authority.
+                target._join_observers.add(join_original)
+                dependencies.callback(target._join_observers.discard, join_original)
+                for task in tuple(target.tasks):
+                    join_original(task)
+            else:
+                join_original(target)
+        async with AsyncExitStack() as stack:
+            for coordinator in _OWNED_COORDINATORS.get():
+                await stack.enter_async_context(coordinator.park_native_wait(targets))
+            yield
 
 
 @asynccontextmanager
@@ -74,6 +90,7 @@ class OwnedCallbackScope:
 
     def __init__(self):
         self.tasks = set()
+        self._join_observers = set()
         self.closed = False
         self.coordinators = tuple(c for c in _OWNED_COORDINATORS.get()
                                   if c.current_native_scope() is not None)
@@ -90,6 +107,8 @@ class OwnedCallbackScope:
         task = (self.factories[0](operation, name=name) if self.factories else
                 create_owned_task(operation(), name=name, retain_originals=True))
         self.tasks.add(task)
+        for observer in tuple(self._join_observers):
+            observer(task)
         for coordinator in self.coordinators:
             coordinator.callback_accepted(self, task)
         return task
@@ -152,9 +171,8 @@ def owned_task_join_ancestors(task=None):
 def _tracks_owned_task_join(function):
     @wraps(function)
     async def joined(task, *args, **kwargs):
-        with owned_task_join_dependency(task):
-            async with owned_native_wait((task,)):
-                return await function(task, *args, **kwargs)
+        async with owned_native_wait((task,)):
+            return await function(task, *args, **kwargs)
     return joined
 
 

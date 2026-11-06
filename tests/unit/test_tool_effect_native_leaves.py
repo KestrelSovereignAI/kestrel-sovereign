@@ -14,6 +14,7 @@ from kestrel_sovereign.features.base import Feature, tool
 from kestrel_sovereign.tool_effect_store import ToolEffectReconciliationRequired
 from tests.unit.test_tool_effect_execution import owner
 from tests.unit.test_tool_effect_invocation import governed
+from tests.unit.test_tool_effect_bound_operation import bound_operation
 
 
 pytestmark = [pytest.mark.asyncio, pytest.mark.timeout(30)]
@@ -521,3 +522,72 @@ async def test_original_registration_withdrawn_during_pre_hook_cannot_execute(ow
             'SELECT state FROM tool_effect_claims') == ('NOT_EXECUTED',)
     finally:
         await store.close()
+
+
+@pytest.mark.parametrize('producer', ['direct', 'gather'])
+async def test_accepted_async_worker_can_finish_its_original_nested_bound_operation(bound_operation, producer):
+    from kestrel_sovereign.a2a.scope import NativeRecipientScope
+    from kestrel_sovereign._async_ownership import await_owned_task
+    from kestrel_sovereign.tools.effect_journal import current_tool_effect_turn
+    from tests.utils.native_a2a import manager_for
+
+    owner, binding, witness = bound_operation
+    manager = manager_for(owner.tool_effect_store.backend,
+        NativeRecipientScope(owner.did), owns_backend=False)
+    await manager.initialize()
+    accepted, resume = asyncio.Event(), asyncio.Event()
+    turns = []
+
+    class NestedAsyncFeature(Feature):
+        tool_description = 'Finish the original accepted nested effect'
+
+        async def initialize(self):
+            pass
+
+        async def handle_task(self, task, *, arguments=None):
+            await resume.wait()
+            return await super().handle_task(task, arguments=arguments)
+
+        @tool(name='finish_original_nested_effect', description='Join the original native bound effect')
+        async def finish_original_nested_effect(self) -> dict:
+            async def original_effect():
+                return await binding.invoke({'marker': 'accepted-original-nested-effect'},
+                    session_id='accepted-original-nested-session',
+                    operation_id='accepted-original-nested-intent')
+
+            if producer == 'direct':
+                return await original_effect()
+            from kestrel_sovereign._async_ownership import gather_owned
+            results = await gather_owned([original_effect],
+                work_factory=owner._get_privacy_transition_lock().capture_native_work_factory(acquire_span=False),
+                retain_originals=True)
+            return results[0]
+
+    feature = NestedAsyncFeature(owner)
+    owner.features[feature.name] = feature
+    manager.register_provider(feature.name, feature.get_agent_skills(), feature)
+
+    @governed
+    async def invoke(agent, user_input, *, invocation_id=None):
+        turns.append(current_tool_effect_turn(agent))
+        task = await manager.execute_skill(feature.name, 'finish_original_nested_effect', {}, sync=False)
+        accepted.set()
+        return task
+
+    calling = asyncio.create_task(invoke(owner, 'Original asynchronous nested intention',
+        invocation_id='original-async-nested-intention'))
+    try:
+        await asyncio.wait({calling}, timeout=.5)
+        assert accepted.is_set() and turns[0].closing and not calling.done()
+        resume.set()
+        result = await await_owned_task(calling)
+        assert result.error is None, 'accepted asynchronous executor lost its original nested continuation while closing'
+        persisted = await manager.task_store.get_for_recipient(result.result.id, owner.did)
+        assert persisted.status.state == TaskState.TASK_STATE_COMPLETED
+        assert witness.read_text() == 'accepted-original-nested-effect\n'
+        assert await owner.tool_effect_store.database.fetchall(
+            'SELECT state FROM tool_effect_claims') == [('RETURNED_OK',)] * 3
+    finally:
+        resume.set()
+        await asyncio.gather(calling, return_exceptions=True)
+        await manager.close()

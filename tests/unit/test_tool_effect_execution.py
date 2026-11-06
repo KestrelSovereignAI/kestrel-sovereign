@@ -389,3 +389,14 @@ async def test_copied_journal_context_does_not_admit_an_execution_task(owner, tm
     assert not witness.exists()
     assert await owner.tool_effect_store.database.fetchone(
         'SELECT COUNT(*) FROM tool_effect_claims') == (0,)
+
+
+@pytest.mark.asyncio
+async def test_native_fixture_refuses_two_primary_database_owners(owner, native_tool_effect_agent):
+    database = owner.tool_effect_store.database
+    before = await database.fetchone('SELECT COUNT(*) FROM tool_effect_keys')
+    with pytest.raises(ValueError, match='one primary database owner'):
+        await native_tool_effect_agent(did='did:test:ambiguous-primary',
+            connected_backend=database.backend, borrowed_database=database)
+    assert database.backend.is_connected
+    assert await database.fetchone('SELECT COUNT(*) FROM tool_effect_keys') == before

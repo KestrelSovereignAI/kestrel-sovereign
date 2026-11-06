@@ -508,6 +508,13 @@ class ReentrantTransitionLock:
                 state["entered"] = True
             ancestor = self._members.get(ancestor)
 
+    def _pop_scope_binding(self, task):
+        bindings = self._scope_bindings[task]
+        binding = bindings.pop()
+        if not bindings:
+            del self._scope_bindings[task]
+        return binding
+
     async def __aenter__(self):
         root = await self._enter_span()
         task = asyncio.current_task()
@@ -518,7 +525,7 @@ class ReentrantTransitionLock:
         try:
             await self._acquire_writer(task)
         except BaseException:
-            self._scope_bindings[task].pop().__exit__(*sys.exc_info())
+            self._pop_scope_binding(task).__exit__(*sys.exc_info())
             if root:
                 await self._close_span(sys.exception())
             raise
@@ -534,7 +541,7 @@ class ReentrantTransitionLock:
         if not self._depth:
             self._writer = None
             self._notify()
-        binding = self._scope_bindings[task].pop()
+        binding = self._pop_scope_binding(task)
         try:
             if task in self._root_writers and not self._depth:
                 self._root_writers.remove(task)
@@ -696,10 +703,13 @@ class ReentrantTransitionLock:
         retained.set_result(None)
         return task
     async def join_owned_native_work(self):
+        from kestrel_sovereign._async_ownership import owned_task_join_ancestors
+
         current = asyncio.current_task()
+        joining = owned_task_join_ancestors(current)
         terminal = None
         for task in tuple(self._native_work):
-            if (task is current or self._descends_from(current, task)
+            if (task is current or task in joining
                     or not task._kestrel_native_privacy_state["entered"]):
                 continue
             outcome = await await_owned_task(task)
@@ -808,13 +818,16 @@ class _SharedGateLease:
 class _SharedGateHold:
     """One ``shared()`` frame's claim on a lease; live until that frame exits."""
 
-    __slots__ = ("gate", "lease", "task", "live")
+    __slots__ = ("gate", "lease", "task")
 
     def __init__(self, gate: "DurablePersistenceGate", lease: _SharedGateLease) -> None:
         self.gate = gate
         self.lease = lease
         self.task = asyncio.current_task()
-        self.live = True
+
+    @property
+    def live(self):
+        return self in self.gate._shared_frames
 
 
 class _ExclusiveGateHold:
@@ -889,6 +902,7 @@ class DurablePersistenceGate:
         self._lock = AsyncReaderWriterLock()
         self._owner: Optional["asyncio.Task"] = None
         self._exclusive_hold: Optional[_ExclusiveGateHold] = None
+        self._shared_frames: set[_SharedGateHold] = set()
         self._shared_lock = DurablePersistenceGateSharedLock(self)
 
     def locked(self) -> bool:
@@ -936,16 +950,17 @@ class DurablePersistenceGate:
     def _held_shared_by_current_task(self) -> bool:
         """Refuse upgrades blocked by this task or a caller joining it.
 
-        Actual join dependencies only detect a completion cycle; they never
-        grant shared/exclusive admission or allow a lease upgrade.
+        Original live frames are inventoried by this gate, independent of
+        copied or absent task context. Actual joins only detect a completion
+        cycle; they never grant admission or allow a lease upgrade.
         """
         from kestrel_sovereign._async_ownership import owned_task_join_ancestors
 
         task = asyncio.current_task()
         joining = owned_task_join_ancestors(task)
         return any(
-            hold.gate is self and hold.live and (hold.task is task or hold.task in joining)
-            for hold in _DURABLE_GATE_SHARED_HOLDS.get()
+            hold.task is task or hold.task in joining
+            for hold in self._shared_frames
         )
 
     @asynccontextmanager
@@ -989,13 +1004,14 @@ class DurablePersistenceGate:
     async def _hold_shared_lease(self, lease):
         lease.holds += 1
         hold = _SharedGateHold(self, lease)
+        self._shared_frames.add(hold)
         token = _DURABLE_GATE_SHARED_HOLDS.set(
             _DURABLE_GATE_SHARED_HOLDS.get() + (hold,)
         )
         try:
             yield
         finally:
-            hold.live = False
+            self._shared_frames.remove(hold)
             lease.holds -= 1
             if lease.holds == 0:
                 self._lock.release_read()
