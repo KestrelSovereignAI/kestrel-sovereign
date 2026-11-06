@@ -606,8 +606,6 @@ class TaskManager:
         def require_original_registration():
             if self._providers.get(agent_id) is not registration:
                 raise ResourceConflict('Task provider registration changed during admission')
-            if isinstance(handler, Feature) and not handler.enabled:
-                raise ResourceConflict('Task provider registration changed during admission')
 
         execution_registration = (
             bind_tool_effect_registration(handler.agent, selected_generation, require_original_registration)
