@@ -36,6 +36,13 @@ from kestrel_sovereign.execution_custody import (
     execution_commit_outcome,
     is_execution_control_error,
 )
+# Imported at collection: importing the server configures logging, which
+# would drop a test's caplog handler if it happened inside that test.
+from kestrel_sovereign.server import (
+    _distributed_invocation_owner_fence_reason,
+    _distributed_invocation_owner_status,
+    _distributed_invocation_owners_healthy,
+)
 from kestrel_sovereign.stop import (
     DistributedInvocationRegistry,
     DistributedInvocationStore,
@@ -374,6 +381,351 @@ async def test_a_restarted_heartbeat_that_does_not_renew_refuses_the_turn_by_nam
     finally:
         kill.clear()
         failing.clear()
+        await registry.close()
+        await db.close()
+
+
+def _server_owner_health(agent) -> tuple[str, str | None, bool]:
+    """What server health reads of an agent's Stop owner (#3987)."""
+
+    return (
+        _distributed_invocation_owner_status(agent),
+        _distributed_invocation_owner_fence_reason(agent),
+        _distributed_invocation_owners_healthy(agent, None),
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(60)
+async def test_server_health_reports_a_restart_that_cannot_renew_until_it_does(
+    tmp_path, monkeypatch
+):
+    """An idle heartbeat dies and its restart cannot renew: every turn is
+    refused, and server health says so, naming why. Once the restarted
+    heartbeat renews the same owner, health is healthy again and turns are
+    admitted (#3987)."""
+
+    db, store, registry = await _owner_registry(
+        tmp_path / "restart-health.db",
+        poll_seconds=0.01,
+        owner_lease_seconds=_HEALTHY_LEASE_SECONDS,
+    )
+    agent = _SelfFencingReplicaAgent("did:test:restart-health")
+    registry.attach(agent)
+    kill, failing = _killable_heartbeat(monkeypatch)
+    registry.start()
+    heartbeat = registry._heartbeat
+    turn = None
+    try:
+        await _wait_for(lambda: heartbeat.latest_renewed() is not None)
+        kill.set()
+        await _wait_for(lambda: not heartbeat.alive)
+        failing.set()
+        # Death alone is left to the next turn, which restarts the thread.
+        assert _server_owner_health(agent) == ("healthy", None, True)
+
+        for request_id in ("first-refused-turn", "second-refused-turn"):
+            with pytest.raises(InvocationSelfFencedError) as refused:
+                await agent.run_turn(request_id)
+            assert "has not renewed the owner lease" in str(refused.value)
+            status, reason, ready = _server_owner_health(agent)
+            assert status == "self_fenced"
+            assert not ready
+            assert reason.startswith(
+                "epoch 1: the owner heartbeat was restarted and has not "
+                "renewed the owner lease: "
+            )
+            assert "its last renewal failed (ConnectionError)" in reason
+        assert not agent.operation_started.is_set()
+        assert heartbeat.alive
+        assert heartbeat.launches == 2
+
+        # Nothing is held, so nothing fences, and the relay does not clear it.
+        await asyncio.sleep(_HEALTHY_LEASE_SECONDS + 0.1)
+        assert not registry._lease_lost
+        assert _server_owner_health(agent)[0] == "self_fenced"
+        assert heartbeat.launches == 2
+
+        failing.clear()
+        await _wait_for(lambda: _server_owner_health(agent)[0] == "healthy")
+        assert _server_owner_health(agent) == ("healthy", None, True)
+        # The current owner renewed; it was not replaced.
+        assert registry.owner_epoch == 1
+        assert heartbeat.renewed_since_launch(registry._owner_id)
+        assert heartbeat.launches == 2
+
+        turn = asyncio.create_task(agent.run_turn("admitted-turn"))
+        await asyncio.wait_for(agent.operation_started.wait(), timeout=10)
+        (generation_id,) = (
+            generation_id
+            for (_, turn_id, _), generation_id in registry._by_local_generation.items()
+            if turn_id == "admitted-turn"
+        )
+        inventory = await store.read_owner(
+            registry._owner_id, lease_seconds=_HEALTHY_LEASE_SECONDS
+        )
+        assert generation_id in inventory.live_generation_ids
+        agent.release_operation.set()
+        assert await turn == "admitted-turn"
+        assert _server_owner_health(agent) == ("healthy", None, True)
+    finally:
+        kill.clear()
+        failing.clear()
+        agent.release_operation.set()
+        if turn is not None:
+            await asyncio.gather(turn, return_exceptions=True)
+        await registry.close()
+        await db.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(60)
+async def test_a_restarted_heartbeat_that_died_before_renewing_is_restarted_without_traffic(
+    tmp_path, monkeypatch, caplog
+):
+    """A restart whose thread dies before renewing is reported at once. The
+    relay starts another one a lease later, with no turn to do it, so health
+    recovers even after a load balancer has stopped sending turns (#3987)."""
+
+    caplog.set_level(logging.ERROR, logger="kestrel_sovereign.stop.invocation")
+    db, _store, registry = await _owner_registry(
+        tmp_path / "restart-dies-again.db",
+        poll_seconds=0.01,
+        owner_lease_seconds=_HEALTHY_LEASE_SECONDS,
+    )
+    agent = _SelfFencingReplicaAgent("did:test:restart-dies-again")
+    registry.attach(agent)
+    kill, _failing = _killable_heartbeat(monkeypatch, kill_restarted=True)
+    registry.start()
+    heartbeat = registry._heartbeat
+    try:
+        await _wait_for(lambda: heartbeat.latest_renewed() is not None)
+        kill.set()
+        await _wait_for(lambda: not heartbeat.alive)
+
+        with pytest.raises(InvocationSelfFencedError):
+            await agent.run_turn("refused-turn")
+        assert heartbeat.launches == 2
+        assert not heartbeat.alive
+        refused_launch = heartbeat.launched_at
+        status, reason, ready = _server_owner_health(agent)
+        assert (status, ready) == ("self_fenced", False)
+        assert reason == (
+            "epoch 1: the owner heartbeat was restarted and has not renewed "
+            "the owner lease: the heartbeat thread has exited "
+            "(it raised _HeartbeatKilled)"
+        )
+
+        # Once a lease has passed since that start, the relay restarts it;
+        # this one dies again, so health still reports it.
+        await _wait_for(lambda: heartbeat.launches == 3, timeout=10)
+        assert heartbeat.launched_at - refused_launch >= _HEALTHY_LEASE_SECONDS
+        await _wait_for(lambda: not heartbeat.alive)
+        assert _server_owner_health(agent)[0] == "self_fenced"
+        # Each thread's exit is reported, once: the relay looks every poll.
+        await _wait_for(lambda: len(_exit_reports(caplog)) >= 3)
+        assert len(_exit_reports(caplog)) <= heartbeat.launches
+
+        # The next one renews: health recovers, with no turn sent.
+        kill.clear()
+        await _wait_for(lambda: _server_owner_health(agent)[0] == "healthy")
+        assert _server_owner_health(agent) == ("healthy", None, True)
+        assert heartbeat.launches >= 4
+        assert len(_exit_reports(caplog)) == heartbeat.launches - 1
+        assert heartbeat.alive
+        assert not registry._lease_lost
+        assert registry.owner_epoch == 1
+        assert not agent.operation_started.is_set()
+    finally:
+        kill.clear()
+        agent.release_operation.set()
+        await registry.close()
+        await db.close()
+
+
+_RESTART_REASON = (
+    "epoch 1: the owner heartbeat was restarted and has not renewed the owner "
+    "lease: "
+)
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(60)
+async def test_a_failed_restart_stays_unhealthy_through_the_next_restart_until_a_renewal(
+    tmp_path, monkeypatch
+):
+    """A restarted heartbeat dies before renewing; the relay starts another,
+    whose renewals keep failing. Through that thread's first lease, while
+    admission would still wait for it, health keeps reporting the failure
+    rather than reading healthy before anything renewed the owner (#3987)."""
+
+    db, _store, registry = await _owner_registry(
+        tmp_path / "restart-retry-still-failing.db",
+        poll_seconds=0.01,
+        owner_lease_seconds=_HEALTHY_LEASE_SECONDS,
+    )
+    agent = _SelfFencingReplicaAgent("did:test:restart-retry-still-failing")
+    registry.attach(agent)
+    kill, failing = _killable_heartbeat(monkeypatch)
+    registry.start()
+    heartbeat = registry._heartbeat
+    try:
+        await _wait_for(lambda: heartbeat.latest_renewed() is not None)
+        kill.set()
+        await _wait_for(lambda: not heartbeat.alive)
+        # The thread the next turn starts dies on its first renewal.
+        kill.set()
+        with pytest.raises(InvocationSelfFencedError):
+            await agent.run_turn("refused-turn")
+        assert heartbeat.launches == 2
+        assert not heartbeat.alive
+        died = (
+            "the heartbeat thread has exited (it raised _HeartbeatKilled)"
+        )
+        assert _server_owner_health(agent) == (
+            "self_fenced", _RESTART_REASON + died, False
+        )
+
+        # The relay's next thread cannot renew either.
+        failing.set()
+        await _wait_for(lambda: heartbeat.launches == 3, timeout=10)
+        third_launch = heartbeat.launched_at
+        samples = []
+        while time.monotonic() < third_launch + _HEALTHY_LEASE_SECONDS + 0.2:
+            samples.append((time.monotonic(), _server_owner_health(agent)))
+            await asyncio.sleep(0.005)
+        assert heartbeat.alive
+        assert heartbeat.launches == 3
+        assert not heartbeat.renewed_since_launch(registry._owner_id)
+        assert all(
+            status == "self_fenced" and not ready
+            for _, (status, _reason, ready) in samples
+        )
+        within = [
+            reason
+            for sampled_at, (_status, reason, _ready) in samples
+            if sampled_at < third_launch + _HEALTHY_LEASE_SECONDS
+        ]
+        assert within
+        assert all(
+            reason.startswith(
+                _RESTART_REASON + died + "; the next restart has not renewed "
+                "it yet: "
+            )
+            for reason in within
+        )
+        assert any("its last renewal failed (ConnectionError)" in r for r in within)
+        # Past its first lease the newest thread's own failure is named.
+        assert samples[-1][1][1].startswith(
+            _RESTART_REASON + "its last renewal failed (ConnectionError)"
+        )
+        assert not agent.operation_started.is_set()
+
+        failing.clear()
+        await _wait_for(lambda: _server_owner_health(agent)[0] == "healthy")
+        assert _server_owner_health(agent) == ("healthy", None, True)
+        # The relay's next observation drops the recovered failure.
+        await _wait_for(lambda: registry._heartbeat_restart_failure is None)
+        assert heartbeat.launches == 3
+        assert registry.owner_epoch == 1
+        assert not registry._lease_lost
+    finally:
+        kill.clear()
+        failing.clear()
+        agent.release_operation.set()
+        await registry.close()
+        await db.close()
+
+
+def _refusable_heartbeat_start(monkeypatch) -> threading.Event:
+    """While the returned event is set, a heartbeat thread cannot start.
+
+    ``Thread.start()`` raises as CPython does when the OS cannot create a
+    thread; every other thread starts as usual.
+    """
+
+    refuse = threading.Event()
+    original_start = threading.Thread.start
+
+    def start(thread):
+        if thread.name == THREAD_NAME and refuse.is_set():
+            raise RuntimeError("can't start new thread")
+        return original_start(thread)
+
+    monkeypatch.setattr(threading.Thread, "start", start)
+    return refuse
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(60)
+async def test_a_heartbeat_thread_that_cannot_be_started_is_named_until_one_renews(
+    tmp_path, monkeypatch
+):
+    """Restarting the idle owner's dead heartbeat fails in ``Thread.start()``.
+    Turns are refused naming that, health names it, through every failed
+    restart and while the thread that finally starts has not renewed yet;
+    its renewal clears it (#3987)."""
+
+    db, _store, registry = await _owner_registry(
+        tmp_path / "restart-cannot-start.db",
+        poll_seconds=0.01,
+        owner_lease_seconds=_HEALTHY_LEASE_SECONDS,
+    )
+    agent = _SelfFencingReplicaAgent("did:test:restart-cannot-start")
+    registry.attach(agent)
+    kill, failing = _killable_heartbeat(monkeypatch)
+    refuse_start = _refusable_heartbeat_start(monkeypatch)
+    registry.start()
+    heartbeat = registry._heartbeat
+    try:
+        await _wait_for(lambda: heartbeat.latest_renewed() is not None)
+        kill.set()
+        await _wait_for(lambda: not heartbeat.alive)
+        refuse_start.set()
+
+        cannot_start = (
+            "a new heartbeat thread could not be started "
+            "(RuntimeError: can't start new thread)"
+        )
+        for request_id in ("first-refused-turn", "second-refused-turn"):
+            with pytest.raises(InvocationSelfFencedError) as refused:
+                await agent.run_turn(request_id)
+            assert str(refused.value) == (
+                "distributed Stop owner heartbeat could not be restarted, so "
+                "admission was refused: " + cannot_start
+            )
+            assert _server_owner_health(agent) == (
+                "self_fenced", _RESTART_REASON + cannot_start, False
+            )
+        assert heartbeat.launches >= 3
+        assert not heartbeat.alive
+        assert not agent.operation_started.is_set()
+
+        # The relay retries a lease after each failed start; one starts at
+        # last, but cannot renew yet: health still names the failed start.
+        failed_launches = heartbeat.launches
+        failing.set()
+        refuse_start.clear()
+        await _wait_for(lambda: heartbeat.alive, timeout=10)
+        assert heartbeat.launches == failed_launches + 1
+        status, reason, ready = _server_owner_health(agent)
+        assert (status, ready) == ("self_fenced", False)
+        assert reason.startswith(
+            _RESTART_REASON + cannot_start + "; the next restart has not "
+            "renewed it yet: "
+        )
+
+        failing.clear()
+        await _wait_for(lambda: _server_owner_health(agent)[0] == "healthy")
+        assert _server_owner_health(agent) == ("healthy", None, True)
+        assert heartbeat.launches == failed_launches + 1
+        assert registry.owner_epoch == 1
+        assert not registry._lease_lost
+    finally:
+        refuse_start.clear()
+        kill.clear()
+        failing.clear()
+        agent.release_operation.set()
         await registry.close()
         await db.close()
 
@@ -1884,11 +2236,94 @@ async def test_a_stopped_heartbeat_is_not_restarted(tmp_path):
         registry.start()
         heartbeat: OwnerHeartbeat = registry._heartbeat
         assert await heartbeat.stop(timeout=5)
-        heartbeat.ensure_running()
+        assert heartbeat.ensure_running() is False
         assert not heartbeat.alive
     finally:
         await registry.close()
         await db.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(60)
+async def test_a_restart_whose_thread_cannot_start_is_a_named_launch(monkeypatch):
+    """``ensure_running()`` reports a thread it could not start, rather than
+    raising out of admission; the launch is counted and named until the next
+    one, which starts normally (#3987)."""
+
+    @asynccontextmanager
+    async def opener():
+        yield object()
+
+    attempts = 0
+
+    async def renew(_database, _owner_id):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise _HeartbeatKilled()
+
+    refuse_start = _refusable_heartbeat_start(monkeypatch)
+    heartbeat = OwnerHeartbeat(opener, renew, interval_seconds=0.01)
+    heartbeat.start("owner-whose-restart-cannot-start")
+    try:
+        await _wait_for(lambda: not heartbeat.alive)
+        refuse_start.set()
+        assert heartbeat.ensure_running() is False
+        assert heartbeat.launches == 2
+        assert not heartbeat.alive
+        assert heartbeat.exit_cause() == (
+            "a new thread could not be started (RuntimeError: can't start new thread)"
+        )
+        assert heartbeat.describe(time.monotonic(), _HEALTHY_LEASE_SECONDS) == (
+            "a new heartbeat thread could not be started "
+            "(RuntimeError: can't start new thread)"
+        )
+
+        refuse_start.clear()
+        assert heartbeat.ensure_running() is True
+        assert heartbeat.launches == 3
+        await _wait_for(
+            lambda: heartbeat.renewed_since_launch("owner-whose-restart-cannot-start")
+        )
+        assert heartbeat.exit_cause() is None
+    finally:
+        refuse_start.clear()
+        assert await heartbeat.stop(timeout=10)
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(60)
+async def test_a_retry_in_flight_still_names_the_failure_it_retries():
+    """Health reads describe() whenever it is asked, often mid-retry: the
+    failure being retried stays named rather than hidden by the retry."""
+
+    @asynccontextmanager
+    async def opener():
+        yield object()
+
+    attempts = 0
+    retrying, release = threading.Event(), threading.Event()
+
+    async def renew(_database, _owner_id):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise ConnectionError("renewal store unavailable")
+        retrying.set()
+        await asyncio.to_thread(release.wait, 30)
+
+    heartbeat = OwnerHeartbeat(opener, renew, interval_seconds=0.01)
+    heartbeat.start("owner-retrying-a-failure")
+    try:
+        assert await asyncio.to_thread(retrying.wait, 10)
+        description = heartbeat.describe(time.monotonic(), _HEALTHY_LEASE_SECONDS)
+        assert description.startswith(
+            "its last renewal failed (ConnectionError); its retry has been in "
+            "flight for "
+        )
+    finally:
+        release.set()
+        assert await heartbeat.stop(timeout=10)
 
 
 def test_the_heartbeat_stops_once_the_thread_that_started_it_ends(tmp_path):

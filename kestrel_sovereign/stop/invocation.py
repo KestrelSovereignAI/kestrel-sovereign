@@ -198,6 +198,21 @@ class _LocalGeneration:
     admitted_at: float
 
 
+@dataclass(frozen=True, slots=True)
+class _HeartbeatRestartFailure:
+    """A restarted owner heartbeat thread that failed to renew one owner.
+
+    ``launched_at`` is when that thread was started, or its start attempted;
+    ``reason`` is the heartbeat's state when it was found to have failed. The
+    failure stands through every later restart, until the heartbeat renews
+    ``owner_id`` in a renewal that started no earlier (#3987).
+    """
+
+    owner_id: str
+    launched_at: float
+    reason: str
+
+
 class _TerminalStopDatabase:
     """Private executor for the fixed exact-identity settlement, never exposed."""
 
@@ -1030,7 +1045,10 @@ class DistributedInvocationRegistry:
     identity is retired, and ownership for new work is re-established under a
     fresh owner identity and epoch, so a stale lease can never be revived. If
     re-establishment fails, the registry stays fenced and reports why through
-    :attr:`owner_fence_reason` until a later attempt succeeds.
+    :attr:`owner_fence_reason` until a later attempt succeeds. Once a
+    restarted heartbeat has failed to renew the current owner, the registry
+    admits nothing under it and reports it the same way, through every later
+    restart, until the heartbeat renews that owner (#3987).
     """
 
     def __init__(
@@ -1076,6 +1094,9 @@ class DistributedInvocationRegistry:
         self._observed_renewal: OwnerRenewal | None = None
         # The heartbeat thread (by launch count) whose exit was reported.
         self._reported_heartbeat_exit = 0
+        # A restarted heartbeat's failure to renew the current owner, kept
+        # past later restarts until the heartbeat renews that owner (#3987).
+        self._heartbeat_restart_failure: _HeartbeatRestartFailure | None = None
         # The identity a fenced registry will adopt once the heartbeat has
         # renewed it in time, and when the heartbeat was pointed at it.
         self._candidate_owner_id: str | None = None
@@ -1134,9 +1155,19 @@ class DistributedInvocationRegistry:
 
     @property
     def owner_lifecycle_status(self) -> str:
-        """Health-facing status of this process's current owner lease."""
+        """Health-facing status of this process's current owner lease.
 
-        return "self_fenced" if self._lease_lost else "healthy"
+        ``self_fenced`` while the lease is lost, and from a restarted owner
+        heartbeat's failure to renew the current owner until the heartbeat
+        renews it (#3987): admissions are refused then too, though nothing is
+        held to fence.
+        """
+
+        if self._lease_lost:
+            return "self_fenced"
+        if self._heartbeat_unavailable(time.monotonic()) is not None:
+            return "self_fenced"
+        return "healthy"
 
     @property
     def owner_epoch(self) -> int:
@@ -1149,11 +1180,19 @@ class DistributedInvocationRegistry:
         """Why the registry is fenced now, or ``None`` while it can admit.
 
         Names both the lease loss and, once one was attempted, why ownership
-        could not yet be re-established.
+        could not yet be re-established. An owner whose restarted heartbeat
+        failed to renew it is named with the heartbeat's state, until the
+        heartbeat renews it, through any restart in between.
         """
 
         if not self._lease_lost:
-            return None
+            unavailable = self._heartbeat_unavailable(time.monotonic())
+            if unavailable is None:
+                return None
+            return (
+                f"epoch {self._owner_epoch}: the owner heartbeat was restarted "
+                f"and has not renewed the owner lease: {unavailable}"
+            )
         reason = self._fence_reason or "owner lease lost"
         if self._reacquisition_failure is None:
             return f"epoch {self._owner_epoch}: {reason}"
@@ -1210,6 +1249,11 @@ class DistributedInvocationRegistry:
         self._heartbeat_attempt()
         if self._lease_lost:
             return
+        if (
+            self._heartbeat_restart_failure is not None
+            and self._standing_restart_failure() is None
+        ):
+            self._heartbeat_restart_failure = None
         owner_id = self._owner_id
         heartbeat = self._heartbeat
         renewal = heartbeat.latest_renewed() if heartbeat is not None else None
@@ -1327,38 +1371,169 @@ class DistributedInvocationRegistry:
             return
         if not heartbeat.alive:
             self._note_heartbeat_exit()
-            # Work already in flight whose lease lapsed fences first: a new
-            # thread must not renew an owner whose lease has expired.
-            self._observe_owner_heartbeat()
-            self._require_terminal_control()
-            if self._lease_lost:
-                return
-            launches = heartbeat.launches
-            heartbeat.ensure_running()
-            if heartbeat.launches == launches:
+            if not self._restart_heartbeat():
                 raise InvocationSelfFencedError(
                     "distributed Stop owner heartbeat could not be restarted, "
                     "so admission was refused: "
                     + heartbeat.describe(time.monotonic(), self._owner_lease_seconds)
                 )
+            if self._lease_lost:
+                return
         if heartbeat.launches < 2:
             return
         owner_id = self._owner_id
-        deadline = heartbeat.launched_at + self._owner_lease_seconds
         while not heartbeat.renewed_since_launch(owner_id):
             self._heartbeat_attempt()
             self._require_terminal_control()
             if self._lease_lost:
                 return
-            now = time.monotonic()
-            if not heartbeat.alive or now >= deadline:
+            unavailable = self._newest_restart_failure(time.monotonic())
+            if unavailable is not None:
                 self._note_heartbeat_exit()
+                self._record_restart_failure(time.monotonic())
                 raise InvocationSelfFencedError(
                     "distributed Stop owner heartbeat was restarted and has not "
                     "renewed the owner lease, so admission was refused: "
-                    + heartbeat.describe(now, self._owner_lease_seconds)
+                    + unavailable
                 )
             await asyncio.sleep(self._poll_seconds)
+
+    def _restart_heartbeat(self) -> bool:
+        """Start a new heartbeat thread for the current owner, if it may run.
+
+        Callers hold ``_registration_lock`` and have seen the thread exit.
+        Work already in flight whose lease lapsed fences first: a new thread
+        must not renew an owner whose lease has expired, and then nothing is
+        started. Returns ``False`` only when a thread should have started and
+        did not, including when it could not be started at all.
+
+        A thread being replaced that had failed to renew the current owner,
+        and a new one that could not be started, are retained as the owner's
+        restart failure, so health keeps reporting it while the next thread
+        has not renewed yet (#3987).
+        """
+
+        heartbeat = self._heartbeat
+        self._observe_owner_heartbeat()
+        self._require_terminal_control()
+        if self._lease_lost:
+            return True
+        self._record_restart_failure(time.monotonic())
+        try:
+            return heartbeat.ensure_running()
+        finally:
+            self._record_restart_failure(time.monotonic())
+
+    def _newest_restart_failure(self, now: float) -> str | None:
+        """Why the newest restarted heartbeat thread failed the current owner.
+
+        A thread started after the previous one exited admits no work until it
+        has renewed the current owner (#3889). It has failed to once it exited
+        without doing so (or could not be started), or once a lease has passed
+        since it started; admission refuses from then on, naming the
+        heartbeat's state. ``None`` for a heartbeat that was never restarted,
+        whose newest thread has renewed the current owner since it started, or
+        whose newest thread is still within its first lease: admission waits
+        for that one. This judges the newest thread alone; health also reports
+        an earlier restart's failure (:meth:`_heartbeat_unavailable`).
+        """
+
+        heartbeat = self._heartbeat
+        if heartbeat is None or heartbeat.launches < 2:
+            return None
+        if heartbeat.renewed_since_launch(self._owner_id):
+            return None
+        if heartbeat.alive and now < heartbeat.launched_at + self._owner_lease_seconds:
+            return None
+        return heartbeat.describe(now, self._owner_lease_seconds)
+
+    def _record_restart_failure(self, now: float) -> None:
+        """Retain the newest restarted thread's failure, if it has failed."""
+
+        reason = self._newest_restart_failure(now)
+        if reason is None:
+            return
+        self._heartbeat_restart_failure = _HeartbeatRestartFailure(
+            owner_id=self._owner_id,
+            launched_at=self._heartbeat.launched_at,
+            reason=reason,
+        )
+
+    def _standing_restart_failure(self) -> _HeartbeatRestartFailure | None:
+        """The retained restart failure, unless the owner was renewed since.
+
+        It stands for the current owner until the heartbeat has renewed that
+        owner in a renewal that started no earlier than the failed thread did.
+        A failure of an owner the registry has since replaced stands for
+        nothing.
+        """
+
+        failure = self._heartbeat_restart_failure
+        if failure is None or failure.owner_id != self._owner_id:
+            return None
+        heartbeat = self._heartbeat
+        renewed = heartbeat.latest_renewed() if heartbeat is not None else None
+        if (
+            renewed is not None
+            and renewed.owner_id == failure.owner_id
+            and renewed.started >= failure.launched_at
+        ):
+            return None
+        return failure
+
+    def _heartbeat_unavailable(self, now: float) -> str | None:
+        """Why health reports the current owner's heartbeat unavailable.
+
+        From a restarted heartbeat thread's failure to renew the current owner
+        until the heartbeat renews it (#3987). A later restart does not clear
+        it: while the thread that replaced the failed one is still within its
+        first lease and has not renewed, admission waits for it, but health
+        names the failure it has not yet recovered from, then that thread's
+        state. ``None`` while the owner is not held back by its heartbeat.
+        """
+
+        newest = self._newest_restart_failure(now)
+        if newest is not None:
+            return newest
+        standing = self._standing_restart_failure()
+        if standing is None:
+            return None
+        return (
+            f"{standing.reason}; the next restart has not renewed it yet: "
+            + self._heartbeat.describe(now, self._owner_lease_seconds)
+        )
+
+    async def _relay_restart_heartbeat(self) -> None:
+        """Restart a restarted heartbeat that exited before it renewed.
+
+        That includes a thread that could not be started. Health reports that
+        owner as unavailable, so a load balancer may stop sending the
+        admissions that would otherwise restart it again. Once a lease has
+        passed since its newest start, the relay restarts it; health keeps
+        reporting the failure until a thread renews the owner. Any other
+        exited heartbeat (one never restarted, or one that renewed the current
+        owner since its newest start) reads as healthy and is still left to
+        the next admission, as before.
+        """
+
+        heartbeat = self._heartbeat
+        if (
+            heartbeat is None
+            or self._lease_lost
+            or heartbeat.alive
+            or heartbeat.launches < 2
+            or time.monotonic() < heartbeat.launched_at + self._owner_lease_seconds
+        ):
+            return
+        async with self._registration_lock:
+            if (
+                self._closing
+                or self._lease_lost
+                or heartbeat.alive
+                or self._newest_restart_failure(time.monotonic()) is None
+            ):
+                return
+            self._restart_heartbeat()
 
     def _renewal_raised_control(self) -> bool:
         """Whether a heartbeat renewal has raised execution control.
@@ -1930,6 +2105,8 @@ class DistributedInvocationRegistry:
         self._owner_id = candidate
         self._owner_epoch = fenced_epoch + 1
         self._observed_renewal = renewal
+        # A restart failure of the fenced owner stands for nothing now.
+        self._heartbeat_restart_failure = None
         self._candidate_owner_id = None
         self._candidate_since = None
         self._lease_lost = False
@@ -1971,6 +2148,7 @@ class DistributedInvocationRegistry:
                     await self._relay_reacquire_owner_lease()
                 else:
                     self._observe_owner_heartbeat()
+                    await self._relay_restart_heartbeat()
             except asyncio.CancelledError:
                 raise
             except Exception as error:
