@@ -5,12 +5,15 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 import pytest
+import pytest_asyncio
 from kestrel_sdk.native_a2a.helpers.proto_helpers import new_task, new_text_artifact, new_text_message
 from kestrel_sdk.native_a2a.types import TaskState
 from kestrel_sdk.tools.result import ToolResult
 
 from kestrel_sovereign.a2a.projections import embedded_json_value
 from kestrel_sovereign.features.base import Feature, tool
+from kestrel_sovereign.tools.effect_journal import bind_tool_effect_turn
+from tests.unit.test_tool_effect_execution import admit, owner
 
 
 class NativeFeature(Feature):
@@ -34,6 +37,17 @@ def feature():
     return NativeFeature(SimpleNamespace())
 
 
+@pytest_asyncio.fixture
+async def hosted_feature(owner):
+    """The real leaf now requires its original native journal and turn."""
+    turn = await admit(owner)
+    try:
+        with bind_tool_effect_turn((turn, None)):
+            yield NativeFeature(owner)
+    finally:
+        await turn.close()
+
+
 def task(**metadata):
     result = new_task(
         "native-task",
@@ -45,12 +59,12 @@ def task(**metadata):
     return result
 
 
-async def test_native_feature_preserves_history_and_existing_artifacts_and_produces_native_ids():
+async def test_native_feature_preserves_history_and_existing_artifacts_and_produces_native_ids(hosted_feature):
     original = task(skill="native_echo", args={"value": {"nested": [None, {}, []]}})
     before = original.history[0].SerializeToString()
     existing = new_text_artifact("earlier", "Keep this")
     original.artifacts.append(existing)
-    result = await feature().handle_task(original)
+    result = await hosted_feature.handle_task(original)
     assert result.status.state == TaskState.TASK_STATE_COMPLETED
     assert result.history[0].SerializeToString() == before
     assert result.artifacts[0] == existing
@@ -73,8 +87,8 @@ async def test_missing_unknown_or_malformed_skills_are_rejected_without_executio
     assert list(result.artifacts) == []
 
 
-async def test_native_feature_does_not_report_a_typed_tool_error_as_completed():
-    result = await feature().handle_task(task(skill="native_failure"))
+async def test_native_feature_does_not_report_a_typed_tool_error_as_completed(hosted_feature):
+    result = await hosted_feature.handle_task(task(skill="native_failure"))
     assert result.status.state == TaskState.TASK_STATE_FAILED
     assert embedded_json_value(result.artifacts[0].parts[0])[1]["status"] == "error"
 
@@ -100,7 +114,7 @@ def test_dynamic_tools_no_longer_carry_a_second_cached_skill_model():
         {"skill": "native_failure"},
     ],
 )
-async def test_all_feature_status_messages_identify_their_parent_task(metadata):
-    result = await feature().handle_task(task(**metadata))
+async def test_all_feature_status_messages_identify_their_parent_task(metadata, hosted_feature):
+    result = await hosted_feature.handle_task(task(**metadata))
     assert result.status.message.task_id == result.id
     assert result.status.message.context_id == result.context_id
