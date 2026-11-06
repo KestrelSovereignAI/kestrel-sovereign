@@ -391,6 +391,7 @@ async def trigger_sovereignty_import(request: Request, http_response: Response):
             invocation_provenance=request_invocation_provenance(
                 request,
                 source_locator="POST:/api/sovereignty/import",
+                body=data,
             ),
         )
 
@@ -405,6 +406,14 @@ async def trigger_sovereignty_import(request: Request, http_response: Response):
     except HTTPException:
         raise
     except Exception as e:
+        from kestrel_sovereign.execution_custody import is_execution_control_error
+        from kestrel_sovereign.api_errors import tool_effect_api_error
+
+        if is_execution_control_error(e):
+            raise
+        effect_error = tool_effect_api_error(e)
+        if effect_error is not None:
+            raise effect_error from e
         logger.error(f"Error triggering sovereignty import: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="Error triggering import.")
 

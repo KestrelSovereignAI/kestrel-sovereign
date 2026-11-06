@@ -73,6 +73,11 @@ class ToolEffectTurn:
         if self.owner is not owner or not self.live or self.closing:
             raise ToolEffectJournalUnavailable("tool_effect_attempt_retired")
 
+    def require_confirmed(self) -> None:
+        """An uncertain effect cannot be followed by ordinary turn output."""
+        if self.unconfirmed:
+            raise ToolEffectOutcomeUnconfirmed("tool_effect_outcome_unconfirmed") from self.unconfirmed[0]
+
     async def close(self, error: BaseException | None = None) -> None:
         """Join original claimants before closing admission; never cancel them."""
         self.closing = True
@@ -96,9 +101,9 @@ class ToolEffectTurn:
                 terminal = execution_terminal_error(
                     terminal, finish_error, retain_originals=True,
                 )
-            if self.unconfirmed:
-                unknown = ToolEffectOutcomeUnconfirmed("tool_effect_outcome_unconfirmed")
-                unknown.__cause__ = self.unconfirmed[0]
+            try:
+                self.require_confirmed()
+            except ToolEffectOutcomeUnconfirmed as unknown:
                 terminal = execution_terminal_error(
                     terminal, unknown, retain_originals=True,
                 )

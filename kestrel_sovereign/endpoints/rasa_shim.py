@@ -265,6 +265,7 @@ async def rasa_webhook(
     invocation_provenance = request_invocation_provenance(
         request,
         source_locator="POST:/webhooks/rest/webhook",
+        body=payload,
         # The endpoint's shared-secret gate authenticates a gateway service,
         # not the untrusted payload ``sender``. Record that service principal
         # rather than falsely attributing a patient delivery to the agent.
@@ -299,5 +300,13 @@ async def rasa_webhook(
     except HTTPException:
         raise
     except Exception as exc:
+        from kestrel_sovereign.execution_custody import is_execution_control_error
+        from kestrel_sovereign.api_errors import tool_effect_api_error
+
+        if is_execution_control_error(exc):
+            raise
+        effect_error = tool_effect_api_error(exc)
+        if effect_error is not None:
+            raise effect_error from exc
         logger.error(f"[rasa-shim] Error processing message from {sender}: {exc}", exc_info=True)
         raise HTTPException(status_code=500, detail="Kestrel agent failed to process the message.")

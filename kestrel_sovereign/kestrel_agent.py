@@ -116,6 +116,7 @@ from kestrel_sovereign.agent.invocation import (
     bind_async_invocation,
     mark_current_invocation_effect_checkpointed,
 )
+from kestrel_sovereign.tools.effect_invocation import journal_async_invocation
 from kestrel_sovereign.agent.model_preference import ModelPreferenceMixin
 from kestrel_sovereign.agent.operator_signals import inject_operator_turn
 from kestrel_sovereign.agent.orchestrator_engine import (
@@ -8092,6 +8093,7 @@ Expected Duration: {expected_duration}
         return None
 
     @bind_async_invocation("invocation_id", track_request_lifecycle=True)
+    @journal_async_invocation
     async def process_input(self, user_input: str, model_override: str = None, session_id: str = None, include_memories: bool = True, caller=None, system_prompt_addendum: str = None, system_prompt_budget_bytes: int = None, anchored_doctrine=None, user_passphrase: str = None, signal_wake: Optional[dict] = None, invocation_context: Optional[LLMInvocationContext] = None, pre_turn_guard=None, *, invocation_id: Optional[str] = None, invocation_provenance=None, wake_reply: Optional[WakeReplyReceipt] = None) -> str:
         """
         Processes user input by consulting the constitution, retrieving context,

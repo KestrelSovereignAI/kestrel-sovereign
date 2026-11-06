@@ -46,6 +46,44 @@ class ApiHTTPException(HTTPException):
         self.details = details
 
 
+def tool_effect_api_error(error: BaseException) -> ApiHTTPException | None:
+    """Classify known journal failures without reflecting exception content."""
+    from kestrel_sdk.resources import ResourceOutcomeUnknown
+    from kestrel_sovereign.tool_effect_store import (
+        ToolEffectAttemptClosed, ToolEffectAttemptSuperseded,
+        ToolEffectOperationConflict, ToolEffectReconciliationRequired,
+    )
+    from kestrel_sovereign.tools.effect_journal import (
+        ToolEffectJournalUnavailable, ToolEffectPrivacyRefused,
+    )
+
+    if is_execution_control_error(error):
+        return None
+    if isinstance(error, ToolEffectReconciliationRequired):
+        return ApiHTTPException(409, code='tool_effect_reconciliation_required',
+            message='Reconcile the previous tool effects before starting another operation.',
+            details=[{'counts': dict(error.counts)}])
+    if isinstance(error, ToolEffectOperationConflict):
+        return ApiHTTPException(409, code='tool_effect_operation_conflict',
+            message='The operation identity was reused with different input.')
+    if isinstance(error, ToolEffectAttemptSuperseded):
+        return ApiHTTPException(409, code='tool_effect_attempt_superseded',
+            message='A newer attempt owns this operation.')
+    if isinstance(error, ToolEffectAttemptClosed):
+        return ApiHTTPException(409, code='tool_effect_attempt_closed',
+            message='This operation no longer admits tool effects.')
+    if isinstance(error, ResourceOutcomeUnknown):
+        return ApiHTTPException(502, code='tool_effect_outcome_unconfirmed',
+            message='The tool outcome is uncertain. Reconcile before sending another operation.')
+    if isinstance(error, ToolEffectPrivacyRefused):
+        return ApiHTTPException(403, code='tool_effect_privacy_mode_refused',
+            message='The current privacy policy does not allow durable tool effects.')
+    if isinstance(error, ToolEffectJournalUnavailable):
+        return ApiHTTPException(503, code='tool_effect_journal_unavailable',
+            message='The durable tool-effect journal is unavailable.')
+    return None
+
+
 def rate_limited_until(
     declined: AdvisedWaitExceedsRetryBudget, *, now: datetime | None = None
 ) -> ApiHTTPException:

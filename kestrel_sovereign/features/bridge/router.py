@@ -184,6 +184,7 @@ def get_router() -> APIRouter:
         invocation_provenance = request_invocation_provenance(
             request,
             source_locator="POST:/api/bridge/invoke",
+            body=body,
         )
         await prime_durable_stop_fence(request, agent, request_id)
         try:
@@ -252,6 +253,11 @@ def get_router() -> APIRouter:
             except Exception as error:
                 if is_execution_control_error(error):
                     raise
+                from kestrel_sovereign.api_errors import tool_effect_api_error
+
+                effect_error = tool_effect_api_error(error)
+                if effect_error is not None:
+                    raise effect_error from error
                 # Exception text and tracebacks can contain bridge
                 # message/context content. Keep both client and logs bounded.
                 logger.error("Bridge invoke failed")
@@ -331,6 +337,7 @@ def get_router() -> APIRouter:
         invocation_provenance = request_invocation_provenance(
             request,
             source_locator="POST:/api/bridge/stream",
+            body=body,
         )
         await prime_durable_stop_fence(request, agent, request_id)
         try:

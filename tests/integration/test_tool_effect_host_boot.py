@@ -86,3 +86,30 @@ async def test_volatile_restart_reopens_original_journal_when_persistence_return
         assert db.execute('SELECT key_id, scope_digest, wrapped_key FROM tool_effect_keys').fetchall() == expected
         assert db.execute('SELECT COUNT(*) FROM tool_effect_operations').fetchone() == (0,)
     assert await c.peer.witness(None, None) == []
+
+
+@pytest.mark.asyncio
+async def test_actual_http_retry_preserves_client_input_before_session_resolution(host_campaign):
+    c = host_campaign
+    endpoint = '/api/agents/permission-host/api/agent/invoke'
+    body = {'input': '!help', 'request_id': 'owned-http-intent'}
+    async with native_host(c.home, c.descriptor, c.environment, c.peer, 'http-retry-root') as host:
+        database = Path(host.state['agent_database']).resolve()
+        async with host_client(c, host.state) as client:
+            response = await client.post(endpoint, json=body)
+            assert response.status_code == 200, response.text
+            with closing(sqlite3.connect(database.as_uri() + '?mode=ro', uri=True)) as db:
+                first, = db.execute('SELECT attempt_id, revision, state FROM tool_effect_operations').fetchall()
+                assert first[2] == 'CLOSED'
+            response = await client.post(endpoint, json=body)
+            assert response.status_code == 200, 'Unchanged client input was mistaken for another operation: ' + response.text
+            with closing(sqlite3.connect(database.as_uri() + '?mode=ro', uri=True)) as db:
+                second, = db.execute('SELECT attempt_id, revision, state FROM tool_effect_operations').fetchall()
+                assert second[0] != first[0] and second[1] > first[1] and second[2] == 'CLOSED'
+            response = await client.post(endpoint, json=dict(body, input='!status'))
+            assert response.status_code == 409, response.text
+            assert response.json()['error']['code'] == 'tool_effect_operation_conflict'
+            with closing(sqlite3.connect(database.as_uri() + '?mode=ro', uri=True)) as db:
+                assert db.execute('SELECT attempt_id, revision, state FROM tool_effect_operations').fetchall() == [second]
+                assert db.execute('SELECT COUNT(*) FROM tool_effect_claims').fetchone() == (0,)
+    assert await c.peer.witness(None, None) == []

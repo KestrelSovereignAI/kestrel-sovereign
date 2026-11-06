@@ -3,6 +3,7 @@
 from typing import Mapping
 
 from fastapi import HTTPException, Request
+from pydantic import BaseModel
 
 from kestrel_sovereign.agent.invocation import (
     InvocationProvenance,
@@ -14,6 +15,7 @@ from kestrel_sovereign.agent.invocation import (
 )
 from kestrel_sovereign.api_errors import ApiHTTPException
 from kestrel_sovereign.features.security.hooks import reserved_session_id
+from kestrel_sovereign.tools.effect_journal import logical_operation_key
 
 
 def require_sovereign_host_lifecycle(request: Request):
@@ -170,6 +172,7 @@ def request_invocation_provenance(
     request: Request,
     *,
     source_locator: str,
+    body: Mapping | BaseModel,
     fallback_actor: str | None = None,
 ) -> InvocationProvenance:
     """Bind authenticated actor and transport provenance for one HTTP turn.
@@ -183,10 +186,20 @@ def request_invocation_provenance(
     actor = getattr(caller, "identity", None)
     if not isinstance(actor, str) or not actor:
         actor = fallback_actor
+    original = body.model_dump(mode='json') if isinstance(body, BaseModel) else dict(body)
+    original = {key: value for key, value in original.items()
+        if key not in {'request_id', 'invocation_id', 'id', 'user_passphrase'}}
+    original['session_id'] = original.get('session_id')
+    try:
+        input_digest = logical_operation_key(['http-request-input-v1', original])
+    except ValueError as error:
+        raise ApiHTTPException(status_code=400, code='invalid_tool_effect_input',
+            message='Request input must be canonical JSON.') from error
     return request_provenance(
         actor=actor,
         source_kind="http_request",
         source_locator=source_locator,
+        input_digest=input_digest,
     )
 
 

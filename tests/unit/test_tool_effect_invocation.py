@@ -1,14 +1,24 @@
 """Real Agent generations, native SQL admission and external file effects."""
 
+import asyncio
 import pytest
 
-from kestrel_sovereign.agent.invocation import bind_async_invocation, request_provenance
+from kestrel_sdk.resources import ResourceOutcomeUnknown
+from kestrel_sovereign.agent.invocation import (
+    bind_async_generator_invocation, bind_async_invocation, request_provenance,
+)
 from kestrel_sovereign.auth import CallerContext
+from kestrel_sovereign.api_errors import tool_effect_api_error
+from kestrel_sovereign.llm.streaming_errors import bridge_sse_error_event
 from kestrel_sovereign.tool_effect_store import (
     ToolEffectOperationConflict, ToolEffectReconciliationRequired,
 )
-from kestrel_sovereign.tools.effect_invocation import journal_async_invocation
-from kestrel_sovereign.tools.effect_journal import current_tool_effect_turn, execute_tool_effect
+from kestrel_sovereign.tools.effect_invocation import (
+    journal_async_generator_invocation, journal_async_invocation,
+)
+from kestrel_sovereign.tools.effect_journal import (
+    ToolEffectOutcomeUnconfirmed, current_tool_effect_turn, execute_tool_effect,
+)
 from tests.unit.test_tool_effect_execution import owner
 
 
@@ -18,6 +28,11 @@ pytestmark = pytest.mark.timeout(30)
 def governed(function):
     return bind_async_invocation('invocation_id', track_request_lifecycle=True)(
         journal_async_invocation(function))
+
+
+def governed_stream(function):
+    return bind_async_generator_invocation('request_id', track_request_lifecycle=True)(
+        journal_async_generator_invocation(function))
 
 
 @pytest.mark.asyncio
@@ -45,8 +60,12 @@ async def test_root_admission_precedes_body_and_rejects_retry_before_another_eff
     assert await invoke(owner, 'one effect', **first) == 'acknowledged'
     assert await owner.tool_effect_store.database.fetchone('SELECT state FROM tool_effect_operations') == ('CLOSED',)
     rotated = dict(first, caller=CallerContext.sovereign(credential='owned-rotated-key'))
-    with pytest.raises(ToolEffectReconciliationRequired):
+    with pytest.raises(ToolEffectReconciliationRequired) as blocked:
         await invoke(owner, 'one effect', user_passphrase='different-secret', **rotated)
+    public = tool_effect_api_error(blocked.value)
+    assert public.status_code == 409 and public.code == 'tool_effect_reconciliation_required'
+    assert public.details == [{'counts': dict(returned_ok=1, returned_error=0, unconfirmed=0, unsettled=0, not_executed=0)}]
+    assert public.headers is None
     with pytest.raises(ToolEffectOperationConflict):
         await invoke(owner, 'changed input', **first)
     assert entered == ['one effect']
@@ -116,3 +135,65 @@ async def test_nested_invocation_keeps_its_original_parent_effect_claim(owner, t
     assert len(roots) == len(children) == 1, 'Nested invocation detached the original effect claim'
     assert children[0][1] == roots[0]
     assert witness.read_text() == 'one physical effect'
+
+
+@pytest.mark.asyncio
+async def test_stream_never_holds_binding_tokens_across_outward_yields(owner):
+    turns = []
+
+    @governed_stream
+    async def stream(agent, user_input, *, request_id=None):
+        turn = current_tool_effect_turn(agent)
+        turns.append(turn)
+        yield 'first'
+        assert current_tool_effect_turn(agent) is turn
+        yield 'second'
+
+    iterator = stream(owner, 'owned input', request_id='stream-intent')
+    try:
+        assert await anext(iterator) == 'first'
+        assert current_tool_effect_turn(owner) is None
+        assert await asyncio.create_task(anext(iterator)) == 'second'
+        assert current_tool_effect_turn(owner) is None
+        with pytest.raises(StopAsyncIteration):
+            await asyncio.create_task(anext(iterator))
+    finally:
+        await iterator.aclose()
+    assert len(turns) == 1 and turns[0].live is False
+    assert await owner.tool_effect_store.database.fetchone('SELECT state FROM tool_effect_operations') == ('CLOSED',)
+
+
+@pytest.mark.asyncio
+async def test_stream_cannot_publish_narration_after_a_swallowed_unknown_effect(owner, tmp_path):
+    witness = tmp_path / 'uncertain-effect'
+
+    @governed_stream
+    async def stream(agent, user_input, *, request_id=None):
+        yield 'known prefix'
+
+        async def effect():
+            witness.write_text('one physical effect')
+            raise ResourceOutcomeUnknown('owned result lost after effect')
+
+        try:
+            await execute_tool_effect(agent, registration='owned-file', arguments={}, execute=effect)
+        except ResourceOutcomeUnknown:
+            pass
+        yield 'incorrect success narration'
+
+    iterator = stream(owner, 'owned input', request_id='uncertain-intent')
+    try:
+        assert await anext(iterator) == 'known prefix'
+        with pytest.raises(ToolEffectOutcomeUnconfirmed, match='tool_effect_outcome_unconfirmed') as blocked:
+            await anext(iterator)
+        public = tool_effect_api_error(blocked.value)
+        assert public.status_code == 502 and public.code == 'tool_effect_outcome_unconfirmed'
+        assert public.headers is None
+        event = bridge_sse_error_event(blocked.value)
+        assert '"code": "tool_effect_outcome_unconfirmed"' in event
+        assert 'owned result lost' not in event and 'incorrect success' not in event
+    finally:
+        await iterator.aclose()
+    assert witness.read_text() == 'one physical effect'
+    assert current_tool_effect_turn(owner) is None
+    assert await owner.tool_effect_store.database.fetchone('SELECT state FROM tool_effect_claims') == ('UNCONFIRMED',)

@@ -1,6 +1,7 @@
 """Durable operation admission inside the canonical live invocation boundary."""
 
 from contextlib import asynccontextmanager
+from dataclasses import dataclass
 from functools import wraps
 import inspect
 
@@ -8,10 +9,12 @@ from kestrel_sovereign.agent.invocation import (
     current_invocation_id, current_invocation_provenance,
 )
 from kestrel_sovereign.auth import CallerRole, current_caller_context
+from kestrel_sovereign.execution_custody import execution_terminal_error
 from kestrel_sovereign.tools.effect_journal import (
-    ToolEffectJournalUnavailable, admit_tool_effect_turn, bind_tool_effect_turn,
+    ToolEffectJournalUnavailable, ToolEffectTurn, admit_tool_effect_turn, bind_tool_effect_turn,
     current_tool_effect_state,
 )
+from kestrel_sovereign.tool_effect_store import ToolEffectClaim
 
 
 def _operation_namespace():
@@ -26,8 +29,24 @@ def _operation_namespace():
     return ['internal', 'local']
 
 
-@asynccontextmanager
-async def _journal_turn(owner, arguments, route):
+@dataclass(frozen=True)
+class _JournalInvocation:
+    turn: ToolEffectTurn | None
+    parent_claim: ToolEffectClaim | None
+    root: bool
+
+    def bind(self):
+        return bind_tool_effect_turn((self.turn, self.parent_claim))
+
+    async def close(self, error=None):
+        with self.bind():
+            if self.root and self.turn is not None:
+                await self.turn.close(error)
+            elif error is not None:
+                raise error
+
+
+async def _open_journal_turn(owner, arguments, route):
     invocation_id = current_invocation_id()
     if invocation_id is None:
         raise ToolEffectJournalUnavailable('tool_effect_invocation_unavailable')
@@ -45,22 +64,27 @@ async def _journal_turn(owner, arguments, route):
             attachments=arguments.get('attachments'),
             include_memories=arguments.get('include_memories'),
         )
+        if provenance is not None and provenance.input_digest is not None:
+            request = dict(route=provenance.source_locator, input_digest=provenance.input_digest)
         turn = await admit_tool_effect_turn(owner, namespace=_operation_namespace(),
             client_key=invocation_id, request=request, invocation_id=invocation_id)
         if turn is not None:
             turn.generation = generation
     elif turn is not None:
         turn.require_live(owner)
-    with bind_tool_effect_turn((turn, None if root else parent_claim)):
+    return _JournalInvocation(turn, None if root else parent_claim, root)
+
+
+@asynccontextmanager
+async def _journal_turn(owner, arguments, route):
+    state = await _open_journal_turn(owner, arguments, route)
+    with state.bind():
         try:
-            yield turn
+            yield state.turn
         except BaseException as error:
-            if root and turn is not None:
-                await turn.close(error)
-            raise
+            await state.close(error)
         else:
-            if root and turn is not None:
-                await turn.close()
+            await state.close()
 
 
 def journal_async_invocation(function):
@@ -78,5 +102,39 @@ def journal_async_invocation(function):
         bound.apply_defaults()
         async with _journal_turn(args[0], bound.arguments, function.__name__):
             return await function(*args, **kwargs)
+
+    return wrapped
+
+
+def journal_async_generator_invocation(function):
+    """Bind only while advancing or closing, including on a foreign driver."""
+    signature = inspect.signature(function)
+
+    @wraps(function)
+    async def wrapped(*args, **kwargs):
+        bound = signature.bind(*args, **kwargs)
+        bound.apply_defaults()
+        state = await _open_journal_turn(args[0], bound.arguments, function.__name__)
+        iterator = function(*args, **kwargs)
+        terminal = None
+        try:
+            while True:
+                with state.bind():
+                    try:
+                        item = await anext(iterator)
+                    except StopAsyncIteration:
+                        break
+                    if state.turn is not None:
+                        state.turn.require_confirmed()
+                yield item
+        except BaseException as error:
+            terminal = error
+        finally:
+            with state.bind():
+                try:
+                    await iterator.aclose()
+                except BaseException as error:
+                    terminal = execution_terminal_error(terminal, error, retain_originals=True)
+                await state.close(terminal)
 
     return wrapped

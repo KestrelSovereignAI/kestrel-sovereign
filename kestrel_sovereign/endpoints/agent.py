@@ -494,6 +494,7 @@ async def invoke_agent(request: Request, http_response: Response):
         invocation_provenance = request_invocation_provenance(
             request,
             source_locator="POST:/api/agent/invoke",
+            body=data,
         )
         await prime_durable_stop_fence(request, agent, request_id)
         if hasattr(agent, "register_active_request"):
@@ -553,6 +554,7 @@ async def invoke_agent(request: Request, http_response: Response):
                             source_locator=(
                                 "POST:/api/agent/invoke#kite-release-evidence"
                             ),
+                            body=data,
                         ),
                         request=kite_evidence_request,
                     ),
@@ -699,6 +701,11 @@ async def invoke_agent(request: Request, http_response: Response):
     except Exception as exc:
         if is_execution_control_error(exc):
             raise
+        from kestrel_sovereign.api_errors import tool_effect_api_error
+
+        effect_error = tool_effect_api_error(exc)
+        if effect_error is not None:
+            raise effect_error from exc
         # A retry loop that declined a server-advised wait is not an internal
         # error: the route is rate limited until a known time, and the caller
         # can act on that (#3127). The reset time is the provider's number,
@@ -936,6 +943,7 @@ async def stream_agent_response(request: Request):
         invocation_provenance = request_invocation_provenance(
             request,
             source_locator="POST:/api/agent/stream",
+            body=data,
         )
         await prime_durable_stop_fence(request, agent, request_id)
         if hasattr(agent, "register_active_request"):
