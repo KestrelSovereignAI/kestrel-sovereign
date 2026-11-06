@@ -99,6 +99,49 @@ async def test_claim_is_acknowledged_before_file_effect_and_replay_is_fenced(own
 
 
 @pytest.mark.asyncio
+async def test_known_resource_precondition_is_returned_error_but_still_fences_replay(owner):
+    turn = await admit(owner)
+    original = ResourceConflict('Original resource revision changed')
+
+    async def refuse():
+        raise original
+
+    with bind_tool_effect_turn((turn, None)):
+        with pytest.raises(ResourceConflict) as observed:
+            await execute_tool_effect(owner, registration='owned-revision', arguments={}, execute=refuse)
+    assert observed.value is original
+    await turn.close()
+    assert await owner.tool_effect_store.database.fetchone('SELECT state FROM tool_effect_claims') == ('RETURNED_ERROR',)
+    with pytest.raises(ToolEffectReconciliationRequired):
+        await admit(owner)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('terminal_kind', ['unknown', 'cancelled', 'mixed-group'])
+async def test_root_close_preserves_an_original_terminal_error_with_uncertain_effects(owner, tmp_path, terminal_kind):
+    turn = await admit(owner)
+    original_unknown = ResourceOutcomeUnknown('Original uncertain effect')
+    witness = tmp_path / 'uncertain-original'
+
+    async def effect():
+        witness.write_text('one effect')
+        raise original_unknown
+
+    with bind_tool_effect_turn((turn, None)):
+        with pytest.raises(ResourceOutcomeUnknown):
+            await execute_tool_effect(owner, registration='owned-file', arguments={}, execute=effect)
+    terminal = (original_unknown if terminal_kind == 'unknown' else
+        asyncio.CancelledError('original caller withdrawal'))
+    if terminal_kind == 'mixed-group':
+        terminal = BaseExceptionGroup('original control group', [terminal, ValueError('original closer failure')])
+    with pytest.raises(BaseException) as observed:
+        await turn.close(terminal)
+    assert observed.value is terminal
+    assert witness.read_text() == 'one effect'
+    assert await owner.tool_effect_store.database.fetchone('SELECT state FROM tool_effect_claims') == ('UNCONFIRMED',)
+
+
+@pytest.mark.asyncio
 async def test_registration_withdrawal_after_claim_ack_cannot_start_an_effect(owner, tmp_path, monkeypatch):
     from kestrel_sovereign.agent.tool_allowlist import bump_registry_generation
 

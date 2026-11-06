@@ -16,7 +16,8 @@ from kestrel_sdk.resources import ResourceConflict, ResourceError, ResourceOutco
 from kestrel_sdk.tools.result import ToolResult, ToolResultStatus
 from kestrel_sovereign._async_ownership import await_owned_task
 from kestrel_sovereign.execution_custody import (
-    execution_terminal_error, require_execution_work,
+    execution_evidence_carriers, execution_terminal_error, is_execution_control_error,
+    require_execution_work,
 )
 from kestrel_sovereign.tool_effect_store import (
     ToolEffectAttempt, ToolEffectClaim, ToolEffectStore,
@@ -105,12 +106,19 @@ class ToolEffectTurn:
                 terminal = execution_terminal_error(
                     terminal, finish_error, retain_originals=True,
                 )
-            try:
-                self.require_confirmed()
-            except ToolEffectOutcomeUnconfirmed as unknown:
-                terminal = execution_terminal_error(
-                    terminal, unknown, retain_originals=True,
-                )
+            # Preserve an original terminal outcome and cooperative withdrawal.
+            # A swallowed uncertain effect still needs a typed root failure;
+            # adding that synthetic error to an already typed/control failure
+            # would replace or wrap the very evidence the caller must retain.
+            protected = (isinstance(terminal, ResourceOutcomeUnknown)
+                or is_execution_control_error(terminal)
+                or any(isinstance(item, asyncio.CancelledError)
+                    for item in execution_evidence_carriers(terminal)))
+            if self.unconfirmed and not protected:
+                unknown = ToolEffectOutcomeUnconfirmed('tool_effect_outcome_unconfirmed')
+                unknown.__cause__ = execution_terminal_error(
+                    terminal, *self.unconfirmed, retain_originals=True)
+                terminal = unknown
         finally:
             self.live = False
         if terminal is not None:
@@ -228,10 +236,11 @@ async def execute_tool_effect(
             )
             state = (
                 "NOT_EXECUTED" if not started else
+                "RETURNED_ERROR" if isinstance(error, ResourceConflict) else
                 "UNCONFIRMED" if error is not None else
                 "RETURNED_ERROR" if returned_error else "RETURNED_OK"
             )
-            if started and error is not None:
+            if started and error is not None and not isinstance(error, ResourceConflict):
                 turn.unconfirmed.append(error)
             try:
                 # Ordinary SQL authority is required. A revoked runtime may
