@@ -18,6 +18,7 @@ import os
 import re
 import sys
 import time
+import uuid
 from contextlib import aclosing, contextmanager, nullcontext
 from copy import deepcopy
 from dataclasses import dataclass
@@ -113,6 +114,8 @@ from kestrel_sovereign.execution_custody import (
     ExecutionAuthorityError,
     ToolAuditUnconfirmedError,
     is_tool_execution_terminal_error,
+    execution_cleanup_debts,
+    execution_commit_outcome,
     execution_terminal_error,
     is_execution_control_error,
     require_execution_work,
@@ -1020,24 +1023,96 @@ async def _record_inline_tool_dispatch(host, entry, *, session_id, features_by_t
     )
 
 
-async def _write_tool_dispatch(host, *, on_written=None, **row) -> None:
+async def _write_dispatch_row(host, row) -> bool:
+    """Write one ``a2a_tool_dispatches`` row; ``True`` only once it is written.
+
+    The ledger's own writer swallows a failed write unless it is required, so
+    the row is always written as required here: a refusal (such as native
+    storage refusing a write once the execution's authority was revoked)
+    raises instead of being taken for a row. A host with no ledger writes
+    nothing, and has nothing to refuse.
+    """
+    store = getattr(host, "observability_store", None)
+    if not row.get("required") and getattr(store, "log_tool_dispatch", None) is None:
+        await OrchestratorEngineMixin._log_tool_dispatch(host, **row)
+        return False
+    await OrchestratorEngineMixin._log_tool_dispatch(host, **{**row, "required": True})
+    return True
+
+
+def _dispatch_write_evidence(error):
+    """What a dispatch row's failed write leaves its caller to raise (#3778).
+
+    A write that was refused (native storage refuses one once the execution's
+    authority was revoked) or failed wrote nothing: it is reported, and the
+    caller's own outcome stands. A write whose COMMIT outcome is unknown or
+    committed, or that left a native resource unretired, is different: it may
+    have written the row, and its error is the evidence durable state is
+    reconciled from. That evidence is never dropped, so it is returned;
+    anything else returns ``None``.
+    """
+    if error is not None and (execution_commit_outcome(error) is not None
+                              or execution_cleanup_debts(error)):
+        return error
+    return None
+
+
+def _report_unwritten_dispatch(row, error) -> None:
+    """The one report of a dispatch row its write did not confirm (#3778)."""
+    outcome = execution_commit_outcome(error)
+    logging.warning(
+        "[TOOL-DISPATCH] a2a_tool_dispatches row %s: dispatch_id=%s "
+        "tool=%s parent_dispatch_id=%s cause=%s",
+        "not written" if outcome is None else f"write outcome {outcome}",
+        row["dispatch_id"], row.get("tool_name"), row.get("parent_dispatch_id"),
+        exception_log_summary(error),
+    )
+
+
+async def _settle_dispatch_row(host, row, *, name, on_written, on_settled):
+    """Write ``row`` as an owned operation and account for what it did.
+
+    ``on_written`` runs only when the write returned, so only for a row that
+    was written. A write that raised is reported once, by
+    ``_report_unwritten_dispatch``, and is never taken for a row, even when
+    its error says the COMMIT may have landed. ``on_settled`` runs either
+    way, so the caller does not attempt the same row a second time. Both run
+    before a cancellation that arrived during the write is raised. Returns
+    the owned outcome.
+    """
+    row = {**row, "dispatch_id": row.get("dispatch_id") or uuid.uuid4().hex}
+    outcome = await await_owned_operation(
+        _write_dispatch_row(host, row), name=name, retain_originals=True,
+    )
+    if outcome.error is not None:
+        _report_unwritten_dispatch(row, outcome.error)
+    elif outcome.result and on_written is not None:
+        on_written()
+    if on_settled is not None:
+        on_settled()
+    return outcome
+
+
+async def _write_tool_dispatch(host, *, on_written=None, on_settled=None, **row) -> None:
     """Write one ``a2a_tool_dispatches`` row as an owned operation (#3778).
 
     A cancellation that arrives while the row is written waits for the write,
     then is raised: the row is never abandoned half-way, and a caller's
     cancellation handler (``_record_interrupted_dispatch``) never writes the
-    same call a second time. ``on_written`` runs once the write returned,
-    before any such cancellation is raised, so the caller knows its row is
-    accounted for.
+    same call a second time. ``on_written`` runs only once the row was
+    written, ``on_settled`` once the write ended either way; see
+    ``_settle_dispatch_row``. A failed write raises when ``required``, and
+    otherwise only when it carries commit or retirement evidence
+    (``_dispatch_write_evidence``): a best-effort row that was refused or
+    failed is reported, and the caller's outcome is unchanged.
     """
-    outcome = await await_owned_operation(
-        OrchestratorEngineMixin._log_tool_dispatch(host, **row),
-        name="tool-dispatch-record", retain_originals=True,
+    outcome = await _settle_dispatch_row(
+        host, row, name="tool-dispatch-record",
+        on_written=on_written, on_settled=on_settled,
     )
-    if outcome.error is None and on_written is not None:
-        on_written()
     terminal = execution_terminal_error(
-        outcome.error, outcome.cancellation,
+        outcome.error if row.get("required") else _dispatch_write_evidence(outcome.error),
+        outcome.cancellation,
         retain_originals=True, prefer_cancellation=True,
     )
     if terminal is not None:
@@ -1053,12 +1128,16 @@ async def _record_interrupted_dispatch(host, error, *, returned, result=None,
     that cancelled the job, or the envelope that ran it. Its row says so
     instead of vanishing (#3778). ``returned`` says whether the call returned
     first; ``result`` is what it returned, when it did. ``on_written`` runs
-    once the row is written.
+    only once the row is written.
 
     The write is an owned operation, so a repeated cancellation does not cut
-    it short. Returns what the caller raises: ``error`` itself, unless the
-    write ended in execution control evidence, which is retained ahead of it,
-    or a cancellation arrived meanwhile that ``error`` does not carry.
+    it short. It adds no authority: once the execution's authority is revoked,
+    native storage refuses it, and the refusal is reported, never taken for a
+    row. Returns what the caller raises: ``error`` itself, whether or not the
+    row was written, unless the write left commit or retirement evidence
+    (``_dispatch_write_evidence``), or a cancellation arrived meanwhile that
+    ``error`` does not carry. Either is then composed with ``error``, which is
+    retained in it, as ``execution_terminal_error`` composes them.
     """
     kind = type(error).__name__
     message = (
@@ -1068,21 +1147,20 @@ async def _record_interrupted_dispatch(host, error, *, returned, result=None,
         f"Interrupted by {kind} while the call was running; whether it took "
         "effect is unknown. Reconcile before retrying."
     )
-    outcome = await await_owned_operation(
-        OrchestratorEngineMixin._log_tool_dispatch(
-            host, result=result if returned else None, status_hint="error",
-            error_class=kind, error_message=message, **row,
-        ),
-        name="tool-dispatch-interrupted-record", retain_originals=True,
+    outcome = await _settle_dispatch_row(
+        host, {
+            **row, "result": result if returned else None, "status_hint": "error",
+            "error_class": kind, "error_message": message,
+        },
+        name="tool-dispatch-interrupted-record",
+        on_written=on_written, on_settled=None,
     )
-    if outcome.error is None and on_written is not None:
-        on_written()
+    evidence = _dispatch_write_evidence(outcome.error)
     pending = None if isinstance(error, asyncio.CancelledError) else outcome.cancellation
-    if outcome.error is None and pending is None:
+    if evidence is None and pending is None:
         return error
     return execution_terminal_error(
-        error, outcome.error, pending,
-        retain_originals=True, prefer_cancellation=True,
+        error, evidence, pending, retain_originals=True, prefer_cancellation=True,
     )
 
 
@@ -1104,15 +1182,17 @@ def _publication_scope(destination):
 async def _complete_post_tool_result(host, result, post_input, *, adapter,
                                      dispatch_start, on_audited=None,
                                      destination=_CURRENT_TURN,
-                                     dispatch_id=None, parent_dispatch_id=None):
+                                     dispatch_id=None, parent_dispatch_id=None,
+                                     on_settled=None):
     """Complete policy and required audit before invoking a private UI factory.
 
     Every Core route that can receive a ``DeferredToolResult`` completes it
     here; ``destination`` (see ``_CURRENT_TURN``) is the only difference.
     ``dispatch_id`` names the row, and ``parent_dispatch_id`` the dispatch the
     call ran inside, for a feature subagent's own call (#3778). ``on_audited``
-    runs once the row is written, even when a cancellation arrives during the
-    write, so the caller never records the call a second time.
+    runs only once the row is written, and ``on_settled`` once its write ended
+    either way, even when a cancellation arrives during the write, so the
+    caller never records the call a second time.
     """
     deferred = isinstance(result, DeferredToolResult)
     post_outputs = await host.hooks_manager.execute_hooks_parallel(
@@ -1141,6 +1221,7 @@ async def _complete_post_tool_result(host, result, post_input, *, adapter,
             error_message=error_message, error_class=error_class, required=True,
             dispatch_id=dispatch_id, parent_dispatch_id=parent_dispatch_id,
             on_written=None if on_audited is None else lambda: on_audited(status),
+            on_settled=on_settled,
         )
         require_execution_work(host)
     except BaseException as error:
@@ -1383,6 +1464,8 @@ class OrchestratorEngineMixin:
         audit_adapter=None,
         on_audited=None,
         on_refused=None,
+        on_settled=None,
+        dispatch_id=None,
     ) -> dict:
         """
         Execute a tool with PRE_TOOL_USE and POST_TOOL_USE hook enforcement.
@@ -1404,6 +1487,12 @@ class OrchestratorEngineMixin:
                         as they stood when the deciding hook ran, so the
                         caller records the refused call with them rather than
                         with ``args`` (#3953).
+            on_audited / on_settled: For a deferred result, called once its
+                        required dispatch row is written / once that write
+                        ended either way (``_complete_post_tool_result``).
+            dispatch_id: The ``ledger_id`` of the dispatch, which a deferred
+                        result's row is written under. A feature subagent's
+                        own calls name it as their parent (#3778).
 
         Returns:
             Tool result dict, or an error dict if permission was denied.
@@ -1473,7 +1562,8 @@ class OrchestratorEngineMixin:
         return await _complete_post_tool_result(
             self, result, post_hook_input,
             adapter=audit_adapter or f"{feature_name}.{tool_name}",
-            dispatch_start=exec_start, on_audited=on_audited,
+            dispatch_start=exec_start, on_audited=on_audited, on_settled=on_settled,
+            dispatch_id=dispatch_id,
         )
 
     async def _generate_with_messages_bounded(
@@ -2239,8 +2329,9 @@ class OrchestratorEngineMixin:
         subagent's own calls name that id as their parent, so the row must
         exist on every transport: without an inline caller to record it, and
         when the codex turn that ran it fails before its executed calls are
-        recorded. The result returned is the single-use receipt for that row,
-        so the inline recorder does not write it again.
+        recorded. The result returned is the single-use receipt that the row's
+        write is settled, so the inline recorder does not attempt it again: a
+        refused write is reported once and is not marked recorded.
 
         Args:
             feature: The Feature subagent to dispatch to.
@@ -2260,16 +2351,19 @@ class OrchestratorEngineMixin:
         feature_name = type(feature).__name__
         dispatch_start = time.time()
         adapter = f"named:{source}:{feature_name}.execute_as_subagent"
-        row_written = False
+        # Whether the row's write ended, written or not: it is attempted once.
+        row_settled = False
 
-        def _row_written(status):
-            nonlocal row_written
-            row_written = True
+        def _row_settled():
+            nonlocal row_settled
+            row_settled = True
+
+        def _row_audited(status):
             _mark_tool_dispatch_audited(dispatch_meta, execution, status=status)
 
         async def _recorded(row_args, result, *, status=None, error_class=None,
                             error_message=None):
-            """Write the envelope row, then return the receipt for it."""
+            """Write the envelope row, then return the receipt that it was."""
             if not isinstance(result, dict):
                 # The shape the completion hooks already report it as: a
                 # receipt is a dict, and only a receipt stops a second row.
@@ -2284,7 +2378,7 @@ class OrchestratorEngineMixin:
                 status_hint=status, error_class=error_class,
                 error_message=error_message,
                 dispatch_id=None if call_context is None else call_context.ledger_id,
-                on_written=lambda: _row_written(status),
+                on_written=lambda: _row_audited(status), on_settled=_row_settled,
             )
             return _AuditedDeferredResult(
                 result, host=self, tool_name=tool_name, session_id=session_id,
@@ -2507,11 +2601,11 @@ class OrchestratorEngineMixin:
             )
             receipt = await _recorded(effective_args, result)
         except BaseException as error:
-            if row_written:
+            if row_settled:
                 raise
             raise await _record_interrupted_dispatch(
                 self, error, returned=returned, result=result,
-                on_written=lambda: _row_written("error"),
+                on_written=lambda: _row_audited("error"),
                 tool_name=tool_name, adapter=adapter, args=effective_args,
                 session_id=session_id, dispatch_start=dispatch_start,
                 dispatch_id=None if call_context is None else call_context.ledger_id,
@@ -2838,13 +2932,15 @@ class OrchestratorEngineMixin:
                         user_message, tool_events=tool_events, streaming=streaming,
                         session_id=session_id, dispatch_meta=dispatch_meta,
                         effective_model=effective_model,
+                        dispatch_id=call_context.ledger_id,
                     )
                 except BaseException as error:
                     # The subagent's own calls name this row as their parent,
                     # so a dispatch that ends here once the subagent started is
                     # recorded too (#3778).
                     if (not dispatch_meta.get("subagent_started")
-                            or dispatch_meta.get("audit_recorded")):
+                            or dispatch_meta.get("audit_recorded")
+                            or dispatch_meta.get("audit_settled")):
                         raise
                     raise await _record_interrupted_dispatch(
                         self, error,
@@ -3072,13 +3168,17 @@ class OrchestratorEngineMixin:
     async def _dispatch_feature_tool(
         self, tool_call, feature, args, dispatch_start, dispatch_event_id,
         user_message, *, tool_events=None, streaming=False, session_id="orchestrator",
-        dispatch_meta=None, effective_model=None,
+        dispatch_meta=None, effective_model=None, dispatch_id=None,
     ):
         """Dispatch to a feature subagent with hook enforcement.
 
         ``effective_model`` is the route/model the orchestrator resolved for
         this turn; it's forwarded into ``execute_as_subagent`` so the subagent's
         own reasoning call targets the same route the main turn used (#2352).
+
+        ``dispatch_id`` is the dispatch's ``ledger_id``. The subagent's own
+        calls name it as their parent, so a deferred result's row, which its
+        completion writes here, is written under it too (#3778).
         """
         tool_name = tool_call.name
         hook_feature_name = type(feature).__name__
@@ -3193,6 +3293,13 @@ class OrchestratorEngineMixin:
                     dispatch_meta, status=status,
                 ),
                 on_refused=_on_refused,
+                # A refused row was its one attempt: ``_dispatch_tool_call``
+                # does not record the dispatch again as interrupted (#3778).
+                on_settled=(
+                    None if dispatch_meta is None
+                    else lambda: dispatch_meta.__setitem__("audit_settled", True)
+                ),
+                dispatch_id=dispatch_id,
             )
             # #2641: parts the subagent's tools produced ride the result
             # envelope; ``_execute_tool_with_hooks`` re-emitted them into this
@@ -3496,6 +3603,7 @@ class OrchestratorEngineMixin:
                 on_refused=lambda arguments: _record_refused_tool_arguments(
                     dispatch_meta, arguments, execution,
                 ),
+                dispatch_id=None if call_context is None else call_context.ledger_id,
                 **({"prepare_args": _prepare_bound_arguments} if bound_tool is not None else {}),
             )
             # #2641: direct tools carry the same envelope contract as

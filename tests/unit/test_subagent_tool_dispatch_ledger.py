@@ -17,6 +17,15 @@ envelope writes its own row, so it exists without an inline caller and when
 the codex turn fails before recording its executed calls; the inline recorder
 does not write it twice. A cancellation after a call started is recorded, as an
 interrupted call, on the call and on its envelope.
+
+A write the ledger refuses is never taken for a row. Native storage refuses
+one once execution authority is revoked, and nothing grants it authority to
+write after that. The refusal is reported once, as a WARNING naming the row,
+the row is not attempted again, and the original error is raised unchanged.
+A write whose COMMIT outcome is unknown, or that left a native resource
+unretired, is not taken for a row either, but its evidence is never dropped:
+the caller receives it, with the original error or cancellation retained in
+it, even for a best-effort row.
 """
 
 from __future__ import annotations
@@ -25,21 +34,35 @@ import asyncio
 import copy
 import json
 import pickle
+import re
 from types import SimpleNamespace
 
 import pytest
 import pytest_asyncio
 from kestrel_sdk.hooks.base import Hook, HookEvent, HookInput, HookOutput
 from kestrel_sdk.llm.response import LLMResponse, ToolCall
+from kestrel_sdk.tools import DeferredToolResult, ToolResult
 from kestrel_sdk.tools.base import ToolCategory
 
 from kestrel_sovereign.a2a.stores.unified.observability_store import (
     ObservabilityStore,
     ToolDispatchEntry,
 )
+from kestrel_sovereign.agent import orchestrator_engine
 from kestrel_sovereign.agent.orchestrator_engine import OrchestratorEngineMixin
 from kestrel_sovereign.agent.tool_registry import ToolRegistryMixin
 from kestrel_sovereign.agent.turn_lifecycle import TurnLifecycleMixin
+from kestrel_sovereign.execution_custody import (
+    ExecutionAuthorityError,
+    ExecutionCommitOutcomeError,
+    ExecutionCustody,
+    ToolAuditUnconfirmedError,
+    bind_execution_custody_snapshot,
+    execution_cleanup_debts,
+    execution_commit_outcome,
+    execution_evidence_carriers,
+    is_execution_control_error,
+)
 from kestrel_sovereign.features.base import Feature, tool
 from kestrel_sovereign.hooks.manager import HooksManager
 from kestrel_sovereign.llm.adapter import InlineToolOutcome, inline_tool_dispatch_id
@@ -64,6 +87,8 @@ class _TalonProbe(Feature):
         self.error: BaseException | None = None
         self.hold_cancel = False
         self.cancel_entered = asyncio.Event()
+        # What cancelling the job does, when a test needs a real effect.
+        self.cancel_effect = None
 
     @property
     def tool_description(self) -> str:
@@ -82,6 +107,8 @@ class _TalonProbe(Feature):
     @tool(name="talon_cancel", description="Cancel a job.", category=ToolCategory.UTILITY)
     async def talon_cancel(self, job_id: str) -> dict:
         self.calls.append(("talon_cancel", job_id))
+        if self.cancel_effect is not None:
+            await self.cancel_effect(job_id)
         if self.hold_cancel:
             # The job is cancelled; the call has not returned yet.
             self.cancel_entered.set()
@@ -507,23 +534,29 @@ async def test_a_call_cancelled_after_it_returned_says_so(make_host):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("refused", [False, True], ids=["written", "refused"])
+@pytest.mark.parametrize("target", ["talon_cancel", DISPATCHER], ids=["call", "envelope"])
 async def test_a_cancellation_during_a_rows_write_leaves_exactly_that_row(
-    make_host, monkeypatch,
+    make_host, monkeypatch, caplog, target, refused,
 ):
     """The write is owned: the cancellation waits for it, so the call is not
-    recorded a second time as interrupted."""
+    recorded a second time as interrupted. A refused write was the row's one
+    attempt too: it is reported once, and nothing records it again."""
     host = await make_host()
     store = host.agent.observability_store
     write = store.log_tool_dispatch
     entered, release = asyncio.Event(), asyncio.Event()
 
     async def slow(entry, **kwargs):
-        if entry.tool_name == "talon_cancel" and not entered.is_set():
+        if entry.tool_name == target and not entered.is_set():
             entered.set()
             await release.wait()
+            if refused:
+                raise OSError("disk I/O error")
         await write(entry, **kwargs)
 
     monkeypatch.setattr(store, "log_tool_dispatch", slow)
+    interrupted = _spy_interrupted_records(monkeypatch)
     dispatch = asyncio.create_task(_dispatch(host, "named", {"task": "claim, then cancel"}))
     await asyncio.wait_for(entered.wait(), 5)
     dispatch.cancel()
@@ -534,11 +567,23 @@ async def test_a_cancellation_during_a_rows_write_leaves_exactly_that_row(
     with pytest.raises(asyncio.CancelledError):
         await dispatch
 
-    envelope, inner = _envelope_and_inner(await host.rows())
-    assert [(row["tool_name"], row["result_status"]) for row in inner] == [
-        ("talon_claim", "success"), ("talon_cancel", "success"),
-    ]
-    assert (envelope["result_status"], envelope["error_class"]) == ("error", "CancelledError")
+    rows = await host.rows()
+    assert target not in [entry["tool_name"] for entry in interrupted]
+    reports = _unwritten_reports(caplog)
+    assert [report["tool_name"] for report in reports] == ([target] if refused else [])
+    statuses = [(row["tool_name"], row["result_status"]) for row in rows]
+    if target == "talon_cancel":
+        assert statuses[:-1] == [("talon_claim", "success")] + (
+            [] if refused else [("talon_cancel", "success")]
+        )
+        envelope = rows[-1]
+        assert (envelope["tool_name"], envelope["result_status"], envelope["error_class"]) == (
+            DISPATCHER, "error", "CancelledError",
+        )
+    else:
+        assert statuses == [("talon_claim", "success"), ("talon_cancel", "success")] + (
+            [] if refused else [(DISPATCHER, "success")]
+        )
 
 
 @pytest.mark.asyncio
@@ -573,6 +618,580 @@ async def test_a_repeated_cancellation_does_not_cut_the_interrupted_row_short(
     envelope, [_claim, cancel] = _envelope_and_inner(await host.rows())
     assert (cancel["result_status"], cancel["error_class"]) == ("error", "CancelledError")
     assert cancel["parent_dispatch_id"] == envelope["dispatch_id"]
+
+
+class _LiveRuntimeFence:
+    """The runtime fence a SQLite host's execution custody is bound to.
+
+    Live until its ``ExecutionCustody`` is revoked: native SQLite storage then
+    refuses every write made under that custody.
+    """
+
+    backend_type = "sqlite"
+
+    def require_work(self) -> None:
+        return None
+
+    async def lock_and_validate(self, _connection) -> None:
+        self.require_work()
+
+
+_UNWRITTEN = re.compile(
+    r"a2a_tool_dispatches row not written: dispatch_id=(\S+) tool=(\S+) "
+    r"parent_dispatch_id=(\S+) cause=(\w+)"
+)
+
+
+def _unwritten_reports(caplog) -> list[dict]:
+    """Every WARNING that a dispatch row was not written, parsed."""
+    reports = []
+    for record in caplog.records:
+        match = _UNWRITTEN.search(record.getMessage())
+        if match is not None:
+            assert record.levelname == "WARNING"
+            dispatch_id, tool_name, parent, cause = match.groups()
+            reports.append({
+                "dispatch_id": dispatch_id, "tool_name": tool_name,
+                "parent_dispatch_id": None if parent == "None" else parent,
+                "cause": cause,
+            })
+    return reports
+
+
+def _spy_interrupted_records(monkeypatch) -> list[dict]:
+    """Record what each interrupted-call record was given and raised, and
+    whether it reported its row written (``on_written``)."""
+    records = []
+    record = orchestrator_engine._record_interrupted_dispatch
+
+    async def spy(host, error, **kwargs):
+        entry = {"tool_name": kwargs["tool_name"], "error": error, "written": []}
+        on_written = kwargs.get("on_written")
+        if on_written is not None:
+            def _written():
+                entry["written"].append(True)
+                on_written()
+            kwargs["on_written"] = _written
+        entry["raised"] = await record(host, error, **kwargs)
+        records.append(entry)
+        return entry["raised"]
+
+    monkeypatch.setattr(orchestrator_engine, "_record_interrupted_dispatch", spy)
+    return records
+
+
+async def _revoke_after_effect(host):
+    """``talon_cancel`` cancels the job in SQLite, then execution authority
+    is revoked, as a Stop revokes it, before the call's row is written."""
+    runtime = ExecutionCustody(_LiveRuntimeFence())
+    await host.backend.execute("CREATE TABLE talon_jobs (job_id TEXT, state TEXT)")
+
+    async def cancel_effect(job_id):
+        await host.backend.execute(
+            "INSERT INTO talon_jobs (job_id, state) VALUES (?, 'cancelled')", (job_id,),
+        )
+        runtime.revoke("Stop arrived after talon_cancel took effect")
+
+    host.feature.cancel_effect = cancel_effect
+    return runtime
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("inline", [False, True], ids=["loop", "inline"])
+@pytest.mark.parametrize("door", ["chat", "named"])
+async def test_a_write_refused_once_authority_is_revoked_is_reported_not_recorded(
+    make_host, monkeypatch, caplog, capsys, door, inline,
+):
+    """The reviewer's case on real SQLite under native custody: the effect is
+    done, authority is revoked, and native storage refuses the interrupted
+    call's row. Nothing is marked recorded, one WARNING names each refused
+    row, and the original authority error propagates unchanged. No authority
+    to write after revocation is added: the fenced owner does not write."""
+    host = await make_host(inline=inline)
+    runtime = await _revoke_after_effect(host)
+    interrupted = _spy_interrupted_records(monkeypatch)
+
+    with bind_execution_custody_snapshot((runtime,)):
+        with pytest.raises(ExecutionAuthorityError) as raised:
+            await _dispatch(host, door, {"task": "claim, then cancel"})
+
+    # The effect is committed, and only the call before the revocation has a
+    # row: neither the cancel nor its envelope is recorded.
+    assert await host.backend.fetch_all("SELECT job_id, state FROM talon_jobs") == [
+        ("692b13dd", "cancelled"),
+    ]
+    [claim] = await host.rows()
+    assert claim["tool_name"] == "talon_claim"
+
+    # Both interrupted records ran, neither was reported written, and each
+    # raised the error it was given: the one the caller sees.
+    assert [entry["tool_name"] for entry in interrupted] == ["talon_cancel", DISPATCHER]
+    for entry in interrupted:
+        assert entry["raised"] is entry["error"]
+        assert entry["written"] == []
+    assert interrupted[0]["error"] is interrupted[1]["error"] is raised.value
+    assert type(raised.value) is ExecutionAuthorityError
+    assert "talon_cancel took effect" in str(raised.value)
+    # Unchanged: the refusal is not attached to it as its cause.
+    assert raised.value.__cause__ is None
+
+    # One WARNING for each refused row, naming it, its tool and its envelope.
+    envelope_id = claim["parent_dispatch_id"]
+    cancel_report, envelope_report = _unwritten_reports(caplog)
+    assert envelope_report == {
+        "dispatch_id": envelope_id, "tool_name": DISPATCHER,
+        "parent_dispatch_id": None, "cause": "ExecutionAuthorityError",
+    }
+    assert cancel_report["tool_name"] == "talon_cancel"
+    assert cancel_report["parent_dispatch_id"] == envelope_id
+    assert cancel_report["dispatch_id"] not in (envelope_id, claim["dispatch_id"])
+    assert cancel_report["cause"] == "ExecutionAuthorityError"
+    # Reported by the writer alone, not also by the ledger's own fallback.
+    assert "a2a_tool_dispatches" not in capsys.readouterr().err
+
+
+class _RevokeAtPost(Hook):
+    """Revokes execution authority during one tool's POST_TOOL_USE: the call
+    returned, its row is not yet written."""
+
+    def __init__(self, tool_name: str, runtime: ExecutionCustody):
+        super().__init__(name="revoke-at-post", events=[HookEvent.POST_TOOL_USE])
+        self.tool_name = tool_name
+        self.runtime = runtime
+
+    async def execute(self, input: HookInput) -> HookOutput:
+        if input.tool_name == self.tool_name:
+            self.runtime.revoke("Stop arrived during talon_cancel's POST_TOOL_USE")
+        return HookOutput.allow()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("door", ["chat", "named"])
+async def test_a_refused_row_is_not_attempted_again_as_interrupted(
+    make_host, monkeypatch, caplog, door,
+):
+    """The call's own row is refused, then the revocation ends the call. The
+    refused write settled the row: no second attempt, no second report."""
+    host = await make_host()
+    runtime = ExecutionCustody(_LiveRuntimeFence())
+    host.agent.hooks_manager.register(_RevokeAtPost("talon_cancel", runtime))
+    interrupted = _spy_interrupted_records(monkeypatch)
+
+    with bind_execution_custody_snapshot((runtime,)):
+        with pytest.raises(ExecutionAuthorityError) as raised:
+            await _dispatch(host, door, {"task": "claim, then cancel"})
+
+    [claim] = await host.rows()
+    assert host.feature.calls[-1] == ("talon_cancel", "692b13dd")
+    # Only the envelope is recorded as interrupted; the cancel's refused row
+    # was its one attempt.
+    assert [entry["tool_name"] for entry in interrupted] == [DISPATCHER]
+    assert interrupted[0]["raised"] is raised.value
+    reports = _unwritten_reports(caplog)
+    assert [report["tool_name"] for report in reports] == ["talon_cancel", DISPATCHER]
+    assert reports[0]["parent_dispatch_id"] == claim["parent_dispatch_id"]
+    assert reports[1]["dispatch_id"] == claim["parent_dispatch_id"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("required", [False, True], ids=["best-effort", "required"])
+async def test_a_failed_write_never_reports_its_row_written(make_host, monkeypatch, caplog,
+                                                           required):
+    """``on_written`` is the receipt for a row; only a written row gets one.
+    A best-effort row's failure leaves the caller's outcome as it was; a
+    required row's failure is raised, as before."""
+    host = await make_host()
+    failure = OSError("disk I/O error")
+
+    async def fail(entry, **kwargs):
+        raise failure
+
+    monkeypatch.setattr(host.agent.observability_store, "log_tool_dispatch", fail)
+    written, settled = [], []
+    write = orchestrator_engine._write_tool_dispatch(
+        host.agent, tool_name="talon_cancel", adapter="subagent:_TalonProbe.talon_cancel",
+        args=dict(CANCEL[1]), result={"cancelled": "692b13dd"}, session_id=SESSION,
+        dispatch_start=0.0, parent_dispatch_id="envelope-1",
+        on_written=lambda: written.append(True), on_settled=lambda: settled.append(True),
+        **({"required": True} if required else {}),
+    )
+    if required:
+        with pytest.raises(OSError) as raised:
+            await write
+        assert raised.value is failure
+    else:
+        assert await write is None
+    assert (written, settled) == ([], [True])
+    [report] = _unwritten_reports(caplog)
+    assert (report["tool_name"], report["parent_dispatch_id"], report["cause"]) == (
+        "talon_cancel", "envelope-1", "OSError",
+    )
+    assert re.fullmatch(r"[0-9a-f]{32}", report["dispatch_id"])
+
+    # A written row is.
+    monkeypatch.undo()
+    await orchestrator_engine._write_tool_dispatch(
+        host.agent, tool_name="talon_cancel", adapter="subagent:_TalonProbe.talon_cancel",
+        args=dict(CANCEL[1]), result={"cancelled": "692b13dd"}, session_id=SESSION,
+        dispatch_start=0.0, on_written=lambda: written.append(True),
+    )
+    assert written == [True]
+
+
+@pytest.mark.asyncio
+async def test_a_host_with_no_ledger_reports_no_row_written(make_host, caplog):
+    """No ledger, no row: nothing is marked recorded, and nothing refused it."""
+    host = await make_host()
+    host.agent.observability_store = None
+    written, settled = [], []
+    await orchestrator_engine._write_tool_dispatch(
+        host.agent, tool_name="talon_cancel", adapter="subagent:_TalonProbe.talon_cancel",
+        args=dict(CANCEL[1]), result={"cancelled": "692b13dd"}, session_id=SESSION,
+        dispatch_start=0.0,
+        on_written=lambda: written.append(True), on_settled=lambda: settled.append(True),
+    )
+    assert (written, settled) == ([], [True])
+    assert _unwritten_reports(caplog) == []
+
+
+class _DeferredTool:
+    """A subagent tool whose result is deferred: its row is the required one
+    its completion writes."""
+
+    name = "talon_view"
+    schema = SimpleNamespace(parameters=[])
+
+    def __init__(self):
+        self.published: list[str] = []
+
+    def _publish(self):
+        self.published.append("published")
+        return []
+
+    async def execute(self, **kwargs):
+        return DeferredToolResult(ToolResult.ok("job view").to_dict(), publish=self._publish)
+
+
+@pytest.mark.asyncio
+async def test_a_deferred_calls_failed_row_is_not_attempted_again(
+    make_host, monkeypatch, caplog,
+):
+    """The completion's required row fails: the call is reported once and
+    refused as unconfirmed, not recorded a second time as interrupted."""
+    host = await make_host()
+    tool = _DeferredTool()
+    store = host.agent.observability_store
+
+    async def fail(entry, **kwargs):
+        raise OSError("disk I/O error")
+
+    monkeypatch.setattr(store, "log_tool_dispatch", fail)
+    interrupted = _spy_interrupted_records(monkeypatch)
+    with pytest.raises(ToolAuditUnconfirmedError):
+        await host.feature._execute_subagent_tool(
+            tool_name=tool.name, args={}, tools_by_name={tool.name: tool},
+            session_id=SESSION, parent_dispatch_id="envelope-1",
+        )
+
+    assert interrupted == []
+    [report] = _unwritten_reports(caplog)
+    assert (report["tool_name"], report["parent_dispatch_id"]) == ("talon_view", "envelope-1")
+    # Its UI is withheld, not published, once the row could not be written.
+    assert tool.published == []
+
+
+class _DeferredEnvelope(Feature):
+    """A custom feature whose subagent dispatch itself returns a deferred
+    result: the envelope's row is the required one its completion writes."""
+
+    tool_name = "talon_view_feature"
+
+    def __init__(self, agent):
+        super().__init__(agent)
+        self.tool = _DeferredTool()
+
+    @property
+    def tool_description(self) -> str:
+        return "View a Talon job."
+
+    async def initialize(self) -> None:
+        return None
+
+    async def execute_as_subagent(self, **kwargs):
+        return await self.tool.execute()
+
+
+@pytest.mark.asyncio
+async def test_a_chat_envelopes_failed_deferred_row_is_not_attempted_again(
+    make_host, monkeypatch, caplog,
+):
+    host = await make_host()
+    feature = _DeferredEnvelope(host.agent)
+    store = host.agent.observability_store
+
+    async def fail(entry, **kwargs):
+        raise OSError("disk I/O error")
+
+    monkeypatch.setattr(store, "log_tool_dispatch", fail)
+    interrupted = _spy_interrupted_records(monkeypatch)
+    with pytest.raises(ToolAuditUnconfirmedError):
+        async with host.agent._turn_lifecycle():
+            await host.agent._dispatch_tool_call(
+                ToolCall(id="tc-1", name=feature.tool_name, arguments={"task": "view"}),
+                features_by_tool_name={feature.tool_name: feature},
+                known_tools={feature.tool_name},
+                messages=[],
+                iteration=0,
+                user_message="",
+                session_id=SESSION,
+            )
+
+    assert interrupted == []
+    assert [report["tool_name"] for report in _unwritten_reports(caplog)] == [
+        feature.tool_name,
+    ]
+    assert feature.tool.published == []
+
+
+class _DeferredTalonProbe(_TalonProbe):
+    """Runs its subagent's calls, then returns a deferred result: the
+    envelope's row is the required one its completion writes, and the calls
+    name that row as their parent."""
+
+    def __init__(self, agent):
+        super().__init__(agent)
+        self.published: list[str] = []
+
+    def _publish(self):
+        self.published.append("published")
+        return []
+
+    async def execute_as_subagent(self, **kwargs):
+        await super().execute_as_subagent(**kwargs)
+        return DeferredToolResult(
+            ToolResult.ok("claimed, then cancelled").to_dict(), publish=self._publish,
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("inline", [False, True], ids=["loop", "inline"])
+async def test_a_deferred_envelope_is_written_under_the_id_its_calls_name(make_host, inline):
+    """The reviewer's case: the completion wrote the envelope's row under a
+    fresh id, so ``talon_claim`` and ``talon_cancel`` named a parent no row
+    had, and the correctly named row was suppressed as already audited."""
+    host = await make_host(inline=inline)
+    feature = _DeferredTalonProbe(host.agent)
+
+    async with host.agent._turn_lifecycle():
+        result = await host.agent._dispatch_tool_call(
+            ToolCall(id="tc-1", name=DISPATCHER, arguments={"task": "claim, then cancel"}),
+            features_by_tool_name={DISPATCHER: feature},
+            known_tools={DISPATCHER},
+            messages=[],
+            iteration=0,
+            user_message="",
+            session_id=SESSION,
+        )
+
+    assert result["status"] == "ok", result
+    assert feature.published == ["published"]
+    rows = await host.rows()
+    envelope, inner = _envelope_and_inner(rows)
+    assert (envelope["adapter"], envelope["result_status"]) == (
+        "_DeferredTalonProbe.execute_as_subagent", "success",
+    )
+    assert [row["tool_name"] for row in inner] == ["talon_claim", "talon_cancel"]
+    for row in inner:
+        assert row["parent_dispatch_id"] == envelope["dispatch_id"]
+    assert len({row["dispatch_id"] for row in rows}) == len(rows) == 3
+
+
+@pytest.mark.asyncio
+async def test_a_direct_tools_deferred_row_is_written_under_its_dispatch(
+    make_host, monkeypatch,
+):
+    """Every positioned dispatch's row is written under its ``ledger_id``,
+    including the one a direct tool's deferred completion writes."""
+    host = await make_host()
+    tool = _DeferredTool()
+    host.agent._direct_tools[tool.name] = tool
+    contexts = []
+    begin = orchestrator_engine.begin_tool_call
+
+    def _begin(agent, known_tools):
+        context = begin(agent, known_tools)
+        contexts.append(context)
+        return context
+
+    monkeypatch.setattr(orchestrator_engine, "begin_tool_call", _begin)
+    async with host.agent._turn_lifecycle():
+        result = await host.agent._dispatch_tool_call(
+            ToolCall(id="tc-1", name=tool.name, arguments={}),
+            features_by_tool_name={},
+            known_tools={tool.name},
+            messages=[],
+            iteration=0,
+            user_message="",
+            session_id=SESSION,
+        )
+
+    assert result["status"] == "ok", result
+    assert tool.published == ["published"]
+    [context] = contexts
+    [row] = await host.rows()
+    assert (row["tool_name"], row["dispatch_id"]) == (tool.name, context.ledger_id)
+
+
+def _lose_commit_ack(monkeypatch, host, tool_name):
+    """The next COMMIT of ``tool_name``'s row lands, then its acknowledgement
+    is lost: native SQLite cannot say whether the row was written."""
+    store = host.agent.observability_store
+    write = store.log_tool_dispatch
+    connection = host.backend._connection
+    commit = connection.commit
+    armed = []
+
+    async def _write(entry, **kwargs):
+        if entry.tool_name == tool_name and not armed:
+            armed.append(entry)
+        await write(entry, **kwargs)
+
+    async def _commit():
+        await commit()
+        if armed and armed[-1] is not None:
+            armed.append(None)
+            raise OSError("native COMMIT acknowledgement lost")
+
+    monkeypatch.setattr(store, "log_tool_dispatch", _write)
+    monkeypatch.setattr(connection, "commit", _commit)
+
+
+_UNCONFIRMED = re.compile(
+    r"a2a_tool_dispatches row write outcome (\w+): dispatch_id=(\S+) tool=(\S+) "
+)
+
+
+def _unconfirmed_reports(caplog) -> list[tuple[str, str]]:
+    """``(tool, commit outcome)`` of every WARNING that a row's write may
+    have landed."""
+    reports = []
+    for record in caplog.records:
+        match = _UNCONFIRMED.search(record.getMessage())
+        if match is not None:
+            assert record.levelname == "WARNING"
+            outcome, _dispatch_id, tool_name = match.groups()
+            reports.append((tool_name, outcome))
+    return reports
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("inline", [False, True], ids=["loop", "inline"])
+@pytest.mark.parametrize("door", ["chat", "named"])
+async def test_an_interrupted_rows_lost_commit_ack_reaches_the_caller(
+    make_host, monkeypatch, caplog, door, inline,
+):
+    """The reviewer's case on real SQLite under native custody: the job is
+    cancelled, then the turn is, and the interrupted call's row COMMITs and
+    loses its acknowledgement. The caller receives that commit uncertainty,
+    with the cancellation retained in it, not a plain ``CancelledError``."""
+    host = await make_host(inline=inline)
+    host.feature.hold_cancel = True
+    runtime = ExecutionCustody(_LiveRuntimeFence())
+    _lose_commit_ack(monkeypatch, host, "talon_cancel")
+    interrupted = _spy_interrupted_records(monkeypatch)
+
+    with bind_execution_custody_snapshot((runtime,)):
+        dispatch = asyncio.create_task(_dispatch(host, door, {"task": "claim, then cancel"}))
+    await asyncio.wait_for(host.feature.cancel_entered.wait(), 5)
+    dispatch.cancel()
+    with pytest.raises(ExecutionCommitOutcomeError) as raised:
+        await dispatch
+
+    assert is_execution_control_error(raised.value)
+    assert execution_commit_outcome(raised.value) == "unknown"
+    cancel_record, envelope_record = interrupted
+    assert cancel_record["tool_name"] == "talon_cancel"
+    assert type(cancel_record["error"]) is asyncio.CancelledError
+    # The cancellation is retained in what the caller receives.
+    assert any(
+        carrier is cancel_record["error"]
+        for carrier in execution_evidence_carriers(raised.value)
+    )
+    assert envelope_record["tool_name"] == DISPATCHER
+    assert envelope_record["raised"] is raised.value
+    # Neither row is taken for written: the cancel's may have landed, and the
+    # envelope's was refused by the custody that latched that uncertainty.
+    assert cancel_record["written"] == envelope_record["written"] == []
+    assert _unconfirmed_reports(caplog) == [
+        ("talon_cancel", "unknown"), (DISPATCHER, "unknown"),
+    ]
+    rows = await host.rows()
+    assert [(row["tool_name"], row["error_class"]) for row in rows] == [
+        ("talon_claim", None), ("talon_cancel", "CancelledError"),
+    ]
+
+
+class _UnretiredWrite(OSError):
+    """A write failure that left a native resource it could not release."""
+
+
+def _unretired_write_error():
+    error = _UnretiredWrite("native connection reset failed")
+    owner = asyncio.get_running_loop().create_future()
+    owner.set_exception(OSError("reset failed"))
+    owner.exception()
+    error._kestrel_native_retirement_debts = ((object(), owner),)
+    return error
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("required", [False, True], ids=["best-effort", "required"])
+@pytest.mark.parametrize("evidence", ["commit-unknown", "unretired"])
+async def test_a_writes_commit_or_retirement_evidence_is_never_dropped(
+    make_host, monkeypatch, caplog, required, evidence,
+):
+    """A refused or failed best-effort row leaves its caller's outcome alone
+    (``test_a_failed_write_never_reports_its_row_written``). A write that may
+    have committed, or that left a resource unretired, does not: its error
+    is raised even for a best-effort row, and its row is not taken for
+    written."""
+    host = await make_host()
+    if evidence == "commit-unknown":
+        _lose_commit_ack(monkeypatch, host, "talon_cancel")
+    else:
+        failure = _unretired_write_error()
+
+        async def fail(entry, **kwargs):
+            raise failure
+
+        monkeypatch.setattr(host.agent.observability_store, "log_tool_dispatch", fail)
+    written, settled = [], []
+
+    with pytest.raises(Exception) as raised:
+        await orchestrator_engine._write_tool_dispatch(
+            host.agent, tool_name="talon_cancel",
+            adapter="subagent:_TalonProbe.talon_cancel", args=dict(CANCEL[1]),
+            result={"cancelled": "692b13dd"}, session_id=SESSION, dispatch_start=0.0,
+            parent_dispatch_id="envelope-1",
+            on_written=lambda: written.append(True),
+            on_settled=lambda: settled.append(True),
+            **({"required": True} if required else {}),
+        )
+
+    assert (written, settled) == ([], [True])
+    if evidence == "commit-unknown":
+        assert type(raised.value) is ExecutionCommitOutcomeError
+        assert execution_commit_outcome(raised.value) == "unknown"
+        assert _unconfirmed_reports(caplog) == [("talon_cancel", "unknown")]
+        # It did land: native SQLite could not say so.
+        [row] = await host.rows()
+        assert row["tool_name"] == "talon_cancel"
+    else:
+        assert raised.value is failure
+        assert execution_cleanup_debts(raised.value)
+        [report] = _unwritten_reports(caplog)
+        assert (report["tool_name"], report["cause"]) == ("talon_cancel", "_UnretiredWrite")
+
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("inline", [False, True], ids=["loop", "inline"])

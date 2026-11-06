@@ -407,7 +407,7 @@ async def _complete_feature_deferred_result(
     adapter: str,
     destination: Any,
     parent_dispatch_id: Optional[str] = None,
-    on_audited: Optional[Callable[[str], None]] = None,
+    on_settled: Optional[Callable[[], None]] = None,
 ) -> Dict[str, Any]:
     """Complete a feature route's deferred result at the main boundary.
 
@@ -416,7 +416,8 @@ async def _complete_feature_deferred_result(
     the required dispatch row, then ``finalize`` at ``destination``, all in
     ``_complete_post_tool_result``. Only the public result is returned. A host
     without that completion withholds the UI, and the tool is not replayed.
-    ``on_audited`` runs once the dispatch row is written.
+    ``on_settled`` runs once the dispatch row's write ended, whether or not
+    it wrote the row.
     """
     from kestrel_sdk.hooks.base import HookEvent, HookInput
     from kestrel_sdk.resources import ResourceUnsupported
@@ -441,7 +442,7 @@ async def _complete_feature_deferred_result(
     completed = await _complete_post_tool_result(
         host, result, post_input, adapter=adapter,
         dispatch_start=exec_start, destination=destination,
-        parent_dispatch_id=parent_dispatch_id, on_audited=on_audited,
+        parent_dispatch_id=parent_dispatch_id, on_settled=on_settled,
     )
     return dict(completed)
 
@@ -2084,7 +2085,9 @@ class Feature(_SdkFeature):
         hooks, and as an owned operation: a cancellation arriving meanwhile
         waits for it. A cancellation or Stop that ends the call after the tool
         started and before its row writes an interrupted row instead, then is
-        raised as it arrived.
+        raised as it arrived. A write the ledger refuses (as native storage
+        does once execution authority is revoked) is reported once and is
+        never taken for a row; the call is not attempted a second time.
 
         ``return_with_effective_args`` controls the return shape:
 
@@ -2116,11 +2119,13 @@ class Feature(_SdkFeature):
 
         dispatch_start = time.time()
         dispatch_adapter = f"subagent:{type(self).__name__}.{tool_name}"
-        row_written = False
+        # Whether the row's write ended, written or refused: it is attempted
+        # once, so a refusal is reported once.
+        row_settled = False
 
-        def _row_written(_status: Any = None) -> None:
-            nonlocal row_written
-            row_written = True
+        def _row_settled() -> None:
+            nonlocal row_settled
+            row_settled = True
 
         async def _recorded(
             effective_args_value: Dict[str, Any],
@@ -2140,7 +2145,7 @@ class Feature(_SdkFeature):
                 session_id=session_id, dispatch_start=dispatch_start,
                 status_hint=status, error_class=error_class,
                 error_message=error_message,
-                parent_dispatch_id=parent_dispatch_id, on_written=_row_written,
+                parent_dispatch_id=parent_dispatch_id, on_settled=_row_settled,
             )
             return _shape(effective_args_value, result_value)
 
@@ -2372,7 +2377,7 @@ class Feature(_SdkFeature):
                             adapter=dispatch_adapter,
                             destination=parent_collector,
                             parent_dispatch_id=parent_dispatch_id,
-                            on_audited=_row_written,
+                            on_settled=_row_settled,
                         )
                         require_execution_work(self.agent)
                         return _shape(effective_args, completed)
@@ -2397,7 +2402,7 @@ class Feature(_SdkFeature):
                     )
                 recorded = await _recorded(effective_args, serialized, **raised_fields)
             except BaseException as error:
-                if row_written:
+                if row_settled:
                     raise
                 # A deferred result is not serialized into the row: only its
                 # completion may consume it.
