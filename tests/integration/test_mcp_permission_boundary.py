@@ -371,6 +371,7 @@ async def test_same_instance_disable_enable_restores_the_governed_connection(mcp
     assert result["status"] == "ok"
 
 
+@pytest.mark.docker_mcp
 @pytest.mark.parametrize("mcp_boundary", ["container"], indirect=True)
 async def test_disable_cannot_release_custody_ahead_of_an_admitted_docker_acquisition(mcp_boundary, monkeypatch):
     from kestrel_feature_mcp.manager import MCPToolManager
