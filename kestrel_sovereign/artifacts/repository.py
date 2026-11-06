@@ -21,7 +21,6 @@ from datetime import UTC, datetime, timedelta
 import hashlib
 import hmac
 import json
-import secrets
 from typing import Callable
 from uuid import uuid4
 
@@ -35,6 +34,7 @@ from kestrel_sdk.security.aead import AEADCipher
 from kestrel_sdk.security.exceptions import DecryptionError
 from kestrel_sdk.storage.database.interface import TransactionError
 from kestrel_sovereign.storage.async_database import AsyncDatabase
+from kestrel_sovereign.security.envelope_keys import resolve_envelope_key
 from kestrel_sovereign.execution_custody import execution_commit_outcome
 
 
@@ -154,22 +154,20 @@ class ArtifactRepository:
                 sql = statement.replace(" BLOB", " BYTEA") if self.db.backend_type == "postgres" else statement
                 await self.db.execute(sql)
             row = await self.db.fetchone("SELECT wrapped_key FROM artifact_keys WHERE key_id = ?", ("v1",))
-            if row is None:
-                if await self.db.fetchone("SELECT 1 FROM artifact_owners LIMIT 1"):
-                    raise ArtifactIntegrityError("artifact envelope key is missing; restore the original key")
-                index_key = secrets.token_bytes(32)
+            index_key, new_envelope = resolve_envelope_key(
+                wrapping_cipher, bytes(row[0]) if row is not None else None,
+                has_dependents=bool(await self.db.fetchone("SELECT 1 FROM artifact_owners LIMIT 1")) if row is None else False,
+                integrity_error=ArtifactIntegrityError,
+                missing_message="artifact envelope key is missing; restore the original key",
+                unavailable_message=(
+                    "artifact envelope cannot be opened; restore its original KESTREL_DATA_KEY "
+                    "or complete offline key rotation"
+                ),
+                invalid_message="invalid artifact envelope key",
+            )
+            if new_envelope is not None:
                 await self.db.execute("INSERT INTO artifact_keys (key_id, wrapped_key) VALUES (?, ?)",
-                                      ("v1", wrapping_cipher.encrypt(index_key)))
-            else:
-                try:
-                    index_key = wrapping_cipher.decrypt(bytes(row[0]))
-                except DecryptionError:
-                    raise ArtifactIntegrityError(
-                        "artifact envelope cannot be opened; restore its original KESTREL_DATA_KEY "
-                        "or complete offline key rotation"
-                    ) from None
-            if len(index_key) != 32:
-                raise ArtifactIntegrityError("invalid artifact envelope key")
+                                      ("v1", new_envelope))
         for name, table, columns in (
             ("idx_artifact_refs_blob", "artifact_blob_refs", "owner, blob_key"),
             ("idx_artifact_staging_expiry", "artifact_staging", "expires_at, owner"),

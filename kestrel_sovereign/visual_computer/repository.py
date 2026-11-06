@@ -12,7 +12,6 @@ import base64
 import hashlib
 import hmac
 import json
-import secrets
 from datetime import datetime
 from contextlib import asynccontextmanager
 from typing import Literal
@@ -29,6 +28,7 @@ from kestrel_sdk.security.exceptions import DecryptionError
 from kestrel_sdk.storage.database.interface import TransactionError
 
 from kestrel_sovereign.execution_custody import ExecutionAuthorityError, execution_commit_outcome
+from kestrel_sovereign.security.envelope_keys import resolve_envelope_key
 from .step import PlanningRecord, StepIntent
 from .runpod_quote_storage import _RunpodEnvironmentEnvelope
 
@@ -138,16 +138,16 @@ class VisualCustodyRepository:
                     ):
                         await self.db.execute(sql)
                     row = await self.db.fetchone("SELECT wrapped_key FROM visual_computer_keys WHERE key_id = ?", ("v1",))
-                    if row is None:
-                        if await self.db.fetchone("SELECT 1 FROM visual_computer_requests LIMIT 1"):
-                            raise CustodyIntegrityError("original visual custody key is missing")
-                        key = secrets.token_bytes(32)
-                        await self.db.execute("INSERT INTO visual_computer_keys (key_id, wrapped_key) VALUES (?, ?)", ("v1", cipher.encrypt(key)))
-                    else:
-                        try:
-                            key = cipher.decrypt(bytes(row[0]))
-                        except DecryptionError:
-                            raise CustodyIntegrityError("original visual custody key is unavailable") from None
+                    key, new_envelope = resolve_envelope_key(
+                        cipher, bytes(row[0]) if row is not None else None,
+                        has_dependents=bool(await self.db.fetchone("SELECT 1 FROM visual_computer_requests LIMIT 1")) if row is None else False,
+                        integrity_error=CustodyIntegrityError,
+                        missing_message="original visual custody key is missing",
+                        unavailable_message="original visual custody key is unavailable",
+                        invalid_message="invalid visual custody envelope key",
+                    )
+                    if new_envelope is not None:
+                        await self.db.execute("INSERT INTO visual_computer_keys (key_id, wrapped_key) VALUES (?, ?)", ("v1", new_envelope))
                     # These indexed flags are projections of authenticated
                     # payloads, never an independent authority/ownership store.
                     for table, column in (("visual_computer_requests", "released"),
