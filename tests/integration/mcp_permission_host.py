@@ -140,13 +140,19 @@ async def serve(descriptor, ready):
                         close_budget,
                         agent_module._minimum_storage_potential_preclose_timeout(agent.storage))
                     prefix, reserved = agent_module._resolve_shutdown_budget(tail)
+                    journal = getattr(agent, 'tool_effect_store', None)
+                    assert journal is not None, 'Owned host did not initialize its tool effect journal'
+                    assert journal.initialized, 'Owned host published readiness before journal initialization'
+                    assert journal.database is agent._raw_storage.db
                     temporary = ready.with_suffix('.starting')
                     temporary.write_text(json.dumps(dict(port=port, pid=os.getpid(),
                         did=agent.did, server_source=server.__file__,
                         sqlite_close_timeout_s=close_budget,
                         shutdown_prefix_floor_s=prefix_floor,
                         shutdown_prefix_s=prefix, shutdown_tail_s=reserved,
-                        agent_shutdown_timeout_s=agent_module.KESTREL_AGENT_SHUTDOWN_TIMEOUT_S)))
+                        agent_shutdown_timeout_s=agent_module.KESTREL_AGENT_SHUTDOWN_TIMEOUT_S,
+                        journal_initialized=journal.initialized,
+                        agent_database=str(agent.storage_path))))
                     temporary.replace(ready)
                     await serving
                 finally:

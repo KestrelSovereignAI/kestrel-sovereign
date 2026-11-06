@@ -1872,6 +1872,7 @@ class KestrelAgent(
         # (``features/isolated_runtime.py``), which never receives this object.
         self._raw_storage = None
         self.storage = None
+        self.tool_effect_store = None
         # Set only from the durable spawned_by edge during initialize().
         # AgentManager consumes this private projection when rebuilding its
         # runtime authority indexes; it must never trust an arbitrary in-memory
@@ -3273,9 +3274,21 @@ class KestrelAgent(
         # Native admission and context ownership share the primary connection.
         # AsyncStorage owns this backend; every A2A store borrows it so partial
         # boot rollback cannot retire storage still held by other services.
+        scope = NativeRecipientScope(self.did)
+        privacy = self.privacy_config
+        if privacy is None:
+            raise RuntimeError("Tool effect journal boot requires initialized privacy policy")
+        if privacy.allows_persistent_storage():
+            from kestrel_sovereign.tool_effect_store import ToolEffectStore
+
+            journal = ToolEffectStore(self._raw_storage.db, scope=scope)
+            # Initialization failures are fatal. Replacing or ignoring the
+            # original envelope would erase the evidence preventing replay.
+            await journal.initialize()
+            self.tool_effect_store = journal
         self.task_manager = TaskManager.from_backend(
             self._raw_storage._backend,
-            scope=NativeRecipientScope(self.did),
+            scope=scope,
             owns_backend=False,
             hooks_manager=self.hooks_manager,  # Pass hooks manager for security
             on_task_complete=self._on_background_task_complete,  # For notifications
@@ -4911,10 +4924,19 @@ class KestrelAgent(
             outcome = reported_outcome(await raw.close())
             if outcome is not ReleaseOutcome.RELEASED:
                 return outcome
+        await self._retire_tool_effect_store()
         self._raw_storage = None
         self.storage = None
         self.privacy_agent = None
         return ReleaseOutcome.RELEASED
+
+    async def _retire_tool_effect_store(self) -> None:
+        """Drop the borrower only after the primary storage owner retires."""
+        journal = getattr(self, "tool_effect_store", None)
+        if journal is not None:
+            await journal.close()
+            if self.tool_effect_store is journal:
+                self.tool_effect_store = None
 
     async def _boot_teardown_background_tasks(self) -> ReleaseOutcome:
         """Cancel agent-owned background work and reap it, within one bound."""
@@ -9769,6 +9791,8 @@ Expected Duration: {expected_duration}
             closed = ReleaseOutcome.RELEASED
             if storage is not None and hasattr(storage, "close"):
                 closed = reported_outcome(await storage.close())
+            if closed is ReleaseOutcome.RELEASED:
+                await self._retire_tool_effect_store()
             return closed if precloses is ReleaseOutcome.RELEASED else precloses
 
         if dispatcher is not None and hasattr(dispatcher, "shutdown_durable_delivery"):
@@ -11443,6 +11467,8 @@ Expected Duration: {expected_duration}
 
             async def close_storage() -> ReleaseOutcome:
                 closed = reported_outcome(await storage.close())
+                if closed is ReleaseOutcome.RELEASED:
+                    await self._retire_tool_effect_store()
                 if storage_preclose_status in {"error", "abandoned", "cancelled"}:
                     # The cached SQLAlchemy engine may still hold the store.
                     return ReleaseOutcome.RETAINED

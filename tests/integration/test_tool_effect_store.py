@@ -164,7 +164,9 @@ async def test_independent_connections_serialize_supersession_against_claim(jour
 @pytest.mark.asyncio
 async def test_borrowed_store_close_leaves_primary_database_usable(journal):
     store, _, _ = journal
+    assert store.initialized is True
     await store.close()
+    assert store.initialized is False
     assert await store.database.fetchone("SELECT 1") == (1,)
 
 

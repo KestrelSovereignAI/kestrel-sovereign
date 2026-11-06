@@ -81,6 +81,16 @@ class ToolEffectStore(UnifiedStoreBase):
         self._root: bytes | None = None
         self._initialization_lock = asyncio.Lock()
 
+    @property
+    def initialized(self) -> bool:
+        """Whether the original envelope has been durably acknowledged."""
+        return self._root is not None
+
+    async def close(self) -> None:
+        """Retire the borrowed handle without closing the primary database."""
+        await super().close()
+        self._root = None
+
     def _require_outermost(self) -> None:
         if self.database.owns_open_transaction is not False:
             raise ResourceConflict("tool effect journal requires its own durable transaction")
