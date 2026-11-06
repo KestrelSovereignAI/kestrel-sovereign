@@ -1,9 +1,11 @@
-"""Refuse one real owned-task observation allocation at its original owner."""
+"""Observe original task joins and refuse real observation allocations."""
 
 import asyncio
 import inspect
 import sys
+from functools import wraps
 
+from kestrel_sovereign import _async_ownership as ownership
 from kestrel_sovereign._async_ownership import await_owned_task
 
 
@@ -35,13 +37,38 @@ def refuse_owned_observation_allocation(monkeypatch, owner, *, allocation, error
     return refused
 
 
-def observe_bounded_asyncio_wait(monkeypatch, before_wait):
-    """Observe bounded resource joins while preserving the full wait API."""
+def observe_bounded_asyncio_wait(
+    monkeypatch, before_wait=None, *, on_enter=None, on_withdrawal=None,
+):
+    """Align bounded waits and observe native caller withdrawals unchanged."""
     original = asyncio.wait
 
     async def wait(owners, *, timeout=None, return_when=asyncio.ALL_COMPLETED):
-        if timeout is not None:
-            await before_wait(owners, timeout)
-        return await original(owners, timeout=timeout, return_when=return_when)
+        if on_enter is not None:
+            on_enter(owners)
+        try:
+            if timeout is not None and before_wait is not None:
+                await before_wait(owners, timeout)
+            return await original(owners, timeout=timeout, return_when=return_when)
+        except asyncio.CancelledError as error:
+            if on_withdrawal is not None:
+                on_withdrawal(owners, error)
+            raise
 
     monkeypatch.setattr(asyncio, 'wait', wait)
+
+
+def observe_owned_task(monkeypatch, *, on_enter=None, on_outcome=None):
+    """Observe the original join API, independently of its private waiter."""
+    original = ownership.await_owned_task
+
+    @wraps(original)
+    async def join(task, *args, **kwargs):
+        if on_enter is not None:
+            on_enter(task)
+        outcome = await original(task, *args, **kwargs)
+        if on_outcome is not None:
+            on_outcome(task, outcome)
+        return outcome
+
+    monkeypatch.setattr(ownership, 'await_owned_task', join)
