@@ -20,18 +20,17 @@ async def test_sqlite_keeps_actual_close_wait_and_worker_wait_withdrawals(native
     worker = getattr(connection, "_thread", connection)
     close_entered, close_release = asyncio.Event(), asyncio.Event()
     worker_entered, worker_release = asyncio.Event(), asyncio.Event()
-    actual_close, actual_wait, actual_worker_wait = connection.close, asyncio.wait, sqlite_module._wait_for_aiosqlite_worker_shutdown
+    actual_close, actual_worker_wait = connection.close, sqlite_module._wait_for_aiosqlite_worker_shutdown
     withdrawals, worker_observations = [], []
+    owner = None
+    from tests.shared.owned_task_observation import observe_bounded_asyncio_wait
     async def held_close():
         await actual_close()
         close_entered.set()
         await close_release.wait()
-    async def wait(*args, **kwargs):
-        try:
-            return await actual_wait(*args, **kwargs)
-        except asyncio.CancelledError as error:
+    def withdrew_wait(_tasks, error):
+        if asyncio.current_task() is owner:
             withdrawals.append(error)
-            raise
     async def worker_wait(*args, **kwargs):
         result = await actual_worker_wait(*args, **kwargs)
         worker_observations.append(not worker.is_alive())
@@ -44,7 +43,7 @@ async def test_sqlite_keeps_actual_close_wait_and_worker_wait_withdrawals(native
                 raise
         return result
     monkeypatch.setattr(connection, "close", held_close)
-    monkeypatch.setattr(asyncio, "wait", wait)
+    observe_bounded_asyncio_wait(monkeypatch, on_withdrawal=withdrew_wait)
     monkeypatch.setattr(sqlite_module, "_wait_for_aiosqlite_worker_shutdown", worker_wait)
     backend._cancelled_write_drain_error = source.error
     owner = create_owned_task(backend.close(), retain_originals=True)

@@ -1,8 +1,8 @@
 """Owned Docker and native HTTPS peers for the same host security campaign."""
 
 import asyncio
-from contextlib import AsyncExitStack, asynccontextmanager
-from dataclasses import dataclass
+from contextlib import AsyncExitStack, asynccontextmanager, contextmanager
+from dataclasses import dataclass, field
 import json
 import os
 from pathlib import Path
@@ -21,6 +21,8 @@ class MCPTestPeer:
     witness_file: Path | None = None
     provider_url: str | None = None
     provider_witness: Path | None = None
+    tls_certificate: Path | None = None
+    local_ports: set[int] = field(default_factory=set)
 
     def provider_requests(self):
         if self.provider_witness is None:
@@ -41,6 +43,80 @@ class MCPTestPeer:
         if self.kind == "remote":
             return feature._remote_connections[name].connection
         return feature.manager.owned_containers[name]["connection"]
+
+
+@contextmanager
+def owned_provider_network(monkeypatch, peer):
+    """Permit only the exact owned TLS listener for provider and MCP traffic."""
+    import socket
+    from urllib.parse import urlsplit
+
+    endpoint = urlsplit(peer.provider_url or peer.selector)
+    with monkeypatch.context() as network:
+        network.setenv("NO_PROXY", endpoint.hostname)
+        original_connect = socket.socket.connect
+        original_connect_ex = socket.socket.connect_ex
+        dials = []
+
+        def require_owned(address):
+            assert isinstance(address, tuple) and address[0] == "127.0.0.1" and address[1] in {endpoint.port, *peer.local_ports}
+            dials.append(address)
+
+        def connect(sock, address):
+            require_owned(address)
+            return original_connect(sock, address)
+
+        def connect_ex(sock, address):
+            require_owned(address)
+            return original_connect_ex(sock, address)
+
+        network.setattr(socket.socket, "connect", connect)
+        network.setattr(socket.socket, "connect_ex", connect_ex)
+        yield dials
+
+
+
+@contextmanager
+def owned_https_network(monkeypatch, peer):
+    """Pin public-looking fixture DNS to one real, certificate-verified listener."""
+    from urllib.parse import urlsplit
+    import docker
+    import httpcore2
+
+    endpoint = urlsplit(peer.selector)
+    assert endpoint.scheme == "https" and endpoint.hostname and endpoint.port
+    assert peer.tls_certificate is not None
+    hostname, owned_port = endpoint.hostname, endpoint.port
+    original = httpcore2.AnyIOBackend.connect_tcp
+
+    def resolve(host, requested_port, *, type, proto):
+        if host == "127.0.0.1" and requested_port in peer.local_ports:
+            address = "127.0.0.1"
+        else:
+            assert host == hostname and requested_port == owned_port
+            address = "8.8.8.8"
+        return [(socket.AF_INET, type, proto, "", (address, requested_port))]
+
+    async def dial(backend, host, port, **kwargs):
+        if host == "127.0.0.1" and port in peer.local_ports:
+            return await original(backend, host, port, **kwargs)
+        allowed_hosts = {"8.8.8.8", hostname} if peer.provider_url else {"8.8.8.8"}
+        assert host in allowed_hosts and port == owned_port
+        return await original(backend, "127.0.0.1", port, **kwargs)
+
+    def refuse_docker(*args, **kwargs):
+        raise AssertionError("Remote MCP path attempted to acquire Docker")
+
+    with monkeypatch.context() as network:
+        network.setattr(socket, "getaddrinfo", resolve)
+        network.setattr(httpcore2.AnyIOBackend, "connect_tcp", dial)
+        network.setattr(docker, "from_env", refuse_docker)
+        network.setenv("SSL_CERT_FILE", str(peer.tls_certificate))
+        network.delenv("SSL_CERT_DIR", raising=False)
+        network.setenv("HTTPS_PROXY", "http://127.0.0.1:1")
+        network.setenv("ALL_PROXY", "http://127.0.0.1:1")
+        network.setenv("NO_PROXY", "")
+        yield
 
 
 @asynccontextmanager
@@ -64,9 +140,6 @@ async def docker_peer(tmp_path):
 
 @asynccontextmanager
 async def https_peer(tmp_path, monkeypatch, *, provider_model: str | None = None, provider_fault: str | None = None):
-    import httpcore2
-    import docker
-
     hostname = "remote-permission.example"
     _, client_context, certificate = make_tls_contexts(tmp_path, hostname, ip_addresses=())
     ready, witness = tmp_path / "peer-ready.json", tmp_path / "remote-witness"
@@ -99,33 +172,12 @@ async def https_peer(tmp_path, monkeypatch, *, provider_model: str | None = None
                             return port
                     await asyncio.sleep(0.01)
             port = await asyncio.wait_for(await_ready(), 10)
-            owned_port = port
-            original = httpcore2.AnyIOBackend.connect_tcp
-
-            def resolve(host, requested_port, *, type, proto):
-                assert host == hostname and requested_port == port
-                return [(socket.AF_INET, type, proto, "", ("8.8.8.8", port))]
-
-            async def dial(backend, host, port, **kwargs):
-                allowed_hosts = {"8.8.8.8", hostname} if provider_model else {"8.8.8.8"}
-                assert host in allowed_hosts and port == owned_port
-                return await original(backend, "127.0.0.1", port, **kwargs)
-
-            def refuse_docker(*args, **kwargs):
-                raise AssertionError("Remote MCP path attempted to acquire Docker")
-
-            with monkeypatch.context() as network:
-                network.setattr(socket, "getaddrinfo", resolve)
-                network.setattr(httpcore2.AnyIOBackend, "connect_tcp", dial)
-                network.setattr(docker, "from_env", refuse_docker)
-                network.setenv("SSL_CERT_FILE", str(certificate))
-                network.delenv("SSL_CERT_DIR", raising=False)
-                network.setenv("HTTPS_PROXY", "http://127.0.0.1:1")
-                network.setenv("ALL_PROXY", "http://127.0.0.1:1")
-                network.setenv("NO_PROXY", "")
-                yield MCPTestPeer("remote", f"https://{hostname}:{port}/mcp", witness,
-                                  f"https://{hostname}:{port}/v1" if provider_model else None,
-                                  witness.with_suffix(".provider.jsonl") if provider_model else None)
+            peer = MCPTestPeer("remote", f"https://{hostname}:{port}/mcp", witness,
+                f"https://{hostname}:{port}/v1" if provider_model else None,
+                witness.with_suffix(".provider.jsonl") if provider_model else None,
+                tls_certificate=certificate)
+            with owned_https_network(monkeypatch, peer):
+                yield peer
         finally:
             if process.returncode is None:
                 process.terminate()

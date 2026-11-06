@@ -5,7 +5,7 @@ OAuth. The dedicated MCP CI job installs the optional feature explicitly.
 """
 
 import asyncio
-from contextlib import AsyncExitStack, contextmanager
+from contextlib import AsyncExitStack
 from dataclasses import dataclass
 from pathlib import Path
 import uuid
@@ -13,7 +13,9 @@ import uuid
 import pytest
 import pytest_asyncio
 
-from tests.integration.mcp_permission_peers import MCPTestPeer, docker_peer, https_peer
+from tests.integration.mcp_permission_peers import (
+    MCPTestPeer, docker_peer, https_peer, owned_provider_network,
+)
 from kestrel_sovereign.a2a.stores.unified.feature_enablement_store import FeatureEnablementStore
 from kestrel_sovereign.storage.db.sqlite import SQLiteBackend
 
@@ -25,36 +27,6 @@ from kestrel_sovereign.kestrel_agent import KestrelAgent
 
 
 pytestmark = [pytest.mark.mcp_integration, pytest.mark.timeout(120)]
-
-
-@contextmanager
-def owned_provider_network(monkeypatch, peer):
-    """Permit only the exact owned TLS listener for provider and MCP traffic."""
-    import socket
-    from urllib.parse import urlsplit
-
-    endpoint = urlsplit(peer.provider_url)
-    with monkeypatch.context() as network:
-        network.setenv("NO_PROXY", endpoint.hostname)
-        original_connect = socket.socket.connect
-        original_connect_ex = socket.socket.connect_ex
-        dials = []
-
-        def require_owned(address):
-            assert isinstance(address, tuple) and address[:2] == ("127.0.0.1", endpoint.port)
-            dials.append(address)
-
-        def connect(sock, address):
-            require_owned(address)
-            return original_connect(sock, address)
-
-        def connect_ex(sock, address):
-            require_owned(address)
-            return original_connect_ex(sock, address)
-
-        network.setattr(socket.socket, "connect", connect)
-        network.setattr(socket.socket, "connect_ex", connect_ex)
-        yield dials
 
 
 async def test_owned_native_provider_wire_has_no_remote_tool_effect(tmp_path, monkeypatch):
@@ -141,7 +113,12 @@ async def test_full_boot_http_invoke_governs_external_mcp_effect(tmp_path, monke
             llm_service=service, allowed_features={"MCPAgent", "BootstrapFeature"}, sync_enabled=False)
 
         async def shutdown():
-            await asyncio.wait_for(agent.shutdown(), 30)
+            from tests.shared.native_shutdown_budget import shutdown_fixture_agent
+
+            async with asyncio.timeout(30):
+                await shutdown_fixture_agent(agent)
+                await agent.wait_for_shutdown_completion()
+                assert not service.has_pending_close_owners()
 
         cleanup.push_async_callback(shutdown)
         await asyncio.wait_for(agent.initialize(), 30)
@@ -399,6 +376,7 @@ async def test_same_instance_disable_enable_restores_the_governed_connection(mcp
     assert result["status"] == "ok"
 
 
+@pytest.mark.docker_mcp
 @pytest.mark.parametrize("mcp_boundary", ["container"], indirect=True)
 async def test_disable_cannot_release_custody_ahead_of_an_admitted_docker_acquisition(mcp_boundary, monkeypatch):
     from kestrel_feature_mcp.manager import MCPToolManager

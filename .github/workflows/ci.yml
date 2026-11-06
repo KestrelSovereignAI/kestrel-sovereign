@@ -435,6 +435,11 @@ jobs:
 
   mcp-permission-seam:
     runs-on: ubuntu-latest
+    env:
+      # Match the measured shared-runner WAL checkpoint allowance used by
+      # the other native integration lanes. The process fixture carries this
+      # explicit setting into its child and composes the enclosing guards.
+      KESTREL_AIOSQLITE_WORKER_SHUTDOWN_TIMEOUT_S: "5.0"
     permissions:
       contents: read
     needs: lint-and-imports
@@ -462,11 +467,17 @@ jobs:
         # 146.82s/151s cold and 132.82s/135s restored (pytest/process wall time).
         # These are at least nineteen complete local runs; the slowest
         # process wall time rounds up to 2.6 minutes.
+        # Those measurements cover the historical fifteen-case baseline.
+        # This expanded lane collects 47 cases, including the real host-process
+        # restart campaign. Its 41 non-Docker cases pass locally; six Docker
+        # cases require this CI job. The complete expanded lane's duration must
+        # be established on the current PR tree, not inferred from the baseline.
         # The ratio is the integration tier's observed runner spread. Its
         # conftest also enforces the 180s per-test ceiling on these tests.
         run: >-
           uv run --no-sync python -m pytest tests/integration/test_mcp_permission_boundary.py
           tests/integration/test_mcp_apps_host.py
+          tests/integration/test_mcp_permission_host_restart.py
           -q --timeout=120 --session-timeout=480
         timeout-minutes: 12
 

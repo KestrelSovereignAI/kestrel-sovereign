@@ -121,16 +121,16 @@ async def test_llm_bounded_native_commit_owner_reports_late_uncertainty(
         service.providers = [{stage: resource}, {"client": SimpleNamespace(close=later)}]
     monkeypatch.setattr(service_module, "CLIENT_CLOSE_TIMEOUT", 0.02)
     original_wait = asyncio.wait
+    from tests.shared.owned_task_observation import observe_bounded_asyncio_wait
 
-    async def wait_after_commit(tasks, *, timeout):
+    async def wait_after_commit(tasks, timeout):
         if timeout == 0.02 and any(
             task.get_name() == f"llm-close:{'preference-writers' if stage == 'preference' else stage}"
             for task in tasks
         ):
             await asyncio.wait_for(entered.wait(), 5)
-        return await original_wait(tasks, timeout=timeout)
 
-    monkeypatch.setattr(asyncio, "wait", wait_after_commit)
+    observe_bounded_asyncio_wait(monkeypatch, wait_after_commit)
     try:
         closer = asyncio.create_task(service.close())
         await asyncio.wait_for(entered.wait(), 5)

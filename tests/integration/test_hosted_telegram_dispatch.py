@@ -936,12 +936,13 @@ async def test_foreign_control_shaped_callback_cannot_forge_native_provenance(tm
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("allocation", ["completion", "shield"])
+@pytest.mark.parametrize("allocation", ["completion", "observation"])
 async def test_retirement_observer_allocation_cannot_release_authority_before_stop(tmp_path, monkeypatch, allocation):
     from contextlib import asynccontextmanager
     from kestrel_sovereign.features.hosted_telegram_dispatch import HostedTelegramOutbound
+    from tests.shared.owned_task_observation import refuse_owned_observation_allocation
 
-    exited, refused, target = asyncio.Event(), False, None
+    exited, target = asyncio.Event(), None
 
     def factory(binding, events):
         @asynccontextmanager
@@ -953,22 +954,10 @@ async def test_retirement_observer_allocation_cannot_release_authority_before_st
         return authority
 
     async with sdk_host(tmp_path, monkeypatch, factory) as (proxy, services, clients, _):
-        loop, client, service = asyncio.get_running_loop(), clients[0], services[0]
-        original = loop.create_future
-
-        def allocate():
-            nonlocal refused
-            frame = sys._getframe(1)
-            if allocation == "shield" and frame.f_code.co_name == "shield":
-                frame = frame.f_back
-            if (not refused and frame.f_code.co_name == 'await_owned_task'
-                    and frame.f_locals.get('task') is target and target is not None
-                    and (allocation == "completion" or sys._getframe(1).f_code.co_name == "shield")):
-                refused = True
-                raise RuntimeError('controlled original retirement observation refusal')
-            return original()
-
-        monkeypatch.setattr(loop, 'create_future', allocate)
+        client, service = clients[0], services[0]
+        refused = refuse_owned_observation_allocation(monkeypatch, lambda: target,
+            allocation=allocation,
+            error=RuntimeError('controlled original retirement observation refusal'))
         service.activation_release.clear()
         client.stop_release.clear()
         operation = asyncio.create_task(proxy.call_isolated_tool('telegram_send', {'to': '555', 'message': 'controlled'}))
@@ -980,7 +969,7 @@ async def test_retirement_observer_allocation_cannot_release_authority_before_st
             shutdown = asyncio.create_task(proxy.shutdown())
             await asyncio.wait_for(client.wire_closed.wait(), 2)
             await asyncio.sleep(0.02)
-            assert refused
+            assert refused.is_set()
             assert not exited.is_set(), 'Observer allocation released original host authority before stop'
             client.stop_release.set()
             await asyncio.wait_for(operation, 2)
