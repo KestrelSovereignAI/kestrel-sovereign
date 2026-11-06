@@ -76,9 +76,6 @@ LEDGER_POINTER_KEY = "ledger_file"
 _PATTERN_ID_PREFIX = "pat_"
 _BLOCKER_ID_PREFIX = "blk_"
 
-#: The row field naming the session of the turn that recorded the row (#3875).
-SESSION_KEY = "session_id"
-
 
 def _digest(*parts: Any) -> str:
     joined = "\x00".join(str(p or "").strip().lower() for p in parts)
@@ -145,25 +142,6 @@ def assign_row_ids(rows: List[Dict[str, Any]], minter) -> int:
         taken.add(row_id)
         minted += 1
     return minted
-
-
-def recorded_session_id(row: Mapping[str, Any]) -> Optional[str]:
-    """The session the turn that recorded ``row`` filed its rows under, or None.
-
-    Written once, when the row is recorded, and never by a later turn: a row is
-    projected best-effort, possibly by another turn in another session or in
-    none, and only the recording turn's session says where the row came from.
-    The key is returned exactly as recorded. An unquoted digit-only key reads
-    back from YAML as an integer, so an integer names that same key. A row with
-    no recorded session, including every row recorded before this field
-    existed, names none.
-    """
-    value = row.get(SESSION_KEY)
-    if isinstance(value, int) and not isinstance(value, bool):
-        return str(value)
-    if isinstance(value, str) and value.strip():
-        return value
-    return None
 
 
 def is_active_pattern(row: Dict[str, Any]) -> bool:
@@ -272,6 +250,10 @@ class LedgerCommit:
     #: The file had changed on disk, so it was re-read and only this change
     #: was applied to what it now holds.
     reloaded: bool = False
+    #: Refused because the caller's ``admit`` check declined ``value``: the
+    #: value is what the change computed against the file as it now stands,
+    #: for the caller to clear before committing again.
+    unadmitted: bool = False
 
     @property
     def persisted(self) -> bool:
@@ -570,7 +552,11 @@ class StrategyLedger:
         self._capture_snapshot(confirmed=True)
         return None
 
-    def commit(self, change: Callable[["StrategyLedger"], Any]) -> LedgerCommit:
+    def commit(
+        self,
+        change: Callable[["StrategyLedger"], Any],
+        admit: Optional[Callable[[Any], bool]] = None,
+    ) -> LedgerCommit:
         """Apply ``change`` and persist it without erasing edits made on disk.
 
         ``change`` is one caller's mutation, written against a ledger: it finds
@@ -589,6 +575,14 @@ class StrategyLedger:
 
         A write that fails outright (a full disk) keeps the change in memory,
         to be carried by the next successful write.
+
+        ``admit``, when given, is asked before any write whether the value
+        ``change`` returned may be written. A value it declines is written
+        nowhere: the commit is refused with ``unadmitted`` set, its ``value``
+        computed against the file as it now stands, so the caller can do what
+        must precede the write and commit again (#3990). Nothing is awaited in
+        here, so no other caller can act on the ledger between the check and
+        the write.
         """
         before = copy.deepcopy(self.data)
         unsaved = self._unsaved_normalization
@@ -601,6 +595,11 @@ class StrategyLedger:
             conflict: Optional[str] = str(e)
         else:
             conflict = None
+        if conflict is None and admit is not None and not admit(value):
+            # Not written. The copy read at start may be stale, so the value
+            # the caller is to clear is computed against the file below.
+            conflict = "its value has not been admitted"
+        elif conflict is None:
             # Reset here too: a replaced ``save`` must not inherit a refusal
             # an earlier write recorded.
             self._write_refusal = None
@@ -620,7 +619,7 @@ class StrategyLedger:
                 refused=True,
             )
         held = self._holds_unwritten_change
-        outcome = self._reload_and_reapply(change)
+        outcome = self._reload_and_reapply(change, admit)
         if held and outcome.reloaded and not outcome.refused:
             logger.warning(
                 "%s changed on disk while a change an earlier failed write "
@@ -639,9 +638,15 @@ class StrategyLedger:
         return LedgerCommit(error=error, refused=True)
 
     def _reload_and_reapply(
-        self, change: Callable[["StrategyLedger"], Any]
+        self,
+        change: Callable[["StrategyLedger"], Any],
+        admit: Optional[Callable[[Any], bool]] = None,
     ) -> LedgerCommit:
-        """Apply ``change`` to the file as it is now, and write that."""
+        """Apply ``change`` to the file as it is now, and write that.
+
+        Writes nothing when ``admit`` declines the value ``change`` returns;
+        see :meth:`commit`.
+        """
         path = self.path
         previous = self._disk_digest
         try:
@@ -676,6 +681,16 @@ class StrategyLedger:
         except LedgerChangeConflict as e:
             return self._refused_commit(
                 f"this change does not apply to {path} as it now stands: {e}"
+            )
+        if admit is not None and not admit(value):
+            return LedgerCommit(
+                value=value,
+                error=self._refusal(
+                    "the value this change writes has not been admitted"
+                ),
+                refused=True,
+                reloaded=reloaded,
+                unadmitted=True,
             )
 
         if reloaded:
@@ -755,13 +770,14 @@ class StrategyLedger:
     # ------------------------------------------------------------------
 
     def add_pattern(
-        self,
-        pattern: str,
-        source: str = "",
-        implication: str = "",
-        session_id: Optional[str] = None,
+        self, pattern: str, source: str = "", implication: str = ""
     ) -> Dict[str, Any]:
-        """Append one pattern, naming the recording turn's ``session_id``."""
+        """Append one pattern.
+
+        The row names no session: the file is in the agent's own data
+        directory, so the session a row was recorded in is attested where the
+        agent cannot write (#3990).
+        """
         rows = self.patterns
         entry = {
             "id": _unique_id(
@@ -773,7 +789,6 @@ class StrategyLedger:
             "implication": implication,
             "recorded_at": str(date.today()),
         }
-        _record_session(entry, session_id)
         self.data.setdefault(PATTERNS_KEY, []).append(entry)
         return entry
 
@@ -785,7 +800,6 @@ class StrategyLedger:
         owner: str,
         notes: str = "",
         repo: str = "",
-        session_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Append one blocker.
 
@@ -794,8 +808,7 @@ class StrategyLedger:
         and bind to whichever one happens to contain a number 42 — which is how
         a blocker gets resolved against a stranger's closed ticket.
 
-        ``session_id`` is the recording turn's session, as for
-        :meth:`add_pattern`.
+        The row names no session, as for :meth:`add_pattern`.
         """
         rows = self.blockers
         entry = {
@@ -811,7 +824,6 @@ class StrategyLedger:
             "blocked_since": str(date.today()),
             "notes": notes,
         }
-        _record_session(entry, session_id)
         self.data.setdefault(BLOCKERS_KEY, []).append(entry)
         return entry
 
@@ -923,12 +935,6 @@ class StrategyLedger:
             target.append(copied)
             absorbed += 1
         return absorbed
-
-
-def _record_session(entry: Dict[str, Any], session_id: Optional[str]) -> None:
-    """Name the recording turn's session on a new row; None names none."""
-    if session_id is not None:
-        entry[SESSION_KEY] = session_id
 
 
 def strip_ledger_sections(strategy_data: Dict[str, Any]) -> bool:

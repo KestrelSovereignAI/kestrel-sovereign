@@ -1679,6 +1679,50 @@ class AsyncStorage:
             revision_ids
         )
 
+    async def assertion_session_attestations(self, revisions):
+        """The attested sessions of each strategy-ledger revision, for a corpus (#3990).
+
+        ``revisions`` are ``(assertion, sources)`` pairs. A ledger row names
+        its session only in ``STRATEGY_LEDGER.yaml``, which the agent can
+        edit, so a ledger-derived revision is admitted to a session-excluding
+        corpus only on the attestation host code wrote for its row's current
+        content before the row reached the file. Its stored locator, written
+        when it was projected, may predate the attestation record or miss a
+        session attested since. A ledger-derived revision whose content has no
+        attestation, or whose attestation key it does not name, is unattested.
+        Other revisions are absent from the result: their locators alone say
+        which sessions they name.
+        """
+        if not self._initialized:
+            await self.initialize()
+        from kestrel_sovereign.features.strategic_memory import ledger_assertions
+        from kestrel_sovereign.knowledge.corpus import SessionAttestation
+        from kestrel_sovereign.storage.ledger_row_attestations import (
+            row_attestations,
+        )
+
+        keys = {
+            assertion.revision_id: ledger_assertions.revision_attestation_key(
+                assertion
+            )
+            for assertion, sources in revisions
+            if ledger_assertions.is_ledger_derived(assertion, sources)
+        }
+        if not keys:
+            return {}
+        attested = await row_attestations(self.db, agent_id=self.agent_id)
+        result = {}
+        for revision_id, key in keys.items():
+            sessions = attested.get(key) if key is not None else None
+            result[revision_id] = (
+                SessionAttestation(
+                    sessions=frozenset(item for item in sessions if item is not None)
+                )
+                if sessions
+                else SessionAttestation(attested=False)
+            )
+        return result
+
     async def get_source_occurrence(self, source_occurrence_id: str):
         if not self._initialized:
             await self.initialize()

@@ -83,6 +83,7 @@ from .ledger import (
     has_ledger_sections,
     strip_ledger_sections,
 )
+from .ledger_assertions import attestation_digest
 from .ledger_index import (
     MEMBERSHIP_READ_CAP,
     BLOCKER_SECTION,
@@ -239,6 +240,11 @@ def _is_github_prereq_failure(body: str) -> bool:
 #: would rebuild the same problem inside a tool result. The renderer says how
 #: many it withheld — a silently capped list is a lie about the record.
 _PATTERN_VIEW_LIMIT = 25
+
+#: How many times a new ledger row is attested before its write gives up
+#: (#3990). Each further attempt means the file changed between the
+#: attestation and the write, and the row's content (its id) with it.
+ROW_ATTESTATION_ATTEMPTS = 3
 
 # Try to import yaml; fall back to a simple parser if not available
 try:
@@ -830,13 +836,13 @@ class StrategicMemoryFeature(Feature):
     async def _recording_session_id(self) -> Optional[str]:
         """The session this turn's conversation rows are filed under, or None.
 
-        Recorded on a row as it is written (#3875), so the row's semantic
-        source names the session it came from even when a later turn, in
-        another session or in none, is the one that projects it. Read through
-        the turn lifecycle, never from tool arguments, and resolved by the
-        privacy wrapper that files the turn's rows. A storage without that
+        Attested for a row as it is written (#3875, #3990), so the row's
+        semantic source names the session it came from even when a later turn,
+        in another session or in none, is the one that projects it. Read
+        through the turn lifecycle, never from tool arguments, and resolved by
+        the privacy wrapper that files the turn's rows. A storage without that
         resolver also has no assertion producer, so nothing projects the row
-        through it; the turn's key is recorded as given.
+        through it; the turn's key is attested as given.
         """
         session_id = self._turn_session_id()
         if session_id is None:
@@ -846,6 +852,79 @@ class StrategicMemoryFeature(Feature):
         if filed_session_id is None:
             return session_id
         return await filed_session_id(session_id)
+
+    async def _commit_attested_row(
+        self,
+        section_key: str,
+        session_id: Optional[str],
+        change: Callable[[StrategyLedger], Dict[str, Any]],
+    ) -> Tuple[Optional[LedgerCommit], Optional[str]]:
+        """Commit ``change``, which adds one row, once that row is attested (#3990).
+
+        ``STRATEGY_LEDGER.yaml`` is in the agent's own data directory, so
+        nothing in it says which session a row was recorded in. Host code
+        attests the row's exact content with ``session_id`` in the agent's
+        database instead, and the row reaches the file only after that
+        attestation is written: the commit writes only a row whose content
+        digest this call attested. A file edited since it was read is re-read
+        (#3636), and the row the change then adds may differ, notably in its
+        id; that row is attested in turn, up to ``ROW_ATTESTATION_ATTEMPTS``
+        times. An attestation for a row that is never written matches nothing.
+
+        Returns ``(None, why)``, having written nothing, when the attestation
+        could not be written or the file kept changing under it; else the
+        commit and ``None``. The row is never written unattested in its place.
+        A storage without the record has no assertion producer either, so its
+        rows are written unattested and nothing projects them.
+        """
+        storage = getattr(self.agent, "storage", None)
+        attest = getattr(storage, "attest_strategy_ledger_row", None)
+        if attest is None:
+            return self._ledger.commit(change), None
+        attested: set = set()
+
+        def admit(row: Dict[str, Any]) -> bool:
+            return attestation_digest(section_key, row) in attested
+
+        commit = self._ledger.commit(change, admit=admit)
+        for _ in range(ROW_ATTESTATION_ATTEMPTS):
+            if not commit.unadmitted:
+                return commit, None
+            digest = attestation_digest(section_key, commit.value)
+            try:
+                await attest(
+                    section_key=section_key,
+                    content_digest=digest,
+                    session_id=session_id,
+                )
+            except Exception as exc:  # noqa: BLE001 - refused, never unattested
+                if is_execution_control_error(exc):
+                    raise
+                logger.warning(
+                    "strategy ledger: a new %s row could not be attested: %s",
+                    section_key,
+                    exception_log_summary(exc),
+                )
+                return None, (
+                    "The agent's database could not attest the session this "
+                    f"row is recorded in ({type(exc).__name__})."
+                )
+            attested.add(digest)
+            commit = self._ledger.commit(change, admit=admit)
+        if commit.unadmitted:
+            return None, (
+                f"{LEDGER_FILENAME} kept changing on disk while the new row was "
+                "attested."
+            )
+        return commit, None
+
+    @staticmethod
+    def _unattested_row_result(why: Optional[str]) -> ToolResult:
+        """The refusal for a row that was not written because it was not attested."""
+        return ToolResult.failed(
+            f"{why} Nothing was recorded.",
+            data={"recorded": False, "persisted": False},
+        )
 
     def _projection_agent_id(self) -> Optional[str]:
         """The identity decisions are indexed under.
@@ -1323,7 +1402,9 @@ class StrategicMemoryFeature(Feature):
                     repo_error, data={"recorded": False, "issue": issue}
                 )
             session_id = await self._recording_session_id()
-            commit = self._ledger.commit(
+            commit, unattested = await self._commit_attested_row(
+                BLOCKERS_KEY,
+                session_id,
                 lambda ledger: ledger.add_blocker(
                     issue=issue,
                     title=title,
@@ -1331,9 +1412,10 @@ class StrategicMemoryFeature(Feature):
                     owner=owner,
                     notes=notes,
                     repo=resolved_repo,
-                    session_id=session_id,
-                )
+                ),
             )
+            if commit is None:
+                return self._unattested_row_result(unattested)
             entry = commit.value
             result, snapshot = self._persisted_ledger_result(
                 commit,
@@ -1373,14 +1455,17 @@ class StrategicMemoryFeature(Feature):
                 # exists nowhere on disk and vanishes on restart.
                 return self._ledger_unreadable_result({"recorded": False})
             session_id = await self._recording_session_id()
-            commit = self._ledger.commit(
+            commit, unattested = await self._commit_attested_row(
+                PATTERNS_KEY,
+                session_id,
                 lambda ledger: ledger.add_pattern(
                     pattern=pattern,
                     source=source,
                     implication=implication,
-                    session_id=session_id,
-                )
+                ),
             )
+            if commit is None:
+                return self._unattested_row_result(unattested)
             entry = commit.value
             result, snapshot = self._persisted_ledger_result(
                 commit,

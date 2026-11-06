@@ -59,6 +59,7 @@ class GovernedCorpusBudgetExceeded(GovernedCorpusError):
 class CorpusEligibilityReason(str, Enum):
     INCLUDED = "included"
     EXCLUDED = "explicitly_excluded"
+    SESSION_UNATTESTED = "session_unattested"
     LIFECYCLE = "lifecycle_ineligible"
     EPISTEMIC_STATE = "epistemic_state_disallowed"
     PRIVACY = "privacy_classification_disallowed"
@@ -70,6 +71,14 @@ class CorpusEligibilityReason(str, Enum):
     DERIVATION_INPUT = "derivation_input_ineligible"
     ONTOLOGY = "ontology_pin_disallowed"
     VALIDATION = "validation_not_conformant"
+
+
+#: The decisions a source's session makes: an excluded session, or a session
+#: that cannot be known while some session is excluded. An inference built on
+#: material held out for either is held out with the same reason.
+_SESSION_HOLD_OUT_REASONS = frozenset(
+    {CorpusEligibilityReason.EXCLUDED, CorpusEligibilityReason.SESSION_UNATTESTED}
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -118,6 +127,35 @@ def _mapping_items(value: object, name: str) -> tuple[object, ...]:
     if isinstance(value, (str, bytes)) or not isinstance(value, Sequence):
         raise GovernedCorpusError(f"{name} must be an array")
     return tuple(value)
+
+
+@dataclass(frozen=True, slots=True)
+class SessionAttestation:
+    """The sessions a host attests one revision's material was recorded in.
+
+    Some material names its session only in a record its producing agent can
+    edit, such as a strategy-ledger row in the agent's own data directory.
+    For such material the host keeps its own record (#3990), and a corpus
+    with session exclusions decides from it rather than from any locator the
+    agent could have influenced. ``sessions`` are the named sessions; a
+    recording in a turn with no session names none. ``attested`` is false
+    when the host holds no record for the material: its session is unknown.
+    """
+
+    sessions: frozenset[str] = frozenset()
+    attested: bool = True
+
+    def __post_init__(self) -> None:
+        if type(self.attested) is not bool:
+            raise GovernedCorpusError("session attestation attested must be a boolean")
+        if not isinstance(self.sessions, frozenset) or any(
+            not isinstance(item, str) or not item for item in self.sessions
+        ):
+            raise GovernedCorpusError(
+                "session attestation sessions must be a frozenset of non-empty keys"
+            )
+        if not self.attested and self.sessions:
+            raise GovernedCorpusError("an unattested revision names no session")
 
 
 _EXCLUSION_FIELDS = (
@@ -170,6 +208,15 @@ class GovernedCorpusPolicy:
     :func:`~kestrel_sovereign.knowledge.assertion.source_reference_segment`).
     A derived revision built on an excluded premise is rejected with it.  Ids
     are compared exactly: a display prefix of a saved-item id matches nothing.
+
+    A host may attest which sessions a revision's material was recorded in
+    (:class:`SessionAttestation`).  An attested session is matched exactly as
+    a session the locator names.  While any session is excluded, a revision
+    whose session is unknown, because the host holds no attestation for it or
+    a source is marked ``unattested-session``, is held out as well
+    (:meth:`withholds_unattested`): material whose session cannot be matched
+    does not enter a session-excluding corpus.  A policy without session
+    exclusions is unaffected.
     """
 
     policy_id: str
@@ -358,17 +405,49 @@ class GovernedCorpusPolicy:
         return cls(**values)
 
     def excludes(
-        self, assertion: Assertion, sources: Sequence[SourceOccurrence]
+        self,
+        assertion: Assertion,
+        sources: Sequence[SourceOccurrence],
+        attestation: SessionAttestation | None = None,
     ) -> bool:
-        """Whether a direct source this revision was read from is excluded."""
+        """Whether a direct source this revision was read from is excluded.
+
+        ``attestation`` is the host's record of the revision's sessions, when
+        it keeps one; a session it attests is excluded as a named one is.
+        """
         if isinstance(assertion.lineage, DirectLineage) and not set(
             self.excluded_source_occurrence_ids
         ).isdisjoint(assertion.lineage.source_occurrence_ids):
+            return True
+        if attestation is not None and not attestation.sessions.isdisjoint(
+            self.excluded_session_ids
+        ):
             return True
         references = {
             (SourceReferenceKind.SAVED_ITEM, item) for item in self.excluded_saved_item_ids
         } | {(SourceReferenceKind.SESSION, item) for item in self.excluded_session_ids}
         return any(not references.isdisjoint(source.references) for source in sources)
+
+    def withholds_unattested(
+        self,
+        sources: Sequence[SourceOccurrence],
+        attestation: SessionAttestation | None = None,
+    ) -> bool:
+        """Whether a revision is held out because its session is unknown.
+
+        Only while some session is excluded: its session could be that one.
+        Unknown when the host keeps a record for the revision's material and
+        holds none for it, or when a source is marked unattested.
+        """
+        if not self.excluded_session_ids:
+            return False
+        if attestation is not None and not attestation.attested:
+            return True
+        return any(
+            kind is SourceReferenceKind.UNATTESTED_SESSION
+            for source in sources
+            for kind, _ in source.references
+        )
 
     @property
     def digest(self) -> str:
@@ -536,6 +615,16 @@ class GovernedCorpusStorage(Protocol):
     async def list_assertion_revision_sources(self, revision_id: str) -> list[SourceOccurrence]: ...
 
     async def list_assertion_revision_sources_batch(self, revision_ids: Sequence[str]) -> Mapping[str, Sequence[SourceOccurrence]]: ...
+
+    async def assertion_session_attestations(
+        self, revisions: Sequence[tuple[Assertion, Sequence[SourceOccurrence]]]
+    ) -> Mapping[str, SessionAttestation]:
+        """The host's session record for each revision it keeps one for.
+
+        Keyed by revision id. A revision absent from the result has no host
+        record, and its locators alone say which sessions it names.
+        """
+        ...
 
     async def assertion_validation_statuses(self, assertions: Sequence[Assertion]) -> Mapping[str, CorpusValidationStatus]: ...
 
@@ -779,6 +868,15 @@ class GovernedAssertionCorpusService:
             )
             for change in changes
             if not change.eligible
+        ) + await self._session_attestation_tombstones(
+            snapshot,
+            policy=policy,
+            limits=limits,
+            started=started,
+            generation=head.generation,
+            settled_assertion_ids=frozenset(
+                change.assertion_id for change in changes if change.assertion_id
+            ),
         )
         snapshot_hash = _digest({
             "base": snapshot.snapshot_hash,
@@ -843,6 +941,14 @@ class GovernedAssertionCorpusService:
             if isinstance(assertion.lineage, DirectLineage)
         )
         source_cache = await self._source_batch(direct_revision_ids)
+        attestation_cache = await self._attestation_batch(
+            tuple(
+                assertion
+                for assertion in candidates
+                if isinstance(assertion.lineage, DirectLineage)
+            ),
+            source_cache,
+        )
         examples: list[GovernedCorpusExample] = []
         excluded: dict[str, int] = {}
         used_bytes = 0
@@ -863,6 +969,7 @@ class GovernedAssertionCorpusService:
                 stack=frozenset(),
                 governed_revisions=governed_revisions,
                 source_cache=source_cache,
+                attestation_cache=attestation_cache,
             )
             if reason is not CorpusEligibilityReason.INCLUDED:
                 excluded[reason.value] = excluded.get(reason.value, 0) + 1
@@ -895,6 +1002,7 @@ class GovernedAssertionCorpusService:
         stack: frozenset[str],
         governed_revisions: set[str],
         source_cache: dict[str, tuple[SourceOccurrence, ...]],
+        attestation_cache: dict[str, SessionAttestation | None],
     ) -> tuple[CorpusEligibilityReason, tuple[SourceOccurrence, ...]]:
         """Enforce policy recursively over exact derivation revisions."""
         self._check_time(limits, started)
@@ -906,11 +1014,17 @@ class GovernedAssertionCorpusService:
                 "max_assertions exhausted by derivation traversal"
             )
         sources: tuple[SourceOccurrence, ...] = ()
+        attestation: SessionAttestation | None = None
         if isinstance(assertion.lineage, DirectLineage):
             if assertion.revision_id not in source_cache:
                 source_cache.update(await self._source_batch((assertion.revision_id,)))
             sources = source_cache.get(assertion.revision_id, ())
-        reason = self._eligibility(assertion, validation, policy, sources)
+            if assertion.revision_id not in attestation_cache:
+                attestation_cache.update(
+                    await self._attestation_batch((assertion,), source_cache)
+                )
+            attestation = attestation_cache[assertion.revision_id]
+        reason = self._eligibility(assertion, validation, policy, sources, attestation)
         if reason is not CorpusEligibilityReason.INCLUDED:
             return reason, ()
         if isinstance(assertion.lineage, DirectLineage):
@@ -975,6 +1089,16 @@ class GovernedAssertionCorpusService:
         )
         if missing_direct_sources:
             source_cache.update(await self._source_batch(missing_direct_sources))
+        missing_attestations = tuple(
+            item
+            for item in inputs
+            if isinstance(item.lineage, DirectLineage)
+            and item.revision_id not in attestation_cache
+        )
+        if missing_attestations:
+            attestation_cache.update(
+                await self._attestation_batch(missing_attestations, source_cache)
+            )
         transitive_sources: dict[str, SourceOccurrence] = {}
         nested_stack = stack.union((assertion.revision_id,))
         for item in inputs:
@@ -992,9 +1116,10 @@ class GovernedAssertionCorpusService:
                 stack=nested_stack,
                 governed_revisions=governed_revisions,
                 source_cache=source_cache,
+                attestation_cache=attestation_cache,
             )
-            if item_reason is CorpusEligibilityReason.EXCLUDED:
-                return CorpusEligibilityReason.EXCLUDED, ()
+            if item_reason in _SESSION_HOLD_OUT_REASONS:
+                return item_reason, ()
             if item_reason is not CorpusEligibilityReason.INCLUDED:
                 return CorpusEligibilityReason.DERIVATION_INPUT, ()
             for source in item_sources:
@@ -1018,9 +1143,12 @@ class GovernedAssertionCorpusService:
         validation: CorpusValidationStatus,
         policy: GovernedCorpusPolicy,
         sources: Sequence[SourceOccurrence],
+        attestation: SessionAttestation | None = None,
     ) -> CorpusEligibilityReason:
-        if policy.excludes(assertion, sources):
+        if policy.excludes(assertion, sources, attestation):
             return CorpusEligibilityReason.EXCLUDED
+        if policy.withholds_unattested(sources, attestation):
+            return CorpusEligibilityReason.SESSION_UNATTESTED
         if assertion.status is not AssertionStatus.ACTIVE:
             return CorpusEligibilityReason.LIFECYCLE
         if validation.state is not ValidationState.CONFORMS or validation.action not in (ValidationWriteAction.ACCEPT, ValidationWriteAction.ACCEPT_WITH_REPORT):
@@ -1065,6 +1193,194 @@ class GovernedAssertionCorpusService:
             for revision_id in normalized
         }
 
+    async def _attestation_batch(
+        self,
+        assertions: Sequence[Assertion],
+        source_cache: Mapping[str, Sequence[SourceOccurrence]],
+    ) -> dict[str, SessionAttestation | None]:
+        """Load the host's session record for direct revisions, ``None`` where it keeps none.
+
+        Read at build time, from the record as it stands, so a stored locator
+        written before the record (or before it grew) never decides alone.
+        """
+        if not assertions:
+            return {}
+        revisions = tuple(
+            (assertion, tuple(source_cache.get(assertion.revision_id, ())))
+            for assertion in assertions
+        )
+        recorded = dict(await self._storage.assertion_session_attestations(revisions))
+        requested = {assertion.revision_id for assertion in assertions}
+        if not set(recorded) <= requested or any(
+            not isinstance(item, SessionAttestation) for item in recorded.values()
+        ):
+            raise GovernedCorpusUnavailable("session_attestations_invalid")
+        return {revision_id: recorded.get(revision_id) for revision_id in requested}
+
+    async def _session_attestation_tombstones(
+        self,
+        snapshot: GovernedCorpusSnapshot,
+        *,
+        policy: GovernedCorpusPolicy,
+        limits: GovernedCorpusLimits,
+        started: float,
+        generation: int,
+        settled_assertion_ids: frozenset[str],
+    ) -> tuple[GovernedCorpusTombstone, ...]:
+        """Withdraw base examples a fresh snapshot would now hold out on their session (#3990).
+
+        A host's session attestations are read when a corpus is built, and
+        they grow without any assertion change: content recorded again,
+        unchanged, in another session attests that session for the same
+        revision, and the change stream says nothing. So every base example
+        the stream left alone, and that is still the current revision, is
+        governed again against the attestations as they stand, by the lineage
+        rules a snapshot uses. One that is now ``explicitly_excluded`` or
+        ``session_unattested`` is tombstoned, and so is an inference built on
+        one. Each incremental read recomputes this against its base, so an
+        attestation that lands during one read is reported by the next.
+
+        Only attestations withdraw an example here, and only a policy that
+        excludes some session consults them. Material newly attested in
+        admitted sessions alone is not added: it stays out of incremental
+        reads until a fresh snapshot admits it.
+        """
+        if not policy.excluded_session_ids:
+            return ()
+        base = {
+            (example.assertion.assertion_id, example.assertion.revision_id)
+            for example in snapshot.examples
+            if example.assertion.assertion_id not in settled_assertion_ids
+        }
+        if not base:
+            return ()
+        assertion_ids = tuple(sorted({assertion_id for assertion_id, _ in base}))
+        if len(assertion_ids) > limits.max_assertions:
+            raise GovernedCorpusBudgetExceeded(
+                "max_assertions exhausted by the base snapshot"
+            )
+        current = sorted(
+            (
+                assertion
+                for assertion in await self._storage.assertion_inference_inputs(
+                    AssertionQuery(assertion_ids=assertion_ids, limit=len(assertion_ids))
+                )
+                if (assertion.assertion_id, assertion.revision_id) in base
+            ),
+            key=lambda item: (item.assertion_id, item.revision_id),
+        )
+        direct = tuple(
+            assertion
+            for assertion in current
+            if isinstance(assertion.lineage, DirectLineage)
+        )
+        source_cache = await self._source_batch(
+            tuple(assertion.revision_id for assertion in direct)
+        )
+        attestation_cache = await self._attestation_batch(direct, source_cache)
+        validation_cache: dict[str, CorpusValidationStatus] = {}
+        governed_revisions: set[str] = set()
+        withdrawn = await self._held_out_on_session(
+            tuple(
+                assertion
+                for assertion in direct
+                if attestation_cache.get(assertion.revision_id) is not None
+            ),
+            policy=policy,
+            limits=limits,
+            started=started,
+            validation_cache=validation_cache,
+            governed_revisions=governed_revisions,
+            source_cache=source_cache,
+            attestation_cache=attestation_cache,
+        )
+        if withdrawn:
+            # Every premise of an included inference was itself included, so
+            # an inference can be withdrawn only when a direct example was.
+            withdrawn.update(
+                await self._held_out_on_session(
+                    tuple(
+                        assertion
+                        for assertion in current
+                        if not isinstance(assertion.lineage, DirectLineage)
+                    ),
+                    policy=policy,
+                    limits=limits,
+                    started=started,
+                    validation_cache=validation_cache,
+                    governed_revisions=governed_revisions,
+                    source_cache=source_cache,
+                    attestation_cache=attestation_cache,
+                )
+            )
+        return tuple(
+            GovernedCorpusTombstone(
+                event_id="session-attestation:"
+                + _digest(
+                    {
+                        "v": 1,
+                        "assertion_id": assertion.assertion_id,
+                        "revision_id": assertion.revision_id,
+                        "reason": withdrawn[assertion.revision_id].value,
+                    }
+                ),
+                assertion_id=assertion.assertion_id,
+                revision_id=assertion.revision_id,
+                operation="session_attestation",
+                generation=generation,
+                reason=withdrawn[assertion.revision_id].value,
+            )
+            for assertion in current
+            if assertion.revision_id in withdrawn
+        )
+
+    async def _held_out_on_session(
+        self,
+        assertions: Sequence[Assertion],
+        *,
+        policy: GovernedCorpusPolicy,
+        limits: GovernedCorpusLimits,
+        started: float,
+        validation_cache: dict[str, CorpusValidationStatus],
+        governed_revisions: set[str],
+        source_cache: dict[str, tuple[SourceOccurrence, ...]],
+        attestation_cache: dict[str, SessionAttestation | None],
+    ) -> dict[str, CorpusEligibilityReason]:
+        """The revisions among ``assertions`` held out on their session, with why.
+
+        Governed exactly as a snapshot governs them; any other outcome is not
+        a session decision and is left to the change stream.
+        """
+        missing = tuple(
+            assertion
+            for assertion in assertions
+            if assertion.assertion_id not in validation_cache
+        )
+        if missing:
+            validation_cache.update(
+                await self._storage.assertion_validation_statuses(missing)
+            )
+        held_out: dict[str, CorpusEligibilityReason] = {}
+        for assertion in assertions:
+            reason, _ = await self._govern_lineage(
+                assertion,
+                policy=policy,
+                validation=validation_cache.get(
+                    assertion.assertion_id, CorpusValidationStatus(None, None)
+                ),
+                validation_cache=validation_cache,
+                limits=limits,
+                started=started,
+                depth=0,
+                stack=frozenset(),
+                governed_revisions=governed_revisions,
+                source_cache=source_cache,
+                attestation_cache=attestation_cache,
+            )
+            if reason in _SESSION_HOLD_OUT_REASONS:
+                held_out[assertion.revision_id] = reason
+        return held_out
+
     @staticmethod
     def _tombstone_reason(operation: str) -> str:
         """Preserve the persisted invalidation cause without inventing one."""
@@ -1105,4 +1421,5 @@ __all__ = [
     "GovernedCorpusDelta", "GovernedCorpusError", "GovernedCorpusExample", "GovernedCorpusLimits",
     "GovernedCorpusObservability", "GovernedCorpusPolicy", "GovernedCorpusSnapshot",
     "GovernedCorpusStorage", "GovernedCorpusTombstone", "GovernedCorpusUnavailable",
+    "SessionAttestation",
 ]

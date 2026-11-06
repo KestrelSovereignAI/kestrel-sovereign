@@ -85,6 +85,7 @@ import re
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from decimal import Decimal
+from types import MappingProxyType
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 from kestrel_sovereign.agent.invocation import current_invocation_provenance
@@ -99,13 +100,13 @@ from kestrel_sovereign.knowledge import (
     with_source_reference,
 )
 from kestrel_sovereign.knowledge.registry import get_knowledge_registry
+from kestrel_sovereign.storage.ledger_row_attestations import RowAttestations
 from kestrel_sovereign.storage.semantic_binding import SemanticAssertionBinding
 
 from .ledger import (
     BLOCKERS_KEY,
     LEDGER_FILENAME,
     PATTERNS_KEY,
-    recorded_session_id,
 )
 from .ledger_index import BLOCKER_SECTION, PATTERN_SECTION, LedgerSection
 
@@ -165,6 +166,9 @@ _SECTION_CONTENT_FIELDS = {
 _ROW_ID_RE = re.compile(r"^[A-Za-z0-9._~-]{1,128}$")
 
 _SECTIONS = (PATTERN_SECTION, BLOCKER_SECTION)
+_SECTIONS_BY_KEY = {section.ledger_key: section for section in _SECTIONS}
+
+_NO_ATTESTATIONS: RowAttestations = MappingProxyType({})
 
 #: Every terminal action this adapter can take, for the transition digest.
 ACTION_WRITE = "write"
@@ -282,6 +286,24 @@ def row_content_digest(section: LedgerSection, row: Mapping[str, Any]) -> str:
     return _canonical_digest(material)
 
 
+def attestation_digest(section_key: str, row: Mapping[str, Any]) -> str:
+    """The content digest a row is attested under (#3990).
+
+    The same digest projection reads the attestation back by
+    (:func:`row_content_digest`), so the session the strategy-ledger tool
+    attests for a row is the one its assertion's source names. It covers the
+    row's id and every content field, and nothing else: a row whose id or
+    text is edited by hand has a digest nothing attested.
+    """
+    try:
+        section = _SECTIONS_BY_KEY[section_key]
+    except KeyError as error:
+        raise LedgerAssertionMappingError(
+            f"no ledger section {section_key!r} to attest a row in"
+        ) from error
+    return row_content_digest(section, row)
+
+
 def transition_digest(
     *, content_digest: str, predecessor_revision_id: Optional[str], action: str
 ) -> str:
@@ -349,13 +371,19 @@ class LedgerRowProposal:
     ontology: OntologyRef
     content_digest: str
     assertion_id: str
-    #: The session of the turn that recorded the row, read off the row itself
-    #: (#3875). Never the projecting turn's: projection is best-effort, so a
-    #: row whose first projection failed is projected later by whichever turn
-    #: next reindexes, in another session or in none. ``None`` for a row that
-    #: records no session. Not part of the content digest, so naming a session
-    #: never re-keys a row's revisions.
-    session_id: Optional[str] = None
+    #: The sessions host code attested the row's current content in, sorted
+    #: (#3875, #3990). Read from the agent's database, never from the row,
+    #: whose fields and id the agent can edit, and never the projecting turn's:
+    #: projection is best-effort, so a row whose first projection failed is
+    #: projected later by whichever turn next reindexes, in another session or
+    #: in none. Empty for content attested only in turns with no session. Not
+    #: part of the content digest, so naming a session never re-keys a row's
+    #: revisions.
+    sessions: Tuple[str, ...] = ()
+    #: Whether any attestation exists for the row's current content. One that
+    #: has none (a row recorded before attestations existed, edited by hand,
+    #: or whose attestation failed) is projected marked unattested.
+    attested: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -395,14 +423,22 @@ def map_ledger_row(
     *,
     tenant_id: str,
     ontology_ref: OntologyRef,
+    attestations: RowAttestations = _NO_ATTESTATIONS,
 ) -> LedgerRowProposal:
-    """Map one active, projectable ledger row to closed canonical terms."""
+    """Map one active, projectable ledger row to closed canonical terms.
+
+    ``attestations`` is the agent's database record of the sessions each
+    row's content was attested in (#3990); without it every row is
+    unattested.
+    """
     from kestrel_sovereign.knowledge.assertion import derive_assertion_id
 
     row_id = section.row_id(row)
     subject = ledger_subject(tenant_id)
     predicate = IRI(f"{ontology_ref.namespace}{section_term(section)}")
     target = ledger_row_object(tenant_id, row_id)
+    content_digest = row_content_digest(section, row)
+    attested = attestations.get((section.ledger_key, content_digest), frozenset())
     return LedgerRowProposal(
         section_key=section.ledger_key,
         row_id=row_id,
@@ -410,14 +446,15 @@ def map_ledger_row(
         predicate=predicate,
         object=target,
         ontology=ontology_ref,
-        content_digest=row_content_digest(section, row),
+        content_digest=content_digest,
         assertion_id=derive_assertion_id(
             tenant_id=tenant_id,
             subject=subject,
             predicate=predicate,
             object=target,
         ),
-        session_id=recorded_session_id(row),
+        sessions=tuple(sorted(item for item in attested if item is not None)),
+        attested=bool(attested),
     )
 
 
@@ -426,8 +463,12 @@ def build_proposal_plan(
     *,
     tenant_id: str,
     ontology_ref: Optional[OntologyRef] = None,
+    attestations: RowAttestations = _NO_ATTESTATIONS,
 ) -> LedgerProposalPlan:
     """Read the canonical ledger into proposals, refusing ambiguous sections.
+
+    Each proposal names the sessions ``attestations`` holds for its row's
+    current content; see :func:`map_ledger_row`.
 
     Row ids are addresses, and ``StrategyLedger.normalize`` only disambiguates
     the ones it mints — a hand-edited file can hold two rows under one id.
@@ -516,7 +557,11 @@ def build_proposal_plan(
                 # the keep-set, so it is deliberately absent from here.
                 continue
             mapped = map_ledger_row(
-                section, row, tenant_id=tenant_id, ontology_ref=ontology_ref
+                section,
+                row,
+                tenant_id=tenant_id,
+                ontology_ref=ontology_ref,
+                attestations=attestations,
             )
             if not section.is_projectable(row):
                 # Present, active, and currently says nothing. Keep it; do not
@@ -545,12 +590,15 @@ def build_source(
     """Build provenance from the trusted turn context, never from row text.
 
     The locator names the canonical file and the row's address, which is a
-    truthful pointer that carries no pattern or blocker prose. It names the
-    session the row was recorded in, or none when the row records no session;
-    the projecting turn's own session never enters it.
+    truthful pointer that carries no pattern or blocker prose. It names every
+    session host code attested the row's current content in, and none when it
+    was attested only in turns with no session; the projecting turn's own
+    session never enters it. A row whose content has no attestation is marked
+    ``unattested-session`` instead, naming its content digest: nothing the
+    agent cannot write says which session it came from (#3990).
 
     Raises :class:`~kestrel_sovereign.knowledge.AssertionValidationError` when
-    the recorded session cannot be named in a locator, rather than dropping
+    an attested session cannot be named in a locator, rather than dropping
     it: a source that silently names no session would escape an exclusion of
     the session the row was recorded in.
     """
@@ -566,12 +614,19 @@ def build_source(
         locator = f"{provenance.source_locator}#{stem}"
         actor = provenance.actor or owning_agent_id
         observed_at = provenance.received_at
+    if proposal.attested:
+        for session in proposal.sessions:
+            locator = with_source_reference(
+                locator, SourceReferenceKind.SESSION, session
+            )
+    else:
+        locator = with_source_reference(
+            locator, SourceReferenceKind.UNATTESTED_SESSION, proposal.content_digest
+        )
     return SourceOccurrence(
         source_occurrence_id=source_occurrence_id(transition),
         source_kind=source_kind,
-        locator=with_source_reference(
-            locator, SourceReferenceKind.SESSION, proposal.session_id
-        ),
+        locator=locator,
         received_at=observed_at,
         content_digest=f"sha256:{proposal.content_digest}",
         actor=actor,
@@ -662,6 +717,47 @@ def is_adapter_source(source: SourceOccurrence) -> bool:
 
 def has_adapter_provenance(sources: Iterable[SourceOccurrence]) -> bool:
     return any(is_adapter_source(source) for source in sources)
+
+
+def is_ledger_derived(
+    assertion: Assertion, sources: Iterable[SourceOccurrence]
+) -> bool:
+    """Whether a revision claims to come from a strategy-ledger row (#3990).
+
+    Any one sign suffices: the ledger's subject, one of its predicate terms,
+    or this adapter's provenance grammar. A governed corpus with session
+    exclusions admits such a revision only on its row's attestation, so a
+    revision that looks like the ledger's in any way is treated as the
+    ledger's.
+    """
+    return (
+        assertion.subject == ledger_subject(assertion.tenant_id)
+        or _attested_section(assertion) is not None
+        or has_adapter_provenance(sources)
+    )
+
+
+def revision_attestation_key(assertion: Assertion) -> Optional[Tuple[str, str]]:
+    """``(section key, content digest)`` a ledger revision's attestation is under.
+
+    ``None`` when the revision does not name both, such as one whose revision
+    id this adapter did not write: no attestation can be found for it, so it
+    is unattested.
+    """
+    section_key = _attested_section(assertion)
+    digest = content_digest_of(assertion)
+    if section_key is None or digest is None:
+        return None
+    return section_key, digest
+
+
+def _attested_section(assertion: Assertion) -> Optional[str]:
+    """The ledger section a revision's predicate is the term of, if any."""
+    namespace = assertion.ontology_version.namespace
+    for section_key, term in _SECTION_TERMS.items():
+        if assertion.predicate.value == f"{namespace}{term}":
+            return section_key
+    return None
 
 
 @dataclass

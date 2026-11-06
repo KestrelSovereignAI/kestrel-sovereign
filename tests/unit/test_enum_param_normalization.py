@@ -13,6 +13,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from kestrel_sdk.tools.result import ToolResultStatus
+from tests.utils.ledger_storage import without_row_attestations
 
 
 # ---------------------------------------------------------------------------
@@ -50,7 +51,9 @@ def _make_strategic():
     from kestrel_sovereign.features.strategic_memory.feature import _SaveOutcome
     from kestrel_sovereign.features.strategic_memory.ledger import StrategyLedger
 
-    feat = StrategicMemoryFeature(agent=MagicMock())
+    agent = MagicMock()
+    without_row_attestations(agent.storage)
+    feat = StrategicMemoryFeature(agent=agent)
     feat._data = {}
     feat._strategy_path = Path("/tmp/kestrel-test/STRATEGY.yaml")
     feat._save = MagicMock(return_value=_SaveOutcome(persisted=True))

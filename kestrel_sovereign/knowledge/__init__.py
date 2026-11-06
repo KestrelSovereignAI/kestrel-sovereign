@@ -72,6 +72,7 @@ if TYPE_CHECKING:
         GovernedCorpusStorage,
         GovernedCorpusTombstone,
         GovernedCorpusUnavailable,
+        SessionAttestation,
     )
     from .rdf_codec import (
         RdfAssertionCodec,
@@ -256,6 +257,7 @@ __all__ = [
     "GovernedCorpusStorage",
     "GovernedCorpusTombstone",
     "GovernedCorpusUnavailable",
+    "SessionAttestation",
     "ShaclCapabilityUnavailable",
     "ShaclSnapshotMismatch",
     "ShaclValidationError",
@@ -456,6 +458,7 @@ _CORPUS_EXPORTS = frozenset(
         "GovernedCorpusStorage",
         "GovernedCorpusTombstone",
         "GovernedCorpusUnavailable",
+        "SessionAttestation",
     }
 )
 

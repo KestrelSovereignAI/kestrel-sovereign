@@ -45,6 +45,7 @@ from kestrel_sovereign.features.strategic_memory.morning_signal import (
 from kestrel_sovereign.features.strategic_memory.workflow_runs import (
     WorkflowRunsNotAssessed,
 )
+from tests.utils.ledger_storage import without_row_attestations
 
 SELF_REPO = "KestrelSovereignAI/kestrel-sovereign"
 SCAN_REPOS = [
@@ -100,7 +101,7 @@ async def _feature(tmp_path, blockers, *, scan_repos=SCAN_REPOS):
     agent = MagicMock()
     agent.agent_id = "did:test:reconcile"
     agent.agent_data_dir = str(tmp_path)
-    agent.storage = MagicMock()
+    agent.storage = without_row_attestations(MagicMock())
     agent.storage.graph = None
     (tmp_path / "STRATEGY.yaml").write_text(
         _yaml.dump(

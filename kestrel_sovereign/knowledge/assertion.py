@@ -766,17 +766,23 @@ class SourceReferenceKind(str, Enum):
     never from tool arguments, or names none when the turn has no session. A
     producer that reads a saved item names it as ``saved-item:<id>`` the same
     way.
+
+    A producer that takes a session only from a host attestation, never from
+    material the agent can edit, marks material with no attestation
+    ``unattested-session:<id>``, naming what went unattested. Its session is
+    unknown, so a corpus that excludes any session holds it out (#3990).
     """
 
     SAVED_ITEM = "saved-item"
     SESSION = "session"
+    UNATTESTED_SESSION = "unattested-session"
 
 
 _SOURCE_REFERENCE_KINDS = {kind.value: kind for kind in SourceReferenceKind}
 
 
 def source_reference_segment(kind: SourceReferenceKind | str, identifier: str) -> str:
-    """The locator segment naming one saved item or session, by its exact id.
+    """The locator segment naming one artifact of ``kind``, by its exact id.
 
     The id is percent-encoded, so an id containing ``#`` or ``:`` still reads
     back as one segment naming exactly that id.
@@ -789,7 +795,7 @@ def source_reference_segment(kind: SourceReferenceKind | str, identifier: str) -
 def with_source_reference(
     locator: str, kind: SourceReferenceKind | str, identifier: str | None
 ) -> str:
-    """``locator`` with the segment naming one saved item or session appended.
+    """``locator`` with the segment naming one artifact of ``kind`` appended.
 
     The segment goes last, so a producer stem that readers match as the
     locator's prefix still leads it. ``None`` appends nothing: a producer that
@@ -812,7 +818,7 @@ def without_source_references(locator: str, kind: SourceReferenceKind | str) -> 
 
 
 def _source_reference(segment: str) -> tuple[SourceReferenceKind, str] | None:
-    """The saved item or session one locator segment names, if it names one."""
+    """The ``(kind, id)`` one locator segment names, if it names one."""
     kind, separator, encoded = segment.partition(":")
     reference_kind = _SOURCE_REFERENCE_KINDS.get(kind)
     if reference_kind is None or not separator or not encoded:
@@ -849,7 +855,7 @@ class SourceOccurrence:
 
     @property
     def references(self) -> frozenset[tuple[SourceReferenceKind, str]]:
-        """The saved items and sessions this occurrence's locator names."""
+        """The ``(kind, id)`` artifacts this occurrence's locator names."""
         references = map(_source_reference, self.locator.split("#"))
         return frozenset(item for item in references if item is not None)
 

@@ -4313,9 +4313,13 @@ class PrivacyEnforcingStorage:
         fail the ledger mutation. The report says what happened; the next
         projection reconciles.
 
-        Each source names the session its row was recorded in, read off the
-        row (#3875). The projecting turn's session is never used: a row whose
-        first projection failed is projected by whichever turn reindexes next.
+        Each source names the sessions its row's current content was attested
+        in (#3875, #3990), as :meth:`attest_strategy_ledger_row` recorded them
+        in the agent's database before the row reached the file; nothing in
+        the file, which the agent can edit, is read for provenance. A row with
+        no attestation is marked unattested. The projecting turn's session is
+        never used: a row whose first projection failed is projected by
+        whichever turn reindexes next.
         """
         from kestrel_sovereign.features.strategic_memory.ledger_assertions import (
             LedgerAssertionReport,
@@ -4445,9 +4449,14 @@ class PrivacyEnforcingStorage:
         self._ledger_projected_sequences[key] = snapshot.persisted_sequence
         ledger_data = snapshot.data
 
+        attestations = await self._read_ledger_row_attestations(report)
+        if attestations is None:
+            return report
         try:
             plan = ledger_assertions.build_proposal_plan(
-                ledger_data, tenant_id=binding.tenant_id
+                ledger_data,
+                tenant_id=binding.tenant_id,
+                attestations=attestations,
             )
         except Exception as error:  # noqa: BLE001 - never fail a persisted write
             logger.warning("strategy ledger assertion mapping unavailable: %s", error)
@@ -4485,6 +4494,58 @@ class PrivacyEnforcingStorage:
                 continue
             await self._retract_ledger_assertion(held, report)
         return report
+
+    async def _read_ledger_row_attestations(self, report):
+        """The agent's database record of each ledger row's sessions (#3990).
+
+        Returns ``None`` when it cannot be read, and the pass writes nothing.
+        A source is immutable once written, so a row projected without its
+        attestation would stay marked unattested even after a read that
+        succeeds; the next pass projects it instead.
+        """
+        from kestrel_sovereign.storage.ledger_row_attestations import (
+            row_attestations,
+        )
+
+        try:
+            return await row_attestations(self._storage.db, agent_id=self.agent_id)
+        except Exception as error:  # noqa: BLE001
+            if is_execution_control_error(error):
+                raise
+            logger.warning("strategy ledger row attestations unreadable: %s", error)
+            report.skipped_reason = "row_attestations_unreadable"
+            return None
+
+    async def attest_strategy_ledger_row(
+        self,
+        *,
+        section_key: str,
+        content_digest: str,
+        session_id: Optional[str],
+    ) -> None:
+        """Attest, where the agent cannot write, a ledger row's content and session.
+
+        The strategy-ledger tool calls this before the row reaches
+        ``STRATEGY_LEDGER.yaml``, with the session the turn's rows are filed
+        under (``None`` for a turn with no session) and the row's content
+        digest. The file is in the agent's own data directory, so a row's
+        source names only the sessions attested for its content (#3990).
+
+        Append-only: nothing attested is replaced or removed, and an
+        attestation for content that never reached the file matches nothing.
+        Written in every privacy mode, as the ledger file is. The record holds
+        a digest and a session key, never row text, and a row recorded while
+        semantic writes are denied is projected once they are allowed again.
+        """
+        from kestrel_sovereign.storage.ledger_row_attestations import attest_row
+
+        await attest_row(
+            self._storage.db,
+            agent_id=self.agent_id,
+            section=section_key,
+            content_digest=content_digest,
+            session_id=session_id,
+        )
 
     async def _read_ledger_assertions(self, plan, report):
         """Every current assertion on this adapter's predicates, paged in full.
@@ -4608,8 +4669,8 @@ class PrivacyEnforcingStorage:
                 owning_agent_id=binding.owning_agent_id,
             )
         except AssertionValidationError as error:
-            # The row's provenance cannot be built, notably because its
-            # recorded session cannot be named in a locator. Writing the row
+            # The row's provenance cannot be built, notably because an
+            # attested session cannot be named in a locator. Writing the row
             # without that session would escape an exclusion of it, so this
             # row fails and the rest of the pass goes on.
             logger.warning(
@@ -5377,6 +5438,10 @@ class PrivacyEnforcingStorage:
     async def list_assertion_revision_sources_batch(self, revision_ids):
         self._assert_semantic_assertion_read_allowed("provenance reads")
         return await self._storage.list_assertion_revision_sources_batch(revision_ids)
+
+    async def assertion_session_attestations(self, revisions):
+        self._assert_semantic_assertion_read_allowed("provenance reads")
+        return await self._storage.assertion_session_attestations(revisions)
 
     async def get_source_occurrence(self, source_occurrence_id):
         self._assert_semantic_assertion_read_allowed("provenance reads")
