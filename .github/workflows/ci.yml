@@ -462,6 +462,11 @@ jobs:
         # 146.82s/151s cold and 132.82s/135s restored (pytest/process wall time).
         # These are at least nineteen complete local runs; the slowest
         # process wall time rounds up to 2.6 minutes.
+        # Those measurements cover the historical fifteen-case baseline.
+        # This expanded lane collects 47 cases, including the real host-process
+        # restart campaign. Its 41 non-Docker cases pass locally; six Docker
+        # cases require this CI job. The complete expanded lane's duration must
+        # be established on the current PR tree, not inferred from the baseline.
         # The ratio is the integration tier's observed runner spread. Its
         # conftest also enforces the 180s per-test ceiling on these tests.
         run: >-
