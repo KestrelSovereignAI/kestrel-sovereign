@@ -249,6 +249,25 @@ CREATE TABLE IF NOT EXISTS strategy_ledger_row_attestations (
 )
 """
 
+#: ``corpus_exclusion_watermarks`` -- per agent, the highest sequence of the
+#: Sovereign-signed corpus exclusion manifest a governed corpus build has
+#: admitted, and that manifest's digest (#3893). A build refuses a lower
+#: sequence, so an older signed manifest that excluded less cannot be put back;
+#: see ``kestrel_sovereign.storage.corpus_exclusion_watermarks``. ``BIGINT``
+#: holds every sequence a manifest may carry, on both backends.
+#:
+#: Kept out of ``CORE_SCHEMA`` for the reason given above
+#: ``_MODEL_USAGE_PERIODS_DDL``: ``_ensure_corpus_exclusion_watermarks``
+#: creates it through probe -> migration lock -> re-probe.
+_CORPUS_EXCLUSION_WATERMARKS_DDL = """
+CREATE TABLE IF NOT EXISTS corpus_exclusion_watermarks (
+    agent_id TEXT NOT NULL PRIMARY KEY,
+    sequence BIGINT NOT NULL,
+    manifest_sha256 TEXT NOT NULL,
+    recorded_at TEXT NOT NULL
+)
+"""
+
 #: ``(name, table, columns)`` of the index that makes the #2959 staleness probe
 #: the "one indexed ``max(id)`` lookup" it is described as.
 #:
@@ -1470,6 +1489,17 @@ class AsyncDatabase:
         await migrate_semantic_assertion_store(self)
         await migrate_semantic_vector_projection(self)
         await migrate_semantic_governed_artifacts(self)
+        # A corpus artifact names the corpus exclusion manifest it was built
+        # under (#3893), so it is served only while the host still admits that
+        # manifest. Existing rows keep NULL: built before manifests existed,
+        # they are revoked rather than served.
+        await self.migrate_columns_once(
+            "semantic_governed_artifacts",
+            (
+                ("exclusion_manifest_sha256", "TEXT"),
+                ("exclusion_manifest_sequence", "BIGINT"),
+            ),
+        )
         await migrate_semantic_validation_reports(self)
         await migrate_semantic_maintenance(self)
         await migrate_legacy_graph_fact_migration_state(self)
@@ -1672,6 +1702,7 @@ class AsyncDatabase:
         )
         await self._ensure_wait_signal_rekeys()
         await self._ensure_strategy_ledger_row_attestations()
+        await self._ensure_corpus_exclusion_watermarks()
         # Both indexes go through ``ensure_index`` rather than a bare
         # ``CREATE INDEX IF NOT EXISTS``: that spelling is idempotent in
         # sequence but not safe in parallel, and ``_init_schema`` runs on every
@@ -2497,6 +2528,25 @@ class AsyncDatabase:
             raise RuntimeError(
                 f"{table} was not created; a strategy-ledger row's session "
                 "cannot be attested where the agent cannot write"
+            )
+
+    async def _ensure_corpus_exclusion_watermarks(self) -> None:
+        """Create the #3893 exclusion-manifest watermark table under concurrent boot.
+
+        New in an upgrade, so the first post-upgrade PostgreSQL boot races
+        exactly as ``_ensure_wait_signal_rekeys`` describes. Same probe ->
+        migration lock -> re-probe.
+        """
+        table = "corpus_exclusion_watermarks"
+        if not await self.table_exists(table):
+            async with self.migration_lock(f"create_{table}"):
+                if not await self.table_exists(table):
+                    await self.execute(_CORPUS_EXCLUSION_WATERMARKS_DDL)
+
+        if not await self.table_exists(table):
+            raise RuntimeError(
+                f"{table} was not created; a governed corpus could not refuse "
+                "an exclusion manifest that moved back"
             )
 
     async def ensure_index(

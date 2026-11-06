@@ -2493,6 +2493,10 @@ def build_parser() -> argparse.ArgumentParser:
     from kestrel_sovereign.cli_decisions import add_decisions_subparser
     add_decisions_subparser(subparsers)
 
+    # kestrel corpus exclusions check  (corpus exclusion manifest, #3893)
+    from kestrel_sovereign.cli_corpus import add_corpus_subparser
+    add_corpus_subparser(subparsers)
+
     # kestrel start|terminate|restart|update|status|logs
     from kestrel_sovereign.cli_lifecycle import add_lifecycle_subparsers
     add_lifecycle_subparsers(subparsers)
@@ -2970,6 +2974,7 @@ def main() -> int:
     from kestrel_sovereign.cli_embeddings import run as cmd_embeddings
     from kestrel_sovereign.cli_serve import run as cmd_serve
     from kestrel_sovereign.cli_decisions import run as cmd_decisions
+    from kestrel_sovereign.cli_corpus import run as cmd_corpus
 
     commands = {
         "start": cmd_start,
@@ -3010,6 +3015,7 @@ def main() -> int:
         "embeddings": cmd_embeddings,
         "serve": cmd_serve,
         "decisions": cmd_decisions,
+        "corpus": cmd_corpus,
     }
 
     # Core dispatch dict first; then the extension registry. Feature-contributed

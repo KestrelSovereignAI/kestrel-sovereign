@@ -364,16 +364,18 @@ def runtime_path_env(
     return value
 
 
-def host_data_dir() -> Path:
+def host_data_dir(*, environ: Mapping[str, str] | None = None) -> Path:
     """Resolve the dedicated host-runtime root without source discovery.
 
     An explicit ``KESTREL_HOME`` is an operator custody decision and remains
     authoritative. Without it, host runtime belongs under
     ``~/.kestrel/host-data`` even when the current directory is a source clone.
     Resolution has no filesystem side effects; each storage owner must securely
-    create and validate the returned directory before writing.
+    create and validate the returned directory before writing. ``environ``
+    (``os.environ`` when None) is where ``KESTREL_HOME`` is read, so a tool
+    can ask where a launched host's root is without becoming that host.
     """
-    explicit_home = runtime_path_env(HOME_ENV)
+    explicit_home = runtime_path_env(HOME_ENV, environ=environ)
     base = (
         Path(explicit_home).expanduser()
         if explicit_home

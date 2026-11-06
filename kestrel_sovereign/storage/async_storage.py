@@ -162,6 +162,7 @@ class AsyncStorage:
         semantic_capabilities=None,
         _artifact_clock=None,
         cold_read: bool = False,
+        sovereign_trust_root_path: Optional[str] = None,
     ):
         """
         Initialize AsyncStorage.
@@ -173,8 +174,12 @@ class AsyncStorage:
             config: Full configuration dict (overrides other args)
             agent_id: Agent/companion ID for multi-tenant isolation
             llm_service: Agent-scoped LLM service used for provider-backed embeddings
+            sovereign_trust_root_path: The operator-pinned Sovereign trust root
+                that verifies the corpus exclusion manifest, when the agent was
+                given one explicitly; else ``KESTREL_SOVEREIGN_TRUST_ROOT_PATH``.
         """
         self._backend: Optional[DatabaseBackend] = None
+        self._sovereign_trust_root_path = sovereign_trust_root_path
         self.db_path: Optional[str] = None
         self.agent_id = agent_id
         self.llm_service = llm_service
@@ -2277,17 +2282,20 @@ class AsyncStorage:
         """Produce the public immutable learning-corpus snapshot.
 
         This host service is intentionally the only feature-facing corpus
-        ingress; it never returns the database handle or property graph.
+        ingress; it never returns the database handle or property graph. It
+        holds out what the host's Sovereign-signed exclusion manifest names
+        for this agent, whatever ``policy`` excludes, and refuses to build
+        without a manifest it can verify (#3893). Reading and admitting the
+        manifest spends the same ``limits.max_wall_time_seconds`` as the build.
         """
-        from kestrel_sovereign.knowledge.corpus import (
-            GovernedAssertionCorpusService,
-            GovernedCorpusLimits,
-        )
+        from kestrel_sovereign.knowledge.corpus import GovernedAssertionCorpusService
 
+        limits, deadline = self._corpus_budget(limits)
+        exclusions = await self._host_corpus_exclusions(deadline=deadline)
         snapshot = await GovernedAssertionCorpusService(self).snapshot(
             policy=policy,
             inference_profile=inference_profile,
-            limits=limits if limits is not None else GovernedCorpusLimits(),
+            limits=self._remaining_corpus_limits(limits, deadline),
             inference_limits=inference_limits,
             maintenance_limits=maintenance_limits,
             semantic_capabilities=self._resolve_semantic_capabilities(
@@ -2295,6 +2303,7 @@ class AsyncStorage:
             ),
             prior_verified_snapshot=prior_verified_snapshot,
             allow_prior_verified_snapshot=allow_prior_verified_snapshot,
+            exclusions=exclusions,
         )
         await self._register_produced_semantic_artifact(
             artifact_id=artifact_id,
@@ -2311,6 +2320,7 @@ class AsyncStorage:
             ),
             retention_seconds=retention_seconds,
             artifact_digest=snapshot.snapshot_hash,
+            exclusion_manifest=snapshot.exclusion_manifest,
         )
         return snapshot
 
@@ -2330,22 +2340,26 @@ class AsyncStorage:
         consumer_public_key: str,
         retention_seconds: float,
     ):
-        """Read first-class governed additions/tombstones after a snapshot."""
-        from kestrel_sovereign.knowledge.corpus import (
-            GovernedAssertionCorpusService,
-            GovernedCorpusLimits,
-        )
+        """Read first-class governed additions/tombstones after a snapshot.
 
+        Under the same exclusion manifest as ``snapshot`` only, read within
+        the same time budget as the delta (#3893).
+        """
+        from kestrel_sovereign.knowledge.corpus import GovernedAssertionCorpusService
+
+        limits, deadline = self._corpus_budget(limits)
+        exclusions = await self._host_corpus_exclusions(deadline=deadline)
         delta = await GovernedAssertionCorpusService(self).changes_since(
             snapshot,
             policy=policy,
             inference_profile=inference_profile,
-            limits=limits if limits is not None else GovernedCorpusLimits(),
+            limits=self._remaining_corpus_limits(limits, deadline),
             inference_limits=inference_limits,
             maintenance_limits=maintenance_limits,
             semantic_capabilities=self._resolve_semantic_capabilities(
                 semantic_capabilities
             ),
+            exclusions=exclusions,
         )
         lineage_pairs = {
             (example.assertion.assertion_id, example.assertion.revision_id)
@@ -2369,8 +2383,80 @@ class AsyncStorage:
             lineage=tuple(sorted(lineage_pairs)),
             retention_seconds=retention_seconds,
             artifact_digest=delta.snapshot_hash,
+            exclusion_manifest=delta.exclusion_manifest,
         )
         return delta
+
+    @staticmethod
+    def _corpus_budget(limits):
+        """``limits`` (the defaults when ``None``) and the loop time its budget ends.
+
+        One ``max_wall_time_seconds`` covers reading and admitting the
+        exclusion manifest as well as the build (#3893).
+        """
+        from kestrel_sovereign.knowledge.corpus import (
+            GovernedCorpusError,
+            GovernedCorpusLimits,
+        )
+
+        limits = limits if limits is not None else GovernedCorpusLimits()
+        if not isinstance(limits, GovernedCorpusLimits):
+            raise GovernedCorpusError("limits must be GovernedCorpusLimits")
+        return limits, asyncio.get_running_loop().time() + limits.max_wall_time_seconds
+
+    @staticmethod
+    def _remaining_corpus_limits(limits, deadline: float):
+        """``limits`` with only the wall time left before ``deadline``."""
+        from dataclasses import replace
+
+        from kestrel_sovereign.knowledge.corpus import GovernedCorpusBudgetExceeded
+
+        remaining = deadline - asyncio.get_running_loop().time()
+        if remaining <= 0:
+            raise GovernedCorpusBudgetExceeded("max_wall_time_seconds exhausted")
+        return replace(limits, max_wall_time_seconds=remaining)
+
+    async def _host_corpus_exclusions(self, *, deadline: float):
+        """What the host's exclusion manifest holds out of this agent's corpora (#3893).
+
+        Read and verified on every build, never cached: a replaced or removed
+        manifest takes effect on the next build. The files are read in a
+        worker thread, never on the event loop, and only until ``deadline``
+        (loop time); anything but a regular file is refused unread, so a FIFO
+        put in the manifest's place cannot hold the read open.
+
+        Its sequence is then admitted against the highest this agent's builds
+        have admitted before the corpus is read, so a manifest that moved back
+        refuses the build. Every corpus artifact built under another manifest
+        is revoked: it may hold what this one holds out.
+        """
+        if not self._initialized:
+            await self.initialize()
+        from kestrel_sovereign.knowledge.corpus import GovernedCorpusBudgetExceeded
+        from kestrel_sovereign.knowledge.corpus_exclusions import (
+            load_corpus_exclusions,
+        )
+        from kestrel_sovereign.storage.corpus_exclusion_watermarks import (
+            admit_manifest,
+        )
+
+        store = self._assertion_store()
+        agent_id = store.tenant_id
+        try:
+            async with asyncio.timeout_at(deadline):
+                manifest = await asyncio.to_thread(
+                    load_corpus_exclusions,
+                    trust_root_path=self._sovereign_trust_root_path,
+                    agent_dids=frozenset({agent_id}),
+                )
+        except TimeoutError as error:
+            raise GovernedCorpusBudgetExceeded(
+                "max_wall_time_seconds exhausted reading the corpus exclusion manifest"
+            ) from error
+        exclusions = manifest.exclusions_for(agent_id)
+        await admit_manifest(self.db, agent_id=agent_id, receipt=exclusions.receipt)
+        await store.revoke_governed_corpus_artifacts_outside_manifest(exclusions.receipt)
+        return exclusions
 
     async def repair_semantic_maintenance(
         self,
@@ -2473,8 +2559,13 @@ class AsyncStorage:
         lineage,
         retention_seconds,
         artifact_digest,
+        exclusion_manifest=None,
     ):
-        """Seal producer-derived bytes and trusted runtime pins before return."""
+        """Seal producer-derived bytes and trusted runtime pins before return.
+
+        A corpus records ``exclusion_manifest``, the receipt of the manifest
+        it was built under, so it is served only while that manifest stands.
+        """
         if not self._initialized:
             await self.initialize()
         if (
@@ -2521,15 +2612,38 @@ class AsyncStorage:
                 + timedelta(seconds=float(retention_seconds))
             ).isoformat().replace("+00:00", "Z"),
             artifact_digest=artifact_digest,
+            exclusion_manifest_sha256=(
+                None if exclusion_manifest is None else exclusion_manifest.manifest_sha256
+            ),
+            exclusion_manifest_sequence=(
+                None if exclusion_manifest is None else exclusion_manifest.sequence
+            ),
         )
         return await self._assertion_store().register_governed_artifact(registration)
 
     async def consume_governed_semantic_artifact(self, artifact_id, *, expected_generation: int):
-        """Generation-fenced guard for a previously sealed semantic artifact."""
+        """Generation-fenced guard for a previously sealed semantic artifact.
+
+        A corpus is served only under the host's exclusion manifest as it
+        stands now, read and admitted exactly as a build reads it (#3893): an
+        unverifiable manifest refuses, and a corpus built under another one
+        is revoked rather than served.
+        """
         if not self._initialized:
             await self.initialize()
-        return await self._assertion_store().consume_governed_artifact(
-            artifact_id, expected_generation=expected_generation
+        from kestrel_sovereign.knowledge.artifact_lifecycle import CORPUS_ARTIFACT_KINDS
+
+        store = self._assertion_store()
+        exclusion_manifest = None
+        if await store.governed_artifact_kind(artifact_id) in CORPUS_ARTIFACT_KINDS:
+            _limits, deadline = self._corpus_budget(None)
+            exclusion_manifest = (
+                await self._host_corpus_exclusions(deadline=deadline)
+            ).receipt
+        return await store.consume_governed_artifact(
+            artifact_id,
+            expected_generation=expected_generation,
+            exclusion_manifest=exclusion_manifest,
         )
 
     async def claim_governed_semantic_artifact_revocation(self, authentication, *, lease_seconds: float = 60.0):

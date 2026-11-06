@@ -32,6 +32,14 @@ class GovernedArtifactKind(str, Enum):
     FUTURE_CORPUS_CANDIDATE = "future_corpus_candidate"
 
 
+#: Kinds built under the host's corpus exclusion manifest (#3893). Each names
+#: the manifest it was built under, and is served only while that manifest is
+#: still the one the host admits.
+CORPUS_ARTIFACT_KINDS = frozenset(
+    {GovernedArtifactKind.CORPUS_MANIFEST, GovernedArtifactKind.FUTURE_CORPUS_CANDIDATE}
+)
+
+
 class GovernedArtifactState(str, Enum):
     ACTIVE = "active"
     REVOCATION_PENDING = "revocation_pending"
@@ -99,6 +107,10 @@ class GovernedArtifactRegistration:
     lineage: Sequence[GovernedArtifactLineage]
     retention_expires_at: str
     artifact_digest: str
+    #: For a corpus kind, the digest and sequence of the corpus exclusion
+    #: manifest it was built under (#3893); ``None`` for an export snapshot.
+    exclusion_manifest_sha256: str | None = None
+    exclusion_manifest_sequence: int | None = None
 
     def __post_init__(self) -> None:
         artifact_id = _text(self.artifact_id, "artifact_id")
@@ -124,6 +136,26 @@ class GovernedArtifactRegistration:
         if type(self.checkpoint_generation) is not int or self.checkpoint_generation < 0:
             raise GovernedArtifactError("checkpoint_generation must be a non-negative integer")
         kind = GovernedArtifactKind(self.kind)
+        if kind in CORPUS_ARTIFACT_KINDS:
+            if self.exclusion_manifest_sha256 is None or self.exclusion_manifest_sequence is None:
+                raise GovernedArtifactError(
+                    "a corpus artifact must name the exclusion manifest it was built under"
+                )
+            _sha256(self.exclusion_manifest_sha256, "exclusion_manifest_sha256")
+            if (
+                type(self.exclusion_manifest_sequence) is not int
+                or self.exclusion_manifest_sequence < 1
+            ):
+                raise GovernedArtifactError(
+                    "exclusion_manifest_sequence must be a positive integer"
+                )
+        elif (
+            self.exclusion_manifest_sha256 is not None
+            or self.exclusion_manifest_sequence is not None
+        ):
+            raise GovernedArtifactError(
+                f"a {kind.value} artifact is not built under a corpus exclusion manifest"
+            )
         pins = dict(self.capability_pins)
         if not pins or any(not isinstance(key, str) or not key for key in pins):
             raise GovernedArtifactError("capability_pins must be a non-empty string mapping")
@@ -275,7 +307,7 @@ class GovernedArtifactErasureObservation:
 
 
 __all__ = [
-    "ARTIFACT_LIFECYCLE_SCHEMA_VERSION", "GovernedArtifactErasureObservation",
+    "ARTIFACT_LIFECYCLE_SCHEMA_VERSION", "CORPUS_ARTIFACT_KINDS", "GovernedArtifactErasureObservation",
     "GovernedArtifactConsumerAuthentication", "GovernedArtifactDeletionOwner",
     "GovernedArtifactDeletionProof", "GovernedArtifactError", "GovernedArtifactKind", "GovernedArtifactLineage",
     "GovernedArtifactReceipt", "GovernedArtifactRegistration", "GovernedArtifactRevocationLease",

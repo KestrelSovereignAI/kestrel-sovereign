@@ -49,6 +49,7 @@ from kestrel_sovereign.storage.sqla.migrations import (
     _SEMANTIC_MAINTENANCE_LEASE_PRECISION_SCHEMA_VERSION,
     migrate_semantic_maintenance,
 )
+from tests.utils.corpus_exclusions import ExclusionAuthority
 from tests.utils.native_a2a import manager_for
 from tests.utils.virtual_clock import pinned_shacl_validation_clock
 
@@ -155,7 +156,7 @@ async def test_governed_artifact_erasure_lifecycle_has_backend_parity(
 @pytest.mark.asyncio
 @pytest.mark.dual_backend
 async def test_empty_export_and_corpus_expiry_have_backend_parity(
-    db_backend, tmp_path,
+    db_backend, tmp_path, monkeypatch,
 ):
     """Zero-lineage artifacts remain legitimate, revocable, and non-resurrectable."""
     from cryptography.hazmat.primitives import serialization
@@ -174,6 +175,7 @@ async def test_empty_export_and_corpus_expiry_have_backend_parity(
     tenant, identity = await _incepted_assertion_identity(
         tmp_path, "empty-artifact-parity",
     )
+    ExclusionAuthority(tmp_path / "sovereign", monkeypatch).admit(tenant)
     storage = await _assertion_storage_for_backend(db_backend, tenant, identity)
     private_key = Ed25519PrivateKey.generate()
     public_key = private_key.public_key().public_bytes(
@@ -2136,6 +2138,134 @@ async def test_vector_export_erasure_lifecycle_has_backend_parity(db_backend, tm
             (tenant,),
         ) == [(None, "")]
     finally:
+        await storage.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.dual_backend
+async def test_corpus_exclusion_manifest_holds_out_and_never_moves_back_on_either_backend(
+    db_backend, tmp_path, monkeypatch,
+):
+    """The host's signed exclusions apply, and an older manifest is refused (#3893)."""
+    from kestrel_sovereign.knowledge import (
+        EpistemicState,
+        GovernedArtifactError,
+        GovernedCorpusPolicy,
+        Visibility,
+    )
+    from kestrel_sovereign.knowledge.corpus_exclusions import CorpusExclusionManifestError
+
+    tenant, identity = await _incepted_assertion_identity(tmp_path, "corpus-exclusions")
+    authority = ExclusionAuthority(tmp_path / "sovereign", monkeypatch)
+    authority.admit(tenant)
+    older = json.loads(authority.manifest_path.read_text())
+    storage = await _assertion_storage_for_backend(db_backend, tenant, identity)
+    unique = uuid4().hex
+    exam_source = f"source:parity-exam-v1:{unique}{unique}"
+    everyday_source = f"source:parity-everyday-v1:{unique}{unique}"
+    stored = []
+    try:
+        for name, source_id in (("exam", exam_source), ("everyday", everyday_source)):
+            assertion = _semantic_assertion(
+                tenant, f"{name}-revision-{unique}",
+                value=f"{name}-{unique}", source_id=source_id,
+            )
+            await storage.put_assertion(
+                assertion, source_occurrences=(_semantic_source(source_id),),
+            )
+            stored.append(assertion)
+        await storage.run_semantic_maintenance(None)
+        capabilities = await storage.semantic_maintenance_capability_versions(None)
+        policy = GovernedCorpusPolicy(
+            policy_id="corpus-exclusion-parity",
+            policy_version="1",
+            accepted_epistemic_states=(EpistemicState.REPORTED,),
+            accepted_visibility=(Visibility.PRIVATE,),
+            accepted_privacy_classifications=(stored[0].privacy_classification,),
+            accepted_consent_references=(stored[0].release_policy_reference,),
+            accepted_grounding_classes=(stored[0].confidence_basis,),
+            accepted_source_kinds=("parity-test",),
+            accepted_ontology_pins=(stored[0].ontology_version,),
+            accepted_semantic_capability_versions=tuple(capabilities.items()),
+        )
+        consumer = {
+            "consumer_id": "corpus-exclusion-parity",
+            "consumer_key_id": "corpus-exclusion-parity-key",
+            "consumer_public_key": "0" * 64,
+            "retention_seconds": 300,
+        }
+        unexcluded_id = str(uuid4())
+        unexcluded = await storage.governed_assertion_corpus_snapshot(
+            policy=policy, inference_profile=None, artifact_id=unexcluded_id, **consumer,
+        )
+        assert len(unexcluded.examples) == 2
+        authority.exclude(tenant, source_occurrence=[exam_source])
+        corpus_id = str(uuid4())
+        corpus = await storage.governed_assertion_corpus_snapshot(
+            policy=policy, inference_profile=None, artifact_id=corpus_id, **consumer,
+        )
+        assert [item.assertion.revision_id for item in corpus.examples] == [
+            stored[1].revision_id
+        ]
+        assert corpus.exclusion_manifest.sequence == 2
+        # Admitting sequence 2 revoked the corpus still carrying the exam.
+        assert await storage.db.fetchall(
+            "SELECT artifact_id, exclusion_manifest_sequence FROM semantic_governed_artifacts "
+            "WHERE tenant_id = ? AND kind = 'corpus_manifest' AND state = 'active'",
+            (tenant,),
+        ) == [(corpus_id, 2)]
+        assert await storage.consume_governed_semantic_artifact(
+            corpus_id, expected_generation=corpus.checkpoint.generation,
+        )
+        with pytest.raises(GovernedArtifactError):
+            await storage.consume_governed_semantic_artifact(
+                unexcluded_id, expected_generation=unexcluded.checkpoint.generation,
+            )
+
+        authority.write(older)
+        with pytest.raises(CorpusExclusionManifestError, match="lower than sequence 2"):
+            await storage.governed_assertion_corpus_snapshot(
+                policy=policy, inference_profile=None, artifact_id=str(uuid4()),
+                **consumer,
+            )
+        authority.write(authority.sign({tenant: {}}, sequence=2))
+        with pytest.raises(CorpusExclusionManifestError, match="already admitted"):
+            await storage.governed_assertion_corpus_snapshot(
+                policy=policy, inference_profile=None, artifact_id=str(uuid4()),
+                **consumer,
+            )
+        assert await storage.db.fetchone(
+            "SELECT sequence, manifest_sha256 FROM corpus_exclusion_watermarks "
+            "WHERE agent_id = ?",
+            (tenant,),
+        ) == (2, corpus.exclusion_manifest.manifest_sha256)
+
+        # A newer manifest withdraws the corpus at its next consumption.
+        authority.exclude(tenant, source_occurrence=[exam_source])
+        with pytest.raises(GovernedArtifactError, match="revoked"):
+            await storage.consume_governed_semantic_artifact(
+                corpus_id, expected_generation=corpus.checkpoint.generation,
+            )
+        assert await storage.db.fetchval(
+            "SELECT COUNT(*) FROM semantic_governed_artifacts "
+            "WHERE tenant_id = ? AND kind = 'corpus_manifest'",
+            (tenant,),
+        ) == 0
+        assert await storage.db.fetchval(
+            "SELECT COUNT(*) FROM semantic_governed_artifact_revocations "
+            "WHERE tenant_id = ? AND kind = 'corpus_manifest' AND acknowledged_at IS NULL",
+            (tenant,),
+        ) == 2
+    finally:
+        for assertion in stored:
+            if await storage.get_assertion(assertion.assertion_id) is not None:
+                await storage.erase_assertion(
+                    assertion.assertion_id,
+                    operation_id=f"corpus-exclusion-cleanup-{assertion.revision_id}",
+                )
+        await storage.db.execute(
+            "DELETE FROM corpus_exclusion_watermarks WHERE agent_id = ?", (tenant,),
+        )
         await storage.close()
 
 

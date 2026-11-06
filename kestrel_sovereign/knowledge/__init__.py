@@ -59,6 +59,7 @@ if TYPE_CHECKING:
         CorpusCheckpoint,
         CorpusEligibilityDecision,
         CorpusEligibilityReason,
+        CorpusExclusionReceipt,
         CorpusValidationStatus,
         GovernedAssertionCorpusService,
         GovernedCorpusBudgetExceeded,
@@ -72,6 +73,7 @@ if TYPE_CHECKING:
         GovernedCorpusStorage,
         GovernedCorpusTombstone,
         GovernedCorpusUnavailable,
+        HostCorpusExclusions,
         SessionAttestation,
     )
     from .rdf_codec import (
@@ -178,6 +180,7 @@ __all__ = [
     "CorpusCheckpoint",
     "CorpusEligibilityDecision",
     "CorpusEligibilityReason",
+    "CorpusExclusionReceipt",
     "CorpusValidationStatus",
     "DerivationExplanation",
     "IDENTITY_VERSION",
@@ -257,6 +260,7 @@ __all__ = [
     "GovernedCorpusStorage",
     "GovernedCorpusTombstone",
     "GovernedCorpusUnavailable",
+    "HostCorpusExclusions",
     "SessionAttestation",
     "ShaclCapabilityUnavailable",
     "ShaclSnapshotMismatch",
@@ -445,6 +449,7 @@ _CORPUS_EXPORTS = frozenset(
         "CorpusCheckpoint",
         "CorpusEligibilityDecision",
         "CorpusEligibilityReason",
+        "CorpusExclusionReceipt",
         "CorpusValidationStatus",
         "GovernedAssertionCorpusService",
         "GovernedCorpusBudgetExceeded",
@@ -458,6 +463,7 @@ _CORPUS_EXPORTS = frozenset(
         "GovernedCorpusStorage",
         "GovernedCorpusTombstone",
         "GovernedCorpusUnavailable",
+        "HostCorpusExclusions",
         "SessionAttestation",
     }
 )

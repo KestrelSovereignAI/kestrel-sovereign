@@ -41,6 +41,7 @@ from kestrel_sovereign.knowledge.shacl_validation import (
     ValidationWriteAction,
 )
 from kestrel_sovereign.knowledge.artifact_lifecycle import (
+    CORPUS_ARTIFACT_KINDS,
     GovernedArtifactConsumerAuthentication,
     GovernedArtifactDeletionOwner,
     GovernedArtifactDeletionProof,
@@ -5841,12 +5842,15 @@ class AsyncAssertionStore:
             await self._database.execute(
                 "INSERT INTO semantic_governed_artifacts "
                 "(tenant_id, artifact_id, kind, consumer_id, consumer_key_id, consumer_public_key, "
-                "checkpoint_generation, policy_pin, capability_digest, artifact_digest, retention_expires_at, state, created_at, updated_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "checkpoint_generation, policy_pin, capability_digest, artifact_digest, retention_expires_at, state, "
+                "exclusion_manifest_sha256, exclusion_manifest_sequence, created_at, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (tenant_id, registration.artifact_id, registration.kind.value, registration.consumer_id,
                  registration.consumer_key_id, registration.consumer_public_key,
                  generation, registration.policy_pin, registration.capability_digest, registration.artifact_digest,
-                 registration.retention_expires_at, GovernedArtifactState.ACTIVE.value, now, now),
+                 registration.retention_expires_at, GovernedArtifactState.ACTIVE.value,
+                 registration.exclusion_manifest_sha256, registration.exclusion_manifest_sequence,
+                 now, now),
             )
             for item in registration.lineage:
                 await self._database.execute(
@@ -5859,33 +5863,109 @@ class AsyncAssertionStore:
                 state=GovernedArtifactState.ACTIVE, generation=generation,
             )
 
+    async def governed_artifact_kind(self, artifact_id: str) -> GovernedArtifactKind | None:
+        """The kind of this tenant's registered artifact, or ``None`` if there is none.
+
+        A kind never changes once registered, so a caller may decide from it
+        what a later :meth:`consume_governed_artifact` needs.
+        """
+        if not isinstance(artifact_id, str) or not artifact_id:
+            raise GovernedArtifactError("artifact_id must be non-empty")
+        tenant_id, _ = self._require_scope()
+        row = await self._database.fetchone(
+            "SELECT kind FROM semantic_governed_artifacts WHERE tenant_id = ? AND artifact_id = ?",
+            (tenant_id, artifact_id),
+        )
+        return None if row is None else GovernedArtifactKind(str(row[0]))
+
+    @staticmethod
+    def _exclusion_manifest_binding(exclusion_manifest) -> tuple[str, int]:
+        """``(manifest_sha256, sequence)`` of a verified corpus exclusion receipt."""
+        from kestrel_sovereign.knowledge.corpus import CorpusExclusionReceipt
+
+        if not isinstance(exclusion_manifest, CorpusExclusionReceipt):
+            raise GovernedArtifactError(
+                "a governed corpus is served only under the host's current, "
+                "verified exclusion manifest"
+            )
+        return exclusion_manifest.manifest_sha256, exclusion_manifest.sequence
+
+    async def revoke_governed_corpus_artifacts_outside_manifest(self, exclusion_manifest) -> int:
+        """Revoke every active corpus artifact not built under ``exclusion_manifest``.
+
+        Called once the host has admitted ``exclusion_manifest`` (#3893). A
+        corpus built under an earlier manifest, or before manifests existed,
+        may hold what the admitted one holds out, so it starts the normal
+        revocation: its consumer is asked to delete it, and anything it built
+        from it with it. Returns how many were revoked.
+        """
+        manifest_sha256, sequence = self._exclusion_manifest_binding(exclusion_manifest)
+        tenant_id, _ = self._require_scope()
+        kinds = tuple(sorted(kind.value for kind in CORPUS_ARTIFACT_KINDS))
+        stale_sql = (
+            "SELECT artifact_id FROM semantic_governed_artifacts "
+            f"WHERE tenant_id = ? AND state = ? AND kind IN ({_placeholders(kinds)}) "
+            "AND (exclusion_manifest_sha256 IS NULL OR exclusion_manifest_sequence IS NULL "
+            "OR exclusion_manifest_sha256 <> ? OR exclusion_manifest_sequence <> ?)"
+        )
+        params = (tenant_id, GovernedArtifactState.ACTIVE.value, *kinds, manifest_sha256, sequence)
+        # Most builds find nothing stale: decide that without the tenant lock.
+        if not await self._database.fetchall(stale_sql, params):
+            return 0
+        async with self._mutation():
+            stale = await self._database.fetchall(stale_sql, params)
+            if not stale:
+                return 0
+            return await self._revoke_governed_artifacts_for_lineage(
+                artifact_ids=tuple(str(row[0]) for row in stale),
+                generation=await self._generation(),
+            )
+
     async def consume_governed_artifact(
-        self, artifact_id: str, *, expected_generation: int,
+        self, artifact_id: str, *, expected_generation: int, exclusion_manifest=None,
     ) -> GovernedArtifactReceipt:
-        """Fence serving/generation to a live, exact checkpoint-bound registry row."""
+        """Fence serving/generation to a live, exact checkpoint-bound registry row.
+
+        A corpus artifact is served only under ``exclusion_manifest``, the
+        host's current verified exclusion manifest (#3893). One built under
+        another manifest is revoked rather than served: the manifest it was
+        built under may have excluded less.
+        """
         if not isinstance(artifact_id, str) or not artifact_id:
             raise GovernedArtifactError("artifact_id must be non-empty")
         if type(expected_generation) is not int or expected_generation < 0:
             raise GovernedArtifactError("expected_generation must be a non-negative integer")
+        current_manifest = (
+            None if exclusion_manifest is None
+            else self._exclusion_manifest_binding(exclusion_manifest)
+        )
         async with self._mutation():
             generation = await self._generation()
             tenant_id, _ = self._require_scope()
             row = await self._database.fetchone(
-                "SELECT kind, checkpoint_generation, retention_expires_at, state FROM semantic_governed_artifacts "
+                "SELECT kind, checkpoint_generation, retention_expires_at, state, "
+                "exclusion_manifest_sha256, exclusion_manifest_sequence "
+                "FROM semantic_governed_artifacts "
                 "WHERE tenant_id = ? AND artifact_id = ?",
                 (tenant_id, artifact_id),
             )
             if row is None:
                 raise GovernedArtifactError("artifact is not registered or has been revoked")
-            kind, checkpoint, expires_at, state = row
+            kind, checkpoint, expires_at, state, bound_sha256, bound_sequence = row
+            artifact_kind = GovernedArtifactKind(str(kind))
             if state != GovernedArtifactState.ACTIVE.value:
                 raise GovernedArtifactError("artifact is not active")
             if generation != expected_generation or int(checkpoint) != generation:
                 raise GovernedArtifactError("artifact generation fence does not match current tenant generation")
+            if artifact_kind in CORPUS_ARTIFACT_KINDS and current_manifest is None:
+                raise GovernedArtifactError(
+                    "a governed corpus is served only under the host's current, "
+                    "verified exclusion manifest"
+                )
             if datetime.fromisoformat(str(expires_at).replace("Z", "+00:00")) <= datetime.now(timezone.utc):
                 await self._record_artifact_receipt(
                     artifact_key=self._artifact_key(artifact_id),
-                    kind=GovernedArtifactKind(str(kind)),
+                    kind=artifact_kind,
                     state=GovernedArtifactState.EXPIRED,
                     generation=generation,
                 )
@@ -5897,13 +5977,28 @@ class AsyncAssertionStore:
                 # receipt, registry removal, and pending physical-deletion
                 # work must commit before a consumer is told this artifact is
                 # unavailable.
+                refusal = "artifact retention expiry elapsed"
+            elif artifact_kind in CORPUS_ARTIFACT_KINDS and (
+                bound_sha256 is None
+                or bound_sequence is None
+                or (str(bound_sha256), int(bound_sequence)) != current_manifest
+            ):
+                await self._revoke_governed_artifacts_for_lineage(
+                    artifact_ids=(artifact_id,),
+                    generation=generation,
+                )
+                # Raised after the revocation commits, as for expiry.
+                refusal = (
+                    "corpus artifact was built under another corpus exclusion "
+                    "manifest and has been revoked"
+                )
             else:
                 return GovernedArtifactReceipt(
-                    self._artifact_key(artifact_id), GovernedArtifactKind(str(kind)),
+                    self._artifact_key(artifact_id), artifact_kind,
                     GovernedArtifactState.ACTIVE, generation,
-                    self._artifact_receipt_digest(self._artifact_key(artifact_id), GovernedArtifactKind(str(kind)), GovernedArtifactState.ACTIVE, generation),
+                    self._artifact_receipt_digest(self._artifact_key(artifact_id), artifact_kind, GovernedArtifactState.ACTIVE, generation),
                 )
-        raise GovernedArtifactError("artifact retention expiry elapsed")
+        raise GovernedArtifactError(refusal)
 
     async def _authenticate_governed_artifact_consumer(
         self, authentication: GovernedArtifactConsumerAuthentication,

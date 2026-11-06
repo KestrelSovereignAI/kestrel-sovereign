@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import json
 import sqlite3
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
@@ -52,6 +53,7 @@ from kestrel_sovereign.storage.privacy_wrapper import (
     PrivacyViolationError,
 )
 from kestrel_sovereign.privacy import PrivacyMode
+from tests.utils.corpus_exclusions import ExclusionAuthority
 from tests.utils.live_turn import TurnBoundAgent, live_turn
 
 
@@ -64,7 +66,13 @@ async def _open_storage(db_path: str, tenant_id: str, capability) -> AsyncStorag
 
 
 @pytest.fixture
-async def storage(tmp_path):
+def exclusion_authority(tmp_path, monkeypatch) -> ExclusionAuthority:
+    """The host's Sovereign, who signs its corpus exclusion manifest (#3893)."""
+    return ExclusionAuthority(tmp_path / "sovereign", monkeypatch)
+
+
+@pytest.fixture
+async def storage(tmp_path, exclusion_authority):
     identity_dir = tmp_path / "identity"
     credentials = await create_kestrel_identity_async(
         str(identity_dir), identity_method="did:pkh", agent_name="Artifact lifecycle test",
@@ -72,6 +80,7 @@ async def storage(tmp_path):
     key_id = f"kestrel_{credentials.agent_did.rsplit(':', 1)[-1]}"
     identity: AgentIdentity = load_agent_identity(key_id, identity_dir)
     capability = _resolve_authenticated_agent_assertion_capability(credentials.agent_did, identity)
+    exclusion_authority.admit(credentials.agent_did)
     instance = await _open_storage(":memory:", credentials.agent_did, capability)
     try:
         yield instance
@@ -138,10 +147,26 @@ def _owner(
     )
 
 
+def _admitted_receipt():
+    """The receipt of the exclusion manifest this test host admits now (#3893)."""
+    from kestrel_sovereign.knowledge.corpus_exclusions import load_corpus_exclusions
+
+    return load_corpus_exclusions().receipt
+
+
+def _elsewhere_receipt():
+    """A manifest no test host admits: a corpus registered under it is never served."""
+    from kestrel_sovereign.knowledge import CorpusExclusionReceipt
+
+    return CorpusExclusionReceipt("d" * 64, 1, "2026-11-01T00:00:00+00:00")
+
+
 def _registration(
     assertion: Assertion, generation: int, *, private_key: Ed25519PrivateKey,
-    artifact_id: str | None = None,
+    artifact_id: str | None = None, exclusion_manifest=None,
 ) -> GovernedArtifactRegistration:
+    """A corpus registration, built under the host's admitted manifest by default."""
+    receipt = exclusion_manifest or _admitted_receipt()
     return GovernedArtifactRegistration(
         artifact_id=artifact_id or str(uuid4()), kind=GovernedArtifactKind.CORPUS_MANIFEST,
         tenant_id=assertion.tenant_id, consumer_id="parametric-self-test",
@@ -152,6 +177,8 @@ def _registration(
         lineage=(GovernedArtifactLineage(assertion.assertion_id, assertion.revision_id),),
         retention_expires_at=(datetime.now(timezone.utc) + timedelta(hours=1)).isoformat(),
         artifact_digest="c" * 64,
+        exclusion_manifest_sha256=receipt.manifest_sha256,
+        exclusion_manifest_sequence=receipt.sequence,
     )
 
 
@@ -254,6 +281,8 @@ async def test_registration_rejects_forged_stale_or_expired_lineage(storage: Asy
         policy_pin=registration.policy_pin, capability_pins=registration.capability_pins,
         lineage=(GovernedArtifactLineage(assertion.assertion_id, "forged-revision"),),
         retention_expires_at=registration.retention_expires_at, artifact_digest=registration.artifact_digest,
+        exclusion_manifest_sha256=registration.exclusion_manifest_sha256,
+        exclusion_manifest_sequence=registration.exclusion_manifest_sequence,
     )
     with pytest.raises(GovernedArtifactError, match="lineage"):
         await storage._assertion_store().register_governed_artifact(forged)
@@ -267,6 +296,8 @@ async def test_registration_rejects_forged_stale_or_expired_lineage(storage: Asy
         policy_pin=expired.policy_pin, capability_pins=expired.capability_pins,
         lineage=expired.lineage, retention_expires_at="2020-01-01T00:00:00Z",
         artifact_digest=expired.artifact_digest,
+        exclusion_manifest_sha256=expired.exclusion_manifest_sha256,
+        exclusion_manifest_sequence=expired.exclusion_manifest_sequence,
     )
     with pytest.raises(GovernedArtifactError, match="expiry"):
         await storage._assertion_store().register_governed_artifact(expired)
@@ -294,7 +325,10 @@ async def test_pending_revocation_survives_restart_and_replays_only_to_its_consu
         await first.put_assertion(assertion, source_occurrences=(_source(),))
         checkpoint = await first.assertion_checkpoint()
         await first._assertion_store().register_governed_artifact(
-            _registration(assertion, checkpoint.generation, private_key=private_key)
+            _registration(
+                assertion, checkpoint.generation, private_key=private_key,
+                exclusion_manifest=_elsewhere_receipt(),
+            )
         )
         await first.erase_assertion(assertion.assertion_id)
     finally:
@@ -1336,7 +1370,7 @@ async def test_a_session_attested_after_projection_still_holds_the_row_out(
 
 
 @pytest.fixture
-async def file_storage(tmp_path):
+async def file_storage(tmp_path, exclusion_authority):
     """Native storage over a SQLite file, as an agent's database is."""
     identity_dir = tmp_path / "identity"
     credentials = await create_kestrel_identity_async(
@@ -1347,6 +1381,7 @@ async def file_storage(tmp_path):
     capability = _resolve_authenticated_agent_assertion_capability(
         credentials.agent_did, identity
     )
+    exclusion_authority.admit(credentials.agent_did)
     instance = await _open_storage(
         str(tmp_path / "native.db"), credentials.agent_did, capability
     )
@@ -1425,6 +1460,633 @@ async def test_an_incremental_read_withdraws_a_row_since_attested_in_an_excluded
     assert (await _corpus_delta(storage, base, excluding)).tombstones == delta.tombstones
     # A corpus that excludes no session never consults attestations.
     assert (await _corpus_delta(storage, unexcluded_base, policy)).tombstones == ()
+
+
+# --- The host's Sovereign-signed exclusion manifest (#3893) -----------------
+
+
+async def _governed_snapshot(governed: PrivacyEnforcingStorage, policy):
+    """A corpus read as a learning consumer reads it: through the privacy gate."""
+    return await governed.governed_assertion_corpus_snapshot(
+        policy=policy,
+        inference_profile=None,
+        artifact_id=str(uuid4()),
+        consumer_id="parametric-self-test",
+        consumer_key_id="parametric-self-key-v1",
+        consumer_public_key=_CORPUS_CONSUMER_PUBLIC_KEY,
+        retention_seconds=300,
+    )
+
+
+async def _corpus_artifact_count(storage: AsyncStorage) -> int:
+    return await storage.db.fetchval(
+        "SELECT COUNT(*) FROM semantic_governed_artifacts "
+        "WHERE tenant_id = ? AND kind = 'corpus_manifest'",
+        (storage.agent_id,),
+    )
+
+
+async def _store_alongside(storage: AsyncStorage, taught: dict, source) -> dict:
+    """Another fact of the taught one's classes, from a source of its own."""
+    assertion = await storage.get_assertion(taught["assertion_id"])
+    other_source = replace(
+        source,
+        source_occurrence_id=f"source:test-everyday-v1:{'e' * 64}",
+        locator="POST:/api/agent/invoke#note:everyday",
+    )
+    other = replace(
+        assertion,
+        assertion_id=None,
+        revision_id="everyday-revision",
+        object=Literal("everyday-region", XSD_STRING),
+        lineage=DirectLineage((other_source.source_occurrence_id,)),
+    )
+    await storage.put_assertion(other, source_occurrences=(other_source,))
+    return {"revision_id": other.revision_id}
+
+
+@pytest.mark.asyncio
+async def test_a_manifest_source_occurrence_is_held_out_whatever_the_consumer_policy(
+    storage: AsyncStorage, exclusion_authority: ExclusionAuthority
+) -> None:
+    """The exam's source is excluded on the corpus path a consumer actually calls.
+
+    The consumer's policy names no exclusions, as parametric-self's does: the
+    host supplies them from its signed manifest, and the policy, its digest and
+    the registered ``policy_pin`` stay the consumer's own.
+    """
+    feature, agent, governed = _fact_feature(storage)
+    with live_turn(agent, None):
+        exam = await _teach(feature, "exam-turn", "sealed-exam-answer")
+    (exam_source,) = await governed.list_assertion_revision_sources(exam["revision_id"])
+    everyday = await _store_alongside(storage, exam, exam_source)
+    policy = await _taught_fact_policy(storage, exam)
+    assert policy.excluded_source_occurrence_ids == ()
+
+    exclusion_authority.exclude(
+        storage.agent_id, source_occurrence=[exam_source.source_occurrence_id]
+    )
+    snapshot = await _governed_snapshot(governed, policy)
+
+    assert [item.assertion.revision_id for item in snapshot.examples] == [
+        everyday["revision_id"]
+    ]
+    assert snapshot.observability.excluded == {"explicitly_excluded": 1}
+    assert "sealed-exam-answer" not in str(
+        [item.canonical_mapping() for item in snapshot.examples]
+    )
+    assert snapshot.policy == policy
+    assert snapshot.observability.policy_digest == policy.digest
+    assert snapshot.exclusion_manifest.sequence == exclusion_authority.sequence
+    assert await storage.db.fetchone(
+        "SELECT policy_pin, artifact_digest FROM semantic_governed_artifacts "
+        "WHERE tenant_id = ? AND kind = 'corpus_manifest'",
+        (storage.agent_id,),
+    ) == (policy.digest, snapshot.snapshot_hash)
+    assert await storage.db.fetchone(
+        "SELECT sequence, manifest_sha256 FROM corpus_exclusion_watermarks "
+        "WHERE agent_id = ?",
+        (storage.agent_id,),
+    ) == (
+        snapshot.exclusion_manifest.sequence,
+        snapshot.exclusion_manifest.manifest_sha256,
+    )
+
+    # The same material under an empty section enters, under another hash.
+    exclusion_authority.admit(storage.agent_id)
+    admitted = await _governed_snapshot(governed, policy)
+    assert {item.assertion.revision_id for item in admitted.examples} == {
+        exam["revision_id"], everyday["revision_id"],
+    }
+    assert admitted.snapshot_hash != snapshot.snapshot_hash
+
+
+@pytest.mark.asyncio
+async def test_a_manifest_session_holds_out_what_was_taught_in_it(
+    storage: AsyncStorage, exclusion_authority: ExclusionAuthority
+) -> None:
+    feature, agent, governed = _fact_feature(storage)
+    with live_turn(agent, EXAM_SESSION):
+        exam = await _teach(feature, "exam-turn", "exam-answer-region")
+    policy = await _taught_fact_policy(storage, exam)
+
+    exclusion_authority.exclude(storage.agent_id, session=[EXAM_SESSION])
+    snapshot = await _governed_snapshot(governed, policy)
+
+    assert snapshot.examples == ()
+    assert snapshot.observability.excluded == {"explicitly_excluded": 1}
+
+
+def _sign_unchecked(authority: ExclusionAuthority, manifest: dict) -> dict:
+    """Sign ``manifest`` as written: the builders would refuse a malformed one."""
+    from kestrel_sovereign.knowledge.corpus_exclusions import (
+        canonical_corpus_exclusions_bytes,
+    )
+    from kestrel_sovereign.security.crypto_suite import (
+        ALG_ECDSA_SECP256K1_SHA256,
+        get_suite,
+    )
+
+    signature = get_suite(ALG_ECDSA_SECP256K1_SHA256).sign(
+        canonical_corpus_exclusions_bytes(manifest), authority.private_key
+    )
+    return {
+        **manifest,
+        "signature": {
+            "alg": ALG_ECDSA_SECP256K1_SHA256, "kid": "keys-1", "sig": signature.hex(),
+        },
+    }
+
+
+def _with_section(authority, agent_id, section) -> dict:
+    manifest = authority.sign({agent_id: {}}, sequence=authority.sequence + 1)
+    manifest.pop("signature")
+    manifest["agents"] = {agent_id: section}
+    return _sign_unchecked(authority, manifest)
+
+
+def _missing_manifest(authority, agent_id):
+    authority.manifest_path.unlink()
+
+
+def _not_json(authority, agent_id):
+    authority.manifest_path.write_text("{not json")
+
+
+def _tampered(authority, agent_id):
+    manifest = json.loads(authority.manifest_path.read_text())
+    manifest["agents"][agent_id] = {}
+    manifest["reason"] = "excludes less than the Sovereign signed"
+    authority.write(manifest)
+
+
+def _forged(authority, agent_id):
+    from kestrel_sovereign.knowledge.corpus_exclusions import (
+        build_legacy_signed_corpus_exclusions,
+    )
+    from kestrel_sovereign.security.crypto_suite import Secp256k1Suite
+
+    authority.write(build_legacy_signed_corpus_exclusions(
+        signer_did=authority.did_document["id"],
+        sequence=authority.sequence + 1,
+        agents={agent_id: {}},
+        private_key=Secp256k1Suite().generate_keypair().private_key,
+    ))
+
+
+def _no_section(authority, agent_id):
+    authority.write(authority.sign({}, sequence=authority.sequence + 1))
+
+
+def _unknown_kind(authority, agent_id):
+    authority.write(_with_section(authority, agent_id, {"conversation": ["x"]}))
+
+
+def _shortened_saved_item(authority, agent_id):
+    authority.write(_with_section(authority, agent_id, {"saved_item": ["2ca40dbd"]}))
+
+
+def _shortened_source(authority, agent_id):
+    authority.write(_with_section(
+        authority, agent_id,
+        {"source_occurrence": ["source:memory-agency-save-fact-v1:3a9b12"]},
+    ))
+
+
+def _shortened_session(authority, agent_id):
+    authority.write(_with_section(authority, agent_id, {"session": ["dcd6f767"]}))
+
+
+def _unmatchable_saved_item(authority, agent_id):
+    authority.exclude(agent_id, saved_item=["2ca40dbd-0000-4000-8000-000000000000"])
+
+
+def _unsigned_field(authority, agent_id):
+    manifest = json.loads(authority.manifest_path.read_text())
+    manifest["excluded_by_default"] = False
+    authority.write(manifest)
+
+
+def _duplicate_key(authority, agent_id):
+    text = authority.manifest_path.read_text()
+    authority.manifest_path.write_text(text[:-1] + ', "reason": "other"}')
+
+
+def _no_trust_root(authority, agent_id):
+    authority.trust_root_path.unlink()
+
+
+def _agent_as_trust_root(authority, agent_id):
+    document = {**authority.did_document, "id": agent_id}
+    authority.trust_root_path.write_text(json.dumps(document))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("break_manifest", "message"),
+    [
+        (_missing_manifest, "no manifest at"),
+        (_not_json, "not valid JSON"),
+        (_tampered, "signature verification failed"),
+        (_forged, "signature verification failed"),
+        (_no_section, "has no section for"),
+        (_unknown_kind, "unknown id kind 'conversation'"),
+        (_shortened_saved_item, "malformed or shortened"),
+        (_shortened_source, "malformed or shortened"),
+        (_shortened_session, "malformed or shortened"),
+        (_unmatchable_saved_item, "no producer records"),
+        (_unsigned_field, "unsigned field"),
+        (_duplicate_key, "repeats a key"),
+        (_no_trust_root, "no Sovereign trust root"),
+        (_agent_as_trust_root, "agent-owned DID"),
+    ],
+)
+async def test_a_corpus_build_refuses_rather_than_run_without_its_exclusions(
+    storage: AsyncStorage,
+    exclusion_authority: ExclusionAuthority,
+    break_manifest,
+    message: str,
+) -> None:
+    from kestrel_sovereign.knowledge.corpus_exclusions import CorpusExclusionManifestError
+
+    feature, agent, governed = _fact_feature(storage)
+    with live_turn(agent, None):
+        exam = await _teach(feature, "exam-turn", "sealed-exam-answer")
+    policy = await _taught_fact_policy(storage, exam)
+    break_manifest(exclusion_authority, storage.agent_id)
+
+    with pytest.raises(CorpusExclusionManifestError, match=message):
+        await _governed_snapshot(governed, policy)
+    assert await _corpus_artifact_count(storage) == 0
+
+
+@pytest.mark.asyncio
+async def test_an_older_signed_manifest_cannot_be_put_back(
+    storage: AsyncStorage, exclusion_authority: ExclusionAuthority
+) -> None:
+    from kestrel_sovereign.knowledge.corpus_exclusions import CorpusExclusionManifestError
+
+    feature, agent, governed = _fact_feature(storage)
+    with live_turn(agent, None):
+        exam = await _teach(feature, "exam-turn", "sealed-exam-answer")
+    (exam_source,) = await governed.list_assertion_revision_sources(exam["revision_id"])
+    policy = await _taught_fact_policy(storage, exam)
+    older = json.loads(exclusion_authority.manifest_path.read_text())
+    exclusion_authority.exclude(
+        storage.agent_id, source_occurrence=[exam_source.source_occurrence_id]
+    )
+    assert (await _governed_snapshot(governed, policy)).examples == ()
+
+    # Validly signed, and it excludes less: the build refuses it.
+    exclusion_authority.write(older)
+    with pytest.raises(CorpusExclusionManifestError, match="lower than sequence 2"):
+        await _governed_snapshot(governed, policy)
+    # Re-signed at the admitted sequence with other content: refused too.
+    exclusion_authority.write(
+        exclusion_authority.sign({storage.agent_id: {}}, sequence=2)
+    )
+    with pytest.raises(CorpusExclusionManifestError, match="already admitted"):
+        await _governed_snapshot(governed, policy)
+    assert await storage.db.fetchval(
+        "SELECT sequence FROM corpus_exclusion_watermarks WHERE agent_id = ?",
+        (storage.agent_id,),
+    ) == 2
+    assert await _corpus_artifact_count(storage) == 1
+
+
+@pytest.mark.asyncio
+async def test_another_agents_unmatchable_section_does_not_refuse_this_agent(
+    storage: AsyncStorage, exclusion_authority: ExclusionAuthority
+) -> None:
+    feature, agent, governed = _fact_feature(storage)
+    with live_turn(agent, None):
+        exam = await _teach(feature, "exam-turn", "an-answer")
+    policy = await _taught_fact_policy(storage, exam)
+    exclusion_authority.exclude(
+        "did:web:agents.example:meridian",
+        saved_item=["469a149e-0000-4000-8000-000000000000"],
+    )
+
+    snapshot = await _governed_snapshot(governed, policy)
+
+    assert [item.assertion.revision_id for item in snapshot.examples] == [
+        exam["revision_id"]
+    ]
+
+
+@pytest.mark.asyncio
+async def test_an_incremental_read_refuses_once_the_manifest_has_changed(
+    storage: AsyncStorage, exclusion_authority: ExclusionAuthority
+) -> None:
+    """A newer manifest may hold out what the base corpus already holds."""
+    from kestrel_sovereign.knowledge import GovernedCorpusUnavailable
+
+    feature, agent, governed = _fact_feature(storage)
+    with live_turn(agent, None):
+        exam = await _teach(feature, "exam-turn", "sealed-exam-answer")
+    (exam_source,) = await governed.list_assertion_revision_sources(exam["revision_id"])
+    policy = await _taught_fact_policy(storage, exam)
+    base = await _governed_snapshot(governed, policy)
+    assert (await _corpus_delta(storage, base, policy)).exclusion_manifest == (
+        base.exclusion_manifest
+    )
+
+    exclusion_authority.exclude(
+        storage.agent_id, source_occurrence=[exam_source.source_occurrence_id]
+    )
+    with pytest.raises(GovernedCorpusUnavailable, match="corpus_exclusion_manifest_changed"):
+        await _corpus_delta(storage, base, policy)
+
+
+async def _registered_corpus(governed: PrivacyEnforcingStorage, policy):
+    """A corpus as its consumer receives it, with the artifact id it consumes by."""
+    artifact_id = str(uuid4())
+    snapshot = await governed.governed_assertion_corpus_snapshot(
+        policy=policy,
+        inference_profile=None,
+        artifact_id=artifact_id,
+        consumer_id="parametric-self-test",
+        consumer_key_id="parametric-self-key-v1",
+        consumer_public_key=_CORPUS_CONSUMER_PUBLIC_KEY,
+        retention_seconds=300,
+    )
+    return snapshot, artifact_id
+
+
+async def _pending_corpus_revocations(storage: AsyncStorage) -> list[str]:
+    return [
+        str(row[0]) for row in await storage.db.fetchall(
+            "SELECT kind FROM semantic_governed_artifact_revocations "
+            "WHERE tenant_id = ? AND acknowledged_at IS NULL ORDER BY kind",
+            (storage.agent_id,),
+        )
+    ]
+
+
+async def _active_artifact_ids(storage: AsyncStorage) -> set[str]:
+    return {
+        str(row[0]) for row in await storage.db.fetchall(
+            "SELECT artifact_id FROM semantic_governed_artifacts "
+            "WHERE tenant_id = ? AND state = 'active'",
+            (storage.agent_id,),
+        )
+    }
+
+
+@pytest.mark.asyncio
+async def test_a_corpus_built_before_the_exam_was_excluded_is_never_served_again(
+    storage: AsyncStorage, exclusion_authority: ExclusionAuthority
+) -> None:
+    """The manifest a corpus was built under must still stand when it is consumed.
+
+    A corpus holding the exam, built before the Sovereign excluded it, stays
+    on its consumer's disk. Once a manifest that excludes the exam is
+    admitted, that corpus is revoked, so its consumer is told to delete it,
+    and consuming it refuses.
+    """
+    feature, agent, governed = _fact_feature(storage)
+    with live_turn(agent, None):
+        exam = await _teach(feature, "exam-turn", "sealed-exam-answer")
+    (exam_source,) = await governed.list_assertion_revision_sources(exam["revision_id"])
+    policy = await _taught_fact_policy(storage, exam)
+    with_exam, with_exam_id = await _registered_corpus(governed, policy)
+    assert [item.assertion.revision_id for item in with_exam.examples] == [
+        exam["revision_id"]
+    ]
+    generation = with_exam.checkpoint.generation
+    assert await governed.consume_governed_semantic_artifact(
+        with_exam_id, expected_generation=generation
+    )
+
+    exclusion_authority.exclude(
+        storage.agent_id, source_occurrence=[exam_source.source_occurrence_id]
+    )
+    with pytest.raises(GovernedArtifactError, match="revoked"):
+        await governed.consume_governed_semantic_artifact(
+            with_exam_id, expected_generation=generation
+        )
+    assert with_exam_id not in await _active_artifact_ids(storage)
+    assert await _pending_corpus_revocations(storage) == ["corpus_manifest"]
+
+    # A corpus built under the manifest that stands is served.
+    without_exam, without_exam_id = await _registered_corpus(governed, policy)
+    assert without_exam.examples == ()
+    assert await governed.consume_governed_semantic_artifact(
+        without_exam_id, expected_generation=without_exam.checkpoint.generation
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_newer_manifest_revokes_every_corpus_built_under_an_older_one(
+    storage: AsyncStorage, exclusion_authority: ExclusionAuthority
+) -> None:
+    """Admitting a manifest revokes stale corpora and the deltas built on them.
+
+    Their consumer is asked to delete each one, whether or not it is ever
+    consumed again; an export, which no manifest governs, is left alone.
+    """
+    feature, agent, governed = _fact_feature(storage)
+    with live_turn(agent, None):
+        exam = await _teach(feature, "exam-turn", "sealed-exam-answer")
+    policy = await _taught_fact_policy(storage, exam)
+    base, base_id = await _registered_corpus(governed, policy)
+    delta_id = str(uuid4())
+    await storage.governed_assertion_corpus_changes_since(
+        base, policy=policy, inference_profile=None, artifact_id=delta_id,
+        consumer_id="parametric-self-test", consumer_key_id="parametric-self-key-v1",
+        consumer_public_key=_CORPUS_CONSUMER_PUBLIC_KEY, retention_seconds=300,
+    )
+    export_id = str(uuid4())
+    await storage.export_assertion_snapshot(
+        artifact_id=export_id, consumer_id="parametric-self-test",
+        consumer_key_id="parametric-self-key-v1",
+        consumer_public_key=_CORPUS_CONSUMER_PUBLIC_KEY, retention_seconds=300,
+    )
+    assert {base_id, delta_id, export_id} <= await _active_artifact_ids(storage)
+
+    exclusion_authority.exclude(storage.agent_id, session=[EXAM_SESSION])
+    rebuilt, rebuilt_id = await _registered_corpus(governed, policy)
+
+    assert await _active_artifact_ids(storage) == {export_id, rebuilt_id}
+    assert await _pending_corpus_revocations(storage) == [
+        "corpus_manifest", "future_corpus_candidate",
+    ]
+    assert await storage.db.fetchone(
+        "SELECT exclusion_manifest_sha256, exclusion_manifest_sequence "
+        "FROM semantic_governed_artifacts WHERE tenant_id = ? AND artifact_id = ?",
+        (storage.agent_id, rebuilt_id),
+    ) == (rebuilt.exclusion_manifest.manifest_sha256, exclusion_authority.sequence)
+
+
+@pytest.mark.asyncio
+async def test_a_corpus_is_not_served_while_no_manifest_can_be_verified(
+    storage: AsyncStorage, exclusion_authority: ExclusionAuthority
+) -> None:
+    """An unverifiable manifest refuses consumption, but deletes nothing.
+
+    Removing the manifest is something an agent can do. Without one there is
+    no current manifest to judge the corpus against, so it is neither served
+    nor revoked; an export, which no manifest governs, is still served.
+    """
+    from kestrel_sovereign.knowledge.corpus_exclusions import CorpusExclusionManifestError
+
+    feature, agent, governed = _fact_feature(storage)
+    with live_turn(agent, None):
+        exam = await _teach(feature, "exam-turn", "sealed-exam-answer")
+    policy = await _taught_fact_policy(storage, exam)
+    corpus, corpus_id = await _registered_corpus(governed, policy)
+    export_id = str(uuid4())
+    exported_at, _ = await storage.export_assertion_snapshot(
+        artifact_id=export_id, consumer_id="parametric-self-test",
+        consumer_key_id="parametric-self-key-v1",
+        consumer_public_key=_CORPUS_CONSUMER_PUBLIC_KEY, retention_seconds=300,
+    )
+
+    exclusion_authority.manifest_path.unlink()
+    with pytest.raises(CorpusExclusionManifestError, match="no manifest at"):
+        await governed.consume_governed_semantic_artifact(
+            corpus_id, expected_generation=corpus.checkpoint.generation
+        )
+    assert await storage.consume_governed_semantic_artifact(
+        export_id, expected_generation=exported_at.generation
+    )
+    assert corpus_id in await _active_artifact_ids(storage)
+    assert await _pending_corpus_revocations(storage) == []
+
+
+@pytest.mark.asyncio
+async def test_a_corpus_registered_before_manifests_existed_is_revoked(
+    storage: AsyncStorage,
+) -> None:
+    """A corpus row with no manifest was built with no exclusions at all."""
+    feature, agent, governed = _fact_feature(storage)
+    with live_turn(agent, None):
+        exam = await _teach(feature, "exam-turn", "sealed-exam-answer")
+    policy = await _taught_fact_policy(storage, exam)
+    corpus, corpus_id = await _registered_corpus(governed, policy)
+    await storage.db.execute(
+        "UPDATE semantic_governed_artifacts SET exclusion_manifest_sha256 = NULL, "
+        "exclusion_manifest_sequence = NULL WHERE tenant_id = ? AND artifact_id = ?",
+        (storage.agent_id, corpus_id),
+    )
+
+    with pytest.raises(GovernedArtifactError, match="revoked"):
+        await storage.consume_governed_semantic_artifact(
+            corpus_id, expected_generation=corpus.checkpoint.generation
+        )
+    assert await _pending_corpus_revocations(storage) == ["corpus_manifest"]
+
+
+@pytest.mark.asyncio
+async def test_the_store_serves_a_corpus_only_under_the_manifest_it_was_built_under(
+    storage: AsyncStorage,
+) -> None:
+    """The store's own check, which holds under a concurrent admission too."""
+    from kestrel_sovereign.knowledge import CorpusExclusionReceipt
+
+    private_key = Ed25519PrivateKey.generate()
+    assertion = _assertion(storage.agent_id, "store-binding-revision")
+    await storage.put_assertion(assertion, source_occurrences=(_source(),))
+    generation = (await storage.assertion_checkpoint()).generation
+    admitted = _admitted_receipt()
+    store = storage._assertion_store()
+    served = _registration(assertion, generation, private_key=private_key)
+    stale = _registration(assertion, generation, private_key=private_key)
+    await store.register_governed_artifact(served)
+    await store.register_governed_artifact(stale)
+
+    with pytest.raises(GovernedArtifactError, match="current, verified exclusion manifest"):
+        await store.consume_governed_artifact(
+            served.artifact_id, expected_generation=generation
+        )
+    assert await store.consume_governed_artifact(
+        served.artifact_id, expected_generation=generation, exclusion_manifest=admitted
+    )
+    newer = CorpusExclusionReceipt("e" * 64, admitted.sequence + 1, admitted.issued_at)
+    with pytest.raises(GovernedArtifactError, match="another corpus exclusion manifest"):
+        await store.consume_governed_artifact(
+            stale.artifact_id, expected_generation=generation, exclusion_manifest=newer
+        )
+    assert await _active_artifact_ids(storage) == {served.artifact_id}
+    assert await _pending_corpus_revocations(storage) == ["corpus_manifest"]
+
+
+def test_a_corpus_registration_must_name_its_manifest_and_an_export_must_not() -> None:
+    assertion = _assertion("did:example:registration-binding")
+    corpus = _registration(
+        assertion, 1, private_key=Ed25519PrivateKey.generate(),
+        exclusion_manifest=_elsewhere_receipt(),
+    )
+    with pytest.raises(GovernedArtifactError, match="must name the exclusion manifest"):
+        replace(corpus, exclusion_manifest_sha256=None)
+    with pytest.raises(GovernedArtifactError, match="exclusion_manifest_sha256"):
+        replace(corpus, exclusion_manifest_sha256="d" * 63)
+    with pytest.raises(GovernedArtifactError, match="positive integer"):
+        replace(corpus, exclusion_manifest_sequence=0)
+    with pytest.raises(GovernedArtifactError, match="export_snapshot artifact is not built"):
+        replace(corpus, kind=GovernedArtifactKind.EXPORT_SNAPSHOT)
+    assert replace(
+        corpus,
+        kind=GovernedArtifactKind.EXPORT_SNAPSHOT,
+        exclusion_manifest_sha256=None,
+        exclusion_manifest_sequence=None,
+    ).kind is GovernedArtifactKind.EXPORT_SNAPSHOT
+
+
+@pytest.mark.asyncio
+async def test_the_manifest_is_read_off_the_event_loop_within_the_build_budget(
+    storage: AsyncStorage, monkeypatch
+) -> None:
+    """A manifest read that does not return cannot stall the host (#3893).
+
+    The read runs in a worker thread while the loop keeps serving, and it
+    spends the build's own ``max_wall_time_seconds``.
+    """
+    import threading
+    import time
+
+    from kestrel_sovereign.knowledge import GovernedCorpusBudgetExceeded, GovernedCorpusLimits
+    from kestrel_sovereign.knowledge import corpus_exclusions
+    from kestrel_sovereign.knowledge.corpus_exclusions import CorpusExclusionManifestError
+
+    feature, agent, governed = _fact_feature(storage)
+    with live_turn(agent, None):
+        exam = await _teach(feature, "exam-turn", "an-answer")
+    policy = await _taught_fact_policy(storage, exam)
+    released = threading.Event()
+
+    def stalled_read(**_kwargs):
+        if not released.wait(5):
+            raise CorpusExclusionManifestError("test stall was never released")
+        raise CorpusExclusionManifestError("released")
+
+    monkeypatch.setattr(corpus_exclusions, "load_corpus_exclusions", stalled_read)
+    ticks = 0
+
+    async def heartbeat() -> None:
+        nonlocal ticks
+        while True:
+            await asyncio.sleep(0.02)
+            ticks += 1
+
+    beating = asyncio.create_task(heartbeat())
+    started = time.monotonic()
+    try:
+        with pytest.raises(GovernedCorpusBudgetExceeded, match="exclusion manifest"):
+            await storage.governed_assertion_corpus_snapshot(
+                policy=policy, inference_profile=None,
+                limits=GovernedCorpusLimits(max_wall_time_seconds=0.3),
+                artifact_id=str(uuid4()), consumer_id="parametric-self-test",
+                consumer_key_id="parametric-self-key-v1",
+                consumer_public_key=_CORPUS_CONSUMER_PUBLIC_KEY, retention_seconds=300,
+            )
+        elapsed = time.monotonic() - started
+    finally:
+        released.set()
+        beating.cancel()
+    assert elapsed < 2.0
+    assert ticks >= 5
+    assert await _corpus_artifact_count(storage) == 0
 
 
 @pytest.mark.asyncio

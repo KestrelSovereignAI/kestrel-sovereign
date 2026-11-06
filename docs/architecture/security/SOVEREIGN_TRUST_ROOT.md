@@ -38,6 +38,9 @@ backup.
 The same root also verifies governing-constitution **source descriptors**
 (#2553), which choose the source whose bytes govern an agent; see
 [Custom governing constitution sources](#custom-governing-constitution-sources).
+It also verifies the **corpus exclusion manifest** (#3893), which names the
+material held out of every governed learning corpus; see
+[Corpus exclusion manifest](#corpus-exclusion-manifest).
 
 ## Storage and configuration
 
@@ -57,7 +60,9 @@ Select the file through exactly one of these mechanisms:
 If an explicit path and the environment variable are both present, they must
 resolve to the same file. Different paths are an ambiguous authority state and
 fail closed. Missing, unreadable, malformed, oversized, keyless, or
-agent-owned DID documents also fail closed.
+agent-owned DID documents also fail closed, as does anything at the path that
+is not a regular file: a FIFO put there is refused unread rather than left to
+block its reader (#3893).
 
 Graph properties named `sovereign_root_did_document`,
 `trusted_sovereign_did_document`, `sovereign_root_did`, and
@@ -757,6 +762,142 @@ the trust root.
   non-list `signatures`, or a signature entry whose `alg`, `kid`, or `sig` is
   not a string makes the descriptor untrusted. It never escapes doctor's or
   reanchor's untrusted-descriptor handling as a `TypeError`.
+
+## Corpus exclusion manifest
+
+A governed learning corpus must not contain held-out material, such as a
+fidelity exam an adapter is later measured against. Which material that is
+is the Sovereign's decision, not the learning consumer's and not the filtered
+agent's, so it lives in one host-level file signed by this trust root
+(`kestrel_sovereign.knowledge.corpus_exclusions`, #3893). Every governed corpus
+build reads it and holds out the ids it names for the building agent, whatever
+the consumer's corpus policy says.
+
+### Location and format
+
+The host reads `KESTREL_CORPUS_EXCLUSIONS_PATH` (an absolute path), else
+`<host data>/corpus-exclusions.json` (`$KESTREL_HOME/host-data`, or
+`~/.kestrel/host-data`). Keep it outside every agent's data directory. The
+agents and the host may run as one OS user, so file permissions separate
+nothing: integrity comes from the signature. An agent can delete or replace
+the file, which refuses its corpus builds, but cannot forge one.
+
+The manifest is a `kestrel.corpus.exclusions.v1` artifact. Every field below is
+signed; any other top-level field is refused.
+
+| Field | Meaning |
+|---|---|
+| `artifact_type`, `version`, `subject` | `kestrel.corpus.exclusions.v1`, `1`, `governed_corpus_exclusions` |
+| `signer` | The pinned trust root's DID |
+| `sequence` | A positive integer that only moves forward |
+| `issued_at` | ISO-8601 timestamp with a UTC offset |
+| `reason` | Provenance |
+| `agents` | Agent DID → `{"source_occurrence": [...], "session": [...], "saved_item": [...]}` |
+
+Each id is the whole id; ids are compared exactly, so the 8-character prefix a
+console shows excludes nothing. A source occurrence is
+`source:<producer>:<64 hex>`; a session is the key its conversation rows are
+filed under, a UUID session id all 36 characters of it; a saved item is its
+whole UUID. It carries exactly one of `signature` (legacy) or `signatures`
+(hybrid), verified as source descriptors are.
+
+### Fail-closed semantics
+
+A build refuses, and never runs without exclusions, when:
+
+- the manifest is missing, unreadable, not a regular file, not JSON, repeats a
+  key, or carries an unsigned field. A FIFO put in its place is refused
+  unread, and the files are read in a worker thread within the build's own
+  `max_wall_time_seconds`, so a read that does not return cannot stall the
+  host;
+- the trust root is missing or ambiguous, names the building agent's own DID,
+  or did not sign the manifest;
+- an id is malformed or shortened, or names an unknown kind;
+- the manifest has no section for the building agent. "No exclusions" is a
+  signed, empty section (`{}`), never an absent file or section;
+- the agent's section names `saved_item` ids. No producer yet records which
+  saved item a source was read from, so they would match nothing; exclude that
+  material by its `source_occurrence` or `session` ids. Another agent's section
+  does not refuse this agent's builds;
+- the sequence is lower than the highest this agent's builds have admitted, or
+  equals it with different signed content. Each build records the admitted
+  sequence and the manifest's content digest per agent
+  (`corpus_exclusion_watermarks`), so an older manifest that excluded less
+  cannot be put back.
+
+Each corpus records the manifest's receipt (`exclusion_manifest`: content
+digest, sequence, `issued_at`), covered by its snapshot hash. An incremental
+read against a corpus built under another manifest refuses
+(`corpus_exclusion_manifest_changed`), so a changed manifest means a fresh
+snapshot.
+
+A corpus already handed to its consumer is governed too. Its registered
+artifact records the manifest it was built under, and consuming it
+(`consume_governed_semantic_artifact`) reads and admits the current manifest
+exactly as a build does:
+
+- an unverifiable manifest (missing, forged, rolled back) refuses consumption
+  and revokes nothing;
+- once a manifest is admitted, by a build or a consumption, every active
+  corpus artifact built under another one is revoked, including one
+  registered before manifests existed. Its consumer receives the normal
+  revocation lease to delete it, and anything it built from it, such as an
+  adapter trained on it;
+- an export snapshot is not governed by the manifest and is served without
+  one.
+
+So installing a manifest that holds out an exam also withdraws every corpus
+that still carries it.
+
+A session exclusion holds out only material that names its session. `save_fact`
+assertions recorded before #3875 name none; exclude them by
+`source_occurrence` id. A strategy-ledger row whose session is not attested is
+held out of any corpus that excludes a session (#3990).
+
+### Signing and installing
+
+Sign on the operator host that holds the Sovereign key, never inside an agent,
+with `build_legacy_signed_corpus_exclusions` or
+`build_hybrid_signed_corpus_exclusions` from the module above. Each new
+manifest needs a higher `sequence` than the last one installed, even when only
+`issued_at` or `reason` changes.
+
+```python
+import json
+from pathlib import Path
+from kestrel_sovereign.knowledge.corpus_exclusions import (
+    build_legacy_signed_corpus_exclusions,  # or build_hybrid_signed_corpus_exclusions
+)
+
+manifest = build_legacy_signed_corpus_exclusions(
+    signer_did="did:pkh:eip155:1:0x…",          # the pinned root's DID
+    sequence=1,
+    agents={
+        "did:web:agents.example:meridian": {
+            "source_occurrence": ["source:memory-agency-save-fact-v1:<64 hex>"],
+            "session": ["<whole session id>"],
+        },
+        "did:web:agents.example:emma": {},       # excludes nothing
+    },
+    private_key=sovereign_private_key,
+    reason="Held-out fidelity exams",
+)
+Path("/secure/host-data/corpus-exclusions.json").write_text(json.dumps(manifest))
+```
+
+Then run the operator check from the project, as the host's agents would read
+the manifest:
+
+```bash
+kestrel corpus exclusions check --agent-did did:web:agents.example:meridian \
+  --agent-did did:web:agents.example:emma
+```
+
+It verifies the manifest against the trust root in the environment `kestrel
+start` launches agents with, prints every agent's section with each excluded
+id, and exits 1 when the manifest is refused or any section, or any named
+agent's missing section, would refuse a build (`--json` for a script). It
+writes nothing; the next corpus build admits the sequence.
 
 ## Migration from `constitution_path` overrides
 
