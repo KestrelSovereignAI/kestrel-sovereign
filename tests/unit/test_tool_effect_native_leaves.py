@@ -1,5 +1,6 @@
 """Actual named, subagent and native A2A leaves claim before file effects."""
 
+import asyncio
 import pytest
 from kestrel_sdk.native_a2a.helpers.proto_helpers import new_task
 from kestrel_sdk.native_a2a.types import TaskState
@@ -16,6 +17,130 @@ from tests.unit.test_tool_effect_invocation import governed
 
 
 pytestmark = [pytest.mark.asyncio, pytest.mark.timeout(30)]
+
+
+async def test_async_registration_refusal_settles_the_native_task_without_dispatch(owner, tmp_path):
+    from kestrel_sovereign.a2a.scope import NativeRecipientScope
+    from kestrel_sdk.native_a2a.types import AgentSkill
+    from tests.utils.native_a2a import manager_for
+
+    witness = tmp_path / 'withdrawn-async-provider'
+    manager = manager_for(owner.tool_effect_store.backend,
+        NativeRecipientScope(owner.did), owns_backend=False)
+    await manager.initialize()
+
+    class Provider:
+        async def handle_task(self, task, *, arguments=None):
+            witness.write_text('withdrawn provider executed')
+            return task
+
+    manager.register_provider('owned-provider', [AgentSkill(id='owned-skill', name='Owned skill',
+        description='Original asynchronous registration', tags=['test'])], Provider())
+    denials = []
+    try:
+        accepted = await manager.execute_skill('owned-provider', 'owned-skill', {}, sync=False)
+        manager.unregister_provider('owned-provider')
+        try:
+            await manager.drain_execution_tasks()
+        except ResourceConflict as error:
+            denials.append(error)
+        persisted = await manager.task_store.get_for_recipient(accepted.id, manager.did)
+    finally:
+        try:
+            await manager.close()
+        except ResourceConflict as error:
+            denials.append(error)
+    assert not witness.exists()
+    assert persisted.status.state == TaskState.TASK_STATE_FAILED, 'Withdrawn provider left its native task SUBMITTED'
+    assert not denials, 'Known pre-dispatch refusal escaped its original task settlement'
+
+
+@pytest.mark.parametrize('uncertain', [False, True])
+async def test_async_feature_task_retains_its_original_journal_until_native_completion(owner, tmp_path, uncertain):
+    from kestrel_sovereign.a2a.scope import NativeRecipientScope
+    from tests.utils.native_a2a import manager_for
+
+    witness = tmp_path / 'original-async-feature-effect'
+    entered, resume, accepted = asyncio.Event(), asyncio.Event(), asyncio.Event()
+    background = []
+    accepted_tasks = []
+    lost_reply = ResourceOutcomeUnknown('Owned asynchronous reply lost after file effect')
+    manager = manager_for(owner.tool_effect_store.backend,
+        NativeRecipientScope(owner.did), owns_backend=False)
+    await manager.initialize()
+
+    class AsyncFileFeature(Feature):
+        @property
+        def tool_description(self):
+            return 'Owned asynchronous feature task'
+
+        async def initialize(self):
+            pass
+
+        async def handle_task(self, task, *, arguments=None):
+            entered.set()
+            await resume.wait()
+            return await super().handle_task(task, arguments=arguments)
+
+        @tool(name='owned_async_task_effect', description='Append the original task marker')
+        async def owned_async_task_effect(self) -> dict:
+            rows = await owner.tool_effect_store.database.fetchall(
+                'SELECT parent_claim_id,state FROM tool_effect_claims')
+            assert len(rows) == 2 and any(parent is not None and state == 'STARTED'
+                for parent, state in rows), 'Async task did not retain its original dispatch claim'
+            witness.write_text('one original asynchronous effect')
+            if uncertain:
+                raise lost_reply
+            return {'success': True}
+
+    feature = AsyncFileFeature(owner)
+    owner.features[feature.name] = feature
+    manager.register_provider(feature.name, feature.get_agent_skills(), feature)
+
+    @governed
+    async def invoke(agent, user_input, *, invocation_id=None):
+        task = await manager.execute_skill(feature.name, 'owned_async_task_effect', {}, sync=False)
+        background.extend(manager._execution_tasks)
+        accepted_tasks.append(task)
+        accepted.set()
+        return task
+
+    invocation = asyncio.create_task(invoke(owner, 'original async intention', invocation_id='original-async-task-intent'))
+    try:
+        await asyncio.wait_for(accepted.wait(), 2)
+        await asyncio.wait_for(entered.wait(), 2)
+        await asyncio.sleep(0.02)
+        assert not invocation.done(), 'Originating journal retired before its accepted worker'
+        assert await owner.tool_effect_store.database.fetchall('SELECT state FROM tool_effect_claims') == [('RETURNED_OK',)]
+        resume.set()
+        if uncertain:
+            from kestrel_sovereign.execution_custody import execution_evidence_carriers
+
+            with pytest.raises((ResourceOutcomeUnknown, BaseExceptionGroup)) as denied:
+                await invocation
+            assert any(error is lost_reply for error in execution_evidence_carriers(denied.value))
+            task = accepted_tasks[0]
+        else:
+            task = await invocation
+        await asyncio.gather(*background)
+        assert witness.exists(), 'Accepted async task inherited a retired parent journal'
+        assert witness.read_text() == 'one original asynchronous effect'
+        persisted = await manager.task_store.get_for_recipient(task.id, manager.did)
+        assert persisted.status.state == (TaskState.TASK_STATE_FAILED if uncertain else TaskState.TASK_STATE_COMPLETED)
+        if uncertain:
+            from kestrel_sovereign.a2a.lifecycle import task_outcome_unknown
+
+            assert task_outcome_unknown(persisted)
+        assert await owner.tool_effect_store.database.fetchone('SELECT state FROM tool_effect_operations') == ('CLOSED',)
+        assert await owner.tool_effect_store.database.fetchall('SELECT state FROM tool_effect_claims') == [
+            ('RETURNED_OK',), ('UNCONFIRMED' if uncertain else 'RETURNED_OK',)]
+        with pytest.raises(ToolEffectReconciliationRequired):
+            await invoke(owner, 'original async intention', invocation_id='original-async-task-intent')
+        assert witness.read_text() == 'one original asynchronous effect'
+    finally:
+        resume.set()
+        await asyncio.gather(invocation, *background, return_exceptions=True)
+        await manager.close()
 
 
 @pytest.mark.parametrize('lane,feature_base', [

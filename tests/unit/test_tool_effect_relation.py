@@ -60,6 +60,8 @@ def test_exact_canonical_checks_and_four_builtin_fk_triggers_are_admitted():
     (1, 2, 'index', 999), (1, 3, 'builtin_expression', False),
     (1, 3, 'expression', "evil(state) = ANY (ARRAY['OPEN','CLOSED'])"),
     (1, 3, 'expression', "state OPERATOR(evil.=) ANY (ARRAY['OPEN','CLOSED'])"),
+    (1, 3, 'expression', "state = ANY (ARRAY['OP EN','CLOSED'])"),
+    (1, 3, 'expression', "state = ANY (ARRAY['OP(EN)','CLOSED'])"),
     (1, 4, 'expression', '(latched IN (0,1) OR evil())'),
     (2, 0, 'function', 'application_trigger'), (2, 0, 'internal', False),
     (2, 0, 'builtin_function', False), (2, 0, 'constraint', 999),
@@ -84,3 +86,11 @@ def test_missing_or_duplicated_catalog_members_are_refused(collection):
 def test_check_normalization_keeps_foreign_program_names():
     assert _check_program("(state = ANY (ARRAY['OPEN'::pg_catalog.text, 'CLOSED'::text]))") == "state=ANYARRAY['OPEN','CLOSED']"
     assert 'evil' in _check_program('evil(state) OPERATOR(evil.=) ANY (ARRAY[0,1])')
+
+
+def test_literal_spelling_is_part_of_the_closed_enum_program():
+    for expression in ["state = ANY (ARRAY['OP EN','CLOSED'])",
+                       "state = ANY (ARRAY['OP(EN)','CLOSED'])"]:
+        rows = catalog()
+        rows[1][3]['expression'] = expression
+        assert not _verify_tool_effect_programs(*rows), 'Altered literal was admitted as a canonical enum'

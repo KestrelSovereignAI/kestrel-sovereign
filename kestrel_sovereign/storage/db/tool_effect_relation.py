@@ -11,7 +11,8 @@ def _check_program(expression):
     # pg_get_expr qualifies a non-visible operator/function. Only these exact
     # enum expressions and their builtin scalar casts are admitted. Catalog
     # dependencies below separately reject non-builtin expression programs.
-    return re.sub(r'\s+|[()]|::(?:pg_catalog\.)?(?:text|bigint)\b', '', expression)
+    return re.sub(r"(?P<literal>'(?:[^']|'')*')|\s+|[()]|::(?:pg_catalog\.)?(?:text|bigint)\b",
+        lambda match: match.group('literal') or '', expression)
 
 
 def _verify_tool_effect_programs(tables, constraints, triggers):

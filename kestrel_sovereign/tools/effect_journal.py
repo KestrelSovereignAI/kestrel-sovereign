@@ -75,7 +75,8 @@ class ToolEffectTurn:
     unconfirmed: list[BaseException] = field(default_factory=list)
 
     def require_live(self, owner: Any) -> None:
-        if self.owner is not owner or not self.live or self.closing:
+        if (self.owner is not owner or not self.live
+                or (self.closing and asyncio.current_task() not in self.pending)):
             raise ToolEffectJournalUnavailable("tool_effect_attempt_retired")
 
     def require_confirmed(self) -> None:
@@ -91,6 +92,7 @@ class ToolEffectTurn:
             while self.pending:
                 for completion in tuple(self.pending):
                     outcome = await await_owned_task(completion)
+                    self.pending.discard(completion)
                     terminal = execution_terminal_error(
                         terminal, outcome.error, outcome.cancellation,
                         retain_originals=True,

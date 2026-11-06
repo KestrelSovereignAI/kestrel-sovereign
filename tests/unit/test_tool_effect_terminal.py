@@ -53,6 +53,16 @@ async def test_terminal_cannot_borrow_a_reconnected_backing_for_an_old_attempt(o
         'SELECT state FROM tool_effect_operations') == ('OPEN',)
 
 
+async def test_reconnected_backing_cannot_admit_a_claim_for_the_original_attempt(owner):
+    turn = await admit(owner)
+    backend = owner.tool_effect_store.backend
+    await backend.close()
+    await backend.connect()
+    with pytest.raises(ExecutionAuthorityError):
+        await owner.tool_effect_store.claim(turn.attempt, registration='retired-attempt', arguments={})
+    assert await owner.tool_effect_store.database.fetchone('SELECT COUNT(*) FROM tool_effect_claims') == (0,)
+
+
 @pytest.mark.parametrize('field,value', [
     ('scope_digest', 'not-a-digest'), ('operation_digest', '0' * 63),
     ('attempt_id', 'not-an-attempt'), ('attempt_id', None),

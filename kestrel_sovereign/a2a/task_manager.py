@@ -614,168 +614,201 @@ class TaskManager:
         if isinstance(handler, Feature):
             require_persistent_tool_effects(handler.agent)
 
-        session_id = session_id or uuid4().hex
-        # #3921: coerce before PRE_TOOL_USE, so the hooks authorize the binding
-        # the tool runs with (a workflow step's ``"30"`` arrives as ``30``). A
-        # value that cannot be coerced fails the call before its hooks run, with
-        # the message the tool's wrapper would give, as every other path does.
-        from kestrel_sovereign.agent.direct_tool_arguments import (
-            coerce_declared_tool_arguments,
-            hook_rewrite_argument_error,
+        from kestrel_sovereign.tools.effect_journal import (
+            current_tool_effect_turn, execute_tool_effect,
         )
-        get_tool = getattr(handler, "_get_tool_by_name", None)
-        tool = get_tool(skill_id) if callable(get_tool) else None
-        args, argument_error = coerce_declared_tool_arguments(skill_id, tool, args)
-        denied_reason = None
-        if self.hooks_manager and argument_error is None:
-            from kestrel_sdk.hooks.base import HookEvent, HookInput
-            from kestrel_sovereign.hooks.decision_gate import (
-                decided_tool_input, evaluate_blocking_decision,
-            )
+        original_turn = None
+        if isinstance(handler, Feature) and not sync:
+            from copy import deepcopy
 
-            hook_input = HookInput(
-                session_id=session_id,
-                hook_event_name=HookEvent.PRE_TOOL_USE.value,
-                tool_name=skill_id,
-                tool_input=args,
-                feature_name=hook_feature_name,
-            )
-            hook_output = await self.hooks_manager.execute_hooks(
-                HookEvent.PRE_TOOL_USE, hook_input
-            )
-            # Retain post-hook redaction even when the decision blocks.
-            args = decided_tool_input(hook_input, hook_output)
-            blocked = evaluate_blocking_decision(hook_output)
-            if blocked is not None:
-                denied_reason = blocked.error
-            else:
-                # A rewrite the tool's wrapper would still coerce is not what
-                # the tool would run with (#3921).
-                argument_error = hook_rewrite_argument_error(skill_id, tool, args)
-        # Local arguments are passed explicitly to the handler. Their durable
-        # input representation must also retain exact JSON types and strings.
-        argument_part = Part(
-            raw=encode_inline_json(args), media_type="application/json"
-        )
-        metadata = {"skill": skill_id, "provider_id": agent_id}
-        if self._causation_chain_provider is not None:
-            chain = self._causation_chain_provider()
-            if chain is not None:
-                metadata.update(causation_metadata(chain))
-        request = SendMessageRequest(
-            tenant=self.task_store.scope.tenant,
-            message=new_text_message(
-                f"Execute {skill_id} on {agent_id}",
-                role=Role.ROLE_USER,
-            ),
-            metadata=metadata,
-        )
-        request.message.parts.append(argument_part)
-        task = await self.create_task(
-            request,
-            creator_agent_id=authority_agent_id,
-            notify_submitted=False,
-            cognition_wake_eligible=not sync,
-            input_wake_eligible=False,
-        )
-        baseline = Task.FromString(task.SerializeToString())
-        if denied_reason is not None:
-            task.metadata.update({"denied": True})
-            task.status.CopyFrom(
-                new_task_status(
-                    at=self.task_store.now_utc(),
-                    state=TaskState.TASK_STATE_REJECTED,
-                    message=new_text_message(
-                        denied_reason,
-                        task_id=task.id,
-                        context_id=task.context_id,
-                    ),
-                )
-            )
-            task, _ = await self._persist_execution_outcome(
-                task,
-                baseline=baseline,
-                authority_agent_id=authority_agent_id,
-                expected_state=TaskState.TASK_STATE_SUBMITTED,
-            )
-            return task
-        if argument_error is not None:
-            task.status.CopyFrom(
-                new_task_status(
-                    at=self.task_store.now_utc(),
-                    state=TaskState.TASK_STATE_FAILED,
-                    message=new_text_message(
-                        argument_error,
-                        task_id=task.id,
-                        context_id=task.context_id,
-                    ),
-                )
-            )
-            task, _ = await self._persist_execution_outcome(
-                task,
-                baseline=baseline,
-                authority_agent_id=authority_agent_id,
-                expected_state=TaskState.TASK_STATE_SUBMITTED,
-            )
-            return task
+            original_turn = current_tool_effect_turn(handler.agent)
+            if original_turn is None:
+                from kestrel_sovereign.tools.effect_journal import ToolEffectJournalUnavailable
 
-        if sync:
-            # Execute synchronously with transaction safety
-            try:
-                expected_state = task.status.state
-                with execution_registration:
-                    require_original_registration()
-                    task = await handler.handle_task(task, arguments=args)
-                # The canonical outcome writer owns CAS and uncertain-commit
-                # reconciliation. A persistence failure must reach the caller; an
-                # extra transaction/retry cannot manufacture a completed receipt.
-                task = await self._persist_sync_execution_outcome(
-                    task,
-                    baseline=baseline,
-                    authority_agent_id=authority_agent_id,
-                    expected_state=expected_state,
-                )
-            except asyncio.CancelledError as cancellation:
-                if is_execution_control_error(cancellation):
-                    raise
-                await self._settle_execution_interruption(
-                    baseline, authority_agent_id, cancellation
-                )
-                raise
-            # Execute POST_TOOL_USE hooks
-            if self.hooks_manager:
+                raise ToolEffectJournalUnavailable('tool_effect_attempt_unavailable')
+            original_turn.require_live(handler.agent)
+            args = deepcopy(args)
+
+        async def execute_original_skill():
+            nonlocal args, session_id
+            session_id = session_id or uuid4().hex
+            # #3921: coerce before PRE_TOOL_USE, so the hooks authorize the binding
+            # the tool runs with (a workflow step's ``"30"`` arrives as ``30``). A
+            # value that cannot be coerced fails the call before its hooks run, with
+            # the message the tool's wrapper would give, as every other path does.
+            from kestrel_sovereign.agent.direct_tool_arguments import (
+                coerce_declared_tool_arguments,
+                hook_rewrite_argument_error,
+            )
+            get_tool = getattr(handler, "_get_tool_by_name", None)
+            tool = get_tool(skill_id) if callable(get_tool) else None
+            args, argument_error = coerce_declared_tool_arguments(skill_id, tool, args)
+            denied_reason = None
+            if self.hooks_manager and argument_error is None:
                 from kestrel_sdk.hooks.base import HookEvent, HookInput
+                from kestrel_sovereign.hooks.decision_gate import (
+                    decided_tool_input, evaluate_blocking_decision,
+                )
 
-                post_hook_input = HookInput(
+                hook_input = HookInput(
                     session_id=session_id,
-                    hook_event_name=HookEvent.POST_TOOL_USE.value,
+                    hook_event_name=HookEvent.PRE_TOOL_USE.value,
                     tool_name=skill_id,
                     tool_input=args,
                     feature_name=hook_feature_name,
-                    tool_response={
-                        "task_id": task.id,
-                        "state": task_state_label(task.status.state),
-                    },
                 )
-                # Post hooks run in parallel (non-blocking)
-                await self.hooks_manager.execute_hooks_parallel(
-                    HookEvent.POST_TOOL_USE, post_hook_input
+                hook_output = await self.hooks_manager.execute_hooks(
+                    HookEvent.PRE_TOOL_USE, hook_input
                 )
-
-            return task
-        else:
-            async def execute_original_provider():
-                with execution_registration:
-                    require_original_registration()
-                    await self._execute_async(handler, Task.FromString(task.SerializeToString()),
-                        authority_agent_id, arguments=args)
-
-            self._track_execution_task(
-                execute_original_provider(),
-                task.id,
-                authority_agent_id,
+                # Retain post-hook redaction even when the decision blocks.
+                args = decided_tool_input(hook_input, hook_output)
+                blocked = evaluate_blocking_decision(hook_output)
+                if blocked is not None:
+                    denied_reason = blocked.error
+                else:
+                    # A rewrite the tool's wrapper would still coerce is not what
+                    # the tool would run with (#3921).
+                    argument_error = hook_rewrite_argument_error(skill_id, tool, args)
+            # Local arguments are passed explicitly to the handler. Their durable
+            # input representation must also retain exact JSON types and strings.
+            argument_part = Part(
+                raw=encode_inline_json(args), media_type="application/json"
             )
-            return task
+            metadata = {"skill": skill_id, "provider_id": agent_id}
+            if self._causation_chain_provider is not None:
+                chain = self._causation_chain_provider()
+                if chain is not None:
+                    metadata.update(causation_metadata(chain))
+            request = SendMessageRequest(
+                tenant=self.task_store.scope.tenant,
+                message=new_text_message(
+                    f"Execute {skill_id} on {agent_id}",
+                    role=Role.ROLE_USER,
+                ),
+                metadata=metadata,
+            )
+            request.message.parts.append(argument_part)
+            task = await self.create_task(
+                request,
+                creator_agent_id=authority_agent_id,
+                notify_submitted=False,
+                cognition_wake_eligible=not sync,
+                input_wake_eligible=False,
+            )
+            baseline = Task.FromString(task.SerializeToString())
+            if denied_reason is not None:
+                task.metadata.update({"denied": True})
+                task.status.CopyFrom(
+                    new_task_status(
+                        at=self.task_store.now_utc(),
+                        state=TaskState.TASK_STATE_REJECTED,
+                        message=new_text_message(
+                            denied_reason,
+                            task_id=task.id,
+                            context_id=task.context_id,
+                        ),
+                    )
+                )
+                task, _ = await self._persist_execution_outcome(
+                    task,
+                    baseline=baseline,
+                    authority_agent_id=authority_agent_id,
+                    expected_state=TaskState.TASK_STATE_SUBMITTED,
+                )
+                return task
+            if argument_error is not None:
+                task.status.CopyFrom(
+                    new_task_status(
+                        at=self.task_store.now_utc(),
+                        state=TaskState.TASK_STATE_FAILED,
+                        message=new_text_message(
+                            argument_error,
+                            task_id=task.id,
+                            context_id=task.context_id,
+                        ),
+                    )
+                )
+                task, _ = await self._persist_execution_outcome(
+                    task,
+                    baseline=baseline,
+                    authority_agent_id=authority_agent_id,
+                    expected_state=TaskState.TASK_STATE_SUBMITTED,
+                )
+                return task
+
+            if sync:
+                # Execute synchronously with transaction safety
+                try:
+                    expected_state = task.status.state
+                    with execution_registration:
+                        require_original_registration()
+                        task = await handler.handle_task(task, arguments=args)
+                    # The canonical outcome writer owns CAS and uncertain-commit
+                    # reconciliation. A persistence failure must reach the caller; an
+                    # extra transaction/retry cannot manufacture a completed receipt.
+                    task = await self._persist_sync_execution_outcome(
+                        task,
+                        baseline=baseline,
+                        authority_agent_id=authority_agent_id,
+                        expected_state=expected_state,
+                    )
+                except asyncio.CancelledError as cancellation:
+                    if is_execution_control_error(cancellation):
+                        raise
+                    await self._settle_execution_interruption(
+                        baseline, authority_agent_id, cancellation
+                    )
+                    raise
+                # Execute POST_TOOL_USE hooks
+                if self.hooks_manager:
+                    from kestrel_sdk.hooks.base import HookEvent, HookInput
+
+                    post_hook_input = HookInput(
+                        session_id=session_id,
+                        hook_event_name=HookEvent.POST_TOOL_USE.value,
+                        tool_name=skill_id,
+                        tool_input=args,
+                        feature_name=hook_feature_name,
+                        tool_response={
+                            "task_id": task.id,
+                            "state": task_state_label(task.status.state),
+                        },
+                    )
+                    # Post hooks run in parallel (non-blocking)
+                    await self.hooks_manager.execute_hooks_parallel(
+                        HookEvent.POST_TOOL_USE, post_hook_input
+                    )
+
+                return task
+            else:
+                async def execute_original_provider():
+                    with execution_registration:
+                        await self._execute_async(handler, Task.FromString(task.SerializeToString()),
+                            authority_agent_id, arguments=args,
+                            validate_registration=require_original_registration)
+
+                execution = self._track_execution_task(
+                    execute_original_provider(),
+                    task.id,
+                    authority_agent_id,
+                )
+                if original_turn is not None:
+                    # The local async API returns its accepted native Task now;
+                    # its originating turn still owns this exact worker through
+                    # journal finalization. A copied/foreign Task is not enrolled.
+                    original_turn.pending.add(execution)
+                    execution.add_done_callback(original_turn.pending.discard)
+                return task
+
+        if original_turn is not None:
+            # Durable acceptance itself fences reissuing an asynchronous task,
+            # even if the process dies before the worker reaches its tool leaf.
+            return await execute_tool_effect(handler.agent,
+                registration=['a2a-task-dispatch', agent_id, skill_id], arguments=args,
+                expected_generation=selected_generation,
+                validate_registration=require_original_registration,
+                execute=execute_original_skill)
+        return await execute_original_skill()
 
     def _track_execution_task(
         self,
@@ -954,6 +987,7 @@ class TaskManager:
         task: Task,
         authority_agent_id: str,
         *,
+        validate_registration: Callable[[], None],
         arguments: dict[str, Any] | None = None,
     ) -> None:
         """Execute a task asynchronously and update the store."""
@@ -961,6 +995,7 @@ class TaskManager:
         baseline = Task.FromString(task.SerializeToString())
         try:
             try:
+                validate_registration()
                 task = await handler.handle_task(task, arguments=arguments)
             except Exception as error:
                 if is_execution_control_error(error):

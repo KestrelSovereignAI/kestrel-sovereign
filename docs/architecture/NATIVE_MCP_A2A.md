@@ -356,6 +356,14 @@ Cancellation retains the caller's withdrawal and actual commit evidence.
 budget (default 5 seconds). Expiry still joins any accepted native transaction
 and connection retirement; it never certifies that the tool did not execute.
 
+Local `TaskManager.execute_skill(sync=False)` returns the accepted native Task
+while its feature worker runs. Its dispatch claim is durable before scheduling;
+the originating journal turn joins that exact worker before finalization. A
+copied context cannot authorize another task to enter a closing turn. Both the
+original provider registration and registry generation remain checked at the
+actual leaf. A withdrawn provider settles its task as FAILED without dispatch.
+Native network A2A task and signal lifecycles retain their existing owners.
+
 A local A2A skill whose execution met a `ResourceOutcomeUnknown` marks its
 task with `outcome_unknown: true` metadata (#3946). That covers a skill raising
 it, a Core or SDK `@tool` wrapper that returns it to a model as an ordinary

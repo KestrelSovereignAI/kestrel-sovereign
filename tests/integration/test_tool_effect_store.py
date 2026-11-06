@@ -150,6 +150,37 @@ async def test_sqlite_auxiliary_generation_uses_the_original_primary_admission(j
 
 
 @pytest.mark.asyncio
+async def test_sqlite_terminal_deadline_joins_native_lock_retirement(journal):
+    store, reopen, cleanup = journal
+    if not store.is_sqlite:
+        pytest.skip('SQLite native lock retirement contract')
+    store.terminal_timeout_seconds = 0.03
+    other = await reopen()
+    cleanup.push_async_callback(other.close)
+    attempt = await admit(store)
+    await store.claim(attempt, registration='owned-before-lock', arguments={})
+    finishing = None
+    try:
+        async with other.backend.transaction():
+            await other.execute('UPDATE tool_effect_operations SET revision = revision + 1')
+            finishing = asyncio.create_task(store.finish(attempt))
+            await asyncio.sleep(0.1)
+            # The budget expired, but the original SQLite worker is still
+            # physically queued behind this native lock. No early retirement.
+            assert not finishing.done()
+            assert store.backend._original_result_holds
+        with pytest.raises(TimeoutError):
+            await asyncio.wait_for(finishing, timeout=2)
+        assert not store.backend._original_result_holds
+        assert await store.database.fetchone('SELECT state FROM tool_effect_operations') == ('OPEN',)
+        with pytest.raises(ToolEffectReconciliationRequired):
+            await admit(store)
+    finally:
+        if finishing is not None:
+            await asyncio.gather(finishing, return_exceptions=True)
+
+
+@pytest.mark.asyncio
 async def test_replay_after_actual_effect_and_clean_database_restart_is_fenced(journal, tmp_path):
     store, reopen, cleanup = journal
     attempt = await admit(store)
