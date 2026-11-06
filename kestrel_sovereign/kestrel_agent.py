@@ -3275,17 +3275,7 @@ class KestrelAgent(
         # AsyncStorage owns this backend; every A2A store borrows it so partial
         # boot rollback cannot retire storage still held by other services.
         scope = NativeRecipientScope(self.did)
-        privacy = self.privacy_config
-        if privacy is None:
-            raise RuntimeError("Tool effect journal boot requires initialized privacy policy")
-        if privacy.allows_persistent_storage():
-            from kestrel_sovereign.tool_effect_store import ToolEffectStore
-
-            journal = ToolEffectStore(self._raw_storage.db, scope=scope)
-            # Initialization failures are fatal. Replacing or ignoring the
-            # original envelope would erase the evidence preventing replay.
-            await journal.initialize()
-            self.tool_effect_store = journal
+        await self._initialize_tool_effect_store()
         self.task_manager = TaskManager.from_backend(
             self._raw_storage._backend,
             scope=scope,
@@ -5189,6 +5179,32 @@ class KestrelAgent(
             return None
         return privacy_agent.privacy_config
 
+    async def _initialize_tool_effect_store(self) -> None:
+        """Open the original journal only under an installed persistent policy.
+
+        Boot and privacy transitions share this boundary. A volatile boot
+        opens no journal; returning to persistence must open the same durable
+        envelope before the transition can report success.
+        """
+        from kestrel_sovereign.tool_effect_store import ToolEffectStore
+
+        async with self._get_durable_persistence_gate().exclusive():
+            privacy = self.privacy_config
+            if privacy is None:
+                raise RuntimeError("Tool effect journal requires initialized privacy policy")
+            if not privacy.allows_persistent_storage():
+                return
+            journal = self.tool_effect_store
+            if journal is not None:
+                if not journal.initialized or journal.database is not self._raw_storage.db:
+                    raise RuntimeError("Original tool effect journal is unavailable")
+                return
+            journal = ToolEffectStore(self._raw_storage.db, scope=NativeRecipientScope(self.did))
+            # Failed initialization cannot publish a replacement or discard
+            # the original envelope and the evidence that prevents replay.
+            await journal.initialize()
+            self.tool_effect_store = journal
+
     def _get_privacy_transition_lock(self) -> ReentrantTransitionLock:
         """Return the lock that serializes privacy transitions with active turns.
 
@@ -5552,6 +5568,7 @@ class KestrelAgent(
             self._privacy_policy_epoch = getattr(self, "_privacy_policy_epoch", 0) + 1
             status_message = self.privacy_agent.set_mode(mode)
             self._install_privacy_mandate(plan)
+            await self._initialize_tool_effect_store()
         if plan.warning:
             status_message = f"{status_message} {plan.warning}"
 

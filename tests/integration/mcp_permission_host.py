@@ -77,7 +77,11 @@ class ObservedHost:
         assert agent is not None
         receipt = self.receipt / (nonce + '.json')
         temporary = receipt.with_suffix('.writing')
+        journal = agent.tool_effect_store
         temporary.write_text(json.dumps(dict(pid=os.getpid(), did=agent.did,
+            privacy_mode=agent.privacy_mode.value,
+            journal_initialized=journal is not None and journal.initialized,
+            journal_on_primary=journal is not None and journal.database is agent._raw_storage.db,
             remote_tools={name: owner for name, owner in agent._tool_to_feature.items()
                 if owner.startswith('mcp:remote:')})))
         temporary.replace(receipt)
@@ -141,9 +145,12 @@ async def serve(descriptor, ready):
                         agent_module._minimum_storage_potential_preclose_timeout(agent.storage))
                     prefix, reserved = agent_module._resolve_shutdown_budget(tail)
                     journal = getattr(agent, 'tool_effect_store', None)
-                    assert journal is not None, 'Owned host did not initialize its tool effect journal'
-                    assert journal.initialized, 'Owned host published readiness before journal initialization'
-                    assert journal.database is agent._raw_storage.db
+                    if agent.privacy_config.allows_persistent_storage():
+                        assert journal is not None, 'Owned host did not initialize its tool effect journal'
+                        assert journal.initialized, 'Owned host published readiness before journal initialization'
+                        assert journal.database is agent._raw_storage.db
+                    else:
+                        assert journal is None, 'Volatile boot opened durable journal metadata'
                     temporary = ready.with_suffix('.starting')
                     temporary.write_text(json.dumps(dict(port=port, pid=os.getpid(),
                         did=agent.did, server_source=server.__file__,
@@ -151,7 +158,7 @@ async def serve(descriptor, ready):
                         shutdown_prefix_floor_s=prefix_floor,
                         shutdown_prefix_s=prefix, shutdown_tail_s=reserved,
                         agent_shutdown_timeout_s=agent_module.KESTREL_AGENT_SHUTDOWN_TIMEOUT_S,
-                        journal_initialized=journal.initialized,
+                        journal_initialized=journal is not None and journal.initialized,
                         agent_database=str(agent.storage_path))))
                     temporary.replace(ready)
                     await serving

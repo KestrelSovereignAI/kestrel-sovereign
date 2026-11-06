@@ -1,12 +1,16 @@
 """The normal process host owns journal boot and refuses a corrupt envelope."""
 
 from pathlib import Path
+from contextlib import closing
 import sqlite3
 import sys
+import uuid
 
 import pytest
 
-from tests.integration.test_mcp_permission_host_restart import host_campaign, native_host
+from tests.integration.test_mcp_permission_host_restart import (
+    host_campaign, host_client, native_host, observe_registry,
+)
 
 
 pytestmark = [pytest.mark.mcp_integration, pytest.mark.timeout(120),
@@ -41,3 +45,44 @@ async def test_corrupt_journal_cannot_be_ignored_during_normal_host_boot(host_ca
         assert db.execute('SELECT wrapped_key FROM tool_effect_keys').fetchone() == (b'owned-corrupt-envelope',)
     assert c.peer.witness_file is not None
     assert not c.peer.witness_file.exists() or not c.peer.witness_file.read_text().splitlines()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('corrupt', [False, True])
+async def test_volatile_restart_reopens_original_journal_when_persistence_returns(host_campaign, corrupt):
+    c = host_campaign
+    endpoint = '/api/agents/permission-host/api/agent/privacy-mode'
+    async with native_host(c.home, c.descriptor, c.environment, c.peer, 'before-volatile') as first:
+        database = Path(first.state['agent_database']).resolve()
+        assert database.is_relative_to(c.home.resolve())
+        async with host_client(c, first.state) as client:
+            response = await client.post(endpoint, json={'mode': 'ephemeral'})
+            assert response.status_code == 200 and response.json()['success'], response.text
+    with closing(sqlite3.connect(database.as_uri() + '?mode=ro', uri=True)) as db:
+        original = db.execute('SELECT key_id, scope_digest, wrapped_key FROM tool_effect_keys').fetchall()
+        assert len(original) == 1
+    if corrupt:
+        with closing(sqlite3.connect(database)) as db, db:
+            db.execute('UPDATE tool_effect_keys SET wrapped_key = ?', (b'owned-corrupt-envelope',))
+    async with native_host(c.home, c.descriptor, c.environment, c.peer, 'volatile-restart') as second:
+        assert second.state['pid'] != first.state['pid']
+        assert second.state['journal_initialized'] is False
+        async with host_client(c, second.state) as client:
+            nonce = uuid.uuid4().hex
+            response = await client.post(endpoint, json={'mode': 'normal'},
+                headers={'X-Owned-Registry-Observation': nonce})
+            observed = await observe_registry(c, second.state, nonce)
+            assert observed['privacy_mode'] == 'normal'
+            if corrupt:
+                assert response.status_code == 500, 'Transition ignored the original corrupt envelope'
+                assert observed['journal_initialized'] is False
+                assert observed['journal_on_primary'] is False
+            else:
+                assert response.status_code == 200 and response.json()['success'], response.text
+                assert observed['journal_initialized'], 'Persistent transition left the journal unavailable'
+                assert observed['journal_on_primary'], 'Transition replaced the original primary database'
+    with closing(sqlite3.connect(database.as_uri() + '?mode=ro', uri=True)) as db:
+        expected = [(original[0][0], original[0][1], b'owned-corrupt-envelope')] if corrupt else original
+        assert db.execute('SELECT key_id, scope_digest, wrapped_key FROM tool_effect_keys').fetchall() == expected
+        assert db.execute('SELECT COUNT(*) FROM tool_effect_operations').fetchone() == (0,)
+    assert await c.peer.witness(None, None) == []

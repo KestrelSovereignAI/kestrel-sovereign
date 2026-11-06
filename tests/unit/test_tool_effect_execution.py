@@ -54,6 +54,39 @@ async def admit(owner, key="owned-op"):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize('unavailable', ['policy', 'retired', 'foreign'])
+async def test_journal_initialization_cannot_replace_an_unavailable_original(owner, tmp_path, unavailable):
+    from kestrel_sovereign.storage.async_database import AsyncDatabase
+
+    original = owner.tool_effect_store
+    foreign_db = foreign = None
+    try:
+        if unavailable == 'policy':
+            owner.privacy_agent = None
+            message = 'initialized privacy policy'
+        else:
+            message = 'Original tool effect journal is unavailable'
+            if unavailable == 'retired':
+                await original.close()
+            else:
+                foreign_db = await AsyncDatabase.sqlite(str(tmp_path / 'foreign-journal.db'))
+                foreign = ToolEffectStore(foreign_db, scope=NativeRecipientScope(owner.did))
+                await foreign.initialize()
+                owner.tool_effect_store = foreign
+        retained = owner.tool_effect_store
+        with pytest.raises(RuntimeError, match=message):
+            await owner._initialize_tool_effect_store()
+        assert owner.tool_effect_store is retained
+        assert await original.database.fetchone('SELECT COUNT(*) FROM tool_effect_keys') == (1,)
+    finally:
+        owner.tool_effect_store = original
+        if foreign is not None:
+            await foreign.close()
+        if foreign_db is not None:
+            await foreign_db.close()
+
+
+@pytest.mark.asyncio
 async def test_claim_is_acknowledged_before_file_effect_and_replay_is_fenced(owner, tmp_path):
     turn = await admit(owner)
     path = tmp_path / "effect"
