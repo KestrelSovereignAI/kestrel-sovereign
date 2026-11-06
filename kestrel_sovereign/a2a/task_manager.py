@@ -593,6 +593,12 @@ class TaskManager:
         authority_agent_id = self.did
         hook_feature_name = getattr(handler, "name", None) or agent_id
 
+        from kestrel_sdk.features.base import Feature
+        from kestrel_sovereign.tools.effect_journal import require_persistent_tool_effects
+
+        if isinstance(handler, Feature):
+            require_persistent_tool_effects(handler.agent)
+
         session_id = session_id or uuid4().hex
         # #3921: coerce before PRE_TOOL_USE, so the hooks authorize the binding
         # the tool runs with (a workflow step's ``"30"`` arrives as ``30``). A

@@ -2028,6 +2028,10 @@ class OrchestratorEngineMixin:
             "[GOVERNED-DISPATCH] source=%s session=%s tool=%s feature=%s",
             source, session_id, tool_name, feature_name,
         )
+        from kestrel_sovereign.tools.effect_journal import (
+            execute_tool_effect, require_persistent_tool_effects,
+        )
+        require_persistent_tool_effects(self)
 
         # --- PRE_TOOL_USE hook ---
         # The real HookManager threads input through the hook chain,
@@ -2101,9 +2105,15 @@ class OrchestratorEngineMixin:
         # executions.
         exec_start = time.time()
         require_execution_work(self)
-        execution.started = True
-        result = await found_tool.execute(**effective_args)
-        execution.returned = True
+
+        async def execute_registered():
+            execution.started = True
+            result = await found_tool.execute(**effective_args)
+            execution.returned = True
+            return result
+
+        result = await execute_tool_effect(self, registration=[feature_name, tool_name],
+            arguments=effective_args, execute=execute_registered)
         mark_current_invocation_effect_completed(session_id)
         require_execution_work(self)
         exec_duration_ms = int((time.time() - exec_start) * 1000)
@@ -3436,12 +3446,22 @@ class OrchestratorEngineMixin:
                 rewrite_error = hook_rewrite_argument_error(tool_name, t, effective_args)
                 if rewrite_error is not None:
                     raise ToolArgumentRewriteError(rewrite_error)
-            execution.started = True
-            result = await t.execute(**effective_args)
-            execution.returned = True
-            return result
+            async def execute_registered():
+                execution.started = True
+                result = await t.execute(**effective_args)
+                execution.returned = True
+                return result
+
+            from kestrel_sovereign.tools.effect_journal import execute_tool_effect
+
+            return await execute_tool_effect(self, registration=[hook_feature_name, tool_name],
+                arguments=effective_args, execute=execute_registered,
+                validate_registration=bound_tool.require_current if bound_tool is not None else None)
 
         async def run():
+            from kestrel_sovereign.tools.effect_journal import require_persistent_tool_effects
+
+            require_persistent_tool_effects(self)
             result = await self._execute_tool_with_hooks(
                 tool_name=tool_name,
                 feature_name=hook_feature_name,

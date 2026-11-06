@@ -7,11 +7,12 @@ from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 import hashlib
+import inspect
 from typing import Any, Awaitable, Callable, Iterator
 
 import rfc8785
 
-from kestrel_sdk.resources import ResourceError, ResourceOutcomeUnknown
+from kestrel_sdk.resources import ResourceConflict, ResourceError, ResourceOutcomeUnknown
 from kestrel_sdk.tools.result import ToolResult, ToolResultStatus
 from kestrel_sovereign._async_ownership import await_owned_task
 from kestrel_sovereign.execution_custody import (
@@ -21,6 +22,7 @@ from kestrel_sovereign.tool_effect_store import (
     ToolEffectAttempt, ToolEffectClaim, ToolEffectStore,
 )
 from kestrel_sovereign.turn_scope import turn_scoped
+from kestrel_sovereign.agent.tool_allowlist import registry_generation
 
 
 class ToolEffectJournalUnavailable(ResourceError):
@@ -46,6 +48,8 @@ def logical_operation_key(value: object) -> str:
 
 def require_persistent_tool_effects(owner: Any) -> ToolEffectStore:
     """Refuse before approval prompts as well as immediately before claims."""
+    if owner is None:
+        raise ToolEffectJournalUnavailable("tool_effect_journal_unavailable")
     privacy = owner.privacy_config
     if privacy is None or not privacy.allows_persistent_storage():
         raise ToolEffectPrivacyRefused("tool_effect_privacy_mode_refused")
@@ -175,12 +179,14 @@ async def admit_tool_effect_turn(
 async def execute_tool_effect(
     owner: Any, *, registration: object, arguments: dict,
     execute: Callable[[], Awaitable[Any]],
+    validate_registration: Callable[[], None] | None = None,
 ) -> Any:
     """Claim durably, call once, settle truthfully, and retain every failure."""
     turn = current_tool_effect_turn(owner)
     if turn is None:
         raise ToolEffectJournalUnavailable("tool_effect_attempt_unavailable")
     turn.require_live(owner)
+    generation = registry_generation(owner)
     completion = asyncio.get_running_loop().create_future()
     turn.pending.add(completion)
     try:
@@ -191,7 +197,7 @@ async def execute_tool_effect(
                 raise ToolEffectJournalUnavailable("tool_effect_journal_changed")
             require_execution_work(owner)
             claim = await store.claim(
-                turn.attempt, registration=registration, arguments=arguments,
+                turn.attempt, registration=[generation, registration], arguments=arguments,
                 parent=_current_claim.get(),
             )
             started = False
@@ -200,6 +206,14 @@ async def execute_tool_effect(
             token = _current_claim.set(claim)
             try:
                 require_execution_work(owner)
+                if registry_generation(owner) != generation:
+                    raise ResourceConflict('Tool registration changed during effect admission')
+                if validate_registration is not None:
+                    validation = validate_registration()
+                    if validation is not None:
+                        if inspect.iscoroutine(validation):
+                            validation.close()
+                        raise TypeError('Tool registration validation must complete synchronously')
                 started = True
                 result = await execute()
             except BaseException as execution_error:

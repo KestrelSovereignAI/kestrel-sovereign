@@ -10,7 +10,7 @@ from cryptography.fernet import Fernet
 import pytest
 import pytest_asyncio
 
-from kestrel_sdk.resources import ResourceOutcomeUnknown
+from kestrel_sdk.resources import ResourceConflict, ResourceOutcomeUnknown
 from kestrel_sovereign.a2a.scope import NativeRecipientScope
 from kestrel_sovereign.features.privacy.feature import PrivacyAgent
 from kestrel_sovereign.privacy import PrivacyMode
@@ -106,6 +106,53 @@ async def test_claim_is_acknowledged_before_file_effect_and_replay_is_fenced(own
         await admit(owner)
     assert path.read_text() == "one effect"
     assert await owner.tool_effect_store.database.fetchone("SELECT state FROM tool_effect_claims") == ("RETURNED_OK",)
+
+
+@pytest.mark.asyncio
+async def test_registration_withdrawal_after_claim_ack_cannot_start_an_effect(owner, tmp_path, monkeypatch):
+    from kestrel_sovereign.agent.tool_allowlist import bump_registry_generation
+
+    turn = await admit(owner)
+    original = owner.tool_effect_store.claim
+    witness = tmp_path / 'must-not-execute'
+
+    async def withdraw_after_ack(*args, **kwargs):
+        claim = await original(*args, **kwargs)
+        assert owner.tool_effect_store.database.owns_open_transaction is False
+        bump_registry_generation(owner)
+        return claim
+
+    async def effect():
+        witness.write_text('unpermitted effect')
+
+    monkeypatch.setattr(owner.tool_effect_store, 'claim', withdraw_after_ack)
+    with bind_tool_effect_turn((turn, None)):
+        with pytest.raises(ResourceConflict, match='registration changed'):
+            await execute_tool_effect(owner, registration='original-file-tool', arguments={}, execute=effect)
+    await turn.close()
+    assert not witness.exists()
+    assert await owner.tool_effect_store.database.fetchone('SELECT state FROM tool_effect_claims') == ('NOT_EXECUTED',)
+    assert (await admit(owner)).attempt.attempt_id != turn.attempt.attempt_id
+
+
+@pytest.mark.asyncio
+async def test_registration_validator_cannot_publish_an_unawaited_guard(owner, tmp_path):
+    turn = await admit(owner)
+    witness = tmp_path / 'must-not-execute'
+
+    async def invalid_validation():
+        pytest.fail('An asynchronous validation must not execute after admission')
+
+    async def effect():
+        witness.write_text('unpermitted effect')
+
+    with bind_tool_effect_turn((turn, None)):
+        with pytest.raises(TypeError, match='must complete synchronously'):
+            await execute_tool_effect(owner, registration='original-file-tool', arguments={},
+                execute=effect, validate_registration=invalid_validation)
+    await turn.close()
+    assert not witness.exists()
+    assert await owner.tool_effect_store.database.fetchone('SELECT state FROM tool_effect_claims') == ('NOT_EXECUTED',)
 
 
 @pytest.mark.asyncio

@@ -1519,6 +1519,10 @@ class Feature(_SdkFeature):
                 )
             )
             return task
+        from kestrel_sovereign.tools.effect_journal import (
+            execute_tool_effect, require_persistent_tool_effects,
+        )
+        require_persistent_tool_effects(self.agent)
         task.status.CopyFrom(TaskStatus(state=TaskState.TASK_STATE_WORKING))
         from kestrel_sovereign.a2a.lifecycle import mark_outcome_unknown
 
@@ -1549,7 +1553,9 @@ class Feature(_SdkFeature):
             # skill returns, and a skill they run as a task is part of this
             # task's execution like one the skill ran itself.
             with _bind_flattened_outcome_unknown(flattened):
-                result = await selected.execute(**args)
+                result = await execute_tool_effect(self.agent,
+                    registration=[type(self).__name__, skill_name], arguments=args,
+                    execute=lambda: selected.execute(**args))
                 if isinstance(result, DeferredToolResult):
                     # An A2A task has no chat, so its publication is headless.
                     # The artifact carries only the completed public result.
@@ -2171,6 +2177,11 @@ class Feature(_SdkFeature):
                 error_message=coercion_error,
             )
 
+        from kestrel_sovereign.tools.effect_journal import (
+            execute_tool_effect, require_persistent_tool_effects,
+        )
+        require_persistent_tool_effects(self.agent)
+
         # #2641: bind the subagent-local parts sink as the active collector
         # for the WHOLE gated call — PRE_TOOL_USE hooks included, not just the
         # tool body — so ``emit_part`` lands deterministically on THIS
@@ -2296,7 +2307,9 @@ class Feature(_SdkFeature):
             require_execution_work(self.agent)
             exec_start = time.time()
             try:
-                result = await selected_tool.execute(**effective_args)
+                result = await execute_tool_effect(self.agent,
+                    registration=[type(self).__name__, tool_name], arguments=effective_args,
+                    execute=lambda: selected_tool.execute(**effective_args))
                 from kestrel_sovereign.agent.invocation import (
                     mark_current_invocation_effect_completed,
                 )
