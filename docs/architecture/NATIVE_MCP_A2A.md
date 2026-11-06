@@ -329,6 +329,33 @@ exact-True capability before connection acquisition or Apps/OAuth enablement.
 Other SDK-only hosts must implement the same contract. It is independent of caller
 authority and permission checks and does not authorize a retry.
 
+### Durable tool-effect admission
+
+The host binds each logical invocation to its authenticated recipient, caller
+namespace and original input. The primary SQLite or PostgreSQL database records
+keyed digests and server-generated attempt/claim identifiers, without retaining
+tool arguments or results. The journal key is wrapped by the original data key;
+boot refuses an unavailable or inconsistent journal rather than creating a fresh
+replay history. An operation identifier correlates intent and grants no authority.
+
+Each governed tool leaf acknowledges a STARTED claim before dispatch. A claim
+that might have executed fences replay after a lost reply or process restart,
+including a known returned error. An uncertain settlement also fences further
+effects in the live turn even if its database transaction failed. Only a proven
+NOT_EXECUTED claim permits a subsequent attempt to supersede the old one. Reusing
+an intent with changed input conflicts; an explicitly new intent gets a new ID.
+This is a local replay fence, not a cross-vendor exactly-once guarantee.
+
+Terminal retirement closes only the original attempt through the shared native
+result-custody writer. It retains the original connection generation or pool
+recipe, wrapped-key lifetime and catalog identities of both journal tables. The
+writer checks native programs and constraints under its existing locks, owns
+COMMIT/rollback and connection retirement, and cannot admit another tool claim.
+Cancellation retains the caller's withdrawal and actual commit evidence.
+`KESTREL_TOOL_EFFECT_TERMINAL_TIMEOUT_S` sets the finite positive checkout/body
+budget (default 5 seconds). Expiry still joins any accepted native transaction
+and connection retirement; it never certifies that the tool did not execute.
+
 A local A2A skill whose execution met a `ResourceOutcomeUnknown` marks its
 task with `outcome_unknown: true` metadata (#3946). That covers a skill raising
 it, a Core or SDK `@tool` wrapper that returns it to a model as an ordinary

@@ -81,6 +81,75 @@ async def test_native_terminal_closes_original_without_admitting_cleanup_work(jo
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize('table', ['tool_effect_operations', 'tool_effect_claims'])
+async def test_native_terminal_refuses_added_program_before_effect(journal, table):
+    from kestrel_sovereign.execution_custody import is_execution_control_error
+
+    store, _, _ = journal
+    attempt = await admit(store)
+    db = store.database
+    await db.execute('CREATE TABLE terminal_effect_witness(value BIGINT)')
+    if store.is_sqlite:
+        await db.execute(f'CREATE TRIGGER terminal_effect BEFORE UPDATE ON {table} BEGIN INSERT INTO terminal_effect_witness VALUES(1); END')
+    else:
+        await db.execute('CREATE FUNCTION terminal_effect() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN INSERT INTO terminal_effect_witness VALUES(1); RETURN NEW; END $$')
+        await db.execute(f'CREATE TRIGGER terminal_effect BEFORE UPDATE ON {table} FOR EACH ROW EXECUTE FUNCTION terminal_effect()')
+    with pytest.raises(BaseExceptionGroup) as denied:
+        await store.finish(attempt)
+    assert is_execution_control_error(denied.value)
+    assert await db.fetchone('SELECT COUNT(*) FROM terminal_effect_witness') == (0,)
+    assert await db.fetchone('SELECT state FROM tool_effect_operations') == ('OPEN',)
+
+
+@pytest.mark.asyncio
+async def test_terminal_deadline_retires_original_when_postgres_pool_is_full(journal):
+    store, _, _ = journal
+    if not store.is_postgres:
+        pytest.skip('Native PostgreSQL pool checkout contract')
+    store.terminal_timeout_seconds = 0.1
+    attempt = await admit(store)
+    await store.claim(attempt, registration='owned-before-pool-exhaustion', arguments={})
+    async with AsyncExitStack() as holds:
+        for _ in range(store.backend._pool.get_max_size()):
+            await holds.enter_async_context(store.backend._pool.acquire())
+        with pytest.raises(TimeoutError):
+            await asyncio.wait_for(store.finish(attempt), timeout=2)
+        assert not store.backend._original_result_holds
+    assert await store.database.fetchone('SELECT state FROM tool_effect_operations') == ('OPEN',)
+    with pytest.raises(ToolEffectReconciliationRequired):
+        await admit(store)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('cleanup_only', [False, True])
+async def test_sqlite_auxiliary_generation_uses_the_original_primary_admission(journal, cleanup_only):
+    from contextlib import nullcontext
+    from kestrel_sovereign.execution_custody import (
+        ExecutionCustody, ProcessRuntimeExecutionFence, bind_execution_cleanup,
+        is_execution_control_error,
+    )
+
+    store, reopen, cleanup = journal
+    if not store.is_sqlite:
+        pytest.skip('SQLite native data_version contract')
+    await store.database.execute('CREATE TABLE unrelated_native_witness(value BIGINT)')
+    other = await reopen()
+    cleanup.push_async_callback(other.close)
+    attempt = await admit(store)
+    await other.execute('INSERT INTO unrelated_native_witness VALUES(1)')
+    scope = ExecutionCustody(ProcessRuntimeExecutionFence('owned-generation-check'))
+    with bind_execution_cleanup(store.database, (scope,)) if cleanup_only else nullcontext():
+        if cleanup_only:
+            with pytest.raises(BaseExceptionGroup) as refused:
+                await store.finish(attempt)
+            assert is_execution_control_error(refused.value)
+        else:
+            await store.finish(attempt)
+    assert await store.database.fetchone('SELECT state FROM tool_effect_operations') == ('OPEN' if cleanup_only else 'CLOSED',)
+    assert await store.database.fetchone('SELECT COUNT(*) FROM unrelated_native_witness') == (1,)
+
+
+@pytest.mark.asyncio
 async def test_replay_after_actual_effect_and_clean_database_restart_is_fenced(journal, tmp_path):
     store, reopen, cleanup = journal
     attempt = await admit(store)
@@ -348,6 +417,11 @@ async def test_sql_refusal_rolls_back_claim_and_does_not_dispatch(journal, tmp_p
         witness.write_text("must never execute")
     assert not witness.exists()
     assert await db.fetchone("SELECT COUNT(*) FROM tool_effect_claims") == (0,)
+    from kestrel_sovereign.execution_custody import ExecutionAuthorityError
+    with pytest.raises(ExecutionAuthorityError):
+        await admit(store)
+    await db.execute('DROP TRIGGER refuse_claim' if store.is_sqlite
+        else 'DROP TRIGGER refuse_claim ON tool_effect_claims')
     replacement = await admit(store)
     assert replacement.attempt_id != attempt.attempt_id
 

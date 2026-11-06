@@ -129,8 +129,14 @@ async def test_failed_unknown_settlement_still_fences_new_effects_in_the_live_tu
         assert witness.read_text() == 'first effect'
         assert await db.fetchone('SELECT COUNT(*) FROM tool_effect_claims') == (1,)
     finally:
-        with pytest.raises(ToolEffectOutcomeUnconfirmed):
+        with pytest.raises(BaseExceptionGroup) as closed:
             await turn.close()
+        # The DDL changed the admitted catalog generation. Terminal custody
+        # refuses that destination and must retain the earlier lost reply.
+        from kestrel_sovereign.execution_custody import is_execution_control_error
+        assert is_execution_control_error(closed.value)
+        assert any(error is original for error in execution_evidence_carriers(closed.value))
+        assert await db.fetchone('SELECT state,latched FROM tool_effect_operations') == ('OPEN', 0)
 
 
 @pytest.mark.asyncio

@@ -7,9 +7,11 @@ neither an operation key nor a stored claim grants permission to execute.
 from __future__ import annotations
 
 import asyncio
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import hashlib
 import hmac
+import math
+import os
 from typing import Literal, NoReturn
 from uuid import uuid4
 
@@ -58,6 +60,7 @@ class ToolEffectAttempt:
     scope_digest: str
     operation_digest: str
     attempt_id: str
+    _terminal: object = field(repr=False, compare=False)
 
 
 @dataclass(frozen=True)
@@ -68,6 +71,18 @@ class ToolEffectClaim:
 
 TOOL_EFFECT_OPERATIONS_SQL = "CREATE TABLE tool_effect_operations (scope_digest TEXT NOT NULL, operation_digest TEXT NOT NULL, request_digest TEXT NOT NULL, attempt_id TEXT NOT NULL, revision BIGINT NOT NULL, state TEXT NOT NULL CHECK(state IN ('OPEN', 'CLOSED')), latched BIGINT NOT NULL CHECK(latched IN (0, 1)), PRIMARY KEY(scope_digest, operation_digest))"
 
+TOOL_EFFECT_OPERATIONS_COLUMNS = {
+    'scope_digest': 'TEXT', 'operation_digest': 'TEXT', 'request_digest': 'TEXT',
+    'attempt_id': 'TEXT', 'revision': 'BIGINT', 'state': 'TEXT', 'latched': 'BIGINT',
+}
+
+TOOL_EFFECT_CLAIMS_SQL = "CREATE TABLE tool_effect_claims (scope_digest TEXT NOT NULL, operation_digest TEXT NOT NULL, claim_id TEXT NOT NULL, attempt_id TEXT NOT NULL, parent_claim_id TEXT, registration_digest TEXT NOT NULL, args_digest TEXT NOT NULL, state TEXT NOT NULL CHECK(state IN ('STARTED', 'RETURNED_OK', 'RETURNED_ERROR', 'UNCONFIRMED', 'NOT_EXECUTED')), PRIMARY KEY(scope_digest, operation_digest, claim_id), FOREIGN KEY(scope_digest, operation_digest) REFERENCES tool_effect_operations(scope_digest, operation_digest))"
+
+TOOL_EFFECT_CLAIMS_COLUMNS = dict.fromkeys((
+    'scope_digest', 'operation_digest', 'claim_id', 'attempt_id', 'parent_claim_id',
+    'registration_digest', 'args_digest', 'state',
+), 'TEXT')
+
 
 ClaimTerminal = Literal["RETURNED_OK", "RETURNED_ERROR", "UNCONFIRMED", "NOT_EXECUTED"]
 
@@ -75,8 +90,14 @@ ClaimTerminal = Literal["RETURNED_OK", "RETURNED_ERROR", "UNCONFIRMED", "NOT_EXE
 class ToolEffectStore(UnifiedStoreBase):
     """Borrow the primary database and fence replays with acknowledged claims."""
 
-    def __init__(self, database: AsyncDatabase, *, scope: NativeRecipientScope):
+    def __init__(self, database: AsyncDatabase, *, scope: NativeRecipientScope,
+                 terminal_timeout_seconds: float | None = None):
         super().__init__(database.backend, owns_backend=False)
+        timeout = (float(os.environ.get('KESTREL_TOOL_EFFECT_TERMINAL_TIMEOUT_S', '5'))
+            if terminal_timeout_seconds is None else terminal_timeout_seconds)
+        if isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or not math.isfinite(timeout) or timeout <= 0:
+            raise ValueError('Tool effect terminal timeout must be finite and positive')
+        self.terminal_timeout_seconds = float(timeout)
         self.database = database
         self.scope_digest = hashlib.sha256(rfc8785.dumps([
             "kestrel-tool-effect-scope-v1", scope.recipient_id, scope.tenant,
@@ -126,7 +147,7 @@ class ToolEffectStore(UnifiedStoreBase):
                         for sql in (
                             f"CREATE TABLE tool_effect_keys (key_id TEXT PRIMARY KEY, scope_digest TEXT NOT NULL UNIQUE, wrapped_key {binary} NOT NULL)",
                             TOOL_EFFECT_OPERATIONS_SQL,
-                            "CREATE TABLE tool_effect_claims (scope_digest TEXT NOT NULL, operation_digest TEXT NOT NULL, claim_id TEXT NOT NULL, attempt_id TEXT NOT NULL, parent_claim_id TEXT, registration_digest TEXT NOT NULL, args_digest TEXT NOT NULL, state TEXT NOT NULL CHECK(state IN ('STARTED', 'RETURNED_OK', 'RETURNED_ERROR', 'UNCONFIRMED', 'NOT_EXECUTED')), PRIMARY KEY(scope_digest, operation_digest, claim_id), FOREIGN KEY(scope_digest, operation_digest) REFERENCES tool_effect_operations(scope_digest, operation_digest))",
+                            TOOL_EFFECT_CLAIMS_SQL,
                         ):
                             await self.database.execute(sql)
                         await self.database.execute("INSERT INTO tool_effect_schema(singleton, revision) VALUES (1, 1)")
@@ -164,6 +185,11 @@ class ToolEffectStore(UnifiedStoreBase):
         if self._root is None:
             raise RuntimeError("tool effect journal must be initialized")
         self._require_outermost()
+        from kestrel_sovereign.storage.original_tool_effect_finish import _OriginalToolEffectFinish
+
+        if type(attempt._terminal) is not _OriginalToolEffectFinish:
+            raise ResourceConflict('tool effect attempt lacks its original native backing')
+        attempt._terminal.require_attempt(self, attempt)
 
     async def _counts(self, operation: str) -> dict[str, int]:
         counts = dict(returned_ok=0, returned_error=0, unconfirmed=0, unsettled=0, not_executed=0)
@@ -188,7 +214,12 @@ class ToolEffectStore(UnifiedStoreBase):
         stable_token(client_key, "operation_id")
         operation = self._digest("op-v1", [namespace, client_key])
         request_digest = self._digest("request-v1", request)
-        attempt = ToolEffectAttempt(self.scope_digest, operation, str(uuid4()))
+        from kestrel_sovereign.storage.original_tool_effect_finish import _OriginalToolEffectFinish
+
+        attempt_id = str(uuid4())
+        terminal = await _OriginalToolEffectFinish.prepare(self,
+            (self.scope_digest, operation, attempt_id))
+        attempt = ToolEffectAttempt(self.scope_digest, operation, attempt_id, terminal)
         async with self.write_transaction():
             await self.database.execute(
                 "INSERT INTO tool_effect_operations(scope_digest, operation_digest, request_digest, attempt_id, revision, state, latched) VALUES (?, ?, ?, ?, 0, 'OPEN', 0) ON CONFLICT(scope_digest, operation_digest) DO NOTHING",
@@ -212,6 +243,7 @@ class ToolEffectStore(UnifiedStoreBase):
                 "UPDATE tool_effect_operations SET attempt_id = ?, state = 'OPEN', latched = 0 WHERE scope_digest = ? AND operation_digest = ?",
                 (attempt.attempt_id, self.scope_digest, operation),
             )
+        terminal.admitted(attempt)
         return attempt
 
     async def claim(self, attempt: ToolEffectAttempt, *, registration: object,
@@ -264,11 +296,4 @@ class ToolEffectStore(UnifiedStoreBase):
 
     async def finish(self, attempt: ToolEffectAttempt) -> None:
         self._require_scope(attempt)
-        # Closing an existing exact attempt is a fixed native terminal
-        # operation. It cannot borrow ordinary SQL authority after Stop or an
-        # early stream close, create a claim, or reopen a successor.
-        from kestrel_sovereign.storage.db.tool_effect_terminal import finish_tool_effect_attempt
-
-        changed = await finish_tool_effect_attempt(self._backend, attempt)
-        if not changed:
-            raise ToolEffectAttemptSuperseded("tool effect attempt was superseded")
+        await attempt._terminal.finish()

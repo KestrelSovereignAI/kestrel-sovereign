@@ -114,6 +114,11 @@ class ToolEffectTurn:
                 or is_execution_control_error(terminal)
                 or any(isinstance(item, asyncio.CancelledError)
                     for item in execution_evidence_carriers(terminal)))
+            if self.unconfirmed and protected:
+                terminal = execution_terminal_error(
+                    terminal, *self.unconfirmed, retain_originals=True,
+                    prefer_cancellation=True,
+                )
             if self.unconfirmed and not protected:
                 unknown = ToolEffectOutcomeUnconfirmed('tool_effect_outcome_unconfirmed')
                 unknown.__cause__ = execution_terminal_error(
