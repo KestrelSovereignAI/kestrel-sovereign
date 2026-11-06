@@ -3735,7 +3735,7 @@ class OrchestratorEngineMixin:
         # Capture before the first foreign task is constructed. Both the
         # lifecycle and operation handoffs must retain this exact held frame;
         # the later invocation decorator cannot recover an already lost owner.
-        start_privacy_work = self._get_privacy_transition_lock().capture_native_work_factory()
+        start_privacy_work = self._get_privacy_transition_lock().capture_native_work_factory(acquire_span=False)
 
         async def join_original_operation():
             turn_scope = capture_turn_scope(self)

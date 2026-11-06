@@ -307,14 +307,14 @@ async def test_external_tool_and_real_privacy_transition_follow_one_lock_order(b
         await asyncio.gather(calling, *([changing] if changing is not None else []), return_exceptions=True)
 
 
-async def test_external_lifecycle_holds_privacy_from_native_admission_to_dispatch(bound_operation, monkeypatch):
+async def test_external_admission_rechecks_privacy_before_dispatch(bound_operation, monkeypatch):
     from kestrel_sovereign._async_ownership import await_owned_task
+    from kestrel_sovereign.features.privacy.feature import PrivacyAgent
+    from kestrel_sovereign.privacy import PrivacyMode
 
     owner, binding, witness = bound_operation
-    acknowledged, resume, transitioned = asyncio.Event(), asyncio.Event(), asyncio.Event()
+    acknowledged, resume = asyncio.Event(), asyncio.Event()
     admit = owner.tool_effect_store.admit
-    tool = owner._direct_tools[binding.name]
-    execute = tool.execute
 
     async def hold_native_admission(*args, **kwargs):
         attempt = await admit(*args, **kwargs)
@@ -323,29 +323,28 @@ async def test_external_lifecycle_holds_privacy_from_native_admission_to_dispatc
         await resume.wait()
         return attempt
 
-    async def observe_original_execution(**kwargs):
-        assert not transitioned.is_set(), 'Privacy transition overtook an already admitted lifecycle'
-        return await execute(**kwargs)
-
-    async def transition():
+    async def revoke():
         async with owner.privacy_transition():
-            transitioned.set()
+            owner.privacy_agent = PrivacyAgent(owner.storage, PrivacyMode.EPHEMERAL)
 
     monkeypatch.setattr(owner.tool_effect_store, 'admit', hold_native_admission)
-    monkeypatch.setattr(tool, 'execute', observe_original_execution)
-    calling = asyncio.create_task(binding.invoke({'marker': 'ordered'},
-        session_id='owned-lifecycle-span', operation_id='owned-lifecycle-span-intent'))
+    calling = asyncio.create_task(binding.invoke({'marker': 'forbidden'},
+        session_id='owned-lifecycle-policy', operation_id='owned-lifecycle-policy-intent'))
     changing = None
     try:
         await asyncio.wait_for(acknowledged.wait(), 2)
-        changing = asyncio.create_task(transition())
+        changing = asyncio.create_task(revoke())
         await asyncio.sleep(0.02)
         resume.set()
-        outcome = await await_owned_task(calling)
-        healthy = outcome.error is None
-        assert healthy, 'External lifecycle lost its privacy span before native dispatch'
         await changing
-        assert transitioned.is_set() and witness.read_text() == 'ordered\n'
+        outcome = await await_owned_task(calling)
+        assert outcome.error is None
+        assert outcome.result == {'success': False, 'error': 'tool_effect_privacy_mode_refused'}
+        assert not witness.exists(), 'Revoked privacy policy admitted the original effect'
+        assert await owner.tool_effect_store.database.fetchone(
+            'SELECT COUNT(*) FROM tool_effect_claims') == (0,)
+        assert await owner.tool_effect_store.database.fetchone(
+            'SELECT state FROM tool_effect_operations') == ('OPEN',)
         assert not owner._active_request_ids
     finally:
         resume.set()
@@ -383,3 +382,84 @@ async def test_external_named_intent_and_effect_share_the_same_owned_argument_sn
         operation_id='original-mutable-intent', source='voice_realtime')
     assert witness.read_text() == 'original\n', 'Caller mutation changed the effect after its original intent was journaled'
     assert arguments == {'marker': 'caller mutation after admission'}
+
+
+async def test_independent_external_approvals_do_not_own_the_effect_mutex(bound_operation):
+    from kestrel_sdk.hooks.base import Hook, HookEvent, HookOutput
+
+    owner, binding, witness = bound_operation
+    requests, release = asyncio.Queue(), asyncio.Event()
+
+    class AwaitApproval(Hook):
+        def __init__(self):
+            super().__init__('owned-concurrent-approvals', [HookEvent.PRE_TOOL_USE])
+
+        async def execute(self, value):
+            if value.tool_name == binding.name:
+                requests.put_nowait(value.tool_input['marker'])
+                await release.wait()
+            return HookOutput.allow()
+
+    owner.hooks_manager.register(AwaitApproval())
+    calls = [asyncio.create_task(binding.invoke({'marker': str(index)},
+        session_id='owned-concurrent-approval-session', operation_id=f'owned-approval-{index}'))
+        for index in range(2)]
+    try:
+        await asyncio.wait(calls, timeout=0.5)
+        assert requests.qsize() == 2, 'An independent external approval waited behind another approval privacy span'
+        assert not witness.exists(), 'Native effect executed before its original approval'
+        release.set()
+        assert all(result['success'] for result in await asyncio.gather(*calls))
+        assert sorted(witness.read_text().splitlines()) == ['0', '1']
+        assert await owner.tool_effect_store.database.fetchall(
+            'SELECT state FROM tool_effect_claims') == [('RETURNED_OK',), ('RETURNED_OK',)]
+    finally:
+        release.set()
+        await asyncio.gather(*calls, return_exceptions=True)
+
+
+async def test_privacy_revocation_during_external_approval_refuses_the_original_effect(bound_operation):
+    from kestrel_sdk.hooks.base import Hook, HookEvent, HookOutput
+    from kestrel_sovereign.features.privacy.feature import PrivacyAgent
+    from kestrel_sovereign.privacy import PrivacyMode
+    from kestrel_sovereign._async_ownership import await_owned_task
+
+    owner, binding, witness = bound_operation
+    requested, release = asyncio.Event(), asyncio.Event()
+
+    class AwaitApproval(Hook):
+        def __init__(self):
+            super().__init__('owned-revoked-approval', [HookEvent.PRE_TOOL_USE])
+
+        async def execute(self, value):
+            if value.tool_name == binding.name:
+                requested.set()
+                await release.wait()
+            return HookOutput.allow()
+
+    async def revoke():
+        async with owner.privacy_transition():
+            owner.privacy_agent = PrivacyAgent(owner.storage, PrivacyMode.EPHEMERAL)
+
+    owner.hooks_manager.register(AwaitApproval())
+    calling = asyncio.create_task(binding.invoke({'marker': 'forbidden'},
+        session_id='owned-revoked-approval-session', operation_id='owned-revoked-approval'))
+    changing = None
+    try:
+        await asyncio.wait_for(requested.wait(), 2)
+        changing = asyncio.create_task(revoke())
+        _, pending = await asyncio.wait({changing}, timeout=0.5)
+        assert not pending, 'Pending external approval prevented the original privacy revocation'
+        await changing
+        release.set()
+        outcome = await await_owned_task(calling)
+        assert outcome.error is None
+        assert outcome.result == {'success': False, 'error': 'tool_effect_privacy_mode_refused'}
+        assert not witness.exists()
+        assert await owner.tool_effect_store.database.fetchone(
+            'SELECT COUNT(*) FROM tool_effect_claims') == (0,)
+        assert await owner.tool_effect_store.database.fetchone(
+            'SELECT state FROM tool_effect_operations') == ('OPEN',)
+    finally:
+        release.set()
+        await asyncio.gather(calling, *([changing] if changing is not None else []), return_exceptions=True)
