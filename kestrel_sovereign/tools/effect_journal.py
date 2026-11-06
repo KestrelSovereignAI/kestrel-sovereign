@@ -63,6 +63,7 @@ class ToolEffectTurn:
     store: ToolEffectStore
     attempt: ToolEffectAttempt
     invocation_id: str
+    generation: int | None = None
     live: bool = True
     closing: bool = False
     pending: set[asyncio.Future] = field(default_factory=set)
@@ -115,9 +116,14 @@ _current_claim: ContextVar[ToolEffectClaim | None] = ContextVar(
 )
 
 
-def current_tool_effect_turn(owner: Any) -> ToolEffectTurn | None:
+def current_tool_effect_state(owner: Any) -> tuple[ToolEffectTurn | None, ToolEffectClaim | None]:
+    """Capture one owner's turn and its exact parent claim together."""
     turn = _current_turn.get()
-    return turn if turn is not None and turn.owner is owner else None
+    return (turn, _current_claim.get()) if turn is not None and turn.owner is owner else (None, None)
+
+
+def current_tool_effect_turn(owner: Any) -> ToolEffectTurn | None:
+    return current_tool_effect_state(owner)[0]
 
 
 @contextmanager
@@ -137,7 +143,7 @@ def bind_tool_effect_turn(
 turn_scoped(
     "tool_effect_attempt",
     variables=(_current_turn, _current_claim),
-    capture=lambda owner: (current_tool_effect_turn(owner), _current_claim.get()),
+    capture=current_tool_effect_state,
     bind=bind_tool_effect_turn,
 )
 
