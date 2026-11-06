@@ -133,6 +133,28 @@ _current_claim: ContextVar[ToolEffectClaim | None] = ContextVar(
 )
 
 
+@dataclass(frozen=True)
+class _ToolEffectRegistration:
+    owner: Any
+    generation: int
+    validate: Callable[[], None]
+
+
+_current_registration: ContextVar[_ToolEffectRegistration | None] = ContextVar(
+    'kestrel_tool_effect_registration', default=None,
+)
+
+
+@contextmanager
+def bind_tool_effect_registration(owner, generation, validate):
+    """Retain an original native provider through approval and owned handoff."""
+    token = _current_registration.set(_ToolEffectRegistration(owner, generation, validate))
+    try:
+        yield
+    finally:
+        _current_registration.reset(token)
+
+
 def current_tool_effect_state(owner: Any) -> tuple[ToolEffectTurn | None, ToolEffectClaim | None]:
     """Capture one owner's turn and its exact parent claim together."""
     turn = _current_turn.get()
@@ -199,7 +221,13 @@ async def execute_tool_effect(
     if turn is None:
         raise ToolEffectJournalUnavailable("tool_effect_attempt_unavailable")
     turn.require_live(owner)
-    generation = registry_generation(owner) if expected_generation is None else expected_generation
+    turn.require_confirmed()
+    prepared = _current_registration.get()
+    if prepared is not None and prepared.owner is not owner:
+        prepared = None
+    generation = expected_generation
+    if generation is None:
+        generation = prepared.generation if prepared is not None else registry_generation(owner)
     completion = asyncio.get_running_loop().create_future()
     turn.pending.add(completion)
     try:
@@ -219,10 +247,14 @@ async def execute_tool_effect(
             token = _current_claim.set(claim)
             try:
                 require_execution_work(owner)
+                turn.require_confirmed()
                 if registry_generation(owner) != generation:
                     raise ResourceConflict('Tool registration changed during effect admission')
+                validators = ([prepared.validate] if prepared is not None else [])
                 if validate_registration is not None:
-                    validation = validate_registration()
+                    validators.append(validate_registration)
+                for validate in validators:
+                    validation = validate()
                     if validation is not None:
                         if inspect.iscoroutine(validation):
                             validation.close()

@@ -83,6 +83,74 @@ async def test_actual_leaf_cannot_execute_before_claim_ack_or_repeat_after_root_
         await store.close()
 
 
+@pytest.mark.parametrize('withdrawal', ['provider-registration', 'registry-generation', 'provider-after-claim'])
+async def test_task_manager_cannot_execute_a_registration_withdrawn_during_approval(owner, tmp_path, monkeypatch, withdrawal):
+    from kestrel_sovereign.a2a.scope import NativeRecipientScope
+    from kestrel_sovereign.agent.tool_allowlist import bump_registry_generation
+    from tests.utils.native_a2a import manager_for
+
+    witness = tmp_path / 'withdrawn-task-manager-effect'
+    manager = manager_for(owner.tool_effect_store.database.backend,
+        NativeRecipientScope(owner.did), owns_backend=False)
+    await manager.initialize()
+    manager.hooks_manager = owner.hooks_manager
+
+    class FileFeature(Feature):
+        @property
+        def tool_description(self):
+            return 'Owned task file witness'
+
+        async def initialize(self):
+            pass
+
+        @tool(name='withdrawn_task_effect', description='Must retain original task provider')
+        async def withdrawn_task_effect(self) -> dict:
+            witness.write_text('withdrawn task provider executed')
+            return {'success': True}
+
+    feature = FileFeature(owner)
+    owner.features[feature.name] = feature
+    manager.register_provider(feature.name, feature.get_agent_skills(), feature)
+
+    class Withdraw(Hook):
+        def __init__(self):
+            super().__init__('withdraw-task-provider', [HookEvent.PRE_TOOL_USE])
+
+        async def execute(self, value):
+            if withdrawal == 'provider-registration':
+                manager.unregister_provider(feature.name)
+            elif withdrawal == 'registry-generation':
+                bump_registry_generation(owner)
+            return HookOutput.allow()
+
+    owner.hooks_manager.register(Withdraw())
+    if withdrawal == 'provider-after-claim':
+        original_claim = owner.tool_effect_store.claim
+
+        async def withdraw_after_ack(*args, **kwargs):
+            claim = await original_claim(*args, **kwargs)
+            assert owner.tool_effect_store.database.owns_open_transaction is False
+            manager.unregister_provider(feature.name)
+            return claim
+
+        monkeypatch.setattr(owner.tool_effect_store, 'claim', withdraw_after_ack)
+
+    @governed
+    async def invoke(agent, user_input, *, invocation_id=None):
+        return await manager.execute_skill(feature.name, 'withdrawn_task_effect', {})
+
+    try:
+        try:
+            await invoke(owner, 'original task intention', invocation_id='original-task-intent')
+        except ResourceConflict:
+            pass
+        assert not witness.exists(), 'TaskManager executed a provider withdrawn during PRE_TOOL_USE'
+        assert all(row == ('NOT_EXECUTED',) for row in
+            await owner.tool_effect_store.database.fetchall('SELECT state FROM tool_effect_claims'))
+    finally:
+        await manager.close()
+
+
 @pytest.mark.parametrize('lane', ['named', 'direct', 'subagent'])
 async def test_original_registration_withdrawn_during_pre_hook_cannot_execute(owner, tmp_path, lane):
     from kestrel_sovereign.agent.tool_allowlist import bump_registry_generation

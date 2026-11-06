@@ -1839,12 +1839,13 @@ class OrchestratorEngineMixin:
 
             operation_id = validate_invocation_id(operation_id)
             if tool_name != PHANTOM_RECEIPT_TOOL_NAME:
+                owned_args = deepcopy(args)
                 outcome = await self._execute_tool_operation_at_stop_boundary(
-                    lambda: self.execute_named_tool(tool_name, args, session_id=session_id,
+                    lambda: self.execute_named_tool(tool_name, owned_args, session_id=session_id,
                         source=source, _capture=_capture),
                     name='named-tool-invocation', cancel_on_caller_cancellation=True,
                     tool_operation=ToolEffectOperation('named_tool', operation_id,
-                        'named-registry', tool_name, deepcopy(args), session_id))
+                        'named-registry', tool_name, owned_args, session_id))
                 return raise_owned_outcome(outcome, operation='named tool operation', retain_originals=True)
 
         # #2935: count the call into its turn, as ``_dispatch_tool_call`` does

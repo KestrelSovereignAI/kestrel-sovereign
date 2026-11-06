@@ -589,12 +589,29 @@ class TaskManager:
         if agent_id not in self._providers:
             raise ValueError(f"Unknown agent: {agent_id}")
 
-        _, handler = self._providers[agent_id]
+        registration = self._providers[agent_id]
+        _, handler = registration
         authority_agent_id = self.did
         hook_feature_name = getattr(handler, "name", None) or agent_id
 
         from kestrel_sdk.features.base import Feature
-        from kestrel_sovereign.tools.effect_journal import require_persistent_tool_effects
+        from kestrel_sovereign.tools.effect_journal import (
+            bind_tool_effect_registration, require_persistent_tool_effects,
+        )
+        from kestrel_sovereign.agent.tool_allowlist import registry_generation
+        from kestrel_sdk.resources import ResourceConflict
+
+        selected_generation = registry_generation(handler.agent) if isinstance(handler, Feature) else None
+
+        def require_original_registration():
+            if self._providers.get(agent_id) is not registration:
+                raise ResourceConflict('Task provider registration changed during admission')
+            if isinstance(handler, Feature) and not handler.enabled:
+                raise ResourceConflict('Task provider registration changed during admission')
+
+        execution_registration = (
+            bind_tool_effect_registration(handler.agent, selected_generation, require_original_registration)
+            if isinstance(handler, Feature) else nullcontext())
 
         if isinstance(handler, Feature):
             require_persistent_tool_effects(handler.agent)
@@ -708,7 +725,9 @@ class TaskManager:
             # Execute synchronously with transaction safety
             try:
                 expected_state = task.status.state
-                task = await handler.handle_task(task, arguments=args)
+                with execution_registration:
+                    require_original_registration()
+                    task = await handler.handle_task(task, arguments=args)
                 # The canonical outcome writer owns CAS and uncertain-commit
                 # reconciliation. A persistence failure must reach the caller; an
                 # extra transaction/retry cannot manufacture a completed receipt.
@@ -747,13 +766,14 @@ class TaskManager:
 
             return task
         else:
+            async def execute_original_provider():
+                with execution_registration:
+                    require_original_registration()
+                    await self._execute_async(handler, Task.FromString(task.SerializeToString()),
+                        authority_agent_id, arguments=args)
+
             self._track_execution_task(
-                self._execute_async(
-                    handler,
-                    Task.FromString(task.SerializeToString()),
-                    authority_agent_id,
-                    arguments=args,
-                ),
+                execute_original_provider(),
                 task.id,
                 authority_agent_id,
             )

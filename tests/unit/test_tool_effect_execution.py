@@ -99,6 +99,41 @@ async def test_claim_is_acknowledged_before_file_effect_and_replay_is_fenced(own
 
 
 @pytest.mark.asyncio
+async def test_failed_unknown_settlement_still_fences_new_effects_in_the_live_turn(owner, tmp_path):
+    from kestrel_sovereign.execution_custody import execution_evidence_carriers
+
+    turn = await admit(owner)
+    db = owner.tool_effect_store.database
+    witness = tmp_path / 'live-turn-effects'
+    original = ResourceOutcomeUnknown('Original reply lost after owned effect')
+
+    async def first_effect():
+        witness.write_text('first effect')
+        raise original
+
+    async def must_not_execute():
+        witness.write_text('second effect incorrectly executed')
+        return {'success': True}
+
+    await db.execute("CREATE TRIGGER reject_effect_settlement BEFORE UPDATE ON tool_effect_claims BEGIN SELECT RAISE(ABORT, 'owned settlement refusal'); END")
+    try:
+        with bind_tool_effect_turn((turn, None)):
+            with pytest.raises((ResourceOutcomeUnknown, BaseExceptionGroup)) as failed:
+                await execute_tool_effect(owner, registration='first', arguments={}, execute=first_effect)
+            assert any(error is original for error in execution_evidence_carriers(failed.value))
+            assert await db.fetchone('SELECT state,latched FROM tool_effect_operations') == ('OPEN', 0)
+            assert await db.fetchone('SELECT state FROM tool_effect_claims') == ('STARTED',)
+            await db.execute('DROP TRIGGER reject_effect_settlement')
+            with pytest.raises(ToolEffectOutcomeUnconfirmed):
+                await execute_tool_effect(owner, registration='second', arguments={}, execute=must_not_execute)
+        assert witness.read_text() == 'first effect'
+        assert await db.fetchone('SELECT COUNT(*) FROM tool_effect_claims') == (1,)
+    finally:
+        with pytest.raises(ToolEffectOutcomeUnconfirmed):
+            await turn.close()
+
+
+@pytest.mark.asyncio
 async def test_known_resource_precondition_is_returned_error_but_still_fences_replay(owner):
     turn = await admit(owner)
     original = ResourceConflict('Original resource revision changed')
@@ -242,7 +277,7 @@ async def test_lost_result_latches_attempt_and_root_refuses_success(owner, tmp_p
         with pytest.raises(ResourceOutcomeUnknown) as error:
             await execute_tool_effect(owner, registration="file", arguments={}, execute=effect)
         assert error.value is original
-        with pytest.raises(ToolEffectAttemptClosed):
+        with pytest.raises(ToolEffectOutcomeUnconfirmed):
             await execute_tool_effect(owner, registration="file", arguments={}, execute=effect)
     with pytest.raises(ToolEffectOutcomeUnconfirmed, match="tool_effect_outcome_unconfirmed"):
         await turn.close()

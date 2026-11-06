@@ -92,3 +92,20 @@ async def test_external_named_dispatch_owns_its_explicit_operation_without_a_mod
     assert witness.read_text() == 'one\n'
     assert await owner.tool_effect_store.database.fetchone('SELECT state FROM tool_effect_operations') == ('CLOSED',)
     assert not owner._active_request_ids
+
+
+async def test_external_named_intent_and_effect_share_the_same_owned_argument_snapshot(bound_operation, monkeypatch):
+    owner, binding, witness = bound_operation
+    arguments = {'marker': 'original'}
+    original_admit = owner.tool_effect_store.admit
+
+    async def mutate_caller_arguments_after_admission(**options):
+        attempt = await original_admit(**options)
+        arguments['marker'] = 'caller mutation after admission'
+        return attempt
+
+    monkeypatch.setattr(owner.tool_effect_store, 'admit', mutate_caller_arguments_after_admission)
+    await owner.execute_named_tool(binding.name, arguments, session_id='owned-mutable-caller',
+        operation_id='original-mutable-intent', source='voice_realtime')
+    assert witness.read_text() == 'original\n', 'Caller mutation changed the effect after its original intent was journaled'
+    assert arguments == {'marker': 'caller mutation after admission'}
