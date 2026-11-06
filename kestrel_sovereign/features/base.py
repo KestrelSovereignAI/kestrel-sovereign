@@ -2180,6 +2180,9 @@ class Feature(_SdkFeature):
         from kestrel_sovereign.tools.effect_journal import (
             execute_tool_effect, require_persistent_tool_effects,
         )
+        from kestrel_sovereign.agent.tool_allowlist import registry_generation
+
+        selected_generation = registry_generation(self.agent)
         require_persistent_tool_effects(self.agent)
 
         # #2641: bind the subagent-local parts sink as the active collector
@@ -2309,6 +2312,7 @@ class Feature(_SdkFeature):
             try:
                 result = await execute_tool_effect(self.agent,
                     registration=[type(self).__name__, tool_name], arguments=effective_args,
+                    expected_generation=selected_generation,
                     execute=lambda: selected_tool.execute(**effective_args))
                 from kestrel_sovereign.agent.invocation import (
                     mark_current_invocation_effect_completed,

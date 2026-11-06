@@ -79,3 +79,16 @@ async def test_missing_operation_id_is_a_required_interface_failure(bound_operat
     with pytest.raises(TypeError, match='operation_id'):
         await binding.invoke({'marker': 'forbidden'}, session_id='owned-session')
     assert not witness.exists()
+
+
+async def test_external_named_dispatch_owns_its_explicit_operation_without_a_model_turn(bound_operation):
+    owner, binding, witness = bound_operation
+    context = dict(session_id='owned-voice-session', operation_id='owned-voice-intent', source='voice_realtime')
+    with caller_context_scope(CallerContext.authenticated('owned-voice-principal')):
+        result = await owner.execute_named_tool(binding.name, {'marker': 'one'}, **context)
+        assert result['success'] is True
+        with pytest.raises(ToolEffectReconciliationRequired):
+            await owner.execute_named_tool(binding.name, {'marker': 'one'}, **context)
+    assert witness.read_text() == 'one\n'
+    assert await owner.tool_effect_store.database.fetchone('SELECT state FROM tool_effect_operations') == ('CLOSED',)
+    assert not owner._active_request_ids

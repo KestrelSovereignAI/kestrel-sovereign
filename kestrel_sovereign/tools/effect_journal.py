@@ -188,13 +188,18 @@ async def execute_tool_effect(
     owner: Any, *, registration: object, arguments: dict,
     execute: Callable[[], Awaitable[Any]],
     validate_registration: Callable[[], None] | None = None,
+    expected_generation: int | None = None,
 ) -> Any:
-    """Claim durably, call once, settle truthfully, and retain every failure."""
+    """Claim durably and revalidate the registration selected before hooks.
+
+    Dispatchers retain ``expected_generation`` from selection through awaited
+    approval. Component callers without hooks capture it here before admission.
+    """
     turn = current_tool_effect_turn(owner)
     if turn is None:
         raise ToolEffectJournalUnavailable("tool_effect_attempt_unavailable")
     turn.require_live(owner)
-    generation = registry_generation(owner)
+    generation = registry_generation(owner) if expected_generation is None else expected_generation
     completion = asyncio.get_running_loop().create_future()
     turn.pending.add(completion)
     try:

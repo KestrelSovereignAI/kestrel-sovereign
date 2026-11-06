@@ -5,6 +5,8 @@ from kestrel_sdk.native_a2a.helpers.proto_helpers import new_task
 from kestrel_sdk.native_a2a.types import TaskState
 from kestrel_sdk.resources import ResourceOutcomeUnknown
 from kestrel_sdk.features.base import Feature as SDKFeature
+from kestrel_sdk.hooks.base import Hook, HookEvent, HookOutput
+from kestrel_sdk.resources import ResourceConflict
 
 from kestrel_sovereign.a2a.stores.unified.observability_store import ObservabilityStore
 from kestrel_sovereign.features.base import Feature, tool
@@ -77,5 +79,69 @@ async def test_actual_leaf_cannot_execute_before_claim_ack_or_repeat_after_root_
             await invoke(owner, 'owned intent', invocation_id='original-leaf-intent')
         assert entered == [lane]
         assert witness.read_text() == 'one\n'
+    finally:
+        await store.close()
+
+
+@pytest.mark.parametrize('lane', ['named', 'direct', 'subagent'])
+async def test_original_registration_withdrawn_during_pre_hook_cannot_execute(owner, tmp_path, lane):
+    from kestrel_sovereign.agent.tool_allowlist import bump_registry_generation
+    from kestrel_sovereign.llm.adapter import ToolCall
+
+    witness = tmp_path / 'withdrawn-effect'
+    store = ObservabilityStore(owner.tool_effect_store.database.backend, owns_backend=False)
+    await store.initialize()
+    owner.observability_store = store
+
+    class FileFeature(Feature):
+        @property
+        def tool_description(self):
+            return 'Owned file witness'
+
+        async def initialize(self):
+            pass
+
+        @tool(name='withdrawn_effect', description='Must not execute after withdrawal')
+        async def withdrawn_effect(self) -> dict:
+            witness.write_text('stale registration executed')
+            return {'success': True}
+
+    feature = FileFeature(owner)
+    owner.features[feature.name] = feature
+    registered = feature.get_tools()[0]
+
+    class Withdraw(Hook):
+        def __init__(self):
+            super().__init__('withdraw-original-registration', [HookEvent.PRE_TOOL_USE])
+
+        async def execute(self, value):
+            # The real registry's withdrawal changes the epoch while approval
+            # is suspended. The selected object must retain its old epoch.
+            owner.features.pop(feature.name)
+            bump_registry_generation(owner)
+            return HookOutput.allow()
+
+    owner.hooks_manager.register(Withdraw())
+
+    @governed
+    async def invoke(agent, user_input, *, invocation_id=None):
+        if lane == 'named':
+            return await agent.execute_named_tool(registered.name, {}, session_id='withdrawn-turn')
+        if lane == 'subagent':
+            return await feature._execute_subagent_tool(tool_name=registered.name,
+                args={}, tools_by_name={registered.name: registered}, session_id='withdrawn-turn')
+        call = ToolCall(id='withdrawn-call', name=registered.name, arguments={})
+        return await agent._dispatch_direct_tool(call, registered.name, {}, 0,
+            'withdrawn-dispatch', session_id='withdrawn-turn', tool=registered,
+            feature_name=feature.name)
+
+    try:
+        try:
+            await invoke(owner, 'owned withdrawal intent', invocation_id=f'withdrawal-{lane}')
+        except ResourceConflict:
+            pass
+        assert not witness.exists(), 'PRE_TOOL_USE withdrawal executed the stale selected tool'
+        assert await owner.tool_effect_store.database.fetchone(
+            'SELECT state FROM tool_effect_claims') == ('NOT_EXECUTED',)
     finally:
         await store.close()

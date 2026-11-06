@@ -1773,6 +1773,7 @@ class OrchestratorEngineMixin:
         *,
         session_id: str,
         source: str = "external",
+        operation_id: str | None = None,
         _capture: Optional[Dict[str, Any]] = None,
     ) -> Any:
         """Transport-agnostic governed tool dispatch.
@@ -1805,6 +1806,9 @@ class OrchestratorEngineMixin:
             source: Free-form label for audit logs identifying the calling
                 transport (e.g. ``"voice_realtime"``, ``"mcp"``).  Logged
                 only; does not change dispatch behavior.
+            operation_id: Stable intention key required for an external call
+                outside a governed turn. Redelivery must retain it; a new
+                intention must use a new key. Inner calls reuse their turn.
 
         Returns:
             On execution: whatever the tool returns (typically a
@@ -1828,6 +1832,20 @@ class OrchestratorEngineMixin:
         from kestrel_sovereign.signals.constitution_canary import (
             PHANTOM_RECEIPT_TOOL_NAME,
         )
+
+        if operation_id is not None:
+            from kestrel_sovereign.agent.invocation import validate_invocation_id
+            from kestrel_sovereign.tools.effect_invocation import ToolEffectOperation
+
+            operation_id = validate_invocation_id(operation_id)
+            if tool_name != PHANTOM_RECEIPT_TOOL_NAME:
+                outcome = await self._execute_tool_operation_at_stop_boundary(
+                    lambda: self.execute_named_tool(tool_name, args, session_id=session_id,
+                        source=source, _capture=_capture),
+                    name='named-tool-invocation', cancel_on_caller_cancellation=True,
+                    tool_operation=ToolEffectOperation('named_tool', operation_id,
+                        'named-registry', tool_name, deepcopy(args), session_id))
+                return raise_owned_outcome(outcome, operation='named tool operation', retain_originals=True)
 
         # #2935: count the call into its turn, as ``_dispatch_tool_call`` does
         # for the orchestrator loops, so the codex inline executor's calls
@@ -1917,6 +1935,9 @@ class OrchestratorEngineMixin:
         path records it (#2935).
         """
         found_tool, found_feature = self._resolve_named_tool(tool_name)
+        from kestrel_sovereign.agent.tool_allowlist import registry_generation
+
+        selected_generation = registry_generation(self)
         direct_tool_feature_name: Optional[str] = None
         if found_tool is None and tool_name in getattr(self, "_direct_tools", {}):
             # Dynamically-mounted tools — e.g. an MCP server's tools mounted as
@@ -2113,7 +2134,8 @@ class OrchestratorEngineMixin:
             return result
 
         result = await execute_tool_effect(self, registration=[feature_name, tool_name],
-            arguments=effective_args, execute=execute_registered)
+            arguments=effective_args, execute=execute_registered,
+            expected_generation=selected_generation)
         mark_current_invocation_effect_completed(session_id)
         require_execution_work(self)
         exec_duration_ms = int((time.time() - exec_start) * 1000)
@@ -3369,6 +3391,9 @@ class OrchestratorEngineMixin:
         execution = bound_execution if bound_execution is not None else _ToolExecution()
         dispatch_meta = {} if dispatch_meta is None else dispatch_meta
         tool = tool if tool is not None else self._direct_tools[tool_name]
+        from kestrel_sovereign.agent.tool_allowlist import registry_generation
+
+        selected_generation = registry_generation(self)
         hook_feature_name = (
             feature_name or self._security_feature_name_for_tool(tool_name)
         )
@@ -3456,6 +3481,7 @@ class OrchestratorEngineMixin:
 
             return await execute_tool_effect(self, registration=[hook_feature_name, tool_name],
                 arguments=effective_args, execute=execute_registered,
+                expected_generation=selected_generation,
                 validate_registration=bound_tool.require_current if bound_tool is not None else None)
 
         async def run():

@@ -52,6 +52,7 @@ class _JournalInvocation:
 class ToolEffectOperation:
     """An external intent, independent of transport/physical View lifetimes."""
 
+    namespace: str
     operation_id: str
     owner: str
     tool_name: str
@@ -67,7 +68,7 @@ async def journal_tool_operation(owner, operation: ToolEffectOperation):
     require_persistent_tool_effects(owner)
     caller = current_caller_context() or CallerContext.anonymous()
     turn = await admit_tool_effect_turn(owner,
-        namespace=['mcp_app', caller.role.value, caller.auth_method.value, caller.identity],
+        namespace=[operation.namespace, caller.role.value, caller.auth_method.value, caller.identity],
         client_key=operation.operation_id,
         request=dict(owner=operation.owner, tool=operation.tool_name,
             arguments=operation.arguments, session_id=operation.session_id),
