@@ -115,11 +115,13 @@ _JSDELIVR_NPM_SCRIPT = re.compile(
 # contracts. Version 0.46 adds the host-selected deferred-publication context.
 # Version 0.48 adds public argument coercion and the host control-error predicate.
 # Version 0.49 adds native completion evidence and the streaming EOF contract.
+# Version 0.51 requires explicit intent IDs on governed bindings and preserves
+# original uncertain tool exceptions. Core must require that exact contract.
 # A private development wheel does not satisfy the normal lock gate.
 # This is a Core-only release gate: sibling packages release independently.
 # Core must never lower its declared/locked line to accommodate an older
 # consumer. Host feature acceptance remains a release prerequisite in README.md.
-SDK_RELEASE_CASCADE_SPECIFIERS = frozenset({(">=", "0.49.0"), ("<", "1")})
+SDK_RELEASE_CASCADE_SPECIFIERS = frozenset({(">=", "0.51.0"), ("<", "1")})
 SDK_RELEASE_CASCADE_CONTRACTS = {
     "base": frozenset({"a2a", "httpx", "tracing"}),
     "observability": frozenset({"metrics"}),
@@ -462,7 +464,9 @@ def test_sdk_native_release_cascade_contract_is_declared():
         assert Version("0.46.0") not in specifier
         assert Version("0.47.0") not in specifier
         assert Version("0.48.0") not in specifier
-        assert Version("0.49.0") in specifier
+        assert Version("0.49.0") not in specifier
+        assert Version("0.50.0") not in specifier
+        assert Version("0.51.0") in specifier
         assert Version("1.0.0") not in specifier
 
 
@@ -498,7 +502,7 @@ def test_sdk_native_release_cascade_contract_is_locked():
     ]
     assert sdk_versions
     assert all(
-        Version("0.49.0") <= version < Version("1.0.0") for version in sdk_versions
+        Version("0.51.0") <= version < Version("1.0.0") for version in sdk_versions
     )
 
 

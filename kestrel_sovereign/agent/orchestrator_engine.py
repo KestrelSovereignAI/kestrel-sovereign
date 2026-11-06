@@ -1192,6 +1192,9 @@ class OrchestratorEngineMixin:
     # execution starts; an unconfirmed required audit terminates delivery and
     # route fallback. Registration alone does not establish these guarantees.
     supports_unconfirmed_tool_outcomes: bool = True
+    # Native persistent claims fence replay across host restart. Bound calls
+    # require the SDK's explicit operation_id and retain original custody.
+    supports_durable_tool_effects: bool = True
 
     @staticmethod
     def _signals_unfinished_tool_work(content: Optional[str]) -> bool:
