@@ -45,8 +45,8 @@ async def test_restarted_host_does_not_replay_a_lost_remote_effect(host_campaign
             repeated = await client.post(path, json=payload)
             effects = await c.peer.witness(None, None)
             (c.home / 'request-retry-observation.json').write_text(json.dumps(dict(
-                first_http_status=original.status_code, first_reply=original.json(),
-                repeated_http_status=repeated.status_code, repeated_reply=repeated.json(),
+                first_http_status=original.status_code, first_reply=original.text,
+                repeated_http_status=repeated.status_code, repeated_reply=repeated.text,
                 effects=effects), indent=2) + '\n')
             assert effects == ['owned-provider-effect']
             assert repeated.status_code == 409, repeated.text
@@ -57,3 +57,5 @@ async def test_restarted_host_does_not_replay_a_lost_remote_effect(host_campaign
             assert fresh.status_code == 200, fresh.text
             assert await c.peer.witness(None, None) == [
                 'owned-provider-effect', 'owned-provider-effect']
+            assert original.status_code == 502, original.text
+            assert original.json()['error']['code'] == 'tool_effect_outcome_unconfirmed'
