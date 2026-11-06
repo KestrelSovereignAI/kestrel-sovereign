@@ -292,8 +292,9 @@ async def test_text_only_stream_carries_the_notice_too():
     items = await _collect(GoogleAdapter().get_streaming_response(
         client=client, model="gemini-2.5-pro", messages=MESSAGES,
     ))
-    assert all(isinstance(i, str) for i in items)
-    assert "".join(items) == f"Partial answer\n\n{NOTICE}"
+    assert isinstance(items[-1], LLMResponse)
+    assert items[-1].stop_reason == "MAX_TOKENS"
+    assert "".join(i for i in items if isinstance(i, str)) == f"Partial answer\n\n{NOTICE}"
 
 
 @pytest.mark.asyncio

@@ -99,7 +99,7 @@ class NoCompletionEvidenceError(IncompleteGenerationError):
             f"{provider} returned a response for model {model!r} without a "
             f"stop reason, so there is no evidence it finished; the attempt "
             f"failed. The route's adapter must report the provider's stop "
-            f"reason (attach_stop_reason)."
+            f"reason in LLMResponse.stop_reason."
         )
 
 

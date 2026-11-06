@@ -2139,7 +2139,6 @@ class Feature(_SdkFeature):
                 from kestrel_sdk.hooks.base import (
                     HookEvent,
                     HookInput,
-                    PermissionDecision,
                 )
                 hook_input = HookInput(
                     session_id=hook_session_id,
@@ -2168,24 +2167,15 @@ class Feature(_SdkFeature):
                 if isinstance(updated, dict):
                     effective_args = updated
 
-                # Both DENY and ASK must short-circuit. ASK means "human
-                # approval required" — the orchestrator-driven path's
-                # ``execute_named_tool`` blocks both, and the codex inline
-                # subagent path must match that contract or approval-gated
-                # tools silently run without approval (codex round 2 P1
-                # on #1461 follow-up).
-                if hook_output.permission_decision in (
-                    PermissionDecision.DENY,
-                    PermissionDecision.ASK,
-                ):
-                    reason = (
-                        hook_output.permission_reason
-                        or "Blocked by security policy"
-                    )
+                # The loop and inline executors share the same DENY, ASK,
+                # and explicit-stop rule as the orchestrator.
+                from kestrel_sovereign.hooks.decision_gate import evaluate_blocking_decision
+
+                blocked = evaluate_blocking_decision(hook_output)
+                if blocked is not None:
+                    reason = blocked.reason
                     decision_label = (
-                        "PERMISSION DENIED"
-                        if hook_output.permission_decision == PermissionDecision.DENY
-                        else "APPROVAL REQUIRED"
+                        "APPROVAL REQUIRED" if blocked.is_ask else "PERMISSION DENIED"
                     )
                     logger.info(
                         "[SUBAGENT-TOOL] %s blocked (%s): reason %s",

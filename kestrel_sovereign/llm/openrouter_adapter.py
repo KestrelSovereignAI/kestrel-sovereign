@@ -17,6 +17,8 @@ Key features:
 - Rich model metadata (pricing, context length, capabilities)
 - OpenAI-compatible chat completions API
 """
+
+from contextlib import aclosing
 import os
 import logging
 from contextlib import asynccontextmanager
@@ -280,19 +282,14 @@ class OpenRouterAdapter(OpenAIAdapter):
         tools: Optional[List[Dict[str, Any]]] = None,
         response_format: Optional[Type[BaseModel]] = None,
         **kwargs
-    ) -> AsyncIterator[str]:
-        """Get a streaming response from an OpenRouter model."""
-        async with self._client_lifetime(client) as client:
-            async with owned_execution_stream(self, super().get_streaming_response(
-                client=client,
-                model=model,
-                messages=messages,
-                tools=tools,
-                response_format=response_format,
-                **kwargs
-            )) as owned_stream:
-                async for chunk in owned_stream:
-                    yield chunk
+    ) -> AsyncIterator[Union[str, LLMResponse]]:
+        """Yield plain text and one terminal response from the canonical stream."""
+        async with aclosing(self._plain_stream(
+            client=client, model=model, messages=messages, tools=tools,
+            response_format=response_format, **kwargs,
+        )) as stream:
+            async for item in stream:
+                yield item
 
     async def get_streaming_response_with_tools(
         self,

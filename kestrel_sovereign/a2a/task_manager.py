@@ -607,7 +607,10 @@ class TaskManager:
         args, argument_error = coerce_declared_tool_arguments(skill_id, tool, args)
         denied_reason = None
         if self.hooks_manager and argument_error is None:
-            from kestrel_sdk.hooks.base import HookEvent, HookInput, PermissionDecision
+            from kestrel_sdk.hooks.base import HookEvent, HookInput
+            from kestrel_sovereign.hooks.decision_gate import (
+                decided_tool_input, evaluate_blocking_decision,
+            )
 
             hook_input = HookInput(
                 session_id=session_id,
@@ -619,17 +622,12 @@ class TaskManager:
             hook_output = await self.hooks_manager.execute_hooks(
                 HookEvent.PRE_TOOL_USE, hook_input
             )
-            if hook_output.permission_decision == PermissionDecision.DENY:
-                denied_reason = (
-                    hook_output.permission_reason or "Blocked by security policy"
-                )
+            # Retain post-hook redaction even when the decision blocks.
+            args = decided_tool_input(hook_input, hook_output)
+            blocked = evaluate_blocking_decision(hook_output)
+            if blocked is not None:
+                denied_reason = blocked.error
             else:
-                # The arguments the hooks authorized: a MODIFY rewrite, else
-                # the threaded input, which a hook may have mutated in place.
-                if hook_output.updated_input is not None:
-                    args = hook_output.updated_input
-                elif isinstance(hook_input.tool_input, dict):
-                    args = hook_input.tool_input
                 # A rewrite the tool's wrapper would still coerce is not what
                 # the tool would run with (#3921).
                 argument_error = hook_rewrite_argument_error(skill_id, tool, args)
@@ -667,7 +665,7 @@ class TaskManager:
                     at=self.task_store.now_utc(),
                     state=TaskState.TASK_STATE_REJECTED,
                     message=new_text_message(
-                        f"Permission denied: {denied_reason}",
+                        denied_reason,
                         task_id=task.id,
                         context_id=task.context_id,
                     ),

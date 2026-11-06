@@ -159,7 +159,7 @@ async def _follow_up(route, wire: _Gemini, messages, path: str) -> Any:
         return await adapter.get_response(
             client=client, model=MODEL, messages=messages, tools=TOOLS,
         )
-    return [item async for item in adapter.get_streaming_response(
+    return [item async for item in adapter._stream_with_usage(
         client=client, model=MODEL, messages=messages, tools=TOOLS,
     )]
 
@@ -287,7 +287,8 @@ async def test_the_agents_streaming_entry_point_keeps_the_signature(route):
     items = [item async for item in adapter.get_streaming_response_with_tools(
         client=client, model=MODEL, messages=FIRST_TURN, tools=TOOLS,
     )]
-    [response] = items
+    response = items[-1]
+    assert items[0].id == response.tool_calls[0].id
     items = [item async for item in adapter.get_streaming_response_with_tools(
         client=client, model=MODEL, messages=_tool_round(response), tools=TOOLS,
     )]
@@ -312,7 +313,7 @@ async def test_a_call_streamed_by_vertex_keeps_its_signature():
     assert first.extra_content == {"google": {"thought_signature": WIRE_SIGNATURE}}
     assert type(second) is ToolCall
 
-    [item async for item in adapter.get_streaming_response(
+    [item async for item in adapter._stream_with_usage(
         client=client, model=MODEL, messages=_tool_round(response), tools=TOOLS,
     )]
 

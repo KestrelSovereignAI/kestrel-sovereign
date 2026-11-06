@@ -37,7 +37,7 @@ class FakeRemoteClient:
             raise RuntimeError("private transport details")
         return SimpleNamespace(
             choices=[
-                SimpleNamespace(message=SimpleNamespace(content=self.response_text))
+                SimpleNamespace(index=0, finish_reason="stop", message=SimpleNamespace(content=self.response_text))
             ]
         )
 

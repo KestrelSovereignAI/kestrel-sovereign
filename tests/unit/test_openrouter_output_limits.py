@@ -101,7 +101,7 @@ async def test_unreported_limits_are_unknown_not_4096(monkeypatch):
 def _completion(content: str, finish_reason: Any) -> SimpleNamespace:
     message = SimpleNamespace(content=content, tool_calls=None, reasoning_content=None)
     return SimpleNamespace(
-        choices=[SimpleNamespace(message=message, finish_reason=finish_reason)],
+        choices=[SimpleNamespace(index=0, message=message, finish_reason=finish_reason)],
         usage=None,
     )
 
@@ -174,7 +174,7 @@ def _chunk(content: str = None, finish_reason: str = None, usage: Any = None):
     choices = []
     if content is not None or finish_reason is not None:
         delta = SimpleNamespace(content=content, tool_calls=None, reasoning_content=None)
-        choices = [SimpleNamespace(delta=delta, finish_reason=finish_reason)]
+        choices = [SimpleNamespace(index=0, delta=delta, finish_reason=finish_reason)]
     return SimpleNamespace(choices=choices, usage=usage)
 
 

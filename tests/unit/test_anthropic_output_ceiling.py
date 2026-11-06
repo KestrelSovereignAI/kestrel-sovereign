@@ -507,12 +507,12 @@ async def test_tool_stream_cut_at_callers_budget_has_no_notice():
 async def test_tool_stream_cut_drops_the_incomplete_trailing_tool_call():
     events = [
         _ev("content_block_start", index=0, content_block=SimpleNamespace(
-            type="tool_use", id="call_1", name="read_file")),
+            type="tool_use", id="call_1", name="read_file", input={})),
         _ev("content_block_delta", index=0, delta=SimpleNamespace(
             type="input_json_delta", partial_json='{"path": "a.py"}')),
         _ev("content_block_stop", index=0),
         _ev("content_block_start", index=1, content_block=SimpleNamespace(
-            type="tool_use", id="call_2", name="shell")),
+            type="tool_use", id="call_2", name="shell", input={})),
         _ev("content_block_delta", index=1, delta=SimpleNamespace(
             type="input_json_delta", partial_json='{"command": "rm -rf /tmp/wo')),
         _ev("content_block_stop", index=1),
@@ -537,7 +537,7 @@ def _prose_then_cut_tool_events(prose: str) -> List[Any]:
         _ev("content_block_delta", index=0, delta=SimpleNamespace(type="text_delta", text=prose)),
         _ev("content_block_stop", index=0),
         _ev("content_block_start", index=1, content_block=SimpleNamespace(
-            type="tool_use", id="call_cut", name="shell")),
+            type="tool_use", id="call_cut", name="shell", input={})),
         _ev("content_block_delta", index=1, delta=SimpleNamespace(
             type="input_json_delta", partial_json='{"command": "rm -rf /tmp/wo')),
         _ev("content_block_stop", index=1),
@@ -591,7 +591,9 @@ async def test_text_stream_cut_at_model_ceiling_ends_with_the_notice():
         client=_streaming_client(_text_events("Question 1: yes", stop_reason="max_tokens")),
         model="claude-opus-5", messages=USER,
     ))
-    assert items == ["Question 1: yes", f"\n\n{NOTICE}"]
+    assert items[:-1] == ["Question 1: yes", f"\n\n{NOTICE}"]
+    assert isinstance(items[-1], LLMResponse)
+    assert items[-1].stop_reason == "max_tokens"
 
 
 @pytest.mark.asyncio
@@ -605,7 +607,9 @@ async def test_text_stream_cut_with_no_text_yields_only_the_notice():
     items = await _collect(AnthropicAdapter().get_streaming_response(
         client=_streaming_client(events), model="claude-opus-5", messages=USER,
     ))
-    assert items == [NOTICE]
+    assert items[:-1] == [NOTICE]
+    assert isinstance(items[-1], LLMResponse)
+    assert items[-1].stop_reason == "max_tokens"
 
 
 @pytest.mark.asyncio
@@ -614,7 +618,9 @@ async def test_text_stream_finished_has_no_notice():
         client=_streaming_client(_text_events("All done.", stop_reason="end_turn")),
         model="claude-opus-5", messages=USER,
     ))
-    assert items == ["All done."]
+    assert items[:-1] == ["All done."]
+    assert isinstance(items[-1], LLMResponse)
+    assert items[-1].stop_reason == "end_turn"
 
 
 # ---------------------------------------------------------------------------

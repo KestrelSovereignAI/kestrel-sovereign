@@ -794,8 +794,10 @@ async def test_lost_commit_ack_reconciles_only_the_canonical_payload(
     assert {item.name for item in persisted.artifacts} == {"concurrent", "result"}
 
 
-async def test_denied_local_skill_returns_a_native_rejection_without_running_the_tool(
-    manager,
+@pytest.mark.parametrize("decision", ["allow", "deny", "ask", "stop"])
+@pytest.mark.parametrize("redact", [False, True])
+async def test_blocking_local_skill_decisions_match_the_shared_policy_gate(
+    manager, tmp_path, decision, redact,
 ):
     from kestrel_sdk.hooks.base import Hook, HookEvent, HookOutput
 
@@ -806,11 +808,32 @@ async def test_denied_local_skill_returns_a_native_rejection_without_running_the
             super().__init__("deny-native-export", events=[HookEvent.PRE_TOOL_USE])
 
         async def execute(self, input):
+            if decision == "allow":
+                return HookOutput.allow()
+            if decision == "ask":
+                return HookOutput.ask("owned-approval", "Export needs approval")
+            if decision == "stop":
+                return HookOutput(continue_execution=False, stop_reason="Export stopped")
             return HookOutput.deny("This recipient does not permit export")
 
+    witness = tmp_path / "owned-native-skill-effect.txt"
+
+    class RecordingProvider(CompletingProvider):
+        async def handle_task(self, task, *, arguments=None):
+            witness.write_text("owned-native-skill-effect", encoding="utf-8")
+            return await super().handle_task(task, arguments=arguments)
+
+    class RedactExport(Hook):
+        def __init__(self):
+            super().__init__("redact-native-export", events=[HookEvent.PRE_TOOL_USE], priority=90)
+        async def execute(self, input):
+            return HookOutput.modify({"value": "owned-redacted-argument"})
+
     manager.hooks_manager = HooksManager()
+    if redact:
+        manager.hooks_manager.register(RedactExport())
     manager.hooks_manager.register(DenyExport())
-    provider = CompletingProvider()
+    provider = RecordingProvider()
     manager.register_provider(
         "feature",
         [
@@ -823,7 +846,17 @@ async def test_denied_local_skill_returns_a_native_rejection_without_running_the
         ],
         provider,
     )
-    result = await manager.execute_skill("feature", "native-tool", {})
+    import json
+    result = await manager.execute_skill("feature", "native-tool", {"value": "owned-original-argument"})
+    expected_args = {"value": "owned-redacted-argument" if redact else "owned-original-argument"}
+    assert json.loads(result.history[0].parts[-1].raw) == expected_args
+    if decision == "allow":
+        assert provider.calls == 1
+        assert witness.read_text(encoding="utf-8") == "owned-native-skill-effect"
+        assert result.status.state == TaskState.TASK_STATE_COMPLETED
+        assert await manager.get_task_for_recipient(result.id, manager.did) == result
+        return
+    assert not witness.exists(), "A blocked native skill performed its actual effect"
     assert provider.calls == 0
     assert result.status.state == TaskState.TASK_STATE_REJECTED
     assert result.status.message.task_id == result.id

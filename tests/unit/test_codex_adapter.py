@@ -1996,14 +1996,15 @@ class TestToolExecutorBridge:
         assert {r[0] for r in results} == {"first", "second"}
 
     @pytest.mark.asyncio
-    async def test_dynamic_tool_call_item_surfaces_as_tool_call_event(self):
+    @pytest.mark.parametrize("arguments", ['{"city": "SF"}', "{", "[]", 17])
+    async def test_dynamic_tool_call_item_surfaces_as_tool_call_event(self, arguments):
         """The app-server emits inline-executed tool items with type
         ``dynamicToolCall`` — historically I only matched
         functionCall/toolCall and dropped these silently."""
         events = [
             {"method": "item/completed", "params": {"item": {
                 "type": "dynamicToolCall", "id": "c1",
-                "name": "get_weather", "arguments": '{"city": "SF"}'}}},
+                "name": "get_weather", "arguments": arguments}}},
             {"method": "item/completed",
              "params": {"item": {"type": "agentMessage", "text": "ok"}}},
             {"method": "turn/completed", "params": {}},
@@ -2013,8 +2014,7 @@ class TestToolExecutorBridge:
         async def exe(name, args):
             return {"success": True, "result": "sunny"}
 
-        seen = [
-            c async for c in a.get_streaming_response_with_tools(
+        stream = a.get_streaming_response_with_tools(
                 client="x", model="auto",
                 messages=[{"role": "user", "content": "hi"}],
                 tools=[{"type": "function", "function": {
@@ -2022,7 +2022,13 @@ class TestToolExecutorBridge:
                     "parameters": {"type": "object"}}}],
                 session_id="s", tool_executor=exe,
             )
-        ]
+        if arguments != '{"city": "SF"}':
+            from kestrel_sdk.llm import LLMProtocolError
+
+            with pytest.raises(LLMProtocolError):
+                _ = [item async for item in stream]
+            return
+        seen = [item async for item in stream]
         starts = [c for c in seen if isinstance(c, ToolCallStarted)]
         assert starts and starts[0].name == "get_weather"
 
@@ -2043,7 +2049,7 @@ class TestToolExecutorBridge:
         ]
         a = _adapter_with(events)
         out = [
-            c async for c in a.get_streaming_response(
+            c async for c in a.get_streaming_response_with_tools(
                 client="x", model="auto",
                 messages=[{"role": "user", "content": "hi"}],
                 session_id="s",
@@ -2051,6 +2057,13 @@ class TestToolExecutorBridge:
         ]
         deltas = [c for c in out if isinstance(c, ThinkingDelta)]
         assert [d.content for d in deltas] == ["thinking-one", "summary-two"]
+
+        plain_adapter = _adapter_with(events)
+        plain = [item async for item in plain_adapter.get_streaming_response(
+            client="x", model="auto", messages=[{"role": "user", "content": "hi"}], session_id="plain",
+        )]
+        assert not any(isinstance(item, ThinkingDelta) for item in plain)
+        assert isinstance(plain[-1], LLMResponse)
 
     @pytest.mark.asyncio
     async def test_executed_tool_calls_attached_with_app_server_callid(self):

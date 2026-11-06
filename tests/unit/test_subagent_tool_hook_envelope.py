@@ -253,3 +253,67 @@ async def test_session_less_turn_files_hooks_under_empty_session_not_a_sentinel(
 
     assert recorder.event_names() == ["PreToolUse", "PostToolUse"]
     assert [e["session_id"] for e in recorder.edges] == ["", ""]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("capture_args", [False, True])
+@pytest.mark.parametrize("scenario,decision", [
+    ("allow", None), ("bare_stop", None), ("bare_stop", "allow"),
+    ("stop_then_deny", None), ("stop_then_deny", "allow"),
+])
+async def test_real_subagent_tool_cannot_cross_a_stopped_hook_chain(
+    tmp_path, capture_args, scenario, decision,
+):
+    from kestrel_sovereign.features.base import tool
+    from kestrel_sovereign.kestrel_agent import KestrelAgent
+    from kestrel_sdk.hooks.base import PermissionDecision
+
+    witness = tmp_path / "owned-subagent-effect.txt"
+
+    class OwnedEffectFeature(Feature):
+        @property
+        def tool_description(self):
+            return "Owned subagent policy probe"
+        async def initialize(self):
+            pass
+        @tool(name="record_marker", description="Record the owned subagent marker")
+        async def record_marker(self, marker: str):
+            witness.write_text(marker, encoding="utf-8")
+            return {"success": True, "data": {"marker": marker}}
+
+    class PolicyHook(Hook):
+        def __init__(self, name, output, priority):
+            super().__init__(name, events=[HookEvent.PRE_TOOL_USE], priority=priority)
+            self.output = output
+        async def execute(self, input):
+            return self.output
+
+    agent = KestrelAgent(did="did:test:owned-subagent-policy", storage_path=str(tmp_path / "agent.db"))
+    # This path calls no model; retire the unused real service before the tool.
+    await agent.llm_service.close()
+    agent.hooks_manager = HooksManager()
+    agent.hooks_manager.register(PolicyHook("redact", HookOutput.modify({"marker": "owned-redacted-marker"}), 5))
+    if scenario != "allow":
+        output = HookOutput(continue_execution=False, stop_reason="Owned stop",
+            permission_decision=PermissionDecision.ALLOW if decision == "allow" else None)
+        agent.hooks_manager.register(PolicyHook("stop", output, 10))
+    if scenario == "stop_then_deny":
+        agent.hooks_manager.register(PolicyHook("later-deny", HookOutput.deny("Owned later denial"), 50))
+    feature = OwnedEffectFeature(agent)
+    tools = {item.name: item for item in feature.get_tools()}
+    name, = tools
+    output = await feature._execute_subagent_tool(tool_name=name,
+        args={"marker": "owned-private-marker"}, tools_by_name=tools,
+        session_id="owned-subagent-turn", return_with_effective_args=capture_args)
+    if capture_args:
+        effective, result = output
+        assert effective == {"marker": "owned-redacted-marker"}
+    else:
+        result = output
+    if scenario == "allow":
+        assert result["success"] is True
+        assert witness.read_text(encoding="utf-8") == "owned-redacted-marker"
+    else:
+        assert not witness.exists(), "A stopped subagent performed its real tool effect"
+        assert result["success"] is False
+        assert "NOT executed" in result["error"]

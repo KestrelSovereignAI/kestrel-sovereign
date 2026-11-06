@@ -23,6 +23,7 @@ from kestrel_sdk.llm import (
 from pydantic import BaseModel, SecretStr
 from kestrel_sovereign.execution_custody import _explicit_control_chain, execution_cleanup_debts
 
+from kestrel_sovereign.llm.streaming import LLMStreamingError
 from kestrel_sovereign.llm.adapter import LLMResponse, ToolCall
 from kestrel_sovereign.llm.claude_max_adapter import ClaudeMaxAdapter
 from kestrel_sovereign.llm.output_ceiling import attach_stop_reason, response_stop_reason
@@ -2683,7 +2684,7 @@ class TestInvocationBoundary:
         assert meter_calls[0]["completion_tokens"] == 5
 
     @pytest.mark.asyncio
-    async def test_unknown_plain_stream_usage_is_logged_but_never_billed(
+    async def test_missing_plain_stream_terminal_is_failed_without_billing(
         self, llm_service, mock_adapter, caplog
     ):
         async def basic_stream(**_kwargs):
@@ -2703,18 +2704,18 @@ class TestInvocationBoundary:
             companion_id="legacy-companion", user_id="legacy-user"
         )
 
-        with caplog.at_level("INFO", logger="kestrel_sovereign.llm.service"):
-            items = [
+        with pytest.raises(LLMStreamingError), caplog.at_level("INFO", logger="kestrel_sovereign.llm.service"):
+            _ = [
                 item
                 async for item in llm_service.get_streaming_response(
                     system_prompt="system", user_prompt="hello"
                 )
             ]
 
-        assert items == ["legacy chunk"]
         llm_service._track_model_usage.assert_not_awaited()
         store.log_llm_call.assert_awaited_once()
         logged = store.log_llm_call.await_args.kwargs
+        assert logged["success"] is False
         assert logged["input_tokens"] is None
         assert logged["output_tokens"] is None
         assert logged["metadata"]["usage_available"] is False
@@ -3319,6 +3320,7 @@ class TestStreamingMandatePreference:
         async def mock_streaming(*args, **kwargs):
             yield "Hello "
             yield "world"
+            yield _finished(LLMResponse(content="complete"))
         mock_adapter.get_streaming_response = Mock(return_value=mock_streaming())
 
         chunks = []
@@ -3345,6 +3347,7 @@ class TestStreamingMandatePreference:
         async def mock_streaming(*args, **kwargs):
             yield "Streamed "
             yield "response"
+            yield _finished(LLMResponse(content="complete"))
         mock_adapter.get_streaming_response = Mock(return_value=mock_streaming())
 
         messages = [{"role": "user", "content": "Test"}]
@@ -3366,6 +3369,7 @@ class TestStreamingMandatePreference:
         """Request cancellation token is forwarded to adapter streams."""
         async def mock_streaming(*args, **kwargs):
             yield "response"
+            yield _finished(LLMResponse(content="complete"))
 
         mock_adapter.get_streaming_response = Mock(return_value=mock_streaming())
         token = Mock(return_value=False)
@@ -3429,6 +3433,7 @@ class TestStreamingMandatePreference:
 
         async def mock_streaming(*args, **kwargs):
             yield "Default response"
+            yield _finished(LLMResponse(content="complete"))
         mock_adapter.get_streaming_response = Mock(return_value=mock_streaming())
 
         messages = [{"role": "user", "content": "Test"}]
@@ -3453,6 +3458,7 @@ class TestStreamingMandatePreference:
 
         async def mock_streaming(*args, **kwargs):
             yield "Override response"
+            yield _finished(LLMResponse(content="complete"))
         mock_adapter.get_streaming_response = Mock(return_value=mock_streaming())
 
         messages = [{"role": "user", "content": "Test"}]

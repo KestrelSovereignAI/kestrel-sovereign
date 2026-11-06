@@ -60,16 +60,17 @@ def tool_call_from_part(part: Any, call_id: str) -> Optional[ToolCall]:
     if fc is None:
         return None
     args = dict(fc.args) if getattr(fc, "args", None) else {}
+    native_call_id = getattr(fc, "id", None) or call_id
     signature = getattr(part, "thought_signature", None)
     if signature is None:
-        return ToolCall(id=call_id, name=fc.name, arguments=args)
+        return ToolCall(id=native_call_id, name=fc.name, arguments=args)
     if not isinstance(signature, bytes):
         raise TypeError(
             f"function call {fc.name!r} has a thought_signature of type "
             f"{type(signature).__name__}, not bytes"
         )
     return ToolCallWithExtraContent(
-        id=call_id,
+        id=native_call_id,
         name=fc.name,
         arguments=args,
         extra_content={GOOGLE_EXTRA_CONTENT: {

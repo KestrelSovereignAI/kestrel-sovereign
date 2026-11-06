@@ -19,6 +19,13 @@ class MCPTestPeer:
     kind: str
     selector: str
     witness_file: Path | None = None
+    provider_url: str | None = None
+    provider_witness: Path | None = None
+
+    def provider_requests(self):
+        if self.provider_witness is None:
+            raise ValueError("This peer did not start an owned provider")
+        return [json.loads(line) for line in self.provider_witness.read_text().splitlines()] if self.provider_witness.exists() else []
 
     async def witness(self, feature, name):
         if self.kind == "remote":
@@ -56,7 +63,7 @@ async def docker_peer(tmp_path):
 
 
 @asynccontextmanager
-async def https_peer(tmp_path, monkeypatch):
+async def https_peer(tmp_path, monkeypatch, *, provider_model: str | None = None, provider_fault: str | None = None):
     import httpcore2
     import docker
 
@@ -69,6 +76,8 @@ async def https_peer(tmp_path, monkeypatch):
             sys.executable, str(Path(__file__).with_name("mcp_permission_peer.py")),
             "--tls-cert", str(certificate), "--tls-key", str(tmp_path / "private-key.pem"),
             "--witness", str(witness), "--ready", str(ready),
+            *(["--provider-model", provider_model] if provider_model is not None else []),
+            *(["--provider-fault", provider_fault] if provider_fault is not None else []),
             env={"PATH": os.environ["PATH"], "PYTHONUNBUFFERED": "1"},
             stdout=output, stderr=asyncio.subprocess.STDOUT,
         )
@@ -90,6 +99,7 @@ async def https_peer(tmp_path, monkeypatch):
                             return port
                     await asyncio.sleep(0.01)
             port = await asyncio.wait_for(await_ready(), 10)
+            owned_port = port
             original = httpcore2.AnyIOBackend.connect_tcp
 
             def resolve(host, requested_port, *, type, proto):
@@ -97,7 +107,8 @@ async def https_peer(tmp_path, monkeypatch):
                 return [(socket.AF_INET, type, proto, "", ("8.8.8.8", port))]
 
             async def dial(backend, host, port, **kwargs):
-                assert host == "8.8.8.8"
+                allowed_hosts = {"8.8.8.8", hostname} if provider_model else {"8.8.8.8"}
+                assert host in allowed_hosts and port == owned_port
                 return await original(backend, "127.0.0.1", port, **kwargs)
 
             def refuse_docker(*args, **kwargs):
@@ -112,7 +123,9 @@ async def https_peer(tmp_path, monkeypatch):
                 network.setenv("HTTPS_PROXY", "http://127.0.0.1:1")
                 network.setenv("ALL_PROXY", "http://127.0.0.1:1")
                 network.setenv("NO_PROXY", "")
-                yield MCPTestPeer("remote", f"https://{hostname}:{port}/mcp", witness)
+                yield MCPTestPeer("remote", f"https://{hostname}:{port}/mcp", witness,
+                                  f"https://{hostname}:{port}/v1" if provider_model else None,
+                                  witness.with_suffix(".provider.jsonl") if provider_model else None)
         finally:
             if process.returncode is None:
                 process.terminate()

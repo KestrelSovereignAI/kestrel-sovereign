@@ -2154,8 +2154,9 @@ async def test_network_discovery_and_recipient_admission_do_not_inherit_sender_c
     assert all(value is None for _, value in observed)
 
 
+@pytest.mark.parametrize("discovery_delay", [0.0, 0.2])
 async def test_blocking_peer_timeout_retires_http_subscription_without_replaying_task(
-    local_native_peer,
+    local_native_peer, monkeypatch, discovery_delay,
 ):
     import httpx
     from kestrel_sdk.native_a2a.types import ListTasksRequest
@@ -2164,16 +2165,48 @@ async def test_blocking_peer_timeout_retires_http_subscription_without_replaying
     from kestrel_sovereign.features.peers.feature import PeersFeature
 
     p = local_native_peer
-    p.directory.open_a2a_session = lambda selected, peer: (
-        open_hosted_native_peer_session(
+    if discovery_delay:
+        original_profile = p.recipient.get_public_profile
+
+        async def delayed_profile(*args, **kwargs):
+            await asyncio.sleep(discovery_delay)
+            return await original_profile(*args, **kwargs)
+
+        monkeypatch.setattr(p.recipient, "get_public_profile", delayed_profile)
+
+    timed_task_ids = []
+
+    async def arm_subscription_timeout(request):
+        if request.method != "POST":
+            return
+
+        async def trace(name, info):
+            if name != "http11.receive_response_headers.started":
+                return
+            # Time out the unanswered blocking response, not card discovery,
+            # signing or database admission. The actual HTTP read still owns
+            # and raises the timeout after the recipient opened its stream.
+            while not p.manager._subscribers:
+                await asyncio.sleep(0.001)
+            timed_task_ids.extend(p.manager._subscribers)
+            info["request"].extensions["timeout"]["read"] = 0.1
+
+        request.extensions["trace"] = trace
+
+    @asynccontextmanager
+    async def timed_session(selected, peer):
+        async with open_hosted_native_peer_session(
             p.app,
             p.host,
             sender=p.sender,
             requester=selected,
             peer=peer,
-            timeout=httpx.Timeout(0.1),
-        )
-    )
+            timeout=httpx.Timeout(10),
+        ) as session:
+            session._http.event_hooks["request"].append(arm_subscription_timeout)
+            yield session
+
+    p.directory.open_a2a_session = timed_session
     feature = PeersFeature(p.sender)
     feature._peer_router = p.directory
     feature._peer_requester = p.requester
@@ -2182,6 +2215,7 @@ async def test_blocking_peer_timeout_retires_http_subscription_without_replaying
         feature.ask_agent("Peer", "An unanswered blocking native ask"), 5
     )
     assert result.data["sent"] is None and result.data["delivery_state"] == "unknown"
+    assert len(timed_task_ids) == 1, "One admitted subscription must own the timeout"
     async with asyncio.timeout(5):
         while p.manager._subscribers:
             await asyncio.sleep(0.001)
@@ -2194,6 +2228,7 @@ async def test_blocking_peer_timeout_retires_http_subscription_without_replaying
     )
     assert (
         len(tasks.tasks) == 1
+        and tasks.tasks[0].id == timed_task_ids[0]
         and tasks.tasks[0].status.state
         == __import__(
             "kestrel_sdk.native_a2a.types", fromlist=["TaskState"]

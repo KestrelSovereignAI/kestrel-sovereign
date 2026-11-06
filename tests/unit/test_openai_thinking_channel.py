@@ -88,6 +88,7 @@ async def test_streaming_response_yields_reasoning_content_as_thinking_delta():
         yield SimpleNamespace(
             choices=[
                 SimpleNamespace(
+                    index=0,
                     delta=SimpleNamespace(
                         reasoning_content="hidden reasoning",
                         content=None,
@@ -98,6 +99,7 @@ async def test_streaming_response_yields_reasoning_content_as_thinking_delta():
         yield SimpleNamespace(
             choices=[
                 SimpleNamespace(
+                    index=0,
                     delta=SimpleNamespace(content="Visible answer.")
                 )
             ]
@@ -111,7 +113,7 @@ async def test_streaming_response_yields_reasoning_content_as_thinking_delta():
     )
 
     items = []
-    async for item in adapter.get_streaming_response(
+    async for item in adapter.get_streaming_response_with_tools(
         client=client,
         model="Kimi-K2.6",
         messages=[{"role": "user", "content": "hi"}],
@@ -131,6 +133,7 @@ async def test_openai_compatible_adapter_uses_configured_provider_name():
         yield SimpleNamespace(
             choices=[
                 SimpleNamespace(
+                    index=0,
                     delta=SimpleNamespace(
                         reasoning_content="local hidden reasoning",
                         content=None,
@@ -147,7 +150,7 @@ async def test_openai_compatible_adapter_uses_configured_provider_name():
     )
 
     items = []
-    async for item in adapter.get_streaming_response(
+    async for item in adapter.get_streaming_response_with_tools(
         client=client,
         model="Kimi-K2.6",
         messages=[{"role": "user", "content": "hi"}],

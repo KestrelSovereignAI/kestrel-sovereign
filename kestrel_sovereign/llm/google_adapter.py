@@ -7,12 +7,17 @@ Adapter for Google's Gemini API with support for:
 - Streaming responses
 - API-based model discovery
 """
+
+from contextlib import aclosing
+
 import logging
 import os
 from enum import Enum
 from typing import Any, Dict, List, Optional, Union, AsyncIterator
 
 from .adapter import LLMAdapter, LLMResponse
+from kestrel_sdk.llm import LLMProtocolError, ToolCallStarted
+
 from kestrel_sdk.llm import (
     ProviderCapabilities,
     StructuredOutputMode,
@@ -524,6 +529,10 @@ class GoogleAdapter(LLMAdapter):
                 candidates = getattr(chunk, "candidates", None)
                 if candidates:
                     finish_reason = _finish_reason(candidates[0]) or finish_reason
+                if any(getattr(part, "function_call", None) is not None
+                       for candidate in candidates or ()
+                       for part in getattr(getattr(candidate, "content", None), "parts", None) or ()):
+                    raise LLMProtocolError("Plain Gemini streaming received unexpected tool evidence.")
                 text = getattr(chunk, "text", None)
                 if text:
                     text_content += text
@@ -569,18 +578,14 @@ class GoogleAdapter(LLMAdapter):
         messages: List[Dict[str, Any]],
         tools: Optional[List[Dict[str, Any]]] = None,
         **kwargs
-    ) -> AsyncIterator[str]:
-        """Preserve the public text-only stream while retaining one source."""
-        async with joined_iterator(self._stream_with_usage(
-            client=client,
-            model=model,
-            messages=messages,
-            tools=tools,
+    ) -> AsyncIterator[Union[str, LLMResponse]]:
+        """Yield plain text and one terminal response from the canonical stream."""
+        async with aclosing(self._plain_stream(
+            client=client, model=model, messages=messages, tools=tools,
             **kwargs,
         )) as stream:
             async for item in stream:
-                if isinstance(item, str):
-                    yield item
+                yield item
 
     async def get_streaming_response_with_tools(
         self,
@@ -605,6 +610,8 @@ class GoogleAdapter(LLMAdapter):
                 **kwargs,
             )
             if response.has_tool_calls:
+                for index, call in enumerate(response.tool_calls):
+                    yield ToolCallStarted(index=index, id=call.id or None, name=call.name or None)
                 yield response
                 return
             if response.content:
