@@ -66,6 +66,9 @@ class ToolEffectClaim:
     claim_id: str
 
 
+TOOL_EFFECT_OPERATIONS_SQL = "CREATE TABLE tool_effect_operations (scope_digest TEXT NOT NULL, operation_digest TEXT NOT NULL, request_digest TEXT NOT NULL, attempt_id TEXT NOT NULL, revision BIGINT NOT NULL, state TEXT NOT NULL CHECK(state IN ('OPEN', 'CLOSED')), latched BIGINT NOT NULL CHECK(latched IN (0, 1)), PRIMARY KEY(scope_digest, operation_digest))"
+
+
 ClaimTerminal = Literal["RETURNED_OK", "RETURNED_ERROR", "UNCONFIRMED", "NOT_EXECUTED"]
 
 
@@ -122,7 +125,7 @@ class ToolEffectStore(UnifiedStoreBase):
                         binary = "BYTEA" if self.is_postgres else "BLOB"
                         for sql in (
                             f"CREATE TABLE tool_effect_keys (key_id TEXT PRIMARY KEY, scope_digest TEXT NOT NULL UNIQUE, wrapped_key {binary} NOT NULL)",
-                            "CREATE TABLE tool_effect_operations (scope_digest TEXT NOT NULL, operation_digest TEXT NOT NULL, request_digest TEXT NOT NULL, attempt_id TEXT NOT NULL, revision BIGINT NOT NULL, state TEXT NOT NULL CHECK(state IN ('OPEN', 'CLOSED')), latched BIGINT NOT NULL CHECK(latched IN (0, 1)), PRIMARY KEY(scope_digest, operation_digest))",
+                            TOOL_EFFECT_OPERATIONS_SQL,
                             "CREATE TABLE tool_effect_claims (scope_digest TEXT NOT NULL, operation_digest TEXT NOT NULL, claim_id TEXT NOT NULL, attempt_id TEXT NOT NULL, parent_claim_id TEXT, registration_digest TEXT NOT NULL, args_digest TEXT NOT NULL, state TEXT NOT NULL CHECK(state IN ('STARTED', 'RETURNED_OK', 'RETURNED_ERROR', 'UNCONFIRMED', 'NOT_EXECUTED')), PRIMARY KEY(scope_digest, operation_digest, claim_id), FOREIGN KEY(scope_digest, operation_digest) REFERENCES tool_effect_operations(scope_digest, operation_digest))",
                         ):
                             await self.database.execute(sql)
@@ -261,10 +264,11 @@ class ToolEffectStore(UnifiedStoreBase):
 
     async def finish(self, attempt: ToolEffectAttempt) -> None:
         self._require_scope(attempt)
-        async with self.write_transaction():
-            changed = await self.database.execute(
-                "UPDATE tool_effect_operations SET state = 'CLOSED', revision = revision + 1 WHERE scope_digest = ? AND operation_digest = ? AND attempt_id = ?",
-                (self.scope_digest, attempt.operation_digest, attempt.attempt_id),
-            )
-            if changed != 1:
-                raise ToolEffectAttemptSuperseded("tool effect attempt was superseded")
+        # Closing an existing exact attempt is a fixed native terminal
+        # operation. It cannot borrow ordinary SQL authority after Stop or an
+        # early stream close, create a claim, or reopen a successor.
+        from kestrel_sovereign.storage.db.tool_effect_terminal import finish_tool_effect_attempt
+
+        changed = await finish_tool_effect_attempt(self._backend, attempt)
+        if not changed:
+            raise ToolEffectAttemptSuperseded("tool effect attempt was superseded")

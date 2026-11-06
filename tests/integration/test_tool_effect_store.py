@@ -60,6 +60,27 @@ async def admit(store, *, key="owned-operation", request=None, namespace=None):
 
 
 @pytest.mark.asyncio
+async def test_native_terminal_closes_original_without_admitting_cleanup_work(journal):
+    from kestrel_sovereign.execution_custody import (
+        ExecutionAuthorityError, ExecutionCustody, ProcessRuntimeExecutionFence,
+        bind_execution_cleanup,
+    )
+
+    store, _, _ = journal
+    first = await admit(store)
+    successor = await admit(store)
+    scope = ExecutionCustody(ProcessRuntimeExecutionFence('owned-native-terminal'))
+    with bind_execution_cleanup(store.database, (scope,)):
+        with pytest.raises(ToolEffectAttemptSuperseded):
+            await store.finish(first)
+        await store.finish(successor)
+        with pytest.raises(ExecutionAuthorityError, match='cleanup-only'):
+            await store.claim(successor, registration='forbidden', arguments={})
+    assert await store.database.fetchone('SELECT attempt_id,state FROM tool_effect_operations') == (successor.attempt_id, 'CLOSED')
+    assert await store.database.fetchone('SELECT COUNT(*) FROM tool_effect_claims') == (0,)
+
+
+@pytest.mark.asyncio
 async def test_replay_after_actual_effect_and_clean_database_restart_is_fenced(journal, tmp_path):
     store, reopen, cleanup = journal
     attempt = await admit(store)
