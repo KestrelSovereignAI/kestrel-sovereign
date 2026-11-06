@@ -217,7 +217,21 @@ def test_native_mcp_host_carries_the_documented_ci_sqlite_budget(tmp_path, monke
     assert setting not in owned_host_environment(tmp_path, api_key='owned-api', data_key='owned-data')
 
 
-def test_owned_lifespan_observer_reports_original_pending_shutdown(tmp_path, capfd, caplog):
+def test_owned_lifespan_observer_reports_original_pending_shutdown(tmp_path):
+    """A child owns its timer; the parent's pytest backstop stays armed."""
+    from tests.shared.child_pytest import run_child_pytest
+
+    result = run_child_pytest(tmp_path, conftest='',
+        test_file='test_lifespan_diagnostics.py',
+        source='''from tests.unit.test_ci_timeout_budget import _assert_original_shutdown_diagnostics
+
+def test_original_shutdown(tmp_path, capfd, caplog):
+    _assert_original_shutdown_diagnostics(tmp_path, capfd, caplog)
+''', args=['test_lifespan_diagnostics.py', '-q'], timeout=15)
+    assert result.returncode == 0, result.stdout
+
+
+def _assert_original_shutdown_diagnostics(tmp_path, capfd, caplog):
     """Real ASGI lifespan diagnostics; this is not a Core boot/retirement test."""
     import asyncio
     from contextlib import asynccontextmanager

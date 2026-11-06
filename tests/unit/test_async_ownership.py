@@ -177,7 +177,7 @@ async def test_borrowed_callback_removal_failure_cannot_demote_caller_cancellati
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("allocation", ["completion", "shield"])
+@pytest.mark.parametrize("allocation", ["completion", "observation"])
 async def test_completion_allocation_refusal_cannot_abandon_original(monkeypatch, allocation):
     release, refused = asyncio.Event(), asyncio.Event()
     failure = RuntimeError("controlled original completion allocation refusal")
@@ -192,11 +192,14 @@ async def test_completion_allocation_refusal_cannot_abandon_original(monkeypatch
 
     def controlled_allocation():
         frame = sys._getframe(1)
-        if allocation == "shield" and frame.f_code.co_name == "shield":
-            frame = frame.f_back
-        if (not refused.is_set() and frame.f_code.co_name == "await_owned_task"
+        caller = frame.f_code.co_name
+        if allocation == "observation":
+            while frame is not None and frame.f_code.co_name != "await_owned_task":
+                frame = frame.f_back
+        if (not refused.is_set() and frame is not None
+                and frame.f_code.co_name == "await_owned_task"
                 and frame.f_locals.get("task") is source
-                and (allocation == "completion" or sys._getframe(1).f_code.co_name == "shield")):
+                and caller == ("await_owned_task" if allocation == "completion" else "_wait")):
             refused.set()
             raise failure
         return allocate()
@@ -343,6 +346,52 @@ async def test_repeated_cancellation_waits_for_owned_task_completion():
     release_owned.set()
     with pytest.raises(asyncio.CancelledError):
         await owner_task
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('bounded', [False, True])
+async def test_repeated_withdrawal_does_not_accumulate_completion_callbacks(tmp_path, bounded):
+    """Cancellation must not grow the original owner's observation inventory."""
+    from kestrel_sovereign._async_ownership import wait_owned_or_pending
+    from kestrel_sovereign.storage.async_database import AsyncDatabase
+
+    release = asyncio.Event()
+    database = await AsyncDatabase.sqlite(str(tmp_path / 'original-owner.db'))
+    await database.execute('CREATE TABLE original_receipt(value TEXT)')
+
+    async def original():
+        await release.wait()
+        await database.execute("INSERT INTO original_receipt VALUES ('settled')")
+        return 'settled'
+
+    source = create_owned_task(original(), retain_originals=True)
+    operation = (wait_owned_or_pending(source, cancellation_grace=10,
+        cancel_on_caller_cancellation=False) if bounded else await_owned_task(source))
+    observer = asyncio.create_task(operation)
+    try:
+        await asyncio.sleep(0)
+        # Inspect the real completion Future, without replacing allocation,
+        # cancellation delivery, or the native database operation.
+        awaited = observer.get_coro()
+        while awaited.cr_code.co_name not in {'await_owned_task', 'wait_owned_or_pending'}:
+            awaited = awaited.cr_await
+        completion = awaited.cr_frame.f_locals['completion']
+        for number in range(128):
+            observer.cancel(f'withdrawal-{number}')
+            await asyncio.sleep(0)
+        assert not source.done() and not source.cancelling()
+        assert len(completion._callbacks or ()) <= 2, (
+            'each withdrawal retained another callback on the original completion')
+    finally:
+        release.set()
+        outcome = await observer
+        try:
+            assert outcome.error is None and outcome.result == 'settled'
+            assert outcome.cancellation.args == ('withdrawal-0',)
+            row = await database.fetchone('SELECT COUNT(*) FROM original_receipt')
+            assert row[0] == 1
+        finally:
+            await database.close()
 
 
 @pytest.mark.asyncio

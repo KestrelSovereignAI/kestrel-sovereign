@@ -1080,15 +1080,17 @@ async def await_owned_task(
 ) -> OwnedTaskOutcome[_T]:
     """Retrieve ``task`` despite repeated cancellation of its caller.
 
-    The shielded waiter carries only a successful result, never the owned
+    The completion waiter carries only a successful result, never the owned
     task's exception. The owned result is retrieved exactly once after
     terminalization, avoiding orphaned-task and shield-future warnings.
 
     The waiter is a plain future rather than a task: event-loop teardown
-    cancels every task, and a waiter task cancelled while ``task`` still runs
-    would make each ``shield`` raise at once, without yielding, so this loop
-    would spin and ``task`` could never finish. Nothing but this function
-    holds the future, so only ``task`` completing resolves it.
+    cancels every task. Only the original task completing resolves this
+    signal. ``asyncio.wait`` gives each observation a private cancellable
+    waiter and removes its callback on withdrawal. Repeated ``shield`` on
+    Python 3.14 instead retains an awaited-by callback for every cancellation
+    until the original signal completes, making cancellation grow its own
+    observation inventory without bound.
 
     ``cancel_on_caller_cancellation`` forwards the first caller cancellation
     once to an operation that needs it to begin unwinding. Subsequent caller
@@ -1137,7 +1139,7 @@ async def await_owned_task(
                     # shield would delay terminal readers behind close return.
                     await completion
                 else:
-                    await asyncio.shield(completion)
+                    await asyncio.wait((completion,))
             except asyncio.CancelledError as error:
                 if pending_cancellation is None:
                     pending_cancellation = error
@@ -1157,7 +1159,7 @@ async def await_owned_task(
                     except BaseException as failure:  # noqa: BLE001 - forwarding failure cannot abandon its owner
                         forwarding_error = failure
             except BaseException as error:  # noqa: BLE001 - observing a producer never discharges its ownership
-                # Shield creates and publishes another plain observer Future.
+                # Waiting creates and publishes another plain observer Future.
                 # Its failure is observation debt, not physical completion.
                 # Reuse the existing positive-interval must-join path; borrowed
                 # observers may leave, but original owners must still join.
@@ -1219,7 +1221,7 @@ async def wait_owned_or_pending(
     try:
         while not task.done() and not completion.done():
             try:
-                await asyncio.shield(completion)
+                await asyncio.wait((completion,))
             except asyncio.CancelledError as error:
                 if cancellation is None:
                     cancellation = error
