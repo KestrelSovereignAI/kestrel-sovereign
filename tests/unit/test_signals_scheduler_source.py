@@ -425,7 +425,7 @@ async def test_handler_exception_becomes_failed_status(
 
 @pytest.mark.asyncio
 async def test_failed_tool_result_becomes_failed_status(
-    dispatcher_components, caplog,
+    dispatcher_components, caplog, native_tool_effect_agent,
 ):
     """The production lookup rejects failure before its JSON boundary."""
     agent, registry, dispatcher, backend = dispatcher_components
@@ -439,7 +439,11 @@ async def test_failed_tool_result_becomes_failed_status(
     memory_feature.enabled = True
     memory_feature.get_tools.return_value = [failed_tool]
     agent.features = {"MemoryFeature": memory_feature}
-    scheduler_feature = SchedulerFeature(agent)
+    execution_agent = await native_tool_effect_agent(did=agent.did)
+    execution_agent.features = agent.features
+    scheduler_feature = SchedulerFeature(execution_agent)
+    dispatcher = SignalDispatcher(agent=execution_agent, registry=registry,
+        lock_manager=OrderedLockManager(), store=SignalLogStore(backend))
 
     for reg in build_cron_registrations(
         tool_lookup=scheduler_feature._lookup_raw_tool_result,
@@ -458,7 +462,21 @@ async def test_failed_tool_result_becomes_failed_status(
         logging.ERROR,
         logger="kestrel_sovereign.signals.sources.scheduler",
     ):
-        result = await dispatcher.dispatch_signal(signal)
+        observed = []
+
+        async def execute(name, arguments):
+            observed.append(await dispatcher.dispatch_signal(signal))
+            return scheduler_feature._translate_signal_result(observed[-1], name)
+
+        db = execution_agent.tool_effect_store.database
+        runner = SchedulerRunner(db, execution_agent.did, execute)
+        try:
+            await runner._ensure_tables()
+            await _seed_due_schedule(db, execution_agent.did, 'failed-result', 'memory_consolidate')
+            await tick_and_settle(runner)
+            result, = observed
+        finally:
+            await runner.stop()
 
     assert result.status == Status.FAILED
     assert "scheduled tool memory_consolidate failed" in (result.error or "")
@@ -1210,13 +1228,14 @@ async def _seed_due_schedule(db, agent_id, schedule_id, task_name, *, cron="@dai
     return due_at
 
 
-def _barrier_scheduler(agent, registry):
+def _barrier_scheduler(agent, registry, *, execution_agent=None):
     """A SchedulerFeature wired exactly as initialize() wires its sources."""
     feature = SchedulerFeature(agent)
     feature._agent_id = agent.did
+    execution = feature if execution_agent is None else SchedulerFeature(execution_agent)
     for registration in build_cron_registrations(
-        tool_lookup=feature._lookup_raw_tool_result,
-        reason_codes_lookup=feature._declared_reason_codes,
+        tool_lookup=execution._lookup_raw_tool_result,
+        reason_codes_lookup=execution._declared_reason_codes,
         builtin_handlers=feature._builtin_cron_handlers(),
     ):
         registry.register(registration)
@@ -1225,17 +1244,21 @@ def _barrier_scheduler(agent, registry):
 
 @pytest.mark.asyncio
 async def test_due_builtin_whose_owner_loads_later_runs_once_after_barrier(
-    dispatcher_components,
+    dispatcher_components, native_tool_effect_agent,
 ):
     """#2474: a due restart_coordinator whose owner has not loaded yet must
     not be recorded as a (skipped) success nor advance its cron. Once the
     owner loads and the post_all_features_loaded barrier completes, the SAME
     occurrence executes exactly once and a later tick never re-runs it."""
     agent, registry, dispatcher, backend = dispatcher_components
+    execution_agent = await native_tool_effect_agent(did=agent.did)
+    execution_agent.features = {}
+    dispatcher = SignalDispatcher(agent=execution_agent, registry=registry,
+        lock_manager=OrderedLockManager(), store=SignalLogStore(backend))
     agent.dispatcher = dispatcher
     agent.features = {}
     agent._post_all_features_loaded_complete = False
-    feature = _barrier_scheduler(agent, registry)
+    feature = _barrier_scheduler(agent, registry, execution_agent=execution_agent)
 
     owner_ran = asyncio.Event()
     calls = []
@@ -1250,7 +1273,7 @@ async def test_due_builtin_whose_owner_loads_later_runs_once_after_barrier(
         get_tools=lambda: [SimpleNamespace(name="restart_coordinator", execute=execute)],
     )
 
-    db = AsyncDatabase(backend)
+    db = execution_agent.tool_effect_store.database
     runner = SchedulerRunner(db, agent.did, feature._dispatch_scheduled_task)
     await runner.start(polling=False)
     due_at = await _seed_due_schedule(
@@ -1278,6 +1301,7 @@ async def test_due_builtin_whose_owner_loads_later_runs_once_after_barrier(
 
     # The owner finishes loading, then the lifecycle barrier completes.
     agent.features = {"RestartCoordinatorFeature": owner}
+    execution_agent.features = agent.features
     agent._post_all_features_loaded_complete = True
     # The deferred claim is recovered once its lease lapses (expire it in the
     # database rather than sleeping out the lease interval).

@@ -48,7 +48,41 @@ async def bound_operation(owner, tmp_path):
     await store.close()
 
 
+async def _foreign_effect(owner, operation):
+    class RelayTool:
+        name = 'owned.foreign_relay'
+        schema = ToolSchema(name, 'Join an original foreign continuation', ToolCategory.UTILITY)
+
+        async def execute(self):
+            return await operation()
+
+    mounted = []
+    owner.register_dynamic_tools('owned-foreign-continuation', [RelayTool()],
+        on_registered=lambda tool, binding: mounted.append(binding))
+    relay, = mounted
+    async with owner._get_privacy_transition_lock():
+        return await relay.invoke({}, session_id='owned-foreign-session', operation_id='owned-foreign-intent')
+
+
+async def _retire_foreign_scenario(calling, names):
+    children = [task for task in asyncio.all_tasks() if task is not calling
+        and any(name in task.get_name() for name in names)] if not calling.done() else []
+    for child in children:
+        child.cancel()
+    if not calling.done():
+        calling.cancel()
+    await asyncio.gather(calling, *children, return_exceptions=True)
+
+
 async def test_parallel_batch_retains_original_privacy_ownership_for_its_native_leaves(bound_operation):
+    await _parallel_scenario(bound_operation, foreign=False)
+
+
+async def test_nested_foreign_parallel_batch_retains_its_original_privacy_frame(bound_operation):
+    await _parallel_scenario(bound_operation, foreign=True)
+
+
+async def _parallel_scenario(bound_operation, *, foreign):
     from kestrel_sovereign.llm.adapter import ToolCall
     from tests.unit.test_tool_effect_invocation import governed
 
@@ -57,12 +91,18 @@ async def test_parallel_batch_retains_original_privacy_ownership_for_its_native_
 
     @governed
     async def invoke(agent, user_input, *, invocation_id=None):
-        async with agent._get_privacy_transition_lock():
+        async def batch():
             await agent._execute_tool_batch_at_stop_boundary(
                 [ToolCall(id=str(index), name=binding.name, arguments={'marker': marker})
                     for index, marker in enumerate(('first', 'second'))],
                 {}, {binding.name}, messages, 0, user_input,
                 tool_results=results, session_id='owned-parallel-session')
+            return {'success': True}
+
+        if foreign:
+            return await _foreign_effect(agent, batch)
+        async with agent._get_privacy_transition_lock():
+            return await batch()
 
     calling = asyncio.create_task(invoke(owner, 'original parallel intention',
         invocation_id='owned-parallel-intent'))
@@ -74,7 +114,7 @@ async def test_parallel_batch_retains_original_privacy_ownership_for_its_native_
         assert [row['name'] for row in results] == [binding.name, binding.name]
         assert [row['tool_call_id'] for row in results] == ['0', '1']
         assert await owner.tool_effect_store.database.fetchall(
-            'SELECT state FROM tool_effect_claims') == [('RETURNED_OK',), ('RETURNED_OK',)]
+            'SELECT state FROM tool_effect_claims') == [('RETURNED_OK',)] * (3 if foreign else 2)
         assert not owner._active_request_ids
     finally:
         # Retire the actual batch children first if the regression deadlocks;
@@ -84,9 +124,7 @@ async def test_parallel_batch_retains_original_privacy_ownership_for_its_native_
         for task in children:
             task.cancel()
         await asyncio.gather(*children, return_exceptions=True)
-        if not calling.done():
-            calling.cancel()
-        await asyncio.gather(calling, return_exceptions=True)
+        await _retire_foreign_scenario(calling, (binding.name, 'owned.foreign_relay'))
 
 
 async def test_external_async_a2a_worker_retains_original_privacy_ownership(bound_operation):
@@ -161,6 +199,15 @@ async def test_external_async_a2a_worker_retains_original_privacy_ownership(boun
 
 @pytest.mark.parametrize('lane', ['bound', 'named', 'audit'])
 async def test_nested_external_operation_retains_its_original_privacy_frame(bound_operation, lane):
+    await _nested_scenario(bound_operation, lane, foreign=False)
+
+
+@pytest.mark.parametrize('lane', ['bound', 'named', 'audit'])
+async def test_nested_foreign_operation_retains_its_original_privacy_frame(bound_operation, lane):
+    await _nested_scenario(bound_operation, lane, foreign=True)
+
+
+async def _nested_scenario(bound_operation, lane, *, foreign):
     from tests.unit.test_tool_effect_invocation import governed
     from kestrel_sovereign.tools.effect_journal import execute_tool_effect
 
@@ -197,7 +244,11 @@ async def test_nested_external_operation_retains_its_original_privacy_frame(boun
         return await execute_tool_effect(agent, registration='owned-parent-effect',
             arguments={}, execute=outer_effect)
 
-    calling = asyncio.create_task(invoke(owner, 'original nested intention', invocation_id='owned-parent-intent'))
+    async def call():
+        operation = lambda: invoke(owner, 'original nested intention', invocation_id='owned-parent-intent')
+        return await _foreign_effect(owner, operation) if foreign else await operation()
+
+    calling = asyncio.create_task(call())
     try:
         _done, pending = await asyncio.wait({calling}, timeout=0.5)
         assert not pending, 'Nested external tool lost its original held privacy frame'
@@ -213,12 +264,10 @@ async def test_nested_external_operation_retains_its_original_privacy_frame(boun
         assert result['success'] is True
         assert witness.read_text() == ('nested\naudit\n' if lane == 'audit' else 'nested\n')
         assert await owner.tool_effect_store.database.fetchall(
-            'SELECT state FROM tool_effect_claims') == [('RETURNED_OK',), ('RETURNED_OK',)]
+            'SELECT state FROM tool_effect_claims') == [('RETURNED_OK',)] * (3 if foreign else 2)
         assert not owner._active_request_ids
     finally:
-        if not calling.done():
-            calling.cancel()
-        await asyncio.gather(calling, return_exceptions=True)
+        await _retire_foreign_scenario(calling, (binding.name, 'owned.foreign_relay', 'owned-nested-audit'))
 
 
 async def test_bound_operation_fences_retry_before_another_native_effect(bound_operation):
