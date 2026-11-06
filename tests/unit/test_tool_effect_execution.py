@@ -11,6 +11,7 @@ import pytest
 import pytest_asyncio
 
 from kestrel_sdk.resources import ResourceConflict, ResourceOutcomeUnknown
+from kestrel_sovereign._async_ownership import create_owned_task
 from kestrel_sovereign.a2a.scope import NativeRecipientScope
 from kestrel_sovereign.features.privacy.feature import PrivacyAgent
 from kestrel_sovereign.privacy import PrivacyMode
@@ -256,7 +257,7 @@ async def test_root_drain_waits_for_original_claimant_before_closing_attempt(own
         (tmp_path / "effect").write_text("one")
 
     with bind_tool_effect_turn((turn, None)):
-        leaf = asyncio.create_task(execute_tool_effect(owner, registration="file", arguments={}, execute=effect))
+        leaf = create_owned_task(execute_tool_effect(owner, registration="file", arguments={}, execute=effect))
     await entered.wait()
     closer = asyncio.create_task(turn.close())
     try:
@@ -316,7 +317,7 @@ async def test_privacy_writer_cannot_pass_claim_through_settlement(owner):
             writer_entered.set()
 
     with bind_tool_effect_turn((turn, None)):
-        leaf = asyncio.create_task(execute_tool_effect(owner, registration="file", arguments={}, execute=effect))
+        leaf = create_owned_task(execute_tool_effect(owner, registration="file", arguments={}, execute=effect))
     await entered.wait()
     transition = asyncio.create_task(writer())
     await asyncio.sleep(0)
@@ -365,3 +366,26 @@ def test_wire_identifiers_encode_to_bounded_stable_store_keys(key):
 def test_noncanonical_key_is_refused_before_admission():
     with pytest.raises(ValueError, match="canonical JSON"):
         logical_operation_key(float("nan"))
+
+
+@pytest.mark.asyncio
+async def test_copied_journal_context_does_not_admit_an_execution_task(owner, tmp_path):
+    import contextvars
+    from kestrel_sovereign.execution_custody import ExecutionAuthorityError
+
+    turn = await admit(owner, key='copied-journal-context')
+    witness = tmp_path / 'unadmitted-effect'
+
+    async def effect():
+        witness.write_text('unadmitted effect')
+
+    with bind_tool_effect_turn((turn, None)):
+        copied = contextvars.copy_context()
+        task = asyncio.create_task(execute_tool_effect(owner, registration='file',
+            arguments={}, execute=effect), context=copied)
+    with pytest.raises(ExecutionAuthorityError, match='original native privacy lifetime'):
+        await task
+    await turn.close()
+    assert not witness.exists()
+    assert await owner.tool_effect_store.database.fetchone(
+        'SELECT COUNT(*) FROM tool_effect_claims') == (0,)

@@ -43,6 +43,7 @@ from kestrel_sovereign.deidentification import (
 from kestrel_sovereign.execution_custody import (
     execution_terminal_error,
     is_execution_control_error,
+    ExecutionAuthorityError,
 )
 from kestrel_sovereign.knowledge import IRI, Visibility
 from kestrel_sovereign.privacy import (
@@ -375,7 +376,7 @@ class ReentrantTransitionLock:
 
     def require_native_scope(self, scope):
         if scope not in self._native_scopes or self.current_native_scope() is not scope:
-            raise RuntimeError("execution requires its original native privacy lifetime")
+            raise ExecutionAuthorityError("execution requires its original native privacy lifetime")
 
     def _is_member(self, task):
         return self._scope_for(task) is not None
@@ -633,7 +634,8 @@ class ReentrantTransitionLock:
 
         def start(operation, context=None, *, name="privacy-owned-native-work"):
             return self.start_owned_native_work(operation, context=context, name=name,
-                acquire_span=acquire_span, _parent=parent, _span=captured)
+                acquire_span=acquire_span,
+                _parent=parent if captured is not None else None, _span=captured)
         return start
 
     def start_owned_native_work(self, operation, *, context=None,
