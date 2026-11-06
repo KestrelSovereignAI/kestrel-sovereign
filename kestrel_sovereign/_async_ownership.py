@@ -443,7 +443,7 @@ async def gather_owned(operations, *, cancel_siblings_on_error=True,
     for child in children:
         outcome = await await_owned_task(child)
         results.append(outcome.result)
-        if outcome.error is not None and (not isinstance(outcome.error, asyncio.CancelledError) or is_execution_control_error(outcome.error)):
+        if outcome.error is not None and (not issubclass(type(outcome.error), asyncio.CancelledError) or is_execution_control_error(outcome.error)):
             errors.append(outcome.error)
         errors.append(outcome.cancellation)
     terminal = execution_terminal_error(
@@ -858,7 +858,7 @@ class OwnedAsyncIterator(Generic[_T]):
         outcome = await await_owned_task(self._owner)
         watcher = await await_owned_task(self._cancellation_owner) if self._cancellation_owner is not None else None
         watcher_error = watcher.error if watcher is not None else None
-        if isinstance(watcher_error, asyncio.CancelledError) and not is_execution_control_error(watcher_error):
+        if issubclass(type(watcher_error), asyncio.CancelledError) and not is_execution_control_error(watcher_error):
             watcher_error = None  # The watcher's private Stop handoff, not reader withdrawal.
         return OwnedTaskOutcome(
             outcome.result,
@@ -937,15 +937,9 @@ class OwnedAsyncIterator(Generic[_T]):
                 # failure after its final item. Only an initiated close owns a
                 # non-cancellation unwind as cleanup debt; the marker extends
                 # ownership solely to cancellation that interrupted the source.
-                if close_requested and not isinstance(
-                    error,
-                    asyncio.CancelledError,
-                ):
+                if close_requested and not issubclass(type(error), asyncio.CancelledError):
                     self._cleanup_error = error
-                if cancellation_requested and isinstance(
-                    error,
-                    asyncio.CancelledError,
-                ):
+                if cancellation_requested and issubclass(type(error), asyncio.CancelledError):
                     self._interrupted_by_cleanup = True
                     self._items.put_nowait((_ITERATOR_INTERRUPTED, None))
                     return
@@ -992,7 +986,7 @@ class OwnedAsyncIterator(Generic[_T]):
         from kestrel_sovereign.execution_custody import is_execution_control_error
         if (
             (owner_cancelled_by_close or self._construction_error is not None)
-            and isinstance(outcome.error, asyncio.CancelledError)
+            and issubclass(type(outcome.error), asyncio.CancelledError)
             and self._cleanup_error is None
             and not is_execution_control_error(outcome.error)
         ):

@@ -20,13 +20,18 @@ pytestmark = [pytest.mark.asyncio, pytest.mark.timeout(30)]
 
 
 @pytest.mark.parametrize('feature_base', [Feature, SDKFeature], ids=['core', 'sdk'])
-@pytest.mark.parametrize('shape', ['task-group', 'explicit-cause'])
+@pytest.mark.parametrize('shape', ['task-group', 'explicit-cause', 'attribute-hook'])
 async def test_composite_unknown_cannot_be_flattened_by_named_tool_wrappers(owner, tmp_path, feature_base, shape):
     from kestrel_sovereign.execution_custody import execution_evidence_carriers
     from kestrel_sovereign.tools.effect_journal import ToolEffectOutcomeUnconfirmed
 
     witness = tmp_path / 'composite-unknown-effects'
     unknown = ResourceOutcomeUnknown('Original grouped or chained remote reply was lost')
+
+    class OpaqueConflict(ResourceConflict):
+        @property
+        def __class__(self):
+            raise RuntimeError('Application class hook replaced the original Core carrier')
     observability = ObservabilityStore(owner.tool_effect_store.backend, owns_backend=False)
     await observability.initialize()
     owner.observability_store = observability
@@ -49,7 +54,9 @@ async def test_composite_unknown_cannot_be_flattened_by_named_tool_wrappers(owne
             if shape == 'task-group':
                 async with asyncio.TaskGroup() as children:
                     children.create_task(lose_reply())
-            raise ResourceConflict('Original wrapper precondition') from unknown
+            carrier = (OpaqueConflict('Original opaque wrapper') if shape == 'attribute-hook'
+                       else ResourceConflict('Original wrapper precondition'))
+            raise carrier from unknown
 
     feature = CompoundFeature(owner)
     owner.features[feature.name] = feature
