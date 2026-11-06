@@ -635,3 +635,36 @@ async def test_nested_native_privacy_transition_does_not_join_its_waiting_ancest
             if not task.done():
                 task.cancel()
         await asyncio.gather(calling, *children, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_ordinary_token_writer_cannot_promote_itself_to_an_original_root(owner):
+    from kestrel_sovereign.execution_custody import ExecutionAuthorityError
+    from kestrel_sovereign.tools.effect_journal import bind_tool_effect_turn
+    from tests.unit.test_tool_effect_execution import admit
+
+    lock = owner._get_privacy_transition_lock()
+    turn = await admit(owner, key='ordinary-token-cannot-open-native-root')
+
+    async def copied(token):
+        with bind_transition_lock_reentry(token):
+            async with lock:
+                pass
+        scope, owned = lock.begin_native_scope('unaccepted-token-caller')
+        try:
+            return scope
+        finally:
+            if owned:
+                await lock.close_native_scope(scope, None)
+
+    try:
+        with bind_tool_effect_turn((turn, None)):
+            async with lock.policy_span():
+                task = asyncio.create_task(copied(lock.current_reentry_token()))
+                with pytest.raises(ExecutionAuthorityError, match='original root or accepted child'):
+                    await task
+                assert lock._native_scopes == {turn.privacy_scope}
+        assert await owner.tool_effect_store.database.fetchone(
+            'SELECT COUNT(*) FROM tool_effect_claims') == (0,)
+    finally:
+        await turn.close()
