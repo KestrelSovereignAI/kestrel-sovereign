@@ -580,6 +580,9 @@ async def test_async_native_sibling_effects_exclude_each_other_without_delaying_
         assert first_started.is_set(), 'Nested background effects waited behind their joining parent privacy mutex'
         assert all_accepted.is_set(), 'Native background acceptance waited for its sibling effect'
         assert entered == ['first'], 'Native sibling effects bypassed their shared privacy mutex'
+        if lane != 'external':
+            admitted = sum(worker._kestrel_native_privacy_state['entered'] for worker in manager._execution_tasks)
+            assert admitted == (2 if lane == 'async-parent' else 1), 'Queued native worker was classified as already entered'
         release.set()
         assert (await calling)['success'] is True
         assert witness.read_text() == 'first\nsecond\n'

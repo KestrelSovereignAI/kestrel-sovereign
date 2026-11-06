@@ -61,17 +61,13 @@ class ToolEffectOperation:
 
 
 @asynccontextmanager
-async def journal_tool_operation(owner, operation: ToolEffectOperation):
-    """Admit inside the existing request lifecycle, before approval or effect."""
+async def _journal_operation(owner, *, namespace, client_key, request):
+    """Own one admitted operation through the original invocation lifecycle."""
     from kestrel_sovereign.tools.effect_journal import require_persistent_tool_effects
 
     require_persistent_tool_effects(owner)
-    caller = current_caller_context() or CallerContext.anonymous()
     turn = await admit_tool_effect_turn(owner,
-        namespace=[operation.namespace, caller.role.value, caller.auth_method.value, caller.identity],
-        client_key=operation.operation_id,
-        request=dict(owner=operation.owner, tool=operation.tool_name,
-            arguments=operation.arguments, session_id=operation.session_id),
+        namespace=namespace, client_key=client_key, request=request,
         invocation_id=current_invocation_id())
     if turn is None:
         require_persistent_tool_effects(owner)
@@ -85,6 +81,53 @@ async def journal_tool_operation(owner, operation: ToolEffectOperation):
             await state.close(error)
         else:
             await state.close()
+
+
+@asynccontextmanager
+async def journal_tool_operation(owner, operation: ToolEffectOperation):
+    """Admit inside the existing request lifecycle, before approval or effect."""
+    caller = current_caller_context() or CallerContext.anonymous()
+    async with _journal_operation(owner,
+        namespace=[operation.namespace, caller.role.value, caller.auth_method.value, caller.identity],
+        client_key=operation.operation_id,
+        request=dict(owner=operation.owner, tool=operation.tool_name,
+            arguments=operation.arguments, session_id=operation.session_id)):
+        yield
+
+
+async def run_scheduled_tool_operation(owner, *, feature_name, tool_name, arguments, operation):
+    """Admit a tool from its original durable, revocable scheduler occurrence."""
+    from copy import deepcopy
+    from kestrel_sovereign.agent.invocation import bind_async_invocation
+    from kestrel_sovereign.features.scheduler.runner import get_current_scheduler_execution
+    from kestrel_sovereign.tools.effect_journal import logical_operation_key
+
+    execution = get_current_scheduler_execution()
+    if execution is None or execution.agent_id != owner.did:
+        raise ToolEffectJournalUnavailable('tool_effect_scheduler_occurrence_unavailable')
+    owned_arguments = deepcopy(arguments)
+    turn, _claim = current_tool_effect_state(owner)
+    if turn is not None:
+        turn.require_live(owner)
+        if (turn.invocation_id != current_invocation_id()
+                or turn.generation != owner._request_generation_for_current_task(turn.invocation_id)):
+            raise ToolEffectJournalUnavailable('tool_effect_generation_unavailable')
+        return await operation(owned_arguments)
+
+    operation_id = logical_operation_key(['scheduler', execution.agent_id,
+        execution.schedule_id, execution.idempotency_key, feature_name, tool_name])
+
+    @bind_async_invocation('invocation_id', track_request_lifecycle=True)
+    async def invoke(agent, *, invocation_id):
+        # Transport credentials, recovery attempt numbers and lease tokens
+        # cannot mint another identity for this original scheduled intent.
+        async with _journal_operation(agent, namespace=['scheduler', execution.agent_id],
+            client_key=operation_id,
+            request=dict(owner=feature_name, tool=tool_name,
+                arguments=owned_arguments, session_id='scheduler')):
+            return await operation(owned_arguments)
+
+    return await invoke(owner, invocation_id=operation_id)
 
 
 async def _open_journal_turn(owner, arguments, route):

@@ -196,7 +196,7 @@ class _Harness:
 
 
 @pytest_asyncio.fixture
-async def harness(tmp_path):
+async def harness(tmp_path, native_tool_effect_agent):
     """Build the production path for one ``* * * * *`` restart_coordinator row.
 
     ``request.param``-free: each test calls ``build(*answers)`` with the
@@ -214,8 +214,9 @@ async def harness(tmp_path):
         registry = SourceRegistry()
 
         agent = _FakeAgent()
+        execution_agent = await native_tool_effect_agent(did=agent.did)
         dispatcher = SignalDispatcher(
-            agent=agent,
+            agent=execution_agent,
             registry=registry,
             lock_manager=OrderedLockManager(),
             store=store,
@@ -231,15 +232,21 @@ async def harness(tmp_path):
         agent.features = {"StubRestartFeature": tool_feature}
         agent.dispatcher = dispatcher
         agent.signal_registry = registry
+        execution_agent.hooks_manager = hooks
+        execution_agent.features = agent.features
+        execution_agent.dispatcher = dispatcher
+        execution_agent.signal_registry = registry
 
-        scheduler_backend = SQLiteBackend(
-            str(tmp_path / f"scheduler-{len(opened)}.db")
-        )
-        await scheduler_backend.connect()
-        db = AsyncDatabase(scheduler_backend)
-        opened.append(db)
+        # The execution host's original primary owns scheduler, journal and
+        # health rows, as it does in production. Its fixture owns retirement.
+        db = execution_agent.tool_effect_store.database
 
-        feature = SchedulerFeature(agent)
+        # Keep the small source-routing fixture separate from the real
+        # execution host. No runtime READY/model publication is fabricated.
+        routing_feature = SchedulerFeature(agent)
+        routing_feature._db = db
+        routing_feature._agent_id = agent.did
+        feature = SchedulerFeature(execution_agent)
         feature._db = db
         feature._agent_id = agent.did
         agent.features["SchedulerFeature"] = feature
@@ -253,7 +260,7 @@ async def harness(tmp_path):
         runner = SchedulerRunner(
             db,
             agent.did,
-            feature._dispatch_scheduled_task,
+            routing_feature._dispatch_scheduled_task,
             owner_id="hook-failure-worker",
         )
         await runner._ensure_tables()

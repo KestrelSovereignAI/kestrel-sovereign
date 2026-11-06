@@ -41,7 +41,7 @@ from kestrel_sovereign.hold import HeldWorkDisposition
 from kestrel_sovereign.signals.sources.scheduler import cron_source_name
 from kestrel_sovereign.storage.async_database import AsyncDatabase
 from kestrel_sovereign.storage.db.sqlite import SQLiteBackend
-from tests.utils.scheduler_ticks import tick_and_settle
+from tests.utils.scheduler_ticks import dispatch_scheduled_tool, tick_and_settle
 
 
 # =========================================================================
@@ -2233,6 +2233,14 @@ class TestSchedulerInit:
 
 class TestTaskExecutor:
 
+    @pytest_asyncio.fixture
+    async def native_feature(self, native_tool_effect_agent):
+        agent = await native_tool_effect_agent(did='did:test:scheduler-agent')
+        feature = SchedulerFeature(agent)
+        feature._db = agent.tool_effect_store.database
+        feature._agent_id = agent.did
+        return feature
+
     @staticmethod
     def _passthrough_hooks_manager():
         """A hooks_manager whose PRE_TOOL_USE hook allows the tool through
@@ -2254,7 +2262,8 @@ class TestTaskExecutor:
         return hm
 
     @pytest.mark.asyncio
-    async def test_execute_known_task(self, feature):
+    async def test_execute_known_task(self, native_feature):
+        feature = native_feature
         # Mock a feature with a matching tool. Phase 4 of #889 renamed
         # `_execute_scheduled_task` → `_lookup_and_run_tool` (the
         # tool-search body) when the dispatcher took over the executor
@@ -2271,19 +2280,19 @@ class TestTaskExecutor:
         feature.agent.features = {"WellnessFeature": mock_feature}
         feature.agent.hooks_manager = self._passthrough_hooks_manager()
 
-        result = await feature._lookup_and_run_tool("wellness_check", {})
+        result = await dispatch_scheduled_tool(feature, "wellness_check", {})
         parsed = json.loads(result)
         assert parsed["success"] is True
         mock_tool.execute.assert_awaited_once()
 
     @pytest.mark.asyncio
-    async def test_direct_run_names_only_a_declared_reason_code(self):
+    async def test_direct_run_names_only_a_declared_reason_code(self, native_feature):
+        feature = native_feature
         # The direct-run path (#3184): a failed ToolResult's reason_code
         # reaches the raised message only when the owning feature declared
         # it in ``tool_reason_codes`` — the same door the cron sources use.
         from kestrel_sdk.tools.result import ToolResult
 
-        feature = SchedulerFeature(MagicMock())
         feature.agent.hooks_manager = self._passthrough_hooks_manager()
         mock_tool = MagicMock()
         mock_tool.name = "wellness_check"
@@ -2297,12 +2306,12 @@ class TestTaskExecutor:
 
         mock_feature.tool_reason_codes = {"wellness_check": frozenset({"WELLNESS_DOWN"})}
         with pytest.raises(RuntimeError) as excinfo:
-            await feature._lookup_and_run_tool("wellness_check", {})
+            await dispatch_scheduled_tool(feature, "wellness_check", {})
         assert str(excinfo.value) == "scheduled tool wellness_check failed (WELLNESS_DOWN)"
 
         mock_feature.tool_reason_codes = {}
         with pytest.raises(RuntimeError) as excinfo:
-            await feature._lookup_and_run_tool("wellness_check", {})
+            await dispatch_scheduled_tool(feature, "wellness_check", {})
         assert str(excinfo.value) == "scheduled tool wellness_check failed"
 
     @pytest.mark.asyncio
@@ -2434,11 +2443,12 @@ class TestTaskExecutor:
     @pytest.mark.asyncio
     @pytest.mark.parametrize("decision", ["deny", "ask"])
     async def test_scheduled_permission_hook_returns_blocked_outcome(
-        self, feature, decision,
+        self, native_feature, decision,
     ):
         """F245: a PRE_TOOL_USE DENY on a scheduler tick must block the
         tool. #2430: DENY/ASK is an expected headless state, so return a
         structured outcome instead of raising through the dispatcher."""
+        feature = native_feature
         from types import SimpleNamespace
 
         from kestrel_sdk.hooks.base import PermissionDecision
@@ -2463,7 +2473,7 @@ class TestTaskExecutor:
         hm.execute_hooks_parallel = AsyncMock(return_value=None)
         feature.agent.hooks_manager = hm
 
-        result = await feature._lookup_and_run_tool("dangerous_op", {})
+        result = await dispatch_scheduled_tool(feature, "dangerous_op", {})
 
         assert isinstance(result, ScheduledTaskOutcome)
         assert result.status == "blocked"
@@ -2486,9 +2496,10 @@ class TestTaskExecutor:
 
     @pytest.mark.asyncio
     async def test_failed_tool_result_raises_before_scheduler_serialization(
-        self, feature,
+        self, native_feature,
     ):
         """The production lookup cannot JSON-encode failure into success."""
+        feature = native_feature
         failed_tool = MagicMock()
         failed_tool.name = "memory_consolidate"
         failed_tool.execute = AsyncMock(
@@ -2507,10 +2518,11 @@ class TestTaskExecutor:
         with pytest.raises(
             RuntimeError, match="scheduled tool memory_consolidate failed"
         ):
-            await feature._lookup_and_run_tool("memory_consolidate", {})
+            await dispatch_scheduled_tool(feature, "memory_consolidate", {})
 
     @pytest.mark.asyncio
-    async def test_legacy_tool_exception_envelope_also_raises(self, feature):
+    async def test_legacy_tool_exception_envelope_also_raises(self, native_feature):
+        feature = native_feature
         failed_tool = MagicMock()
         failed_tool.name = "job"
         failed_tool.execute = AsyncMock(
@@ -2526,7 +2538,7 @@ class TestTaskExecutor:
         feature.agent.hooks_manager = self._passthrough_hooks_manager()
 
         with pytest.raises(RuntimeError, match="scheduled tool job failed"):
-            await feature._lookup_and_run_tool("job", {})
+            await dispatch_scheduled_tool(feature, "job", {})
 
     @pytest.mark.asyncio
     async def test_builtin_cron_task_with_absent_owner_fails_honestly(
@@ -2727,38 +2739,40 @@ class TestTaskExecutor:
         assert owner.calls == 0
 
     @pytest.mark.asyncio
-    async def test_disabled_feature_tool_is_not_executed(self, feature):
+    async def test_disabled_feature_tool_is_not_executed(self, native_feature):
         """#2522: a soft-disabled feature stays in ``agent.features`` with
         ``enabled=False`` but its tools are detached from every other surface.
         A persisted schedule that names one of its tools must NOT execute on a
         tick — the scheduler skips it benignly (no failure spam) — and
         re-enabling the feature restores execution."""
+        feature = native_feature
         job_feature = _StubJobFeature()
         feature.agent.features = {"JobFeature": job_feature}
         feature.agent.hooks_manager = self._passthrough_hooks_manager()
 
         # Enabled → the tool runs.
-        result = await feature._lookup_and_run_tool("job", {})
+        result = await dispatch_scheduled_tool(feature, "job", {})
         assert job_feature.calls == 1
         assert json.loads(result)["success"] is True
 
         # Soft-disabled → the SAME tool is skipped, not executed, not raised.
         job_feature.enabled = False
-        result = await feature._lookup_and_run_tool("job", {})
+        result = await dispatch_scheduled_tool(feature, "job", {})
         assert job_feature.calls == 1  # unchanged — never ran
         assert result.startswith("skipped:")
         assert "JobFeature" in result and "disabled" in result
 
         # Re-enabled → execution is restored on the next tick.
         job_feature.enabled = True
-        result = await feature._lookup_and_run_tool("job", {})
+        result = await dispatch_scheduled_tool(feature, "job", {})
         assert job_feature.calls == 2
         assert json.loads(result)["success"] is True
 
     @pytest.mark.asyncio
-    async def test_enabled_owner_wins_over_disabled_same_name(self, feature):
+    async def test_enabled_owner_wins_over_disabled_same_name(self, native_feature):
         """If both a disabled and an enabled feature expose the same tool name,
         the enabled owner executes (the disabled scan runs only as a fallback)."""
+        feature = native_feature
         disabled = _StubJobFeature()
         disabled.name = "OldJobFeature"
         disabled.enabled = False
@@ -2770,7 +2784,7 @@ class TestTaskExecutor:
         }
         feature.agent.hooks_manager = self._passthrough_hooks_manager()
 
-        result = await feature._lookup_and_run_tool("job", {})
+        result = await dispatch_scheduled_tool(feature, "job", {})
         assert enabled.calls == 1
         assert disabled.calls == 0
         assert json.loads(result)["success"] is True

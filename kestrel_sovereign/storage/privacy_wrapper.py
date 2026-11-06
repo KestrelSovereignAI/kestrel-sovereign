@@ -498,7 +498,7 @@ class ReentrantTransitionLock:
             token = _transition_lock_reentry_token.get()
         if token is None:
             token = _captured_token
-        state = {"entered": foreign}
+        state = {"entered": foreign and not serialize}
         retained = asyncio.get_running_loop().create_future()
         async def run():
             # Even an eager task factory cannot dispatch the body before its
@@ -509,6 +509,7 @@ class ReentrantTransitionLock:
             if foreign:
                 if serialize:
                     async with parent_branch.children_lock:
+                        state["entered"] = True
                         return await operation()
                 return await operation()
             with bind_transition_lock_reentry(token):

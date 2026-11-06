@@ -1271,6 +1271,16 @@ class SchedulerFeature(Feature):
     async def _run_tool_hook_gated(
         self, feature_name: str, agent_tool: Any, args: dict
     ) -> Any:
+        """Admit the original scheduled intent before hooks or tool effects."""
+        from kestrel_sovereign.tools.effect_invocation import run_scheduled_tool_operation
+
+        return await run_scheduled_tool_operation(self.agent,
+            feature_name=feature_name, tool_name=agent_tool.name, arguments=args,
+            operation=lambda owned: self._run_tool_hook_gated_body(feature_name, agent_tool, owned))
+
+    async def _run_tool_hook_gated_body(
+        self, feature_name: str, agent_tool: Any, args: dict
+    ) -> Any:
         """Run a feature tool on a scheduler tick through the SAME
         PRE_TOOL_USE / POST_TOOL_USE hook envelope the chat and subagent
         dispatch paths use (F245).
@@ -1296,6 +1306,16 @@ class SchedulerFeature(Feature):
             hook_rewrite_argument_error,
             refused_tool_result,
         )
+        from kestrel_sovereign.agent.tool_allowlist import registry_generation
+        from kestrel_sovereign.tools.effect_journal import execute_tool_effect
+
+        selected_generation = registry_generation(self.agent)
+
+        async def execute_approved(approved):
+            return await execute_tool_effect(self.agent,
+                registration=['scheduler', feature_name, agent_tool.name],
+                arguments=approved, expected_generation=selected_generation,
+                execute=lambda: agent_tool.execute(**approved))
 
         # #3921: coerce before PRE_TOOL_USE, as every dispatch path does, so
         # the hooks authorize the binding the tool runs with. A value that
@@ -1326,12 +1346,9 @@ class SchedulerFeature(Feature):
             # Resolve post-hook (redacted) args first — a MODIFY hook may
             # run before a later DENY hook; the effective args must be the
             # redacted form even on the block path.
-            mutated = getattr(pre_input, "tool_input", None)
-            if isinstance(mutated, dict):
-                effective_args = mutated
-            updated = getattr(pre_output, "updated_input", None)
-            if isinstance(updated, dict):
-                effective_args = updated
+            from kestrel_sovereign.hooks.decision_gate import decided_tool_input
+
+            effective_args = decided_tool_input(pre_input, pre_output)
 
             # DENY and ASK both block the scheduled run. A scheduler tick has
             # no interactive approver, so return a structured blocked outcome
@@ -1387,7 +1404,7 @@ class SchedulerFeature(Feature):
                 )
                 return refused_tool_result(agent_tool.name, rewrite_error)
 
-            result = await agent_tool.execute(**effective_args)
+            result = await execute_approved(effective_args)
 
             post_input = HookInput(
                 session_id="scheduler",
@@ -1404,8 +1421,7 @@ class SchedulerFeature(Feature):
             )
             return result
 
-        # No hooks manager (bare test host) — execute directly.
-        return await agent_tool.execute(**effective_args)
+        return await execute_approved(effective_args)
 
     def _semantic_maintenance_required_for_training(self) -> bool:
         """Whether this agent has an operator-selected semantic phase.
