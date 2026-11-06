@@ -74,6 +74,13 @@ async def native_host(home, descriptor, environment, peer, generation):
             expected = Path(kestrel_sovereign.__file__).resolve().with_name('server.py')
             assert Path(state['server_source']).resolve() == expected, (
                 'Owned child Core runtime differs from parent')
+            configured = environment.get('KESTREL_AIOSQLITE_WORKER_SHUTDOWN_TIMEOUT_S')
+            if configured is not None:
+                assert state['sqlite_close_timeout_s'] >= float(configured)
+                assert state['shutdown_prefix_s'] >= state['shutdown_prefix_floor_s'] > 0
+                assert state['shutdown_tail_s'] >= state['sqlite_close_timeout_s']
+                assert state['agent_shutdown_timeout_s'] >= (
+                    state['shutdown_prefix_s'] + state['shutdown_tail_s'])
             peer.local_ports.add(state['port'])
             yield running
         finally:
@@ -85,7 +92,7 @@ async def native_host(home, descriptor, environment, peer, generation):
 
 
 @pytest_asyncio.fixture
-async def host_campaign(tmp_path, monkeypatch):
+async def host_campaign(tmp_path, monkeypatch, request):
     home = tmp_path / 'host'
     home.mkdir(mode=0o700)
     data = home / 'agent'
@@ -110,20 +117,33 @@ async def host_campaign(tmp_path, monkeypatch):
         descriptor = home / 'host-test.json'
         descriptor.write_text(json.dumps(dict(agent_name='permission-host', agent_data=str(data),
             selector=peer.selector, provider_url=peer.provider_url, certificate=str(peer.tls_certificate))))
-        repository = Path(__file__).resolve().parents[2]
-        environment = dict(PATH=os.environ['PATH'], HOME=str(home), KESTREL_HOME=str(home),
-            KESTREL_DB_BACKEND='sqlite', KESTREL_HOST_DB_PATH=str(home / 'host-control/host.db'),
-            KESTREL_MULTI_AGENT_CONFIG=str(home / 'multi_agent.toml'),
-            KESTREL_DATA_KEY=key, KESTREL_API_KEY=api_key, KESTREL_SKIP_DOTENV='1',
-            PYTHON_DOTENV_DISABLED='1', PYTHONDONTWRITEBYTECODE='1',
-            PYTHONPATH=os.pathsep.join([
-                str(Path(kestrel_sovereign.__file__).resolve().parent.parent), str(repository)]),
-            KESTREL_PHOENIX_ENABLED='0', KESTREL_TRACING_ENABLED='0',
-            AWS_EC2_METADATA_DISABLED='true', EMAIL_DRY_RUN='true')
+        settings = getattr(request, 'param', {})
+        if 'sqlite_worker_budget' in settings:
+            monkeypatch.setenv('KESTREL_AIOSQLITE_WORKER_SHUTDOWN_TIMEOUT_S',
+                settings['sqlite_worker_budget'])
+        environment = owned_host_environment(home, api_key=api_key, data_key=key)
         headers = {'X-API-Key': api_key, 'X-Kestrel-Allow-Destructive': 'true'}
         with owned_provider_network(monkeypatch, peer):
             yield SimpleNamespace(home=home, descriptor=descriptor, environment=environment,
                 peer=peer, did=identity.agent_did, headers=headers)
+
+
+def owned_host_environment(home, *, api_key, data_key):
+    """Own all state while carrying the explicit native SQLite fixture budget."""
+    repository = Path(__file__).resolve().parents[2]
+    environment = dict(PATH=os.environ['PATH'], HOME=str(home), KESTREL_HOME=str(home),
+        KESTREL_DB_BACKEND='sqlite', KESTREL_HOST_DB_PATH=str(home / 'host-control/host.db'),
+        KESTREL_MULTI_AGENT_CONFIG=str(home / 'multi_agent.toml'),
+        KESTREL_DATA_KEY=data_key, KESTREL_API_KEY=api_key, KESTREL_SKIP_DOTENV='1',
+        PYTHON_DOTENV_DISABLED='1', PYTHONDONTWRITEBYTECODE='1',
+        PYTHONPATH=os.pathsep.join([
+            str(Path(kestrel_sovereign.__file__).resolve().parent.parent), str(repository)]),
+        KESTREL_PHOENIX_ENABLED='0', KESTREL_TRACING_ENABLED='0',
+        AWS_EC2_METADATA_DISABLED='true', EMAIL_DRY_RUN='true')
+    setting = 'KESTREL_AIOSQLITE_WORKER_SHUTDOWN_TIMEOUT_S'
+    if setting in os.environ:
+        environment[setting] = os.environ[setting]
+    return environment
 
 
 def host_client(campaign, state):
@@ -298,6 +318,7 @@ async def test_owned_host_setup_failure_preserves_original_diagnostic(tmp_path):
     assert not (home / 'host-failure-ready.json').exists()
 
 
+@pytest.mark.parametrize('host_campaign', [{'sqlite_worker_budget': '5.0'}], indirect=True)
 async def test_owned_host_refuses_a_different_core_runtime(host_campaign):
     c = host_campaign
     alternate = c.home / 'alternate-runtime'

@@ -197,3 +197,21 @@ async def test_owned_process_shutdown_preserves_full_original_diagnostic(tmp_pat
     with pytest.raises(AssertionError) as raised:
         await host.stop()
     assert all(line in str(raised.value) for line in diagnostic.splitlines())
+
+
+def test_native_mcp_host_carries_the_documented_ci_sqlite_budget(tmp_path, monkeypatch):
+    from tests.integration.test_mcp_permission_host_restart import owned_host_environment
+
+    setting = 'KESTREL_AIOSQLITE_WORKER_SHUTDOWN_TIMEOUT_S'
+    jobs = yaml.safe_load(CI_WORKFLOW.read_text())['jobs']
+    configured = jobs['integration-tests']['env'][setting]
+    assert jobs['mcp-permission-seam']['env'][setting] == configured
+    assert jobs['native-postgres-tests']['env'][setting] == configured
+    monkeypatch.setenv(setting, configured)
+    monkeypatch.setenv('UNOWNED_OPERATOR_SETTING', 'must-not-cross')
+    environment = owned_host_environment(tmp_path, api_key='owned-api', data_key='owned-data')
+    assert environment[setting] == configured
+    assert environment['HOME'] == environment['KESTREL_HOME'] == str(tmp_path)
+    assert 'UNOWNED_OPERATOR_SETTING' not in environment
+    monkeypatch.delenv(setting)
+    assert setting not in owned_host_environment(tmp_path, api_key='owned-api', data_key='owned-data')

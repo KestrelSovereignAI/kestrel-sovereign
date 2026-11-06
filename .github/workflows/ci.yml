@@ -435,6 +435,11 @@ jobs:
 
   mcp-permission-seam:
     runs-on: ubuntu-latest
+    env:
+      # Match the measured shared-runner WAL checkpoint allowance used by
+      # the other native integration lanes. The process fixture carries this
+      # explicit setting into its child and composes the enclosing guards.
+      KESTREL_AIOSQLITE_WORKER_SHUTDOWN_TIMEOUT_S: "5.0"
     permissions:
       contents: read
     needs: lint-and-imports

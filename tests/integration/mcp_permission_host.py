@@ -87,9 +87,28 @@ async def serve(descriptor, ready):
                     agent = server.app.state.agent_manager.get_agent(spec['agent_name'])
                     assert agent is not None and agent._boot_state is BootPhaseState.READY
                     assert not agent._safe_mode
+                    from kestrel_sovereign import kestrel_agent as agent_module
+
+                    prefix_floor = max(float(agent_module.SHUTDOWN_TIMEOUT),
+                        agent_module.KESTREL_AGENT_SHUTDOWN_TIMEOUT_S)
+                    if 'KESTREL_AIOSQLITE_WORKER_SHUTDOWN_TIMEOUT_S' in os.environ:
+                        from tests.shared.native_shutdown_budget import reserve_native_shutdown_budget
+                        from kestrel_sovereign.multi_agent import agent_manager
+
+                        reserve_native_shutdown_budget(agent, network,
+                            lifecycle_module=agent_manager)
+                    close_budget = agent._raw_storage.db.backend.minimum_close_timeout_s
+                    tail = agent._durable_tail_minimum_budget(
+                        close_budget,
+                        agent_module._minimum_storage_potential_preclose_timeout(agent.storage))
+                    prefix, reserved = agent_module._resolve_shutdown_budget(tail)
                     temporary = ready.with_suffix('.starting')
                     temporary.write_text(json.dumps(dict(port=port, pid=os.getpid(),
-                        did=agent.did, server_source=server.__file__)))
+                        did=agent.did, server_source=server.__file__,
+                        sqlite_close_timeout_s=close_budget,
+                        shutdown_prefix_floor_s=prefix_floor,
+                        shutdown_prefix_s=prefix, shutdown_tail_s=reserved,
+                        agent_shutdown_timeout_s=agent_module.KESTREL_AGENT_SHUTDOWN_TIMEOUT_S)))
                     temporary.replace(ready)
                     await serving
                 finally:
