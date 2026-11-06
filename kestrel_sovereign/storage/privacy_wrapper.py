@@ -293,9 +293,14 @@ turn_scoped(
 class _PrivacySpan:
     """A lifetime identity, never an exclusive-writer capability."""
 
-    def __init__(self, coordinator):
+    def __init__(self, coordinator, root, lifetime_owner=None):
         self.coordinator = coordinator
+        self.root = root
+        self.lifetime_owner = lifetime_owner
         self.closing = False
+        self.active = False
+        self.members = {root: None}
+        self.admissions = {}
 
 
 @dataclass
@@ -321,14 +326,13 @@ class ReentrantTransitionLock:
         self._owner = None
         self._writer = None
         self._depth = 0
-        self._members = {}
-        self._admissions = {}
+        self._native_scopes = set()
         self._native_work = set()
         self._parked = []
         self._changed = set()
         self._root_writers = set()
         self._scope_bindings = {}
-        self._callback_scopes = set()
+        self._callback_scopes = {}
 
     def _notify(self):
         for future in tuple(self._changed):
@@ -343,47 +347,95 @@ class ReentrantTransitionLock:
         finally:
             self._changed.discard(future)
 
+    @property
+    def _members(self):
+        return self._token.members if self._token is not None else {}
+
+    @property
+    def _admissions(self):
+        return self._token.admissions if self._token is not None else {}
+
+    def _scope_for(self, task):
+        for scope in self._native_scopes:
+            if task in scope.members:
+                return scope
+        return None
+
+    def current_native_scope(self):
+        return self._scope_for(asyncio.current_task())
+
+    def begin_native_scope(self, lifetime_owner):
+        """Record original native lifetime without pinning privacy policy."""
+        scope = self.current_native_scope()
+        if scope is not None:
+            return scope, False
+        scope = _PrivacySpan(self, asyncio.current_task(), lifetime_owner)
+        self._native_scopes.add(scope)
+        return scope, True
+
+    def require_native_scope(self, scope):
+        if scope not in self._native_scopes or self.current_native_scope() is not scope:
+            raise RuntimeError("execution requires its original native privacy lifetime")
+
     def _is_member(self, task):
-        return self._token is not None and task in self._members
+        return self._scope_for(task) is not None
 
     def admit_owned_task(self, parent, task, admission):
-        """Enroll an exact gated native child before its payload can run."""
-        if not self._is_member(parent):
+        """Enroll the original child before dispatch, even before policy activation."""
+        scope = self._scope_for(parent)
+        if scope is None:
             return False
         if type(admission) is not OwnedTaskAdmission or admission.task is not task:
             raise TypeError("privacy membership requires original native acceptance")
-        if task in self._members:
-            if self._admissions.get(task) is not admission:
+        existing = self._scope_for(task)
+        if existing is not None:
+            if existing is not scope or scope.admissions.get(task) is not admission:
                 raise RuntimeError("privacy task has a different original admission")
             return True
-        self._members[task] = parent
-        self._admissions[task] = admission
+        scope.members[task] = parent
+        scope.admissions[task] = admission
         task.add_done_callback(lambda _task: self._notify())
         return True
 
     def current_reentry_token(self):
-        return self._token if self._is_member(asyncio.current_task()) else None
+        scope = self.current_native_scope()
+        return scope if scope is self._token else None
 
     def locked(self):
         return self._lock.locked()
 
+    async def _activate_scope(self, scope):
+        if scope not in self._native_scopes:
+            raise RuntimeError("privacy policy span is closed or stale")
+        if self._token is scope:
+            return
+        await self._lock.acquire()
+        if scope not in self._native_scopes:
+            self._lock.release()
+            raise RuntimeError("privacy policy span is closed or stale")
+        self._token = scope
+        self._owner = scope.root
+        scope.active = True
+
     async def _enter_span(self):
         task = asyncio.current_task()
-        if self._is_member(task):
+        scope = self._scope_for(task)
+        if scope is not None:
+            await self._activate_scope(scope)
             return False
         presented = _transition_lock_reentry_token.get()
         if isinstance(presented, _PrivacySpan) and presented.coordinator is self:
             if presented is not self._token or presented.closing:
                 raise RuntimeError("privacy policy span is closed or stale")
-            # Foreign readers still queue for the same exclusive writer. This
-            # token does not enroll their children or allow a parked-writer loan.
-            self._members[task] = None
+            presented.members[task] = None
             return False
-        await self._lock.acquire()
-        self._token = _PrivacySpan(self)
-        self._owner = task
-        self._members[task] = None
-        return True
+        scope, owned = self.begin_native_scope(None)
+        try:
+            await self._activate_scope(scope)
+        except BaseException:
+            self._native_scopes.discard(scope)
+            raise
+        return owned
 
     @asynccontextmanager
     async def policy_span(self):
@@ -419,10 +471,11 @@ class ReentrantTransitionLock:
     def register_callback_scope(self, scope):
         if not self._is_member(asyncio.current_task()):
             raise RuntimeError("callback scope requires original policy membership")
-        self._callback_scopes.add(scope)
+        self._callback_scopes[scope] = self.current_native_scope()
 
     def callback_accepted(self, scope, task):
-        if scope not in self._callback_scopes or task not in self._admissions:
+        lifetime = self._callback_scopes.get(scope)
+        if lifetime is None or self._scope_for(task) is not lifetime or task not in lifetime.admissions:
             raise RuntimeError("callback requires its original native acceptance")
         self._notify()
 
@@ -432,7 +485,9 @@ class ReentrantTransitionLock:
             return
         while self._writer is not None or not self._writer_eligible(task):
             await self._wait_change()
-        if not self._is_member(task):
+        scope = self._token
+        if (scope is None or self._scope_for(task) is not scope
+                or (scope.closing and task is not scope.root and task not in scope.admissions)):
             raise RuntimeError("privacy writer no longer belongs to the retained span")
         self._writer, self._depth = task, 1
         ancestor = task
@@ -530,39 +585,51 @@ class ReentrantTransitionLock:
                 raise execution_terminal_error(pending, cancellation, retain_originals=True)
 
     async def _close_span(self, pending):
-        self._token.closing = True
+        await self.close_native_scope(self._token, pending)
+
+    async def close_native_scope(self, scope, pending=None):
+        """Retire originals after their journal and protected writers settle."""
+        if scope not in self._native_scopes:
+            raise RuntimeError("native privacy lifetime is already retired")
+        scope.closing = True
+        current = asyncio.current_task()
+        if self._token is scope and self._writer is current:
+            raise RuntimeError("cannot retire a native lifetime inside its writer frame")
         terminal = pending
-        # Accepted children can admit their fixed cleanup while closing.
-        # Re-read the exact cohort until physically retired, never a timeout.
         while True:
-            children = [task for task in self._admissions if not task.done()]
-            if not children and self._writer is None:
+            children = [task for task in scope.admissions
+                        if task is not current and not task.done()]
+            active_writer = self._token is scope and self._writer is not None
+            if not children and not active_writer:
                 break
             for child in children:
                 outcome = await await_owned_task(child)
                 if outcome.error is not None and is_execution_control_error(outcome.error):
                     terminal = execution_terminal_error(terminal, outcome.error)
                 terminal = execution_terminal_error(terminal, outcome.cancellation)
-            if self._writer is not None:
+            if self._token is scope and self._writer is not None:
                 try:
                     await self._wait_change()
                 except asyncio.CancelledError as error:
                     terminal = execution_terminal_error(terminal, error, retain_originals=True)
-        # Release only after physical retirement. An unexpected observation
-        # failure leaves the original span retained and fails closed.
-        self._token = self._owner = None
-        self._members.clear()
-        self._admissions.clear()
-        self._native_work.clear()
-        self._callback_scopes.clear()
-        self._lock.release()
+        if self._token is scope:
+            self._token = self._owner = None
+            self._lock.release()
+        self._native_scopes.remove(scope)
+        for cohort, lifetime in tuple(self._callback_scopes.items()):
+            if lifetime is scope:
+                self._callback_scopes.pop(cohort)
+        for task in scope.admissions:
+            self._native_work.discard(task)
+        scope.members.clear()
+        scope.admissions.clear()
         self._notify()
         if terminal is not None and terminal is not pending:
             raise terminal
 
     def capture_native_work_factory(self, *, acquire_span=True):
         parent = asyncio.current_task()
-        captured = self.current_reentry_token()
+        captured = self.current_native_scope()
 
         def start(operation, context=None, *, name="privacy-owned-native-work"):
             return self.start_owned_native_work(operation, context=context, name=name,
@@ -573,10 +640,10 @@ class ReentrantTransitionLock:
                                 name="privacy-owned-native-work", acquire_span=True,
                                 _parent=None, _span=None):
         parent = asyncio.current_task() if _parent is None else _parent
-        captured = self.current_reentry_token() if _span is None else _span
+        captured = self.current_native_scope() if _span is None else _span
         if captured is not None and (
-            captured is not self._token or not self._is_member(parent) or parent.done()
-            or (captured.closing and parent not in self._admissions)
+            captured not in self._native_scopes or self._scope_for(parent) is not captured
+            or parent.done() or (captured.closing and parent not in captured.admissions)
         ):
             raise RuntimeError("native work factory belongs to a closed privacy span")
         retained = asyncio.get_running_loop().create_future()

@@ -76,7 +76,7 @@ class OwnedCallbackScope:
         self.tasks = set()
         self.closed = False
         self.coordinators = tuple(c for c in _OWNED_COORDINATORS.get()
-                                  if c.current_reentry_token() is not None)
+                                  if c.current_native_scope() is not None)
         self.factories = tuple(c.capture_native_work_factory(acquire_span=False)
                                for c in self.coordinators)
         for coordinator in self.coordinators:
@@ -380,8 +380,13 @@ def create_owned_task(operation, *, name=None, context=None, retain_originals=Fa
     try:
         task._kestrel_owned_admission = admission
         task.add_done_callback(close_unstarted)
+        # An explicit context narrows the original ownership handoff. Resident
+        # contexts deliberately carry no invocation coordinator. Routing still
+        # cannot enroll anything unless the actual creator is an original member.
+        coordinators = (_OWNED_COORDINATORS.get() if context is None else
+                        context.get(_OWNED_COORDINATORS, ()))
         admitted_coordinators = tuple(
-            coordinator for coordinator in _OWNED_COORDINATORS.get()
+            coordinator for coordinator in coordinators
             if coordinator.admit_owned_task(asyncio.current_task(), task, admission)
         )
     except BaseException as opening:

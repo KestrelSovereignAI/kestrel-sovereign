@@ -856,19 +856,19 @@ async def test_chat_path_still_reports_a_tool_that_raises(orchestrator, ):
     dispatch_meta: dict = {}
 
     from kestrel_sdk.resources import ResourceOutcomeUnknown
-    with pytest.raises(ResourceOutcomeUnknown):
+    with pytest.raises(ResourceOutcomeUnknown) as raised:
         await _dispatch_direct(agent, tool.name, {"n": "1"}, dispatch_meta=dispatch_meta)
 
-    unknown = "Tool outcome is unconfirmed; reconcile before retrying. Do not replay"
-    original = dispatch_meta.pop("outcome_error")
-    assert isinstance(original, TimeoutError) and str(original) == "took too long"
-    assert dispatch_meta == {
-        "arguments": {"n": "1"},
-        "status": "error",
-        "error_class": "ResourceOutcomeUnknown",
-        "error_message": unknown,
-        "outcome_unknown": True,
-    }
+    from kestrel_sovereign.execution_custody import execution_evidence_carriers
+    from kestrel_sovereign.api_errors import tool_effect_api_error
+    originals = [error for error in execution_evidence_carriers(raised.value)
+                 if isinstance(error, TimeoutError)]
+    assert len(originals) == 1 and str(originals[0]) == "took too long"
+    assert dispatch_meta["arguments"] == {"n": "1"}
+    public_error = tool_effect_api_error(raised.value)
+    assert public_error.status_code == 502 and public_error.code == "tool_effect_outcome_unconfirmed"
+    assert await agent.tool_effect_store.database.fetchall(
+        'SELECT state FROM tool_effect_claims') == [('UNCONFIRMED',)]
     assert agent.audit.rows == []
 
 

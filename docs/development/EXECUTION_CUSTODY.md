@@ -16,9 +16,15 @@ Core issue #3569 extends existing PostgreSQL advisory and native transaction
 custody. This is a host authority contract, not a causation-derived permission.
 
 Privacy policy retention and exclusive execution have separate lifetimes within
-one `ReentrantTransitionLock`. Turn entry uses `policy_span()`; each effect and
-identity write still acquires the same exclusive writer through classification
-and journal settlement. A captured token identifies the live policy span and
+one `ReentrantTransitionLock`. Journal admission records the original native
+lifetime without pinning policy, so independent approvals and privacy revocation
+can progress. Turn entry uses `policy_span()` after the conversation lock; a
+non-turn invocation activates its policy span at the first effect. Each effect
+and identity write acquires the exclusive writer through classification and
+settlement. Releasing that writer does not delay asynchronous acceptance: the
+original journal lifetime retains accepted workers until journal finalization.
+An explicit resident task context preserves runtime ownership and cannot enroll
+a continuing service as an invocation child. A captured token identifies the live policy span and
 never grants writer ownership.
 
 The shared native task helpers record exact accepted tasks before dispatch. An

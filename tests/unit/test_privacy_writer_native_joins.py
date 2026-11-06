@@ -388,3 +388,105 @@ async def test_copied_callback_inventory_cannot_invent_native_admission(tmp_path
             scope.close()
         await task
     assert witness.read_text() == 'queued writer'
+
+
+@pytest.mark.asyncio
+async def test_resident_health_interval_handoff_does_not_extend_invocation_scope(owner):
+    from kestrel_sovereign.a2a.scope import NativeRecipientScope
+    from kestrel_sovereign.features.health.feature import HealthFeature
+    from tests.unit.test_tool_effect_invocation import governed
+    from tests.utils.native_a2a import manager_for
+    from kestrel_sdk.native_a2a.types import TaskState
+
+    feature = HealthFeature(owner)
+    await feature.initialize()
+    owner.features[feature.name] = feature
+    original_resident = feature._background_task
+    assert not owner._runtime_publication_ready.is_set()
+    manager = manager_for(owner.tool_effect_store.backend,
+        NativeRecipientScope(owner.did), owns_backend=False)
+    await manager.initialize()
+    manager.register_provider(feature.name, feature.get_agent_skills(), feature)
+
+    @governed
+    async def invoke(agent, user_input, *, invocation_id=None):
+        return await manager.execute_skill(feature.name, 'health_interval',
+            {'seconds': 90}, sync=True)
+
+    calling = asyncio.create_task(invoke(owner, 'Change resident interval',
+        invocation_id='native-resident-interval'))
+    try:
+        done, _ = await asyncio.wait({calling}, timeout=2)
+        assert calling in done, 'invocation adopted the replacement resident as an effect child'
+        result = await calling
+        assert result.status.state == TaskState.TASK_STATE_COMPLETED
+        replacement = feature._background_task
+        assert replacement is not original_resident and not replacement.done()
+        assert replacement in owner._background_tasks and replacement._kestrel_runtime_service
+        assert not owner._runtime_publication_ready.is_set()
+        assert not owner._get_privacy_transition_lock().locked()
+        assert await owner.tool_effect_store.database.fetchall('SELECT state FROM tool_effect_claims') == [('RETURNED_OK',)]
+    finally:
+        await feature._stop_background_loop()
+        await asyncio.gather(calling, return_exceptions=True)
+        await feature.shutdown()
+        await manager.close()
+
+
+@pytest.mark.asyncio
+async def test_callback_admission_precedes_first_policy_activation(bound_operation):
+    import contextvars
+    from kestrel_sovereign._async_ownership import OwnedCallbackScope
+    from tests.unit.test_tool_effect_invocation import governed
+
+    owner, binding, witness = bound_operation
+    lock = owner._get_privacy_transition_lock()
+
+    @governed
+    async def invoke(agent, user_input, *, invocation_id=None):
+        assert lock.current_native_scope() is not None and not lock.locked()
+        scope = OwnedCallbackScope()
+
+        async def foreign_reader():
+            task = scope.start(lambda: binding.invoke({'marker': 'lazy-policy-callback'},
+                session_id='lazy-policy-callback', operation_id='lazy-policy-callback'))
+            outcome = await await_owned_task(task)
+            assert outcome.error is None
+            return outcome.result
+
+        reader = asyncio.create_task(foreign_reader(), context=contextvars.Context())
+        try:
+            async with scope.wait():
+                return await reader
+        finally:
+            scope.close()
+            for task in tuple(scope.tasks):
+                await await_owned_task(task)
+
+    result = await invoke(owner, 'First effect from the original reader',
+        invocation_id='lazy-policy-callback-invocation')
+    assert result['success'] is True
+    assert witness.read_text() == 'lazy-policy-callback\n'
+    assert not lock.locked()
+    assert await owner.tool_effect_store.database.fetchall(
+        'SELECT state FROM tool_effect_claims') == [('RETURNED_OK',)]
+
+
+@pytest.mark.asyncio
+async def test_queued_token_writer_cannot_run_after_its_policy_span_retires(tmp_path):
+    lock = ReentrantTransitionLock()
+    attempted = asyncio.Event()
+    witness = tmp_path / 'retired-policy-effect'
+
+    async def queued(token):
+        with bind_transition_lock_reentry(token):
+            attempted.set()
+            async with lock:
+                witness.write_text('invalid retired-span write')
+
+    async with lock:
+        task = asyncio.create_task(queued(lock.current_reentry_token()))
+        await attempted.wait()
+    with pytest.raises(RuntimeError, match='retained span|closed or stale'):
+        await task
+    assert not witness.exists() and not lock.locked()

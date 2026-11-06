@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 import hashlib
@@ -80,6 +80,14 @@ class ToolEffectTurn:
     pending: dict[asyncio.Future, asyncio.Task] = field(default_factory=dict)
     unconfirmed: list[BaseException] = field(default_factory=list)
 
+    privacy_lock: Any = field(init=False, repr=False)
+    privacy_scope: Any = field(init=False, repr=False)
+    owns_privacy_scope: bool = field(init=False, repr=False)
+
+    def __post_init__(self):
+        self.privacy_lock = self.owner._get_privacy_transition_lock()
+        self.privacy_scope, self.owns_privacy_scope = self.privacy_lock.begin_native_scope(self)
+
     def require_live(self, owner: Any) -> None:
         if (self.owner is not owner or not self.live
                 or (self.closing and asyncio.current_task() not in self.pending.values())):
@@ -92,50 +100,58 @@ class ToolEffectTurn:
 
     async def close(self, error: BaseException | None = None) -> None:
         """Join original claimants before closing admission; never cancel them."""
-        self.closing = True
-        terminal = error
-        try:
-            while self.pending:
-                for completion, executor in tuple(self.pending.items()):
-                    from kestrel_sovereign._async_ownership import owned_native_wait
-                    async with owned_native_wait((executor,)):
-                        outcome = await await_owned_task(completion)
-                    self.pending.pop(completion, None)
-                    terminal = execution_terminal_error(
-                        terminal, outcome.error, outcome.cancellation,
-                        retain_originals=True,
-                    )
+        from kestrel_sovereign._async_ownership import bind_owned_coordinator
+        with bind_owned_coordinator(self.privacy_lock):
+            self.closing = True
+            if self.owns_privacy_scope:
+                self.privacy_scope.closing = True
+            terminal = error
             try:
-                async with self.owner._get_durable_persistence_gate().shared_lock():
-                    privacy = self.owner.privacy_config
-                    if privacy is None:
-                        raise ToolEffectJournalUnavailable("tool_effect_journal_unavailable")
-                    if privacy.allows_persistent_storage():
-                        await self.store.finish(self.attempt)
-            except BaseException as finish_error:
-                terminal = execution_terminal_error(
-                    terminal, finish_error, retain_originals=True,
-                )
-            # Preserve an original terminal outcome and cooperative withdrawal.
-            # A swallowed uncertain effect still needs a typed root failure;
-            # adding that synthetic error to an already typed/control failure
-            # would replace or wrap the very evidence the caller must retain.
-            protected = _requires_original_terminal_error(terminal)
-            if self.unconfirmed and protected:
-                terminal = execution_terminal_error(
-                    terminal, *self.unconfirmed, retain_originals=True,
-                    prefer_cancellation=True,
-                )
-            if self.unconfirmed and not protected:
-                unknown = ToolEffectOutcomeUnconfirmed('tool_effect_outcome_unconfirmed')
-                unknown.__cause__ = execution_terminal_error(
-                    terminal, *self.unconfirmed, retain_originals=True)
-                terminal = unknown
-        finally:
-            self.live = False
-        if terminal is not None:
-            raise terminal
-
+                while self.pending:
+                    for completion, executor in tuple(self.pending.items()):
+                        from kestrel_sovereign._async_ownership import owned_native_wait
+                        async with owned_native_wait((executor,)):
+                            outcome = await await_owned_task(completion)
+                        self.pending.pop(completion, None)
+                        terminal = execution_terminal_error(
+                            terminal, outcome.error, outcome.cancellation,
+                            retain_originals=True,
+                        )
+                try:
+                    async with self.owner._get_durable_persistence_gate().shared_lock():
+                        privacy = self.owner.privacy_config
+                        if privacy is None:
+                            raise ToolEffectJournalUnavailable("tool_effect_journal_unavailable")
+                        if privacy.allows_persistent_storage():
+                            await self.store.finish(self.attempt)
+                except BaseException as finish_error:
+                    terminal = execution_terminal_error(
+                        terminal, finish_error, retain_originals=True,
+                    )
+                # Preserve an original terminal outcome and cooperative withdrawal.
+                # A swallowed uncertain effect still needs a typed root failure;
+                # adding that synthetic error to an already typed/control failure
+                # would replace or wrap the very evidence the caller must retain.
+                protected = _requires_original_terminal_error(terminal)
+                if self.unconfirmed and protected:
+                    terminal = execution_terminal_error(
+                        terminal, *self.unconfirmed, retain_originals=True,
+                        prefer_cancellation=True,
+                    )
+                if self.unconfirmed and not protected:
+                    unknown = ToolEffectOutcomeUnconfirmed('tool_effect_outcome_unconfirmed')
+                    unknown.__cause__ = execution_terminal_error(
+                        terminal, *self.unconfirmed, retain_originals=True)
+                    terminal = unknown
+            finally:
+                self.live = False
+                if self.owns_privacy_scope:
+                    try:
+                        await self.privacy_lock.close_native_scope(self.privacy_scope, terminal)
+                    except BaseException as retirement_error:
+                        terminal = execution_terminal_error(terminal, retirement_error, retain_originals=True)
+            if terminal is not None:
+                raise terminal
 
 _current_turn: ContextVar[ToolEffectTurn | None] = ContextVar(
     "kestrel_tool_effect_turn", default=None,
@@ -184,11 +200,15 @@ def bind_tool_effect_turn(
     """Re-present the original revocable object; a snapshot cannot revive it."""
     turn_token = _current_turn.set(state[0])
     claim_token = _current_claim.set(state[1])
-    try:
-        yield
-    finally:
-        _current_claim.reset(claim_token)
-        _current_turn.reset(turn_token)
+    from kestrel_sovereign._async_ownership import bind_owned_coordinator
+    with ExitStack() as routing:
+        if state[0] is not None:
+            routing.enter_context(bind_owned_coordinator(state[0].privacy_lock))
+        try:
+            yield
+        finally:
+            _current_claim.reset(claim_token)
+            _current_turn.reset(turn_token)
 
 
 turn_scoped(
@@ -234,6 +254,7 @@ async def execute_tool_effect(
         raise ToolEffectJournalUnavailable("tool_effect_attempt_unavailable")
     turn.require_live(owner)
     turn.require_confirmed()
+    turn.privacy_lock.require_native_scope(turn.privacy_scope)
     prepared = _current_registration.get()
     if prepared is not None and prepared.owner is not owner:
         prepared = None
