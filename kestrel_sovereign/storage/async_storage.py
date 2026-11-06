@@ -1679,6 +1679,50 @@ class AsyncStorage:
             revision_ids
         )
 
+    async def assertion_session_attestations(self, revisions):
+        """The attested sessions of each strategy-ledger revision, for a corpus (#3990).
+
+        ``revisions`` are ``(assertion, sources)`` pairs. A ledger row names
+        its session only in ``STRATEGY_LEDGER.yaml``, which the agent can
+        edit, so a ledger-derived revision is admitted to a session-excluding
+        corpus only on the attestation host code wrote for its row's current
+        content before the row reached the file. Its stored locator, written
+        when it was projected, may predate the attestation record or miss a
+        session attested since. A ledger-derived revision whose content has no
+        attestation, or whose attestation key it does not name, is unattested.
+        Other revisions are absent from the result: their locators alone say
+        which sessions they name.
+        """
+        if not self._initialized:
+            await self.initialize()
+        from kestrel_sovereign.features.strategic_memory import ledger_assertions
+        from kestrel_sovereign.knowledge.corpus import SessionAttestation
+        from kestrel_sovereign.storage.ledger_row_attestations import (
+            row_attestations,
+        )
+
+        keys = {
+            assertion.revision_id: ledger_assertions.revision_attestation_key(
+                assertion
+            )
+            for assertion, sources in revisions
+            if ledger_assertions.is_ledger_derived(assertion, sources)
+        }
+        if not keys:
+            return {}
+        attested = await row_attestations(self.db, agent_id=self.agent_id)
+        result = {}
+        for revision_id, key in keys.items():
+            sessions = attested.get(key) if key is not None else None
+            result[revision_id] = (
+                SessionAttestation(
+                    sessions=frozenset(item for item in sessions if item is not None)
+                )
+                if sessions
+                else SessionAttestation(attested=False)
+            )
+        return result
+
     async def get_source_occurrence(self, source_occurrence_id: str):
         if not self._initialized:
             await self.initialize()
@@ -2213,29 +2257,6 @@ class AsyncStorage:
         )
         return service.capability_versions()
 
-    async def _require_ledger_row_provenance(self) -> None:
-        """Refuse a corpus while a strategy-ledger row's session is unverified (#3990).
-
-        The last strategy-ledger projection records each row it did not write
-        because the agent's database does not vouch for its session: the
-        row's ``session_id`` in ``STRATEGY_LEDGER.yaml``, which the agent can
-        edit, disagrees with the record, or the row has none. Such a row is
-        never written, but a corpus built meanwhile would be built as though
-        the row's provenance were settled. Nothing is built until a later
-        projection verifies the row or finds it gone.
-        """
-        from kestrel_sovereign.knowledge.corpus import GovernedCorpusUnavailable
-        from kestrel_sovereign.storage.ledger_row_sessions import (
-            unresolved_row_refusals,
-        )
-
-        if not self._initialized:
-            await self.initialize()
-        if await unresolved_row_refusals(self.db, agent_id=self.agent_id):
-            raise GovernedCorpusUnavailable(
-                "strategy_ledger_row_provenance_unverified"
-            )
-
     async def governed_assertion_corpus_snapshot(
         self,
         *,
@@ -2263,7 +2284,6 @@ class AsyncStorage:
             GovernedCorpusLimits,
         )
 
-        await self._require_ledger_row_provenance()
         snapshot = await GovernedAssertionCorpusService(self).snapshot(
             policy=policy,
             inference_profile=inference_profile,
@@ -2316,7 +2336,6 @@ class AsyncStorage:
             GovernedCorpusLimits,
         )
 
-        await self._require_ledger_row_provenance()
         delta = await GovernedAssertionCorpusService(self).changes_since(
             snapshot,
             policy=policy,

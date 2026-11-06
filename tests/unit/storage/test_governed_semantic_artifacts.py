@@ -34,7 +34,6 @@ from kestrel_sovereign.knowledge import (
     GovernedArtifactLineage,
     GovernedArtifactRegistration,
     GovernedCorpusPolicy,
-    GovernedCorpusUnavailable,
     IRI,
     Literal,
     OntologyRef,
@@ -974,35 +973,6 @@ async def _ledger_row_references(governed: PrivacyEnforcingStorage) -> dict:
     return named
 
 
-async def _ledger_assertions_by_row(governed: PrivacyEnforcingStorage) -> dict:
-    """Each projected ledger row's current assertion, keyed by row id."""
-    return {
-        held.object.value.rsplit(":", 1)[-1]: held
-        for held in await governed.query_assertions(AssertionQuery(limit=50))
-    }
-
-
-async def _ledger_corpus_policy(
-    storage: AsyncStorage, governed: PrivacyEnforcingStorage, assertion
-) -> GovernedCorpusPolicy:
-    """A corpus policy every class filter of which accepts a ledger row."""
-    (source,) = await governed.list_assertion_revision_sources(assertion.revision_id)
-    await storage.run_semantic_maintenance(None)
-    capabilities = await storage.semantic_maintenance_capability_versions(None)
-    return GovernedCorpusPolicy(
-        policy_id="exam-holdout",
-        policy_version="1",
-        accepted_epistemic_states=(assertion.epistemic_state,),
-        accepted_visibility=(assertion.visibility,),
-        accepted_privacy_classifications=(assertion.privacy_classification,),
-        accepted_consent_references=(assertion.release_policy_reference,),
-        accepted_grounding_classes=(assertion.confidence_basis,),
-        accepted_source_kinds=(source.source_kind,),
-        accepted_ontology_pins=(assertion.ontology_version,),
-        accepted_semantic_capability_versions=tuple(capabilities.items()),
-    )
-
-
 @pytest.mark.asyncio
 @pytest.mark.parametrize("projecting_session", ["later-session", None])
 async def test_a_ledger_row_names_the_session_that_recorded_it_not_the_one_projecting(
@@ -1051,9 +1021,28 @@ async def test_a_ledger_row_names_the_session_that_recorded_it_not_the_one_proje
         later_row: [later_references],
     }
 
-    by_row = await _ledger_assertions_by_row(governed)
+    by_row = {
+        held.object.value.rsplit(":", 1)[-1]: held
+        for held in await governed.query_assertions(AssertionQuery(limit=50))
+    }
     exam_assertion = by_row[exam_row]
-    policy = await _ledger_corpus_policy(storage, governed, exam_assertion)
+    (exam_source,) = await governed.list_assertion_revision_sources(
+        exam_assertion.revision_id
+    )
+    await storage.run_semantic_maintenance(None)
+    capabilities = await storage.semantic_maintenance_capability_versions(None)
+    policy = GovernedCorpusPolicy(
+        policy_id="exam-holdout",
+        policy_version="1",
+        accepted_epistemic_states=(exam_assertion.epistemic_state,),
+        accepted_visibility=(exam_assertion.visibility,),
+        accepted_privacy_classifications=(exam_assertion.privacy_classification,),
+        accepted_consent_references=(exam_assertion.release_policy_reference,),
+        accepted_grounding_classes=(exam_assertion.confidence_basis,),
+        accepted_source_kinds=(exam_source.source_kind,),
+        accepted_ontology_pins=(exam_assertion.ontology_version,),
+        accepted_semantic_capability_versions=tuple(capabilities.items()),
+    )
 
     unexcluded = await _corpus_snapshot(storage, policy)
     held_out = await _corpus_snapshot(
@@ -1070,48 +1059,89 @@ async def test_a_ledger_row_names_the_session_that_recorded_it_not_the_one_proje
     assert held_out.observability.excluded == {"explicitly_excluded": 1}
 
 
-def _edit_ledger_row(path, row_id, edit) -> None:
-    """Rewrite one pattern row of ``STRATEGY_LEDGER.yaml`` on disk, as the agent can."""
+async def _ledger_rows(governed: PrivacyEnforcingStorage) -> dict:
+    """Each current ledger assertion, keyed by the row id its object names."""
+    return {
+        held.object.value.rsplit(":", 1)[-1]: held
+        for held in await governed.query_assertions(AssertionQuery(limit=50))
+    }
+
+
+async def _ledger_corpus_policy(
+    storage: AsyncStorage, governed: PrivacyEnforcingStorage
+) -> GovernedCorpusPolicy:
+    """A policy every ledger assertion's class rules accept, and no exclusions."""
+    await storage.run_semantic_maintenance(None)
+    capabilities = await storage.semantic_maintenance_capability_versions(None)
+    held = next(iter((await _ledger_rows(governed)).values()))
+    sources = await governed.list_assertion_revision_sources(held.revision_id)
+    return GovernedCorpusPolicy(
+        policy_id="exam-holdout",
+        policy_version="1",
+        accepted_epistemic_states=(held.epistemic_state,),
+        accepted_visibility=(held.visibility,),
+        accepted_privacy_classifications=(held.privacy_classification,),
+        accepted_consent_references=(held.release_policy_reference,),
+        accepted_grounding_classes=(held.confidence_basis,),
+        accepted_source_kinds=tuple(sorted({source.source_kind for source in sources})),
+        accepted_ontology_pins=(held.ontology_version,),
+        accepted_semantic_capability_versions=tuple(capabilities.items()),
+    )
+
+
+def _corpus_rows(snapshot) -> set:
+    """The ledger row ids a corpus admitted."""
+    return {
+        item.assertion.object.value.rsplit(":", 1)[-1] for item in snapshot.examples
+    }
+
+
+def _edit_ledger_file(feature, edit) -> None:
+    """Edit ``STRATEGY_LEDGER.yaml`` by hand, as an agent with file access can."""
     import yaml
 
+    path = feature._ledger.path
     data = yaml.safe_load(path.read_text(encoding="utf-8"))
-    (row,) = [row for row in data["patterns_learned"] if row["id"] == row_id]
-    edit(row)
-    path.write_text(yaml.safe_dump(data, sort_keys=False), encoding="utf-8")
+    edit(data["patterns_learned"])
+    path.write_text(yaml.dump(data, sort_keys=False), encoding="utf-8")
 
 
-def _name_session(session_id):
-    def edit(row):
-        row["session_id"] = session_id
-
-    return edit
+def _rename_row(rows) -> None:
+    rows[0]["id"] = "pat_renamed"
 
 
-def _remove_session(row):
-    del row["session_id"]
+def _name_another_session(rows) -> None:
+    rows[0]["session_id"] = "everyday-session"
+
+
+def _edit_row_text(rows) -> None:
+    rows[0]["pattern"] = "Learned during the exam, reworded"
+
+
+def _leave_row(rows) -> None:
+    raise AssertionError("the untouched file is not rewritten")
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "tamper",
+    ("edit", "reason"),
     [
-        pytest.param(_name_session("not-the-exam"), id="session-edited"),
-        pytest.param(_remove_session, id="session-removed"),
+        (_leave_row, "explicitly_excluded"),
+        (_name_another_session, "explicitly_excluded"),
+        (_rename_row, "session_unattested"),
+        (_edit_row_text, "session_unattested"),
     ],
 )
-async def test_a_ledger_row_whose_file_session_is_tampered_never_escapes_its_session(
-    storage: AsyncStorage, tmp_path, tamper
+async def test_an_edit_after_a_failed_projection_never_lets_a_row_escape_its_session(
+    storage: AsyncStorage, tmp_path, edit, reason
 ) -> None:
-    """#3990: a ledger row's session comes from the agent's database, not its file.
+    """#3990: the row's session comes from what host code attested, never the file.
 
-    The row is recorded in the exam session and its first projection fails.
-    Before the next projection the row's ``session_id`` in
-    ``STRATEGY_LEDGER.yaml``, which is in the agent's own data directory, is
-    edited to another session or removed. The row is then refused, never
-    written under the edited session or under none, and the governed corpus
-    build refuses while it stays unverified. Once the file agrees with the
-    agent's database again the row names the exam session, the corpus builds,
-    and the row is held out.
+    A row recorded in the exam session whose first projection failed is
+    projected later, after the agent edited ``STRATEGY_LEDGER.yaml``. A session
+    field it wrote names nothing; a row whose id or text it changed has content
+    nothing attested. Neither escapes a corpus excluding the exam session, and
+    neither is lost from a corpus that excludes no session.
     """
     feature, agent, governed = await _ledger_feature(storage, tmp_path)
     store_put = governed.put_assertion
@@ -1126,235 +1156,275 @@ async def test_a_ledger_row_whose_file_session_is_tampered_never_escapes_its_ses
         )
     assert recorded.data["persisted"] is True
     assert await governed.query_assertions(AssertionQuery(limit=50)) == []
-    exam_row = recorded.data["pattern_id"]
 
-    _edit_ledger_row(feature._ledger.path, exam_row, tamper)
+    if edit is not _leave_row:
+        _edit_ledger_file(feature, edit)
     governed.put_assertion = store_put
-    with live_turn(agent, "later-session", turn_id="projecting-turn"):
+    with live_turn(agent, "everyday-session", turn_id="later-turn"):
         later = await feature.strategy_add_pattern(
             pattern="Learned later", source="later", implication="keep"
         )
-    assert later.data["reloaded_from_disk"] is True
-    later_row = later.data["pattern_id"]
+    assert later.data.get("reloaded_from_disk", False) is (edit is not _leave_row)
+    rows = await _ledger_rows(governed)
+    assert len(rows) == 2
+    exam_row = next(row for row in rows if row != later.data["pattern_id"])
 
-    named = {
-        iri.rsplit(":", 1)[-1]: references
-        for iri, references in (await _ledger_row_references(governed)).items()
-    }
-    assert named == {
-        later_row: [frozenset({(SourceReferenceKind.SESSION, "later-session")})]
-    }
-    by_row = await _ledger_assertions_by_row(governed)
-    policy = await _ledger_corpus_policy(storage, governed, by_row[later_row])
-    for excluded in ((), (EXAM_SESSION,)):
-        with pytest.raises(
-            GovernedCorpusUnavailable, match="strategy_ledger_row_provenance_unverified"
-        ):
-            await _corpus_snapshot(
-                storage, replace(policy, excluded_session_ids=excluded)
-            )
-
-    _edit_ledger_row(feature._ledger.path, exam_row, _name_session(EXAM_SESSION))
-    repaired = await feature.strategy_add_pattern(
-        pattern="Learned off any turn", source="cron", implication="keep"
-    )
-    assert repaired.data["reloaded_from_disk"] is True
-
-    named = {
-        iri.rsplit(":", 1)[-1]: references
-        for iri, references in (await _ledger_row_references(governed)).items()
-    }
-    assert named[exam_row] == [frozenset({(SourceReferenceKind.SESSION, EXAM_SESSION)})]
-    by_row = await _ledger_assertions_by_row(governed)
-    await storage.run_semantic_maintenance(None)
+    policy = await _ledger_corpus_policy(storage, governed)
+    unexcluded = await _corpus_snapshot(storage, policy)
     held_out = await _corpus_snapshot(
         storage, replace(policy, excluded_session_ids=(EXAM_SESSION,))
     )
-    assert {item.assertion.revision_id for item in held_out.examples} == {
-        by_row[later_row].revision_id,
-        by_row[repaired.data["pattern_id"]].revision_id,
-    }
-    assert held_out.observability.excluded == {"explicitly_excluded": 1}
+
+    assert _corpus_rows(unexcluded) == {exam_row, later.data["pattern_id"]}
+    assert _corpus_rows(held_out) == {later.data["pattern_id"]}
+    assert held_out.observability.excluded == {reason: 1}
 
 
 @pytest.mark.asyncio
-async def test_both_corpus_doors_refuse_while_a_ledger_row_is_unverified(
-    storage: AsyncStorage,
+async def test_identical_content_recorded_in_two_sessions_is_held_out_with_either(
+    storage: AsyncStorage, tmp_path
 ) -> None:
-    """#3990: the snapshot and the delta both refuse until the refusal is resolved.
+    """One digest may carry several sessions; excluding any one holds it out.
 
-    Scoped to the agent: another agent's unverified row refuses nothing here.
+    The exam row's projection fails and the agent deletes it from the file. The
+    same pattern recorded later, in another session on the same day, has the
+    same id and content, so its digest is attested in both sessions.
     """
-    from kestrel_sovereign.knowledge import GovernedCorpusError
-    from kestrel_sovereign.storage.ledger_row_sessions import replace_row_refusals
-
-    governance = dict(
-        artifact_id=str(uuid4()),
-        consumer_id="parametric-self-test",
-        consumer_key_id="parametric-self-key-v1",
-        consumer_public_key=_CORPUS_CONSUMER_PUBLIC_KEY,
-        retention_seconds=300,
-    )
-    unverified = {("patterns_learned", "pat_unverified"): "no record"}
-    await replace_row_refusals(
-        storage.db,
-        agent_id=storage.agent_id,
-        sections=("patterns_learned",),
-        refusals=unverified,
-    )
-    match = "strategy_ledger_row_provenance_unverified"
-    with pytest.raises(GovernedCorpusUnavailable, match=match):
-        await storage.governed_assertion_corpus_snapshot(
-            policy=None, inference_profile=None, **governance
-        )
-    with pytest.raises(GovernedCorpusUnavailable, match=match):
-        await storage.governed_assertion_corpus_changes_since(
-            object(), policy=None, inference_profile=None, **governance
-        )
-
-    await replace_row_refusals(
-        storage.db,
-        agent_id=storage.agent_id,
-        sections=("patterns_learned",),
-        refusals={},
-    )
-    await replace_row_refusals(
-        storage.db,
-        agent_id="did:example:another-agent",
-        sections=("patterns_learned",),
-        refusals=unverified,
-    )
-    # Past the gate, the service itself now judges the (missing) policy.
-    with pytest.raises(GovernedCorpusError, match="policy must be"):
-        await storage.governed_assertion_corpus_snapshot(
-            policy=None, inference_profile=None, **governance
-        )
-
-
-def _exam_projection_fails(governed: PrivacyEnforcingStorage):
-    """Make the next projection's assertion writes fail; returns the restorer."""
+    feature, agent, governed = await _ledger_feature(storage, tmp_path)
     store_put = governed.put_assertion
 
     async def unavailable(*args, **kwargs):
         raise RuntimeError("assertion store unavailable")
 
     governed.put_assertion = unavailable
+    with live_turn(agent, EXAM_SESSION):
+        first = await feature.strategy_add_pattern(
+            pattern="Learned twice", source="s", implication="i"
+        )
+    _edit_ledger_file(feature, lambda rows: rows.clear())
+    governed.put_assertion = store_put
+    with live_turn(agent, "everyday-session", turn_id="later-turn"):
+        again = await feature.strategy_add_pattern(
+            pattern="Learned twice", source="s", implication="i"
+        )
+    assert again.data["pattern_id"] == first.data["pattern_id"]
+    assert list(await _ledger_rows(governed)) == [again.data["pattern_id"]]
 
-    def restore() -> None:
-        governed.put_assertion = store_put
-
-    return restore
+    policy = await _ledger_corpus_policy(storage, governed)
+    assert _corpus_rows(await _corpus_snapshot(storage, policy)) == {
+        again.data["pattern_id"]
+    }
+    for excluded in (EXAM_SESSION, "everyday-session"):
+        held_out = await _corpus_snapshot(
+            storage, replace(policy, excluded_session_ids=(excluded,))
+        )
+        assert held_out.examples == ()
+        assert held_out.observability.excluded == {"explicitly_excluded": 1}
 
 
 @pytest.mark.asyncio
-async def test_a_renamed_ledger_row_never_escapes_its_session(
+async def test_a_row_whose_attestation_fails_is_never_recorded(
     storage: AsyncStorage, tmp_path
 ) -> None:
-    """#3990: a ledger row's ``id`` in the file is an address, not provenance.
-
-    The row is recorded in the exam session and its first projection fails.
-    Its ``id`` is then changed and its ``session_id`` removed, so neither the
-    address the agent's database recorded nor any session is left in the
-    file. The renamed row has no record, so it is refused, never taken for a
-    row recorded before sessions were named, and the governed corpus build
-    refuses until it is gone.
-    """
+    """A failed attestation refuses the write; the row is never admitted unattested."""
     feature, agent, governed = await _ledger_feature(storage, tmp_path)
-    restore = _exam_projection_fails(governed)
+    await storage.db.execute(
+        "CREATE TRIGGER refuse_attestation BEFORE INSERT ON "
+        "strategy_ledger_row_attestations BEGIN "
+        "SELECT RAISE(ABORT, 'attestation refused'); END"
+    )
     with live_turn(agent, EXAM_SESSION):
-        recorded = await feature.strategy_add_pattern(
+        result = await feature.strategy_add_pattern(
             pattern="Learned during the exam", source="exam", implication="hold out"
         )
-    restore()
-    renamed = "pat_renamed"
 
-    def rename(row):
-        row["id"] = renamed
-        del row["session_id"]
-
-    _edit_ledger_row(feature._ledger.path, recorded.data["pattern_id"], rename)
-    later = await feature.strategy_add_pattern(
-        pattern="Learned later", source="later", implication="keep"
+    assert result.status is ToolResultStatus.ERROR
+    assert "Nothing was recorded" in result.error
+    assert result.data == {"recorded": False, "persisted": False}
+    assert feature._ledger.patterns == []
+    assert not feature._ledger.path.exists() or "Learned during the exam" not in (
+        feature._ledger.path.read_text(encoding="utf-8")
     )
-    assert later.data["reloaded_from_disk"] is True
-
-    by_row = await _ledger_assertions_by_row(governed)
-    assert set(by_row) == {later.data["pattern_id"]}
-    policy = await _ledger_corpus_policy(
-        storage, governed, by_row[later.data["pattern_id"]]
-    )
-    with pytest.raises(
-        GovernedCorpusUnavailable, match="strategy_ledger_row_provenance_unverified"
-    ):
-        await _corpus_snapshot(
-            storage, replace(policy, excluded_session_ids=(EXAM_SESSION,))
-        )
-
-    import yaml
-
-    data = yaml.safe_load(feature._ledger.path.read_text(encoding="utf-8"))
-    data["patterns_learned"] = [
-        row for row in data["patterns_learned"] if row["id"] != renamed
-    ]
-    feature._ledger.path.write_text(yaml.safe_dump(data), encoding="utf-8")
-    await feature.strategy_add_pattern(
-        pattern="Learned after the cleanup", source="cron", implication="keep"
-    )
-    await storage.run_semantic_maintenance(None)
-    corpus = await _corpus_snapshot(
-        storage, replace(policy, excluded_session_ids=(EXAM_SESSION,))
-    )
-    assert renamed not in {
-        item.assertion.object.value.rsplit(":", 1)[-1] for item in corpus.examples
-    }
-    assert len(corpus.examples) == 2
+    assert await governed.query_assertions(AssertionQuery(limit=50)) == []
 
 
 @pytest.mark.asyncio
-async def test_a_ledger_row_moved_by_an_edit_is_never_written_without_its_session(
+async def test_a_legacy_row_is_held_out_only_of_a_session_excluding_corpus(
     storage: AsyncStorage, tmp_path
 ) -> None:
-    """#3990: a row is written only under an address whose session is recorded.
+    """A row nothing attested has an unknown session (#3990).
 
-    An edit puts another row at the address the exam row was to take, so the
-    exam row moves to the next one, and recording its session there fails.
-    The exam row is then not written at all: a row in the file with no record
-    could be stripped of its ``session_id`` and pass for one recorded in no
-    session.
+    That covers a row written into the file by hand or before attestations
+    existed, and one projected before then, whose stored locator carries no
+    marker: the corpus decides from the attestations as they are when it is
+    built, never from the stored locator alone.
     """
     feature, agent, governed = await _ledger_feature(storage, tmp_path)
-    text = "Learned during the exam"
-    planned = feature._ledger.next_pattern_id(text)
-    feature._ledger.path.write_text(
-        "version: 1\n"
-        "patterns_learned:\n"
-        f"- id: {planned}\n"
-        "  pattern: A row written by hand\n",
-        encoding="utf-8",
-    )
-    await storage.db.execute(
-        "CREATE TRIGGER refuse_moved_row_session BEFORE INSERT ON "
-        "strategy_ledger_row_sessions "
-        f"WHEN NEW.row_id = '{planned}-2' "
-        "BEGIN SELECT RAISE(ABORT, 'session recorder unavailable'); END"
-    )
-    with live_turn(agent, EXAM_SESSION):
-        refused = await feature.strategy_add_pattern(
-            pattern=text, source="exam", implication="hold out"
+    with live_turn(agent, None):
+        recorded = await feature.strategy_add_pattern(
+            pattern="Recorded before attestations", source="s", implication="i"
         )
-    assert refused.data == {"recorded": False, "persisted": False}
-    assert text not in feature._ledger.path.read_text(encoding="utf-8")
+    row = recorded.data["pattern_id"]
+    (held,) = (await _ledger_rows(governed)).values()
+    (source,) = await governed.list_assertion_revision_sources(held.revision_id)
+    assert source.references == frozenset()
+    # As if the row had been projected before the attestation record existed.
+    await storage.db.execute("DELETE FROM strategy_ledger_row_attestations")
 
-    await feature.strategy_add_pattern(
-        pattern="Learned later", source="later", implication="keep"
+    _edit_ledger_file(
+        feature,
+        lambda rows: rows.append(
+            {"id": "pat_by_hand", "pattern": "Written by hand", "session_id": "x"}
+        ),
     )
-    by_row = await _ledger_assertions_by_row(governed)
-    assert set(by_row) == {planned, feature._ledger.patterns[-1]["id"]}
-    policy = await _ledger_corpus_policy(storage, governed, by_row[planned])
-    corpus = await _corpus_snapshot(
+    with live_turn(agent, None, turn_id="later-turn"):
+        later = await feature.strategy_add_pattern(
+            pattern="Recorded since", source="s", implication="i"
+        )
+    assert set(await _ledger_rows(governed)) == {
+        row, "pat_by_hand", later.data["pattern_id"]
+    }
+
+    policy = await _ledger_corpus_policy(storage, governed)
+    assert _corpus_rows(await _corpus_snapshot(storage, policy)) == {
+        row, "pat_by_hand", later.data["pattern_id"]
+    }
+    held_out = await _corpus_snapshot(
         storage, replace(policy, excluded_session_ids=(EXAM_SESSION,))
     )
-    assert len(corpus.examples) == 2
+    assert _corpus_rows(held_out) == {later.data["pattern_id"]}
+    assert held_out.observability.excluded == {"session_unattested": 2}
+    saved_item_only = await _corpus_snapshot(
+        storage, replace(policy, excluded_saved_item_ids=("item-1",))
+    )
+    assert _corpus_rows(saved_item_only) == {
+        row, "pat_by_hand", later.data["pattern_id"]
+    }
+
+
+@pytest.mark.asyncio
+async def test_a_session_attested_after_projection_still_holds_the_row_out(
+    storage: AsyncStorage, tmp_path
+) -> None:
+    """The stored locator was written at projection; attestations grow after it."""
+    from kestrel_sovereign.features.strategic_memory import ledger_assertions
+
+    feature, agent, governed = await _ledger_feature(storage, tmp_path)
+    with live_turn(agent, "everyday-session"):
+        recorded = await feature.strategy_add_pattern(
+            pattern="Learned twice", source="s", implication="i"
+        )
+    (row,) = feature._ledger.patterns
+    await governed.attest_strategy_ledger_row(
+        section_key="patterns_learned",
+        content_digest=ledger_assertions.attestation_digest("patterns_learned", row),
+        session_id=EXAM_SESSION,
+    )
+    (held,) = (await _ledger_rows(governed)).values()
+    (source,) = await governed.list_assertion_revision_sources(held.revision_id)
+    assert source.references == frozenset(
+        {(SourceReferenceKind.SESSION, "everyday-session")}
+    )
+
+    policy = await _ledger_corpus_policy(storage, governed)
+    held_out = await _corpus_snapshot(
+        storage, replace(policy, excluded_session_ids=(EXAM_SESSION,))
+    )
+    assert recorded.data["pattern_id"] == row["id"]
+    assert held_out.examples == ()
+    assert held_out.observability.excluded == {"explicitly_excluded": 1}
+
+
+@pytest.fixture
+async def file_storage(tmp_path):
+    """Native storage over a SQLite file, as an agent's database is."""
+    identity_dir = tmp_path / "identity"
+    credentials = await create_kestrel_identity_async(
+        str(identity_dir), identity_method="did:pkh", agent_name="Ledger delta test",
+    )
+    key_id = f"kestrel_{credentials.agent_did.rsplit(':', 1)[-1]}"
+    identity = load_agent_identity(key_id, identity_dir)
+    capability = _resolve_authenticated_agent_assertion_capability(
+        credentials.agent_did, identity
+    )
+    instance = await _open_storage(
+        str(tmp_path / "native.db"), credentials.agent_did, capability
+    )
+    try:
+        yield instance
+    finally:
+        await instance.close()
+
+
+async def _corpus_delta(storage: AsyncStorage, base, policy: GovernedCorpusPolicy):
+    """One incremental read against ``base``, registered for the same consumer."""
+    return await storage.governed_assertion_corpus_changes_since(
+        base,
+        policy=policy,
+        inference_profile=None,
+        artifact_id=str(uuid4()),
+        consumer_id="parametric-self-test",
+        consumer_key_id="parametric-self-key-v1",
+        consumer_public_key=_CORPUS_CONSUMER_PUBLIC_KEY,
+        retention_seconds=300,
+    )
+
+
+@pytest.mark.asyncio
+async def test_an_incremental_read_withdraws_a_row_since_attested_in_an_excluded_session(
+    file_storage: AsyncStorage, tmp_path
+) -> None:
+    """#3990: a new attestation, not only an assertion change, withdraws a row.
+
+    The row is recorded in an everyday session and admitted to a corpus that
+    excludes the exam session. The agent deletes it from the file, and the
+    same content is then recorded during the exam: same id, same digest, so
+    the stored assertion is unchanged and the change stream is empty. A fresh
+    snapshot holds the row out, and an incremental read against the earlier
+    snapshot withdraws it.
+    """
+    storage = file_storage
+    feature, agent, governed = await _ledger_feature(storage, tmp_path)
+    with live_turn(agent, "everyday-session"):
+        recorded = await feature.strategy_add_pattern(
+            pattern="Learned twice", source="s", implication="i"
+        )
+    row = recorded.data["pattern_id"]
+    policy = await _ledger_corpus_policy(storage, governed)
+    excluding = replace(policy, excluded_session_ids=(EXAM_SESSION,))
+    base = await _corpus_snapshot(storage, excluding)
+    unexcluded_base = await _corpus_snapshot(storage, policy)
+    assert _corpus_rows(base) == _corpus_rows(unexcluded_base) == {row}
+    (example,) = base.examples
+    checkpoint = await storage.assertion_event_checkpoint()
+
+    _edit_ledger_file(feature, lambda rows: rows.clear())
+    with live_turn(agent, EXAM_SESSION, turn_id="exam-turn"):
+        again = await feature.strategy_add_pattern(
+            pattern="Learned twice", source="s", implication="i"
+        )
+    assert again.data["persisted"] is True
+    assert again.data["pattern_id"] == row
+    assert await storage.assertion_event_checkpoint() == checkpoint
+    fresh = await _corpus_snapshot(storage, excluding)
+    assert fresh.examples == ()
+
+    delta = await _corpus_delta(storage, base, excluding)
+
+    assert delta.additions == ()
+    (tombstone,) = delta.tombstones
+    assert (tombstone.assertion_id, tombstone.revision_id) == (
+        example.assertion.assertion_id,
+        example.assertion.revision_id,
+    )
+    assert (tombstone.operation, tombstone.reason) == (
+        "session_attestation",
+        "explicitly_excluded",
+    )
+    assert tombstone.generation == checkpoint.generation
+    assert (await _corpus_delta(storage, base, excluding)).tombstones == delta.tombstones
+    # A corpus that excludes no session never consults attestations.
+    assert (await _corpus_delta(storage, unexcluded_base, policy)).tombstones == ()
 
 
 @pytest.mark.asyncio

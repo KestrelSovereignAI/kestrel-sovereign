@@ -527,9 +527,10 @@ def _governed_assertion_replay_binding(
     """Bind every immutable proposal field while ignoring delivery context.
 
     Delivery context is when a retry arrived and which session it was filed
-    under. Neither identifies the operation: a retry may resolve a session
-    the first delivery did not, and an operation recorded before sources
-    named their session (#3875) must still replay idempotently.
+    under, or found attested (#3990). None identifies the operation: a retry
+    may resolve a session the first delivery did not, and an operation
+    recorded before sources named their session (#3875) must still replay
+    idempotently.
     """
     if not isinstance(assertion, Assertion) or not isinstance(
         source,
@@ -549,9 +550,10 @@ def _governed_assertion_replay_binding(
         assertion_mapping.pop(field, None)
     source_mapping = source.to_mapping()
     source_mapping.pop("received_at", None)
-    source_mapping["locator"] = without_source_references(
-        source.locator, SourceReferenceKind.SESSION
-    )
+    locator = source.locator
+    for kind in (SourceReferenceKind.SESSION, SourceReferenceKind.UNATTESTED_SESSION):
+        locator = without_source_references(locator, kind)
+    source_mapping["locator"] = locator
     fingerprint = _operation_digest(
         {
             "namespace": "semantic-explicit-fact-proposal-v1",

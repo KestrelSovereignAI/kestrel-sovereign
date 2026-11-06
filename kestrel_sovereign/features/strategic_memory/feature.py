@@ -76,7 +76,6 @@ from .ledger import (
     PATTERNS_KEY,
     LedgerChangeConflict,
     LedgerCommit,
-    LedgerRowIdTaken,
     LedgerSnapshot,
     StrategyLedger,
     active_blockers,
@@ -84,6 +83,7 @@ from .ledger import (
     has_ledger_sections,
     strip_ledger_sections,
 )
+from .ledger_assertions import attestation_digest
 from .ledger_index import (
     MEMBERSHIP_READ_CAP,
     BLOCKER_SECTION,
@@ -241,10 +241,10 @@ def _is_github_prereq_failure(body: str) -> bool:
 #: many it withheld — a silently capped list is a lie about the record.
 _PATTERN_VIEW_LIMIT = 25
 
-#: How many addresses a new ledger row is reserved under before the tool gives
-#: up (#3990). Each retry means an edit put a row at the address reserved for
-#: it between the reservation and the write.
-ROW_RESERVATION_ATTEMPTS = 3
+#: How many times a new ledger row is attested before its write gives up
+#: (#3990). Each further attempt means the file changed between the
+#: attestation and the write, and the row's content (its id) with it.
+ROW_ATTESTATION_ATTEMPTS = 3
 
 # Try to import yaml; fall back to a simple parser if not available
 try:
@@ -823,7 +823,6 @@ class StrategicMemoryFeature(Feature):
             # Nothing has ever been confirmed on disk, so there is no state the
             # producer may reconcile against.
             return {"skipped_reason": "ledger_ids_unpersisted"}
-        await self._take_row_inventory(storage, snapshot)
         try:
             report = await project(snapshot)
         except Exception as e:  # noqa: BLE001 - the producer is best-effort
@@ -834,39 +833,16 @@ class StrategicMemoryFeature(Feature):
             logger.info("strategy ledger assertions: %s", data)
         return data
 
-    async def _take_row_inventory(self, storage, snapshot: LedgerSnapshot) -> None:
-        """Record the rows that came before the agent's database recorded rows (#3990).
-
-        Taken once, the first time a confirmed ledger file is seen, and in
-        every privacy mode: the projection also takes it, but only while
-        semantic writes are allowed, and a row written into the file by hand
-        in the meantime must not be taken for one recorded before sessions
-        were named. Best-effort: projection refuses every row until it is in
-        place.
-        """
-        take = getattr(storage, "take_strategy_ledger_row_inventory", None)
-        if take is None:
-            return
-        try:
-            await take(snapshot)
-        except Exception as e:  # noqa: BLE001 - projection retries and refuses
-            if is_execution_control_error(e):
-                raise
-            logger.warning(
-                "strategy ledger row inventory not taken: %s",
-                exception_log_summary(e),
-            )
-
     async def _recording_session_id(self) -> Optional[str]:
         """The session this turn's conversation rows are filed under, or None.
 
-        Recorded on a row as it is written (#3875), so the row's semantic
-        source names the session it came from even when a later turn, in
-        another session or in none, is the one that projects it. Read through
-        the turn lifecycle, never from tool arguments, and resolved by the
-        privacy wrapper that files the turn's rows. A storage without that
+        Attested for a row as it is written (#3875, #3990), so the row's
+        semantic source names the session it came from even when a later turn,
+        in another session or in none, is the one that projects it. Read
+        through the turn lifecycle, never from tool arguments, and resolved by
+        the privacy wrapper that files the turn's rows. A storage without that
         resolver also has no assertion producer, so nothing projects the row
-        through it; the turn's key is recorded as given.
+        through it; the turn's key is attested as given.
         """
         session_id = self._turn_session_id()
         if session_id is None:
@@ -877,120 +853,74 @@ class StrategicMemoryFeature(Feature):
             return session_id
         return await filed_session_id(session_id)
 
-    async def _reserve_row(
-        self,
-        reserve,
-        section_key: str,
-        session_id: Optional[str],
-        mint_id: Callable[[StrategyLedger, set], str],
-        seen: set,
-    ):
-        """Reserve a new row's address and session where the agent cannot write (#3990).
-
-        Returns ``(reservation, None)``, or ``(None, why)`` when nothing could
-        be reserved. The address avoids every id the ledger holds, every one
-        the file was seen to hold (``seen``) and every one already recorded,
-        so one writer's stale view of the file never takes another's address.
-        """
-        try:
-            reservation = await reserve(
-                section_key=section_key,
-                session_id=session_id,
-                mint=lambda recorded: mint_id(self._ledger, set(recorded) | seen),
-            )
-        except Exception as exc:  # noqa: BLE001 - reported as the row's refusal
-            if is_execution_control_error(exc):
-                raise
-            logger.warning(
-                "strategy ledger: a new %s row could not be reserved: %s",
-                section_key,
-                exception_log_summary(exc),
-            )
-            return None, (
-                "The agent's database could not reserve this row and record "
-                f"the session it is recorded in ({type(exc).__name__})."
-            )
-        return reservation, None
-
-    async def _release_row(self, release, reservation) -> None:
-        """Remove the reservation of a row that was not written."""
-        try:
-            await release(reservation)
-        except Exception as exc:  # noqa: BLE001 - a stale record only refuses
-            if is_execution_control_error(exc):
-                raise
-            # Left in place it vouches for whichever row a hand edit puts at
-            # this address; a row whose own session differs is then refused,
-            # never misnamed.
-            logger.warning(
-                "strategy ledger row %s: the reservation of a row that was not "
-                "written could not be removed: %s",
-                reservation.row_id,
-                exception_log_summary(exc),
-            )
-
-    async def _commit_recorded_row(
+    async def _commit_attested_row(
         self,
         section_key: str,
         session_id: Optional[str],
-        mint_id: Callable[[StrategyLedger, set], str],
-        change: Callable[[StrategyLedger, Optional[str]], Any],
+        change: Callable[[StrategyLedger], Dict[str, Any]],
     ) -> Tuple[Optional[LedgerCommit], Optional[str]]:
-        """Commit one new row whose address and session were recorded first (#3990).
+        """Commit ``change``, which adds one row, once that row is attested (#3990).
 
-        ``STRATEGY_LEDGER.yaml`` is in the agent's own data directory, so the
-        session a row names there is checked against a record in the agent's
-        database, and a row with no record is never projected. The record is
-        therefore made before the row reaches the file, under exactly the id
-        it is written with: ``mint_id(ledger, taken)`` names the id, and
-        ``change(ledger, row_id)`` writes the row under it.
+        ``STRATEGY_LEDGER.yaml`` is in the agent's own data directory, so
+        nothing in it says which session a row was recorded in. Host code
+        attests the row's exact content with ``session_id`` in the agent's
+        database instead, and the row reaches the file only after that
+        attestation is written: the commit writes only a row whose content
+        digest this call attested. A file edited since it was read is re-read
+        (#3636), and the row the change then adds may differ, notably in its
+        id; that row is attested in turn, up to ``ROW_ATTESTATION_ATTEMPTS``
+        times. An attestation for a row that is never written matches nothing.
 
-        A file edited since it was read is re-read (#3636). If the edit put a
-        row at the reserved address, nothing is written: the reservation is
-        released and another address reserved, up to
-        ``ROW_RESERVATION_ATTEMPTS`` times. A commit refused for any other
-        reason releases its reservation too. Only a reservation this call made
-        is ever released.
-
-        Returns ``(None, why)`` when no address could be reserved and nothing
-        was written, else the commit and ``None``. A storage without the
-        recorder has no assertion producer either, so its rows are written
-        with no record and nothing projects them.
+        Returns ``(None, why)``, having written nothing, when the attestation
+        could not be written or the file kept changing under it; else the
+        commit and ``None``. The row is never written unattested in its place.
+        A storage without the record has no assertion producer either, so its
+        rows are written unattested and nothing projects them.
         """
         storage = getattr(self.agent, "storage", None)
-        reserve = getattr(storage, "reserve_strategy_ledger_row", None)
-        release = getattr(storage, "release_strategy_ledger_row", None)
-        if reserve is None or release is None:
-            return self._ledger.commit(lambda ledger: change(ledger, None)), None
-        seen: set = set()
-        commit: Optional[LedgerCommit] = None
-        for _ in range(ROW_RESERVATION_ATTEMPTS):
-            reservation, why = await self._reserve_row(
-                reserve, section_key, session_id, mint_id, seen
-            )
-            if reservation is None:
-                return None, why
-            taken: List[str] = []
+        attest = getattr(storage, "attest_strategy_ledger_row", None)
+        if attest is None:
+            return self._ledger.commit(change), None
+        attested: set = set()
 
-            def apply(ledger: StrategyLedger, row_id: str = reservation.row_id):
-                seen.update(ledger.section_row_ids(section_key))
-                try:
-                    return change(ledger, row_id)
-                except LedgerRowIdTaken:
-                    taken.append(row_id)
+        def admit(row: Dict[str, Any]) -> bool:
+            return attestation_digest(section_key, row) in attested
+
+        commit = self._ledger.commit(change, admit=admit)
+        for _ in range(ROW_ATTESTATION_ATTEMPTS):
+            if not commit.unadmitted:
+                return commit, None
+            digest = attestation_digest(section_key, commit.value)
+            try:
+                await attest(
+                    section_key=section_key,
+                    content_digest=digest,
+                    session_id=session_id,
+                )
+            except Exception as exc:  # noqa: BLE001 - refused, never unattested
+                if is_execution_control_error(exc):
                     raise
-
-            commit = self._ledger.commit(apply)
-            if not commit.refused:
-                return commit, None
-            await self._release_row(release, reservation)
-            if not taken:
-                return commit, None
+                logger.warning(
+                    "strategy ledger: a new %s row could not be attested: %s",
+                    section_key,
+                    exception_log_summary(exc),
+                )
+                return None, (
+                    "The agent's database could not attest the session this "
+                    f"row is recorded in ({type(exc).__name__})."
+                )
+            attested.add(digest)
+            commit = self._ledger.commit(change, admit=admit)
+        if commit.unadmitted:
+            return None, (
+                f"{LEDGER_FILENAME} kept changing on disk while the new row was "
+                "attested."
+            )
         return commit, None
 
     @staticmethod
-    def _unreserved_row_result(why: Optional[str]) -> ToolResult:
-        """The refusal for a row whose address and session could not be recorded."""
+    def _unattested_row_result(why: Optional[str]) -> ToolResult:
+        """The refusal for a row that was not written because it was not attested."""
         return ToolResult.failed(
             f"{why} Nothing was recorded.",
             data={"recorded": False, "persisted": False},
@@ -1472,25 +1402,20 @@ class StrategicMemoryFeature(Feature):
                     repo_error, data={"recorded": False, "issue": issue}
                 )
             session_id = await self._recording_session_id()
-            commit, unreserved = await self._commit_recorded_row(
+            commit, unattested = await self._commit_attested_row(
                 BLOCKERS_KEY,
                 session_id,
-                lambda ledger, taken: ledger.next_blocker_id(
-                    issue, title, also_taken=taken
-                ),
-                lambda ledger, row_id: ledger.add_blocker(
+                lambda ledger: ledger.add_blocker(
                     issue=issue,
                     title=title,
                     severity=severity,
                     owner=owner,
                     notes=notes,
                     repo=resolved_repo,
-                    session_id=session_id,
-                    row_id=row_id,
                 ),
             )
             if commit is None:
-                return self._unreserved_row_result(unreserved)
+                return self._unattested_row_result(unattested)
             entry = commit.value
             result, snapshot = self._persisted_ledger_result(
                 commit,
@@ -1530,22 +1455,17 @@ class StrategicMemoryFeature(Feature):
                 # exists nowhere on disk and vanishes on restart.
                 return self._ledger_unreadable_result({"recorded": False})
             session_id = await self._recording_session_id()
-            commit, unreserved = await self._commit_recorded_row(
+            commit, unattested = await self._commit_attested_row(
                 PATTERNS_KEY,
                 session_id,
-                lambda ledger, taken: ledger.next_pattern_id(
-                    pattern, also_taken=taken
-                ),
-                lambda ledger, row_id: ledger.add_pattern(
+                lambda ledger: ledger.add_pattern(
                     pattern=pattern,
                     source=source,
                     implication=implication,
-                    session_id=session_id,
-                    row_id=row_id,
                 ),
             )
             if commit is None:
-                return self._unreserved_row_result(unreserved)
+                return self._unattested_row_result(unattested)
             entry = commit.value
             result, snapshot = self._persisted_ledger_result(
                 commit,

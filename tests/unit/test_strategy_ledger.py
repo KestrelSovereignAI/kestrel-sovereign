@@ -20,7 +20,6 @@ decisions.
 
 import copy
 from unittest.mock import AsyncMock, MagicMock, patch
-from tests.utils.ledger_storage import without_ledger_row_record
 
 import pytest
 import yaml as _yaml
@@ -46,6 +45,7 @@ from kestrel_sovereign.features.strategic_memory.ledger_index import (
     project_ledger,
     search_rows,
 )
+from tests.utils.ledger_storage import without_row_attestations
 
 
 AGENT = "did:test:ledger"
@@ -143,7 +143,7 @@ async def _feature(tmp_path, *, graph=None, strategy=None):
     agent = MagicMock()
     agent.agent_id = AGENT
     agent.agent_data_dir = str(tmp_path)
-    agent.storage = without_ledger_row_record(MagicMock())
+    agent.storage = without_row_attestations(MagicMock())
     agent.storage.graph = graph if graph is not None else _FakeGraph()
     if strategy is not None:
         (tmp_path / "STRATEGY.yaml").write_text(
@@ -291,7 +291,7 @@ class TestTheLedgerIsNotABootstrapFile:
         agent = MagicMock()
         agent.agent_id = AGENT
         agent.agent_data_dir = str(tmp_path)
-        agent.storage = without_ledger_row_record(MagicMock())
+        agent.storage = without_row_attestations(MagicMock())
         agent.storage.graph = _FakeGraph()
         (tmp_path / "STRATEGY.yaml").write_text(
             _yaml.dump({"version": 1, PATTERNS_KEY: [{"pattern": "keep me"}]}),
@@ -2277,7 +2277,7 @@ class TestTheDefaultTemplateIsNotSharedBetweenAgents:
         agent.agent_id = f"did:test:{name}"
         agent.agent_data_dir = str(tmp_path / name)
         (tmp_path / name).mkdir(parents=True, exist_ok=True)
-        agent.storage = without_ledger_row_record(MagicMock())
+        agent.storage = without_row_attestations(MagicMock())
         agent.storage.graph = _FakeGraph()
         feature = StrategicMemoryFeature(agent)
         await feature.initialize()

@@ -30,7 +30,7 @@ from kestrel_sovereign.features.strategic_memory.ledger import (
     PATTERNS_KEY,
     StrategyLedger,
 )
-from tests.utils.ledger_storage import without_ledger_row_record
+from tests.utils.ledger_storage import without_row_attestations
 
 
 def _make_feature(
@@ -42,7 +42,7 @@ def _make_feature(
 ) -> StrategicMemoryFeature:
     if agent is None:
         agent = MagicMock()
-        without_ledger_row_record(agent.storage)
+        without_row_attestations(agent.storage)
     feat = StrategicMemoryFeature(agent=agent)
     feat._data = data if data is not None else {}
     # A strategy path IS configured; ``_save`` is stubbed to report a

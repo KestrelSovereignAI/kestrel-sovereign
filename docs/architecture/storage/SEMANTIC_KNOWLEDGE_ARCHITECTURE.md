@@ -671,63 +671,44 @@ the producer canonicalizes it as the conversation store does before filing a
 row, so the source names the key the turn's rows are filed under; a trimmed
 copy would name a session no row belongs to and slip past its exclusion. Work outside a
 turn, and a turn with no session, names none: the store then derives each row's
-session as it writes it, so no single session is the turn's. A strategy-ledger
-row records that session in its `session_id` field when the row is written,
-and projection names the row's recorded session, never the projecting turn's:
-projection is best-effort, so a row whose first projection failed is projected
-by whichever turn reindexes next, in another session or in none. A row with no
-recorded session, including every row written before #3875, names none.
+session as it writes it, so no single session is the turn's.
 
-That field is only a hint (#3990). `STRATEGY_LEDGER.yaml` is in the agent's own
-data directory, so an agent that can write the file can edit or remove the
-field, or change the row's `id`, before a row is projected. The agent's
-database, which only host code writes, therefore holds the record that decides
-(`kestrel_sovereign.storage.ledger_row_sessions`):
-
-- **Reservation before the write.** Before the tool writes a row, it reserves
-  the row's address and session in `strategy_ledger_row_sessions`, and the row
-  is written under exactly that address. A reservation never replaces a record,
-  so a writer whose copy of the file is stale cannot take or rebind another
-  writer's row. If an edit has meanwhile put a row at the reserved address, the
-  reservation is released and the next address reserved; only the attempt that
-  made a reservation can release it. If no address can be reserved, the row is
-  not written, whether or not it has a session.
-- **Inventory of the rows from before.** The first time the agent's database
-  sees a confirmed ledger file, it records every row already there whose field
-  names no session as written in no session
-  (`strategy_ledger_row_inventories`). This is taken in every privacy mode. A
-  row whose field names a session is left out: it was recorded after #3875, and
-  nothing the agent cannot write vouches for it.
-- **Verification.** Projection names a session only when the record and the
-  field agree. A row whose field disagrees with its record, or that has no
-  record at all, is refused: it is not projected, and never written under
-  another session or under none. A row with no record is one written into the
-  file after the inventory by something other than the tool, or one whose `id`
-  was changed; an unfamiliar `id` never passes for a row from before sessions
-  were named. If the inventory cannot be taken or the record cannot be read,
-  the pass projects nothing. An already-projected row whose text is unchanged
-  keeps the source it was first written with.
-- **Corpus refusal.** Each pass records the rows it refused in
-  `strategy_ledger_row_refusals`, and `governed_assertion_corpus_snapshot` and
-  `governed_assertion_corpus_changes_since` raise `GovernedCorpusUnavailable`
-  (`strategy_ledger_row_provenance_unverified`) while any remain. A later pass
-  resolves a refusal once the row's field agrees with its record again or the
-  row is gone from the file. A row written into the file by hand after the
-  inventory (including rows absorbed from an old `STRATEGY.yaml`, or an id-less
-  row given an id at load) stays refused until it is removed; to keep its
-  content, record it through `strategy_add_pattern` or `strategy_add_blocker`.
-
-Rows already in the file when the inventory is taken are trusted as they stand
-then: an edit made before that moment cannot be told apart.
-
-A session key that a locator cannot carry, such as one containing a control
-character, is refused rather than dropped: `save_fact` writes nothing, and the
-ledger row's assertion fails to project while the rest of the pass proceeds.
-Any producer that reads a saved item must name it as `saved-item:<id>` the
-same way. The explicit-fact replay fingerprint ignores session segments, as it
-ignores delivery time, so a retry filed under another session, or of an
-operation recorded before sources named one, still replays idempotently.
-Assertions recorded before #3875 name no session and can be held out only by
+`STRATEGY_LEDGER.yaml` is in the agent's own data directory, so nothing in it,
+neither a field naming a session nor a row's `id`, is provenance (#3990).
+Before a strategy-ledger tool writes a row, host code attests the row's exact
+content, as its section and content digest, with that session (or none) in the
+append-only `strategy_ledger_row_attestations` table; the ledger commit writes
+only a row whose digest the call attested, re-attesting when a file edited
+since it was read gives the row another id. An attestation is never replaced or
+removed, one digest may carry several sessions, and one whose row was never
+written matches nothing. A failed attestation refuses the write. Projection
+names every session attested for the row's current digest, never the
+projecting turn's: projection is best-effort, so a row whose first projection
+failed is projected by whichever turn reindexes next, in another session or in
+none. A row whose digest nothing attested (written before attestations
+existed, or edited by hand in its id or text) is marked
+`unattested-session:<digest>`. A corpus with session exclusions decides a
+ledger-derived revision from the attestations as they are when it is built
+(`assertion_session_attestations`), not from its stored locator alone: one
+attested in an excluded session is `explicitly_excluded`, and one with no
+attestation, or a source marked unattested, is `session_unattested`. A policy
+without session exclusions is unaffected. Attestations grow without any
+assertion change: identical content recorded again in another session attests
+that session for the same revision, and the change stream is empty. So an
+incremental read also governs again each example of its base snapshot that the
+stream left alone and that is still current, against the attestations as they
+stand. One now held out on its session, and any inference built on it, comes
+back as a tombstone with operation `session_attestation` and that reason, on
+every read against that base. Material newly attested only in admitted
+sessions is not added incrementally; a fresh snapshot admits it. A session key
+that a locator cannot carry, such as one containing a control character, is
+refused rather than dropped: `save_fact` writes nothing, and the ledger row's
+assertion fails to project while the rest of the pass proceeds. Any producer that reads a saved
+item must name it as `saved-item:<id>` the same way. The explicit-fact replay
+fingerprint ignores session and unattested segments, as it ignores delivery
+time, so a retry filed under another session, or of an operation recorded
+before sources named one, still replays idempotently. `save_fact` assertions
+recorded before #3875 name no session and can be held out only by
 source-occurrence id.
 
 The host admits only current,

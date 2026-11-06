@@ -226,63 +226,28 @@ _WAIT_SIGNAL_REKEYS_INDEX = (
     "agent_id, kind, handle",
 )
 
-#: The #3990 record of each strategy-ledger row's session, as host code recorded
-#: it. ``STRATEGY_LEDGER.yaml`` lives in the agent's own data directory and
-#: names the same session in each row's ``session_id`` field, but an agent that
-#: can write that file can rewrite the field or the row's ``id``, so projection
-#: verifies each row against these tables and never trusts the file alone. See
-#: ``kestrel_sovereign.storage.ledger_row_sessions``:
-#:
-#: * ``strategy_ledger_row_sessions`` -- one row per ``(agent_id, section,
-#:   row_id)`` address; a NULL ``session_id`` is a row recorded in no session,
-#:   and ``attempt_id`` names the reservation that owns it.
-#: * ``strategy_ledger_row_inventories`` -- whether the rows already in the
-#:   ledger when the record began have been recorded, per agent.
-#: * ``strategy_ledger_row_refusals`` -- the rows the last projection could not
-#:   verify; the governed corpus build refuses while any remain.
+#: ``strategy_ledger_row_attestations`` -- append-only record of the session
+#: each strategy-ledger row's content was recorded in, as host code attested it
+#: before the row reached ``STRATEGY_LEDGER.yaml`` (#3990). The file is in the
+#: agent's own data directory, so this table, which only host code writes, is
+#: where a row's session comes from; see
+#: ``kestrel_sovereign.storage.ledger_row_attestations``. An empty
+#: ``session_id`` is a turn with no session. The primary key is the only index
+#: it needs: every read is one agent's rows.
 #:
 #: Kept out of ``CORE_SCHEMA`` for the reason given above
-#: ``_MODEL_USAGE_PERIODS_DDL``: ``_ensure_strategy_ledger_row_sessions``
-#: creates them through probe -> migration lock -> re-probe. Each primary key
-#: is the only index it needs, since every read is one agent's rows.
-_STRATEGY_LEDGER_ROW_SESSION_TABLES = (
-    (
-        "strategy_ledger_row_sessions",
-        """
-CREATE TABLE IF NOT EXISTS strategy_ledger_row_sessions (
+#: ``_MODEL_USAGE_PERIODS_DDL``: ``_ensure_strategy_ledger_row_attestations``
+#: creates it through probe -> migration lock -> re-probe.
+_STRATEGY_LEDGER_ROW_ATTESTATIONS_DDL = """
+CREATE TABLE IF NOT EXISTS strategy_ledger_row_attestations (
     agent_id TEXT NOT NULL,
     section TEXT NOT NULL,
-    row_id TEXT NOT NULL,
-    session_id TEXT,
-    attempt_id TEXT NOT NULL,
-    recorded_at TEXT NOT NULL,
-    PRIMARY KEY (agent_id, section, row_id)
+    content_digest TEXT NOT NULL,
+    session_id TEXT NOT NULL,
+    attested_at TEXT NOT NULL,
+    PRIMARY KEY (agent_id, section, content_digest, session_id)
 )
-""",
-    ),
-    (
-        "strategy_ledger_row_inventories",
-        """
-CREATE TABLE IF NOT EXISTS strategy_ledger_row_inventories (
-    agent_id TEXT NOT NULL PRIMARY KEY,
-    taken_at TEXT NOT NULL
-)
-""",
-    ),
-    (
-        "strategy_ledger_row_refusals",
-        """
-CREATE TABLE IF NOT EXISTS strategy_ledger_row_refusals (
-    agent_id TEXT NOT NULL,
-    section TEXT NOT NULL,
-    row_id TEXT NOT NULL,
-    reason TEXT NOT NULL,
-    detected_at TEXT NOT NULL,
-    PRIMARY KEY (agent_id, section, row_id)
-)
-""",
-    ),
-)
+"""
 
 #: ``(name, table, columns)`` of the index that makes the #2959 staleness probe
 #: the "one indexed ``max(id)`` lookup" it is described as.
@@ -1706,7 +1671,7 @@ class AsyncDatabase:
             },
         )
         await self._ensure_wait_signal_rekeys()
-        await self._ensure_strategy_ledger_row_sessions()
+        await self._ensure_strategy_ledger_row_attestations()
         # Both indexes go through ``ensure_index`` rather than a bare
         # ``CREATE INDEX IF NOT EXISTS``: that spelling is idempotent in
         # sequence but not safe in parallel, and ``_init_schema`` runs on every
@@ -2515,24 +2480,24 @@ class AsyncDatabase:
             )
         await self.ensure_index(*_WAIT_SIGNAL_REKEYS_INDEX)
 
-    async def _ensure_strategy_ledger_row_sessions(self) -> None:
-        """Create the #3990 ledger-row session tables safely under concurrent boot.
+    async def _ensure_strategy_ledger_row_attestations(self) -> None:
+        """Create the #3990 ledger-row attestation table safely under concurrent boot.
 
         New in an upgrade, so the first post-upgrade PostgreSQL boot races
         exactly as ``_ensure_wait_signal_rekeys`` describes. Same probe ->
-        migration lock -> re-probe, per table.
+        migration lock -> re-probe.
         """
-        for table, ddl in _STRATEGY_LEDGER_ROW_SESSION_TABLES:
-            if not await self.table_exists(table):
-                async with self.migration_lock(f"create_{table}"):
-                    if not await self.table_exists(table):
-                        await self.execute(ddl)
+        table = "strategy_ledger_row_attestations"
+        if not await self.table_exists(table):
+            async with self.migration_lock(f"create_{table}"):
+                if not await self.table_exists(table):
+                    await self.execute(_STRATEGY_LEDGER_ROW_ATTESTATIONS_DDL)
 
-            if not await self.table_exists(table):
-                raise RuntimeError(
-                    f"{table} was not created; a strategy-ledger row's session "
-                    "cannot be verified against host-owned state"
-                )
+        if not await self.table_exists(table):
+            raise RuntimeError(
+                f"{table} was not created; a strategy-ledger row's session "
+                "cannot be attested where the agent cannot write"
+            )
 
     async def ensure_index(
         self, name: str, table: str, columns: str, *, lock_name: str = "",
