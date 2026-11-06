@@ -406,6 +406,8 @@ class HooksManager:
         # next hook's input but dropped from the returned output (#2033).
         accumulated_updated_input: Optional[Dict[str, Any]] = None
 
+        from .decision_gate import evaluate_blocking_decision
+
         for hook in matching_hooks:
             try:
                 # Hooks that block on human input (approvals, prompts)
@@ -439,11 +441,9 @@ class HooksManager:
                         f"Hook '{hook.name}' advisory [{sev}]: {output.warning_message}"
                     )
 
-                # DENY or ASK stops the chain (attach accumulated warnings)
-                if output.permission_decision in (
-                    PermissionDecision.DENY,
-                    PermissionDecision.ASK
-                ):
+                # Preserve every shared blocking decision, including an
+                # explicit stop without a separate permission decision.
+                if evaluate_blocking_decision(output) is not None:
                     if accumulated_warnings:
                         output.warning_message = " | ".join(accumulated_warnings)
                         output.warning_severity = max_warning_severity
