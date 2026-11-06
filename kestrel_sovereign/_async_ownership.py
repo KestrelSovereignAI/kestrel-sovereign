@@ -1082,7 +1082,7 @@ async def await_owned_task(
 
     The completion waiter carries only a successful result, never the owned
     task's exception. The owned result is retrieved exactly once after
-    terminalization, avoiding orphaned-task and shield-future warnings.
+    terminalization, avoiding orphaned-task and observer-future warnings.
 
     The waiter is a plain future rather than a task: event-loop teardown
     cancels every task. Only the original task completing resolves this
@@ -1094,7 +1094,7 @@ async def await_owned_task(
 
     ``cancel_on_caller_cancellation`` forwards the first caller cancellation
     once to an operation that needs it to begin unwinding. Subsequent caller
-    cancellations remain shielded until that same owner physically settles.
+    cancellations cannot reach the original task while that owner settles.
     True uses the task's native cancel method. A synchronous callable instead
     routes that first request through the original lifecycle owner's delivery
     policy. A failed forwarder cannot abandon the operation: its error is
@@ -1102,8 +1102,8 @@ async def await_owned_task(
 
     A borrowed observer can set ``defer_cancellation=False``: it neither
     cancels nor adopts the original Task, and actual caller withdrawal escapes
-    immediately. The successful completion signal still avoids shield's
-    synthetic cancellation when the original Task itself was cancelled.
+    immediately. Cancellation of the original Task is retrieved from that
+    Task, rather than from the observer's completion signal.
     """
     if not defer_cancellation and (cancel_on_caller_cancellation or pending_cancellation is not None):
         raise ValueError("borrowed observation cannot forward or own pending cancellation")
@@ -1136,7 +1136,7 @@ async def await_owned_task(
                 elif not defer_cancellation:
                     # This Future belongs only to the borrowed observer. Its
                     # cancellation cannot reach the producer, and an extra
-                    # shield would delay terminal readers behind close return.
+                    # observation waiter would delay terminal readers behind close return.
                     await completion
                 else:
                     await asyncio.wait((completion,))

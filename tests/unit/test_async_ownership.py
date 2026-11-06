@@ -179,7 +179,9 @@ async def test_borrowed_callback_removal_failure_cannot_demote_caller_cancellati
 @pytest.mark.asyncio
 @pytest.mark.parametrize("allocation", ["completion", "observation"])
 async def test_completion_allocation_refusal_cannot_abandon_original(monkeypatch, allocation):
-    release, refused = asyncio.Event(), asyncio.Event()
+    from tests.shared.owned_task_observation import refuse_owned_observation_allocation
+
+    release = asyncio.Event()
     failure = RuntimeError("controlled original completion allocation refusal")
 
     async def original():
@@ -187,24 +189,8 @@ async def test_completion_allocation_refusal_cannot_abandon_original(monkeypatch
         return "original result"
 
     source = create_owned_task(original(), retain_originals=True)
-    loop = asyncio.get_running_loop()
-    allocate = loop.create_future
-
-    def controlled_allocation():
-        frame = sys._getframe(1)
-        caller = frame.f_code.co_name
-        if allocation == "observation":
-            while frame is not None and frame.f_code.co_name != "await_owned_task":
-                frame = frame.f_back
-        if (not refused.is_set() and frame is not None
-                and frame.f_code.co_name == "await_owned_task"
-                and frame.f_locals.get("task") is source
-                and caller == ("await_owned_task" if allocation == "completion" else "_wait")):
-            refused.set()
-            raise failure
-        return allocate()
-
-    monkeypatch.setattr(loop, "create_future", controlled_allocation)
+    refused = refuse_owned_observation_allocation(monkeypatch, lambda: source,
+        allocation=allocation, error=failure)
     observer = asyncio.create_task(await_owned_task(source))
     try:
         await asyncio.wait_for(refused.wait(), 2)
