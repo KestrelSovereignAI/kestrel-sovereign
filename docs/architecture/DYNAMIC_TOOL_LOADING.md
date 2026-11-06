@@ -402,6 +402,16 @@ The projections never raise: one tool's schema must not fail every turn it is of
 
 Regression coverage: `tests.unit.test_isolated_tool_schema_exposure` and `tests.unit.test_tool_schema_provider_dialects`.
 
+### A subagent's own calls in the dispatch log (#3778)
+
+**Risk**: `a2a_tool_dispatches`, which `kestrel tool-dispatches` reads, recorded a feature dispatcher call only as its envelope. The calls the feature's subagent made inside it reached `security_audit_log` and nowhere else, so an irreversible call made through a subagent (a `talon_claim`, the `talon_cancel` that stopped it) could not be found where operators look for what an agent called.
+
+**Mitigation**: `Feature._execute_subagent_tool`, the one path both of a subagent's doors (its own tool loop and the inline executor the codex app-server calls) run a tool through, writes a row for every call, whatever its outcome: run, raised, refused by `PRE_TOOL_USE` (`policy_denied`, `PermissionDenied` or `ApprovalRequired`), refused before it ran (`ToolArgumentError`, `ToolArgumentRewriteError`), or not in the subagent's palette (`UnknownToolError`). Its `adapter` is `subagent:<Feature>.<tool>`, and it is written after `POST_TOOL_USE`, as the chat loop writes its own.
+
+Every row has a `dispatch_id`. Each positioned dispatch's `ToolCallContext` carries a durable `ledger_id`, and the envelope row is written with it: by the chat loop, and from the codex adapter's executed-call entry when the envelope ran inline (the executor returns an `InlineToolOutcome`, still the `(effective_args, result)` pair, naming it). A subagent reads the id of the dispatch it runs inside once, when it starts, and each of its rows records it as `parent_dispatch_id`. A subagent run outside any dispatch, such as an A2A skill, records none. "Who cancelled this job?" is then one query: find the `talon_cancel` row, and the row whose `dispatch_id` is its `parent_dispatch_id` is the envelope, with the task the agent gave it.
+
+Regression coverage: `tests.unit.test_subagent_tool_dispatch_ledger`.
+
 ### Session persistence
 
 **Risk**: If explored tools persist across sessions, the tool list could be stale after feature code changes or restarts.

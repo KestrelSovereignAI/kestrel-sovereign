@@ -35,6 +35,7 @@ import hashlib
 import itertools
 import json
 import re
+import uuid
 from collections import OrderedDict
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -219,12 +220,16 @@ class ToolCallContext:
     against. ``turn_id`` and ``call_index`` are ``None`` outside a turn.
 
     ``dispatch_id`` is unique to this dispatch, including a nested one that
-    shares its enclosing call's ``call_index``."""
+    shares its enclosing call's ``call_index``. It counts within one process;
+    ``ledger_id`` is the durable name the dispatch is recorded under in
+    ``a2a_tool_dispatches``, so a row written inside it can name it as its
+    parent (#3778)."""
 
     turn_id: Optional[str]
     call_index: Optional[int]
     known_tools: Collection[str]
     dispatch_id: int = field(default_factory=lambda: next(_DISPATCH_IDS))
+    ledger_id: str = field(default_factory=lambda: uuid.uuid4().hex)
 
 
 @dataclass(frozen=True)
@@ -415,6 +420,17 @@ def enclosing_tool_call(agent: Any) -> Optional[ToolCallContext]:
     if marker is None or not marker.open or marker.agent is not agent:
         return None
     return marker.context
+
+
+def enclosing_dispatch_ledger_id(agent: Any) -> Optional[str]:
+    """The ``a2a_tool_dispatches`` id of the call the calling task runs inside.
+
+    ``None`` outside a counted call of ``agent``. A feature subagent reads it
+    when it starts, and its own tool calls record it as their
+    ``parent_dispatch_id`` (#3778).
+    """
+    context = enclosing_tool_call(agent)
+    return None if context is None else context.ledger_id
 
 
 def begin_tool_call(agent: Any, known_tools: Collection[str]) -> ToolCallContext:

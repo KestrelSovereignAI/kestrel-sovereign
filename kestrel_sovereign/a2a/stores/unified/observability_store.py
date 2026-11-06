@@ -166,7 +166,14 @@ class LLMCallEvent(BaseModel):
 
 @dataclass(frozen=True)
 class ToolDispatchEntry:
-    """Structured row for a model-requested tool/subagent dispatch."""
+    """Structured row for a model-requested tool/subagent dispatch.
+
+    ``dispatch_id`` names the row; the writer assigns a fresh one when the
+    caller has none. ``parent_dispatch_id`` is the ``dispatch_id`` of the
+    dispatch this call ran inside: a feature subagent's own tool calls name
+    the envelope that delegated to it (#3778), so "what did this agent call?"
+    includes what it called through a subagent.
+    """
 
     agent_did: str
     session_id: Optional[str]
@@ -179,6 +186,8 @@ class ToolDispatchEntry:
     error_message: Optional[str]
     latency_ms: int
     result_size_bytes: Optional[int]
+    dispatch_id: Optional[str] = None
+    parent_dispatch_id: Optional[str] = None
 
 
 ToolCallLogEntry = ToolDispatchEntry
@@ -415,12 +424,26 @@ class ObservabilityStore(UnifiedStoreBase):
                 error_class TEXT,
                 error_message TEXT,
                 latency_ms INTEGER NOT NULL,
-                result_size_bytes INTEGER
+                result_size_bytes INTEGER,
+                dispatch_id TEXT,
+                parent_dispatch_id TEXT
             )
         """)
+        await self.add_column_if_missing("a2a_tool_dispatches", "dispatch_id", "TEXT")
+        await self.add_column_if_missing(
+            "a2a_tool_dispatches", "parent_dispatch_id", "TEXT"
+        )
         await self._backend.execute(
             "CREATE INDEX IF NOT EXISTS idx_tool_dispatches_agent_turn "
             "ON a2a_tool_dispatches(agent_did, turn_id, id)"
+        )
+        await self._backend.execute(
+            "CREATE INDEX IF NOT EXISTS idx_tool_dispatches_dispatch "
+            "ON a2a_tool_dispatches(agent_did, dispatch_id)"
+        )
+        await self._backend.execute(
+            "CREATE INDEX IF NOT EXISTS idx_tool_dispatches_parent "
+            "ON a2a_tool_dispatches(agent_did, parent_dispatch_id)"
         )
         await self._backend.execute(
             "CREATE INDEX IF NOT EXISTS idx_tool_dispatches_agent_ts "
@@ -444,9 +467,10 @@ class ObservabilityStore(UnifiedStoreBase):
                 INSERT INTO a2a_tool_dispatches (
                     agent_did, session_id, turn_id, ts, tool_name, adapter,
                     args_redacted, result_status, error_class, error_message,
-                    latency_ms, result_size_bytes
+                    latency_ms, result_size_bytes, dispatch_id,
+                    parent_dispatch_id
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     entry.agent_did,
@@ -466,6 +490,8 @@ class ObservabilityStore(UnifiedStoreBase):
                     ),
                     int(entry.latency_ms),
                     entry.result_size_bytes,
+                    entry.dispatch_id or generate_id(),
+                    entry.parent_dispatch_id,
                 ),
             )
         except Exception as exc:
@@ -560,7 +586,7 @@ class ObservabilityStore(UnifiedStoreBase):
             SELECT
                 id, agent_did, session_id, turn_id, ts, tool_name, adapter,
                 args_redacted, result_status, error_class, error_message,
-                latency_ms, result_size_bytes
+                latency_ms, result_size_bytes, dispatch_id, parent_dispatch_id
             FROM a2a_tool_dispatches
             WHERE agent_did = ? AND result_status != 'success'
             ORDER BY id DESC
@@ -583,6 +609,8 @@ class ObservabilityStore(UnifiedStoreBase):
                 "error_message": row[10],
                 "latency_ms": row[11],
                 "result_size_bytes": row[12],
+                "dispatch_id": row[13],
+                "parent_dispatch_id": row[14],
             }
             for row in rows
         ]

@@ -1091,6 +1091,26 @@ async def test_route_without_a_chat_turn_publishes_headless(route):
     assert route.tool.publication_contexts == [None]
 
 
+async def test_route_records_a_subagent_call_under_its_envelope(route):
+    """#3778: the deferred call's row names the dispatch that delegated to the
+    subagent. An A2A skill runs under no dispatch, so its row names none."""
+    route.policy.release.set()
+    await route.invoke()
+    [(parent_dispatch_id,)] = await route.backend.fetch_all(
+        "SELECT parent_dispatch_id FROM a2a_tool_dispatches WHERE tool_name = ?",
+        (DeferredTool.name,),
+    )
+    if route.kind == "a2a":
+        assert parent_dispatch_id is None
+        return
+    [(envelope_dispatch_id,)] = await route.backend.fetch_all(
+        "SELECT dispatch_id FROM a2a_tool_dispatches WHERE tool_name = ?",
+        (route.feature.tool_name,),
+    )
+    assert envelope_dispatch_id
+    assert parent_dispatch_id == envelope_dispatch_id
+
+
 @pytest.mark.parametrize("decision", ["deny", "ask", "stop"])
 async def test_route_post_policy_decision_withholds_without_replaying(route, decision):
     route.policy.output = {
@@ -1122,7 +1142,18 @@ async def test_route_cancellation_while_post_policy_is_pending_never_publishes(r
             await asyncio.gather(call, return_exceptions=True)
         assert "private_view" not in [part["type"] for part in drain_parts()]
     assert route.tool.executions == [{}] and not route.tool.publications
-    assert await route.deferred_dispatch_rows() == []
+    if route.kind == "a2a":
+        assert await route.deferred_dispatch_rows() == []
+    else:
+        # The tool ran, so a subagent's call is recorded as interrupted
+        # rather than erased by the cancellation (#3778). Its UI still never
+        # publishes.
+        assert await route.deferred_dispatch_rows() == [(route.adapter, "error", SESSION)]
+        [(error_class,)] = await route.backend.fetch_all(
+            "SELECT error_class FROM a2a_tool_dispatches WHERE tool_name = ?",
+            (DeferredTool.name,),
+        )
+        assert error_class == "CancelledError"
 
 
 async def test_route_publication_waits_for_its_required_dispatch_row(route, monkeypatch):

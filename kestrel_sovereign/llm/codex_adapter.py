@@ -77,7 +77,13 @@ from kestrel_sovereign.execution_custody import (
     owned_execution_stream,
 )
 
-from .adapter import LLMAdapter, LLMResponse, ThinkingDelta, ToolCall
+from .adapter import (
+    LLMAdapter,
+    LLMResponse,
+    ThinkingDelta,
+    ToolCall,
+    inline_tool_dispatch_id,
+)
 from .call_progress import report_call_progress
 from .cancellation import CancelToken, await_or_cancelled, raise_if_cancelled
 from .codex_app_server import (
@@ -108,7 +114,8 @@ logger = logging.getLogger(__name__)
 # wrapper returns the post-hook args alongside the result so the
 # adapter can record the *actually-executed* arguments into audit /
 # UI breadcrumbs — pre-hook args may carry values a PRE_TOOL_USE
-# redactor intentionally stripped.
+# redactor intentionally stripped. An ``InlineToolOutcome`` also names
+# the dispatch row the call is recorded under (#3778).
 ToolExecutor = Callable[
     [str, Dict[str, Any]],
     Awaitable[Tuple[Dict[str, Any], Any]],
@@ -2137,11 +2144,17 @@ class CodexAdapter(LLMAdapter):
             else:
                 result = ret
             if executed_log is not None:
-                executed_log.append({
+                executed_entry: Dict[str, Any] = {
                     "id": call_id, "name": name,
                     "arguments": effective_args,
                     "result": result,
-                })
+                }
+                # The dispatch row this call is recorded under, so the
+                # calls a feature subagent made inside it can name it (#3778).
+                dispatch_id = inline_tool_dispatch_id(ret)
+                if dispatch_id is not None:
+                    executed_entry["dispatch_id"] = dispatch_id
+                executed_log.append(executed_entry)
             # Pass tool/feature scope + audit slice so the classifier
             # has the right evidence to classify a failure against
             # (#1563). For success results these are unused. The

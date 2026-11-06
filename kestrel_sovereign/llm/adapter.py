@@ -143,6 +143,42 @@ class ToolCallWithExtraContent(ToolCall):
     extra_content: Optional[Dict[str, Any]] = None
 
 
+class InlineToolOutcome(tuple):
+    """What an inline tool executor returns: ``(effective_args, result)``.
+
+    Every reader that unpacks or indexes it still sees that 2-tuple.
+    ``dispatch_id`` also names the ``a2a_tool_dispatches`` row the call is
+    recorded under. An adapter that runs tools inside its call copies it onto
+    the call's ``executed_tool_calls`` entry, so the row recorded from that
+    entry carries it, and a feature subagent's own calls, which name it as
+    their parent, can be traced to it (#3778). ``None`` when the executor has
+    no dispatch to name.
+    """
+
+    dispatch_id: Optional[str]
+
+    def __new__(
+        cls,
+        effective_args: Dict[str, Any],
+        result: Any,
+        dispatch_id: Optional[str] = None,
+    ) -> "InlineToolOutcome":
+        outcome = super().__new__(cls, (effective_args, result))
+        outcome.dispatch_id = dispatch_id
+        return outcome
+
+    def __getnewargs__(self) -> tuple:
+        return (self[0], self[1], self.dispatch_id)
+
+
+def inline_tool_dispatch_id(outcome: Any) -> Optional[str]:
+    """The ``dispatch_id`` an inline executor's return names, if any."""
+    if not isinstance(outcome, InlineToolOutcome):
+        return None
+    dispatch_id = outcome.dispatch_id
+    return dispatch_id if isinstance(dispatch_id, str) and dispatch_id else None
+
+
 def tool_call_history_entry(tool_call: ToolCall) -> Dict[str, Any]:
     """``tool_call`` as an OpenAI-format assistant ``tool_calls`` entry.
 
@@ -294,12 +330,14 @@ __all__ = [
     "LLMAdapter",
     "LLMResponse",
     "CancelToken",
+    "InlineToolOutcome",
     "ThinkingDelta",
     "ThinkingContentSplitter",
     "ToolCall",
     "ToolCallWithExtraContent",
     "build_messages",
     "messages_for",
+    "inline_tool_dispatch_id",
     "split_thinking_from_content",
     "tool_call_history_entry",
 ]

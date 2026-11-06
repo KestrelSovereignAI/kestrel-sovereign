@@ -43,6 +43,7 @@ from kestrel_sdk.tools import DeferredToolResult
 
 from kestrel_sovereign._async_ownership import (
     OwnedTaskOutcome,
+    await_owned_operation,
     await_owned_task,
     create_owned_task,
     gather_owned,
@@ -59,6 +60,7 @@ from kestrel_sovereign.agent.direct_tool_arguments import (
     normalize_direct_tool_arguments,
 )
 from kestrel_sovereign.llm.adapter import (
+    InlineToolOutcome,
     LLMResponse,
     ThinkingDelta,
     tool_call_history_entry,
@@ -1014,6 +1016,73 @@ async def _record_inline_tool_dispatch(host, entry, *, session_id, features_by_t
         args=args if isinstance(args, dict) else {}, result=result,
         session_id=session_id, dispatch_start=time.time(),
         error_message=error_message, error_class=error_class,
+        dispatch_id=entry.get("dispatch_id"),
+    )
+
+
+async def _write_tool_dispatch(host, *, on_written=None, **row) -> None:
+    """Write one ``a2a_tool_dispatches`` row as an owned operation (#3778).
+
+    A cancellation that arrives while the row is written waits for the write,
+    then is raised: the row is never abandoned half-way, and a caller's
+    cancellation handler (``_record_interrupted_dispatch``) never writes the
+    same call a second time. ``on_written`` runs once the write returned,
+    before any such cancellation is raised, so the caller knows its row is
+    accounted for.
+    """
+    outcome = await await_owned_operation(
+        OrchestratorEngineMixin._log_tool_dispatch(host, **row),
+        name="tool-dispatch-record", retain_originals=True,
+    )
+    if outcome.error is None and on_written is not None:
+        on_written()
+    terminal = execution_terminal_error(
+        outcome.error, outcome.cancellation,
+        retain_originals=True, prefer_cancellation=True,
+    )
+    if terminal is not None:
+        raise terminal
+
+
+async def _record_interrupted_dispatch(host, error, *, returned, result=None,
+                                       on_written=None, **row):
+    """Record a call that ``error`` ended after it started, before its row.
+
+    A cancellation (or a Stop, or any error that escapes the call) can end a
+    call whose effect is already done: a feature subagent's ``talon_cancel``
+    that cancelled the job, or the envelope that ran it. Its row says so
+    instead of vanishing (#3778). ``returned`` says whether the call returned
+    first; ``result`` is what it returned, when it did. ``on_written`` runs
+    once the row is written.
+
+    The write is an owned operation, so a repeated cancellation does not cut
+    it short. Returns what the caller raises: ``error`` itself, unless the
+    write ended in execution control evidence, which is retained ahead of it,
+    or a cancellation arrived meanwhile that ``error`` does not carry.
+    """
+    kind = type(error).__name__
+    message = (
+        f"Interrupted by {kind} after the call returned; its result was not "
+        "delivered."
+        if returned else
+        f"Interrupted by {kind} while the call was running; whether it took "
+        "effect is unknown. Reconcile before retrying."
+    )
+    outcome = await await_owned_operation(
+        OrchestratorEngineMixin._log_tool_dispatch(
+            host, result=result if returned else None, status_hint="error",
+            error_class=kind, error_message=message, **row,
+        ),
+        name="tool-dispatch-interrupted-record", retain_originals=True,
+    )
+    if outcome.error is None and on_written is not None:
+        on_written()
+    pending = None if isinstance(error, asyncio.CancelledError) else outcome.cancellation
+    if outcome.error is None and pending is None:
+        return error
+    return execution_terminal_error(
+        error, outcome.error, pending,
+        retain_originals=True, prefer_cancellation=True,
     )
 
 
@@ -1034,11 +1103,16 @@ def _publication_scope(destination):
 
 async def _complete_post_tool_result(host, result, post_input, *, adapter,
                                      dispatch_start, on_audited=None,
-                                     destination=_CURRENT_TURN):
+                                     destination=_CURRENT_TURN,
+                                     dispatch_id=None, parent_dispatch_id=None):
     """Complete policy and required audit before invoking a private UI factory.
 
     Every Core route that can receive a ``DeferredToolResult`` completes it
     here; ``destination`` (see ``_CURRENT_TURN``) is the only difference.
+    ``dispatch_id`` names the row, and ``parent_dispatch_id`` the dispatch the
+    call ran inside, for a feature subagent's own call (#3778). ``on_audited``
+    runs once the row is written, even when a cancellation arrives during the
+    write, so the caller never records the call a second time.
     """
     deferred = isinstance(result, DeferredToolResult)
     post_outputs = await host.hooks_manager.execute_hooks_parallel(
@@ -1059,15 +1133,15 @@ async def _complete_post_tool_result(host, result, post_input, *, adapter,
     try:
         error_message, error_class = _extract_inline_error_fields(post_result)
         status = infer_tool_result_status(reviewed)
-        await OrchestratorEngineMixin._log_tool_dispatch(
+        await _write_tool_dispatch(
             host, tool_name=post_input.tool_name, adapter=adapter,
             args=post_input.tool_input, result=reviewed,
             session_id=post_input.session_id, dispatch_start=dispatch_start,
             status_hint=status,
             error_message=error_message, error_class=error_class, required=True,
+            dispatch_id=dispatch_id, parent_dispatch_id=parent_dispatch_id,
+            on_written=None if on_audited is None else lambda: on_audited(status),
         )
-        if on_audited is not None:
-            on_audited(status)
         require_execution_work(host)
     except BaseException as error:
         # Consume the factory when storage or Stop prevents publication.
@@ -1554,7 +1628,10 @@ class OrchestratorEngineMixin:
                 session_id,
                 checkpoint=effect_checkpoint,
             )
-            return capture.get("effective_args", args), result
+            return InlineToolOutcome(
+                capture.get("effective_args", args), result,
+                capture.get("dispatch_id"),
+            )
 
         async def _persist_completed_effects(executed: list[dict]) -> None:
             """Checkpoint an inline effect before transport cancellation wins."""
@@ -1774,6 +1851,10 @@ class OrchestratorEngineMixin:
         call_context = begin_tool_call(
             self, registered() if callable(registered) else frozenset()
         )
+        if _capture is not None:
+            # The row the inline caller records this call under, which a
+            # feature subagent's own calls name as their parent (#3778).
+            _capture["dispatch_id"] = call_context.ledger_id
 
         if tool_name == PHANTOM_RECEIPT_TOOL_NAME:
             handler = getattr(self, "_handle_constitution_receipt_tool", None)
@@ -1889,7 +1970,8 @@ class OrchestratorEngineMixin:
                 return await self._execute_named_subagent(
                     subagent_feature, tool_name=tool_name, args=args,
                     session_id=session_id, source=source, _capture=_capture,
-                    call_context=call_context,
+                    call_context=call_context, execution=execution,
+                    dispatch_meta=dispatch_meta,
                 )
             evidence = allowlist_evidence(self, call_context, tool_name)
             if evidence is not None:
@@ -2057,7 +2139,7 @@ class OrchestratorEngineMixin:
         )
         return await _complete_post_tool_result(
             self, result, post_input, adapter=f"named:{source}:{feature_name}.{tool_name}",
-            dispatch_start=exec_start,
+            dispatch_start=exec_start, dispatch_id=call_context.ledger_id,
             on_audited=lambda status: _mark_tool_dispatch_audited(
                 dispatch_meta, execution, status=status,
             ),
@@ -2138,17 +2220,27 @@ class OrchestratorEngineMixin:
         source: str,
         _capture: Optional[Dict[str, Any]] = None,
         call_context: Optional[ToolCallContext] = None,
+        execution=None,
+        dispatch_meta: Optional[Dict[str, Any]] = None,
     ) -> Any:
         """Run a feature subagent through the governance stack.
 
         Mirrors ``_dispatch_feature_tool`` (the chat path) but in the
         ``execute_named_tool`` shape: no streaming/event-emit side
-        channels, no dispatch_meta, no observability_store coupling.
-        The hooks (``PRE_SUBAGENT_CALL`` / ``POST_SUBAGENT_CALL``) and
-        denied-tools stripping ARE applied — that's the security
+        channels. The hooks (``PRE_SUBAGENT_CALL`` / ``POST_SUBAGENT_CALL``)
+        and denied-tools stripping ARE applied — that's the security
         envelope subagent dispatch sits inside, separate from the
         ``PRE_TOOL_USE`` / ``POST_TOOL_USE`` envelope individual tools
         sit inside.
+
+        The envelope's ``a2a_tool_dispatches`` row is written here, under
+        ``call_context.ledger_id``, whatever the outcome: refused, raised,
+        returned, or interrupted after the subagent started (#3778). The
+        subagent's own calls name that id as their parent, so the row must
+        exist on every transport: without an inline caller to record it, and
+        when the codex turn that ran it fails before its executed calls are
+        recorded. The result returned is the single-use receipt for that row,
+        so the inline recorder does not write it again.
 
         Args:
             feature: The Feature subagent to dispatch to.
@@ -2161,8 +2253,42 @@ class OrchestratorEngineMixin:
             call_context: The call's place in its turn (#2935), recorded as
                 accepted once the argument guardrail passes, before the
                 permission hooks, as the chat path records a subagent call.
+            execution / dispatch_meta: ``execute_named_tool``'s execution
+                facts: when the subagent started and returned, and that its
+                row was written.
         """
         feature_name = type(feature).__name__
+        dispatch_start = time.time()
+        adapter = f"named:{source}:{feature_name}.execute_as_subagent"
+        row_written = False
+
+        def _row_written(status):
+            nonlocal row_written
+            row_written = True
+            _mark_tool_dispatch_audited(dispatch_meta, execution, status=status)
+
+        async def _recorded(row_args, result, *, status=None, error_class=None,
+                            error_message=None):
+            """Write the envelope row, then return the receipt for it."""
+            if not isinstance(result, dict):
+                # The shape the completion hooks already report it as: a
+                # receipt is a dict, and only a receipt stops a second row.
+                result = {"result": str(result)}
+            if error_class is None and error_message is None:
+                error_message, error_class = _extract_inline_error_fields(result)
+            status = infer_tool_result_status(result, status)
+            await _write_tool_dispatch(
+                self, tool_name=tool_name, adapter=adapter,
+                args=row_args if isinstance(row_args, dict) else {}, result=result,
+                session_id=session_id, dispatch_start=dispatch_start,
+                status_hint=status, error_class=error_class,
+                error_message=error_message,
+                dispatch_id=None if call_context is None else call_context.ledger_id,
+                on_written=lambda: _row_written(status),
+            )
+            return _AuditedDeferredResult(
+                result, host=self, tool_name=tool_name, session_id=session_id,
+            )
 
         # Same arg-validation guardrail individual tools get.
         is_valid, validation_error = validate_tool_arguments(tool_name, args)
@@ -2173,7 +2299,12 @@ class OrchestratorEngineMixin:
                 source, feature_name, _TOOL_VALIDATION_ERROR,
                 content_log_summary(str(validation_error)),
             )
-            return {"success": False, "error": f"Invalid tool arguments: {validation_error}"}
+            return await _recorded(
+                args,
+                {"success": False, "error": f"Invalid tool arguments: {validation_error}"},
+                status="error", error_class=_TOOL_VALIDATION_ERROR,
+                error_message=f"Tool validation failed: {validation_error}",
+            )
         record_tool_acceptance(self, call_context, tool_name)
 
         logging.info(
@@ -2203,7 +2334,13 @@ class OrchestratorEngineMixin:
                 blocked.decision.value, source, feature_name,
                 content_log_summary(str(blocked.reason)),
             )
-            return blocked.envelope
+            # As the chat path records a refused subagent call (#3953): an
+            # ASK is a ``policy_denied`` row its ``error_class`` names.
+            return await _recorded(
+                post_hook_args, blocked.envelope, status="policy_denied",
+                error_class="ApprovalRequired" if blocked.is_ask else "PermissionDenied",
+                error_message=blocked.reason,
+            )
 
         effective_args = post_hook_args if isinstance(post_hook_args, dict) else args
         task = effective_args.get("task", "")
@@ -2251,7 +2388,13 @@ class OrchestratorEngineMixin:
                 result=inner_blocked.envelope,
                 exec_duration_ms=0,
             )
-            return inner_blocked.envelope
+            return await _recorded(
+                refused_args, inner_blocked.envelope, status="policy_denied",
+                error_class=(
+                    "ApprovalRequired" if inner_blocked.is_ask else "PermissionDenied"
+                ),
+                error_message=inner_blocked.reason,
+            )
         # Honor inner-MODIFY rewrites for the same reason the outer
         # hook does — a PRE_TOOL_USE redactor on subagent args must
         # apply to the call that actually runs.
@@ -2271,84 +2414,110 @@ class OrchestratorEngineMixin:
         # on the failure path so observability/audit hooks see every
         # dispatch outcome.
         require_execution_work(self)
+        # Once the subagent starts, its calls may have taken effect, and
+        # their rows name this envelope: whatever ends it from here, it is
+        # recorded (#3778).
+        returned, result = False, None
         try:
-            with optional_span("agent.feature_dispatch", {
-                OI_SPAN_KIND: OI_SPAN_KIND_CHAIN,
-                # Read defensively: this mixin can be hosted by a minimal /
-                # duck-typed object with no ``agent_name`` (see the dispatcher
-                # site in #2699). ``optional_span`` drops the None, so telemetry
-                # stamping never turns into a hard dependency that crashes an
-                # otherwise-valid dispatch.
-                KESTREL_AGENT_NAME: getattr(self, "agent_name", None),
-                # #2916: group the dispatch under the same session band as the
-                # turn span that drove it. ``real_session_id`` drops the
-                # sentinels this parameter also carries, and ``optional_span``
-                # then drops the None.
-                KESTREL_SESSION_ID: real_session_id(session_id),
-                "agent.session_id": real_session_id(session_id),
-                "feature.name": getattr(feature, "tool_name", feature_name),
-                "tool.source": source,
-            }):
-                result = await feature.execute_as_subagent(
-                    task=task, context=context, denied_tools=denied_tools,
-                )
-                result = _discard_tool_supplied_receipt(result)
-                mark_current_invocation_effect_completed(session_id)
-                require_execution_work(self)
-        except ExecutionAuthorityError:
-            raise
-        except Exception as e:  # noqa: BLE001 — boundary catch is the contract
-            if is_execution_control_error(e):
+            if execution is not None:
+                execution.started = True
+            try:
+                with optional_span("agent.feature_dispatch", {
+                    OI_SPAN_KIND: OI_SPAN_KIND_CHAIN,
+                    # Read defensively: this mixin can be hosted by a minimal /
+                    # duck-typed object with no ``agent_name`` (see the
+                    # dispatcher site in #2699). ``optional_span`` drops the
+                    # None, so telemetry stamping never turns into a hard
+                    # dependency that crashes an otherwise-valid dispatch.
+                    KESTREL_AGENT_NAME: getattr(self, "agent_name", None),
+                    # #2916: group the dispatch under the same session band as
+                    # the turn span that drove it. ``real_session_id`` drops
+                    # the sentinels this parameter also carries, and
+                    # ``optional_span`` then drops the None.
+                    KESTREL_SESSION_ID: real_session_id(session_id),
+                    "agent.session_id": real_session_id(session_id),
+                    "feature.name": getattr(feature, "tool_name", feature_name),
+                    "tool.source": source,
+                }):
+                    result = await feature.execute_as_subagent(
+                        task=task, context=context, denied_tools=denied_tools,
+                    )
+                    result = _discard_tool_supplied_receipt(result)
+                    returned = True
+                    if execution is not None:
+                        execution.returned = True
+                    mark_current_invocation_effect_completed(session_id)
+                    require_execution_work(self)
+            except ExecutionAuthorityError:
                 raise
-            logging.warning(
-                "[GOVERNED-DISPATCH] subagent execute raised source=%s feature=%s err=%s\n%s",
-                source, feature_name, exception_log_summary(e), exception_frames(e),
-            )
+            except Exception as e:  # noqa: BLE001 — boundary catch is the contract
+                if is_execution_control_error(e):
+                    raise
+                logging.warning(
+                    "[GOVERNED-DISPATCH] subagent execute raised source=%s feature=%s err=%s\n%s",
+                    source, feature_name, exception_log_summary(e), exception_frames(e),
+                )
+                exec_duration_ms = int((time.time() - exec_start) * 1000)
+                err_result = {
+                    "success": False,
+                    "error": f"Subagent {feature_name} failed: {e}",
+                }
+                await self._fire_post_subagent_hook(
+                    session_id=session_id, tool_name=tool_name,
+                    feature_name=feature_name, effective_args=effective_args,
+                    result=err_result, exec_duration_ms=exec_duration_ms,
+                )
+                return await _recorded(
+                    effective_args, err_result, status="error",
+                    error_class=type(e).__name__, error_message=str(e),
+                )
             exec_duration_ms = int((time.time() - exec_start) * 1000)
-            err_result = {
-                "success": False,
-                "error": f"Subagent {feature_name} failed: {e}",
-            }
+            # #2641: envelope-carried subagent parts → this turn's collector
+            # (the codex inline executor re-binds it around this call, so
+            # parts emitted on the app-server's reader tasks still reach the
+            # owning turn).
+            self._reemit_envelope_parts(result)
+            self._register_explored_feature_tools(feature)
+
+            # Emit tool update event for progressive disclosure (#1315)
+            # After exploring a feature for the first time, notify connected
+            # clients (particularly realtime voice sessions) of the updated
+            # tool registry
+            await self._emit_tool_update_event(session_id)
+
+            # --- POST_TOOL_USE hook (inner envelope; parity with chat path) ---
+            inner_post = HookInput(
+                session_id=session_id,
+                hook_event_name=HookEvent.POST_TOOL_USE.value,
+                tool_name=tool_name,
+                tool_input=effective_args,
+                feature_name=feature_name,
+                tool_response=result if isinstance(result, dict) else {"result": str(result)},
+                execution_time_ms=exec_duration_ms,
+            )
+            await self.hooks_manager.execute_hooks_parallel(
+                HookEvent.POST_TOOL_USE, inner_post,
+            )
+
+            # --- POST_SUBAGENT_CALL hook (outer envelope) ---
             await self._fire_post_subagent_hook(
                 session_id=session_id, tool_name=tool_name,
                 feature_name=feature_name, effective_args=effective_args,
-                result=err_result, exec_duration_ms=exec_duration_ms,
+                result=result, exec_duration_ms=exec_duration_ms,
             )
-            return err_result
-        exec_duration_ms = int((time.time() - exec_start) * 1000)
-        # #2641: envelope-carried subagent parts → this turn's collector (the
-        # codex inline executor re-binds it around this call, so parts emitted
-        # on the app-server's reader tasks still reach the owning turn).
-        self._reemit_envelope_parts(result)
-        self._register_explored_feature_tools(feature)
-
-        # Emit tool update event for progressive disclosure (#1315)
-        # After exploring a feature for the first time, notify connected clients
-        # (particularly realtime voice sessions) of the updated tool registry
-        await self._emit_tool_update_event(session_id)
-
-        # --- POST_TOOL_USE hook (inner envelope; parity with chat path) ---
-        inner_post = HookInput(
-            session_id=session_id,
-            hook_event_name=HookEvent.POST_TOOL_USE.value,
-            tool_name=tool_name,
-            tool_input=effective_args,
-            feature_name=feature_name,
-            tool_response=result if isinstance(result, dict) else {"result": str(result)},
-            execution_time_ms=exec_duration_ms,
-        )
-        await self.hooks_manager.execute_hooks_parallel(
-            HookEvent.POST_TOOL_USE, inner_post,
-        )
-
-        # --- POST_SUBAGENT_CALL hook (outer envelope) ---
-        await self._fire_post_subagent_hook(
-            session_id=session_id, tool_name=tool_name,
-            feature_name=feature_name, effective_args=effective_args,
-            result=result, exec_duration_ms=exec_duration_ms,
-        )
+            receipt = await _recorded(effective_args, result)
+        except BaseException as error:
+            if row_written:
+                raise
+            raise await _record_interrupted_dispatch(
+                self, error, returned=returned, result=result,
+                on_written=lambda: _row_written("error"),
+                tool_name=tool_name, adapter=adapter, args=effective_args,
+                session_id=session_id, dispatch_start=dispatch_start,
+                dispatch_id=None if call_context is None else call_context.ledger_id,
+            )
         require_execution_work(self)
-        return result
+        return receipt
 
     async def _fire_post_subagent_hook(
         self,
@@ -2610,6 +2779,7 @@ class OrchestratorEngineMixin:
                 status_hint="error",
                 error_class=_TOOL_VALIDATION_ERROR,
                 error_message=f"Tool validation failed: {validation_error}",
+                dispatch_id=call_context.ledger_id,
                 **({"required": True} if bound_tool is not None else {}),
             )
             if bound_execution is not None:
@@ -2662,12 +2832,31 @@ class OrchestratorEngineMixin:
                 # The guardrails are done with a subagent dispatch; anything that
                 # refuses it from here on is the permission layer's decision.
                 record_tool_acceptance(self, call_context, tool_name)
-                result = await self._dispatch_feature_tool(
-                    tool_call, feature, args, dispatch_start, dispatch_event_id,
-                    user_message, tool_events=tool_events, streaming=streaming,
-                    session_id=session_id, dispatch_meta=dispatch_meta,
-                    effective_model=effective_model,
-                )
+                try:
+                    result = await self._dispatch_feature_tool(
+                        tool_call, feature, args, dispatch_start, dispatch_event_id,
+                        user_message, tool_events=tool_events, streaming=streaming,
+                        session_id=session_id, dispatch_meta=dispatch_meta,
+                        effective_model=effective_model,
+                    )
+                except BaseException as error:
+                    # The subagent's own calls name this row as their parent,
+                    # so a dispatch that ends here once the subagent started is
+                    # recorded too (#3778).
+                    if (not dispatch_meta.get("subagent_started")
+                            or dispatch_meta.get("audit_recorded")):
+                        raise
+                    raise await _record_interrupted_dispatch(
+                        self, error,
+                        returned=bool(dispatch_meta.get("subagent_returned")),
+                        tool_name=tool_name,
+                        adapter=OrchestratorEngineMixin._tool_call_adapter(
+                            self, tool_name, features_by_tool_name
+                        ),
+                        args=dispatch_meta.get("arguments", args),
+                        session_id=session_id, dispatch_start=dispatch_start,
+                        dispatch_id=call_context.ledger_id,
+                    )
             elif tool_name in self._direct_tools:
                 result = await self._dispatch_direct_tool(
                     tool_call, tool_name, args, dispatch_start, dispatch_event_id,
@@ -2769,8 +2958,14 @@ class OrchestratorEngineMixin:
         audited = (isinstance(result, _AuditedDeferredResult)
                    and result.claim(self, tool_name, session_id))
         if not audited and not dispatch_meta.get("audit_recorded"):
-            await OrchestratorEngineMixin._log_tool_dispatch(
+            # Owned, so a cancellation that arrives meanwhile cannot leave the
+            # row half-written: a feature subagent's own calls name it (#3778).
+            await _write_tool_dispatch(
                 self,
+                on_written=(
+                    None if bound_execution is None
+                    else lambda: setattr(bound_execution, "audit_recorded", True)
+                ),
                 tool_name=tool_name,
                 adapter=bound_adapter or OrchestratorEngineMixin._tool_call_adapter(
                     self, tool_name, features_by_tool_name
@@ -2782,6 +2977,8 @@ class OrchestratorEngineMixin:
                 status_hint=dispatch_meta.get("status"),
                 error_class=dispatch_meta.get("error_class"),
                 error_message=dispatch_meta.get("error_message"),
+                # A feature subagent's own calls name this row as their parent.
+                dispatch_id=call_context.ledger_id,
                 **({"required": True} if bound_tool is not None else {}),
             )
 
@@ -2818,8 +3015,15 @@ class OrchestratorEngineMixin:
         error_class: Optional[str] = None,
         error_message: Optional[str] = None,
         required: bool = False,
+        dispatch_id: Optional[str] = None,
+        parent_dispatch_id: Optional[str] = None,
     ) -> None:
-        """Build the canonical dispatch entry, optionally requiring persistence."""
+        """Build the canonical dispatch entry, optionally requiring persistence.
+
+        ``dispatch_id`` names the row (the store assigns one when it is
+        ``None``); ``parent_dispatch_id`` names the dispatch this call ran
+        inside, such as the feature subagent envelope that made it (#3778).
+        """
         observability_store = getattr(self, "observability_store", None)
         if observability_store is None:
             if required:
@@ -2851,6 +3055,8 @@ class OrchestratorEngineMixin:
                     error_message=error_message,
                     latency_ms=int((time.time() - dispatch_start) * 1000),
                     result_size_bytes=tool_result_size_bytes(result),
+                    dispatch_id=dispatch_id,
+                    parent_dispatch_id=parent_dispatch_id,
                 ),
                 **({"required": True} if required else {}),
             )
@@ -2942,6 +3148,11 @@ class OrchestratorEngineMixin:
                 context = f"User's original request: {user_message}"
             log_tag = "[STREAM] " if streaming else ""
             logging.info(f"{log_tag}Dispatching to feature subagent: {f.tool_name}")
+            # From here the subagent's calls may take effect, and their rows
+            # name this dispatch: ``_dispatch_tool_call`` records it however
+            # it ends (#3778).
+            if dispatch_meta is not None:
+                dispatch_meta["subagent_started"] = True
             with optional_span("agent.feature_dispatch", {
                 OI_SPAN_KIND: OI_SPAN_KIND_CHAIN,
                 # Defensive read — minimal mixin hosts may lack ``agent_name``;
@@ -2956,6 +3167,8 @@ class OrchestratorEngineMixin:
                 r = await f.execute_as_subagent(
                     task=task, context=context, denied_tools=dt, model_override=em,
                 )
+            if dispatch_meta is not None:
+                dispatch_meta["subagent_returned"] = True
             self._register_explored_feature_tools(f)
             return r
 
