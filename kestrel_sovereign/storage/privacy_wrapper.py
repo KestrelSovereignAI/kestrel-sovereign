@@ -432,7 +432,7 @@ class ReentrantTransitionLock:
         self._native_foreign_frames = {}
         self._native_foreign_depths = {}
 
-    def capture_native_work_factory(self, *, acquire_span=True):
+    def capture_native_work_factory(self, *, acquire_span=True, inherit_frame=True):
         """Capture the constructing owner's held frame for one lazy source.
 
         Registration is still deferred until dispatch, and an ended foreign
@@ -440,18 +440,22 @@ class ReentrantTransitionLock:
         Background effect workers may retain an existing foreign frame without
         acquiring a new whole-worker span; their actual effect leaves still
         acquire this mutex and revalidate policy through ordinary admission.
+        Deferred independent workers set inherit_frame=False: they retain the
+        held span token, but must serialize at their actual effect entry. Only
+        bounded child continuations may borrow their joining parent's mutex.
         """
         parent = asyncio.current_task()
-        frame = parent if parent is not None and self._reentry_owner is parent else self._native_foreign_frames.get(parent)
+        frame = ((parent if parent is not None and self._reentry_owner is parent else self._native_foreign_frames.get(parent))
+                 if inherit_frame else None)
         token = self.current_reentry_token()
         if token is None and self._token_matches_current_span():
             token = _transition_lock_reentry_token.get()
         def start(operation, context=None, *, name="privacy-owned-native-work"):
             return self.start_owned_native_work(operation, context=context, name=name,
-                _captured_frame=frame, _captured_token=token, acquire_span=acquire_span)
+                _captured_frame=frame, _captured_token=token, acquire_span=acquire_span, inherit_frame=inherit_frame)
         return start
 
-    def start_owned_native_work(self, operation, *, context=None, name="privacy-owned-native-work", _captured_frame=None, _captured_token=None, acquire_span=True):
+    def start_owned_native_work(self, operation, *, context=None, name="privacy-owned-native-work", _captured_frame=None, _captured_token=None, acquire_span=True, inherit_frame=True):
         """Retain a fixed native body without lending arbitrary reentry rights.
 
         Only the actual foreign-mutex owner may reserve continuation of that
@@ -459,8 +463,9 @@ class ReentrantTransitionLock:
         Other workers acquire the ordinary lock path and revalidate live policy.
         """
         parent = asyncio.current_task()
-        frame = parent if parent is not None and self._reentry_owner is parent else self._native_foreign_frames.get(parent)
-        if frame is None and _captured_frame is self._reentry_owner:
+        frame = ((parent if parent is not None and self._reentry_owner is parent else self._native_foreign_frames.get(parent))
+                 if inherit_frame else None)
+        if inherit_frame and frame is None and _captured_frame is self._reentry_owner:
             frame = _captured_frame
         foreign = frame is not None and self._reentry_owner is frame
         token = self.current_reentry_token()

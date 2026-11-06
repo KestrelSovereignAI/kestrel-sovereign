@@ -576,7 +576,7 @@ def bind_async_invocation(
                         if capture_transition_lock_reentry(lifecycle_owner) is not None:
                             privacy_work_factory = (
                                 lifecycle_owner._get_privacy_transition_lock()
-                                .capture_native_work_factory()
+                                .capture_native_work_factory(acquire_span=False)
                             )
                         dispatcher = getattr(lifecycle_owner, "dispatcher", None)
                         lock_manager = getattr(dispatcher, "lock_manager", None)

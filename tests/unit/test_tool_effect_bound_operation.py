@@ -463,3 +463,81 @@ async def test_privacy_revocation_during_external_approval_refuses_the_original_
     finally:
         release.set()
         await asyncio.gather(calling, *([changing] if changing is not None else []), return_exceptions=True)
+
+
+@pytest.mark.parametrize('lane', ['external', 'normal-turn'])
+async def test_async_native_sibling_effects_exclude_each_other_without_delaying_acceptance(bound_operation, lane):
+    from kestrel_sovereign.a2a.scope import NativeRecipientScope
+    from kestrel_sovereign.features.base import Feature, tool
+    from kestrel_sdk.native_a2a.types import TaskState
+    from tests.utils.native_a2a import manager_for
+
+    owner, _binding, witness = bound_operation
+    manager = manager_for(owner.tool_effect_store.backend, NativeRecipientScope(owner.did), owns_backend=False)
+    await manager.initialize()
+    entered, accepted = [], []
+    first_started, all_accepted, release = asyncio.Event(), asyncio.Event(), asyncio.Event()
+
+    class SiblingFeature(Feature):
+        @property
+        def tool_description(self):
+            return 'Mutually exclusive original background effects'
+
+        async def initialize(self):
+            pass
+
+        @tool(name='owned_sibling_effect', description='Write under the native privacy mutex')
+        async def owned_sibling_effect(self, marker: str) -> dict:
+            async with owner._get_privacy_transition_lock():
+                entered.append(marker)
+                if marker == 'first':
+                    first_started.set()
+                    await release.wait()
+                with witness.open('a') as stream:
+                    stream.write(marker + '\n')
+            return {'success': True}
+
+    feature = SiblingFeature(owner)
+    owner.features[feature.name] = feature
+    manager.register_provider(feature.name, feature.get_agent_skills(), feature)
+
+    class DispatchTool:
+        name = 'owned.sibling_dispatch'
+        schema = ToolSchema(name, 'Accept two asynchronous native effects', ToolCategory.UTILITY)
+
+        async def execute(self):
+            for marker in ('first', 'second'):
+                accepted.append(await manager.execute_skill(feature.name, 'owned_sibling_effect',
+                    {'marker': marker}, sync=False))
+            all_accepted.set()
+            return {'success': True}
+
+    mounted = []
+    owner.register_dynamic_tools('owned-sibling-background', [DispatchTool()],
+        on_registered=lambda tool, binding: mounted.append(binding))
+    binding, = mounted
+
+    async def call():
+        if lane == 'normal-turn':
+            async with owner._get_privacy_transition_lock():
+                return await binding.invoke({}, session_id='owned-sibling-session', operation_id='owned-sibling-intent')
+        return await binding.invoke({}, session_id='owned-sibling-session', operation_id='owned-sibling-intent')
+
+    calling = asyncio.create_task(call())
+    try:
+        await asyncio.wait_for(first_started.wait(), 2)
+        await asyncio.wait({calling}, timeout=0.2)
+        assert all_accepted.is_set(), 'Native background acceptance waited for its sibling effect'
+        assert entered == ['first'], 'Native sibling effects bypassed their shared privacy mutex'
+        release.set()
+        assert (await calling)['success'] is True
+        assert witness.read_text() == 'first\nsecond\n'
+        for task in accepted:
+            persisted = await manager.task_store.get_for_recipient(task.id, manager.did)
+            assert persisted.status.state == TaskState.TASK_STATE_COMPLETED
+        states = await owner.tool_effect_store.database.fetchall('SELECT state FROM tool_effect_claims')
+        assert states == [('RETURNED_OK',)] * 5
+    finally:
+        release.set()
+        await asyncio.gather(calling, *tuple(manager._execution_tasks), return_exceptions=True)
+        await manager.close()
