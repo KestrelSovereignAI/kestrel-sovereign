@@ -215,3 +215,36 @@ def test_native_mcp_host_carries_the_documented_ci_sqlite_budget(tmp_path, monke
     assert 'UNOWNED_OPERATOR_SETTING' not in environment
     monkeypatch.delenv(setting)
     assert setting not in owned_host_environment(tmp_path, api_key='owned-api', data_key='owned-data')
+
+
+def test_owned_lifespan_observer_reports_original_pending_shutdown(tmp_path, capfd, caplog):
+    """Real ASGI lifespan diagnostics; this is not a Core boot/retirement test."""
+    import asyncio
+    from contextlib import asynccontextmanager
+    from fastapi import FastAPI
+    from starlette.testclient import TestClient
+    from tests.integration.mcp_permission_host import ObservedHost
+
+    phases = []
+
+    @asynccontextmanager
+    async def lifespan(app):
+        phases.append('startup')
+        yield
+        await asyncio.sleep(0.15)
+        phases.append('shutdown')
+
+    observed = ObservedHost(FastAPI(lifespan=lifespan), 'unused', tmp_path,
+        shutdown_trace_interval=0.025)
+    with TestClient(observed):
+        assert phases == ['startup']
+    assert phases == ['startup', 'shutdown']
+    diagnostic = capfd.readouterr().err
+    assert 'Timeout (' in diagnostic and 'Thread ' in diagnostic
+    assert 'Owned shutdown pending task:' in caplog.text
+    assert 'Owned shutdown await:' in caplog.text
+    assert 'lifespan' in caplog.text
+    # The timer is scoped to that original lifespan, not left for another app.
+    import time
+    time.sleep(0.06)
+    assert capfd.readouterr().err == ''

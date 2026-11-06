@@ -2,10 +2,13 @@
 
 import argparse
 import asyncio
+import faulthandler
 import json
+import logging
 import re
 from pathlib import Path
 import socket
+import sys
 
 import pytest
 import uvicorn
@@ -17,10 +20,30 @@ from tests.integration.mcp_permission_peers import (
 
 class ObservedHost:
     """Record actual registry state after requests; never change app behavior."""
-    def __init__(self, app, agent_name, receipt):
+    def __init__(self, app, agent_name, receipt, *, shutdown_trace_interval=1.0):
         self.app, self.agent_name, self.receipt = app, agent_name, receipt
+        self.shutdown_trace_interval = shutdown_trace_interval
 
     async def __call__(self, scope, receive, send):
+        if scope['type'] == 'lifespan':
+            pending_snapshot = None
+
+            async def observe_lifespan():
+                nonlocal pending_snapshot
+                event = await receive()
+                if event['type'] == 'lifespan.shutdown':
+                    faulthandler.dump_traceback_later(self.shutdown_trace_interval, repeat=True)
+                    pending_snapshot = asyncio.get_running_loop().call_later(
+                        self.shutdown_trace_interval, self.record_shutdown_tasks)
+                return event
+
+            try:
+                await self.app(scope, observe_lifespan, send)
+            finally:
+                if pending_snapshot is not None:
+                    pending_snapshot.cancel()
+                faulthandler.cancel_dump_traceback_later()
+            return
         await self.app(scope, receive, send)
         if scope['type'] != 'http':
             return
@@ -32,6 +55,21 @@ class ObservedHost:
         # Complete the real app call, including its request-task epilogue,
         # before observing the registry from the host's original context.
         self.record_registry(nonce)
+
+    def record_shutdown_tasks(self):
+        """Report original awaits without observing locals or changing owners."""
+        logger = logging.getLogger(__name__)
+        for task in asyncio.all_tasks():
+            logger.warning('Owned shutdown pending task: %s', task.get_name())
+            task.print_stack(file=sys.stderr)
+            awaited, seen = task.get_coro(), set()
+            while awaited is not None and id(awaited) not in seen:
+                seen.add(id(awaited))
+                frame = getattr(awaited, 'cr_frame', getattr(awaited, 'gi_frame', None))
+                if frame is not None:
+                    logger.warning('Owned shutdown await: %s at %s:%s',
+                        frame.f_code.co_qualname, frame.f_code.co_filename, frame.f_lineno)
+                awaited = getattr(awaited, 'cr_await', getattr(awaited, 'gi_yieldfrom', None))
 
     def record_registry(self, nonce):
         import os
