@@ -9,6 +9,7 @@ import pytest
 
 from tests.utils.virtual_clock import (
     AdvanceableClock,
+    AdvanceableClockLoop,
     advanceable_loop_clock,
     await_within_hang_guard,
     pinned_loop_clock,
@@ -176,3 +177,20 @@ async def test_wait_for_thread_event_names_the_step_it_waited_for() -> None:
         await wait_for_thread_event(
             threading.Event(), step="the worker starting", seconds=0.01
         )
+
+
+def test_advanceable_loop_keeps_native_polls_live_after_manual_progress() -> None:
+    loop = AdvanceableClockLoop()
+
+    async def observe() -> None:
+        start = loop.time()
+        loop.advance(400)
+        await await_within_hang_guard(
+            asyncio.sleep(0.001), step="native retirement poll after manual progress",
+        )
+        assert loop.time() >= start + 400
+
+    try:
+        loop.run_until_complete(observe())
+    finally:
+        loop.close()

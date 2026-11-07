@@ -9,8 +9,8 @@ model's own (up to 128,000 tokens), a response that is still streaming would
 be cut off mid-answer. It now re-arms on every streamed item: a progressing
 stream is never killed, a silent one still is.
 
-Time is virtual — an event loop whose clock the fake stream advances — so
-these tests cover 400 "seconds" of streaming without sleeping.
+The stream advances the loop clock through 400 simulated seconds. Real time
+also keeps moving so native SQL retirement polls can complete after the stream.
 """
 
 from __future__ import annotations
@@ -20,7 +20,7 @@ from typing import Any, List, Optional, Tuple
 
 from kestrel_sovereign.agent.streaming import _parse_stream_sentinels
 from kestrel_sovereign.llm.adapter import LLMResponse, ToolCall
-from tests.utils.virtual_clock import VirtualClockLoop as _VirtualClockLoop
+from tests.utils.virtual_clock import AdvanceableClockLoop as _VirtualClockLoop
 from tests.utils.native_tool_effects import drive_native
 
 

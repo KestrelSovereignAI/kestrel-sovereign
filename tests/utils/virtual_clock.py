@@ -112,6 +112,14 @@ class AdvanceableClock:
         self._skipped += seconds
 
 
+class AdvanceableClockLoop(VirtualClockLoop):
+    """Manual deadline jumps while real native I/O polls keep advancing."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._clock = AdvanceableClock(lambda: asyncio.BaseEventLoop.time(self))
+
+
 @contextmanager
 def advanceable_loop_clock() -> Iterator[AdvanceableClock]:
     """Let an ``async`` test jump the running loop's clock forward.
