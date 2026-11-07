@@ -165,13 +165,14 @@ async def test_parallel_join_keeps_actual_outer_withdrawal_and_source(
     actual_terminal = execution_custody.execution_terminal_error
 
     def terminal(*errors, **kwargs):
-        if asyncio.current_task() is caller:
-            for error in errors:
-                if isinstance(error, asyncio.CancelledError) and error.args == (
-                    "actual batch observer withdrawal",
-                ):
-                    if error not in withdrawals:
-                        withdrawals.append(error)
+        # The native invocation owns its isolated Task. Capture the actual
+        # uniquely marked observer carrier wherever that owner composes it.
+        for error in errors:
+            if isinstance(error, asyncio.CancelledError) and error.args == (
+                "actual batch observer withdrawal",
+            ):
+                if error not in withdrawals:
+                    withdrawals.append(error)
         return actual_terminal(*errors, **kwargs)
 
     agent = await native_tool_effect_agent(did="did:test:parallel-original-pg", connected_backend=backend)
@@ -218,6 +219,9 @@ async def test_parallel_join_keeps_actual_outer_withdrawal_and_source(
     )
     calls = [SimpleNamespace(name=str(i), id=str(i), arguments={}) for i in range(2)]
     monkeypatch.setattr(execution_custody, "execution_terminal_error", terminal)
+    from kestrel_sovereign.agent import invocation as invocation_module
+
+    monkeypatch.setattr(invocation_module, "execution_terminal_error", terminal)
 
     async def execute():
         # Actual production carrier from the joined batch, not a fabricated

@@ -140,6 +140,12 @@ async def _open_journal_turn(owner, arguments, route):
     turn, parent_claim = current_tool_effect_state(owner)
     root = turn is None or (turn.invocation_id, turn.generation) != (invocation_id, generation)
     if root:
+        from kestrel_sovereign.agent.runtime_start import (
+            require_input_storage_ready, require_runtime_start_allowed,
+        )
+
+        require_runtime_start_allowed(owner)
+        require_input_storage_ready(owner)
         provenance = current_invocation_provenance()
         request = dict(
             route=provenance.source_locator if provenance is not None else route,

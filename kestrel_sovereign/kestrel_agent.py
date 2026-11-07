@@ -8177,11 +8177,9 @@ Expected Duration: {expected_duration}
         # storage/context. There is no durable receipt to inspect yet, so keep
         # the existing retryable pre-init deferral instead of crashing inside
         # the genesis gate or returning a terminal user-facing block.
-        if getattr(self, "storage", None) is None:
-            raise RuntimeError(
-                "agent not fully initialized: context_manager and storage "
-                "unavailable; deferring turn for retry until initialize() completes"
-            )
+        from kestrel_sovereign.agent.runtime_start import require_input_storage_ready
+
+        require_input_storage_ready(self)
 
         # GENESIS READINESS: no bootstrap, context build, or provider cognition
         # may precede the durable audit receipt. The shared helper also covers
