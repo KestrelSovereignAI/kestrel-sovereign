@@ -13,10 +13,10 @@ through the chat stream after the first ToolCallStarted marker, with
 the correct wire format and JSON payload. Client-side stripping is
 covered in tests/frontend/.
 """
+from tests.utils.native_streaming import streaming_agent
 import json
 
 import pytest
-from contextlib import asynccontextmanager
 from unittest.mock import AsyncMock, MagicMock
 
 from kestrel_sdk.llm import ToolCallStarted
@@ -104,89 +104,28 @@ class TestSentinelConstruction:
         assert strip_revise_sentinels(chunk) == "visible answer"
 
 
-@asynccontextmanager
-async def _passthrough():
-    yield
 
 
-def _build_mock_agent():
-    """Reusable mock agent — same shape as the Wave 5B test."""
-    from kestrel_sovereign.agent.streaming import StreamingMixin
-
-    privacy_agent = MagicMock()
-    privacy_agent.add_conversation = AsyncMock()
-    privacy_agent.privacy_config.allows_cloud_llm.return_value = True
-    privacy_agent.privacy_mode.name = "normal"
-    privacy_agent.get_conversation_history = AsyncMock(return_value=[])
-
-    agent = MagicMock()
-    agent.privacy_agent = privacy_agent
-    agent.features = {}
-    agent.did = "did:test"
-    agent.extension = None
-    agent._cached_features_prompt = ""
-    agent.is_request_cancelled = MagicMock(return_value=False)
-    agent._maybe_audit = AsyncMock()
-    agent._genesis_audit_cognition_block = AsyncMock(return_value=None)
-    agent._get_privacy_transition_lock = MagicMock(return_value=_passthrough())
-    agent._turn_lifecycle = MagicMock(return_value=_passthrough())
-    agent.hooks_manager = None
-    agent._get_governing_constitution = AsyncMock(return_value="")
-    agent.check_solvency = AsyncMock(return_value="test-model")
-    agent._build_all_tools = MagicMock(return_value=[])
-    agent._fire_post_response_hook = AsyncMock(side_effect=lambda text, sid, **_: text)
-    agent.user_prompt_template = MagicMock()
-    agent.user_prompt_template.format.return_value = "rendered"
-    agent._current_request_id = "req-abc"
-    agent.emit_event = AsyncMock()
-    agent.operator_signal_producer = None
-
-    ctx = MagicMock()
-    ctx.system_prompt = "system"
-    ctx.dynamic_user_context = ""
-    ctx.messages = []
-    agent.context_manager = MagicMock()
-    agent.context_manager.build_context = AsyncMock(return_value=ctx)
-
-    agent.observability_store = MagicMock()
-    agent.observability_store.log_tool_call = AsyncMock(return_value="evt-1")
-    agent.observability_store.log_tool_response = AsyncMock()
-    agent.observability_store.log_metric = AsyncMock()
-
-    agent.process_input_streaming = StreamingMixin.process_input_streaming.__get__(agent)
-    agent._process_input_streaming_traced_locked = (
-        StreamingMixin._process_input_streaming_traced_locked.__get__(agent)
-    )
-    agent._persist_assistant_turn_safely = (
-        StreamingMixin._persist_assistant_turn_safely.__get__(agent)
-    )
-    agent._emit_revising_event = StreamingMixin._emit_revising_event.__get__(agent)
-    agent._fire_post_response_hook = (
-        StreamingMixin._fire_post_response_hook.__get__(agent)
-    )
-
-    # Disable the post-tool path so these tests focus on pre-tool +
-    # marker handling. Tests that need post-tool synthesis override.
-    async def post_tool(*, tool_results=None, **kw):
+async def _build_mock_agent(native_tool_effect_agent):
+    agent = await streaming_agent(native_tool_effect_agent)
+    async def post_tool(*, tool_results=None, **kwargs):
         if tool_results is not None:
-            tool_results.append({
-                "tool_call_id": "tc1", "name": "github",
-                "result": {"status": "ok"},
-            })
+            tool_results.append({"tool_call_id": "tc1", "name": "github", "result": {"status": "ok"}})
         yield "post-tool synthesis"
     agent._handle_orchestrator_response_streaming = post_tool
     return agent
 
 
+
 @pytest.mark.asyncio
-async def test_inband_sentinel_yielded_through_chat_stream():
+async def test_inband_sentinel_yielded_through_chat_stream(native_tool_effect_agent):
     """The sentinel must arrive on the chat stream (via the agent
     generator) after the pre-tool chunks but before the post-tool
     synthesis chunks — strict ordering is the whole point of going
     in-band."""
     from kestrel_sovereign.llm.adapter import LLMResponse, ToolCall
 
-    agent = _build_mock_agent()
+    agent = await _build_mock_agent(native_tool_effect_agent)
 
     async def stream():
         yield "Saving that now"
@@ -196,7 +135,6 @@ async def test_inband_sentinel_yielded_through_chat_stream():
             content="",
             tool_calls=[ToolCall(id="tc1", name="github", arguments={})],
         )
-    agent.llm_service = MagicMock()
     agent.llm_service.stream_with_tool_detection = lambda **kw: stream()
 
     chunks = []
@@ -229,7 +167,7 @@ async def test_inband_sentinel_yielded_through_chat_stream():
 
 
 @pytest.mark.asyncio
-async def test_sentinel_not_appended_to_persisted_assistant_text():
+async def test_sentinel_not_appended_to_persisted_assistant_text(native_tool_effect_agent):
     """Wire-protocol bytes must NEVER reach storage. If the sentinel
     leaks into the persisted assistant turn, the next turn's history
     loader feeds it back to the LLM and the LLM would see raw control
@@ -237,7 +175,7 @@ async def test_sentinel_not_appended_to_persisted_assistant_text():
     """
     from kestrel_sovereign.llm.adapter import LLMResponse, ToolCall
 
-    agent = _build_mock_agent()
+    agent = await _build_mock_agent(native_tool_effect_agent)
     persisted = []
     agent.privacy_agent.add_conversation = AsyncMock(
         side_effect=lambda role, content, **kw: persisted.append({
@@ -252,7 +190,6 @@ async def test_sentinel_not_appended_to_persisted_assistant_text():
             content="",
             tool_calls=[ToolCall(id="tc1", name="github", arguments={})],
         )
-    agent.llm_service = MagicMock()
     agent.llm_service.stream_with_tool_detection = lambda **kw: stream()
 
     async for _ in agent.process_input_streaming("save", session_id="s"):
@@ -269,14 +206,13 @@ async def test_sentinel_not_appended_to_persisted_assistant_text():
 
 
 @pytest.mark.asyncio
-async def test_no_sentinel_when_no_marker_fires():
+async def test_no_sentinel_when_no_marker_fires(native_tool_effect_agent):
     """A turn with no tool calls must not emit the sentinel. The
     sentinel is a tool-call boundary signal, not a heartbeat."""
-    agent = _build_mock_agent()
+    agent = await _build_mock_agent(native_tool_effect_agent)
 
     async def stream():
         yield "Plain answer, no tools."
-    agent.llm_service = MagicMock()
     agent.llm_service.stream_with_tool_detection = lambda **kw: stream()
 
     chunks = []
@@ -286,9 +222,9 @@ async def test_no_sentinel_when_no_marker_fires():
 
 
 @pytest.mark.asyncio
-async def test_thinking_delta_yielded_as_ui_only_sentinel_and_not_persisted():
+async def test_thinking_delta_yielded_as_ui_only_sentinel_and_not_persisted(native_tool_effect_agent):
     """Provider-separated reasoning should render as UI metadata only."""
-    agent = _build_mock_agent()
+    agent = await _build_mock_agent(native_tool_effect_agent)
     persisted = []
     agent.privacy_agent.add_conversation = AsyncMock(
         side_effect=lambda role, content, **kw: persisted.append({
@@ -299,7 +235,6 @@ async def test_thinking_delta_yielded_as_ui_only_sentinel_and_not_persisted():
     async def stream():
         yield ThinkingDelta("The user wants a concise answer.", provider="openai")
         yield "Final answer."
-    agent.llm_service = MagicMock()
     agent.llm_service.stream_with_tool_detection = lambda **kw: stream()
 
     chunks = []
@@ -318,11 +253,11 @@ async def test_thinking_delta_yielded_as_ui_only_sentinel_and_not_persisted():
 
 
 @pytest.mark.asyncio
-async def test_post_tool_thinking_delta_is_ui_only_and_not_persisted():
+async def test_post_tool_thinking_delta_is_ui_only_and_not_persisted(native_tool_effect_agent):
     """Post-tool final synthesis can also emit provider thinking metadata."""
     from kestrel_sovereign.llm.adapter import LLMResponse, ToolCall
 
-    agent = _build_mock_agent()
+    agent = await _build_mock_agent(native_tool_effect_agent)
     persisted = []
     agent.privacy_agent.add_conversation = AsyncMock(
         side_effect=lambda role, content, **kw: persisted.append({
@@ -347,7 +282,6 @@ async def test_post_tool_thinking_delta_is_ui_only_and_not_persisted():
         yield ThinkingDelta("Now synthesize from the tool result.", provider="openai")
         yield "Final post-tool answer."
 
-    agent.llm_service = MagicMock()
     agent.llm_service.stream_with_tool_detection = lambda **kw: stream()
     agent._handle_orchestrator_response_streaming = post_tool
 
@@ -371,12 +305,12 @@ async def test_post_tool_thinking_delta_is_ui_only_and_not_persisted():
 
 
 @pytest.mark.asyncio
-async def test_multiple_markers_yield_multiple_sentinels():
+async def test_multiple_markers_yield_multiple_sentinels(native_tool_effect_agent):
     """Two ToolCallStarted markers in the same LLM turn → two
     sentinels in stream order. Each is a distinct tool boundary."""
     from kestrel_sovereign.llm.adapter import LLMResponse, ToolCall
 
-    agent = _build_mock_agent()
+    agent = await _build_mock_agent(native_tool_effect_agent)
 
     async def stream():
         yield "thinking..."
@@ -389,7 +323,6 @@ async def test_multiple_markers_yield_multiple_sentinels():
                 ToolCall(id="tc-b", name="fetch", arguments={}),
             ],
         )
-    agent.llm_service = MagicMock()
     agent.llm_service.stream_with_tool_detection = lambda **kw: stream()
 
     chunks = []

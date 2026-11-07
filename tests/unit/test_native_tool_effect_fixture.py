@@ -97,10 +97,21 @@ def test_native_fixture_is_available_to_integration_without_plugin_autoload(tmp_
     import subprocess
     import sys
 
+    import kestrel_sovereign
+
     repository = Path(__file__).resolve().parents[2]
+    core_file = Path(kestrel_sovereign.__file__).resolve()
     environment = dict(os.environ, PYTEST_DISABLE_PLUGIN_AUTOLOAD="1")
+    # A wheel-consumer run must exercise that SAME installed Core in its child,
+    # even though pytest adds the test checkout to the child's import path.
+    same_core = (
+        "import pathlib,sys; sys.path.insert(0,sys.argv.pop(1)); "
+        "import kestrel_sovereign; "
+        "assert str(pathlib.Path(kestrel_sovereign.__file__).resolve()) == sys.argv.pop(1); "
+        "import pytest; raise SystemExit(pytest.main(sys.argv[1:]))"
+    )
     result = subprocess.run(
-        [sys.executable, "-B", "-m", "pytest", "-q",
+        [sys.executable, "-B", "-c", same_core, str(core_file.parent.parent), str(core_file), "-q",
          "-p", "pytest_asyncio.plugin", "-p", "pytest_timeout",
          "-p", "no:cacheprovider", "-o", "addopts=",
          "--basetemp=" + str(tmp_path / "native-fixture-child"),
