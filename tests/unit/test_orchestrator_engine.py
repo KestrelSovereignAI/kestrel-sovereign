@@ -16,6 +16,7 @@ import inspect
 
 import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
+from tests.utils.native_tool_effects import drive_native
 
 from kestrel_sovereign.agent.orchestrator_engine import OrchestratorEngineMixin
 from kestrel_sovereign.llm.adapter import LLMResponse, ToolCall
@@ -35,14 +36,14 @@ def _tool_call_response():
     )
 
 
-def _base_agent():
-    agent = MagicMock()
+async def _base_agent(native_tool_effect_agent):
+    agent = await native_tool_effect_agent(did="did:test:orchestrator-history")
     agent.features = {}
     agent._direct_tools = {}
     agent._build_assistant_tool_history_msg = MagicMock(
         return_value={"role": "assistant", "content": "", "tool_calls": []}
     )
-    agent._execute_tool_batch = AsyncMock()
+    agent._execute_tool_batch = AsyncMock(return_value=None)
     agent._execute_tool_batch_at_stop_boundary = (
         OrchestratorEngineMixin._execute_tool_batch_at_stop_boundary.__get__(agent)
     )
@@ -73,15 +74,15 @@ class TestSignatures:
 
 @pytest.mark.asyncio
 class TestNonStreamingHistoryContinuation:
-    async def test_history_continuation_reaches_generate_with_messages(self):
-        agent = _base_agent()
+    async def test_history_continuation_reaches_generate_with_messages(self, native_tool_effect_agent):
+        agent = await _base_agent(native_tool_effect_agent)
         agent.llm_service = MagicMock()
         agent.llm_service.generate_with_messages = AsyncMock(
             return_value=LLMResponse(content="done", tool_calls=None)
         )
 
         handler = OrchestratorEngineMixin._handle_orchestrator_response.__get__(agent)
-        await handler(
+        await drive_native(agent, lambda: handler(
             response=_tool_call_response(),
             feature_tools=[],
             system_prompt="sys",
@@ -90,7 +91,7 @@ class TestNonStreamingHistoryContinuation:
             user_message="what codeword did I give you?",
             session_id="s-1",
             conversation_history=HISTORY,
-        )
+        ))
 
         agent.llm_service.generate_with_messages.assert_awaited()
         sent = agent.llm_service.generate_with_messages.await_args.kwargs["messages"]
@@ -104,16 +105,16 @@ class TestNonStreamingHistoryContinuation:
             "content": "what codeword did I give you?",
         }
 
-    async def test_history_continuation_omitted_when_no_history(self):
+    async def test_history_continuation_omitted_when_no_history(self, native_tool_effect_agent):
         """No history (e.g. first turn of a session) keeps the legacy shape."""
-        agent = _base_agent()
+        agent = await _base_agent(native_tool_effect_agent)
         agent.llm_service = MagicMock()
         agent.llm_service.generate_with_messages = AsyncMock(
             return_value=LLMResponse(content="done", tool_calls=None)
         )
 
         handler = OrchestratorEngineMixin._handle_orchestrator_response.__get__(agent)
-        await handler(
+        await drive_native(agent, lambda: handler(
             response=_tool_call_response(),
             feature_tools=[],
             system_prompt="sys",
@@ -121,7 +122,7 @@ class TestNonStreamingHistoryContinuation:
             effective_model="claude-opus-5",
             user_message="hi",
             session_id="s-1",
-        )
+        ))
 
         sent = agent.llm_service.generate_with_messages.await_args.kwargs["messages"]
         assert sent[0]["role"] == "system"
@@ -130,8 +131,8 @@ class TestNonStreamingHistoryContinuation:
 
 @pytest.mark.asyncio
 class TestStreamingHistoryContinuation:
-    async def test_history_continuation_reaches_stream_with_tool_detection(self):
-        agent = _base_agent()
+    async def test_history_continuation_reaches_stream_with_tool_detection(self, native_tool_effect_agent):
+        agent = await _base_agent(native_tool_effect_agent)
 
         captured = {}
 
@@ -148,19 +149,22 @@ class TestStreamingHistoryContinuation:
                 agent
             )
         )
-        async for _chunk in handler(
-            response=_tool_call_response(),
-            feature_tools=[],
-            system_prompt="sys",
-            force_local_only=False,
-            effective_model="claude-opus-5",
-            user_message="what codeword did I give you?",
-            tool_events=[],
-            tool_results=[],
-            session_id="s-1",
-            conversation_history=HISTORY,
-        ):
-            pass
+        async def consume_stream():
+            async for _chunk in handler(
+                response=_tool_call_response(),
+                feature_tools=[],
+                system_prompt="sys",
+                force_local_only=False,
+                effective_model="claude-opus-5",
+                user_message="what codeword did I give you?",
+                tool_events=[],
+                tool_results=[],
+                session_id="s-1",
+                conversation_history=HISTORY,
+            ):
+                pass
+
+        await drive_native(agent, consume_stream)
 
         sent = captured["messages"]
         assert sent[0]["role"] == "system"
@@ -498,8 +502,8 @@ class TestContinuationReplaysRenderedPrompt:
     hint), so the two travel separately.
     """
 
-    async def test_rendered_prompt_is_used_over_raw_user_message(self):
-        agent = _base_agent()
+    async def test_rendered_prompt_is_used_over_raw_user_message(self, native_tool_effect_agent):
+        agent = await _base_agent(native_tool_effect_agent)
         captured = {}
 
         async def _fake_stream(*_args, **kwargs):
@@ -515,20 +519,23 @@ class TestContinuationReplaysRenderedPrompt:
                 agent
             )
         )
-        async for _ in handler(
-            response=_tool_call_response(),
-            feature_tools=[],
-            system_prompt="sys",
-            force_local_only=False,
-            effective_model="claude-opus-5",
-            user_message="raw ask",
-            tool_events=[],
-            tool_results=[],
-            session_id="s-1",
-            conversation_history=HISTORY,
-            continuation_user_content="RENDERED: memories+rag\n\nraw ask",
-        ):
-            pass
+        async def consume_stream():
+            async for _ in handler(
+                response=_tool_call_response(),
+                feature_tools=[],
+                system_prompt="sys",
+                force_local_only=False,
+                effective_model="claude-opus-5",
+                user_message="raw ask",
+                tool_events=[],
+                tool_results=[],
+                session_id="s-1",
+                conversation_history=HISTORY,
+                continuation_user_content="RENDERED: memories+rag\n\nraw ask",
+            ):
+                pass
+
+        await drive_native(agent, consume_stream)
 
         sent = captured["messages"]
         assert sent[3] == {
@@ -536,15 +543,15 @@ class TestContinuationReplaysRenderedPrompt:
             "content": "RENDERED: memories+rag\n\nraw ask",
         }, "continuation lost this turn's retrieved context"
 
-    async def test_falls_back_to_user_message_when_not_supplied(self):
-        agent = _base_agent()
+    async def test_falls_back_to_user_message_when_not_supplied(self, native_tool_effect_agent):
+        agent = await _base_agent(native_tool_effect_agent)
         agent.llm_service = MagicMock()
         agent.llm_service.generate_with_messages = AsyncMock(
             return_value=LLMResponse(content="done", tool_calls=None)
         )
 
         handler = OrchestratorEngineMixin._handle_orchestrator_response.__get__(agent)
-        await handler(
+        await drive_native(agent, lambda: handler(
             response=_tool_call_response(),
             feature_tools=[],
             system_prompt="sys",
@@ -553,7 +560,7 @@ class TestContinuationReplaysRenderedPrompt:
             user_message="plain ask",
             session_id="s-1",
             conversation_history=HISTORY,
-        )
+        ))
         sent = agent.llm_service.generate_with_messages.await_args.kwargs["messages"]
         assert sent[3] == {"role": "user", "content": "plain ask"}
 
@@ -591,8 +598,8 @@ class TestRepairTurnIsPruned:
     turn that fit the first call can overflow on the repair call.
     """
 
-    async def test_repair_path_prunes_the_history_bearing_array(self):
-        agent = _base_agent()
+    async def test_repair_path_prunes_the_history_bearing_array(self, native_tool_effect_agent):
+        agent = await _base_agent(native_tool_effect_agent)
         agent.llm_service = MagicMock()
         agent.llm_service.generate_with_messages = AsyncMock(
             return_value=LLMResponse(content="done", tool_calls=None)
@@ -612,7 +619,7 @@ class TestRepairTurnIsPruned:
             handler = OrchestratorEngineMixin._handle_orchestrator_response.__get__(
                 agent
             )
-            await handler(
+            await drive_native(agent, lambda: handler(
                 response=LLMResponse(content="let me check that", tool_calls=None),
                 feature_tools=[{"function": {"name": "t"}}],
                 system_prompt="sys",
@@ -621,7 +628,7 @@ class TestRepairTurnIsPruned:
                 user_message="ask",
                 session_id="s-1",
                 conversation_history=HISTORY,
-            )
+            ))
 
         pruned.assert_called_once()
         kwargs = pruned.call_args.kwargs

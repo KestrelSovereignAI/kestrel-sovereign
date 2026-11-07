@@ -17,88 +17,62 @@ from __future__ import annotations
 
 import asyncio
 from typing import Any, List, Optional, Tuple
-from unittest.mock import AsyncMock, MagicMock
 
 from kestrel_sovereign.agent.streaming import _parse_stream_sentinels
 from kestrel_sovereign.llm.adapter import LLMResponse, ToolCall
 from tests.utils.virtual_clock import VirtualClockLoop as _VirtualClockLoop
+from tests.utils.native_tool_effects import drive_native
 
 
-_BOUND_METHODS = (
-    "_handle_orchestrator_response_streaming",
-    "_execute_tool_batch_at_stop_boundary",
-    "_execute_tool_with_hooks", "_execute_tool_batch",
-    "_partition_tool_calls", "_dispatch_tool_call",
-    "_dispatch_feature_tool", "_dispatch_direct_tool",
-    "_get_denied_tools", "_handle_feature_error",
-    "_prune_orchestrator_messages", "_build_all_tools",
-    "_build_feature_tools", "_visible_features_by_tool_name",
-    "_visible_known_tool_names", "_known_tool_names",
-    "_registered_tool_names", "_registered_features_by_tool_name",
-    "_feature_supports_subagent_dispatch", "_hidden_context_features",
-    "_hidden_context_tools", "_feature_hidden_from_context",
-    "_direct_tool_hidden_from_context",
-)
+async def _agent_with_followup(create, followup):
+    """Create the real partial Agent on the same loop as native SQL and input."""
+    from kestrel_sovereign.features.base import Feature
 
+    class TestTool(Feature):
+        @property
+        def tool_description(self):
+            return "One owned successful tool before the observed generation"
 
-def _agent_with_followup(followup) -> MagicMock:
-    """A KestrelAgent whose orchestrator methods are real and whose one tool
-    succeeds, with ``followup`` as the post-tool ``stream_with_tool_detection``."""
-    from kestrel_sovereign.hooks import HooksManager
-    from kestrel_sovereign.kestrel_agent import KestrelAgent
+        async def initialize(self):
+            pass
 
-    feature = MagicMock()
-    feature.tool_name = "test_tool"
-    feature.name = "test_feature"
-    feature.execute_as_subagent = AsyncMock(return_value={"success": True})
-    feature.to_orchestrator_tool.return_value = {
-        "type": "function",
-        "function": {"name": "test_tool", "description": "", "parameters": {}},
-    }
-    agent = MagicMock()
-    agent.did = "did:test"
-    agent.features = {"test_feature": feature}
-    agent.observability_store = MagicMock()
-    agent.observability_store.log_tool_call = AsyncMock(return_value="e1")
-    agent.observability_store.log_tool_response = AsyncMock()
-    agent.observability_store.log_metric = AsyncMock()
-    agent._direct_tools = {}
-    agent._tool_to_feature = {}
-    agent.hooks_manager = HooksManager()
-    agent.is_request_cancelled = MagicMock(return_value=False)
-    agent._explored_features = {}
-    agent._direct_tool_defs = []
-    agent._register_explored_feature_tools = MagicMock()
-    agent.llm_service = MagicMock()
+        async def execute_as_subagent(self, **kwargs):
+            return {"success": True}
+
+    agent = await create(did="did:test:watchdog")
+    feature = TestTool(agent)
+    agent.features[feature.name] = feature
     agent.llm_service.stream_with_tool_detection = followup
-    for name in _BOUND_METHODS:
-        setattr(agent, name, getattr(KestrelAgent, name).__get__(agent))
-    agent._build_tool_calls_msg = KestrelAgent._build_tool_calls_msg
     return agent
 
 
-def _run_turn(
-    loop: _VirtualClockLoop, agent: MagicMock,
-) -> Tuple[List[Any], Optional[BaseException]]:
-    """The chunks the follow-up yielded, and the timeout that failed it, if any
-    (#3552: a cut follow-up is raised out of the turn after its error card)."""
+def _run_turn(loop: _VirtualClockLoop, followup, *, tmp_path, monkeypatch) -> Tuple[List[Any], Optional[BaseException]]:
+    """Observe the actual follow-up and retire its native fixture on this loop."""
     from kestrel_sovereign.agent.orchestrator_engine import LLMCallInactivityTimeout
+    from kestrel_sovereign.testing.fixtures import native_tool_effect_agent
 
     chunks: List[Any] = []
 
-    async def drive() -> None:
-        first = LLMResponse(
-            content="",
-            tool_calls=[ToolCall(id="tc1", name="test_tool", arguments={})],
-        )
-        async for chunk in agent._handle_orchestrator_response_streaming(
-            response=first, feature_tools=[], system_prompt="sys",
-            force_local_only=False, effective_model="m", user_message="hi",
-        ):
-            chunks.append(chunk)
+    async def run():
+        lifetime = native_tool_effect_agent.__wrapped__(tmp_path, monkeypatch)
+        try:
+            create = await anext(lifetime)
+            agent = await _agent_with_followup(create, followup)
+
+            async def drive():
+                first = LLMResponse(content="", tool_calls=[ToolCall(id="tc1", name="test_tool", arguments={})])
+                async for chunk in agent._handle_orchestrator_response_streaming(
+                    response=first, feature_tools=[], system_prompt="sys",
+                    force_local_only=False, effective_model="m", user_message="hi",
+                ):
+                    chunks.append(chunk)
+
+            await drive_native(agent, drive)
+        finally:
+            await lifetime.aclose()
 
     try:
-        loop.run_until_complete(drive())
+        loop.run_until_complete(run())
     except LLMCallInactivityTimeout as exc:
         return chunks, exc
     return chunks, None
@@ -110,7 +84,7 @@ def _timeout_markers(chunks: List[Any]) -> List[dict]:
     return [p for p in parts if p["phase"] == "error" and "timeout" in (p.get("detail") or "")]
 
 
-def test_a_stream_that_keeps_progressing_past_the_watchdog_is_not_cut():
+def test_a_stream_that_keeps_progressing_past_the_watchdog_is_not_cut(tmp_path, monkeypatch):
     """400 virtual seconds of output, a chunk every 10 — more than twice the
     180s watchdog — completes with every chunk and no timeout marker."""
     from kestrel_sovereign.agent.orchestrator_engine import (
@@ -128,7 +102,7 @@ def test_a_stream_that_keeps_progressing_past_the_watchdog_is_not_cut():
         yield LLMResponse(content="".join(words), tool_calls=[])
 
     try:
-        chunks, failure = _run_turn(loop, _agent_with_followup(long_followup))
+        chunks, failure = _run_turn(loop, long_followup, tmp_path=tmp_path, monkeypatch=monkeypatch)
     finally:
         loop.close()
 
@@ -139,7 +113,7 @@ def test_a_stream_that_keeps_progressing_past_the_watchdog_is_not_cut():
     assert "".join(words) in text
 
 
-def test_a_stream_that_goes_silent_is_still_cut():
+def test_a_stream_that_goes_silent_is_still_cut(tmp_path, monkeypatch):
     """One chunk, then 300 virtual seconds with nothing: the watchdog trips
     180 seconds after the last item and the turn shows a timeout marker."""
     from kestrel_sovereign.agent.orchestrator_engine import (
@@ -159,7 +133,7 @@ def test_a_stream_that_goes_silent_is_still_cut():
         yield "this never arrives"
 
     try:
-        chunks, failure = _run_turn(loop, _agent_with_followup(stalling_followup))
+        chunks, failure = _run_turn(loop, stalling_followup, tmp_path=tmp_path, monkeypatch=monkeypatch)
     finally:
         loop.close()
 
@@ -173,7 +147,7 @@ def test_a_stream_that_goes_silent_is_still_cut():
     assert ORCHESTRATOR_TURN_TIMEOUT_SECS <= silence <= ORCHESTRATOR_TURN_TIMEOUT_SECS + 20
 
 
-def test_a_stream_that_never_starts_is_still_cut():
+def test_a_stream_that_never_starts_is_still_cut(tmp_path, monkeypatch):
     """No item at all — the hung-upstream case the watchdog exists for."""
     loop = _VirtualClockLoop()
 
@@ -184,7 +158,7 @@ def test_a_stream_that_never_starts_is_still_cut():
         yield "this never arrives"
 
     try:
-        chunks, failure = _run_turn(loop, _agent_with_followup(hung_followup))
+        chunks, failure = _run_turn(loop, hung_followup, tmp_path=tmp_path, monkeypatch=monkeypatch)
     finally:
         loop.close()
 
