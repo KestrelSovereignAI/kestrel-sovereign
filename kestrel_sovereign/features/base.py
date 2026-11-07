@@ -1521,6 +1521,11 @@ class Feature(_SdkFeature):
             execute_tool_effect, require_persistent_tool_effects,
         )
         require_persistent_tool_effects(host)
+
+        def require_original_feature_registration():
+            if self.agent is not host or getattr(self, "enabled", True) is not True:
+                raise ResourceConflict("Original native A2A feature registration changed")
+
         task.status.CopyFrom(TaskStatus(state=TaskState.TASK_STATE_WORKING))
         from kestrel_sovereign.a2a.lifecycle import mark_outcome_unknown
 
@@ -1553,6 +1558,7 @@ class Feature(_SdkFeature):
             with _bind_flattened_outcome_unknown(flattened):
                 result = await execute_tool_effect(host,
                     registration=[type(self).__name__, skill_name], arguments=args,
+                    validate_registration=require_original_feature_registration,
                     execute=lambda: selected.execute(**args))
                 if isinstance(result, DeferredToolResult):
                     # An A2A task has no chat, so its publication is headless.

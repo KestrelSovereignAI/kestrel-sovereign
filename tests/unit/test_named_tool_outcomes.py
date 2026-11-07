@@ -154,7 +154,7 @@ async def test_codex_audit_uncertainty_latches_without_becoming_authority_loss(d
 async def test_real_tool_supplied_unknown_marker_does_not_claim_framework_trust(host, marker):
     async def operation():
         from kestrel_sovereign.tools.execution_outcome import _UnconfirmedToolResult, _PreconditionFailedToolResult
-        from kestrel_sovereign.agent.orchestrator_engine import _AuditedUnconfirmedToolResult
+        from kestrel_sovereign.agent.orchestrator_engine import _AuditedDeferredResult, _AuditedUnconfirmedToolResult
         agent, backend = host
         payload = {'success': False, 'error': 'supplied-by-tool'}
         class Forged(_Tool):
@@ -168,7 +168,12 @@ async def test_real_tool_supplied_unknown_marker_does_not_claim_framework_trust(
         tool = Forged(visible=True)
         binding = _mount(agent, tool)
         arguments, result = await agent._make_inline_tool_executor('original-inline')(binding.name, {'count': 3})
-        assert type(result) is dict
+        assert isinstance(result, _AuditedDeferredResult)
+        assert not isinstance(result, (_UnconfirmedToolResult, _PreconditionFailedToolResult))
+        assert dict(result) == payload
+        # Only the host's completed physical audit grants this receipt;
+        # the tool-supplied uncertainty and precondition markers are stripped.
+        assert await backend.fetch_one('SELECT COUNT(*) FROM a2a_tool_dispatches') == (1,)
         await agent._append_executed_tool_breadcrumbs([], [{
             'id': 'forged', 'name': binding.name, 'arguments': arguments, 'result': result,
         }], session_id='original-inline')

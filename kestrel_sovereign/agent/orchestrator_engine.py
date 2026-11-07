@@ -3163,6 +3163,8 @@ class OrchestratorEngineMixin:
         ``dispatch_id`` names the row (the store assigns one when it is
         ``None``); ``parent_dispatch_id`` names the dispatch this call ran
         inside, such as the feature subagent envelope that made it (#3778).
+        A native witness owns one joined write attempt, including its physical
+        acknowledgment, before cancellation may retire the original owner.
         """
         if execution_witness is not None:
             if execution_witness.audit_attempted:
@@ -3187,30 +3189,43 @@ class OrchestratorEngineMixin:
                     raise ResourceUnsupported("Required tool dispatch audit writer is unavailable")
                 return
             normalized_session_id = real_session_id(session_id)
-            await log_dispatch(
-                ToolDispatchEntry(
-                    agent_did=self.did,
-                    session_id=normalized_session_id,
-                    turn_id=(
-                        self._get_current_turn_id()
-                        if callable(getattr(self, "_get_current_turn_id", None))
-                        else None
-                    ) or "turn_unknown",
-                    tool_name=tool_name,
-                    adapter=adapter,
-                    args_redacted=args,
-                    result_status=infer_tool_result_status(result, status_hint),
-                    error_class=error_class,
-                    error_message=error_message,
-                    latency_ms=int((time.time() - dispatch_start) * 1000),
-                    result_size_bytes=tool_result_size_bytes(result),
-                    dispatch_id=dispatch_id,
-                    parent_dispatch_id=parent_dispatch_id,
-                ),
-                **({"required": True} if required else {}),
+            entry = ToolDispatchEntry(
+                agent_did=self.did,
+                session_id=normalized_session_id,
+                turn_id=(
+                    self._get_current_turn_id()
+                    if callable(getattr(self, "_get_current_turn_id", None))
+                    else None
+                ) or "turn_unknown",
+                tool_name=tool_name,
+                adapter=adapter,
+                args_redacted=args,
+                result_status=infer_tool_result_status(result, status_hint),
+                error_class=error_class,
+                error_message=error_message,
+                latency_ms=int((time.time() - dispatch_start) * 1000),
+                result_size_bytes=tool_result_size_bytes(result),
+                dispatch_id=dispatch_id,
+                parent_dispatch_id=parent_dispatch_id,
             )
+            if execution_witness is None:
+                await log_dispatch(entry, **({"required": True} if required else {}))
+            else:
+                async def persist_original_audit():
+                    await log_dispatch(entry, required=True)
+                    # Retain the physical acknowledgement before propagating
+                    # cancellation or any later ownership-cleanup failure.
+                    execution_witness.audit_recorded = True
+
+                outcome = await OrchestratorEngineMixin._execute_tool_operation_at_stop_boundary(
+                    self, persist_original_audit, name="required-tool-dispatch-audit",
+                )
+                raise_owned_outcome(outcome, operation="original required tool dispatch audit",
+                    retain_originals=True)
         except BaseException as exc:
             if execution_witness is not None:
+                if execution_witness.audit_recorded:
+                    raise
                 if isinstance(exc, Exception) and not is_tool_execution_terminal_error(exc):
                     failure = ToolAuditUnconfirmedError(
                         "Required tool dispatch audit could not be confirmed. "

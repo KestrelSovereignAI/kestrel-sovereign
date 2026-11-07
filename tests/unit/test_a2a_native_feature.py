@@ -137,3 +137,60 @@ async def test_missing_required_native_arguments_are_rejected_before_effect_clai
         assert result.status.message.context_id == result.context_id
         assert await owner.tool_effect_store.database.fetchone(
             "SELECT COUNT(*) FROM tool_effect_claims") == (0,), "invalid native input claimed an effect before binding"
+
+
+@pytest.mark.parametrize('lane', ['direct', 'manager'])
+@pytest.mark.parametrize('withdrawal', ['host', 'disabled'])
+async def test_native_a2a_claim_retains_original_feature_registration(
+    owner, native_tool_effect_agent, tmp_path, monkeypatch, lane, withdrawal,
+):
+    from kestrel_sovereign.a2a.scope import NativeRecipientScope
+    from tests.utils.native_a2a import manager_for
+    from tests.utils.native_tool_effects import drive_native
+
+    foreign = await native_tool_effect_agent(did=owner.did)
+    owner.native_effect_target = tmp_path / 'original-host-effect'
+    foreign.native_effect_target = tmp_path / 'foreign-host-effect'
+
+    class HostFeature(Feature):
+        tool_description = 'Write only through the original admitted host'
+
+        async def initialize(self):
+            pass
+
+        @tool(name='host_bound_effect', description='Write the selected host marker')
+        async def host_bound_effect(self):
+            self.agent.native_effect_target.write_text('native A2A effect')
+            return {'success': True}
+
+    native = HostFeature(owner)
+    owner.features[native.name] = native
+    manager = manager_for(owner.tool_effect_store.database.backend,
+        NativeRecipientScope(owner.did), owns_backend=False)
+    await manager.initialize()
+    manager.register_provider('feature', native.get_agent_skills(), native)
+    claim = owner.tool_effect_store.claim
+
+    async def withdraw_after_physical_ack(*args, **kwargs):
+        receipt = await claim(*args, **kwargs)
+        assert owner.tool_effect_store.database.owns_open_transaction is False
+        if withdrawal == 'host':
+            native.agent = foreign
+        else:
+            native.enabled = False
+        return receipt
+
+    monkeypatch.setattr(owner.tool_effect_store, 'claim', withdraw_after_physical_ack)
+    async def operation():
+        if lane == 'manager':
+            return await manager.execute_skill('feature', 'host_bound_effect', {})
+        return await native.handle_task(task(skill='host_bound_effect', args={}))
+    try:
+        result = await drive_native(owner, operation)
+        assert not foreign.native_effect_target.exists(), 'A2A claim executed through a replacement host'
+        assert not owner.native_effect_target.exists(), 'A2A claim executed a withdrawn feature'
+        assert result.status.state == TaskState.TASK_STATE_FAILED
+        assert await owner.tool_effect_store.database.fetchall(
+            'SELECT state FROM tool_effect_claims') == [('NOT_EXECUTED',)]
+    finally:
+        await manager.close()

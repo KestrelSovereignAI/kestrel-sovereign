@@ -813,11 +813,11 @@ def _spy_store_refusals(host) -> list[BaseException]:
 async def test_a_write_refused_once_authority_is_revoked_is_reported_not_recorded(
     make_host, monkeypatch, caplog, capsys, door, inline, target,
 ):
-    """Ruling 1's case on real SQLite under native custody: the call takes
-    effect, authority is revoked, and native storage refuses its row. Nothing
-    is marked recorded, one WARNING names the refused row, and the original
-    authority error propagates unchanged. No authority to write after
-    revocation is added: the fenced owner does not write."""
+    """Revocation refuses new native audit admission before reaching SQL.
+
+    The original admitted effect remains committed, but shutdown cannot
+    grant another task authority after the shared custody is revoked.
+    """
     host = await make_host(inline=inline)
     await host.backend.execute("CREATE TABLE talon_jobs (job_id TEXT, state TEXT)")
 
@@ -828,6 +828,17 @@ async def test_a_write_refused_once_authority_is_revoked_is_reported_not_recorde
 
     host.feature.cancel_effect = cancel_effect
     runtime = ExecutionCustody(_LiveRuntimeFence())
+    denials = []
+    require_work = runtime.require_work
+
+    def observe_original_denial():
+        try:
+            require_work()
+        except ExecutionAuthorityError as error:
+            denials.append(error)
+            raise
+
+    monkeypatch.setattr(runtime, 'require_work', observe_original_denial)
     host.agent.hooks_manager.register(_RevokeAtPost(target, runtime))
     audited = _spy_audited_marks(monkeypatch)
     refusals = _spy_store_refusals(host)
@@ -851,9 +862,8 @@ async def test_a_write_refused_once_authority_is_revoked_is_reported_not_recorde
 
     # The original Stop is checked before an audit write is admitted.
     assert _unwritten_reports(caplog) == []
-    [refusal] = refusals
-    assert isinstance(refusal, ExecutionAuthorityError)
-    assert raised.value is refusal, 'The original authority denial was replaced'
+    assert refusals == [], "Revoked authority reached the physical audit writer"
+    assert denials and raised.value is denials[0], "The original admission denial was replaced"
 
     assert type(raised.value) is ExecutionAuthorityError
     assert f"Stop arrived after {target} took effect" in str(raised.value)

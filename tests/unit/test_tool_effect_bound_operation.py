@@ -1058,3 +1058,50 @@ async def test_post_approval_argument_owner_cannot_change_the_admitted_effect(bo
     assert [json.loads(row[0]) for row in rows] == [{'marker': 'approved'}]
     assert await owner.tool_effect_store.database.fetchone(
         'SELECT state FROM tool_effect_claims') == ('RETURNED_OK',)
+
+
+@pytest.mark.parametrize('lane', ['chat', 'named', 'bound'])
+async def test_original_required_audit_joins_before_repeated_cancellation_retires_its_owner(
+    response_loss_dispatch, monkeypatch, lane,
+):
+    from kestrel_sdk.resources import ResourceOutcomeUnknown
+    from kestrel_sovereign.execution_custody import execution_evidence_carriers
+
+    owner, binding, witness, _, original, invoke = response_loss_dispatch
+    monkeypatch.setattr(binding.tool, 'execute', original)
+    entered, release = asyncio.Event(), asyncio.Event()
+    writes = []
+    write = owner.observability_store.log_tool_dispatch
+
+    async def pending_original_write(entry, **kwargs):
+        writes.append(entry.dispatch_id)
+        entered.set()
+        await release.wait()
+        return await write(entry, **kwargs)
+
+    monkeypatch.setattr(owner.observability_store, 'log_tool_dispatch', pending_original_write)
+    calling = None
+    with caller_context_scope(CallerContext.sovereign()):
+        try:
+            calling = asyncio.create_task(invoke(lane))
+            await asyncio.wait_for(entered.wait(), 5)
+            assert witness.read_text().splitlines() == ['once']
+            for _ in range(2):
+                calling.cancel()
+                await asyncio.sleep(0.02)
+                assert not calling.done(), 'Original required audit was abandoned before its physical SQL acknowledgement'
+            release.set()
+            with pytest.raises((asyncio.CancelledError, ResourceOutcomeUnknown)) as caught:
+                await calling
+            assert any(isinstance(error, asyncio.CancelledError)
+                for error in execution_evidence_carriers(caught.value))
+            assert len(writes) == 1, 'Cancellation issued another physical audit attempt'
+            assert await owner.tool_effect_store.database.fetchone(
+                'SELECT result_status FROM a2a_tool_dispatches') == ('success',)
+            with pytest.raises(ToolEffectReconciliationRequired):
+                await invoke(lane)
+            assert len(writes) == 1 and witness.read_text().splitlines() == ['once']
+        finally:
+            release.set()
+            if calling is not None:
+                await asyncio.gather(calling, return_exceptions=True)
