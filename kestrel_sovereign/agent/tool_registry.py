@@ -488,6 +488,16 @@ class ToolRegistryMixin:
             self._visible_known_tool_names()
         )
 
+    def _feature_for_tool_owner(self, owner):
+        """Resolve the registered Feature behind its exact mount owner."""
+        if owner is None:
+            return None
+        features = getattr(self, "features", {})
+        for feature in features.values():
+            if getattr(feature, "tool_name", None) == owner:
+                return feature
+        return features.get(owner)
+
     def register_dynamic_tools(
         self, owner: str, tools, *, pin: bool = False,
         on_registered: Callable[[Any, GovernedToolBinding], None] | None = None,
@@ -593,7 +603,7 @@ class ToolRegistryMixin:
                     self, name, owner, registration, tool,
                     self._security_feature_name_for_tool(name),
                     validate_feature_registration=_capture_tool_feature_registration(
-                        self, tool, getattr(self, "features", {}).get(owner)),
+                        self, tool, self._feature_for_tool_owner(owner)),
                 ))
         return registered
 

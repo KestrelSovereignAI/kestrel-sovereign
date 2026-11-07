@@ -61,6 +61,7 @@ from kestrel_sovereign.a2a.lifecycle import (
     STREAM_STOP_STATES,
     TERMINAL_STATES,
     new_task_status,
+    mark_outcome_unknown,
     task_outcome_unknown,
     task_state_label,
 )
@@ -603,7 +604,12 @@ class TaskManager:
 
         from kestrel_sovereign.agent.tool_registry import _capture_tool_feature_registration
 
+        from kestrel_sovereign.features.base import Feature as HostFeature
+
+        selected_handler = handler.handle_task
         original_host = handler.agent if isinstance(handler, Feature) else None
+        opaque_feature_handler = (original_host is not None
+            and getattr(selected_handler, '__func__', None) is not HostFeature.handle_task)
         selected_generation = registry_generation(original_host) if original_host is not None else None
         require_feature = (_capture_tool_feature_registration(original_host, None, handler)
             if original_host is not None else None)
@@ -613,6 +619,8 @@ class TaskManager:
                 raise ResourceConflict('Task provider registration changed during admission')
             if require_feature is not None:
                 require_feature()
+                if handler.handle_task != selected_handler:
+                    raise ResourceConflict('Task provider handler changed during admission')
                 if registry_generation(original_host) != selected_generation:
                     raise ResourceConflict('Task provider generation changed during admission')
 
@@ -637,6 +645,35 @@ class TaskManager:
                 raise ToolEffectJournalUnavailable('tool_effect_attempt_unavailable')
             original_turn.require_live(original_host)
             args = deepcopy(args)
+
+        async def execute_selected_handler(task, *, arguments):
+            if not opaque_feature_handler:
+                return await selected_handler(task, arguments=arguments)
+
+            async def execute_opaque_handler():
+                result = await selected_handler(task, arguments=arguments)
+                if not issubclass(type(result), Task):
+                    raise TypeError('Native Feature handler must return a Task')
+                return result
+
+            try:
+                return await execute_tool_effect(original_host,
+                    registration=['a2a-native-handler', agent_id, skill_id],
+                    arguments=arguments, expected_generation=selected_generation,
+                    validate_registration=require_original_registration,
+                    execute=execute_opaque_handler)
+            except ResourceOutcomeUnknown as unknown:
+                if is_execution_control_error(unknown):
+                    raise
+                # The journal retains the exact original failure and fences
+                # replay. Persist that same recipient-owned Task as unknown;
+                # a custom handler need not enter the canonical tool leaf.
+                task.status.CopyFrom(new_task_status(
+                    at=self.task_store.now_utc(), state=TaskState.TASK_STATE_FAILED,
+                    message=new_text_message('Native task effect outcome is unknown',
+                        task_id=task.id, context_id=task.context_id)))
+                mark_outcome_unknown(task)
+                return task
 
         async def execute_original_skill():
             nonlocal args, session_id
@@ -754,6 +791,7 @@ class TaskManager:
                     with execution_registration:
                         try:
                             require_original_registration()
+                            task = await execute_selected_handler(task, arguments=args)
                         except ResourceConflict as refusal:
                             # The original native task was already admitted.
                             # Settle that same recipient-owned task through the
@@ -763,7 +801,6 @@ class TaskManager:
                                 agent_name=authority_agent_id,
                                 recipient_agent_id=authority_agent_id)
                             raise
-                        task = await handler.handle_task(task, arguments=args)
                     # The canonical outcome writer owns CAS and uncertain-commit
                     # reconciliation. A persistence failure must reach the caller; an
                     # extra transaction/retry cannot manufacture a completed receipt.
@@ -804,7 +841,7 @@ class TaskManager:
             else:
                 async def execute_original_provider():
                     with execution_registration:
-                        await self._execute_async(handler, Task.FromString(task.SerializeToString()),
+                        await self._execute_async(execute_selected_handler, Task.FromString(task.SerializeToString()),
                             authority_agent_id, arguments=args,
                             validate_registration=require_original_registration)
 
@@ -1013,7 +1050,7 @@ class TaskManager:
 
     async def _execute_async(
         self,
-        handler: TaskHandler,
+        handler: Callable[..., Coroutine[Any, Any, Task]],
         task: Task,
         authority_agent_id: str,
         *,
@@ -1026,7 +1063,7 @@ class TaskManager:
         try:
             try:
                 validate_registration()
-                task = await handler.handle_task(task, arguments=arguments)
+                task = await handler(task, arguments=arguments)
             except Exception as error:
                 if is_execution_control_error(error):
                     raise

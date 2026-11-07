@@ -28,6 +28,8 @@ import pytest
 import pytest_asyncio
 
 from kestrel_sdk.hooks.base import Hook, HookEvent, HookInput, HookOutput
+from kestrel_sdk.tools.base import AgentTool
+from kestrel_sovereign.features.base import Feature
 from kestrel_sovereign import cli_lifecycle
 from kestrel_sovereign.features.health import checks as health_checks
 from kestrel_sovereign.features.health.feature import HealthFeature
@@ -104,18 +106,23 @@ def _no_real_restart(monkeypatch):
     )
 
 
-class _StubRestartFeature:
+class _StubRestartFeature(Feature):
     """Exposes a ``restart_coordinator`` tool that only counts its calls."""
 
-    def __init__(self):
-        self.enabled = True
+    tool_description = 'Owned scheduler restart-counter test tool'
+
+    async def initialize(self):
+        pass
+
+    def __init__(self, agent):
+        super().__init__(agent)
         self.calls = 0
 
         async def execute(**_kwargs):
             self.calls += 1
             return {"success": True, "processed": 0}
 
-        tool = MagicMock()
+        tool = MagicMock(spec=AgentTool)
         tool.name = TASK_NAME
         tool.execute = AsyncMock(side_effect=execute)
         self._tool = tool
@@ -227,7 +234,7 @@ async def harness(tmp_path, native_tool_effect_agent):
         )
         hooks = HooksManager()
         hooks.register(SecurityHook(permissions, approvals))
-        tool_feature = _StubRestartFeature()
+        tool_feature = _StubRestartFeature(execution_agent)
         agent.hooks_manager = hooks
         agent.features = {"StubRestartFeature": tool_feature}
         agent.dispatcher = dispatcher

@@ -132,7 +132,7 @@ async def test_actual_a2a_producers_and_projections_propagate_original_control(t
                         raise ResourceConflict('Original worker registration changed')
                     validated.append(True)
 
-                await manager._execute_async(provider, task, "did:test:recipient",
+                await manager._execute_async(provider.handle_task, task, "did:test:recipient",
                     validate_registration=validate_original_registration)
             elif stage == "command":
                 manager.register_provider(

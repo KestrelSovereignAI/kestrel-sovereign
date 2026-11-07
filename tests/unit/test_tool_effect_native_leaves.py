@@ -156,7 +156,7 @@ async def test_async_feature_task_retains_its_original_journal_until_native_comp
         async def owned_async_task_effect(self) -> dict:
             rows = await owner.tool_effect_store.database.fetchall(
                 'SELECT parent_claim_id,state FROM tool_effect_claims')
-            assert len(rows) == 2 and any(parent is not None and state == 'STARTED'
+            assert len(rows) == 3 and sum(state == 'STARTED' for _parent, state in rows) == 2 and any(parent is not None and state == 'STARTED'
                 for parent, state in rows), 'Async task did not retain its original dispatch claim'
             witness.write_text('one original asynchronous effect')
             if uncertain:
@@ -181,7 +181,7 @@ async def test_async_feature_task_retains_its_original_journal_until_native_comp
         assert accepted.is_set(), 'Native asynchronous acceptance waited for a whole-worker privacy span'
         assert entered.is_set(), 'Accepted native asynchronous worker never entered its original handler'
         assert not invocation.done(), 'Originating journal retired before its accepted worker'
-        assert await owner.tool_effect_store.database.fetchall('SELECT state FROM tool_effect_claims') == [('RETURNED_OK',)]
+        assert await owner.tool_effect_store.database.fetchall('SELECT state FROM tool_effect_claims') == [('RETURNED_OK',), ('STARTED',)]
         resume.set()
         if uncertain:
             from kestrel_sovereign.execution_custody import execution_evidence_carriers
@@ -203,7 +203,7 @@ async def test_async_feature_task_retains_its_original_journal_until_native_comp
             assert task_outcome_unknown(persisted)
         assert await owner.tool_effect_store.database.fetchone('SELECT state FROM tool_effect_operations') == ('CLOSED',)
         assert await owner.tool_effect_store.database.fetchall('SELECT state FROM tool_effect_claims') == [
-            ('RETURNED_OK',), ('UNCONFIRMED' if uncertain else 'RETURNED_OK',)]
+            ('RETURNED_OK',), ('RETURNED_OK',), ('UNCONFIRMED' if uncertain else 'RETURNED_OK',)]
         with pytest.raises(ToolEffectReconciliationRequired):
             await invoke(owner, 'original async intention', invocation_id='original-async-task-intent')
         assert witness.read_text() == 'one original asynchronous effect'
@@ -586,7 +586,7 @@ async def test_accepted_async_worker_can_finish_its_original_nested_bound_operat
         assert persisted.status.state == TaskState.TASK_STATE_COMPLETED
         assert witness.read_text() == 'accepted-original-nested-effect\n'
         assert await owner.tool_effect_store.database.fetchall(
-            'SELECT state FROM tool_effect_claims') == [('RETURNED_OK',)] * 3
+            'SELECT state FROM tool_effect_claims') == [('RETURNED_OK',)] * 4
     finally:
         resume.set()
         await asyncio.gather(calling, return_exceptions=True)

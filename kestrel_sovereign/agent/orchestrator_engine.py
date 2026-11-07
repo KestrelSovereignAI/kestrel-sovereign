@@ -2188,7 +2188,8 @@ class OrchestratorEngineMixin:
         from kestrel_sovereign.agent.tool_registry import _capture_tool_feature_registration
 
         registration_validator = _capture_tool_feature_registration(self, found_tool,
-            found_feature if found_feature is not None else self.features.get(direct_tool_feature_name))
+            found_feature if found_feature is not None else self._feature_for_tool_owner(
+                self._tool_to_feature.get(tool_name)))
 
         # --- PRE_TOOL_USE hook ---
         # The real HookManager threads input through the hook chain,
@@ -3457,11 +3458,8 @@ class OrchestratorEngineMixin:
         snake = self._tool_to_feature.get(tool_name)
         if not snake:
             return tool_name
-        features = getattr(self, "features", None) or {}
-        for feature in features.values():
-            if getattr(feature, "tool_name", None) == snake:
-                return getattr(feature, "name", snake)
-        return snake
+        feature = self._feature_for_tool_owner(snake)
+        return getattr(feature, "name", snake) if feature is not None else snake
 
     async def _get_denied_tools(self, feature_name: str) -> set:
         """Get tools denied by security policy for a feature.
@@ -3600,7 +3598,8 @@ class OrchestratorEngineMixin:
         from kestrel_sovereign.agent.tool_registry import _capture_tool_feature_registration
 
         registration_validator = _capture_tool_feature_registration(self, tool,
-            feature if feature is not None else self.features.get(hook_feature_name))
+            feature if feature is not None else self._feature_for_tool_owner(
+                self._tool_to_feature.get(tool_name)))
 
         async def _failed(error_message, *, error_class, status="error"):
             if dispatch_meta is not None:
