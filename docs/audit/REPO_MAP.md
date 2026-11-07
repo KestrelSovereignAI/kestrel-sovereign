@@ -18,8 +18,8 @@ generated: true
 Auto-generated file-tree + per-file purpose index. Always-loaded context for the kestrel-agent
 GitHub App (issue #791). Do **not** edit by hand — regenerate via `python scripts/generate_repo_map.py`.
 
-**Generated:** 2026-11-06
-**Scope:** 3618 tracked files (2752 `.py`, 377 `.md`, 489 other). Excludes `__pycache__`, `node_modules`, `.venv`, `.claude`, build artifacts.
+**Generated:** 2026-11-07
+**Scope:** 3623 tracked files (2757 `.py`, 377 `.md`, 489 other). Excludes `__pycache__`, `node_modules`, `.venv`, `.claude`, build artifacts.
 
 **Format per file:** `path — one-line purpose` plus the public top-level Python symbols on the next line
 (classes and functions; private `_name` skipped).
@@ -795,9 +795,9 @@ Repo entry points and standard project files.
 - **kestrel_sovereign/features/strategic_memory/issue_selection.py** — Select the highest-priority actionable GitHub issue.
   - `async def pick_top_issue(data, diagnostics, run_history, talon_workspaces)`; `def describe_exclusion(exclusion)`
 - **kestrel_sovereign/features/strategic_memory/ledger.py** — The strategy ledger: patterns and blockers, canonical but not prompt-injected.
-  - `def pattern_row_id(entry)`; `def blocker_row_id(entry)`; `def assign_row_ids(rows, minter)`; `def recorded_session_id(row)`; `def is_active_pattern(row)`; `def is_active_blocker(row)`; `def active_patterns(rows)`; `def active_blockers(rows)`; `…`
+  - `def pattern_row_id(entry)`; `def blocker_row_id(entry)`; `def assign_row_ids(rows, minter)`; `def is_active_pattern(row)`; `def is_active_blocker(row)`; `def active_patterns(rows)`; `def active_blockers(rows)`; `class LedgerSnapshot`; `…`
 - **kestrel_sovereign/features/strategic_memory/ledger_assertions.py** — Map strategy-ledger rows onto canonical semantic assertions (#3051).
-  - `class LedgerAssertionMappingError`; `def sections()`; `def section_term(section)`; `def ontology()`; `def ledger_subject(tenant_id)`; `def ledger_row_object(tenant_id, row_id)`; `def row_content_digest(section, row)`; `def transition_digest()`; `…`
+  - `class LedgerAssertionMappingError`; `def sections()`; `def section_term(section)`; `def ontology()`; `def ledger_subject(tenant_id)`; `def ledger_row_object(tenant_id, row_id)`; `def row_content_digest(section, row)`; `def attestation_digest(section_key, row)`; `…`
 - **kestrel_sovereign/features/strategic_memory/ledger_index.py** — Project the strategy ledger into the knowledge graph as an index.
   - `def ledger_node_id(node_type, agent_id, row_id)`; `class LedgerSection`; `async def project_ledger(graph_store, agent_id, ledger)`; `class IndexedRow`; `async def index_membership(graph_store, agent_id, node_type)`; `async def recall_nodes(graph_store, agent_id, node_type)`; `def search_rows(ledger_data, query, kind, limit, …)`
 - **kestrel_sovereign/features/strategic_memory/morning_signal.py** — Morning Signal briefing generator for Strategic Memory.
@@ -1013,7 +1013,7 @@ Repo entry points and standard project files.
 - **kestrel_sovereign/knowledge/capabilities.py** — Exact per-agent selection of stable or experimental semantic capabilities.
   - `class SemanticCapabilityConfigurationError`; `class CapabilitySelection`; `class SemanticRuntimeCapabilities`; `def semantic_capabilities_from_config(config)`
 - **kestrel_sovereign/knowledge/corpus.py** — Backend-neutral governed assertion corpus contract for learning consumers.
-  - `class GovernedCorpusError`; `class GovernedCorpusUnavailable`; `class GovernedCorpusBudgetExceeded`; `class CorpusEligibilityReason`; `class CorpusCheckpoint`; `class GovernedCorpusLimits`; `class GovernedCorpusPolicy`; `class CorpusValidationStatus`; `…`
+  - `class GovernedCorpusError`; `class GovernedCorpusUnavailable`; `class GovernedCorpusBudgetExceeded`; `class CorpusEligibilityReason`; `class CorpusCheckpoint`; `class SessionAttestation`; `class GovernedCorpusLimits`; `class GovernedCorpusPolicy`; `…`
 - **kestrel_sovereign/knowledge/inference.py** — Deterministic, bounded RDFS and allowlisted OWL 2 RL materialization.
   - `class InferenceError`; `class ClosureStatus`; `class InferenceLimits`; `class InferenceProfile`; `def inference_profile_from_config(config)`; `def inference_limits_from_config(config)`; `def validate_inference_profile(profile)`; `class ClosureState`; `…`
 - **kestrel_sovereign/knowledge/kite_erasure_authority.py** — Opaque, one-shot authority for the fixed Kite core-erasure drill.
@@ -1636,6 +1636,8 @@ Repo entry points and standard project files.
   - `def format_bytes(count)`; `class DatabaseSize`; `async def measure_database_size(db)`
 - **kestrel_sovereign/storage/identity_metadata.py** — Field-only identity updates under native graph custody.
   - `async def merge_identity_metadata_in_database(db, agent_id, updates)`; `async def merge_identity_metadata(storage, agent_id, updates)`
+- **kestrel_sovereign/storage/ledger_row_attestations.py** — Which sessions host code attested each strategy-ledger row's content in (#3990).
+  - `async def attest_row(db)`; `async def row_attestations(db)`
 - **kestrel_sovereign/storage/legacy_fact_migration.py** — Bounded, restart-safe import of the one verified legacy fact shape.
   - `class LegacyFactMigrationError`; `class LegacyFactCandidate`; `class MigrationPlan`; `class MigrationResult`; `class MigrationSourceReview`; `class LegacyGraphFactMigration`
 - **kestrel_sovereign/storage/legacy_session_stamp.py** — Write down which session a legacy row is in, once (#3120).
@@ -2622,10 +2624,12 @@ Repo entry points and standard project files.
   - `def pytest_collection_modifyitems(config, items)`; `def pytest_timeout_set_timer(item, settings)`; `def live_call_budget(request)`; `async def complete_bootstrap(agent)`; `async def grant_permissions(agent)`; `def skip_bootstrap()`
 - **tests/integration/live_routes.py** — Deadlines and usable-route probes for tests that call live LLM routes (#3269).
   - `def record_backstop(item, timeout)`; `class LiveCallBudget`; `def describe_chat_routes(llm_service)`; `def describe_discovery_routes(llm_service)`; `def await_chain(task)`; `def parked_in(task)`; `async def bounded_live_call(awaitable)`; `def require_answering_ollama(deadline)`; `…`
+- **tests/integration/mcp_permission_host.py** — Launch the real Core app over one private, process-owned HTTP listener.
+  - `class ObservedHost`; `async def serve(descriptor, ready)`; `def main()`
 - **tests/integration/mcp_permission_peer.py** — Native external MCP peer with a real filesystem side-effect witness.
   - `def add_owned_provider_routes(app, model, request_witness)`; `def create_server(witness)`; `def main()`
 - **tests/integration/mcp_permission_peers.py** — Owned Docker and native HTTPS peers for the same host security campaign.
-  - `class MCPTestPeer`; `async def docker_peer(tmp_path)`; `async def https_peer(tmp_path, monkeypatch)`
+  - `class MCPTestPeer`; `def owned_provider_network(monkeypatch, peer)`; `def owned_https_network(monkeypatch, peer)`; `async def docker_peer(tmp_path)`; `async def https_peer(tmp_path, monkeypatch)`
 - **tests/integration/native_memory_original_control.py** — Owned local SDK/SQLite/PG fixtures; not Agent READY or paid-provider acceptance.
   - `class NativeMemoryOwners`; `async def native_memory_owners(native_pg, tmp_path, monkeypatch)`; `def native_vector_consumers(native_memory_owners)`; `def actual_native_loss(lease, observed)`
 - **tests/integration/test_a2a_cancel_original_control.py** — Actual native cancellation CAS/readback must retain its FIRST receipt.
@@ -3107,7 +3111,9 @@ Repo entry points and standard project files.
 - **tests/integration/test_mcp_apps_host.py** — Real Core HTTP credentials, native MCP effects, approvals and SQLite audit.
   - `class OwnedAuditStore`; `class Boundary`; `async def apps_boundary(tmp_path, monkeypatch)`; `async def test_initial_result_is_private_and_reopens_without_replaying_native_tool(apps_boundary)`; `async def test_apps_require_original_native_feature_activation(apps_boundary, retirement)`; `async def test_fixed_routes_resolve_the_current_optional_host_without_retargeting_views(apps_boundary)`; `async def test_locator_does_not_grant_another_principal_or_chat_access(apps_boundary, owner, reader, session)`; `async def test_app_tool_uses_original_core_one_shot_approval_and_required_audit(apps_boundary)`; `…`
 - **tests/integration/test_mcp_permission_boundary.py** — Installed MCP package, native peers, and the host's actual security rail.
-  - `def owned_provider_network(monkeypatch, peer)`; `async def test_owned_native_provider_wire_has_no_remote_tool_effect(tmp_path, monkeypatch)`; `async def test_full_boot_http_invoke_governs_external_mcp_effect(tmp_path, monkeypatch, permission, decision, …)`; `class MCPBoundary`; `async def mcp_boundary(request, tmp_path, monkeypatch)`; `async def test_denied_tool_has_no_generic_dispatcher_bypass(mcp_boundary)`; `async def test_one_shot_approval_cannot_be_replayed_for_an_external_call(mcp_boundary)`; `async def test_pending_approval_cannot_execute_against_a_replacement_connection(mcp_boundary)`; `…`
+  - `async def test_owned_native_provider_wire_has_no_remote_tool_effect(tmp_path, monkeypatch)`; `async def test_full_boot_http_invoke_governs_external_mcp_effect(tmp_path, monkeypatch, permission, decision, …)`; `class MCPBoundary`; `async def mcp_boundary(request, tmp_path, monkeypatch)`; `async def test_denied_tool_has_no_generic_dispatcher_bypass(mcp_boundary)`; `async def test_one_shot_approval_cannot_be_replayed_for_an_external_call(mcp_boundary)`; `async def test_pending_approval_cannot_execute_against_a_replacement_connection(mcp_boundary)`; `async def test_same_instance_disable_enable_restores_the_governed_connection(mcp_boundary)`; `…`
+- **tests/integration/test_mcp_permission_host_restart.py** — Actual host lifespan/process restart preserves remote MCP permission effects.
+  - `class RunningHost`; `async def native_host(home, descriptor, environment, peer, …)`; `async def host_campaign(tmp_path, monkeypatch, request)`; `def owned_host_environment(home)`; `def host_client(campaign, state)`; `async def observe_registry(campaign, state, nonce)`; `async def configure_remote(client, campaign, state)`; `async def set_permission(client, owner, tool, level)`; `…`
 - **tests/integration/test_memory_access_hot_retention.py** — Bounded actual memory work, declared retired-lease callbacks, repeated reads.
   - `async def test_original_memory_receipt_keeps_one_payload_and_bounded_reader_frames(native_memory_owners, monkeypatch, reader)`
 - **tests/integration/test_memory_access_native_publication.py** — Actual bound rehearsal SQL must settle before context publication.
@@ -3389,7 +3395,7 @@ Repo entry points and standard project files.
 - **tests/integration/test_sqlite_close_join_observation.py** — Actual cancelled-write drain and worker close retain join control/local C.
   - `async def test_sqlite_close_keeps_original_drain_observation_and_actual_withdrawal(native_pg, tmp_path, monkeypatch, remove)`
 - **tests/integration/test_sqlite_deadline_drain_withdrawals.py** — Close timeout and the earlier native drain retain every delivered caller C.
-  - `async def test_close_deadline_keeps_actual_withdrawal_and_same_retained_owner(native_pg, tmp_path, monkeypatch)`; `async def test_close_drain_keeps_two_distinct_actual_observer_withdrawals(native_pg, tmp_path, monkeypatch)`
+  - `async def test_close_deadline_keeps_actual_withdrawal_and_same_retained_owner(native_pg, tmp_path, monkeypatch)`; `async def test_close_drain_keeps_two_distinct_actual_observer_withdrawals(native_pg, tmp_path, monkeypatch)`; `async def test_close_drain_observer_uses_original_join_and_ignores_foreign_borrower(tmp_path, monkeypatch)`
 - **tests/integration/test_sqlite_distinct_waiter_withdrawals.py** — Two actual close/worker-wait withdrawals survive one finite native failure.
   - `async def test_sqlite_keeps_actual_close_wait_and_worker_wait_withdrawals(native_pg, tmp_path, monkeypatch)`
 - **tests/integration/test_sqlite_inner_close_admission.py** — Original real SQLite worker stays owned when its inner closer cannot publish.
@@ -3606,6 +3612,8 @@ Repo entry points and standard project files.
   - `def refuse_overlong_node_ids(items)`; `def pytest_xdist_node_collection_finished(node, ids)`
 - **tests/shared/original_task_admission.py** — Assertions for a refused opaque factory with no exact native carrier.
   - `def assert_unknown_task_admission(error, original)`
+- **tests/shared/owned_task_observation.py** — Observe original task joins and refuse real observation allocations.
+  - `def refuse_owned_observation_allocation(monkeypatch, owner)`; `def observe_bounded_asyncio_wait(monkeypatch, before_wait)`; `def observe_owned_task(monkeypatch)`
 - **tests/shared/postgres_requirement.py** — Make the PostgreSQL leg of dual-backend tests fail instead of skip (#3381).
   - `def mark_native_postgres_cases(items)`; `def postgres_required(environ)`; `def check_session(environ)`; `def is_postgres_case(item)`; `def fail_skipped_postgres_case(item, report)`
 - **tests/shared/postgres_worker_isolation.py** — Give each xdist worker its own PostgreSQL database (#3383).
@@ -3933,7 +3941,7 @@ Repo entry points and standard project files.
 - **tests/unit/test_associative_linker.py** — Unit tests for AssociativeLinker typed LinkedConcept return shape.
   - `class TestExtractAndLinkTypedReturn`; `class TestPersonNameCategorization`
 - **tests/unit/test_async_ownership.py** — Contract tests for cancellation-safe ownership and borrowed observation.
-  - `async def test_original_admission_cell_precedes_all_callback_publication(tmp_path, mode, eager)`; `async def test_borrowed_observation_withdraws_without_cancelling_or_joining_original()`; `async def test_borrowed_callback_removal_failure_cannot_demote_caller_cancellation()`; `async def test_completion_allocation_refusal_cannot_abandon_original(monkeypatch, allocation)`; `async def test_borrowed_observation_returns_original_cancelled_source_not_shield_surrogate()`; `async def test_borrowed_observation_refuses_owning_or_forwarding_cancellation(mode)`; `async def test_native_original_policy_keeps_caused_cancellation_without_changing_default(retain_originals)`; `async def test_only_explicit_owned_iterator_sources_inherit_observation_lineage()`; `…`
+  - `async def test_original_admission_cell_precedes_all_callback_publication(tmp_path, mode, eager)`; `async def test_borrowed_observation_withdraws_without_cancelling_or_joining_original()`; `async def test_borrowed_callback_removal_failure_cannot_demote_caller_cancellation()`; `async def test_completion_allocation_refusal_cannot_abandon_original(monkeypatch, allocation)`; `async def test_bounded_wait_observer_preserves_unbounded_and_first_completed(monkeypatch)`; `async def test_borrowed_observation_returns_original_cancelled_source_not_shield_surrogate()`; `async def test_borrowed_observation_refuses_owning_or_forwarding_cancellation(mode)`; `async def test_native_original_policy_keeps_caused_cancellation_without_changing_default(retain_originals)`; `…`
 - **tests/unit/test_async_rag_store.py** — AsyncRAGStore writes: chunk content at rest (#2677), chunks without a vector (#3415).
   - `async def test_current_writer_persists_document_chunk_content_as_plaintext(tmp_path)`; `async def test_chunk_document_warns_about_chunks_stored_without_a_vector(tmp_path, caplog, outcome, stored_without, …)`; `async def test_chunk_document_is_quiet_when_nothing_was_left_unembedded(tmp_path, caplog, compute_embeddings)`
 - **tests/unit/test_async_rwlock.py** — Contracts for scheduler lifecycle reader/writer admission.
@@ -4081,7 +4089,7 @@ Repo entry points and standard project files.
 - **tests/unit/test_ci_sqlite_cleanup_budget.py** — Integration runners reserve bounded native SQLite checkpoint retirement.
   - `def test_ci_database_tiers_reserve_bounded_checkpoint_retirement(job)`
 - **tests/unit/test_ci_timeout_budget.py** — Each pytest tier's time budget must outlast a slow runner (#3212, #3330).
-  - `def test_each_tier_has_its_own_marker()`; `def test_the_budget_basis_is_declared_and_parsable(tier, job, suite)`; `def test_the_budget_outlasts_the_slowest_run_on_the_slowest_runner(tier, job, suite)`; `def test_pytest_reaches_its_own_deadline_before_the_runner_kills_the_step(tier, job, suite)`
+  - `def test_each_tier_has_its_own_marker()`; `def test_the_budget_basis_is_declared_and_parsable(tier, job, suite)`; `def test_the_budget_outlasts_the_slowest_run_on_the_slowest_runner(tier, job, suite)`; `def test_pytest_reaches_its_own_deadline_before_the_runner_kills_the_step(tier, job, suite)`; `def test_mcp_lane_runs_the_actual_host_process_restart_campaign()`; `async def test_owned_process_shutdown_preserves_full_original_diagnostic(tmp_path)`; `def test_native_mcp_host_carries_the_documented_ci_sqlite_budget(tmp_path, monkeypatch)`; `def test_owned_lifespan_observer_reports_original_pending_shutdown(tmp_path)`
 - **tests/unit/test_ci_wait_provider.py** — Tests for the ``ci:`` Waitable provider (#2729).
   - `def test_parse_ci_handle_ok()`; `def test_parse_ci_handle_rejects_malformed(bad)`; `def test_check_verdict_unknown_when_rollup_not_read()`; `def test_check_verdict_none_when_rollup_read_and_empty()`; `def test_check_verdict_pending_on_incomplete_run()`; `def test_check_verdict_ignores_combined_pending_with_zero_statuses()`; `def test_check_verdict_honors_combined_pending_with_real_statuses()`; `def test_check_verdict_success()`; `…`
 - **tests/unit/test_ci_wait_underscoped_token.py** — An under-scoped token must not read as a CI gate that is merely slow.
@@ -6145,6 +6153,8 @@ Repo entry points and standard project files.
   - `def write_wheel(directory, name, version, requires, …)`; `def write_checkout(directory, name, version)`
 - **tests/utils/hold_history_v1.py** — Rewind a Hold store to the state a pre-``authority`` release left behind.
   - `def v1_history_anchor(rows)`; `async def v1_receipt_rows(db)`; `async def publish_history_head(store, payload)`; `async def rewind_to_v1_history_anchor(db, store)`; `def v2_history_anchor(rows)`; `async def rewind_to_v2_history_anchor(db, store)`
+- **tests/utils/ledger_storage.py** — Mock storages for strategy-ledger tests that keep no row attestations.
+  - `def without_row_attestations(storage)`
 - **tests/utils/legacy_conversation_history.py** — Seed a pre-#3009 ``conversation_history`` and open it (#3009).
   - `def write_legacy_history(path, rows)`; `async def open_legacy_history(path, rows)`
 - **tests/utils/legacy_embedding_column.py** — A pre-#3411 schema for tests that need the legacy ``embedding`` column.
