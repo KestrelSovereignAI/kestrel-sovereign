@@ -49,49 +49,50 @@ async def native_tool_effect_agent(tmp_path, monkeypatch):
     from kestrel_sovereign.storage.privacy_wrapper import PrivacyEnforcingStorage
     from kestrel_sovereign.tool_effect_store import ToolEffectStore
 
-    if 'KESTREL_DATA_KEY' not in os.environ and 'KESTREL_DATA_KEY_FILE' not in os.environ:
-        monkeypatch.setenv('KESTREL_DATA_KEY', Fernet.generate_key().decode())
-    # Explicitly unconfigured real provider service: no ambient operator
-    # routes or credentials are inputs to this component fixture.
-    monkeypatch.setattr(service_module, 'load_section', lambda _section: {})
-    monkeypatch.setattr(service_module.ProviderRegistry,
-        '_discover_entrypoint_providers', lambda _registry: [])
-    async with AsyncExitStack() as resources:
-        async def create(*, did, connected_backend=None, borrowed_storage=None):
-            if connected_backend is not None and borrowed_storage is not None:
-                raise ValueError("A native test Agent must have one primary database owner")
-            root = tmp_path / ('native-tool-effect-' + uuid4().hex)
-            root.mkdir()
-            if borrowed_storage is not None:
-                if not borrowed_storage._initialized or borrowed_storage.agent_id != did:
-                    raise ValueError("Borrowed native storage must be initialized for the Agent DID")
-                storage = borrowed_storage
-            else:
-                backend = (SQLiteBackend(str(root / 'primary.db'))
-                    if connected_backend is None else connected_backend)
-                storage = AsyncStorage(backend=backend, agent_id=did)
-                resources.push_async_callback(storage.close)
-                await storage.initialize()
-            database = storage.db
-            service = service_module.LLMService(usage_db=database, agent_data_dir=root)
-            resources.push_async_callback(service.close)
-            agent = KestrelAgent(did=did, storage_path=str(root / 'agent.db'),
-                llm_service=service, allowed_features=[], sync_enabled=False)
-            agent._raw_storage = storage
-            agent.storage = PrivacyEnforcingStorage(storage, agent.privacy_mode)
-            agent.privacy_agent = PrivacyAgent(storage)
-            journal = ToolEffectStore(database, scope=NativeRecipientScope(did))
-            await journal.initialize()
-            resources.push_async_callback(journal.close)
-            agent.tool_effect_store = journal
-            observability = ObservabilityStore(database.backend, owns_backend=False)
-            await observability.initialize()
-            resources.push_async_callback(observability.close)
-            agent.observability_store = observability
-            assert not agent._runtime_publication_ready.is_set()
-            return agent
+    with monkeypatch.context() as isolated:
+        if 'KESTREL_DATA_KEY' not in os.environ and 'KESTREL_DATA_KEY_FILE' not in os.environ:
+            isolated.setenv('KESTREL_DATA_KEY', Fernet.generate_key().decode())
+        # Explicitly unconfigured real provider service: no ambient operator
+        # routes or credentials are inputs to this component fixture.
+        isolated.setattr(service_module, 'load_section', lambda _section: {})
+        isolated.setattr(service_module.ProviderRegistry,
+            '_discover_entrypoint_providers', lambda _registry: [])
+        async with AsyncExitStack() as resources:
+            async def create(*, did, connected_backend=None, borrowed_storage=None):
+                if connected_backend is not None and borrowed_storage is not None:
+                    raise ValueError("A native test Agent must have one primary database owner")
+                root = tmp_path / ('native-tool-effect-' + uuid4().hex)
+                root.mkdir()
+                if borrowed_storage is not None:
+                    if not borrowed_storage._initialized or borrowed_storage.agent_id != did:
+                        raise ValueError("Borrowed native storage must be initialized for the Agent DID")
+                    storage = borrowed_storage
+                else:
+                    backend = (SQLiteBackend(str(root / 'primary.db'))
+                        if connected_backend is None else connected_backend)
+                    storage = AsyncStorage(backend=backend, agent_id=did)
+                    resources.push_async_callback(storage.close)
+                    await storage.initialize()
+                database = storage.db
+                service = service_module.LLMService(usage_db=database, agent_data_dir=root)
+                resources.push_async_callback(service.close)
+                agent = KestrelAgent(did=did, storage_path=str(root / 'agent.db'),
+                    llm_service=service, allowed_features=[], sync_enabled=False)
+                agent._raw_storage = storage
+                agent.storage = PrivacyEnforcingStorage(storage, agent.privacy_mode)
+                agent.privacy_agent = PrivacyAgent(storage)
+                journal = ToolEffectStore(database, scope=NativeRecipientScope(did))
+                await journal.initialize()
+                resources.push_async_callback(journal.close)
+                agent.tool_effect_store = journal
+                observability = ObservabilityStore(database.backend, owns_backend=False)
+                await observability.initialize()
+                resources.push_async_callback(observability.close)
+                agent.observability_store = observability
+                assert not agent._runtime_publication_ready.is_set()
+                return agent
 
-        yield create
+            yield create
 
 
 @pytest.fixture

@@ -247,13 +247,18 @@ async def test_replay_after_actual_effect_and_clean_database_restart_is_fenced(j
 @pytest.mark.asyncio
 async def test_zero_effect_supersession_fences_the_old_owner_and_changed_input_conflicts(journal):
     store, _, _ = journal
-    old = await admit(store)
-    current = await admit(store)
+    name = os.fsdecode(b"report-\xff.txt")
+    request = {"input": {"id": 10**30, "name": name}, "route": "chat"}
+    reordered = {"route": "chat", "input": {"name": name, "id": 10**30}}
+    old = await admit(store, request=request)
+    current = await admit(store, request=reordered)
+    assert old.operation_digest == current.operation_digest
+    assert await store.database.fetchval("SELECT COUNT(*) FROM tool_effect_operations") == 1
     assert old.attempt_id != current.attempt_id
     with pytest.raises(ToolEffectAttemptSuperseded):
         await store.claim(old, registration="owned-tool", arguments={})
     with pytest.raises(ToolEffectOperationConflict):
-        await admit(store, request={"input": "different"})
+        await admit(store, request={"input": {"id": 10**30 + 1, "name": name}, "route": "chat"})
     await store.claim(current, registration="owned-tool", arguments={})
 
 

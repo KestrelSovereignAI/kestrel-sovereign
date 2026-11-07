@@ -361,6 +361,17 @@ def test_wire_identifiers_encode_to_bounded_stable_store_keys(key):
     assert encoded != logical_operation_key([key])
 
 
+def test_logical_operation_identity_retains_exact_json_and_ignores_object_order():
+    import os
+
+    name = os.fsdecode(b"report-\xff.txt")
+    original = ["opaque-source", {"id": 10**30, "name": name}]
+    reordered = ["opaque-source", {"name": name, "id": 10**30}]
+    changed = ["opaque-source", {"name": name, "id": 10**30 + 1}]
+    assert logical_operation_key(original) == logical_operation_key(reordered)
+    assert logical_operation_key(original) != logical_operation_key(changed)
+
+
 def test_noncanonical_key_is_refused_before_admission():
     with pytest.raises(ValueError, match="non-finite"):
         logical_operation_key(float("nan"))
@@ -394,7 +405,7 @@ async def test_native_fixture_refuses_two_primary_database_owners(owner, native_
     database = owner.tool_effect_store.database
     before = await database.fetchone('SELECT COUNT(*) FROM tool_effect_keys')
     with pytest.raises(ValueError, match='one primary database owner'):
-        await native_tool_effect_agent(did='did:test:ambiguous-primary',
+        await native_tool_effect_agent(did=owner.did,
             connected_backend=database.backend, borrowed_storage=owner._raw_storage)
     assert database.backend.is_connected
     assert await database.fetchone('SELECT COUNT(*) FROM tool_effect_keys') == before

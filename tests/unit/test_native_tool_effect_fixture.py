@@ -1,12 +1,14 @@
 """Borrowed native storage keeps its caller's original encryption lifetime."""
 
 import os
+from unittest.mock import patch
 
 from cryptography.fernet import Fernet
 import pytest
 import pytest_asyncio
 
 from kestrel_sovereign.storage.async_storage import AsyncStorage
+from kestrel_sovereign.storage.async_file_store import AsyncFileStore
 
 
 @pytest_asyncio.fixture(autouse=True)
@@ -32,6 +34,8 @@ async def test_native_agent_reads_original_encrypted_borrowed_storage(
         did=storage.agent_id, borrowed_storage=storage,
     )
     assert agent.tool_effect_store.database is storage.db
+    reader = AsyncFileStore(storage.db, agent_id=storage.agent_id)
+    assert await reader.retrieve_file(digest) == content
     assert await agent._raw_storage.retrieve_file(digest) == content
     assert os.environ['KESTREL_DATA_KEY'] == key
     assert not agent._runtime_publication_ready.is_set()
@@ -66,3 +70,21 @@ async def test_native_agent_refuses_incompatible_borrowed_storage(
         await native_tool_effect_agent(did=did, borrowed_storage=supplied)
     assert storage.db.backend.is_connected
     assert await storage.retrieve_file(digest) == content
+
+
+@pytest.mark.asyncio
+async def test_native_fixture_retires_its_patches_before_the_outer_provider_fixture(tmp_path, monkeypatch):
+    from kestrel_sovereign.llm import service
+    from kestrel_sovereign.testing.fixtures import native_tool_effect_agent
+
+    original = service.load_section
+    with patch.object(service, 'load_section', return_value={}) as outer:
+        lifetime = native_tool_effect_agent.__wrapped__(tmp_path, monkeypatch)
+        try:
+            create = await anext(lifetime)
+            agent = await create(did='did:test:nested-provider-fixture')
+            assert not agent._runtime_publication_ready.is_set()
+        finally:
+            await lifetime.aclose()
+        assert service.load_section is outer, 'Native fixture patches outlived their original lifetime'
+    assert service.load_section is original
