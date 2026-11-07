@@ -5,7 +5,7 @@ import asyncio
 import pytest
 
 from kestrel_sdk.native_a2a.types import TaskState
-from kestrel_sovereign._async_ownership import await_owned_task, create_owned_task, gather_owned
+from kestrel_sovereign._async_ownership import await_owned_task, create_owned_task, gather_owned, owned_native_wait
 from kestrel_sovereign.a2a.scope import NativeRecipientScope
 from kestrel_sovereign.execution_custody import execution_evidence_carriers
 from kestrel_sovereign.features.base import Feature, tool
@@ -25,7 +25,7 @@ async def test_closing_original_worker_retains_its_admitted_business_descendants
     manager = manager_for(owner.tool_effect_store.backend, NativeRecipientScope(owner.did), owns_backend=False)
     await manager.initialize()
     witness = tmp_path / 'original-worker-native-effects'
-    release, root_closing, entered = asyncio.Event(), asyncio.Event(), asyncio.Event()
+    release, root_closing, entered, sibling_joined = (asyncio.Event() for _ in range(4))
     turns, children, rejections, workers = [], [], [], []
     original_close = ToolEffectTurn.close
     track = manager._track_execution_task
@@ -50,6 +50,8 @@ async def test_closing_original_worker_retains_its_admitted_business_descendants
 
     async def nested():
         await release.wait()
+        if child_kind == 'unretained-sibling':
+            await sibling_joined.wait()
         try:
             await execute_tool_effect(owner, registration='original-worker-nested-effect',
                 arguments={}, execute=effect)
@@ -74,7 +76,9 @@ async def test_closing_original_worker_retains_its_admitted_business_descendants
                 children.append(borrowed)
                 await borrowed
             else:
-                await await_owned_task(children[0])
+                async with owned_native_wait((children[0],)):
+                    sibling_joined.set()
+                    await await_owned_task(children[0])
             return {'success': not rejections}
 
     feature = WorkerFeature(owner)
@@ -112,6 +116,7 @@ async def test_closing_original_worker_retains_its_admitted_business_descendants
         assert len(workers) == 1
     finally:
         release.set()
+        sibling_joined.set()
         await await_owned_task(invocation)
         for child in [*children, *workers]:
             await await_owned_task(child)
