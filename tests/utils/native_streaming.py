@@ -5,8 +5,8 @@ from unittest.mock import AsyncMock, MagicMock
 from kestrel_sovereign.agent.context_manager import ContextResult
 
 
-async def streaming_agent(native_tool_effect_agent, *, persisted=None):
-    agent = await native_tool_effect_agent(did="did:test:streaming-component")
+async def streaming_agent(native_tool_effect_agent, *, persisted=None, connected_backend=None):
+    agent = await native_tool_effect_agent(did="did:test:streaming-component", connected_backend=connected_backend)
     context = ContextResult(system_prompt="system", messages=[], total_tokens=0,
                             budget_summary={}, dynamic_user_context="ctx")
     agent.context_manager = SimpleNamespace(build_context=AsyncMock(return_value=context))
