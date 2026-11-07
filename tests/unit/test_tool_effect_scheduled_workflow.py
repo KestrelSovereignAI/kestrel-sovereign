@@ -167,7 +167,7 @@ async def test_scheduled_completion_failure_fences_the_original_live_turn(schedu
 
     case = scheduled_case
     failure = ValueError('original scheduled completion failed')
-    observed, fenced = [], []
+    observed, fenced, original_states, uncertainty, refused = [], [], [], [], []
     second = case.witness.with_name('second-scheduled-effect')
     task_name = 'morning_signal' if route == 'artifact' else 'signal_dispatch'
 
@@ -222,19 +222,17 @@ async def test_scheduled_completion_failure_fences_the_original_live_turn(schedu
             await dispatch()
         except Exception as error:
             observed.append(error)
-        assert case.witness.read_text() == 'one acknowledged scheduled effect'
-        assert await case.database.fetchone('SELECT state FROM tool_effect_claims') == ('RETURNED_OK',)
-        assert observed and isinstance(observed[0], ResourceOutcomeUnknown), (
-            'scheduler completion failure escaped the live-turn uncertainty fence')
-        assert observed[0].__cause__ is failure
-        assert current_tool_effect_turn(agent).unconfirmed
+        original_states.append(await case.database.fetchone('SELECT state FROM tool_effect_claims'))
+        uncertainty.append(tuple(current_tool_effect_turn(agent).unconfirmed))
 
         async def another_effect():
             second.write_text('must remain refused')
 
-        with pytest.raises(ToolEffectOutcomeUnconfirmed):
+        try:
             await execute_tool_effect(agent, registration='later-scheduled-effect',
                 arguments={}, execute=another_effect)
+        except ToolEffectOutcomeUnconfirmed:
+            refused.append(True)
 
     async def execute(name, arguments):
         if journal == 'retained':
@@ -244,9 +242,7 @@ async def test_scheduled_completion_failure_fences_the_original_live_turn(schedu
             with pytest.raises(ResourceOutcomeUnknown) as caught:
                 await dispatch()
             observed.append(caught.value)
-            assert caught.value.__cause__ is failure
-            assert case.witness.read_text() == 'one acknowledged scheduled effect'
-            assert await case.database.fetchone('SELECT state FROM tool_effect_claims') == ('RETURNED_OK',)
+            original_states.append(await case.database.fetchone('SELECT state FROM tool_effect_claims'))
             with pytest.raises(ToolEffectReconciliationRequired):
                 await case.scheduler._lookup_and_run_tool(task_name, {})
         fenced.append(True)
@@ -258,6 +254,13 @@ async def test_scheduled_completion_failure_fences_the_original_live_turn(schedu
         await seed_occurrence(case, runner, task_name, {})
         await tick_and_settle(runner)
         assert observed, 'Original scheduler completion path did not run'
+        assert isinstance(observed[0], ResourceOutcomeUnknown), (
+            'scheduler completion failure escaped the live-turn uncertainty fence')
+        assert observed[0].__cause__ is failure
+        assert case.witness.read_text() == 'one acknowledged scheduled effect'
+        assert original_states == [('RETURNED_OK',)]
+        if journal == 'retained':
+            assert uncertainty and uncertainty[0] and refused == [True]
         if not fenced:
             raise AssertionError('scheduler completion failure escaped the live-turn uncertainty fence') from observed[0]
         assert not second.exists()
