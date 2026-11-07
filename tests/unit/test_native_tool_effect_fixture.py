@@ -115,8 +115,8 @@ def test_native_fixture_is_available_to_integration_without_plugin_autoload(tmp_
          "-p", "pytest_asyncio.plugin", "-p", "pytest_timeout",
          "-p", "no:cacheprovider", "-o", "addopts=",
          "--basetemp=" + str(tmp_path / "native-fixture-child"),
-         "tests/integration/test_mcp_permission_boundary.py::"
-         "test_post_persistence_disable_reports_the_real_saved_connection_and_restore[remote]"],
+         "tests/integration/test_native_input_fixture.py::"
+         "test_native_fixture_owns_original_storage_and_effect"],
         cwd=repository, env=environment, capture_output=True, text=True, timeout=20,
     )
     assert result.returncode == 0, (
