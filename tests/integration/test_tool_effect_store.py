@@ -60,6 +60,7 @@ async def admit(store, *, key="owned-operation", request=None, namespace=None):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize('journal', [pytest.param('postgres', marks=pytest.mark.native_postgres)], indirect=True)
 @pytest.mark.parametrize('untyped_projection', [
     None, 'k.contype', 'k.confupdtype', 'k.confdeltype', 'k.confmatchtype', 't.tgenabled',
 ])
@@ -67,8 +68,7 @@ async def test_postgres_catalog_requires_native_text_codes(journal, untyped_proj
     from kestrel_sovereign.storage.db.tool_effect_relation import _tool_effect_program_identity
 
     store, _, _ = journal
-    if not store.is_postgres:
-        pytest.skip('Native PostgreSQL catalog code types')
+    assert store.is_postgres
     changed = []
     async with store.backend._pool.acquire() as connection:
         relation = await connection.fetchrow(
@@ -139,10 +139,10 @@ async def test_native_terminal_refuses_added_program_before_effect(journal, tabl
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize('journal', [pytest.param('postgres', marks=pytest.mark.native_postgres)], indirect=True)
 async def test_terminal_deadline_retires_original_when_postgres_pool_is_full(journal):
     store, _, _ = journal
-    if not store.is_postgres:
-        pytest.skip('Native PostgreSQL pool checkout contract')
+    assert store.is_postgres
     store.terminal_timeout_seconds = 0.1
     attempt = await admit(store)
     await store.claim(attempt, registration='owned-before-pool-exhaustion', arguments={})
@@ -158,6 +158,7 @@ async def test_terminal_deadline_retires_original_when_postgres_pool_is_full(jou
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize('journal', ['sqlite'], indirect=True)
 @pytest.mark.parametrize('cleanup_only', [False, True])
 async def test_sqlite_auxiliary_generation_uses_the_original_primary_admission(journal, cleanup_only):
     from contextlib import nullcontext
@@ -167,8 +168,7 @@ async def test_sqlite_auxiliary_generation_uses_the_original_primary_admission(j
     )
 
     store, reopen, cleanup = journal
-    if not store.is_sqlite:
-        pytest.skip('SQLite native data_version contract')
+    assert store.is_sqlite
     await store.database.execute('CREATE TABLE unrelated_native_witness(value BIGINT)')
     other = await reopen()
     cleanup.push_async_callback(other.close)
@@ -187,10 +187,10 @@ async def test_sqlite_auxiliary_generation_uses_the_original_primary_admission(j
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize('journal', ['sqlite'], indirect=True)
 async def test_sqlite_terminal_deadline_joins_native_lock_retirement(journal):
     store, reopen, cleanup = journal
-    if not store.is_sqlite:
-        pytest.skip('SQLite native lock retirement contract')
+    assert store.is_sqlite
     store.terminal_timeout_seconds = 0.03
     other = await reopen()
     cleanup.push_async_callback(other.close)
