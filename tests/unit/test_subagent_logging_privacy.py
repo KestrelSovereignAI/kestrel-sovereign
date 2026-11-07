@@ -36,7 +36,7 @@ from kestrel_sdk.hooks.base import (
 from kestrel_sdk.llm.response import LLMResponse, ToolCall
 from kestrel_sdk.native_a2a.helpers.proto_helpers import new_task, new_text_message
 from kestrel_sdk.native_a2a.types import TaskState
-from kestrel_sdk.tools.base import ToolCategory, ToolSchema
+from kestrel_sdk.tools.base import AgentTool, ToolCategory, ToolSchema
 
 from kestrel_sovereign.agent.orchestrator_engine import OrchestratorEngineMixin
 from kestrel_sovereign.features.base import Feature, tool
@@ -496,7 +496,7 @@ async def test_chat_path_tool_refusal_reason_is_logged_as_summary(debug_caplog, 
     hooks = _DecidingHooks({
         HookEvent.PRE_TOOL_USE: HookOutput.deny(f"to={REASON_MARKER}"),
     })
-    tool_ = MagicMock()
+    tool_ = MagicMock(spec=AgentTool)
     tool_.name = "send_email"
     tool_.execute = AsyncMock(return_value={"success": True})
 
@@ -512,7 +512,7 @@ async def test_chat_path_tool_refusal_reason_is_logged_as_summary(debug_caplog, 
 
 @pytest.mark.asyncio
 async def test_chat_path_direct_tool_failure_is_logged_by_class(debug_caplog, *, native_tool_effect_agent):
-    tool_ = MagicMock()
+    tool_ = MagicMock(spec=AgentTool)
     tool_.name = "send_email"
     tool_.execute = AsyncMock(side_effect=ValueError(f"bad {ERROR_MARKER}"))
 

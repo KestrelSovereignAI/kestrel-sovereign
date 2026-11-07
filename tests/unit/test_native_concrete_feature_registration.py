@@ -336,3 +336,204 @@ async def test_custom_native_reply_contract_fences_its_original_effect(concrete_
         assert persisted.status.state == TaskState.TASK_STATE_FAILED and task_outcome_unknown(persisted)
     finally:
         await manager.close()
+
+
+@pytest.mark.parametrize('lane', ['direct', 'workflow'])
+async def test_canonical_native_encoding_failure_keeps_original_effect_receipt(
+    native_tool_effect_agent, tmp_path, lane,
+):
+    from kestrel_sdk.resources import ResourceOutcomeUnknown
+    from kestrel_sovereign.a2a.scope import NativeRecipientScope
+    from kestrel_sovereign.features.tasks.feature import TaskFeature
+    from kestrel_sovereign.execution_custody import execution_evidence_carriers
+    from tests.utils.native_a2a import manager_for
+
+    host = await native_tool_effect_agent(did='did:test:original-native-encoding')
+    witness = tmp_path / 'native-encoding-effects'
+    class NativeEncodingFeature(Feature):
+        tool_description = 'Original native result encoding'
+        async def initialize(self):
+            pass
+        @tool(name='native_encoding_effect', description='Write before native encoding')
+        async def native_encoding_effect(self):
+            with witness.open('a') as stream:
+                stream.write('once\n')
+            return {'value': float('nan')}
+    provider = NativeEncodingFeature(host)
+    host.features[provider.name] = provider
+    manager = manager_for(host.tool_effect_store.backend, NativeRecipientScope(host.did), owns_backend=False)
+    await manager.initialize()
+    manager.register_provider(provider.name, provider.get_agent_skills(), provider)
+    workflow = TaskFeature(host)
+    workflow.set_task_manager(manager)
+    host.features[workflow.name] = workflow
+    observed = []
+    async def operation():
+        if lane == 'direct':
+            return await manager.execute_skill(provider.name, 'native_encoding_effect', {}, sync=True)
+        return await workflow.run_workflow([{'feature': provider.name,
+            'skill': 'native_encoding_effect', 'max_retries': 1, 'retry_delay_ms': 0}])
+    try:
+        with caller_context_scope(CallerContext.sovereign()):
+            try:
+                await drive_native(host, operation)
+            except ResourceOutcomeUnknown as error:
+                observed.extend(execution_evidence_carriers(error))
+        assert witness.read_text().splitlines() == ['once'], 'Workflow repeated an acknowledged native effect after encoding failed'
+        assert any(isinstance(error, ResourceOutcomeUnknown) for error in observed), 'Native encoding failure erased completion uncertainty'
+        assert any(isinstance(error, ValueError) for error in observed)
+        assert await host.tool_effect_store.database.fetchall('SELECT state FROM tool_effect_claims') == [('RETURNED_OK',)], 'Completion failure rewrote an acknowledged effect claim'
+    finally:
+        await manager.close()
+
+
+@pytest.mark.parametrize('lane', ['direct', 'workflow'])
+@pytest.mark.parametrize('malformation', ['duplicate-artifact', 'missing-artifact-parts'])
+async def test_native_task_invariant_failure_keeps_one_original_effect(concrete_feature, lane, malformation):
+    from kestrel_sdk.native_a2a.types import Artifact, Part, TaskState
+    from kestrel_sdk.resources import ResourceOutcomeUnknown
+    from kestrel_sovereign.a2a.lifecycle import task_outcome_unknown
+    from kestrel_sovereign.a2a.scope import NativeRecipientScope
+    from kestrel_sovereign.features.tasks.feature import TaskFeature
+    from kestrel_sovereign.execution_custody import execution_evidence_carriers
+    from tests.utils.native_a2a import manager_for
+
+    p = concrete_feature
+    task_ids = []
+    async def malformed_handler(task, *, arguments=None):
+        task_ids.append(task.id)
+        with p.host.native_effect_target.open('a') as stream:
+            stream.write('once\n')
+        task.status.state = TaskState.TASK_STATE_COMPLETED
+        if malformation == 'duplicate-artifact':
+            for _ in range(2):
+                task.artifacts.append(Artifact(artifact_id='duplicate', parts=[Part(text='done')]))
+        else:
+            task.artifacts.append(Artifact(artifact_id='missing-parts'))
+        return task
+    p.feature.handle_task = malformed_handler
+    manager = manager_for(p.host.tool_effect_store.backend, NativeRecipientScope(p.host.did), owns_backend=False)
+    await manager.initialize()
+    manager.register_provider(p.feature.name, p.feature.get_agent_skills(), p.feature)
+    workflow = TaskFeature(p.host)
+    workflow.set_task_manager(manager)
+    p.host.features[workflow.name] = workflow
+    observed = []
+    async def operation():
+        if lane == 'direct':
+            return await manager.execute_skill(p.feature.name, 'concrete_effect', {}, sync=True)
+        return await workflow.run_workflow([{'feature': p.feature.name,
+            'skill': 'concrete_effect', 'max_retries': 1, 'retry_delay_ms': 0}])
+    try:
+        with caller_context_scope(CallerContext.sovereign()):
+            try:
+                await drive_native(p.host, operation)
+            except (ValueError, ResourceOutcomeUnknown) as error:
+                observed.extend(execution_evidence_carriers(error))
+        assert p.host.native_effect_target.read_text().splitlines() == ['once'], 'Workflow repeated an effect after native Task invariants failed'
+        assert any(isinstance(error, ResourceOutcomeUnknown) for error in observed), 'Native Task invariant failure erased completion uncertainty'
+        assert len(task_ids) == 1
+        persisted = await manager.task_store.get_for_recipient(task_ids[0], manager.did)
+        assert persisted.status.state == TaskState.TASK_STATE_FAILED and task_outcome_unknown(persisted), 'Malformed native Task remained submitted after its effect'
+        assert await p.host.tool_effect_store.database.fetchall('SELECT state FROM tool_effect_claims') == [('UNCONFIRMED',)]
+    finally:
+        await manager.close()
+
+
+@pytest.mark.parametrize('error_type', [RuntimeError, ResourceConflict], ids=['ordinary-error', 'known-refusal'])
+async def test_result_classification_failure_settles_and_fences_its_original_claim(native_tool_effect_agent, tmp_path, error_type):
+    from kestrel_sdk.resources import ResourceOutcomeUnknown
+    from kestrel_sovereign.execution_custody import execution_evidence_carriers
+    from kestrel_sovereign.tools.effect_journal import execute_tool_effect
+
+    host = await native_tool_effect_agent(did='did:test:original-result-classification')
+    witness = tmp_path / 'classification-effects'
+    original = error_type('Original result classifier refused')
+    class UnreadableResult(dict):
+        def get(self, *args, **kwargs):
+            raise original
+    async def effect():
+        with witness.open('a') as stream:
+            stream.write('first\n')
+        return UnreadableResult()
+    async def second():
+        with witness.open('a') as stream:
+            stream.write('repeated\n')
+        return {'success': True}
+    observed = []
+    async def operation():
+        try:
+            await execute_tool_effect(host, registration='original-classification', arguments={}, execute=effect)
+        except (RuntimeError, ResourceConflict, ResourceOutcomeUnknown) as error:
+            observed.extend(execution_evidence_carriers(error))
+        try:
+            await execute_tool_effect(host, registration='unsafe-repeat', arguments={}, execute=second)
+        except ResourceOutcomeUnknown:
+            pass
+    with caller_context_scope(CallerContext.sovereign()):
+        try:
+            await drive_native(host, operation)
+        except ResourceOutcomeUnknown as error:
+            observed.extend(execution_evidence_carriers(error))
+    assert witness.read_text().splitlines() == ['first'], 'Result classification escaped the original live uncertainty fence'
+    assert any(error is original for error in observed)
+    assert await host.tool_effect_store.database.fetchall('SELECT state FROM tool_effect_claims') == [('UNCONFIRMED',)], 'Result classification abandoned its original STARTED claim'
+
+
+@pytest.mark.parametrize('lane', ['direct', 'workflow', 'async'])
+async def test_native_completion_conflict_preserves_acknowledgement_and_fences_retry(concrete_feature, lane):
+    from kestrel_sdk.native_a2a.types import Artifact, Part, TaskState
+    from kestrel_sdk.resources import ResourceOutcomeUnknown
+    from kestrel_sovereign.a2a.outcomes import TaskOutcomeConflictError
+    from kestrel_sovereign.a2a.scope import NativeRecipientScope
+    from kestrel_sovereign.features.tasks.feature import TaskFeature
+    from kestrel_sovereign.execution_custody import execution_evidence_carriers
+    from tests.utils.native_a2a import manager_for
+
+    p = concrete_feature
+    manager = manager_for(p.host.tool_effect_store.backend, NativeRecipientScope(p.host.did), owns_backend=False)
+    await manager.initialize()
+    task_ids = []
+    async def conflicting_handler(task, *, arguments=None):
+        task_ids.append(task.id)
+        with p.host.native_effect_target.open('a') as stream:
+            stream.write('once\n')
+        # A real concurrent durable artifact must survive our incompatible
+        # final result. Both values are independently valid native artifacts.
+        await manager.task_store.add_artifact(task.id,
+            Artifact(artifact_id='shared', parts=[Part(text='committed other value')]),
+            recipient_agent_id=manager.did)
+        task.status.state = TaskState.TASK_STATE_COMPLETED
+        task.artifacts.append(Artifact(artifact_id='shared', parts=[Part(text='our incompatible value')]))
+        return task
+    p.feature.handle_task = conflicting_handler
+    manager.register_provider(p.feature.name, p.feature.get_agent_skills(), p.feature)
+    workflow = TaskFeature(p.host)
+    workflow.set_task_manager(manager)
+    p.host.features[workflow.name] = workflow
+    observed = []
+    persisted = None
+    async def operation():
+        if lane in {'direct', 'async'}:
+            return await manager.execute_skill(p.feature.name, 'concrete_effect', {}, sync=lane == 'direct')
+        return await workflow.run_workflow([{'feature': p.feature.name,
+            'skill': 'concrete_effect', 'max_retries': 1, 'retry_delay_ms': 0}])
+    try:
+        with caller_context_scope(CallerContext.sovereign()):
+            try:
+                await drive_native(p.host, operation)
+            except (ValueError, ResourceOutcomeUnknown, BaseExceptionGroup) as error:
+                observed.extend(execution_evidence_carriers(error))
+        if task_ids:
+            persisted = await manager.task_store.get_for_recipient(task_ids[0], manager.did)
+    finally:
+        try:
+            await manager.close()
+        except (ValueError, ResourceOutcomeUnknown, BaseExceptionGroup) as error:
+            observed.extend(execution_evidence_carriers(error))
+    assert p.host.native_effect_target.read_text().splitlines() == ['once'], 'Workflow repeated an acknowledged effect after native completion conflicted'
+    assert any(isinstance(error, ResourceOutcomeUnknown) for error in observed), 'Native completion conflict erased delivery uncertainty'
+    assert any(isinstance(error, TaskOutcomeConflictError) for error in observed)
+    assert len(task_ids) == 1
+    assert persisted.artifacts[0].parts[0].text == 'committed other value'
+    assert await p.host.tool_effect_store.database.fetchall('SELECT state FROM tool_effect_claims') == [('RETURNED_OK',)] * (2 if lane == 'async' else 1), 'Native completion failure rewrote acknowledged effect receipts'

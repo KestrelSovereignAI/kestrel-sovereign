@@ -17,11 +17,12 @@ from kestrel_sdk.tools.result import ToolResult, ToolResultStatus
 from kestrel_sovereign._async_ownership import await_owned_task
 from kestrel_sovereign.execution_custody import (
     execution_evidence_carriers, execution_terminal_error, is_execution_control_error,
-    require_execution_work,
+    require_execution_work, is_tool_execution_terminal_error,
 )
 from kestrel_sovereign.tool_effect_store import (
     ToolEffectAttempt, ToolEffectClaim, ToolEffectStore,
 )
+from kestrel_sovereign.tools.execution_outcome import TOOL_OUTCOME_UNCONFIRMED
 from kestrel_sovereign.turn_scope import turn_scoped
 from kestrel_sovereign.agent.tool_allowlist import registry_generation
 
@@ -39,9 +40,29 @@ class ToolEffectOutcomeUnconfirmed(ResourceOutcomeUnknown):
 
 
 def _requires_original_terminal_error(error: BaseException | None) -> bool:
-    return (bool(observed_outcome_unknown(error)) or is_execution_control_error(error)
+    return (is_tool_execution_terminal_error(error)
         or any(issubclass(type(item), asyncio.CancelledError)
             for item in execution_evidence_carriers(error)))
+
+
+def _record_uncertain_effect(turn, error: BaseException, *,
+        message: str = 'tool_effect_outcome_unconfirmed') -> BaseException:
+    """Retain the original cause once, independently of acknowledged claims."""
+    if not _requires_original_terminal_error(error):
+        original = error
+        error = ToolEffectOutcomeUnconfirmed(message)
+        error.__cause__ = original
+    if not any(item is error for item in turn.unconfirmed):
+        turn.unconfirmed.append(error)
+    return error
+
+
+def record_tool_effect_completion_failure(owner, error: BaseException) -> BaseException:
+    """Fence failed delivery without rewriting an acknowledged effect/audit."""
+    turn = current_tool_effect_turn(owner)
+    if turn is None:
+        raise ToolEffectJournalUnavailable('tool_effect_attempt_unavailable') from error
+    return _record_uncertain_effect(turn, error, message=TOOL_OUTCOME_UNCONFIRMED)
 
 
 def logical_operation_key(value: object) -> str:
@@ -280,6 +301,8 @@ async def execute_tool_effect(
             started = False
             result = None
             error = None
+            returned = False
+            returned_error = False
             token = _current_claim.set(claim)
             try:
                 require_execution_work(owner)
@@ -297,19 +320,19 @@ async def execute_tool_effect(
                         raise TypeError('Tool registration validation must complete synchronously')
                 started = True
                 result = await execute()
+                returned = True
+                returned_error = (
+                    isinstance(result, ToolResult) and result.status == ToolResultStatus.ERROR
+                ) or (
+                    isinstance(result, dict)
+                    and (result.get("success") is False or result.get("status") == "error")
+                )
             except BaseException as execution_error:
                 error = execution_error
             finally:
                 _current_claim.reset(token)
-            returned_error = (
-                isinstance(result, ToolResult) and result.status == ToolResultStatus.ERROR
-            ) or (
-                isinstance(result, dict)
-                and (result.get("success") is False or result.get("status") == "error")
-            )
-            known_conflict = (issubclass(type(error), ResourceConflict)
-                and not observed_outcome_unknown(error)
-                and not is_execution_control_error(error))
+            known_conflict = (not returned and issubclass(type(error), ResourceConflict)
+                and not is_tool_execution_terminal_error(error))
             state = (
                 "NOT_EXECUTED" if not started else
                 "RETURNED_ERROR" if known_conflict else
@@ -317,11 +340,7 @@ async def execute_tool_effect(
                 "RETURNED_ERROR" if returned_error else "RETURNED_OK"
             )
             if started and error is not None and not known_conflict:
-                if not _requires_original_terminal_error(error):
-                    original = error
-                    error = ToolEffectOutcomeUnconfirmed('tool_effect_outcome_unconfirmed')
-                    error.__cause__ = original
-                turn.unconfirmed.append(error)
+                error = _record_uncertain_effect(turn, error)
             try:
                 # Ordinary SQL authority is required. A revoked runtime may
                 # refuse settlement; the original STARTED row then fences

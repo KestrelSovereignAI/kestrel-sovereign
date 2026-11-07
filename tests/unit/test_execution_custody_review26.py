@@ -133,7 +133,8 @@ async def test_actual_a2a_producers_and_projections_propagate_original_control(t
                     validated.append(True)
 
                 await manager._execute_async(provider.handle_task, task, "did:test:recipient",
-                    validate_registration=validate_original_registration)
+                    validate_registration=validate_original_registration,
+                    completion_failure=lambda error: error)
             elif stage == "command":
                 manager.register_provider(
                     "feature", [AgentSkill(id="fixture", name="Fixture", description="Fixture", tags=["test"])],

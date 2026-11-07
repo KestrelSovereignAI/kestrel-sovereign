@@ -25,13 +25,29 @@ from kestrel_sdk.signals import (
     SignalMode,
     Status,
 )
+from kestrel_sdk.tools.base import AgentTool, ToolCategory, ToolSchema
 from kestrel_sdk.tools.result import ToolResult
 
+from kestrel_sovereign.features.base import Feature
 from kestrel_sovereign.agent.sleep import SleepMixin
 from kestrel_sovereign.features.scheduler.feature import SchedulerFeature
 from kestrel_sovereign.features.scheduler.outcome import ScheduledTaskOutcome
 from kestrel_sovereign.features.scheduler.runner import SchedulerRunner
 from tests.utils.scheduler_ticks import tick_and_settle
+
+
+class _SourceToolFeature(Feature):
+    tool_description = 'Original scheduler source tool'
+
+    def __init__(self, agent, name, tools):
+        super().__init__(agent)
+        self.name, self._tools = name, tools
+
+    async def initialize(self):
+        pass
+
+    def get_tools(self):
+        return self._tools
 
 
 def _NO_REASON_CODES(task_name: str) -> frozenset[str]:
@@ -430,16 +446,14 @@ async def test_failed_tool_result_becomes_failed_status(
     """The production lookup rejects failure before its JSON boundary."""
     agent, registry, dispatcher, backend = dispatcher_components
     private_marker = "private-consolidation-detail-2907"
-    failed_tool = MagicMock()
+    failed_tool = MagicMock(spec=AgentTool)
     failed_tool.name = "memory_consolidate"
     failed_tool.execute = AsyncMock(
         return_value=ToolResult.failed(private_marker).to_dict()
     )
-    memory_feature = MagicMock()
-    memory_feature.enabled = True
-    memory_feature.get_tools.return_value = [failed_tool]
-    agent.features = {"MemoryFeature": memory_feature}
     execution_agent = await native_tool_effect_agent(did=agent.did)
+    memory_feature = _SourceToolFeature(execution_agent, "MemoryFeature", [failed_tool])
+    agent.features = {"MemoryFeature": memory_feature}
     execution_agent.features = agent.features
     scheduler_feature = SchedulerFeature(execution_agent)
     dispatcher = SignalDispatcher(agent=execution_agent, registry=registry,
@@ -1268,10 +1282,9 @@ async def test_due_builtin_whose_owner_loads_later_runs_once_after_barrier(
         owner_ran.set()
         return {"success": True, "restarted": False}
 
-    owner = SimpleNamespace(
-        name="RestartCoordinatorFeature",
-        get_tools=lambda: [SimpleNamespace(name="restart_coordinator", execute=execute)],
-    )
+    owner = _SourceToolFeature(execution_agent, "RestartCoordinatorFeature", [
+        SimpleNamespace(name="restart_coordinator", execute=execute,
+            schema=ToolSchema("restart_coordinator", "Owned restart counter", ToolCategory.UTILITY))])
 
     db = execution_agent.tool_effect_store.database
     runner = SchedulerRunner(db, agent.did, feature._dispatch_scheduled_task)

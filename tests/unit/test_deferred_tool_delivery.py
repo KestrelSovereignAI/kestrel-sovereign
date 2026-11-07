@@ -976,6 +976,21 @@ class ScriptedSubagentModel:
         return "Subagent finished."
 
 
+async def _inspect_refused_native_input(host, operation):
+    """Inspect an internal result after proving native delivery was refused."""
+    from kestrel_sdk.resources import ResourceOutcomeUnknown
+
+    observed = []
+    async def capture():
+        result = await operation()
+        observed.append(result)
+        return result
+    with pytest.raises(ResourceOutcomeUnknown):
+        await _drive_native(host, capture)
+    assert len(observed) == 1
+    return observed[0]
+
+
 @dataclass
 class Route:
     kind: str
@@ -1246,7 +1261,7 @@ async def test_route_audit_failure_withholds_the_ui_and_is_not_replayable(route,
     await route.backend.execute("DROP TABLE a2a_tool_dispatches")
     with part_collector(host=route.host, session_id=SESSION):
         if route.kind == "a2a":
-            outcome = await route.invoke()
+            outcome = await _inspect_refused_native_input(route.host, route._invoke)
         else:
             with pytest.raises(ToolAuditUnconfirmedError):
                 await route.invoke()
@@ -1279,7 +1294,7 @@ async def test_workflow_never_retries_a_skill_whose_required_audit_failed(route)
     workflow.set_task_manager(route.manager)
     route.policy.release.set()
     await route.backend.execute("DROP TABLE a2a_tool_dispatches")
-    result = await _drive_native(route.host, lambda: workflow.run_workflow([{
+    result = await _inspect_refused_native_input(route.host, lambda: workflow.run_workflow([{
         "feature": PROVIDER, "skill": DeferredTool.name,
         "max_retries": 1, "retry_delay_ms": 0,
     }]))
@@ -1410,7 +1425,8 @@ async def test_route_host_without_audited_completion_withholds_the_ui(route, mon
     monkeypatch.setattr(DeferredToolResult, "for_tool", record)
     route.host.supports_audited_deferred_tool_results = False
     route.policy.release.set()
-    outcome = await route.invoke()
+    outcome = (await _inspect_refused_native_input(route.host, route._invoke)
+        if route.kind == "a2a" else await route.invoke())
     if route.kind == "a2a":
         assert outcome.status.state == TaskState.TASK_STATE_FAILED
         detail = message_text(outcome.status.message)

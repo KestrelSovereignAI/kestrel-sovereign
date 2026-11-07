@@ -5,6 +5,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 import pytest_asyncio
+from kestrel_sdk.tools.base import AgentTool
 from tests.utils.native_tool_effects import drive_native
 
 from kestrel_sovereign.agent.orchestrator_engine import OrchestratorEngineMixin
@@ -312,7 +313,7 @@ class _FeatureForTurnCompletion(Feature):
 
 @pytest.mark.asyncio
 async def test_feature_subagent_tool_history_preserves_provider_reasoning(native_tool_effect_agent):
-    tool = MagicMock()
+    tool = MagicMock(spec=AgentTool)
     tool.name = "health_check"
     tool.execute = AsyncMock(return_value={"status": "ok"})
 
@@ -350,7 +351,7 @@ async def test_feature_subagent_tool_history_preserves_provider_reasoning(native
 
 @pytest.mark.asyncio
 async def test_feature_subagent_no_tool_continuation_gets_repair_step(native_tool_effect_agent):
-    tool = MagicMock()
+    tool = MagicMock(spec=AgentTool)
     tool.name = "launch_job"
     tool.execute = AsyncMock(return_value={"success": True, "claimed": 1237})
 

@@ -633,6 +633,7 @@ class TaskManager:
 
         from kestrel_sovereign.tools.effect_journal import (
             current_tool_effect_turn, execute_tool_effect,
+            record_tool_effect_completion_failure,
         )
         original_turn = None
         if isinstance(handler, Feature) and not sync:
@@ -646,15 +647,25 @@ class TaskManager:
             original_turn.require_live(original_host)
             args = deepcopy(args)
 
+        def completion_failure(error):
+            if original_host is None:
+                return error
+            return record_tool_effect_completion_failure(original_host, error)
+
         async def execute_selected_handler(task, *, arguments):
             if not opaque_feature_handler:
                 return await selected_handler(task, arguments=arguments)
 
+            handler_baseline = Task.FromString(task.SerializeToString())
             async def execute_opaque_handler():
+                from kestrel_sdk.native_a2a.utils.proto_utils import validate_proto_required_fields
+                from kestrel_sovereign.a2a.outcomes import merge_task_outcome
+
                 result = await selected_handler(task, arguments=arguments)
                 if not issubclass(type(result), Task):
                     raise TypeError('Native Feature handler must return a Task')
-                return result
+                validate_proto_required_fields(result)
+                return merge_task_outcome(handler_baseline, handler_baseline, result)
 
             try:
                 return await execute_tool_effect(original_host,
@@ -668,6 +679,7 @@ class TaskManager:
                 # The journal retains the exact original failure and fences
                 # replay. Persist that same recipient-owned Task as unknown;
                 # a custom handler need not enter the canonical tool leaf.
+                task = Task.FromString(handler_baseline.SerializeToString())
                 task.status.CopyFrom(new_task_status(
                     at=self.task_store.now_utc(), state=TaskState.TASK_STATE_FAILED,
                     message=new_text_message('Native task effect outcome is unknown',
@@ -804,12 +816,15 @@ class TaskManager:
                     # The canonical outcome writer owns CAS and uncertain-commit
                     # reconciliation. A persistence failure must reach the caller; an
                     # extra transaction/retry cannot manufacture a completed receipt.
-                    task = await self._persist_sync_execution_outcome(
-                        task,
-                        baseline=baseline,
-                        authority_agent_id=authority_agent_id,
-                        expected_state=expected_state,
-                    )
+                    try:
+                        task = await self._persist_sync_execution_outcome(
+                            task,
+                            baseline=baseline,
+                            authority_agent_id=authority_agent_id,
+                            expected_state=expected_state,
+                        )
+                    except BaseException as error:
+                        raise completion_failure(error)
                 except asyncio.CancelledError as cancellation:
                     if is_execution_control_error(cancellation):
                         raise
@@ -843,7 +858,8 @@ class TaskManager:
                     with execution_registration:
                         await self._execute_async(execute_selected_handler, Task.FromString(task.SerializeToString()),
                             authority_agent_id, arguments=args,
-                            validate_registration=require_original_registration)
+                            validate_registration=require_original_registration,
+                            completion_failure=completion_failure)
 
                 execution = self._track_execution_task(
                     execute_original_provider,
@@ -1055,6 +1071,7 @@ class TaskManager:
         authority_agent_id: str,
         *,
         validate_registration: Callable[[], None],
+        completion_failure: Callable[[BaseException], BaseException],
         arguments: dict[str, Any] | None = None,
     ) -> None:
         """Execute a task asynchronously and update the store."""
@@ -1080,17 +1097,20 @@ class TaskManager:
             # Persistence and notification are infrastructure boundaries. Their
             # failure cannot rewrite a successful handler result as FAILED or
             # initiate a second terminal write. The tracked owner retains it.
-            task, owns_notification = await self._persist_execution_outcome(
-                task,
-                baseline=baseline,
-                authority_agent_id=authority_agent_id,
-                expected_state=expected_state,
-            )
-            if owns_notification:
-                await self._notify_status_update(
+            try:
+                task, owns_notification = await self._persist_execution_outcome(
                     task,
-                    final=task.status.state in TERMINAL_STATES,
+                    baseline=baseline,
+                    authority_agent_id=authority_agent_id,
+                    expected_state=expected_state,
                 )
+                if owns_notification:
+                    await self._notify_status_update(
+                        task,
+                        final=task.status.state in TERMINAL_STATES,
+                    )
+            except BaseException as error:
+                raise completion_failure(error)
         except asyncio.CancelledError as cancellation:
             if is_execution_control_error(cancellation):
                 raise

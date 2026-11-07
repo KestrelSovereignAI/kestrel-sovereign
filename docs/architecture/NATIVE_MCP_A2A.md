@@ -346,6 +346,16 @@ NOT_EXECUTED claim permits a subsequent attempt to supersede the old one. Reusin
 an intent with changed input conflicts; an explicitly new intent gets a new ID.
 This is a local replay fence, not a cross-vendor exactly-once guarantee.
 
+Result classification finishes before claim settlement. A failed classifier
+settles that same claim as UNCONFIRMED and fences the turn. After RETURNED_OK,
+native result serialization or persistence failures preserve the acknowledged
+claim and its first audit receipt. Shared completion handling records uncertainty
+on the original turn, retains the original exception and prevents another effect.
+Opaque Feature task handlers validate required fields and canonical Task outcome
+invariants before acknowledging their claim. A malformed reply produces a FAILED
+Task with `outcome_unknown` from the admitted baseline for the recipient writer;
+concurrent committed task data remains authoritative.
+
 Terminal retirement closes only the original attempt through the shared native
 result-custody writer. It retains the original connection generation or pool
 recipe, wrapped-key lifetime and catalog identities of both journal tables. The

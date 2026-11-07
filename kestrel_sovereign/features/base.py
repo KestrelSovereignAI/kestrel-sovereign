@@ -1519,6 +1519,7 @@ class Feature(_SdkFeature):
             return task
         from kestrel_sovereign.tools.effect_journal import (
             execute_tool_effect, require_persistent_tool_effects,
+            record_tool_effect_completion_failure,
         )
         require_persistent_tool_effects(host)
 
@@ -1553,6 +1554,8 @@ class Feature(_SdkFeature):
 
         def settle_outcome(raised: BaseException | None = None) -> None:
             observed = [*flattened, *observed_outcome_unknown(raised)]
+            if is_tool_execution_terminal_error(raised) and not any(value is raised for value in observed):
+                observed.append(raised)
             if not observed:
                 return
             mark_outcome_unknown(task)
@@ -1594,9 +1597,33 @@ class Feature(_SdkFeature):
                 artifact = new_raw_artifact(
                     f"{skill_name}_result", payload, media_type="application/json"
                 )
-        except Exception as error:
-            if is_execution_control_error(error):
-                raise
+                task.artifacts.append(artifact)
+                failed = (
+                    isinstance(result, dict) and (
+                        result.get("success") is False
+                        or (is_flat_toolresult_envelope(result) and result["status"] == ToolResultStatus.ERROR)
+                    )
+                )
+                task.status.CopyFrom(
+                    TaskStatus(
+                        state=TaskState.TASK_STATE_FAILED
+                        if failed
+                        else TaskState.TASK_STATE_COMPLETED,
+                        message=new_text_message(
+                            str(result.get("error") or "Tool reported failure without error details") if failed else f"Completed {skill_name}",
+                            task_id=task.id,
+                            context_id=task.context_id,
+                        ),
+                    )
+                )
+                settle_outcome()
+                return task
+
+        except BaseException as error:
+            if execution.returned:
+                error = record_tool_effect_completion_failure(host, error)
+            if not issubclass(type(error), Exception) or is_execution_control_error(error):
+                raise error
             logger.error(
                 "Feature %s task handling failed for %s: %s\n%s",
                 self.name, skill_name, exception_log_summary(error),
@@ -1612,28 +1639,6 @@ class Feature(_SdkFeature):
             )
             settle_outcome(error)
             return task
-        task.artifacts.append(artifact)
-        failed = (
-            isinstance(result, dict) and (
-                result.get("success") is False
-                or (is_flat_toolresult_envelope(result) and result["status"] == ToolResultStatus.ERROR)
-            )
-        )
-        task.status.CopyFrom(
-            TaskStatus(
-                state=TaskState.TASK_STATE_FAILED
-                if failed
-                else TaskState.TASK_STATE_COMPLETED,
-                message=new_text_message(
-                    str(result.get("error") or "Tool reported failure without error details") if failed else f"Completed {skill_name}",
-                    task_id=task.id,
-                    context_id=task.context_id,
-                ),
-            )
-        )
-        settle_outcome()
-        return task
-
     def _get_tool_by_name(self, name: str) -> Optional[AgentTool]:
         """Get a tool by its name."""
         for tool in self.get_tools():
