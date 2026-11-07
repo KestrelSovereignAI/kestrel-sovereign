@@ -85,7 +85,10 @@ async def kestrel_agent(llm_service, temp_db):
         did="did:test:agent_tools_test",
         storage_path=str(temp_db),
         llm_service=llm_service,
-        privacy_mode=PrivacyMode.NORMAL
+        privacy_mode=PrivacyMode.NORMAL,
+        # Exercise the real model-tool host and mandatory security lifecycle.
+        # Unrelated optional schedulers must not race a skipped live-route test.
+        allowed_features={"ModelAgent"},
     )
 
     # Initialize async storage
@@ -232,6 +235,11 @@ async def test_kestrel_agent_has_task_manager(kestrel_agent):
 @pytest.mark.asyncio
 async def test_kestrel_agent_features_registered(kestrel_agent):
     """The model feature contributes the same native skills as its host catalog."""
+    from kestrel_sovereign.multi_agent.config import MANDATORY_FEATURES
+
+    assert set(kestrel_agent.features) == MANDATORY_FEATURES | {"ModelAgent"}, (
+        "Tool-routing fixture started unrelated optional feature lifecycles"
+    )
     providers = kestrel_agent.task_manager.get_provider_skills()
     feature = kestrel_agent.features["ModelAgent"]
     assert "ModelAgent" in providers
