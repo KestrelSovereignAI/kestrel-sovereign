@@ -38,6 +38,30 @@ def governed_stream(function):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize('blocked', ['maintenance', 'storage-unavailable'])
+async def test_input_readiness_refusal_precedes_journal_writes(owner, blocked):
+    database = owner.tool_effect_store.database
+    if blocked == 'maintenance':
+        owner.defer_agent_readiness_to_host(maintenance=True)
+        reason = 'maintenance boot'
+    else:
+        owner.storage = None
+        reason = 'not fully initialized'
+    entered = []
+
+    @governed
+    async def invoke(agent, user_input, *, invocation_id=None):
+        entered.append(user_input)
+        return 'must not run'
+
+    with pytest.raises(RuntimeError, match=reason):
+        await invoke(owner, 'refused native input', invocation_id='owned-readiness-refusal')
+    assert entered == []
+    assert await database.fetchone('SELECT COUNT(*) FROM tool_effect_operations') == (0,)
+    assert await database.fetchone('SELECT COUNT(*) FROM tool_effect_claims') == (0,)
+
+
+@pytest.mark.asyncio
 async def test_root_admission_precedes_body_and_rejects_retry_before_another_effect(owner, tmp_path):
     entered = []
     witness = tmp_path / 'effects'
