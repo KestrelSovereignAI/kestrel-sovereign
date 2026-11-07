@@ -751,15 +751,14 @@ async def test_deferred_readiness_keeps_retained_scope_and_rejects_hook_loss():
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("hosted", [False, True])
-async def test_public_stream_rename_retains_privacy_lock_reentry(monkeypatch, hosted):
+async def test_public_stream_rename_retains_privacy_lock_reentry(monkeypatch, hosted, native_tool_effect_agent):
     from tests.unit.test_streaming_audit import _make_streaming_audit_agent
-    from kestrel_sovereign.storage.privacy_wrapper import ReentrantTransitionLock
     from kestrel_sovereign.features.bootstrap.feature import rename_agent_core
     import kestrel_sovereign.features.storage_access as storage_access
 
-    agent, _ = _make_streaming_audit_agent([], mode="warn", register_hook=False)
-    lock = ReentrantTransitionLock()
-    agent._get_privacy_transition_lock.return_value = lock
+    agent, _ = await _make_streaming_audit_agent([], mode="warn", register_hook=False,
+        native_tool_effect_agent=native_tool_effect_agent)
+    lock = agent._get_privacy_transition_lock()
     agent._agent_name = "Before"
     original_acquire = lock._lock.acquire
     base_acquisitions = []

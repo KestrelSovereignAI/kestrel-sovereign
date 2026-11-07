@@ -141,16 +141,34 @@ class ArtifactRepository:
                     ):
                         await self.initialize()
 
-    async def initialize(self) -> None:
+    async def prepare_schema(self) -> None:
+        """Prepare metadata before native invocations without opening an envelope.
+
+        A loaded feature's first tool call must not migrate the database after
+        the operation's original terminal destination has been sealed.
+        """
         self._require_outermost()
-        wrapping_cipher = get_fernet()
-        if wrapping_cipher is None:
-            raise ArtifactIntegrityError("artifact persistence requires encryption")
         async with self.db.migration_lock("artifact-repository-v1"):
             for statement in _SCHEMA:
                 # AsyncDatabase handles placeholders, but schema byte types differ.
                 sql = statement.replace(" BLOB", " BYTEA") if self.db.backend_type == "postgres" else statement
                 await self.db.execute(sql)
+            for name, table, columns in (
+                ("idx_artifact_refs_blob", "artifact_blob_refs", "owner, blob_key"),
+                ("idx_artifact_staging_expiry", "artifact_staging", "expires_at, owner"),
+                ("idx_artifact_staging_blob", "artifact_staging", "owner, blob_key"),
+                ("idx_artifact_history", "artifact_revisions", "owner, artifact_id, committed_at, revision_id"),
+                ("idx_artifact_publication_artifact", "artifact_publications", "owner, artifact_id"),
+            ):
+                await self.db.ensure_index(name, table, columns)
+
+    async def initialize(self) -> None:
+        self._require_outermost()
+        wrapping_cipher = get_fernet()
+        if wrapping_cipher is None:
+            raise ArtifactIntegrityError("artifact persistence requires encryption")
+        await self.prepare_schema()
+        async with self.db.migration_lock("artifact-repository-v1"):
             row = await self.db.fetchone("SELECT wrapped_key FROM artifact_keys WHERE key_id = ?", ("v1",))
             index_key, new_envelope = resolve_envelope_key(
                 wrapping_cipher, bytes(row[0]) if row is not None else None,
@@ -166,14 +184,6 @@ class ArtifactRepository:
             if new_envelope is not None:
                 await self.db.execute("INSERT INTO artifact_keys (key_id, wrapped_key) VALUES (?, ?)",
                                       ("v1", new_envelope))
-        for name, table, columns in (
-            ("idx_artifact_refs_blob", "artifact_blob_refs", "owner, blob_key"),
-            ("idx_artifact_staging_expiry", "artifact_staging", "expires_at, owner"),
-            ("idx_artifact_staging_blob", "artifact_staging", "owner, blob_key"),
-            ("idx_artifact_history", "artifact_revisions", "owner, artifact_id, committed_at, revision_id"),
-            ("idx_artifact_publication_artifact", "artifact_publications", "owner, artifact_id"),
-        ):
-            await self.db.ensure_index(name, table, columns)
         self._index_key = index_key
 
     def _require_outermost(self) -> None:

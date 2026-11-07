@@ -43,6 +43,8 @@ from kestrel_sovereign.security.tool_audit import (
 from kestrel_sovereign.telemetry import bind_current_turn_id, turn_span_scope
 from kestrel_sovereign.turn_scope import capture_turn_scope
 from tests.unit.test_feature_runtime_lifecycle import _agent, _DispatchFeature
+from tests.utils.native_tool_effects import drive_native
+from kestrel_sovereign._async_ownership import OwnedCallbackScope
 from tests.unit.test_tool_allowlist_registry import (  # noqa: F401
     _attach_security_feature,
     _make_feature,
@@ -95,7 +97,8 @@ def mcp_agent(dispatch_agent):  # noqa: F811 - the imported fixture
     dispatch_agent.register_dynamic_tools("mcp:files", [dispatch_agent.mcp_read])
     dispatch_agent.features = {
         "MemoryFeature": _make_feature(
-            "memory_feature", [_make_tool("recall_a"), _make_tool("recall_b")]
+            "memory_feature", [_make_tool("recall_a"), _make_tool("recall_b")],
+            agent=dispatch_agent,
         ),
     }
     return dispatch_agent
@@ -116,17 +119,20 @@ class TestMidTurnEviction:
 
         On the code #2934 left, the exploration evicted ``mcp:files`` and the
         second call was refused as not in the allowlist."""
-        async with _live_turn(mcp_agent, "turn_repro"):
-            first, _ = await _dispatch(mcp_agent, "mcp__files__read", iteration=0)
-            await _dispatch(
-                mcp_agent, "memory_feature", {"task": "recall"}, iteration=1
-            )
-            assert "mcp__files__read" in mcp_agent._known_tool_names()
-            second, _ = await _dispatch(mcp_agent, "mcp__files__read", iteration=2)
+        async def exercise():
+            async with _live_turn(mcp_agent, "turn_repro"):
+                first, _ = await _dispatch(mcp_agent, "mcp__files__read", iteration=0)
+                await _dispatch(
+                    mcp_agent, "memory_feature", {"task": "recall"}, iteration=1
+                )
+                assert "mcp__files__read" in mcp_agent._known_tool_names()
+                second, _ = await _dispatch(mcp_agent, "mcp__files__read", iteration=2)
 
-        assert first == {"success": True, "tool": "mcp__files__read"}
-        assert second == {"success": True, "tool": "mcp__files__read"}
-        assert mcp_agent.mcp_read.execute.await_count == 2
+            assert first == {"success": True, "tool": "mcp__files__read"}
+            assert second == {"success": True, "tool": "mcp__files__read"}
+            assert mcp_agent.mcp_read.execute.await_count == 2
+
+        await drive_native(mcp_agent, exercise)
 
     @pytest.mark.asyncio
     async def test_eviction_still_runs_for_a_tool_an_earlier_turn_used(
@@ -134,20 +140,23 @@ class TestMidTurnEviction:
     ):
         """The protection is scoped to the live turn: LRU still sheds an owner
         the previous turn used, and the refusal then says so."""
-        store = _attach_security_feature(mcp_agent)
-        async with _live_turn(mcp_agent, "turn_one"):
-            await _dispatch(mcp_agent, "mcp__files__read")
-        async with _live_turn(mcp_agent, "turn_two"):
-            await _dispatch(mcp_agent, "memory_feature", {"task": "recall"})
-            assert "mcp__files__read" not in mcp_agent._direct_tools
-            await _dispatch(mcp_agent, "mcp__files__read", iteration=1)
+        async def exercise():
+            store = _attach_security_feature(mcp_agent)
+            async with _live_turn(mcp_agent, "turn_one"):
+                await _dispatch(mcp_agent, "mcp__files__read")
+            async with _live_turn(mcp_agent, "turn_two"):
+                await _dispatch(mcp_agent, "memory_feature", {"task": "recall"})
+                assert "mcp__files__read" not in mcp_agent._direct_tools
+                await _dispatch(mcp_agent, "mcp__files__read", iteration=1)
 
-        assert mcp_agent.mcp_read.execute.await_count == 1
-        assert len(store.rows) == 1
-        fields = _evidence_fields(store.rows[0]["args_summary"])
-        assert fields["in_set"] == "no"
-        assert fields["turn"] == "turn_two"
-        assert fields["accepted_earlier_this_turn"] == "no"
+            assert mcp_agent.mcp_read.execute.await_count == 1
+            assert len(store.rows) == 1
+            fields = _evidence_fields(store.rows[0]["args_summary"])
+            assert fields["in_set"] == "no"
+            assert fields["turn"] == "turn_two"
+            assert fields["accepted_earlier_this_turn"] == "no"
+
+        await drive_native(mcp_agent, exercise)
 
     @pytest.mark.asyncio
     async def test_a_feature_owner_the_turn_used_is_still_evictable(
@@ -156,24 +165,27 @@ class TestMidTurnEviction:
         """Evicting a feature's tools leaves them resolvable through the
         feature, so only mount-only tools hold their owner. Holding feature
         owners too would let a busy turn grow the schema past the cap."""
-        subject = dispatch_agent
-        subject.MAX_DIRECT_TOOLS = 2
-        github_issue = _make_tool("get_github_issue")
-        github = _make_feature("github", [github_issue])
-        memory = _make_feature(
-            "memory_feature", [_make_tool("recall_a"), _make_tool("recall_b")]
-        )
-        subject.features = {"GitHubFeature": github, "MemoryFeature": memory}
+        async def exercise():
+            subject = dispatch_agent
+            subject.MAX_DIRECT_TOOLS = 2
+            github_issue = _make_tool("get_github_issue")
+            github = _make_feature("github", [github_issue], agent=dispatch_agent)
+            memory = _make_feature(
+                "memory_feature", [_make_tool("recall_a"), _make_tool("recall_b")]
+            , agent=dispatch_agent)
+            subject.features = {"GitHubFeature": github, "MemoryFeature": memory}
 
-        async with _live_turn(subject, "turn_feature"):
-            await _dispatch(subject, "github", {"task": "read"})
-            await _dispatch(subject, "get_github_issue", iteration=1)
-            await _dispatch(subject, "memory_feature", {"task": "recall"}, iteration=2)
-            assert "get_github_issue" not in subject._direct_tools  # evicted
-            result, _ = await _dispatch(subject, "get_github_issue", iteration=3)
+            async with _live_turn(subject, "turn_feature"):
+                await _dispatch(subject, "github", {"task": "read"})
+                await _dispatch(subject, "get_github_issue", iteration=1)
+                await _dispatch(subject, "memory_feature", {"task": "recall"}, iteration=2)
+                assert "get_github_issue" not in subject._direct_tools  # evicted
+                result, _ = await _dispatch(subject, "get_github_issue", iteration=3)
 
-        assert result == {"success": True, "tool": "get_github_issue"}
-        assert github_issue.execute.await_count == 2
+            assert result == {"success": True, "tool": "get_github_issue"}
+            assert github_issue.execute.await_count == 2
+
+        await drive_native(dispatch_agent, exercise)
 
     @pytest.mark.asyncio
     async def test_eviction_from_outside_the_turn_still_holds_its_tools(
@@ -181,30 +193,36 @@ class TestMidTurnEviction:
     ):
         """An MCP server remounting from a background task runs eviction with
         no turn id of its own; the agent's live turn still holds its tools."""
-        async with _live_turn(mcp_agent, "turn_background"):
-            await _dispatch(mcp_agent, "mcp__files__read")
-            with bind_current_turn_id(None):
-                assert mcp_agent._get_current_turn_id() is None
-                mcp_agent.register_dynamic_tools(
-                    "mcp:other", [_make_tool("other_a"), _make_tool("other_b")]
-                )
-            assert "mcp__files__read" in mcp_agent._direct_tools
-            result, _ = await _dispatch(mcp_agent, "mcp__files__read", iteration=1)
+        async def exercise():
+            async with _live_turn(mcp_agent, "turn_background"):
+                await _dispatch(mcp_agent, "mcp__files__read")
+                with bind_current_turn_id(None):
+                    assert mcp_agent._get_current_turn_id() is None
+                    mcp_agent.register_dynamic_tools(
+                        "mcp:other", [_make_tool("other_a"), _make_tool("other_b")]
+                    )
+                assert "mcp__files__read" in mcp_agent._direct_tools
+                result, _ = await _dispatch(mcp_agent, "mcp__files__read", iteration=1)
 
-        assert result == {"success": True, "tool": "mcp__files__read"}
+            assert result == {"success": True, "tool": "mcp__files__read"}
+
+        await drive_native(mcp_agent, exercise)
 
     @pytest.mark.asyncio
     async def test_a_finished_turn_holds_nothing(self, mcp_agent):
         """A task detached from a finished turn still carries that turn's id.
         The turn is over, so its tools are evictable again."""
-        async with _live_turn(mcp_agent, "turn_done"):
-            await _dispatch(mcp_agent, "mcp__files__read")
-        with bind_current_turn_id("turn_done"):
-            mcp_agent.register_dynamic_tools(
-                "mcp:other", [_make_tool("other_a"), _make_tool("other_b")]
-            )
+        async def exercise():
+            async with _live_turn(mcp_agent, "turn_done"):
+                await _dispatch(mcp_agent, "mcp__files__read")
+            with bind_current_turn_id("turn_done"):
+                mcp_agent.register_dynamic_tools(
+                    "mcp:other", [_make_tool("other_a"), _make_tool("other_b")]
+                )
 
-        assert "mcp__files__read" not in mcp_agent._direct_tools
+            assert "mcp__files__read" not in mcp_agent._direct_tools
+
+        await drive_native(mcp_agent, exercise)
 
     @pytest.mark.asyncio
     async def test_when_nothing_is_evictable_the_cap_waits_for_the_turn(
@@ -212,15 +230,18 @@ class TestMidTurnEviction:
     ):
         """Every unpinned owner held by the live turn: eviction bails with a
         warning naming the held owner instead of unmounting it."""
-        mcp_agent._pinned_features.add("memory_feature")
-        async with _live_turn(mcp_agent, "turn_held"):
-            with caplog.at_level(logging.WARNING):
-                await _dispatch(mcp_agent, "mcp__files__read")
-                await _dispatch(mcp_agent, "memory_feature", {"task": "recall"})
+        async def exercise():
+            mcp_agent._pinned_features.add("memory_feature")
+            async with _live_turn(mcp_agent, "turn_held"):
+                with caplog.at_level(logging.WARNING):
+                    await _dispatch(mcp_agent, "mcp__files__read")
+                    await _dispatch(mcp_agent, "memory_feature", {"task": "recall"})
 
-        assert "mcp__files__read" in mcp_agent._direct_tools
-        assert "Cannot evict" in caplog.text
-        assert "mcp:files" in caplog.text
+            assert "mcp__files__read" in mcp_agent._direct_tools
+            assert "Cannot evict" in caplog.text
+            assert "mcp:files" in caplog.text
+
+        await drive_native(mcp_agent, exercise)
 
     @pytest.mark.asyncio
     async def test_a_mount_refused_for_a_held_owner_is_a_warning(
@@ -229,22 +250,25 @@ class TestMidTurnEviction:
         """At the cap with every older owner held, the owner being mounted
         is the one LRU can take, so an MCP server's mount is refused. It is
         logged at WARNING naming its tools and the owner held in its place."""
-        async with _live_turn(mcp_agent, "turn_refused_mount"):
-            await _dispatch(mcp_agent, "mcp__files__read")
-            with caplog.at_level(logging.INFO):
-                mounted = mcp_agent.register_dynamic_tools(
-                    "mcp:new", [_make_tool("new_a"), _make_tool("new_b")]
-                )
+        async def exercise():
+            async with _live_turn(mcp_agent, "turn_refused_mount"):
+                await _dispatch(mcp_agent, "mcp__files__read")
+                with caplog.at_level(logging.INFO):
+                    mounted = mcp_agent.register_dynamic_tools(
+                        "mcp:new", [_make_tool("new_a"), _make_tool("new_b")]
+                    )
 
-        assert mounted == 0
-        assert set(mcp_agent._direct_tools) == {"mcp__files__read"}
-        [warning] = [
-            r.getMessage() for r in caplog.records
-            if r.levelno == logging.WARNING and "Evicted" in r.getMessage()
-        ]
-        assert "from mcp:new in place of" in warning
-        assert "(mcp:files)" in warning
-        assert "new_a, new_b" in warning
+            assert mounted == 0
+            assert set(mcp_agent._direct_tools) == {"mcp__files__read"}
+            [warning] = [
+                r.getMessage() for r in caplog.records
+                if r.levelno == logging.WARNING and "Evicted" in r.getMessage()
+            ]
+            assert "from mcp:new in place of" in warning
+            assert "(mcp:files)" in warning
+            assert "new_a, new_b" in warning
+
+        await drive_native(mcp_agent, exercise)
 
     @pytest.mark.asyncio
     async def test_an_eviction_that_passes_over_nothing_stays_at_info(
@@ -266,13 +290,11 @@ class TestMidTurnEviction:
 # Step 1, codex route: execute_named_tool feeds the same ledger
 # =============================================================================
 
-async def _on_reader_task(executor, name, arguments):
+async def _on_reader_task(reader, executor, name, arguments):
     """Run one inline call the way the codex app-server does: on a task born
     with none of the turn's context, so only the executor's re-presented turn
     scope tells it which turn it belongs to."""
-    return await asyncio.create_task(
-        executor(name, arguments), context=contextvars.Context()
-    )
+    return await reader.dispatch(executor, name, arguments)
 
 
 def _evidence_logs(caplog, level):
@@ -299,44 +321,50 @@ class TestNamedToolDispatch:
         Before the ledger was fed from ``execute_named_tool``, the exploration
         evicted ``mcp:files`` and the second call raised
         ToolNotRegisteredError."""
-        async with _live_turn(mcp_agent, "turn_inline"):
-            executor = mcp_agent._make_inline_tool_executor("chat-inline")
-            _, first = await _on_reader_task(
-                executor, "mcp__files__read", {"query": "x"}
-            )
-            _, explored = await _on_reader_task(
-                executor, "memory_feature", {"task": "recall"}
-            )
-            # Exploration ran and the cap was enforced: the newest owner was
-            # the only evictable one, so the turn's MCP tool is what is left.
-            assert set(mcp_agent._direct_tools) == {"mcp__files__read"}
-            _, second = await _on_reader_task(
-                executor, "mcp__files__read", {"query": "x"}
-            )
+        async def exercise():
+            async with _live_turn(mcp_agent, "turn_inline"):
+                executor = mcp_agent._make_inline_tool_executor("chat-inline")
+                _, first = await _on_reader_task(
+                    mcp_agent._test_inline_reader, executor, "mcp__files__read", {"query": "x"}
+                )
+                _, explored = await _on_reader_task(
+                    mcp_agent._test_inline_reader, executor, "memory_feature", {"task": "recall"}
+                )
+                # Exploration ran and the cap was enforced: the newest owner was
+                # the only evictable one, so the turn's MCP tool is what is left.
+                assert set(mcp_agent._direct_tools) == {"mcp__files__read"}
+                _, second = await _on_reader_task(
+                    mcp_agent._test_inline_reader, executor, "mcp__files__read", {"query": "x"}
+                )
 
-        assert explored == {"success": True, "result": "memory_feature ran"}
-        assert first == second == {"success": True, "tool": "mcp__files__read"}
-        assert mcp_agent.mcp_read.execute.await_count == 2
+            assert explored == {"success": True, "result": "memory_feature ran"}
+            assert first == second == {"success": True, "tool": "mcp__files__read"}
+            assert mcp_agent.mcp_read.execute.await_count == 2
+
+        await drive_native(mcp_agent, exercise)
 
     @pytest.mark.asyncio
     async def test_inline_and_chat_calls_share_one_count(self, mcp_agent):
         """Both routes count into the same turn, once per call: an inline call
         between two chat-path calls is call 2, and the refusal after them is
         call 4 and knows the inline acceptance."""
-        store = _attach_security_feature(mcp_agent)
-        mcp_agent.MAX_DIRECT_TOOLS = 10
-        async with _live_turn(mcp_agent, "turn_shared"):
-            executor = mcp_agent._make_inline_tool_executor("chat-shared")
-            await _dispatch(mcp_agent, "memory_feature", {"task": "recall"})
-            await _on_reader_task(executor, "mcp__files__read", {"query": "x"})
-            await _dispatch(mcp_agent, "ghost_tool", iteration=1)
-            mcp_agent.unregister_dynamic_tools("mcp:files")
-            await _dispatch(mcp_agent, "mcp__files__read", iteration=2)
+        async def exercise():
+            store = _attach_security_feature(mcp_agent)
+            mcp_agent.MAX_DIRECT_TOOLS = 10
+            async with _live_turn(mcp_agent, "turn_shared"):
+                executor = mcp_agent._make_inline_tool_executor("chat-shared")
+                await _dispatch(mcp_agent, "memory_feature", {"task": "recall"})
+                await _on_reader_task(mcp_agent._test_inline_reader, executor, "mcp__files__read", {"query": "x"})
+                await _dispatch(mcp_agent, "ghost_tool", iteration=1)
+                mcp_agent.unregister_dynamic_tools("mcp:files")
+                await _dispatch(mcp_agent, "mcp__files__read", iteration=2)
 
-        calls = [_evidence_fields(row["args_summary"]) for row in store.rows]
-        assert [fields["call"] for fields in calls] == ["3", "4"]
-        assert calls[1]["accepted_earlier_this_turn"] == "yes"
-        assert calls[1]["accepted_at_call"] == "2"
+            calls = [_evidence_fields(row["args_summary"]) for row in store.rows]
+            assert [fields["call"] for fields in calls] == ["3", "4"]
+            assert calls[1]["accepted_earlier_this_turn"] == "yes"
+            assert calls[1]["accepted_at_call"] == "2"
+
+        await drive_native(mcp_agent, exercise)
 
     @pytest.mark.asyncio
     async def test_inline_bounce_of_a_tool_this_turn_used_is_a_warning(
@@ -344,70 +372,79 @@ class TestNamedToolDispatch:
     ):
         """The same-turn bounce on the codex route (an MCP server removed
         mid-turn) is logged at WARNING with what the registry held."""
-        async with _live_turn(mcp_agent, "turn_inline_bounce"):
-            executor = mcp_agent._make_inline_tool_executor("chat-bounce")
-            accepted_known = mcp_agent._registered_tool_names()
-            await _on_reader_task(executor, "mcp__files__read", {"query": "x"})
-            mcp_agent.unregister_dynamic_tools("mcp:files")
-            with caplog.at_level(logging.INFO):
-                with pytest.raises(ToolNotRegisteredError):
-                    await _on_reader_task(
-                        executor, "mcp__files__read", {"query": "x"}
-                    )
+        async def exercise():
+            async with _live_turn(mcp_agent, "turn_inline_bounce"):
+                executor = mcp_agent._make_inline_tool_executor("chat-bounce")
+                accepted_known = mcp_agent._registered_tool_names()
+                await _on_reader_task(mcp_agent._test_inline_reader, executor, "mcp__files__read", {"query": "x"})
+                mcp_agent.unregister_dynamic_tools("mcp:files")
+                with caplog.at_level(logging.INFO):
+                    with pytest.raises(ToolNotRegisteredError):
+                        await _on_reader_task(
+                            mcp_agent._test_inline_reader, executor, "mcp__files__read", {"query": "x"}
+                        )
 
-        [fields] = _evidence_logs(caplog, logging.WARNING)
-        assert fields["in_set"] == "no"
-        assert fields["turn"] == "turn_inline_bounce"
-        assert fields["call"] == "2"
-        assert fields["accepted_earlier_this_turn"] == "yes"
-        assert fields["accepted_at_call"] == "1"
-        assert fields["accepted_sha256_16"] == accepted_known.digest
-        assert int(fields["registry_generation"]) > int(
-            fields["accepted_registry_generation"]
-        )
+            [fields] = _evidence_logs(caplog, logging.WARNING)
+            assert fields["in_set"] == "no"
+            assert fields["turn"] == "turn_inline_bounce"
+            assert fields["call"] == "2"
+            assert fields["accepted_earlier_this_turn"] == "yes"
+            assert fields["accepted_at_call"] == "1"
+            assert fields["accepted_sha256_16"] == accepted_known.digest
+            assert int(fields["registry_generation"]) > int(
+                fields["accepted_registry_generation"]
+            )
+
+        await drive_native(mcp_agent, exercise)
 
     @pytest.mark.asyncio
     async def test_inline_subagent_call_is_recorded(self, mcp_agent, caplog):
         """The subagent branch records its acceptance too: a dispatcher the
         turn called inline, then disabled mid-turn, is refused as a name this
         turn already used."""
-        memory = mcp_agent.features["MemoryFeature"]
-        async with _live_turn(mcp_agent, "turn_inline_subagent"):
-            executor = mcp_agent._make_inline_tool_executor("chat-subagent")
-            await _on_reader_task(executor, "memory_feature", {"task": "recall"})
-            memory.enabled = False
-            with caplog.at_level(logging.INFO):
-                with pytest.raises(ToolNotRegisteredError):
-                    await _on_reader_task(
-                        executor, "memory_feature", {"task": "recall"}
-                    )
+        async def exercise():
+            memory = mcp_agent.features["MemoryFeature"]
+            async with _live_turn(mcp_agent, "turn_inline_subagent"):
+                executor = mcp_agent._make_inline_tool_executor("chat-subagent")
+                await _on_reader_task(mcp_agent._test_inline_reader, executor, "memory_feature", {"task": "recall"})
+                memory.enabled = False
+                with caplog.at_level(logging.INFO):
+                    with pytest.raises(ToolNotRegisteredError):
+                        await _on_reader_task(
+                            mcp_agent._test_inline_reader, executor, "memory_feature", {"task": "recall"}
+                        )
 
-        [fields] = _evidence_logs(caplog, logging.WARNING)
-        assert fields["call"] == "2"
-        assert fields["accepted_at_call"] == "1"
-        assert fields["features_enabled"] == "0/1"
+            [fields] = _evidence_logs(caplog, logging.WARNING)
+            assert fields["call"] == "2"
+            assert fields["accepted_at_call"] == "1"
+            assert fields["features_enabled"] == "0/1"
+
+        await drive_native(mcp_agent, exercise)
 
     @pytest.mark.asyncio
     async def test_inline_argument_refusal_carries_evidence(self, mcp_agent):
         """The inline route's argument check writes the same evidence as the
         chat path's, and a call it refuses is not an acceptance."""
-        store = _attach_security_feature(mcp_agent)
-        async with _live_turn(mcp_agent, "turn_inline_args"):
-            executor = mcp_agent._make_inline_tool_executor("chat-args")
-            await _on_reader_task(executor, "mcp__files__read", {"query": "x"})
-            for _ in range(2):
-                await _on_reader_task(
-                    executor, "mcp__files__read", {"querry": "x"}
-                )
+        async def exercise():
+            store = _attach_security_feature(mcp_agent)
+            async with _live_turn(mcp_agent, "turn_inline_args"):
+                executor = mcp_agent._make_inline_tool_executor("chat-args")
+                await _on_reader_task(mcp_agent._test_inline_reader, executor, "mcp__files__read", {"query": "x"})
+                for _ in range(2):
+                    await _on_reader_task(
+                        mcp_agent._test_inline_reader, executor, "mcp__files__read", {"querry": "x"}
+                    )
 
-        assert len(store.rows) == 2
-        first, second = (_evidence_fields(r["args_summary"]) for r in store.rows)
-        assert first["in_set"] == "yes"
-        assert first["turn"] == "turn_inline_args"
-        assert first["call"] == "2"
-        assert first["accepted_at_call"] == "1"
-        assert second["call"] == "3"
-        assert second["accepted_at_call"] == "1"
+            assert len(store.rows) == 2
+            first, second = (_evidence_fields(r["args_summary"]) for r in store.rows)
+            assert first["in_set"] == "yes"
+            assert first["turn"] == "turn_inline_args"
+            assert first["call"] == "2"
+            assert first["accepted_at_call"] == "1"
+            assert second["call"] == "3"
+            assert second["accepted_at_call"] == "1"
+
+        await drive_native(mcp_agent, exercise)
 
     @pytest.mark.asyncio
     async def test_inline_probe_for_a_tool_never_used_is_not_a_warning(
@@ -415,16 +452,19 @@ class TestNamedToolDispatch:
     ):
         """Callers probe for an optional tool by name and handle the error;
         that refusal carries the evidence at INFO, not WARNING."""
-        async with _live_turn(mcp_agent, "turn_probe"):
-            executor = mcp_agent._make_inline_tool_executor("chat-probe")
-            with caplog.at_level(logging.INFO):
-                with pytest.raises(ToolNotRegisteredError):
-                    await _on_reader_task(executor, "workflow_run", {})
+        async def exercise():
+            async with _live_turn(mcp_agent, "turn_probe"):
+                executor = mcp_agent._make_inline_tool_executor("chat-probe")
+                with caplog.at_level(logging.INFO):
+                    with pytest.raises(ToolNotRegisteredError):
+                        await _on_reader_task(mcp_agent._test_inline_reader, executor, "workflow_run", {})
 
-        assert _evidence_logs(caplog, logging.WARNING) == []
-        [fields] = _evidence_logs(caplog, logging.INFO)
-        assert fields["call"] == "1"
-        assert fields["accepted_earlier_this_turn"] == "no"
+            assert _evidence_logs(caplog, logging.WARNING) == []
+            [fields] = _evidence_logs(caplog, logging.INFO)
+            assert fields["call"] == "1"
+            assert fields["accepted_earlier_this_turn"] == "no"
+
+        await drive_native(mcp_agent, exercise)
 
     @pytest.mark.asyncio
     async def test_a_call_a_running_tool_makes_is_not_counted_again(
@@ -433,28 +473,31 @@ class TestNamedToolDispatch:
         """A tool that dispatches another by name (a workflow runner) does so
         inside its own call: the nested call takes that call's position, so
         the count stays the turn's own calls, on either route."""
-        store = _attach_security_feature(mcp_agent)
+        async def exercise():
+            store = _attach_security_feature(mcp_agent)
 
-        async def _run_nested(**_kwargs):
-            return await mcp_agent.execute_named_tool(
-                "mcp__files__read", {"query": "x"},
-                session_id="nested", source="workflow_runner",
-            )
+            async def _run_nested(**_kwargs):
+                return await mcp_agent.execute_named_tool(
+                    "mcp__files__read", {"query": "x"},
+                    session_id="nested", source="workflow_runner",
+                )
 
-        runner = _make_tool("run_steps")
-        runner.execute.side_effect = _run_nested
-        mcp_agent.register_dynamic_tools("runner", [runner])
-        mcp_agent.MAX_DIRECT_TOOLS = 10
+            runner = _make_tool("run_steps")
+            runner.execute.side_effect = _run_nested
+            mcp_agent.register_dynamic_tools("runner", [runner])
+            mcp_agent.MAX_DIRECT_TOOLS = 10
 
-        async with _live_turn(mcp_agent, "turn_nested"):
-            executor = mcp_agent._make_inline_tool_executor("chat-nested")
-            await _dispatch(mcp_agent, "run_steps")
-            await _on_reader_task(executor, "run_steps", {"query": "x"})
-            await _dispatch(mcp_agent, "ghost_tool", iteration=1)
+            async with _live_turn(mcp_agent, "turn_nested"):
+                executor = mcp_agent._make_inline_tool_executor("chat-nested")
+                await _dispatch(mcp_agent, "run_steps")
+                await _on_reader_task(mcp_agent._test_inline_reader, executor, "run_steps", {"query": "x"})
+                await _dispatch(mcp_agent, "ghost_tool", iteration=1)
 
-        assert mcp_agent.mcp_read.execute.await_count == 2
-        [fields] = [_evidence_fields(row["args_summary"]) for row in store.rows]
-        assert fields["call"] == "3"
+            assert mcp_agent.mcp_read.execute.await_count == 2
+            [fields] = [_evidence_fields(row["args_summary"]) for row in store.rows]
+            assert fields["call"] == "3"
+
+        await drive_native(mcp_agent, exercise)
 
     @pytest.mark.asyncio
     async def test_a_nested_bounce_knows_its_sibling_acceptance(
@@ -463,37 +506,40 @@ class TestNamedToolDispatch:
         """A runner's two calls to one tool share the runner's call index.
         When the second is refused after the first answered, the refusal
         still says the name was accepted earlier this turn."""
-        refusals = []
+        async def exercise():
+            refusals = []
 
-        async def _run_twice(**_kwargs):
-            await mcp_agent.execute_named_tool(
-                "mcp__files__read", {"query": "x"},
-                session_id="nested", source="workflow_runner",
-            )
-            mcp_agent.unregister_dynamic_tools("mcp:files")
-            try:
+            async def _run_twice(**_kwargs):
                 await mcp_agent.execute_named_tool(
                     "mcp__files__read", {"query": "x"},
                     session_id="nested", source="workflow_runner",
                 )
-            except ToolNotRegisteredError as exc:
-                refusals.append(exc)
-            return {"success": True}
+                mcp_agent.unregister_dynamic_tools("mcp:files")
+                try:
+                    await mcp_agent.execute_named_tool(
+                        "mcp__files__read", {"query": "x"},
+                        session_id="nested", source="workflow_runner",
+                    )
+                except ToolNotRegisteredError as exc:
+                    refusals.append(exc)
+                return {"success": True}
 
-        runner = _make_tool("run_steps")
-        runner.execute.side_effect = _run_twice
-        mcp_agent.register_dynamic_tools("runner", [runner])
-        mcp_agent.MAX_DIRECT_TOOLS = 10
+            runner = _make_tool("run_steps")
+            runner.execute.side_effect = _run_twice
+            mcp_agent.register_dynamic_tools("runner", [runner])
+            mcp_agent.MAX_DIRECT_TOOLS = 10
 
-        async with _live_turn(mcp_agent, "turn_sibling"):
-            with caplog.at_level(logging.INFO):
-                await _dispatch(mcp_agent, "run_steps")
+            async with _live_turn(mcp_agent, "turn_sibling"):
+                with caplog.at_level(logging.INFO):
+                    await _dispatch(mcp_agent, "run_steps")
 
-        assert len(refusals) == 1
-        [fields] = _evidence_logs(caplog, logging.WARNING)
-        assert fields["call"] == "1"
-        assert fields["accepted_earlier_this_turn"] == "yes"
-        assert fields["accepted_at_call"] == "1"
+            assert len(refusals) == 1
+            [fields] = _evidence_logs(caplog, logging.WARNING)
+            assert fields["call"] == "1"
+            assert fields["accepted_earlier_this_turn"] == "yes"
+            assert fields["accepted_at_call"] == "1"
+
+        await drive_native(mcp_agent, exercise)
 
     @pytest.mark.asyncio
     async def test_a_nested_call_still_holds_its_tool_against_eviction(
@@ -501,58 +547,67 @@ class TestNamedToolDispatch:
     ):
         """The nested call is recorded at its enclosing call's position, so an
         MCP tool only a workflow runner called is held for the turn too."""
-        async def _run_nested(**_kwargs):
-            return await mcp_agent.execute_named_tool(
-                "mcp__files__read", {"query": "x"},
-                session_id="nested", source="workflow_runner",
-            )
+        async def exercise():
+            async def _run_nested(**_kwargs):
+                return await mcp_agent.execute_named_tool(
+                    "mcp__files__read", {"query": "x"},
+                    session_id="nested", source="workflow_runner",
+                )
 
-        runner = _make_feature(
-            "runner_feature", [], name="RunnerFeature",
-        )
-        runner.execute_as_subagent.side_effect = _run_nested
-        mcp_agent.features["RunnerFeature"] = runner
+            runner = _make_feature(
+                "runner_feature", [], name="RunnerFeature",
+             agent=mcp_agent)
+            runner.execute_as_subagent.side_effect = _run_nested
+            mcp_agent.features["RunnerFeature"] = runner
 
-        async with _live_turn(mcp_agent, "turn_nested_held"):
-            await _dispatch(mcp_agent, "runner_feature", {"task": "run"})
-            await _dispatch(
-                mcp_agent, "memory_feature", {"task": "recall"}, iteration=1
-            )
-            assert "mcp__files__read" in mcp_agent._direct_tools
+            async with _live_turn(mcp_agent, "turn_nested_held"):
+                await _dispatch(mcp_agent, "runner_feature", {"task": "run"})
+                await _dispatch(
+                    mcp_agent, "memory_feature", {"task": "recall"}, iteration=1
+                )
+                assert "mcp__files__read" in mcp_agent._direct_tools
+
+        await drive_native(mcp_agent, exercise)
 
     @pytest.mark.asyncio
     async def test_a_task_outliving_its_call_is_not_nested(self, mcp_agent):
         """A task created inside a call keeps the call's marker after the call
         returns (a lazily started reader loop can be such a task). Its later
         calls are the turn's own, not the finished call's."""
-        store = _attach_security_feature(mcp_agent)
-        spawned = []
-        release = asyncio.Event()
+        async def exercise():
+            store = _attach_security_feature(mcp_agent)
+            spawned = []
+            callback_scope = OwnedCallbackScope()
+            release = asyncio.Event()
 
-        async def _later_call():
-            await release.wait()
-            return await mcp_agent.execute_named_tool(
-                "mcp__files__read", {"query": "x"},
-                session_id="later", source="reader",
-            )
+            async def _later_call():
+                await release.wait()
+                return await mcp_agent.execute_named_tool(
+                    "mcp__files__read", {"query": "x"},
+                    session_id="later", source="reader",
+                )
 
-        async def _spawn(**_kwargs):
-            spawned.append(asyncio.create_task(_later_call()))
-            return {"success": True}
+            async def _spawn(**_kwargs):
+                spawned.append(callback_scope.start(_later_call))
+                return {"success": True}
 
-        spawner = _make_tool("spawn_reader")
-        spawner.execute.side_effect = _spawn
-        mcp_agent.register_dynamic_tools("spawner", [spawner])
-        mcp_agent.MAX_DIRECT_TOOLS = 10
+            spawner = _make_tool("spawn_reader")
+            spawner.execute.side_effect = _spawn
+            mcp_agent.register_dynamic_tools("spawner", [spawner])
+            mcp_agent.MAX_DIRECT_TOOLS = 10
 
-        async with _live_turn(mcp_agent, "turn_outlived"):
-            await _dispatch(mcp_agent, "spawn_reader")
-            release.set()
-            await spawned[0]
-            await _dispatch(mcp_agent, "ghost_tool", iteration=1)
+            async with _live_turn(mcp_agent, "turn_outlived"):
+                await _dispatch(mcp_agent, "spawn_reader")
+                release.set()
+                async with callback_scope.wait():
+                    await spawned[0]
+                callback_scope.close()
+                await _dispatch(mcp_agent, "ghost_tool", iteration=1)
 
-        [fields] = [_evidence_fields(row["args_summary"]) for row in store.rows]
-        assert fields["call"] == "3"
+            [fields] = [_evidence_fields(row["args_summary"]) for row in store.rows]
+            assert fields["call"] == "3"
+
+        await drive_native(mcp_agent, exercise)
 
 
 # =============================================================================
@@ -590,7 +645,7 @@ class _NestingFeature(Feature):
         self.executor = self._make_feature_inline_tool_executor(
             parts_sink=None, runtime_tools=[step]
         )
-        _, result = await _on_reader_task(self.executor, "run_step", {})
+        _, result = await _on_reader_task(self.agent._test_inline_reader, self.executor, "run_step", {})
         return {"success": True, "result": result}
 
     async def _run_step(self, **_kwargs):
@@ -614,7 +669,7 @@ async def _dispatch_nesting(target, route):
         await _dispatch(target, "nesting_feature", {"task": "run"})
     else:
         executor = target._make_inline_tool_executor("chat-nesting")
-        await _on_reader_task(executor, "nesting_feature", {"task": "run"})
+        await _on_reader_task(target._test_inline_reader, executor, "nesting_feature", {"task": "run"})
 
 
 class TestNestedCallOnForeignTask:
@@ -631,20 +686,23 @@ class TestNestedCallOnForeignTask:
         Before the in-flight call was turn-scoped state, the reader task did
         not know it ran inside call 1, so the nested call became call 2 and
         every later refusal reported an index one too high."""
-        store = _attach_security_feature(nesting_agent)
-        async with _live_turn(nesting_agent, "turn_foreign"):
-            await _dispatch_nesting(nesting_agent, route)
-            ledger = nesting_agent._tool_turn_ledgers["turn_foreign"]
-            assert ledger.calls == 1
-            assert [
-                accepted.call_index
-                for accepted in ledger.accepted["mcp__files__read"]
-            ] == [1]
-            await _dispatch(nesting_agent, "ghost_tool", iteration=1)
+        async def exercise():
+            store = _attach_security_feature(nesting_agent)
+            async with _live_turn(nesting_agent, "turn_foreign"):
+                await _dispatch_nesting(nesting_agent, route)
+                ledger = nesting_agent._tool_turn_ledgers["turn_foreign"]
+                assert ledger.calls == 1
+                assert [
+                    accepted.call_index
+                    for accepted in ledger.accepted["mcp__files__read"]
+                ] == [1]
+                await _dispatch(nesting_agent, "ghost_tool", iteration=1)
 
-        assert nesting_agent.mcp_read.execute.await_count == 1
-        [fields] = [_evidence_fields(row["args_summary"]) for row in store.rows]
-        assert fields["call"] == "2"
+            assert nesting_agent.mcp_read.execute.await_count == 1
+            [fields] = [_evidence_fields(row["args_summary"]) for row in store.rows]
+            assert fields["call"] == "2"
+
+        await drive_native(nesting_agent, exercise)
 
     @pytest.mark.asyncio
     async def test_a_nested_call_on_a_reader_task_holds_its_tool(
@@ -652,18 +710,21 @@ class TestNestedCallOnForeignTask:
     ):
         """What the nested call is accepted for is held against eviction on
         the reader task too."""
-        nesting_agent.MAX_DIRECT_TOOLS = 2
-        async with _live_turn(nesting_agent, "turn_foreign_held"):
-            await _dispatch_nesting(nesting_agent, "inline")
-            await _dispatch(
-                nesting_agent, "memory_feature", {"task": "recall"}, iteration=1
-            )
-            assert "mcp__files__read" in nesting_agent._direct_tools
-            result, _ = await _dispatch(
-                nesting_agent, "mcp__files__read", iteration=2
-            )
+        async def exercise():
+            nesting_agent.MAX_DIRECT_TOOLS = 2
+            async with _live_turn(nesting_agent, "turn_foreign_held"):
+                await _dispatch_nesting(nesting_agent, "inline")
+                await _dispatch(
+                    nesting_agent, "memory_feature", {"task": "recall"}, iteration=1
+                )
+                assert "mcp__files__read" in nesting_agent._direct_tools
+                result, _ = await _dispatch(
+                    nesting_agent, "mcp__files__read", iteration=2
+                )
 
-        assert result == {"success": True, "tool": "mcp__files__read"}
+            assert result == {"success": True, "tool": "mcp__files__read"}
+
+        await drive_native(nesting_agent, exercise)
 
     @pytest.mark.asyncio
     async def test_a_re_presented_call_ends_when_its_call_returns(
@@ -673,16 +734,19 @@ class TestNestedCallOnForeignTask:
         A later call through it is the turn's own, not the finished call's:
         the carried marker is the call's own, so the call closes it for every
         task holding it."""
-        async with _live_turn(nesting_agent, "turn_reused"):
-            await _dispatch(nesting_agent, "nesting_feature", {"task": "run"})
-            await _on_reader_task(nesting_agent.nesting.executor, "run_step", {})
-            ledger = nesting_agent._tool_turn_ledgers["turn_reused"]
+        async def exercise():
+            async with _live_turn(nesting_agent, "turn_reused"):
+                await _dispatch(nesting_agent, "nesting_feature", {"task": "run"})
+                await _on_reader_task(nesting_agent._test_inline_reader, nesting_agent.nesting.executor, "run_step", {})
+                ledger = nesting_agent._tool_turn_ledgers["turn_reused"]
 
-        assert ledger.calls == 2
-        assert [
-            accepted.call_index
-            for accepted in ledger.accepted["mcp__files__read"]
-        ] == [1, 2]
+            assert ledger.calls == 2
+            assert [
+                accepted.call_index
+                for accepted in ledger.accepted["mcp__files__read"]
+            ] == [1, 2]
+
+        await drive_native(nesting_agent, exercise)
 
     @pytest.mark.asyncio
     async def test_only_the_capturing_agents_call_is_carried(
@@ -741,42 +805,45 @@ class TestRejectionEvidence:
         removed) and refused at call 2: the row records the requested name,
         the set's size and digest, the registry generation that produced it,
         the turn and call index, and the earlier acceptance."""
-        store = _attach_security_feature(mcp_agent)
-        async with _live_turn(mcp_agent, "turn_fields"):
-            accepted_known = mcp_agent._known_tool_names()
-            await _dispatch(mcp_agent, "mcp__files__read", known=accepted_known)
-            mcp_agent.unregister_dynamic_tools("mcp:files")
-            refused_known = mcp_agent._known_tool_names()
-            await _dispatch(
-                mcp_agent, "mcp__files__read", iteration=1, known=refused_known
-            )
+        async def exercise():
+            store = _attach_security_feature(mcp_agent)
+            async with _live_turn(mcp_agent, "turn_fields"):
+                accepted_known = mcp_agent._known_tool_names()
+                await _dispatch(mcp_agent, "mcp__files__read", known=accepted_known)
+                mcp_agent.unregister_dynamic_tools("mcp:files")
+                refused_known = mcp_agent._known_tool_names()
+                await _dispatch(
+                    mcp_agent, "mcp__files__read", iteration=1, known=refused_known
+                )
 
-        assert len(store.rows) == 1
-        row = store.rows[0]
-        assert row["tool_name"] == "mcp__files__read"
-        assert row["action"] == ACTION_TOOL_VALIDATION
-        fields = _evidence_fields(row["args_summary"])
-        assert fields == {
-            "in_set": "no",
-            "size": str(len(refused_known)),
-            "sha256_16": tool_name_set_digest(refused_known),
-            "registry_generation": str(refused_known.registry_generation),
-            "registry_generation_now": str(registry_generation(mcp_agent)),
-            "features_enabled": "2/2",
-            "unreadable_features": "none",
-            "turn": "turn_fields",
-            "call": "2",
-            "accepted_earlier_this_turn": "yes",
-            "accepted_at_call": "1",
-            "accepted_size": str(len(accepted_known)),
-            "accepted_sha256_16": tool_name_set_digest(accepted_known),
-            "accepted_registry_generation": str(accepted_known.registry_generation),
-        }
-        # The transition the evidence exists to show: the set shrank and was
-        # produced by a later registry than the one that accepted the name.
-        assert len(refused_known) < len(accepted_known)
-        assert fields["sha256_16"] != fields["accepted_sha256_16"]
-        assert refused_known.registry_generation > accepted_known.registry_generation
+            assert len(store.rows) == 1
+            row = store.rows[0]
+            assert row["tool_name"] == "mcp__files__read"
+            assert row["action"] == ACTION_TOOL_VALIDATION
+            fields = _evidence_fields(row["args_summary"])
+            assert fields == {
+                "in_set": "no",
+                "size": str(len(refused_known)),
+                "sha256_16": tool_name_set_digest(refused_known),
+                "registry_generation": str(refused_known.registry_generation),
+                "registry_generation_now": str(registry_generation(mcp_agent)),
+                "features_enabled": "2/2",
+                "unreadable_features": "none",
+                "turn": "turn_fields",
+                "call": "2",
+                "accepted_earlier_this_turn": "yes",
+                "accepted_at_call": "1",
+                "accepted_size": str(len(accepted_known)),
+                "accepted_sha256_16": tool_name_set_digest(accepted_known),
+                "accepted_registry_generation": str(accepted_known.registry_generation),
+            }
+            # The transition the evidence exists to show: the set shrank and was
+            # produced by a later registry than the one that accepted the name.
+            assert len(refused_known) < len(accepted_known)
+            assert fields["sha256_16"] != fields["accepted_sha256_16"]
+            assert refused_known.registry_generation > accepted_known.registry_generation
+
+        await drive_native(mcp_agent, exercise)
 
     @pytest.mark.asyncio
     async def test_dispatcher_accepted_then_disabled_mid_turn(
@@ -785,43 +852,49 @@ class TestRejectionEvidence:
         """A feature disabled mid-turn is a real capability boundary, so its
         dispatcher IS refused; the refusal says it answered earlier in the
         turn and that one fewer feature was enabled."""
-        store = _attach_security_feature(dispatch_agent)
-        github = _make_feature("github", [_make_tool("get_github_issue")])
-        dispatch_agent.features["GitHubFeature"] = github
-        async with _live_turn(dispatch_agent, "turn_disabled"):
-            accepted_known = dispatch_agent._known_tool_names()
-            first, _ = await _dispatch(
-                dispatch_agent, "github", {"task": "read"}, known=accepted_known
-            )
-            github.enabled = False
-            refused_known = dispatch_agent._known_tool_names()
-            await _dispatch(
-                dispatch_agent, "github", {"task": "read"}, iteration=1,
-                known=refused_known,
-            )
+        async def exercise():
+            store = _attach_security_feature(dispatch_agent)
+            github = _make_feature("github", [_make_tool("get_github_issue")], agent=dispatch_agent)
+            dispatch_agent.features["GitHubFeature"] = github
+            async with _live_turn(dispatch_agent, "turn_disabled"):
+                accepted_known = dispatch_agent._known_tool_names()
+                first, _ = await _dispatch(
+                    dispatch_agent, "github", {"task": "read"}, known=accepted_known
+                )
+                github.enabled = False
+                refused_known = dispatch_agent._known_tool_names()
+                await _dispatch(
+                    dispatch_agent, "github", {"task": "read"}, iteration=1,
+                    known=refused_known,
+                )
 
-        assert first == {"success": True, "result": "github ran"}
-        fields = _evidence_fields(store.rows[0]["args_summary"])
-        assert fields["in_set"] == "no"
-        assert fields["accepted_earlier_this_turn"] == "yes"
-        assert fields["accepted_at_call"] == "1"
-        assert fields["features_enabled"] == "1/2"
-        assert accepted_known.features_enabled == 2
+            assert first == {"success": True, "result": "github ran"}
+            fields = _evidence_fields(store.rows[0]["args_summary"])
+            assert fields["in_set"] == "no"
+            assert fields["accepted_earlier_this_turn"] == "yes"
+            assert fields["accepted_at_call"] == "1"
+            assert fields["features_enabled"] == "1/2"
+            assert accepted_known.features_enabled == 2
+
+        await drive_native(dispatch_agent, exercise)
 
     @pytest.mark.asyncio
     async def test_the_most_recent_acceptance_is_reported(self, mcp_agent):
         """The acceptance closest to the refusal is the one that brackets the
         transition, so it is the one reported."""
-        store = _attach_security_feature(mcp_agent)
-        async with _live_turn(mcp_agent, "turn_recent"):
-            await _dispatch(mcp_agent, "mcp__files__read")
-            await _dispatch(mcp_agent, "mcp__files__read", iteration=1)
-            mcp_agent.unregister_dynamic_tools("mcp:files")
-            await _dispatch(mcp_agent, "mcp__files__read", iteration=2)
+        async def exercise():
+            store = _attach_security_feature(mcp_agent)
+            async with _live_turn(mcp_agent, "turn_recent"):
+                await _dispatch(mcp_agent, "mcp__files__read")
+                await _dispatch(mcp_agent, "mcp__files__read", iteration=1)
+                mcp_agent.unregister_dynamic_tools("mcp:files")
+                await _dispatch(mcp_agent, "mcp__files__read", iteration=2)
 
-        fields = _evidence_fields(store.rows[0]["args_summary"])
-        assert fields["call"] == "3"
-        assert fields["accepted_at_call"] == "2"
+            fields = _evidence_fields(store.rows[0]["args_summary"])
+            assert fields["call"] == "3"
+            assert fields["accepted_at_call"] == "2"
+
+        await drive_native(mcp_agent, exercise)
 
     def test_a_call_is_never_earlier_than_itself(
         self, agent,  # noqa: F811 - the imported fixture
@@ -886,108 +959,126 @@ class TestRejectionEvidence:
     async def test_accepted_earlier_is_false_for_a_name_never_accepted(
         self, dispatch_agent,  # noqa: F811 - the imported fixture
     ):
-        store = _attach_security_feature(dispatch_agent)
-        dispatch_agent.features["GitHubFeature"] = _make_feature(
-            "github", [_make_tool("get_github_issue")]
-        )
-        async with _live_turn(dispatch_agent, "turn_never"):
-            await _dispatch(dispatch_agent, "get_github_issue")
-            await _dispatch(dispatch_agent, "ghost_tool", iteration=1)
+        async def exercise():
+            store = _attach_security_feature(dispatch_agent)
+            dispatch_agent.features["GitHubFeature"] = _make_feature(
+                "github", [_make_tool("get_github_issue")]
+            , agent=dispatch_agent)
+            async with _live_turn(dispatch_agent, "turn_never"):
+                await _dispatch(dispatch_agent, "get_github_issue")
+                await _dispatch(dispatch_agent, "ghost_tool", iteration=1)
 
-        fields = _evidence_fields(store.rows[0]["args_summary"])
-        assert fields["call"] == "2"
-        assert fields["accepted_earlier_this_turn"] == "no"
-        assert "accepted_at_call" not in fields
+            fields = _evidence_fields(store.rows[0]["args_summary"])
+            assert fields["call"] == "2"
+            assert fields["accepted_earlier_this_turn"] == "no"
+            assert "accepted_at_call" not in fields
+
+        await drive_native(dispatch_agent, exercise)
 
     @pytest.mark.asyncio
     async def test_accepted_earlier_is_false_when_another_turn_accepted_it(
         self, mcp_agent,
     ):
-        store = _attach_security_feature(mcp_agent)
-        async with _live_turn(mcp_agent, "turn_a"):
-            await _dispatch(mcp_agent, "mcp__files__read")
-        mcp_agent.unregister_dynamic_tools("mcp:files")
-        async with _live_turn(mcp_agent, "turn_b"):
-            await _dispatch(mcp_agent, "mcp__files__read")
+        async def exercise():
+            store = _attach_security_feature(mcp_agent)
+            async with _live_turn(mcp_agent, "turn_a"):
+                await _dispatch(mcp_agent, "mcp__files__read")
+            mcp_agent.unregister_dynamic_tools("mcp:files")
+            async with _live_turn(mcp_agent, "turn_b"):
+                await _dispatch(mcp_agent, "mcp__files__read")
 
-        fields = _evidence_fields(store.rows[0]["args_summary"])
-        assert fields["turn"] == "turn_b"
-        assert fields["call"] == "1"
-        assert fields["accepted_earlier_this_turn"] == "no"
+            fields = _evidence_fields(store.rows[0]["args_summary"])
+            assert fields["turn"] == "turn_b"
+            assert fields["call"] == "1"
+            assert fields["accepted_earlier_this_turn"] == "no"
+
+        await drive_native(mcp_agent, exercise)
 
     @pytest.mark.asyncio
     async def test_outside_a_turn_nothing_counts_as_earlier(self, mcp_agent):
-        store = _attach_security_feature(mcp_agent)
-        await _dispatch(mcp_agent, "mcp__files__read")
-        mcp_agent.unregister_dynamic_tools("mcp:files")
-        await _dispatch(mcp_agent, "mcp__files__read")
+        async def exercise():
+            store = _attach_security_feature(mcp_agent)
+            await _dispatch(mcp_agent, "mcp__files__read")
+            mcp_agent.unregister_dynamic_tools("mcp:files")
+            await _dispatch(mcp_agent, "mcp__files__read")
 
-        fields = _evidence_fields(store.rows[0]["args_summary"])
-        assert fields["turn"] == "none"
-        assert fields["call"] == "unknown"
-        assert fields["accepted_earlier_this_turn"] == "no"
+            fields = _evidence_fields(store.rows[0]["args_summary"])
+            assert fields["turn"] == "none"
+            assert fields["call"] == "unknown"
+            assert fields["accepted_earlier_this_turn"] == "no"
+
+        await drive_native(mcp_agent, exercise)
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("route", ["chat", "inline"])
     async def test_constitution_receipt_call_is_counted(self, mcp_agent, route):
         """The constitution receipt tool short-circuits the allowlist, but
         the model still made the call, so the next call is call 2."""
-        from kestrel_sovereign.signals.constitution_canary import (
-            PHANTOM_RECEIPT_TOOL_NAME,
-        )
+        async def exercise():
+            from kestrel_sovereign.signals.constitution_canary import (
+                PHANTOM_RECEIPT_TOOL_NAME,
+            )
 
-        store = _attach_security_feature(mcp_agent)
-        mcp_agent.register_constitution_receipt_tool(canary="c", signal_id="s")
-        async with _live_turn(mcp_agent, "turn_receipt"):
-            if route == "chat":
-                await _dispatch(
-                    mcp_agent, PHANTOM_RECEIPT_TOOL_NAME, {"canary": "c"}
-                )
-            else:
-                executor = mcp_agent._make_inline_tool_executor("chat-receipt")
-                await _on_reader_task(
-                    executor, PHANTOM_RECEIPT_TOOL_NAME, {"canary": "c"}
-                )
-            await _dispatch(mcp_agent, "ghost_tool", iteration=1)
+            store = _attach_security_feature(mcp_agent)
+            mcp_agent.register_constitution_receipt_tool(canary="c", signal_id="s")
+            async with _live_turn(mcp_agent, "turn_receipt"):
+                if route == "chat":
+                    await _dispatch(
+                        mcp_agent, PHANTOM_RECEIPT_TOOL_NAME, {"canary": "c"}
+                    )
+                else:
+                    executor = mcp_agent._make_inline_tool_executor("chat-receipt")
+                    await _on_reader_task(
+                        mcp_agent._test_inline_reader, executor, PHANTOM_RECEIPT_TOOL_NAME, {"canary": "c"}
+                    )
+                await _dispatch(mcp_agent, "ghost_tool", iteration=1)
 
-        assert len(mcp_agent._constitution_receipt_tool_calls) == 1
-        [fields] = [_evidence_fields(row["args_summary"]) for row in store.rows]
-        assert fields["call"] == "2"
+            assert len(mcp_agent._constitution_receipt_tool_calls) == 1
+            [fields] = [_evidence_fields(row["args_summary"]) for row in store.rows]
+            assert fields["call"] == "2"
+
+        await drive_native(mcp_agent, exercise)
 
     @pytest.mark.asyncio
     async def test_call_index_counts_across_iterations(
         self, dispatch_agent,  # noqa: F811 - the imported fixture
     ):
-        store = _attach_security_feature(dispatch_agent)
-        async with _live_turn(dispatch_agent, "turn_count"):
-            for iteration in range(3):
-                await _dispatch(dispatch_agent, "ghost_tool", iteration=iteration)
+        async def exercise():
+            store = _attach_security_feature(dispatch_agent)
+            async with _live_turn(dispatch_agent, "turn_count"):
+                for iteration in range(3):
+                    await _dispatch(dispatch_agent, "ghost_tool", iteration=iteration)
 
-        assert [
-            _evidence_fields(row["args_summary"])["call"] for row in store.rows
-        ] == ["1", "2", "3"]
+            assert [
+                _evidence_fields(row["args_summary"])["call"] for row in store.rows
+            ] == ["1", "2", "3"]
+
+        await drive_native(dispatch_agent, exercise)
 
     @pytest.mark.asyncio
     async def test_resolution_rejection_carries_evidence(
         self, dispatch_agent,  # noqa: F811 - the imported fixture
     ):
         """Allowlisted but resolvable by no loaded feature."""
-        store = _attach_security_feature(dispatch_agent)
-        async with _live_turn(dispatch_agent, "turn_resolution"):
-            await _dispatch(
-                dispatch_agent, "ghost_tool", known={"ghost_tool", "other"}
-            )
+        async def exercise():
+            store = _attach_security_feature(dispatch_agent)
+            async with _live_turn(dispatch_agent, "turn_resolution"):
+                await _dispatch(
+                    dispatch_agent, "ghost_tool", known={"ghost_tool", "other"}
+                )
 
-        row = store.rows[0]
-        assert row["action"] == ACTION_TOOL_RESOLUTION
-        fields = _evidence_fields(row["args_summary"])
-        assert fields["in_set"] == "yes"
-        assert fields["size"] == "2"
-        assert fields["sha256_16"] == tool_name_set_digest({"ghost_tool", "other"})
-        # A plain set carries no provenance; the evidence says so rather than
-        # inventing a generation.
-        assert fields["registry_generation"] == "unknown"
-        assert fields["features_enabled"] == "unknown/unknown"
+            row = store.rows[0]
+            assert row["action"] == ACTION_TOOL_RESOLUTION
+            fields = _evidence_fields(row["args_summary"])
+            assert fields["in_set"] == "yes"
+            assert fields["size"] == "2"
+            assert fields["sha256_16"] == tool_name_set_digest({"ghost_tool", "other"})
+            # A plain set carries no provenance; the evidence says so rather than
+            # inventing a generation.
+            assert fields["registry_generation"] == "unknown"
+            assert fields["features_enabled"] == "unknown/unknown"
+
+        await drive_native(dispatch_agent, exercise)
 
     @pytest.mark.asyncio
     async def test_direct_tool_argument_refusal_carries_evidence(
@@ -995,23 +1086,26 @@ class TestRejectionEvidence:
     ):
         """The argument check is the last guardrail: a call it refuses is not
         an acceptance, and its row carries the same evidence."""
-        store = _attach_security_feature(mcp_agent)
-        async with _live_turn(mcp_agent, "turn_args"):
-            await _dispatch(mcp_agent, "mcp__files__read")
-            await _dispatch(
-                mcp_agent, "mcp__files__read", {"querry": "x"}, iteration=1
-            )
-            await _dispatch(
-                mcp_agent, "mcp__files__read", {"querry": "x"}, iteration=2
-            )
+        async def exercise():
+            store = _attach_security_feature(mcp_agent)
+            async with _live_turn(mcp_agent, "turn_args"):
+                await _dispatch(mcp_agent, "mcp__files__read")
+                await _dispatch(
+                    mcp_agent, "mcp__files__read", {"querry": "x"}, iteration=1
+                )
+                await _dispatch(
+                    mcp_agent, "mcp__files__read", {"querry": "x"}, iteration=2
+                )
 
-        assert len(store.rows) == 2
-        first, second = (_evidence_fields(r["args_summary"]) for r in store.rows)
-        assert first["in_set"] == "yes"
-        assert first["call"] == "2"
-        assert first["accepted_at_call"] == "1"
-        # The refused call 2 did not replace call 1 as the last acceptance.
-        assert second["accepted_at_call"] == "1"
+            assert len(store.rows) == 2
+            first, second = (_evidence_fields(r["args_summary"]) for r in store.rows)
+            assert first["in_set"] == "yes"
+            assert first["call"] == "2"
+            assert first["accepted_at_call"] == "1"
+            # The refused call 2 did not replace call 1 as the last acceptance.
+            assert second["accepted_at_call"] == "1"
+
+        await drive_native(mcp_agent, exercise)
 
     @pytest.mark.asyncio
     async def test_registry_generation_is_the_one_that_produced_the_set(
@@ -1019,16 +1113,19 @@ class TestRejectionEvidence:
     ):
         """A batch derives the set once; a change later in the batch moves the
         live registry on, and the evidence keeps the two apart."""
-        store = _attach_security_feature(dispatch_agent)
-        known = dispatch_agent._known_tool_names()
-        dispatch_agent.register_dynamic_tools("mcp:late", [_make_tool("late_tool")])
+        async def exercise():
+            store = _attach_security_feature(dispatch_agent)
+            known = dispatch_agent._known_tool_names()
+            dispatch_agent.register_dynamic_tools("mcp:late", [_make_tool("late_tool")])
 
-        async with _live_turn(dispatch_agent, "turn_generation"):
-            await _dispatch(dispatch_agent, "late_tool", known=known)
+            async with _live_turn(dispatch_agent, "turn_generation"):
+                await _dispatch(dispatch_agent, "late_tool", known=known)
 
-        fields = _evidence_fields(store.rows[0]["args_summary"])
-        assert fields["registry_generation"] == str(known.registry_generation)
-        assert int(fields["registry_generation_now"]) > known.registry_generation
+            fields = _evidence_fields(store.rows[0]["args_summary"])
+            assert fields["registry_generation"] == str(known.registry_generation)
+            assert int(fields["registry_generation_now"]) > known.registry_generation
+
+        await drive_native(dispatch_agent, exercise)
 
     @pytest.mark.asyncio
     async def test_unreadable_feature_is_named(
@@ -1036,16 +1133,19 @@ class TestRejectionEvidence:
     ):
         """A feature whose ``get_tools()`` raises loses its names from the set
         without any registry change; the evidence names it."""
-        store = _attach_security_feature(dispatch_agent)
-        broken = _make_feature("github", [])
-        broken.get_tools.side_effect = RuntimeError("client not ready")
-        dispatch_agent.features["GitHubFeature"] = broken
+        async def exercise():
+            store = _attach_security_feature(dispatch_agent)
+            broken = _make_feature("github", [], agent=dispatch_agent)
+            broken.get_tools.side_effect = RuntimeError("client not ready")
+            dispatch_agent.features["GitHubFeature"] = broken
 
-        async with _live_turn(dispatch_agent, "turn_unreadable"):
-            await _dispatch(dispatch_agent, "create_github_issue")
+            async with _live_turn(dispatch_agent, "turn_unreadable"):
+                await _dispatch(dispatch_agent, "create_github_issue")
 
-        fields = _evidence_fields(store.rows[0]["args_summary"])
-        assert fields["unreadable_features"] == "GitHubFeature"
+            fields = _evidence_fields(store.rows[0]["args_summary"])
+            assert fields["unreadable_features"] == "GitHubFeature"
+
+        await drive_native(dispatch_agent, exercise)
 
     @pytest.mark.asyncio
     async def test_unreadable_feature_name_is_reduced_to_plain_characters(
@@ -1054,20 +1154,23 @@ class TestRejectionEvidence:
         """A feature key is written into the audit row in front of
         ``args=``; whatever it holds, it cannot open a bracketed structure or
         forge an ``args=`` segment there."""
-        store = _attach_security_feature(dispatch_agent)
-        broken = _make_feature("github", [])
-        broken.get_tools.side_effect = RuntimeError("client not ready")
-        dispatch_agent.features['Git[Hub] | args={"x": 1}'] = broken
+        async def exercise():
+            store = _attach_security_feature(dispatch_agent)
+            broken = _make_feature("github", [], agent=dispatch_agent)
+            broken.get_tools.side_effect = RuntimeError("client not ready")
+            dispatch_agent.features['Git[Hub] | args={"x": 1}'] = broken
 
-        async with _live_turn(dispatch_agent, "turn_hostile_key"):
-            await _dispatch(dispatch_agent, "create_github_issue")
+            async with _live_turn(dispatch_agent, "turn_hostile_key"):
+                await _dispatch(dispatch_agent, "create_github_issue")
 
-        stored = store.rows[0]["args_summary"]
-        evidence = next(p for p in stored.split(" | ") if p.startswith("allowlist "))
-        assert not set('[]{}"') & set(evidence)
-        assert stored.count(" | args=") == 1
-        assert evidence in remask_summary(stored)
-        assert _evidence_fields(stored)["unreadable_features"] == "Git_Hub____args___x_:_1_"
+            stored = store.rows[0]["args_summary"]
+            evidence = next(p for p in stored.split(" | ") if p.startswith("allowlist "))
+            assert not set('[]{}"') & set(evidence)
+            assert stored.count(" | args=") == 1
+            assert evidence in remask_summary(stored)
+            assert _evidence_fields(stored)["unreadable_features"] == "Git_Hub____args___x_:_1_"
+
+        await drive_native(dispatch_agent, exercise)
 
     @pytest.mark.asyncio
     async def test_evidence_holds_no_arguments(
@@ -1075,18 +1178,21 @@ class TestRejectionEvidence:
     ):
         """Names, counts and digests only. The arguments stay in ``args=``,
         masked exactly as before."""
-        store = _attach_security_feature(dispatch_agent)
-        async with _live_turn(dispatch_agent, "turn_secret"):
-            await _dispatch(
-                dispatch_agent, "ghost_tool",
-                {"api_key": "sk-live-secret", "repo": "owner/private-repo"},
-            )
+        async def exercise():
+            store = _attach_security_feature(dispatch_agent)
+            async with _live_turn(dispatch_agent, "turn_secret"):
+                await _dispatch(
+                    dispatch_agent, "ghost_tool",
+                    {"api_key": "sk-live-secret", "repo": "owner/private-repo"},
+                )
 
-        summary = store.rows[0]["args_summary"]
-        evidence = next(p for p in summary.split(" | ") if p.startswith("allowlist "))
-        assert "owner/private-repo" not in evidence
-        assert "sk-live-secret" not in summary
-        assert "owner/private-repo" in summary.split(" | args=", 1)[1]
+            summary = store.rows[0]["args_summary"]
+            evidence = next(p for p in summary.split(" | ") if p.startswith("allowlist "))
+            assert "owner/private-repo" not in evidence
+            assert "sk-live-secret" not in summary
+            assert "owner/private-repo" in summary.split(" | args=", 1)[1]
+
+        await drive_native(dispatch_agent, exercise)
 
     @pytest.mark.asyncio
     async def test_audit_read_path_shows_the_evidence_verbatim(
@@ -1094,36 +1200,42 @@ class TestRejectionEvidence:
     ):
         """``remask_summary`` withholds bracketed structure it cannot parse in
         front of ``args=``. The evidence must survive it whole."""
-        store = _attach_security_feature(mcp_agent)
-        async with _live_turn(mcp_agent, "turn_read"):
-            await _dispatch(mcp_agent, "mcp__files__read")
-            mcp_agent.unregister_dynamic_tools("mcp:files")
-            await _dispatch(mcp_agent, "mcp__files__read", {"query": "q"})
+        async def exercise():
+            store = _attach_security_feature(mcp_agent)
+            async with _live_turn(mcp_agent, "turn_read"):
+                await _dispatch(mcp_agent, "mcp__files__read")
+                mcp_agent.unregister_dynamic_tools("mcp:files")
+                await _dispatch(mcp_agent, "mcp__files__read", {"query": "q"})
 
-        stored = store.rows[0]["args_summary"]
-        evidence = next(p for p in stored.split(" | ") if p.startswith("allowlist "))
-        assert evidence in remask_summary(stored)
+            stored = store.rows[0]["args_summary"]
+            evidence = next(p for p in stored.split(" | ") if p.startswith("allowlist "))
+            assert evidence in remask_summary(stored)
+
+        await drive_native(mcp_agent, exercise)
 
     @pytest.mark.asyncio
     async def test_rejection_is_logged_at_warning_with_the_evidence(
         self, mcp_agent, caplog,
     ):
-        async with _live_turn(mcp_agent, "turn_log"):
-            with caplog.at_level(logging.WARNING):
-                await _dispatch(mcp_agent, "mcp__files__read")
-                mcp_agent.unregister_dynamic_tools("mcp:files")
-                await _dispatch(mcp_agent, "mcp__files__read", iteration=1)
+        async def exercise():
+            async with _live_turn(mcp_agent, "turn_log"):
+                with caplog.at_level(logging.WARNING):
+                    await _dispatch(mcp_agent, "mcp__files__read")
+                    mcp_agent.unregister_dynamic_tools("mcp:files")
+                    await _dispatch(mcp_agent, "mcp__files__read", iteration=1)
 
-        refusals = [
-            r for r in caplog.records
-            if r.levelno == logging.WARNING and "refused tool" in r.getMessage()
-        ]
-        assert len(refusals) == 1
-        message = refusals[0].getMessage()
-        assert "'mcp__files__read'" in message
-        assert "accepted_earlier_this_turn=yes" in message
-        assert "accepted_at_call=1" in message
-        assert "turn=turn_log" in message
+            refusals = [
+                r for r in caplog.records
+                if r.levelno == logging.WARNING and "refused tool" in r.getMessage()
+            ]
+            assert len(refusals) == 1
+            message = refusals[0].getMessage()
+            assert "'mcp__files__read'" in message
+            assert "accepted_earlier_this_turn=yes" in message
+            assert "accepted_at_call=1" in message
+            assert "turn=turn_log" in message
+
+        await drive_native(mcp_agent, exercise)
 
 
 # =============================================================================
@@ -1171,7 +1283,7 @@ class TestNameSetDigest:
     def test_known_tool_names_digest_matches(
         self, agent,  # noqa: F811 - the imported fixture
     ):
-        agent.features = {"GitHubFeature": _make_feature("github", [_make_tool("t")])}
+        agent.features = {"GitHubFeature": _make_feature("github", [_make_tool("t")], agent=agent)}
         known = agent._known_tool_names()
         assert isinstance(known, KnownToolNames)
         assert known.digest == tool_name_set_digest(set(known))

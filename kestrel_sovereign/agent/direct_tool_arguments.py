@@ -287,6 +287,11 @@ def coerce_declared_tool_arguments(
     """
     if isinstance(arguments, dict):
         arguments = deepcopy(arguments)
+    declared = _declared_parameters(tool)
+    if declared is not None and isinstance(arguments, dict) and any(
+        name not in arguments for name in declared.required
+    ):
+        return arguments, _incomplete_call_error(tool_name, (), arguments, declared)
     parameters = _wrapper_coerced_parameters(tool)
     if parameters is None or not isinstance(arguments, dict):
         return arguments, None
@@ -439,9 +444,9 @@ def _incomplete_call_error(
         return (
             f"{tool_name} is missing required {noun} "
             f"{', '.join(repr(name) for name in missing)}. "
-            f"It does not accept {dropped_names}, so {described} was not "
-            f"passed: send each value as its own parameter. "
-            f"Valid parameters: {valid}."
+            + (f"It does not accept {dropped_names}, so {described} was not passed: "
+               if dropped else "")
+            + f"send each value as its own parameter. Valid parameters: {valid}."
         )
     return (
         f"{tool_name} does not accept {dropped_names}, so {described} was not "

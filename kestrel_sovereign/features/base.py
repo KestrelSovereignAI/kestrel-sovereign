@@ -6,6 +6,7 @@ import logging
 import os
 import re
 import time
+from uuid import uuid4
 from contextvars import ContextVar
 from typing import (
     TYPE_CHECKING,
@@ -1501,6 +1502,15 @@ class Feature(_SdkFeature):
                 )
             )
             return task
+        from kestrel_sovereign.agent.direct_tool_arguments import normalize_direct_tool_arguments
+
+        args, argument_error = normalize_direct_tool_arguments(skill_name, selected, args)
+        if argument_error is not None:
+            task.status.CopyFrom(TaskStatus(
+                state=TaskState.TASK_STATE_REJECTED,
+                message=new_text_message(argument_error, task_id=task.id, context_id=task.context_id),
+            ))
+            return task
         from kestrel_sovereign.tools.effect_journal import (
             execute_tool_effect, require_persistent_tool_effects,
         )
@@ -1730,6 +1740,9 @@ class Feature(_SdkFeature):
         max_iterations: Optional[int] = None,
         denied_tools: Optional[set] = None,
         model_override: Optional[str] = None,
+        *,
+        _validate_registration: Optional[Callable[[], None]] = None,
+        _dispatch_execution: Optional[Any] = None,
     ) -> Dict[str, Any]:
         """
         Execute this feature as a subagent with its own LLM context.
@@ -1770,6 +1783,8 @@ class Feature(_SdkFeature):
         # dispatching orchestrator by contract instead of ContextVar
         # happenstance.
         subagent_parts: List[dict] = []
+        if _validate_registration is not None:
+            _validate_registration()
         try:
             # The canonical runtime toolset for this invocation: the feature's
             # own tools minus anything security denied, plus the framework's
@@ -1857,6 +1872,8 @@ class Feature(_SdkFeature):
                     runtime_tools=available_tools,
                     session_id=turn_session_id,
                     parent_dispatch_id=parent_dispatch_id,
+                    _validate_registration=_validate_registration,
+                    _dispatch_execution=_dispatch_execution,
                 )
                 if feature_tools else None
             )
@@ -1903,6 +1920,8 @@ class Feature(_SdkFeature):
                 session_id=turn_session_id,
                 runtime_tools=available_tools,
                 parent_dispatch_id=parent_dispatch_id,
+                _validate_registration=_validate_registration,
+                _dispatch_execution=_dispatch_execution,
             )
 
             logger.info(
@@ -1941,6 +1960,8 @@ class Feature(_SdkFeature):
         runtime_tools: Optional[List[Any]] = None,
         session_id: Optional[str] = None,
         parent_dispatch_id: Optional[str] = None,
+        _validate_registration: Optional[Callable[[], None]] = None,
+        _dispatch_execution: Optional[Any] = None,
     ):
         """Build an inline ``(name, args) -> result_dict`` async callable
         bound to this invocation's runtime tool palette, gated by the same
@@ -2020,6 +2041,8 @@ class Feature(_SdkFeature):
                         parts_sink=parts_sink,
                         session_id=session_id,
                         parent_dispatch_id=parent_dispatch_id,
+                        _validate_registration=_validate_registration,
+                        _dispatch_execution=_dispatch_execution,
                     )
                 except Exception as error:
                     # The adapter running this executor returns what it raises
@@ -2042,6 +2065,8 @@ class Feature(_SdkFeature):
         parts_sink: Optional[List[dict]] = None,
         session_id: Optional[str] = None,
         parent_dispatch_id: Optional[str] = None,
+        _validate_registration: Optional[Callable[[], None]] = None,
+        _dispatch_execution: Optional[Any] = None,
     ) -> Any:
         """Execute one of this feature's tools inside the PRE_TOOL_USE /
         POST_TOOL_USE hook envelope. Shared between the inline-executor
@@ -2098,9 +2123,13 @@ class Feature(_SdkFeature):
         from kestrel_sovereign.agent.orchestrator_engine import (
             _TOOL_ARGUMENT_ERROR,
             _extract_inline_error_fields,
-            _write_tool_dispatch,
+            _write_tool_dispatch, _run_tool_execution, _record_terminal_tool_dispatch,
         )
+        from kestrel_sovereign.agent.tool_registry import _ToolExecution
 
+        execution = _ToolExecution()
+        dispatch_meta = {}
+        dispatch_id = uuid4().hex
         dispatch_start = time.time()
         dispatch_adapter = f"subagent:{type(self).__name__}.{tool_name}"
 
@@ -2123,6 +2152,7 @@ class Feature(_SdkFeature):
                 status_hint=status, error_class=error_class,
                 error_message=error_message,
                 parent_dispatch_id=parent_dispatch_id,
+                dispatch_id=dispatch_id, execution_witness=execution,
             )
             return _shape(effective_args_value, result_value)
 
@@ -2224,12 +2254,8 @@ class Feature(_SdkFeature):
                 # ``a2a_tool_dispatches.args_redacted`` /
                 # ``executed_tool_calls``. Codex round 5 P1 on #1461
                 # follow-up.
-                mutated_input = getattr(hook_input, "tool_input", None)
-                if isinstance(mutated_input, dict):
-                    effective_args = mutated_input
-                updated = getattr(hook_output, "updated_input", None)
-                if isinstance(updated, dict):
-                    effective_args = updated
+                from kestrel_sovereign.hooks.decision_gate import decided_tool_input
+                effective_args = decided_tool_input(hook_input, hook_output)
 
                 # The loop and inline executors share the same DENY, ASK,
                 # and explicit-stop rule as the orchestrator.
@@ -2291,11 +2317,34 @@ class Feature(_SdkFeature):
 
             require_execution_work(self.agent)
             exec_start = time.time()
-            try:
-                result = await execute_tool_effect(self.agent,
+
+            async def execute():
+                execution.started = True
+                if _dispatch_execution is not None:
+                    _dispatch_execution.started = True
+                result = await selected_tool.execute(**effective_args)
+                execution.returned = True
+                return result
+
+            async def operation():
+                return await execute_tool_effect(self.agent,
                     registration=[type(self).__name__, tool_name], arguments=effective_args,
                     expected_generation=selected_generation,
-                    execute=lambda: selected_tool.execute(**effective_args))
+                    validate_registration=_validate_registration,
+                    execute=execute)
+
+            async def failed(error, unknown):
+                raise error
+
+            try:
+                result = await _run_tool_execution(self.agent, operation,
+                    execution=execution, dispatch_meta=dispatch_meta, session_id=session_id,
+                    on_failure=failed,
+                    on_terminal=lambda error: _record_terminal_tool_dispatch(
+                        self.agent, error, execution, dispatch_meta, tool_name=tool_name,
+                        adapter=dispatch_adapter, args=effective_args, session_id=session_id,
+                        dispatch_start=dispatch_start, dispatch_id=dispatch_id,
+                        parent_dispatch_id=parent_dispatch_id))
                 from kestrel_sovereign.agent.invocation import (
                     mark_current_invocation_effect_completed,
                 )
@@ -2557,6 +2606,8 @@ ABSOLUTE PROHIBITION - NEVER FABRICATE:
         session_id: Optional[str] = None,
         runtime_tools: Optional[List[Any]] = None,
         parent_dispatch_id: Optional[str] = None,
+        _validate_registration: Optional[Callable[[], None]] = None,
+        _dispatch_execution: Optional[Any] = None,
     ) -> str:
         """
         Handle tool calls within this feature's context.
@@ -2676,6 +2727,8 @@ ABSOLUTE PROHIBITION - NEVER FABRICATE:
                     parts_sink=parts_sink,
                     session_id=session_id,
                     parent_dispatch_id=parent_dispatch_id,
+                    _validate_registration=_validate_registration,
+                    _dispatch_execution=_dispatch_execution,
                 )
                 call_ms = int((time.monotonic() - call_start) * 1000)
                 result_str = json.dumps(result) if isinstance(result, dict) else str(result)

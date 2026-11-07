@@ -776,3 +776,285 @@ async def test_nested_foreign_parallel_effects_exclude_siblings_inside_the_nativ
         release.set()
         await _retire_foreign_scenario(calling, (binding.name, 'owned.foreign_relay',
             'orchestrator-parallel-tool:'))
+
+
+@pytest_asyncio.fixture
+async def response_loss_dispatch(bound_operation, monkeypatch):
+    """Retain one real file effect and every entry point's original intention."""
+    from kestrel_sovereign.llm.adapter import ToolCall
+    from tests.unit.test_tool_effect_invocation import governed
+
+    owner, binding, witness = bound_operation
+    original = binding.tool.execute
+    failure = TimeoutError('owned file completed before original response loss')
+
+    async def lose_response(**arguments):
+        await original(**arguments)
+        raise failure
+
+    monkeypatch.setattr(binding.tool, 'execute', lose_response)
+
+    @governed
+    async def chat(agent, user_input, *, invocation_id=None):
+        return await agent._dispatch_tool_call(
+            ToolCall(id='original-native-call', name=binding.name, arguments={'marker': 'once'}),
+            {}, {binding.name}, [], 0, user_input, session_id='unknown-native-audit')
+
+    async def invoke(lane):
+        intent = 'unknown-native-audit-' + lane
+        if lane == 'chat':
+            return await chat(owner, 'one original intention', invocation_id=intent)
+        if lane == 'named':
+            return await owner.execute_named_tool(binding.name, {'marker': 'once'},
+                session_id='unknown-native-audit', operation_id=intent)
+        return await binding.invoke({'marker': 'once'}, session_id='unknown-native-audit', operation_id=intent)
+
+    return owner, binding, witness, failure, original, invoke
+
+
+@pytest.mark.parametrize('lane', ['chat', 'named', 'bound'])
+async def test_unknown_effect_keeps_one_required_dispatch_row_without_replay(response_loss_dispatch, lane):
+    from kestrel_sdk.resources import ResourceOutcomeUnknown
+    from kestrel_sovereign.execution_custody import execution_evidence_carriers
+
+    owner, _binding, witness, failure, _original, invoke = response_loss_dispatch
+    with caller_context_scope(CallerContext.sovereign()):
+        with pytest.raises(ResourceOutcomeUnknown) as caught:
+            await invoke(lane)
+        assert any(error is failure for error in execution_evidence_carriers(caught.value))
+        assert witness.read_text().splitlines() == ['once']
+        assert await owner.tool_effect_store.database.fetchone(
+            'SELECT state FROM tool_effect_claims') == ('UNCONFIRMED',)
+        rows = await owner.tool_effect_store.database.fetchall(
+            'SELECT result_status, error_class FROM a2a_tool_dispatches')
+        assert rows == [('error', 'ResourceOutcomeUnknown')], 'original unknown effect lost its required dispatch audit row'
+        with pytest.raises(ToolEffectReconciliationRequired):
+            await invoke(lane)
+        assert witness.read_text().splitlines() == ['once']
+        assert await owner.tool_effect_store.database.fetchone(
+            'SELECT COUNT(*) FROM a2a_tool_dispatches') == (1,)
+
+
+@pytest.mark.parametrize('lane', ['chat', 'named', 'bound'])
+@pytest.mark.parametrize('failure_mode,delivery', [('refused', 'ordinary'), ('lost_ack', 'ordinary'), ('lost_ack', 'deferred')])
+async def test_dispatch_audit_failure_preserves_original_receipts_without_another_write(
+    response_loss_dispatch, monkeypatch, lane, failure_mode, delivery,
+):
+    from kestrel_sdk.resources import observed_outcome_unknown
+    from kestrel_sdk.storage.database import QueryError
+    from kestrel_sovereign.execution_custody import (
+        ExecutionCommitOutcomeError, execution_commit_outcome, execution_evidence_carriers,
+    )
+
+    owner, binding, witness, body_error, original, invoke = response_loss_dispatch
+    database = owner.tool_effect_store.database
+    if failure_mode == 'refused':
+        await database.execute("CREATE TRIGGER refuse_dispatch_audit BEFORE INSERT ON a2a_tool_dispatches BEGIN SELECT RAISE(ABORT, 'owned audit insertion refusal'); END")
+    else:
+        if delivery == 'deferred':
+            from kestrel_sdk.tools import DeferredToolResult
+
+            async def completed_deferred(**arguments):
+                result = await original(**arguments)
+                return DeferredToolResult(result, publish=lambda: publications.append('published') or [])
+
+            monkeypatch.setattr(binding.tool, 'execute', completed_deferred)
+        else:
+            monkeypatch.setattr(binding.tool, 'execute', original)
+    publications = []
+    write = owner.observability_store.log_tool_dispatch
+    audit_errors = []
+
+    async def observe_original_write(*args, **kwargs):
+        try:
+            result = await write(*args, **kwargs)
+        except BaseException as error:
+            audit_errors.append(error)
+            raise
+        error = QueryError('original audit commit acknowledgement lost')
+        error.__cause__ = ExecutionCommitOutcomeError('unknown')
+        audit_errors.append(error)
+        raise error
+
+    monkeypatch.setattr(owner.observability_store, 'log_tool_dispatch', observe_original_write)
+    with caller_context_scope(CallerContext.sovereign()):
+        with pytest.raises(BaseException) as caught:
+            await invoke(lane)
+        carriers = execution_evidence_carriers(caught.value)
+        assert audit_errors and any(error is audit_errors[0] for error in carriers), 'dispatch discarded its original audit write failure'
+        assert len(audit_errors) == 1, 'dispatch retried an original audit write whose completion was not confirmed'
+        assert not any(type(error) is RuntimeError and 'audit is still pending' in str(error) for error in carriers), 'settled audit failure lost its retained completion error'
+        expected_rows = 0 if failure_mode == 'refused' else 1
+        assert await database.fetchone('SELECT COUNT(*) FROM a2a_tool_dispatches') == (expected_rows,), 'one original audit write produced another physical row'
+        assert witness.read_text().splitlines() == ['once']
+        if failure_mode == 'refused':
+            assert any(error is body_error for error in carriers)
+            assert observed_outcome_unknown(caught.value)
+        else:
+            assert execution_commit_outcome(caught.value) == 'unknown'
+        with pytest.raises(ToolEffectReconciliationRequired):
+            await invoke(lane)
+        assert len(audit_errors) == 1
+        assert witness.read_text().splitlines() == ['once']
+        assert publications == [], 'unconfirmed native audit published a private UI factory'
+
+
+@pytest_asyncio.fixture(params=['core', 'sdk'])
+async def custom_feature_dispatch(bound_operation, request):
+    kind = request.param
+    from kestrel_sdk.resources import ResourceOutcomeUnknown
+    from kestrel_sovereign.features.base import Feature
+    from kestrel_sdk.features.base import Feature as SDKFeature
+    from kestrel_sovereign.features.subagent_dispatch import ensure_subagent_dispatch
+    from kestrel_sovereign.llm.adapter import ToolCall
+    from tests.unit.test_tool_effect_invocation import governed
+    from kestrel_sovereign.execution_custody import execution_evidence_carriers
+
+    owner, _binding, witness = bound_operation
+    original = TimeoutError('custom feature lost its original reply after a file effect')
+
+    class CustomFeature(Feature if kind == "core" else SDKFeature):
+        tool_description = 'Owned custom feature effect'
+
+        async def initialize(self):
+            pass
+
+        async def execute_as_subagent(self, **kwargs):
+            with witness.open('a') as stream:
+                stream.write('once\n')
+            raise original
+
+    feature = ensure_subagent_dispatch(CustomFeature)(owner)
+    owner.features[feature.name] = feature
+
+    @governed
+    async def chat(agent, user_input, *, invocation_id=None):
+        return await agent._dispatch_tool_call(
+            ToolCall(id='custom-feature-call', name=feature.tool_name, arguments={'task': 'one effect'}),
+            {feature.tool_name: feature}, {feature.tool_name}, [], 0, user_input,
+            session_id='owned-custom-feature')
+
+    async def invoke(lane):
+        if lane == 'named':
+            return await owner.execute_named_tool(feature.tool_name, {'task': 'one effect'},
+                session_id='owned-custom-feature', operation_id='custom-feature-original-intent')
+        return await chat(owner, 'one original custom feature input',
+            invocation_id='custom-feature-original-intent')
+
+    return owner, feature, witness, original, invoke
+
+
+@pytest.mark.parametrize('lane', ['chat', 'named'])
+async def test_custom_feature_dispatch_cannot_repeat_an_unconfirmed_file_effect(custom_feature_dispatch, lane):
+    from kestrel_sdk.resources import ResourceOutcomeUnknown
+    from kestrel_sovereign.execution_custody import execution_evidence_carriers
+
+    owner, feature, witness, original, invoke = custom_feature_dispatch
+    outcomes = []
+    for delivery in range(2):
+        try:
+            outcomes.append(await invoke(lane))
+        except BaseException as error:
+            outcomes.append(error)
+    assert witness.read_text().splitlines() == ['once'], 'Original custom feature uncertainty allowed a repeated file effect'
+    assert isinstance(outcomes[0], ResourceOutcomeUnknown), 'Custom feature failure was flattened into a business reply'
+    assert any(error is original for error in execution_evidence_carriers(outcomes[0]))
+    assert isinstance(outcomes[1], ToolEffectReconciliationRequired)
+    assert await owner.tool_effect_store.database.fetchone(
+        'SELECT state FROM tool_effect_claims') == ('UNCONFIRMED',)
+
+
+@pytest.mark.parametrize('lane', ['chat', 'named'])
+@pytest.mark.parametrize('change', ['feature', 'method', 'disabled', 'foreign-owner', 'registry'])
+async def test_custom_feature_revalidates_its_original_registration_after_permission(
+    custom_feature_dispatch, native_tool_effect_agent, lane, change,
+):
+    from kestrel_sdk.hooks.base import Hook, HookEvent, HookOutput
+    from kestrel_sdk.resources import ResourceConflict
+
+    owner, feature, witness, original, invoke = custom_feature_dispatch
+    replacement = type(feature)(owner)
+    foreign = await native_tool_effect_agent(did=owner.did) if change == 'foreign-owner' else None
+
+    class ReplaceAfterPermission(Hook):
+        def __init__(self):
+            super().__init__('original-custom-feature-approval', [HookEvent.PRE_SUBAGENT_CALL])
+            self.calls = 0
+
+        async def execute(self, value):
+            self.calls += 1
+            if change == 'feature':
+                owner.features[feature.name] = replacement
+            elif change == 'method':
+                feature.execute_as_subagent = replacement.execute_as_subagent
+            elif change == 'disabled':
+                feature.enabled = False
+            elif change == 'registry':
+                assert owner.register_dynamic_tools('owned-permission-generation',
+                    list(owner._direct_tools.values())[:1]) == 1
+            else:
+                feature.agent = foreign
+            return HookOutput.allow()
+
+    policy = ReplaceAfterPermission()
+    owner.hooks_manager.register(policy)
+    if lane == 'named':
+        with pytest.raises(ResourceConflict):
+            await invoke(lane)
+    else:
+        result = await invoke(lane)
+        assert result['success'] is False
+    assert policy.calls == 1, 'The permission hook never reached the selected custom feature'
+    assert not witness.exists(), 'A replaced or foreign feature entered its physical effect'
+    assert await owner.tool_effect_store.database.fetchone(
+        'SELECT state FROM tool_effect_claims') == ('NOT_EXECUTED',)
+
+
+@pytest.mark.parametrize('lane', ['chat', 'named', 'bound'])
+async def test_post_approval_argument_owner_cannot_change_the_admitted_effect(bound_operation, monkeypatch, lane):
+    import json
+    from kestrel_sdk.hooks.base import Hook, HookEvent, HookOutput
+    from kestrel_sovereign.llm.adapter import ToolCall
+    from tests.unit.test_tool_effect_invocation import governed
+
+    owner, binding, witness = bound_operation
+    approved = {'marker': 'approved'}
+
+    class Rewrite(Hook):
+        def __init__(self):
+            super().__init__('owned-argument-rewrite', [HookEvent.PRE_TOOL_USE])
+
+        async def execute(self, value):
+            return HookOutput.modify(approved)
+
+    owner.hooks_manager.register(Rewrite())
+    claim = owner.tool_effect_store.claim
+
+    async def change_after_actual_admission(*args, **kwargs):
+        receipt = await claim(*args, **kwargs)
+        approved['marker'] = 'unapproved'
+        return receipt
+
+    monkeypatch.setattr(owner.tool_effect_store, 'claim', change_after_actual_admission)
+
+    @governed
+    async def chat(agent, user_input, *, invocation_id=None):
+        return await agent._dispatch_tool_call(
+            ToolCall(id='owned-argument-call', name=binding.name, arguments={'marker': 'requested'}),
+            {}, {binding.name}, [], 0, user_input, session_id='owned-argument-session')
+
+    if lane == 'chat':
+        result = await chat(owner, 'one approved file effect', invocation_id='owned-argument-intent')
+    elif lane == 'named':
+        result = await owner.execute_named_tool(binding.name, {'marker': 'requested'},
+            session_id='owned-argument-session', operation_id='owned-argument-intent')
+    else:
+        result = await binding.invoke({'marker': 'requested'},
+            session_id='owned-argument-session', operation_id='owned-argument-intent')
+    assert result['success'] is True
+    assert approved == {'marker': 'unapproved'}, 'The external argument owner never changed its data'
+    assert witness.read_text().splitlines() == ['approved'], 'An argument changed after approval and durable effect admission'
+    rows = await owner.tool_effect_store.database.fetchall('SELECT args_redacted FROM a2a_tool_dispatches')
+    assert [json.loads(row[0]) for row in rows] == [{'marker': 'approved'}]
+    assert await owner.tool_effect_store.database.fetchone(
+        'SELECT state FROM tool_effect_claims') == ('RETURNED_OK',)

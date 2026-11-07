@@ -120,6 +120,7 @@ class ArtifactsFeature(ArtifactProducerTools, ArtifactWorkspaceTools, Feature):
         if db is None:
             raise RuntimeError("Artifacts require the agent's durable database")
         repository = ArtifactRepository(db, storage_id="agent-artifacts")
+        await repository.prepare_schema()
         self._agent_id = agent_id
         self._service = AuthorizedArtifactService(repository, ArtifactAuthority())
         self._service.preview_renderer = DockerArtifactRenderer(os.environ.get("KESTREL_ARTIFACT_RENDERER_IMAGE"))

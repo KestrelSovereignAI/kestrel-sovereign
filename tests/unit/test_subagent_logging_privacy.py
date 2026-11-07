@@ -49,7 +49,7 @@ from tests.unit.test_execute_named_tool import (
     _FakeFeature,
     _FakeHooksManager,
     _FakeTool,
-    _MinimalOrchestrator,
+    _make_orchestrator,
     _SubagentFeature,
 )
 from tests.unit.test_tool_allowlist_registry import (  # noqa: F401
@@ -60,6 +60,9 @@ from tests.unit.test_tool_allowlist_registry import (  # noqa: F401
     dispatch_agent,
 )
 from tests.utils.log_records import records_containing
+from tests.utils.native_tool_effects import drive_native
+from kestrel_sdk.resources import ResourceOutcomeUnknown
+from uuid import uuid4
 
 # None of these letters is a hex digit, so no digest can spell one by chance.
 TOOL_MARKER = "SECRET-MARKER-qzXjvw"
@@ -78,6 +81,8 @@ SUMMARY = re.compile(r"chars=\d+ digest=[0-9a-f]+")
 
 
 def _leaks(records):
+    # SQLite worker SQL diagnostics are tracked separately in Core #3998.
+    records = [r for r in records if r.name == "root" or r.name.startswith("kestrel")]
     return {
         marker: [
             f"{r.levelname} {r.name} {r.pathname}:{r.lineno}"
@@ -160,19 +165,30 @@ class _InlineDoorLLM:
 DOORS = {"loop": _LoopDoorLLM, "inline": _InlineDoorLLM}
 
 
-def _feature(llm, tool_, hooks=()):
+async def _feature(llm, tool_, hooks=(), *, native_tool_effect_agent):
     manager = HooksManager()
     for hook in hooks:
         manager.register(hook)
-    host = SimpleNamespace(
-        llm_service=llm,
-        did="did:test:probe",
-        hooks_manager=manager,
-        get_turn_bound_session_id=lambda: "sess-3919",
-    )
+    host = await native_tool_effect_agent(did="did:test:probe")
+    host.llm_service = llm
+    host.hooks_manager = manager
     feature = _ProbeFeature(host)
     feature._fake_tools = [tool_]
+    host.features[feature.name] = feature
     return feature
+
+
+async def _run_feature(feature, **kwargs):
+    return await drive_native(feature.agent, lambda: feature.execute_as_subagent(**kwargs))
+
+
+async def _named_host(features, hooks_manager, *, native_tool_effect_agent):
+    return await _make_orchestrator(features, hooks_manager,
+        native_tool_effect_agent=native_tool_effect_agent)
+
+
+async def _named(host, name, args, **kwargs):
+    return await drive_native(host, lambda: host.execute_named_tool(name, args, **kwargs))
 
 
 @pytest.fixture
@@ -182,14 +198,14 @@ def debug_caplog(caplog):
 
 
 @pytest.mark.asyncio
-async def test_tool_result_task_and_final_answer_are_logged_as_summaries(debug_caplog):
+async def test_tool_result_task_and_final_answer_are_logged_as_summaries(debug_caplog, *, native_tool_effect_agent):
     tool_ = _Tool(
         "search_memory",
         returns={"success": True, "data": {"text": f"the heron {TOOL_MARKER}"}},
     )
-    feature = _feature(_LoopDoorLLM(tool_.name), tool_)
+    feature = (await _feature(_LoopDoorLLM(tool_.name), tool_, native_tool_effect_agent=native_tool_effect_agent))
 
-    envelope = await feature.execute_as_subagent(task=f"find {TASK_MARKER}")
+    envelope = await _run_feature(feature, task=f"find {TASK_MARKER}")
 
     # The content itself still reaches the orchestrator; only the log is blind.
     assert envelope["success"] is True, envelope
@@ -212,7 +228,7 @@ async def test_tool_result_task_and_final_answer_are_logged_as_summaries(debug_c
 
 
 @pytest.mark.asyncio
-async def test_text_only_subagent_answer_is_not_previewed_at_debug(debug_caplog):
+async def test_text_only_subagent_answer_is_not_previewed_at_debug(debug_caplog, *, native_tool_effect_agent):
     class _TextOnlyLLM:
         async def generate(self, **kwargs):
             return LLMResponse(content=f"No tools needed: {ANSWER_MARKER}", tool_calls=None)
@@ -220,9 +236,9 @@ async def test_text_only_subagent_answer_is_not_previewed_at_debug(debug_caplog)
         async def generate_with_messages(self, **kwargs):
             return LLMResponse(content=f"No tools needed: {ANSWER_MARKER}", tool_calls=None)
 
-    feature = _feature(_TextOnlyLLM(), _Tool("search_memory", returns={"success": True}))
+    feature = (await _feature(_TextOnlyLLM(), _Tool("search_memory", returns={"success": True}), native_tool_effect_agent=native_tool_effect_agent))
 
-    envelope = await feature.execute_as_subagent(task=f"answer {TASK_MARKER}")
+    envelope = await _run_feature(feature, task=f"answer {TASK_MARKER}")
 
     assert envelope["success"] is True, envelope
     leaks = _leaks(debug_caplog.records)
@@ -235,20 +251,17 @@ async def test_text_only_subagent_answer_is_not_previewed_at_debug(debug_caplog)
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("door", sorted(DOORS))
-async def test_tool_exception_is_logged_by_class_and_summary(door, debug_caplog):
+async def test_tool_exception_is_logged_by_class_and_summary(door, debug_caplog, *, native_tool_effect_agent):
     tool_ = _Tool("read_message_by_id", returns=ValueError(f"row {ERROR_MARKER}"))
-    feature = _feature(DOORS[door](tool_.name), tool_)
+    feature = (await _feature(DOORS[door](tool_.name), tool_, native_tool_effect_agent=native_tool_effect_agent))
 
-    await feature.execute_as_subagent(task="read it")
+    with pytest.raises(ResourceOutcomeUnknown) as caught:
+        await _run_feature(feature, task='read it')
+    assert caught.value.__cause__ is not None
 
     leaks = _leaks(debug_caplog.records)
     assert not leaks, leaks
-    [raised] = _lines(debug_caplog.records, "[SUBAGENT-TOOL] read_message_by_id raised")
-    assert re.fullmatch(
-        r"\[SUBAGENT-TOOL\] read_message_by_id raised ValueError "
-        r"chars=\d+ digest=[0-9a-f]+",
-        raised,
-    ), raised
+    assert ERROR_MARKER not in str(caught.value)
 
 
 @pytest.mark.asyncio
@@ -261,12 +274,12 @@ async def test_tool_exception_is_logged_by_class_and_summary(door, debug_caplog)
     ],
     ids=["deny", "ask"],
 )
-async def test_hook_refusal_reason_is_logged_as_summary(door, decision, label, debug_caplog):
+async def test_hook_refusal_reason_is_logged_as_summary(door, decision, label, debug_caplog, *, native_tool_effect_agent):
     """A hook's reason can echo the tool's arguments (#3873)."""
     tool_ = _Tool("shell", returns={"success": True})
-    feature = _feature(DOORS[door](tool_.name), tool_, hooks=[_DenyHook(decision)])
+    feature = (await _feature(DOORS[door](tool_.name), tool_, hooks=[_DenyHook(decision)], native_tool_effect_agent=native_tool_effect_agent))
 
-    await feature.execute_as_subagent(task="run it")
+    await _run_feature(feature, task="run it")
 
     leaks = _leaks(debug_caplog.records)
     assert not leaks, leaks
@@ -275,14 +288,14 @@ async def test_hook_refusal_reason_is_logged_as_summary(door, decision, label, d
 
 
 @pytest.mark.asyncio
-async def test_subagent_failure_is_logged_by_class_and_summary(debug_caplog):
+async def test_subagent_failure_is_logged_by_class_and_summary(debug_caplog, *, native_tool_effect_agent):
     class _FailingLLM:
         async def generate(self, **kwargs):
             raise RuntimeError(f"provider echoed {ERROR_MARKER}")
 
-    feature = _feature(_FailingLLM(), _Tool("search_memory", returns={"success": True}))
+    feature = (await _feature(_FailingLLM(), _Tool("search_memory", returns={"success": True}), native_tool_effect_agent=native_tool_effect_agent))
 
-    envelope = await feature.execute_as_subagent(task="anything")
+    envelope = await _run_feature(feature, task="anything")
 
     assert envelope["success"] is False
     leaks = _leaks(debug_caplog.records)
@@ -319,8 +332,10 @@ async def test_decorated_tool_exception_is_logged_by_class_and_summary(debug_cap
 
 
 @pytest.mark.asyncio
-async def test_native_task_failure_logs_frames_without_the_message(debug_caplog):
-    feature = _ProbeFeature(SimpleNamespace())
+async def test_native_task_failure_logs_frames_without_the_message(debug_caplog, native_tool_effect_agent):
+    host = await native_tool_effect_agent(did="did:test:probe")
+    feature = _ProbeFeature(host)
+    host.features[feature.name] = feature
     feature._fake_tools = [_Tool("fs_read", returns=OSError(f"bad {ERROR_MARKER}"))]
     task = new_task(
         "task-3919", "ctx-3919", TaskState.TASK_STATE_SUBMITTED,
@@ -328,15 +343,20 @@ async def test_native_task_failure_logs_frames_without_the_message(debug_caplog)
     )
     task.metadata.update({"skill": "fs_read", "args": {}})
 
-    result = await feature.handle_task(task)
+    completed = []
+    async def exercise():
+        completed.append(await feature.handle_task(task))
+    with pytest.raises(ResourceOutcomeUnknown):
+        await drive_native(host, exercise)
+    [result] = completed
 
     assert result.status.state == TaskState.TASK_STATE_FAILED
     leaks = _leaks(debug_caplog.records)
     assert not leaks, leaks
     [failed] = [r for r in debug_caplog.records if "task handling failed" in r.getMessage()]
     assert failed.exc_info is None
-    assert "OSError chars=" in failed.getMessage()
-    assert "in execute" in failed.getMessage(), "the frames still say where it failed"
+    assert "ToolEffectOutcomeUnconfirmed chars=" in failed.getMessage()
+    assert "in execute_tool_effect" in failed.getMessage(), "the native boundary retains its location"
 
 
 @pytest.mark.asyncio
@@ -411,21 +431,17 @@ class _DecidingHooks:
         return None
 
 
-class _ChatPathAgent(OrchestratorEngineMixin):
-    def __init__(self, hooks):
-        self.hooks_manager = hooks
-        self._direct_tools = {}
-        self._tool_to_feature = {}
-        self.features = {}
-        self.observability_store = MagicMock()
-        self.observability_store.log_tool_response = AsyncMock()
-        self._get_denied_tools = AsyncMock(return_value=set())
-        self._register_explored_feature_tools = MagicMock()
+async def _chat_host(hooks, *, native_tool_effect_agent):
+    host = await native_tool_effect_agent(did="did:test:probe")
+    host.hooks_manager = hooks
+    return host
 
 
 def _subagent_feature(side_effect=None):
     feature = MagicMock()
     feature.tool_name = "memory_feature"
+    feature.name = "MemoryFeature"
+    feature.enabled = True
     feature.execute_as_subagent = AsyncMock(
         return_value={"success": True}, side_effect=side_effect,
     )
@@ -433,7 +449,9 @@ def _subagent_feature(side_effect=None):
 
 
 async def _dispatch_feature(host, feature):
-    return await host._dispatch_feature_tool(
+    feature.agent = host
+    host.features[feature.name] = feature
+    return await drive_native(host, lambda: host._dispatch_feature_tool(
         tool_call=SimpleNamespace(name=feature.tool_name),
         feature=feature,
         args={"task": "find it"},
@@ -441,29 +459,29 @@ async def _dispatch_feature(host, feature):
         dispatch_event_id="evt-feature",
         user_message="find it",
         session_id="sess-3919",
-    )
+    ))
 
 
 async def _dispatch_direct(host, tool_, name="send_email", args=None):
-    host._direct_tools[name] = tool_
-    return await host._dispatch_direct_tool(
+    assert tool_.name == name
+    host.register_dynamic_tools("privacy-probe", [tool_])
+    return await drive_native(host, lambda: host._dispatch_direct_tool(
         tool_call=SimpleNamespace(name=name),
         tool_name=name,
         args=args or {},
         dispatch_start=0.0,
         dispatch_event_id="evt-direct",
         session_id="sess-3919",
-    )
-
+    ))
 
 @pytest.mark.asyncio
-async def test_chat_path_subagent_refusal_reason_is_logged_as_summary(debug_caplog):
+async def test_chat_path_subagent_refusal_reason_is_logged_as_summary(debug_caplog, *, native_tool_effect_agent):
     hooks = _DecidingHooks({
         HookEvent.PRE_SUBAGENT_CALL: HookOutput.deny(f"task={REASON_MARKER}"),
     })
     feature = _subagent_feature()
 
-    result = await _dispatch_feature(_ChatPathAgent(hooks), feature)
+    result = await _dispatch_feature((await _chat_host(hooks, native_tool_effect_agent=native_tool_effect_agent)), feature)
 
     assert result["success"] is False
     feature.execute_as_subagent.assert_not_awaited()
@@ -474,14 +492,15 @@ async def test_chat_path_subagent_refusal_reason_is_logged_as_summary(debug_capl
 
 
 @pytest.mark.asyncio
-async def test_chat_path_tool_refusal_reason_is_logged_as_summary(debug_caplog):
+async def test_chat_path_tool_refusal_reason_is_logged_as_summary(debug_caplog, *, native_tool_effect_agent):
     hooks = _DecidingHooks({
         HookEvent.PRE_TOOL_USE: HookOutput.deny(f"to={REASON_MARKER}"),
     })
     tool_ = MagicMock()
+    tool_.name = "send_email"
     tool_.execute = AsyncMock(return_value={"success": True})
 
-    result = await _dispatch_direct(_ChatPathAgent(hooks), tool_)
+    result = await _dispatch_direct((await _chat_host(hooks, native_tool_effect_agent=native_tool_effect_agent)), tool_)
 
     assert result["success"] is False
     tool_.execute.assert_not_awaited()
@@ -492,36 +511,36 @@ async def test_chat_path_tool_refusal_reason_is_logged_as_summary(debug_caplog):
 
 
 @pytest.mark.asyncio
-async def test_chat_path_direct_tool_failure_is_logged_by_class(debug_caplog):
+async def test_chat_path_direct_tool_failure_is_logged_by_class(debug_caplog, *, native_tool_effect_agent):
     tool_ = MagicMock()
+    tool_.name = "send_email"
     tool_.execute = AsyncMock(side_effect=ValueError(f"bad {ERROR_MARKER}"))
 
-    result = await _dispatch_direct(_ChatPathAgent(_DecidingHooks()), tool_)
+    with pytest.raises(ResourceOutcomeUnknown) as caught:
+        await _dispatch_direct((await _chat_host(_DecidingHooks(), native_tool_effect_agent=native_tool_effect_agent)), tool_)
+    assert caught.value.__cause__ is not None
 
-    assert result["success"] is False and "unconfirmed" in result["error"]
-    assert ERROR_MARKER not in result["error"]
     leaks = _leaks(debug_caplog.records)
     assert not leaks, leaks
-    [line] = _lines(debug_caplog.records, "[DIRECT-TOOL] send_email failed")
-    assert "ValueError chars=" in line, line
+    assert ERROR_MARKER not in str(caught.value)
 
 
 @pytest.mark.asyncio
-async def test_chat_path_subagent_failure_keeps_frames_without_the_message(debug_caplog):
+async def test_chat_path_subagent_failure_keeps_frames_without_the_message(debug_caplog, *, native_tool_effect_agent):
     feature = _subagent_feature(side_effect=RuntimeError(f"echoed {ERROR_MARKER}"))
 
-    result = await _dispatch_feature(_ChatPathAgent(_DecidingHooks()), feature)
+    with pytest.raises(ResourceOutcomeUnknown) as caught:
+        await _dispatch_feature((await _chat_host(_DecidingHooks(), native_tool_effect_agent=native_tool_effect_agent)), feature)
+    assert caught.value.__cause__ is not None
 
-    assert result["success"] is False and ERROR_MARKER in result["error"]
     leaks = _leaks(debug_caplog.records)
     assert not leaks, leaks
-    [line] = _lines(debug_caplog.records, "Feature memory_feature execution failed")
-    assert "RuntimeError chars=" in line and "File " in line, line
+    assert ERROR_MARKER not in str(caught.value)
 
 
 @pytest.mark.asyncio
-async def test_governed_refusal_reasons_are_logged_as_summaries(debug_caplog):
-    host = _MinimalOrchestrator(
+async def test_governed_refusal_reasons_are_logged_as_summaries(debug_caplog, *, native_tool_effect_agent):
+    host = (await _named_host(
         features={
             "email": _FakeFeature("email", [_FakeTool("send_email", returns={"ok": 1})]),
             "memory": _SubagentFeature("memory_feature", returns={"ok": 1}),
@@ -530,12 +549,12 @@ async def test_governed_refusal_reasons_are_logged_as_summaries(debug_caplog):
             pre_decision=PermissionDecision.DENY,
             pre_reason=f"arg={REASON_MARKER}",
         ),
-    )
+    native_tool_effect_agent=native_tool_effect_agent))
 
-    tool_result = await host.execute_named_tool(
+    tool_result = await _named(host,
         "send_email", {}, session_id="s", source="codex_app_server",
     )
-    subagent_result = await host.execute_named_tool(
+    subagent_result = await _named(host,
         "memory_feature", {"task": "x"}, session_id="s", source="codex_app_server",
     )
 
@@ -550,25 +569,23 @@ async def test_governed_refusal_reasons_are_logged_as_summaries(debug_caplog):
 
 
 @pytest.mark.asyncio
-async def test_governed_subagent_failure_is_logged_by_class(debug_caplog):
-    host = _MinimalOrchestrator(
+async def test_governed_subagent_failure_is_logged_by_class(debug_caplog, *, native_tool_effect_agent):
+    host = (await _named_host(
         features={
             "memory": _SubagentFeature(
                 "memory_feature", side_effect=RuntimeError(f"echoed {ERROR_MARKER}"),
             ),
         },
         hooks_manager=_FakeHooksManager(),
-    )
+    native_tool_effect_agent=native_tool_effect_agent))
 
-    result = await host.execute_named_tool(
-        "memory_feature", {"task": "x"}, session_id="s", source="codex_app_server",
-    )
+    with pytest.raises(ResourceOutcomeUnknown) as caught:
+        await _named(host, 'memory_feature', {'task': 'x'}, session_id='s', source='codex_app_server')
+    assert caught.value.__cause__ is not None
 
-    assert result["success"] is False and ERROR_MARKER in result["error"]
     leaks = _leaks(debug_caplog.records)
     assert not leaks, leaks
-    [line] = _lines(debug_caplog.records, "[GOVERNED-DISPATCH] subagent execute raised")
-    assert "err=RuntimeError chars=" in line and "File " in line, line
+    assert ERROR_MARKER not in str(caught.value)
 
 
 # ---------------------------------------------------------------------------
@@ -610,25 +627,25 @@ class _AuditStore:
         self.rows.append(row)
 
 
-def _notes_orchestrator(store=None):
+async def _notes_orchestrator(store=None, *, native_tool_effect_agent):
     features = {"notes": _NotesFeature(SimpleNamespace())}
     if store is not None:
         features["SecurityFeature"] = SimpleNamespace(
             permission_store=store, get_tools=lambda: [],
         )
-    return _MinimalOrchestrator(features=features, hooks_manager=_FakeHooksManager())
+    return (await _named_host(features=features, hooks_manager=_FakeHooksManager(), native_tool_effect_agent=native_tool_effect_agent))
 
 
 @pytest.mark.asyncio
 async def test_governed_argument_refusal_names_the_argument_to_the_model_only(
-    debug_caplog,
+    debug_caplog,*, native_tool_effect_agent
 ):
     """``execute_named_tool`` logged the argument error itself and again
     through ``record_tool_rejection``."""
     store = _AuditStore()
-    host = _notes_orchestrator(store)
+    host = (await _notes_orchestrator(store, native_tool_effect_agent=native_tool_effect_agent))
 
-    result = await host.execute_named_tool(
+    result = await _named(host,
         "search_notes", dict(REFUSED_ARGS), session_id="s", source="codex_app_server",
     )
 
@@ -658,10 +675,10 @@ async def test_governed_argument_refusal_names_the_argument_to_the_model_only(
 
 
 @pytest.mark.asyncio
-async def test_failed_refusal_audit_is_logged_as_summaries(debug_caplog):
-    host = _notes_orchestrator(_AuditStore(error=RuntimeError(f"row {ERROR_MARKER}")))
+async def test_failed_refusal_audit_is_logged_as_summaries(debug_caplog, *, native_tool_effect_agent):
+    host = (await _notes_orchestrator(_AuditStore(error=RuntimeError(f"row {ERROR_MARKER}")), native_tool_effect_agent=native_tool_effect_agent))
 
-    result = await host.execute_named_tool(
+    result = await _named(host,
         "search_notes", dict(REFUSED_ARGS), session_id="s", source="codex_app_server",
     )
 
@@ -678,12 +695,12 @@ async def test_failed_refusal_audit_is_logged_as_summaries(debug_caplog):
 
 @pytest.mark.asyncio
 async def test_chat_path_argument_refusal_names_the_argument_to_the_model_only(
-    debug_caplog,
+    debug_caplog,*, native_tool_effect_agent
 ):
     [search_notes] = _NotesFeature(SimpleNamespace()).get_tools()
 
     result = await _dispatch_direct(
-        _ChatPathAgent(_DecidingHooks()), search_notes,
+        (await _chat_host(_DecidingHooks(), native_tool_effect_agent=native_tool_effect_agent)), search_notes,
         name="search_notes", args=dict(REFUSED_ARGS),
     )
 
@@ -708,13 +725,13 @@ async def test_chat_path_argument_refusal_names_the_argument_to_the_model_only(
     ids=["tool", "subagent"],
 )
 async def test_governed_argument_validation_is_logged_as_summary(
-    name, args, debug_caplog,
+    name, args, debug_caplog,*, native_tool_effect_agent
 ):
     """The input guardrail's error names an argument of the wrong type."""
-    host = _notes_orchestrator()
+    host = (await _notes_orchestrator(native_tool_effect_agent=native_tool_effect_agent))
     host.features["memory"] = _SubagentFeature("memory_feature", returns={"ok": 1})
 
-    result = await host.execute_named_tool(
+    result = await _named(host,
         name, args, session_id="s", source="codex_app_server",
     )
 
@@ -737,17 +754,17 @@ async def test_chat_path_argument_validation_is_logged_as_summary(
     dispatch_agent, debug_caplog,  # noqa: F811 - the imported fixture
 ):
     dispatch_agent.features = {
-        "MemoryFeature": _make_feature("memory_feature", [_make_tool("recall_a")]),
+        "MemoryFeature": _make_feature("memory_feature", [_make_tool("recall_a")], agent=dispatch_agent),
     }
 
-    result = await dispatch_agent._dispatch_tool_call(
+    result = await drive_native(dispatch_agent, lambda: dispatch_agent._dispatch_tool_call(
         _tool_call("recall_a", {"query": "q", ARGUMENT_MARKER: {1}}),
         dispatch_agent._visible_features_by_tool_name(),
         dispatch_agent._known_tool_names(),
         [],
         0,
         None,
-    )
+    ))
 
     assert f"argument '{ARGUMENT_MARKER}' has invalid type set" in str(result), result
     dispatcher = [
@@ -756,7 +773,8 @@ async def test_chat_path_argument_validation_is_logged_as_summary(
     ]
     leaks = _leaks(dispatcher)
     assert not leaks, leaks
-    [failed] = [m for m in (r.getMessage() for r in dispatcher) if "Tool validation failed" in m]
+    [failed] = [r.getMessage() for r in dispatcher
+        if r.name == "root" and r.getMessage().startswith("[ORCHESTRATOR] Tool validation failed")]
     assert re.search(
         r"Tool validation failed: tool='recall_a' err=ToolValidationError "
         r"chars=\d+ digest=[0-9a-f]+$",

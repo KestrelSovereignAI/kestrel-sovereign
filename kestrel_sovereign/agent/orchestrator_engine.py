@@ -39,7 +39,7 @@ from typing import (
 
 from kestrel_sdk.hooks.base import HookEvent, HookInput
 from kestrel_sdk.llm import ToolCallStarted
-from kestrel_sdk.resources import ResourceConflict, ResourceOutcomeUnknown, ResourceUnsupported
+from kestrel_sdk.resources import ResourceConflict, ResourceOutcomeUnknown, ResourceUnsupported, observed_outcome_unknown
 from kestrel_sdk.tools import DeferredToolResult
 
 from kestrel_sovereign._async_ownership import (
@@ -116,6 +116,7 @@ from kestrel_sovereign.execution_custody import (
     execution_cleanup_debts,
     execution_commit_outcome,
     execution_terminal_error,
+    retained_execution_error,
     is_execution_control_error,
     require_execution_work,
 )
@@ -947,12 +948,11 @@ def _mark_tool_dispatch_audited(dispatch_meta, bound_execution=None, *, status):
         bound_execution.audit_recorded = True
 
 
-def _record_refused_tool_arguments(dispatch_meta, arguments, bound_execution=None):
-    """A refused call's dispatch row names the arguments its hooks refused.
+def _record_tool_arguments(dispatch_meta, arguments, bound_execution=None):
+    """Retain the exact hook decision arguments for normal and terminal audit.
 
-    They are the arguments as they stood when the deciding hook ran, not the
-    call's: a rewrite or redaction an earlier hook made stays in the record,
-    as it does for a call that ran with it (#3953).
+    A rewrite or redaction must survive a refusal or an uncertain effect;
+    recording the earlier input would undo the hook's decision (#3953).
     """
     if dispatch_meta is not None:
         dispatch_meta["arguments"] = arguments
@@ -986,13 +986,32 @@ def _raise_terminal_tool_error(error, dispatch_meta):
         ) from error
 
 
+async def _record_terminal_tool_dispatch(host, error, execution, dispatch_meta, **row):
+    """Preserve the mandatory diagnostic row before propagating uncertainty."""
+    if dispatch_meta.get("audit_recorded"):
+        return
+    from kestrel_sovereign.agent.tool_registry import _record_incomplete_tool_dispatch
+
+    await _record_incomplete_tool_dispatch(host, execution, error=error, **row)
+    _mark_tool_dispatch_audited(dispatch_meta, execution, status="error")
+
+
 async def _run_tool_execution(host, operation, *, execution, dispatch_meta,
-                             session_id, on_failure, recover_audited=False):
+                             session_id, on_failure, on_terminal, recover_audited=False):
     """One execution boundary for model, bound and ordinary named tools."""
     try:
         return await operation()
     except Exception as error:
         if is_tool_execution_terminal_error(error):
+            if execution.started:
+                mark_current_invocation_effect_completed(session_id)
+            if execution.started and observed_outcome_unknown(error) and not is_execution_control_error(error):
+                try:
+                    require_execution_work(host)
+                    await on_terminal(error)
+                except BaseException as audit_error:
+                    raise execution_terminal_error(error, audit_error,
+                        retain_originals=True, isolate_control_originals=True)
             raise
         if not recover_audited:
             _raise_terminal_tool_error(error, dispatch_meta)
@@ -1005,6 +1024,68 @@ async def _run_tool_execution(host, operation, *, execution, dispatch_meta,
             mark_current_invocation_effect_completed(session_id)
             require_execution_work(host)
         return await on_failure(error, unknown)
+
+
+async def _execute_feature_subagent(host, feature, dispatch, arguments, *,
+        selected_generation, execution, dispatch_meta, audit_args, session_id,
+        adapter, dispatch_start, dispatch_id):
+    """Journal a custom dispatcher as one opaque effect.
+
+    The canonical Core/SDK subagent loop owns its individual leaf claims.
+    An override may perform effects outside those leaves, so its entire body
+    needs the same native admission, uncertainty and audit boundary as a tool.
+    Only the actual canonical bound implementation qualifies for leaf ownership.
+    """
+    from types import MethodType
+    from kestrel_sovereign.features.base import Feature
+    from kestrel_sovereign.tools.effect_journal import execute_tool_effect
+
+    native_loop = (type(dispatch) is MethodType
+        and dispatch.__self__ is feature
+        and dispatch.__func__ is Feature.execute_as_subagent)
+    _record_tool_arguments(dispatch_meta, audit_args, execution)
+
+    def validate():
+        from kestrel_sovereign.agent.tool_allowlist import registry_generation
+        if registry_generation(host) != selected_generation:
+            raise ResourceConflict("Original feature dispatcher registry changed")
+        current = feature.execute_as_subagent
+        same_dispatch = (current is dispatch or (
+            type(current) is MethodType and type(dispatch) is MethodType
+            and current.__self__ is dispatch.__self__
+            and current.__func__ is dispatch.__func__))
+        if (getattr(feature, "agent", None) is not host
+                or not any(value is feature for value in host.features.values())
+                or getattr(feature, "enabled", True) is not True
+                or not same_dispatch):
+            raise ResourceConflict("Original feature dispatcher registration changed")
+
+    async def execute():
+        execution.started = True
+        result = await dispatch(**arguments)
+        execution.returned = True
+        return result
+
+    async def operation():
+        if native_loop:
+            validate()
+            return await dispatch(**arguments, _validate_registration=validate,
+                _dispatch_execution=execution)
+        return await execute_tool_effect(host,
+            registration=["feature_subagent", feature.name, feature.tool_name],
+            arguments=audit_args, execute=execute,
+            expected_generation=selected_generation, validate_registration=validate)
+
+    async def failed(error, unknown):
+        raise error
+
+    return await _run_tool_execution(host, operation,
+        execution=execution, dispatch_meta=dispatch_meta, session_id=session_id,
+        on_failure=failed,
+        on_terminal=lambda error: _record_terminal_tool_dispatch(
+            host, error, execution, dispatch_meta, tool_name=feature.tool_name,
+            adapter=adapter, args=audit_args, session_id=session_id,
+            dispatch_start=dispatch_start, dispatch_id=dispatch_id))
 
 
 async def _record_inline_tool_dispatch(host, entry, *, session_id, features_by_tool_name):
@@ -1038,7 +1119,7 @@ def _report_unwritten_dispatch(row, error) -> None:
     )
 
 
-async def _write_tool_dispatch(host, *, on_written=None, **row) -> None:
+async def _write_tool_dispatch(host, *, on_written=None, execution_witness=None, **row) -> None:
     """Write one best-effort ``a2a_tool_dispatches`` row (#3778).
 
     The row is written in the calling task, as ``_log_tool_dispatch`` writes
@@ -1055,6 +1136,12 @@ async def _write_tool_dispatch(host, *, on_written=None, **row) -> None:
     is never taken for written: nothing there can say whether it was.
     """
     row = {**row, "dispatch_id": row.get("dispatch_id") or uuid.uuid4().hex}
+    if execution_witness is not None:
+        await OrchestratorEngineMixin._log_tool_dispatch(host, **row,
+            required=True, execution_witness=execution_witness)
+        if on_written is not None:
+            on_written()
+        return
     store = getattr(host, "observability_store", None)
     if getattr(store, "log_tool_dispatch", None) is None:
         await OrchestratorEngineMixin._log_tool_dispatch(host, **row)
@@ -1088,7 +1175,8 @@ def _publication_scope(destination):
 async def _complete_post_tool_result(host, result, post_input, *, adapter,
                                      dispatch_start, on_audited=None,
                                      destination=_CURRENT_TURN,
-                                     dispatch_id=None, parent_dispatch_id=None):
+                                     dispatch_id=None, parent_dispatch_id=None,
+                                     execution_witness=None):
     """Complete policy and required audit before invoking a private UI factory.
 
     Every Core route that can receive a ``DeferredToolResult`` completes it
@@ -1122,6 +1210,7 @@ async def _complete_post_tool_result(host, result, post_input, *, adapter,
             status_hint=status,
             error_message=error_message, error_class=error_class, required=True,
             dispatch_id=dispatch_id, parent_dispatch_id=parent_dispatch_id,
+            execution_witness=execution_witness,
         )
         if on_audited is not None:
             on_audited(status)
@@ -1370,6 +1459,7 @@ class OrchestratorEngineMixin:
         on_audited=None,
         on_refused=None,
         dispatch_id=None,
+        execution_witness=None,
     ) -> dict:
         """
         Execute a tool with PRE_TOOL_USE and POST_TOOL_USE hook enforcement.
@@ -1464,7 +1554,7 @@ class OrchestratorEngineMixin:
             self, result, post_hook_input,
             adapter=audit_adapter or f"{feature_name}.{tool_name}",
             dispatch_start=exec_start, on_audited=on_audited,
-            dispatch_id=dispatch_id,
+            dispatch_id=dispatch_id, execution_witness=execution_witness,
         )
 
     async def _generate_with_messages_bounded(
@@ -1877,6 +1967,7 @@ class OrchestratorEngineMixin:
 
         from kestrel_sovereign.agent.tool_registry import _ToolExecution
         execution, dispatch_meta = _ToolExecution(), {}
+        dispatch_start = time.time()
 
         async def run():
             return await self._dispatch_named_tool(
@@ -1914,8 +2005,27 @@ class OrchestratorEngineMixin:
             result = await _run_tool_execution(
                 self, run, execution=execution, dispatch_meta=dispatch_meta,
                 session_id=session_id, on_failure=failed,
+                on_terminal=lambda error: _record_terminal_tool_dispatch(
+                    self, error, execution, dispatch_meta,
+                    tool_name=tool_name,
+                    adapter=f"named:{source}:" + self._tool_call_adapter(tool_name, {}),
+                    args=dispatch_meta.get("arguments", args), session_id=session_id,
+                    dispatch_start=dispatch_start, dispatch_id=call_context.ledger_id),
                 recover_audited=_capture is not None,
             )
+            if _capture is None and not dispatch_meta.get("audit_recorded"):
+                error_message, error_class = _extract_inline_error_fields(result)
+                await self._log_tool_dispatch(
+                    tool_name=tool_name,
+                    adapter=f"named:{source}:" + self._tool_call_adapter(tool_name, {}),
+                    args=dispatch_meta.get("arguments", args), result=result,
+                    session_id=session_id, dispatch_start=dispatch_start,
+                    error_message=error_message, error_class=error_class,
+                    dispatch_id=call_context.ledger_id, required=True,
+                    execution_witness=execution,
+                )
+                _mark_tool_dispatch_audited(dispatch_meta, execution,
+                    status=infer_tool_result_status(result))
             if isinstance(result, _AuditedDeferredResult) and _capture is None:
                 return dict(result)
             return result
@@ -2085,6 +2195,7 @@ class OrchestratorEngineMixin:
         # blocked. A PRE_TOOL_USE redactor running before a denial
         # must not be undone by the breadcrumb.
         post_hook_args = decided_tool_input(pre_input, pre_output)
+        _record_tool_arguments(dispatch_meta, post_hook_args, execution)
         if _capture is not None:
             _capture["effective_args"] = post_hook_args
 
@@ -2164,6 +2275,7 @@ class OrchestratorEngineMixin:
         return await _complete_post_tool_result(
             self, result, post_input, adapter=f"named:{source}:{feature_name}.{tool_name}",
             dispatch_start=exec_start, dispatch_id=call_context.ledger_id,
+            execution_witness=execution,
             on_audited=lambda status: _mark_tool_dispatch_audited(
                 dispatch_meta, execution, status=status,
             ),
@@ -2289,6 +2401,10 @@ class OrchestratorEngineMixin:
         feature_name = type(feature).__name__
         dispatch_start = time.time()
         adapter = f"named:{source}:{feature_name}.execute_as_subagent"
+        from kestrel_sovereign.agent.tool_allowlist import registry_generation
+
+        selected_generation = registry_generation(self)
+        feature_dispatch = feature.execute_as_subagent
 
         async def _recorded(row_args, result, *, status=None, error_class=None,
                             error_message=None):
@@ -2316,7 +2432,7 @@ class OrchestratorEngineMixin:
                 status_hint=status, error_class=error_class,
                 error_message=error_message,
                 dispatch_id=None if call_context is None else call_context.ledger_id,
-                on_written=_on_written,
+                on_written=_on_written, execution_witness=execution,
             )
             if _capture is None:
                 return result
@@ -2362,6 +2478,7 @@ class OrchestratorEngineMixin:
             HookEvent.PRE_SUBAGENT_CALL, pre_input,
         )
         post_hook_args = decided_tool_input(pre_input, pre_output)
+        _record_tool_arguments(dispatch_meta, post_hook_args, execution)
         if _capture is not None:
             _capture["effective_args"] = post_hook_args
 
@@ -2476,16 +2593,20 @@ class OrchestratorEngineMixin:
                 "feature.name": getattr(feature, "tool_name", feature_name),
                 "tool.source": source,
             }):
-                result = await feature.execute_as_subagent(
-                    task=task, context=context, denied_tools=denied_tools,
-                )
+                result = await _execute_feature_subagent(
+                    self, feature, feature_dispatch,
+                    dict(task=task, context=context, denied_tools=denied_tools),
+                    selected_generation=selected_generation, execution=execution,
+                    dispatch_meta=dispatch_meta, audit_args=effective_args,
+                    session_id=session_id, adapter=adapter,
+                    dispatch_start=dispatch_start, dispatch_id=call_context.ledger_id)
                 result = _discard_tool_supplied_receipt(result)
                 mark_current_invocation_effect_completed(session_id)
                 require_execution_work(self)
         except ExecutionAuthorityError:
             raise
         except Exception as e:  # noqa: BLE001 — boundary catch is the contract
-            if is_execution_control_error(e):
+            if is_tool_execution_terminal_error(e) or isinstance(e, ResourceConflict):
                 raise
             logging.warning(
                 "[GOVERNED-DISPATCH] subagent execute raised source=%s feature=%s err=%s\n%s",
@@ -2803,6 +2924,7 @@ class OrchestratorEngineMixin:
                 error_message=f"Tool validation failed: {validation_error}",
                 dispatch_id=call_context.ledger_id,
                 **({"required": True} if bound_tool is not None else {}),
+                execution_witness=bound_execution,
             )
             if bound_execution is not None:
                 bound_execution.audit_recorded = True
@@ -2978,6 +3100,7 @@ class OrchestratorEngineMixin:
                 # A feature subagent's own calls name this row as their parent.
                 dispatch_id=call_context.ledger_id,
                 **({"required": True} if bound_tool is not None else {}),
+                execution_witness=bound_execution,
             )
 
         if bound_execution is not None:
@@ -3015,6 +3138,7 @@ class OrchestratorEngineMixin:
         required: bool = False,
         dispatch_id: Optional[str] = None,
         parent_dispatch_id: Optional[str] = None,
+        execution_witness=None,
     ) -> None:
         """Build the canonical dispatch entry, optionally requiring persistence.
 
@@ -3022,19 +3146,28 @@ class OrchestratorEngineMixin:
         ``None``); ``parent_dispatch_id`` names the dispatch this call ran
         inside, such as the feature subagent envelope that made it (#3778).
         """
-        observability_store = getattr(self, "observability_store", None)
-        if observability_store is None:
-            if required:
-                raise ResourceUnsupported("Required tool dispatch audit store is unavailable")
-            return
-        log_dispatch = getattr(observability_store, "log_tool_dispatch", None)
-        if log_dispatch is None and not required:
-            log_dispatch = getattr(observability_store, "log_structured_tool_call", None)
-        if log_dispatch is None:
-            if required:
-                raise ResourceUnsupported("Required tool dispatch audit writer is unavailable")
-            return
+        if execution_witness is not None:
+            if execution_witness.audit_attempted:
+                if execution_witness.audit_error is not None:
+                    raise retained_execution_error(execution_witness.audit_error)
+                if execution_witness.audit_recorded:
+                    return
+                raise RuntimeError("Original tool dispatch audit is still pending")
+            execution_witness.audit_attempted = True
+            required = True
         try:
+            observability_store = getattr(self, "observability_store", None)
+            if observability_store is None:
+                if required:
+                    raise ResourceUnsupported("Required tool dispatch audit store is unavailable")
+                return
+            log_dispatch = getattr(observability_store, "log_tool_dispatch", None)
+            if log_dispatch is None and not required:
+                log_dispatch = getattr(observability_store, "log_structured_tool_call", None)
+            if log_dispatch is None:
+                if required:
+                    raise ResourceUnsupported("Required tool dispatch audit writer is unavailable")
+                return
             normalized_session_id = real_session_id(session_id)
             await log_dispatch(
                 ToolDispatchEntry(
@@ -3058,14 +3191,20 @@ class OrchestratorEngineMixin:
                 ),
                 **({"required": True} if required else {}),
             )
-        except Exception as exc:
-            if required or is_execution_control_error(exc):
+        except BaseException as exc:
+            if execution_witness is not None:
+                execution_witness.audit_error = exc
+            if not isinstance(exc, Exception) or required or is_execution_control_error(exc):
                 raise
             print(
                 "a2a_tool_dispatches dispatch wrapper failed: "
                 f"{exception_log_summary(exc)}",
                 file=sys.stderr,
             )
+        else:
+            if execution_witness is not None:
+                execution_witness.audit_recorded = True
+
 
     async def _dispatch_feature_tool(
         self, tool_call, feature, args, dispatch_start, dispatch_event_id,
@@ -3084,6 +3223,14 @@ class OrchestratorEngineMixin:
         """
         tool_name = tool_call.name
         hook_feature_name = type(feature).__name__
+        from kestrel_sovereign.agent.tool_allowlist import registry_generation
+        from kestrel_sovereign.agent.tool_registry import _ToolExecution
+
+        selected_generation = registry_generation(self)
+        feature_dispatch = feature.execute_as_subagent
+        execution = _ToolExecution()
+        if dispatch_meta is None:
+            dispatch_meta = {}
 
         # --- PRE_SUBAGENT_CALL hooks ---
         subagent_hook_input = HookInput(
@@ -3110,7 +3257,7 @@ class OrchestratorEngineMixin:
                 content_log_summary(str(reason)),
             )
             result = blocked.envelope
-            _record_refused_tool_arguments(
+            _record_tool_arguments(
                 dispatch_meta,
                 decided_tool_input(subagent_hook_input, subagent_hook_output),
             )
@@ -3161,9 +3308,14 @@ class OrchestratorEngineMixin:
                 "agent.session_id": real_session_id(session_id),
                 "feature.name": f.tool_name,
             }):
-                r = await f.execute_as_subagent(
-                    task=task, context=context, denied_tools=dt, model_override=em,
-                )
+                r = await _execute_feature_subagent(
+                    self, f, feature_dispatch,
+                    dict(task=task, context=context, denied_tools=dt, model_override=em),
+                    selected_generation=selected_generation, execution=execution,
+                    dispatch_meta=dispatch_meta, audit_args=effective_args,
+                    session_id=session_id,
+                    adapter=f"{type(f).__name__}.execute_as_subagent",
+                    dispatch_start=dispatch_start, dispatch_id=dispatch_id)
             self._register_explored_feature_tools(f)
             return r
 
@@ -3174,7 +3326,7 @@ class OrchestratorEngineMixin:
 
         def _on_refused(arguments):
             refused["arguments"] = arguments
-            _record_refused_tool_arguments(dispatch_meta, arguments)
+            _record_tool_arguments(dispatch_meta, arguments)
 
         try:
             result = await self._execute_tool_with_hooks(
@@ -3185,10 +3337,10 @@ class OrchestratorEngineMixin:
                 execute_fn=_exec_feature,
                 audit_adapter=f"{type(feature).__name__}.execute_as_subagent",
                 on_audited=lambda status: _mark_tool_dispatch_audited(
-                    dispatch_meta, status=status,
+                    dispatch_meta, execution, status=status,
                 ),
                 on_refused=_on_refused,
-                dispatch_id=dispatch_id,
+                dispatch_id=dispatch_id, execution_witness=execution,
             )
             # #2641: parts the subagent's tools produced ride the result
             # envelope; ``_execute_tool_with_hooks`` re-emitted them into this
@@ -3503,7 +3655,8 @@ class OrchestratorEngineMixin:
                 on_audited=lambda status: _mark_tool_dispatch_audited(
                     dispatch_meta, execution, status=status,
                 ),
-                on_refused=lambda arguments: _record_refused_tool_arguments(
+                execution_witness=execution,
+                on_refused=lambda arguments: _record_tool_arguments(
                     dispatch_meta, arguments, execution,
                 ),
                 dispatch_id=None if call_context is None else call_context.ledger_id,
@@ -3549,6 +3702,14 @@ class OrchestratorEngineMixin:
         return await _run_tool_execution(
             self, run, execution=execution, dispatch_meta=dispatch_meta,
             session_id=session_id, on_failure=failed,
+            on_terminal=lambda error: _record_terminal_tool_dispatch(
+                self, error, execution, dispatch_meta,
+                tool_name=tool_name,
+                adapter=(f"{bound_tool.owner}.{tool_name}" if bound_tool is not None
+                    else self._tool_call_adapter(tool_name, {})),
+                args=dispatch_meta.get("arguments", args), session_id=session_id,
+                dispatch_start=dispatch_start,
+                dispatch_id=call_context.ledger_id if call_context is not None else None),
         )
 
     # ------------------------------------------------------------------

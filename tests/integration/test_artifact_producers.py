@@ -122,7 +122,10 @@ async def test_producer_checks_privacy_and_live_feature_before_staging(host, mon
 
 
 @pytest.mark.asyncio
-async def test_real_registered_producer_dispatch_keeps_plaintext_audits_content_free(host, tmp_path):
+@pytest.mark.parametrize('lane', ['bound', 'in-turn'])
+async def test_real_registered_producer_dispatch_keeps_plaintext_audits_content_free(
+    tmp_path, native_tool_effect_agent, monkeypatch, lane,
+):
     import json
     import aiosqlite
     from kestrel_sovereign.a2a.stores.unified.observability_store import ObservabilityStore
@@ -130,29 +133,34 @@ async def test_real_registered_producer_dispatch_keeps_plaintext_audits_content_
     from kestrel_sovereign.features.security.permissions import PermissionStore, PermissionLevel
     from kestrel_sovereign.features.security.hooks import SecurityHook
     from kestrel_sovereign.features.security.approval_queue import ApprovalQueue
-    from tests.unit.test_governed_tool_bindings import _Agent
+    from kestrel_sovereign.features.artifacts import ArtifactsFeature
+    from tests.utils.native_tool_effects import drive_native
+    from uuid import uuid4
 
-    _, agents, _ = host
-    feature = agents['kite'].features['ArtifactsFeature']
-    backend = SQLiteBackend(str(tmp_path / 'dispatch.db'))
-    await backend.connect()
-    store = ObservabilityStore(backend)
-    await store.initialize()
+    monkeypatch.setenv('KESTREL_API_KEY', KEY)
+    dispatcher = await native_tool_effect_agent(did='did:test:artifact-producer-audit')
+    feature = ArtifactsFeature(dispatcher)
+    await feature.initialize()
+    dispatcher.features[feature.name] = feature
+    await feature.on_enable()
+    backend = dispatcher.observability_store._backend
     permissions = PermissionStore(str(tmp_path / 'permissions.db'))
     await permissions.initialize()
-    dispatcher = _Agent(store)
-    dispatcher.did = agents['kite'].did
-    dispatcher.features = {feature.name: feature}
     approvals = ApprovalQueue(permission_store=permissions, agent=dispatcher)
     dispatcher.hooks_manager.register(SecurityHook(permissions, approvals))
-    tool = tools(agents['kite'])['artifact_publish_text']
+    tool = tools(dispatcher)['artifact_publish_text']
     bindings = []
     dispatcher.register_dynamic_tools(feature.tool_name, [tool], on_registered=lambda _, binding: bindings.append(binding))
     await permissions.set_permission(feature.tool_name, bindings[0].name, PermissionLevel.ALLOW)
     source, title, private_path = 'CONFIDENTIAL-SOURCE-3703', 'CONFIDENTIAL-TITLE-3703', 'confidential-path-3703.md'
     try:
         with caller_context_scope(caller()):
-            result = await bindings[0].invoke(dict(title=title, text=source, path=private_path, publication_key='audit-private'), session_id='artifact-private-audit')
+            async def operation():
+                return await bindings[0].invoke(
+                    dict(title=title, text=source, path=private_path, publication_key='audit-private'),
+                    session_id='artifact-private-audit', operation_id=uuid4().hex)
+
+            result = await drive_native(dispatcher, operation) if lane == 'in-turn' else await operation()
         assert result['status'] == 'ok', result
         assert result['data']['state'] == 'saved'
         for table in ('a2a_tool_dispatches', 'a2a_observability'):
@@ -166,7 +174,7 @@ async def test_real_registered_producer_dispatch_keeps_plaintext_audits_content_
         ref = result['data']['receipt']['ref']
         # Redaction changes diagnostics, never the actual canonical source.
         with caller_context_scope(caller()):
-            opened = await tools(agents['kite'])['artifact_get'].execute(artifact_id=ref['artifact_id'], include_text=True)
+            opened = await tools(dispatcher)['artifact_get'].execute(artifact_id=ref['artifact_id'], include_text=True)
         assert opened['data']['source_text'] == source
     finally:
-        await store.close()
+        await feature.shutdown()

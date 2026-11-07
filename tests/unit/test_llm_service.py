@@ -3561,7 +3561,7 @@ from tests.unit.test_deferred_tool_delivery import boundary as deferred_boundary
 @pytest.mark.parametrize('entry,delivery', [
     ('generate_with_messages', 'public'), ('generate_with_messages', 'codex-inline'),
     ('get_response', 'public'), ('get_response', 'codex-inline'),
-    ('stream_with_tool_detection', 'public'),
+    ('stream_with_tool_detection', 'codex-inline'),
 ])
 async def test_inline_audit_failure_never_rotates_to_another_route(
     llm_service, mock_adapter, deferred_boundary, entry, delivery,  # noqa: F811 - imported pytest fixture
@@ -3573,36 +3573,44 @@ async def test_inline_audit_failure_never_rotates_to_another_route(
     b.policy.release.set()
     await b.backend.execute('DROP TABLE a2a_tool_dispatches')
     attempts = []
-    async def respond(**kwargs):
-        attempts.append(kwargs['client'])
-        if len(attempts) == 1:
-            if delivery == 'public':
-                await b.host.execute_named_tool(b.binding.name, {}, session_id='deferred-owned-session')
-            else:
-                from kestrel_sovereign.llm.codex_adapter import CodexAdapter
-                handler = CodexAdapter()._make_tool_call_handler(
-                    kwargs['tool_executor'], 'owned', frozenset({b.binding.name}), terminal_errors=[],
-                )
-                await handler({'threadId': 'owned', 'name': b.binding.name, 'arguments': {}})
-        return _finished(LLMResponse(content='fallback must not run'))
-    mock_adapter.get_response = AsyncMock(side_effect=respond)
-    executor = b.host._make_inline_tool_executor('deferred-owned-session')
-    messages = [{'role': 'user', 'content': 'run once'}]
-    if entry == 'generate_with_messages':
-        call = llm_service.generate_with_messages(messages=messages, tool_executor=executor)
-    elif entry == 'get_response':
-        call = llm_service.get_response('system', 'run once', tool_executor=executor)
-    else:
-        llm_service._adapter_has_usage_stream = lambda adapter: False
-        async def stream():
-            return [chunk async for chunk in llm_service.stream_with_tool_detection(
-                messages=messages, tools=[{'type': 'function', 'function': {
-                    'name': b.binding.name, 'parameters': {'type': 'object', 'properties': {}},
-                }}], tool_executor=executor,
-            )]
-        call = stream()
+    from tests.utils.native_tool_effects import drive_native
+
+    async def operation():
+        async def respond(**kwargs):
+            attempts.append(kwargs['client'])
+            if len(attempts) == 1:
+                if delivery == 'public':
+                    await b.host.execute_named_tool(b.binding.name, {}, session_id='deferred-owned-session')
+                else:
+                    from kestrel_sovereign.llm.codex_adapter import CodexAdapter
+                    handler = CodexAdapter()._make_tool_call_handler(
+                        kwargs['tool_executor'], 'owned', frozenset({b.binding.name}), terminal_errors=[],
+                    )
+                    await handler({'threadId': 'owned', 'name': b.binding.name, 'arguments': {}})
+            return _finished(LLMResponse(content='fallback must not run'))
+        mock_adapter.get_response = AsyncMock(side_effect=respond)
+        executor = b.host._make_inline_tool_executor('deferred-owned-session')
+        messages = [{'role': 'user', 'content': 'run once'}]
+        if entry == 'generate_with_messages':
+            call = llm_service.generate_with_messages(messages=messages, tool_executor=executor)
+        elif entry == 'get_response':
+            call = llm_service.get_response('system', 'run once', tool_executor=executor)
+        else:
+            async def provider_stream(**kwargs):
+                yield await respond(**kwargs)
+
+            mock_adapter.get_streaming_response_with_tools = provider_stream
+            async def stream():
+                return [chunk async for chunk in llm_service.stream_with_tool_detection(
+                    messages=messages, tools=[{'type': 'function', 'function': {
+                        'name': b.binding.name, 'parameters': {'type': 'object', 'properties': {}},
+                    }}], tool_executor=executor,
+                )]
+            call = stream()
+        return await call
+
     with pytest.raises(Exception) as caught:
-        await call
+        await drive_native(b.host, operation)
     assert any(isinstance(error, ResourceOutcomeUnknown) for error in _explicit_control_chain(caught.value))
     assert len(attempts) == 1
     assert b.tool.executions == [{}] and b.tool.publications == []

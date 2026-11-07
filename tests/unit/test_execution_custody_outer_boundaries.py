@@ -31,10 +31,10 @@ async def test_adapter_retry_does_not_redispatch_wrapped_unknown():
 
 
 @pytest.mark.asyncio
-async def test_public_stream_source_receives_the_requested_session():
+async def test_public_stream_source_receives_the_requested_session(native_tool_effect_agent):
     from tests.unit.test_turn_outcome_spans import _real_agent, _drain
     from kestrel_sovereign.agent.turn_lifecycle import capture_turn_session_binding
-    agent = _real_agent()
+    agent = await _real_agent(native_tool_effect_agent=native_tool_effect_agent)
     sessions = []
 
     async def body(*_a, **_k):

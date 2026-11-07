@@ -38,7 +38,31 @@ class _ToolExecution:
     returned: bool = False
     admitted: bool = False
     audit_recorded: bool = False
+    audit_attempted: bool = False
+    audit_error: BaseException | None = None
     arguments: dict | None = None
+
+
+async def _record_incomplete_tool_dispatch(host, execution, *, tool_name, adapter,
+        args, session_id, dispatch_start, dispatch_id, error, parent_dispatch_id=None):
+    """Record one original incomplete execution without producing a tool result."""
+    if execution.audit_recorded:
+        return
+    unknown = execution.started
+    await host._log_tool_dispatch(
+        tool_name=tool_name, adapter=adapter,
+        args=execution.arguments if execution.arguments is not None else args,
+        result={"success": False, "error": "Tool invocation did not complete"},
+        session_id=session_id, dispatch_start=dispatch_start,
+        status_hint="error",
+        error_class=("ResourceOutcomeUnknown" if unknown else
+            type(error).__name__ if error is not None else "CancelledError"),
+        error_message=(TOOL_OUTCOME_UNCONFIRMED if unknown else
+            "Invocation stopped before tool execution"),
+        dispatch_id=dispatch_id, parent_dispatch_id=parent_dispatch_id,
+        required=True, execution_witness=execution,
+    )
+    execution.audit_recorded = True
 
 
 @dataclass(frozen=True)
@@ -92,25 +116,10 @@ class _GovernedToolBinding:
         async def finalize(outcome):
             if execution.audit_recorded or not execution.admitted:
                 return
-            unknown = execution.started
-            error_class = (
-                "ResourceOutcomeUnknown" if unknown else
-                type(outcome.error).__name__ if outcome.error is not None else
-                "CancelledError"
-            )
-            await self.agent._log_tool_dispatch(
+            await _record_incomplete_tool_dispatch(self.agent, execution,
                 tool_name=self.name, adapter=f"{self.owner}.{self.name}",
-                args=execution.arguments if execution.arguments is not None else call.arguments,
-                result={"success": False, "error": "Tool invocation did not complete"},
-                session_id=session_id, dispatch_start=dispatch_start,
-                status_hint="error", error_class=error_class,
-                error_message=(
-                    TOOL_OUTCOME_UNCONFIRMED
-                    if unknown else "Invocation stopped before tool execution"
-                ),
-                required=True,
-            )
-            execution.audit_recorded = True
+                args=call.arguments, session_id=session_id,
+                dispatch_start=dispatch_start, dispatch_id=call.id, error=outcome.error)
 
         outcome = await self.agent._execute_tool_operation_at_stop_boundary(
             lambda: self.agent._dispatch_tool_call(

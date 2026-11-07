@@ -38,11 +38,13 @@ async def native_tool_effect_agent(tmp_path, monkeypatch):
     from uuid import uuid4
     from cryptography.fernet import Fernet
     from kestrel_sovereign.a2a.scope import NativeRecipientScope
+    from kestrel_sovereign.a2a.stores.unified.observability_store import ObservabilityStore
     from kestrel_sovereign.features.privacy.feature import PrivacyAgent
     from kestrel_sovereign.kestrel_agent import KestrelAgent
     from kestrel_sovereign.llm import service as service_module
     from kestrel_sovereign.storage.async_database import AsyncDatabase
     from kestrel_sovereign.storage.async_storage import AsyncStorage
+    from kestrel_sovereign.storage.privacy_wrapper import PrivacyEnforcingStorage
     from kestrel_sovereign.tool_effect_store import ToolEffectStore
 
     monkeypatch.setenv('KESTREL_DATA_KEY', Fernet.generate_key().decode())
@@ -68,12 +70,17 @@ async def native_tool_effect_agent(tmp_path, monkeypatch):
                 llm_service=service, allowed_features=[], sync_enabled=False)
             storage = AsyncStorage(backend=database.backend)
             storage.db = database
-            agent.storage = agent._raw_storage = storage
+            agent._raw_storage = storage
+            agent.storage = PrivacyEnforcingStorage(storage, agent.privacy_mode)
             agent.privacy_agent = PrivacyAgent(storage)
             journal = ToolEffectStore(database, scope=NativeRecipientScope(did))
             await journal.initialize()
             resources.push_async_callback(journal.close)
             agent.tool_effect_store = journal
+            observability = ObservabilityStore(database.backend, owns_backend=False)
+            await observability.initialize()
+            resources.push_async_callback(observability.close)
+            agent.observability_store = observability
             assert not agent._runtime_publication_ready.is_set()
             return agent
 

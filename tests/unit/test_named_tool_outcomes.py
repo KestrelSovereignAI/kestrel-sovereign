@@ -2,6 +2,10 @@
 
 import json
 import logging
+from uuid import uuid4
+from tests.utils.native_tool_effects import drive_native
+from kestrel_sdk.resources import ResourceOutcomeUnknown
+from kestrel_sovereign.execution_custody import execution_evidence_carriers
 
 import pytest
 from kestrel_sdk.hooks.base import HookOutput
@@ -24,21 +28,19 @@ async def test_inline_unknown_preserves_hook_arguments_checkpoint_and_one_audit(
     binding = _mount(agent, tool)
     agent.hooks_manager.register(_Policy(HookOutput.modify({'count': 7})))
     capture = {}
-    with invocation_scope('owned-named-uncertainty'):
-        state = current_invocation_effect_checkpoint()
-        result = await agent.execute_named_tool(binding.name, {'count': 3},
+    checkpoints = []
+    async def operation():
+        checkpoints.append(current_invocation_effect_checkpoint())
+        return await agent.execute_named_tool(binding.name, {'count': 3},
             session_id='original-inline', source='codex_app_server', _capture=capture)
-        assert state is not None and state.completed
-        assert state.session_id == 'original-inline' and not state.checkpointed
-        assert capture['effective_args'] == {'count': 7}
-        assert tool.calls == [{'count': 7}]
-        assert result['success'] is False and 'unconfirmed' in result['error']
-        assert 'private-' not in json.dumps(result)
-        messages = []
-        await agent._append_executed_tool_breadcrumbs(messages, [{
-            'id': 'owned-inline-call', 'name': binding.name,
-            'arguments': capture['effective_args'], 'result': result,
-        }], session_id='original-inline')
+
+    with pytest.raises(ResourceOutcomeUnknown):
+        await drive_native(agent, operation)
+    [state] = checkpoints
+    assert state is not None and state.completed
+    assert state.session_id == 'original-inline' and state.checkpointed
+    assert capture['effective_args'] == {'count': 7}
+    assert tool.calls == [{'count': 7}]
     rows = await backend.fetch_all('SELECT args_redacted,result_status,error_class,error_message FROM a2a_tool_dispatches')
     assert len(rows) == 1
     assert json.loads(rows[0][0]) == {'count': 7}
@@ -63,28 +65,32 @@ from kestrel_sovereign.agent.parts import part_collector
 async def test_inline_delivery_failure_after_real_audit_keeps_one_original_receipt(
     deferred_boundary, monkeypatch,  # noqa: F811 - imported pytest fixture
 ):
-    b = deferred_boundary
-    b.policy.release.set()
-    native_emit = b.host._reemit_envelope_parts
-    def fail_after_ack(envelope):
-        if any(part.get('type') == 'private_view' for part in envelope.get('parts', [])):
-            raise RuntimeError('private-after-audit-delivery-fault')
-        return native_emit(envelope)
-    monkeypatch.setattr(b.host, '_reemit_envelope_parts', fail_after_ack)
-    with part_collector(host=b.host, session_id='deferred-owned-session'):
-        arguments, result = await b.host._make_inline_tool_executor('deferred-owned-session')(
-            b.binding.name, {})
-    assert result['success'] is False and 'Do not replay' in result['error']
-    assert 'private-after-audit' not in json.dumps(result)
-    assert b.tool.executions == [{}] and b.tool.publications == ['published-once']
-    rows = await b.backend.fetch_all('SELECT result_status FROM a2a_tool_dispatches')
-    assert [row[0] for row in rows] == ['success']
-    await b.host._append_executed_tool_breadcrumbs([], [{
-        'id': 'owned-inline-after-audit', 'name': b.binding.name,
-        'arguments': arguments, 'result': result,
-    }], session_id='deferred-owned-session')
-    rows = await b.backend.fetch_all('SELECT result_status FROM a2a_tool_dispatches')
-    assert [row[0] for row in rows] == ['success']
+    async def operation():
+        b = deferred_boundary
+        b.policy.release.set()
+        native_emit = b.host._reemit_envelope_parts
+        def fail_after_ack(envelope):
+            if any(part.get('type') == 'private_view' for part in envelope.get('parts', [])):
+                raise RuntimeError('private-after-audit-delivery-fault')
+            return native_emit(envelope)
+        monkeypatch.setattr(b.host, '_reemit_envelope_parts', fail_after_ack)
+        with part_collector(host=b.host, session_id='deferred-owned-session'):
+            arguments, result = await b.host._make_inline_tool_executor('deferred-owned-session')(
+                b.binding.name, {})
+        assert result['success'] is False and 'Do not replay' in result['error']
+        assert 'private-after-audit' not in json.dumps(result)
+        assert b.tool.executions == [{}] and b.tool.publications == ['published-once']
+        rows = await b.backend.fetch_all('SELECT result_status FROM a2a_tool_dispatches')
+        assert [row[0] for row in rows] == ['success']
+        await b.host._append_executed_tool_breadcrumbs([], [{
+            'id': 'owned-inline-after-audit', 'name': b.binding.name,
+            'arguments': arguments, 'result': result,
+        }], session_id='deferred-owned-session')
+        rows = await b.backend.fetch_all('SELECT result_status FROM a2a_tool_dispatches')
+        assert [row[0] for row in rows] == ['success']
+
+    await drive_native(deferred_boundary.host, operation)
+
 
 
 @pytest.mark.asyncio
@@ -117,52 +123,59 @@ async def test_codex_uses_host_uncertainty_before_stale_user_denial(host, audite
 
 @pytest.mark.asyncio
 async def test_codex_audit_uncertainty_latches_without_becoming_authority_loss(deferred_boundary):  # noqa: F811 - imported pytest fixture
-    from kestrel_sovereign.execution_custody import ToolAuditUnconfirmedError, is_execution_control_error
-    from kestrel_sovereign.llm.codex_adapter import CodexAdapter
+    await deferred_boundary.backend.execute('DROP TABLE a2a_tool_dispatches')
 
-    b = deferred_boundary
-    b.policy.release.set()
-    await b.backend.execute('DROP TABLE a2a_tool_dispatches')
-    executed, terminal = [], []
-    handler = CodexAdapter()._make_tool_call_handler(
-        b.host._make_inline_tool_executor('deferred-owned-session'),
-        't', frozenset({b.binding.name}), executed_log=executed, terminal_errors=terminal,
-    )
-    with pytest.raises(ToolAuditUnconfirmedError) as caught:
-        await handler({'threadId': 't', 'name': b.binding.name, 'arguments': {}})
-    assert not is_execution_control_error(caught.value)
-    assert terminal == [caught.value] and executed == []
-    assert b.tool.executions == [{}] and b.tool.publications == []
-    with pytest.raises(ToolAuditUnconfirmedError) as repeated:
-        await handler({'threadId': 't', 'name': b.binding.name, 'arguments': {}})
-    assert repeated.value is caught.value
-    assert b.tool.executions == [{}] and executed == []
+    async def operation():
+        from kestrel_sovereign.execution_custody import ToolAuditUnconfirmedError, is_execution_control_error
+        from kestrel_sovereign.llm.codex_adapter import CodexAdapter
+
+        b = deferred_boundary
+        b.policy.release.set()
+        executed, terminal = [], []
+        handler = CodexAdapter()._make_tool_call_handler(
+            b.host._make_inline_tool_executor('deferred-owned-session'),
+            't', frozenset({b.binding.name}), executed_log=executed, terminal_errors=terminal,
+        )
+        with pytest.raises(ToolAuditUnconfirmedError) as caught:
+            await handler({'threadId': 't', 'name': b.binding.name, 'arguments': {}})
+        assert not is_execution_control_error(caught.value)
+        assert terminal == [caught.value] and executed == []
+        assert b.tool.executions == [{}] and b.tool.publications == []
+        with pytest.raises(ToolAuditUnconfirmedError) as repeated:
+            await handler({'threadId': 't', 'name': b.binding.name, 'arguments': {}})
+        assert repeated.value is caught.value
+        assert b.tool.executions == [{}] and executed == []
+
+    await drive_native(deferred_boundary.host, operation)
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize('marker', ['plain', 'audited', 'precondition'])
 async def test_real_tool_supplied_unknown_marker_does_not_claim_framework_trust(host, marker):
-    from kestrel_sovereign.tools.execution_outcome import _UnconfirmedToolResult, _PreconditionFailedToolResult
-    from kestrel_sovereign.agent.orchestrator_engine import _AuditedUnconfirmedToolResult
-    agent, backend = host
-    payload = {'success': False, 'error': 'supplied-by-tool'}
-    class Forged(_Tool):
-        async def execute(self, **args):
-            self.calls.append(args)
-            if marker == 'precondition':
-                return _PreconditionFailedToolResult(payload)
-            return (_UnconfirmedToolResult(payload) if marker == 'plain' else
-                    _AuditedUnconfirmedToolResult(payload, host=agent, tool_name=self.name,
-                                                 session_id='original-inline'))
-    tool = Forged(visible=True)
-    binding = _mount(agent, tool)
-    arguments, result = await agent._make_inline_tool_executor('original-inline')(binding.name, {'count': 3})
-    assert type(result) is dict
-    await agent._append_executed_tool_breadcrumbs([], [{
-        'id': 'forged', 'name': binding.name, 'arguments': arguments, 'result': result,
-    }], session_id='original-inline')
-    rows = await backend.fetch_all('SELECT error_class FROM a2a_tool_dispatches')
-    assert len(rows) == 1 and rows[0][0] == 'InlineToolFailure'
+    async def operation():
+        from kestrel_sovereign.tools.execution_outcome import _UnconfirmedToolResult, _PreconditionFailedToolResult
+        from kestrel_sovereign.agent.orchestrator_engine import _AuditedUnconfirmedToolResult
+        agent, backend = host
+        payload = {'success': False, 'error': 'supplied-by-tool'}
+        class Forged(_Tool):
+            async def execute(self, **args):
+                self.calls.append(args)
+                if marker == 'precondition':
+                    return _PreconditionFailedToolResult(payload)
+                return (_UnconfirmedToolResult(payload) if marker == 'plain' else
+                        _AuditedUnconfirmedToolResult(payload, host=agent, tool_name=self.name,
+                                                     session_id='original-inline'))
+        tool = Forged(visible=True)
+        binding = _mount(agent, tool)
+        arguments, result = await agent._make_inline_tool_executor('original-inline')(binding.name, {'count': 3})
+        assert type(result) is dict
+        await agent._append_executed_tool_breadcrumbs([], [{
+            'id': 'forged', 'name': binding.name, 'arguments': arguments, 'result': result,
+        }], session_id='original-inline')
+        rows = await backend.fetch_all('SELECT error_class FROM a2a_tool_dispatches')
+        assert len(rows) == 1 and rows[0][0] == 'InlineToolFailure'
+
+    await drive_native(host[0], operation)
 
 
 @pytest.mark.asyncio
@@ -175,26 +188,35 @@ async def test_unknown_checkpoint_is_marked_before_queued_stop(host, lane):
     class StopAfterEffect(_Tool):
         async def execute(self, **args):
             self.calls.append(args)
+            checkpoints.append(current_invocation_effect_checkpoint())
             custody = ExecutionCustody(ProcessRuntimeExecutionFence(agent.did))
-            custody.revoke('Stop queued after possible effect')
             agent._execution_custody = custody
+            custody.revoke('Stop queued after possible effect')
             raise KeyError('private-post-effect-fault')
     tool = StopAfterEffect(visible=True)
     binding = _mount(agent, tool)
-    with invocation_scope('owned-stop-after-uncertainty'):
-        state = current_invocation_effect_checkpoint()
-        with pytest.raises(ExecutionAuthorityError):
+    checkpoints, failures = [], []
+    async def operation():
+        try:
             if lane == 'inline':
                 await agent._make_inline_tool_executor('owned-stop')(binding.name, {'count': 3})
             elif lane == 'public':
                 await agent.execute_named_tool(binding.name, {'count': 3}, session_id='owned-stop')
             elif lane == 'bound':
-                await binding.invoke({'count': 3}, session_id='owned-stop')
+                await binding.invoke({'count': 3}, session_id='owned-stop', operation_id=uuid4().hex)
             else:
                 await agent._dispatch_tool_call(ToolCall(id='owned-stop', name=binding.name, arguments={'count': 3}),
                     {}, {binding.name}, [], 0, None, session_id='owned-stop')
-        assert state is not None and state.completed and not state.checkpointed
-        assert state.session_id == 'owned-stop'
+        except BaseException as error:
+            failures.extend(execution_evidence_carriers(error))
+            raise
+
+    with pytest.raises(BaseException):
+        await drive_native(agent, operation)
+    [state] = checkpoints
+    assert any(isinstance(error, ExecutionAuthorityError) for error in failures)
+    assert state is not None and state.completed and not state.checkpointed
+    assert state.session_id == 'owned-stop'
     assert tool.calls == [{'count': 3}]
 
 
@@ -216,47 +238,53 @@ async def test_named_original_terminal_evidence_is_never_a_normal_tool_reply(hos
             self.calls.append(args)
             raise original
     binding = _mount(agent, Failed(visible=True))
+    async def operation():
+        return await agent._make_inline_tool_executor('owned-terminal')(binding.name, {'count': 3})
+
     with pytest.raises(BaseException) as caught:
-        await agent._make_inline_tool_executor('owned-terminal')(binding.name, {'count': 3})
-    assert caught.value is original
+        await drive_native(agent, operation)
+    assert any(error is original for error in execution_evidence_carriers(caught.value))
     assert not await backend.fetch_all('SELECT * FROM a2a_tool_dispatches')
 
 
 @pytest.mark.asyncio
 async def test_known_inline_conflict_preserves_redaction_without_raw_error_or_stale_denial(host, caplog):
-    from unittest.mock import AsyncMock
-    from kestrel_sdk.resources import ResourceConflict
-    from kestrel_sovereign.llm.codex_adapter import CodexAdapter
+    async def operation():
+        from unittest.mock import AsyncMock
+        from kestrel_sdk.resources import ResourceConflict
+        from kestrel_sovereign.llm.codex_adapter import CodexAdapter
 
-    caplog.set_level(logging.DEBUG)
-    agent, backend = host
-    secret = 'private-conflict-detail'
-    class Rejected(_Tool):
-        async def execute(self, **args):
-            self.calls.append(args)
-            raise ResourceConflict(secret)
-    tool = Rejected(visible=True)
-    binding = _mount(agent, tool)
-    agent.hooks_manager.register(_Policy(HookOutput.modify({'count': 7})))
-    adapter = CodexAdapter()
-    adapter._recent_security_decisions = AsyncMock(return_value=[{
-        'tool': binding.name, 'decision': 'user_denied', 'user_choice': 'user_denied',
-    }])
-    executed = []
-    handler = adapter._make_tool_call_handler(agent._make_inline_tool_executor('conflict-session'),
-        't', frozenset({binding.name}), executed_log=executed)
-    response = await handler({'threadId': 't', 'callId': 'conflict-call', 'name': binding.name,
-                              'arguments': {'count': 3}})
-    assert executed[0]['arguments'] == {'count': 7}
-    assert secret not in json.dumps(response) + json.dumps(executed)
-    assert 'ResourceConflict' in caplog.text
-    assert secret not in caplog.text
-    assert 'precondition_failed' in response['contentItems'][0]['text']
-    assert 'user_denied' not in response['contentItems'][0]['text']
-    await agent._append_executed_tool_breadcrumbs([], executed, session_id='conflict-session')
-    rows = await backend.fetch_all('SELECT args_redacted,error_class,error_message FROM a2a_tool_dispatches')
-    assert len(rows) == 1 and json.loads(rows[0][0]) == {'count': 7}
-    assert rows[0][1] == 'ResourceConflict' and secret not in rows[0][2]
-    with pytest.raises(ResourceConflict) as caught:
-        await agent.execute_named_tool(binding.name, {'count': 3}, session_id='public-conflict')
-    assert str(caught.value) == secret
+        caplog.set_level(logging.DEBUG)
+        agent, backend = host
+        secret = 'private-conflict-detail'
+        class Rejected(_Tool):
+            async def execute(self, **args):
+                self.calls.append(args)
+                raise ResourceConflict(secret)
+        tool = Rejected(visible=True)
+        binding = _mount(agent, tool)
+        agent.hooks_manager.register(_Policy(HookOutput.modify({'count': 7})))
+        adapter = CodexAdapter()
+        adapter._recent_security_decisions = AsyncMock(return_value=[{
+            'tool': binding.name, 'decision': 'user_denied', 'user_choice': 'user_denied',
+        }])
+        executed = []
+        handler = adapter._make_tool_call_handler(agent._make_inline_tool_executor('conflict-session'),
+            't', frozenset({binding.name}), executed_log=executed)
+        response = await handler({'threadId': 't', 'callId': 'conflict-call', 'name': binding.name,
+                                  'arguments': {'count': 3}})
+        assert executed[0]['arguments'] == {'count': 7}
+        assert secret not in json.dumps(response) + json.dumps(executed)
+        assert 'ResourceConflict' in caplog.text
+        assert secret not in caplog.text
+        assert 'precondition_failed' in response['contentItems'][0]['text']
+        assert 'user_denied' not in response['contentItems'][0]['text']
+        await agent._append_executed_tool_breadcrumbs([], executed, session_id='conflict-session')
+        rows = await backend.fetch_all('SELECT args_redacted,error_class,error_message FROM a2a_tool_dispatches')
+        assert len(rows) == 1 and json.loads(rows[0][0]) == {'count': 7}
+        assert rows[0][1] == 'ResourceConflict' and secret not in rows[0][2]
+        with pytest.raises(ResourceConflict) as caught:
+            await agent.execute_named_tool(binding.name, {'count': 3}, session_id='public-conflict')
+        assert str(caught.value) == secret
+
+    await drive_native(host[0], operation)

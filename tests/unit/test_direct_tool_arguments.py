@@ -1262,3 +1262,21 @@ async def test_emmas_call_is_refused_on_the_inline_executor_path(orchestrator, )
     assert feature.calls == []
     assert agent.hooks_manager.pre_calls == []
     assert [row["action"] for row in agent.audit.rows] == [ACTION_TOOL_VALIDATION]
+
+
+@pytest.mark.parametrize('schema_kind', ['sdk', 'json'])
+def test_required_schema_arguments_are_refused_before_native_execution(schema_kind):
+    if schema_kind == 'sdk':
+        tool = _SchemaTool('required', 'marker')
+        tool.schema = ToolSchema('required', 'Required input', ToolCategory.UTILITY,
+            parameters=[ToolParameter('marker', 'string', 'Marker', required=True)])
+    else:
+        tool = _JsonSchemaTool('required', {
+            'type': 'object', 'properties': {'marker': {'type': 'string'}},
+            'required': ['marker'], 'additionalProperties': False,
+        })
+    arguments, error = normalize_direct_tool_arguments('required', tool, {})
+    assert arguments == {}
+    assert error is not None and "'marker'" in error, 'required native schema input was admitted without its binding'
+    assert 'does not accept ,' not in error
+    assert tool.calls == []

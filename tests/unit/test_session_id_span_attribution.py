@@ -67,6 +67,7 @@ from kestrel_sovereign.features.base import Feature
 from kestrel_sovereign.features.context.feature import ContextFeature
 from kestrel_sovereign.features.memory.feature import MemoryFeature
 from kestrel_sovereign.kestrel_agent import KestrelAgent
+from tests.unit.test_non_streaming_turn_privacy_span import _configure_turn_probe
 from kestrel_sovereign.llm.adapter import LLMResponse, ToolCall
 from kestrel_sovereign.llm.service import LLMService
 from kestrel_sovereign.signals import (
@@ -111,9 +112,9 @@ async def _noop_lifecycle():
     yield
 
 
-def _turn_host(**overrides):
+async def _turn_host(*, native_tool_effect_agent, **overrides):
     """A minimal host for the real turn methods, stubbed below the span."""
-    host = MagicMock()
+    host = _configure_turn_probe(await native_tool_effect_agent(did="did:pkh:eip155:1:0xabc"))
     host.agent_name = "Emma"
     host.did = "did:pkh:eip155:1:0xabc"
     host._safe_mode = False
@@ -128,10 +129,10 @@ def _turn_host(**overrides):
     return host
 
 
-def _correlated_turn_host(turn_id: str, **overrides):
+async def _correlated_turn_host(turn_id: str, *, native_tool_effect_agent, **overrides):
     """Minimal host with the real canonical turn/span evidence methods."""
 
-    host = _turn_host(**overrides)
+    host = (await _turn_host(**overrides, native_tool_effect_agent=native_tool_effect_agent))
     host._turn_trace_identities = {}
     host._turn_trace_index = TurnLifecycleMixin._turn_trace_index.__get__(host)
     host.get_current_turn_id = TurnLifecycleMixin.get_current_turn_id.__get__(host)
@@ -171,7 +172,6 @@ async def _run_process_input_streaming(host, session_id):
         yield "42"
 
     host._process_input_streaming_traced_locked = _traced_locked
-    host._get_privacy_transition_lock = lambda: asyncio.Lock()
     host.process_input_streaming = (
         StreamingMixin.process_input_streaming.__get__(host)
     )
@@ -191,10 +191,10 @@ class TestTurnSpansCarryTimelineSessionKey:
     """Both turn entry points stamp the key the Timeline groups on."""
 
     @pytest.mark.asyncio
-    async def test_process_input_stamps_kestrel_session_id(self, span_exporter):
-        host = _turn_host(
+    async def test_process_input_stamps_kestrel_session_id(self, span_exporter, *, native_tool_effect_agent):
+        host = (await _turn_host(
             _process_input_traced_locked=AsyncMock(return_value="42"),
-        )
+        native_tool_effect_agent=native_tool_effect_agent))
         assert await _run_process_input(host, SESSION) == "42"
 
         spans = _roots(span_exporter, "agent.process_input")
@@ -208,8 +208,8 @@ class TestTurnSpansCarryTimelineSessionKey:
     @pytest.mark.asyncio
     async def test_process_input_streaming_stamps_kestrel_session_id(
         self, span_exporter
-    ):
-        host = _turn_host()
+    , *, native_tool_effect_agent):
+        host = (await _turn_host(native_tool_effect_agent=native_tool_effect_agent))
         assert await _run_process_input_streaming(host, SESSION) == ["42"]
 
         spans = _roots(span_exporter, "agent.process_input_streaming")
@@ -219,21 +219,21 @@ class TestTurnSpansCarryTimelineSessionKey:
         assert attrs.get(LEGACY_SESSION_ID) == SESSION
 
     @pytest.mark.asyncio
-    async def test_two_turns_in_one_session_share_the_value(self, span_exporter):
+    async def test_two_turns_in_one_session_share_the_value(self, span_exporter, *, native_tool_effect_agent):
         """The property that collapses the staircase into a single band.
 
         Each turn is its own trace, so the Timeline can only pack them onto one
         lane track if they agree on a session key. Both transports must produce
         the same value for the same session.
         """
-        non_streaming = _turn_host(
+        non_streaming = (await _turn_host(
             _process_input_traced_locked=AsyncMock(return_value="42"),
-        )
+        native_tool_effect_agent=native_tool_effect_agent))
         await _run_process_input(non_streaming, SESSION)
-        await _run_process_input(_turn_host(
+        await _run_process_input((await _turn_host(
             _process_input_traced_locked=AsyncMock(return_value="43"),
-        ), SESSION)
-        await _run_process_input_streaming(_turn_host(), SESSION)
+        native_tool_effect_agent=native_tool_effect_agent)), SESSION)
+        await _run_process_input_streaming((await _turn_host(native_tool_effect_agent=native_tool_effect_agent)), SESSION)
 
         roots = [
             s
@@ -251,18 +251,18 @@ class TestTurnSpansCarryTimelineSessionKey:
     @pytest.mark.asyncio
     async def test_sessionless_turn_omits_the_attribute_entirely(
         self, span_exporter
-    ):
+    , *, native_tool_effect_agent):
         """Never stamp the empty string.
 
         ``optional_span``/``start_span`` drop ``None`` but export ``""``. An
         empty attribute reads the same as an absent one to ``sessionKeyOf``, so
         exporting it is pure noise.
         """
-        host = _turn_host(
+        host = (await _turn_host(
             _process_input_traced_locked=AsyncMock(return_value="42"),
-        )
+        native_tool_effect_agent=native_tool_effect_agent))
         await _run_process_input(host, None)
-        await _run_process_input_streaming(_turn_host(), None)
+        await _run_process_input_streaming((await _turn_host(native_tool_effect_agent=native_tool_effect_agent)), None)
 
         roots = [
             s
@@ -276,9 +276,9 @@ class TestTurnSpansCarryTimelineSessionKey:
 
 class TestTurnSpansCarryCanonicalStopCorrelation:
     @pytest.mark.asyncio
-    async def test_process_input_binds_root_span_to_live_turn(self, span_exporter):
+    async def test_process_input_binds_root_span_to_live_turn(self, span_exporter, *, native_tool_effect_agent):
         observed = {}
-        host = _correlated_turn_host("turn_invoke")
+        host = (await _correlated_turn_host("turn_invoke", native_tool_effect_agent=native_tool_effect_agent))
 
         async def traced_locked(*_args, **_kwargs):
             observed.update(host.active_turn_trace_identities())
@@ -293,16 +293,15 @@ class TestTurnSpansCarryCanonicalStopCorrelation:
         assert host.active_turn_trace_identities() == {}
 
     @pytest.mark.asyncio
-    async def test_streaming_binds_root_span_to_live_turn(self, span_exporter):
+    async def test_streaming_binds_root_span_to_live_turn(self, span_exporter, *, native_tool_effect_agent):
         observed = {}
-        host = _correlated_turn_host("turn_stream")
+        host = (await _correlated_turn_host("turn_stream", native_tool_effect_agent=native_tool_effect_agent))
 
         async def traced_locked(*_args, **_kwargs):
             observed.update(host.active_turn_trace_identities())
             yield "42"
 
         host._process_input_streaming_traced_locked = traced_locked
-        host._get_privacy_transition_lock = lambda: asyncio.Lock()
         host.process_input_streaming = StreamingMixin.process_input_streaming.__get__(
             host
         )
@@ -887,16 +886,19 @@ class _SubagentFeature(Feature):
         return {"status": "ok"}
 
 
-def _subagent_agent(session_id, llm_service):
-    """Agent double exposing only what the subagent path reads off the agent."""
-    agent = MagicMock()
-    agent.hooks_manager = None
-    agent.llm_service = llm_service
+async def _subagent_agent(session_id, *, native_tool_effect_agent):
+    """Real native host for the subagent's tool and journal ownership."""
+    from kestrel_sovereign.a2a.stores.unified.observability_store import ObservabilityStore
+
+    agent = await native_tool_effect_agent(did="did:test:subagent-span")
+    store = ObservabilityStore(agent.tool_effect_store.database.backend, owns_backend=False)
+    await store.initialize()
+    agent.observability_store = store
     agent.get_turn_bound_session_id = lambda: session_id
     return agent
 
 
-async def _run_subagent(session_id):
+async def _run_subagent(session_id, *, native_tool_effect_agent):
     """Drive the real ``execute_as_subagent`` through initial → continuation →
     repair, stubbed below the spans.
 
@@ -904,7 +906,12 @@ async def _run_subagent(session_id):
     continuation answers with continuation-intent prose and NO tool call, which
     is what triggers the one repair turn. Three provider calls, three spans.
     """
-    service = LLMService()
+    from tests.unit.test_tool_effect_execution import admit
+    from kestrel_sovereign.tools.effect_journal import bind_tool_effect_turn
+
+    agent = await _subagent_agent(session_id, native_tool_effect_agent=native_tool_effect_agent)
+    service = agent.llm_service
+    turn = await admit(agent)
     try:
         service.get_last_response_identity = lambda: {"model": "m"}
         service._get_response_frozen = AsyncMock(
@@ -921,14 +928,16 @@ async def _run_subagent(session_id):
                 LLMResponse(content="Probe reported ok.", tool_calls=None),
             ]
         )
-        feature = _SubagentFeature(_subagent_agent(session_id, service))
-        envelope = await feature.execute_as_subagent(task="probe the thing")
+        feature = _SubagentFeature(agent)
+        with bind_tool_effect_turn((turn, None)):
+            envelope = await feature.execute_as_subagent(task="probe the thing")
         assert envelope["success"] is True, envelope
         assert envelope["result"] == "Probe reported ok."
         assert service._generate_with_messages_inner.await_count == 2
         return service
     finally:
-        await service.close()
+        await turn.close()
+        await agent.observability_store.close()
 
 
 class TestSubagentContinuationSpansCarrySession:
@@ -942,8 +951,8 @@ class TestSubagentContinuationSpansCarrySession:
     """
 
     @pytest.mark.asyncio
-    async def test_every_step_of_the_run_carries_both_keys(self, llm_span_exporter):
-        await _run_subagent(SESSION)
+    async def test_every_step_of_the_run_carries_both_keys(self, llm_span_exporter, *, native_tool_effect_agent):
+        await _run_subagent(SESSION, native_tool_effect_agent=native_tool_effect_agent)
 
         spans = _roots(llm_span_exporter, "llm.generate") + _roots(
             llm_span_exporter, "llm.generate_with_messages"
@@ -956,9 +965,9 @@ class TestSubagentContinuationSpansCarrySession:
             assert attrs.get(OI_SESSION_ID) == SESSION, span.name
 
     @pytest.mark.asyncio
-    async def test_a_sessionless_subagent_stamps_nothing(self, llm_span_exporter):
+    async def test_a_sessionless_subagent_stamps_nothing(self, llm_span_exporter, *, native_tool_effect_agent):
         """Unattended work (a cron tick, a detached task) has no chat window."""
-        await _run_subagent(None)
+        await _run_subagent(None, native_tool_effect_agent=native_tool_effect_agent)
 
         spans = _roots(llm_span_exporter, "llm.generate") + _roots(
             llm_span_exporter, "llm.generate_with_messages"
@@ -972,7 +981,7 @@ class TestSubagentContinuationSpansCarrySession:
     @pytest.mark.asyncio
     async def test_the_turn_session_never_becomes_the_provider_thread_key(
         self, llm_span_exporter
-    ):
+    , *, native_tool_effect_agent):
         """The reason the session rides ``invocation_context``, not the wire.
 
         ``generate_with_messages(session_id=...)`` is a provider CONTINUATION
@@ -987,7 +996,7 @@ class TestSubagentContinuationSpansCarrySession:
         Attribution therefore travels as invocation identity while the wire
         session stays unset. Mutating either half of that split fails here.
         """
-        service = await _run_subagent(SESSION)
+        service = await _run_subagent(SESSION, native_tool_effect_agent=native_tool_effect_agent)
 
         for call in service._generate_with_messages_inner.await_args_list:
             assert call.kwargs.get("session_id") is None

@@ -537,19 +537,13 @@ class TestPrivacyMode:
         assert agent.privacy_mode == PrivacyMode.ANONYMOUS
 
     @pytest.mark.asyncio
-    async def test_set_privacy_mode_changes_internal_state(self, tmp_path):
+    async def test_set_privacy_mode_changes_internal_state(self, tmp_path, native_tool_effect_agent):
         """set_privacy_mode() updates internal _privacy_mode."""
-        agent = KestrelAgent(
-            did="did:test:123",
-            storage_path=str(tmp_path / "test.db"),
-            privacy_mode=PrivacyMode.NORMAL
-        )
+        agent = await native_tool_effect_agent(did="did:test:123")
 
-        # Mock storage and privacy agent (since not initialized)
-        agent.storage = MagicMock()
-        agent.storage.set_privacy_mode = MagicMock()
-        agent.privacy_agent = MagicMock()
-        agent.privacy_agent.set_mode = MagicMock()
+        # Observe the actual storage and policy transitions without replacing ownership.
+        agent.storage.set_privacy_mode = MagicMock(wraps=agent.storage.set_privacy_mode)
+        agent.privacy_agent.set_mode = MagicMock(wraps=agent.privacy_agent.set_mode)
         agent.privacy_agent.evaluate_transition = _no_confirm_evaluate()
 
         await agent.set_privacy_mode(PrivacyMode.EPHEMERAL)
@@ -558,21 +552,18 @@ class TestPrivacyMode:
         assert agent.privacy_mode == PrivacyMode.EPHEMERAL
 
     @pytest.mark.asyncio
-    async def test_set_privacy_mode_updates_storage_wrapper(self, tmp_path):
+    async def test_set_privacy_mode_updates_storage_wrapper(self, tmp_path, native_tool_effect_agent):
         """set_privacy_mode() updates storage wrapper if initialized."""
-        agent = KestrelAgent(
-            did="did:test:123",
-            storage_path=str(tmp_path / "test.db")
-        )
+        agent = await native_tool_effect_agent(did="did:test:123")
 
         # Mock storage to verify call
-        mock_storage = MagicMock()
-        mock_storage.set_privacy_mode = MagicMock()
+        mock_storage = agent.storage
+        mock_storage.set_privacy_mode = MagicMock(wraps=mock_storage.set_privacy_mode)
         agent.storage = mock_storage
 
         # Mock privacy agent
-        mock_privacy_agent = MagicMock()
-        mock_privacy_agent.set_mode = MagicMock()
+        mock_privacy_agent = agent.privacy_agent
+        mock_privacy_agent.set_mode = MagicMock(wraps=mock_privacy_agent.set_mode)
         mock_privacy_agent.evaluate_transition = _no_confirm_evaluate()
         agent.privacy_agent = mock_privacy_agent
 
@@ -584,7 +575,7 @@ class TestPrivacyMode:
     @pytest.mark.asyncio
     async def test_storage_refusal_returns_retryable_non_applied_transition(
         self,
-        tmp_path,
+        tmp_path,native_tool_effect_agent
     ):
         """An in-flight durable fact cannot leave agent/privacy state split."""
         from kestrel_sovereign.storage.privacy_wrapper import (
@@ -592,16 +583,10 @@ class TestPrivacyMode:
             PrivacyViolationError,
         )
 
-        agent = KestrelAgent(
-            did="did:test:123",
-            storage_path=str(tmp_path / "test.db"),
-            privacy_mode=PrivacyMode.NORMAL,
-        )
-        agent.storage = MagicMock()
-        agent.storage.set_privacy_mode.side_effect = PrivacyViolationError(
-            "explicit semantic fact operation is in flight"
-        )
-        agent.privacy_agent = MagicMock()
+        agent = await native_tool_effect_agent(did="did:test:123")
+        agent.storage.set_privacy_mode = MagicMock(side_effect=PrivacyViolationError(
+            "explicit semantic fact operation is in flight"))
+        agent.privacy_agent.set_mode = MagicMock(wraps=agent.privacy_agent.set_mode)
         agent.privacy_agent.evaluate_transition = _no_confirm_evaluate()
 
         result = await agent.set_privacy_mode_with_effects(
@@ -615,20 +600,22 @@ class TestPrivacyMode:
         agent.privacy_agent.set_mode.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_set_privacy_mode_returns_privacy_agent_message(self, tmp_path):
+    async def test_set_privacy_mode_returns_privacy_agent_message(self, tmp_path, native_tool_effect_agent):
         """set_privacy_mode() returns the canonical privacy-agent status message."""
-        agent = KestrelAgent(
-            did="did:test:123",
-            storage_path=str(tmp_path / "test.db"),
-            privacy_mode=PrivacyMode.NORMAL,
-        )
+        agent = await native_tool_effect_agent(did="did:test:123")
 
-        mock_storage = MagicMock()
-        mock_storage.set_privacy_mode = MagicMock()
+        mock_storage = agent.storage
+        mock_storage.set_privacy_mode = MagicMock(wraps=mock_storage.set_privacy_mode)
         agent.storage = mock_storage
 
-        mock_privacy_agent = MagicMock()
-        mock_privacy_agent.set_mode = MagicMock(return_value="Privacy mode changed from normal to isolated.")
+        mock_privacy_agent = agent.privacy_agent
+        original_set_mode = mock_privacy_agent.set_mode
+
+        def reported_transition(mode):
+            original_set_mode(mode)
+            return "Privacy mode changed from normal to isolated."
+
+        mock_privacy_agent.set_mode = MagicMock(side_effect=reported_transition)
         mock_privacy_agent.evaluate_transition = _no_confirm_evaluate()
         agent.privacy_agent = mock_privacy_agent
 
