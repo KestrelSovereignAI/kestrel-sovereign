@@ -886,10 +886,9 @@ class TaskManager:
                     # The local async API returns its accepted native Task now;
                     # its originating turn still owns this exact worker through
                     # journal finalization. A copied/foreign Task is not enrolled.
+                    # Root harvesting removes it after observing its outcome,
+                    # including workers that fail before Root starts closing.
                     original_turn.pending[execution] = execution
-                    def retire_execution(finished):
-                        original_turn.pending.pop(finished, None)
-                    execution.add_done_callback(retire_execution)
                 return task
 
         if original_turn is not None and not sync:
