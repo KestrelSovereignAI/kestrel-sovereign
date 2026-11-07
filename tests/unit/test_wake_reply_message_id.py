@@ -82,13 +82,13 @@ def _registration(template: Path, *, result_summary=_identity_summary) -> Source
     )
 
 
-def _wake(*, session_id=None, kind="done") -> Signal:
+def _wake(*, session_id=None, kind="done", target_agent="did:test:3655") -> Signal:
     return Signal(
         source=SOURCE,
         kind=kind,
         mode=SignalMode.COGNITION,
         payload={},
-        target_agent="did:test:3655",
+        target_agent=target_agent,
         visibility=Visibility.USER_VISIBLE,
         session_id=session_id,
     )
@@ -438,8 +438,8 @@ async def test_event_id_is_the_row_holding_that_wakes_reply(tmp_path, monkeypatc
                 snapshot_patch.setattr(backend, "_open_snapshot_read_connection", opened_snapshot)
                 snapshot_patch.setattr(sqlite_backend_module, "_close_aiosqlite_connection", close_snapshot)
                 chain = new_session_id()
-                first = _wake(session_id=chain, kind="first")
-                second = _wake(session_id=chain, kind="second")
+                first = _wake(session_id=chain, kind="first", target_agent=agent.did)
+                second = _wake(session_id=chain, kind="second", target_agent=agent.did)
                 assert (await agent.dispatcher.dispatch_signal(first)).status == Status.OK
                 assert (await agent.dispatcher.dispatch_signal(second)).status == Status.OK
                 await _settle(agent)
@@ -483,7 +483,7 @@ async def _conversation_doors(agent):
 @pytest.mark.asyncio
 async def test_message_door_serves_the_full_reply(tmp_path, monkeypatch, template):
     async with _waking_agent(tmp_path, monkeypatch, template, [LONG_REPLY]) as (agent, emitted):
-        await agent.dispatcher.dispatch_signal(_wake(session_id=new_session_id()))
+        await agent.dispatcher.dispatch_signal(_wake(session_id=new_session_id(), target_agent=agent.did))
         await _settle(agent)
         message_id = emitted[0]["reply_message_id"]
 
@@ -510,13 +510,13 @@ async def test_a_reply_kept_out_of_storage_carries_no_id(tmp_path, monkeypatch, 
     async with _waking_agent(
         tmp_path, monkeypatch, template, [LONG_REPLY, LONG_REPLY]
     ) as (agent, emitted):
-        await agent.dispatcher.dispatch_signal(_wake(session_id=new_session_id()))
+        await agent.dispatcher.dispatch_signal(_wake(session_id=new_session_id(), target_agent=agent.did))
         await _settle(agent)
         stored_id = emitted[0]["reply_message_id"]
         assert isinstance(stored_id, int)
 
         await agent.set_privacy_mode(PrivacyMode.ISOLATED)
-        await agent.dispatcher.dispatch_signal(_wake(session_id=new_session_id()))
+        await agent.dispatcher.dispatch_signal(_wake(session_id=new_session_id(), target_agent=agent.did))
         await _settle(agent)
 
         assert emitted[1]["reply_message_id"] is None
@@ -535,7 +535,7 @@ async def test_a_reply_kept_in_memory_never_names_an_earlier_stored_reply(
     async with _waking_agent(
         tmp_path, monkeypatch, template, [LONG_REPLY, "A different reply."]
     ) as (agent, emitted):
-        signal = _wake(session_id=new_session_id())
+        signal = _wake(session_id=new_session_id(), target_agent=agent.did)
         await agent.dispatcher.dispatch_signal(signal)
         await _settle(agent)
         earlier = emitted[0]["reply_message_id"]
