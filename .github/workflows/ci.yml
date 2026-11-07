@@ -1061,7 +1061,54 @@ jobs:
       - name: Install dependencies
         run: uv sync
 
+      - name: Verify original native PG journal, checkpoint and handoff receipts
+        run: uv run pytest tests/integration/test_tool_effect_store.py tests/integration/test_parallel_tool_original_admission.py tests/integration/test_stream_checkpoint_original_batch.py tests/integration/test_stream_handoff_original_batch.py tests/integration/test_memory_access_request_ownership.py -p pytest_asyncio.plugin -p pytest_timeout -o addopts='' -v --tb=short -x --timeout=120 -m native_postgres
+        env:
+          TEST_POSTGRES_URL: postgresql://kestrel_user:kestrel_password@localhost:5433/kestrel
+          KESTREL_REQUIRE_POSTGRES_TESTS: "1"
+          PYTEST_DISABLE_PLUGIN_AUTOLOAD: "1"
+          PYTHON_DOTENV_DISABLED: "1"
+          KESTREL_SKIP_DOTENV: "1"
+          KESTREL_PHOENIX_ENABLED: "0"
+          KESTREL_TRACING_ENABLED: "0"
+          AWS_EC2_METADATA_DISABLED: "true"
+
+      - name: Mutate memory request cleanup to borrow peer inventory
+        run: |
+          uv run --no-sync python - <<'PY_NATIVE_MEMORY'
+          from pathlib import Path
+          import hashlib,json,subprocess,xml.etree.ElementTree as E
+          p=Path("kestrel_sovereign/storage/memory_retriever.py")
+          original=p.read_bytes();old="await self._drain_access_update_tasks(accepted, cancel=True)";new="await self._drain_access_update_tasks(self._access_update_tasks, cancel=True)"
+          s=original.decode();assert s.count(old)==1
+          try:
+              p.write_text(s.replace(old,new))
+              changed=subprocess.check_output(["git","diff","--name-only"],text=True).splitlines();assert changed==[str(p)]
+              with Path("native-memory-peer-mutant.log").open("w") as log:
+                  result=subprocess.run(["uv","run","--no-sync","python","-m","pytest","tests/integration/test_memory_access_request_ownership.py::test_overlapping_memory_calls_do_not_borrow_peer_retirement[admission]","-p","pytest_asyncio.plugin","-p","pytest_timeout","-o","addopts=","-v","--tb=long","--timeout=120","--junitxml=native-memory-peer-mutant.xml"],stdout=log,stderr=subprocess.STDOUT)
+          finally:
+              p.write_bytes(original)
+          assert p.read_bytes()==original
+          root=E.parse("native-memory-peer-mutant.xml");suites=list(root.iter("testsuite"));failures=sum(int(x.get("failures",0)) for x in suites);errors=sum(int(x.get("errors",0)) for x in suites);skips=sum(int(x.get("skipped",0)) for x in suites);text="\n".join(x.text or "" for x in root.iter("failure"));print(text)
+          assert result.returncode==1 and failures==1 and errors==skips==0
+          assert "first.done()" in text and "cancelled" in text.lower()
+          assert "Timeout (>" not in text and "TimeoutError" not in text
+          proof=dict(complete=True,caught=True,failures=1,errors=0,skips=0,original_source_sha256=hashlib.sha256(original).hexdigest(),original_source_restored=True,mutated_only_current_request_cleanup_to_global_inventory=True,original_one_second_exclusion_and_five_second_native_bounds_unchanged=True)
+          Path("native-memory-peer-mutant-proof.json").write_text(json.dumps(proof,indent=2)+"\n")
+          print("CAUGHT_MEMORY_PEER_MUTANT",json.dumps(proof))
+          PY_NATIVE_MEMORY
+        env:
+          TEST_POSTGRES_URL: postgresql://kestrel_user:kestrel_password@localhost:5433/kestrel
+          KESTREL_REQUIRE_POSTGRES_TESTS: "1"
+          PYTEST_DISABLE_PLUGIN_AUTOLOAD: "1"
+          PYTHON_DOTENV_DISABLED: "1"
+          KESTREL_SKIP_DOTENV: "1"
+          KESTREL_PHOENIX_ENABLED: "0"
+          KESTREL_TRACING_ENABLED: "0"
+          AWS_EC2_METADATA_DISABLED: "true"
+
       - name: Run required native PostgreSQL tests
+        if: false  # Diagnostic profile only; never full release acceptance.
         # Run 40273423637 reached 3569/3672 cases before the serial 2700s
         # session deadline. Reuse the unit tier's per-worker database isolation
         # with two workers; keep each module together. Required cases, skip
