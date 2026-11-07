@@ -60,25 +60,40 @@ async def admit(store, *, key="owned-operation", request=None, namespace=None):
 
 
 @pytest.mark.asyncio
-async def test_observe_actual_postgres_journal_catalog(journal):
-    import json
+@pytest.mark.parametrize('untyped_projection', [
+    None, 'k.contype', 'k.confupdtype', 'k.confdeltype', 'k.confmatchtype', 't.tgenabled',
+])
+async def test_postgres_catalog_requires_native_text_codes(journal, untyped_projection):
     from kestrel_sovereign.storage.db.tool_effect_relation import _tool_effect_program_identity
 
     store, _, _ = journal
     if not store.is_postgres:
-        pytest.skip('Actual PostgreSQL catalog observation')
-    observed = []
+        pytest.skip('Native PostgreSQL catalog code types')
+    changed = []
     async with store.backend._pool.acquire() as connection:
-        relation = await connection.fetchrow("SELECT c.oid::bigint AS relation_oid, c.relnamespace::bigint AS namespace_oid FROM pg_catalog.pg_class c WHERE c.oid=pg_catalog.to_regclass('tool_effect_operations')")
-        class ObservedCatalog:
+        relation = await connection.fetchrow(
+            "SELECT c.oid::bigint AS relation_oid, c.relnamespace::bigint AS namespace_oid "
+            "FROM pg_catalog.pg_class c WHERE c.oid=pg_catalog.to_regclass('tool_effect_operations')"
+        )
+
+        class CatalogReader:
             async def fetch(self, query, *arguments):
-                rows = await connection.fetch(query, *arguments)
-                observed.append([dict(row) for row in rows])
-                return rows
-        identity = await _tool_effect_program_identity(ObservedCatalog(), dict(relation))
-    if identity is None:
-        pytest.fail('ACTUAL_NATIVE_CATALOG=' + json.dumps(observed,
-            default=lambda value: {'bytes_hex': value.hex()} if isinstance(value, bytes) else str(value)), pytrace=False)
+                if untyped_projection is not None:
+                    projection = untyped_projection + '::pg_catalog.text'
+                    if projection in query:
+                        assert query.count(projection) == 1
+                        query = query.replace(projection, untyped_projection)
+                        changed.append(untyped_projection)
+                return await connection.fetch(query, *arguments)
+
+        identity = await _tool_effect_program_identity(CatalogReader(), dict(relation))
+    if untyped_projection is None:
+        assert identity is not None
+        assert changed == []
+    else:
+        assert changed == [untyped_projection]
+        assert identity is None, 'An untyped native catalog code escaped the closed grammar'
+    assert await store.database.fetchone('SELECT COUNT(*) FROM tool_effect_claims') == (0,)
 
 
 @pytest.mark.asyncio
