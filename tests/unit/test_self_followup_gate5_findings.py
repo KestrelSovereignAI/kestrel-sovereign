@@ -365,7 +365,7 @@ def test_no_await_between_the_pre_turn_guard_and_the_turn():
     )
 
     src = inspect.getsource(KestrelAgent.process_input)
-    span_marker = "async with transition_lock:"
+    span_marker = "async with transition_lock.policy_span():"
     span = src.index(span_marker)
     guard = src.index("self._evaluate_pre_turn_guard(pre_turn_guard)")
     assert span < guard, (
