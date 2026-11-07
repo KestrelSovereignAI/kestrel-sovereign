@@ -218,9 +218,13 @@ _transition_lock_reentry_token: "contextvars.ContextVar[Optional[object]]" = (
 
 
 @contextmanager
-def bind_transition_lock_reentry(token: Optional[object]):
-    """Bind a captured policy-span identity without granting writer ownership."""
-    if token is None:
+def bind_transition_lock_reentry(token: Optional[object], *, replace: bool = False):
+    """Bind a span identity without granting writer ownership.
+
+    An explicit replacement with None clears an inherited, retired identity
+    when an acknowledged continuation acquires its own policy span.
+    """
+    if token is None and not replace:
         yield
         return
     reset = _transition_lock_reentry_token.set(token)

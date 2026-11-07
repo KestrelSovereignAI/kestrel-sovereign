@@ -24,7 +24,7 @@ Usage::
 
 import asyncio
 import logging
-from contextlib import contextmanager
+from contextlib import asynccontextmanager, contextmanager
 from dataclasses import dataclass, field
 from typing import AsyncIterator, Optional
 
@@ -107,7 +107,9 @@ class _TapRequestFence:
     generation: int
     drain_retained: bool = False
     privacy_token: object | None = None
+    native_work_factory: object | None = None
     privacy_ready: asyncio.Event = field(default_factory=asyncio.Event)
+    finished: asyncio.Event = field(default_factory=asyncio.Event)
     @property
     def backend_type(self):
         return self.owner.storage.db.backend_type
@@ -194,21 +196,50 @@ class AgentStreamTap:
         token = capture_transition_lock_reentry(owner)
         if token is None:
             return
+        lock = owner._get_privacy_transition_lock()
+        if lock.current_native_scope() is None:
+            raise ExecutionAuthorityError("stream tap admission requires its original native producer")
+        factory = lock.capture_native_work_factory()
         for fence in self._requests.values():
             if fence.owner is owner and fence.request_id == request_id and fence.generation == generation:
                 fence.require_work()
                 fence.privacy_token = token
+                fence.native_work_factory = factory
                 fence.privacy_ready.set()
 
+    @asynccontextmanager
     async def producer_privacy(self, delivery_id: str, owner):
-        self.producer_custody(delivery_id, owner)
+        """Admit short native work, then allow only an acknowledged final drain.
+
+        A span token alone cannot admit a provider's nested native tasks. While
+        text is live, its actual producer supplies the original work factory.
+        Once that lifetime starts closing, new work waits for the completed
+        drain handoff and acquires its own policy span under the retained
+        request generation. No stale writer token crosses that handoff.
+        """
+        from kestrel_sovereign.storage.privacy_wrapper import bind_transition_lock_reentry
+        producer = self.producer_custody(delivery_id, owner)
         fence = self._requests.get(delivery_id)
         if fence is None:
-            return None  # Standalone text taps have no Core turn privacy span.
-        await asyncio.wait_for(fence.privacy_ready.wait(), timeout=30.0)
+            yield None
+            return
+        async with asyncio.timeout(30.0):
+            await fence.privacy_ready.wait()
+            token = fence.privacy_token
+            if token is not None and token.closing and not fence.finished.is_set():
+                await fence.finished.wait()
         self.producer_custody(delivery_id, owner)
         fence.require_work()
-        return fence.privacy_token
+        if fence.finished.is_set():
+            if not fence.drain_retained:
+                raise ExecutionAuthorityError("original stream did not admit a completed native drain")
+            token, factory = None, None
+        else:
+            token, factory = fence.privacy_token, fence.native_work_factory
+            if token is None or factory is None:
+                raise ExecutionAuthorityError("original stream native admission is unavailable")
+        with bind_execution_custody_snapshot(producer), bind_transition_lock_reentry(token, replace=True):
+            yield factory
 
     async def publish(self, delivery_id: str, text_chunk: str) -> None:
         """Push a text chunk to subscribers of one stream delivery."""
@@ -229,6 +260,7 @@ class AgentStreamTap:
                 fence.drain_retained = True
             if fence is not None:
                 fence.privacy_ready.set()
+                fence.finished.set()
             if delivery_id not in self._consumers and delivery_id not in self._expiry:
                 self._expiry[delivery_id] = asyncio.get_running_loop().call_later(
                     30.0, self.unregister, delivery_id)

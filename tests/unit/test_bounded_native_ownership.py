@@ -20,7 +20,8 @@ from kestrel_sovereign.storage.privacy_wrapper import ReentrantTransitionLock, b
 @pytest.mark.asyncio
 @pytest.mark.parametrize('first_cancellation', [False, True])
 @pytest.mark.parametrize('receipt', ['returned', 'committed-error'])
-async def test_general_join_retains_native_outcome_through_writer_restoration(first_cancellation, receipt):
+@pytest.mark.parametrize('bounded', [False, True])
+async def test_general_join_retains_native_outcome_through_writer_restoration(first_cancellation, receipt, bounded):
     lock = ReentrantTransitionLock()
     entered, release_child, release_writer = (asyncio.Event() for _ in range(3))
     children, observations = [], []
@@ -33,7 +34,10 @@ async def test_general_join_retains_native_outcome_through_writer_restoration(fi
 
     async def native():
         children.append(lock.start_owned_native_work(native_writer))
-        await release_child.wait()
+        try:
+            await release_child.wait()
+        except asyncio.CancelledError:
+            await release_child.wait()
         if receipt == 'committed-error':
             raise original
         return 'original general-join result'
@@ -43,7 +47,8 @@ async def test_general_join_retains_native_outcome_through_writer_restoration(fi
             async with lock:
                 child = lock.start_owned_native_work(native, acquire_span=False)
                 children.append(child)
-                result = await await_owned_task(child)
+                result = (await wait_owned_or_pending(child, cancellation_grace=.03)
+                    if bounded else await await_owned_task(child))
                 observations.append((result, lock._writer is asyncio.current_task(), lock._depth))
 
     async def restoring():
@@ -77,7 +82,8 @@ async def test_general_join_retains_native_outcome_through_writer_restoration(fi
         assert execution_native_source_error(result.error) is original
         assert len(execution_observer_cancellations(result.error)) == 1
     else:
-        assert result.result == 'original general-join result'
+        assert result.result == 'original general-join result', (
+            'native join discarded successful result during writer restoration')
     if first_cancellation:
         assert result.cancellation is not None and result.cancellation.args == ('first general-join withdrawal',), (
             'general join lost its first observer withdrawal')

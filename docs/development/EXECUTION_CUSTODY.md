@@ -47,6 +47,18 @@ Bounded observation includes writer restoration: later withdrawals remain with
 the first cancellation, and the original task is sampled after restoration.
 A still-pending handoff retains its exact task and finite observation errors;
 shared native-source projections exclude the observer's cancellations.
+Both bounded and ordinary joins retain a successful collected result when
+writer restoration adds an independent observation error.
+
+Stream taps transfer short provider work through the actual text producer's
+native factory, rather than treating its policy token as child admission.
+`AgentStreamTap.producer_privacy()` is an asynchronous context manager yielding
+that factory. Provider acquisition and each sentence finish within this native
+admission; waiting for more text does not hold a provider writer. If the text
+lifetime is closing, admission waits for its original physical work and the
+acknowledged drain handoff. A successful final drain retains the same request
+generation and acquires a fresh policy span with the retired text token cleared.
+Stopped, foreign, or unsuccessfully completed deliveries cannot admit work.
 
 Closing journal admission uses the original native parent-admission tree of a
 retained worker, not the writer-loan wait graph. Its admitted gather children can

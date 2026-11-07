@@ -1392,7 +1392,7 @@ async def wait_owned_or_pending(
         outcome = await await_owned_task(task, cancellation)
         if restoration_error is not None:
             from kestrel_sovereign.execution_custody import execution_observation_error
-            return OwnedTaskOutcome(None,
+            return OwnedTaskOutcome(outcome.result,
                 execution_observation_error(outcome.error, restoration_error), outcome.cancellation)
         return outcome
     finally:
