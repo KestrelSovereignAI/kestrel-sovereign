@@ -72,6 +72,9 @@ from kestrel_sovereign.hooks.manager import HooksManager
 from kestrel_sovereign.llm.adapter import InlineToolOutcome, inline_tool_dispatch_id
 from kestrel_sovereign.llm.codex_adapter import CodexAdapter
 from kestrel_sovereign.storage.db.sqlite import SQLiteBackend
+from tests.utils.native_tool_effects import drive_native
+from kestrel_sdk.resources import ResourceConflict, ResourceOutcomeUnknown
+from kestrel_sovereign.execution_custody import execution_evidence_carriers
 
 SESSION = "sess-3778"
 AGENT_DID = "did:test:claw"
@@ -173,18 +176,6 @@ class _Decide(Hook):
         return HookOutput.allow()
 
 
-class _Agent(OrchestratorEngineMixin, ToolRegistryMixin, TurnLifecycleMixin):
-    def __init__(self, store, hooks):
-        self.did = AGENT_DID
-        self.features = {}
-        self._direct_tools, self._tool_to_feature, self._explored_features = {}, {}, {}
-        self._direct_tool_defs, self._pinned_features = [], set()
-        self.hooks_manager, self.observability_store = hooks, store
-
-    def get_turn_bound_session_id(self):
-        return SESSION
-
-
 class _SubagentLLM:
     """The subagent's model: ``calls`` in one response, then a final answer.
 
@@ -236,29 +227,22 @@ class _Host:
 
 
 @pytest_asyncio.fixture
-async def make_host(tmp_path):
-    stores = []
-
+async def make_host(native_tool_effect_agent):
     async def _make(*, calls=(CLAIM, CANCEL), inline=False, decide=None) -> _Host:
-        backend = SQLiteBackend(str(tmp_path / f"dispatch-{len(stores)}.db"))
-        await backend.connect()
-        store = ObservabilityStore(backend)
-        await store.initialize()
-        stores.append(store)
+        agent = await native_tool_effect_agent(did=AGENT_DID)
+        backend = agent._raw_storage.db.backend
         hooks = HooksManager()
         if decide is not None:
             hooks.register(_Decide(*decide))
         spy = _Spy(backend)
         hooks.register(spy)
-        agent = _Agent(store, hooks)
+        agent.hooks_manager = hooks
         agent.llm_service = _SubagentLLM(calls, inline=inline)
         feature = _TalonProbe(agent)
         agent.features[type(feature).__name__] = feature
         return _Host(agent, feature, backend, spy)
 
-    yield _make
-    for store in stores:
-        await store.close()
+    return _make
 
 
 def _envelope_and_inner(rows: list[dict]) -> tuple[dict, list[dict]]:
@@ -305,16 +289,22 @@ def _spy_audited_marks(monkeypatch) -> list[str]:
 @pytest.mark.parametrize("inline", [False, True], ids=["loop", "inline"])
 async def test_chat_loop_envelope_names_the_calls_its_subagent_made(make_host, inline):
     host = await make_host(inline=inline)
-    async with host.agent._turn_lifecycle():
-        result = await host.agent._dispatch_tool_call(
-            ToolCall(id="tc-1", name=DISPATCHER, arguments={"task": "claim, then cancel"}),
-            features_by_tool_name={DISPATCHER: host.feature},
-            known_tools={DISPATCHER},
-            messages=[],
-            iteration=0,
-            user_message="",
-            session_id=SESSION,
-        )
+    result = None
+    async def native_turn_operation():
+        nonlocal result
+        async with host.agent._turn_lifecycle():
+            host.agent._active_session_id = SESSION
+            result = await host.agent._dispatch_tool_call(
+                ToolCall(id="tc-1", name=DISPATCHER, arguments={"task": "claim, then cancel"}),
+                features_by_tool_name={DISPATCHER: host.feature},
+                known_tools={DISPATCHER},
+                messages=[],
+                iteration=0,
+                user_message="",
+                session_id=SESSION,
+            )
+
+    await drive_native(host.agent, native_turn_operation)
 
     assert result["success"] is True, result
     assert host.feature.calls == [
@@ -329,17 +319,23 @@ async def test_chat_loop_envelope_names_the_calls_its_subagent_made(make_host, i
 @pytest.mark.asyncio
 async def test_two_envelopes_in_one_turn_each_name_their_own_calls(make_host):
     host = await make_host(calls=(CLAIM,))
-    async with host.agent._turn_lifecycle():
-        for call_id in ("tc-1", "tc-2"):
-            await host.agent._dispatch_tool_call(
-                ToolCall(id=call_id, name=DISPATCHER, arguments={"task": "claim"}),
-                features_by_tool_name={DISPATCHER: host.feature},
-                known_tools={DISPATCHER},
-                messages=[],
-                iteration=0,
-                user_message="",
-                session_id=SESSION,
-            )
+    call_id = None
+    async def native_turn_operation():
+        nonlocal call_id
+        async with host.agent._turn_lifecycle():
+            host.agent._active_session_id = SESSION
+            for call_id in ("tc-1", "tc-2"):
+                await host.agent._dispatch_tool_call(
+                    ToolCall(id=call_id, name=DISPATCHER, arguments={"task": "claim"}),
+                    features_by_tool_name={DISPATCHER: host.feature},
+                    known_tools={DISPATCHER},
+                    messages=[],
+                    iteration=0,
+                    user_message="",
+                    session_id=SESSION,
+                )
+
+    await drive_native(host.agent, native_turn_operation)
 
     rows = await host.rows()
     assert [row["tool_name"] for row in rows] == [
@@ -359,21 +355,28 @@ async def _codex_dispatch(host, arguments, *, record=True, before_record=None):
     ``before_record`` is awaited, in the turn, before it is.
     """
     executed: list[dict] = []
-    async with host.agent._turn_lifecycle():
-        handler = CodexAdapter()._make_tool_call_handler(
-            host.agent._make_inline_tool_executor(SESSION),
-            "t", frozenset({DISPATCHER}), executed_log=executed,
-        )
-        response = await handler({
-            "threadId": "t", "callId": "call-1", "name": DISPATCHER,
-            "arguments": arguments,
-        })
-        if before_record is not None:
-            await before_record()
-        if record:
-            await host.agent._append_executed_tool_breadcrumbs(
-                [], executed, session_id=SESSION,
+    handler = None
+    response = None
+    async def native_turn_operation():
+        nonlocal handler, response
+        async with host.agent._turn_lifecycle():
+            host.agent._active_session_id = SESSION
+            handler = CodexAdapter()._make_tool_call_handler(
+                host.agent._make_inline_tool_executor(SESSION),
+                "t", frozenset({DISPATCHER}), executed_log=executed,
             )
+            response = await handler({
+                "threadId": "t", "callId": "call-1", "name": DISPATCHER,
+                "arguments": arguments,
+            })
+            if before_record is not None:
+                await before_record()
+            if record:
+                await host.agent._append_executed_tool_breadcrumbs(
+                    [], executed, session_id=SESSION,
+                )
+
+    await drive_native(host.agent, native_turn_operation)
     return response, executed
 
 
@@ -387,20 +390,24 @@ async def _dispatch(host, door, arguments):
     if door == "codex":
         response, _executed = await _codex_dispatch(host, arguments)
         return response
-    async with host.agent._turn_lifecycle():
-        if door == "chat":
-            return await host.agent._dispatch_tool_call(
-                ToolCall(id="tc-1", name=DISPATCHER, arguments=arguments),
-                features_by_tool_name={DISPATCHER: host.feature},
-                known_tools={DISPATCHER},
-                messages=[],
-                iteration=0,
-                user_message="",
-                session_id=SESSION,
+    async def native_turn_operation():
+        async with host.agent._turn_lifecycle():
+            host.agent._active_session_id = SESSION
+            if door == "chat":
+                return await host.agent._dispatch_tool_call(
+                    ToolCall(id="tc-1", name=DISPATCHER, arguments=arguments),
+                    features_by_tool_name={DISPATCHER: host.feature},
+                    known_tools={DISPATCHER},
+                    messages=[],
+                    iteration=0,
+                    user_message="",
+                    session_id=SESSION,
+                )
+            return await host.agent.execute_named_tool(
+                DISPATCHER, arguments, session_id=SESSION, source="voice_realtime",
             )
-        return await host.agent.execute_named_tool(
-            DISPATCHER, arguments, session_id=SESSION, source="voice_realtime",
-        )
+
+    return await drive_native(host.agent, native_turn_operation)
 
 
 @pytest.mark.asyncio
@@ -466,42 +473,28 @@ async def test_a_codex_envelope_is_recorded_when_its_turn_fails_before_its_bread
 
 
 @pytest.mark.asyncio
-async def test_a_codex_envelope_whose_own_write_failed_is_recorded_by_its_breadcrumb(
-    make_host, caplog,
-):
-    """The reviewer's case on real SQLite: the envelope's own write is
-    refused, so the codex caller gets no receipt, and the executed-call
-    recorder writes the row under the id its calls name. Before, the caller
-    got the receipt anyway, the recorder claimed it, and no row named the
-    calls' parent."""
+async def test_native_codex_envelope_audit_refusal_withholds_reply_and_breadcrumbs(make_host, monkeypatch):
+    """A refused native audit cannot be healed or replayed by a breadcrumb."""
     host = await make_host()
     await host.backend.execute(
         "CREATE TRIGGER refuse_envelope BEFORE INSERT ON a2a_tool_dispatches "
         f"WHEN NEW.tool_name = '{DISPATCHER}' "
         "BEGIN SELECT RAISE(ABORT, 'envelope refused'); END"
     )
-
+    original = host.agent.observability_store.log_tool_dispatch
+    attempted = []
+    async def write(entry, **kwargs):
+        attempted.append(entry.tool_name)
+        return await original(entry, **kwargs)
+    monkeypatch.setattr(host.agent.observability_store, 'log_tool_dispatch', write)
+    healed = []
     async def heal():
-        assert [row["tool_name"] for row in await host.rows()] == [
-            "talon_claim", "talon_cancel",
-        ]
-        await host.backend.execute("DROP TRIGGER refuse_envelope")
-
-    response, executed = await _codex_dispatch(
-        host, {"task": "claim, then cancel"}, before_record=heal,
-    )
-
-    assert response["success"] is True, response
-    [entry] = executed
-    assert not isinstance(entry["result"], orchestrator_engine._AuditedDeferredResult)
-    [report] = _unwritten_reports(caplog)
-    assert (report["tool_name"], report["dispatch_id"]) == (DISPATCHER, entry["dispatch_id"])
-    rows = await host.rows()
-    envelope, inner = _envelope_and_inner(rows)
-    assert envelope["dispatch_id"] == entry["dispatch_id"]
-    assert envelope["adapter"].startswith("inline:")
-    assert envelope["result_status"] == "success"
-    _assert_inner_calls_name_their_envelope(rows, envelope, inner, host.spy)
+        healed.append(True)
+    with pytest.raises(ResourceOutcomeUnknown):
+        await _codex_dispatch(host, {"task": "claim, then cancel"}, before_record=heal)
+    assert healed == [], 'An unconfirmed native audit reached normal delivery'
+    assert attempted == ['talon_claim', 'talon_cancel', DISPATCHER], 'An original audit was attempted twice'
+    assert [row['tool_name'] for row in await host.rows()] == ['talon_claim', 'talon_cancel']
 
 
 @pytest.mark.asyncio
@@ -612,66 +605,64 @@ async def test_a_refused_codex_envelope_is_recorded_once(make_host, arguments, r
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("door", ["chat", "named", "codex"])
-async def test_a_subagent_call_inside_a_transaction_returns_and_commits(make_host, door):
-    """The reviewer's case on real SQLite: a dispatch made inside the caller's
-    transaction. Every row is written in the calling task, so each joins the
-    transaction instead of waiting on the writer that task holds, and they
-    commit with it, as the job the call cancelled does."""
+async def test_native_subagent_effects_refuse_the_callers_transaction(make_host, door):
+    """STARTED must commit durably before a subagent can perform its effect."""
     host = await make_host()
     await host.backend.execute("CREATE TABLE talon_jobs (job_id TEXT, state TEXT)")
-
     async def cancel_effect(job_id):
-        await host.backend.execute(
-            "INSERT INTO talon_jobs (job_id, state) VALUES (?, 'cancelled')", (job_id,),
-        )
-
+        await host.backend.execute("INSERT INTO talon_jobs VALUES (?, 'cancelled')", (job_id,))
     host.feature.cancel_effect = cancel_effect
-
-    async def dispatch():
-        async with host.backend.transaction():
-            return await _dispatch(host, door, {"task": "claim, then cancel"})
-
-    result = await asyncio.wait_for(dispatch(), 10)
-
-    assert result["success"] is True, result
-    assert await host.backend.fetch_all("SELECT job_id, state FROM talon_jobs") == [
-        ("692b13dd", "cancelled"),
-    ]
+    async def operation():
+        async with host.agent._turn_lifecycle():
+            host.agent._active_session_id = SESSION
+            async with host.backend.transaction():
+                if door == 'chat':
+                    result = await host.agent._dispatch_tool_call(
+                        ToolCall(id='transaction-call', name=DISPATCHER, arguments={'task':'claim, then cancel'}),
+                        {DISPATCHER:host.feature}, {DISPATCHER}, [], 0, '', session_id=SESSION)
+                    assert result['success'] is False and 'own durable transaction' in result['error']
+                elif door == 'named':
+                    with pytest.raises(ResourceConflict, match='own durable transaction'):
+                        await host.agent.execute_named_tool(DISPATCHER, {'task':'claim, then cancel'},
+                            session_id=SESSION, source='voice_realtime')
+                else:
+                    handler = CodexAdapter()._make_tool_call_handler(
+                        host.agent._make_inline_tool_executor(SESSION), 'transaction-thread',
+                        frozenset({DISPATCHER}), executed_log=[])
+                    response = await handler({'threadId':'transaction-thread', 'callId':'transaction-call',
+                        'name':DISPATCHER, 'arguments':{'task':'claim, then cancel'}})
+                    assert response['success'] is False and 'own durable transaction' in str(response)
+    async with asyncio.timeout(5):
+        await drive_native(host.agent, operation)
+    assert host.feature.calls == [], 'An effect started in a rollbackable transaction'
+    assert await host.backend.fetch_all('SELECT * FROM talon_jobs') == []
+    assert await host.backend.fetch_all('SELECT state FROM tool_effect_claims') == []
     rows = await host.rows()
-    envelope, inner = _envelope_and_inner(rows)
-    _assert_inner_calls_name_their_envelope(rows, envelope, inner, host.spy)
+    assert [row['tool_name'] for row in rows] == ([DISPATCHER] if door == 'chat' else [])
+    if rows:
+        assert rows[0]['error_class'] == 'ResourceConflict'
 
 
 @pytest.mark.asyncio
-async def test_a_subagent_tool_call_inside_a_transaction_returns_and_commits(make_host):
-    """The same, for one call of the subagent's own, as the reviewer ran it."""
+async def test_native_subagent_leaf_refuses_the_callers_transaction(make_host):
     host = await make_host()
     await host.backend.execute("CREATE TABLE talon_jobs (job_id TEXT, state TEXT)")
-
     async def cancel_effect(job_id):
-        await host.backend.execute(
-            "INSERT INTO talon_jobs (job_id, state) VALUES (?, 'cancelled')", (job_id,),
-        )
-
+        await host.backend.execute("INSERT INTO talon_jobs VALUES (?, 'cancelled')", (job_id,))
     host.feature.cancel_effect = cancel_effect
     tools = {tool.name: tool for tool in host.feature.get_tools()}
-
-    async def call():
+    async def operation():
         async with host.backend.transaction():
-            return await host.feature._execute_subagent_tool(
-                tool_name="talon_cancel", args=dict(CANCEL[1]), tools_by_name=tools,
-                session_id=SESSION, parent_dispatch_id="envelope-1",
-            )
-
-    await asyncio.wait_for(call(), 10)
-
-    assert await host.backend.fetch_all("SELECT job_id, state FROM talon_jobs") == [
-        ("692b13dd", "cancelled"),
-    ]
-    [row] = await host.rows()
-    assert (row["tool_name"], row["result_status"], row["parent_dispatch_id"]) == (
-        "talon_cancel", "success", "envelope-1",
-    )
+            with pytest.raises(ResourceConflict, match='own durable transaction'):
+                await host.feature._execute_subagent_tool(
+                    tool_name='talon_cancel', args=dict(CANCEL[1]), tools_by_name=tools,
+                    session_id=SESSION, parent_dispatch_id='envelope-1')
+    async with asyncio.timeout(5):
+        await drive_native(host.agent, operation)
+    assert host.feature.calls == []
+    assert await host.backend.fetch_all('SELECT * FROM talon_jobs') == []
+    assert await host.backend.fetch_all('SELECT state FROM tool_effect_claims') == []
+    assert await host.rows() == []
 
 
 @pytest.mark.asyncio
@@ -858,20 +849,13 @@ async def test_a_write_refused_once_authority_is_revoked_is_reported_not_recorde
     # Nothing is marked audited: the envelope's row was never written.
     assert audited == []
 
-    # One WARNING for the refused row, naming it, its tool and its envelope.
-    [report] = _unwritten_reports(caplog)
-    assert (report["tool_name"], report["cause"]) == (target, "ExecutionAuthorityError")
-    if target == DISPATCHER:
-        assert (report["dispatch_id"], report["parent_dispatch_id"]) == (envelope_id, None)
-    else:
-        assert report["parent_dispatch_id"] == envelope_id
-        assert report["dispatch_id"] not in (envelope_id, rows[0]["dispatch_id"])
-
-    # The original authority error, unchanged: not the refusal, nor carrying it.
+    # The original Stop is checked before an audit write is admitted.
+    assert _unwritten_reports(caplog) == []
     [refusal] = refusals
     assert isinstance(refusal, ExecutionAuthorityError)
+    assert raised.value is refusal, 'The original authority denial was replaced'
+
     assert type(raised.value) is ExecutionAuthorityError
-    assert raised.value is not refusal
     assert f"Stop arrived after {target} took effect" in str(raised.value)
     assert raised.value.__cause__ is None
     # Reported by the writer alone, not also by the ledger's own fallback.
@@ -1053,10 +1037,10 @@ async def test_a_subagents_deferred_call_is_written_under_its_parent(make_host):
     host = await make_host()
     tool = _DeferredTool()
 
-    result = await host.feature._execute_subagent_tool(
+    result = await drive_native(host.agent, lambda: host.feature._execute_subagent_tool(
         tool_name=tool.name, args={}, tools_by_name={tool.name: tool},
         session_id=SESSION, parent_dispatch_id="envelope-1",
-    )
+    ))
 
     assert result["status"] == "ok", result
     assert tool.published == ["published"]
@@ -1079,10 +1063,10 @@ async def test_a_subagents_deferred_call_whose_row_fails_withholds_its_ui(
 
     monkeypatch.setattr(host.agent.observability_store, "log_tool_dispatch", fail)
     with pytest.raises(ToolAuditUnconfirmedError):
-        await host.feature._execute_subagent_tool(
+        await drive_native(host.agent, lambda: host.feature._execute_subagent_tool(
             tool_name=tool.name, args={}, tools_by_name={tool.name: tool},
             session_id=SESSION, parent_dispatch_id="envelope-1",
-        )
+        ))
 
     assert tool.published == []
 
@@ -1143,16 +1127,22 @@ async def test_a_direct_tools_deferred_row_is_written_under_its_dispatch(
         return context
 
     monkeypatch.setattr(orchestrator_engine, "begin_tool_call", _begin)
-    async with host.agent._turn_lifecycle():
-        result = await host.agent._dispatch_tool_call(
-            ToolCall(id="tc-1", name=tool.name, arguments={}),
-            features_by_tool_name={},
-            known_tools={tool.name},
-            messages=[],
-            iteration=0,
-            user_message="",
-            session_id=SESSION,
-        )
+    result = None
+    async def native_turn_operation():
+        nonlocal result
+        async with host.agent._turn_lifecycle():
+            host.agent._active_session_id = SESSION
+            result = await host.agent._dispatch_tool_call(
+                ToolCall(id="tc-1", name=tool.name, arguments={}),
+                features_by_tool_name={},
+                known_tools={tool.name},
+                messages=[],
+                iteration=0,
+                user_message="",
+                session_id=SESSION,
+            )
+
+    await drive_native(host.agent, native_turn_operation)
 
     assert result["status"] == "ok", result
     assert tool.published == ["published"]
@@ -1204,19 +1194,30 @@ async def test_a_call_that_did_not_succeed_is_recorded_under_its_envelope(
     host = await make_host(calls=calls, inline=inline, decide=decide)
     host.feature.error = error
     host.feature.claim_result = returned
-    async with host.agent._turn_lifecycle():
-        await host.agent._dispatch_tool_call(
-            ToolCall(id="tc-1", name=DISPATCHER, arguments={"task": "try it"}),
-            features_by_tool_name={DISPATCHER: host.feature},
-            known_tools={DISPATCHER},
-            messages=[],
-            iteration=0,
-            user_message="",
-            session_id=SESSION,
-        )
+    async def native_turn_operation():
+        async with host.agent._turn_lifecycle():
+            host.agent._active_session_id = SESSION
+            await host.agent._dispatch_tool_call(
+                ToolCall(id="tc-1", name=DISPATCHER, arguments={"task": "try it"}),
+                features_by_tool_name={DISPATCHER: host.feature},
+                known_tools={DISPATCHER},
+                messages=[],
+                iteration=0,
+                user_message="",
+                session_id=SESSION,
+            )
+
+    if error is not None:
+        with pytest.raises(ResourceOutcomeUnknown) as caught:
+            await drive_native(host.agent, native_turn_operation)
+        assert any(carrier is error for carrier in execution_evidence_carriers(caught.value))
+    else:
+        await drive_native(host.agent, native_turn_operation)
 
     envelope, inner = _envelope_and_inner(await host.rows())
     tool_name, status, error_class = expected
+    if error is not None:
+        error_class = "ResourceOutcomeUnknown"
     [row] = inner
     assert (row["tool_name"], row["result_status"], row["error_class"]) == (
         tool_name, status, error_class,
@@ -1236,37 +1237,38 @@ class _RaisingTool:
     name = "talon_status"
     schema = SimpleNamespace(parameters=[])
 
+    def __init__(self):
+        self.error = RuntimeError("talon unreachable")
+        self.calls = 0
+
     async def execute(self, **kwargs):
-        raise RuntimeError("talon unreachable")
+        self.calls += 1
+        raise self.error
 
 
 @pytest.mark.asyncio
-async def test_a_tool_that_raises_is_recorded_with_its_error(make_host):
+async def test_a_tool_that_raises_retains_uncertainty_and_its_parent_audit(make_host):
     host = await make_host()
     tool = _RaisingTool()
-
-    result = await host.feature._execute_subagent_tool(
-        tool_name=tool.name, args={}, tools_by_name={tool.name: tool},
-        session_id=SESSION, parent_dispatch_id="envelope-1",
-    )
-
-    assert result == {"success": False, "error": "RuntimeError: talon unreachable"}
+    with pytest.raises(ResourceOutcomeUnknown) as caught:
+        await drive_native(host.agent, lambda: host.feature._execute_subagent_tool(
+            tool_name=tool.name, args={}, tools_by_name={tool.name: tool},
+            session_id=SESSION, parent_dispatch_id="envelope-1"))
+    assert any(carrier is tool.error for carrier in execution_evidence_carriers(caught.value))
+    assert tool.calls == 1
     [row] = await host.rows()
     assert (row["tool_name"], row["result_status"], row["error_class"]) == (
-        "talon_status", "error", "RuntimeError",
-    )
-    assert row["error_message"] == "talon unreachable"
+        "talon_status", "error", "ResourceOutcomeUnknown")
+    assert "unconfirmed" in row["error_message"] and "talon unreachable" not in row["error_message"]
     assert row["parent_dispatch_id"] == "envelope-1"
-    assert host.spy.edges == [
-        (HookEvent.PRE_TOOL_USE.value, "talon_status"),
-        (HookEvent.POST_TOOL_USE.value, "talon_status"),
-    ]
+    assert host.spy.edges == [(HookEvent.PRE_TOOL_USE.value, "talon_status")]
+    assert await host.backend.fetch_all('SELECT state FROM tool_effect_claims') == [('UNCONFIRMED',)]
 
 
 @pytest.mark.asyncio
 async def test_a_subagent_run_outside_any_dispatch_records_no_parent(make_host):
     host = await make_host()
-    envelope = await host.feature.execute_as_subagent(task="claim, then cancel")
+    envelope = await drive_native(host.agent, lambda: host.feature.execute_as_subagent(task="claim, then cancel"))
 
     assert envelope["success"] is True, envelope
     rows = await host.rows()

@@ -16,6 +16,7 @@ together fit inside the test's timeout.
 """
 
 from kestrel_sovereign.testing.native_shutdown_budget import shutdown_fixture_agent
+from tests.utils.native_tool_effects import drive_native
 
 import os
 import pytest
@@ -385,7 +386,7 @@ async def test_e2e_feature_as_a2a_agent(kestrel_agent, usable_model_list, live_c
     task.metadata.update({"skill": "list_models", "args": {}})
 
     result_task = await bounded_live_call(
-        model_feature.handle_task(task),
+        drive_native(kestrel_agent, lambda: model_feature.handle_task(task)),
         budget=live_call_budget,
         what="ModelAgent handle_task(list_models)",
         waiting_on=describe_discovery_routes(kestrel_agent.llm_service),

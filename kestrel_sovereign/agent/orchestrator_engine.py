@@ -1069,8 +1069,10 @@ async def _execute_feature_subagent(host, feature, dispatch, arguments, *,
     async def operation():
         if native_loop:
             validate()
-            return await dispatch(**arguments, _validate_registration=validate,
-                _dispatch_execution=execution)
+            result = await dispatch(**arguments, _validate_registration=validate,
+                _dispatch_execution=execution, _dispatch_host=host)
+            validate()
+            return result
         return await execute_tool_effect(host,
             registration=["feature_subagent", feature.name, feature.tool_name],
             arguments=audit_args, execute=execute,
@@ -1184,6 +1186,20 @@ async def _complete_post_tool_result(host, result, post_input, *, adapter,
     ``dispatch_id`` names the row, and ``parent_dispatch_id`` the dispatch the
     call ran inside, for a feature subagent's own call (#3778).
     """
+    async def record_required_audit(payload):
+        error_message, error_class = _extract_inline_error_fields(payload)
+        status = infer_tool_result_status(payload)
+        await OrchestratorEngineMixin._log_tool_dispatch(
+            host, tool_name=post_input.tool_name, adapter=adapter,
+            args=post_input.tool_input, result=payload,
+            session_id=post_input.session_id, dispatch_start=dispatch_start,
+            status_hint=status, error_message=error_message, error_class=error_class,
+            required=True, dispatch_id=dispatch_id, parent_dispatch_id=parent_dispatch_id,
+            execution_witness=execution_witness)
+        if on_audited is not None:
+            on_audited(status)
+        require_execution_work(host)
+
     deferred = isinstance(result, DeferredToolResult)
     post_outputs = await host.hooks_manager.execute_hooks_parallel(
         HookEvent.POST_TOOL_USE, post_input,
@@ -1191,6 +1207,9 @@ async def _complete_post_tool_result(host, result, post_input, *, adapter,
     )
     require_execution_work(host)
     if not isinstance(result, DeferredToolResult):
+        if execution_witness is not None:
+            from kestrel_sovereign.features.base import _serialize_tool_result
+            await record_required_audit(_serialize_tool_result(result))
         return _discard_tool_supplied_receipt(result)
     allowed = all(evaluate_blocking_decision(output) is None for output in post_outputs)
     post_result = post_input.tool_response
@@ -1201,20 +1220,7 @@ async def _complete_post_tool_result(host, result, post_input, *, adapter,
         result.finalize(post_result, allowed=False)
     reviewed = deepcopy(dict(post_result))
     try:
-        error_message, error_class = _extract_inline_error_fields(post_result)
-        status = infer_tool_result_status(reviewed)
-        await OrchestratorEngineMixin._log_tool_dispatch(
-            host, tool_name=post_input.tool_name, adapter=adapter,
-            args=post_input.tool_input, result=reviewed,
-            session_id=post_input.session_id, dispatch_start=dispatch_start,
-            status_hint=status,
-            error_message=error_message, error_class=error_class, required=True,
-            dispatch_id=dispatch_id, parent_dispatch_id=parent_dispatch_id,
-            execution_witness=execution_witness,
-        )
-        if on_audited is not None:
-            on_audited(status)
-        require_execution_work(host)
+        await record_required_audit(reviewed)
     except BaseException as error:
         # Consume the factory when storage or Stop prevents publication.
         # Execution already happened: never invite a replay to recover its UI.
@@ -2028,6 +2034,18 @@ class OrchestratorEngineMixin:
                     status=infer_tool_result_status(result))
             if isinstance(result, _AuditedDeferredResult) and _capture is None:
                 return dict(result)
+            if (_capture is not None and execution.audit_recorded
+                    and not isinstance(result, (_AuditedDeferredResult, _HostToolFailure))):
+                # The normal completion path now owns its required row too.
+                # Mint the same host receipt used by deferred completion so
+                # adapter history cannot write a second enclosing dispatch.
+                from kestrel_sovereign.features.base import _serialize_tool_result
+
+                payload = _serialize_tool_result(result)
+                if not isinstance(payload, dict):
+                    payload = {"result": payload}
+                return _AuditedDeferredResult(payload, host=self, tool_name=tool_name,
+                    session_id=session_id)
             return result
 
     async def _dispatch_named_tool(
@@ -3193,6 +3211,13 @@ class OrchestratorEngineMixin:
             )
         except BaseException as exc:
             if execution_witness is not None:
+                if isinstance(exc, Exception) and not is_tool_execution_terminal_error(exc):
+                    failure = ToolAuditUnconfirmedError(
+                        "Required tool dispatch audit could not be confirmed. "
+                        "Reconcile before retrying. Do not replay")
+                    failure.__cause__ = exc
+                    execution_witness.audit_error = failure
+                    raise failure
                 execution_witness.audit_error = exc
             if not isinstance(exc, Exception) or required or is_execution_control_error(exc):
                 raise

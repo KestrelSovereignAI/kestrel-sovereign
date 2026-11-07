@@ -332,44 +332,50 @@ class _AllowAllHooks:
         return None
 
 
-class _Agent(OrchestratorEngineMixin):
-    pass
+from tests.utils.native_tool_effects import drive_native
+from kestrel_sovereign.features.base import Feature
 
 
-def _dispatch_agent():
-    agent = _Agent()
-    agent.agent_name = "Emma"
+async def _dispatch_agent(*, native_tool_effect_agent):
+    agent = await native_tool_effect_agent(did="did:test:span-dispatch")
+    agent._agent_name = "Emma"
     agent.hooks_manager = _AllowAllHooks()
-    agent.observability_store = MagicMock()
-    agent.observability_store.log_tool_response = AsyncMock()
-    agent._get_denied_tools = AsyncMock(return_value=set())
-    agent._register_explored_feature_tools = MagicMock()
-    agent._reemit_envelope_parts = MagicMock()
-    agent._emit_tool_update_event = AsyncMock()
-    agent._fire_post_subagent_hook = AsyncMock()
     return agent
 
 
-def _subagent_feature():
-    feature = MagicMock()
-    feature.tool_name = "memory_feature"
-    feature.execute_as_subagent = AsyncMock(return_value={"success": True})
-    return feature
+async def _native_feature_dispatch(agent, *, named=False, session_id="orchestrator"):
+    class SessionFeature(Feature):
+        tool_name = "memory_feature"
+        tool_description = "Native session attribution"
+        executions = 0
+
+        async def initialize(self):
+            pass
+
+        async def execute_as_subagent(self, **kwargs):
+            self.executions += 1
+            return {"success": True}
+
+    feature = SessionFeature(agent)
+    agent.features[feature.name] = feature
+    async def operation():
+        if named:
+            return await agent.execute_named_tool(feature.tool_name, {"task":"recall"},
+                session_id=session_id, source="inline-executor")
+        return await agent._dispatch_feature_tool(SimpleNamespace(name=feature.tool_name), feature,
+            {"task":"recall"}, 0, "evt-feature", "remember this", session_id=session_id)
+    result = await drive_native(agent, operation)
+    assert feature.executions == 1, "The native feature never reached its body"
+    return result
 
 
 class TestFeatureDispatchSpansCarrySession:
     """``agent.feature_dispatch`` joins the band of the turn that drove it."""
 
     @pytest.mark.asyncio
-    async def test_named_subagent_dispatch_stamps_session(self, span_exporter):
-        agent = _dispatch_agent()
-        result = await agent._execute_named_subagent(
-            _subagent_feature(),
-            tool_name="memory_feature",
-            args={"task": "recall"},
-            session_id=SESSION,
-            source="inline-executor",
-        )
+    async def test_named_subagent_dispatch_stamps_session(self, span_exporter, *, native_tool_effect_agent):
+        agent = (await _dispatch_agent(native_tool_effect_agent=native_tool_effect_agent))
+        result = await _native_feature_dispatch(agent, named=True, session_id=SESSION)
         assert result == {"success": True}
 
         spans = _roots(span_exporter, "agent.feature_dispatch")
@@ -379,17 +385,9 @@ class TestFeatureDispatchSpansCarrySession:
         assert attrs.get(LEGACY_SESSION_ID) == SESSION
 
     @pytest.mark.asyncio
-    async def test_chat_path_feature_dispatch_stamps_session(self, span_exporter):
-        agent = _dispatch_agent()
-        result = await agent._dispatch_feature_tool(
-            tool_call=SimpleNamespace(name="memory_feature"),
-            feature=_subagent_feature(),
-            args={"task": "recall"},
-            dispatch_start=0.0,
-            dispatch_event_id="evt-feature",
-            user_message="remember this",
-            session_id=SESSION,
-        )
+    async def test_chat_path_feature_dispatch_stamps_session(self, span_exporter, *, native_tool_effect_agent):
+        agent = (await _dispatch_agent(native_tool_effect_agent=native_tool_effect_agent))
+        result = await _native_feature_dispatch(agent, session_id=SESSION)
         assert result == {"success": True}
 
         spans = _roots(span_exporter, "agent.feature_dispatch")
@@ -399,22 +397,15 @@ class TestFeatureDispatchSpansCarrySession:
         assert attrs.get(LEGACY_SESSION_ID) == SESSION
 
     @pytest.mark.asyncio
-    async def test_sentinel_session_is_not_stamped(self, span_exporter):
+    async def test_sentinel_session_is_not_stamped(self, span_exporter, *, native_tool_effect_agent):
         """``session_id`` doubles as a source tag; sentinels are not sessions.
 
         ``"orchestrator"`` is the parameter's own default. Stamping it would
         invent a fleet-wide session that every sessionless dispatch on every
         agent shares — worse than the staircase this fix removes.
         """
-        agent = _dispatch_agent()
-        await agent._dispatch_feature_tool(
-            tool_call=SimpleNamespace(name="memory_feature"),
-            feature=_subagent_feature(),
-            args={"task": "recall"},
-            dispatch_start=0.0,
-            dispatch_event_id="evt-feature",
-            user_message="remember this",
-        )
+        agent = (await _dispatch_agent(native_tool_effect_agent=native_tool_effect_agent))
+        await _native_feature_dispatch(agent)
 
         spans = _roots(span_exporter, "agent.feature_dispatch")
         assert len(spans) == 1

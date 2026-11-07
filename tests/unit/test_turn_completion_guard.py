@@ -4,6 +4,8 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+import pytest_asyncio
+from tests.utils.native_tool_effects import drive_native
 
 from kestrel_sovereign.agent.orchestrator_engine import OrchestratorEngineMixin
 from kestrel_sovereign.features.base import Feature
@@ -112,8 +114,8 @@ def test_assistant_tool_history_omits_reasoning_without_tool_calls():
 
 
 @pytest.mark.asyncio
-async def test_no_tool_continuation_gets_one_repair_step():
-    agent = MagicMock()
+async def test_no_tool_continuation_gets_one_repair_step(native_tool_effect_agent):
+    agent = await native_tool_effect_agent(did="did:test:repair-loop")
     _bind_turn_completion_helpers(agent)
     agent.llm_service = MagicMock()
     agent.llm_service.generate_with_messages = AsyncMock(
@@ -142,7 +144,7 @@ async def test_no_tool_continuation_gets_one_repair_step():
     agent._prune_orchestrator_messages = MagicMock(side_effect=lambda msgs, _tools, **_kw: msgs)
 
     handler = OrchestratorEngineMixin._handle_orchestrator_response.__get__(agent)
-    result = await handler(
+    result = await drive_native(agent, lambda: handler(
         response=LLMResponse(content="Let me check the GitHub issue.", tool_calls=None),
         feature_tools=[_tool_schema()],
         system_prompt="sys",
@@ -150,7 +152,7 @@ async def test_no_tool_continuation_gets_one_repair_step():
         effective_model="gpt-5.4",
         user_message="has this been done yet?",
         session_id="session-123",
-    )
+    ))
 
     assert result == "Issue loaded."
     assert agent.llm_service.generate_with_messages.await_count == 2
@@ -214,7 +216,7 @@ def test_tool_call_as_text_detector_ignores_documentation_and_examples():
 
 
 @pytest.mark.asyncio
-async def test_tool_call_as_text_gets_repaired_and_executed():
+async def test_tool_call_as_text_gets_repaired_and_executed(native_tool_effect_agent):
     """A model that writes <function_calls>/<invoke> markup as TEXT (no
     structured tool_use) is given one repair turn that re-emits a real tool
     call, which then executes — instead of silently fabricating success.
@@ -222,7 +224,7 @@ async def test_tool_call_as_text_gets_repaired_and_executed():
     This is the regression for the `kestrel ask` -> /api/agent/invoke path
     returning literal tool-call syntax with narrated fake results.
     """
-    agent = MagicMock()
+    agent = await native_tool_effect_agent(did="did:test:repair-loop")
     _bind_turn_completion_helpers(agent)
     agent.llm_service = MagicMock()
     agent.llm_service.generate_with_messages = AsyncMock(
@@ -259,7 +261,7 @@ async def test_tool_call_as_text_gets_repaired_and_executed():
     )
 
     handler = OrchestratorEngineMixin._handle_orchestrator_response.__get__(agent)
-    result = await handler(
+    result = await drive_native(agent, lambda: handler(
         response=LLMResponse(content=tools_as_text, tool_calls=None),
         feature_tools=[_tool_schema("todo_add")],
         system_prompt="sys",
@@ -267,7 +269,7 @@ async def test_tool_call_as_text_gets_repaired_and_executed():
         effective_model="claude-opus-4-8",
         user_message="add a todo titled x",
         session_id="session-123",
-    )
+    ))
 
     assert result == "Added todo, id 4."
     assert agent.llm_service.generate_with_messages.await_count == 2
@@ -280,14 +282,14 @@ async def test_tool_call_as_text_gets_repaired_and_executed():
 
 
 @pytest.mark.asyncio
-async def test_final_no_tool_answer_does_not_repair():
-    agent = MagicMock()
+async def test_final_no_tool_answer_does_not_repair(native_tool_effect_agent):
+    agent = await native_tool_effect_agent(did="did:test:repair-loop")
     _bind_turn_completion_helpers(agent)
     agent.llm_service = MagicMock()
     agent.llm_service.generate_with_messages = AsyncMock()
 
     handler = OrchestratorEngineMixin._handle_orchestrator_response.__get__(agent)
-    result = await handler(
+    result = await drive_native(agent, lambda: handler(
         response=LLMResponse(content="No, it is still open.", tool_calls=None),
         feature_tools=[_tool_schema()],
         system_prompt="sys",
@@ -295,7 +297,7 @@ async def test_final_no_tool_answer_does_not_repair():
         effective_model="gpt-5.4",
         user_message="has this been done yet?",
         session_id="session-123",
-    )
+    ))
 
     assert result == "No, it is still open."
     agent.llm_service.generate_with_messages.assert_not_awaited()
@@ -309,21 +311,22 @@ class _FeatureForTurnCompletion(Feature):
 
 
 @pytest.mark.asyncio
-async def test_feature_subagent_tool_history_preserves_provider_reasoning():
+async def test_feature_subagent_tool_history_preserves_provider_reasoning(native_tool_effect_agent):
     tool = MagicMock()
     tool.name = "health_check"
     tool.execute = AsyncMock(return_value={"status": "ok"})
 
-    agent = MagicMock()
+    agent = await native_tool_effect_agent(did="did:test:subagent-loop")
     agent.hooks_manager = None
     agent.llm_service = MagicMock()
     agent.llm_service.generate_with_messages = AsyncMock(
         return_value=LLMResponse(content="Health is ok.", tool_calls=None)
     )
     feature = _FeatureForTurnCompletion(agent)
+    agent.features[feature.name] = feature
     feature.get_tools = MagicMock(return_value=[tool])
 
-    result = await feature._handle_feature_tool_calls(
+    result = await drive_native(agent, lambda: feature._handle_feature_tool_calls(
         response=LLMResponse(
             content=None,
             tool_calls=[ToolCall(id="call_1", name="health_check", arguments={})],
@@ -332,7 +335,7 @@ async def test_feature_subagent_tool_history_preserves_provider_reasoning():
         tools=[_tool_schema("health_check")],
         system_prompt="sys",
         user_prompt="Task: health",
-    )
+    ))
 
     assert result == "Health is ok."
     continuation_messages = agent.llm_service.generate_with_messages.await_args.kwargs[
@@ -346,12 +349,12 @@ async def test_feature_subagent_tool_history_preserves_provider_reasoning():
 
 
 @pytest.mark.asyncio
-async def test_feature_subagent_no_tool_continuation_gets_repair_step():
+async def test_feature_subagent_no_tool_continuation_gets_repair_step(native_tool_effect_agent):
     tool = MagicMock()
     tool.name = "launch_job"
     tool.execute = AsyncMock(return_value={"success": True, "claimed": 1237})
 
-    agent = MagicMock()
+    agent = await native_tool_effect_agent(did="did:test:subagent-loop")
     agent.hooks_manager = None
     agent.llm_service = MagicMock()
     agent.llm_service.generate_with_messages = AsyncMock(
@@ -364,16 +367,17 @@ async def test_feature_subagent_no_tool_continuation_gets_repair_step():
         ]
     )
     feature = _FeatureForTurnCompletion(agent)
+    agent.features[feature.name] = feature
     feature.get_tools = MagicMock(return_value=[tool])
 
-    result = await feature._handle_feature_tool_calls(
+    result = await drive_native(agent, lambda: feature._handle_feature_tool_calls(
         response=LLMResponse(
             content="Let me use the job launcher for that.", tool_calls=None
         ),
         tools=[_tool_schema("launch_job")],
         system_prompt="sys",
         user_prompt="Task: claim issue 1237",
-    )
+    ))
 
     assert result == "The job was launched."
     assert agent.llm_service.generate_with_messages.await_count == 2
@@ -546,23 +550,24 @@ async def test_already_streamed_answer_yields_only_the_addition():
 
 
 @pytest.mark.asyncio
-async def test_feature_subagent_confirmed_answer_is_kept():
-    agent = MagicMock()
+async def test_feature_subagent_confirmed_answer_is_kept(native_tool_effect_agent):
+    agent = await native_tool_effect_agent(did="did:test:subagent-loop")
     agent.hooks_manager = None
     agent.llm_service = MagicMock()
     agent.llm_service.generate_with_messages = AsyncMock(
         return_value=LLMResponse(content="[answer complete]", tool_calls=None)
     )
     feature = _FeatureForTurnCompletion(agent)
+    agent.features[feature.name] = feature
     feature.get_tools = MagicMock(return_value=[])
     answer = "The job is queued.\n\nWhen it finishes I will check the job log."
 
-    result = await feature._handle_feature_tool_calls(
+    result = await drive_native(agent, lambda: feature._handle_feature_tool_calls(
         response=LLMResponse(content=answer, tool_calls=None),
         tools=[_tool_schema("launch_job")],
         system_prompt="sys",
         user_prompt="Task: report the job",
-    )
+    ))
 
     assert result == answer
     assert agent.llm_service.generate_with_messages.await_count == 1
@@ -600,8 +605,8 @@ def test_repair_that_ran_tools_inline_goes_on_as_the_turn():
     assert settled.executed_tool_calls == executed
 
 
-def _streaming_agent(stream_items, repair_reply):
-    agent = MagicMock()
+async def _streaming_agent(stream_items, repair_reply, *, native_tool_effect_agent):
+    agent = await native_tool_effect_agent(did="did:test:repair-stream")
     agent.features = {}
     agent._direct_tools = {}
     agent._build_assistant_tool_history_msg = MagicMock(
@@ -635,6 +640,10 @@ def _streaming_agent(stream_items, repair_reply):
 
 
 async def _drain_streaming(agent):
+    return await drive_native(agent, lambda: _consume_streaming(agent))
+
+
+async def _consume_streaming(agent):
     handler = OrchestratorEngineMixin._handle_orchestrator_response_streaming.__get__(agent)
     chunks = []
     async for chunk in handler(
@@ -657,11 +666,11 @@ async def _drain_streaming(agent):
 
 
 @pytest.mark.asyncio
-async def test_streamed_answer_is_not_repeated_after_a_confirmed_repair():
-    agent = _streaming_agent(
+async def test_streamed_answer_is_not_repeated_after_a_confirmed_repair(*, native_tool_effect_agent):
+    agent = (await _streaming_agent(
         [_ENDS_WITH_PLAN, LLMResponse(content=_ENDS_WITH_PLAN, tool_calls=None)],
         "[answer complete]",
-    )
+    native_tool_effect_agent=native_tool_effect_agent))
 
     text = await _drain_streaming(agent)
 
@@ -671,13 +680,13 @@ async def test_streamed_answer_is_not_repeated_after_a_confirmed_repair():
 
 
 @pytest.mark.asyncio
-async def test_unstreamed_answer_is_delivered_after_a_confirmed_repair():
+async def test_unstreamed_answer_is_delivered_after_a_confirmed_repair(*, native_tool_effect_agent):
     """A terminal response whose text never streamed as chunks has not reached
     the client, so the confirmed answer is delivered whole (codex review r2)."""
-    agent = _streaming_agent(
+    agent = (await _streaming_agent(
         [LLMResponse(content=_ENDS_WITH_PLAN, tool_calls=None)],
         "[answer complete]",
-    )
+    native_tool_effect_agent=native_tool_effect_agent))
 
     text = await _drain_streaming(agent)
 

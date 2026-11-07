@@ -14,6 +14,8 @@ quiet loss.
 """
 
 import pytest
+import pytest_asyncio
+from tests.utils.native_tool_effects import drive_native
 from unittest.mock import MagicMock
 
 from kestrel_sovereign.features.base import (
@@ -24,12 +26,7 @@ from kestrel_sovereign.features.base import (
 
 class _StubFeature(Feature):
     def __init__(self, agent=None):
-        self.agent = agent
-        self.disabled_skills = set()
-
-    @property
-    def name(self):
-        return "StubFeature"
+        super().__init__(agent)
 
     @property
     def tool_description(self) -> str:
@@ -70,9 +67,12 @@ def known_limits(monkeypatch):
     monkeypatch.setattr(TokenCounter, "resolved_context_limit", fake)
 
 
-@pytest.fixture
-def feature():
-    return _StubFeature(agent=MagicMock())
+@pytest_asyncio.fixture
+async def feature(native_tool_effect_agent):
+    agent = await native_tool_effect_agent(did="did:test:subagent-loop")
+    feature = _StubFeature(agent=agent)
+    agent.features[feature.name] = feature
+    return feature
 
 
 def _messages(total_chars):
@@ -215,12 +215,12 @@ async def test_loop_refuses_before_calling_the_provider(feature, monkeypatch):
 
     tool = MagicMock(); tool.name = "big_tool"
     with pytest.raises(SubagentContextBudgetExceeded) as excinfo:
-        await feature._handle_feature_tool_calls(
+        await drive_native(feature.agent, lambda: feature._handle_feature_tool_calls(
             _Resp(tool_calls=[_Call("big_tool")]),
             tools=[], system_prompt="sp", max_iterations=3,
             model_override=SMALL_MODEL,
             runtime_tools=[tool],
-        )
+        ))
 
     assert called["provider"] == 0, "loop sent a request it knew would be rejected"
     assert "context budget" in str(excinfo.value)
@@ -243,12 +243,12 @@ async def test_loop_still_continues_when_it_fits(feature):
     feature._execute_subagent_tool = _small
 
     tool = MagicMock(); tool.name = "small_tool"
-    result = await feature._handle_feature_tool_calls(
+    result = await drive_native(feature.agent, lambda: feature._handle_feature_tool_calls(
         _Resp(tool_calls=[_Call("small_tool")]),
         tools=[], system_prompt="sp", max_iterations=3,
         model_override=SMALL_MODEL,
         runtime_tools=[tool],
-    )
+    ))
 
     assert called["provider"] == 1
     assert result == "done"
@@ -277,11 +277,11 @@ async def test_loop_learns_the_model_from_the_response(feature):
     first.model = SMALL_MODEL          # the provider says what it served
 
     with pytest.raises(SubagentContextBudgetExceeded):
-        await feature._handle_feature_tool_calls(
+        await drive_native(feature.agent, lambda: feature._handle_feature_tool_calls(
             first, tools=[], system_prompt="sp", max_iterations=3,
             model_override=None,       # as every real caller does
             runtime_tools=[tool],
-        )
+        ))
     assert called["provider"] == 0
 
 

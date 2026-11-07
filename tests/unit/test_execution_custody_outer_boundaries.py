@@ -194,25 +194,34 @@ async def test_failed_provider_accounting_cannot_hide_unknown(modality):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("boundary", ["named", "chat"])
-async def test_named_subagent_outer_boundary_keeps_unknown(boundary):
-    from kestrel_sovereign.agent.orchestrator_engine import OrchestratorEngineMixin
-    from kestrel_sovereign.hooks.manager import HooksManager
+async def test_named_subagent_outer_boundary_keeps_unknown(boundary, native_tool_effect_agent):
+    from kestrel_sovereign.features.base import Feature
+    from tests.utils.native_tool_effects import drive_native
     error = wrapped()
+    agent = await native_tool_effect_agent(did="did:test:outer-subagent")
+    agent._fire_post_subagent_hook = AsyncMock()
 
-    class Agent(OrchestratorEngineMixin):
-        hooks_manager = HooksManager()
-        _get_denied_tools = AsyncMock(return_value=set())
-        _fire_post_subagent_hook = AsyncMock()
-        observability_store = SimpleNamespace(log_tool_response=AsyncMock())
+    class NativeFeature(Feature):
+        tool_name = "test"
+        tool_description = "Original uncertain provider"
 
-    feature = SimpleNamespace(execute_as_subagent=AsyncMock(side_effect=error), tool_name="test")
-    agent = Agent()
-    with pytest.raises(RuntimeError) as caught:
+        async def initialize(self):
+            pass
+
+        async def execute_as_subagent(self, **kwargs):
+            raise error
+
+    feature = NativeFeature(agent)
+    agent.features[feature.name] = feature
+
+    async def operation():
         if boundary == "named":
-            await agent._execute_named_subagent(feature, tool_name="test", args={"task": "effect"}, session_id="session", source="test")
-        else:
-            await agent._dispatch_feature_tool(SimpleNamespace(name="test"), feature,
-                {"task": "effect"}, 0, "event", None, session_id="session")
+            return await agent.execute_named_tool("test", {"task": "effect"}, session_id="session", source="test")
+        return await agent._dispatch_feature_tool(SimpleNamespace(name="test"), feature,
+            {"task": "effect"}, 0, "event", None, session_id="session")
+
+    with pytest.raises(RuntimeError) as caught:
+        await drive_native(agent, operation)
     assert caught.value is error
     assert execution_commit_outcome(caught.value) == "unknown"
     agent._fire_post_subagent_hook.assert_not_awaited()

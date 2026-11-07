@@ -57,7 +57,7 @@ from kestrel_sdk.tools.base import ToolParameter as ToolParameter
 from kestrel_sdk.tools import coerce_tool_arguments
 from kestrel_sdk.tools.result import ToolResult, ToolResultStatus
 from kestrel_sdk.tools.deferred import DeferredToolResult
-from kestrel_sdk.resources import ResourceOutcomeUnknown, observed_outcome_unknown
+from kestrel_sdk.resources import ResourceConflict, ResourceError, ResourceOutcomeUnknown, observed_outcome_unknown
 
 from kestrel_sovereign.execution_custody import (
     ExecutionAuthorityError,
@@ -383,6 +383,7 @@ async def _complete_feature_deferred_result(
     feature: Any,
     result: DeferredToolResult,
     *,
+    host: Any,
     tool_name: str,
     tool_input: Dict[str, Any],
     session_id: str,
@@ -390,6 +391,8 @@ async def _complete_feature_deferred_result(
     adapter: str,
     destination: Any,
     parent_dispatch_id: Optional[str] = None,
+    dispatch_id: Optional[str] = None,
+    execution_witness: Optional[Any] = None,
 ) -> Dict[str, Any]:
     """Complete a feature route's deferred result at the main boundary.
 
@@ -405,7 +408,6 @@ async def _complete_feature_deferred_result(
     from kestrel_sdk.resources import ResourceUnsupported
     from kestrel_sovereign.agent.orchestrator_engine import _complete_post_tool_result
 
-    host = feature.agent
     if getattr(host, "supports_audited_deferred_tool_results", False) is not True:
         result.finalize(result, allowed=False)
         raise ResourceUnsupported(
@@ -424,7 +426,8 @@ async def _complete_feature_deferred_result(
     completed = await _complete_post_tool_result(
         host, result, post_input, adapter=adapter,
         dispatch_start=exec_start, destination=destination,
-        parent_dispatch_id=parent_dispatch_id,
+        parent_dispatch_id=parent_dispatch_id, dispatch_id=dispatch_id,
+        execution_witness=execution_witness,
     )
     return dict(completed)
 
@@ -571,6 +574,7 @@ class Feature(_SdkFeature):
         model_override: Optional[str] = None,
         session_id: Optional[str] = None,
         request: Optional[str] = None,
+        _dispatch_host: Optional[Any] = None,
     ) -> Any:
         """Give a feature subagent one more step when it narrates but emits no tool.
 
@@ -590,14 +594,15 @@ class Feature(_SdkFeature):
         invocation *identity*, never as the wire ``session_id`` — see
         :func:`_subagent_turn_identity` for why that distinction is load-bearing.
         """
+        host = _dispatch_host if _dispatch_host is not None else self.agent
         content = getattr(response, "content", "") or ""
         if not tools or not self._signals_unfinished_tool_work(content):
             return response
         # The pattern is usually a finished answer's plan; confirm it first
         # when the decision check is on (#3527).
-        require_execution_work(self.agent)
+        require_execution_work(host)
         if not await confirm_unfinished(
-            self.agent.llm_service, content, request=request, session_id=session_id,
+            host.llm_service, content, request=request, session_id=session_id,
         ):
             return response
 
@@ -605,15 +610,15 @@ class Feature(_SdkFeature):
             "[SUBAGENT %s] Model signaled continuation without tool_calls; issuing one repair turn",
             self.name,
         )
-        require_execution_work(self.agent)
-        repaired = await self.agent.llm_service.generate_with_messages(
+        require_execution_work(host)
+        repaired = await host.llm_service.generate_with_messages(
             messages=self._append_missing_tool_call_repair(messages, content),
             tools=tools if tools else None,
             tool_executor=tool_executor,
             model_override=model_override,
             invocation_context=_subagent_turn_identity(session_id),
         )
-        require_execution_work(self.agent)
+        require_execution_work(host)
         # A repair that neither calls a tool nor ran one inline either confirms
         # the message was the subagent's answer (keep it, followed by anything
         # the repair adds) or is a new answer. Settled on the response itself,
@@ -1472,6 +1477,7 @@ class Feature(_SdkFeature):
         The SDK Feature contributes skills from ToolSchema. The host owns its
         signed Agent Card; features do not publish cards or wire identities.
         """
+        host = self.agent
         if not isinstance(task, Task):
             raise TypeError("Feature task handling requires an official A2A Task")
         metadata = MessageToDict(task.metadata)
@@ -1514,7 +1520,7 @@ class Feature(_SdkFeature):
         from kestrel_sovereign.tools.effect_journal import (
             execute_tool_effect, require_persistent_tool_effects,
         )
-        require_persistent_tool_effects(self.agent)
+        require_persistent_tool_effects(host)
         task.status.CopyFrom(TaskStatus(state=TaskState.TASK_STATE_WORKING))
         from kestrel_sovereign.a2a.lifecycle import mark_outcome_unknown
 
@@ -1545,7 +1551,7 @@ class Feature(_SdkFeature):
             # skill returns, and a skill they run as a task is part of this
             # task's execution like one the skill ran itself.
             with _bind_flattened_outcome_unknown(flattened):
-                result = await execute_tool_effect(self.agent,
+                result = await execute_tool_effect(host,
                     registration=[type(self).__name__, skill_name], arguments=args,
                     execute=lambda: selected.execute(**args))
                 if isinstance(result, DeferredToolResult):
@@ -1556,7 +1562,7 @@ class Feature(_SdkFeature):
                     )
 
                     result = await _complete_feature_deferred_result(
-                        self, result, tool_name=skill_name, tool_input=args,
+                        self, result, host=host, tool_name=skill_name, tool_input=args,
                         session_id="", exec_start=exec_start,
                         adapter=f"a2a:{type(self).__name__}.{skill_name}",
                         destination=HEADLESS_PUBLICATION,
@@ -1743,6 +1749,7 @@ class Feature(_SdkFeature):
         *,
         _validate_registration: Optional[Callable[[], None]] = None,
         _dispatch_execution: Optional[Any] = None,
+        _dispatch_host: Optional[Any] = None,
     ) -> Dict[str, Any]:
         """
         Execute this feature as a subagent with its own LLM context.
@@ -1776,12 +1783,16 @@ class Feature(_SdkFeature):
             into the parent turn's collector. Callers that don't handle parts
             can ignore the key.
         """
+        host = _dispatch_host if _dispatch_host is not None else self.agent
         # Subagent-local buffer for typed parts (#2641). Tools executed inside
         # this subagent — via the post-LLM loop OR the codex inline executor,
         # which runs on a reader-spawned task with a frozen context — deposit
         # their parts here, and the envelope carries them back to the
         # dispatching orchestrator by contract instead of ContextVar
         # happenstance.
+        from kestrel_sovereign.agent.tool_registry import _ToolExecution
+        if _dispatch_execution is None:
+            _dispatch_execution = _ToolExecution()
         subagent_parts: List[dict] = []
         if _validate_registration is not None:
             _validate_registration()
@@ -1865,7 +1876,7 @@ class Feature(_SdkFeature):
             from kestrel_sovereign.agent.tool_allowlist import (
                 enclosing_dispatch_ledger_id,
             )
-            parent_dispatch_id = enclosing_dispatch_ledger_id(self.agent)
+            parent_dispatch_id = enclosing_dispatch_ledger_id(host)
             tool_executor = (
                 self._make_feature_inline_tool_executor(
                     parts_sink=subagent_parts,
@@ -1874,11 +1885,12 @@ class Feature(_SdkFeature):
                     parent_dispatch_id=parent_dispatch_id,
                     _validate_registration=_validate_registration,
                     _dispatch_execution=_dispatch_execution,
+                    _dispatch_host=host,
                 )
                 if feature_tools else None
             )
-            require_execution_work(self.agent)
-            response = await self.agent.llm_service.generate(
+            require_execution_work(host)
+            response = await host.llm_service.generate(
                 system_prompt=system_prompt,
                 user_prompt=user_prompt,
                 tools=feature_tools if feature_tools else None,
@@ -1890,7 +1902,7 @@ class Feature(_SdkFeature):
                 # so it carries no provider-continuation meaning to collide with.
                 session_id=turn_session_id,
             )
-            require_execution_work(self.agent)
+            require_execution_work(host)
 
             # Log what we got back
             if hasattr(response, 'tool_calls') and response.tool_calls:
@@ -1922,6 +1934,7 @@ class Feature(_SdkFeature):
                 parent_dispatch_id=parent_dispatch_id,
                 _validate_registration=_validate_registration,
                 _dispatch_execution=_dispatch_execution,
+                _dispatch_host=host,
             )
 
             logger.info(
@@ -1933,14 +1946,17 @@ class Feature(_SdkFeature):
             envelope: Dict[str, Any] = {"success": True, "result": result}
             if subagent_parts:
                 envelope["parts"] = subagent_parts
-            require_execution_work(self.agent)
+            require_execution_work(host)
             return envelope
 
         except ExecutionAuthorityError:
             raise
         except Exception as e:
-            if is_tool_execution_terminal_error(e):
+            if is_tool_execution_terminal_error(e) or issubclass(type(e), ResourceError):
                 raise
+            if _dispatch_execution.started:
+                from kestrel_sovereign.tools.execution_outcome import TOOL_OUTCOME_UNCONFIRMED
+                raise ResourceOutcomeUnknown(TOOL_OUTCOME_UNCONFIRMED) from e
             logger.error(
                 "Feature %s subagent execution failed: %s",
                 self.name, exception_log_summary(e),
@@ -1962,6 +1978,7 @@ class Feature(_SdkFeature):
         parent_dispatch_id: Optional[str] = None,
         _validate_registration: Optional[Callable[[], None]] = None,
         _dispatch_execution: Optional[Any] = None,
+        _dispatch_host: Optional[Any] = None,
     ):
         """Build an inline ``(name, args) -> result_dict`` async callable
         bound to this invocation's runtime tool palette, gated by the same
@@ -2025,11 +2042,12 @@ class Feature(_SdkFeature):
         built outside a live turn captures an explicit unbound value, so it
         grants nothing to unrelated background work.
         """
-        turn_scope = capture_turn_scope(self.agent)
+        host = _dispatch_host if _dispatch_host is not None else self.agent
+        turn_scope = capture_turn_scope(host)
 
         async def _exec(name: str, args: Dict[str, Any]):
             with turn_scope.bind():
-                require_execution_work(self.agent)
+                require_execution_work(host)
                 try:
                     result = await self._execute_subagent_tool(
                         tool_name=name,
@@ -2043,6 +2061,7 @@ class Feature(_SdkFeature):
                         parent_dispatch_id=parent_dispatch_id,
                         _validate_registration=_validate_registration,
                         _dispatch_execution=_dispatch_execution,
+                        _dispatch_host=host,
                     )
                 except Exception as error:
                     # The adapter running this executor returns what it raises
@@ -2051,7 +2070,7 @@ class Feature(_SdkFeature):
                     # first (#3946). Any error propagates unchanged.
                     report_flattened_outcome_unknown(error)
                     raise
-                require_execution_work(self.agent)
+                require_execution_work(host)
                 return result
         return _exec
 
@@ -2067,6 +2086,7 @@ class Feature(_SdkFeature):
         parent_dispatch_id: Optional[str] = None,
         _validate_registration: Optional[Callable[[], None]] = None,
         _dispatch_execution: Optional[Any] = None,
+        _dispatch_host: Optional[Any] = None,
     ) -> Any:
         """Execute one of this feature's tools inside the PRE_TOOL_USE /
         POST_TOOL_USE hook envelope. Shared between the inline-executor
@@ -2094,10 +2114,9 @@ class Feature(_SdkFeature):
         subagent is found where every other call the agent made is, and
         traced to the envelope that made it. The row is written in this task
         after POST_TOOL_USE, as the chat path writes its row after its hooks.
-        A call that a cancellation or Stop ends before then records nothing,
-        as a top-level call does. A write the ledger refuses (as native
-        storage does once execution authority is revoked) is reported once,
-        as a WARNING, and is never taken for a row.
+        A terminal failure retains its original execution and audit evidence.
+        Each native dispatch attempts its required row once; an unconfirmed
+        write propagates its original uncertainty and cannot invite replay.
 
         ``return_with_effective_args`` controls the return shape:
 
@@ -2110,6 +2129,16 @@ class Feature(_SdkFeature):
             ``a2a_tool_dispatches.args_redacted``, persisted
             ``tool_results``) record the PRE-redaction args even
             when a hook rewrote them, leaking PII into log storage."""
+        host = _dispatch_host if _dispatch_host is not None else self.agent
+
+        def require_original_registration():
+            if self.agent is not host:
+                raise ResourceConflict("Original subagent host changed")
+            if _validate_registration is not None:
+                _validate_registration()
+
+        require_original_registration()
+
         def _shape(effective_args_value: Dict[str, Any], result_value: Any) -> Any:
             """Return either the raw result or the
             ``(effective_args, result)`` tuple per the
@@ -2146,7 +2175,7 @@ class Feature(_SdkFeature):
             if error_class is None and error_message is None:
                 error_message, error_class = _extract_inline_error_fields(result_value)
             await _write_tool_dispatch(
-                self.agent, tool_name=tool_name, adapter=dispatch_adapter,
+                host, tool_name=tool_name, adapter=dispatch_adapter,
                 args=effective_args_value, result=result_value,
                 session_id=session_id, dispatch_start=dispatch_start,
                 status_hint=status, error_class=error_class,
@@ -2194,8 +2223,8 @@ class Feature(_SdkFeature):
         )
         from kestrel_sovereign.agent.tool_allowlist import registry_generation
 
-        selected_generation = registry_generation(self.agent)
-        require_persistent_tool_effects(self.agent)
+        selected_generation = registry_generation(host)
+        require_persistent_tool_effects(host)
 
         # #2641: bind the subagent-local parts sink as the active collector
         # for the WHOLE gated call — PRE_TOOL_USE hooks included, not just the
@@ -2227,7 +2256,7 @@ class Feature(_SdkFeature):
 
         hook_session_id = session_id or ""
         with sink_scope:
-            hooks_manager = getattr(self.agent, "hooks_manager", None)
+            hooks_manager = getattr(host, "hooks_manager", None)
             effective_args = args
             if hooks_manager is not None:
                 from kestrel_sdk.hooks.base import (
@@ -2244,6 +2273,7 @@ class Feature(_SdkFeature):
                 hook_output = await hooks_manager.execute_hooks(
                     HookEvent.PRE_TOOL_USE, hook_input,
                 )
+                require_original_registration()
                 # Compute the effective args from the post-hook state FIRST,
                 # before the block check. A hook chain may redact via an
                 # early MODIFY hook (in-place mutation of
@@ -2315,7 +2345,7 @@ class Feature(_SdkFeature):
                         error_message=rewrite_error,
                     )
 
-            require_execution_work(self.agent)
+            require_execution_work(host)
             exec_start = time.time()
 
             async def execute():
@@ -2327,74 +2357,56 @@ class Feature(_SdkFeature):
                 return result
 
             async def operation():
-                return await execute_tool_effect(self.agent,
+                return await execute_tool_effect(host,
                     registration=[type(self).__name__, tool_name], arguments=effective_args,
                     expected_generation=selected_generation,
-                    validate_registration=_validate_registration,
+                    validate_registration=require_original_registration,
                     execute=execute)
 
             async def failed(error, unknown):
                 raise error
 
-            try:
-                result = await _run_tool_execution(self.agent, operation,
-                    execution=execution, dispatch_meta=dispatch_meta, session_id=session_id,
-                    on_failure=failed,
-                    on_terminal=lambda error: _record_terminal_tool_dispatch(
-                        self.agent, error, execution, dispatch_meta, tool_name=tool_name,
-                        adapter=dispatch_adapter, args=effective_args, session_id=session_id,
-                        dispatch_start=dispatch_start, dispatch_id=dispatch_id,
-                        parent_dispatch_id=parent_dispatch_id))
-                from kestrel_sovereign.agent.invocation import (
-                    mark_current_invocation_effect_completed,
-                )
+            result = await _run_tool_execution(host, operation,
+                execution=execution, dispatch_meta=dispatch_meta, session_id=session_id,
+                on_failure=failed,
+                on_terminal=lambda error: _record_terminal_tool_dispatch(
+                    host, error, execution, dispatch_meta, tool_name=tool_name,
+                    adapter=dispatch_adapter, args=effective_args, session_id=session_id,
+                    dispatch_start=dispatch_start, dispatch_id=dispatch_id,
+                    parent_dispatch_id=parent_dispatch_id))
+            from kestrel_sovereign.agent.invocation import (
+                mark_current_invocation_effect_completed,
+            )
 
-                mark_current_invocation_effect_completed(None)
-                require_execution_work(self.agent)
-            except ExecutionAuthorityError:
-                raise
-            except Exception as e:
-                if is_tool_execution_terminal_error(e):
-                    raise
-                logger.warning(
-                    "[SUBAGENT-TOOL] %s raised %s",
-                    tool_name, exception_log_summary(e),
+            mark_current_invocation_effect_completed(None)
+            require_execution_work(host)
+            deferred = isinstance(result, DeferredToolResult)
+            serialized = result if deferred else _serialize_tool_result(result)
+            # Harvest envelope-carried parts (``ToolResult.parts`` / a result
+            # dict's ``parts`` field) into the sink too — the explicit,
+            # ContextVar-free half of the #2641 contract. The envelope keeps
+            # its copy; delivery to the outbound stream happens once, at the
+            # orchestrator's dispatch site. Harvested BEFORE POST_TOOL_USE
+            # fires, so a part a POST hook emits lands after the tool's own,
+            # the order the chat path keeps.
+            if parts_sink is not None and isinstance(serialized, dict):
+                envelope_parts = serialized.get("parts")
+                if isinstance(envelope_parts, list) and envelope_parts:
+                    parts_sink.extend(envelope_parts)
+            if deferred:
+                # Its POST_TOOL_USE, required dispatch row and publication
+                # all run at the main completion boundary. The subagent's
+                # model sees only the completed public result.
+                completed = await _complete_feature_deferred_result(
+                    self, result, host=host, tool_name=tool_name, tool_input=effective_args,
+                    session_id=hook_session_id, exec_start=exec_start,
+                    adapter=dispatch_adapter,
+                    destination=parent_collector,
+                    parent_dispatch_id=parent_dispatch_id, dispatch_id=dispatch_id,
+                    execution_witness=execution,
                 )
-                report_flattened_outcome_unknown(e)
-                serialized = {"success": False, "error": f"{type(e).__name__}: {e}"}
-                raised_fields = {
-                    "status": "error",
-                    "error_class": type(e).__name__,
-                    "error_message": str(e),
-                }
-            else:
-                raised_fields = {}
-                deferred = isinstance(result, DeferredToolResult)
-                serialized = result if deferred else _serialize_tool_result(result)
-                # Harvest envelope-carried parts (``ToolResult.parts`` / a result
-                # dict's ``parts`` field) into the sink too — the explicit,
-                # ContextVar-free half of the #2641 contract. The envelope keeps
-                # its copy; delivery to the outbound stream happens once, at the
-                # orchestrator's dispatch site. Harvested BEFORE POST_TOOL_USE
-                # fires, so a part a POST hook emits lands after the tool's own,
-                # the order the chat path keeps.
-                if parts_sink is not None and isinstance(serialized, dict):
-                    envelope_parts = serialized.get("parts")
-                    if isinstance(envelope_parts, list) and envelope_parts:
-                        parts_sink.extend(envelope_parts)
-                if deferred:
-                    # Its POST_TOOL_USE, required dispatch row and publication
-                    # all run at the main completion boundary. The subagent's
-                    # model sees only the completed public result.
-                    completed = await _complete_feature_deferred_result(
-                        self, result, tool_name=tool_name, tool_input=effective_args,
-                        session_id=hook_session_id, exec_start=exec_start,
-                        adapter=dispatch_adapter,
-                        destination=parent_collector,
-                        parent_dispatch_id=parent_dispatch_id,
-                    )
-                    require_execution_work(self.agent)
-                    return _shape(effective_args, completed)
+                require_execution_work(host)
+                return _shape(effective_args, completed)
             exec_duration_ms = int((time.time() - exec_start) * 1000)
 
             if hooks_manager is not None:
@@ -2414,8 +2426,8 @@ class Feature(_SdkFeature):
                 await hooks_manager.execute_hooks_parallel(
                     HookEvent.POST_TOOL_USE, post_hook_input,
                 )
-            recorded = await _recorded(effective_args, serialized, **raised_fields)
-            require_execution_work(self.agent)
+            recorded = await _recorded(effective_args, serialized)
+            require_execution_work(host)
             return recorded
 
     def _compose_subagent_runtime_tools(
@@ -2608,6 +2620,7 @@ ABSOLUTE PROHIBITION - NEVER FABRICATE:
         parent_dispatch_id: Optional[str] = None,
         _validate_registration: Optional[Callable[[], None]] = None,
         _dispatch_execution: Optional[Any] = None,
+        _dispatch_host: Optional[Any] = None,
     ) -> str:
         """
         Handle tool calls within this feature's context.
@@ -2646,6 +2659,7 @@ ABSOLUTE PROHIBITION - NEVER FABRICATE:
         Returns:
             Final text response after all tool calls are processed
         """
+        host = _dispatch_host if _dispatch_host is not None else self.agent
         # Use module constant if not explicitly specified
         if max_iterations is None:
             max_iterations = MAX_TOOL_ITERATIONS
@@ -2680,6 +2694,7 @@ ABSOLUTE PROHIBITION - NEVER FABRICATE:
                 model_override=model_override,
                 session_id=session_id,
                 request=user_prompt,
+                _dispatch_host=host,
             )
             if isinstance(response, str):
                 return response
@@ -2729,6 +2744,7 @@ ABSOLUTE PROHIBITION - NEVER FABRICATE:
                     parent_dispatch_id=parent_dispatch_id,
                     _validate_registration=_validate_registration,
                     _dispatch_execution=_dispatch_execution,
+                    _dispatch_host=host,
                 )
                 call_ms = int((time.monotonic() - call_start) * 1000)
                 result_str = json.dumps(result) if isinstance(result, dict) else str(result)
@@ -2763,8 +2779,8 @@ ABSOLUTE PROHIBITION - NEVER FABRICATE:
             # turns don't hit the same "requires a tool_executor"
             # provider error the initial subagent call avoided
             # (codex round 1 P2 on #1461 follow-up).
-            require_execution_work(self.agent)
-            response = await self.agent.llm_service.generate_with_messages(
+            require_execution_work(host)
+            response = await host.llm_service.generate_with_messages(
                 messages=messages,
                 tools=tools if tools else None,
                 tool_executor=tool_executor,
@@ -2774,7 +2790,7 @@ ABSOLUTE PROHIBITION - NEVER FABRICATE:
                 # share its provider thread (:func:`_subagent_turn_identity`).
                 invocation_context=_subagent_turn_identity(session_id),
             )
-            require_execution_work(self.agent)
+            require_execution_work(host)
 
             effective_model = (
                 model_override or getattr(response, "model", None) or effective_model
@@ -2799,6 +2815,7 @@ ABSOLUTE PROHIBITION - NEVER FABRICATE:
                     model_override=model_override,
                     session_id=session_id,
                     request=user_prompt,
+                    _dispatch_host=host,
                 )
                 if isinstance(response, str):
                     return response

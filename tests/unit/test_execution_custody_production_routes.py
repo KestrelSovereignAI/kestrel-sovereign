@@ -34,14 +34,14 @@ def uncertain(*args, **kwargs):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("pool_supplied", [False, True])
-async def test_a2a_boot_reuses_guarded_native_backend_without_new_pool(monkeypatch, pool_supplied):
+async def test_a2a_boot_reuses_original_primary_backend_without_new_pool(monkeypatch, pool_supplied, native_tool_effect_agent):
     from kestrel_sovereign.kestrel_agent import KestrelAgent
     from kestrel_sovereign.agent.boot import BootContext
-    from kestrel_sovereign.storage.db.postgres import PostgresBackend
     import kestrel_sovereign.kestrel_agent as agent_module
 
     scope = ExecutionCustody(Authority())
-    backend = PostgresBackend.__new__(PostgresBackend)
+    owner = await native_tool_effect_agent(did="did:test:guarded-a2a")
+    backend = owner._raw_storage.db.backend
     backend._execution_custody = scope
     stores = []
 
@@ -59,13 +59,7 @@ async def test_a2a_boot_reuses_guarded_native_backend_without_new_pool(monkeypat
             raise ReachedStores
 
     monkeypatch.setattr(agent_module, "TaskManager", Manager)
-    owner = KestrelAgent.__new__(KestrelAgent)
-    owner._db_backend = "postgres"
     owner.pg_pool = object() if pool_supplied else None
-    owner._raw_storage = SimpleNamespace(_backend=backend)
-    owner.storage_path = ":memory:"
-    owner.did = "did:test:guarded-a2a"
-    owner.hooks_manager = None
     with pytest.raises(ReachedStores):
         await owner._boot_phase_a2a_observability_signals(BootContext())
     assert len(stores) == 8
@@ -80,9 +74,13 @@ async def test_a2a_boot_reuses_guarded_native_backend_without_new_pool(monkeypat
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("boundary", ["inline", "subagent"])
-async def test_feature_subagent_preserves_wrapped_commit_uncertainty(boundary):
+async def test_feature_subagent_preserves_wrapped_commit_uncertainty(boundary, native_tool_effect_agent):
     from tests.unit.test_feature_subagent_tool_executor import _FakeTool, _make_feature_with_agent_capture
-    feature, _ = _make_feature_with_agent_capture([_FakeTool("effect", {})])
+    from tests.utils.native_tool_effects import drive_native
+    feature, _ = await _make_feature_with_agent_capture(
+        [_FakeTool("effect", {})], native_tool_effect_agent=native_tool_effect_agent,
+    )
+    owner = feature.agent
     feature._fake_tools[0].execute = AsyncMock(side_effect=uncertain)
     if boundary == "inline":
         operation = lambda: feature._make_feature_inline_tool_executor()("effect", {})
@@ -90,7 +88,7 @@ async def test_feature_subagent_preserves_wrapped_commit_uncertainty(boundary):
         feature.agent.llm_service.generate = AsyncMock(side_effect=uncertain)
         operation = lambda: feature.execute_as_subagent(task="effect")
     with pytest.raises(RuntimeError) as caught:
-        await operation()
+        await drive_native(owner, operation)
     assert execution_commit_outcome(caught.value) == "unknown"
 
 
@@ -272,7 +270,7 @@ async def test_provider_failure_keeps_unknown_evidence_after_runtime_retirement(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("boundary", ["dynamic", "direct"])
-async def test_native_tool_wrapped_uncertainty_is_not_retryable_envelope(boundary):
+async def test_native_tool_wrapped_uncertainty_is_not_retryable_envelope(boundary, native_tool_effect_agent):
     from kestrel_sovereign.features.base import Feature, tool
     from kestrel_sovereign.agent.orchestrator_engine import OrchestratorEngineMixin
     from kestrel_sovereign.hooks.manager import HooksManager
@@ -289,22 +287,18 @@ async def test_native_tool_wrapped_uncertainty_is_not_retryable_envelope(boundar
         async def effect(self):
             uncertain()
 
-    feature = Effects.__new__(Effects)
-    feature.agent = None
-    feature.disabled_skills = set()
-    native_tool = next(t for t in feature.get_tools() if t.name == "effect")
-
-    class Agent(OrchestratorEngineMixin):
-        hooks_manager = HooksManager()
-        _direct_tools = {"effect": native_tool}
-        observability_store = SimpleNamespace(log_tool_response=AsyncMock())
-
+    from tests.utils.native_tool_effects import drive_native
     if boundary == "dynamic":
+        feature = Effects(None)
+        native_tool = next(t for t in feature.get_tools() if t.name == "effect")
         operation = native_tool.execute
     else:
-        operation = lambda: Agent()._dispatch_direct_tool(
-            None, "effect", {}, 0, "event", tool=native_tool, feature_name="Effects"
-        )
+        agent = await native_tool_effect_agent(did="did:test:direct-custody")
+        feature = Effects(agent)
+        agent.features[feature.name] = feature
+        agent.register_dynamic_tools(feature.tool_name, feature.get_tools())
+        operation = lambda: drive_native(agent, lambda: agent._dispatch_direct_tool(
+            SimpleNamespace(name="effect"), "effect", {}, 0, "event", session_id="session"))
     with pytest.raises(RuntimeError) as caught:
         await operation()
     assert execution_commit_outcome(caught.value) == "unknown"
@@ -772,7 +766,9 @@ async def test_public_stream_rename_retains_privacy_lock_reentry(monkeypatch, ho
 
     monkeypatch.setattr(lock._lock, "acquire", observe_actual_base_acquire)
     if hosted:
-        agent._execution_custody = ExecutionCustody(Authority())
+        class SQLiteAuthority(Authority):
+            backend_type = "sqlite"
+        agent._execution_custody = ExecutionCustody(SQLiteAuthority())
     monkeypatch.setattr(storage_access, "hides_persisted_user_content", lambda owner: True)
 
     async def body(*args, **kwargs):

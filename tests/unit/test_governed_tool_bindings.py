@@ -500,7 +500,7 @@ async def test_transient_response_audit_failure_after_effect_is_unknown(host):
     assert tool.calls == [{"count": 3}]
     row = await backend.fetch_one("SELECT result_status, error_class FROM a2a_tool_dispatches")
     assert row is not None, repr(captured.value.__cause__)
-    assert tuple(row) == ("error", "ResourceOutcomeUnknown")
+    assert tuple(row) == ("success", None), "A confirmed audit must retain the actual effect result"
 
 
 @pytest.mark.asyncio
@@ -680,7 +680,8 @@ async def test_tool_attempt_without_confirmed_result_is_not_a_retryable_failure(
     binding = _mount(agent, tool)
     with pytest.raises(ResourceOutcomeUnknown) as captured:
         await binding.invoke({"count": 3}, session_id="mcp-app:view-1", operation_id=uuid4().hex)
-    assert captured.value.__cause__ is error
+    from kestrel_sovereign.execution_custody import execution_evidence_carriers
+    assert any(carrier is error for carrier in execution_evidence_carriers(captured.value))
     assert tool.calls == [{"count": 3}]
     row = await backend.fetch_one("SELECT result_status, error_class FROM a2a_tool_dispatches")
     assert tuple(row) == ("error", "ResourceOutcomeUnknown")
@@ -724,7 +725,7 @@ async def test_unserializable_result_after_effect_is_unknown_and_audited_once(ho
     assert isinstance(captured.value.__cause__, TypeError)
     assert tool.calls == [{"count": 3}]
     rows = await backend.fetch_all("SELECT result_status, error_class FROM a2a_tool_dispatches")
-    assert [tuple(row) for row in rows] == [("error", "ResourceOutcomeUnknown")]
+    assert [tuple(row) for row in rows] == [("success", None)], "Delivery failure cannot rewrite a confirmed effect audit"
 
 
 @pytest.mark.asyncio
@@ -786,13 +787,15 @@ async def test_every_direct_tool_lane_preserves_unconfirmed_effects_after_unexpe
     agent, backend = host
     assert agent.supports_unconfirmed_tool_outcomes is True
     assert getattr(ToolRegistryMixin, 'supports_unconfirmed_tool_outcomes', None) is not True
+    from kestrel_sovereign.execution_custody import execution_evidence_carriers
+    original = (ExceptionGroup('unexpected operation failure', [
+        ValueError('private-invalid-state'), KeyError('private-bug-detail')])
+        if failure == 'mixed-group' else
+        (KeyError if failure == 'key' else TypeError)('private-bug-detail'))
     class FailedAfterEffect(_Tool):
         async def execute(self, **args):
             self.calls.append(args)
-            if failure == 'mixed-group':
-                raise ExceptionGroup('unexpected operation failure', [
-                    ValueError('private-invalid-state'), KeyError('private-bug-detail')])
-            raise (KeyError if failure == 'key' else TypeError)('private-bug-detail')
+            raise original
 
     tool = FailedAfterEffect(visible=True)
     binding = _mount(agent, tool)
@@ -807,28 +810,22 @@ async def test_every_direct_tool_lane_preserves_unconfirmed_effects_after_unexpe
                 session_id='original-effect', source='owned-named-transport')
         call = ToolCall(id='model-original-effect', name=binding.name, arguments={'count': 3})
         if lane == 'direct':
-            result = await owner._dispatch_direct_tool(call, binding.name, {'count': 3}, 0,
+            return await owner._dispatch_direct_tool(call, binding.name, {'count': 3}, 0,
                 'internal-original-effect', session_id='original-effect')
         else:
-            result = await owner._dispatch_tool_call(call, {}, {binding.name}, messages, 0, None,
+            return await owner._dispatch_tool_call(call, {}, {binding.name}, messages, 0, None,
                 session_id='original-effect')
-        assert result['success'] is False
-        assert result['error'] == TOOL_OUTCOME_UNCONFIRMED
-        assert 'private-bug-detail' not in json.dumps(messages)
-
     with pytest.raises(ResourceOutcomeUnknown) as caught:
         await original_turn(agent, 'owned effect intent', invocation_id=uuid4().hex)
-    if lane in {'bound', 'named'}:
-        assert str(caught.value) == TOOL_OUTCOME_UNCONFIRMED
+    assert any(carrier is original for carrier in execution_evidence_carriers(caught.value))
+    assert 'private-bug-detail' not in str(caught.value)
+    assert messages == []
     assert tool.calls == [{'count': 3}]
     rows = await backend.fetch_all('SELECT result_status, error_class, error_message FROM a2a_tool_dispatches')
-    if lane in {'direct', 'named'}:
-        # These executors do not own the outer dispatch/inline receipt.
-        assert rows == []
-    else:
-        assert len(rows) == 1
-        assert tuple(rows[0][:2]) == ('error', 'ResourceOutcomeUnknown')
-        assert 'private-bug-detail' not in rows[0][2]
+    assert len(rows) == 1
+    assert tuple(rows[0][:2]) == ('error', 'ResourceOutcomeUnknown')
+    assert 'private-bug-detail' not in rows[0][2]
+    assert await agent.tool_effect_store.database.fetchall('SELECT state FROM tool_effect_claims') == [('UNCONFIRMED',)]
 
 
 @pytest.mark.asyncio
