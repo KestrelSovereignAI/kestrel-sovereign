@@ -16,12 +16,14 @@ These tests pin the two contracts that close it:
 """
 
 import pytest
-from unittest.mock import AsyncMock, MagicMock, patch
+import pytest_asyncio
+from unittest.mock import AsyncMock, MagicMock
 
 from kestrel_sdk.hooks.base import HookOutput
 from kestrel_sdk.tools.base import ToolCategory, ToolParameter, ToolSchema
 
-from kestrel_sovereign.kestrel_agent import KestrelAgent
+from tests.utils.codex_inline import OwnedCallbackReader
+from tests.utils.native_tool_effects import drive_native
 from kestrel_sovereign.security.tool_audit import (
     ACTION_TOOL_RESOLUTION,
     ACTION_TOOL_VALIDATION,
@@ -36,7 +38,9 @@ from kestrel_sovereign.security.tool_audit import (
 # =============================================================================
 
 def _make_tool(name: str):
-    tool = MagicMock()
+    from kestrel_sdk.tools.base import AgentTool
+
+    tool = MagicMock(spec=AgentTool)
     tool.name = name
     tool.schema = ToolSchema(
         name=name,
@@ -50,8 +54,9 @@ def _make_tool(name: str):
     return tool
 
 
-def _make_feature(tool_name: str, tools: list, *, name: str | None = None):
+def _make_feature(tool_name: str, tools: list, *, name: str | None = None, agent=None):
     feature = MagicMock()
+    feature.agent = agent
     feature.supports_subagent_dispatch = True
     feature.tool_name = tool_name
     feature.name = name or "".join(p.title() for p in tool_name.split("_"))
@@ -94,22 +99,24 @@ def _attach_security_feature(agent):
     return store
 
 
-@pytest.fixture
-def agent():
-    with patch("kestrel_sovereign.kestrel_agent.LLMService"):
-        a = KestrelAgent(did="did:test:allowlist")
+@pytest_asyncio.fixture
+async def agent(native_tool_effect_agent):
+    a = await native_tool_effect_agent(did="did:test:allowlist")
     a.features = {}
-    return a
+    a._test_inline_reader = OwnedCallbackReader()
+    await a._test_inline_reader.start()
+    try:
+        yield a
+    finally:
+        await a._test_inline_reader.stop()
 
 
 @pytest.fixture
 def dispatch_agent(agent):
     """An agent wired for ``_dispatch_tool_call`` (hooks allow everything)."""
-    agent.observability_store = MagicMock()
-    agent.observability_store.log_tool_call = AsyncMock(return_value="evt-1")
-    agent.observability_store.log_tool_response = AsyncMock()
-    agent.observability_store.log_error = AsyncMock()
-    agent.observability_store.log_tool_dispatch = AsyncMock(return_value="d-1")
+    for name in ('log_tool_call', 'log_tool_response', 'log_error', 'log_tool_dispatch'):
+        store = agent.observability_store
+        setattr(store, name, AsyncMock(wraps=getattr(store, name)))
     agent.hooks_manager = MagicMock()
     agent.hooks_manager.execute_hooks = AsyncMock(return_value=HookOutput())
     agent.hooks_manager.execute_hooks_parallel = AsyncMock(return_value=None)
@@ -133,7 +140,7 @@ class TestAllowlistDerivation:
         """A loaded feature's @tool is known before it is ever promoted."""
         feature = _make_feature(
             "github", [_make_tool("get_github_issue"), _make_tool("create_github_issue")]
-        )
+        , agent=agent)
         agent.features = {"GitHubFeature": feature}
 
         advertised = {t["function"]["name"] for t in agent._build_all_tools()}
@@ -147,7 +154,7 @@ class TestAllowlistDerivation:
     def test_explored_feature_dispatcher_stays_known(self, agent):
         """The mid-turn bounce: exploration drops the dispatcher from the
         advertised view, and the same name must not become "unknown"."""
-        feature = _make_feature("github", [_make_tool("get_github_issue")])
+        feature = _make_feature("github", [_make_tool("get_github_issue")], agent=agent)
         agent.features = {"GitHubFeature": feature}
 
         assert "github" in agent._known_tool_names()
@@ -164,7 +171,7 @@ class TestAllowlistDerivation:
         capability boundary — hidden is not unknown."""
         feature = _make_feature(
             "model_agent", [_make_tool("list_models"), _make_tool("get_current_model")]
-        )
+        , agent=agent)
         agent.features = {"ModelAgent": feature}
         agent._register_explored_feature_tools(feature)
         agent._tool_context_hidden_tools = {"get_current_model"}
@@ -179,7 +186,7 @@ class TestAllowlistDerivation:
     def test_evicted_direct_tools_stay_known(self, agent):
         """LRU eviction unmounts direct tools; the owning feature still
         exposes them, so they remain known."""
-        feature = _make_feature("model_agent", [_make_tool("list_models")])
+        feature = _make_feature("model_agent", [_make_tool("list_models")], agent=agent)
         agent.features = {"ModelAgent": feature}
         agent._register_explored_feature_tools(feature)
         assert "list_models" in agent._direct_tools
@@ -198,7 +205,7 @@ class TestAllowlistDerivation:
 
     def test_disabled_feature_tools_are_not_known(self, agent):
         """A soft-disabled feature IS a capability boundary (#2522)."""
-        feature = _make_feature("github", [_make_tool("get_github_issue")])
+        feature = _make_feature("github", [_make_tool("get_github_issue")], agent=agent)
         feature.enabled = False
         agent.features = {"GitHubFeature": feature}
 
@@ -215,10 +222,10 @@ class TestAllowlistDerivation:
         """
         github = _make_feature(
             "github", [_make_tool("get_github_issue"), _make_tool("create_github_issue")]
-        )
+        , agent=agent)
         external = _make_feature(
             "external_observer", [_make_tool("external_job_status")]
-        )
+        , agent=agent)
         agent.features = {"GitHubFeature": github, "ExternalObserverFeature": external}
         agent._register_explored_feature_tools(github)
         agent._tool_context_hidden_features = {"external_observer"}
@@ -241,45 +248,51 @@ class TestRegisteredToolDispatch:
     @pytest.mark.asyncio
     async def test_unpromoted_feature_tool_dispatches(self, dispatch_agent):
         """``create_github_issue`` before exploration: registered, so it runs."""
-        tool = _make_tool("create_github_issue")
-        feature = _make_feature("github", [tool], name="GitHubFeature")
-        dispatch_agent.features = {"GitHubFeature": feature}
-        messages = []
+        async def exercise():
+            tool = _make_tool("create_github_issue")
+            feature = _make_feature("github", [tool], name="GitHubFeature", agent=dispatch_agent)
+            dispatch_agent.features = {"GitHubFeature": feature}
+            messages = []
 
-        result = await dispatch_agent._dispatch_tool_call(
-            _tool_call("create_github_issue", {"query": "t"}),
-            {},  # nothing visible this turn
-            {"create_github_issue"},
-            messages,
-            0,
-            None,
-        )
+            result = await dispatch_agent._dispatch_tool_call(
+                _tool_call("create_github_issue", {"query": "t"}),
+                {},  # nothing visible this turn
+                {"create_github_issue"},
+                messages,
+                0,
+                None,
+            )
 
-        assert result == {"success": True, "tool": "create_github_issue"}
-        tool.execute.assert_awaited_once_with(query="t")
-        # The permission lookup names the OWNING feature, not the tool.
-        pre_call = dispatch_agent.hooks_manager.execute_hooks.await_args_list[0]
-        assert pre_call.args[1].feature_name == "GitHubFeature"
+            assert result == {"success": True, "tool": "create_github_issue"}
+            tool.execute.assert_awaited_once_with(query="t")
+            # The permission lookup names the OWNING feature, not the tool.
+            pre_call = dispatch_agent.hooks_manager.execute_hooks.await_args_list[0]
+            assert pre_call.args[1].feature_name == "GitHubFeature"
+
+        await drive_native(dispatch_agent, exercise)
 
     @pytest.mark.asyncio
     async def test_context_hidden_feature_dispatcher_dispatches(self, dispatch_agent):
         """A hidden dispatcher is absent from the visible map but still live."""
-        feature = _make_feature("github", [_make_tool("get_github_issue")])
-        dispatch_agent.features = {"GitHubFeature": feature}
-        dispatch_agent._tool_context_hidden_features = {"github"}
-        messages = []
+        async def exercise():
+            feature = _make_feature("github", [_make_tool("get_github_issue")], agent=dispatch_agent)
+            dispatch_agent.features = {"GitHubFeature": feature}
+            dispatch_agent._tool_context_hidden_features = {"github"}
+            messages = []
 
-        result = await dispatch_agent._dispatch_tool_call(
-            _tool_call("github", {"task": "read #1"}),
-            dispatch_agent._visible_features_by_tool_name(),
-            dispatch_agent._known_tool_names(),
-            messages,
-            0,
-            None,
-        )
+            result = await dispatch_agent._dispatch_tool_call(
+                _tool_call("github", {"task": "read #1"}),
+                dispatch_agent._visible_features_by_tool_name(),
+                dispatch_agent._known_tool_names(),
+                messages,
+                0,
+                None,
+            )
 
-        assert result == {"success": True, "result": "github ran"}
-        feature.execute_as_subagent.assert_awaited_once()
+            assert result == {"success": True, "result": "github ran"}
+            feature.execute_as_subagent.assert_awaited_once()
+
+        await drive_native(dispatch_agent, exercise)
 
 
 # =============================================================================
@@ -289,44 +302,50 @@ class TestRegisteredToolDispatch:
 class TestRejectionAudit:
     @pytest.mark.asyncio
     async def test_allowlist_rejection_writes_audit_entry(self, dispatch_agent):
-        store = _attach_security_feature(dispatch_agent)
-        messages = []
+        async def exercise():
+            store = _attach_security_feature(dispatch_agent)
+            messages = []
 
-        await dispatch_agent._dispatch_tool_call(
-            _tool_call("ghost_tool", {"query": "x"}),
-            {},
-            {"some_other_tool"},
-            messages,
-            0,
-            None,
-        )
+            await dispatch_agent._dispatch_tool_call(
+                _tool_call("ghost_tool", {"query": "x"}),
+                {},
+                {"some_other_tool"},
+                messages,
+                0,
+                None,
+            )
 
-        assert len(store.rows) == 1
-        row = store.rows[0]
-        assert row["tool_name"] == "ghost_tool"
-        assert row["feature_name"] == REJECTION_FEATURE_NAME
-        assert row["action"] == ACTION_TOOL_VALIDATION
-        assert row["decision"] == REJECTION_DECISION
-        assert "not in the known tool allowlist" in row["args_summary"]
+            assert len(store.rows) == 1
+            row = store.rows[0]
+            assert row["tool_name"] == "ghost_tool"
+            assert row["feature_name"] == REJECTION_FEATURE_NAME
+            assert row["action"] == ACTION_TOOL_VALIDATION
+            assert row["decision"] == REJECTION_DECISION
+            assert "not in the known tool allowlist" in row["args_summary"]
+
+        await drive_native(dispatch_agent, exercise)
 
     @pytest.mark.asyncio
     async def test_unresolvable_tool_writes_audit_entry(self, dispatch_agent):
         """Passing the allowlist but resolving to nothing is also audited."""
-        store = _attach_security_feature(dispatch_agent)
-        messages = []
+        async def exercise():
+            store = _attach_security_feature(dispatch_agent)
+            messages = []
 
-        await dispatch_agent._dispatch_tool_call(
-            _tool_call("ghost_tool", {"query": "x"}),
-            {},
-            {"ghost_tool"},  # allowlisted, but no feature exposes it
-            messages,
-            0,
-            None,
-        )
+            await dispatch_agent._dispatch_tool_call(
+                _tool_call("ghost_tool", {"query": "x"}),
+                {},
+                {"ghost_tool"},  # allowlisted, but no feature exposes it
+                messages,
+                0,
+                None,
+            )
 
-        assert len(store.rows) == 1
-        assert store.rows[0]["action"] == ACTION_TOOL_RESOLUTION
-        assert store.rows[0]["decision"] == REJECTION_DECISION
+            assert len(store.rows) == 1
+            assert store.rows[0]["action"] == ACTION_TOOL_RESOLUTION
+            assert store.rows[0]["decision"] == REJECTION_DECISION
+
+        await drive_native(dispatch_agent, exercise)
 
     @pytest.mark.asyncio
     async def test_audit_masks_sensitive_arguments(self):

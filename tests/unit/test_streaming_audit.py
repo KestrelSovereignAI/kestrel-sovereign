@@ -22,11 +22,11 @@ class TestStreamingBasics:
             ("!help", False),
         ],
     )
-    async def test_command_input_uses_regular_processing(self, command, audited):
+    async def test_command_input_uses_regular_processing(self, command, audited, *, native_tool_effect_agent):
         """Test that commands fall back to non-streaming processing."""
         from kestrel_sovereign.agent.streaming import StreamingMixin
 
-        mock_agent = MagicMock()
+        mock_agent = await native_tool_effect_agent(did="did:test:streaming-command")
         mock_agent._maybe_audit = AsyncMock()
         mock_agent._genesis_audit_cognition_block = AsyncMock(return_value=None)
         mock_agent.process_input = AsyncMock(return_value="Command executed successfully")
@@ -58,7 +58,9 @@ class TestStreamingBasics:
             StreamingMixin.process_input_streaming.__get__(mock_agent)
         )
 
-        with pytest.raises(RuntimeError, match="agent not fully initialized"):
+        from kestrel_sovereign.tools.effect_journal import ToolEffectJournalUnavailable
+
+        with pytest.raises(ToolEffectJournalUnavailable, match="tool_effect_journal_unavailable"):
             async for _chunk in mock_agent.process_input_streaming("hello"):
                 pass
 
@@ -126,23 +128,31 @@ class TestRealStreaming:
         assert "".join(chunks) == "Simple response"
 
     @pytest.mark.asyncio
-    async def test_orchestrator_streaming_with_tool_calls(self):
+    async def test_orchestrator_streaming_with_tool_calls(self, *, native_tool_effect_agent):
         """Test that tool calls are executed then response is streamed."""
         from kestrel_sovereign.kestrel_agent import KestrelAgent
         from kestrel_sovereign.llm.adapter import LLMResponse, ToolCall
         from kestrel_sovereign.hooks import HooksManager
 
-        mock_agent = MagicMock()
-        mock_agent.did = "test-did"
+        mock_agent = await native_tool_effect_agent(did="did:test:streaming-orchestrator")
 
-        mock_feature = MagicMock()
-        mock_feature.tool_name = "test_tool"
-        mock_feature.name = "test_feature"
-        mock_feature.execute_as_subagent = AsyncMock(return_value={"success": True, "data": "result"})
-        mock_feature.to_orchestrator_tool.return_value = {
-            "type": "function",
-            "function": {"name": "test_tool", "description": "test", "parameters": {}}
-        }
+        from kestrel_sovereign.features.base import Feature
+
+        class StreamingProbe(Feature):
+            tool_description = "Exercise one registered streaming subagent dispatch"
+
+            @property
+            def tool_name(self):
+                return "test_tool"
+
+            async def initialize(self):
+                pass
+
+            async def execute_as_subagent(self, **kwargs):
+                return {"success": True, "data": "result"}
+
+        mock_feature = StreamingProbe(mock_agent)
+        mock_feature.execute_as_subagent = AsyncMock(wraps=mock_feature.execute_as_subagent)
         mock_agent.features = {"test_feature": mock_feature}
 
         mock_agent.hooks_manager = HooksManager()
@@ -212,18 +222,26 @@ class TestRealStreaming:
         mock_agent._direct_tool_defs = []
         mock_agent._register_explored_feature_tools = MagicMock()
 
-        chunks = []
-        async for chunk in mock_agent._handle_orchestrator_response_streaming(
-            response=first_response,
-            feature_tools=[],
-            system_prompt="test",
-            force_local_only=False,
-            effective_model="test-model",
-            user_message="test message"
-        ):
-            chunks.append(chunk)
+        from tests.unit.test_tool_effect_execution import admit
+        from kestrel_sovereign.tools.effect_journal import bind_tool_effect_turn
 
-        mock_feature.execute_as_subagent.assert_called_once()
+        turn = await admit(mock_agent)
+        try:
+            with bind_tool_effect_turn((turn, None)):
+                chunks = []
+                async for chunk in mock_agent._handle_orchestrator_response_streaming(
+                    response=first_response,
+                    feature_tools=[],
+                    system_prompt="test",
+                    force_local_only=False,
+                    effective_model="test-model",
+                    user_message="test message"
+                ):
+                    chunks.append(chunk)
+        finally:
+            await turn.close()
+
+        mock_feature.execute_as_subagent.assert_awaited_once()
 
         full_output = "".join(chunks)
         assert "Final streamed response" in full_output
@@ -244,14 +262,14 @@ async def _passthrough():
     yield
 
 
-def _make_streaming_audit_agent(
+async def _make_streaming_audit_agent(
     add_convo_calls,
     *,
     mode: str,
     audit_response: dict = None,
     audit_side_effect=None,
     hook_timeout: float = None,
-    register_hook: bool = True,
+    register_hook: bool = True,native_tool_effect_agent
 ):
     """Build a mock agent wired with a REAL HooksManager + ResponseAuditHook.
 
@@ -267,27 +285,23 @@ def _make_streaming_audit_agent(
     from kestrel_sovereign.hooks import HooksManager
     from kestrel_sovereign.features.response_audit.hook import ResponseAuditHook
 
-    privacy_agent = MagicMock()
+    agent = await native_tool_effect_agent(did="did:test:streaming-audit")
+    privacy_agent = agent.privacy_agent
     privacy_agent.add_conversation = AsyncMock(
         side_effect=lambda role, content, **kw: add_convo_calls.append({
             "role": role, "content": content, **kw,
         })
     )
-    privacy_agent.privacy_config.allows_cloud_llm.return_value = True
-    privacy_agent.privacy_mode.name = "normal"
     privacy_agent.get_conversation_history = AsyncMock(return_value=[])
 
-    agent = MagicMock()
     agent.privacy_agent = privacy_agent
     agent.features = {}
-    agent.did = "test-did"
     agent.extension = None
     agent._cached_features_prompt = ""
     agent.is_request_cancelled = MagicMock(return_value=False)
     agent.emit_event = AsyncMock()
     agent._maybe_audit = AsyncMock()
     agent._genesis_audit_cognition_block = AsyncMock(return_value=None)
-    agent._get_privacy_transition_lock = MagicMock(return_value=_passthrough())
     agent._turn_lifecycle = MagicMock(return_value=_passthrough())
     agent._get_governing_constitution = AsyncMock(return_value="")
     agent.check_solvency = AsyncMock(return_value="test-model")
@@ -374,15 +388,15 @@ class TestStrictStreamingAuditBuffering:
         return captured
 
     @pytest.mark.asyncio
-    async def test_strict_deny_exposes_no_original_text(self):
+    async def test_strict_deny_exposes_no_original_text(self, *, native_tool_effect_agent):
         """A strict DENY must expose none of the original assistant text; only
         the fail-closed block message reaches the client, and only AFTER the
         upstream stream was fully drained (no pre-verdict byte escaped)."""
         add_convo_calls = []
-        agent, _hook = _make_streaming_audit_agent(
+        agent, _hook = (await _make_streaming_audit_agent(
             add_convo_calls, mode="strict",
             audit_response={"risk_level": 3, "reasoning": "harmful content"},
-        )
+        native_tool_effect_agent=native_tool_effect_agent))
 
         exhausted = {"done": False}
 
@@ -415,14 +429,14 @@ class TestStrictStreamingAuditBuffering:
         assert "Hello" not in persisted[0]["content"]
 
     @pytest.mark.asyncio
-    async def test_strict_allow_emits_reviewed_text_once(self):
+    async def test_strict_allow_emits_reviewed_text_once(self, *, native_tool_effect_agent):
         """A strict ALLOW releases the reviewed text exactly once, after the
         verdict — byte-identical to what was streamed, just later."""
         add_convo_calls = []
-        agent, _hook = _make_streaming_audit_agent(
+        agent, _hook = (await _make_streaming_audit_agent(
             add_convo_calls, mode="strict",
             audit_response={"risk_level": 1, "reasoning": "clean"},
-        )
+        native_tool_effect_agent=native_tool_effect_agent))
 
         exhausted = {"done": False}
 
@@ -446,14 +460,14 @@ class TestStrictStreamingAuditBuffering:
         assert persisted[0]["content"] == _LONG_TEXT
 
     @pytest.mark.asyncio
-    async def test_strict_provider_failure_emits_only_block_message(self):
+    async def test_strict_provider_failure_emits_only_block_message(self, *, native_tool_effect_agent):
         """Audit provider failure (get_audit_response raises) in strict mode
         fails closed: only the block message is emitted, no original bytes."""
         add_convo_calls = []
-        agent, _hook = _make_streaming_audit_agent(
+        agent, _hook = (await _make_streaming_audit_agent(
             add_convo_calls, mode="strict",
             audit_side_effect=RuntimeError("provider down"),
-        )
+        native_tool_effect_agent=native_tool_effect_agent))
 
         exhausted = {"done": False}
 
@@ -474,7 +488,7 @@ class TestStrictStreamingAuditBuffering:
         assert all(done for _, done in captured)
 
     @pytest.mark.asyncio
-    async def test_strict_audit_timeout_emits_only_block_message(self):
+    async def test_strict_audit_timeout_emits_only_block_message(self, *, native_tool_effect_agent):
         """A hung audit provider that trips the hook's manager-level timeout
         resolves to DENY (fail-closed) — only the block message escapes, and
         no original byte reaches the client before the verdict."""
@@ -486,11 +500,11 @@ class TestStrictStreamingAuditBuffering:
             await asyncio.sleep(5.0)
             return {"risk_level": 1, "reasoning": "late"}
 
-        agent, _hook = _make_streaming_audit_agent(
+        agent, _hook = (await _make_streaming_audit_agent(
             add_convo_calls, mode="strict",
             audit_side_effect=_hang,
             hook_timeout=0.05,  # manager cancels the hung audit
-        )
+        native_tool_effect_agent=native_tool_effect_agent))
 
         exhausted = {"done": False}
 
@@ -512,14 +526,14 @@ class TestStrictStreamingAuditBuffering:
         assert all(done for _, done in captured)
 
     @pytest.mark.asyncio
-    async def test_warn_mode_streams_incrementally(self):
+    async def test_warn_mode_streams_incrementally(self, *, native_tool_effect_agent):
         """Advisory/warn mode is NOT enforcing, so it must NOT inherit the
         strict-mode latency — text streams incrementally as before."""
         add_convo_calls = []
-        agent, _hook = _make_streaming_audit_agent(
+        agent, _hook = (await _make_streaming_audit_agent(
             add_convo_calls, mode="warn",
             audit_response={"risk_level": 1, "reasoning": "clean"},
-        )
+        native_tool_effect_agent=native_tool_effect_agent))
 
         exhausted = {"done": False}
 
@@ -542,7 +556,7 @@ class TestStrictStreamingAuditBuffering:
         assert joined == _LONG_TEXT
 
     @pytest.mark.asyncio
-    async def test_strict_deny_with_tools_blocks_and_drops_parts(self):
+    async def test_strict_deny_with_tools_blocks_and_drops_parts(self, *, native_tool_effect_agent):
         """The tool path: a strict DENY must leak neither the post-tool prose
         nor any typed part / revise sentinel to the live client, and must not
         persist the scrubbed part."""
@@ -551,10 +565,10 @@ class TestStrictStreamingAuditBuffering:
         from kestrel_sovereign.agent.parts import build_part_sentinel
 
         add_convo_calls = []
-        agent, _hook = _make_streaming_audit_agent(
+        agent, _hook = (await _make_streaming_audit_agent(
             add_convo_calls, mode="strict",
             audit_response={"risk_level": 3, "reasoning": "unsafe"},
-        )
+        native_tool_effect_agent=native_tool_effect_agent))
 
         async def mock_stream(**kwargs):
             yield "Updating the list. "
@@ -596,7 +610,7 @@ class TestStrictStreamingAuditBuffering:
         assert "parts" not in metadata
 
     @pytest.mark.asyncio
-    async def test_strict_allow_with_tools_releases_and_persists_only_reviewed_text(self):
+    async def test_strict_allow_with_tools_releases_and_persists_only_reviewed_text(self, *, native_tool_effect_agent):
         """#2674 finding 2: a strict ALLOW releases AND persists ONLY the reviewed
         post-tool text — the exact bytes the audit examined. Under an enforcing
         (buffered) audit the client saw nothing live, so persisting the typed part
@@ -615,10 +629,10 @@ class TestStrictStreamingAuditBuffering:
         from kestrel_sovereign.agent.parts import build_part_sentinel
 
         add_convo_calls = []
-        agent, _hook = _make_streaming_audit_agent(
+        agent, _hook = (await _make_streaming_audit_agent(
             add_convo_calls, mode="strict",
             audit_response={"risk_level": 1, "reasoning": "clean"},
-        )
+        native_tool_effect_agent=native_tool_effect_agent))
 
         async def mock_stream(**kwargs):
             yield "Updating the list. "
@@ -668,7 +682,7 @@ class TestStrictStreamingAuditBuffering:
         assert "smuggled-past-audit" not in _json.dumps(persisted[0], default=str)
 
     @pytest.mark.asyncio
-    async def test_strict_deny_with_tools_drops_pre_tool_reasoning_metadata(self):
+    async def test_strict_deny_with_tools_drops_pre_tool_reasoning_metadata(self, *, native_tool_effect_agent):
         """#2674 finding 2: a strict DENY on a tool turn must NOT persist the
         rejected pre-tool prose in ``pre_tool_reasoning`` / ``context_replay``.
         ContextBuilder reinjects that metadata into the next LLM turn's context
@@ -681,10 +695,10 @@ class TestStrictStreamingAuditBuffering:
         secret_pre_tool = "SECRET-PRETOOL-REASONING-should-not-persist"
 
         add_convo_calls = []
-        agent, _hook = _make_streaming_audit_agent(
+        agent, _hook = (await _make_streaming_audit_agent(
             add_convo_calls, mode="strict",
             audit_response={"risk_level": 3, "reasoning": "unsafe"},
-        )
+        native_tool_effect_agent=native_tool_effect_agent))
 
         async def mock_stream(**kwargs):
             yield secret_pre_tool + ". "
@@ -722,7 +736,7 @@ class TestStrictStreamingAuditBuffering:
         assert secret_pre_tool not in _json.dumps(persisted[0], default=str)
 
     @pytest.mark.asyncio
-    async def test_strict_deny_drops_secret_bearing_tool_event_metadata(self):
+    async def test_strict_deny_drops_secret_bearing_tool_event_metadata(self, *, native_tool_effect_agent):
         """#2674 P1 (denied tool metadata): a codex-native tool turn embeds a
         TOOL *error* sentinel whose ``detail`` carries a secret (an exception /
         stack string the frontend renders on the tool card). That sentinel is
@@ -742,10 +756,10 @@ class TestStrictStreamingAuditBuffering:
         secret = "SECRET-TOOL-ERROR-detail-should-not-persist-abc123"
 
         add_convo_calls = []
-        agent, _hook = _make_streaming_audit_agent(
+        agent, _hook = (await _make_streaming_audit_agent(
             add_convo_calls, mode="strict",
             audit_response={"risk_level": 3, "reasoning": "unsafe"},
-        )
+        native_tool_effect_agent=native_tool_effect_agent))
 
         error_sentinel = _build_tool_sentinel(
             "error", "shell", index=0, detail=secret,
@@ -790,7 +804,7 @@ class TestStrictStreamingAuditBuffering:
         assert secret not in _json.dumps(persisted[0], default=str)
 
     @pytest.mark.asyncio
-    async def test_strict_cancel_before_dispatch_persists_no_unaudited_text(self):
+    async def test_strict_cancel_before_dispatch_persists_no_unaudited_text(self, *, native_tool_effect_agent):
         """#2674 finding 1: when a strict turn is cancelled after the LLM reports
         tool calls but BEFORE dispatch, the withheld partial pre-tool prose was
         never audited. It must not be persisted as assistant content (it would
@@ -801,10 +815,10 @@ class TestStrictStreamingAuditBuffering:
         partial_prose = "PARTIAL-UNAUDITED-PRETOOL-PROSE"
 
         add_convo_calls = []
-        agent, _hook = _make_streaming_audit_agent(
+        agent, _hook = (await _make_streaming_audit_agent(
             add_convo_calls, mode="strict",
             audit_response={"risk_level": 1, "reasoning": "clean"},
-        )
+        native_tool_effect_agent=native_tool_effect_agent))
 
         exhausted = {"done": False}
 
@@ -844,16 +858,16 @@ class TestStrictStreamingAuditBuffering:
         assert (persisted[0].get("metadata") or {}).get("cancelled") is True
 
     @pytest.mark.asyncio
-    async def test_fire_post_response_hook_returns_explicit_verdict(self):
+    async def test_fire_post_response_hook_returns_explicit_verdict(self, *, native_tool_effect_agent):
         """#2674 finding 3: the release/metadata rules must key off an EXPLICIT
         verdict, not ``text == original``. ``_fire_post_response_hook`` returns a
         str carrying ``denied`` / ``modified`` so a DENY whose block message
         equals the original prose is still unambiguously a DENY."""
         add_convo_calls = []
-        agent, _hook = _make_streaming_audit_agent(
+        agent, _hook = (await _make_streaming_audit_agent(
             add_convo_calls, mode="strict",
             audit_response={"risk_level": 3, "reasoning": "unsafe"},
-        )
+        native_tool_effect_agent=native_tool_effect_agent))
         denied = await agent._fire_post_response_hook(
             "A long enough answer to reach the audit gate.", "s1",
         )
@@ -869,19 +883,19 @@ class TestStrictStreamingAuditBuffering:
         assert getattr(allowed, "denied", False) is False
 
     @pytest.mark.asyncio
-    async def test_strict_block_message_does_not_reflect_audit_reasoning(self):
+    async def test_strict_block_message_does_not_reflect_audit_reasoning(self, *, native_tool_effect_agent):
         """#2674 finding 2: the audit hook's reasoning is UNTRUSTED — the audit
         LLM may quote raw response content (secrets and all) into it. The block
         message is the ONLY text a buffered turn releases AND persists, so it
         must be a CONSTANT sanitized string that never reflects the reasoning.
         The full reason still reaches the operator log (a different boundary)."""
         add_convo_calls = []
-        agent, _hook = _make_streaming_audit_agent(
+        agent, _hook = (await _make_streaming_audit_agent(
             add_convo_calls, mode="strict",
             audit_response={
                 "risk_level": 3, "reasoning": "response leaked SECRET-abc123",
             },
-        )
+        native_tool_effect_agent=native_tool_effect_agent))
         denied = await agent._fire_post_response_hook(
             "A long enough answer to reach the audit gate.", "s1",
         )
@@ -893,7 +907,7 @@ class TestStrictStreamingAuditBuffering:
         )
 
     @pytest.mark.asyncio
-    async def test_strict_deny_drops_parts_even_on_equality_collision(self):
+    async def test_strict_deny_drops_parts_even_on_equality_collision(self, *, native_tool_effect_agent):
         """#2674 finding 3 (reproduced): a strict DENY whose block message
         happens to EQUAL the original post-tool prose must still drop the typed
         part and release only the block message. The old ``final == original``
@@ -909,10 +923,10 @@ class TestStrictStreamingAuditBuffering:
         collision = "[Response blocked by audit: response withheld by audit policy]"
 
         add_convo_calls = []
-        agent, _hook = _make_streaming_audit_agent(
+        agent, _hook = (await _make_streaming_audit_agent(
             add_convo_calls, mode="strict",
             audit_response={"risk_level": 3, "reasoning": "collide"},
-        )
+        native_tool_effect_agent=native_tool_effect_agent))
 
         async def mock_stream(**kwargs):
             yield "pre. "
@@ -953,7 +967,7 @@ class TestStrictStreamingAuditBuffering:
         assert "leak-me" not in _json.dumps(persisted[0], default=str)
 
     @pytest.mark.asyncio
-    async def test_warn_to_strict_switch_midturn_takes_effect_next_turn(self):
+    async def test_warn_to_strict_switch_midturn_takes_effect_next_turn(self, *, native_tool_effect_agent):
         """#2674 (self-review P1): a tool that flips an already-registered audit
         hook from warn to strict INSIDE a tool turn must not enforce
         retroactively. ``buffer_audit`` was decided (False) before any byte
@@ -966,10 +980,10 @@ class TestStrictStreamingAuditBuffering:
         from kestrel_sovereign.llm.adapter import LLMResponse, ToolCall
 
         add_convo_calls = []
-        agent, hook = _make_streaming_audit_agent(
+        agent, hook = (await _make_streaming_audit_agent(
             add_convo_calls, mode="warn",
             audit_response={"risk_level": 3, "reasoning": "unsafe"},
-        )
+        native_tool_effect_agent=native_tool_effect_agent))
 
         async def mock_stream(**kwargs):
             yield "Pre-tool prose. "
@@ -1012,7 +1026,7 @@ class TestStrictStreamingAuditBuffering:
         assert hook.mode == "strict"
 
     @pytest.mark.asyncio
-    async def test_strict_deny_discards_hook_emitted_parts_no_tool(self):
+    async def test_strict_deny_discards_hook_emitted_parts_no_tool(self, *, native_tool_effect_agent):
         """#2674 (self-review P2): a POST_RESPONSE hook that runs BEFORE the
         denying audit hook can stash the response text into an emitted part. On a
         strict DENY the drained hook-emitted parts must be discarded, not
@@ -1037,10 +1051,10 @@ class TestStrictStreamingAuditBuffering:
                 return HookOutput.allow()
 
         add_convo_calls = []
-        agent, _hook = _make_streaming_audit_agent(
+        agent, _hook = (await _make_streaming_audit_agent(
             add_convo_calls, mode="strict",
             audit_response={"risk_level": 3, "reasoning": "unsafe"},
-        )
+        native_tool_effect_agent=native_tool_effect_agent))
         agent.hooks_manager.register(_PartEmittingHook())
 
         async def mock_stream(**kwargs):
@@ -1072,7 +1086,7 @@ class TestStrictStreamingAuditBuffering:
             assert word not in blob
 
     @pytest.mark.asyncio
-    async def test_strict_deny_discards_hook_emitted_parts_with_tools(self):
+    async def test_strict_deny_discards_hook_emitted_parts_with_tools(self, *, native_tool_effect_agent):
         """#2674 (self-review P2): same leak on the tool branch — a
         part-emitting POST_RESPONSE hook running before the denying audit hook
         must not persist its part when the audit DENIES."""
@@ -1095,10 +1109,10 @@ class TestStrictStreamingAuditBuffering:
                 return HookOutput.allow()
 
         add_convo_calls = []
-        agent, _hook = _make_streaming_audit_agent(
+        agent, _hook = (await _make_streaming_audit_agent(
             add_convo_calls, mode="strict",
             audit_response={"risk_level": 3, "reasoning": "unsafe"},
-        )
+        native_tool_effect_agent=native_tool_effect_agent))
         agent.hooks_manager.register(_PartEmittingHook())
 
         async def mock_stream(**kwargs):
@@ -1133,7 +1147,7 @@ class TestStrictStreamingAuditBuffering:
         assert "SECRET-POST-TOOL" not in _json.dumps(persisted[0], default=str)
 
     @pytest.mark.asyncio
-    async def test_skip_to_enable_strict_midturn_no_retroactive_deny(self):
+    async def test_skip_to_enable_strict_midturn_no_retroactive_deny(self, *, native_tool_effect_agent):
         """#2674 (self-review P1): a tool that calls ``audit_enable("strict")``
         while audit started in ``skip`` REGISTERS a brand-new strict hook
         mid-turn. ``buffer_audit`` was False (no POST_RESPONSE hook at turn
@@ -1152,10 +1166,10 @@ class TestStrictStreamingAuditBuffering:
         add_convo_calls = []
         # Empty manager at turn start. The audit provider would DENY (risk 3) if
         # it ever ran on this turn — with the fix it is never consulted.
-        agent, _none = _make_streaming_audit_agent(
+        agent, _none = (await _make_streaming_audit_agent(
             add_convo_calls, mode="strict", register_hook=False,
             audit_response={"risk_level": 3, "reasoning": "unsafe"},
-        )
+        native_tool_effect_agent=native_tool_effect_agent))
         feature = ResponseAuditFeature(agent)
         feature._mode = "skip"
         feature._hook = None
@@ -1207,7 +1221,7 @@ class TestStrictStreamingAuditBuffering:
         assert any(getattr(h, "mode", None) == "strict" for h in enabled)
 
     @pytest.mark.asyncio
-    async def test_strict_to_disable_midturn_still_audits_that_turn(self):
+    async def test_strict_to_disable_midturn_still_audits_that_turn(self, *, native_tool_effect_agent):
         """#2674 (self-review P1): a tool that calls ``audit_disable`` mid-turn
         drops the hook from the live enabled list. But the turn was BUFFERED
         because it was strict at turn start, so enforcement must still run the
@@ -1221,10 +1235,10 @@ class TestStrictStreamingAuditBuffering:
         )
 
         add_convo_calls = []
-        agent, _none = _make_streaming_audit_agent(
+        agent, _none = (await _make_streaming_audit_agent(
             add_convo_calls, mode="strict", register_hook=False,
             audit_response={"risk_level": 3, "reasoning": "unsafe"},
-        )
+        native_tool_effect_agent=native_tool_effect_agent))
         feature = ResponseAuditFeature(agent)
         feature._mode = "skip"
         feature._hook = None
@@ -1275,7 +1289,7 @@ class TestStrictStreamingAuditBuffering:
         assert agent.hooks_manager.get_enabled_hooks(HookEvent.POST_RESPONSE) == []
 
     @pytest.mark.asyncio
-    async def test_strict_approval_ask_withholds_text_fail_closed(self):
+    async def test_strict_approval_ask_withholds_text_fail_closed(self, *, native_tool_effect_agent):
         """#2674 (self-review P1): a POST_RESPONSE approval hook that BUFFERS the
         turn (``awaits_user_input`` → ``_hook_is_enforcing`` → buffer) and returns
         ASK must fail CLOSED. ASK means "not approved yet", so none of the
@@ -1302,9 +1316,9 @@ class TestStrictStreamingAuditBuffering:
                 )
 
         add_convo_calls = []
-        agent, _none = _make_streaming_audit_agent(
+        agent, _none = (await _make_streaming_audit_agent(
             add_convo_calls, mode="strict", register_hook=False,
-        )
+        native_tool_effect_agent=native_tool_effect_agent))
         agent.hooks_manager.register(_ApprovalHook())
 
         exhausted = {"done": False}
@@ -1349,11 +1363,11 @@ class TestCommandWrapperEnforcingVerdict:
     non-enforcing.
     """
 
-    def _make_command_agent(self, process_input):
+    async def _make_command_agent(self, process_input, *, native_tool_effect_agent):
         from unittest.mock import MagicMock
         from kestrel_sovereign.agent.streaming import StreamingMixin
 
-        agent = MagicMock()
+        agent = await native_tool_effect_agent(did="did:test:streaming-command")
         agent._maybe_audit = AsyncMock()
         agent._genesis_audit_cognition_block = AsyncMock(return_value=None)
         # Model the DIVERGENCE: the live registry is now EMPTY, so a fresh
@@ -1375,7 +1389,7 @@ class TestCommandWrapperEnforcingVerdict:
         return chunks
 
     @pytest.mark.asyncio
-    async def test_enforcing_audited_result_drops_parts_despite_empty_live_registry(self):
+    async def test_enforcing_audited_result_drops_parts_despite_empty_live_registry(self, *, native_tool_effect_agent):
         """An audited ``_PostResponseText(enforcing=True)`` whose live registry is
         now empty must still WITHHOLD the turn's typed parts. The old wrapper
         re-snapshotted the (now empty) registry, decided "non-enforcing", and
@@ -1391,7 +1405,7 @@ class TestCommandWrapperEnforcingVerdict:
                 "Reviewed and approved prose.", enforcing=True,
             )
 
-        agent = self._make_command_agent(process_input)
+        agent = (await self._make_command_agent(process_input, native_tool_effect_agent=native_tool_effect_agent))
         chunks = await self._run(agent)
         joined = "".join(chunks)
 
@@ -1400,7 +1414,7 @@ class TestCommandWrapperEnforcingVerdict:
         assert "leak-me" not in joined
 
     @pytest.mark.asyncio
-    async def test_nonenforcing_audited_result_releases_parts(self):
+    async def test_nonenforcing_audited_result_releases_parts(self, *, native_tool_effect_agent):
         """A warn-mode audited turn (``enforcing=False``) is not fail-closed, so
         its typed parts still flow — the ALLOW passthrough is preserved."""
         from kestrel_sovereign.agent.streaming import _PostResponseText
@@ -1412,7 +1426,7 @@ class TestCommandWrapperEnforcingVerdict:
                 "Reviewed prose.", enforcing=False,
             )
 
-        agent = self._make_command_agent(process_input)
+        agent = (await self._make_command_agent(process_input, native_tool_effect_agent=native_tool_effect_agent))
         chunks = await self._run(agent)
         joined = "".join(chunks)
 
@@ -1421,7 +1435,7 @@ class TestCommandWrapperEnforcingVerdict:
         assert "visible" in joined
 
     @pytest.mark.asyncio
-    async def test_pure_local_command_result_releases_parts(self):
+    async def test_pure_local_command_result_releases_parts(self, *, native_tool_effect_agent):
         """A pure-local command returns a plain ``str`` (never an audited LLM
         turn): ``enforcing`` / ``denied`` fall back to ``False`` via ``getattr``,
         so its parts — e.g. a ``!todo add`` card — always flow, even when a
@@ -1432,7 +1446,7 @@ class TestCommandWrapperEnforcingVerdict:
             emit_part("todo", {"note": "card"}, "t1")
             return "Added todo."  # plain str — pure-local command result
 
-        agent = self._make_command_agent(process_input)
+        agent = (await self._make_command_agent(process_input, native_tool_effect_agent=native_tool_effect_agent))
         # A strict audit is live in the registry — proves the pure-local result
         # is judged by its OWN (non-enforcing) verdict, not the live registry.
         agent.hooks_manager.get_enabled_hooks.return_value = [MagicMock(fail_closed=True)]
@@ -1444,7 +1458,7 @@ class TestCommandWrapperEnforcingVerdict:
         assert "card" in joined
 
     @pytest.mark.asyncio
-    async def test_denied_audited_result_drops_parts(self):
+    async def test_denied_audited_result_drops_parts(self, *, native_tool_effect_agent):
         """A DENY verdict drops parts regardless of the enforcing flag — the
         client receives only the block message."""
         from kestrel_sovereign.agent.streaming import _PostResponseText
@@ -1457,7 +1471,7 @@ class TestCommandWrapperEnforcingVerdict:
                 denied=True, modified=True, enforcing=True,
             )
 
-        agent = self._make_command_agent(process_input)
+        agent = (await self._make_command_agent(process_input, native_tool_effect_agent=native_tool_effect_agent))
         chunks = await self._run(agent)
         joined = "".join(chunks)
 
@@ -1518,10 +1532,8 @@ def _wire_real_command_llm_path(agent, *, llm_content: str):
     from kestrel_sovereign.llm.adapter import LLMResponse
 
     # Collaborators the non-streaming path touches beyond the streaming fixture.
-    agent.storage = MagicMock()
     agent.bootstrap_service = None  # skip the bootstrap branch
     agent._session_briefed = True
-    agent._privacy_mode = MagicMock()
     agent.context_stats = MagicMock()
     agent._maybe_refresh_user_byok_resolver = AsyncMock()
     agent._maybe_compact_codex_thread = AsyncMock()
@@ -1568,14 +1580,14 @@ class TestCommandRealProcessInputFailClosed:
         return chunks
 
     @pytest.mark.asyncio
-    async def test_continue_enforcing_ask_fails_closed_real_path(self):
+    async def test_continue_enforcing_ask_fails_closed_real_path(self, *, native_tool_effect_agent):
         """An enforcing approval hook returning ASK on the real command LLM turn
         must fail CLOSED: the raw LLM output is neither yielded to the client nor
         persisted — only the fail-closed block message is."""
         add_convo_calls = []
-        agent, _none = _make_streaming_audit_agent(
+        agent, _none = (await _make_streaming_audit_agent(
             add_convo_calls, mode="strict", register_hook=False,
-        )
+        native_tool_effect_agent=native_tool_effect_agent))
         agent.hooks_manager.register(_CommandApprovalHook())
         _wire_real_command_llm_path(agent, llm_content=_RAW_LLM_OUTPUT)
 
@@ -1593,16 +1605,16 @@ class TestCommandRealProcessInputFailClosed:
         assert _RAW_LLM_OUTPUT not in persisted[0]["content"]
 
     @pytest.mark.asyncio
-    async def test_continue_snapshot_pins_enforcement_when_hook_unregistered_midturn(self):
+    async def test_continue_snapshot_pins_enforcement_when_hook_unregistered_midturn(self, *, native_tool_effect_agent):
         """Turn-start snapshot semantics (command path): a tool that UNREGISTERS
         the enforcing approval hook mid-turn (during the LLM/tool turn) must not
         disarm THIS turn — ``_fire_post_response_hook`` runs the turn-start
         snapshot, so the pinned hook still ASKs and the turn fails closed. The
         removal takes effect on the NEXT turn (the live registry is now empty)."""
         add_convo_calls = []
-        agent, _none = _make_streaming_audit_agent(
+        agent, _none = (await _make_streaming_audit_agent(
             add_convo_calls, mode="strict", register_hook=False,
-        )
+        native_tool_effect_agent=native_tool_effect_agent))
         approval = _CommandApprovalHook()
         agent.hooks_manager.register(approval)
         _wire_real_command_llm_path(agent, llm_content=_RAW_LLM_OUTPUT)
@@ -1630,7 +1642,7 @@ class TestCommandRealProcessInputFailClosed:
         assert agent.hooks_manager.get_enabled_hooks(HookEvent.POST_RESPONSE) == []
 
     @pytest.mark.asyncio
-    async def test_continue_snapshot_pins_mode_when_flipped_midturn(self):
+    async def test_continue_snapshot_pins_mode_when_flipped_midturn(self, *, native_tool_effect_agent):
         """Turn-start snapshot semantics (command path): a strict audit hook
         flipped to ``warn`` mid-turn must still DENY THIS turn — the fire pins
         each snapshotted hook to its turn-start mode (strict). The switch is
@@ -1639,10 +1651,10 @@ class TestCommandRealProcessInputFailClosed:
         from kestrel_sovereign.features.response_audit.hook import ResponseAuditHook
 
         add_convo_calls = []
-        agent, _none = _make_streaming_audit_agent(
+        agent, _none = (await _make_streaming_audit_agent(
             add_convo_calls, mode="strict", register_hook=False,
             audit_response={"risk_level": 3, "reasoning": "unsafe"},
-        )
+        native_tool_effect_agent=native_tool_effect_agent))
         # A real strict ResponseAuditHook (fail_closed) registered at turn start.
         audit_hook = ResponseAuditHook(agent=agent, mode="strict", risk_threshold=3)
         agent.hooks_manager.register(audit_hook)
@@ -1710,14 +1722,14 @@ class TestNonStreamingStopHookSanitized:
         }, default=str)
 
     @pytest.mark.asyncio
-    async def test_enforcing_allow_nulls_stop_tool_payload(self):
+    async def test_enforcing_allow_nulls_stop_tool_payload(self, *, native_tool_effect_agent):
         secret = "NONSTREAM-SECRET-tool-result-xyz789"
         stop_inputs: list = []
         add_convo_calls = []
-        agent, _hook = _make_streaming_audit_agent(
+        agent, _hook = (await _make_streaming_audit_agent(
             add_convo_calls, mode="strict",
             audit_response={"risk_level": 1, "reasoning": "clean"},
-        )
+        native_tool_effect_agent=native_tool_effect_agent))
         agent.hooks_manager.register(_RecordingStopHook(stop_inputs))
         _wire_real_command_llm_path(agent, llm_content=_BENIGN_NONSTREAM_ANSWER)
         agent._handle_orchestrator_response = _nonstream_secret_orchestrator(secret)
@@ -1733,17 +1745,17 @@ class TestNonStreamingStopHookSanitized:
         assert secret not in self._dump(stop)
 
     @pytest.mark.asyncio
-    async def test_advisory_retains_stop_tool_payload(self):
+    async def test_advisory_retains_stop_tool_payload(self, *, native_tool_effect_agent):
         """Warn (non-enforcing) mode keeps the STOP tool payload intact — the
         null-out is specific to the enforcing buffered path, not a blanket
         change to the non-streaming STOP contract."""
         marker = "NONSTREAM-warn-tool-visible-marker"
         stop_inputs: list = []
         add_convo_calls = []
-        agent, _hook = _make_streaming_audit_agent(
+        agent, _hook = (await _make_streaming_audit_agent(
             add_convo_calls, mode="warn",
             audit_response={"risk_level": 1, "reasoning": "clean"},
-        )
+        native_tool_effect_agent=native_tool_effect_agent))
         agent.hooks_manager.register(_RecordingStopHook(stop_inputs))
         _wire_real_command_llm_path(agent, llm_content=_BENIGN_NONSTREAM_ANSWER)
         agent._handle_orchestrator_response = _nonstream_secret_orchestrator(marker)
@@ -1766,13 +1778,13 @@ class TestNonStreamingContentPreviewRedaction:
     the verdict), while advisory / no-audit turns keep the operator diagnostic."""
 
     @pytest.mark.asyncio
-    async def test_enforcing_redacts_content_preview(self):
+    async def test_enforcing_redacts_content_preview(self, *, native_tool_effect_agent):
         raw = "Use the tool! secret-token-abc123 leaked in prose here."
         add_convo_calls = []
-        agent, _hook = _make_streaming_audit_agent(
+        agent, _hook = (await _make_streaming_audit_agent(
             add_convo_calls, mode="strict",
             audit_response={"risk_level": 1, "reasoning": "clean"},
-        )
+        native_tool_effect_agent=native_tool_effect_agent))
         agent.observability_store.log_error = AsyncMock()
         _wire_real_command_llm_path(agent, llm_content=raw)
 
@@ -1785,13 +1797,13 @@ class TestNonStreamingContentPreviewRedaction:
         assert "redacted" in meta["content_preview"]
 
     @pytest.mark.asyncio
-    async def test_advisory_keeps_content_preview(self):
+    async def test_advisory_keeps_content_preview(self, *, native_tool_effect_agent):
         raw = "Use the tool! diagnostic-visible-marker in prose here."
         add_convo_calls = []
-        agent, _hook = _make_streaming_audit_agent(
+        agent, _hook = (await _make_streaming_audit_agent(
             add_convo_calls, mode="warn",
             audit_response={"risk_level": 1, "reasoning": "clean"},
-        )
+        native_tool_effect_agent=native_tool_effect_agent))
         agent.observability_store.log_error = AsyncMock()
         _wire_real_command_llm_path(agent, llm_content=raw)
 
@@ -1848,15 +1860,15 @@ class TestStrictRevisingEventSuppression:
     revise sentinel is suppressed too. Warn mode still emits both, as before."""
 
     @pytest.mark.asyncio
-    async def test_strict_allow_emits_no_revising_event(self):
+    async def test_strict_allow_emits_no_revising_event(self, *, native_tool_effect_agent):
         """Strict ALLOW: the turn completes and releases the reviewed text, but
         no revising event fired at any point (before OR after the ALLOW), and no
         in-band revise sentinel leaked."""
         add_convo_calls = []
-        agent, _hook = _make_streaming_audit_agent(
+        agent, _hook = (await _make_streaming_audit_agent(
             add_convo_calls, mode="strict",
             audit_response={"risk_level": 1, "reasoning": "clean"},
-        )
+        native_tool_effect_agent=native_tool_effect_agent))
         agent.llm_service.stream_with_tool_detection = _tool_turn_stream()
         agent._handle_orchestrator_response_streaming = _clean_post_tool_orchestrator
 
@@ -1872,14 +1884,14 @@ class TestStrictRevisingEventSuppression:
         assert "\x1eKESTREL:REVISE:" not in joined
 
     @pytest.mark.asyncio
-    async def test_strict_deny_emits_no_revising_event(self):
+    async def test_strict_deny_emits_no_revising_event(self, *, native_tool_effect_agent):
         """Strict DENY: only the block message reaches the client, and — as on
         ALLOW — no revising event fired and no revise sentinel leaked."""
         add_convo_calls = []
-        agent, _hook = _make_streaming_audit_agent(
+        agent, _hook = (await _make_streaming_audit_agent(
             add_convo_calls, mode="strict",
             audit_response={"risk_level": 3, "reasoning": "unsafe"},
-        )
+        native_tool_effect_agent=native_tool_effect_agent))
         agent.llm_service.stream_with_tool_detection = _tool_turn_stream()
         agent._handle_orchestrator_response_streaming = _clean_post_tool_orchestrator
 
@@ -1893,15 +1905,15 @@ class TestStrictRevisingEventSuppression:
         assert "\x1eKESTREL:REVISE:" not in joined
 
     @pytest.mark.asyncio
-    async def test_warn_still_emits_revising_event(self):
+    async def test_warn_still_emits_revising_event(self, *, native_tool_effect_agent):
         """Warn mode is not fail-closed (buffer_audit False): the revising event
         fires with the marker's tool id/name and the in-band sentinel rides the
         live chat stream — the established behavior, preserved."""
         add_convo_calls = []
-        agent, _hook = _make_streaming_audit_agent(
+        agent, _hook = (await _make_streaming_audit_agent(
             add_convo_calls, mode="warn",
             audit_response={"risk_level": 1, "reasoning": "clean"},
-        )
+        native_tool_effect_agent=native_tool_effect_agent))
         agent.llm_service.stream_with_tool_detection = _tool_turn_stream()
         agent._handle_orchestrator_response_streaming = _clean_post_tool_orchestrator
 
@@ -1940,12 +1952,12 @@ class TestToolJoinSeparatorUnderAudit:
     has no join to separate: it gets the reviewed synthesis alone."""
 
     @pytest.mark.asyncio
-    async def test_strict_allow_releases_no_join_separator(self):
+    async def test_strict_allow_releases_no_join_separator(self, *, native_tool_effect_agent):
         add_convo_calls = []
-        agent, _hook = _make_streaming_audit_agent(
+        agent, _hook = (await _make_streaming_audit_agent(
             add_convo_calls, mode="strict",
             audit_response={"risk_level": 1, "reasoning": "clean"},
-        )
+        native_tool_effect_agent=native_tool_effect_agent))
         agent.llm_service.stream_with_tool_detection = _markerless_tool_turn_stream()
         agent._handle_orchestrator_response_streaming = _clean_post_tool_orchestrator
 
@@ -1958,12 +1970,12 @@ class TestToolJoinSeparatorUnderAudit:
         assert persisted[0]["content"] == yielded[0]
 
     @pytest.mark.asyncio
-    async def test_warn_streams_join_separator_before_the_synthesis(self):
+    async def test_warn_streams_join_separator_before_the_synthesis(self, *, native_tool_effect_agent):
         add_convo_calls = []
-        agent, _hook = _make_streaming_audit_agent(
+        agent, _hook = (await _make_streaming_audit_agent(
             add_convo_calls, mode="warn",
             audit_response={"risk_level": 1, "reasoning": "clean"},
-        )
+        native_tool_effect_agent=native_tool_effect_agent))
         agent.llm_service.stream_with_tool_detection = _markerless_tool_turn_stream()
         agent._handle_orchestrator_response_streaming = _clean_post_tool_orchestrator
 
@@ -2050,14 +2062,14 @@ class TestStrictStopHookSanitized:
         }, default=str)
 
     @pytest.mark.asyncio
-    async def test_strict_allow_stop_hook_omits_secret_tool_data(self):
+    async def test_strict_allow_stop_hook_omits_secret_tool_data(self, *, native_tool_effect_agent):
         secret = "SECRET-TOOL-RESULT-must-not-reach-stop-hook-xyz789"
         stop_inputs: list = []
         add_convo_calls = []
-        agent, _hook = _make_streaming_audit_agent(
+        agent, _hook = (await _make_streaming_audit_agent(
             add_convo_calls, mode="strict",
             audit_response={"risk_level": 1, "reasoning": "clean"},
-        )
+        native_tool_effect_agent=native_tool_effect_agent))
         agent.hooks_manager.register(_RecordingStopHook(stop_inputs))
         agent.llm_service.stream_with_tool_detection = _secret_tool_turn_stream()
         agent._handle_orchestrator_response_streaming = _secret_tool_orchestrator(secret)
@@ -2086,14 +2098,14 @@ class TestStrictStopHookSanitized:
         assert secret not in _json.dumps(persisted[0], default=str)
 
     @pytest.mark.asyncio
-    async def test_strict_deny_stop_hook_omits_secret_tool_data(self):
+    async def test_strict_deny_stop_hook_omits_secret_tool_data(self, *, native_tool_effect_agent):
         secret = "SECRET-TOOL-RESULT-denied-turn-must-not-leak-abc456"
         stop_inputs: list = []
         add_convo_calls = []
-        agent, _hook = _make_streaming_audit_agent(
+        agent, _hook = (await _make_streaming_audit_agent(
             add_convo_calls, mode="strict",
             audit_response={"risk_level": 3, "reasoning": "unsafe"},
-        )
+        native_tool_effect_agent=native_tool_effect_agent))
         agent.hooks_manager.register(_RecordingStopHook(stop_inputs))
         agent.llm_service.stream_with_tool_detection = _secret_tool_turn_stream()
         agent._handle_orchestrator_response_streaming = _secret_tool_orchestrator(secret)
@@ -2120,17 +2132,17 @@ class TestStrictStopHookSanitized:
         assert secret not in _json.dumps(persisted[0], default=str)
 
     @pytest.mark.asyncio
-    async def test_warn_stop_hook_retains_tool_data(self):
+    async def test_warn_stop_hook_retains_tool_data(self, *, native_tool_effect_agent):
         """Warn mode (buffer_audit False) keeps the STOP tool_calls/tool_results
         intact — proving the null-out is specific to the enforcing buffered path,
         not a blanket change to the STOP contract."""
         marker = "warn-tool-result-visible-to-stop"
         stop_inputs: list = []
         add_convo_calls = []
-        agent, _hook = _make_streaming_audit_agent(
+        agent, _hook = (await _make_streaming_audit_agent(
             add_convo_calls, mode="warn",
             audit_response={"risk_level": 1, "reasoning": "clean"},
-        )
+        native_tool_effect_agent=native_tool_effect_agent))
         agent.hooks_manager.register(_RecordingStopHook(stop_inputs))
         agent.llm_service.stream_with_tool_detection = _secret_tool_turn_stream()
         agent._handle_orchestrator_response_streaming = _secret_tool_orchestrator(marker)
@@ -2172,15 +2184,15 @@ class TestSnapshotFailClosed:
         assert _snapshot_post_response_hooks(None) == []
 
     @pytest.mark.asyncio
-    async def test_streaming_snapshot_failure_fails_closed_no_llm_no_persist(self):
+    async def test_streaming_snapshot_failure_fails_closed_no_llm_no_persist(self, *, native_tool_effect_agent):
         """Streaming entry path: a turn-start registry read failure raises
         before the LLM stream is opened and persists no assistant row."""
         from kestrel_sovereign.agent.streaming import PostResponseHookSnapshotError
 
         add_convo_calls = []
-        agent, _none = _make_streaming_audit_agent(
+        agent, _none = (await _make_streaming_audit_agent(
             add_convo_calls, mode="strict", register_hook=False,
-        )
+        native_tool_effect_agent=native_tool_effect_agent))
         # The turn-start POST_RESPONSE registry read blows up (infra failure).
         agent.hooks_manager.get_enabled_hooks = MagicMock(
             side_effect=RuntimeError("hook registry unavailable")
@@ -2210,7 +2222,7 @@ class TestSnapshotFailClosed:
         assert add_convo_calls == []
 
     @pytest.mark.asyncio
-    async def test_command_continue_snapshot_failure_fails_closed_no_llm_no_persist(self):
+    async def test_command_continue_snapshot_failure_fails_closed_no_llm_no_persist(self, *, native_tool_effect_agent):
         """Non-streaming command-produced LLM path: ``!continue`` delegates to
         the REAL ``process_input`` → ``_process_input_traced_locked``, whose
         turn-start snapshot read failure must raise before any LLM turn and
@@ -2218,9 +2230,9 @@ class TestSnapshotFailClosed:
         from kestrel_sovereign.agent.streaming import PostResponseHookSnapshotError
 
         add_convo_calls = []
-        agent, _none = _make_streaming_audit_agent(
+        agent, _none = (await _make_streaming_audit_agent(
             add_convo_calls, mode="strict", register_hook=False,
-        )
+        native_tool_effect_agent=native_tool_effect_agent))
         _wire_real_command_llm_path(agent, llm_content=_RAW_LLM_OUTPUT)
         agent.hooks_manager.get_enabled_hooks = MagicMock(
             side_effect=RuntimeError("hook registry unavailable")
@@ -2283,20 +2295,27 @@ def _bind_real_orchestrator(agent):
     return agent
 
 
-def _two_iteration_tool_feature():
-    """A feature whose ``test_tool`` succeeds — dispatched twice across a
-    two-iteration continuation."""
-    feature = MagicMock()
-    feature.tool_name = "test_tool"
-    feature.name = "test_feature"
-    feature.execute_as_subagent = AsyncMock(
-        return_value={"success": True, "data": "tool ok"}
-    )
-    feature.to_orchestrator_tool.return_value = {
-        "type": "function",
-        "function": {"name": "test_tool", "description": "t", "parameters": {}},
-    }
-    return feature
+def _two_iteration_tool_feature(agent):
+    """A registered native feature whose two dispatches actually run."""
+    from kestrel_sovereign.features.base import Feature
+
+    class TwoIterationFeature(Feature):
+        tool_name = "test_tool"
+        tool_description = "Two real continuation dispatches"
+
+        def __init__(self, owner):
+            super().__init__(owner)
+            self.name = "test_feature"
+            self.executions = 0
+
+        async def initialize(self):
+            pass
+
+        async def execute_as_subagent(self, **kwargs):
+            self.executions += 1
+            return {"success": True, "data": "tool ok"}
+
+    return TwoIterationFeature(agent)
 
 
 def _two_iteration_streams():
@@ -2339,12 +2358,12 @@ def _two_iteration_streams():
 class TestFinding1OrchestratorReviseSuppression:
     """#2674 finding 1: real two-iteration continuation honors the buffer."""
 
-    def _agent(self, add_convo, *, mode):
-        agent, hook = _make_streaming_audit_agent(
+    async def _agent(self, add_convo, *, mode, native_tool_effect_agent):
+        agent, hook = (await _make_streaming_audit_agent(
             add_convo, mode=mode,
             audit_response={"risk_level": 1, "reasoning": "clean"},
-        )
-        agent.features = {"test_feature": _two_iteration_tool_feature()}
+        native_tool_effect_agent=native_tool_effect_agent))
+        agent.features = {"test_feature": _two_iteration_tool_feature(agent)}
         _bind_real_orchestrator(agent)
         stream, _state = _two_iteration_streams()
         agent.llm_service.stream_with_tool_detection = stream
@@ -2354,12 +2373,13 @@ class TestFinding1OrchestratorReviseSuppression:
         chunks = []
         async for c in agent.process_input_streaming("hi there", session_id="s1"):
             chunks.append(c)
+        assert agent.features["test_feature"].executions == 2, "Both real feature dispatches must run"
         return chunks
 
     @pytest.mark.asyncio
-    async def test_strict_allow_two_iterations_suppresses_revise(self):
+    async def test_strict_allow_two_iterations_suppresses_revise(self, *, native_tool_effect_agent):
         add_convo = []
-        agent, _hook = self._agent(add_convo, mode="strict")
+        agent, _hook = (await self._agent(add_convo, mode="strict", native_tool_effect_agent=native_tool_effect_agent))
         chunks = await self._drive(agent)
         joined = "".join(str(c) for c in chunks)
 
@@ -2379,13 +2399,13 @@ class TestFinding1OrchestratorReviseSuppression:
         assert "final reviewed answer." in persisted[0]["content"]
 
     @pytest.mark.asyncio
-    async def test_strict_deny_two_iterations_blocks_and_suppresses_revise(self):
+    async def test_strict_deny_two_iterations_blocks_and_suppresses_revise(self, *, native_tool_effect_agent):
         add_convo = []
-        agent, _hook = _make_streaming_audit_agent(
+        agent, _hook = (await _make_streaming_audit_agent(
             add_convo, mode="strict",
             audit_response={"risk_level": 3, "reasoning": "harmful"},
-        )
-        agent.features = {"test_feature": _two_iteration_tool_feature()}
+        native_tool_effect_agent=native_tool_effect_agent))
+        agent.features = {"test_feature": _two_iteration_tool_feature(agent)}
         _bind_real_orchestrator(agent)
         stream, _state = _two_iteration_streams()
         agent.llm_service.stream_with_tool_detection = stream
@@ -2408,11 +2428,11 @@ class TestFinding1OrchestratorReviseSuppression:
         assert "final reviewed answer" not in persisted[0]["content"]
 
     @pytest.mark.asyncio
-    async def test_warn_two_iterations_still_emits_revise(self):
+    async def test_warn_two_iterations_still_emits_revise(self, *, native_tool_effect_agent):
         """Advisory (warn) turns are NOT buffered — the follow-up revise SSE +
         in-band sentinel must still fire (no behavior change off the gate)."""
         add_convo = []
-        agent, _hook = self._agent(add_convo, mode="warn")
+        agent, _hook = (await self._agent(add_convo, mode="warn", native_tool_effect_agent=native_tool_effect_agent))
         chunks = await self._drive(agent)
         joined = "".join(str(c) for c in chunks)
 
@@ -2473,12 +2493,12 @@ def _tool_then_timeout_streams(*, partial_marker: str = ""):
 class TestContinuationTimeoutFailsTheTurn:
     """#2674 / #3552: a continuation timeout fails the turn in every mode."""
 
-    def _agent(self, add_convo, *, mode, partial_marker=""):
-        agent, hook = _make_streaming_audit_agent(
+    async def _agent(self, add_convo, *, mode, partial_marker="", native_tool_effect_agent):
+        agent, hook = (await _make_streaming_audit_agent(
             add_convo, mode=mode,
             audit_response={"risk_level": 1, "reasoning": "clean"},
-        )
-        agent.features = {"test_feature": _two_iteration_tool_feature()}
+        native_tool_effect_agent=native_tool_effect_agent))
+        agent.features = {"test_feature": _two_iteration_tool_feature(agent)}
         _bind_real_orchestrator(agent)
         stream, _state = _tool_then_timeout_streams(partial_marker=partial_marker)
         agent.llm_service.stream_with_tool_detection = stream
@@ -2498,6 +2518,7 @@ class TestContinuationTimeoutFailsTheTurn:
         ), pytest.raises(LLMCallInactivityTimeout) as raised:
             async for c in agent.process_input_streaming("hi there", session_id="s1"):
                 chunks.append(c)
+        assert agent.features["test_feature"].executions == 1, "The effect must precede the continuation timeout"
         return chunks, raised.value
 
     @staticmethod
@@ -2516,11 +2537,11 @@ class TestContinuationTimeoutFailsTheTurn:
             assert marker not in str(persisted[0])
 
     @pytest.mark.asyncio
-    async def test_strict_timeout_fails_with_a_nonempty_safe_notice(self):
+    async def test_strict_timeout_fails_with_a_nonempty_safe_notice(self, *, native_tool_effect_agent):
         from kestrel_sovereign.llm.streaming_errors import agent_stream_error_block
 
         add_convo = []
-        agent, _hook = self._agent(add_convo, mode="strict")
+        agent, _hook = (await self._agent(add_convo, mode="strict", native_tool_effect_agent=native_tool_effect_agent))
         chunks, failure = await self._drive(agent)
         joined = "".join(str(c) for c in chunks)
 
@@ -2537,13 +2558,13 @@ class TestContinuationTimeoutFailsTheTurn:
         self._assert_only_the_checkpoint_persisted(add_convo)
 
     @pytest.mark.asyncio
-    async def test_strict_timeout_discards_partial_protected_text(self):
+    async def test_strict_timeout_discards_partial_protected_text(self, *, native_tool_effect_agent):
         """Partial synthesis prose buffered before the timeout is PROTECTED,
         unfinished, unreviewed content — it must never be released or
         persisted."""
         marker = "PROTECTED_PARTIAL_MARKER_must_never_surface"
         add_convo = []
-        agent, _hook = self._agent(add_convo, mode="strict", partial_marker=marker)
+        agent, _hook = (await self._agent(add_convo, mode="strict", partial_marker=marker, native_tool_effect_agent=native_tool_effect_agent))
         chunks, _failure = await self._drive(agent)
 
         assert marker not in "".join(str(c) for c in chunks), (
@@ -2552,13 +2573,13 @@ class TestContinuationTimeoutFailsTheTurn:
         self._assert_only_the_checkpoint_persisted(add_convo, marker)
 
     @pytest.mark.asyncio
-    async def test_advisory_timeout_shows_its_card_and_records_no_answer(self):
+    async def test_advisory_timeout_shows_its_card_and_records_no_answer(self, *, native_tool_effect_agent):
         """Warn (advisory) turns are NOT buffered: the partial prose and the ❌
         error tool card stream live, but the partial prose is not an answer
         and is never persisted as one (#3552)."""
         marker = "PARTIAL_SYNTHESIS_not_an_answer"
         add_convo = []
-        agent, _hook = self._agent(add_convo, mode="warn", partial_marker=marker)
+        agent, _hook = (await self._agent(add_convo, mode="warn", partial_marker=marker, native_tool_effect_agent=native_tool_effect_agent))
         chunks, _failure = await self._drive(agent)
         joined = "".join(str(c) for c in chunks)
 
@@ -2655,18 +2676,18 @@ class TestFinding2EnforcingPipeline:
 
     RAW = "The raw unaudited assistant answer with sensitive detail."
 
-    def _agent_with_gate(self, add_convo, *, mode="strict", audit_risk=1):
-        agent, hook = _make_streaming_audit_agent(
+    async def _agent_with_gate(self, add_convo, *, mode="strict", audit_risk=1, native_tool_effect_agent):
+        agent, hook = (await _make_streaming_audit_agent(
             add_convo, mode=mode,
             audit_response={"risk_level": audit_risk, "reasoning": "x"},
-        )
+        native_tool_effect_agent=native_tool_effect_agent))
         return agent, hook
 
     @pytest.mark.asyncio
-    async def test_low_priority_recorder_never_sees_raw_on_deny(self):
+    async def test_low_priority_recorder_never_sees_raw_on_deny(self, *, native_tool_effect_agent):
         """A lower-priority advisory recorder must receive the SANITIZED block,
         never the raw response, even though its priority is BEFORE the gate."""
-        agent, _hook = self._agent_with_gate([], mode="strict", audit_risk=3)
+        agent, _hook = (await self._agent_with_gate([], mode="strict", audit_risk=3, native_tool_effect_agent=native_tool_effect_agent))
         recorder = _RecorderHook(priority=10)  # BEFORE the strict gate (50)
         agent.hooks_manager.register(recorder)
 
@@ -2681,10 +2702,10 @@ class TestFinding2EnforcingPipeline:
         assert all("[Response blocked by audit:" in seen for seen in recorder.seen)
 
     @pytest.mark.asyncio
-    async def test_high_priority_modifier_cannot_rewrite_release(self):
+    async def test_high_priority_modifier_cannot_rewrite_release(self, *, native_tool_effect_agent):
         """A higher-priority advisory modifier (AFTER the gate) must not rewrite
         the gate-approved release; the reviewed text is released unchanged."""
-        agent, _hook = self._agent_with_gate([], mode="strict", audit_risk=1)
+        agent, _hook = (await self._agent_with_gate([], mode="strict", audit_risk=1, native_tool_effect_agent=native_tool_effect_agent))
         modifier = _ModifierHook(priority=90, new_text="UNAUDITED REWRITE")
         agent.hooks_manager.register(modifier)
 
@@ -2699,11 +2720,11 @@ class TestFinding2EnforcingPipeline:
         assert modifier.seen == [self.RAW]
 
     @pytest.mark.asyncio
-    async def test_gate_modify_releases_reviewed_rewrite_to_observers(self):
+    async def test_gate_modify_releases_reviewed_rewrite_to_observers(self, *, native_tool_effect_agent):
         """An enforcing gate MODIFY becomes the reviewed release; observers see
         the rewritten (reviewed) text, never the raw."""
         add_convo = []
-        agent, hook = _make_streaming_audit_agent(add_convo, mode="warn")
+        agent, hook = (await _make_streaming_audit_agent(add_convo, mode="warn", native_tool_effect_agent=native_tool_effect_agent))
         # Replace the warn hook with a scripted enforcing MODIFY gate.
         agent.hooks_manager.unregister(hook)
         gate = _EnforcingGateHook(priority=50, verdict="modify", text="REVIEWED REWRITE")
@@ -2720,9 +2741,9 @@ class TestFinding2EnforcingPipeline:
         assert all(self.RAW not in s for s in recorder.seen)
 
     @pytest.mark.asyncio
-    async def test_gate_ask_blocks_and_observer_sees_sanitized(self):
+    async def test_gate_ask_blocks_and_observer_sees_sanitized(self, *, native_tool_effect_agent):
         add_convo = []
-        agent, hook = _make_streaming_audit_agent(add_convo, mode="warn")
+        agent, hook = (await _make_streaming_audit_agent(add_convo, mode="warn", native_tool_effect_agent=native_tool_effect_agent))
         agent.hooks_manager.unregister(hook)
         gate = _EnforcingGateHook(priority=50, verdict="ask", text="secret reason")
         recorder = _RecorderHook(priority=10)
@@ -2738,10 +2759,10 @@ class TestFinding2EnforcingPipeline:
         assert recorder.seen and all(self.RAW not in s for s in recorder.seen)
 
     @pytest.mark.asyncio
-    async def test_observer_can_reblock_approved_release(self):
+    async def test_observer_can_reblock_approved_release(self, *, native_tool_effect_agent):
         """A stricter observer DENY re-blocks an otherwise-approved release
         (fail-safe), but only sees the reviewed text."""
-        agent, _hook = self._agent_with_gate([], mode="strict", audit_risk=1)
+        agent, _hook = (await self._agent_with_gate([], mode="strict", audit_risk=1, native_tool_effect_agent=native_tool_effect_agent))
 
         class _DenyObserver(Hook):
             def __init__(self):
@@ -2763,12 +2784,12 @@ class TestFinding2EnforcingPipeline:
         assert obs.seen == [self.RAW]
 
     @pytest.mark.asyncio
-    async def test_no_enforcing_hook_preserves_modify_chain(self):
+    async def test_no_enforcing_hook_preserves_modify_chain(self, *, native_tool_effect_agent):
         """With NO enforcing hook, the normal priority-ordered MODIFY chain is
         preserved: a lower-priority modifier's rewrite feeds the higher one and
         the final rewrite is returned."""
         add_convo = []
-        agent, hook = _make_streaming_audit_agent(add_convo, mode="warn")
+        agent, hook = (await _make_streaming_audit_agent(add_convo, mode="warn", native_tool_effect_agent=native_tool_effect_agent))
         agent.hooks_manager.unregister(hook)
         first = _ModifierHook(priority=10, new_text="FIRST REWRITE")
         second = _RecorderHook(priority=20)
@@ -2788,12 +2809,12 @@ class TestFinding2EndToEndStreaming:
     ever sees the reviewed/sanitized release, not the raw buffered response."""
 
     @pytest.mark.asyncio
-    async def test_streaming_strict_deny_recorder_sees_sanitized(self):
+    async def test_streaming_strict_deny_recorder_sees_sanitized(self, *, native_tool_effect_agent):
         add_convo = []
-        agent, _hook = _make_streaming_audit_agent(
+        agent, _hook = (await _make_streaming_audit_agent(
             add_convo, mode="strict",
             audit_response={"risk_level": 3, "reasoning": "harmful"},
-        )
+        native_tool_effect_agent=native_tool_effect_agent))
         recorder = _RecorderHook(priority=10)
         agent.hooks_manager.register(recorder)
 
@@ -2843,12 +2864,12 @@ class TestFinding3MainCallRedactionWiring:
     end-to-end through the real turn paths."""
 
     @pytest.mark.asyncio
-    async def test_streaming_strict_marks_context_redacting(self):
+    async def test_streaming_strict_marks_context_redacting(self, *, native_tool_effect_agent):
         add_convo = []
-        agent, _hook = _make_streaming_audit_agent(
+        agent, _hook = (await _make_streaming_audit_agent(
             add_convo, mode="strict",
             audit_response={"risk_level": 1, "reasoning": "clean"},
-        )
+        native_tool_effect_agent=native_tool_effect_agent))
         _install_real_resolver(agent)
         seen = {}
 
@@ -2866,12 +2887,12 @@ class TestFinding3MainCallRedactionWiring:
         assert seen["ctx"].redact_content is True
 
     @pytest.mark.asyncio
-    async def test_streaming_warn_context_not_redacting(self):
+    async def test_streaming_warn_context_not_redacting(self, *, native_tool_effect_agent):
         add_convo = []
-        agent, _hook = _make_streaming_audit_agent(
+        agent, _hook = (await _make_streaming_audit_agent(
             add_convo, mode="warn",
             audit_response={"risk_level": 1, "reasoning": "clean"},
-        )
+        native_tool_effect_agent=native_tool_effect_agent))
         _install_real_resolver(agent)
         seen = {}
 
@@ -2889,12 +2910,12 @@ class TestFinding3MainCallRedactionWiring:
         assert seen["ctx"].redact_content is False
 
     @pytest.mark.asyncio
-    async def test_nonstream_strict_marks_context_redacting(self):
+    async def test_nonstream_strict_marks_context_redacting(self, *, native_tool_effect_agent):
         add_convo = []
-        agent, _hook = _make_streaming_audit_agent(
+        agent, _hook = (await _make_streaming_audit_agent(
             add_convo, mode="strict",
             audit_response={"risk_level": 1, "reasoning": "clean"},
-        )
+        native_tool_effect_agent=native_tool_effect_agent))
         _install_real_resolver(agent)
         _wire_real_command_llm_path(agent, llm_content=_RAW_LLM_OUTPUT)
         # Drive the real non-streaming turn via the !continue fall-through.
@@ -2968,11 +2989,11 @@ def _gate_and_observer(gate_output):
 class TestFinding1ObserverReceivesReviewedOnly:
     """The observer never sees raw pre_tool_prose / tool_calls / tool_results."""
 
-    async def _run(self, gate_output):
+    async def _run(self, gate_output, *, native_tool_effect_agent):
         add_convo = []
-        agent, _none = _make_streaming_audit_agent(
+        agent, _none = (await _make_streaming_audit_agent(
             add_convo, mode="strict", register_hook=False,
-        )
+        native_tool_effect_agent=native_tool_effect_agent))
         gate, observer, snapshot = _gate_and_observer(gate_output)
         for h in (gate, observer):
             agent.hooks_manager.register(h)
@@ -2987,8 +3008,8 @@ class TestFinding1ObserverReceivesReviewedOnly:
         return verdict, observer
 
     async def _assert_observer_clean(self, gate_output, *, expected_text_contains=None,
-                                     expected_text_absent=None):
-        verdict, observer = await self._run(gate_output)
+                                     expected_text_absent=None, native_tool_effect_agent):
+        verdict, observer = await self._run(gate_output, native_tool_effect_agent=native_tool_effect_agent)
         assert observer.seen is not None, "observer must have run"
         # The three raw side channels are nulled — no unreviewed leak.
         assert observer.seen.pre_tool_prose is None
@@ -3011,35 +3032,35 @@ class TestFinding1ObserverReceivesReviewedOnly:
         return verdict, observer
 
     @pytest.mark.asyncio
-    async def test_allow(self):
+    async def test_allow(self, *, native_tool_effect_agent):
         from kestrel_sdk.hooks.base import HookOutput
-        await self._assert_observer_clean(HookOutput.allow())
+        await self._assert_observer_clean(HookOutput.allow(), native_tool_effect_agent=native_tool_effect_agent)
 
     @pytest.mark.asyncio
-    async def test_modify(self):
+    async def test_modify(self, *, native_tool_effect_agent):
         from kestrel_sdk.hooks.base import HookOutput
         await self._assert_observer_clean(
             HookOutput.modify(updated_input={"response_text": "REVIEWED REWRITE"}),
             expected_text_contains="REVIEWED REWRITE",
-        )
+        native_tool_effect_agent=native_tool_effect_agent)
 
     @pytest.mark.asyncio
-    async def test_deny(self):
+    async def test_deny(self, *, native_tool_effect_agent):
         from kestrel_sdk.hooks.base import HookOutput
         # DENY releases only the sanitized block message; observer sees THAT,
         # never the raw response or the raw side channels.
         await self._assert_observer_clean(
             HookOutput.deny("model leaked SECRET"),
             expected_text_absent="RAW ASSISTANT RESPONSE",
-        )
+        native_tool_effect_agent=native_tool_effect_agent)
 
     @pytest.mark.asyncio
-    async def test_ask(self):
+    async def test_ask(self, *, native_tool_effect_agent):
         from kestrel_sdk.hooks.base import HookOutput
         await self._assert_observer_clean(
             HookOutput.ask(approval_id="a1", reason="needs approval"),
             expected_text_absent="RAW ASSISTANT RESPONSE",
-        )
+        native_tool_effect_agent=native_tool_effect_agent)
 
 
 # =========================================================================
@@ -3073,12 +3094,12 @@ class TestFinding2SnapshotBeforeUserPrompt:
     """A USER_PROMPT hook cannot disable the strict audit for the current turn."""
 
     @pytest.mark.asyncio
-    async def test_streaming_user_prompt_unregister_still_enforces(self):
+    async def test_streaming_user_prompt_unregister_still_enforces(self, *, native_tool_effect_agent):
         add_convo_calls = []
-        agent, _hook = _make_streaming_audit_agent(
+        agent, _hook = (await _make_streaming_audit_agent(
             add_convo_calls, mode="strict",
             audit_response={"risk_level": 3, "reasoning": "harmful content"},
-        )
+        native_tool_effect_agent=native_tool_effect_agent))
         # A USER_PROMPT_SUBMIT hook unregisters the strict audit as its side
         # effect. Under the pre-#2674-finding-2 ordering (snapshot AFTER
         # USER_PROMPT_SUBMIT) this would empty the snapshot → buffer_audit False
@@ -3114,14 +3135,14 @@ class TestFinding2SnapshotBeforeUserPrompt:
         assert "Hello" not in persisted[0]["content"]
 
     @pytest.mark.asyncio
-    async def test_streaming_user_prompt_disable_still_enforces(self):
+    async def test_streaming_user_prompt_disable_still_enforces(self, *, native_tool_effect_agent):
         """Disabling (not unregistering) the audit from USER_PROMPT is also a
         next-turn transition."""
         add_convo_calls = []
-        agent, _hook = _make_streaming_audit_agent(
+        agent, _hook = (await _make_streaming_audit_agent(
             add_convo_calls, mode="strict",
             audit_response={"risk_level": 3, "reasoning": "harmful content"},
-        )
+        native_tool_effect_agent=native_tool_effect_agent))
         up_cls = _user_prompt_hook_that(
             lambda mgr: mgr.set_hook_enabled("response_audit", False)
         )
@@ -3146,15 +3167,15 @@ class TestFinding2SnapshotBeforeUserPrompt:
         assert "Hello" not in joined
 
     @pytest.mark.asyncio
-    async def test_nonstream_user_prompt_unregister_still_enforces(self):
+    async def test_nonstream_user_prompt_unregister_still_enforces(self, *, native_tool_effect_agent):
         """Non-streaming path: the same turn-start-snapshot guarantee. Drive the
         REAL ``process_input`` → ``_process_input_traced_locked`` so its
         USER_PROMPT_SUBMIT-then-snapshot ordering is exercised end to end."""
         add_convo_calls = []
-        agent, _hook = _make_streaming_audit_agent(
+        agent, _hook = (await _make_streaming_audit_agent(
             add_convo_calls, mode="strict",
             audit_response={"risk_level": 3, "reasoning": "harmful content"},
-        )
+        native_tool_effect_agent=native_tool_effect_agent))
         _wire_real_command_llm_path(agent, llm_content=_RAW_LLM_OUTPUT)
         up_cls = _user_prompt_hook_that(
             lambda mgr: mgr.unregister_by_name("response_audit")
@@ -3185,16 +3206,16 @@ class TestFinding2SnapshotBeforeUserPrompt:
 
 class TestFinding3PreToolBoundaryDefended:
     @pytest.mark.asyncio
-    async def test_pre_tool_hook_sees_full_args_under_strict_audit(self):
+    async def test_pre_tool_hook_sees_full_args_under_strict_audit(self, *, native_tool_effect_agent):
         from kestrel_sovereign.kestrel_agent import KestrelAgent
         from kestrel_sdk.hooks.base import Hook, HookEvent, HookOutput
 
         add_convo = []
         # A strict POST_RESPONSE audit is active for the turn...
-        agent, _hook = _make_streaming_audit_agent(
+        agent, _hook = (await _make_streaming_audit_agent(
             add_convo, mode="strict",
             audit_response={"risk_level": 1, "reasoning": "clean"},
-        )
+        native_tool_effect_agent=native_tool_effect_agent))
 
         seen = {}
 
@@ -3276,12 +3297,12 @@ class TestFinding1TurnStartModeRace:
     streamed live, strict block persisted)."""
 
     @pytest.mark.asyncio
-    async def test_user_prompt_strict_to_warn_flip_still_buffers_this_turn(self):
+    async def test_user_prompt_strict_to_warn_flip_still_buffers_this_turn(self, *, native_tool_effect_agent):
         add_convo_calls = []
-        agent, hook = _make_streaming_audit_agent(
+        agent, hook = (await _make_streaming_audit_agent(
             add_convo_calls, mode="strict",
             audit_response={"risk_level": 3, "reasoning": "unsafe"},
-        )
+        native_tool_effect_agent=native_tool_effect_agent))
         # A USER_PROMPT hook flips the audit strict→warn mid-turn-start.
         agent.hooks_manager.register(_ModeFlippingUserPromptHook(hook))
 
@@ -3373,19 +3394,19 @@ class TestP0CapturedEnforcementAuthoritative:
 
     RAW = "The raw unaudited assistant answer with a SECRET detail."
 
-    def _agent(self):
-        agent, _none = _make_streaming_audit_agent(
+    async def _agent(self, *, native_tool_effect_agent):
+        agent, _none = (await _make_streaming_audit_agent(
             [], mode="strict", register_hook=False,
-        )
+        native_tool_effect_agent=native_tool_effect_agent))
         return agent
 
     @pytest.mark.asyncio
-    async def test_fire_captured_gate_crash_fails_closed_despite_flip(self):
+    async def test_fire_captured_gate_crash_fails_closed_despite_flip(self, *, native_tool_effect_agent):
         """Captured enforcing=True, ``fail_closed`` flipped False BEFORE the fire,
         then the gate CRASHES. Both the partition (captured → gate) and the crash
         handler (captured → DENY) use the snapshot value, so the fire fails closed
         and exposes none of the raw text."""
-        agent = self._agent()
+        agent = (await self._agent(native_tool_effect_agent=native_tool_effect_agent))
         gate = _GenericFlipGate(fail_closed=True, behavior="raise")
         agent.hooks_manager.register(gate)
         snap = _snap(agent.hooks_manager)  # captures enforcing=True
@@ -3402,10 +3423,10 @@ class TestP0CapturedEnforcementAuthoritative:
         assert gate.executed == 1
 
     @pytest.mark.asyncio
-    async def test_fire_captured_gate_timeout_fails_closed_despite_flip(self):
+    async def test_fire_captured_gate_timeout_fails_closed_despite_flip(self, *, native_tool_effect_agent):
         """Same, but the gate HANGS past its timeout: the captured override still
         fails it closed."""
-        agent = self._agent()
+        agent = (await self._agent(native_tool_effect_agent=native_tool_effect_agent))
         gate = _GenericFlipGate(fail_closed=True, behavior="hang", timeout=0.05)
         agent.hooks_manager.register(gate)
         snap = _snap(agent.hooks_manager)
@@ -3419,13 +3440,13 @@ class TestP0CapturedEnforcementAuthoritative:
         assert self.RAW not in str(result)
 
     @pytest.mark.asyncio
-    async def test_fire_captured_nonenforcing_stays_advisory_despite_flip(self):
+    async def test_fire_captured_nonenforcing_stays_advisory_despite_flip(self, *, native_tool_effect_agent):
         """Inverse transition: captured enforcing=False, ``fail_closed`` flipped
         True before the fire, then the (now-observer) hook crashes. The captured
         value keeps it advisory → the crash is skipped, the verdict is a
         non-enforcing ALLOW passthrough, and ``enforcing`` is False (so the
         streaming wrapper would NOT have withheld this turn's parts)."""
-        agent = self._agent()
+        agent = (await self._agent(native_tool_effect_agent=native_tool_effect_agent))
         gate = _GenericFlipGate(fail_closed=False, behavior="raise")
         agent.hooks_manager.register(gate)
         snap = _snap(agent.hooks_manager)  # captures enforcing=False
@@ -3439,16 +3460,16 @@ class TestP0CapturedEnforcementAuthoritative:
         assert str(result) == self.RAW
 
     @pytest.mark.asyncio
-    async def test_streaming_end_to_end_flip_then_crash_fails_closed(self):
+    async def test_streaming_end_to_end_flip_then_crash_fails_closed(self, *, native_tool_effect_agent):
         """End-to-end buffering proof: a generic gate enabled at turn start
         buffers the turn (captured enforcing=True). Its ``execute`` flips
         ``fail_closed`` False and CRASHES at completion — the exact P0-1 repro.
         The turn must fail CLOSED: only the block message is released AND
         persisted, no raw byte, and only after the stream drained."""
         add_convo_calls = []
-        agent, _none = _make_streaming_audit_agent(
+        agent, _none = (await _make_streaming_audit_agent(
             add_convo_calls, mode="strict", register_hook=False,
-        )
+        native_tool_effect_agent=native_tool_effect_agent))
         gate = _GenericFlipGate(fail_closed=True, behavior="flip_then_raise")
         agent.hooks_manager.register(gate)
 
@@ -3493,7 +3514,7 @@ class TestP0CancellationDuringAudit:
     nothing and firing neither the STOP hook nor the memory pipeline."""
 
     @pytest.mark.asyncio
-    async def test_no_tool_cancel_during_audit_persists_empty_cancelled_row(self):
+    async def test_no_tool_cancel_during_audit_persists_empty_cancelled_row(self, *, native_tool_effect_agent):
         marker = "SECRET_NO_TOOL_ALLOWED_PROSE_cancelled_mid_audit"
         add_convo_calls = []
         cancel_state = {"cancelled": False}
@@ -3504,10 +3525,10 @@ class TestP0CancellationDuringAudit:
             cancel_state["cancelled"] = True
             return {"risk_level": 1, "reasoning": "clean"}
 
-        agent, _hook = _make_streaming_audit_agent(
+        agent, _hook = (await _make_streaming_audit_agent(
             add_convo_calls, mode="strict",
             audit_side_effect=_cancel_during_audit,
-        )
+        native_tool_effect_agent=native_tool_effect_agent))
         # Make the memory pipeline + STOP fire OBSERVABLE so "did not run" is a
         # real assertion (not merely "was None / privacy-blocked").
         agent._post_response_pipeline = AsyncMock()
@@ -3552,7 +3573,7 @@ class TestP0CancellationDuringAudit:
         agent._post_response_pipeline.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_tool_cancel_during_audit_persists_redacted_checkpoint(self):
+    async def test_tool_cancel_during_audit_persists_redacted_checkpoint(self, *, native_tool_effect_agent):
         from kestrel_sdk.llm import ToolCallStarted
         from kestrel_sovereign.agent.streaming import (
             STRICT_AUDIT_CANCELLED_TOOL_BATCH_CHECKPOINT,
@@ -3568,10 +3589,10 @@ class TestP0CancellationDuringAudit:
             cancel_state["cancelled"] = True
             return {"risk_level": 1, "reasoning": "clean"}
 
-        agent, _hook = _make_streaming_audit_agent(
+        agent, _hook = (await _make_streaming_audit_agent(
             add_convo_calls, mode="strict",
             audit_side_effect=_cancel_during_audit,
-        )
+        native_tool_effect_agent=native_tool_effect_agent))
         agent._post_response_pipeline = AsyncMock()
         agent._privacy_blocks_background_memory = MagicMock(return_value=False)
         stop_sink = []
@@ -3634,7 +3655,7 @@ class TestP0CancellationDuringAudit:
 
 
 @pytest.mark.asyncio
-async def test_strict_stop_during_owned_tool_batch_persists_redacted_checkpoint():
+async def test_strict_stop_during_owned_tool_batch_persists_redacted_checkpoint(*, native_tool_effect_agent):
     """Strict audit keeps an effect receipt without retaining tool bytes."""
 
     from kestrel_sovereign.agent.streaming import (
@@ -3643,11 +3664,11 @@ async def test_strict_stop_during_owned_tool_batch_persists_redacted_checkpoint(
     from kestrel_sovereign.llm.adapter import LLMResponse, ToolCall
 
     add_convo_calls = []
-    agent, _hook = _make_streaming_audit_agent(
+    agent, _hook = (await _make_streaming_audit_agent(
         add_convo_calls,
         mode="strict",
         audit_response={"risk_level": 1, "reasoning": "clean"},
-    )
+    native_tool_effect_agent=native_tool_effect_agent))
     _bind_real_orchestrator(agent)
     cancelled = False
     batch_started = asyncio.Event()
@@ -3745,13 +3766,13 @@ class TestFinding2StrictCancellationDiscardsWithheldProse:
     batch persists only the fixed redacted anti-repeat checkpoint."""
 
     @pytest.mark.asyncio
-    async def test_strict_no_tool_cancellation_discards_withheld_prose(self):
+    async def test_strict_no_tool_cancellation_discards_withheld_prose(self, *, native_tool_effect_agent):
         marker = "SECRET_NO_TOOL_WITHHELD_PROSE_must_never_persist"
         add_convo_calls = []
-        agent, _hook = _make_streaming_audit_agent(
+        agent, _hook = (await _make_streaming_audit_agent(
             add_convo_calls, mode="strict",
             audit_response={"risk_level": 1, "reasoning": "clean"},
-        )
+        native_tool_effect_agent=native_tool_effect_agent))
         # A STOP subscriber must never see the withheld marker either.
         stop_sink = []
         agent.hooks_manager.register(_RecordingStopHook(stop_sink))
@@ -3795,7 +3816,7 @@ class TestFinding2StrictCancellationDiscardsWithheldProse:
         assert stop_sink == []
 
     @pytest.mark.asyncio
-    async def test_strict_post_tool_continuation_cancellation_discards_withheld_prose(self):
+    async def test_strict_post_tool_continuation_cancellation_discards_withheld_prose(self, *, native_tool_effect_agent):
         from kestrel_sdk.llm import ToolCallStarted
         from kestrel_sovereign.agent.streaming import (
             STRICT_AUDIT_CANCELLED_TOOL_BATCH_CHECKPOINT,
@@ -3804,10 +3825,10 @@ class TestFinding2StrictCancellationDiscardsWithheldProse:
 
         marker = "SECRET_POST_TOOL_CONTINUATION_PROSE_must_never_persist"
         add_convo_calls = []
-        agent, _hook = _make_streaming_audit_agent(
+        agent, _hook = (await _make_streaming_audit_agent(
             add_convo_calls, mode="strict",
             audit_response={"risk_level": 1, "reasoning": "clean"},
-        )
+        native_tool_effect_agent=native_tool_effect_agent))
         stop_sink = []
         agent.hooks_manager.register(_RecordingStopHook(stop_sink))
 

@@ -187,12 +187,13 @@ def _explicit_control_chain(error: BaseException | None) -> Iterator[BaseExcepti
             continue
         seen.add(id(current))
         yield current
-        if current.__cause__ is not None:
-            pending.append(current.__cause__)
-        if isinstance(current, BaseExceptionGroup):
+        cause = BaseException.__cause__.__get__(current, type(current))
+        if cause is not None:
+            pending.append(cause)
+        if issubclass(type(current), BaseExceptionGroup):
             # Lifecycle owners explicitly group child cancellation and close
             # failures. Group members are evidence, unlike incidental context.
-            pending.extend(current.exceptions)
+            pending.extend(BaseExceptionGroup.exceptions.__get__(current, type(current)))
 
 
 def execution_evidence_carriers(error: BaseException | None) -> tuple[BaseException, ...]:
@@ -234,7 +235,7 @@ def execution_commit_outcome(error: BaseException | None) -> str | None:
             return "unknown"
         if unresolved == "committed":
             outcome = "committed"
-        if isinstance(current, ExecutionCommitOutcomeError):
+        if issubclass(type(current), ExecutionCommitOutcomeError):
             if current.commit_outcome == "unknown":
                 return "unknown"
             outcome = current.commit_outcome
@@ -244,7 +245,7 @@ def execution_commit_outcome(error: BaseException | None) -> str | None:
 
 
 def _is_execution_control_node(error: BaseException) -> bool:
-    return (isinstance(error, ExecutionAuthorityError)
+    return (issubclass(type(error), ExecutionAuthorityError)
             or bool(_acknowledged_commits(error))
             or bool(vars(error).get("_kestrel_native_retirement_debts")))
 
@@ -271,13 +272,15 @@ def is_execution_control_error(
 
 
 def is_tool_execution_terminal_error(error: BaseException | None) -> bool:
-    """Tool delivery must propagate control and mandatory audit uncertainty.
+    """Tool delivery must propagate control, unknown effects and audit uncertainty.
 
     An audit error alone is not authority loss or retirement debt. Keep this
     local delivery rule separate from the SDK-registered control predicate.
     """
-    return is_execution_control_error(error) or any(
-        isinstance(current, ToolAuditUnconfirmedError)
+    from kestrel_sdk.resources import observed_outcome_unknown
+
+    return is_execution_control_error(error) or bool(observed_outcome_unknown(error)) or any(
+        issubclass(type(current), ToolAuditUnconfirmedError)
         for current in _explicit_control_chain(error)
     )
 
@@ -336,9 +339,9 @@ def execution_denial_scopes(error: BaseException | None) -> tuple | None:
             if not all(receipt.retired for receipt in receipts):
                 return None
             settled_commit = True
-        if isinstance(carrier, ExecutionCommitOutcomeError):
+        if issubclass(type(carrier), ExecutionCommitOutcomeError):
             return None
-        if isinstance(carrier, ExecutionAuthorityError) or vars(carrier).get("_kestrel_denied_execution_scopes"):
+        if issubclass(type(carrier), ExecutionAuthorityError) or vars(carrier).get("_kestrel_denied_execution_scopes"):
             if vars(carrier).get("_kestrel_unscoped_execution_denial"):
                 return None
             denied = vars(carrier).get("_kestrel_denied_execution_scopes")
@@ -400,7 +403,7 @@ def execution_observer_cancellations(error: BaseException | None) -> tuple[async
         return ()
     source_ids = {id(member) for source in sources for member in _explicit_control_chain(source)}
     return tuple(member for member in _explicit_control_chain(error)
-                 if isinstance(member, asyncio.CancelledError) and id(member) not in source_ids)
+                 if issubclass(type(member), asyncio.CancelledError) and id(member) not in source_ids)
 
 
 def execution_error_with_cause(wrapper: BaseException, error: BaseException) -> BaseException:
@@ -414,7 +417,7 @@ def execution_error_with_cause(wrapper: BaseException, error: BaseException) -> 
     wrapper.__cause__ = error
     sources = _canonical_native_source_originals(error)
     if sources is not None:
-        if isinstance(wrapper, ExecutionCommitOutcomeError):
+        if issubclass(type(wrapper), ExecutionCommitOutcomeError):
             classified_source = ExecutionCommitOutcomeError(wrapper.commit_outcome)
             classified_source.__cause__ = execution_native_source_error(error)
             sources = (classified_source,)
@@ -572,7 +575,7 @@ def execution_terminal_error(*errors: BaseException | None, retain_originals: bo
         for error in present:
             for carrier in _explicit_control_chain(error):
                 commits.extend(receipt for receipt in _acknowledged_commits(carrier) if receipt not in commits)
-                unresolved = (carrier.commit_outcome if isinstance(carrier, ExecutionCommitOutcomeError)
+                unresolved = (carrier.commit_outcome if issubclass(type(carrier), ExecutionCommitOutcomeError)
                     else vars(carrier).get("_kestrel_unresolved_commit_outcome"))
                 if unresolved in {"committed", "unknown"}:
                     if unresolved_commit is None or unresolved == "unknown":
@@ -587,7 +590,7 @@ def execution_terminal_error(*errors: BaseException | None, retain_originals: bo
                 state = vars(carrier)
                 denied = state.get("_kestrel_denied_execution_scopes", ())
                 unscoped_denial |= bool(state.get("_kestrel_unscoped_execution_denial"))
-                if isinstance(carrier, ExecutionAuthorityError) and not denied:
+                if issubclass(type(carrier), ExecutionAuthorityError) and not denied:
                     unscoped_denial = True
                 denied_scopes.extend(scope for scope in denied if scope not in denied_scopes)
         if debts:
@@ -623,21 +626,21 @@ def execution_terminal_error(*errors: BaseException | None, retain_originals: bo
     for error in present:
         # OwnedAsyncIterator carries source cleanup debt as the explicit cause
         # of cancellation. A failed checkpoint is not a successful Stop.
-        if isinstance(error, asyncio.CancelledError) and error.__cause__ is not None:
+        if issubclass(type(error), asyncio.CancelledError) and error.__cause__ is not None:
             return retain(error.__cause__)
     if prefer_cancellation:
         for error in present:
-            if isinstance(error, asyncio.CancelledError):
+            if issubclass(type(error), asyncio.CancelledError):
                 return retain(error)
-    if present and isinstance(present[0], GeneratorExit):
+    if present and issubclass(type(present[0]), GeneratorExit):
         # GeneratorExit is the source's ordinary close request, not caller
         # cancellation. A later cancellation while joining that close must
         # still reach the closer after cleanup settles. Control evidence was
         # already selected above, so it cannot be demoted by this rule.
-        return retain(next((error for error in present[1:] if not isinstance(error, GeneratorExit)), present[0]))
-    if present and isinstance(present[0], (asyncio.CancelledError, GeneratorExit)):
+        return retain(next((error for error in present[1:] if not issubclass(type(error), GeneratorExit)), present[0]))
+    if present and issubclass(type(present[0]), (asyncio.CancelledError, GeneratorExit)):
         for error in present[1:]:
-            if not isinstance(error, (asyncio.CancelledError, GeneratorExit)):
+            if not issubclass(type(error), (asyncio.CancelledError, GeneratorExit)):
                 return retain(error)
     return retain(present[0]) if present else None
 
@@ -1400,7 +1403,7 @@ async def close_native_execution_stream(
             )
     if outcome.error is not None or outcome.cancellation is not None:
         if (outcome.error is None and outcome.cancellation is not None
-            and (original is None or isinstance(original, GeneratorExit))
+            and (original is None or issubclass(type(original), GeneratorExit))
             and not is_execution_control_error(original)):
             # Plain GeneratorExit is the iterator's close protocol, not an
             # independent failure. Attaching it beneath actual withdrawal
@@ -1471,7 +1474,7 @@ class NativeExecutionStreamOwner:
                     # canonical original control; an ordinary SDK status error
                     # must not mask this later observer cancellation.
                     self.handles[:] = [retained for retained in self.handles if retained is not handle]
-                    if isinstance(error, asyncio.CancelledError) and not is_execution_control_error(terminal):
+                    if issubclass(type(error), asyncio.CancelledError) and not is_execution_control_error(terminal):
                         terminal = error
                     else:
                         terminal = execution_terminal_error(
@@ -1641,7 +1644,7 @@ async def await_execution_work_group(
             return await await_execution_work(owner, operation)
         except BaseException as error:
             if (
-                isinstance(error, Exception)
+                issubclass(type(error), Exception)
                 and return_exceptions
                 and not is_execution_control_error(error)
                 and not execution_cleanup_debts(error)

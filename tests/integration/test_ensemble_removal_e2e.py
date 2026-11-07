@@ -21,7 +21,7 @@ than left as dead skip markers.
 """
 from __future__ import annotations
 
-from tests.shared.native_shutdown_budget import shutdown_fixture_agent
+from kestrel_sovereign.testing.native_shutdown_budget import shutdown_fixture_agent
 
 import os
 import re

@@ -30,6 +30,42 @@ from kestrel_sovereign.tools.result_contract import enforce_tool_result_contract
 from kestrel_sovereign.tools.execution_outcome import TOOL_OUTCOME_UNCONFIRMED
 
 
+def _require_original_feature_registration(host, feature, *, registered):
+    """Validate the original Feature, independently of its concrete producer."""
+    if (getattr(feature, "agent", None) is not host
+            or getattr(feature, "enabled", True) is not True
+            or (registered and not any(value is feature
+                for value in getattr(host, "features", {}).values()))):
+        raise ResourceConflict("Original feature ownership or registration changed")
+
+
+def _capture_tool_feature_registration(host, tool, feature=None):
+    """Retain both the exposing Feature and a wrapper's actual bound Feature.
+
+    A plain mounted tool has no Feature. Feature-less registrations remain
+    governed by their existing owner batch and registry generation. A Feature
+    mounted only through a tool batch retains that batch as its registration;
+    a loaded Feature must also remain in its original host's feature map.
+    """
+    attached = getattr(tool, "feature", None)
+    originals = []
+    for selected in (feature, attached):
+        if selected is not None and not any(value is selected for value, _ in originals):
+            registered = any(value is selected for value in getattr(host, "features", {}).values())
+            originals.append((selected, registered))
+    if not originals:
+        return None
+    originals = tuple(originals)
+
+    def require_current():
+        for selected, registered in originals:
+            _require_original_feature_registration(host, selected, registered=registered)
+        if attached is not None and getattr(tool, "feature", None) is not attached:
+            raise ResourceConflict("Original concrete tool feature changed")
+
+    return require_current
+
+
 @dataclass
 class _ToolExecution:
     """Caller-local execution facts, independent of a tool's business result."""
@@ -38,7 +74,31 @@ class _ToolExecution:
     returned: bool = False
     admitted: bool = False
     audit_recorded: bool = False
+    audit_attempted: bool = False
+    audit_error: BaseException | None = None
     arguments: dict | None = None
+
+
+async def _record_incomplete_tool_dispatch(host, execution, *, tool_name, adapter,
+        args, session_id, dispatch_start, dispatch_id, error, parent_dispatch_id=None):
+    """Record one original incomplete execution without producing a tool result."""
+    if execution.audit_recorded:
+        return
+    unknown = execution.started
+    await host._log_tool_dispatch(
+        tool_name=tool_name, adapter=adapter,
+        args=execution.arguments if execution.arguments is not None else args,
+        result={"success": False, "error": "Tool invocation did not complete"},
+        session_id=session_id, dispatch_start=dispatch_start,
+        status_hint="error",
+        error_class=("ResourceOutcomeUnknown" if unknown else
+            type(error).__name__ if error is not None else "CancelledError"),
+        error_message=(TOOL_OUTCOME_UNCONFIRMED if unknown else
+            "Invocation stopped before tool execution"),
+        dispatch_id=dispatch_id, parent_dispatch_id=parent_dispatch_id,
+        required=True, execution_witness=execution,
+    )
+    execution.audit_recorded = True
 
 
 @dataclass(frozen=True)
@@ -55,21 +115,33 @@ class _GovernedToolBinding:
     registration: object
     tool: Any
     security_feature: str
+    validate_feature_registration: Callable[[], None] | None = None
 
     @property
     def is_current(self) -> bool:
-        return (
+        current = (
             self.agent._explored_features.get(self.owner) is self.registration
             and self.agent._direct_tools.get(self.name) is self.tool
             and self.agent._tool_to_feature.get(self.name) == self.owner
         )
 
+        if not current:
+            return False
+        if self.validate_feature_registration is not None:
+            try:
+                self.validate_feature_registration()
+            except ResourceConflict:
+                return False
+        return True
+
     def require_current(self) -> None:
         if not self.is_current:
             raise ResourceConflict("Tool registration expired; reopen the originating view")
 
-    async def invoke(self, arguments: Dict[str, Any], *, session_id: str,
+    async def invoke(self, arguments: Dict[str, Any], *, session_id: str, operation_id: str,
                      source: str = "external") -> Any:
+        from kestrel_sovereign.agent.invocation import validate_invocation_id
+        from kestrel_sovereign.tools.effect_invocation import ToolEffectOperation
         from kestrel_sovereign.llm.adapter import ToolCall
         from kestrel_sovereign.storage.db.interface import DatabaseError
 
@@ -80,6 +152,7 @@ class _GovernedToolBinding:
             raise ValueError("A tool invocation requires a session_id")
         if not isinstance(source, str) or not source.strip():
             raise ValueError("A tool invocation requires a source")
+        operation_id = validate_invocation_id(operation_id)
         call = ToolCall(id=str(uuid4()), name=self.name, arguments=deepcopy(arguments))
         execution = _ToolExecution()
         dispatch_start = time.time()
@@ -89,25 +162,10 @@ class _GovernedToolBinding:
         async def finalize(outcome):
             if execution.audit_recorded or not execution.admitted:
                 return
-            unknown = execution.started
-            error_class = (
-                "ResourceOutcomeUnknown" if unknown else
-                type(outcome.error).__name__ if outcome.error is not None else
-                "CancelledError"
-            )
-            await self.agent._log_tool_dispatch(
+            await _record_incomplete_tool_dispatch(self.agent, execution,
                 tool_name=self.name, adapter=f"{self.owner}.{self.name}",
-                args=execution.arguments if execution.arguments is not None else call.arguments,
-                result={"success": False, "error": "Tool invocation did not complete"},
-                session_id=session_id, dispatch_start=dispatch_start,
-                status_hint="error", error_class=error_class,
-                error_message=(
-                    TOOL_OUTCOME_UNCONFIRMED
-                    if unknown else "Invocation stopped before tool execution"
-                ),
-                required=True,
-            )
-            execution.audit_recorded = True
+                args=call.arguments, session_id=session_id,
+                dispatch_start=dispatch_start, dispatch_id=call.id, error=outcome.error)
 
         outcome = await self.agent._execute_tool_operation_at_stop_boundary(
             lambda: self.agent._dispatch_tool_call(
@@ -118,6 +176,8 @@ class _GovernedToolBinding:
             ),
             name="bound-tool-invocation", cancel_on_caller_cancellation=True,
             finalize=finalize,
+            tool_operation=ToolEffectOperation('mcp_app', operation_id, self.owner,
+                self.name, deepcopy(call.arguments), session_id),
         )
         error = outcome.error
         if isinstance(error, Exception) and not is_execution_control_error(error) and (
@@ -428,6 +488,16 @@ class ToolRegistryMixin:
             self._visible_known_tool_names()
         )
 
+    def _feature_for_tool_owner(self, owner):
+        """Resolve the registered Feature behind its exact mount owner."""
+        if owner is None:
+            return None
+        features = getattr(self, "features", {})
+        for feature in features.values():
+            if getattr(feature, "tool_name", None) == owner:
+                return feature
+        return features.get(owner)
+
     def register_dynamic_tools(
         self, owner: str, tools, *, pin: bool = False,
         on_registered: Callable[[Any, GovernedToolBinding], None] | None = None,
@@ -532,6 +602,8 @@ class ToolRegistryMixin:
                 on_registered(tool, _GovernedToolBinding(
                     self, name, owner, registration, tool,
                     self._security_feature_name_for_tool(name),
+                    validate_feature_registration=_capture_tool_feature_registration(
+                        self, tool, self._feature_for_tool_owner(owner)),
                 ))
         return registered
 

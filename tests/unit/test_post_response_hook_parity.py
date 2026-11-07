@@ -99,16 +99,14 @@ class _CapturingHooks:
 # ---------------------------------------------------------------------------
 
 
-def _build_streaming_agent(hooks: _CapturingHooks):
+async def _build_streaming_agent(hooks: _CapturingHooks, *, native_tool_effect_agent):
     from kestrel_sovereign.agent.streaming import StreamingMixin
 
-    privacy_agent = MagicMock()
+    agent = await native_tool_effect_agent(did="did:test:streaming")
+    privacy_agent = agent.privacy_agent
     privacy_agent.add_conversation = AsyncMock()
-    privacy_agent.privacy_config.allows_cloud_llm.return_value = True
-    privacy_agent.privacy_mode.name = "normal"
     privacy_agent.get_conversation_history = AsyncMock(return_value=[])
 
-    agent = MagicMock()
     agent.privacy_agent = privacy_agent
     agent.features = {}
     agent.did = "did:test:streaming"
@@ -117,7 +115,6 @@ def _build_streaming_agent(hooks: _CapturingHooks):
     agent.is_request_cancelled = MagicMock(return_value=False)
     agent._maybe_audit = AsyncMock()
     agent._genesis_audit_cognition_block = AsyncMock(return_value=None)
-    agent._get_privacy_transition_lock = MagicMock(return_value=_passthrough())
     agent._turn_lifecycle = MagicMock(return_value=_passthrough())
     agent.hooks_manager = hooks
     agent._get_governing_constitution = AsyncMock(return_value="")
@@ -155,10 +152,10 @@ def _build_streaming_agent(hooks: _CapturingHooks):
     return agent
 
 
-async def _run_streaming_tool_turn(hooks: _CapturingHooks):
+async def _run_streaming_tool_turn(hooks: _CapturingHooks, *, native_tool_effect_agent):
     from kestrel_sovereign.llm.adapter import LLMResponse, ToolCall
 
-    agent = _build_streaming_agent(hooks)
+    agent = (await _build_streaming_agent(hooks, native_tool_effect_agent=native_tool_effect_agent))
 
     async def stream():
         yield _PRE_TOOL_PROSE
@@ -188,12 +185,12 @@ async def _run_streaming_tool_turn(hooks: _CapturingHooks):
 # ---------------------------------------------------------------------------
 
 
-def _build_nonstreaming_agent(hooks: _CapturingHooks):
+async def _build_nonstreaming_agent(hooks: _CapturingHooks, *, native_tool_effect_agent):
     from kestrel_sovereign.kestrel_agent import KestrelAgent
     from kestrel_sovereign.agent.streaming import StreamingMixin
     from kestrel_sovereign.privacy import PrivacyMode
 
-    agent = MagicMock()
+    agent = await native_tool_effect_agent(did="did:test:nonstream")
     agent.did = "did:test:nonstream"
     agent.extension = None
     agent.features = {}
@@ -201,10 +198,9 @@ def _build_nonstreaming_agent(hooks: _CapturingHooks):
     agent._privacy_mode = PrivacyMode.NORMAL
     agent.hooks_manager = hooks
 
-    privacy_agent = MagicMock()
+    privacy_agent = agent.privacy_agent
     privacy_agent.add_conversation = AsyncMock()
     privacy_agent.get_conversation_history = AsyncMock(return_value=[])
-    privacy_agent.privacy_config.allows_cloud_llm.return_value = True
     agent.privacy_agent = privacy_agent
 
     agent._maybe_compact_codex_thread = AsyncMock()
@@ -281,9 +277,9 @@ def _patch_nonstreaming_module_helpers(monkeypatch):
     )
 
 
-async def _run_nonstreaming_turn(hooks, monkeypatch, *, initial_response, orchestrator):
+async def _run_nonstreaming_turn(hooks, monkeypatch, *, initial_response, orchestrator, native_tool_effect_agent):
     _patch_nonstreaming_module_helpers(monkeypatch)
-    agent = _build_nonstreaming_agent(hooks)
+    agent = (await _build_nonstreaming_agent(hooks, native_tool_effect_agent=native_tool_effect_agent))
     agent.llm_service = MagicMock()
     agent.llm_service.generate_with_messages = AsyncMock(return_value=initial_response)
     agent._handle_orchestrator_response = orchestrator
@@ -293,7 +289,7 @@ async def _run_nonstreaming_turn(hooks, monkeypatch, *, initial_response, orches
     return hooks.post_response_input
 
 
-async def _run_nonstreaming_tool_turn(hooks, monkeypatch):
+async def _run_nonstreaming_tool_turn(hooks, monkeypatch, *, native_tool_effect_agent):
     from kestrel_sovereign.llm.adapter import LLMResponse, ToolCall
 
     initial = LLMResponse(
@@ -308,7 +304,7 @@ async def _run_nonstreaming_tool_turn(hooks, monkeypatch):
 
     return await _run_nonstreaming_turn(
         hooks, monkeypatch, initial_response=initial, orchestrator=orchestrator
-    )
+    , native_tool_effect_agent=native_tool_effect_agent)
 
 
 # ---------------------------------------------------------------------------
@@ -440,11 +436,11 @@ def _fold_inline_executed_into_tool_results(response, tool_results):
 
 
 @pytest.mark.asyncio
-async def test_tool_turn_evidence_matches_across_transports(monkeypatch):
+async def test_tool_turn_evidence_matches_across_transports(monkeypatch, *, native_tool_effect_agent):
     """Equivalent tool turns must produce equivalent POST_RESPONSE evidence on
     both transports — the core #2675 parity claim."""
-    st_input = await _run_streaming_tool_turn(_CapturingHooks())
-    ns_input = await _run_nonstreaming_tool_turn(_CapturingHooks(), monkeypatch)
+    st_input = await _run_streaming_tool_turn(_CapturingHooks(), native_tool_effect_agent=native_tool_effect_agent)
+    ns_input = await _run_nonstreaming_tool_turn(_CapturingHooks(), monkeypatch, native_tool_effect_agent=native_tool_effect_agent)
 
     assert st_input is not None, "streaming path never fired POST_RESPONSE"
     assert ns_input is not None, "non-streaming path never fired POST_RESPONSE"
@@ -473,14 +469,14 @@ async def test_tool_turn_evidence_matches_across_transports(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_narration_check_fires_identically_on_both_transports(monkeypatch):
+async def test_narration_check_fires_identically_on_both_transports(monkeypatch, *, native_tool_effect_agent):
     """A real ResponseAuditHook run over each path's captured HookInput must
     reach the SAME deterministic narration verdict — the dishonest 'Saved.'
     before a failed tool is caught on non-streaming exactly as on streaming."""
     from kestrel_sovereign.features.response_audit.hook import ResponseAuditHook
 
-    st_input = await _run_streaming_tool_turn(_CapturingHooks())
-    ns_input = await _run_nonstreaming_tool_turn(_CapturingHooks(), monkeypatch)
+    st_input = await _run_streaming_tool_turn(_CapturingHooks(), native_tool_effect_agent=native_tool_effect_agent)
+    ns_input = await _run_nonstreaming_tool_turn(_CapturingHooks(), monkeypatch, native_tool_effect_agent=native_tool_effect_agent)
 
     def _make_audit_agent():
         agent = MagicMock()
@@ -522,14 +518,14 @@ async def test_narration_check_fires_identically_on_both_transports(monkeypatch)
 
 
 @pytest.mark.asyncio
-async def test_no_tool_turn_evidence_matches_and_stays_empty(monkeypatch):
+async def test_no_tool_turn_evidence_matches_and_stays_empty(monkeypatch, *, native_tool_effect_agent):
     """No-tool turns remain unchanged: both transports pass None for all three
     narration fields, so the check has nothing to verify."""
     from kestrel_sovereign.llm.adapter import LLMResponse
 
     # Streaming no-tool turn.
     st_hooks = _CapturingHooks()
-    st_agent = _build_streaming_agent(st_hooks)
+    st_agent = (await _build_streaming_agent(st_hooks, native_tool_effect_agent=native_tool_effect_agent))
 
     async def stream():
         yield "Hello! No tools needed."
@@ -549,7 +545,7 @@ async def test_no_tool_turn_evidence_matches_and_stays_empty(monkeypatch):
 
     ns_input = await _run_nonstreaming_turn(
         ns_hooks, monkeypatch, initial_response=initial, orchestrator=orchestrator
-    )
+    , native_tool_effect_agent=native_tool_effect_agent)
 
     for hook_input in (st_input, ns_input):
         assert hook_input is not None
@@ -560,7 +556,7 @@ async def test_no_tool_turn_evidence_matches_and_stays_empty(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_nonstreaming_multi_iteration_tool_evidence_ordered(monkeypatch):
+async def test_nonstreaming_multi_iteration_tool_evidence_ordered(monkeypatch, *, native_tool_effect_agent):
     """Multi-iteration non-streaming flow (model calls A, sees result, calls B)
     must hand POST_RESPONSE tool_calls and tool_results that line up by index
     across every iteration — ordered and complete, not just the first call."""
@@ -591,7 +587,7 @@ async def test_nonstreaming_multi_iteration_tool_evidence_ordered(monkeypatch):
 
     hook_input = await _run_nonstreaming_turn(
         hooks, monkeypatch, initial_response=initial, orchestrator=orchestrator
-    )
+    , native_tool_effect_agent=native_tool_effect_agent)
 
     assert hook_input is not None
     assert hook_input.tool_calls is not None and len(hook_input.tool_calls) == 2
@@ -683,7 +679,7 @@ async def test_inline_codex_streaming_and_nonstreaming_snapshot_same_boundary():
 
 
 @pytest.mark.asyncio
-async def test_inline_codex_tool_turn_narration_caught_on_nonstreaming(monkeypatch):
+async def test_inline_codex_tool_turn_narration_caught_on_nonstreaming(monkeypatch, *, native_tool_effect_agent):
     """End-to-end #2675 P1: a real inline Codex turn whose pre-tool prose lies
     ('Saved your color.') about a tool that FAILED is caught by the
     deterministic narration check on the NON-streaming path — the same
@@ -703,7 +699,7 @@ async def test_inline_codex_tool_turn_narration_caught_on_nonstreaming(monkeypat
     hook_input = await _run_nonstreaming_turn(
         _CapturingHooks(), monkeypatch,
         initial_response=initial, orchestrator=orchestrator,
-    )
+    native_tool_effect_agent=native_tool_effect_agent)
 
     assert hook_input is not None
     # The assembly fed the narration check the marker-bound pre-tool prose,

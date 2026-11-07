@@ -41,6 +41,7 @@ from kestrel_sovereign.agent.turn_outcome import (
     resolve_turn_outcome,
 )
 from kestrel_sovereign.kestrel_agent import KestrelAgent
+from tests.unit.test_non_streaming_turn_privacy_span import _configure_turn_probe
 
 # Spelled literally: a rename of the constant must not silently satisfy a test
 # whose consumer is still reading the old string.
@@ -64,10 +65,13 @@ def span_exporter(monkeypatch):
     return exporter
 
 
-def _turn_host(turn_id="turn_1", *, lifecycle_error=None, **overrides):
+async def _turn_host(turn_id="turn_1", *, lifecycle_error=None, native_tool_effect_agent, **overrides):
     """A minimal host running the REAL turn methods, stubbed below the span."""
 
-    host = MagicMock()
+    host = _configure_turn_probe(await native_tool_effect_agent(did="did:pkh:eip155:1:0xabc"))
+    from kestrel_sovereign.command_handler import CommandHandler
+
+    host.command_handler = CommandHandler(host)
     host.agent_name = "Emma"
     host.did = "did:pkh:eip155:1:0xabc"
     host._safe_mode = False
@@ -78,7 +82,6 @@ def _turn_host(turn_id="turn_1", *, lifecycle_error=None, **overrides):
     host.bootstrap_service = None
     host._turn_trace_identities = {}
     host._turn_outcome_listeners = []
-    host._get_privacy_transition_lock = lambda: asyncio.Lock()
 
     # No Stop was recorded unless a test says so. These are real sets, which is
     # also what stops a MagicMock's truthy attribute from reading as evidence.
@@ -183,8 +186,8 @@ async def _answer(*_a, **_k):
 
 class TestStreamingTurnEndsOnEveryExit:
     @pytest.mark.asyncio
-    async def test_normal_completion_is_completed(self, span_exporter):
-        host = _turn_host()
+    async def test_normal_completion_is_completed(self, span_exporter, *, native_tool_effect_agent):
+        host = (await _turn_host(native_tool_effect_agent=native_tool_effect_agent))
         assert await _drain(_streaming(host, _answer)) == ["42"]
 
         span = _only(span_exporter, STREAM_SPAN)
@@ -194,12 +197,12 @@ class TestStreamingTurnEndsOnEveryExit:
     @pytest.mark.asyncio
     async def test_exception_is_failed_and_is_the_only_error_status(
         self, span_exporter
-    ):
+    , *, native_tool_effect_agent):
         async def boom(*_a, **_k):
             raise ValueError("provider exploded")
             yield  # pragma: no cover - generator marker
 
-        host = _turn_host()
+        host = (await _turn_host(native_tool_effect_agent=native_tool_effect_agent))
         with pytest.raises(ValueError):
             await _drain(_streaming(host, boom))
 
@@ -210,7 +213,7 @@ class TestStreamingTurnEndsOnEveryExit:
     @pytest.mark.asyncio
     async def test_cooperative_checkpoint_stop_returns_normally_but_reads_stopped(
         self, span_exporter
-    ):
+    , *, native_tool_effect_agent):
         """The case that used to be indistinguishable from `completed`.
 
         A checkpoint Stop is observed by the turn, which then returns normally.
@@ -222,7 +225,7 @@ class TestStreamingTurnEndsOnEveryExit:
             _record_stop(host)
             yield "partial"
 
-        host = _turn_host()
+        host = (await _turn_host(native_tool_effect_agent=native_tool_effect_agent))
         assert await _drain(_streaming(host, stopped_at_checkpoint)) == [
             "partial"
         ]
@@ -235,13 +238,13 @@ class TestStreamingTurnEndsOnEveryExit:
     @pytest.mark.asyncio
     async def test_hard_cancellation_from_a_stop_reads_stopped(
         self, span_exporter
-    ):
+    , *, native_tool_effect_agent):
         async def cancelled(*_a, **_k):
             _record_stop(host)
             raise asyncio.CancelledError()
             yield  # pragma: no cover - generator marker
 
-        host = _turn_host()
+        host = (await _turn_host(native_tool_effect_agent=native_tool_effect_agent))
         with pytest.raises(asyncio.CancelledError):
             await _drain(_streaming(host, cancelled))
 
@@ -250,15 +253,15 @@ class TestStreamingTurnEndsOnEveryExit:
         assert span.status.status_code is not StatusCode.ERROR
 
     @pytest.mark.asyncio
-    async def test_pre_admission_stop_is_stopped_not_failed(self, span_exporter):
+    async def test_pre_admission_stop_is_stopped_not_failed(self, span_exporter, *, native_tool_effect_agent):
         """The durable admission refusal raises; it is still a Stop.
 
         This is the path that used to end ERROR and read as a failure.
         """
 
-        host = _turn_host(
+        host = (await _turn_host(
             lifecycle_error=InvocationCancelledError("stopped before admission")
-        )
+        , native_tool_effect_agent=native_tool_effect_agent))
         _record_stop(host)
         with pytest.raises(InvocationCancelledError):
             await _drain(_streaming(host, _answer))
@@ -270,7 +273,7 @@ class TestStreamingTurnEndsOnEveryExit:
     @pytest.mark.asyncio
     async def test_a_bare_close_records_nothing_and_is_interrupted(
         self, span_exporter
-    ):
+    , *, native_tool_effect_agent):
         """``GeneratorExit`` is an exception type, not a record.
 
         A closer that recorded no consumer close is not evidence of a
@@ -282,7 +285,7 @@ class TestStreamingTurnEndsOnEveryExit:
             while True:
                 yield "tick"
 
-        host = _turn_host()
+        host = (await _turn_host(native_tool_effect_agent=native_tool_effect_agent))
         stream = _streaming(host, forever)
         assert await stream.__anext__() == "tick"
         await stream.aclose()
@@ -294,14 +297,14 @@ class TestStreamingTurnEndsOnEveryExit:
     @pytest.mark.asyncio
     async def test_host_shutdown_cancel_is_interrupted_not_stopped(
         self, span_exporter
-    ):
+    , *, native_tool_effect_agent):
         """Cancelled, but by neither a Stop nor the consumer."""
 
         async def cancelled(*_a, **_k):
             raise asyncio.CancelledError()
             yield  # pragma: no cover - generator marker
 
-        host = _turn_host()
+        host = (await _turn_host(native_tool_effect_agent=native_tool_effect_agent))
         with pytest.raises(asyncio.CancelledError):
             await _drain(_streaming(host, cancelled))
 
@@ -312,7 +315,7 @@ class TestStreamingTurnEndsOnEveryExit:
     @pytest.mark.asyncio
     async def test_safe_mode_early_return_still_ends_the_span(
         self, span_exporter, monkeypatch
-    ):
+    , *, native_tool_effect_agent):
         """A ``return`` inside ``try`` skips ``else`` — this span used to leak.
 
         Safe Mode is rechecked INSIDE the lifecycle because a transition can
@@ -326,7 +329,7 @@ class TestStreamingTurnEndsOnEveryExit:
             "kestrel_sovereign.agent.constitution.safe_mode_cognition_block",
             lambda _agent, _text: next(answers),
         )
-        host = _turn_host()
+        host = (await _turn_host(native_tool_effect_agent=native_tool_effect_agent))
         assert await _drain(_streaming(host, _answer)) == ["[safe mode]"]
 
         span = _only(span_exporter, STREAM_SPAN)
@@ -336,8 +339,8 @@ class TestStreamingTurnEndsOnEveryExit:
 
 class TestInvokeTurnEndsOnEveryExit:
     @pytest.mark.asyncio
-    async def test_normal_completion_is_completed(self, span_exporter):
-        host = _turn_host()
+    async def test_normal_completion_is_completed(self, span_exporter, *, native_tool_effect_agent):
+        host = (await _turn_host(native_tool_effect_agent=native_tool_effect_agent))
         assert await _run_invoke(host, AsyncMock(return_value="42")) == "42"
 
         span = _only(span_exporter, INVOKE_SPAN)
@@ -345,8 +348,8 @@ class TestInvokeTurnEndsOnEveryExit:
         assert span.status.status_code is not StatusCode.ERROR
 
     @pytest.mark.asyncio
-    async def test_exception_is_failed(self, span_exporter):
-        host = _turn_host()
+    async def test_exception_is_failed(self, span_exporter, *, native_tool_effect_agent):
+        host = (await _turn_host(native_tool_effect_agent=native_tool_effect_agent))
         with pytest.raises(ValueError):
             await _run_invoke(host, AsyncMock(side_effect=ValueError("boom")))
 
@@ -355,15 +358,17 @@ class TestInvokeTurnEndsOnEveryExit:
         assert span.status.status_code is StatusCode.ERROR
 
     @pytest.mark.asyncio
-    async def test_cancellation_after_a_stop_is_not_an_error(self, span_exporter):
-        host = _turn_host()
+    async def test_cancellation_after_a_stop_is_not_an_error(self, span_exporter, *, native_tool_effect_agent):
+        host = (await _turn_host(native_tool_effect_agent=native_tool_effect_agent))
 
         async def cancelled(*_a, **_k):
             _record_stop(host)
             raise asyncio.CancelledError()
 
-        with pytest.raises(asyncio.CancelledError):
+        with pytest.raises(InvocationCancelledError) as interrupted:
             await _run_invoke(host, cancelled)
+
+        assert isinstance(interrupted.value.__cause__, asyncio.CancelledError)
 
         span = _only(span_exporter, INVOKE_SPAN)
         assert dict(span.attributes)[TURN_OUTCOME] == "stopped"
@@ -371,14 +376,16 @@ class TestInvokeTurnEndsOnEveryExit:
         assert span.status.status_code is not StatusCode.ERROR
 
     @pytest.mark.asyncio
-    async def test_cancellation_without_a_stop_is_interrupted(self, span_exporter):
-        host = _turn_host()
+    async def test_cancellation_without_a_stop_is_interrupted(self, span_exporter, *, native_tool_effect_agent):
+        host = (await _turn_host(native_tool_effect_agent=native_tool_effect_agent))
 
         async def cancelled(*_a, **_k):
             raise asyncio.CancelledError()
 
-        with pytest.raises(asyncio.CancelledError):
+        with pytest.raises(InvocationCancelledError) as interrupted:
             await _run_invoke(host, cancelled)
+
+        assert isinstance(interrupted.value.__cause__, asyncio.CancelledError)
 
         span = _only(span_exporter, INVOKE_SPAN)
         assert dict(span.attributes)[TURN_OUTCOME] == "interrupted"
@@ -387,10 +394,11 @@ class TestInvokeTurnEndsOnEveryExit:
 class TestOutcomeIsNotDerivedFromTheExceptionType:
     """The rule the classifier exists to keep: a type is not an authority."""
 
-    def test_identical_exception_classifies_two_ways(self):
-        stopped_host = _turn_host()
+    @pytest.mark.asyncio
+    async def test_identical_exception_classifies_two_ways(self, *, native_tool_effect_agent):
+        stopped_host = (await _turn_host(native_tool_effect_agent=native_tool_effect_agent))
         _record_stop(stopped_host)
-        interrupted_host = _turn_host()
+        interrupted_host = (await _turn_host(native_tool_effect_agent=native_tool_effect_agent))
         one_exception = asyncio.CancelledError()
 
         assert (
@@ -402,10 +410,11 @@ class TestOutcomeIsNotDerivedFromTheExceptionType:
             is TurnOutcome.INTERRUPTED
         )
 
-    def test_a_self_fenced_lease_is_not_an_operator_stop(self):
+    @pytest.mark.asyncio
+    async def test_a_self_fenced_lease_is_not_an_operator_stop(self, *, native_tool_effect_agent):
         """Infrastructure losing a lease is not evidence anybody asked."""
 
-        host = _turn_host()
+        host = (await _turn_host(native_tool_effect_agent=native_tool_effect_agent))
         _record_stop(host)
         host._self_fenced_request_generations.add((REQUEST_ID, 1))
 
@@ -428,7 +437,7 @@ class TestReceiptEvidenceNeverLandsOnASpan:
     @pytest.mark.asyncio
     async def test_no_attribute_carries_a_receipt_reason_or_actor(
         self, span_exporter
-    ):
+    , *, native_tool_effect_agent):
         receipt_reason = "runaway loop burning the wallet"
         receipt_actor = "did:pkh:eip155:1:0xSOVEREIGN"
 
@@ -436,7 +445,7 @@ class TestReceiptEvidenceNeverLandsOnASpan:
             _record_stop(host)
             yield "partial"
 
-        host = _turn_host()
+        host = (await _turn_host(native_tool_effect_agent=native_tool_effect_agent))
         await _drain(_streaming(host, stopped))
 
         span = _only(span_exporter, STREAM_SPAN)
@@ -476,9 +485,9 @@ class TestFeatureTurnRootReceivesTheSameOutcome:
     )
     async def test_listener_is_called_on_every_exit(
         self, span_exporter, make_body, expected, raises
-    ):
+    , *, native_tool_effect_agent):
         seen = []
-        host = _turn_host()
+        host = (await _turn_host(native_tool_effect_agent=native_tool_effect_agent))
         host.add_turn_outcome_listener(
             lambda turn_id, outcome: seen.append((turn_id, outcome))
         )
@@ -495,8 +504,8 @@ class TestFeatureTurnRootReceivesTheSameOutcome:
         assert seen[0][1] == expected
 
     @pytest.mark.asyncio
-    async def test_a_raising_listener_cannot_fail_the_turn(self, span_exporter):
-        host = _turn_host()
+    async def test_a_raising_listener_cannot_fail_the_turn(self, span_exporter, *, native_tool_effect_agent):
+        host = (await _turn_host(native_tool_effect_agent=native_tool_effect_agent))
 
         def explode(_turn_id, _outcome):
             raise RuntimeError("the observability feature is broken")
@@ -509,13 +518,13 @@ class TestFeatureTurnRootReceivesTheSameOutcome:
         ] == "completed"
 
     @pytest.mark.asyncio
-    async def test_pre_admission_stop_still_names_its_turn(self, span_exporter):
+    async def test_pre_admission_stop_still_names_its_turn(self, span_exporter, *, native_tool_effect_agent):
         """The address exists before the refusal; the listener must get it."""
 
         seen = []
-        host = _turn_host(
+        host = (await _turn_host(
             lifecycle_error=InvocationCancelledError("stopped before admission")
-        )
+        , native_tool_effect_agent=native_tool_effect_agent))
         _record_stop(host)
         host.add_turn_outcome_listener(
             lambda turn_id, outcome: seen.append((turn_id, outcome))
@@ -551,8 +560,8 @@ def _raise(error):
 # --------------------------------------------------------------------------
 
 
-def _real_lifecycle_host(*, admitted=True, **overrides):
-    host = _turn_host(**overrides)
+async def _real_lifecycle_host(*, admitted=True, native_tool_effect_agent, **overrides):
+    host = (await _turn_host(**overrides, native_tool_effect_agent=native_tool_effect_agent))
     host._host_context_publication_gate = None
     host._host_context_publication_state = None
     host._lock_manager = None
@@ -585,11 +594,19 @@ class TestInvokeTurnOverTheRealLifecycle:
     @pytest.mark.asyncio
     async def test_pre_admission_stop_is_stopped_and_published(
         self, span_exporter
-    ):
+    , *, native_tool_effect_agent):
         """The lifecycle's own entry raises; the span and listener still see it."""
 
-        host = _real_lifecycle_host(admitted=False)
-        _record_stop(host)
+        host = (await _real_lifecycle_host(admitted=False, native_tool_effect_agent=native_tool_effect_agent))
+        original_admission = host.await_durable_turn_admission
+
+        async def stopped_admission(*args, **kwargs):
+            # The request is already admitted. Stop arrives at the actual
+            # turn-admission seam whose span/listener contract this tests.
+            _record_stop(host)
+            return await original_admission(*args, **kwargs)
+
+        host.await_durable_turn_admission = stopped_admission
         seen = _listen(host)
         body = AsyncMock(side_effect=AssertionError("body must not run"))
 
@@ -611,8 +628,8 @@ class TestInvokeTurnOverTheRealLifecycle:
     @pytest.mark.asyncio
     async def test_normal_completion_publishes_the_real_turn_id(
         self, span_exporter
-    ):
-        host = _real_lifecycle_host()
+    , *, native_tool_effect_agent):
+        host = (await _real_lifecycle_host(native_tool_effect_agent=native_tool_effect_agent))
         seen = _listen(host)
 
         assert await _run_invoke(host, AsyncMock(return_value="42")) == "42"
@@ -625,13 +642,13 @@ class TestInvokeTurnOverTheRealLifecycle:
     @pytest.mark.asyncio
     async def test_safe_mode_recheck_early_return_ends_the_span(
         self, span_exporter, monkeypatch
-    ):
+    , *, native_tool_effect_agent):
         answers = iter([None, "[safe mode]"])
         monkeypatch.setattr(
             "kestrel_sovereign.kestrel_agent.safe_mode_cognition_block",
             lambda _agent, _text: next(answers),
         )
-        host = _real_lifecycle_host()
+        host = (await _real_lifecycle_host(native_tool_effect_agent=native_tool_effect_agent))
         seen = _listen(host)
         body = AsyncMock(side_effect=AssertionError("body must not run"))
 
@@ -642,8 +659,8 @@ class TestInvokeTurnOverTheRealLifecycle:
         assert [outcome for _turn, outcome in seen] == [TurnOutcome.COMPLETED]
 
     @pytest.mark.asyncio
-    async def test_command_early_return_ends_the_span(self, span_exporter):
-        host = _real_lifecycle_host()
+    async def test_command_early_return_ends_the_span(self, span_exporter, *, native_tool_effect_agent):
+        host = (await _real_lifecycle_host(native_tool_effect_agent=native_tool_effect_agent))
         host.command_handler.handle = AsyncMock(return_value="command done")
         seen = _listen(host)
         host._process_input_traced_locked = AsyncMock(
@@ -662,10 +679,10 @@ class TestInvokeTurnOverTheRealLifecycle:
     @pytest.mark.asyncio
     async def test_a_turn_queue_bypass_command_ends_its_span_without_a_turn(
         self, span_exporter
-    ):
+    , *, native_tool_effect_agent):
         """``!status`` answers beside any in-flight turn (#2658): it is not a
         turn, so its span completes but no turn is minted or published."""
-        host = _real_lifecycle_host()
+        host = (await _real_lifecycle_host(native_tool_effect_agent=native_tool_effect_agent))
         host.command_handler.handle = AsyncMock(return_value="status")
         seen = _listen(host)
         host._process_input_traced_locked = AsyncMock(
@@ -687,12 +704,12 @@ class TestInvokeTurnOverTheRealLifecycle:
     @pytest.mark.asyncio
     async def test_a_refused_pre_turn_guard_is_not_a_failure(
         self, span_exporter
-    ):
+    , *, native_tool_effect_agent):
         """A source's guard declining the turn is policy (DROPPED_VALIDATION)."""
 
         from kestrel_sovereign.signals.pre_turn_guard import PreTurnRefusal
 
-        host = _real_lifecycle_host()
+        host = (await _real_lifecycle_host(native_tool_effect_agent=native_tool_effect_agent))
         host._evaluate_pre_turn_guard = KestrelAgent._evaluate_pre_turn_guard
         host._process_input_traced_locked = AsyncMock(
             side_effect=AssertionError("body must not run")
@@ -723,8 +740,8 @@ class TestTurnCapturesNest:
     @pytest.mark.asyncio
     async def test_the_dispatchers_capture_still_sees_the_turn(
         self, span_exporter
-    ):
-        host = _real_lifecycle_host()
+    , *, native_tool_effect_agent):
+        host = (await _real_lifecycle_host(native_tool_effect_agent=native_tool_effect_agent))
 
         with telemetry.capture_turn_ids() as outer:
             await _run_invoke(host, AsyncMock(return_value="42"))
@@ -737,8 +754,8 @@ class TestStreamingTurnOverTheRealLifecycle:
     @pytest.mark.asyncio
     async def test_pre_admission_stop_is_stopped_and_names_its_turn(
         self, span_exporter
-    ):
-        host = _real_lifecycle_host(admitted=False)
+    , *, native_tool_effect_agent):
+        host = (await _real_lifecycle_host(admitted=False, native_tool_effect_agent=native_tool_effect_agent))
         _record_stop(host)
         seen = _listen(host)
 
@@ -762,18 +779,12 @@ class TestStreamingTurnOverTheRealLifecycle:
 # --------------------------------------------------------------------------
 
 
-def _real_agent(did="did:test:3159-outcome"):
+async def _real_agent(did="did:test:3159-outcome", *, native_tool_effect_agent):
     """A real agent stopped just short of the machinery a turn body needs."""
 
-    agent = KestrelAgent(did=did, storage_path=":memory:")
-    agent.storage = object()
-    agent.context_manager = object()
-    agent.bootstrap_service = None
-    agent._safe_mode = False
-    agent._maybe_audit = AsyncMock()
-    agent._maybe_refresh_user_byok_resolver = AsyncMock()
-    agent._genesis_audit_cognition_block = AsyncMock(return_value=None)
-    return agent
+    from tests.unit.test_non_streaming_turn_privacy_span import _configure_turn_probe
+
+    return _configure_turn_probe(await native_tool_effect_agent(did=did))
 
 
 def _served_stream(agent, body):
@@ -817,8 +828,8 @@ class TestADisconnectIsRecordedNotInferred:
     @pytest.mark.asyncio
     async def test_client_gone_while_producer_awaits_its_next_token(
         self, span_exporter
-    ):
-        agent = _real_agent()
+    , *, native_tool_effect_agent):
+        agent = (await _real_agent(native_tool_effect_agent=native_tool_effect_agent))
         seen = _listen(agent)
         first_sent = asyncio.Event()
         delivered = []
@@ -849,8 +860,8 @@ class TestADisconnectIsRecordedNotInferred:
         ]
 
     @pytest.mark.asyncio
-    async def test_a_failed_send_is_a_disconnect(self, span_exporter):
-        agent = _real_agent()
+    async def test_a_failed_send_is_a_disconnect(self, span_exporter, *, native_tool_effect_agent):
+        agent = (await _real_agent(native_tool_effect_agent=native_tool_effect_agent))
         seen = _listen(agent)
 
         async def receive():
@@ -874,12 +885,12 @@ class TestADisconnectIsRecordedNotInferred:
     @pytest.mark.asyncio
     async def test_the_same_cancel_without_a_close_record_is_interrupted(
         self, span_exporter
-    ):
+    , *, native_tool_effect_agent):
         """Cancel the owner task directly — what a teardown does — and the
         producer unwinds with the very same ``CancelledError``. No consumer
         recorded a close, so it is NOT reported as a disconnect."""
 
-        agent = _real_agent()
+        agent = (await _real_agent(native_tool_effect_agent=native_tool_effect_agent))
         first_sent = asyncio.Event()
         stream = _served_stream(agent, _blocked_after_first_token(first_sent))
 
@@ -897,10 +908,10 @@ class TestADisconnectIsRecordedNotInferred:
     @pytest.mark.asyncio
     async def test_a_recorded_stop_outranks_the_consumer_close(
         self, span_exporter
-    ):
+    , *, native_tool_effect_agent):
         """The endpoint breaks and closes after a Stop: that is a Stop."""
 
-        host = _turn_host()
+        host = (await _turn_host(native_tool_effect_agent=native_tool_effect_agent))
         stopped = asyncio.Event()
 
         async def body(*_a, **_k):
@@ -938,10 +949,10 @@ class TestADispositionBelongsToExactlyOneTask:
     @pytest.mark.asyncio
     async def test_stream_source_child_queues_for_its_own_conversation_turn(
         self, span_exporter
-    ):
+    , *, native_tool_effect_agent):
         from kestrel_sdk.signals import ResourceLock
 
-        agent = _real_agent()
+        agent = (await _real_agent(native_tool_effect_agent=native_tool_effect_agent))
         seen = _listen(agent)
         children = []
         child_entered = asyncio.Event()
@@ -974,8 +985,8 @@ class TestADispositionBelongsToExactlyOneTask:
     @pytest.mark.asyncio
     async def test_a_child_of_a_disconnected_stream_reports_its_own_outcome(
         self, span_exporter
-    ):
-        agent = _real_agent()
+    , *, native_tool_effect_agent):
+        agent = (await _real_agent(native_tool_effect_agent=native_tool_effect_agent))
         seen = _listen(agent)
         agent._process_input_traced_locked = AsyncMock(return_value="child")
         first_sent = asyncio.Event()
@@ -1017,12 +1028,12 @@ class TestADispositionBelongsToExactlyOneTask:
     @pytest.mark.asyncio
     async def test_a_child_turn_never_lands_in_its_parents_capture(
         self, span_exporter
-    ):
+    , *, native_tool_effect_agent):
         """The dispatcher reports ``turn_id`` only when its capture holds
         exactly one address. A child turn minted into the parent's capture
         made it two, and the wake lost the turn it produced."""
 
-        agent = _real_agent()
+        agent = (await _real_agent(native_tool_effect_agent=native_tool_effect_agent))
         seen = _listen(agent)
         children = []
 
@@ -1063,8 +1074,8 @@ class TestTheListenerSeamOnARealAgent:
     @pytest.mark.asyncio
     async def test_invoke_and_stream_each_publish_once_with_the_span_value(
         self, span_exporter
-    ):
-        agent = _real_agent()
+    , *, native_tool_effect_agent):
+        agent = (await _real_agent(native_tool_effect_agent=native_tool_effect_agent))
         seen = _listen(agent)
         agent._process_input_traced_locked = AsyncMock(return_value="42")
 
@@ -1088,8 +1099,8 @@ class TestTheListenerSeamOnARealAgent:
         assert stream[TURN_OUTCOME] == "failed"
 
     @pytest.mark.asyncio
-    async def test_a_raising_listener_never_reaches_the_turn(self, span_exporter):
-        agent = _real_agent()
+    async def test_a_raising_listener_never_reaches_the_turn(self, span_exporter, *, native_tool_effect_agent):
+        agent = (await _real_agent(native_tool_effect_agent=native_tool_effect_agent))
         after = _listen(agent)
 
         def explode(_turn_id, _outcome):
@@ -1105,8 +1116,8 @@ class TestTheListenerSeamOnARealAgent:
         ] == "completed"
 
     @pytest.mark.asyncio
-    async def test_a_removed_listener_is_not_called(self, span_exporter):
-        agent = _real_agent()
+    async def test_a_removed_listener_is_not_called(self, span_exporter, *, native_tool_effect_agent):
+        agent = (await _real_agent(native_tool_effect_agent=native_tool_effect_agent))
         seen = []
 
         def listener(turn_id, outcome):

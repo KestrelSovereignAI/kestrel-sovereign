@@ -468,8 +468,8 @@ jobs:
         # These are at least nineteen complete local runs; the slowest
         # process wall time rounds up to 2.6 minutes.
         # Those measurements cover the historical fifteen-case baseline.
-        # This expanded lane collects 47 cases, including the real host-process
-        # restart campaign. Its 41 non-Docker cases pass locally; six Docker
+        # This expanded lane collects 56 cases, including the real host-process
+        # restart, journal boot and callback-inventory campaigns. Six Docker
         # cases require this CI job. The complete expanded lane's duration must
         # be established on the current PR tree, not inferred from the baseline.
         # The ratio is the integration tier's observed runner spread. Its
@@ -478,6 +478,9 @@ jobs:
           uv run --no-sync python -m pytest tests/integration/test_mcp_permission_boundary.py
           tests/integration/test_mcp_apps_host.py
           tests/integration/test_mcp_permission_host_restart.py
+          tests/integration/test_mcp_permission_unknown_restart.py
+          tests/integration/test_tool_effect_host_boot.py
+          tests/unit/test_async_ownership.py::test_repeated_withdrawal_does_not_accumulate_completion_callbacks
           -q --timeout=120 --session-timeout=480
         timeout-minutes: 12
 

@@ -10,7 +10,7 @@ answer that CI, without the package, never hands out (#3578).
 
 from __future__ import annotations
 
-from tests.shared.native_shutdown_budget import shutdown_fixture_agent
+from kestrel_sovereign.testing.native_shutdown_budget import shutdown_fixture_agent
 
 import os
 from contextlib import asynccontextmanager

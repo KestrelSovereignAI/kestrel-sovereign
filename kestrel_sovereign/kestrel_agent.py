@@ -116,6 +116,7 @@ from kestrel_sovereign.agent.invocation import (
     bind_async_invocation,
     mark_current_invocation_effect_checkpointed,
 )
+from kestrel_sovereign.tools.effect_invocation import journal_async_invocation
 from kestrel_sovereign.agent.model_preference import ModelPreferenceMixin
 from kestrel_sovereign.agent.operator_signals import inject_operator_turn
 from kestrel_sovereign.agent.orchestrator_engine import (
@@ -1872,6 +1873,7 @@ class KestrelAgent(
         # (``features/isolated_runtime.py``), which never receives this object.
         self._raw_storage = None
         self.storage = None
+        self.tool_effect_store = None
         # Set only from the durable spawned_by edge during initialize().
         # AgentManager consumes this private projection when rebuilding its
         # runtime authority indexes; it must never trust an arbitrary in-memory
@@ -3273,9 +3275,11 @@ class KestrelAgent(
         # Native admission and context ownership share the primary connection.
         # AsyncStorage owns this backend; every A2A store borrows it so partial
         # boot rollback cannot retire storage still held by other services.
+        scope = NativeRecipientScope(self.did)
+        await self._initialize_tool_effect_store()
         self.task_manager = TaskManager.from_backend(
             self._raw_storage._backend,
-            scope=NativeRecipientScope(self.did),
+            scope=scope,
             owns_backend=False,
             hooks_manager=self.hooks_manager,  # Pass hooks manager for security
             on_task_complete=self._on_background_task_complete,  # For notifications
@@ -4911,10 +4915,19 @@ class KestrelAgent(
             outcome = reported_outcome(await raw.close())
             if outcome is not ReleaseOutcome.RELEASED:
                 return outcome
+        await self._retire_tool_effect_store()
         self._raw_storage = None
         self.storage = None
         self.privacy_agent = None
         return ReleaseOutcome.RELEASED
+
+    async def _retire_tool_effect_store(self) -> None:
+        """Drop the borrower only after the primary storage owner retires."""
+        journal = getattr(self, "tool_effect_store", None)
+        if journal is not None:
+            await journal.close()
+            if self.tool_effect_store is journal:
+                self.tool_effect_store = None
 
     async def _boot_teardown_background_tasks(self) -> ReleaseOutcome:
         """Cancel agent-owned background work and reap it, within one bound."""
@@ -5166,6 +5179,32 @@ class KestrelAgent(
         if privacy_agent is None:
             return None
         return privacy_agent.privacy_config
+
+    async def _initialize_tool_effect_store(self) -> None:
+        """Open the original journal only under an installed persistent policy.
+
+        Boot and privacy transitions share this boundary. A volatile boot
+        opens no journal; returning to persistence must open the same durable
+        envelope before the transition can report success.
+        """
+        from kestrel_sovereign.tool_effect_store import ToolEffectStore
+
+        async with self._get_durable_persistence_gate().exclusive():
+            privacy = self.privacy_config
+            if privacy is None:
+                raise RuntimeError("Tool effect journal requires initialized privacy policy")
+            if not privacy.allows_persistent_storage():
+                return
+            journal = self.tool_effect_store
+            if journal is not None:
+                if not journal.initialized or journal.database is not self._raw_storage.db:
+                    raise RuntimeError("Original tool effect journal is unavailable")
+                return
+            journal = ToolEffectStore(self._raw_storage.db, scope=NativeRecipientScope(self.did))
+            # Failed initialization cannot publish a replacement or discard
+            # the original envelope and the evidence that prevents replay.
+            await journal.initialize()
+            self.tool_effect_store = journal
 
     def _get_privacy_transition_lock(self) -> ReentrantTransitionLock:
         """Return the lock that serializes privacy transitions with active turns.
@@ -5530,6 +5569,7 @@ class KestrelAgent(
             self._privacy_policy_epoch = getattr(self, "_privacy_policy_epoch", 0) + 1
             status_message = self.privacy_agent.set_mode(mode)
             self._install_privacy_mandate(plan)
+            await self._initialize_tool_effect_store()
         if plan.warning:
             status_message = f"{status_message} {plan.warning}"
 
@@ -8053,6 +8093,7 @@ Expected Duration: {expected_duration}
         return None
 
     @bind_async_invocation("invocation_id", track_request_lifecycle=True)
+    @journal_async_invocation
     async def process_input(self, user_input: str, model_override: str = None, session_id: str = None, include_memories: bool = True, caller=None, system_prompt_addendum: str = None, system_prompt_budget_bytes: int = None, anchored_doctrine=None, user_passphrase: str = None, signal_wake: Optional[dict] = None, invocation_context: Optional[LLMInvocationContext] = None, pre_turn_guard=None, *, invocation_id: Optional[str] = None, invocation_provenance=None, wake_reply: Optional[WakeReplyReceipt] = None) -> str:
         """
         Processes user input by consulting the constitution, retrieving context,
@@ -8249,7 +8290,7 @@ Expected Duration: {expected_duration}
                     # completes fully before the turn reads any policy, or waits until
                     # the turn has finished consuming its prompt.
                     transition_lock = self._get_privacy_transition_lock()
-                    async with transition_lock:
+                    async with transition_lock.policy_span():
                         # The source's own admission runs HERE, first, and nowhere
                         # else. Placing it one line earlier — outside the mutex — is
                         # what rounds 1-3 each did, and each time a transition landed
@@ -9769,6 +9810,8 @@ Expected Duration: {expected_duration}
             closed = ReleaseOutcome.RELEASED
             if storage is not None and hasattr(storage, "close"):
                 closed = reported_outcome(await storage.close())
+            if closed is ReleaseOutcome.RELEASED:
+                await self._retire_tool_effect_store()
             return closed if precloses is ReleaseOutcome.RELEASED else precloses
 
         if dispatcher is not None and hasattr(dispatcher, "shutdown_durable_delivery"):
@@ -11443,6 +11486,8 @@ Expected Duration: {expected_duration}
 
             async def close_storage() -> ReleaseOutcome:
                 closed = reported_outcome(await storage.close())
+                if closed is ReleaseOutcome.RELEASED:
+                    await self._retire_tool_effect_store()
                 if storage_preclose_status in {"error", "abandoned", "cancelled"}:
                     # The cached SQLAlchemy engine may still hold the store.
                     return ReleaseOutcome.RETAINED

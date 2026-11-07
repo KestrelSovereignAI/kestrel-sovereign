@@ -27,6 +27,9 @@ from typing import Any
 from unittest.mock import AsyncMock
 
 import pytest
+import pytest_asyncio
+from kestrel_sovereign.features.base import Feature
+from uuid import uuid4
 
 from kestrel_sdk.hooks.base import (
     HookEvent,
@@ -131,7 +134,12 @@ class _FakeHooksManager:
         self.post_calls.append(hook_input)
 
 
-class _SubagentFeature:
+class _SubagentFeature(Feature):
+    tool_description = "Controlled native named feature dispatch"
+
+    async def initialize(self):
+        pass
+
     """A feature that supports subagent dispatch via the
     ``Feature.to_orchestrator_tool`` path. The orchestrator-level tool
     name equals ``self.tool_name`` (snake_case class name in real
@@ -139,11 +147,16 @@ class _SubagentFeature:
     delegates to the subagent's logic."""
 
     def __init__(self, tool_name: str, *, returns: Any = None, side_effect=None):
+        super().__init__(None)
         self.name = tool_name
-        self.tool_name = tool_name
+        self._tool_name = tool_name
         self._returns = returns
         self._side_effect = side_effect
         self.subagent_calls: list[dict] = []
+
+    @property
+    def tool_name(self):
+        return self._tool_name
 
     def get_tools(self):
         # No @tool methods — the subagent dispatcher is the ONLY way
@@ -163,36 +176,14 @@ class _SubagentFeature:
         return self._returns
 
 
-class _MinimalOrchestrator(OrchestratorEngineMixin):
-    """Just enough orchestrator surface to exercise ``execute_named_tool``."""
-
-    def __init__(self, features: dict, hooks_manager: _FakeHooksManager):
-        self.features = features
-        self.hooks_manager = hooks_manager
-        self._explored_features: set[str] = set()
-
-    # The subagent-dispatch fallback path consults
-    # ``_visible_features_by_tool_name`` (tool_registry mixin in real
-    # code). Stand-in here returns every feature with a ``tool_name``
-    # — no visibility filtering — which is the right scope for these
-    # unit tests.
-    def _visible_features_by_tool_name(self):
-        return {
-            feat.tool_name: feat
-            for feat in self.features.values()
-            if hasattr(feat, "tool_name") and hasattr(feat, "execute_as_subagent")
-        }
-
-    async def _get_denied_tools(self, feature_name: str) -> list:
-        # Default to none; tests that exercise denied-tool stripping
-        # override this directly on the instance.
-        return []
-
-    def _register_explored_feature_tools(self, feature) -> None:
-        # Real implementation registers @tool methods for direct call
-        # after first subagent hop. The dispatch path is what we test
-        # here; just record the call so tests can assert it ran.
-        self._explored_features.add(getattr(feature, "tool_name", ""))
+async def _make_orchestrator(features, hooks_manager, *, native_tool_effect_agent):
+    """A native host; controlled domain methods and policy decisions stay local."""
+    agent = await native_tool_effect_agent(did="did:test:named-entry")
+    agent.features = features
+    agent.hooks_manager = hooks_manager
+    for feature in features.values():
+        feature.agent = agent
+    return agent
 
 
 @pytest.fixture
@@ -200,18 +191,18 @@ def fake_tool():
     return _FakeTool("send_email", returns={"success": True, "message_id": "abc"})
 
 
-@pytest.fixture
-def agent_with_tool(fake_tool):
+@pytest_asyncio.fixture
+async def agent_with_tool(fake_tool, *, native_tool_effect_agent):
     feature = _FakeFeature("email", [fake_tool])
-    return _MinimalOrchestrator(
+    return (await _make_orchestrator(
         features={"email": feature},
         hooks_manager=_FakeHooksManager(),
-    )
+    native_tool_effect_agent=native_tool_effect_agent))
 
 
 class TestExecuteNamedToolGovernance:
     @pytest.mark.asyncio
-    async def test_inline_executor_marks_completed_effect_on_owning_turn(self):
+    async def test_inline_executor_marks_completed_effect_on_owning_turn(self, *, native_tool_effect_agent):
         """The reader-task bridge updates the captured turn durability state."""
 
         from kestrel_sovereign.agent.invocation import (
@@ -219,10 +210,10 @@ class TestExecuteNamedToolGovernance:
             invocation_scope,
         )
 
-        agent = _MinimalOrchestrator(
+        agent = (await _make_orchestrator(
             features={},
             hooks_manager=_FakeHooksManager(),
-        )
+        native_tool_effect_agent=native_tool_effect_agent))
         agent.execute_named_tool = AsyncMock(
             return_value={"success": True, "result": "committed"}
         )
@@ -237,13 +228,13 @@ class TestExecuteNamedToolGovernance:
             assert state.session_id == "effect-session"
 
     @pytest.mark.asyncio
-    async def test_inline_executor_exposes_completed_effect_checkpoint(self):
+    async def test_inline_executor_exposes_completed_effect_checkpoint(self, *, native_tool_effect_agent):
         """The adapter-facing callable is wired to the durable Stop seam."""
 
-        agent = _MinimalOrchestrator(
+        agent = (await _make_orchestrator(
             features={},
             hooks_manager=_FakeHooksManager(),
-        )
+        native_tool_effect_agent=native_tool_effect_agent))
         agent._persist_completed_tool_stop_checkpoint = AsyncMock()
 
         executor = agent._make_inline_tool_executor("session-checkpoint")
@@ -271,7 +262,7 @@ class TestExecuteNamedToolGovernance:
             "send_email",
             {"to": "x@example.com"},
             session_id="voice-session-1",
-            source="voice_realtime",
+            source="voice_realtime", operation_id=uuid4().hex
         )
 
         # Tool actually executed.
@@ -293,7 +284,7 @@ class TestExecuteNamedToolGovernance:
         assert post.feature_name == "email"
 
     @pytest.mark.asyncio
-    async def test_dispatches_dynamically_mounted_direct_tool(self):
+    async def test_dispatches_dynamically_mounted_direct_tool(self, *, native_tool_effect_agent):
         """A dynamically-mounted tool — e.g. an MCP server's tools mounted via
         register_dynamic_tools — lives in ``_direct_tools``, NOT in any
         feature's ``get_tools()``. execute_named_tool must resolve + dispatch it
@@ -306,9 +297,9 @@ class TestExecuteNamedToolGovernance:
         tool = _FakeTool(
             "mcp__test_server__echo", returns={"success": True, "echo": "hi"}
         )
-        agent = _MinimalOrchestrator(
+        agent = (await _make_orchestrator(
             features={}, hooks_manager=_FakeHooksManager()
-        )
+        , native_tool_effect_agent=native_tool_effect_agent))
         # Mounted dynamic tool (not exposed by any feature.get_tools()).
         agent._direct_tools = {"mcp__test_server__echo": tool}
         agent._tool_to_feature = {"mcp__test_server__echo": "mcp_agent"}
@@ -317,7 +308,7 @@ class TestExecuteNamedToolGovernance:
             "mcp__test_server__echo",
             {"text": "hi"},
             session_id="mcp-1",
-            source="mcp",
+            source="mcp", operation_id=uuid4().hex
         )
 
         # Dispatched (not ToolNotRegisteredError) and returned the tool result.
@@ -329,34 +320,34 @@ class TestExecuteNamedToolGovernance:
         assert len(agent.hooks_manager.post_calls) == 1
 
     @pytest.mark.asyncio
-    async def test_unknown_name_still_raises_when_direct_tools_present(self):
+    async def test_unknown_name_still_raises_when_direct_tools_present(self, *, native_tool_effect_agent):
         """A name absent from features AND _direct_tools still raises — the new
         dynamic-tool branch must not swallow genuinely-unknown tools."""
-        agent = _MinimalOrchestrator(
+        agent = (await _make_orchestrator(
             features={}, hooks_manager=_FakeHooksManager()
-        )
+        , native_tool_effect_agent=native_tool_effect_agent))
         agent._direct_tools = {"mcp__test_server__echo": _FakeTool("x")}
         agent._tool_to_feature = {}
         with pytest.raises(ToolNotRegisteredError):
-            await agent.execute_named_tool("does_not_exist", {}, session_id="s")
+            await agent.execute_named_tool("does_not_exist", {}, session_id="s", operation_id=uuid4().hex)
 
     @pytest.mark.asyncio
-    async def test_pre_hook_deny_blocks_execution(self, fake_tool):
+    async def test_pre_hook_deny_blocks_execution(self, fake_tool, *, native_tool_effect_agent):
         """The headline #1314 behavior — a DENY decision must NOT run the tool."""
         feature = _FakeFeature("email", [fake_tool])
-        agent = _MinimalOrchestrator(
+        agent = (await _make_orchestrator(
             features={"email": feature},
             hooks_manager=_FakeHooksManager(
                 pre_decision=PermissionDecision.DENY,
                 pre_reason="user revoked email permission for this session",
             ),
-        )
+        native_tool_effect_agent=native_tool_effect_agent))
 
         result = await agent.execute_named_tool(
             "send_email",
             {"to": "x@example.com"},
             session_id="voice-session-2",
-            source="voice_realtime",
+            source="voice_realtime", operation_id=uuid4().hex
         )
 
         # Tool NOT executed.
@@ -370,7 +361,7 @@ class TestExecuteNamedToolGovernance:
         assert agent.hooks_manager.post_calls == []
 
     @pytest.mark.asyncio
-    async def test_real_manager_modify_chain_reaches_the_tool(self, fake_tool):
+    async def test_real_manager_modify_chain_reaches_the_tool(self, fake_tool, *, native_tool_effect_agent):
         """The real ``HookManager`` mutates ``input.tool_input`` when a
         MODIFY hook fires, then returns a fresh ``allow()`` HookOutput
         with NO ``updated_input``.  Reading args back from
@@ -381,18 +372,18 @@ class TestExecuteNamedToolGovernance:
         ``HookInput.tool_input`` so the production shape works.
         """
         feature = _FakeFeature("email", [fake_tool])
-        agent = _MinimalOrchestrator(
+        agent = (await _make_orchestrator(
             features={"email": feature},
             hooks_manager=_FakeHooksManager(
                 modify_input={"to": "redacted@example.com"},
             ),
-        )
+        native_tool_effect_agent=native_tool_effect_agent))
 
         await agent.execute_named_tool(
             "send_email",
             {"to": "leaked@example.com"},
             session_id="voice-session-3",
-            source="voice_realtime",
+            source="voice_realtime", operation_id=uuid4().hex
         )
 
         # Tool ran with the REDACTED args — without this, a real
@@ -404,27 +395,27 @@ class TestExecuteNamedToolGovernance:
         assert agent.hooks_manager.post_calls[0].tool_input == {"to": "redacted@example.com"}
 
     @pytest.mark.asyncio
-    async def test_single_hook_short_circuit_updated_input_also_reaches_the_tool(self, fake_tool):
+    async def test_single_hook_short_circuit_updated_input_also_reaches_the_tool(self, fake_tool, *, native_tool_effect_agent):
         """The other shape: a single hook short-circuits the chain with
         ``HookOutput(updated_input=...)`` rather than threading the
         modification through.  Both shapes must work — fixtures and
         production hooks should both apply rewrites at execution time.
         """
         feature = _FakeFeature("email", [fake_tool])
-        agent = _MinimalOrchestrator(
+        agent = (await _make_orchestrator(
             features={"email": feature},
             hooks_manager=_FakeHooksManager(
                 short_circuit_input={"to": "redacted@example.com"},
             ),
-        )
+        native_tool_effect_agent=native_tool_effect_agent))
         await agent.execute_named_tool(
             "send_email", {"to": "leaked@example.com"},
-            session_id="s", source="voice_realtime",
+            session_id="s", source="voice_realtime", operation_id=uuid4().hex
         )
         assert fake_tool.calls == [{"to": "redacted@example.com"}]
 
     @pytest.mark.asyncio
-    async def test_non_dict_args_rejected_before_execution(self, fake_tool):
+    async def test_non_dict_args_rejected_before_execution(self, fake_tool, *, native_tool_effect_agent):
         """Non-dict ``args`` would crash at ``**effective_args``.  The
         chat path runs ``validate_tool_arguments`` before dispatch; the
         external path must too, or realtime/MCP/A2A callers can crash
@@ -432,16 +423,16 @@ class TestExecuteNamedToolGovernance:
         round-4 caught this on #1314.
         """
         feature = _FakeFeature("email", [fake_tool])
-        agent = _MinimalOrchestrator(
+        agent = (await _make_orchestrator(
             features={"email": feature},
             hooks_manager=_FakeHooksManager(),
-        )
+        native_tool_effect_agent=native_tool_effect_agent))
 
         result = await agent.execute_named_tool(
             "send_email",
             ["not", "a", "dict"],  # type: ignore[arg-type] — deliberately wrong
             session_id="s",
-            source="voice_realtime",
+            source="voice_realtime", operation_id=uuid4().hex
         )
 
         # Tool NOT executed; structured error returned.
@@ -450,7 +441,7 @@ class TestExecuteNamedToolGovernance:
         assert "must be a dict" in result["error"]
 
     @pytest.mark.asyncio
-    async def test_oversize_string_arg_rejected_before_execution(self, fake_tool):
+    async def test_oversize_string_arg_rejected_before_execution(self, fake_tool, *, native_tool_effect_agent):
         """``validate_tool_arguments`` enforces ``MAX_TOOL_ARG_LENGTH``
         on every string field.  External transports must honor the
         same guardrail — otherwise an unbounded prompt-injection
@@ -461,10 +452,10 @@ class TestExecuteNamedToolGovernance:
         )
 
         feature = _FakeFeature("email", [fake_tool])
-        agent = _MinimalOrchestrator(
+        agent = (await _make_orchestrator(
             features={"email": feature},
             hooks_manager=_FakeHooksManager(),
-        )
+        native_tool_effect_agent=native_tool_effect_agent))
 
         # One byte over the limit.
         too_long = "x" * (MAX_TOOL_ARG_LENGTH + 1)
@@ -472,7 +463,7 @@ class TestExecuteNamedToolGovernance:
             "send_email",
             {"to": too_long},
             session_id="s",
-            source="voice_realtime",
+            source="voice_realtime", operation_id=uuid4().hex
         )
 
         assert fake_tool.calls == []
@@ -480,7 +471,7 @@ class TestExecuteNamedToolGovernance:
         assert "exceeds maximum length" in result["error"]
 
     @pytest.mark.asyncio
-    async def test_hook_rewrite_to_empty_dict_is_honored(self):
+    async def test_hook_rewrite_to_empty_dict_is_honored(self, *, native_tool_effect_agent):
         """An empty-dict rewrite is a legitimate hook decision — a
         constraint hook clearing all sensitive args, or a redactor
         stripping every field.  Truthiness fallbacks (``updated_input or
@@ -490,16 +481,16 @@ class TestExecuteNamedToolGovernance:
         """
         tool = _FakeTool("noop", returns="ok")
         feature = _FakeFeature("noop_feat", [tool])
-        agent = _MinimalOrchestrator(
+        agent = (await _make_orchestrator(
             features={"noop_feat": feature},
             hooks_manager=_FakeHooksManager(short_circuit_input={}),
-        )
+        native_tool_effect_agent=native_tool_effect_agent))
 
         await agent.execute_named_tool(
             "noop",
             {"sensitive": "data", "more": "stuff"},
             session_id="s",
-            source="voice_realtime",
+            source="voice_realtime", operation_id=uuid4().hex
         )
 
         # Tool ran with the EMPTY dict the hook returned, not the
@@ -507,7 +498,7 @@ class TestExecuteNamedToolGovernance:
         assert tool.calls == [{}]
 
     @pytest.mark.asyncio
-    async def test_pre_hook_ask_decision_is_blocking(self, fake_tool):
+    async def test_pre_hook_ask_decision_is_blocking(self, fake_tool, *, native_tool_effect_agent):
         """A PRE hook returning ``PermissionDecision.ASK`` is routing the
         call to an approval queue — the tool must NOT execute until
         approval lands.  Treating ASK as fall-through would bypass the
@@ -515,19 +506,19 @@ class TestExecuteNamedToolGovernance:
         path.  Codex flagged this on round-2 review of #1314.
         """
         feature = _FakeFeature("email", [fake_tool])
-        agent = _MinimalOrchestrator(
+        agent = (await _make_orchestrator(
             features={"email": feature},
             hooks_manager=_FakeHooksManager(
                 pre_decision=PermissionDecision.ASK,
                 pre_reason="this tool requires explicit user approval",
             ),
-        )
+        native_tool_effect_agent=native_tool_effect_agent))
 
         result = await agent.execute_named_tool(
             "send_email",
             {"to": "x@example.com"},
             session_id="voice-session-ask",
-            source="voice_realtime",
+            source="voice_realtime", operation_id=uuid4().hex
         )
 
         # Tool NOT executed.
@@ -553,73 +544,71 @@ class TestExecuteNamedToolGovernance:
                 "nonexistent_tool",
                 {},
                 session_id="s",
-                source="voice_realtime",
+                source="voice_realtime", operation_id=uuid4().hex
             )
 
     @pytest.mark.asyncio
-    async def test_tool_value_error_preserves_public_uncertainty(self):
+    async def test_tool_value_error_preserves_public_uncertainty(self, *, native_tool_effect_agent):
         from kestrel_sdk.resources import ResourceOutcomeUnknown
 
         original = ValueError("private-invalid-recipient")
         bad_tool = _FakeTool("send_email", side_effect=original)
-        agent = _MinimalOrchestrator(
+        agent = (await _make_orchestrator(
             features={"email": _FakeFeature("email", [bad_tool])},
             hooks_manager=_FakeHooksManager(),
-        )
+        native_tool_effect_agent=native_tool_effect_agent))
         with pytest.raises(ResourceOutcomeUnknown, match="unconfirmed") as caught:
             await agent.execute_named_tool(
-                "send_email", {"to": "bad"}, session_id="s", source="voice_realtime",
+                "send_email", {"to": "bad"}, session_id="s", source="voice_realtime", operation_id=uuid4().hex
             )
         assert caught.value.__cause__ is original
         assert "private-invalid-recipient" not in str(caught.value)
 
     @pytest.mark.asyncio
-    async def test_resolver_walks_features_not_explored_cache(self, fake_tool):
+    async def test_resolver_walks_features_not_explored_cache(self, fake_tool, *, native_tool_effect_agent):
         """External transports must work on features that have never been
         subagent-dispatched (the ``_direct_tools`` / ``_explored_features``
         cache is only populated after the chat orchestrator first dispatches
         into a feature).  The resolver must consult ``self.features``
         directly, not the cache."""
         feature = _FakeFeature("email", [fake_tool])
-        agent = _MinimalOrchestrator(
+        agent = (await _make_orchestrator(
             features={"email": feature},
             hooks_manager=_FakeHooksManager(),
-        )
-        # Crucially, _direct_tools / _explored_features attributes are NOT
-        # populated — only self.features.  If the resolver consulted the
-        # cache, the next call would raise ValueError.
-        assert not hasattr(agent, "_direct_tools")
+        native_tool_effect_agent=native_tool_effect_agent))
+        # Native registries exist but remain cold: only the feature is loaded.
+        assert not agent._direct_tools and not agent._explored_features
 
         result = await agent.execute_named_tool(
             "send_email", {"to": "x@example.com"},
-            session_id="s", source="voice_realtime",
+            session_id="s", source="voice_realtime", operation_id=uuid4().hex
         )
         assert result == {"success": True, "message_id": "abc"}
 
     @pytest.mark.asyncio
-    async def test_first_match_wins_across_features(self):
+    async def test_first_match_wins_across_features(self, *, native_tool_effect_agent):
         """Tool names are expected globally unique within an agent's
         enabled features; if they collide the resolver returns the first
         match (deterministic behavior — iteration order of self.features
         is the agent's registration order)."""
         tool_a = _FakeTool("shared_name", returns="from_a")
         tool_b = _FakeTool("shared_name", returns="from_b")
-        agent = _MinimalOrchestrator(
+        agent = (await _make_orchestrator(
             features={
                 "feat_a": _FakeFeature("feat_a", [tool_a]),
                 "feat_b": _FakeFeature("feat_b", [tool_b]),
             },
             hooks_manager=_FakeHooksManager(),
-        )
+        native_tool_effect_agent=native_tool_effect_agent))
 
         result = await agent.execute_named_tool(
             "shared_name", {},
-            session_id="s", source="voice_realtime",
+            session_id="s", source="voice_realtime", operation_id=uuid4().hex
         )
         assert result == "from_a"
 
     @pytest.mark.asyncio
-    async def test_broken_feature_does_not_block_lookup(self, fake_tool):
+    async def test_broken_feature_does_not_block_lookup(self, fake_tool, *, native_tool_effect_agent):
         """A single feature whose ``get_tools()`` raises must not prevent
         the resolver from finding tools on the other features."""
         class _BrokenFeature:
@@ -628,16 +617,16 @@ class TestExecuteNamedToolGovernance:
             def get_tools(self):
                 raise RuntimeError("intentionally broken for this test")
 
-        agent = _MinimalOrchestrator(
+        agent = (await _make_orchestrator(
             features={
                 "broken": _BrokenFeature(),
                 "email": _FakeFeature("email", [fake_tool]),
             },
             hooks_manager=_FakeHooksManager(),
-        )
+        native_tool_effect_agent=native_tool_effect_agent))
         result = await agent.execute_named_tool(
             "send_email", {"to": "x@example.com"},
-            session_id="s", source="voice_realtime",
+            session_id="s", source="voice_realtime", operation_id=uuid4().hex
         )
         assert result == {"success": True, "message_id": "abc"}
 
@@ -653,17 +642,17 @@ class TestExecuteNamedToolSubagentDispatch:
     surfaced the symptom."""
 
     @pytest.mark.asyncio
-    async def test_dispatches_subagent_when_no_tool_match(self):
+    async def test_dispatches_subagent_when_no_tool_match(self, *, native_tool_effect_agent):
         feature = _SubagentFeature(
             "memory_feature", returns={"success": True, "result": "200 msgs"},
         )
-        agent = _MinimalOrchestrator(
+        agent = (await _make_orchestrator(
             features={"memory": feature}, hooks_manager=_FakeHooksManager(),
-        )
+        native_tool_effect_agent=native_tool_effect_agent))
         result = await agent.execute_named_tool(
             "memory_feature",
             {"task": "show me recent memory", "context": "for debugging"},
-            session_id="codex-inline-1", source="codex_app_server",
+            session_id="codex-inline-1", source="codex_app_server", operation_id=uuid4().hex
         )
         assert result == {"success": True, "result": "200 msgs"}
         # Subagent received the task/context unchanged.
@@ -678,15 +667,15 @@ class TestExecuteNamedToolSubagentDispatch:
         assert "memory_feature" in agent._explored_features
 
     @pytest.mark.asyncio
-    async def test_dispatch_fires_pre_and_post_subagent_hooks(self):
+    async def test_dispatch_fires_pre_and_post_subagent_hooks(self, *, native_tool_effect_agent):
         feature = _SubagentFeature("memory_feature", returns={"success": True})
         hooks = _FakeHooksManager()
-        agent = _MinimalOrchestrator(
+        agent = (await _make_orchestrator(
             features={"memory": feature}, hooks_manager=hooks,
-        )
+        native_tool_effect_agent=native_tool_effect_agent))
         await agent.execute_named_tool(
             "memory_feature", {"task": "ping"},
-            session_id="s", source="codex_app_server",
+            session_id="s", source="codex_app_server", operation_id=uuid4().hex
         )
         # Subagent dispatch fires the OUTER PRE_SUBAGENT_CALL envelope.
         # The inner PRE_TOOL_USE envelope is asserted separately in
@@ -706,18 +695,18 @@ class TestExecuteNamedToolSubagentDispatch:
         assert len(post_subagent_calls) == 1
 
     @pytest.mark.asyncio
-    async def test_pre_subagent_deny_blocks_dispatch(self):
+    async def test_pre_subagent_deny_blocks_dispatch(self, *, native_tool_effect_agent):
         feature = _SubagentFeature("memory_feature", returns={"success": True})
-        agent = _MinimalOrchestrator(
+        agent = (await _make_orchestrator(
             features={"memory": feature},
             hooks_manager=_FakeHooksManager(
                 pre_decision=PermissionDecision.DENY,
                 pre_reason="memory access revoked for this session",
             ),
-        )
+        native_tool_effect_agent=native_tool_effect_agent))
         result = await agent.execute_named_tool(
             "memory_feature", {"task": "show secrets"},
-            session_id="s", source="codex_app_server",
+            session_id="s", source="codex_app_server", operation_id=uuid4().hex
         )
         assert result == {
             "success": False,
@@ -727,22 +716,22 @@ class TestExecuteNamedToolSubagentDispatch:
         assert feature.subagent_calls == []
 
     @pytest.mark.asyncio
-    async def test_pre_subagent_ask_blocks_dispatch(self):
+    async def test_pre_subagent_ask_blocks_dispatch(self, *, native_tool_effect_agent):
         """ASK is just as blocking as DENY at this surface — the
         external transport gets an approval-required envelope and the
         subagent does NOT run. (The approval queue is the chat path's
         side channel; external transports don't sit on it.)"""
         feature = _SubagentFeature("memory_feature", returns={"success": True})
-        agent = _MinimalOrchestrator(
+        agent = (await _make_orchestrator(
             features={"memory": feature},
             hooks_manager=_FakeHooksManager(
                 pre_decision=PermissionDecision.ASK,
                 pre_reason="needs sovereign approval",
             ),
-        )
+        native_tool_effect_agent=native_tool_effect_agent))
         result = await agent.execute_named_tool(
             "memory_feature", {"task": "delete all"},
-            session_id="s", source="codex_app_server",
+            session_id="s", source="codex_app_server", operation_id=uuid4().hex
         )
         assert result == {
             "success": False,
@@ -751,14 +740,14 @@ class TestExecuteNamedToolSubagentDispatch:
         assert feature.subagent_calls == []
 
     @pytest.mark.asyncio
-    async def test_denied_tools_threaded_to_subagent(self):
+    async def test_denied_tools_threaded_to_subagent(self, *, native_tool_effect_agent):
         """Per-feature deny-list is honored: the dispatcher fetches
         denied tools and passes them to ``execute_as_subagent`` so the
         inner subagent loop can strip them from its advertised set."""
         feature = _SubagentFeature("memory_feature", returns={"success": True})
-        agent = _MinimalOrchestrator(
+        agent = (await _make_orchestrator(
             features={"memory": feature}, hooks_manager=_FakeHooksManager(),
-        )
+        native_tool_effect_agent=native_tool_effect_agent))
 
         async def fake_denied(_name):
             return ["dangerous_skill"]
@@ -766,12 +755,12 @@ class TestExecuteNamedToolSubagentDispatch:
         agent._get_denied_tools = fake_denied  # type: ignore[assignment]
         await agent.execute_named_tool(
             "memory_feature", {"task": "do safe thing"},
-            session_id="s", source="codex_app_server",
+            session_id="s", source="codex_app_server", operation_id=uuid4().hex
         )
         assert feature.subagent_calls[0]["denied_tools"] == ["dangerous_skill"]
 
     @pytest.mark.asyncio
-    async def test_dispatch_also_fires_pre_and_post_tool_use_inner_envelope(self):
+    async def test_dispatch_also_fires_pre_and_post_tool_use_inner_envelope(self, *, native_tool_effect_agent):
         """Codex P1 on PR #1385: chat-path ``_dispatch_feature_tool``
         wraps ``execute_as_subagent`` in ``_execute_tool_with_hooks``
         which fires PRE_TOOL_USE/POST_TOOL_USE inside the
@@ -782,12 +771,12 @@ class TestExecuteNamedToolSubagentDispatch:
         per transport. This test pins both event types fire."""
         feature = _SubagentFeature("memory_feature", returns={"success": True})
         hooks = _FakeHooksManager()
-        agent = _MinimalOrchestrator(
+        agent = (await _make_orchestrator(
             features={"memory": feature}, hooks_manager=hooks,
-        )
+        native_tool_effect_agent=native_tool_effect_agent))
         await agent.execute_named_tool(
             "memory_feature", {"task": "ping"},
-            session_id="s", source="codex_app_server",
+            session_id="s", source="codex_app_server", operation_id=uuid4().hex
         )
         pre_events = [
             call.hook_event_name for call in hooks.pre_calls
@@ -804,36 +793,29 @@ class TestExecuteNamedToolSubagentDispatch:
         assert HookEvent.POST_TOOL_USE.value in post_events
 
     @pytest.mark.asyncio
-    async def test_subagent_exception_returns_tool_shaped_error(self):
-        """Codex P2 on PR #1385: chat-path catches subagent exceptions
-        and returns a tool-shaped error envelope (the LLM sees a
-        failure result instead of a transport crash). The inline-
-        executor path must do the same — otherwise a subagent runtime
-        failure kills the codex stream instead of letting the LLM
-        recover."""
-        feature = _SubagentFeature(
-            "memory_feature",
-            side_effect=RuntimeError("DB connection lost"),
-        )
+    async def test_subagent_exception_remains_uncertain_before_business_projection(self, *, native_tool_effect_agent):
+        from kestrel_sdk.resources import ResourceOutcomeUnknown
+        from kestrel_sovereign.execution_custody import execution_evidence_carriers
+
+        original = RuntimeError("DB connection lost")
+        feature = _SubagentFeature("memory_feature", side_effect=original)
         hooks = _FakeHooksManager()
-        agent = _MinimalOrchestrator(
+        agent = await _make_orchestrator(
             features={"memory": feature}, hooks_manager=hooks,
-        )
-        result = await agent.execute_named_tool(
-            "memory_feature", {"task": "search"},
-            session_id="s", source="codex_app_server",
-        )
-        # Tool-shaped failure envelope, not exception propagation.
-        assert isinstance(result, dict)
-        assert result["success"] is False
-        assert "DB connection lost" in result["error"]
-        # POST_SUBAGENT_CALL STILL fires on the failure path so
-        # observability sees every dispatch outcome.
-        post_events = [c.hook_event_name for c in hooks.post_calls]
-        assert HookEvent.POST_SUBAGENT_CALL.value in post_events
+            native_tool_effect_agent=native_tool_effect_agent)
+        with pytest.raises(ResourceOutcomeUnknown) as caught:
+            await agent.execute_named_tool("memory_feature", {"task": "search"},
+                session_id="s", source="codex_app_server", operation_id=uuid4().hex)
+        assert any(error is original for error in execution_evidence_carriers(caught.value))
+        assert "DB connection lost" not in str(caught.value)
+        assert hooks.post_calls == [], "An uncertain effect became a business completion hook"
+        assert await agent.tool_effect_store.database.fetchone(
+            'SELECT state FROM tool_effect_claims') == ('UNCONFIRMED',)
+        assert await agent.observability_store._backend.fetch_all(
+            'SELECT result_status FROM a2a_tool_dispatches') == [('error',)]
 
     @pytest.mark.asyncio
-    async def test_inner_pre_tool_use_deny_blocks_dispatch(self):
+    async def test_inner_pre_tool_use_deny_blocks_dispatch(self, *, native_tool_effect_agent):
         """A PRE_TOOL_USE hook denying the dispatch (e.g. per-tool
         deny-list applied to the subagent dispatcher) must block
         execute_as_subagent even if the outer PRE_SUBAGENT_CALL
@@ -858,12 +840,12 @@ class TestExecuteNamedToolSubagentDispatch:
             return result
 
         hooks.execute_hooks = execute_hooks_with_inner_deny
-        agent = _MinimalOrchestrator(
+        agent = (await _make_orchestrator(
             features={"memory": feature}, hooks_manager=hooks,
-        )
+        native_tool_effect_agent=native_tool_effect_agent))
         result = await agent.execute_named_tool(
             "memory_feature", {"task": "do thing"},
-            session_id="s", source="codex_app_server",
+            session_id="s", source="codex_app_server", operation_id=uuid4().hex
         )
         assert result == {
             "success": False,
@@ -875,19 +857,19 @@ class TestExecuteNamedToolSubagentDispatch:
         assert HookEvent.POST_SUBAGENT_CALL.value in post_events
 
     @pytest.mark.asyncio
-    async def test_still_raises_for_unknown_name(self):
+    async def test_still_raises_for_unknown_name(self, *, native_tool_effect_agent):
         """When neither a @tool match nor a subagent match exists,
         ToolNotRegisteredError still raises — backward compat with the
         prior behavior so callers' error handling is unchanged."""
-        agent = _MinimalOrchestrator(
+        agent = (await _make_orchestrator(
             features={"memory": _SubagentFeature("memory_feature")},
             hooks_manager=_FakeHooksManager(),
-        )
+        native_tool_effect_agent=native_tool_effect_agent))
         from kestrel_sovereign.agent.orchestrator_engine import (
             ToolNotRegisteredError,
         )
         with pytest.raises(ToolNotRegisteredError):
             await agent.execute_named_tool(
                 "nonexistent_tool", {},
-                session_id="s", source="voice_realtime",
+                session_id="s", source="voice_realtime", operation_id=uuid4().hex
             )

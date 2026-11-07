@@ -2310,7 +2310,12 @@ class SQLiteBackend(DatabaseBackend):
                 row = cursor.fetchone()
                 if row is None or row[1] <= 0:
                     return None
-                if re.search(r'\b(?:CHECK|COLLATE|REFERENCES|FOREIGN|CONFLICT|AUTOINCREMENT)\b', row[2], re.IGNORECASE):
+                if table in {'tool_effect_operations', 'tool_effect_claims'}:
+                    from kestrel_sovereign.tool_effect_store import TOOL_EFFECT_OPERATIONS_SQL, TOOL_EFFECT_CLAIMS_SQL
+
+                    if row[2] != (TOOL_EFFECT_OPERATIONS_SQL if table == 'tool_effect_operations' else TOOL_EFFECT_CLAIMS_SQL):
+                        return None
+                elif re.search(r'\b(?:CHECK|COLLATE|REFERENCES|FOREIGN|CONFLICT|AUTOINCREMENT)\b', row[2], re.IGNORECASE):
                     return None
                 cursor.execute(f"SELECT 1 FROM main.sqlite_schema WHERE type='trigger' AND tbl_name='{table}' COLLATE NOCASE UNION ALL SELECT 1 FROM temp.sqlite_schema WHERE type='trigger' AND tbl_name='{table}' COLLATE NOCASE LIMIT 1")
                 if cursor.fetchone() is not None:
@@ -2359,6 +2364,20 @@ class SQLiteBackend(DatabaseBackend):
         require_owner()
         return result
 
+    @staticmethod
+    def _original_auxiliary_relation_matches(journal, observed, accepted):
+        if observed == accepted:
+            return True
+        # The primary writer above has already checked the exact locked
+        # relation and, if needed, made a live ordinary admission for the
+        # connection's new global data_version. Auxiliary tables share that
+        # SAME native configuration. They cannot independently renew it or
+        # excuse any schema, rootpage, column or native-program change.
+        return (observed is not None and accepted is not None
+            and observed[:-1] == accepted[:-1]
+            and observed[-1][:-1] == accepted[-1][:-1]
+            and observed[-1] == journal._sqlite_relation[-1])
+
     async def _verify_original_signal_outcome(self, conn, journal):
         journal.require_original(self)
         journal.require_sqlite_cleanup(self, conn)
@@ -2378,10 +2397,11 @@ class SQLiteBackend(DatabaseBackend):
             raise journal.write_refusal('row_missing_or_changed')
         if await self._read_original_signal_outcome_relation(journal) != journal._sqlite_relation:
             raise journal.write_refusal('destination_changed')
-        from .native_row_custody import _current_step
-        if _current_step(journal):
-            for role, accepted in zip(("owners", "requests"), journal._aux_relations):
-                if await self._read_original_signal_outcome_relation(journal, role=role) != accepted:
+        from .native_row_custody import _native_auxiliary_roles
+        if _native_auxiliary_roles(journal):
+            for role, accepted in zip(_native_auxiliary_roles(journal), journal._aux_relations):
+                if not self._original_auxiliary_relation_matches(journal,
+                        await self._read_original_signal_outcome_relation(journal, role=role), accepted):
                     raise journal.write_refusal('auxiliary_destination_changed')
 
 
@@ -2433,12 +2453,13 @@ class SQLiteBackend(DatabaseBackend):
                                 original_outcome._observer_depth -= 1
                             original_outcome._sqlite_relation = observed
                     if original_outcome is not None:
-                        from .native_row_custody import _current_step
-                        if _current_step(original_outcome):
-                            for role, accepted in zip(("owners", "requests"), original_outcome._aux_relations):
-                                if await self._read_original_signal_outcome_relation(original_outcome, role=role) != accepted:
+                        from .native_row_custody import _current_step, _native_auxiliary_roles
+                        if _native_auxiliary_roles(original_outcome):
+                            for role, accepted in zip(_native_auxiliary_roles(original_outcome), original_outcome._aux_relations):
+                                if not self._original_auxiliary_relation_matches(original_outcome,
+                                        await self._read_original_signal_outcome_relation(original_outcome, role=role), accepted):
                                     raise original_outcome.write_refusal('auxiliary_destination_changed')
-                            if original_outcome._mode == "claim":
+                            if _current_step(original_outcome) and original_outcome._mode == "claim":
                                 async with conn.execute("UPDATE main.visual_computer_owners SET generation = generation + 1 WHERE owner = ?", (original_outcome._identity[0],)) as locked:
                                     if locked.rowcount != 1:
                                         raise original_outcome.write_refusal('original_owner_absent')
@@ -2468,6 +2489,12 @@ class SQLiteBackend(DatabaseBackend):
                         await self._rollback_after_failure(conn, error=e, original_outcome=original_outcome)
                     if original_outcome is not None and type(e) is NativeJournalConfigurationError:
                         raise original_outcome.write_refusal('native_programs_changed') from e
+                    from kestrel_sovereign.a2a.stores.unified.base import NativeStoreConflict
+                    if original_outcome is not None and isinstance(e, NativeStoreConflict):
+                        # A closed native CAS refusal is already a typed
+                        # conflict. Rollback above retires its transaction;
+                        # wrapping it as QueryError loses that contract.
+                        raise
                     if is_execution_control_error(e):
                         raise
                     raise QueryError(f"Query failed: {e}\nQuery: {query}") from e

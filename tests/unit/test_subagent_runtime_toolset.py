@@ -14,6 +14,8 @@ not own.
 """
 
 import pytest
+import pytest_asyncio
+from tests.utils.native_tool_effects import drive_native
 from unittest.mock import MagicMock
 
 from kestrel_sovereign.features.base import Feature
@@ -37,12 +39,7 @@ class _StubFeature(Feature):
 
     def __init__(self, own_tools, agent=None):
         self._own = own_tools
-        self.agent = agent
-        self.disabled_skills = set()
-
-    @property
-    def name(self):
-        return "StubFeature"
+        super().__init__(agent)
 
     @property
     def tool_description(self) -> str:
@@ -55,22 +52,21 @@ class _StubFeature(Feature):
         return list(self._own)
 
 
-def _agent_with(context_tools=(), attachment_tools=()):
-    ctx = MagicMock(); ctx.get_tools.return_value = list(context_tools)
-    att = MagicMock(); att.get_tools.return_value = list(attachment_tools)
-    agent = MagicMock()
-    agent.get_feature.side_effect = lambda n: {
-        "ContextFeature": ctx, "AttachmentsFeature": att
-    }.get(n)
-    return agent
+@pytest_asyncio.fixture
+async def feature(native_tool_effect_agent):
+    agent = await native_tool_effect_agent(did="did:test:subagent-loop")
+    for name, tools in {
+        "ContextFeature": [_tool("recursive_query")],
+        "AttachmentsFeature": [_tool("read_attachment")],
+    }.items():
+        lent = MagicMock()
+        lent.get_tools.return_value = tools
+        agent.features[name] = lent
+    feature = _StubFeature([_tool("own_a"), _tool("own_b")], agent=agent)
+    agent.features[feature.name] = feature
+    return feature
 
 
-@pytest.fixture
-def feature():
-    return _StubFeature(
-        [_tool("own_a"), _tool("own_b")],
-        agent=_agent_with([_tool("recursive_query")], [_tool("read_attachment")]),
-    )
 def test_prompt_names_exactly_the_runtime_toolset(feature):
     runtime = feature._compose_subagent_runtime_tools({"own_a"})
     prompt = feature._get_subagent_prompt(runtime)
@@ -120,11 +116,11 @@ async def test_loop_hands_the_executor_a_map_without_denied_tools(feature):
     feature.agent.llm_service.generate_with_messages = _async_return(_Resp(content="done"))
 
     runtime = feature._compose_subagent_runtime_tools({"own_a"})
-    await feature._handle_feature_tool_calls(
+    await drive_native(feature.agent, lambda: feature._handle_feature_tool_calls(
         _Resp(tool_calls=[_Call("own_b")]),
         tools=[], system_prompt="sp", max_iterations=2,
         runtime_tools=runtime,
-    )
+    ))
     assert seen, "executor was never reached — the assertion below would be vacuous"
     assert "own_a" not in seen, "a security-denied tool reached the executable map"
     assert "own_b" in seen
@@ -144,11 +140,11 @@ async def test_loop_still_executes_a_permitted_tool(feature):
     feature.agent.llm_service.generate_with_messages = _async_return(_Resp(content="done"))
 
     runtime = feature._compose_subagent_runtime_tools({"own_a"})
-    await feature._handle_feature_tool_calls(
+    await drive_native(feature.agent, lambda: feature._handle_feature_tool_calls(
         _Resp(tool_calls=[_Call("own_b")]),
         tools=[], system_prompt="sp", max_iterations=2,
         runtime_tools=runtime,
-    )
+    ))
     assert executed == ["own_b"]
 
 
@@ -168,8 +164,10 @@ async def test_inline_executor_uses_the_runtime_toolset(feature):
         return {"ok": True}
 
     feature._execute_subagent_tool = _spy
-    executor = feature._make_feature_inline_tool_executor(runtime_tools=runtime)
-    await executor("own_b", {})
+    async def dispatch():
+        executor = feature._make_feature_inline_tool_executor(runtime_tools=runtime)
+        return await executor("own_b", {})
+    await drive_native(feature.agent, dispatch)
     assert seen, "executor never ran — the assertions below would be vacuous"
     assert "own_a" not in seen
     assert "own_b" in seen
@@ -194,9 +192,9 @@ async def test_all_tools_denied_still_refuses_through_the_real_path(feature):
     feature.agent.llm_service.generate = _never
     feature.agent.llm_service.generate_with_messages = _never
 
-    result = await feature.execute_as_subagent(
+    result = await drive_native(feature.agent, lambda: feature.execute_as_subagent(
         task="anything", denied_tools={"own_a", "own_b"}
-    )
+    ))
 
     assert result["success"] is False
     assert "blocked by security policy" in result["error"]

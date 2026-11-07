@@ -90,7 +90,7 @@ class _SubagentInline(_Notes, parity._SubagentInlinePath):
 class _Registered(_Notes, parity._OrchestratorPath):
     """A feature tool the chat loop resolves by name: not promoted (#2929)."""
 
-    async def call(self, tool_name, arguments, command):
+    async def _call(self, tool_name, arguments, command):
         agent = await self._agent()
         assert tool_name not in agent._direct_tools
         return await agent._dispatch_tool_call(
@@ -114,7 +114,7 @@ class _Dispatcher(_Notes, parity._OrchestratorPath):
         agent.get_turn_bound_session_id = lambda: parity.SESSION
         return agent
 
-    async def call(self, tool_name, arguments, command):
+    async def _call(self, tool_name, arguments, command):
         agent = await self._agent()
         return await agent._dispatch_tool_call(
             ToolCall(id="tc-1", name=tool_name, arguments=dict(arguments)),
@@ -130,7 +130,7 @@ class _Dispatcher(_Notes, parity._OrchestratorPath):
 class _NamedDispatcher(_Dispatcher):
     """A feature's subagent dispatcher called through ``execute_named_tool``."""
 
-    call = parity._NamedPath.call
+    _call = parity._NamedPath._call
 
 
 class _UncapturedNamedDispatcher(_Dispatcher):
@@ -140,7 +140,7 @@ class _UncapturedNamedDispatcher(_Dispatcher):
     allowed: its transport records the call. Only the completion hook it
     fires is this path's own audit."""
 
-    async def call(self, tool_name, arguments, command):
+    async def _call(self, tool_name, arguments, command):
         agent = await self._agent()
         return await agent.execute_named_tool(
             tool_name, dict(arguments), session_id=parity.SESSION, source="mcp",
@@ -165,11 +165,11 @@ DISPATCH = {"task": f"look up {SECRET}", "context": "a note"}
 
 
 @pytest_asyncio.fixture
-async def make_probe(tmp_path):
+async def make_probe(tmp_path, native_tool_effect_agent):
     made: list = []
 
     def _make(path: str, kind: str):
-        made.append({**TOOL_PATHS, **COMPLETION_PATHS}[path](kind, tmp_path))
+        made.append({**TOOL_PATHS, **COMPLETION_PATHS}[path](kind, tmp_path, native_tool_effect_agent))
         return made[-1]
 
     yield _make
@@ -499,10 +499,10 @@ class _BoundResponseLogFails(_Bound):
 @pytest.mark.asyncio
 @pytest.mark.parametrize("kind", sorted(KINDS))
 async def test_a_governed_refusal_the_dispatch_could_not_finish_keeps_its_arguments(
-    tmp_path, kind,
+    tmp_path, kind, native_tool_effect_agent,
 ):
     """The binding's fallback row names what the hooks refused, too."""
-    probe = _BoundResponseLogFails(kind, tmp_path)
+    probe = _BoundResponseLogFails(kind, tmp_path, native_tool_effect_agent)
     try:
         with _chain(
             _Decide(REFUSALS["deny"](), event=HookEvent.PRE_TOOL_USE),
@@ -553,11 +553,11 @@ class _DispatcherResponseLogFailsOnce(_Dispatcher):
 @pytest.mark.parametrize("in_place", [False, True], ids=["modify", "in-place"])
 @pytest.mark.parametrize("kind", sorted(KINDS))
 async def test_a_refused_dispatch_whose_response_write_failed_completes_with_what_was_refused(
-    tmp_path, kind, in_place, decision, failure,
+    tmp_path, kind, in_place, decision, failure, native_tool_effect_agent,
 ):
     """The error recovery's completion hook reports the refused arguments,
     not the call's: the redaction an earlier hook made stays made."""
-    probe = _DispatcherResponseLogFailsOnce(kind, tmp_path)
+    probe = _DispatcherResponseLogFailsOnce(kind, tmp_path, native_tool_effect_agent)
     probe.failure = failure
     completion = _Completion()
     try:

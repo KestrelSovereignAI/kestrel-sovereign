@@ -329,6 +329,80 @@ exact-True capability before connection acquisition or Apps/OAuth enablement.
 Other SDK-only hosts must implement the same contract. It is independent of caller
 authority and permission checks and does not authorize a retry.
 
+### Durable tool-effect admission
+
+The host binds each logical invocation to its authenticated recipient, caller
+namespace and original input. The primary SQLite or PostgreSQL database records
+keyed digests and server-generated attempt/claim identifiers, without retaining
+tool arguments or results. The journal key is wrapped by the original data key;
+boot refuses an unavailable or inconsistent journal rather than creating a fresh
+replay history. An operation identifier correlates intent and grants no authority.
+
+Each governed tool leaf acknowledges a STARTED claim before dispatch. A claim
+that might have executed fences replay after a lost reply or process restart,
+including a known returned error. An uncertain settlement also fences further
+effects in the live turn even if its database transaction failed. Only a proven
+NOT_EXECUTED claim permits a subsequent attempt to supersede the old one. Reusing
+an intent with changed input conflicts; an explicitly new intent gets a new ID.
+This is a local replay fence, not a cross-vendor exactly-once guarantee.
+
+Result classification finishes before claim settlement. A failed classifier
+settles that same claim as UNCONFIRMED and fences the turn. After RETURNED_OK,
+native result serialization or persistence failures preserve the acknowledged
+claim and its first audit receipt. Shared completion handling records uncertainty
+on the original turn, retains the original exception and prevents another effect.
+Model, named and inline execution use that same boundary before recovery or
+terminal propagation. Inline adapters receive the original typed uncertainty
+carrier immediately; neither a later effect nor successful root completion is
+permitted. Acknowledged claim and audit states remain unchanged. The protected
+operation includes canonical subagent leaf serialization, post-tool policy,
+required audit, private delivery and final return shaping; wrapping only the
+journaled body does not protect those completion steps. Canonical parent dispatch
+retains the actual return evidence of its leaves, and its own hooks, delivery
+and final named-result serialization remain inside the shared boundary. The
+original turn must be confirmed before another protected operation starts and
+before any recovered output is handed to a consumer.
+Canonical subagent repair checks that same original confirmation before its
+decision model and again after the decision returns, before requesting a
+repair turn. An adapter swallowing a terminal leaf cannot spend another
+model call, and a leaf failing during the decision cannot authorize repair.
+Opaque Feature task handlers validate required fields and canonical Task outcome
+invariants before acknowledging their claim. A malformed reply produces a FAILED
+Task with `outcome_unknown` from the admitted baseline for the recipient writer;
+concurrent committed task data remains authoritative.
+An explicit unknown native reply fences its original input and settles its
+opaque claim as UNCONFIRMED while preserving the validated Task state and
+artifacts. Native synchronous Task completion includes registration-context
+exit, persistence, post-hooks and final return. Workflows and typed commands
+retain uncertainty when a returned Task cannot be read; a completion failure
+cannot become another execution attempt. The original Feature host and input
+are retained across those readers, and the existing journal refuses further
+Task admission after uncertainty. Required audit uncertainty also fences that
+input when it occurs before a tool body starts. The complete inner leaf boundary
+includes unknown-tool, argument, permission and hook-rewrite refusal audits;
+an inline provider catching their error cannot authorize another leaf.
+Completion retention covers cancellation and mixed `BaseExceptionGroup`
+carriers as well as ordinary errors. Cancellation and process-control objects
+propagate unchanged after their original uncertainty is retained.
+
+Terminal retirement closes only the original attempt through the shared native
+result-custody writer. It retains the original connection generation or pool
+recipe, wrapped-key lifetime and catalog identities of both journal tables. The
+writer checks native programs and constraints under its existing locks, owns
+COMMIT/rollback and connection retirement, and cannot admit another tool claim.
+Cancellation retains the caller's withdrawal and actual commit evidence.
+`KESTREL_TOOL_EFFECT_TERMINAL_TIMEOUT_S` sets the finite positive checkout/body
+budget (default 5 seconds). Expiry still joins any accepted native transaction
+and connection retirement; it never certifies that the tool did not execute.
+
+Local `TaskManager.execute_skill(sync=False)` returns the accepted native Task
+while its feature worker runs. Its dispatch claim is durable before scheduling;
+the originating journal turn joins that exact worker before finalization. A
+copied context cannot authorize another task to enter a closing turn. Both the
+original provider registration and registry generation remain checked at the
+actual leaf. A withdrawn provider settles its task as FAILED without dispatch.
+Native network A2A task and signal lifecycles retain their existing owners.
+
 A local A2A skill whose execution met a `ResourceOutcomeUnknown` marks its
 task with `outcome_unknown: true` metadata (#3946). That covers a skill raising
 it, a Core or SDK `@tool` wrapper that returns it to a model as an ordinary

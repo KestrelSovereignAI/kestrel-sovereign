@@ -129,6 +129,11 @@ def _rate_limited_message(declined) -> tuple[str, str]:
 
 def _classify(exc: BaseException):
     """Map ``exc`` to its ``(header, body)`` safe message pair."""
+    from kestrel_sovereign.api_errors import tool_effect_api_error
+
+    effect_error = tool_effect_api_error(exc)
+    if effect_error is not None:
+        return ('Tool operation could not complete.', effect_error.message)
     declined = _declined_wait(exc)
     if declined is not None:
         return _rate_limited_message(declined)
@@ -167,8 +172,14 @@ def bridge_sse_error_event(exc: BaseException) -> str:
     A stable, safe payload — ``{"type":"error","message": <constant>}`` — never
     the underlying/message/provider text. Same safe message as the agent path.
     """
-    payload = json.dumps({
+    from kestrel_sovereign.api_errors import tool_effect_api_error
+
+    event = {
         "type": "error",
         "message": safe_streaming_error_message(exc),
-    })
+    }
+    effect_error = tool_effect_api_error(exc)
+    if effect_error is not None:
+        event['code'] = effect_error.code
+    payload = json.dumps(event)
     return f"data: {payload}\n\n"

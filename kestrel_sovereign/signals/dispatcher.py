@@ -280,6 +280,11 @@ class _StoppedCognitionResult(SignalResult):
 
 
 @dataclass
+class _ReconciliationCognitionResult(SignalResult):
+    """Tool effects require reconciliation; no automatic cognition replay."""
+
+
+@dataclass
 class _CognitionClaimSettlement:
     """Original claim plus its actual native CAS receipt, never authority."""
 
@@ -910,6 +915,8 @@ class SignalDispatcher:
                 f"durable_cognition_route:{id(self)}", default=False
             )
         )
+        self._original_signal_effect_provenance = contextvars.ContextVar(
+            f'original_signal_effect_provenance:{id(self)}', default=None)
         # Cancellation-resistant cognition turns are intentionally retained
         # rather than abandoned.  Both sets are bounded by the one in-flight
         # cursor delivery per dispatcher/consumer and expose exact ownership
@@ -1247,6 +1254,7 @@ class SignalDispatcher:
         # signal emitted by durable cognition is a new source unit and must not
         # inherit its parent's defer contract.
         durable_route_token = self._durable_cognition_route.set(False)
+        effect_provenance_token = self._original_signal_effect_provenance.set(None)
         # A durable cognition route defers *its own* outcome until the exact
         # delivery ACK/NACK boundary. ContextVars are copied into awaited and
         # background child dispatches, so inheriting that mutable list would
@@ -1416,6 +1424,7 @@ class SignalDispatcher:
             if original_acceptance is not None:
                 self._accepted_signal_outcomes.pop(original_acceptance, None)
             self._durable_cognition_route.reset(durable_route_token)
+            self._original_signal_effect_provenance.reset(effect_provenance_token)
 
     async def enqueue_signal(
         self, signal: Signal, *, source_event_id: Optional[str] = None,
@@ -5780,8 +5789,13 @@ class SignalDispatcher:
                         from kestrel_sovereign.hold.enforcement import (
                             _reuse_turn_admission_snapshot,
                         )
+                        from kestrel_sovereign.signals.effect_provenance import signal_effect_provenance
 
+                        provenance = signal_effect_provenance(delivery.event,
+                            agent_id=self._agent.did, canonical_signal=routing_signal)
                         route_token = self._durable_cognition_route.set(True)
+                        provenance_token = self._original_signal_effect_provenance.set(
+                            provenance)
                         try:
                             with _reuse_turn_admission_snapshot(
                                 self._agent, hold_admission
@@ -5792,6 +5806,7 @@ class SignalDispatcher:
                                     start,
                                 )
                         finally:
+                            self._original_signal_effect_provenance.reset(provenance_token)
                             self._durable_cognition_route.reset(route_token)
 
                     from kestrel_sovereign._async_ownership import create_owned_task
@@ -6080,7 +6095,8 @@ class SignalDispatcher:
         # Rate limits, quiet hours, coalescing, and cognition failures are
         # recoverable for cursor-owning ingress. Validation/cycle refusal is a
         # proven terminal no-op and may be acknowledged idempotently.
-        terminal = isinstance(result, _StoppedCognitionResult) or result.status in {
+        reconciliation = isinstance(result, _ReconciliationCognitionResult)
+        terminal = reconciliation or isinstance(result, _StoppedCognitionResult) or result.status in {
             Status.DROPPED_VALIDATION,
             Status.DROPPED_CYCLE,
         }
@@ -6092,7 +6108,7 @@ class SignalDispatcher:
                 error=result.error or f"Cognition delivery returned {result.status.value}",
                 retry_delay=retry_delay,
                 terminal=terminal,
-                terminal_ackable=terminal,
+                terminal_ackable=terminal and not reconciliation,
             )
             # An ordinary NACK correctly refuses an expired lease.  This
             # dispatcher still owns a live managed token, however, so it can
@@ -6107,7 +6123,7 @@ class SignalDispatcher:
                     lease_token=delivery.lease_token or "",
                     error=result.error or f"Cognition delivery returned {result.status.value}",
                     terminal=terminal,
-                    terminal_ackable=terminal,
+                    terminal_ackable=terminal and not reconciliation,
                 )
         except BaseException as error:
             if is_execution_control_error(error):
@@ -7024,6 +7040,14 @@ class SignalDispatcher:
         except Exception as e:
             if is_execution_control_error(e):
                 raise
+            from kestrel_sovereign.tools.effect_failures import tool_effect_failure
+
+            failure = tool_effect_failure(e)
+            if failure is not None and failure.reconciliation_required:
+                failed = self._fail(signal, start, Status.FAILED,
+                    error=f'{failure.code}: {failure.message}',
+                    registration=registration, audit=audit)
+                return _ReconciliationCognitionResult(**vars(failed))
             # Codex round-3 P2: if process_input raises, the audit
             # would otherwise be lost when the outer try/except in
             # `_route_under_locks` calls `_fail` without it. Catch
@@ -7631,6 +7655,12 @@ class SignalDispatcher:
             # receipt in the process-input/terminal-NACK crash window.
             if _agent_accepts_kwarg(self._agent.process_input, "invocation_id"):
                 process_input_kwargs["invocation_id"] = signal.id
+            if _agent_accepts_kwarg(self._agent.process_input, 'invocation_provenance'):
+                from kestrel_sovereign.signals.effect_provenance import signal_effect_provenance
+
+                process_input_kwargs['invocation_provenance'] = (
+                    self._original_signal_effect_provenance.get()
+                    or signal_effect_provenance(signal, agent_id=self._agent.did))
             if pre_turn_guard is not None:
                 # Bind the signal now; evaluate inside the turn's span. The turn
                 # decides an admission, it does not read signal envelopes, so what

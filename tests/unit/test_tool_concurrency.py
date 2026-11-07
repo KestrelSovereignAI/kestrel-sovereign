@@ -10,6 +10,7 @@ import asyncio
 import pytest
 from dataclasses import dataclass
 from unittest.mock import MagicMock
+from tests.unit.test_tool_effect_execution import owner as owner
 
 from kestrel_sovereign.agent.orchestrator_engine import (
     OrchestratorEngineMixin,
@@ -151,7 +152,7 @@ class TestMaxConcurrency:
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("uncertain", [False, True])
-async def test_parallel_failure_joins_cancellation_resistant_sibling_before_return(uncertain):
+async def test_parallel_failure_joins_cancellation_resistant_sibling_before_return(uncertain, owner, monkeypatch):
     """Exercise the native batch owner, not a detached gather substitute."""
     entered = asyncio.Event()
     cancelled = asyncio.Event()
@@ -163,26 +164,23 @@ async def test_parallel_failure_joins_cancellation_resistant_sibling_before_retu
     first_error = ValueError("first child failed")
     original_unknown = ExecutionCommitOutcomeError("unknown")
 
-    class Agent(OrchestratorEngineMixin):
-        _direct_tools = {"fail": FakeTool(safe=True), "slow": FakeTool(safe=True)}
-        _tool_to_feature = {}
-        features = {}
+    async def dispatch(call, *args, **kwargs):
+        if call.name == "fail":
+            await entered.wait()
+            raise first_error
+        entered.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            cancelled.set()
+            await drained.wait()
+        finished.append("slow child joined")
+        if uncertain:
+            raise original_unknown
 
-        async def _dispatch_tool_call(self, call, *args, **kwargs):
-            if call.name == "fail":
-                await entered.wait()
-                raise first_error
-            entered.set()
-            try:
-                await asyncio.Event().wait()
-            except asyncio.CancelledError:
-                cancelled.set()
-                await drained.wait()
-            finished.append("slow child joined")
-            if uncertain:
-                raise original_unknown
-
-    agent = Agent()
+    agent = owner
+    agent._direct_tools = {"fail": FakeTool(safe=True), "slow": FakeTool(safe=True)}
+    monkeypatch.setattr(agent, '_dispatch_tool_call', dispatch)
     task = asyncio.create_task(agent._execute_tool_batch(
         [FakeToolCall("1", "fail", {}), FakeToolCall("2", "slow", {})],
         {}, set(), [], 0, "message",

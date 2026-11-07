@@ -8,7 +8,7 @@ and cannot be circumvented through various attack vectors.
 Run with: pytest -m adversarial tests/integration/test_constitution_adversarial.py
 """
 
-from tests.shared.native_shutdown_budget import shutdown_fixture_agent
+from kestrel_sovereign.testing.native_shutdown_budget import shutdown_fixture_agent
 import pytest
 import pytest_asyncio
 import sqlite3

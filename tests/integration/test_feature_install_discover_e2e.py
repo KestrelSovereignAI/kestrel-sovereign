@@ -15,7 +15,7 @@ ExternalMonitorFeature) that do NOT exist in the local features/ directory,
 ensuring that the entry_point discovery path is properly tested.
 """
 
-from tests.shared.native_shutdown_budget import shutdown_fixture_agent
+from kestrel_sovereign.testing.native_shutdown_budget import shutdown_fixture_agent
 
 import os
 import logging

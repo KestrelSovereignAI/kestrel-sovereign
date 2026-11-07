@@ -1,6 +1,7 @@
 """External tool bindings use the real dispatcher, hooks, and durable audit."""
 
 import asyncio
+from uuid import uuid4
 import json
 from copy import deepcopy
 
@@ -13,13 +14,14 @@ from kestrel_sdk.tools.base import ToolCategory, ToolParameter, ToolSchema
 from kestrel_sovereign.a2a.stores.unified.observability_store import ObservabilityStore
 from kestrel_sovereign.agent.orchestrator_engine import OrchestratorEngineMixin
 from kestrel_sovereign.agent.tool_registry import ToolRegistryMixin
-from kestrel_sovereign.hooks.manager import HooksManager
 from kestrel_sovereign.features.security.approval_queue import ApprovalQueue, ApprovalStatus
 from kestrel_sovereign.features.security.hooks import SecurityHook
 from kestrel_sovereign.features.security.permissions import PermissionLevel, PermissionStore
 from kestrel_sovereign.storage.db.sqlite import SQLiteBackend
 from kestrel_sovereign.agent import orchestrator_engine
 from kestrel_sovereign.security.input_guardrails import MAX_TOOL_ARG_LENGTH
+from kestrel_sovereign.testing.fixtures import native_tool_effect_agent as native_tool_effect_agent
+from tests.unit.test_tool_effect_invocation import governed
 
 
 class _Tool:
@@ -47,15 +49,6 @@ class _Policy(Hook):
         if self.before is not None:
             await self.before()
         return self.output
-
-
-class _Agent(OrchestratorEngineMixin, ToolRegistryMixin):
-    def __init__(self, store):
-        self.did = "did:test:apps-owner"
-        self.features = {}
-        self._direct_tools, self._tool_to_feature, self._explored_features = {}, {}, {}
-        self._direct_tool_defs, self._pinned_features = [], set()
-        self.hooks_manager, self.observability_store = HooksManager(), store
 
 
 class _Store(ObservabilityStore):
@@ -86,13 +79,15 @@ class _Store(ObservabilityStore):
 
 
 @pytest_asyncio.fixture
-async def host(tmp_path):
+async def host(tmp_path, native_tool_effect_agent):
     backend = SQLiteBackend(str(tmp_path / "app-dispatches.db"))
     await backend.connect()
     store = _Store(backend)
     await store.initialize()
     try:
-        yield _Agent(store), backend
+        agent = await native_tool_effect_agent(did='did:test:apps-owner')
+        agent.observability_store = store
+        yield agent, backend
     finally:
         await store.close()
 
@@ -121,7 +116,7 @@ async def test_app_only_tool_has_governed_registration_without_model_projection(
         assert [item["function"]["name"] for item in schemas] == ["other"]
     policy = _Policy(HookOutput.modify({"count": 7}))
     agent.hooks_manager.register(policy)
-    result = await binding.invoke({"count": 3}, session_id="mcp-app:view-1", source="mcp-app")
+    result = await binding.invoke({"count": 3}, session_id="mcp-app:view-1", source="mcp-app", operation_id=uuid4().hex)
     assert result == {"success": True, "count": 7}
     assert app.calls == [{"count": 7}]
     assert policy.inputs[0].feature_name == "mcp:views"
@@ -141,7 +136,7 @@ async def test_bound_call_does_not_bypass_deny_or_pending_approval(host, output)
     tool = _Tool()
     binding = _mount(agent, tool)
     agent.hooks_manager.register(_Policy(output))
-    result = await binding.invoke({"count": 3}, session_id="mcp-app:view-1")
+    result = await binding.invoke({"count": 3}, session_id="mcp-app:view-1", operation_id=uuid4().hex)
     assert result["success"] is False
     assert tool.calls == []
     rows = await backend.fetch_all("SELECT result_status FROM a2a_tool_dispatches")
@@ -159,7 +154,7 @@ async def test_same_tool_object_cannot_revive_an_unregistered_binding(host):
     assert old.is_current is False
     assert new.is_current is True
     with pytest.raises(ResourceConflict):
-        await old.invoke({"count": 3}, session_id="mcp-app:view-1")
+        await old.invoke({"count": 3}, session_id="mcp-app:view-1", operation_id=uuid4().hex)
     assert tool.calls == []
 
 
@@ -175,7 +170,7 @@ async def test_replacement_during_approval_cannot_execute_either_registration(ho
         await resume.wait()
 
     agent.hooks_manager.register(_Policy(HookOutput.allow(), before=wait_for_approval))
-    call = asyncio.create_task(binding.invoke({"count": 3}, session_id="mcp-app:view-1"))
+    call = asyncio.create_task(binding.invoke({"count": 3}, session_id="mcp-app:view-1", operation_id=uuid4().hex))
     try:
         await entered.wait()
         agent.unregister_dynamic_tools("mcp:views")
@@ -201,7 +196,7 @@ async def test_failed_structured_audit_is_unknown_and_never_reexecutes(host):
     binding = _mount(agent, tool)
     await backend.execute("DROP TABLE a2a_tool_dispatches")
     with pytest.raises(ResourceOutcomeUnknown, match="audit"):
-        await binding.invoke({"count": 3}, session_id="mcp-app:view-1")
+        await binding.invoke({"count": 3}, session_id="mcp-app:view-1", operation_id=uuid4().hex)
     assert tool.calls == [{"count": 3}]
 
 
@@ -219,7 +214,7 @@ async def test_replacement_while_admission_is_awaited_cannot_redirect_the_call(h
     policy = _Policy(HookOutput.allow())
     agent.hooks_manager.register(policy)
     with pytest.raises(ResourceConflict):
-        await binding.invoke({"count": 3}, session_id="mcp-app:view-1")
+        await binding.invoke({"count": 3}, session_id="mcp-app:view-1", operation_id=uuid4().hex)
     assert original.calls == replacement.calls == []
     assert policy.inputs[0].feature_name == "mcp:views"
     row = await backend.fetch_one("SELECT adapter, error_class FROM a2a_tool_dispatches")
@@ -232,7 +227,7 @@ async def test_hook_modified_arguments_are_validated_before_execution(host):
     tool = _Tool()
     binding = _mount(agent, tool)
     agent.hooks_manager.register(_Policy(HookOutput.modify({"misspelled": 7})))
-    result = await binding.invoke({"count": 3}, session_id="mcp-app:view-1")
+    result = await binding.invoke({"count": 3}, session_id="mcp-app:view-1", operation_id=uuid4().hex)
     assert result["success"] is False
     assert "misspelled" in result["error"]
     assert tool.calls == []
@@ -248,7 +243,7 @@ async def test_business_resource_conflict_is_not_misreported_as_stale_binding(ho
 
     agent, _ = host
     binding = _mount(agent, ConflictingTool())
-    result = await binding.invoke({"count": 3}, session_id="mcp-app:view-1")
+    result = await binding.invoke({"count": 3}, session_id="mcp-app:view-1", operation_id=uuid4().hex)
     assert result == {"success": False, "error": "Domain revision changed"}
     assert binding.is_current
 
@@ -261,7 +256,7 @@ async def test_collision_uses_actual_name_and_original_permission_owner(host):
     binding = _mount(agent, second, owner="mcp:second")
     policy = _Policy(HookOutput.allow())
     agent.hooks_manager.register(policy)
-    await binding.invoke({"count": 4}, session_id="mcp-app:view-1")
+    await binding.invoke({"count": 4}, session_id="mcp-app:view-1", operation_id=uuid4().hex)
     assert binding.name == "view_update_2"
     assert first.calls == []
     assert second.calls == [{"count": 4}]
@@ -290,7 +285,7 @@ async def test_lru_eviction_expires_binding(host):
     assert not old.is_current
     assert current.is_current
     with pytest.raises(ResourceConflict):
-        await old.invoke({"count": 3}, session_id="mcp-app:view-1")
+        await old.invoke({"count": 3}, session_id="mcp-app:view-1", operation_id=uuid4().hex)
 
 
 @pytest.mark.asyncio
@@ -304,7 +299,7 @@ async def test_missing_audit_writer_refuses_before_any_effect(host, monkeypatch,
     else:
         monkeypatch.setattr(agent.observability_store, "log_tool_dispatch", None)
     with pytest.raises(ResourceUnsupported, match="audit"):
-        await binding.invoke({"count": 3}, session_id="mcp-app:view-1")
+        await binding.invoke({"count": 3}, session_id="mcp-app:view-1", operation_id=uuid4().hex)
     assert tool.calls == []
 
 
@@ -321,7 +316,7 @@ async def test_binding_requires_valid_invocation_context(host, arguments, sessio
     tool = _Tool()
     binding = _mount(agent, tool)
     with pytest.raises(error):
-        await binding.invoke(arguments, session_id=session_id, source=source)
+        await binding.invoke(arguments, session_id=session_id, source=source, operation_id=uuid4().hex)
     assert tool.calls == []
 
 
@@ -353,7 +348,7 @@ async def test_binding_uses_native_permission_store_and_approval_queue(host, tmp
             "mcp:views", binding.name,
             PermissionLevel.ALLOW if decision == "allow" else PermissionLevel.DENY,
         )
-    call = asyncio.create_task(binding.invoke({"count": 3}, session_id="mcp-app:view-1"))
+    call = asyncio.create_task(binding.invoke({"count": 3}, session_id="mcp-app:view-1", operation_id=uuid4().hex))
     try:
         if decision not in {"allow", "deny"}:
             request = await requests.get()
@@ -391,7 +386,7 @@ async def test_binding_uses_native_permission_store_and_approval_queue(host, tmp
             assert len(rows) == 1
         if decision == "approve":
             # A once-only approval cannot authorize a second app request.
-            call = asyncio.create_task(binding.invoke({"count": 4}, session_id="mcp-app:view-1"))
+            call = asyncio.create_task(binding.invoke({"count": 4}, session_id="mcp-app:view-1", operation_id=uuid4().hex))
             request = await requests.get()
             assert not call.done()
             assert tool.calls == expected
@@ -427,7 +422,7 @@ async def test_binding_checks_canonical_registry_not_just_batch_presence(host, c
         agent._tool_to_feature[binding.name] = "mcp:another-owner"
     assert not binding.is_current
     with pytest.raises(ResourceConflict):
-        await binding.invoke({"count": 3}, session_id="mcp-app:view-1")
+        await binding.invoke({"count": 3}, session_id="mcp-app:view-1", operation_id=uuid4().hex)
     assert original.calls == replacement.calls == []
 
 
@@ -444,7 +439,7 @@ async def test_bound_arguments_are_an_independent_snapshot_while_approval_waits(
 
     agent.hooks_manager.register(_Policy(HookOutput.allow(), before=pending))
     arguments = {"count": {"nested": [3]}}
-    call = asyncio.create_task(binding.invoke(arguments, session_id="mcp-app:view-1"))
+    call = asyncio.create_task(binding.invoke(arguments, session_id="mcp-app:view-1", operation_id=uuid4().hex))
     try:
         await entered.wait()
         arguments["count"]["nested"][0] = 9
@@ -467,7 +462,7 @@ async def test_oversize_argument_returns_an_explicit_refusal_without_execution(h
     value = "x" * (MAX_TOOL_ARG_LENGTH + 1)
     if nested:
         value = {"nested": value}
-    result = await binding.invoke({"count": value}, session_id="mcp-app:view-1")
+    result = await binding.invoke({"count": value}, session_id="mcp-app:view-1", operation_id=uuid4().hex)
     assert isinstance(result, dict) and result["success"] is False
     assert "validation" in result["error"].lower()
     assert tool.calls == []
@@ -488,7 +483,7 @@ async def test_validation_refusal_retains_original_owner_across_rejection_await(
         _mount(agent, _Tool(), owner="mcp:replacement")
 
     monkeypatch.setattr(orchestrator_engine, "record_tool_rejection", replace_after_rejection)
-    await binding.invoke({"count": "x" * (MAX_TOOL_ARG_LENGTH + 1)}, session_id="mcp-app:view-1")
+    await binding.invoke({"count": "x" * (MAX_TOOL_ARG_LENGTH + 1)}, session_id="mcp-app:view-1", operation_id=uuid4().hex)
     assert tool.calls == []
     row = await backend.fetch_one("SELECT adapter FROM a2a_tool_dispatches")
     assert row[0] == "mcp:views.view_update"
@@ -501,11 +496,11 @@ async def test_transient_response_audit_failure_after_effect_is_unknown(host):
     binding = _mount(agent, tool)
     agent.observability_store.fail_success_response_once = True
     with pytest.raises(ResourceOutcomeUnknown) as captured:
-        await binding.invoke({"count": 3}, session_id="mcp-app:view-1")
+        await binding.invoke({"count": 3}, session_id="mcp-app:view-1", operation_id=uuid4().hex)
     assert tool.calls == [{"count": 3}]
     row = await backend.fetch_one("SELECT result_status, error_class FROM a2a_tool_dispatches")
     assert row is not None, repr(captured.value.__cause__)
-    assert tuple(row) == ("error", "ResourceOutcomeUnknown")
+    assert tuple(row) == ("success", None), "A confirmed audit must retain the actual effect result"
 
 
 @pytest.mark.asyncio
@@ -521,7 +516,7 @@ async def test_cancelled_tool_attempt_has_durable_unknown_outcome_before_unwindi
     agent, backend = host
     tool = InterruptedTool()
     binding = _mount(agent, tool)
-    call = asyncio.create_task(binding.invoke({"count": 3}, session_id="mcp-app:view-1"))
+    call = asyncio.create_task(binding.invoke({"count": 3}, session_id="mcp-app:view-1", operation_id=uuid4().hex))
     try:
         await entered.wait()
         call.cancel()
@@ -555,7 +550,7 @@ async def test_repeated_cancellation_joins_the_same_audit_without_reexecuting(ho
     tool = InterruptedTool()
     binding = _mount(agent, tool)
     agent.observability_store.on_dispatch = wait_for_write
-    call = asyncio.create_task(binding.invoke({"count": 3}, session_id="mcp-app:view-1"))
+    call = asyncio.create_task(binding.invoke({"count": 3}, session_id="mcp-app:view-1", operation_id=uuid4().hex))
     try:
         await started.wait()
         call.cancel()
@@ -587,7 +582,7 @@ async def test_post_hooks_and_audit_observe_the_actual_normalized_arguments(host
     post = _Policy(HookOutput.allow())
     post.events = [HookEvent.POST_TOOL_USE]
     agent.hooks_manager.register(post)
-    await binding.invoke({"count": 1}, session_id="mcp-app:view-1")
+    await binding.invoke({"count": 1}, session_id="mcp-app:view-1", operation_id=uuid4().hex)
     assert tool.calls == [{"count": 3}]
     assert post.inputs[0].tool_input == {"count": 3}
     row = await backend.fetch_one("SELECT args_redacted FROM a2a_tool_dispatches")
@@ -600,7 +595,7 @@ async def test_hook_cannot_introduce_an_oversize_argument_after_initial_validati
     tool = _Tool()
     binding = _mount(agent, tool)
     agent.hooks_manager.register(_Policy(HookOutput.modify({"count": "x" * (MAX_TOOL_ARG_LENGTH + 1)})))
-    result = await binding.invoke({"count": 1}, session_id="mcp-app:view-1")
+    result = await binding.invoke({"count": 1}, session_id="mcp-app:view-1", operation_id=uuid4().hex)
     assert result["success"] is False
     assert "maximum length" in result["error"]
     assert tool.calls == []
@@ -618,15 +613,16 @@ async def test_tool_mutation_cannot_rewrite_the_record_of_approved_arguments(hos
     tool = MutatingTool()
     tool.schema.parameters[0].type = "object"
     binding = _mount(agent, tool)
-    await binding.invoke({"count": {"nested": [3]}}, session_id="mcp-app:view-1")
+    await binding.invoke({"count": {"nested": [3]}}, session_id="mcp-app:view-1", operation_id=uuid4().hex)
     assert tool.calls == [{"count": {"nested": [3]}}]
     row = await backend.fetch_one("SELECT args_redacted FROM a2a_tool_dispatches")
     assert json.loads(row[0]) == {"count": {"nested": [3]}}
 
 
 @pytest.mark.asyncio
-async def test_cancelled_audit_failure_preserves_cancellation_and_failed_evidence(host):
+async def test_cancelled_audit_failure_preserves_cancellation_and_failed_evidence(host, monkeypatch):
     from kestrel_sovereign.storage.db.interface import DatabaseError
+    from kestrel_sovereign.execution_custody import execution_evidence_carriers
     entered = asyncio.Event()
 
     class InterruptedTool(_Tool):
@@ -636,17 +632,32 @@ async def test_cancelled_audit_failure_preserves_cancellation_and_failed_evidenc
             await asyncio.Future()
 
     agent, backend = host
+    database_failures = []
+    original_execute = backend.execute
+
+    async def observe_actual_database_failure(*args, **kwargs):
+        try:
+            return await original_execute(*args, **kwargs)
+        except DatabaseError as error:
+            database_failures.append(error)
+            raise
+
+    monkeypatch.setattr(backend, 'execute', observe_actual_database_failure)
     tool = InterruptedTool()
     binding = _mount(agent, tool)
-    call = asyncio.create_task(binding.invoke({"count": 3}, session_id="mcp-app:view-1"))
+    call = asyncio.create_task(binding.invoke({"count": 3}, session_id="mcp-app:view-1", operation_id=uuid4().hex))
     try:
         await entered.wait()
         await backend.execute("DROP TABLE a2a_tool_dispatches")
         call.cancel()
         with pytest.raises(asyncio.CancelledError) as captured:
             await call
-        assert isinstance(captured.value.__cause__, ResourceOutcomeUnknown)
-        assert isinstance(captured.value.__cause__.__cause__, DatabaseError)
+        carriers = execution_evidence_carriers(captured.value)
+        assert database_failures
+        assert all(any(error is carrier for carrier in carriers) for error in database_failures), [
+            type(carrier).__name__ for carrier in carriers]
+        assert await agent.tool_effect_store.database.fetchone(
+            'SELECT state FROM tool_effect_claims') == ('UNCONFIRMED',)
         assert tool.calls == [{"count": 3}]
         assert not any(task.get_name().startswith("bound-tool-invocation")
                        for task in asyncio.all_tasks() if not task.done())
@@ -668,8 +679,9 @@ async def test_tool_attempt_without_confirmed_result_is_not_a_retryable_failure(
     tool = UnconfirmedTool()
     binding = _mount(agent, tool)
     with pytest.raises(ResourceOutcomeUnknown) as captured:
-        await binding.invoke({"count": 3}, session_id="mcp-app:view-1")
-    assert captured.value.__cause__ is error
+        await binding.invoke({"count": 3}, session_id="mcp-app:view-1", operation_id=uuid4().hex)
+    from kestrel_sovereign.execution_custody import execution_evidence_carriers
+    assert any(carrier is error for carrier in execution_evidence_carriers(captured.value))
     assert tool.calls == [{"count": 3}]
     row = await backend.fetch_one("SELECT result_status, error_class FROM a2a_tool_dispatches")
     assert tuple(row) == ("error", "ResourceOutcomeUnknown")
@@ -690,7 +702,7 @@ async def test_tool_control_exception_group_preserves_original_leaves_and_audit(
     tool = InterruptedTool()
     binding = _mount(agent, tool)
     with pytest.raises(BaseExceptionGroup) as captured:
-        await binding.invoke({"count": 3}, session_id="mcp-app:view-1")
+        await binding.invoke({"count": 3}, session_id="mcp-app:view-1", operation_id=uuid4().hex)
     assert captured.value is original
     assert captured.value.exceptions == (interrupted, failed)
     assert tool.calls == [{"count": 3}]
@@ -709,11 +721,11 @@ async def test_unserializable_result_after_effect_is_unknown_and_audited_once(ho
     tool = InvalidResultTool()
     binding = _mount(agent, tool)
     with pytest.raises(ResourceOutcomeUnknown) as captured:
-        await binding.invoke({"count": 3}, session_id="mcp-app:view-1")
+        await binding.invoke({"count": 3}, session_id="mcp-app:view-1", operation_id=uuid4().hex)
     assert isinstance(captured.value.__cause__, TypeError)
     assert tool.calls == [{"count": 3}]
     rows = await backend.fetch_all("SELECT result_status, error_class FROM a2a_tool_dispatches")
-    assert [tuple(row) for row in rows] == [("error", "ResourceOutcomeUnknown")]
+    assert [tuple(row) for row in rows] == [("success", None)], "Delivery failure cannot rewrite a confirmed effect audit"
 
 
 @pytest.mark.asyncio
@@ -729,7 +741,7 @@ async def test_pre_execution_authority_failure_records_its_actual_class(host):
     binding = _mount(agent, tool)
     agent.hooks_manager.register(_Policy(HookOutput.allow(), before=expire))
     with pytest.raises(ExecutionAuthorityError) as captured:
-        await binding.invoke({"count": 3}, session_id="mcp-app:view-1")
+        await binding.invoke({"count": 3}, session_id="mcp-app:view-1", operation_id=uuid4().hex)
     assert captured.value is error
     assert tool.calls == []
     row = await backend.fetch_one("SELECT result_status, error_class FROM a2a_tool_dispatches")
@@ -748,13 +760,17 @@ async def test_external_results_do_not_change_model_context_accounting(host):
     tool = _Tool(visible=True)
     binding = _mount(agent, tool)
     for _ in range(2):
-        await binding.invoke({"count": 3}, session_id="mcp-app:view-1")
+        await binding.invoke({"count": 3}, session_id="mcp-app:view-1", operation_id=uuid4().hex)
     assert agent.context_stats.get_analysis() == before
-    await agent._dispatch_tool_call(
-        ToolCall(id="model-call", name=binding.name, arguments={"count": 3}),
-        features_by_tool_name={}, known_tools=agent._known_tool_names(),
-        messages=[], iteration=0, user_message=None, session_id="model-session",
-    )
+    @governed
+    async def model_turn(owner, user_input, *, invocation_id=None):
+        return await owner._dispatch_tool_call(
+            ToolCall(id="model-call", name=binding.name, arguments={"count": 3}),
+            features_by_tool_name={}, known_tools=owner._known_tool_names(),
+            messages=[], iteration=0, user_message=None, session_id="model-session",
+        )
+
+    await model_turn(agent, 'owned model intent', invocation_id=uuid4().hex)
     analysis = agent.context_stats.get_analysis()
     assert analysis["total_tool_calls"] == before["total_tool_calls"] + 1
     assert analysis["duplicate_tool_calls"] == 0
@@ -771,45 +787,45 @@ async def test_every_direct_tool_lane_preserves_unconfirmed_effects_after_unexpe
     agent, backend = host
     assert agent.supports_unconfirmed_tool_outcomes is True
     assert getattr(ToolRegistryMixin, 'supports_unconfirmed_tool_outcomes', None) is not True
+    from kestrel_sovereign.execution_custody import execution_evidence_carriers
+    original = (ExceptionGroup('unexpected operation failure', [
+        ValueError('private-invalid-state'), KeyError('private-bug-detail')])
+        if failure == 'mixed-group' else
+        (KeyError if failure == 'key' else TypeError)('private-bug-detail'))
     class FailedAfterEffect(_Tool):
         async def execute(self, **args):
             self.calls.append(args)
-            if failure == 'mixed-group':
-                raise ExceptionGroup('unexpected operation failure', [
-                    ValueError('private-invalid-state'), KeyError('private-bug-detail')])
-            raise (KeyError if failure == 'key' else TypeError)('private-bug-detail')
+            raise original
 
     tool = FailedAfterEffect(visible=True)
     binding = _mount(agent, tool)
     messages = []
-    if lane in {'bound', 'named'}:
-        with pytest.raises(ResourceOutcomeUnknown, match='unconfirmed') as caught:
-            if lane == 'bound':
-                await binding.invoke({'count': 3}, session_id='original-effect')
-            else:
-                await agent.execute_named_tool(binding.name, {'count': 3},
-                    session_id='original-effect', source='owned-named-transport')
-        assert str(caught.value) == TOOL_OUTCOME_UNCONFIRMED
-    else:
+
+    @governed
+    async def original_turn(owner, user_input, *, invocation_id=None):
+        if lane == 'bound':
+            return await binding.invoke({'count': 3}, session_id='original-effect', operation_id=uuid4().hex)
+        if lane == 'named':
+            return await owner.execute_named_tool(binding.name, {'count': 3},
+                session_id='original-effect', source='owned-named-transport')
         call = ToolCall(id='model-original-effect', name=binding.name, arguments={'count': 3})
         if lane == 'direct':
-            result = await agent._dispatch_direct_tool(call, binding.name, {'count': 3}, 0,
+            return await owner._dispatch_direct_tool(call, binding.name, {'count': 3}, 0,
                 'internal-original-effect', session_id='original-effect')
         else:
-            result = await agent._dispatch_tool_call(call, {}, {binding.name}, messages, 0, None,
+            return await owner._dispatch_tool_call(call, {}, {binding.name}, messages, 0, None,
                 session_id='original-effect')
-        assert result['success'] is False
-        assert result['error'] == TOOL_OUTCOME_UNCONFIRMED
-        assert 'private-bug-detail' not in json.dumps(messages)
+    with pytest.raises(ResourceOutcomeUnknown) as caught:
+        await original_turn(agent, 'owned effect intent', invocation_id=uuid4().hex)
+    assert any(carrier is original for carrier in execution_evidence_carriers(caught.value))
+    assert 'private-bug-detail' not in str(caught.value)
+    assert messages == []
     assert tool.calls == [{'count': 3}]
     rows = await backend.fetch_all('SELECT result_status, error_class, error_message FROM a2a_tool_dispatches')
-    if lane in {'direct', 'named'}:
-        # These executors do not own the outer dispatch/inline receipt.
-        assert rows == []
-    else:
-        assert len(rows) == 1
-        assert tuple(rows[0][:2]) == ('error', 'ResourceOutcomeUnknown')
-        assert 'private-bug-detail' not in rows[0][2]
+    assert len(rows) == 1
+    assert tuple(rows[0][:2]) == ('error', 'ResourceOutcomeUnknown')
+    assert 'private-bug-detail' not in rows[0][2]
+    assert await agent.tool_effect_store.database.fetchall('SELECT state FROM tool_effect_claims') == [('UNCONFIRMED',)]
 
 
 @pytest.mark.asyncio
@@ -822,7 +838,7 @@ async def test_direct_tool_policy_refusal_before_execution_is_not_unknown(host, 
     binding = _mount(agent, tool)
     agent.hooks_manager.register(_Policy(HookOutput.deny('denied-before-execution')))
     if lane == 'bound':
-        result = await binding.invoke({'count': 3}, session_id='pre-execution')
+        result = await binding.invoke({'count': 3}, session_id='pre-execution', operation_id=uuid4().hex)
     else:
         result = await agent._dispatch_tool_call(
             ToolCall(id='model-refused', name=binding.name, arguments={'count': 3}),

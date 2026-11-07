@@ -33,6 +33,9 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+import pytest_asyncio
+from tests.utils.native_tool_effects import drive_native
+from tests.utils.codex_inline import OwnedCallbackReader
 
 from kestrel_sdk.hooks.base import HookEvent, PermissionDecision
 from kestrel_sdk.llm.response import LLMResponse, ToolCall
@@ -184,9 +187,26 @@ class _SelfieFeature(Feature):
         raise RuntimeError("render backend down")
 
 
-def _make_selfie_feature(llm_service=None) -> _SelfieFeature:
-    agent = SimpleNamespace(llm_service=llm_service, did="did:test:selfie")
-    return _SelfieFeature(agent)
+def _make_selfie_feature(llm_service=None, *, agent=None) -> _SelfieFeature:
+    if agent is None:
+        agent = SimpleNamespace(llm_service=llm_service, did="did:test:selfie")
+        return _SelfieFeature(agent)
+    if llm_service is not None:
+        agent.llm_service = llm_service
+    feature = _SelfieFeature(agent)
+    agent.features[feature.name] = feature
+    return feature
+
+
+@pytest_asyncio.fixture
+async def native_selfie_agent(native_tool_effect_agent):
+    agent = await native_tool_effect_agent(did="did:test:selfie")
+    reader = agent._test_inline_reader = OwnedCallbackReader()
+    await reader.start()
+    try:
+        yield agent
+    finally:
+        await reader.stop()
 
 
 def _tool(feature: Feature, name: str):
@@ -281,19 +301,14 @@ class _CodexInlineLLM:
     frozen BEFORE the turn (no collector, no tool-result buffer). This is the
     exact topology that dropped the Frinz selfie parts."""
 
-    def __init__(self, frozen_ctx: contextvars.Context, tool_name: str):
-        self._frozen_ctx = frozen_ctx
+    def __init__(self, reader: OwnedCallbackReader, tool_name: str):
+        self._reader = reader
         self._tool_name = tool_name
 
     async def generate(self, **kwargs):
         executor = kwargs.get("tool_executor")
         assert executor is not None
-        loop = asyncio.get_running_loop()
-        # Reader-spawned handler task: inherits the reader's frozen context,
-        # not the turn's.
-        await loop.create_task(
-            executor(self._tool_name, {}), context=self._frozen_ctx.copy(),
-        )
+        await self._reader.dispatch(executor, self._tool_name, {})
         return LLMResponse(content="selfie done", tool_calls=None)
 
     async def generate_with_messages(self, **kwargs):
@@ -301,43 +316,52 @@ class _CodexInlineLLM:
 
 
 @pytest.mark.asyncio
-async def test_execute_as_subagent_returns_parts_from_tool_loop():
-    feature = _make_selfie_feature(_ToolCallOnceLLM("generate_selfie"))
-    envelope = await feature.execute_as_subagent(task="take a selfie")
-    assert envelope["success"] is True
-    assert [p["type"] for p in envelope["parts"]] == [
-        "selfie_pending", "selfie_finished",
-    ]
+async def test_execute_as_subagent_returns_parts_from_tool_loop(native_selfie_agent):
+    async def exercise():
+        feature = _make_selfie_feature(_ToolCallOnceLLM("generate_selfie"), agent=native_selfie_agent)
+        envelope = await feature.execute_as_subagent(task="take a selfie")
+        assert envelope["success"] is True
+        assert [p["type"] for p in envelope["parts"]] == [
+            "selfie_pending", "selfie_finished",
+        ]
+
+    await drive_native(native_selfie_agent, exercise)
 
 
 @pytest.mark.asyncio
-async def test_execute_as_subagent_returns_parts_via_codex_inline_executor():
+async def test_execute_as_subagent_returns_parts_via_codex_inline_executor(native_selfie_agent):
     # Freeze a pre-turn context (no collector, no buffer) — the reader task's
     # view of the world in the live codex app-server.
-    frozen_ctx = contextvars.copy_context()
-    feature = _make_selfie_feature(_CodexInlineLLM(frozen_ctx, "generate_selfie"))
-    envelope = await feature.execute_as_subagent(task="take a selfie")
-    assert envelope["success"] is True, envelope
-    assert [p["type"] for p in envelope["parts"]] == [
-        "selfie_pending", "selfie_finished",
-    ], (
-        "parts emitted on a frozen-context inline-executor task must ride the "
-        "subagent envelope — this is the exact Frinz dashboard selfie gap"
-    )
+    async def exercise():
+        frozen_ctx = contextvars.copy_context()
+        feature = _make_selfie_feature(_CodexInlineLLM(native_selfie_agent._test_inline_reader, "generate_selfie"), agent=native_selfie_agent)
+        envelope = await feature.execute_as_subagent(task="take a selfie")
+        assert envelope["success"] is True, envelope
+        assert [p["type"] for p in envelope["parts"]] == [
+            "selfie_pending", "selfie_finished",
+        ], (
+            "parts emitted on a frozen-context inline-executor task must ride the "
+            "subagent envelope — this is the exact Frinz dashboard selfie gap"
+        )
+
+    await drive_native(native_selfie_agent, exercise)
 
 
 @pytest.mark.asyncio
-async def test_execute_as_subagent_returns_explicit_toolresult_parts():
+async def test_execute_as_subagent_returns_explicit_toolresult_parts(native_selfie_agent):
     # #2641 review P2: the subagent loop's explicit-parts harvester. A tool
     # that never calls ``emit_part`` but returns ``ToolResult.parts=[...]``
     # must still deliver through ``execute_as_subagent``'s envelope — with
     # the same per-entry sanitization (the control-char type is dropped).
-    feature = _make_selfie_feature(_ToolCallOnceLLM("explicit_parts_selfie"))
-    envelope = await feature.execute_as_subagent(task="take a selfie")
-    assert envelope["success"] is True
-    assert envelope["parts"] == [
-        {"type": "selfie_finished", "data": {"url": "https://img/z.png"}, "id": "sf-3"},
-    ]
+    async def exercise():
+        feature = _make_selfie_feature(_ToolCallOnceLLM("explicit_parts_selfie"), agent=native_selfie_agent)
+        envelope = await feature.execute_as_subagent(task="take a selfie")
+        assert envelope["success"] is True
+        assert envelope["parts"] == [
+            {"type": "selfie_finished", "data": {"url": "https://img/z.png"}, "id": "sf-3"},
+        ]
+
+    await drive_native(native_selfie_agent, exercise)
 
 
 class _PrePostHooksEmitParts:
@@ -358,67 +382,76 @@ class _PrePostHooksEmitParts:
 
 
 @pytest.mark.asyncio
-async def test_subagent_hook_parts_bracket_tool_body_parts():
+async def test_subagent_hook_parts_bracket_tool_body_parts(native_selfie_agent):
     """#2641 review P1: the parts sink binds BEFORE the PRE_TOOL_USE hooks
     run, so a hook-emitted part keeps its emission-order position (first).
     Binding late let it fall to the ambient turn collector, where the loop's
     stray-drain re-harvested it AFTER the tool-body parts. POST_TOOL_USE
     (#3612) fires inside the same binding, so its part lands last."""
-    feature = _make_selfie_feature(_ToolCallOnceLLM("generate_selfie"))
-    feature.agent.hooks_manager = _PrePostHooksEmitParts()
+    async def exercise():
+        feature = _make_selfie_feature(_ToolCallOnceLLM("generate_selfie"), agent=native_selfie_agent)
+        feature.agent.hooks_manager = _PrePostHooksEmitParts()
 
-    # Simulate the chat-path topology: the parent turn's collector is bound
-    # on the dispatching task while the subagent runs.
-    with part_collector():
-        envelope = await feature.execute_as_subagent(task="take a selfie")
-        leaked = drain_parts()
+        # Simulate the chat-path topology: the parent turn's collector is bound
+        # on the dispatching task while the subagent runs.
+        with part_collector():
+            envelope = await feature.execute_as_subagent(task="take a selfie")
+            leaked = drain_parts()
 
-    assert envelope["success"] is True
-    assert [p["type"] for p in envelope["parts"]] == [
-        "pre_hook_part", "selfie_pending", "selfie_finished", "post_hook_part",
-    ], (
-        "hook parts must ride the subagent sink in emission order — a PRE "
-        "part landing after tool-body parts (or on the parent collector) is "
-        "the #2641 review P1 ordering regression"
-    )
-    # Nothing bled onto the parent turn's collector: the envelope is the
-    # single delivery channel for the whole gated call.
-    assert leaked == []
+        assert envelope["success"] is True
+        assert [p["type"] for p in envelope["parts"]] == [
+            "pre_hook_part", "selfie_pending", "selfie_finished", "post_hook_part",
+        ], (
+            "hook parts must ride the subagent sink in emission order — a PRE "
+            "part landing after tool-body parts (or on the parent collector) is "
+            "the #2641 review P1 ordering regression"
+        )
+        # Nothing bled onto the parent turn's collector: the envelope is the
+        # single delivery channel for the whole gated call.
+        assert leaked == []
+
+    await drive_native(native_selfie_agent, exercise)
 
 
 @pytest.mark.asyncio
-async def test_subagent_post_hook_part_follows_harvested_envelope_parts():
+async def test_subagent_post_hook_part_follows_harvested_envelope_parts(native_selfie_agent):
     """#3612: a tool's EXPLICIT ``ToolResult.parts`` reach the sink by harvest
     from the returned envelope, not through ``emit_part``. The harvest must
     run before POST_TOOL_USE fires, or a POST-hook part jumps ahead of the
     tool's own — the order the chat path keeps by re-emitting envelope parts
     before its POST hooks."""
-    feature = _make_selfie_feature(_ToolCallOnceLLM("explicit_parts_selfie"))
-    feature.agent.hooks_manager = _PrePostHooksEmitParts()
+    async def exercise():
+        feature = _make_selfie_feature(_ToolCallOnceLLM("explicit_parts_selfie"), agent=native_selfie_agent)
+        feature.agent.hooks_manager = _PrePostHooksEmitParts()
 
-    envelope = await feature.execute_as_subagent(task="take a selfie")
+        envelope = await feature.execute_as_subagent(task="take a selfie")
 
-    assert envelope["success"] is True
-    assert [p["type"] for p in envelope["parts"]] == [
-        "pre_hook_part", "selfie_finished", "post_hook_part",
-    ]
+        assert envelope["success"] is True
+        assert [p["type"] for p in envelope["parts"]] == [
+            "pre_hook_part", "selfie_finished", "post_hook_part",
+        ]
+
+    await drive_native(native_selfie_agent, exercise)
 
 
 @pytest.mark.asyncio
-async def test_execute_as_subagent_no_parts_keeps_envelope_shape():
+async def test_execute_as_subagent_no_parts_keeps_envelope_shape(native_selfie_agent):
     # No parts produced → no ``parts`` key; existing callers see the
     # pre-#2641 envelope byte-for-byte.
-    class _PlainLLM:
-        async def generate(self, **kwargs):
-            return LLMResponse(content="just words", tool_calls=None)
+    async def exercise():
+        class _PlainLLM:
+            async def generate(self, **kwargs):
+                return LLMResponse(content="just words", tool_calls=None)
 
-        async def generate_with_messages(self, **kwargs):
-            return LLMResponse(content="just words", tool_calls=None)
+            async def generate_with_messages(self, **kwargs):
+                return LLMResponse(content="just words", tool_calls=None)
 
-    feature = _make_selfie_feature(_PlainLLM())
-    envelope = await feature.execute_as_subagent(task="chat only")
-    assert envelope["success"] is True
-    assert "parts" not in envelope
+        feature = _make_selfie_feature(_PlainLLM(), agent=native_selfie_agent)
+        envelope = await feature.execute_as_subagent(task="chat only")
+        assert envelope["success"] is True
+        assert "parts" not in envelope
+
+    await drive_native(native_selfie_agent, exercise)
 
 
 # --------------------------------------------------------------------------
@@ -433,31 +466,6 @@ def _allow_hook_output():
     )
 
 
-class _Orchestrator(OrchestratorEngineMixin):
-    """Minimal host running the REAL dispatch methods over stubbed
-    governance/observability collaborators."""
-
-    def __init__(self):
-        self.hooks_manager = MagicMock()
-        self.hooks_manager.execute_hooks = AsyncMock(
-            return_value=_allow_hook_output(),
-        )
-        self.hooks_manager.execute_hooks_parallel = AsyncMock(return_value=None)
-        self.observability_store = MagicMock()
-        self.observability_store.log_tool_response = AsyncMock()
-        self._direct_tools = {}
-        self._tool_to_feature = {}
-        self.features = {}
-        self._subagents = {}
-
-    async def _get_denied_tools(self, feature_name):
-        return set()
-
-    def _register_explored_feature_tools(self, feature):
-        return None
-
-    def _visible_features_by_tool_name(self):
-        return dict(self._subagents)
 
 
 def test_reemit_envelope_parts_off_turn_is_noop():
@@ -489,102 +497,111 @@ def test_reemit_envelope_parts_sanitizes_and_delivers():
 
 
 @pytest.mark.asyncio
-async def test_subagent_selfie_part_reaches_outbound_stream():
+async def test_subagent_selfie_part_reaches_outbound_stream(native_selfie_agent):
     """Acceptance (#2641): a subagent-emitted ``selfie_finished`` part reaches
     the outbound stream through the REAL chat-path dispatch chain —
     ``_dispatch_feature_tool`` → ``execute_as_subagent`` → subagent tool loop
     → envelope → re-emit → turn collector → PART sentinel → stream parser."""
-    orch = _Orchestrator()
-    feature = _make_selfie_feature(_ToolCallOnceLLM("generate_selfie"))
+    async def exercise():
+        orch = native_selfie_agent
+        feature = _make_selfie_feature(_ToolCallOnceLLM("generate_selfie"), agent=native_selfie_agent)
 
-    with part_collector():
-        result = await orch._dispatch_feature_tool(
-            SimpleNamespace(name="selfie_feature", id="tc-1"),
-            feature,
-            {"task": "take a selfie"},
-            time.time(),
-            "evt-1",
-            "please take a selfie",
-            tool_events=[],
-            streaming=True,
-            session_id="sess-1",
-        )
-        drained = drain_parts()
+        with part_collector():
+            result = await orch._dispatch_feature_tool(
+                SimpleNamespace(name="selfie_feature", id="tc-1"),
+                feature,
+                {"task": "take a selfie"},
+                time.time(),
+                "evt-1",
+                "please take a selfie",
+                tool_events=[],
+                streaming=True,
+                session_id="sess-1",
+            )
+            drained = drain_parts()
 
-    # The envelope carried the parts...
-    assert result["success"] is True
-    assert [p["type"] for p in result["parts"]] == [
-        "selfie_pending", "selfie_finished",
-    ]
-    # ...and the dispatch site re-emitted each into the turn collector
-    # exactly once (no duplicates from the collector/envelope dual paths).
-    assert [p["type"] for p in drained] == ["selfie_pending", "selfie_finished"]
+        # The envelope carried the parts...
+        assert result["success"] is True
+        assert [p["type"] for p in result["parts"]] == [
+            "selfie_pending", "selfie_finished",
+        ]
+        # ...and the dispatch site re-emitted each into the turn collector
+        # exactly once (no duplicates from the collector/envelope dual paths).
+        assert [p["type"] for p in drained] == ["selfie_pending", "selfie_finished"]
 
-    # Prove stream delivery: the drained part serializes to a PART sentinel
-    # the streaming parser recovers — the outbound-stream wire contract.
-    finished = next(p for p in drained if p["type"] == "selfie_finished")
-    sentinel = build_part_sentinel(finished)
-    clean, _tools, parsed = _parse_stream_sentinels("pre " + sentinel + "post")
-    assert clean == "pre post"
-    assert parsed[0]["type"] == "selfie_finished"
-    assert parsed[0]["data"] == {"url": "https://img/x.png"}
+        # Prove stream delivery: the drained part serializes to a PART sentinel
+        # the streaming parser recovers — the outbound-stream wire contract.
+        finished = next(p for p in drained if p["type"] == "selfie_finished")
+        sentinel = build_part_sentinel(finished)
+        clean, _tools, parsed = _parse_stream_sentinels("pre " + sentinel + "post")
+        assert clean == "pre post"
+        assert parsed[0]["type"] == "selfie_finished"
+        assert parsed[0]["data"] == {"url": "https://img/x.png"}
+
+    await drive_native(native_selfie_agent, exercise)
 
 
 @pytest.mark.asyncio
-async def test_codex_subagent_selfie_part_reaches_outbound_stream():
+async def test_codex_subagent_selfie_part_reaches_outbound_stream(native_selfie_agent):
     """Same acceptance flow on the codex topology: the subagent's tool runs on
     a frozen-context task (no collector anywhere in sight), yet the part
     still lands on the parent turn via the envelope contract."""
-    orch = _Orchestrator()
-    frozen_ctx = contextvars.copy_context()  # captured BEFORE the turn
-    feature = _make_selfie_feature(_CodexInlineLLM(frozen_ctx, "generate_selfie"))
+    async def exercise():
+        orch = native_selfie_agent
+        frozen_ctx = contextvars.copy_context()  # captured BEFORE the turn
+        feature = _make_selfie_feature(_CodexInlineLLM(native_selfie_agent._test_inline_reader, "generate_selfie"), agent=native_selfie_agent)
 
-    with part_collector():
-        result = await orch._dispatch_feature_tool(
-            SimpleNamespace(name="selfie_feature", id="tc-1"),
-            feature,
-            {"task": "take a selfie"},
-            time.time(),
-            "evt-1",
-            "please take a selfie",
-            tool_events=[],
-            streaming=True,
-            session_id="sess-1",
+        with part_collector():
+            result = await orch._dispatch_feature_tool(
+                SimpleNamespace(name="selfie_feature", id="tc-1"),
+                feature,
+                {"task": "take a selfie"},
+                time.time(),
+                "evt-1",
+                "please take a selfie",
+                tool_events=[],
+                streaming=True,
+                session_id="sess-1",
+            )
+            drained = drain_parts()
+
+        assert result["success"] is True
+        assert [p["type"] for p in drained] == ["selfie_pending", "selfie_finished"], (
+            "codex inline-executor subagent parts must reach the parent turn — "
+            "pre-#2641 these were silently dropped and the selfie degraded to an "
+            "inline markdown image"
         )
-        drained = drain_parts()
 
-    assert result["success"] is True
-    assert [p["type"] for p in drained] == ["selfie_pending", "selfie_finished"], (
-        "codex inline-executor subagent parts must reach the parent turn — "
-        "pre-#2641 these were silently dropped and the selfie degraded to an "
-        "inline markdown image"
-    )
+    await drive_native(native_selfie_agent, exercise)
 
 
 @pytest.mark.asyncio
-async def test_direct_tool_dispatch_reemits_envelope_parts():
+async def test_direct_tool_dispatch_reemits_envelope_parts(native_selfie_agent):
     """After progressive disclosure, an explored feature's tools re-register
     as DIRECT tools — the second selfie call in a conversation dispatches via
     ``_dispatch_direct_tool``, which must honor the same envelope contract."""
-    orch = _Orchestrator()
-    feature = _make_selfie_feature()
-    orch._direct_tools = {"explicit_parts_selfie": _tool(feature, "explicit_parts_selfie")}
+    async def exercise():
+        orch = native_selfie_agent
+        feature = _make_selfie_feature(agent=native_selfie_agent)
+        orch.register_dynamic_tools(feature.tool_name, [_tool(feature, "explicit_parts_selfie")])
 
-    with part_collector():
-        result = await orch._dispatch_direct_tool(
-            SimpleNamespace(name="explicit_parts_selfie", id="tc-2"),
-            "explicit_parts_selfie",
-            {},
-            time.time(),
-            "evt-2",
-            tool_events=[],
-            streaming=True,
-            session_id="sess-2",
-        )
-        drained = drain_parts()
+        with part_collector():
+            result = await orch._dispatch_direct_tool(
+                SimpleNamespace(name="explicit_parts_selfie", id="tc-2"),
+                "explicit_parts_selfie",
+                {},
+                time.time(),
+                "evt-2",
+                tool_events=[],
+                streaming=True,
+                session_id="sess-2",
+            )
+            drained = drain_parts()
 
-    assert result["success"] is True
-    assert [p["type"] for p in drained] == ["selfie_finished"]
+        assert result["success"] is True
+        assert [p["type"] for p in drained] == ["selfie_finished"]
+
+    await drive_native(native_selfie_agent, exercise)
 
 
 # --------------------------------------------------------------------------
@@ -592,75 +609,81 @@ async def test_direct_tool_dispatch_reemits_envelope_parts():
 # (#2641 review P1)
 # --------------------------------------------------------------------------
 
-def _post_hook_part_emitter():
+def _post_hook_part_emitter(tool_name=None):
     """execute_hooks_parallel side effect: a POST_TOOL_USE hook that emits
     its own part onto whatever collector is bound (the parent turn's)."""
     async def _emit(event, hook_input):
-        if event == HookEvent.POST_TOOL_USE:
+        if event == HookEvent.POST_TOOL_USE and (tool_name is None or hook_input.tool_name == tool_name):
             emit_part("post_hook_part", {"stage": "post"})
     return _emit
 
 
 @pytest.mark.asyncio
-async def test_feature_dispatch_envelope_parts_precede_post_hook_parts():
+async def test_feature_dispatch_envelope_parts_precede_post_hook_parts(native_selfie_agent):
     """#2641 review P1: the dispatch site re-emits envelope parts BEFORE
     POST_TOOL_USE fires, so the outbound stream keeps the pre-envelope
     collector ordering — tool-body parts first, POST-hook parts after."""
-    orch = _Orchestrator()
-    orch.hooks_manager.execute_hooks_parallel = AsyncMock(
-        side_effect=_post_hook_part_emitter(),
-    )
-    feature = _make_selfie_feature(_ToolCallOnceLLM("generate_selfie"))
-
-    with part_collector():
-        result = await orch._dispatch_feature_tool(
-            SimpleNamespace(name="selfie_feature", id="tc-1"),
-            feature,
-            {"task": "take a selfie"},
-            time.time(),
-            "evt-1",
-            "please take a selfie",
-            tool_events=[],
-            streaming=True,
-            session_id="sess-1",
+    async def exercise():
+        orch = native_selfie_agent
+        orch.hooks_manager.execute_hooks_parallel = AsyncMock(
+            side_effect=_post_hook_part_emitter("selfie_feature"),
         )
-        drained = drain_parts()
+        feature = _make_selfie_feature(_ToolCallOnceLLM("generate_selfie"), agent=native_selfie_agent)
 
-    assert result["success"] is True
-    assert [p["type"] for p in drained] == [
-        "selfie_pending", "selfie_finished", "post_hook_part",
-    ], (
-        "envelope parts must reach the collector before POST_TOOL_USE hooks "
-        "run — a POST-hook part jumping ahead of the tool's own parts is the "
-        "#2641 review P1 ordering regression"
-    )
+        with part_collector():
+            result = await orch._dispatch_feature_tool(
+                SimpleNamespace(name="selfie_feature", id="tc-1"),
+                feature,
+                {"task": "take a selfie"},
+                time.time(),
+                "evt-1",
+                "please take a selfie",
+                tool_events=[],
+                streaming=True,
+                session_id="sess-1",
+            )
+            drained = drain_parts()
+
+        assert result["success"] is True
+        assert [p["type"] for p in drained] == [
+            "selfie_pending", "selfie_finished", "post_hook_part",
+        ], (
+            "envelope parts must reach the collector before POST_TOOL_USE hooks "
+            "run — a POST-hook part jumping ahead of the tool's own parts is the "
+            "#2641 review P1 ordering regression"
+        )
+
+    await drive_native(native_selfie_agent, exercise)
 
 
 @pytest.mark.asyncio
-async def test_direct_dispatch_envelope_parts_precede_post_hook_parts():
+async def test_direct_dispatch_envelope_parts_precede_post_hook_parts(native_selfie_agent):
     """Same ordering contract on the direct-tool dispatch site."""
-    orch = _Orchestrator()
-    orch.hooks_manager.execute_hooks_parallel = AsyncMock(
-        side_effect=_post_hook_part_emitter(),
-    )
-    feature = _make_selfie_feature()
-    orch._direct_tools = {"explicit_parts_selfie": _tool(feature, "explicit_parts_selfie")}
-
-    with part_collector():
-        result = await orch._dispatch_direct_tool(
-            SimpleNamespace(name="explicit_parts_selfie", id="tc-2"),
-            "explicit_parts_selfie",
-            {},
-            time.time(),
-            "evt-2",
-            tool_events=[],
-            streaming=True,
-            session_id="sess-2",
+    async def exercise():
+        orch = native_selfie_agent
+        orch.hooks_manager.execute_hooks_parallel = AsyncMock(
+            side_effect=_post_hook_part_emitter(),
         )
-        drained = drain_parts()
+        feature = _make_selfie_feature(agent=native_selfie_agent)
+        orch.register_dynamic_tools(feature.tool_name, [_tool(feature, "explicit_parts_selfie")])
 
-    assert result["success"] is True
-    assert [p["type"] for p in drained] == ["selfie_finished", "post_hook_part"]
+        with part_collector():
+            result = await orch._dispatch_direct_tool(
+                SimpleNamespace(name="explicit_parts_selfie", id="tc-2"),
+                "explicit_parts_selfie",
+                {},
+                time.time(),
+                "evt-2",
+                tool_events=[],
+                streaming=True,
+                session_id="sess-2",
+            )
+            drained = drain_parts()
+
+        assert result["success"] is True
+        assert [p["type"] for p in drained] == ["selfie_finished", "post_hook_part"]
+
+    await drive_native(native_selfie_agent, exercise)
 
 
 class _SharedPrePartHooks:
@@ -682,7 +705,7 @@ class _SharedPrePartHooks:
 
 
 @pytest.mark.asyncio
-async def test_shared_agent_outer_pre_hook_part_keeps_position():
+async def test_shared_agent_outer_pre_hook_part_keeps_position(native_selfie_agent):
     """#2641 review P1 (round 2): in production the feature and orchestrator
     share one agent/hooks manager, so the OUTER PRE_TOOL_USE gate's part
     lands on the parent turn's collector before ``execute_as_subagent``
@@ -690,43 +713,46 @@ async def test_shared_agent_outer_pre_hook_part_keeps_position():
     ``drain_parts()`` there stole the outer part into the envelope AFTER
     the tool-body parts, reordering the stream to
     ``[pre_part_inner, body, pre_part_outer]`` instead of emission order."""
-    orch = _Orchestrator()
-    orch.hooks_manager = _SharedPrePartHooks()
-    orch.llm_service = _ToolCallOnceLLM("generate_selfie")
-    orch.did = "did:test:selfie"
-    feature = _SelfieFeature(orch)
-    assert feature.agent is orch
+    async def exercise():
+        orch = native_selfie_agent
+        orch.hooks_manager = _SharedPrePartHooks()
+        orch.llm_service = _ToolCallOnceLLM("generate_selfie")
+        orch.did = "did:test:selfie"
+        feature = _make_selfie_feature(agent=orch)
+        assert feature.agent is orch
 
-    with part_collector():
-        result = await orch._dispatch_feature_tool(
-            SimpleNamespace(name="selfie_feature", id="tc-1"),
-            feature,
-            {"task": "take a selfie"},
-            time.time(),
-            "evt-1",
-            "please take a selfie",
-            tool_events=[],
-            streaming=True,
-            session_id="sess-1",
+        with part_collector():
+            result = await orch._dispatch_feature_tool(
+                SimpleNamespace(name="selfie_feature", id="tc-1"),
+                feature,
+                {"task": "take a selfie"},
+                time.time(),
+                "evt-1",
+                "please take a selfie",
+                tool_events=[],
+                streaming=True,
+                session_id="sess-1",
+            )
+            drained = drain_parts()
+
+        assert result["success"] is True
+        # The envelope carries only what the subagent's own gated call produced —
+        # the outer gate's part is NOT harvested into it.
+        assert [p["type"] for p in result["parts"]] == [
+            "pre_part_inner", "selfie_pending", "selfie_finished",
+        ]
+        # The parent collector keeps full emission order: the outer gate's part
+        # first (emitted before the subagent ran), then the re-emitted envelope
+        # parts.
+        assert [p["type"] for p in drained] == [
+            "pre_part_outer", "pre_part_inner", "selfie_pending", "selfie_finished",
+        ], (
+            "the outer PRE_TOOL_USE gate's part must keep its pre-dispatch "
+            "position on the parent collector — the subagent loop draining the "
+            "ambient collector is the #2641 review P1 (round 2) reordering"
         )
-        drained = drain_parts()
 
-    assert result["success"] is True
-    # The envelope carries only what the subagent's own gated call produced —
-    # the outer gate's part is NOT harvested into it.
-    assert [p["type"] for p in result["parts"]] == [
-        "pre_part_inner", "selfie_pending", "selfie_finished",
-    ]
-    # The parent collector keeps full emission order: the outer gate's part
-    # first (emitted before the subagent ran), then the re-emitted envelope
-    # parts.
-    assert [p["type"] for p in drained] == [
-        "pre_part_outer", "pre_part_inner", "selfie_pending", "selfie_finished",
-    ], (
-        "the outer PRE_TOOL_USE gate's part must keep its pre-dispatch "
-        "position on the parent collector — the subagent loop draining the "
-        "ambient collector is the #2641 review P1 (round 2) reordering"
-    )
+    await drive_native(native_selfie_agent, exercise)
 
 
 # --------------------------------------------------------------------------
@@ -736,7 +762,7 @@ async def test_shared_agent_outer_pre_hook_part_keeps_position():
 # --------------------------------------------------------------------------
 
 @pytest.mark.asyncio
-async def test_inline_executor_named_subagent_parts_reach_outbound_stream():
+async def test_inline_executor_named_subagent_parts_reach_outbound_stream(native_selfie_agent):
     """The live top-level codex topology: the PARENT turn's LLM runs on the
     app-server and invokes a feature-dispatch tool via ``item/tool/call`` —
     the reader-spawned handler task carries a frozen pre-turn context. The
@@ -744,38 +770,36 @@ async def test_inline_executor_named_subagent_parts_reach_outbound_stream():
     collector around ``execute_named_tool``, which resolves the subagent
     dispatcher and re-emits the subagent's envelope parts, so they land on
     the outbound stream."""
-    orch = _Orchestrator()
-    feature = _make_selfie_feature(_ToolCallOnceLLM("generate_selfie"))
-    orch._subagents = {"selfie_feature": feature}
+    async def exercise():
+        orch = native_selfie_agent
+        feature = _make_selfie_feature(_ToolCallOnceLLM("generate_selfie"), agent=native_selfie_agent)
 
-    frozen_ctx = contextvars.copy_context()  # reader context: pre-turn
+        with part_collector():
+            # Created INSIDE the turn scope, as process_input_streaming does.
+            executor = orch._make_inline_tool_executor("sess-3")
+            effective_args, result = await orch._test_inline_reader.dispatch(
+                executor, feature.tool_name, {"task": "take a selfie"},
+            )
+            drained = drain_parts()
 
-    with part_collector():
-        # Created INSIDE the turn scope, as process_input_streaming does.
-        executor = orch._make_inline_tool_executor("sess-3")
-        loop = asyncio.get_running_loop()
-        effective_args, result = await loop.create_task(
-            executor("selfie_feature", {"task": "take a selfie"}),
-            context=frozen_ctx.copy(),
+        assert effective_args == {"task": "take a selfie"}
+        assert result["success"] is True
+        assert [p["type"] for p in result["parts"]] == [
+            "selfie_pending", "selfie_finished",
+        ]
+        assert [p["type"] for p in drained] == ["selfie_pending", "selfie_finished"], (
+            "envelope parts from a named-subagent dispatch on a frozen-context "
+            "inline-executor task must reach the parent turn's collector"
         )
-        drained = drain_parts()
 
-    assert effective_args == {"task": "take a selfie"}
-    assert result["success"] is True
-    assert [p["type"] for p in result["parts"]] == [
-        "selfie_pending", "selfie_finished",
-    ]
-    assert [p["type"] for p in drained] == ["selfie_pending", "selfie_finished"], (
-        "envelope parts from a named-subagent dispatch on a frozen-context "
-        "inline-executor task must reach the parent turn's collector"
-    )
+        # Wire-contract proof, same as the chat-path acceptance test.
+        finished = next(p for p in drained if p["type"] == "selfie_finished")
+        sentinel = build_part_sentinel(finished)
+        clean, _tools, parsed = _parse_stream_sentinels("pre " + sentinel + "post")
+        assert clean == "pre post"
+        assert parsed[0]["type"] == "selfie_finished"
 
-    # Wire-contract proof, same as the chat-path acceptance test.
-    finished = next(p for p in drained if p["type"] == "selfie_finished")
-    sentinel = build_part_sentinel(finished)
-    clean, _tools, parsed = _parse_stream_sentinels("pre " + sentinel + "post")
-    assert clean == "pre post"
-    assert parsed[0]["type"] == "selfie_finished"
+    await drive_native(native_selfie_agent, exercise)
 
 
 if __name__ == "__main__":

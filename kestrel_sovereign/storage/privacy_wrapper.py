@@ -43,6 +43,7 @@ from kestrel_sovereign.deidentification import (
 from kestrel_sovereign.execution_custody import (
     execution_terminal_error,
     is_execution_control_error,
+    ExecutionAuthorityError,
 )
 from kestrel_sovereign.knowledge import IRI, Visibility
 from kestrel_sovereign.privacy import (
@@ -208,35 +209,9 @@ class _PrivacyDatabaseView:
         return governed
 
 
-# ── Cross-task reentry token for the privacy-transition lock (#2672 review P1) ──
-#
-# Same-task reentry (below) fixes the ANTHROPIC path, where a durable-identity
-# write dispatched inline runs on the SAME asyncio task that holds the turn's
-# transition lock. It does NOT fix the CODEX app-server path: the long-lived
-# app-server dispatches each ``item/tool/call`` handler on its own reader-spawned
-# task (``agent/orchestrator_engine.py`` — the reader loop spawns a per-call
-# task), NOT the turn task. That handler task calls ``execute_named_tool`` →
-# ``rename_agent_core`` (or description / discovery history / user name / SOUL),
-# which re-acquires the SAME lock. By task identity it is a DIFFERENT task, so it
-# would block waiting for the turn task to release — while the turn task is itself
-# blocked awaiting the app-server's tool response. That is a deadlock.
-#
-# The fix, per the review: give inline tool callbacks a private, captured
-# per-turn ownership token that permits re-entry into the lock for THAT specific
-# active turn. The executor captures the owning turn's token on the turn task
-# (where the lock is held — see ``ReentrantTransitionLock.current_reentry_token``)
-# and re-presents it via ``bind_transition_lock_reentry`` around the tool call.
-# The lock then admits that one turn's nested write cross-task, while a genuinely
-# concurrent ``set_privacy_mode`` from an UNRELATED task (which captured no token)
-# still serializes — cross-turn exclusion, the only exclusion the #2672
-# check-then-write race needs, is preserved.
-#
-# The token authorizes re-entry but does NOT wave the reentrant write straight
-# through: because the app-server can dispatch MULTIPLE inline tools of one turn
-# concurrently — each on its own reader task, all carrying the SAME token — the
-# lock funnels cross-task reentrants through a per-span reentry mutex
-# (``_reentry_lock``) so two durable identity writes cannot interleave. See the
-# ``ReentrantTransitionLock`` docstring and ``__aenter__`` for the serialization.
+# A captured token identifies one live policy span. Every task, including a
+# token-bearing reader, still acquires the same exclusive writer. Native joins
+# use exact admitted tasks and explicit parking; context alone cannot lend it.
 _transition_lock_reentry_token: "contextvars.ContextVar[Optional[object]]" = (
     contextvars.ContextVar("kestrel_transition_lock_reentry_token", default=None)
 )
@@ -244,20 +219,7 @@ _transition_lock_reentry_token: "contextvars.ContextVar[Optional[object]]" = (
 
 @contextmanager
 def bind_transition_lock_reentry(token: Optional[object]):
-    """Re-present a captured transition-lock reentry token on the current task.
-
-    Companion to :meth:`ReentrantTransitionLock.current_reentry_token`. An
-    inline-tool executor built inside a streamed turn captures that turn's token
-    (on the turn task, which holds the lock) and wraps the actual tool call in
-    ``with bind_transition_lock_reentry(token):`` so a nested durable-identity
-    write (rename / description / discovery history / user name / SOUL) dispatched
-    on the codex app-server's SEPARATE reader task can re-enter the lock its
-    OWNING turn holds instead of deadlocking (#2672 review P1). The token is the
-    identity of ONE held span on ONE lock instance, so it authorizes re-entry into
-    that span only — a different lock (another agent) or a later span sees no
-    match. Binding ``None`` is a no-op (the anthropic path runs the tool on the
-    turn task, where reentry is by task identity), preserving prior behaviour.
-    """
+    """Bind a captured policy-span identity without granting writer ownership."""
     if token is None:
         yield
         return
@@ -329,201 +291,426 @@ turn_scoped(
 )
 
 
+class _PrivacySpan:
+    """A lifetime identity, never an exclusive-writer capability."""
+
+    def __init__(self, coordinator, root, lifetime_owner=None):
+        self.coordinator = coordinator
+        self.root = root
+        self.lifetime_owner = lifetime_owner
+        self.closing = False
+        self.active = False
+        self.activation_lock = asyncio.Lock()
+        self.members = {root: None}
+        self.admissions = {}
+
+
+@dataclass
+class _ParkedPrivacyWriter:
+    task: asyncio.Task
+    depth: int
+    targets: tuple
+    restoring: bool = False
+
+
 class ReentrantTransitionLock:
-    """Task-reentrant async lock for the privacy-transition boundary (#2672 P1).
+    """Retain one policy span and serialize every protected writer within it.
 
-    ``asyncio.Lock`` is NOT reentrant. A turn holds the privacy-transition lock
-    across the ENTIRE turn — including feature/tool execution (``agent/streaming.py``
-    acquires it before dispatching tools, and since #3310 so does
-    ``KestrelAgent.process_input``) — so a durable
-    identity write invoked as a tool WITHIN that turn (rename / description /
-    discovery history / user name / SOUL) that re-acquires the SAME lock would wait
-    forever on a lock its own turn already holds, hanging the turn. This lock
-    admits such a nested write via TWO scoped-to-the-held-span signals:
-
-      * SAME-TASK reentry — the task that acquired the lock re-acquires it. This
-        covers the anthropic path, where the inline write runs on the turn task
-        itself. A nested acquire returns immediately and bumps a depth counter;
-        only the OUTERMOST acquire releases to other tasks.
-
-      * CROSS-TASK reentry via a captured token — the codex app-server dispatches
-        each inline tool on its own reader-spawned task, NOT the turn task, so
-        same-task reentry cannot help it and it would DEADLOCK (the tool waits on
-        the lock the turn holds; the turn waits on the app-server's tool result).
-        The inline executor captures this span's token on the turn task (via
-        :meth:`current_reentry_token`) and re-presents it via
-        :func:`bind_transition_lock_reentry`; a caller carrying THIS span's token
-        re-enters cross-task — but through a SEPARATE per-span reentry mutex, not
-        by bypassing the lock outright. That mutex serializes the app-server's
-        concurrent reader tasks against each other: all inline tools of one turn
-        share the same token, so two durable identity writes (e.g. two
-        ``rename_agent`` calls) that would otherwise interleave their
-        metadata/graph/memory/SOUL writes are forced one-at-a-time, the second
-        blocked until the first's critical section completes (#2672 review P1).
-        The mutex is distinct from the base lock the turn owner holds, so the
-        cross-task write still never deadlocks; a nested write on the SAME reader
-        task re-enters the mutex by task identity.
-
-    Cross-turn exclusion is unchanged — a writer in task A and a concurrent
-    ``set_privacy_mode`` in task B (which captured no token) still serialize —
-    which is the only exclusion the #2672 check-then-write race needs. Both reentry
-    signals are scoped to the ONE currently-held span (the token is a fresh object
-    identity minted on the outermost acquire and cleared on the outermost release),
-    so a stale token from a prior span never re-enters a later one. Exposes the
-    ``asyncio.Lock``-compatible surface (``locked()`` + async context manager) the
-    call sites use.
-
-    CANCELLATION DRAIN (#2672 review P1). A cross-task reentry admitted via the
-    token is an ACTIVE LEASE on the outer span, not merely a hold of the reentry
-    mutex: the codex app-server runs each inline tool on a DETACHED reader task, so
-    if the owning turn is cancelled/disconnected while such a reader is mid
-    durable-write, the naive release would clear the token and free ``_lock``
-    immediately — and a concurrent privacy transition could then acquire ``_lock``
-    and flip to a volatile mode while the already-admitted NORMAL-mode write is
-    still persisting. To prevent that, the outermost owner exit first INVALIDATES
-    the token (rejecting any new reentry) and then WAITS for every active
-    token-bearing writer to finish before releasing ``_lock`` — cancellation-safely,
-    re-raising the turn's own cancellation only after the base lock is released. A
-    reader that is itself cancelled unblocks the drain via the same idle signal, so
-    the drain always terminates.
+    A live token identifies a span; it never bypasses writer exclusion. Native
+    children can borrow exclusion only while their actual writer is parked in
+    an owned wait. The suspended parent regains its complete reentrant frame
+    before any continuation or exception handler can run.
     """
 
-    def __init__(self) -> None:
+    def __init__(self):
         self._lock = asyncio.Lock()
-        self._owner: Optional["asyncio.Task"] = None
+        self._token = None
+        self._owner = None
+        self._writer = None
         self._depth = 0
-        # Fresh identity per HELD span, minted on the outermost acquire and
-        # cleared on the outermost release. Handed to inline tool callbacks that
-        # run on a foreign task so they can re-enter THIS span cross-task; a token
-        # from a prior span never matches a later span's fresh identity.
-        self._token: Optional[object] = None
-        # Serializes CROSS-TASK token reentries within a span (#2672 review P1).
-        # The codex app-server dispatches every inline tool RPC of one turn on
-        # its OWN reader-spawned task, and all of them carry the SAME span token.
-        # Admitting them purely on token match (the prior bug) let two durable
-        # identity writes — e.g. two ``rename_agent`` calls in one turn — run
-        # their metadata/graph/memory/SOUL writes concurrently and interleave,
-        # leaving the durable identity sources inconsistent. Cross-task
-        # reentrants therefore acquire THIS mutex — distinct from the base
-        # ``_lock`` the turn owner holds, so there is no deadlock — which makes
-        # the second reentrant write wait for the first to complete. The owner's
-        # own (same-task) reentry never touches it; a single task cannot run two
-        # critical sections at once, so a depth bump is already exclusive there.
-        self._reentry_lock = asyncio.Lock()
-        # The reader task currently inside the reentry mutex, plus its nesting
-        # depth — so a nested durable write on that SAME reader task re-enters by
-        # task identity instead of self-deadlocking on the non-reentrant mutex.
-        self._reentry_owner: Optional["asyncio.Task"] = None
-        self._reentry_depth = 0
-        # Set when NO cross-task reentrant writer holds this span, cleared while one
-        # is active. The outermost owner AWAITS this before releasing ``_lock`` so a
-        # detached reader task's ALREADY-ADMITTED durable write completes INSIDE the
-        # owner's lock span even when the owning turn is cancelled/disconnected
-        # mid-flight (#2672 review P1 cancellation). Without the drain, the owner's
-        # ``__aexit__`` would clear the token and release ``_lock`` the instant the
-        # turn is cancelled — while the codex app-server's detached tool task is
-        # still persisting — and a concurrent ``set_privacy_mode`` could then
-        # acquire ``_lock`` and flip to a volatile mode under that in-flight
-        # NORMAL-mode write. Starts set (no reentrant writer at construction).
-        self._reentry_idle = asyncio.Event()
-        self._reentry_idle.set()
+        self._native_scopes = set()
         self._native_work = set()
-        self._foreign_native_dependencies = {}
-        self._native_foreign_frames = {}
-        self._native_foreign_depths = {}
+        self._parked = []
+        self._changed = set()
+        self._root_writers = set()
+        self._scope_bindings = {}
+        self._callback_scopes = {}
 
-    def capture_native_work_factory(self):
-        """Capture the constructing owner's held frame for one lazy source.
+    def _notify(self):
+        for future in tuple(self._changed):
+            if not future.done():
+                future.set_result(None)
 
-        Registration is still deferred until dispatch, and an ended foreign
-        frame cannot be revived. Copied-context children gain no frame rights.
-        """
+    async def _wait_change(self):
+        future = asyncio.get_running_loop().create_future()
+        self._changed.add(future)
+        try:
+            await future
+        finally:
+            self._changed.discard(future)
+
+    @property
+    def _members(self):
+        return self._token.members if self._token is not None else {}
+
+    @property
+    def _admissions(self):
+        return self._token.admissions if self._token is not None else {}
+
+    def _scope_for(self, task, *, original=False):
+        for scope in self._native_scopes:
+            if task in scope.members and (not original or task is scope.root or task in scope.admissions):
+                return scope
+        return None
+
+    def current_native_scope(self):
+        return self._scope_for(asyncio.current_task(), original=True)
+
+    def begin_native_scope(self, lifetime_owner):
+        """Record original native lifetime without pinning privacy policy."""
+        scope = self.current_native_scope()
+        if scope is not None:
+            return scope, False
+        if self._scope_for(asyncio.current_task()) is not None:
+            raise ExecutionAuthorityError("native lifetime requires an original root or accepted child")
+        scope = _PrivacySpan(self, asyncio.current_task(), lifetime_owner)
+        self._native_scopes.add(scope)
+        return scope, True
+
+    def require_native_scope(self, scope):
+        if scope not in self._native_scopes or self.current_native_scope() is not scope:
+            raise ExecutionAuthorityError("execution requires its original native privacy lifetime")
+
+    def _is_member(self, task):
+        return self._scope_for(task, original=True) is not None
+
+    def admit_owned_task(self, parent, task, admission):
+        """Enroll the original child before dispatch, even before policy activation."""
+        scope = self._scope_for(parent, original=True)
+        if scope is None:
+            return False
+        if type(admission) is not OwnedTaskAdmission or admission.task is not task:
+            raise TypeError("privacy membership requires original native acceptance")
+        existing = self._scope_for(task)
+        if existing is not None:
+            if existing is not scope or scope.admissions.get(task) is not admission:
+                raise RuntimeError("privacy task has a different original admission")
+            return True
+        scope.members[task] = parent
+        scope.admissions[task] = admission
+        task.add_done_callback(lambda _task: self._notify())
+        return True
+
+    def current_reentry_token(self):
+        scope = self.current_native_scope()
+        return scope if scope is self._token else None
+
+    def locked(self):
+        return self._lock.locked()
+
+    async def _activate_scope(self, scope):
+        if scope not in self._native_scopes:
+            raise RuntimeError("privacy policy span is closed or stale")
+        if self._token is scope:
+            return
+        # Exactly one original member acquires the retained base lock. Other
+        # members join that activation and recheck it before trying the base.
+        async with scope.activation_lock:
+            if scope not in self._native_scopes:
+                raise RuntimeError("privacy policy span is closed or stale")
+            if self._token is scope:
+                return
+            await self._lock.acquire()
+            if scope not in self._native_scopes:
+                self._lock.release()
+                raise RuntimeError("privacy policy span is closed or stale")
+            self._token = scope
+            self._owner = scope.root
+            scope.active = True
+
+    async def _enter_span(self):
+        task = asyncio.current_task()
+        scope = self._scope_for(task)
+        if scope is not None:
+            await self._activate_scope(scope)
+            return False
+        presented = _transition_lock_reentry_token.get()
+        if isinstance(presented, _PrivacySpan) and presented.coordinator is self:
+            if presented is not self._token or presented.closing:
+                raise RuntimeError("privacy policy span is closed or stale")
+            presented.members[task] = None
+            return False
+        scope, owned = self.begin_native_scope(None)
+        try:
+            await self._activate_scope(scope)
+        except BaseException:
+            self._native_scopes.discard(scope)
+            raise
+        return owned
+
+    @asynccontextmanager
+    async def policy_span(self):
+        root = await self._enter_span()
+        from kestrel_sovereign._async_ownership import bind_owned_coordinator
+        try:
+            with bind_owned_coordinator(self):
+                yield self
+        finally:
+            if root:
+                await self._close_span(sys.exception())
+
+    def _descends_from(self, task, target):
+        seen = set()
+        while task is not None and task not in seen:
+            if task is target:
+                return True
+            seen.add(task)
+            task = self._members.get(task)
+        return False
+
+    def _writer_eligible(self, task):
+        if not self._parked:
+            return True
+        frame = self._parked[-1]
+        targets = (native for target in frame.targets
+                   for native in (target.tasks if target in self._callback_scopes else (target,)))
+        return not frame.restoring and any(
+            target in self._admissions and not target.done()
+            and self._descends_from(task, target) for target in targets
+        )
+
+    def register_callback_scope(self, scope):
+        if not self._is_member(asyncio.current_task()):
+            raise RuntimeError("callback scope requires original policy membership")
+        self._callback_scopes[scope] = self.current_native_scope()
+
+    def callback_accepted(self, scope, task):
+        lifetime = self._callback_scopes.get(scope)
+        if lifetime is None or self._scope_for(task) is not lifetime or task not in lifetime.admissions:
+            raise RuntimeError("callback requires its original native acceptance")
+        self._notify()
+
+    async def _acquire_writer(self, task):
+        if self._writer is task:
+            self._depth += 1
+            return
+        while self._writer is not None or not self._writer_eligible(task):
+            await self._wait_change()
+        scope = self._token
+        if (scope is None or self._scope_for(task) is not scope
+                or (scope.closing and task is not scope.root and task not in scope.admissions)):
+            raise RuntimeError("privacy writer no longer belongs to the retained span")
+        self._writer, self._depth = task, 1
+        ancestor = task
+        while ancestor is not None:
+            state = getattr(ancestor, "_kestrel_native_privacy_state", None)
+            if state is not None:
+                state["entered"] = True
+            ancestor = self._members.get(ancestor)
+
+    def _pop_scope_binding(self, task):
+        bindings = self._scope_bindings[task]
+        binding = bindings.pop()
+        if not bindings:
+            del self._scope_bindings[task]
+        return binding
+
+    async def __aenter__(self):
+        root = await self._enter_span()
+        task = asyncio.current_task()
+        from kestrel_sovereign._async_ownership import bind_owned_coordinator
+        binding = bind_owned_coordinator(self)
+        binding.__enter__()
+        self._scope_bindings.setdefault(task, []).append(binding)
+        try:
+            await self._acquire_writer(task)
+        except BaseException:
+            self._pop_scope_binding(task).__exit__(*sys.exc_info())
+            if root:
+                await self._close_span(sys.exception())
+            raise
+        if root:
+            self._root_writers.add(task)
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+        task = asyncio.current_task()
+        if self._writer is not task:
+            raise RuntimeError("privacy writer exit requires its actual owner")
+        self._depth -= 1
+        if not self._depth:
+            self._writer = None
+            self._notify()
+        binding = self._pop_scope_binding(task)
+        try:
+            if task in self._root_writers and not self._depth:
+                self._root_writers.remove(task)
+                await self._close_span(exc)
+        finally:
+            binding.__exit__(exc_type, exc, tb)
+        return False
+
+    @asynccontextmanager
+    async def park_native_wait(self, targets):
+        task = asyncio.current_task()
+        accepted = tuple(target for target in targets
+                         if target in self._admissions or target in self._callback_scopes)
+        if self._writer is not task or not accepted:
+            yield
+            return
+        frame = _ParkedPrivacyWriter(task, self._depth, accepted)
+        self._parked.append(frame)
+        self._writer, self._depth = None, 0
+        self._notify()
+        try:
+            yield
+        finally:
+            pending = sys.exception()
+            frame.restoring = True
+            cancellation = None
+            while self._writer is not None or self._parked[-1] is not frame:
+                try:
+                    await self._wait_change()
+                except asyncio.CancelledError as error:
+                    cancellation = execution_terminal_error(cancellation, error, retain_originals=True)
+            self._parked.pop()
+            self._writer, self._depth = task, frame.depth
+            self._notify()
+            if cancellation is not None:
+                raise execution_terminal_error(pending, cancellation, retain_originals=True)
+
+    @asynccontextmanager
+    async def yield_native_writer(self):
+        task = asyncio.current_task()
+        if self._writer is not task:
+            yield
+            return
+        depth = self._depth
+        self._writer, self._depth = None, 0
+        self._notify()
+        try:
+            yield
+        finally:
+            pending, cancellation = sys.exception(), None
+            while True:
+                try:
+                    await self._acquire_writer(task)
+                    break
+                except asyncio.CancelledError as error:
+                    cancellation = execution_terminal_error(cancellation, error, retain_originals=True)
+            self._depth = depth
+            if cancellation is not None:
+                raise execution_terminal_error(pending, cancellation, retain_originals=True)
+
+    async def _close_span(self, pending):
+        await self.close_native_scope(self._token, pending)
+
+    async def close_native_scope(self, scope, pending=None):
+        """Retire originals after their journal and protected writers settle."""
+        if scope not in self._native_scopes:
+            raise RuntimeError("native privacy lifetime is already retired")
+        scope.closing = True
+        current = asyncio.current_task()
+        if self._token is scope and self._writer is current:
+            raise RuntimeError("cannot retire a native lifetime inside its writer frame")
+        terminal = pending
+        while True:
+            children = [task for task in scope.admissions
+                        if task is not current and not task.done()]
+            active_writer = self._token is scope and self._writer is not None
+            if not children and not active_writer:
+                break
+            for child in children:
+                outcome = await await_owned_task(child)
+                if outcome.error is not None and is_execution_control_error(outcome.error):
+                    terminal = execution_terminal_error(terminal, outcome.error)
+                terminal = execution_terminal_error(terminal, outcome.cancellation)
+            if self._token is scope and self._writer is not None:
+                try:
+                    await self._wait_change()
+                except asyncio.CancelledError as error:
+                    terminal = execution_terminal_error(terminal, error, retain_originals=True)
+        if self._token is scope:
+            self._token = self._owner = None
+            self._lock.release()
+        self._native_scopes.remove(scope)
+        for cohort, lifetime in tuple(self._callback_scopes.items()):
+            if lifetime is scope:
+                self._callback_scopes.pop(cohort)
+        for task in scope.admissions:
+            self._native_work.discard(task)
+        scope.members.clear()
+        scope.admissions.clear()
+        self._notify()
+        if terminal is not None and terminal is not pending:
+            raise terminal
+
+    def capture_native_work_factory(self, *, acquire_span=True):
         parent = asyncio.current_task()
-        frame = parent if parent is not None and self._reentry_owner is parent else self._native_foreign_frames.get(parent)
-        token = self.current_reentry_token()
-        if token is None and self._token_matches_current_span():
-            token = _transition_lock_reentry_token.get()
-        def start(operation, context=None):
-            return self.start_owned_native_work(operation, context=context,
-                _captured_frame=frame, _captured_token=token)
+        captured = self.current_native_scope()
+
+        def start(operation, context=None, *, name="privacy-owned-native-work"):
+            return self.start_owned_native_work(operation, context=context, name=name,
+                acquire_span=acquire_span,
+                _parent=parent if captured is not None else None, _span=captured)
         return start
 
-    def start_owned_native_work(self, operation, *, context=None, _captured_frame=None, _captured_token=None):
-        """Retain a fixed native body without lending arbitrary reentry rights.
-
-        Only the actual foreign-mutex owner may reserve continuation of that
-        frame. Its outer exit drains the exact tasks before releasing exclusion.
-        Other workers acquire the ordinary lock path and revalidate live policy.
-        """
-        parent = asyncio.current_task()
-        frame = parent if parent is not None and self._reentry_owner is parent else self._native_foreign_frames.get(parent)
-        if frame is None and _captured_frame is self._reentry_owner:
-            frame = _captured_frame
-        foreign = frame is not None and self._reentry_owner is frame
-        token = self.current_reentry_token()
-        if token is None and self._token_matches_current_span():
-            token = _transition_lock_reentry_token.get()
-        if token is None:
-            token = _captured_token
-        state = {"entered": foreign}
+    def start_owned_native_work(self, operation, *, context=None,
+                                name="privacy-owned-native-work", acquire_span=True,
+                                _parent=None, _span=None):
+        parent = asyncio.current_task() if _parent is None else _parent
+        captured = self.current_native_scope() if _span is None else _span
+        if captured is not None and (
+            captured not in self._native_scopes or self._scope_for(parent, original=True) is not captured
+            or parent.done() or (captured.closing and parent not in captured.admissions)
+        ):
+            raise RuntimeError("native work factory belongs to a closed privacy span")
         retained = asyncio.get_running_loop().create_future()
+        state = {"entered": False}
+
         async def run():
-            # Even an eager task factory cannot dispatch the body before its
-            # exact dependency and terminal-harvesting records are installed.
             opening = await retained
             if opening is not None:
                 raise opening
-            if foreign:
+            from kestrel_sovereign._async_ownership import bind_owned_coordinator
+            with bind_owned_coordinator(self):
+                if acquire_span:
+                    async with self:
+                        return await operation()
                 return await operation()
-            with bind_transition_lock_reentry(token):
-                async with self:
-                    state["entered"] = True
-                    return await operation()
+
         admission = OwnedTaskAdmission()
         try:
-            task = create_owned_task(run(), name="privacy-owned-native-work", context=context,
+            task = create_owned_task(run(), name=name, context=context,
                 admission=admission, retain_originals=True)
         except BaseException:
             if admission.task is None:
                 raise
-            return admission.task  # Same failed native gate, never allocation absence.
-        def completed(finished):
-            owned_task_error(finished)
-            self._native_work.discard(finished)
-            self._native_foreign_frames.pop(finished, None)
-            self._native_foreign_depths.pop(finished, None)
+            return admission.task
         try:
-            self._native_work.add(task)
+            if captured is not None:
+                self.admit_owned_task(parent, task, admission)
             task._kestrel_native_privacy_state = state
-            if foreign:
-                self._native_foreign_frames[task] = frame
-                self._foreign_native_dependencies.setdefault(frame, set()).add(task)
+            self._native_work.add(task)
+            def completed(finished):
+                owned_task_error(finished)
+                self._native_work.discard(finished)
             task.add_done_callback(completed)
-        except BaseException as opening:
-            terminal = _retain_owned_admission_error(task, opening)
+        except BaseException as error:
             self._native_work.discard(task)
-            self._native_foreign_frames.pop(task, None)
-            self._native_foreign_depths.pop(task, None)
-            dependencies = self._foreign_native_dependencies.get(frame)
-            if dependencies is not None:
-                dependencies.discard(task)
-                if not dependencies:
-                    self._foreign_native_dependencies.pop(frame, None)
-            retained.set_result(terminal)
+            retained.set_result(_retain_owned_admission_error(task, error))
             return task
         retained.set_result(None)
         return task
-
     async def join_owned_native_work(self):
-        """Drain entered native bodies before an in-turn policy change.
+        from kestrel_sovereign._async_ownership import owned_task_join_ancestors
 
-        Queued workers have not admitted native work: they recheck policy on
-        acquisition and must not be awaited behind the mutex held by this caller.
-        """
         current = asyncio.current_task()
+        joining = owned_task_join_ancestors(current)
         terminal = None
         for task in tuple(self._native_work):
-            if task is current or not task._kestrel_native_privacy_state["entered"]:
+            if (task is current or task in joining
+                    or not task._kestrel_native_privacy_state["entered"]):
                 continue
             outcome = await await_owned_task(task)
             if outcome.error is not None and is_execution_control_error(outcome.error):
@@ -531,178 +718,6 @@ class ReentrantTransitionLock:
             terminal = execution_terminal_error(terminal, outcome.cancellation)
         if terminal is not None:
             raise terminal
-
-    def locked(self) -> bool:
-        return self._lock.locked()
-
-    def current_reentry_token(self) -> Optional[object]:
-        """The token that permits cross-task re-entry into the CURRENTLY-held span.
-
-        Returns the active span's token ONLY when the current task owns the lock —
-        i.e. when called on the turn task at the point the inline-tool executor
-        closure is built (``_make_inline_tool_executor`` runs inside the streamed
-        turn's ``async with transition_lock``). The executor captures this and
-        re-presents it via :func:`bind_transition_lock_reentry` when its tool runs
-        on the codex app-server's separate reader task, so a nested durable-identity
-        write re-enters the lock instead of deadlocking (#2672 review P1). Returns
-        ``None`` when the current task does not own the lock — there is no span to
-        authorize re-entry into, so an unrelated caller gets no token and still
-        serializes.
-        """
-        task = asyncio.current_task()
-        if task is not None and self._owner is task and self._token is not None:
-            return self._token
-        return None
-
-    def _token_matches_current_span(self) -> bool:
-        """Whether the current task carries THIS span's cross-task reentry token."""
-        token = _transition_lock_reentry_token.get()
-        return token is not None and self._token is not None and token is self._token
-
-    async def __aenter__(self) -> "ReentrantTransitionLock":
-        task = asyncio.current_task()
-        # (1) Same-task reentry by the span owner (the anthropic inline path runs
-        #     the write on the turn task itself; also any nested acquire). A single
-        #     task cannot run two critical sections at once, so a depth bump is
-        #     both sufficient and exclusive — no reentry mutex needed.
-        if task is not None and self._owner is task:
-            self._depth += 1
-            return self
-        # (2) Cross-task reentry by a reader task that ALREADY holds the reentry
-        #     mutex — a nested durable write on that SAME reader task. Reentrant by
-        #     task identity so it can't self-deadlock on the non-reentrant mutex.
-        if task is not None and self._reentry_owner is task:
-            self._reentry_depth += 1
-            return self
-        # Only an exact task registered by the current foreign frame may use
-        # that frame's native continuation. A copied ContextVar is insufficient.
-        frame = self._native_foreign_frames.get(task)
-        if frame is not None and self._reentry_owner is frame:
-            self._native_foreign_depths[task] = self._native_foreign_depths.get(task, 0) + 1
-            return self
-        # (3) First cross-task reentry via a captured span token (the codex
-        #     app-server's per-tool reader task). Multiple inline tools in ONE turn
-        #     all carry the SAME span token; serialize concurrent token-bearers on
-        #     the per-span reentry mutex so the second durable identity write cannot
-        #     enter until the first's critical section completes — while STILL
-        #     bypassing the base lock the turn owner holds, so there is no deadlock
-        #     (#2672 review P1). The owner never reaches here: branch (1) caught it.
-        if self._token_matches_current_span():
-            await self._reentry_lock.acquire()
-            # Re-validate after awaiting: the owning span may have ended while we
-            # waited (owner released the base lock, token now stale). If so this is
-            # no longer a reentry — release the mutex and fall through to a normal
-            # acquire so a genuinely-after-span write serializes as its own turn.
-            if self._token_matches_current_span():
-                self._reentry_owner = task
-                self._reentry_depth = 1
-                # A cross-task reentrant writer is now ACTIVE in this span: mark the
-                # span non-idle so the owner's outermost exit drains it before
-                # releasing ``_lock`` (#2672 review P1 cancellation).
-                self._reentry_idle.clear()
-                return self
-            self._reentry_lock.release()
-        # (4) Normal acquire — an unrelated task (cross-turn), or the stale-token
-        #     fallthrough above. This is the cross-turn exclusion the #2672
-        #     check-then-write race depends on, unchanged.
-        await self._lock.acquire()
-        self._owner = asyncio.current_task()
-        self._token = object()
-        self._depth = 1
-        return self
-
-    async def __aexit__(self, exc_type, exc, tb) -> bool:
-        task = asyncio.current_task()
-        if self._native_foreign_depths.get(task, 0):
-            self._native_foreign_depths[task] -= 1
-            return False
-        # Unwind a cross-task reentry frame (reader task holding the reentry mutex)
-        # before the base-lock frame — the two are always distinct tasks, so task
-        # identity disambiguates which frame this ``__aexit__`` pairs with.
-        if self._reentry_owner is not None and self._reentry_owner is task:
-            self._reentry_depth -= 1
-            if self._reentry_depth <= 0:
-                terminal = exc
-                # A nested waiter may abandon, but this admitted foreign frame
-                # still owns its exact native continuations through settlement.
-                # Nested native owners may be registered while an earlier
-                # child settles. Keep the same frame open until the entire
-                # exact dependency graph is physically joined.
-                dependencies = self._foreign_native_dependencies.setdefault(task, set())
-                while dependencies:
-                    for child in tuple(dependencies):
-                        outcome = await await_owned_task(child)
-                        dependencies.discard(child)
-                        if outcome.error is not None and is_execution_control_error(outcome.error):
-                            terminal = execution_terminal_error(terminal, outcome.error)
-                        terminal = execution_terminal_error(terminal, outcome.cancellation)
-                self._foreign_native_dependencies.pop(task, None)
-                self._reentry_depth = 0
-                self._reentry_owner = None
-                self._reentry_lock.release()
-                # This cross-task reentrant write has finished its critical
-                # section; signal any owner blocked in the drain that it may now
-                # release the base lock (#2672 review P1 cancellation).
-                self._reentry_idle.set()
-                if terminal is not None and terminal is not exc:
-                    raise terminal
-            return False
-        self._depth -= 1
-        if self._depth <= 0:
-            self._depth = 0
-            self._owner = None
-            # (a) Invalidate the span token FIRST so no NEW cross-task reentry is
-            #     admitted past this point — a foreign task presenting the now-stale
-            #     token re-validates in ``__aenter__`` branch (3) and falls through
-            #     to a normal acquire, blocking on ``_lock`` until we release it.
-            self._token = None
-            # (b) DRAIN any ALREADY-admitted cross-task reentrant writer before
-            #     releasing the base lock. On the normal path the reader's write has
-            #     already completed (the app-server returned its tool result, which
-            #     is what unblocked this turn), so the event is set and this is a
-            #     no-op. On the cancellation path a detached reader may still be mid
-            #     durable-write; hold ``_lock`` until it finishes (or is itself
-            #     cancelled — its ``__aexit__`` sets the event either way) so a
-            #     concurrent privacy transition cannot flip the mode under it
-            #     (#2672 review P1 cancellation).
-            pending_cancel = await self._drain_active_reentrant()
-            self._lock.release()
-            # Re-raise a cancellation that arrived DURING the drain only after the
-            # lock is safely released, so the owning turn's cancellation still
-            # propagates but never at the cost of skipping the drain.
-            if pending_cancel is not None:
-                raise execution_terminal_error(exc, pending_cancel)
-        return False
-
-    async def _drain_active_reentrant(self) -> Optional[BaseException]:
-        """Block until no cross-task reentrant writer holds this span.
-
-        Called by the outermost owner exit AFTER the span token is invalidated and
-        BEFORE ``_lock`` is released. Returns immediately on the normal path (the
-        detached reader's write already finished, so ``_reentry_idle`` is set). On
-        the cancellation path a detached codex app-server tool task may still be mid
-        durable-write; wait for it to signal idle — its own ``__aexit__`` sets the
-        event when its critical section completes OR when the reader task is itself
-        cancelled, so the drain always terminates. The wait is SHIELDED so cancelling
-        the owning turn cannot skip the drain (and cannot busy-spin under repeated
-        cancellation — the shielded waiter keeps the reader schedulable); a caught
-        cancellation is returned for the caller to re-raise AFTER releasing the base
-        lock (#2672 review P1 cancellation).
-        """
-        if self._reentry_idle.is_set():
-            return None
-        cancelled: Optional[BaseException] = None
-        waiter = asyncio.ensure_future(self._reentry_idle.wait())
-        try:
-            while not self._reentry_idle.is_set():
-                try:
-                    await asyncio.shield(waiter)
-                except asyncio.CancelledError as exc:
-                    cancelled = exc
-        finally:
-            if not waiter.done():
-                waiter.cancel()
-        return cancelled
 
 
 @asynccontextmanager
@@ -803,13 +818,16 @@ class _SharedGateLease:
 class _SharedGateHold:
     """One ``shared()`` frame's claim on a lease; live until that frame exits."""
 
-    __slots__ = ("gate", "lease", "task", "live")
+    __slots__ = ("gate", "lease", "task")
 
     def __init__(self, gate: "DurablePersistenceGate", lease: _SharedGateLease) -> None:
         self.gate = gate
         self.lease = lease
         self.task = asyncio.current_task()
-        self.live = True
+
+    @property
+    def live(self):
+        return self in self.gate._shared_frames
 
 
 class _ExclusiveGateHold:
@@ -873,7 +891,9 @@ class DurablePersistenceGate:
     normally. A task inside its own shared frame cannot take the gate
     exclusive; that upgrade would wait on itself, so it is refused. A task
     that only inherited a live hold may be detached from its holder, so its
-    transition waits for the lease like any other. Writer preference comes from
+    transition waits for the lease like any other, unless that holder is
+    physically joining the current task. That upgrade is refused as a
+    completion cycle; the join cannot grant an exclusive lease. Writer preference comes from
     :class:`AsyncReaderWriterLock`: once a transition queues, new persists
     wait behind it.
     """
@@ -882,6 +902,7 @@ class DurablePersistenceGate:
         self._lock = AsyncReaderWriterLock()
         self._owner: Optional["asyncio.Task"] = None
         self._exclusive_hold: Optional[_ExclusiveGateHold] = None
+        self._shared_frames: set[_SharedGateHold] = set()
         self._shared_lock = DurablePersistenceGateSharedLock(self)
 
     def locked(self) -> bool:
@@ -927,11 +948,19 @@ class DurablePersistenceGate:
         return None
 
     def _held_shared_by_current_task(self) -> bool:
-        """Whether the current task is inside one of its own shared frames."""
+        """Refuse upgrades blocked by this task or a caller joining it.
+
+        Original live frames are inventoried by this gate, independent of
+        copied or absent task context. Actual joins only detect a completion
+        cycle; they never grant admission or allow a lease upgrade.
+        """
+        from kestrel_sovereign._async_ownership import owned_task_join_ancestors
+
         task = asyncio.current_task()
+        joining = owned_task_join_ancestors(task)
         return any(
-            hold.gate is self and hold.live and hold.task is task
-            for hold in _DURABLE_GATE_SHARED_HOLDS.get()
+            hold.task is task or hold.task in joining
+            for hold in self._shared_frames
         )
 
     @asynccontextmanager
@@ -975,13 +1004,14 @@ class DurablePersistenceGate:
     async def _hold_shared_lease(self, lease):
         lease.holds += 1
         hold = _SharedGateHold(self, lease)
+        self._shared_frames.add(hold)
         token = _DURABLE_GATE_SHARED_HOLDS.set(
             _DURABLE_GATE_SHARED_HOLDS.get() + (hold,)
         )
         try:
             yield
         finally:
-            hold.live = False
+            self._shared_frames.remove(hold)
             lease.holds -= 1
             if lease.holds == 0:
                 self._lock.release_read()

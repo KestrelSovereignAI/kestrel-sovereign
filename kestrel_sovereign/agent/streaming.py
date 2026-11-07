@@ -4,6 +4,7 @@ from kestrel_sovereign.execution_custody import owned_execution_stream
 import inspect
 import json
 import logging
+from kestrel_sovereign.tools.effect_invocation import journal_async_generator_invocation
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
@@ -1024,6 +1025,7 @@ class StreamingMixin:
     @bind_async_generator_invocation(
         "request_id", track_request_lifecycle=True
     )
+    @journal_async_generator_invocation
     async def process_input_streaming(
         self,
         user_input: str,
@@ -1270,7 +1272,7 @@ class StreamingMixin:
                         yield safe_mode_block
                         return
                     transition_lock = self._get_privacy_transition_lock()
-                    async with transition_lock:
+                    async with transition_lock.policy_span():
                         from kestrel_sovereign.streams.tap import AgentStreamTap
                         AgentStreamTap.get_instance().capture_request_privacy(
                             self, request_id, self._request_generation_for_current_task(request_id))

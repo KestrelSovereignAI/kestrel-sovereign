@@ -369,6 +369,7 @@ class _OriginalPostgresJournalRelation:
     relation_oid: int
     schema_name: str
     relation_name: str
+    program_identity: tuple = ()
 
     @property
     def qualified_name(self):

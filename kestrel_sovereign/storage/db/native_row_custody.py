@@ -22,6 +22,12 @@ def _current_row(owner):
 
 
 def _native_row_profile(owner, *, role="primary"):
+    from kestrel_sovereign.storage.original_tool_effect_finish import _OriginalToolEffectFinish
+
+    if type(owner) is _OriginalToolEffectFinish and role == 'claims':
+        from kestrel_sovereign.tool_effect_store import TOOL_EFFECT_CLAIMS_COLUMNS
+
+        return 'tool_effect_claims', TOOL_EFFECT_CLAIMS_COLUMNS
     if _current_step(owner):
         if role == "owners":
             return "visual_computer_owners", {"owner": "TEXT", "generation": "BIGINT"}
@@ -51,6 +57,14 @@ def _native_row_profile(owner, *, role="primary"):
             }
         return _original_result_profile(owner)
     raise ExecutionAuthorityError("Exact closed native relation required")
+
+
+def _native_auxiliary_roles(owner):
+    from kestrel_sovereign.storage.original_tool_effect_finish import _OriginalToolEffectFinish
+
+    if type(owner) is _OriginalToolEffectFinish:
+        return ('claims',)
+    return ('owners', 'requests') if _current_step(owner) else ()
 
 
 def _require_native_row(owner, backend, *, admission=False):

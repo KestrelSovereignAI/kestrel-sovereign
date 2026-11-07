@@ -6,6 +6,8 @@ from types import MappingProxyType
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+import pytest_asyncio
+from tests.utils.native_tool_effects import drive_native
 
 from kestrel_sdk.llm.decisions import (
     DecisionResult,
@@ -244,20 +246,21 @@ class _FeatureForTurnCompletion(Feature):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(("p", "repairs"), [(0.03, 0), (0.95, 1)])
-async def test_feature_subagent_repair_is_confirmed_first(decision_check, p, repairs):
-    agent = MagicMock()
+async def test_feature_subagent_repair_is_confirmed_first(decision_check, p, repairs, native_tool_effect_agent):
+    agent = await native_tool_effect_agent(did="did:test:subagent-loop")
     agent.hooks_manager = None
     agent.llm_service = _service(p)
     feature = _FeatureForTurnCompletion(agent)
+    agent.features[feature.name] = feature
     feature.get_tools = MagicMock(return_value=[])
     answer = "The job is queued.\n\nWhen it finishes I will check the job log."
 
-    result = await feature._handle_feature_tool_calls(
+    result = await drive_native(agent, lambda: feature._handle_feature_tool_calls(
         response=LLMResponse(content=answer, tool_calls=None),
         tools=[_tool_schema("launch_job")],
         system_prompt="sys",
         user_prompt="Task: report the job",
-    )
+    ))
 
     assert result == answer
     assert agent.llm_service.decide.await_count == 1
@@ -325,10 +328,10 @@ def test_shipped_samples_are_the_population_the_decision_sees():
 # --- streaming: a skipped repair never repeats a streamed answer (codex r1) ---
 
 
-async def _stream_with_decision(stream_items, p_unfinished):
+async def _stream_with_decision(stream_items, p_unfinished, *, native_tool_effect_agent):
     from tests.unit.test_turn_completion_guard import _drain_streaming, _streaming_agent
 
-    agent = _streaming_agent(stream_items, "[answer complete]")
+    agent = await _streaming_agent(stream_items, "[answer complete]", native_tool_effect_agent=native_tool_effect_agent)
     decided = _service(p_unfinished)
     agent.llm_service.decide = decided.decide
     return agent, await _drain_streaming(agent)
@@ -336,19 +339,19 @@ async def _stream_with_decision(stream_items, p_unfinished):
 
 @pytest.mark.asyncio
 async def test_a_streamed_complete_answer_is_not_repeated_when_the_repair_is_skipped(
-    decision_check,
+    decision_check,*, native_tool_effect_agent
 ):
     agent, text = await _stream_with_decision(
-        [_PLAN, LLMResponse(content=_PLAN, tool_calls=None)], 0.02)
+        [_PLAN, LLMResponse(content=_PLAN, tool_calls=None)], 0.02, native_tool_effect_agent=native_tool_effect_agent)
     agent.llm_service.generate_with_messages.assert_not_awaited()
     assert text.count(_PLAN) == 1
 
 
 @pytest.mark.asyncio
 async def test_an_unstreamed_complete_answer_is_delivered_when_the_repair_is_skipped(
-    decision_check,
+    decision_check,*, native_tool_effect_agent
 ):
     agent, text = await _stream_with_decision(
-        [LLMResponse(content=_PLAN, tool_calls=None)], 0.02)
+        [LLMResponse(content=_PLAN, tool_calls=None)], 0.02, native_tool_effect_agent=native_tool_effect_agent)
     agent.llm_service.generate_with_messages.assert_not_awaited()
     assert text.count(_PLAN) == 1

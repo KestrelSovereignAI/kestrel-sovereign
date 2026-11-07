@@ -21,7 +21,6 @@ from datetime import UTC, datetime, timedelta
 import hashlib
 import hmac
 import json
-import secrets
 from typing import Callable
 from uuid import uuid4
 
@@ -35,6 +34,8 @@ from kestrel_sdk.security.aead import AEADCipher
 from kestrel_sdk.security.exceptions import DecryptionError
 from kestrel_sdk.storage.database.interface import TransactionError
 from kestrel_sovereign.storage.async_database import AsyncDatabase
+from kestrel_sovereign.storage.initialization_errors import repository_initialization_errors
+from kestrel_sovereign.security.envelope_keys import resolve_envelope_key
 from kestrel_sovereign.execution_custody import execution_commit_outcome
 
 
@@ -134,50 +135,55 @@ class ArtifactRepository:
         if self._index_key is None:
             async with self._initialization_lock:
                 if self._index_key is None:
-                    try:
+                    with repository_initialization_errors(
+                        integrity_error=ArtifactIntegrityError,
+                        unknown_message="artifact initialization requires reconciliation",
+                    ):
                         await self.initialize()
-                    except TransactionError as error:
-                        if execution_commit_outcome(error) is not None:
-                            raise ResourceOutcomeUnknown("artifact initialization requires reconciliation") from error
-                        if isinstance(error.__cause__, ArtifactIntegrityError):
-                            raise error.__cause__ from None
-                        raise
+
+    async def prepare_schema(self) -> None:
+        """Prepare metadata before native invocations without opening an envelope.
+
+        A loaded feature's first tool call must not migrate the database after
+        the operation's original terminal destination has been sealed.
+        """
+        self._require_outermost()
+        async with self.db.migration_lock("artifact-repository-v1"):
+            for statement in _SCHEMA:
+                # AsyncDatabase handles placeholders, but schema byte types differ.
+                sql = statement.replace(" BLOB", " BYTEA") if self.db.backend_type == "postgres" else statement
+                await self.db.execute(sql)
+            for name, table, columns in (
+                ("idx_artifact_refs_blob", "artifact_blob_refs", "owner, blob_key"),
+                ("idx_artifact_staging_expiry", "artifact_staging", "expires_at, owner"),
+                ("idx_artifact_staging_blob", "artifact_staging", "owner, blob_key"),
+                ("idx_artifact_history", "artifact_revisions", "owner, artifact_id, committed_at, revision_id"),
+                ("idx_artifact_publication_artifact", "artifact_publications", "owner, artifact_id"),
+            ):
+                await self.db.ensure_index(name, table, columns)
 
     async def initialize(self) -> None:
         self._require_outermost()
         wrapping_cipher = get_fernet()
         if wrapping_cipher is None:
             raise ArtifactIntegrityError("artifact persistence requires encryption")
+        await self.prepare_schema()
         async with self.db.migration_lock("artifact-repository-v1"):
-            for statement in _SCHEMA:
-                # AsyncDatabase handles placeholders, but schema byte types differ.
-                sql = statement.replace(" BLOB", " BYTEA") if self.db.backend_type == "postgres" else statement
-                await self.db.execute(sql)
             row = await self.db.fetchone("SELECT wrapped_key FROM artifact_keys WHERE key_id = ?", ("v1",))
-            if row is None:
-                if await self.db.fetchone("SELECT 1 FROM artifact_owners LIMIT 1"):
-                    raise ArtifactIntegrityError("artifact envelope key is missing; restore the original key")
-                index_key = secrets.token_bytes(32)
+            index_key, new_envelope = resolve_envelope_key(
+                wrapping_cipher, bytes(row[0]) if row is not None else None,
+                has_dependents=bool(await self.db.fetchone("SELECT 1 FROM artifact_owners LIMIT 1")) if row is None else False,
+                integrity_error=ArtifactIntegrityError,
+                missing_message="artifact envelope key is missing; restore the original key",
+                unavailable_message=(
+                    "artifact envelope cannot be opened; restore its original KESTREL_DATA_KEY "
+                    "or complete offline key rotation"
+                ),
+                invalid_message="invalid artifact envelope key",
+            )
+            if new_envelope is not None:
                 await self.db.execute("INSERT INTO artifact_keys (key_id, wrapped_key) VALUES (?, ?)",
-                                      ("v1", wrapping_cipher.encrypt(index_key)))
-            else:
-                try:
-                    index_key = wrapping_cipher.decrypt(bytes(row[0]))
-                except DecryptionError:
-                    raise ArtifactIntegrityError(
-                        "artifact envelope cannot be opened; restore its original KESTREL_DATA_KEY "
-                        "or complete offline key rotation"
-                    ) from None
-            if len(index_key) != 32:
-                raise ArtifactIntegrityError("invalid artifact envelope key")
-        for name, table, columns in (
-            ("idx_artifact_refs_blob", "artifact_blob_refs", "owner, blob_key"),
-            ("idx_artifact_staging_expiry", "artifact_staging", "expires_at, owner"),
-            ("idx_artifact_staging_blob", "artifact_staging", "owner, blob_key"),
-            ("idx_artifact_history", "artifact_revisions", "owner, artifact_id, committed_at, revision_id"),
-            ("idx_artifact_publication_artifact", "artifact_publications", "owner, artifact_id"),
-        ):
-            await self.db.ensure_index(name, table, columns)
+                                      ("v1", new_envelope))
         self._index_key = index_key
 
     def _require_outermost(self) -> None:

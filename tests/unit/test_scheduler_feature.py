@@ -26,9 +26,10 @@ from kestrel_sdk.signals import (
     SignalResult,
     Status,
 )
+from kestrel_sdk.tools.base import AgentTool
 from kestrel_sdk.tools.result import ToolResult, ToolResultStatus
 from kestrel_sovereign.agent.sleep import SleepMixin
-from kestrel_sovereign.features.base import Feature
+from kestrel_sovereign.features.base import Feature, tool
 from kestrel_sovereign.features.scheduler.feature import SchedulerFeature
 from kestrel_sovereign.features.scheduler.outcome import ScheduledTaskOutcome
 from kestrel_sovereign.features.scheduler.runner import (
@@ -41,7 +42,7 @@ from kestrel_sovereign.hold import HeldWorkDisposition
 from kestrel_sovereign.signals.sources.scheduler import cron_source_name
 from kestrel_sovereign.storage.async_database import AsyncDatabase
 from kestrel_sovereign.storage.db.sqlite import SQLiteBackend
-from tests.utils.scheduler_ticks import tick_and_settle
+from tests.utils.scheduler_ticks import dispatch_scheduled_tool, tick_and_settle
 
 
 # =========================================================================
@@ -224,7 +225,7 @@ def _use_postgres_clock(feature, database_now, *, scheduled_row=None):
     return events
 
 
-class _StubJobFeature:
+class _StubJobFeature(Feature):
     """Minimal feature stand-in for the disabled-feature scheduler tests.
 
     Exposes one tool named ``job``, a REAL boolean ``enabled`` flag (a
@@ -232,16 +233,21 @@ class _StubJobFeature:
     an execution counter so a skipped tick is observable.
     """
 
-    def __init__(self, tool_name: str = "job", name: str = "JobFeature"):
+    tool_description = 'Owned scheduled job counter'
+
+    async def initialize(self):
+        pass
+
+    def __init__(self, tool_name: str = "job", name: str = "JobFeature", *, agent=None):
+        super().__init__(agent)
         self.name = name
-        self.enabled = True
         self.calls = 0
 
         def _execute(**kwargs):
             self.calls += 1
             return {"success": True, "ran": self.calls}
 
-        tool = MagicMock()
+        tool = MagicMock(spec=AgentTool)
         tool.name = tool_name
         tool.execute = AsyncMock(side_effect=_execute)
         self._tool = tool
@@ -1250,10 +1256,10 @@ class TestScheduleAdd:
     async def test_add_accepts_loaded_feature_tool(self, feature):
         """A tool exposed by a loaded feature is a valid scheduled task
         even though it isn't a built-in cron source."""
-        mock_tool = MagicMock()
+        mock_tool = MagicMock(spec=AgentTool)
         mock_tool.name = "wellness_check"
-        mock_feature = MagicMock()
-        mock_feature.get_tools = MagicMock(return_value=[mock_tool])
+        mock_feature = _StubJobFeature(mock_tool.name, agent=feature.agent)
+        mock_feature._tool = mock_tool
         feature.agent.features = {"WellnessFeature": mock_feature}
 
         result = await feature.schedule_add(
@@ -1297,7 +1303,7 @@ class TestScheduleAdd:
         not schedulable — ``schedule_add`` rejects it as an unknown task (a
         persisted row would otherwise be skipped every tick). Re-enabling the
         feature makes the same name schedulable again."""
-        job_feature = _StubJobFeature()
+        job_feature = _StubJobFeature(agent=feature.agent)
         job_feature.enabled = False
         feature.agent.features = {"JobFeature": job_feature}
 
@@ -1325,10 +1331,10 @@ class TestScheduleAdd:
         schedule row must NOT be inserted."""
         from kestrel_sovereign.features.security.permissions import PermissionLevel
 
-        mock_tool = MagicMock()
+        mock_tool = MagicMock(spec=AgentTool)
         mock_tool.name = "dangerous_op"
-        mock_feature = MagicMock()
-        mock_feature.get_tools = MagicMock(return_value=[mock_tool])
+        mock_feature = _StubJobFeature(mock_tool.name, agent=feature.agent)
+        mock_feature._tool = mock_tool
 
         # SecurityFeature exposing a permission_store that DENYs the tool.
         security_feature = MagicMock()
@@ -1364,10 +1370,10 @@ class TestScheduleAdd:
         over-rejecting."""
         from kestrel_sovereign.features.security.permissions import PermissionLevel
 
-        mock_tool = MagicMock()
+        mock_tool = MagicMock(spec=AgentTool)
         mock_tool.name = "wellness_check"
-        mock_feature = MagicMock()
-        mock_feature.get_tools = MagicMock(return_value=[mock_tool])
+        mock_feature = _StubJobFeature(mock_tool.name, agent=feature.agent)
+        mock_feature._tool = mock_tool
 
         security_feature = MagicMock()
         security_feature.permission_store = MagicMock()
@@ -2027,7 +2033,7 @@ class TestSchedulerRunner:
 
     @pytest.mark.asyncio
     async def test_persisted_schedule_skips_disabled_feature_end_to_end(
-        self, tmp_path,
+        self, tmp_path, native_tool_effect_agent,
     ):
         """E2E (#2522): a schedule persisted BEFORE its feature is disabled must
         not invoke the tool on a tick while the feature is disabled, and must
@@ -2038,24 +2044,35 @@ class TestSchedulerRunner:
         ``_lookup_and_run_tool`` → the feature tool — with only the enablement
         state changing between ticks.
         """
-        raw_db = SQLiteBackend(str(tmp_path / "scheduler.db"))
-        await raw_db.connect()
-        db = AsyncDatabase(raw_db)
-
-        agent = _make_mock_agent(db)
-        agent.did = "did:test:scheduler-agent"
+        agent = await native_tool_effect_agent(did="did:test:scheduler-agent")
+        db = agent.tool_effect_store.database
         # Force the direct tool-execution path (no dispatcher) so the tick runs
         # exactly the production `_lookup_and_run_tool` body under test.
         agent.dispatcher = None
-        job_feature = _StubJobFeature()
-        agent.features = {"JobFeature": job_feature}
+        class JobFeature(Feature):
+            calls = 0
+
+            @property
+            def tool_description(self):
+                return 'Native scheduled enablement contract'
+
+            async def initialize(self):
+                pass
+
+            @tool(name='job', description='Count an original scheduled effect')
+            async def job(self) -> dict:
+                self.calls += 1
+                return {'success': True, 'ran': self.calls}
+
+        job_feature = JobFeature(agent)
+        agent.features = {job_feature.name: job_feature}
         agent.hooks_manager = TestTaskExecutor._passthrough_hooks_manager()
 
         sched = SchedulerFeature(agent)
         sched._db = db
         sched._agent_id = agent.did
 
-        runner = SchedulerRunner(db, agent.did, sched._dispatch_scheduled_task)
+        runner = SchedulerRunner(db, agent.did, sched._lookup_and_run_tool)
 
         async def _make_due():
             """Reset the persisted task so the next tick considers it due."""
@@ -2123,7 +2140,7 @@ class TestSchedulerRunner:
             status, _text = await _latest_log_status()
             assert status == "success"
         finally:
-            await db.close()
+            await runner.stop()
 
 
 # =========================================================================
@@ -2233,6 +2250,14 @@ class TestSchedulerInit:
 
 class TestTaskExecutor:
 
+    @pytest_asyncio.fixture
+    async def native_feature(self, native_tool_effect_agent):
+        agent = await native_tool_effect_agent(did='did:test:scheduler-agent')
+        feature = SchedulerFeature(agent)
+        feature._db = agent.tool_effect_store.database
+        feature._agent_id = agent.did
+        return feature
+
     @staticmethod
     def _passthrough_hooks_manager():
         """A hooks_manager whose PRE_TOOL_USE hook allows the tool through
@@ -2254,55 +2279,56 @@ class TestTaskExecutor:
         return hm
 
     @pytest.mark.asyncio
-    async def test_execute_known_task(self, feature):
+    async def test_execute_known_task(self, native_feature):
+        feature = native_feature
         # Mock a feature with a matching tool. Phase 4 of #889 renamed
         # `_execute_scheduled_task` → `_lookup_and_run_tool` (the
         # tool-search body) when the dispatcher took over the executor
         # role. Scheduled dispatch now routes through the PRE/POST_TOOL_USE
         # hook gate (F245), so a passthrough hooks_manager stands in for the
         # real one; the lookup + execute behavior is otherwise unchanged.
-        mock_tool = MagicMock()
+        mock_tool = MagicMock(spec=AgentTool)
         mock_tool.name = "wellness_check"
         mock_tool.execute = AsyncMock(return_value={"success": True, "score": 0.85})
 
-        mock_feature = MagicMock()
-        mock_feature.get_tools = MagicMock(return_value=[mock_tool])
+        mock_feature = _StubJobFeature(mock_tool.name, agent=feature.agent)
+        mock_feature._tool = mock_tool
 
         feature.agent.features = {"WellnessFeature": mock_feature}
         feature.agent.hooks_manager = self._passthrough_hooks_manager()
 
-        result = await feature._lookup_and_run_tool("wellness_check", {})
+        result = await dispatch_scheduled_tool(feature, "wellness_check", {})
         parsed = json.loads(result)
         assert parsed["success"] is True
         mock_tool.execute.assert_awaited_once()
 
     @pytest.mark.asyncio
-    async def test_direct_run_names_only_a_declared_reason_code(self):
+    async def test_direct_run_names_only_a_declared_reason_code(self, native_feature):
+        feature = native_feature
         # The direct-run path (#3184): a failed ToolResult's reason_code
         # reaches the raised message only when the owning feature declared
         # it in ``tool_reason_codes`` — the same door the cron sources use.
         from kestrel_sdk.tools.result import ToolResult
 
-        feature = SchedulerFeature(MagicMock())
         feature.agent.hooks_manager = self._passthrough_hooks_manager()
-        mock_tool = MagicMock()
+        mock_tool = MagicMock(spec=AgentTool)
         mock_tool.name = "wellness_check"
         mock_tool.execute = AsyncMock(return_value=ToolResult.failed(
             "the score fell below threshold at /Users/someone/private",
             data={"reason_code": "WELLNESS_DOWN"},
         ))
-        mock_feature = MagicMock()
-        mock_feature.get_tools = MagicMock(return_value=[mock_tool])
+        mock_feature = _StubJobFeature(mock_tool.name, agent=feature.agent)
+        mock_feature._tool = mock_tool
         feature.agent.features = {"WellnessFeature": mock_feature}
 
         mock_feature.tool_reason_codes = {"wellness_check": frozenset({"WELLNESS_DOWN"})}
         with pytest.raises(RuntimeError) as excinfo:
-            await feature._lookup_and_run_tool("wellness_check", {})
+            await dispatch_scheduled_tool(feature, "wellness_check", {})
         assert str(excinfo.value) == "scheduled tool wellness_check failed (WELLNESS_DOWN)"
 
         mock_feature.tool_reason_codes = {}
         with pytest.raises(RuntimeError) as excinfo:
-            await feature._lookup_and_run_tool("wellness_check", {})
+            await dispatch_scheduled_tool(feature, "wellness_check", {})
         assert str(excinfo.value) == "scheduled tool wellness_check failed"
 
     @pytest.mark.asyncio
@@ -2313,7 +2339,7 @@ class TestTaskExecutor:
 
         feature.agent.features = {
             "StrategicMemoryFeature": _StubJobFeature(
-                "signal_dispatch", "StrategicMemoryFeature"
+                "signal_dispatch", "StrategicMemoryFeature", agent=feature.agent
             )
         }
         feature.agent.dispatcher = MagicMock()
@@ -2366,11 +2392,11 @@ class TestTaskExecutor:
                     ),
                 )
 
-        mock_tool = MagicMock()
+        mock_tool = MagicMock(spec=AgentTool)
         mock_tool.name = "wellness_check"
         mock_tool.execute = AsyncMock(return_value={"success": True})
-        mock_feature = MagicMock()
-        mock_feature.get_tools.return_value = [mock_tool]
+        mock_feature = _StubJobFeature(mock_tool.name, agent=feature.agent)
+        mock_feature._tool = mock_tool
         feature.agent.did = "did:test:scheduler-agent"
         feature.agent._hold_store = _HeldStore()
         feature.agent.features = {"WellnessFeature": mock_feature}
@@ -2388,11 +2414,11 @@ class TestTaskExecutor:
         self, feature,
     ):
         """The generic scheduler path cannot bypass the sleep-hook boundary."""
-        mock_tool = MagicMock()
+        mock_tool = MagicMock(spec=AgentTool)
         mock_tool.name = "training_cycle"
         mock_tool.execute = AsyncMock(return_value={"success": True})
-        mock_feature = MagicMock()
-        mock_feature.get_tools = MagicMock(return_value=[mock_tool])
+        mock_feature = _StubJobFeature(mock_tool.name, agent=feature.agent)
+        mock_feature._tool = mock_tool
 
         readiness = MagicMock(
             ready=False,
@@ -2434,21 +2460,22 @@ class TestTaskExecutor:
     @pytest.mark.asyncio
     @pytest.mark.parametrize("decision", ["deny", "ask"])
     async def test_scheduled_permission_hook_returns_blocked_outcome(
-        self, feature, decision,
+        self, native_feature, decision,
     ):
         """F245: a PRE_TOOL_USE DENY on a scheduler tick must block the
         tool. #2430: DENY/ASK is an expected headless state, so return a
         structured outcome instead of raising through the dispatcher."""
+        feature = native_feature
         from types import SimpleNamespace
 
         from kestrel_sdk.hooks.base import PermissionDecision
 
-        mock_tool = MagicMock()
+        mock_tool = MagicMock(spec=AgentTool)
         mock_tool.name = "dangerous_op"
         mock_tool.execute = AsyncMock(return_value={"success": True})
 
-        mock_feature = MagicMock()
-        mock_feature.get_tools = MagicMock(return_value=[mock_tool])
+        mock_feature = _StubJobFeature(mock_tool.name, agent=feature.agent)
+        mock_feature._tool = mock_tool
 
         feature.agent.features = {"DangerFeature": mock_feature}
         hm = MagicMock()
@@ -2463,7 +2490,7 @@ class TestTaskExecutor:
         hm.execute_hooks_parallel = AsyncMock(return_value=None)
         feature.agent.hooks_manager = hm
 
-        result = await feature._lookup_and_run_tool("dangerous_op", {})
+        result = await dispatch_scheduled_tool(feature, "dangerous_op", {})
 
         assert isinstance(result, ScheduledTaskOutcome)
         assert result.status == "blocked"
@@ -2486,10 +2513,11 @@ class TestTaskExecutor:
 
     @pytest.mark.asyncio
     async def test_failed_tool_result_raises_before_scheduler_serialization(
-        self, feature,
+        self, native_feature,
     ):
         """The production lookup cannot JSON-encode failure into success."""
-        failed_tool = MagicMock()
+        feature = native_feature
+        failed_tool = MagicMock(spec=AgentTool)
         failed_tool.name = "memory_consolidate"
         failed_tool.execute = AsyncMock(
             return_value={
@@ -2499,19 +2527,20 @@ class TestTaskExecutor:
                 "tool": "memory_consolidate",
             }
         )
-        memory_feature = MagicMock()
-        memory_feature.get_tools = MagicMock(return_value=[failed_tool])
+        memory_feature = _StubJobFeature(failed_tool.name, agent=feature.agent)
+        memory_feature._tool = failed_tool
         feature.agent.features = {"MemoryFeature": memory_feature}
         feature.agent.hooks_manager = self._passthrough_hooks_manager()
 
         with pytest.raises(
             RuntimeError, match="scheduled tool memory_consolidate failed"
         ):
-            await feature._lookup_and_run_tool("memory_consolidate", {})
+            await dispatch_scheduled_tool(feature, "memory_consolidate", {})
 
     @pytest.mark.asyncio
-    async def test_legacy_tool_exception_envelope_also_raises(self, feature):
-        failed_tool = MagicMock()
+    async def test_legacy_tool_exception_envelope_also_raises(self, native_feature):
+        feature = native_feature
+        failed_tool = MagicMock(spec=AgentTool)
         failed_tool.name = "job"
         failed_tool.execute = AsyncMock(
             return_value={
@@ -2520,13 +2549,13 @@ class TestTaskExecutor:
                 "tool": "job",
             }
         )
-        job_feature = MagicMock()
-        job_feature.get_tools = MagicMock(return_value=[failed_tool])
+        job_feature = _StubJobFeature(failed_tool.name, agent=feature.agent)
+        job_feature._tool = failed_tool
         feature.agent.features = {"JobFeature": job_feature}
         feature.agent.hooks_manager = self._passthrough_hooks_manager()
 
         with pytest.raises(RuntimeError, match="scheduled tool job failed"):
-            await feature._lookup_and_run_tool("job", {})
+            await dispatch_scheduled_tool(feature, "job", {})
 
     @pytest.mark.asyncio
     async def test_builtin_cron_task_with_absent_owner_fails_honestly(
@@ -2686,7 +2715,7 @@ class TestTaskExecutor:
     async def test_disabled_owner_is_left_to_the_disabled_skip(self, feature):
         """A disabled owner is not an absent one: dispatch proceeds and the
         lookup's existing benign disabled-feature skip applies (#2522)."""
-        owner = _StubJobFeature("restart_coordinator", "RestartCoordinatorFeature")
+        owner = _StubJobFeature("restart_coordinator", "RestartCoordinatorFeature", agent=feature.agent)
         owner.enabled = False
         feature.agent.features = {"RestartCoordinatorFeature": owner}
         feature.agent.dispatcher = MagicMock()
@@ -2711,7 +2740,7 @@ class TestTaskExecutor:
         """#2474: no scheduled task may execute before the agent's
         post_all_features_loaded barrier — not even a built-in whose owner is
         present, and not through the direct no-dispatcher branch."""
-        owner = _StubJobFeature("restart_coordinator", "RestartCoordinatorFeature")
+        owner = _StubJobFeature("restart_coordinator", "RestartCoordinatorFeature", agent=feature.agent)
         feature.agent.features = {"RestartCoordinatorFeature": owner}
         feature.agent._post_all_features_loaded_complete = False
         feature.agent.dispatcher = MagicMock()
@@ -2727,42 +2756,44 @@ class TestTaskExecutor:
         assert owner.calls == 0
 
     @pytest.mark.asyncio
-    async def test_disabled_feature_tool_is_not_executed(self, feature):
+    async def test_disabled_feature_tool_is_not_executed(self, native_feature):
         """#2522: a soft-disabled feature stays in ``agent.features`` with
         ``enabled=False`` but its tools are detached from every other surface.
         A persisted schedule that names one of its tools must NOT execute on a
         tick — the scheduler skips it benignly (no failure spam) — and
         re-enabling the feature restores execution."""
-        job_feature = _StubJobFeature()
+        feature = native_feature
+        job_feature = _StubJobFeature(agent=feature.agent)
         feature.agent.features = {"JobFeature": job_feature}
         feature.agent.hooks_manager = self._passthrough_hooks_manager()
 
         # Enabled → the tool runs.
-        result = await feature._lookup_and_run_tool("job", {})
+        result = await dispatch_scheduled_tool(feature, "job", {})
         assert job_feature.calls == 1
         assert json.loads(result)["success"] is True
 
         # Soft-disabled → the SAME tool is skipped, not executed, not raised.
         job_feature.enabled = False
-        result = await feature._lookup_and_run_tool("job", {})
+        result = await dispatch_scheduled_tool(feature, "job", {})
         assert job_feature.calls == 1  # unchanged — never ran
         assert result.startswith("skipped:")
         assert "JobFeature" in result and "disabled" in result
 
         # Re-enabled → execution is restored on the next tick.
         job_feature.enabled = True
-        result = await feature._lookup_and_run_tool("job", {})
+        result = await dispatch_scheduled_tool(feature, "job", {})
         assert job_feature.calls == 2
         assert json.loads(result)["success"] is True
 
     @pytest.mark.asyncio
-    async def test_enabled_owner_wins_over_disabled_same_name(self, feature):
+    async def test_enabled_owner_wins_over_disabled_same_name(self, native_feature):
         """If both a disabled and an enabled feature expose the same tool name,
         the enabled owner executes (the disabled scan runs only as a fallback)."""
-        disabled = _StubJobFeature()
+        feature = native_feature
+        disabled = _StubJobFeature(agent=feature.agent)
         disabled.name = "OldJobFeature"
         disabled.enabled = False
-        enabled = _StubJobFeature()
+        enabled = _StubJobFeature(agent=feature.agent)
         enabled.name = "NewJobFeature"
         feature.agent.features = {
             "OldJobFeature": disabled,
@@ -2770,7 +2801,7 @@ class TestTaskExecutor:
         }
         feature.agent.hooks_manager = self._passthrough_hooks_manager()
 
-        result = await feature._lookup_and_run_tool("job", {})
+        result = await dispatch_scheduled_tool(feature, "job", {})
         assert enabled.calls == 1
         assert disabled.calls == 0
         assert json.loads(result)["success"] is True
@@ -3419,29 +3450,34 @@ class TestEcosystemDiscoveryWatchHandler:
         feature.agent.dispatcher.enqueue_signal.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_explicit_discovery_tool_resolves_external_feature(self, feature):
-        external = _StubJobFeature()
-        external._tool.name = "discover_ecosystem"
-        external._tool.execute = AsyncMock(return_value=_discovery_finding())
-        feature.agent.features = {"ExternalDiscoveryFeature": external}
-        feature.agent.hooks_manager = None
-        feature._load_ecosystem_discovery_state = AsyncMock(return_value=(None, None))
-        feature._save_ecosystem_discovery_state = AsyncMock()
-        _wire_watch_dispatcher(feature)
+    async def test_explicit_discovery_tool_resolves_external_feature(self, native_tool_effect_agent):
+        feature = SchedulerFeature(await native_tool_effect_agent(did='did:test:discovery-scheduler'))
+        await feature.initialize()
+        try:
+            external = _StubJobFeature(agent=feature.agent)
+            external._tool.name = "discover_ecosystem"
+            external._tool.execute = AsyncMock(return_value=_discovery_finding())
+            feature.agent.features = {"ExternalDiscoveryFeature": external}
+            feature.agent.hooks_manager = None
+            feature._load_ecosystem_discovery_state = AsyncMock(return_value=(None, None))
+            feature._save_ecosystem_discovery_state = AsyncMock()
+            _wire_watch_dispatcher(feature)
 
-        out = await feature._run_ecosystem_discovery_watch(
-            {"tool": "discover_ecosystem", "repo": "owner/name"}
-        )
+            out = await dispatch_scheduled_tool(feature, 'ecosystem_discovery_watch',
+                {"tool": "discover_ecosystem", "repo": "owner/name"},
+                dispatch=lambda _name, arguments: feature._run_ecosystem_discovery_watch(arguments))
 
-        data = json.loads(out)
-        assert data["signaled"] is True
-        assert data["reason"] == "new_findings"
-        assert data["findings_count"] == 1
-        signal = feature.agent.dispatcher.enqueue_signal.call_args.args[0]
-        findings = json.loads(signal.payload["findings"])
-        assert findings[0]["repo"] == "owner/name"
-        assert findings[0]["kind"] == "red_ci"
-        assert findings[0]["number"] == "2281"
+            data = json.loads(out)
+            assert data["signaled"] is True
+            assert data["reason"] == "new_findings"
+            assert data["findings_count"] == 1
+            signal = feature.agent.dispatcher.enqueue_signal.call_args.args[0]
+            findings = json.loads(signal.payload["findings"])
+            assert findings[0]["repo"] == "owner/name"
+            assert findings[0]["kind"] == "red_ci"
+            assert findings[0]["number"] == "2281"
+        finally:
+            await feature.shutdown()
 
     @pytest.mark.asyncio
     async def test_roster_args_forwarded_to_scan_tool(self, feature):

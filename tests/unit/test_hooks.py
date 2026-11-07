@@ -1417,6 +1417,20 @@ class TestSnapshotEnforcementOverrides:
 
 # === Run tests ===
 
+@pytest.mark.parametrize("source", ["threaded", "updated"])
+def test_decided_binding_does_not_borrow_nested_hook_values(source):
+    from kestrel_sovereign.hooks.decision_gate import decided_tool_input
+
+    payload = {"items": [{"marker": "approved"}]}
+    hook_input = HookInput(session_id="owned-binding",
+        hook_event_name=HookEvent.PRE_TOOL_USE.value, tool_name="owned-tool",
+        tool_input=payload)
+    output = HookOutput.modify(payload) if source == "updated" else HookOutput.allow()
+    approved = decided_tool_input(hook_input, output)
+    payload["items"][0]["marker"] = "late mutation"
+    assert approved == {"items": [{"marker": "approved"}]}
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
 

@@ -30,6 +30,8 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from kestrel_sovereign.features.base import Feature
+from kestrel_sdk.resources import ResourceOutcomeUnknown
+from tests.utils.native_tool_effects import drive_native
 from kestrel_sdk.tools.base import ToolCategory, ToolSchema
 
 
@@ -66,8 +68,8 @@ class _ProbeFeature(Feature):
         return self._fake_tools
 
 
-def _make_feature_with_agent_capture(
-    fake_tools: list[_FakeTool],
+async def _make_feature_with_agent_capture(
+    fake_tools: list[_FakeTool],*, native_tool_effect_agent
 ) -> tuple[_ProbeFeature, dict]:
     """Return a probe feature whose agent.llm_service.{generate,
     generate_with_messages} captures the call kwargs into the
@@ -81,33 +83,50 @@ def _make_feature_with_agent_capture(
     from kestrel_sdk.llm.adapter import LLMResponse
 
     class _ProbeLLMService:
+        inline_call = None
+
         async def generate(self, **kwargs):
             captured.update(kwargs)
+            if self.inline_call is not None:
+                await self.inline_call(kwargs["tool_executor"])
             return LLMResponse(content="ok", tool_calls=None)
 
         async def generate_with_messages(self, **kwargs):
             captured.update(kwargs)
+            if self.inline_call is not None:
+                await self.inline_call(kwargs["tool_executor"])
             return LLMResponse(content="ok", tool_calls=None)
 
-    agent = SimpleNamespace(
-        llm_service=_ProbeLLMService(),
-        did="did:test:probe",
-    )
+    agent = await native_tool_effect_agent(did="did:test:probe")
+    agent.llm_service = _ProbeLLMService()
     feature = _ProbeFeature(agent)
     feature._fake_tools = fake_tools
+    agent.features[feature.name] = feature
     return feature, captured
 
 
+async def _dispatch_inline(feature, tool_name, arguments):
+    returned = None
+
+    async def call(executor):
+        nonlocal returned
+        returned = await executor(tool_name, arguments)
+
+    feature.agent.llm_service.inline_call = call
+    await drive_native(feature.agent, lambda: feature.execute_as_subagent(task="anything"))
+    return returned
+
+
 @pytest.mark.asyncio
-async def test_subagent_threads_tool_executor_through_to_llm_service():
+async def test_subagent_threads_tool_executor_through_to_llm_service(*, native_tool_effect_agent):
     """The subagent dispatch must call
     ``llm_service.generate_with_messages`` (the only entrypoint that
     accepts ``tool_executor``), not ``generate`` (which silently drops
     it and forces codex into the no-executor error path)."""
     tool = _FakeTool("search_memory", returns={"success": True, "data": []})
-    feature, captured = _make_feature_with_agent_capture([tool])
+    feature, captured = (await _make_feature_with_agent_capture([tool], native_tool_effect_agent=native_tool_effect_agent))
 
-    result = await feature.execute_as_subagent(task="search for X")
+    result = await drive_native(feature.agent, lambda: feature.execute_as_subagent(task="search for X"))
 
     assert result["success"] is True, (
         f"Subagent must succeed when llm_service returns a non-tool-call "
@@ -127,7 +146,7 @@ async def test_subagent_threads_tool_executor_through_to_llm_service():
 
 
 @pytest.mark.asyncio
-async def test_subagent_executor_dispatches_to_feature_tool():
+async def test_subagent_executor_dispatches_to_feature_tool(*, native_tool_effect_agent):
     """The feature-scoped executor must dispatch to the named tool
     from THIS feature's palette and return ``(effective_args, result)``
     — the tuple shape the codex adapter requires so audit /
@@ -137,11 +156,8 @@ async def test_subagent_executor_dispatches_to_feature_tool():
         "search_memory",
         returns={"success": True, "data": {"hits": 2}},
     )
-    feature, captured = _make_feature_with_agent_capture([tool])
-    await feature.execute_as_subagent(task="anything")
-
-    executor = captured["tool_executor"]
-    returned = await executor("search_memory", {"query": "rescue", "limit": 5})
+    feature, captured = (await _make_feature_with_agent_capture([tool], native_tool_effect_agent=native_tool_effect_agent))
+    returned = await _dispatch_inline(feature, "search_memory", {"query": "rescue", "limit": 5})
 
     assert isinstance(returned, tuple) and len(returned) == 2, (
         "Executor must return the (effective_args, result) tuple the "
@@ -156,18 +172,15 @@ async def test_subagent_executor_dispatches_to_feature_tool():
 
 
 @pytest.mark.asyncio
-async def test_subagent_executor_rejects_tool_outside_palette():
+async def test_subagent_executor_rejects_tool_outside_palette(*, native_tool_effect_agent):
     """Refusing a name not in this feature's palette is the security
     boundary. A subagent shouldn't be able to reach for sibling
     features' tools mid-turn; the codex adapter already constrains
     the visible set, so an unknown name here is a real bug or a
     policy denial and must surface as an error envelope."""
     tool = _FakeTool("allowed", returns={"success": True})
-    feature, captured = _make_feature_with_agent_capture([tool])
-    await feature.execute_as_subagent(task="anything")
-
-    executor = captured["tool_executor"]
-    effective_args, result = await executor("forbidden", {})
+    feature, captured = (await _make_feature_with_agent_capture([tool], native_tool_effect_agent=native_tool_effect_agent))
+    effective_args, result = await _dispatch_inline(feature, "forbidden", {})
 
     assert effective_args == {}
     assert result["success"] is False
@@ -178,34 +191,27 @@ async def test_subagent_executor_rejects_tool_outside_palette():
 
 
 @pytest.mark.asyncio
-async def test_subagent_executor_surfaces_tool_exception_as_error_envelope():
-    """A raised exception inside the tool must NOT propagate up to
-    codex (which would treat it as a transport error and abort the
-    turn). Convert to a ``{success: False, error: ...}`` envelope so
-    codex can return the failure result to the model, which can then
-    decide whether to retry / give up / explain."""
-    tool = _FakeTool("broken", returns=ValueError("bad input"))
-    feature, captured = _make_feature_with_agent_capture([tool])
-    await feature.execute_as_subagent(task="anything")
-
-    executor = captured["tool_executor"]
-    effective_args, result = await executor("broken", {"x": 1})
-
-    assert effective_args == {"x": 1}
-    assert result == {
-        "success": False,
-        "error": "ValueError: bad input",
-    }
+async def test_subagent_executor_preserves_unknown_tool_outcome(*, native_tool_effect_agent):
+    """A body exception after admission cannot become a retryable model result."""
+    original = ValueError("bad input")
+    tool = _FakeTool("broken", returns=original)
+    feature, _ = await _make_feature_with_agent_capture(
+        [tool], native_tool_effect_agent=native_tool_effect_agent,
+    )
+    with pytest.raises(ResourceOutcomeUnknown) as caught:
+        await _dispatch_inline(feature, "broken", {"x": 1})
+    assert caught.value.__cause__ is original
+    assert tool.executed_with == {"x": 1}
 
 
 @pytest.mark.asyncio
-async def test_subagent_no_tools_passes_no_executor():
+async def test_subagent_no_tools_passes_no_executor(*, native_tool_effect_agent):
     """When the feature has no tools (or all are denied), don't
     construct an executor — the LLM call is plain text generation and
     threading a callable would be misleading."""
-    feature, captured = _make_feature_with_agent_capture([])
+    feature, captured = (await _make_feature_with_agent_capture([], native_tool_effect_agent=native_tool_effect_agent))
 
-    await feature.execute_as_subagent(task="just talk")
+    await drive_native(feature.agent, lambda: feature.execute_as_subagent(task="just talk"))
 
     assert captured["tools"] is None
     assert captured["tool_executor"] is None, (
@@ -215,7 +221,7 @@ async def test_subagent_no_tools_passes_no_executor():
 
 
 @pytest.mark.asyncio
-async def test_subagent_executor_enforces_pre_tool_use_hooks():
+async def test_subagent_executor_enforces_pre_tool_use_hooks(*, native_tool_effect_agent):
     """Codex round 1 P1 on #1461 follow-up: the inline executor must
     gate through PRE_TOOL_USE hooks just like the non-inline
     ``_handle_feature_tool_calls`` path. Without this, the codex
@@ -228,7 +234,7 @@ async def test_subagent_executor_enforces_pre_tool_use_hooks():
     )
 
     tool = _FakeTool("dangerous", returns={"success": True})
-    feature, captured = _make_feature_with_agent_capture([tool])
+    feature, captured = (await _make_feature_with_agent_capture([tool], native_tool_effect_agent=native_tool_effect_agent))
 
     # Wire a hook manager that DENIES the tool call. Mirrors what a
     # SecurityHook would emit when the agent lacks permission.
@@ -242,10 +248,8 @@ async def test_subagent_executor_enforces_pre_tool_use_hooks():
     hooks_manager.execute_hooks_parallel = AsyncMock(return_value=[])
     feature.agent.hooks_manager = hooks_manager
 
-    await feature.execute_as_subagent(task="anything")
-    executor = captured["tool_executor"]
 
-    effective_args, result = await executor("dangerous", {"target": "/etc/passwd"})
+    effective_args, result = await _dispatch_inline(feature, "dangerous", {"target": "/etc/passwd"})
 
     # The hook decision must be honored — the tool must NOT execute.
     assert tool.executed_with == {}, (
@@ -269,7 +273,7 @@ async def test_subagent_executor_enforces_pre_tool_use_hooks():
 
 
 @pytest.mark.asyncio
-async def test_subagent_executor_honors_hook_argument_rewrite():
+async def test_subagent_executor_honors_hook_argument_rewrite(*, native_tool_effect_agent):
     """PRE_TOOL_USE hooks may rewrite arguments (PII redaction,
     normalization, constraint enforcement). The inline executor must
     forward the REWRITTEN args to ``tool.execute``, not the original
@@ -278,7 +282,7 @@ async def test_subagent_executor_honors_hook_argument_rewrite():
     from kestrel_sdk.hooks.base import PermissionDecision
 
     tool = _FakeTool("send_email", returns={"success": True})
-    feature, captured = _make_feature_with_agent_capture([tool])
+    feature, captured = (await _make_feature_with_agent_capture([tool], native_tool_effect_agent=native_tool_effect_agent))
 
     # Hook rewrites the to/body to redact PII.
     hook_output = SimpleNamespace(
@@ -291,10 +295,8 @@ async def test_subagent_executor_honors_hook_argument_rewrite():
     hooks_manager.execute_hooks_parallel = AsyncMock(return_value=[])
     feature.agent.hooks_manager = hooks_manager
 
-    await feature.execute_as_subagent(task="anything")
-    executor = captured["tool_executor"]
 
-    effective_args, _ = await executor("send_email", {
+    effective_args, _ = await _dispatch_inline(feature, "send_email", {
         "to": "victim@example.com", "body": "ssn 123-45-6789",
     })
 
@@ -319,7 +321,7 @@ async def test_subagent_executor_honors_hook_argument_rewrite():
 
 
 @pytest.mark.asyncio
-async def test_subagent_executor_blocks_on_permission_decision_ask():
+async def test_subagent_executor_blocks_on_permission_decision_ask(*, native_tool_effect_agent):
     """Codex round 2 P1 on #1461 follow-up: ``PermissionDecision.ASK``
     must block tool execution and surface as APPROVAL REQUIRED,
     matching ``execute_named_tool``'s contract. Without this, codex-
@@ -328,7 +330,7 @@ async def test_subagent_executor_blocks_on_permission_decision_ask():
     from kestrel_sdk.hooks.base import PermissionDecision
 
     tool = _FakeTool("approval_gated", returns={"success": True})
-    feature, captured = _make_feature_with_agent_capture([tool])
+    feature, captured = (await _make_feature_with_agent_capture([tool], native_tool_effect_agent=native_tool_effect_agent))
 
     hook_output = SimpleNamespace(
         permission_decision=PermissionDecision.ASK,
@@ -340,10 +342,8 @@ async def test_subagent_executor_blocks_on_permission_decision_ask():
     hooks_manager.execute_hooks_parallel = AsyncMock(return_value=[])
     feature.agent.hooks_manager = hooks_manager
 
-    await feature.execute_as_subagent(task="anything")
-    executor = captured["tool_executor"]
 
-    effective_args, result = await executor("approval_gated", {"target": "production"})
+    effective_args, result = await _dispatch_inline(feature, "approval_gated", {"target": "production"})
 
     assert tool.executed_with == {}, (
         "PermissionDecision.ASK must short-circuit before tool.execute() "
@@ -359,7 +359,7 @@ async def test_subagent_executor_blocks_on_permission_decision_ask():
 
 
 @pytest.mark.asyncio
-async def test_subagent_executor_honors_in_place_hook_argument_mutation():
+async def test_subagent_executor_honors_in_place_hook_argument_mutation(*, native_tool_effect_agent):
     """Codex round 2 P1 on #1461 follow-up: the real ``HooksManager``
     threads MODIFY-hook rewrites by mutating ``hook_input.tool_input``
     IN PLACE and returns ``HookOutput.allow()`` with
@@ -370,7 +370,7 @@ async def test_subagent_executor_honors_in_place_hook_argument_mutation():
     from kestrel_sdk.hooks.base import PermissionDecision
 
     tool = _FakeTool("send_message", returns={"success": True})
-    feature, captured = _make_feature_with_agent_capture([tool])
+    feature, captured = (await _make_feature_with_agent_capture([tool], native_tool_effect_agent=native_tool_effect_agent))
 
     async def _mutate_in_place(event, hook_input):
         # Real-manager pattern: rewrite by mutating in place; return
@@ -390,10 +390,8 @@ async def test_subagent_executor_honors_in_place_hook_argument_mutation():
     hooks_manager.execute_hooks_parallel = AsyncMock(return_value=[])
     feature.agent.hooks_manager = hooks_manager
 
-    await feature.execute_as_subagent(task="anything")
-    executor = captured["tool_executor"]
 
-    effective_args, _ = await executor("send_message", {
+    effective_args, _ = await _dispatch_inline(feature, "send_message", {
         "to": "victim@example.com",
         "body": "ssn 123-45-6789",
     })
@@ -416,7 +414,7 @@ async def test_subagent_executor_honors_in_place_hook_argument_mutation():
 
 
 @pytest.mark.asyncio
-async def test_subagent_executor_surfaces_redacted_args_on_deny():
+async def test_subagent_executor_surfaces_redacted_args_on_deny(*, native_tool_effect_agent):
     """Codex round 5 P1 on #1461 follow-up: when an upstream redaction
     hook scrubs the args (mutates ``hook_input.tool_input``) and a
     downstream permission hook returns DENY, the executor's returned
@@ -427,7 +425,7 @@ async def test_subagent_executor_surfaces_redacted_args_on_deny():
     from kestrel_sdk.hooks.base import PermissionDecision
 
     tool = _FakeTool("send_email", returns={"success": True})
-    feature, captured = _make_feature_with_agent_capture([tool])
+    feature, captured = (await _make_feature_with_agent_capture([tool], native_tool_effect_agent=native_tool_effect_agent))
 
     async def _redact_then_deny(event, hook_input):
         # Real-manager pattern: a MODIFY hook ran earlier in the
@@ -448,10 +446,8 @@ async def test_subagent_executor_surfaces_redacted_args_on_deny():
     hooks_manager.execute_hooks_parallel = AsyncMock(return_value=[])
     feature.agent.hooks_manager = hooks_manager
 
-    await feature.execute_as_subagent(task="anything")
-    executor = captured["tool_executor"]
 
-    effective_args, result = await executor("send_email", {
+    effective_args, result = await _dispatch_inline(feature, "send_email", {
         "to": "victim@example.com",
         "body": "ssn 123-45-6789",
     })
@@ -476,7 +472,7 @@ async def test_subagent_executor_surfaces_redacted_args_on_deny():
 
 
 @pytest.mark.asyncio
-async def test_subagent_executor_surfaces_redacted_args_on_ask():
+async def test_subagent_executor_surfaces_redacted_args_on_ask(*, native_tool_effect_agent):
     """Same as the DENY case but for the ASK (human approval) path.
     Audit storage for held-for-approval tools must not contain raw
     PII either — approval queues are reviewed by humans and the
@@ -484,7 +480,7 @@ async def test_subagent_executor_surfaces_redacted_args_on_ask():
     from kestrel_sdk.hooks.base import PermissionDecision
 
     tool = _FakeTool("publish_message", returns={"success": True})
-    feature, captured = _make_feature_with_agent_capture([tool])
+    feature, captured = (await _make_feature_with_agent_capture([tool], native_tool_effect_agent=native_tool_effect_agent))
 
     async def _redact_then_ask(event, hook_input):
         hook_input.tool_input = {"channel": "<redacted>", "body": "<redacted>"}
@@ -499,10 +495,8 @@ async def test_subagent_executor_surfaces_redacted_args_on_ask():
     hooks_manager.execute_hooks_parallel = AsyncMock(return_value=[])
     feature.agent.hooks_manager = hooks_manager
 
-    await feature.execute_as_subagent(task="anything")
-    executor = captured["tool_executor"]
 
-    effective_args, result = await executor("publish_message", {
+    effective_args, result = await _dispatch_inline(feature, "publish_message", {
         "channel": "#secret-team",
         "body": "merger details: ...",
     })

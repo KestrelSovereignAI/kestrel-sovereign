@@ -15,6 +15,50 @@ tags:
 Core issue #3569 extends existing PostgreSQL advisory and native transaction
 custody. This is a host authority contract, not a causation-derived permission.
 
+Privacy policy retention and exclusive execution have separate lifetimes within
+one `ReentrantTransitionLock`. Journal admission records the original native
+lifetime without pinning policy, so independent approvals and privacy revocation
+can progress. Turn entry uses `policy_span()` after the conversation lock; a
+non-turn invocation activates its policy span at the first effect. Each effect
+and identity write acquires the exclusive writer through classification and
+settlement. Releasing that writer does not delay asynchronous acceptance: the
+original journal lifetime retains accepted workers until journal finalization.
+An explicit resident task context preserves runtime ownership and cannot enroll
+a continuing service as an invocation child. A captured token identifies the live policy span and
+never grants writer ownership or original execution admission. Ordinary token
+writers are distinct from the original root and accepted native children;
+neither an effect nor child acceptance can borrow their token membership.
+Concurrent original members join one first activation of their lifetime.
+Privacy draining excludes callers actually waiting for the current task,
+whose completion depends on its return, while still joining independent peers.
+Each durable shared frame has one live gate-owned record; copied context routes
+reentry but cannot substitute for the actual frame owner during cycle checks.
+
+The shared native task helpers record exact accepted tasks before dispatch.
+`owned_native_wait` records actual must-join dependencies for every static task
+and each original callback accepted during its wait. Gather, bounded joins and
+callback readers share that observation boundary; creation ancestry cannot
+substitute for an actual wait or grant execution authority. An owned join parks the current writer for those original execution owners and
+restores its full frame before any parent continuation or exception handler
+resumes. Gather retains this barrier through sibling cancellation and physical
+harvesting. Stream producers relinquish the writer at the controlled item
+handshake and reacquire it before advancing. Codex reader callbacks use an
+original callback cohort accepted before their task gate opens. Arbitrary Event
+waits, copied context, and eventual join edges cannot lend a writer.
+
+Span closure closes root factories and drains original accepted work before
+releasing policy retention. Accepted continuations retain their original native
+receipts while closing; stale tokens and factories fail explicitly. Journal
+completion signals retain their exact executor association rather than acting
+as execution identities themselves.
+
+SDK 0.51.2's shared host error policy preserves original decorated-tool errors
+when the host declares durable effect ownership. Core classifies an ordinary
+post-dispatch exception as unconfirmed before task, workflow, or transport
+projection. An explicit returned failure or a nominal known resource conflict
+remains a definite returned error. Existing cancellation, control, and unknown
+outcome carriers retain their original identity and evidence.
+
 Corpus-profile surveys and operator reindexing preserve original native control
 before unreadable-table/zero-count fallbacks, batch splitting, failed-row
 accounting or registry/parity success. Actual localhost SDK outputs, scoped

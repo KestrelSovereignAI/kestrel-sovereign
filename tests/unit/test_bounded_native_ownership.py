@@ -83,8 +83,8 @@ async def test_successful_foreign_native_dependency_releases_original_mutex():
         worker = create_owned_task(foreign(lock.current_reentry_token()))
         result = await await_owned_task(worker)
         assert result.error is None
-    assert not lock.locked() and lock._reentry_idle.is_set()
-    assert not lock._foreign_native_dependencies
+    assert not lock.locked() and lock._writer is None
+    assert not lock._admissions
 
 
 @pytest.mark.asyncio
@@ -117,7 +117,7 @@ async def test_task_creation_failure_dispatches_no_native_body_or_dependency():
         worker = create_owned_task(foreign(lock.current_reentry_token()))
         assert (await await_owned_task(worker)).error is None
     assert not called and not lock._native_work
-    assert not lock._foreign_native_dependencies and not lock.locked()
+    assert not lock._admissions and not lock.locked()
 
 
 @pytest.mark.asyncio
@@ -127,7 +127,7 @@ async def test_eager_task_factory_sees_dependency_before_native_dispatch():
     async def native():
         current = asyncio.current_task()
         assert current in lock._native_work
-        assert any(current in tasks for tasks in lock._foreign_native_dependencies.values())
+        assert lock._admissions[current].task is current
         return "retained-before-dispatch"
     async def foreign(token):
         with bind_transition_lock_reentry(token):

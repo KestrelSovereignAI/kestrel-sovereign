@@ -14,6 +14,7 @@ import asyncio
 from typing import Any
 
 from kestrel_sovereign.execution_custody import is_tool_execution_terminal_error
+from kestrel_sovereign._async_ownership import OwnedCallbackScope, await_owned_task
 
 
 def codex_inline_failure(error: Exception) -> dict[str, Any]:
@@ -26,48 +27,70 @@ def codex_inline_failure(error: Exception) -> dict[str, Any]:
     return {"success": False, "error": f"{error}"}
 
 
-class PreTurnReader:
-    """The codex reader loop, started before the skill whose tools it runs.
-
-    Each inline call runs on a task created from the reader's own context,
-    which predates the skill's ``handle_task``.
-    """
+class OwnedCallbackReader:
+    """One pre-turn reader; each callback has actual owned Task admission."""
 
     def __init__(self) -> None:
         self._calls: asyncio.Queue = asyncio.Queue()
         self._handlers: set[asyncio.Task] = set()
         self._reader: asyncio.Task | None = None
+        self.baseline: dict = {}
 
     async def start(self) -> None:
         self._reader = asyncio.create_task(self._read())
-        # Yield so the reader is running before the caller goes on.
         await asyncio.sleep(0)
 
     async def _read(self) -> None:
+        import contextvars
+
+        self.baseline = dict(contextvars.copy_context().items())
         while (call := await self._calls.get()) is not None:
-            handler = asyncio.create_task(self._handle(*call))
+            scope, *request = call
+            handler = scope.start(lambda request=request: self._handle(*request),
+                name='owned-test-codex-callback')
             self._handlers.add(handler)
             handler.add_done_callback(self._handlers.discard)
 
-    @staticmethod
-    async def _handle(executor, name, args, done: asyncio.Future) -> None:
-        try:
-            _, result = await executor(name, args)
-        except Exception as error:
-            try:
-                result = codex_inline_failure(error)
-            except Exception as terminal:
-                done.set_exception(terminal)
-                return
-        done.set_result(result)
+    async def _execute(self, executor, name, args):
+        return await executor(name, args)
 
-    async def call(self, executor, name: str, args: dict | None = None) -> Any:
-        """Run ``executor(name, args)`` on a reader task; the model's result."""
+    async def _handle(self, executor, name, args, done: asyncio.Future) -> None:
+        try:
+            done.set_result(await self._execute(executor, name, args))
+        except BaseException as error:
+            if not done.done():
+                done.set_exception(error)
+            raise
+
+    async def dispatch(self, executor, name: str = 'tool', args: dict | None = None) -> Any:
+        scope = OwnedCallbackScope()
         done = asyncio.get_running_loop().create_future()
-        await self._calls.put((executor, name, args or {}, done))
-        return await done
+        try:
+            await self._calls.put((scope, executor, name, args or {}, done))
+            async with scope.wait():
+                return await done
+        finally:
+            scope.close()
+            for task in tuple(scope.tasks):
+                outcome = await await_owned_task(task)
+                if outcome.error is not None:
+                    raise outcome.error
 
     async def stop(self) -> None:
         await self._calls.put(None)
         if self._reader is not None:
             await self._reader
+
+
+class PreTurnReader(OwnedCallbackReader):
+    """Apply the Codex model-reply policy on the canonical owned reader."""
+
+    async def _execute(self, executor, name, args):
+        try:
+            _, result = await executor(name, args)
+        except Exception as error:
+            return codex_inline_failure(error)
+        return result
+
+    async def call(self, executor, name: str, args: dict | None = None) -> Any:
+        return await self.dispatch(executor, name, args)

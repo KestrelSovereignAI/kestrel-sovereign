@@ -1,4 +1,4 @@
-"""Physical holds shared only by Core's closed visual result owners.
+"""Physical holds shared only by Core's closed original result owners.
 
 This descriptor grants no SQL or result transition. Each concrete owner still
 authenticates its original admission, row, producer, fixed program and writer.
@@ -14,14 +14,31 @@ from kestrel_sovereign.execution_custody import (
 )
 
 
-def _closed_visual_result(owner):
+def _closed_original_result(owner):
     from .db.native_row_custody import _native_row_profile
 
     if _native_row_profile(owner)[0] not in {
         "visual_computer_actions",
         "visual_computer_requests",
+        "tool_effect_operations",
     }:
-        raise ExecutionAuthorityError("Exact Core visual result owner required")
+        raise ExecutionAuthorityError("Exact Core original result owner required")
+
+
+def _original_result_repository(owner, repository):
+    """Resolve only the canonical repository/key of a closed native profile."""
+    from .db.native_row_custody import _native_row_profile
+    from kestrel_sovereign.tool_effect_store import ToolEffectStore
+    from kestrel_sovereign.visual_computer.repository import VisualCustodyRepository
+
+    _closed_original_result(owner)
+    if _native_row_profile(owner)[0] == 'tool_effect_operations':
+        if type(repository) is not ToolEffectStore:
+            raise ExecutionAuthorityError('Original attempt requires its native journal')
+        return repository.database, repository._root, True
+    if type(repository) is not VisualCustodyRepository:
+        raise ExecutionAuthorityError('Original result requires its native repository')
+    return repository.db, repository._key, False
 
 
 @dataclass(frozen=True, eq=False, repr=False)
@@ -44,26 +61,39 @@ class _OriginalResultBacking:
 class _OriginalResultCustody:
     """Private physical mechanism, with finite exact owner admission only."""
 
+    def has_acknowledged_commit(self):
+        return (self._sqlite_committed_connection is self._backing
+            or any(receipt.acknowledged for receipt in self._acknowledgments))
+
+    def write_refusal(self, reason, cause=None):
+        from kestrel_sovereign.execution_custody import _FINITE_NATIVE_SOURCES, _native_source_originals
+
+        refusal = ExecutionAuthorityError('Original native result write refused: ' + reason)
+        refusal.__cause__ = cause
+        finite = BaseExceptionGroup('original native result write refusal', [refusal])
+        finite._kestrel_finite_native_sources = (_FINITE_NATIVE_SOURCES, _native_source_originals(cause))
+        return finite
+
+    def retain_committed(self, error):
+        # Actual native ACK/reset classification is common to closed profiles.
+        from kestrel_sovereign.signals.outcome_custody import _OriginalSignalOutcome
+
+        return _OriginalSignalOutcome.retain_committed(self, error)
+
     def _capture_native_backing(self, repository):
         from kestrel_sovereign.signals.outcome_custody import (
             _OriginalPostgresJournalPool,
         )
-        from kestrel_sovereign.visual_computer.repository import VisualCustodyRepository
-
         from .async_database import AsyncDatabase
         from .db.postgres import PostgresBackend
         from .db.sqlite import SQLiteBackend
         from .privacy_wrapper import _DURABLE_GATE_SHARED_HOLDS
 
-        _closed_visual_result(self)
-        if (
-            type(repository) is not VisualCustodyRepository
-            or type(repository.db) is not AsyncDatabase
-        ):
+        database, key, content_free_close = _original_result_repository(self, repository)
+        if type(database) is not AsyncDatabase:
             raise ExecutionAuthorityError(
                 "Original result requires its canonical native database"
             )
-        database = repository.db
         backend = database.backend
         if type(backend) not in (SQLiteBackend, PostgresBackend):
             raise ExecutionAuthorityError(
@@ -80,7 +110,7 @@ class _OriginalResultCustody:
             repository,
             database,
             backend,
-            repository._key,
+            key,
             getattr(backend, "_execution_custody", None),
             current_execution_custody(backend),
             asyncio.current_task(),
@@ -89,7 +119,7 @@ class _OriginalResultCustody:
             _OriginalPostgresJournalPool.capture(backing)
             if type(backend) is PostgresBackend
             else None,
-            tuple(
+            () if content_free_close else tuple(
                 (hold, hold.gate, hold.lease)
                 for hold in _DURABLE_GATE_SHARED_HOLDS.get()
                 if hold.live
@@ -107,7 +137,7 @@ class _OriginalResultCustody:
         self._backing, self._generation = descriptor.backing, descriptor.generation
         self._postgres_pool = descriptor.postgres_pool
 
-    def _require_captured_native_lifetime(self):
+    def _require_captured_native_lifetime(self, *, require_inventory=True):
         """Exact physical holds only; grants no native SQL/program admission.
 
         Only the original captured physical worker may borrow these facts. Full
@@ -116,7 +146,7 @@ class _OriginalResultCustody:
         from .db.sqlite import SQLiteBackend
         from .privacy_wrapper import _SharedGateHold, _SharedGateLease
 
-        _closed_visual_result(self)
+        database, key, _ = _original_result_repository(self, self._repository)
         descriptor = self._native_backing
         registration = self._registration
         if (
@@ -135,12 +165,12 @@ class _OriginalResultCustody:
             or self._backing is not descriptor.backing
             or type(self._generation) is not type(descriptor.generation)
             or self._generation != descriptor.generation
-            or self._repository.db is not self._database
+            or database is not self._database
             or self._database.backend is not self._backend
-            or self._repository._key is not self._key
+            or key is not self._key
             or getattr(self._backend, "_execution_custody", None)
             is not self._backend_scope
-            or self._backend._original_result_holds.get(self) is not self._closed
+            or (require_inventory and self._backend._original_result_holds.get(self) is not self._closed)
         ):
             raise ExecutionAuthorityError(
                 "Original result native backing identity retired"
@@ -179,11 +209,11 @@ class _OriginalResultCustody:
             ):
                 raise ExecutionAuthorityError("Original result pool retired")
 
-    def _require_native_backing(self):
+    def _require_native_backing(self, *, require_inventory=True):
         from .db.native_journal_programs import _NativeJournalSQLiteConnection
         from .db.sqlite import SQLiteBackend
 
-        self._require_captured_native_lifetime()
+        self._require_captured_native_lifetime(require_inventory=require_inventory)
         if type(self._backend) is SQLiteBackend:
             if (
                 type(self._backing._conn) is not _NativeJournalSQLiteConnection

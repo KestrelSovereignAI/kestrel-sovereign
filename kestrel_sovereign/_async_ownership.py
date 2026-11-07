@@ -12,7 +12,7 @@ import asyncio
 import contextvars
 import math
 from collections.abc import AsyncIterator, Callable
-from contextlib import contextmanager
+from contextlib import AsyncExitStack, ExitStack, asynccontextmanager, contextmanager
 from dataclasses import dataclass, field
 from functools import wraps
 from typing import Generic, TypeVar, cast
@@ -31,6 +31,101 @@ _NATIVE_CREATE_TASK = asyncio.create_task
 _NATIVE_CREATE_TASK_CODE = asyncio.create_task.__code__
 _NATIVE_LOOP_CREATE_TASK = asyncio.BaseEventLoop.create_task
 _NATIVE_LOOP_CREATE_TASK_CODE = asyncio.BaseEventLoop.create_task.__code__
+
+# Routing only. Each coordinator independently validates the actual caller and
+# original native admission; inheriting this context grants no membership.
+_OWNED_COORDINATORS = contextvars.ContextVar("kestrel_owned_coordinators", default=())
+
+
+@contextmanager
+def bind_owned_coordinator(coordinator):
+    current = _OWNED_COORDINATORS.get()
+    reset = _OWNED_COORDINATORS.set((*current, coordinator) if coordinator not in current else current)
+    try:
+        yield
+    finally:
+        _OWNED_COORDINATORS.reset(reset)
+
+
+@asynccontextmanager
+async def owned_native_wait(targets):
+    """Park an actual writer for exact accepted native execution owners.
+
+    Restoration completes before caller code, including cancellation handlers,
+    resumes. Eventual join edges and copied context alone cannot lend a writer.
+    """
+    targets = tuple(targets)
+    waiter = asyncio.current_task()
+    with ExitStack() as dependencies:
+        def join_original(task):
+            dependencies.enter_context(owned_task_join_dependency(task, waiter=waiter))
+
+        for target in targets:
+            if type(target) is OwnedCallbackScope:
+                # Future reader callbacks join this exact waiting frame before
+                # their producer returns them. The cohort grants no authority.
+                target._join_observers.add(join_original)
+                dependencies.callback(target._join_observers.discard, join_original)
+                for task in tuple(target.tasks):
+                    join_original(task)
+            else:
+                join_original(target)
+        async with AsyncExitStack() as stack:
+            for coordinator in _OWNED_COORDINATORS.get():
+                await stack.enter_async_context(coordinator.park_native_wait(targets))
+            yield
+
+
+@asynccontextmanager
+async def owned_native_yield():
+    """Relinquish delegated writers at the iterator's controlled handshake."""
+    async with AsyncExitStack() as stack:
+        for coordinator in _OWNED_COORDINATORS.get():
+            await stack.enter_async_context(coordinator.yield_native_writer())
+        yield
+
+
+class OwnedCallbackScope:
+    """Original native work accepted during one provider wait."""
+
+    def __init__(self):
+        self.tasks = set()
+        self._join_observers = set()
+        self.closed = False
+        self.coordinators = tuple(c for c in _OWNED_COORDINATORS.get()
+                                  if c.current_native_scope() is not None)
+        self.factories = tuple(c.capture_native_work_factory(acquire_span=False)
+                               for c in self.coordinators)
+        for coordinator in self.coordinators:
+            coordinator.register_callback_scope(self)
+
+    def start(self, operation, *, name=None):
+        if self.closed:
+            raise RuntimeError("native callback admission is closed")
+        if len(self.factories) > 1:
+            raise RuntimeError("a callback must have one original privacy coordinator")
+        task = (self.factories[0](operation, name=name) if self.factories else
+                create_owned_task(operation(), name=name, retain_originals=True))
+        return self.accept(task)
+
+    def accept(self, task):
+        """Retain a producer's exact accepted Task, including failed publication."""
+        if self.closed:
+            raise RuntimeError("native callback admission is closed")
+        self.tasks.add(task)
+        for observer in tuple(self._join_observers):
+            observer(task)
+        for coordinator in self.coordinators:
+            coordinator.callback_accepted(self, task)
+        return task
+
+    def close(self):
+        self.closed = True
+
+    @asynccontextmanager
+    async def wait(self):
+        async with owned_native_wait((self,)):
+            yield
 
 
 @contextmanager
@@ -82,7 +177,7 @@ def owned_task_join_ancestors(task=None):
 def _tracks_owned_task_join(function):
     @wraps(function)
     async def joined(task, *args, **kwargs):
-        with owned_task_join_dependency(task):
+        async with owned_native_wait((task,)):
             return await function(task, *args, **kwargs)
     return joined
 
@@ -147,6 +242,7 @@ def create_owned_task(operation, *, name=None, context=None, retain_originals=Fa
     if admission is None:
         admission = OwnedTaskAdmission()
     gate = None
+    admitted_coordinators = ()
     unstarted_closed = False
     async def run():
         nonlocal started
@@ -156,7 +252,13 @@ def create_owned_task(operation, *, name=None, context=None, retain_originals=Fa
                 if opening is not None:
                     raise opening
             started = True
-            return await operation
+            reset = _OWNED_COORDINATORS.set(tuple(dict.fromkeys(
+                (*_OWNED_COORDINATORS.get(), *admitted_coordinators)
+            )))
+            try:
+                return await operation
+            finally:
+                _OWNED_COORDINATORS.reset(reset)
         except BaseException as error:
             from kestrel_sovereign.execution_custody import (
                 execution_terminal_error,
@@ -302,6 +404,15 @@ def create_owned_task(operation, *, name=None, context=None, retain_originals=Fa
     try:
         task._kestrel_owned_admission = admission
         task.add_done_callback(close_unstarted)
+        # An explicit context narrows the original ownership handoff. Resident
+        # contexts deliberately carry no invocation coordinator. Routing still
+        # cannot enroll anything unless the actual creator is an original member.
+        coordinators = (_OWNED_COORDINATORS.get() if context is None else
+                        context.get(_OWNED_COORDINATORS, ()))
+        admitted_coordinators = tuple(
+            coordinator for coordinator in coordinators
+            if coordinator.admit_owned_task(asyncio.current_task(), task, admission)
+        )
     except BaseException as opening:
         if gate is not None:
             # The payload is still behind its failed gate. Retain this actual
@@ -355,7 +466,8 @@ async def wait_owned_tasks_until(tasks, *, deadline: float):
         if not pending or remaining <= 0:
             break
         try:
-            _, pending = await asyncio.wait(pending, timeout=remaining)
+            async with owned_native_wait(pending):
+                _, pending = await asyncio.wait(pending, timeout=remaining)
         except asyncio.CancelledError as error:
             withdrawal = execution_terminal_error(
                 withdrawal, error, retain_originals=True,
@@ -367,7 +479,7 @@ async def gather_owned(operations, *, cancel_siblings_on_error=True,
                        retirement_resource=None, retain_originals=False,
                        name_prefix: str | None = None,
                        isolate_control_originals=False,
-                       return_when=asyncio.ALL_COMPLETED):
+                       return_when=asyncio.ALL_COMPLETED, work_factory=None):
     """Join accepted children even if later admission or observation fails.
 
     Independent native retirement can disable sibling cancellation: all
@@ -377,6 +489,9 @@ async def gather_owned(operations, *, cancel_siblings_on_error=True,
     receipts. Indexed names are diagnostic only, never a second owner.
     FIRST_COMPLETED races are finite observers: after the first outcome, every
     remaining accepted peer is cancelled and physically joined before return.
+    An explicit native work factory receives lazy operation factories instead
+    of coroutines. It owns gated admission and original-error retention; this
+    gather still owns joining every accepted Task, including a failed gate.
     """
     from kestrel_sovereign.execution_custody import (
         execution_terminal_error,
@@ -388,72 +503,89 @@ async def gather_owned(operations, *, cancel_siblings_on_error=True,
     pending = set()
     primary = None
     first_observed = False
-    try:
-        for index, operation in enumerate(operations):
-            admission = OwnedTaskAdmission()
-            try:
-                children.append(create_owned_task(
-                    operation, retirement_resource=retirement_resource,
-                    retain_originals=retain_originals,
-                    name=f"{name_prefix}:{index}" if name_prefix is not None else None,
-                    admission=admission,
-                ))
-            except BaseException as error:
-                if admission.task is not None:
-                    # Publication failed, not acceptance. This exact gated
-                    # child must be harvested without cancelling away its
-                    # original opening failure.
-                    children.append(admission.task)
-                    outcome = await await_owned_task(admission.task)
-                    error = execution_terminal_error(
-                        error, outcome.error, outcome.cancellation,
-                        retain_originals=retain_originals,
+    accepted_scope = OwnedCallbackScope()
+    async with AsyncExitStack() as parked:
+        await parked.enter_async_context(accepted_scope.wait())
+        try:
+            for index, operation in enumerate(operations):
+                admission = OwnedTaskAdmission()
+                try:
+                    name = f"{name_prefix}:{index}" if name_prefix is not None else None
+                    if work_factory is None:
+                        child = create_owned_task(
+                            operation, retirement_resource=retirement_resource,
+                            retain_originals=retain_originals, name=name, admission=admission,
+                        )
+                    else:
+                        child = work_factory(operation, name=name)
+                        admission.task = child
+                    children.append(child)
+                    accepted_scope.accept(child)
+                except BaseException as error:
+                    if admission.task is not None:
+                        # Publication failed, not acceptance. This exact gated
+                        # child must be harvested without cancelling away its
+                        # original opening failure.
+                        if not children or children[-1] is not admission.task:
+                            children.append(admission.task)
+                        if admission.task not in accepted_scope.tasks:
+                            try:
+                                accepted_scope.accept(admission.task)
+                            except BaseException as publication_error:
+                                error = execution_terminal_error(error, publication_error,
+                                    retain_originals=retain_originals,
+                                    isolate_control_originals=isolate_control_originals)
+                        outcome = await await_owned_task(admission.task)
+                        error = execution_terminal_error(
+                            error, outcome.error, outcome.cancellation,
+                            retain_originals=retain_originals,
+                            isolate_control_originals=isolate_control_originals,
+                        )
+                    error = owned_task_admission_error(
+                        retirement_resource, admission, error,
+                    )
+                    if cancel_siblings_on_error:
+                        raise error
+                    primary = execution_terminal_error(
+                        primary, error, retain_originals=retain_originals,
                         isolate_control_originals=isolate_control_originals,
                     )
-                error = owned_task_admission_error(
-                    retirement_resource, admission, error,
-                )
-                if cancel_siblings_on_error:
-                    raise error
-                primary = execution_terminal_error(
-                    primary, error, retain_originals=retain_originals,
-                    isolate_control_originals=isolate_control_originals,
-                )
-        pending = set(children)
-        while pending:
-            done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
-            first_observed = return_when == asyncio.FIRST_COMPLETED
-            for child in done:
-                error = owned_task_error(child)
-                if error is not None:
-                    raise error
-            if first_observed:
-                break
-    except BaseException as error:
-        primary = execution_terminal_error(
-            primary, error, retain_originals=retain_originals,
+            pending = set(children)
+            while pending:
+                done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
+                first_observed = return_when == asyncio.FIRST_COMPLETED
+                for child in done:
+                    error = owned_task_error(child)
+                    if error is not None:
+                        raise error
+                if first_observed:
+                    break
+        except BaseException as error:
+            primary = execution_terminal_error(
+                primary, error, retain_originals=retain_originals,
+                isolate_control_originals=isolate_control_originals,
+            )
+        finally:
+            accepted_scope.close()
+        if first_observed or (primary is not None and cancel_siblings_on_error):
+            for child in children:
+                if not child.done():
+                    child.cancel()
+        errors = [primary]
+        results = []
+        for child in children:
+            outcome = await await_owned_task(child)
+            results.append(outcome.result)
+            if outcome.error is not None and (not issubclass(type(outcome.error), asyncio.CancelledError) or is_execution_control_error(outcome.error)):
+                errors.append(outcome.error)
+            errors.append(outcome.cancellation)
+        terminal = execution_terminal_error(
+            *errors, retain_originals=retain_originals,
             isolate_control_originals=isolate_control_originals,
         )
-    if first_observed or (primary is not None and cancel_siblings_on_error):
-        for child in children:
-            if not child.done():
-                child.cancel()
-    errors = [primary]
-    results = []
-    for child in children:
-        outcome = await await_owned_task(child)
-        results.append(outcome.result)
-        if outcome.error is not None and (not isinstance(outcome.error, asyncio.CancelledError) or is_execution_control_error(outcome.error)):
-            errors.append(outcome.error)
-        errors.append(outcome.cancellation)
-    terminal = execution_terminal_error(
-        *errors, retain_originals=retain_originals,
-        isolate_control_originals=isolate_control_originals,
-    )
-    if terminal is not None:
-        raise terminal
-    return results
-
+        if terminal is not None:
+            raise terminal
+        return results
 
 class _ConsumerCloseRecord:
     """Whether the consumer of one owned iterator closed it early.
@@ -791,7 +923,8 @@ class OwnedAsyncIterator(Generic[_T]):
                     self._cancel_owner_if_running
                 )
 
-        marker, item = await self._items.get()
+        async with owned_native_wait((self._owner,)):
+            marker, item = await self._items.get()
         if marker is _ITERATOR_INTERRUPTED:
             # Do not join here. The consumer may first publish its bounded Stop
             # acknowledgement; its ``finally`` then calls ``aclose`` and owns
@@ -858,7 +991,7 @@ class OwnedAsyncIterator(Generic[_T]):
         outcome = await await_owned_task(self._owner)
         watcher = await await_owned_task(self._cancellation_owner) if self._cancellation_owner is not None else None
         watcher_error = watcher.error if watcher is not None else None
-        if isinstance(watcher_error, asyncio.CancelledError) and not is_execution_control_error(watcher_error):
+        if issubclass(type(watcher_error), asyncio.CancelledError) and not is_execution_control_error(watcher_error):
             watcher_error = None  # The watcher's private Stop handoff, not reader withdrawal.
         return OwnedTaskOutcome(
             outcome.result,
@@ -899,12 +1032,13 @@ class OwnedAsyncIterator(Generic[_T]):
                 async for item in iterator:
                     if self._stop.is_set():
                         break
-                    await self._items.put((self, item))
-                    self._waiting_for_continue = True
-                    try:
-                        await self._continue.wait()
-                    finally:
-                        self._waiting_for_continue = False
+                    async with owned_native_yield():
+                        await self._items.put((self, item))
+                        self._waiting_for_continue = True
+                        try:
+                            await self._continue.wait()
+                        finally:
+                            self._waiting_for_continue = False
                     self._continue.clear()
                     if self._stop.is_set():
                         break
@@ -937,15 +1071,9 @@ class OwnedAsyncIterator(Generic[_T]):
                 # failure after its final item. Only an initiated close owns a
                 # non-cancellation unwind as cleanup debt; the marker extends
                 # ownership solely to cancellation that interrupted the source.
-                if close_requested and not isinstance(
-                    error,
-                    asyncio.CancelledError,
-                ):
+                if close_requested and not issubclass(type(error), asyncio.CancelledError):
                     self._cleanup_error = error
-                if cancellation_requested and isinstance(
-                    error,
-                    asyncio.CancelledError,
-                ):
+                if cancellation_requested and issubclass(type(error), asyncio.CancelledError):
                     self._interrupted_by_cleanup = True
                     self._items.put_nowait((_ITERATOR_INTERRUPTED, None))
                     return
@@ -992,7 +1120,7 @@ class OwnedAsyncIterator(Generic[_T]):
         from kestrel_sovereign.execution_custody import is_execution_control_error
         if (
             (owner_cancelled_by_close or self._construction_error is not None)
-            and isinstance(outcome.error, asyncio.CancelledError)
+            and issubclass(type(outcome.error), asyncio.CancelledError)
             and self._cleanup_error is None
             and not is_execution_control_error(outcome.error)
         ):

@@ -202,7 +202,7 @@ async def test_cancelled_drain_joins_native_effect_and_retains_receipt(tmp_path,
             await release.wait()
             await db.execute("INSERT INTO effects VALUES (1)")
             raise original
-    child = feature._track_owned_background_task(effect(), name="native") if route == "feature" else manager._track_execution_task(effect(), "original", agent.did)
+    child = feature._track_owned_background_task(effect(), name="native") if route == "feature" else manager._track_execution_task(effect, "original", agent.did)
     # No durable A2A task was submitted: exercise the actual owned drain rather
     # than fabricating a stored task to match this internal native effect.
     manager._execution_authorities.pop(child, None)
@@ -504,7 +504,7 @@ async def test_a2a_cancel_group_cannot_skip_other_native_workers(tmp_path, kind)
         await db.execute("CREATE TABLE IF NOT EXISTS cancellation_receipts(id INTEGER PRIMARY KEY)")
         raise original
     manager.cancel_task = cancel_task
-    workers = [manager._track_execution_task(effect(i), str(i), agent.did) for i in range(2)]
+    workers = [manager._track_execution_task(lambda index=i: effect(index), str(i), agent.did) for i in range(2)]
     try:
         await asyncio.gather(*(event.wait() for event in entered))
         outcome = await join(create_owned_task(manager.drain_execution_tasks(cancel=True)))

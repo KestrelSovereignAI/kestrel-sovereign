@@ -13,7 +13,7 @@ from kestrel_sovereign.constitution.genesis_audit import (
     supersede_genesis_audit,
 )
 from kestrel_sovereign.storage.async_storage import AsyncStorage
-from tests.unit.test_non_streaming_turn_privacy_span import _turn_agent
+from tests.unit.test_non_streaming_turn_privacy_span import _configure_turn_probe
 from tests.integration.test_constitution_refusal_races import _agent
 from kestrel_sovereign.storage.async_graph_store import GraphNode
 
@@ -22,7 +22,7 @@ from kestrel_sovereign.storage.async_graph_store import GraphNode
 @pytest.mark.dual_backend
 @pytest.mark.parametrize("streaming", [False, True])
 async def test_queued_cognition_cannot_use_a_new_pending_governing_hash(
-    db_backend, streaming
+    db_backend, streaming, native_tool_effect_agent
 ):
     identity = "did:test:queued-genesis:" + uuid4().hex
     storage = AsyncStorage(backend=db_backend, agent_id=identity)
@@ -54,7 +54,9 @@ async def test_queued_cognition_cannot_use_a_new_pending_governing_hash(
         )
         await native._anchor_constitution_governance(digest)
 
-        agent = _turn_agent(identity)
+        agent = _configure_turn_probe(await native_tool_effect_agent(
+            did=identity, borrowed_database=storage.db))
+        assert agent.tool_effect_store.database is storage.db
         agent.storage = agent._raw_storage = storage
         agent._genesis_audit_cognition_block = (
             ConstitutionMixin._genesis_audit_cognition_block.__get__(agent)

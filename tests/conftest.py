@@ -8,7 +8,7 @@ This module provides reusable fixtures for:
 - Common test utilities
 """
 
-from tests.shared.native_shutdown_budget import shutdown_fixture_agent
+from kestrel_sovereign.testing.native_shutdown_budget import shutdown_fixture_agent
 import pytest
 import tempfile
 import shutil

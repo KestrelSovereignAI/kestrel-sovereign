@@ -8,6 +8,10 @@ from kestrel_sovereign.execution_custody import ExecutionAuthorityError
 
 
 def _original_result_profile(journal):
+    from kestrel_sovereign.storage.original_tool_effect_finish import _OriginalToolEffectFinish
+    if type(journal) is _OriginalToolEffectFinish:
+        from kestrel_sovereign.tool_effect_store import TOOL_EFFECT_OPERATIONS_COLUMNS
+        return 'tool_effect_operations', TOOL_EFFECT_OPERATIONS_COLUMNS
     from kestrel_sovereign.signals.outcome_custody import _OriginalSignalOutcome
     from kestrel_sovereign.storage.original_action_result import _OriginalActionResult
     if type(journal) is _OriginalSignalOutcome:
