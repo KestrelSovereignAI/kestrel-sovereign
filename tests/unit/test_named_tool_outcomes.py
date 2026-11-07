@@ -66,6 +66,8 @@ async def test_inline_delivery_failure_after_real_audit_keeps_one_original_recei
     deferred_boundary, monkeypatch,  # noqa: F811 - imported pytest fixture
 ):
     async def operation():
+        from kestrel_sovereign.llm.codex_adapter import CodexAdapter
+
         b = deferred_boundary
         b.policy.release.set()
         native_emit = b.host._reemit_envelope_parts
@@ -74,22 +76,23 @@ async def test_inline_delivery_failure_after_real_audit_keeps_one_original_recei
                 raise RuntimeError('private-after-audit-delivery-fault')
             return native_emit(envelope)
         monkeypatch.setattr(b.host, '_reemit_envelope_parts', fail_after_ack)
+        executed, terminal = [], []
+        handler = CodexAdapter()._make_tool_call_handler(
+            b.host._make_inline_tool_executor('deferred-owned-session'),
+            't', frozenset({b.binding.name}), executed_log=executed, terminal_errors=terminal)
         with part_collector(host=b.host, session_id='deferred-owned-session'):
-            arguments, result = await b.host._make_inline_tool_executor('deferred-owned-session')(
-                b.binding.name, {})
-        assert result['success'] is False and 'Do not replay' in result['error']
-        assert 'private-after-audit' not in json.dumps(result)
+            with pytest.raises(ResourceOutcomeUnknown) as caught:
+                await handler({'threadId': 't', 'name': b.binding.name, 'arguments': {}})
+            with pytest.raises(ResourceOutcomeUnknown) as repeated:
+                await handler({'threadId': 't', 'name': b.binding.name, 'arguments': {}})
+        assert repeated.value is caught.value
+        assert terminal == [caught.value] and executed == []
         assert b.tool.executions == [{}] and b.tool.publications == ['published-once']
         rows = await b.backend.fetch_all('SELECT result_status FROM a2a_tool_dispatches')
         assert [row[0] for row in rows] == ['success']
-        await b.host._append_executed_tool_breadcrumbs([], [{
-            'id': 'owned-inline-after-audit', 'name': b.binding.name,
-            'arguments': arguments, 'result': result,
-        }], session_id='deferred-owned-session')
-        rows = await b.backend.fetch_all('SELECT result_status FROM a2a_tool_dispatches')
-        assert [row[0] for row in rows] == ['success']
 
-    await drive_native(deferred_boundary.host, operation)
+    with pytest.raises(ResourceOutcomeUnknown):
+        await drive_native(deferred_boundary.host, operation)
 
 
 
@@ -124,6 +127,7 @@ async def test_codex_uses_host_uncertainty_before_stale_user_denial(host, audite
 @pytest.mark.asyncio
 async def test_codex_audit_uncertainty_latches_without_becoming_authority_loss(deferred_boundary):  # noqa: F811 - imported pytest fixture
     await deferred_boundary.backend.execute('DROP TABLE a2a_tool_dispatches')
+    observed = []
 
     async def operation():
         from kestrel_sovereign.execution_custody import ToolAuditUnconfirmedError, is_execution_control_error
@@ -138,6 +142,7 @@ async def test_codex_audit_uncertainty_latches_without_becoming_authority_loss(d
         )
         with pytest.raises(ToolAuditUnconfirmedError) as caught:
             await handler({'threadId': 't', 'name': b.binding.name, 'arguments': {}})
+        observed.append(caught.value)
         assert not is_execution_control_error(caught.value)
         assert terminal == [caught.value] and executed == []
         assert b.tool.executions == [{}] and b.tool.publications == []
@@ -146,7 +151,9 @@ async def test_codex_audit_uncertainty_latches_without_becoming_authority_loss(d
         assert repeated.value is caught.value
         assert b.tool.executions == [{}] and executed == []
 
-    await drive_native(deferred_boundary.host, operation)
+    with pytest.raises(ResourceOutcomeUnknown) as root:
+        await drive_native(deferred_boundary.host, operation)
+    assert observed[0] in execution_evidence_carriers(root.value)
 
 
 @pytest.mark.asyncio

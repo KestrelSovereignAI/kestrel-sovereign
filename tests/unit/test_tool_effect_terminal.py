@@ -11,7 +11,7 @@ from kestrel_sovereign.execution_custody import (
 )
 from kestrel_sdk.resources import ResourceConflict
 from kestrel_sovereign.tool_effect_store import ToolEffectAttemptSuperseded
-from tests.unit.test_tool_effect_execution import admit, owner
+from tests.unit.test_tool_effect_execution import admit, owner as owner
 
 
 pytestmark = [pytest.mark.asyncio, pytest.mark.timeout(30)]

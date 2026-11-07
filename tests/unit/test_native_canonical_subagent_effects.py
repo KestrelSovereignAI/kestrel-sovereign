@@ -11,7 +11,7 @@ from kestrel_sovereign.features.base import Feature, tool
 from kestrel_sovereign.features.subagent_dispatch import ensure_subagent_dispatch
 from kestrel_sovereign.tool_effect_store import ToolEffectReconciliationRequired
 from kestrel_sovereign.execution_custody import execution_evidence_carriers
-from tests.unit.test_tool_effect_bound_operation import bound_operation
+from tests.unit.test_tool_effect_bound_operation import bound_operation as bound_operation
 from tests.unit.test_tool_effect_execution import owner
 from tests.unit.test_tool_effect_invocation import governed
 from tests.utils.codex_inline import OwnedCallbackReader

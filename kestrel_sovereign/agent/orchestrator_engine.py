@@ -1002,6 +1002,12 @@ async def _run_tool_execution(host, operation, *, execution, dispatch_meta,
     try:
         return await operation()
     except Exception as error:
+        if execution.returned:
+            # All producers retain completion uncertainty before either an
+            # inline recovery or terminal propagation can hide it from Root.
+            from kestrel_sovereign.tools.effect_journal import record_tool_effect_completion_failure
+
+            error = record_tool_effect_completion_failure(host, error)
         if is_tool_execution_terminal_error(error):
             if execution.started:
                 mark_current_invocation_effect_completed(session_id)
@@ -1012,7 +1018,7 @@ async def _run_tool_execution(host, operation, *, execution, dispatch_meta,
                 except BaseException as audit_error:
                     raise execution_terminal_error(error, audit_error,
                         retain_originals=True, isolate_control_originals=True)
-            raise
+            raise error
         if not recover_audited:
             _raise_terminal_tool_error(error, dispatch_meta)
         unknown = execution.returned or (

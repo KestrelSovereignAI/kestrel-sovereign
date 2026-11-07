@@ -13,7 +13,7 @@ from kestrel_sdk.tools.result import ToolResult
 from kestrel_sovereign.a2a.projections import embedded_json_value
 from kestrel_sovereign.features.base import Feature, tool
 from kestrel_sovereign.tools.effect_journal import bind_tool_effect_turn
-from tests.unit.test_tool_effect_execution import admit, owner
+from tests.unit.test_tool_effect_execution import admit, owner as owner
 
 
 class NativeFeature(Feature):

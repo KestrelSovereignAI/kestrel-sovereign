@@ -21,7 +21,7 @@ from kestrel_sovereign.tools.effect_invocation import (
 from kestrel_sovereign.tools.effect_journal import (
     ToolEffectOutcomeUnconfirmed, current_tool_effect_turn, execute_tool_effect,
 )
-from tests.unit.test_tool_effect_execution import owner
+from tests.unit.test_tool_effect_execution import owner as owner
 
 
 pytestmark = pytest.mark.timeout(30)

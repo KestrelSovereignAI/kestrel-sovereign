@@ -25,7 +25,7 @@ from kestrel_sovereign.tools.effect_journal import (
 )
 from kestrel_sovereign.turn_scope import capture_turn_scope
 from tests.unit.test_cleanup_task_admission import _partial_native_agent
-from kestrel_sovereign.testing.fixtures import native_tool_effect_agent
+from kestrel_sovereign.testing.fixtures import native_tool_effect_agent as native_tool_effect_agent
 
 
 pytestmark = pytest.mark.timeout(30)

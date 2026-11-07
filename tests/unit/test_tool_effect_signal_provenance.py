@@ -22,7 +22,7 @@ from kestrel_sovereign.signals.effect_provenance import signal_effect_provenance
 from kestrel_sovereign.signals.sources import a2a_task_submitted, channels
 from kestrel_sovereign.tools.effect_journal import execute_tool_effect
 from tests.unit.test_durable_signal_delivery import _channel_signal
-from tests.unit.test_tool_effect_execution import owner
+from tests.unit.test_tool_effect_execution import owner as owner
 from tests.unit.test_tool_effect_invocation import governed
 from tests.unit.test_a2a_native_input_fencing import private_event
 

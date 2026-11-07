@@ -20,7 +20,7 @@ from kestrel_sovereign.features.security.permissions import PermissionLevel, Per
 from kestrel_sovereign.storage.db.sqlite import SQLiteBackend
 from kestrel_sovereign.agent import orchestrator_engine
 from kestrel_sovereign.security.input_guardrails import MAX_TOOL_ARG_LENGTH
-from kestrel_sovereign.testing.fixtures import native_tool_effect_agent
+from kestrel_sovereign.testing.fixtures import native_tool_effect_agent as native_tool_effect_agent
 from tests.unit.test_tool_effect_invocation import governed
 
 

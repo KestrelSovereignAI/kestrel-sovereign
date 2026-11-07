@@ -351,6 +351,10 @@ settles that same claim as UNCONFIRMED and fences the turn. After RETURNED_OK,
 native result serialization or persistence failures preserve the acknowledged
 claim and its first audit receipt. Shared completion handling records uncertainty
 on the original turn, retains the original exception and prevents another effect.
+Model, named and inline execution use that same boundary before recovery or
+terminal propagation. Inline adapters receive the original typed uncertainty
+carrier immediately; neither a later effect nor successful root completion is
+permitted. Acknowledged claim and audit states remain unchanged.
 Opaque Feature task handlers validate required fields and canonical Task outcome
 invariants before acknowledging their claim. A malformed reply produces a FAILED
 Task with `outcome_unknown` from the admitted baseline for the recipient writer;

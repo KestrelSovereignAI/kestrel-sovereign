@@ -407,12 +407,12 @@ async def test_non_dictionary_policy_replacement_never_restores_prior_data(bound
     peer.policy.replace_with_none = True
     peer.policy.release.set()
     with part_collector():
-        if path == "chat":
-            result = await peer.invoke(path)
-            assert "data" not in result and result["success"] is False
-        else:
-            with pytest.raises((TypeError, ResourceOutcomeUnknown)):
-                await peer.invoke(path)
+        with pytest.raises(ResourceOutcomeUnknown) as caught:
+            await peer.invoke(path)
+        from kestrel_sovereign.execution_custody import execution_evidence_carriers
+
+        assert any(isinstance(error, TypeError)
+            for error in execution_evidence_carriers(caught.value))
         assert peer.tool.executions == [{}] and not peer.tool.publications
         assert [part["type"] for part in drain_parts()] == ["original_part", "post_policy"]
         with pytest.raises(RuntimeError, match="already finalized or transferred"):
@@ -868,8 +868,11 @@ async def test_observer_failure_after_confirmed_dispatch_is_explicitly_not_repla
         return await observe(**kwargs)
 
     monkeypatch.setattr(peer.host.observability_store, "log_tool_response", response)
-    with pytest.raises(ResourceOutcomeUnknown, match="Tool completed.*Do not replay") as captured:
+    with pytest.raises(ResourceOutcomeUnknown) as captured:
         await peer.invoke(path)
+    from kestrel_sovereign.tools.execution_outcome import TOOL_OUTCOME_UNCONFIRMED
+
+    assert str(captured.value) == TOOL_OUTCOME_UNCONFIRMED
     assert captured.value.__cause__ is original
     rows = await peer.backend.fetch_all("SELECT result_status FROM a2a_tool_dispatches")
     assert [tuple(row) for row in rows] == [("success",)]
@@ -1455,3 +1458,120 @@ def test_serializer_refuses_a_deferred_result_at_any_depth():
     assert published == []
     assert deferred.finalize(deferred, allowed=True).withheld is False
     assert published == ["published"]
+
+
+def _install_completed_delivery_failure(boundary, monkeypatch, witness, original):
+    """One actual file effect, followed by a fault after its SQL audit ACK."""
+    native_execute = boundary.tool.execute
+    async def effect(**arguments):
+        with witness.open("a") as stream:
+            stream.write("actual-effect\n")
+        return await native_execute(**arguments)
+    monkeypatch.setattr(boundary.tool, "execute", effect)
+    native_emit = boundary.host._reemit_envelope_parts
+    def fail_after_ack(envelope):
+        if any(part.get("type") == "private_view" for part in envelope.get("parts", [])):
+            raise original
+        return native_emit(envelope)
+    monkeypatch.setattr(boundary.host, "_reemit_envelope_parts", fail_after_ack)
+
+
+@pytest.mark.parametrize("route", ["inline", "codex", "reader", "named", "chat"])
+@pytest.mark.parametrize("failure", ["ordinary", "conflict", "unknown"])
+async def test_completed_delivery_failure_fences_original_turn_before_another_effect(
+    boundary, monkeypatch, tmp_path, route, failure,
+):
+    from contextvars import Context
+    from kestrel_sdk.resources import ResourceConflict, ResourceOutcomeUnknown
+    from kestrel_sovereign.execution_custody import execution_evidence_carriers
+    from kestrel_sovereign.llm.codex_adapter import CodexAdapter
+    from kestrel_sovereign.tools.effect_journal import current_tool_effect_turn
+
+    b = boundary
+    b.policy.release.set()
+    witness = tmp_path / "completed-delivery-effects"
+    original = {"ordinary": RuntimeError, "conflict": ResourceConflict,
+                "unknown": ResourceOutcomeUnknown}[failure]("private-completion-source")
+    _install_completed_delivery_failure(b, monkeypatch, witness, original)
+    reader = PreTurnReader()
+    if route == "reader":
+        await asyncio.create_task(reader.start(), context=Context())
+    seen = {}
+    async def operation():
+        executor = b.host._make_inline_tool_executor("deferred-owned-session")
+        handler = CodexAdapter()._make_tool_call_handler(
+            executor, "owned-thread", frozenset({b.binding.name}), terminal_errors=[])
+        async def invoke():
+            if route == "inline":
+                return await executor(b.binding.name, {})
+            if route == "codex":
+                return await handler({"threadId": "owned-thread", "callId": uuid4().hex,
+                    "name": b.binding.name, "arguments": {}})
+            if route == "reader":
+                return await reader.call(executor, b.binding.name)
+            if route == "named":
+                return await b.host.execute_named_tool(b.binding.name, {},
+                    session_id="deferred-owned-session", source="owned-test")
+            return await b.host._dispatch_tool_call(
+                ToolCall(id=uuid4().hex, name=b.binding.name, arguments={}),
+                features_by_tool_name={}, known_tools=b.host._known_tool_names(),
+                messages=[], iteration=0, user_message=None,
+                session_id="deferred-owned-session")
+        with part_collector(host=b.host, session_id="deferred-owned-session"):
+            try:
+                seen["first_result"] = await invoke()
+            except ResourceOutcomeUnknown as error:
+                seen["first_error"] = error
+            seen["unconfirmed"] = tuple(current_tool_effect_turn(b.host).unconfirmed)
+            try:
+                seen["second_result"] = await invoke()
+            except ResourceOutcomeUnknown as error:
+                seen["second_error"] = error
+    try:
+        try:
+            await _drive_native(b.host, operation)
+        except ResourceOutcomeUnknown as error:
+            seen["root_error"] = error
+    finally:
+        if route == "reader":
+            await reader.stop()
+    assert witness.read_text() == "actual-effect\n", (
+        "Completed delivery failure allowed another physical effect in its original turn")
+    assert any(original is item for error in seen["unconfirmed"]
+        for item in execution_evidence_carriers(error)), "Original completion uncertainty was not retained"
+    assert "first_error" in seen, "Completed delivery uncertainty did not reach the native terminal handler"
+    assert "second_error" in seen and "second_result" not in seen
+    assert "root_error" in seen, "Original input narrated successful completion after delivery failed"
+    assert original in execution_evidence_carriers(seen["root_error"])
+    assert [tuple(row) for row in await b.backend.fetch_all(
+        "SELECT state FROM tool_effect_claims")] == [("RETURNED_OK",)]
+    rows = await b.backend.fetch_all("SELECT result_status,error_class FROM a2a_tool_dispatches")
+    assert [tuple(row) for row in rows] == [("success", None)]
+
+
+async def test_bound_delivery_failure_keeps_original_external_intent_fenced(
+    boundary, monkeypatch, tmp_path,
+):
+    from kestrel_sdk.resources import ResourceOutcomeUnknown
+    from kestrel_sovereign.tool_effect_store import ToolEffectReconciliationRequired
+
+    b = boundary
+    b.policy.release.set()
+    witness = tmp_path / "bound-completed-delivery-effects"
+    original = RuntimeError("private-bound-completion-source")
+    _install_completed_delivery_failure(b, monkeypatch, witness, original)
+    # Public binding calls each own an explicit external intention, rather
+    # than silently borrowing a surrounding model input. Retry the SAME one.
+    operation_id = uuid4().hex
+    with part_collector(host=b.host, session_id="deferred-owned-session"):
+        with pytest.raises(ResourceOutcomeUnknown):
+            await b.binding.invoke({}, session_id="deferred-owned-session",
+                source="owned-test", operation_id=operation_id)
+        with pytest.raises(ToolEffectReconciliationRequired):
+            await b.binding.invoke({}, session_id="deferred-owned-session",
+                source="owned-test", operation_id=operation_id)
+    assert witness.read_text() == "actual-effect\n"
+    assert [tuple(row) for row in await b.backend.fetch_all(
+        "SELECT state FROM tool_effect_claims")] == [("RETURNED_OK",)]
+    assert [tuple(row) for row in await b.backend.fetch_all(
+        "SELECT result_status,error_class FROM a2a_tool_dispatches")] == [("success", None)]

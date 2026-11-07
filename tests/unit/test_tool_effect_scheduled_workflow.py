@@ -17,7 +17,7 @@ from kestrel_sovereign.features.scheduler.runner import (
     SCHEDULER_PROTOCOL_VERSION, SchedulerRunner, get_current_scheduler_execution,
 )
 from kestrel_sovereign.features.tasks.feature import TaskFeature
-from tests.unit.test_tool_effect_execution import owner
+from tests.unit.test_tool_effect_execution import owner as owner
 from tests.utils.native_a2a import manager_for
 from tests.utils.scheduler_ticks import tick_and_settle
 

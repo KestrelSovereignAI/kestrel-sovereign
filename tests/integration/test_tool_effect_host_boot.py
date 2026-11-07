@@ -9,7 +9,7 @@ import uuid
 import pytest
 
 from tests.integration.test_mcp_permission_host_restart import (
-    host_campaign, host_client, native_host, observe_registry,
+    host_campaign as host_campaign, host_client, native_host, observe_registry,
 )
 
 

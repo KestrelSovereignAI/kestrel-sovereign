@@ -11,7 +11,7 @@ from kestrel_sovereign.agent.invocation import current_invocation_id
 from kestrel_sovereign.tool_effect_store import (
     ToolEffectOperationConflict, ToolEffectReconciliationRequired,
 )
-from tests.unit.test_tool_effect_execution import owner
+from tests.unit.test_tool_effect_execution import owner as owner
 
 
 pytestmark = [pytest.mark.asyncio, pytest.mark.timeout(30)]

@@ -2,7 +2,7 @@
 import asyncio
 
 import pytest
-from tests.unit.test_tool_effect_bound_operation import owner, bound_operation
+from tests.unit.test_tool_effect_bound_operation import owner as owner, bound_operation as bound_operation
 
 from kestrel_sovereign._async_ownership import await_owned_task, create_owned_task, gather_owned, owned_task_error
 from kestrel_sovereign.storage.privacy_wrapper import ReentrantTransitionLock, bind_transition_lock_reentry

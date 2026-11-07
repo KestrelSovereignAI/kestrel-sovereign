@@ -9,7 +9,7 @@ from kestrel_sovereign._async_ownership import (
     create_owned_task,
     gather_owned,
 )
-from tests.unit.test_tool_effect_execution import owner
+from tests.unit.test_tool_effect_execution import owner as owner
 
 
 @pytest.mark.asyncio

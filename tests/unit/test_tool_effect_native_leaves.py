@@ -12,9 +12,9 @@ from kestrel_sdk.resources import ResourceConflict
 from kestrel_sovereign.a2a.stores.unified.observability_store import ObservabilityStore
 from kestrel_sovereign.features.base import Feature, tool
 from kestrel_sovereign.tool_effect_store import ToolEffectReconciliationRequired
-from tests.unit.test_tool_effect_execution import owner
+from tests.unit.test_tool_effect_execution import owner as owner
 from tests.unit.test_tool_effect_invocation import governed
-from tests.unit.test_tool_effect_bound_operation import bound_operation
+from tests.unit.test_tool_effect_bound_operation import bound_operation as bound_operation
 
 
 pytestmark = [pytest.mark.asyncio, pytest.mark.timeout(30)]

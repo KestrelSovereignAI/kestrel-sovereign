@@ -333,7 +333,6 @@ class _AllowAllHooks:
 
 
 from tests.utils.native_tool_effects import drive_native
-from kestrel_sovereign.features.base import Feature
 
 
 async def _dispatch_agent(*, native_tool_effect_agent):

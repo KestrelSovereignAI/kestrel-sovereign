@@ -10,7 +10,7 @@ import asyncio
 import pytest
 from dataclasses import dataclass
 from unittest.mock import MagicMock
-from tests.unit.test_tool_effect_execution import owner
+from tests.unit.test_tool_effect_execution import owner as owner
 
 from kestrel_sovereign.agent.orchestrator_engine import (
     OrchestratorEngineMixin,
