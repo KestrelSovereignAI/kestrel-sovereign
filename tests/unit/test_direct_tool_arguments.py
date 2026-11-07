@@ -683,6 +683,21 @@ class _ObservabilityStore(ObservabilityStore):
         self.responses.append(kwargs)
 
 
+class _ExposedToolsFeature(SdkFeature):
+    tool_description = "Original argument-test feature tools"
+
+    def __init__(self, name, tools):
+        super().__init__(None)
+        self.name = name
+        self._tools = tools
+
+    async def initialize(self):
+        pass
+
+    def get_tools(self):
+        return self._tools
+
+
 @pytest.fixture()
 async def orchestrator(native_tool_effect_agent):
     """Real partial Agent, SQLite, journal and lifecycle; no model or READY claim."""
@@ -691,6 +706,8 @@ async def orchestrator(native_tool_effect_agent):
     async def create(*, direct_tools=None, features=None, agent=None):
         if agent is None:
             agent = await native_tool_effect_agent(did='did:test:argument-' + uuid4().hex)
+        for feature in (features or {}).values():
+            feature.agent = agent
         agent._direct_tools = dict(direct_tools or {})
         agent._tool_to_feature = {}
         agent.audit = _AuditStore()
@@ -875,7 +892,7 @@ async def test_chat_path_still_reports_a_tool_that_raises(orchestrator, ):
 @pytest.mark.asyncio
 async def test_inline_executor_path_refuses_an_unknown_argument(orchestrator, ):
     tool = _SchemaTool("get_pull_request", "owner", "repo", "pull_number")
-    feature = SimpleNamespace(name="GitHubFeature", get_tools=lambda: [tool])
+    feature = _ExposedToolsFeature("GitHubFeature", [tool])
     agent = await orchestrator(features={"GitHubFeature": feature})
 
     result = await _inline_dispatch(agent,
@@ -929,7 +946,7 @@ async def _dispatch_isolated(orchestrator, path: str, tool: IsolatedFeatureTool,
     if path == "chat":
         agent = await orchestrator(direct_tools={tool.name: tool})
         return agent, await _dispatch_direct(agent, tool.name, dict(args))
-    feature = SimpleNamespace(name="IsolatedFetchFeature", get_tools=lambda: [tool])
+    feature = _ExposedToolsFeature("IsolatedFetchFeature", [tool])
     agent = await orchestrator(features={"IsolatedFetchFeature": feature})
     return agent, await _inline_dispatch(agent,
         tool.name, dict(args), session_id="s-3396", source="codex_app_server",
@@ -993,20 +1010,21 @@ async def _chat_dispatch(agent, tool_name: str, arguments: dict) -> tuple[Any, l
     return await invoke(agent, {'tool': tool_name, 'arguments': arguments})
 
 
-def _github_feature(*tools):
-    return SimpleNamespace(
-        name="GitHubFeature",
-        tool_name="github",
-        enabled=True,
-        get_tools=lambda: list(tools),
-    )
+class _GitHubToolsFeature(_ExposedToolsFeature):
+    tool_name = "github"
+
+
+def _github_feature(agent, *tools):
+    feature = _GitHubToolsFeature("GitHubFeature", list(tools))
+    feature.agent = agent
+    return feature
 
 
 @pytest.mark.asyncio
 async def test_a_promoted_tool_called_with_task_runs_without_it(chat_agent):
     """The ``get_github_issue(task=...)`` case from the report."""
     tool = _SchemaTool("get_github_issue", "owner", "repo", "number")
-    chat_agent.features["GitHubFeature"] = _github_feature(tool)
+    chat_agent.features["GitHubFeature"] = _github_feature(chat_agent, tool)
     chat_agent.register_dynamic_tools("github", [tool])
 
     result, _ = await _chat_dispatch(
@@ -1023,7 +1041,7 @@ async def test_a_promoted_tool_called_with_task_runs_without_it(chat_agent):
 async def test_an_unpromoted_tool_refuses_an_unknown_argument(chat_agent):
     """The registered-but-unpromoted branch reaches the same check."""
     tool = _SchemaTool("get_pull_request", "owner", "repo", "pull_number")
-    chat_agent.features["GitHubFeature"] = _github_feature(tool)
+    chat_agent.features["GitHubFeature"] = _github_feature(chat_agent, tool)
 
     result, messages = await _chat_dispatch(
         chat_agent, tool.name, {"owner": "o", "repo": "r", "pr_number": "12"}

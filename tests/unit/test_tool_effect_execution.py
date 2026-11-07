@@ -400,3 +400,29 @@ async def test_native_fixture_refuses_two_primary_database_owners(owner, native_
             connected_backend=database.backend, borrowed_database=database)
     assert database.backend.is_connected
     assert await database.fetchone('SELECT COUNT(*) FROM tool_effect_keys') == before
+
+
+@pytest.mark.asyncio
+async def test_prepared_native_registration_keeps_its_original_generation(owner, tmp_path):
+    from kestrel_sovereign.agent.tool_allowlist import bump_registry_generation, registry_generation
+    from kestrel_sovereign.tools.effect_journal import bind_tool_effect_registration
+    from tests.utils.native_tool_effects import drive_native
+
+    witness = tmp_path / 'stale-prepared-generation-effect'
+    selected_generation = registry_generation(owner)
+    async def effect():
+        witness.write_text('stale prepared generation executed')
+        return {'success': True}
+
+    async def operation():
+        with bind_tool_effect_registration(owner, selected_generation, lambda: None):
+            bump_registry_generation(owner)
+            try:
+                await execute_tool_effect(owner, registration='prepared-file', arguments={}, execute=effect)
+            except ResourceConflict:
+                pass
+
+    await drive_native(owner, operation)
+    assert not witness.exists(), 'Prepared native registration refreshed its original generation'
+    assert await owner.tool_effect_store.database.fetchone(
+        'SELECT state FROM tool_effect_claims') == ('NOT_EXECUTED',)
