@@ -88,3 +88,28 @@ async def test_native_fixture_retires_its_patches_before_the_outer_provider_fixt
             await lifetime.aclose()
         assert service.load_section is outer, 'Native fixture patches outlived their original lifetime'
     assert service.load_section is original
+
+
+@pytest.mark.timeout(30)
+def test_native_fixture_is_available_to_integration_without_plugin_autoload(tmp_path):
+    """The native CI tier must not depend on package entry-point autoload."""
+    from pathlib import Path
+    import subprocess
+    import sys
+
+    repository = Path(__file__).resolve().parents[2]
+    environment = dict(os.environ, PYTEST_DISABLE_PLUGIN_AUTOLOAD="1")
+    result = subprocess.run(
+        [sys.executable, "-B", "-m", "pytest", "-q",
+         "-p", "pytest_asyncio.plugin", "-p", "pytest_timeout",
+         "-p", "no:cacheprovider", "-o", "addopts=",
+         "--basetemp=" + str(tmp_path / "native-fixture-child"),
+         "tests/integration/test_mcp_permission_boundary.py::"
+         "test_post_persistence_disable_reports_the_real_saved_connection_and_restore[remote]"],
+        cwd=repository, env=environment, capture_output=True, text=True, timeout=20,
+    )
+    assert result.returncode == 0, (
+        "Native integration fixture registration failed without plugin autoload:\n"
+        + result.stdout + result.stderr
+    )
+    assert "1 passed" in result.stdout

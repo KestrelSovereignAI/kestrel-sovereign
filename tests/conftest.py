@@ -29,6 +29,12 @@ from tests.shared import host_runtime_isolation as _host_runtime_isolation
 
 _SESSION_ISOLATION_ROOT = _host_runtime_isolation.install_session_guard()
 
+# Native CI disables third-party pytest autoload. Bind the public factory at
+# the repository root so every test tier receives the same real Agent fixture.
+from kestrel_sovereign.testing.fixtures import (
+    native_tool_effect_agent as native_tool_effect_agent,
+)
+
 # Import shared test infrastructure for resource cleanup
 from tests.shared.pytest_cleanup_plugin import (
     pytest_configure as _cleanup_configure,
