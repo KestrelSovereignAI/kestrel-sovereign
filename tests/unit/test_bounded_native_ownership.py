@@ -10,7 +10,10 @@ from kestrel_sovereign._async_ownership import (
     PendingOwnedTask, await_owned_task, create_owned_task, run_blocking_operation, owned_task_error,
     wait_owned_or_pending,
 )
-from kestrel_sovereign.execution_custody import ExecutionAuthorityError, ExecutionCommitOutcomeError
+from kestrel_sovereign.execution_custody import (
+    ExecutionAuthorityError, ExecutionCommitOutcomeError,
+    execution_evidence_carriers, execution_observer_cancellations, execution_native_source_error,
+)
 from kestrel_sovereign.storage.privacy_wrapper import ReentrantTransitionLock, bind_transition_lock_reentry
 
 
@@ -53,7 +56,8 @@ async def test_bounded_wait_parks_its_original_reentrant_writer(depth):
 
 
 @pytest.mark.asyncio
-async def test_bounded_writer_restores_only_after_original_cancelled_child_settles():
+@pytest.mark.parametrize("repeat", [False, True])
+async def test_bounded_writer_restores_only_after_original_cancelled_child_settles(repeat):
     lock = ReentrantTransitionLock()
     entered, release, sibling_entered = asyncio.Event(), asyncio.Event(), asyncio.Event()
     children, observations = [], []
@@ -87,9 +91,12 @@ async def test_bounded_writer_restores_only_after_original_cancelled_child_settl
         admitted = bool(completed)
         if admitted:
             peer = create_owned_task(sibling())
-            owner.cancel()
+            owner.cancel("first observer cancellation")
             await asyncio.sleep(.05)
             held = not owner.done() and not sibling_entered.is_set()
+            if repeat:
+                owner.cancel("cancellation during original writer restoration")
+                await asyncio.sleep(0)
     finally:
         release.set()
         if not entered.is_set() and not owner.done():
@@ -102,12 +109,144 @@ async def test_bounded_writer_restores_only_after_original_cancelled_child_settl
             await await_owned_task(peer)
     assert admitted, "bounded observation did not park the original privacy writer for its accepted child"
     assert held, "bounded observation resumed its writer before the original child settled"
+    assert children[0].done() and owned_task_error(children[0]) is original
+    assert observations, "restoration cancellation bypassed the original native outcome"
     result, restored = observations[0]
     assert restored and children[0].done() and sibling_entered.is_set()
     assert not isinstance(result, PendingOwnedTask), "bounded observation returned pending after original physical settlement"
-    assert result.error is owned_task_error(children[0]) is original
+    assert any(error is original for error in execution_evidence_carriers(result.error))
     assert isinstance(result.cancellation, asyncio.CancelledError)
+    assert result.cancellation.args == ("first observer cancellation",)
+    if repeat:
+        assert any(error.args == ("cancellation during original writer restoration",)
+            for error in execution_observer_cancellations(result.error))
+    else:
+        assert result.error is original
     assert settled.error is None and settled.cancellation is None
+    assert not lock.locked() and not lock._native_work and not lock._admissions
+
+
+@pytest.mark.asyncio
+async def test_still_pending_native_owner_retains_restoration_withdrawal():
+    lock = ReentrantTransitionLock()
+    entered, release_writer, release_child, observed = (asyncio.Event() for _ in range(4))
+    children, results = [], []
+
+    async def native_writer():
+        entered.set()
+        await release_writer.wait()
+
+    async def child():
+        writer = lock.start_owned_native_work(native_writer)
+        children.append(writer)
+        await await_owned_task(writer)
+        await release_child.wait()
+        return "physically settled later"
+
+    async def observer():
+        async with lock:
+            native = lock.start_owned_native_work(child, acquire_span=False)
+            children.append(native)
+            result = await wait_owned_or_pending(native, cancellation_grace=.03)
+            results.append(result)
+            observed.set()
+
+    owner = create_owned_task(observer())
+    try:
+        await asyncio.wait_for(entered.wait(), .3)
+        owner.cancel("first pending observer cancellation")
+        await asyncio.sleep(.05)
+        owner.cancel("pending writer restoration cancellation")
+        await asyncio.sleep(0)
+        release_writer.set()
+        await asyncio.wait_for(observed.wait(), .3)
+        pending, = results
+        assert isinstance(pending, PendingOwnedTask) and not pending.task.done()
+        assert pending.task.cancelling() == 1
+        assert pending.cancellation.args == ("first pending observer cancellation",)
+        with pytest.raises(ExecutionAuthorityError) as caught:
+            pending.raise_abandonment()
+        assert caught.value.native_owner is pending.task
+        assert any(error.args == ("pending writer restoration cancellation",)
+            for error in execution_observer_cancellations(caught.value)), (
+                "pending native handoff lost its original restoration withdrawal")
+        native_refusal = execution_native_source_error(caught.value)
+        assert isinstance(native_refusal, ExecutionAuthorityError)
+        assert native_refusal.native_owner is pending.task
+        assert not any(isinstance(error, asyncio.CancelledError)
+            for error in execution_evidence_carriers(native_refusal)), (
+                "pending native handoff promoted observer withdrawal into its shared source")
+    finally:
+        release_writer.set()
+        release_child.set()
+        await await_owned_task(owner)
+        for task in children:
+            await await_owned_task(task)
+    assert not lock.locked() and not lock._native_work and not lock._admissions
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("borrowed_middle", [False, True])
+async def test_original_close_wait_delegates_only_through_accepted_native_tasks(borrowed_middle):
+    lock = ReentrantTransitionLock()
+    started, entered, release, sibling_entered = (asyncio.Event() for _ in range(4))
+    children, restoration = {}, []
+
+    async def source():
+        entered.set()
+        await release.wait()
+        return "original source"
+
+    async def sibling():
+        sibling_entered.set()
+
+    async def close_source():
+        return await await_owned_task(children["source"])
+
+    async def close_wrapper():
+        if borrowed_middle:
+            # Copied coordinator context is routing, never native admission.
+            middle = asyncio.create_task(close_source())
+            children["borrowed"] = middle
+            return await await_owned_task(middle)
+        return await close_source()
+
+    async def writer():
+        async with lock:
+            async with lock:
+                children["source"] = lock.start_owned_native_work(source)
+                children["wrapper"] = create_owned_task(close_wrapper())
+                children["sibling"] = lock.start_owned_native_work(sibling)
+                started.set()
+                result = await await_owned_task(children["wrapper"])
+                restoration.append((result, lock._writer is asyncio.current_task(), lock._depth,
+                    sibling_entered.is_set()))
+
+    owner = create_owned_task(writer())
+    ready = asyncio.create_task(entered.wait())
+    try:
+        await started.wait()
+        completed, _ = await asyncio.wait({ready}, timeout=.05 if borrowed_middle else .3)
+        admitted = bool(completed)
+        excluded = not sibling_entered.is_set()
+    finally:
+        release.set()
+        if borrowed_middle or not entered.is_set():
+            children["source"].cancel()
+        if not ready.done():
+            ready.cancel()
+        await await_owned_task(ready)
+        settled = await await_owned_task(owner)
+        for child in children.values():
+            await await_owned_task(child)
+    assert admitted is not borrowed_middle, "native close writer handoff must follow actual accepted waits, never borrowed observers"
+    assert excluded, "native close wait lent its writer to an unrelated accepted sibling"
+    result, restored, depth, sibling_before_restore = restoration[0]
+    assert restored and depth == 2 and not sibling_before_restore
+    assert settled.error is None and sibling_entered.is_set()
+    if not borrowed_middle:
+        assert result.error is None and result.result.error is None
+        assert result.result.result == "original source"
     assert not lock.locked() and not lock._native_work and not lock._admissions
 
 

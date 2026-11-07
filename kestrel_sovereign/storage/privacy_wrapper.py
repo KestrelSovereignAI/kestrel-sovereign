@@ -303,6 +303,7 @@ class _PrivacySpan:
         self.activation_lock = asyncio.Lock()
         self.members = {root: None}
         self.admissions = {}
+        self.waits = {}
 
 
 @dataclass
@@ -377,9 +378,15 @@ class ReentrantTransitionLock:
         self._native_scopes.add(scope)
         return scope, True
 
-    def require_native_scope(self, scope):
+    def require_native_scope(self, scope, *, retained_owners=None):
         if scope not in self._native_scopes or self.current_native_scope() is not scope:
             raise ExecutionAuthorityError("execution requires its original native privacy lifetime")
+        if retained_owners is not None and not any(
+            (owner is scope.root or owner in scope.admissions)
+            and self._descends_from(asyncio.current_task(), owner, scope=scope)
+            for owner in retained_owners
+        ):
+            raise ExecutionAuthorityError("execution requires an original retained native owner")
 
     def _is_member(self, task):
         return self._scope_for(task, original=True) is not None
@@ -459,25 +466,40 @@ class ReentrantTransitionLock:
             if root:
                 await self._close_span(sys.exception())
 
-    def _descends_from(self, task, target):
+    def _descends_from(self, task, target, *, scope=None):
+        members = self._members if scope is None else scope.members
         seen = set()
         while task is not None and task not in seen:
             if task is target:
                 return True
             seen.add(task)
-            task = self._members.get(task)
+            task = members.get(task)
         return False
 
     def _writer_eligible(self, task):
         if not self._parked:
             return True
         frame = self._parked[-1]
-        targets = (native for target in frame.targets
-                   for native in (target.tasks if target in self._callback_scopes else (target,)))
-        return not frame.restoring and any(
-            target in self._admissions and not target.done()
-            and self._descends_from(task, target) for target in targets
-        )
+        if frame.restoring:
+            return False
+        pending, seen = list(frame.targets), set()
+        while pending:
+            target = pending.pop()
+            if target in seen:
+                continue
+            seen.add(target)
+            if target in self._callback_scopes:
+                if self._callback_scopes[target] is self._token:
+                    pending.extend(target.tasks)
+                continue
+            if target not in self._admissions or target.done():
+                continue
+            if self._descends_from(task, target):
+                return True
+            # Every edge is a currently suspended, originally admitted wait
+            # within this exact lifetime. Generic join ancestry is not authority.
+            pending.extend(self._token.waits.get(target, ()))
+        return False
 
     def register_callback_scope(self, scope):
         if not self._is_member(asyncio.current_task()):
@@ -553,31 +575,48 @@ class ReentrantTransitionLock:
     @asynccontextmanager
     async def park_native_wait(self, targets):
         task = asyncio.current_task()
-        accepted = tuple(target for target in targets
-                         if target in self._admissions or target in self._callback_scopes)
-        if self._writer is not task or not accepted:
+        scope = self.current_native_scope()
+        if scope is None or scope is not self._token:
             yield
             return
-        frame = _ParkedPrivacyWriter(task, self._depth, accepted)
-        self._parked.append(frame)
-        self._writer, self._depth = None, 0
+        accepted = tuple(target for target in targets
+                         if target in self._admissions or self._callback_scopes.get(target) is scope)
+        if not accepted:
+            yield
+            return
+        previous = scope.waits.get(task)
+        scope.waits[task] = accepted
         self._notify()
         try:
-            yield
-        finally:
-            pending = sys.exception()
-            frame.restoring = True
-            cancellation = None
-            while self._writer is not None or self._parked[-1] is not frame:
-                try:
-                    await self._wait_change()
-                except asyncio.CancelledError as error:
-                    cancellation = execution_terminal_error(cancellation, error, retain_originals=True)
-            self._parked.pop()
-            self._writer, self._depth = task, frame.depth
+            if self._writer is not task:
+                yield
+                return
+            frame = _ParkedPrivacyWriter(task, self._depth, accepted)
+            self._parked.append(frame)
+            self._writer, self._depth = None, 0
             self._notify()
-            if cancellation is not None:
-                raise execution_terminal_error(pending, cancellation, retain_originals=True)
+            try:
+                yield
+            finally:
+                pending = sys.exception()
+                frame.restoring = True
+                cancellation = None
+                while self._writer is not None or self._parked[-1] is not frame:
+                    try:
+                        await self._wait_change()
+                    except asyncio.CancelledError as error:
+                        cancellation = execution_terminal_error(cancellation, error, retain_originals=True)
+                self._parked.pop()
+                self._writer, self._depth = task, frame.depth
+                self._notify()
+                if cancellation is not None:
+                    raise execution_terminal_error(pending, cancellation, retain_originals=True)
+        finally:
+            if previous is None:
+                scope.waits.pop(task)
+            else:
+                scope.waits[task] = previous
+            self._notify()
 
     @asynccontextmanager
     async def yield_native_writer(self):

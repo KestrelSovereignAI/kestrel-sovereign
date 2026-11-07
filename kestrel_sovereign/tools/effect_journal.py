@@ -107,9 +107,15 @@ class ToolEffectTurn:
         self.privacy_scope, self.owns_privacy_scope = self.privacy_lock.begin_native_scope(self)
 
     def require_live(self, owner: Any) -> None:
-        if (self.owner is not owner or not self.live
-                or (self.closing and asyncio.current_task() not in self.pending.values())):
+        if self.owner is not owner or not self.live:
             raise ToolEffectJournalUnavailable("tool_effect_attempt_retired")
+        if self.closing:
+            from kestrel_sovereign.execution_custody import ExecutionAuthorityError
+            try:
+                self.privacy_lock.require_native_scope(self.privacy_scope,
+                    retained_owners=self.pending.values())
+            except ExecutionAuthorityError as error:
+                raise ToolEffectJournalUnavailable("tool_effect_attempt_retired") from error
 
     def require_confirmed(self) -> None:
         """An uncertain effect cannot be followed by ordinary turn output."""

@@ -9,6 +9,46 @@ from kestrel_sovereign.storage.privacy_wrapper import ReentrantTransitionLock, b
 
 
 @pytest.mark.asyncio
+async def test_foreign_lifetime_callback_inventory_cannot_lend_this_writer(tmp_path):
+    import contextvars
+    from kestrel_sovereign._async_ownership import OwnedCallbackScope, bind_owned_coordinator
+    lock = ReentrantTransitionLock()
+    registered, retire = asyncio.Event(), asyncio.Event()
+    scopes = []
+    witness = tmp_path / 'different-lifetime-callback'
+
+    async def other_lifetime():
+        lifetime, owned = lock.begin_native_scope(None)
+        assert owned
+        try:
+            with bind_owned_coordinator(lock):
+                scopes.append(OwnedCallbackScope())
+                registered.set()
+                await retire.wait()
+        finally:
+            await lock.close_native_scope(lifetime)
+
+    async def effect():
+        witness.write_text('original admitted child')
+
+    other = asyncio.create_task(other_lifetime(), context=contextvars.Context())
+    try:
+        async with lock:
+            await registered.wait()
+            child = lock.start_owned_native_work(effect)
+            scopes[0].tasks.add(child)  # Corrupt data cannot change its original lifetime.
+            async with scopes[0].wait():
+                await asyncio.sleep(0)
+            assert not witness.exists(), 'callback scope from another native lifetime lent the current writer'
+        assert witness.read_text() == 'original admitted child'
+        assert (await await_owned_task(child)).error is None
+    finally:
+        retire.set()
+        await other
+    assert not lock.locked() and not lock._native_scopes
+
+
+@pytest.mark.asyncio
 async def test_arbitrary_event_wait_does_not_lend_writer_to_accepted_child(tmp_path):
     lock = ReentrantTransitionLock()
     attempted, release = asyncio.Event(), asyncio.Event()

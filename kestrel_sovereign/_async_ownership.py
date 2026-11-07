@@ -754,15 +754,21 @@ class PendingOwnedTask(Generic[_T]):
 
     task: asyncio.Future[_T]
     cancellation: asyncio.CancelledError
+    observation_error: BaseException | None = None
 
     def raise_abandonment(self):
         from kestrel_sovereign.execution_custody import (
-            ExecutionAuthorityError, execution_terminal_error,
+            ExecutionAuthorityError, execution_error_with_cause, execution_observation_error,
         )
         pending = ExecutionAuthorityError("native operation remains pending in its retained lifecycle owner")
         pending.native_owner = self.task
-        pending.__cause__ = self.cancellation
-        raise execution_terminal_error(self.cancellation, pending)
+        # The pending native fact and this observer's withdrawals have
+        # different lifetimes. Keep the typed public refusal without making
+        # its finite cancellation graph part of the shared native source.
+        refusal = ExecutionAuthorityError(*pending.args)
+        refusal.native_owner = self.task
+        raise execution_error_with_cause(refusal,
+            execution_observation_error(pending, self.cancellation, self.observation_error))
 
 
 class OwnedAsyncIterator(Generic[_T]):
@@ -1348,22 +1354,35 @@ async def wait_owned_or_pending(
     task.add_done_callback(wake)
     cancellation = None
     timer = None
+    restoration_error = None
     try:
-        async with owned_native_wait((task,)):
-            while not task.done() and not completion.done():
-                try:
-                    await asyncio.wait((completion,))
-                except asyncio.CancelledError as error:
-                    if cancellation is None:
-                        cancellation = error
-                        timer = loop.call_later(cancellation_grace, wake)
-                        if cancel_on_caller_cancellation:
-                            task.cancel()
+        try:
+            async with owned_native_wait((task,)):
+                while not task.done() and not completion.done():
+                    try:
+                        await asyncio.wait((completion,))
+                    except asyncio.CancelledError as error:
+                        if cancellation is None:
+                            cancellation = error
+                            timer = loop.call_later(cancellation_grace, wake)
+                            if cancel_on_caller_cancellation:
+                                task.cancel()
+        except BaseException as error:
+            # Context restoration is part of this observation. Its withdrawal
+            # cannot bypass either the first cancellation or a late native ACK.
+            restoration_error = error
         # Restoring a delegated writer can outlive the grace. Observe the
         # original owner again so a now-settled receipt is never called pending.
         if not task.done():
-            return PendingOwnedTask(task, cancellation)
-        return await await_owned_task(task, cancellation)
+            if cancellation is None and restoration_error is not None:
+                raise restoration_error
+            return PendingOwnedTask(task, cancellation, restoration_error)
+        outcome = await await_owned_task(task, cancellation)
+        if restoration_error is not None:
+            from kestrel_sovereign.execution_custody import execution_observation_error
+            return OwnedTaskOutcome(None,
+                execution_observation_error(outcome.error, restoration_error), outcome.cancellation)
+        return outcome
     finally:
         task.remove_done_callback(wake)
         if timer is not None:

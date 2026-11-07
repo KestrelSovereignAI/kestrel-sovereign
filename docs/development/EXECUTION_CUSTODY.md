@@ -40,7 +40,21 @@ and each original callback accepted during its wait. Gather, bounded joins and
 callback readers share that observation boundary; creation ancestry cannot
 substitute for an actual wait or grant execution authority. An owned join parks the current writer for those original execution owners and
 restores its full frame before any parent continuation or exception handler
-resumes. Gather retains this barrier through sibling cancellation and physical
+resumes. A close wrapper may delegate that loan to an original source sibling
+only through active waits whose endpoints have original admission in the same
+lifetime. Borrowed observers and generic join ancestry cannot bridge that path.
+Bounded observation includes writer restoration: later withdrawals remain with
+the first cancellation, and the original task is sampled after restoration.
+A still-pending handoff retains its exact task and finite observation errors;
+shared native-source projections exclude the observer's cancellations.
+
+Closing journal admission uses the original native parent-admission tree of a
+retained worker, not the writer-loan wait graph. Its admitted gather children can
+finish in the original journal; unrelated native siblings and copied-context
+observers cannot obtain that business authority. Python task ancestry alone is
+not a native admission receipt.
+
+Gather retains this barrier through sibling cancellation and physical
 harvesting. Stream producers relinquish the writer at the controlled item
 handshake and reacquire it before advancing. Codex reader callbacks use an
 original callback cohort accepted before their task gate opens. Arbitrary Event

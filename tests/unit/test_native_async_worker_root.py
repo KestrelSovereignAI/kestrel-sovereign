@@ -5,17 +5,117 @@ import asyncio
 import pytest
 
 from kestrel_sdk.native_a2a.types import TaskState
-from kestrel_sovereign._async_ownership import await_owned_task, create_owned_task
+from kestrel_sovereign._async_ownership import await_owned_task, create_owned_task, gather_owned
 from kestrel_sovereign.a2a.scope import NativeRecipientScope
 from kestrel_sovereign.execution_custody import execution_evidence_carriers
 from kestrel_sovereign.features.base import Feature, tool
 from kestrel_sovereign.tool_effect_store import ToolEffectReconciliationRequired
-from kestrel_sovereign.tools.effect_journal import ToolEffectTurn, current_tool_effect_turn
+from kestrel_sovereign.tools.effect_journal import (
+    ToolEffectTurn, ToolEffectJournalUnavailable, current_tool_effect_turn, execute_tool_effect,
+)
 from tests.unit.test_tool_effect_execution import owner as owner
 from tests.unit.test_tool_effect_invocation import governed
 from tests.utils.native_a2a import manager_for
 
 pytestmark = [pytest.mark.asyncio, pytest.mark.timeout(30)]
+
+
+@pytest.mark.parametrize('child_kind', ['owned-descendant', 'borrowed-context', 'unretained-sibling'])
+async def test_closing_original_worker_retains_its_admitted_business_descendants(owner, monkeypatch, tmp_path, child_kind):
+    manager = manager_for(owner.tool_effect_store.backend, NativeRecipientScope(owner.did), owns_backend=False)
+    await manager.initialize()
+    witness = tmp_path / 'original-worker-native-effects'
+    release, root_closing, entered = asyncio.Event(), asyncio.Event(), asyncio.Event()
+    turns, children, rejections, workers = [], [], [], []
+    original_close = ToolEffectTurn.close
+    track = manager._track_execution_task
+
+    async def observed_close(turn, *args, **kwargs):
+        if turn.owner is owner:
+            root_closing.set()
+        return await original_close(turn, *args, **kwargs)
+
+    def observed_track(*args, **kwargs):
+        worker = track(*args, **kwargs)
+        workers.append(worker)
+        return worker
+
+    monkeypatch.setattr(ToolEffectTurn, 'close', observed_close)
+    monkeypatch.setattr(manager, '_track_execution_task', observed_track)
+
+    async def effect():
+        with witness.open('a') as output:
+            output.write('original nested effect\n')
+        return {'success': True}
+
+    async def nested():
+        await release.wait()
+        try:
+            await execute_tool_effect(owner, registration='original-worker-nested-effect',
+                arguments={}, execute=effect)
+        except ToolEffectJournalUnavailable as error:
+            rejections.append(error)
+
+    class WorkerFeature(Feature):
+        tool_description = 'Original worker descendant ownership probe'
+
+        async def initialize(self):
+            pass
+
+        @tool(name='owned_worker_descendant', description='Dispatch in the original retained worker')
+        async def owned_worker_descendant(self):
+            entered.set()
+            await release.wait()
+            assert current_tool_effect_turn(owner) is turns[0] and turns[0].closing
+            if child_kind == 'owned-descendant':
+                await gather_owned([nested()])
+            elif child_kind == 'borrowed-context':
+                borrowed = asyncio.create_task(nested())
+                children.append(borrowed)
+                await borrowed
+            else:
+                await await_owned_task(children[0])
+            return {'success': not rejections}
+
+    feature = WorkerFeature(owner)
+    owner.features[feature.name] = feature
+    manager.register_provider(feature.name, feature.get_agent_skills(), feature)
+
+    @governed
+    async def invoke(agent, user_input, *, invocation_id=None):
+        turns.append(current_tool_effect_turn(agent))
+        task = await manager.execute_skill(feature.name, 'owned_worker_descendant', {}, sync=False)
+        if child_kind == 'unretained-sibling':
+            children.append(create_owned_task(nested()))
+        return task
+
+    invocation = create_owned_task(invoke(owner, 'original worker descendant',
+        invocation_id='original-worker-descendant-' + child_kind))
+    try:
+        await asyncio.wait_for(root_closing.wait(), 5)
+        await asyncio.wait_for(entered.wait(), 5)
+        assert len(turns) == 1 and turns[0].closing and turns[0].live
+        release.set()
+        result = await asyncio.wait_for(await_owned_task(invocation), 5)
+        if child_kind == 'owned-descendant':
+            assert witness.exists(), "Original retained worker's admitted child was refused before native dispatch"
+            assert witness.read_text() == 'original nested effect\n' and rejections == []
+        else:
+            assert not witness.exists(), "Closing journal admitted business outside the original retained worker ancestry"
+            assert len(rejections) == 1, "Refused child never reached original native admission"
+        assert result.error is None and len(workers) == 1 and workers[0].done()
+        assert turns[0].pending == {} and not turns[0].live
+        assert await owner.tool_effect_store.database.fetchone('SELECT state FROM tool_effect_operations') == ('CLOSED',)
+        with pytest.raises(ToolEffectReconciliationRequired):
+            await invoke(owner, 'original worker descendant',
+                invocation_id='original-worker-descendant-' + child_kind)
+        assert len(workers) == 1
+    finally:
+        release.set()
+        await await_owned_task(invocation)
+        for child in [*children, *workers]:
+            await await_owned_task(child)
+        await manager.close()
 
 
 @pytest.mark.parametrize('ordering', ['completed-before-close', 'pending-at-close', 'failed-admission-before-close'])
