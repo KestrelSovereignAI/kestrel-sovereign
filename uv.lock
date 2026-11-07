@@ -538,15 +538,15 @@ wheels = [
 
 [[package]]
 name = "authlib"
-version = "1.9.1"
+version = "1.9.5"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "cryptography" },
     { name = "joserfc" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/c9/dc/087c08741a98d234c9b98beef8a28d3c309f814d14b6156422c5815bf6d6/authlib-1.9.1.tar.gz", hash = "sha256:5c7d9848f47cac340f060f76ae0bc09b59f5c8e89cc1bb032d4370a0c55b5974", size = 182700, upload-time = "2026-10-14T14:17:52.307Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/04/96/6e7ed72bb49762a9b65d51c4cb235d793f0485cd8d6f7e9404ce955a4808/authlib-1.9.5.tar.gz", hash = "sha256:3f031d5e9b6486089e91e8f7f1b68f36275f3151c66460d650fc90d420545fd7", size = 183564, upload-time = "2026-11-05T16:13:18.409Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/39/44/a46089266de32a0d809023b6bf31b80a1f26a46954446a7ce695a565cbea/authlib-1.9.1-py2.py3-none-any.whl", hash = "sha256:8b9be8b1e5174dcbf5520e984f1a22dc2edae5b6e40a61d4cedbf86b97e9e69b", size = 266042, upload-time = "2026-10-14T14:17:50.695Z" },
+    { url = "https://files.pythonhosted.org/packages/58/d7/d384e7a639dd1d018767ba0fe39601b61cded066bb7af38db31ec998252d/authlib-1.9.5-py2.py3-none-any.whl", hash = "sha256:e32a63e3d869196b61816b2602231862179a2ffc29358c009d1f022c8b86a8b2", size = 267074, upload-time = "2026-11-05T16:13:16.766Z" },
 ]
 
 [[package]]
@@ -3041,10 +3041,11 @@ wheels = [
 
 [[package]]
 name = "kestrel-feature-mcp"
-version = "0.12.0"
+version = "0.14.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "anyio" },
+    { name = "authlib" },
     { name = "docker" },
     { name = "jsonschema" },
     { name = "kestrel-sovereign-sdk", extra = ["crypto", "httpx2"] },
@@ -3052,9 +3053,9 @@ dependencies = [
     { name = "pydantic" },
     { name = "requests" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/e9/55/df468327042e955659d4183f09db90dbf25939b6a292db1ed6af14d0ac55/kestrel_feature_mcp-0.12.0.tar.gz", hash = "sha256:964e0d5d6becd92e878ce6d0d7ae451f959cf262ea24b0e7dd2df0e7eebf815a", size = 1015056, upload-time = "2026-11-04T18:43:21.104Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/04/e2/1dba79057e624b3e654ce3767f54fa45204f7e720810a6cee7259a215f89/kestrel_feature_mcp-0.14.0.tar.gz", hash = "sha256:4d9cee1fa40d27f6143298d905852a4a0fb8777bb5bc4069cce8662f3782dc77", size = 1102578, upload-time = "2026-11-07T11:44:22.656Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/d1/e9/1daa6fab420fed10bca052d8d5ac7d326801d2391355a7ff0f41c367e959/kestrel_feature_mcp-0.12.0-py3-none-any.whl", hash = "sha256:beff8c67a63cbbb422cbae6f547d8db698051a75104005f1e1a4950885d46cdb", size = 595643, upload-time = "2026-11-04T18:43:19.484Z" },
+    { url = "https://files.pythonhosted.org/packages/90/2c/93f4c9572832b791e5267b2403e79a4a419ffc1e3d82dba124916f8d643f/kestrel_feature_mcp-0.14.0-py3-none-any.whl", hash = "sha256:c6f4d4eb97047470cc4d1e248eec30ad8247f0acb71e8788dcdbd47f7f6fad5b", size = 629040, upload-time = "2026-11-07T11:44:20.644Z" },
 ]
 
 [[package]]
@@ -3414,7 +3415,7 @@ requires-dist = [
     { name = "idna", specifier = ">=3.20,<4" },
     { name = "iniconfig", specifier = "==2.3.0" },
     { name = "itsdangerous", specifier = ">=2.2.0" },
-    { name = "kestrel-feature-mcp", marker = "extra == 'mcp-integration'", specifier = ">=0.12.0,<1" },
+    { name = "kestrel-feature-mcp", marker = "extra == 'mcp-integration'", specifier = ">=0.14.0,<1" },
     { name = "kestrel-llms", extras = ["all"], specifier = ">=0.2.0,<0.3" },
     { name = "kestrel-sovereign", extras = ["all-features"], marker = "extra == 'full'" },
     { name = "kestrel-sovereign", extras = ["cloud"], marker = "extra == 'all-features'" },

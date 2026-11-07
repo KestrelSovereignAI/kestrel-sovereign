@@ -151,16 +151,18 @@ def _assert_requirement_floor(requirement: Requirement, floor: Version) -> None:
 
 
 def test_installed_remote_mcp_campaign_requires_the_public_feature_contract():
-    """Cloud Run requires the public registry and native Apps restore contract."""
+    """Public MCP must retain native intent, refusal and unknown-outcome receipts."""
     dependencies = _pyproject()["project"]["optional-dependencies"]["mcp-integration"]
     (requirement,) = [
         Requirement(raw)
         for raw in dependencies
         if Requirement(raw).name == "kestrel-feature-mcp"
     ]
-    floor = Version("0.12.0")
+    floor = Version("0.14.0")
     _assert_requirement_floor(requirement, floor)
     assert not requirement.specifier.contains("0.11.2")
+    assert not requirement.specifier.contains("0.12.0")
+    assert not requirement.specifier.contains("0.13.0")
     assert requirement.specifier.contains(floor)
     (package,) = [
         item for item in _lock()["package"] if item["name"] == "kestrel-feature-mcp"
