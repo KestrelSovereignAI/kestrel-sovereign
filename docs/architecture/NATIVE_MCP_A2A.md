@@ -354,7 +354,14 @@ on the original turn, retains the original exception and prevents another effect
 Model, named and inline execution use that same boundary before recovery or
 terminal propagation. Inline adapters receive the original typed uncertainty
 carrier immediately; neither a later effect nor successful root completion is
-permitted. Acknowledged claim and audit states remain unchanged.
+permitted. Acknowledged claim and audit states remain unchanged. The protected
+operation includes canonical subagent leaf serialization, post-tool policy,
+required audit, private delivery and final return shaping; wrapping only the
+journaled body does not protect those completion steps. Canonical parent dispatch
+retains the actual return evidence of its leaves, and its own hooks, delivery
+and final named-result serialization remain inside the shared boundary. The
+original turn must be confirmed before another protected operation starts and
+before any recovered output is handed to a consumer.
 Opaque Feature task handlers validate required fields and canonical Task outcome
 invariants before acknowledging their claim. A malformed reply produces a FAILED
 Task with `outcome_unknown` from the admitted baseline for the recipient writer;

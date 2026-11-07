@@ -928,7 +928,7 @@ async def test_custom_feature_deferred_dispatch_uses_the_same_audit_completion(b
             assert [tuple(row) for row in rows] == [("success",)]
             assert peer.tool.publications == ["published-once"]
 
-    await _drive_native(boundary.host, operation)
+    await _inspect_refused_native_input(boundary.host, operation)
 
 
 # ---------------------------------------------------------------------------
@@ -1428,13 +1428,19 @@ async def test_route_host_without_audited_completion_withholds_the_ui(route, mon
     monkeypatch.setattr(DeferredToolResult, "for_tool", record)
     route.host.supports_audited_deferred_tool_results = False
     route.policy.release.set()
-    outcome = (await _inspect_refused_native_input(route.host, route._invoke)
-        if route.kind == "a2a" else await route.invoke())
     if route.kind == "a2a":
+        outcome = await _inspect_refused_native_input(route.host, route._invoke)
         assert outcome.status.state == TaskState.TASK_STATE_FAILED
         detail = message_text(outcome.status.message)
     else:
-        detail = outcome["error"]
+        from kestrel_sdk.resources import ResourceOutcomeUnknown, ResourceUnsupported
+        from kestrel_sovereign.execution_custody import execution_evidence_carriers
+
+        with pytest.raises(ResourceOutcomeUnknown) as caught:
+            await route.invoke()
+        assert any(isinstance(error, ResourceUnsupported)
+            for error in execution_evidence_carriers(caught.value))
+        detail = str(caught.value)
     assert "Do not replay" in detail
     assert route.tool.executions == [{}] and route.tool.publications == []
     assert not route.policy.started.is_set()

@@ -998,9 +998,23 @@ async def _record_terminal_tool_dispatch(host, error, execution, dispatch_meta, 
 
 async def _run_tool_execution(host, operation, *, execution, dispatch_meta,
                              session_id, on_failure, on_terminal, recover_audited=False):
-    """One execution boundary for model, bound and ordinary named tools."""
+    """Protect the complete tool operation, through result delivery and audit.
+
+    The supplied operation retains execution and completion before an
+    error-recovering consumer can see its result. Nested stages may return
+    to another protected operation; serialization, policy, required audit
+    and final shaping must not reach an adapter outside that protection.
+    """
+    from kestrel_sovereign.tools.effect_journal import current_tool_effect_turn
+
+    turn = current_tool_effect_turn(host)
+    if turn is not None:
+        turn.require_confirmed()
     try:
-        return await operation()
+        result = await operation()
+        if turn is not None:
+            turn.require_confirmed()
+        return result
     except Exception as error:
         if execution.returned:
             # All producers retain completion uncertainty before either an
@@ -1982,49 +1996,12 @@ class OrchestratorEngineMixin:
         dispatch_start = time.time()
 
         async def run():
-            return await self._dispatch_named_tool(
+            result = await self._dispatch_named_tool(
                 tool_name, args, session_id=session_id, source=source,
                 _capture=_capture, call_context=call_context,
                 execution=execution, dispatch_meta=dispatch_meta,
             )
 
-        async def failed(error, unknown):
-            if not unknown:
-                if (_capture is not None and execution.started
-                        and isinstance(error, ResourceConflict)):
-                    logging.warning(
-                        "[GOVERNED-DISPATCH] %s precondition refused: %s\n%s",
-                        tool_name, exception_log_summary(error), exception_frames(error),
-                    )
-                    return _PreconditionFailedToolResult({
-                        "success": False, "error": TOOL_PRECONDITION_CHANGED,
-                    })
-                raise error
-            logging.error(
-                "[GOVERNED-DISPATCH] %s failed: %s\n%s",
-                tool_name, exception_log_summary(error), exception_frames(error),
-            )
-            if _capture is None:
-                raise ResourceOutcomeUnknown(TOOL_OUTCOME_UNCONFIRMED) from error
-            payload = {"success": False, "error": TOOL_OUTCOME_UNCONFIRMED}
-            if dispatch_meta.get("audit_recorded"):
-                return _AuditedUnconfirmedToolResult(
-                    payload, host=self, tool_name=tool_name, session_id=session_id,
-                )
-            return _UnconfirmedToolResult(payload)
-
-        with tool_call_scope(self, call_context):
-            result = await _run_tool_execution(
-                self, run, execution=execution, dispatch_meta=dispatch_meta,
-                session_id=session_id, on_failure=failed,
-                on_terminal=lambda error: _record_terminal_tool_dispatch(
-                    self, error, execution, dispatch_meta,
-                    tool_name=tool_name,
-                    adapter=f"named:{source}:" + self._tool_call_adapter(tool_name, {}),
-                    args=dispatch_meta.get("arguments", args), session_id=session_id,
-                    dispatch_start=dispatch_start, dispatch_id=call_context.ledger_id),
-                recover_audited=_capture is not None,
-            )
             if _capture is None and not dispatch_meta.get("audit_recorded"):
                 error_message, error_class = _extract_inline_error_fields(result)
                 await self._log_tool_dispatch(
@@ -2053,6 +2030,44 @@ class OrchestratorEngineMixin:
                 return _AuditedDeferredResult(payload, host=self, tool_name=tool_name,
                     session_id=session_id)
             return result
+
+        async def failed(error, unknown):
+            if not unknown:
+                if (_capture is not None and execution.started
+                        and isinstance(error, ResourceConflict)):
+                    logging.warning(
+                        "[GOVERNED-DISPATCH] %s precondition refused: %s\n%s",
+                        tool_name, exception_log_summary(error), exception_frames(error),
+                    )
+                    return _PreconditionFailedToolResult({
+                        "success": False, "error": TOOL_PRECONDITION_CHANGED,
+                    })
+                raise error
+            logging.error(
+                "[GOVERNED-DISPATCH] %s failed: %s\n%s",
+                tool_name, exception_log_summary(error), exception_frames(error),
+            )
+            if _capture is None:
+                raise ResourceOutcomeUnknown(TOOL_OUTCOME_UNCONFIRMED) from error
+            payload = {"success": False, "error": TOOL_OUTCOME_UNCONFIRMED}
+            if dispatch_meta.get("audit_recorded"):
+                return _AuditedUnconfirmedToolResult(
+                    payload, host=self, tool_name=tool_name, session_id=session_id,
+                )
+            return _UnconfirmedToolResult(payload)
+
+        with tool_call_scope(self, call_context):
+            return await _run_tool_execution(
+                self, run, execution=execution, dispatch_meta=dispatch_meta,
+                session_id=session_id, on_failure=failed,
+                on_terminal=lambda error: _record_terminal_tool_dispatch(
+                    self, error, execution, dispatch_meta,
+                    tool_name=tool_name,
+                    adapter=f"named:{source}:" + self._tool_call_adapter(tool_name, {}),
+                    args=dispatch_meta.get("arguments", args), session_id=session_id,
+                    dispatch_start=dispatch_start, dispatch_id=call_context.ledger_id),
+                recover_audited=_capture is not None,
+            )
 
     async def _dispatch_named_tool(
         self,
@@ -3283,103 +3298,104 @@ class OrchestratorEngineMixin:
         if dispatch_meta is None:
             dispatch_meta = {}
 
-        # --- PRE_SUBAGENT_CALL hooks ---
-        subagent_hook_input = HookInput(
-            session_id=session_id,
-            hook_event_name=HookEvent.PRE_SUBAGENT_CALL.value,
-            tool_name=tool_name,
-            tool_input=args,
-            feature_name=hook_feature_name,
-        )
-        subagent_hook_output = await self.hooks_manager.execute_hooks(
-            HookEvent.PRE_SUBAGENT_CALL, subagent_hook_input
-        )
-        # DENY and ASK both block the subagent dispatch (F038). An ASK
-        # routes to the approval queue; the subagent must NOT run now.
-        blocked = evaluate_blocking_decision(
-            subagent_hook_output,
-            deny_reason_default="Subagent call blocked by policy",
-        )
-        if blocked is not None:
-            reason = blocked.reason
-            logging.warning(
-                "[HOOKS] Subagent blocked (%s): %s.%s - reason %s",
-                blocked.decision.value, hook_feature_name, tool_name,
-                content_log_summary(str(reason)),
-            )
-            result = blocked.envelope
-            _record_tool_arguments(
-                dispatch_meta,
-                decided_tool_input(subagent_hook_input, subagent_hook_output),
-            )
-            if dispatch_meta is not None:
-                # ``a2a_tool_dispatches.result_status`` has no approval
-                # status, and the writer swallows a CHECK failure: an ASK is
-                # a ``policy_denied`` row its ``error_class`` names, or no
-                # row at all (#3953).
-                dispatch_meta.update({
-                    "status": "policy_denied",
-                    "error_class": (
-                        "ApprovalRequired" if blocked.is_ask else "PermissionDenied"
-                    ),
-                    "error_message": reason,
-                })
-
-            dispatch_duration = int((time.time() - dispatch_start) * 1000)
-            await self.observability_store.log_tool_response(
-                event_id=dispatch_event_id,
-                success=False,
-                duration_ms=dispatch_duration,
-                error_message=reason,
-            )
-            if streaming and tool_events is not None:
-                tool_events.append({'type': 'error', 'tool': tool_name, 'error': reason[:200]})
-            return result
-
-        # Subagent hook allowed — collect denied tools before dispatch
-        denied_tools = await self._get_denied_tools(hook_feature_name)
-        if denied_tools:
-            logging.info(f"[SECURITY] Stripping denied tools from {hook_feature_name}: {denied_tools}")
-
-        async def _exec_feature(effective_args, f=feature, dt=denied_tools, em=effective_model):
-            task = effective_args.get("task", "")
-            context = effective_args.get("context")
-            if not context and user_message:
-                context = f"User's original request: {user_message}"
-            log_tag = "[STREAM] " if streaming else ""
-            logging.info(f"{log_tag}Dispatching to feature subagent: {f.tool_name}")
-            with optional_span("agent.feature_dispatch", {
-                OI_SPAN_KIND: OI_SPAN_KIND_CHAIN,
-                # Defensive read — minimal mixin hosts may lack ``agent_name``;
-                # ``optional_span`` drops the None (matches the site above).
-                KESTREL_AGENT_NAME: getattr(self, "agent_name", None),
-                # #2916: same session band as the driving turn span (matches
-                # the ``_execute_named_subagent`` site above).
-                KESTREL_SESSION_ID: real_session_id(session_id),
-                "agent.session_id": real_session_id(session_id),
-                "feature.name": f.tool_name,
-            }):
-                r = await _execute_feature_subagent(
-                    self, f, feature_dispatch,
-                    dict(task=task, context=context, denied_tools=dt, model_override=em),
-                    selected_generation=selected_generation, execution=execution,
-                    dispatch_meta=dispatch_meta, audit_args=effective_args,
-                    session_id=session_id,
-                    adapter=f"{type(f).__name__}.execute_as_subagent",
-                    dispatch_start=dispatch_start, dispatch_id=dispatch_id)
-            self._register_explored_feature_tools(f)
-            return r
-
-        # What the PRE_TOOL_USE chain refused, if it refuses: the dispatch row
-        # and the completion hook report it rather than ``args``, on the error
-        # path too, where a failed response write sends a refused call (#3953).
         refused: Dict[str, Any] = {}
 
-        def _on_refused(arguments):
-            refused["arguments"] = arguments
-            _record_tool_arguments(dispatch_meta, arguments)
+        async def operation():
+            # --- PRE_SUBAGENT_CALL hooks ---
+            subagent_hook_input = HookInput(
+                session_id=session_id,
+                hook_event_name=HookEvent.PRE_SUBAGENT_CALL.value,
+                tool_name=tool_name,
+                tool_input=args,
+                feature_name=hook_feature_name,
+            )
+            subagent_hook_output = await self.hooks_manager.execute_hooks(
+                HookEvent.PRE_SUBAGENT_CALL, subagent_hook_input
+            )
+            # DENY and ASK both block the subagent dispatch (F038). An ASK
+            # routes to the approval queue; the subagent must NOT run now.
+            blocked = evaluate_blocking_decision(
+                subagent_hook_output,
+                deny_reason_default="Subagent call blocked by policy",
+            )
+            if blocked is not None:
+                reason = blocked.reason
+                logging.warning(
+                    "[HOOKS] Subagent blocked (%s): %s.%s - reason %s",
+                    blocked.decision.value, hook_feature_name, tool_name,
+                    content_log_summary(str(reason)),
+                )
+                result = blocked.envelope
+                _record_tool_arguments(
+                    dispatch_meta,
+                    decided_tool_input(subagent_hook_input, subagent_hook_output),
+                )
+                if dispatch_meta is not None:
+                    # ``a2a_tool_dispatches.result_status`` has no approval
+                    # status, and the writer swallows a CHECK failure: an ASK is
+                    # a ``policy_denied`` row its ``error_class`` names, or no
+                    # row at all (#3953).
+                    dispatch_meta.update({
+                        "status": "policy_denied",
+                        "error_class": (
+                            "ApprovalRequired" if blocked.is_ask else "PermissionDenied"
+                        ),
+                        "error_message": reason,
+                    })
 
-        try:
+                dispatch_duration = int((time.time() - dispatch_start) * 1000)
+                await self.observability_store.log_tool_response(
+                    event_id=dispatch_event_id,
+                    success=False,
+                    duration_ms=dispatch_duration,
+                    error_message=reason,
+                )
+                if streaming and tool_events is not None:
+                    tool_events.append({'type': 'error', 'tool': tool_name, 'error': reason[:200]})
+                return result
+
+            # Subagent hook allowed — collect denied tools before dispatch
+            denied_tools = await self._get_denied_tools(hook_feature_name)
+            if denied_tools:
+                logging.info(f"[SECURITY] Stripping denied tools from {hook_feature_name}: {denied_tools}")
+
+            async def _exec_feature(effective_args, f=feature, dt=denied_tools, em=effective_model):
+                task = effective_args.get("task", "")
+                context = effective_args.get("context")
+                if not context and user_message:
+                    context = f"User's original request: {user_message}"
+                log_tag = "[STREAM] " if streaming else ""
+                logging.info(f"{log_tag}Dispatching to feature subagent: {f.tool_name}")
+                with optional_span("agent.feature_dispatch", {
+                    OI_SPAN_KIND: OI_SPAN_KIND_CHAIN,
+                    # Defensive read — minimal mixin hosts may lack ``agent_name``;
+                    # ``optional_span`` drops the None (matches the site above).
+                    KESTREL_AGENT_NAME: getattr(self, "agent_name", None),
+                    # #2916: same session band as the driving turn span (matches
+                    # the ``_execute_named_subagent`` site above).
+                    KESTREL_SESSION_ID: real_session_id(session_id),
+                    "agent.session_id": real_session_id(session_id),
+                    "feature.name": f.tool_name,
+                }):
+                    r = await _execute_feature_subagent(
+                        self, f, feature_dispatch,
+                        dict(task=task, context=context, denied_tools=dt, model_override=em),
+                        selected_generation=selected_generation, execution=execution,
+                        dispatch_meta=dispatch_meta, audit_args=effective_args,
+                        session_id=session_id,
+                        adapter=f"{type(f).__name__}.execute_as_subagent",
+                        dispatch_start=dispatch_start, dispatch_id=dispatch_id)
+                self._register_explored_feature_tools(f)
+                return r
+
+            # What the PRE_TOOL_USE chain refused, if it refuses: the dispatch row
+            # and the completion hook report it rather than ``args``, on the error
+            # path too, where a failed response write sends a refused call (#3953).
+
+            def _on_refused(arguments):
+                refused["arguments"] = arguments
+                _record_tool_arguments(dispatch_meta, arguments)
+
             result = await self._execute_tool_with_hooks(
                 tool_name=tool_name,
                 feature_name=hook_feature_name,
@@ -3426,24 +3442,26 @@ class OrchestratorEngineMixin:
                 tool_events.append({'type': 'complete', 'tool': tool_name, 'ms': dispatch_duration})
             return result
 
-        except ExecutionAuthorityError:
-            raise
-        except (ConnectionError, TimeoutError, ValueError, KeyError, TypeError, AttributeError) as e:
-            _raise_terminal_tool_error(e, dispatch_meta)
+        async def failed(error, unknown):
             return await self._handle_feature_error(
-                e, tool_name, hook_feature_name, refused.get("arguments", args),
+                error, tool_name, hook_feature_name, refused.get("arguments", args),
                 dispatch_start, dispatch_event_id, tool_events=tool_events,
                 streaming=streaming, session_id=session_id,
+                log_traceback=not isinstance(error, (
+                    ConnectionError, TimeoutError, ValueError, KeyError, TypeError, AttributeError)),
                 dispatch_meta=dispatch_meta,
             )
-        except Exception as e:
-            _raise_terminal_tool_error(e, dispatch_meta)
-            return await self._handle_feature_error(
-                e, tool_name, hook_feature_name, refused.get("arguments", args),
-                dispatch_start, dispatch_event_id, tool_events=tool_events,
-                streaming=streaming, log_traceback=True, session_id=session_id,
-                dispatch_meta=dispatch_meta,
-            )
+
+        return await _run_tool_execution(
+            self, operation, execution=execution, dispatch_meta=dispatch_meta,
+            session_id=session_id, on_failure=failed,
+            on_terminal=lambda error: _record_terminal_tool_dispatch(
+                self, error, execution, dispatch_meta, tool_name=tool_name,
+                adapter=f"{type(feature).__name__}.execute_as_subagent",
+                args=dispatch_meta.get("arguments", refused.get("arguments", args)),
+                session_id=session_id, dispatch_start=dispatch_start,
+                dispatch_id=dispatch_id),
+        )
 
     def _security_feature_name_for_tool(self, tool_name: str) -> str:
         """Return the canonical feature name (PascalCase = ``feature.name``)

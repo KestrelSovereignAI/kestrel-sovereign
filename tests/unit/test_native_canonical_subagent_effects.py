@@ -43,13 +43,17 @@ async def canonical_subagent(bound_operation, request):
             if self.defer_result:
                 from kestrel_sdk.tools.deferred import DeferredToolResult
                 from kestrel_sdk.tools.result import ToolResult
-                return DeferredToolResult(ToolResult.ok('original').to_dict(), publish=lambda: [])
+                return DeferredToolResult(ToolResult.ok('original').to_dict(), publish=lambda: self.deferred_parts)
+            if self.native_result is not None:
+                return self.native_result
             return {'success': True, 'marker': marker}
 
     feature = ensure_subagent_dispatch(NativeFeature)(host)
     feature.lose_reply = False
     feature.after_effect = None
     feature.defer_result = False
+    feature.deferred_parts = []
+    feature.native_result = None
     host.features[feature.name] = feature
 
     reader = OwnedCallbackReader()
@@ -387,8 +391,10 @@ async def test_deferred_leaf_retains_original_host_through_completion(
     feature.defer_result = True
     feature.after_effect = lambda: setattr(feature, 'agent', foreign)
     # The original outer registration refuses the now withdrawn dispatcher.
-    with pytest.raises(ResourceConflict):
+    with pytest.raises(ResourceOutcomeUnknown) as caught:
         await invoke('named')
+    assert any(isinstance(error, ResourceConflict)
+        for error in execution_evidence_carriers(caught.value))
     assert witness.read_text().splitlines() == ['original']
     rows = await foreign.tool_effect_store.database.fetchone('SELECT COUNT(*) FROM a2a_tool_dispatches')
     assert rows == (0,), 'Deferred completion wrote the original leaf audit into a foreign host'
@@ -409,3 +415,214 @@ async def test_standalone_canonical_component_refuses_original_host_change(
     assert not witness.exists() and model.continuations == 0
     assert await foreign.tool_effect_store.database.fetchone(
         'SELECT COUNT(*) FROM a2a_tool_dispatches') == (0,)
+
+
+@pytest.mark.parametrize('completion', ['serialize', 'deferred-delivery', 'audit'])
+@pytest.mark.parametrize('route', ['codex', 'catcher'])
+async def test_canonical_leaf_completion_stays_inside_original_execution_boundary(
+    canonical_subagent, monkeypatch, completion, route,
+):
+    from kestrel_sovereign.agent.parts import part_collector
+    from kestrel_sovereign.execution_custody import is_tool_execution_terminal_error
+    from kestrel_sovereign.llm.codex_adapter import CodexAdapter
+    from kestrel_sovereign.storage.db.interface import DatabaseError
+    from kestrel_sovereign.tools.effect_journal import current_tool_effect_turn
+    from tests.utils.native_tool_effects import drive_native
+
+    host, feature, witness, _, _, _, _ = canonical_subagent
+    original = ValueError('private-native-leaf-completion')
+    sql_errors, attempts = [], []
+    if completion == 'serialize':
+        class NativeValue:
+            def to_dict(self):
+                raise original
+        feature.native_result = {'success': True, 'payload': NativeValue()}
+    elif completion == 'deferred-delivery':
+        feature.defer_result = True
+        feature.deferred_parts = [{'type': 'private_view', 'data': {'reference': 'leaf-owned'}}]
+        emit = host._reemit_envelope_parts
+        def fail_after_ack(envelope):
+            if any(part.get('type') == 'private_view' for part in envelope.get('parts', [])):
+                raise original
+            return emit(envelope)
+        monkeypatch.setattr(host, '_reemit_envelope_parts', fail_after_ack)
+    else:
+        await host.tool_effect_store.database.execute(
+            "CREATE TRIGGER refuse_leaf_completion BEFORE INSERT ON a2a_tool_dispatches "
+            "WHEN NEW.tool_name = 'native_leaf' "
+            "BEGIN SELECT RAISE(ABORT, 'private-native-leaf-audit'); END")
+        write = host.observability_store.log_tool_dispatch
+        async def fail_native_audit(entry, **kwargs):
+            attempts.append(entry.tool_name)
+            try:
+                return await write(entry, **kwargs)
+            except DatabaseError as error:
+                sql_errors.append(error)
+                raise
+        monkeypatch.setattr(host.observability_store, 'log_tool_dispatch', fail_native_audit)
+    seen, executed, terminal = {}, [], []
+    async def operation():
+        runtime_tools = feature.get_tools()
+        executor = feature._make_feature_inline_tool_executor(
+            runtime_tools=runtime_tools, session_id='canonical-completion')
+        handler = CodexAdapter()._make_tool_call_handler(
+            executor, 'native-thread', frozenset({'native_leaf'}),
+            executed_log=executed, terminal_errors=terminal)
+        async def invoke():
+            if route == 'codex':
+                return await handler({'threadId': 'native-thread', 'name': 'native_leaf',
+                    'arguments': {'marker': 'original'}})
+            return await feature._execute_subagent_tool(
+                tool_name='native_leaf', args={'marker': 'original'},
+                tools_by_name={tool.name: tool for tool in runtime_tools},
+                session_id='canonical-completion')
+        with part_collector(host=host, session_id='canonical-completion'):
+            try:
+                seen['first_result'] = await invoke()
+            except Exception as error:
+                seen['first_error'] = error
+            seen['unconfirmed'] = tuple(current_tool_effect_turn(host).unconfirmed)
+            try:
+                seen['second_result'] = await invoke()
+            except Exception as error:
+                seen['second_error'] = error
+    try:
+        await drive_native(host, operation)
+    except ResourceOutcomeUnknown as error:
+        seen['root_error'] = error
+    assert witness.read_text().splitlines() == ['original'], (
+        'Canonical leaf completion escaped its shared boundary and repeated the physical effect')
+    source = sql_errors[0] if completion == 'audit' else original
+    assert any(source is item for error in seen['unconfirmed']
+        for item in execution_evidence_carriers(error)), 'Canonical leaf completion lost its original live uncertainty'
+    assert 'first_error' in seen and is_tool_execution_terminal_error(seen['first_error'])
+    assert 'second_error' in seen and 'second_result' not in seen
+    assert 'root_error' in seen, 'Canonical leaf input completed successfully after uncertain delivery'
+    assert source in execution_evidence_carriers(seen['root_error'])
+    if route == 'codex':
+        assert terminal == [seen['first_error'], seen['first_error']] and executed == []
+        assert seen['second_error'] is seen['first_error']
+    assert await host.tool_effect_store.database.fetchall(
+        'SELECT state FROM tool_effect_claims') == [('RETURNED_OK',)]
+    rows = await host.tool_effect_store.database.fetchall(
+        "SELECT result_status,error_class FROM a2a_tool_dispatches WHERE tool_name='native_leaf'")
+    assert rows == ([] if completion == 'audit' else
+        [('success', None)] if completion == 'deferred-delivery' else [('error', 'ResourceOutcomeUnknown')])
+    if completion == 'audit':
+        assert attempts == ['native_leaf'] and len(sql_errors) == 1
+
+
+@pytest.mark.parametrize('completion', ['parent-delivery', 'model-continuation'])
+@pytest.mark.parametrize('failure', ['ordinary', 'conflict', 'unknown'])
+@pytest.mark.parametrize('route', ['chat', 'named-inline'])
+async def test_canonical_parent_completion_retains_returned_leaf_evidence(
+    canonical_subagent, monkeypatch, completion, failure, route,
+):
+    from uuid import uuid4
+    from kestrel_sovereign.agent.parts import part_collector
+    from kestrel_sovereign.execution_custody import is_tool_execution_terminal_error
+    from kestrel_sovereign.tools.effect_journal import current_tool_effect_turn
+    from tests.utils.native_tool_effects import drive_native
+
+    host, feature, witness, model, _, _, _ = canonical_subagent
+    original = {'ordinary': ValueError, 'conflict': ResourceConflict,
+        'unknown': ResourceOutcomeUnknown}[failure]('private-parent-completion')
+    if completion == 'model-continuation':
+        model.continuation_error = original
+    else:
+        emit = host._reemit_envelope_parts
+        def fail_parent_delivery(envelope):
+            if isinstance(envelope, dict) and isinstance(envelope.get('result'), str):
+                raise original
+            return emit(envelope)
+        monkeypatch.setattr(host, '_reemit_envelope_parts', fail_parent_delivery)
+    seen = {}
+    async def operation():
+        async def invoke():
+            if route == 'named-inline':
+                return await host.execute_named_tool(feature.tool_name, {'task': 'one effect'},
+                    session_id='canonical-parent-completion', source='owned-inline', _capture={})
+            return await host._dispatch_tool_call(
+                ToolCall(id=uuid4().hex, name=feature.tool_name, arguments={'task': 'one effect'}),
+                {feature.tool_name: feature}, {feature.tool_name}, [], 0, 'one original input',
+                session_id='canonical-parent-completion')
+        with part_collector(host=host, session_id='canonical-parent-completion'):
+            try:
+                seen['first_result'] = await invoke()
+            except Exception as error:
+                seen['first_error'] = error
+            seen['unconfirmed'] = tuple(current_tool_effect_turn(host).unconfirmed)
+            try:
+                seen['second_result'] = await invoke()
+            except Exception as error:
+                seen['second_error'] = error
+    try:
+        await drive_native(host, operation)
+    except ResourceOutcomeUnknown as error:
+        seen['root_error'] = error
+    assert witness.read_text().splitlines() == ['original'], (
+        'Canonical parent completion lost its returned leaf and repeated the physical effect')
+    assert any(original is item for error in seen['unconfirmed']
+        for item in execution_evidence_carriers(error)), 'Canonical parent completion lost its original live uncertainty'
+    assert 'first_error' in seen and is_tool_execution_terminal_error(seen['first_error'])
+    assert 'second_error' in seen and 'second_result' not in seen
+    assert 'root_error' in seen and original in execution_evidence_carriers(seen['root_error'])
+    assert model.calls == 1, 'A model continued after its original completion became uncertain'
+    assert await host.tool_effect_store.database.fetchall(
+        'SELECT state FROM tool_effect_claims') == [('RETURNED_OK',)]
+    rows = await host.tool_effect_store.database.fetchall(
+        "SELECT result_status,error_class FROM a2a_tool_dispatches WHERE tool_name='native_leaf'")
+    assert rows == [('success', None)]
+
+
+@pytest.mark.parametrize('route', ['chat', 'named-inline'])
+async def test_canonical_parent_cannot_deliver_a_swallowed_terminal_leaf_result(
+    canonical_subagent, monkeypatch, route,
+):
+    from uuid import uuid4
+    from kestrel_sovereign.agent.parts import part_collector
+    from kestrel_sovereign.llm.codex_adapter import CodexAdapter
+    from tests.utils.native_tool_effects import drive_native
+
+    host, feature, witness, model, _, _, _ = canonical_subagent
+    original = ValueError('private-swallowed-leaf-completion')
+    class NativeValue:
+        def to_dict(self):
+            raise original
+    feature.native_result = {'success': True, 'data': NativeValue()}
+    seen = {}
+    async def provider(**kwargs):
+        model.calls += 1
+        handler = CodexAdapter()._make_tool_call_handler(
+            kwargs['tool_executor'], 'swallow-thread', frozenset({'native_leaf'}),
+            executed_log=[], terminal_errors=[])
+        try:
+            await handler({'threadId': 'swallow-thread', 'name': 'native_leaf',
+                'arguments': {'marker': 'original'}})
+        except Exception as error:
+            seen['leaf_error'] = error
+        return LLMResponse(content='done', tool_calls=None)
+    monkeypatch.setattr(model, 'generate', provider)
+    async def operation():
+        with part_collector(host=host, session_id='swallowed-terminal'):
+            try:
+                if route == 'named-inline':
+                    seen['parent_result'] = await host.execute_named_tool(
+                        feature.tool_name, {'task': 'one effect'}, session_id='swallowed-terminal',
+                        source='owned-inline', _capture={})
+                else:
+                    seen['parent_result'] = await host._dispatch_tool_call(
+                        ToolCall(id=uuid4().hex, name=feature.tool_name, arguments={'task': 'one effect'}),
+                        {feature.tool_name: feature}, {feature.tool_name}, [], 0, 'one input',
+                        session_id='swallowed-terminal')
+            except Exception as error:
+                seen['parent_error'] = error
+    try:
+        await drive_native(host, operation)
+    except ResourceOutcomeUnknown as error:
+        seen['root_error'] = error
+    assert 'leaf_error' in seen and original in execution_evidence_carriers(seen['leaf_error'])
+    assert 'parent_result' not in seen, 'Canonical parent delivered business output after its terminal leaf failed'
+    assert isinstance(seen.get('parent_error'), ResourceOutcomeUnknown)
+    assert original in execution_evidence_carriers(seen['parent_error'])
+    assert 'root_error' in seen and witness.read_text().splitlines() == ['original']

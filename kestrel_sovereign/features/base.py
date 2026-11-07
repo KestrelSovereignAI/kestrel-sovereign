@@ -2381,19 +2381,77 @@ class Feature(_SdkFeature):
                     _dispatch_execution.started = True
                 result = await selected_tool.execute(**effective_args)
                 execution.returned = True
+                if _dispatch_execution is not None:
+                    _dispatch_execution.returned = True
                 return result
 
             async def operation():
-                return await execute_tool_effect(host,
+                result = await execute_tool_effect(host,
                     registration=[type(self).__name__, tool_name], arguments=effective_args,
                     expected_generation=selected_generation,
                     validate_registration=require_original_registration,
                     execute=execute)
 
+                from kestrel_sovereign.agent.invocation import (
+                    mark_current_invocation_effect_completed,
+                )
+
+                mark_current_invocation_effect_completed(None)
+                require_execution_work(host)
+                deferred = isinstance(result, DeferredToolResult)
+                serialized = result if deferred else _serialize_tool_result(result)
+                # Harvest envelope-carried parts (``ToolResult.parts`` / a result
+                # dict's ``parts`` field) into the sink too — the explicit,
+                # ContextVar-free half of the #2641 contract. The envelope keeps
+                # its copy; delivery to the outbound stream happens once, at the
+                # orchestrator's dispatch site. Harvested BEFORE POST_TOOL_USE
+                # fires, so a part a POST hook emits lands after the tool's own,
+                # the order the chat path keeps.
+                if parts_sink is not None and isinstance(serialized, dict):
+                    envelope_parts = serialized.get("parts")
+                    if isinstance(envelope_parts, list) and envelope_parts:
+                        parts_sink.extend(envelope_parts)
+                if deferred:
+                    # Its POST_TOOL_USE, required dispatch row and publication
+                    # all run at the main completion boundary. The subagent's
+                    # model sees only the completed public result.
+                    completed = await _complete_feature_deferred_result(
+                        self, result, host=host, tool_name=tool_name, tool_input=effective_args,
+                        session_id=hook_session_id, exec_start=exec_start,
+                        adapter=dispatch_adapter,
+                        destination=parent_collector,
+                        parent_dispatch_id=parent_dispatch_id, dispatch_id=dispatch_id,
+                        execution_witness=execution,
+                    )
+                    require_execution_work(host)
+                    return _shape(effective_args, completed)
+                exec_duration_ms = int((time.time() - exec_start) * 1000)
+
+                if hooks_manager is not None:
+                    post_hook_input = HookInput(
+                        session_id=hook_session_id,
+                        hook_event_name=HookEvent.POST_TOOL_USE.value,
+                        tool_name=tool_name,
+                        tool_input=effective_args,
+                        feature_name=type(self).__name__,
+                        tool_response=(
+                            serialized
+                            if isinstance(serialized, dict)
+                            else {"result": str(serialized)}
+                        ),
+                        execution_time_ms=exec_duration_ms,
+                    )
+                    await hooks_manager.execute_hooks_parallel(
+                        HookEvent.POST_TOOL_USE, post_hook_input,
+                    )
+                recorded = await _recorded(effective_args, serialized)
+                require_execution_work(host)
+                return recorded
+
             async def failed(error, unknown):
                 raise error
 
-            result = await _run_tool_execution(host, operation,
+            return await _run_tool_execution(host, operation,
                 execution=execution, dispatch_meta=dispatch_meta, session_id=session_id,
                 on_failure=failed,
                 on_terminal=lambda error: _record_terminal_tool_dispatch(
@@ -2401,61 +2459,6 @@ class Feature(_SdkFeature):
                     adapter=dispatch_adapter, args=effective_args, session_id=session_id,
                     dispatch_start=dispatch_start, dispatch_id=dispatch_id,
                     parent_dispatch_id=parent_dispatch_id))
-            from kestrel_sovereign.agent.invocation import (
-                mark_current_invocation_effect_completed,
-            )
-
-            mark_current_invocation_effect_completed(None)
-            require_execution_work(host)
-            deferred = isinstance(result, DeferredToolResult)
-            serialized = result if deferred else _serialize_tool_result(result)
-            # Harvest envelope-carried parts (``ToolResult.parts`` / a result
-            # dict's ``parts`` field) into the sink too — the explicit,
-            # ContextVar-free half of the #2641 contract. The envelope keeps
-            # its copy; delivery to the outbound stream happens once, at the
-            # orchestrator's dispatch site. Harvested BEFORE POST_TOOL_USE
-            # fires, so a part a POST hook emits lands after the tool's own,
-            # the order the chat path keeps.
-            if parts_sink is not None and isinstance(serialized, dict):
-                envelope_parts = serialized.get("parts")
-                if isinstance(envelope_parts, list) and envelope_parts:
-                    parts_sink.extend(envelope_parts)
-            if deferred:
-                # Its POST_TOOL_USE, required dispatch row and publication
-                # all run at the main completion boundary. The subagent's
-                # model sees only the completed public result.
-                completed = await _complete_feature_deferred_result(
-                    self, result, host=host, tool_name=tool_name, tool_input=effective_args,
-                    session_id=hook_session_id, exec_start=exec_start,
-                    adapter=dispatch_adapter,
-                    destination=parent_collector,
-                    parent_dispatch_id=parent_dispatch_id, dispatch_id=dispatch_id,
-                    execution_witness=execution,
-                )
-                require_execution_work(host)
-                return _shape(effective_args, completed)
-            exec_duration_ms = int((time.time() - exec_start) * 1000)
-
-            if hooks_manager is not None:
-                post_hook_input = HookInput(
-                    session_id=hook_session_id,
-                    hook_event_name=HookEvent.POST_TOOL_USE.value,
-                    tool_name=tool_name,
-                    tool_input=effective_args,
-                    feature_name=type(self).__name__,
-                    tool_response=(
-                        serialized
-                        if isinstance(serialized, dict)
-                        else {"result": str(serialized)}
-                    ),
-                    execution_time_ms=exec_duration_ms,
-                )
-                await hooks_manager.execute_hooks_parallel(
-                    HookEvent.POST_TOOL_USE, post_hook_input,
-                )
-            recorded = await _recorded(effective_args, serialized)
-            require_execution_work(host)
-            return recorded
 
     def _compose_subagent_runtime_tools(
         self, denied_tools: Optional[Any] = None

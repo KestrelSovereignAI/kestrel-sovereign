@@ -65,34 +65,45 @@ from kestrel_sovereign.agent.parts import part_collector
 async def test_inline_delivery_failure_after_real_audit_keeps_one_original_receipt(
     deferred_boundary, monkeypatch,  # noqa: F811 - imported pytest fixture
 ):
-    async def operation():
-        from kestrel_sovereign.llm.codex_adapter import CodexAdapter
+    from kestrel_sovereign.llm.codex_adapter import CodexAdapter
 
-        b = deferred_boundary
-        b.policy.release.set()
-        native_emit = b.host._reemit_envelope_parts
-        def fail_after_ack(envelope):
-            if any(part.get('type') == 'private_view' for part in envelope.get('parts', [])):
-                raise RuntimeError('private-after-audit-delivery-fault')
-            return native_emit(envelope)
-        monkeypatch.setattr(b.host, '_reemit_envelope_parts', fail_after_ack)
-        executed, terminal = [], []
+    b = deferred_boundary
+    b.policy.release.set()
+    original = RuntimeError('private-after-audit-delivery-fault')
+    native_emit = b.host._reemit_envelope_parts
+    def fail_after_ack(envelope):
+        if any(part.get('type') == 'private_view' for part in envelope.get('parts', [])):
+            raise original
+        return native_emit(envelope)
+    monkeypatch.setattr(b.host, '_reemit_envelope_parts', fail_after_ack)
+    seen, executed, terminal = {}, [], []
+    async def operation():
         handler = CodexAdapter()._make_tool_call_handler(
             b.host._make_inline_tool_executor('deferred-owned-session'),
             't', frozenset({b.binding.name}), executed_log=executed, terminal_errors=terminal)
         with part_collector(host=b.host, session_id='deferred-owned-session'):
-            with pytest.raises(ResourceOutcomeUnknown) as caught:
-                await handler({'threadId': 't', 'name': b.binding.name, 'arguments': {}})
-            with pytest.raises(ResourceOutcomeUnknown) as repeated:
-                await handler({'threadId': 't', 'name': b.binding.name, 'arguments': {}})
-        assert repeated.value is caught.value
-        assert terminal == [caught.value] and executed == []
-        assert b.tool.executions == [{}] and b.tool.publications == ['published-once']
-        rows = await b.backend.fetch_all('SELECT result_status FROM a2a_tool_dispatches')
-        assert [row[0] for row in rows] == ['success']
-
-    with pytest.raises(ResourceOutcomeUnknown):
-        await drive_native(deferred_boundary.host, operation)
+            try:
+                seen['first_result'] = await handler({'threadId': 't', 'name': b.binding.name, 'arguments': {}})
+            except Exception as error:
+                seen['first_error'] = error
+            try:
+                seen['second_result'] = await handler({'threadId': 't', 'name': b.binding.name, 'arguments': {}})
+            except Exception as error:
+                seen['second_error'] = error
+    try:
+        await drive_native(b.host, operation)
+    except ResourceOutcomeUnknown as error:
+        seen['root_error'] = error
+    # Assertions stay outside the journaled input: its real uncertainty must
+    # not accidentally turn a failing test assertion into an expected error.
+    assert isinstance(seen.get('first_error'), ResourceOutcomeUnknown)
+    assert seen['second_error'] is seen['first_error']
+    assert terminal == [seen['first_error'], seen['first_error']] and executed == []
+    assert 'first_result' not in seen and 'second_result' not in seen
+    assert 'root_error' in seen and original in execution_evidence_carriers(seen['root_error'])
+    assert b.tool.executions == [{}] and b.tool.publications == ['published-once']
+    rows = await b.backend.fetch_all('SELECT result_status FROM a2a_tool_dispatches')
+    assert [row[0] for row in rows] == ['success']
 
 
 
@@ -126,34 +137,36 @@ async def test_codex_uses_host_uncertainty_before_stale_user_denial(host, audite
 
 @pytest.mark.asyncio
 async def test_codex_audit_uncertainty_latches_without_becoming_authority_loss(deferred_boundary):  # noqa: F811 - imported pytest fixture
-    await deferred_boundary.backend.execute('DROP TABLE a2a_tool_dispatches')
-    observed = []
+    from kestrel_sovereign.execution_custody import ToolAuditUnconfirmedError, is_execution_control_error
+    from kestrel_sovereign.llm.codex_adapter import CodexAdapter
 
+    b = deferred_boundary
+    await b.backend.execute('DROP TABLE a2a_tool_dispatches')
+    b.policy.release.set()
+    seen, executed, terminal = {}, [], []
     async def operation():
-        from kestrel_sovereign.execution_custody import ToolAuditUnconfirmedError, is_execution_control_error
-        from kestrel_sovereign.llm.codex_adapter import CodexAdapter
-
-        b = deferred_boundary
-        b.policy.release.set()
-        executed, terminal = [], []
         handler = CodexAdapter()._make_tool_call_handler(
             b.host._make_inline_tool_executor('deferred-owned-session'),
-            't', frozenset({b.binding.name}), executed_log=executed, terminal_errors=terminal,
-        )
-        with pytest.raises(ToolAuditUnconfirmedError) as caught:
-            await handler({'threadId': 't', 'name': b.binding.name, 'arguments': {}})
-        observed.append(caught.value)
-        assert not is_execution_control_error(caught.value)
-        assert terminal == [caught.value] and executed == []
-        assert b.tool.executions == [{}] and b.tool.publications == []
-        with pytest.raises(ToolAuditUnconfirmedError) as repeated:
-            await handler({'threadId': 't', 'name': b.binding.name, 'arguments': {}})
-        assert repeated.value is caught.value
-        assert b.tool.executions == [{}] and executed == []
-
-    with pytest.raises(ResourceOutcomeUnknown) as root:
-        await drive_native(deferred_boundary.host, operation)
-    assert observed[0] in execution_evidence_carriers(root.value)
+            't', frozenset({b.binding.name}), executed_log=executed, terminal_errors=terminal)
+        try:
+            seen['first_result'] = await handler({'threadId': 't', 'name': b.binding.name, 'arguments': {}})
+        except Exception as error:
+            seen['first_error'] = error
+        try:
+            seen['second_result'] = await handler({'threadId': 't', 'name': b.binding.name, 'arguments': {}})
+        except Exception as error:
+            seen['second_error'] = error
+    try:
+        await drive_native(b.host, operation)
+    except ResourceOutcomeUnknown as error:
+        seen['root_error'] = error
+    assert isinstance(seen.get('first_error'), ToolAuditUnconfirmedError)
+    assert not is_execution_control_error(seen['first_error'])
+    assert seen['second_error'] is seen['first_error']
+    assert terminal == [seen['first_error'], seen['first_error']] and executed == []
+    assert 'first_result' not in seen and 'second_result' not in seen
+    assert 'root_error' in seen and seen['first_error'] in execution_evidence_carriers(seen['root_error'])
+    assert b.tool.executions == [{}] and b.tool.publications == []
 
 
 @pytest.mark.asyncio
@@ -300,3 +313,74 @@ async def test_known_inline_conflict_preserves_redaction_without_raw_error_or_st
         assert str(caught.value) == secret
 
     await drive_native(host[0], operation)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('route', ['named-inline', 'inline', 'codex'])
+async def test_final_inline_receipt_serialization_stays_inside_original_completion_boundary(
+    host, tmp_path, route,
+):
+    from kestrel_sovereign.llm.codex_adapter import CodexAdapter
+    from kestrel_sovereign.tools.effect_journal import current_tool_effect_turn
+    from kestrel_sovereign.execution_custody import is_tool_execution_terminal_error
+
+    agent, backend = host
+    witness = tmp_path / 'native-receipt-copy-effect'
+    original = ValueError('private-native-receipt-copy')
+    serializations = []
+    class NativeValue:
+        def to_dict(self):
+            serializations.append(True)
+            if len(serializations) > 1:
+                raise original
+            return {'value': 'native-public-result'}
+    class NativeTool(_Tool):
+        async def execute(self, **arguments):
+            self.calls.append(arguments)
+            with witness.open('a') as stream:
+                stream.write('actual-effect\n')
+            return {'success': True, 'count': arguments['count'], 'data': NativeValue()}
+    tool = NativeTool(visible=True)
+    binding = _mount(agent, tool)
+    seen, executed, terminal = {}, [], []
+    async def operation():
+        executor = agent._make_inline_tool_executor('native-receipt-copy')
+        handler = CodexAdapter()._make_tool_call_handler(
+            executor, 'receipt-thread', frozenset({binding.name}),
+            executed_log=executed, terminal_errors=terminal)
+        async def invoke():
+            if route == 'named-inline':
+                return await agent.execute_named_tool(binding.name, {'count': 1},
+                    session_id='native-receipt-copy', source='owned-inline', _capture={})
+            if route == 'inline':
+                return await executor(binding.name, {'count': 1})
+            return await handler({'threadId': 'receipt-thread', 'name': binding.name,
+                'arguments': {'count': 1}})
+        try:
+            seen['first_result'] = await invoke()
+        except Exception as error:
+            seen['first_error'] = error
+        seen['unconfirmed'] = tuple(current_tool_effect_turn(agent).unconfirmed)
+        seen['faults_before_retry'] = len(serializations)
+        try:
+            seen['second_result'] = await invoke()
+        except Exception as error:
+            seen['second_error'] = error
+    try:
+        await drive_native(agent, operation)
+    except ResourceOutcomeUnknown as error:
+        seen['root_error'] = error
+    assert seen['faults_before_retry'] == 2, 'The original completion fault was not actually reached'
+    assert witness.read_text() == 'actual-effect\n', (
+        'Final host receipt construction escaped the original boundary and repeated its effect')
+    assert any(original is item for error in seen['unconfirmed']
+        for item in execution_evidence_carriers(error)), 'Receipt construction lost original live uncertainty'
+    assert 'first_error' in seen and is_tool_execution_terminal_error(seen['first_error'])
+    assert 'second_error' in seen and 'second_result' not in seen
+    assert 'root_error' in seen and original in execution_evidence_carriers(seen['root_error'])
+    if route == 'codex':
+        assert terminal == [seen['first_error'], seen['first_error']] and executed == []
+    assert await agent.tool_effect_store.database.fetchall(
+        'SELECT state FROM tool_effect_claims') == [('RETURNED_OK',)]
+    assert [tuple(row) for row in await backend.fetch_all(
+        'SELECT result_status,error_class FROM a2a_tool_dispatches')] == [('success', None)]
