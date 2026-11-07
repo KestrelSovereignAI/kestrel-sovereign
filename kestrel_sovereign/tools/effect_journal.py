@@ -10,7 +10,7 @@ import hashlib
 import inspect
 from typing import Any, Awaitable, Callable, Iterator
 
-import rfc8785
+from kestrel_sovereign.a2a.media import encode_inline_json
 
 from kestrel_sdk.resources import ResourceConflict, ResourceError, ResourceOutcomeUnknown, observed_outcome_unknown
 from kestrel_sdk.tools.result import ToolResult, ToolResultStatus
@@ -68,10 +68,7 @@ def record_tool_effect_completion_failure(owner, error: BaseException) -> BaseEx
 
 def logical_operation_key(value: object) -> str:
     """Encode opaque transport keys once without narrowing their wire domain."""
-    try:
-        encoded = rfc8785.dumps(["kestrel-tool-effect-client-key-v1", value])
-    except rfc8785.CanonicalizationError as error:
-        raise ValueError("Tool operation identity is not canonical JSON") from error
+    encoded = encode_inline_json(["kestrel-tool-effect-client-key-v2", value], sort_keys=True)
     return hashlib.sha256(encoded).hexdigest()
 
 

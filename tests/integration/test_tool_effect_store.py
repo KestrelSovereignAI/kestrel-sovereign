@@ -432,11 +432,9 @@ async def test_uncommitted_caller_transaction_cannot_receive_claim_admission(jou
 
 @pytest.mark.asyncio
 async def test_noncanonical_arguments_fail_before_a_claim_exists(journal):
-    import rfc8785
-
     store, _, _ = journal
     attempt = await admit(store)
-    with pytest.raises(rfc8785.CanonicalizationError):
+    with pytest.raises(ValueError, match='non-finite'):
         await store.claim(attempt, registration="owned-tool", arguments={"invalid": float("nan")})
     assert await store.database.fetchone("SELECT COUNT(*) FROM tool_effect_claims") == (0,)
 
@@ -507,11 +505,14 @@ async def test_unavailable_encryption_fails_without_changing_original_rows(journ
 
 
 @pytest.mark.asyncio
-async def test_unknown_schema_revision_is_not_migrated_or_marked_initialized(journal):
+@pytest.mark.parametrize('unsupported_revision', [1, 999])
+async def test_unknown_schema_revision_is_not_migrated_or_marked_initialized(journal, unsupported_revision):
     store, _, _ = journal
-    await store.database.execute("UPDATE tool_effect_schema SET revision = 2 WHERE singleton = 1")
+    before = await store.database.fetchall('SELECT * FROM tool_effect_keys')
+    await store.database.execute("UPDATE tool_effect_schema SET revision = ? WHERE singleton = 1", (unsupported_revision,))
     restarted = ToolEffectStore(store.database, scope=NativeRecipientScope("did:test:owned-journal", "tenant"))
     with pytest.raises(ToolEffectIntegrityError, match="unsupported tool effect schema revision"):
         await restarted.initialize()
     assert restarted._root is None
-    assert await store.database.fetchone("SELECT revision FROM tool_effect_schema WHERE singleton = 1") == (2,)
+    assert await store.database.fetchone("SELECT revision FROM tool_effect_schema WHERE singleton = 1") == (unsupported_revision,)
+    assert await store.database.fetchall('SELECT * FROM tool_effect_keys') == before

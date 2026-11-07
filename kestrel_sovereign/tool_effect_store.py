@@ -15,12 +15,11 @@ import os
 from typing import Literal, NoReturn
 from uuid import uuid4
 
-import rfc8785
-
 from kestrel_sdk._validation import stable_token
 from kestrel_sdk.resources import ResourceConflict, ResourceError
 from kestrel_sdk.security.encryption import get_fernet
 from kestrel_sovereign.a2a.scope import NativeRecipientScope
+from kestrel_sovereign.a2a.media import encode_inline_json
 from kestrel_sovereign.a2a.stores.unified.base import NativeStoreConflict, UnifiedStoreBase
 from kestrel_sovereign.security.envelope_keys import resolve_envelope_key
 from kestrel_sovereign.storage.async_database import AsyncDatabase
@@ -84,6 +83,8 @@ TOOL_EFFECT_CLAIMS_COLUMNS = dict.fromkeys((
 ), 'TEXT')
 
 
+TOOL_EFFECT_SCHEMA_REVISION = 2
+
 ClaimTerminal = Literal["RETURNED_OK", "RETURNED_ERROR", "UNCONFIRMED", "NOT_EXECUTED"]
 
 
@@ -99,9 +100,9 @@ class ToolEffectStore(UnifiedStoreBase):
             raise ValueError('Tool effect terminal timeout must be finite and positive')
         self.terminal_timeout_seconds = float(timeout)
         self.database = database
-        self.scope_digest = hashlib.sha256(rfc8785.dumps([
-            "kestrel-tool-effect-scope-v1", scope.recipient_id, scope.tenant,
-        ])).hexdigest()
+        self.scope_digest = hashlib.sha256(encode_inline_json([
+            "kestrel-tool-effect-scope-v2", scope.recipient_id, scope.tenant,
+        ], sort_keys=True)).hexdigest()
         self._root: bytes | None = None
         self._initialization_lock = asyncio.Lock()
 
@@ -140,7 +141,7 @@ class ToolEffectStore(UnifiedStoreBase):
                         "CREATE TABLE IF NOT EXISTS tool_effect_schema (singleton BIGINT PRIMARY KEY, revision BIGINT NOT NULL)"
                     )
                     revision = await self.database.fetchone("SELECT revision FROM tool_effect_schema WHERE singleton = 1")
-                    if revision is not None and revision[0] != 1:
+                    if revision is not None and revision[0] != TOOL_EFFECT_SCHEMA_REVISION:
                         raise ToolEffectIntegrityError("unsupported tool effect schema revision")
                     if revision is None:
                         binary = "BYTEA" if self.is_postgres else "BLOB"
@@ -150,7 +151,10 @@ class ToolEffectStore(UnifiedStoreBase):
                             TOOL_EFFECT_CLAIMS_SQL,
                         ):
                             await self.database.execute(sql)
-                        await self.database.execute("INSERT INTO tool_effect_schema(singleton, revision) VALUES (1, 1)")
+                        await self.database.execute(
+                            "INSERT INTO tool_effect_schema(singleton, revision) VALUES (1, ?)",
+                            (TOOL_EFFECT_SCHEMA_REVISION,),
+                        )
                     # A completed revision never silently recreates lost tables.
                     await self.database.fetchone("SELECT request_digest, attempt_id, revision, state, latched FROM tool_effect_operations WHERE 1 = 0")
                     await self.database.fetchone("SELECT claim_id, attempt_id, parent_claim_id, registration_digest, args_digest, state FROM tool_effect_claims WHERE 1 = 0")
@@ -177,7 +181,7 @@ class ToolEffectStore(UnifiedStoreBase):
     def _digest(self, domain: str, value: object) -> str:
         if self._root is None:
             raise RuntimeError("tool effect journal must be initialized")
-        return hmac.new(self._root, rfc8785.dumps([domain, value]), hashlib.sha256).hexdigest()
+        return hmac.new(self._root, encode_inline_json([domain, value], sort_keys=True), hashlib.sha256).hexdigest()
 
     def _require_scope(self, attempt: ToolEffectAttempt) -> None:
         if attempt.scope_digest != self.scope_digest:
@@ -212,8 +216,8 @@ class ToolEffectStore(UnifiedStoreBase):
     async def admit(self, *, namespace: object, client_key: str, request: object) -> ToolEffectAttempt:
         self._require_outermost()
         stable_token(client_key, "operation_id")
-        operation = self._digest("op-v1", [namespace, client_key])
-        request_digest = self._digest("request-v1", request)
+        operation = self._digest("op-v2", [namespace, client_key])
+        request_digest = self._digest("request-v2", request)
         from kestrel_sovereign.storage.original_tool_effect_finish import _OriginalToolEffectFinish
 
         attempt_id = str(uuid4())
@@ -251,8 +255,8 @@ class ToolEffectStore(UnifiedStoreBase):
         self._require_scope(attempt)
         if parent is not None and parent.attempt != attempt:
             raise ToolEffectAttemptSuperseded("parent claim belongs to another attempt")
-        registration_digest = self._digest("registration-v1", registration)
-        args_digest = self._digest("args-v1", arguments)
+        registration_digest = self._digest("registration-v2", registration)
+        args_digest = self._digest("args-v2", arguments)
         claim = ToolEffectClaim(attempt, str(uuid4()))
         async with self.write_transaction():
             changed = await self.database.execute(
