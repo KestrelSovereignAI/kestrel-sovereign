@@ -370,6 +370,15 @@ Opaque Feature task handlers validate required fields and canonical Task outcome
 invariants before acknowledging their claim. A malformed reply produces a FAILED
 Task with `outcome_unknown` from the admitted baseline for the recipient writer;
 concurrent committed task data remains authoritative.
+An explicit unknown native reply fences its original input and settles its
+opaque claim as UNCONFIRMED while preserving the validated Task state and
+artifacts. Native synchronous Task completion includes registration-context
+exit, persistence, post-hooks and final return. Workflows and typed commands
+retain uncertainty when a returned Task cannot be read; a completion failure
+cannot become another execution attempt. The original Feature host and input
+are retained across those readers, and the existing journal refuses further
+Task admission after uncertainty. Required audit uncertainty also fences that
+input when it occurs before a tool body starts.
 
 Terminal retirement closes only the original attempt through the shared native
 result-custody writer. It retains the original connection generation or pool

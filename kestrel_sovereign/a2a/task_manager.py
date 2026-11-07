@@ -97,6 +97,7 @@ from kestrel_sovereign.a2a.stores.unified.task_store import (
 from kestrel_sovereign.execution_custody import (
     execution_terminal_error,
     is_execution_control_error,
+    is_tool_execution_terminal_error,
 )
 from kestrel_sovereign.storage.db.interface import DatabaseBackend
 
@@ -635,17 +636,19 @@ class TaskManager:
             current_tool_effect_turn, execute_tool_effect,
             record_tool_effect_completion_failure,
         )
-        original_turn = None
-        if isinstance(handler, Feature) and not sync:
-            from copy import deepcopy
-
-            original_turn = current_tool_effect_turn(original_host)
+        original_turn = (current_tool_effect_turn(original_host)
+            if isinstance(handler, Feature) else None)
+        if isinstance(handler, Feature):
             if original_turn is None:
                 from kestrel_sovereign.tools.effect_journal import ToolEffectJournalUnavailable
 
                 raise ToolEffectJournalUnavailable('tool_effect_attempt_unavailable')
             original_turn.require_live(original_host)
-            args = deepcopy(args)
+            original_turn.require_confirmed()
+            if not sync:
+                from copy import deepcopy
+
+                args = deepcopy(args)
 
         def completion_failure(error):
             if original_host is None:
@@ -657,7 +660,9 @@ class TaskManager:
                 return await selected_handler(task, arguments=arguments)
 
             handler_baseline = Task.FromString(task.SerializeToString())
+            unknown_reply: Task | None = None
             async def execute_opaque_handler():
+                nonlocal unknown_reply
                 from kestrel_sdk.native_a2a.utils.proto_utils import validate_proto_required_fields
                 from kestrel_sovereign.a2a.outcomes import merge_task_outcome
 
@@ -665,7 +670,14 @@ class TaskManager:
                 if not issubclass(type(result), Task):
                     raise TypeError('Native Feature handler must return a Task')
                 validate_proto_required_fields(result)
-                return merge_task_outcome(handler_baseline, handler_baseline, result)
+                result = merge_task_outcome(handler_baseline, handler_baseline, result)
+                if task_outcome_unknown(result):
+                    # The native reply itself declares uncertainty. Preserve
+                    # that validated receipt while the same journal records
+                    # UNCONFIRMED and fences its original consuming input.
+                    unknown_reply = result
+                    raise ResourceOutcomeUnknown(self._unknown_outcome_text(result))
+                return result
 
             try:
                 return await execute_tool_effect(original_host,
@@ -676,6 +688,8 @@ class TaskManager:
             except ResourceOutcomeUnknown as unknown:
                 if is_execution_control_error(unknown):
                     raise
+                if unknown_reply is not None:
+                    return unknown_reply
                 # The journal retains the exact original failure and fences
                 # replay. Persist that same recipient-owned Task as unknown;
                 # a custom handler need not enter the canonical tool leaf.
@@ -746,7 +760,7 @@ class TaskManager:
                 metadata=metadata,
             )
             request.message.parts.append(argument_part)
-            if original_turn is not None:
+            if original_turn is not None and not sync:
                 require_original_registration()
             task = await self.create_task(
                 request,
@@ -797,34 +811,54 @@ class TaskManager:
                 return task
 
             if sync:
-                # Execute synchronously with transaction safety
+                # The actual handler return starts completion custody. Keep
+                # context exit, persistence, post-hooks and final handoff in
+                # that same boundary; a late failure cannot invite replay.
+                returned = False
                 try:
-                    expected_state = task.status.state
-                    with execution_registration:
-                        try:
-                            require_original_registration()
-                            task = await execute_selected_handler(task, arguments=args)
-                        except ResourceConflict as refusal:
-                            # The original native task was already admitted.
-                            # Settle that same recipient-owned task through the
-                            # canonical failure transition before propagating
-                            # the known no-dispatch registration refusal.
-                            await self.fail_task(task.id, str(refusal),
-                                agent_name=authority_agent_id,
-                                recipient_agent_id=authority_agent_id)
-                            raise
-                    # The canonical outcome writer owns CAS and uncertain-commit
-                    # reconciliation. A persistence failure must reach the caller; an
-                    # extra transaction/retry cannot manufacture a completed receipt.
                     try:
+                        expected_state = task.status.state
+                        with execution_registration:
+                            try:
+                                require_original_registration()
+                                task = await execute_selected_handler(task, arguments=args)
+                                returned = True
+                            except ResourceConflict as refusal:
+                                # The admitted Task records a known refusal
+                                # before any handler return or completion.
+                                await self.fail_task(task.id, str(refusal),
+                                    agent_name=authority_agent_id,
+                                    recipient_agent_id=authority_agent_id)
+                                raise
+                        # One canonical writer owns CAS and uncertain COMMIT.
                         task = await self._persist_sync_execution_outcome(
                             task,
                             baseline=baseline,
                             authority_agent_id=authority_agent_id,
                             expected_state=expected_state,
                         )
+                        if self.hooks_manager:
+                            from kestrel_sdk.hooks.base import HookEvent, HookInput
+
+                            post_hook_input = HookInput(
+                                session_id=session_id,
+                                hook_event_name=HookEvent.POST_TOOL_USE.value,
+                                tool_name=skill_id,
+                                tool_input=args,
+                                feature_name=hook_feature_name,
+                                tool_response={
+                                    "task_id": task.id,
+                                    "state": task_state_label(task.status.state),
+                                },
+                            )
+                            await self.hooks_manager.execute_hooks_parallel(
+                                HookEvent.POST_TOOL_USE, post_hook_input
+                            )
+                        return task
                     except BaseException as error:
-                        raise completion_failure(error)
+                        if returned:
+                            raise completion_failure(error)
+                        raise
                 except asyncio.CancelledError as cancellation:
                     if is_execution_control_error(cancellation):
                         raise
@@ -832,27 +866,6 @@ class TaskManager:
                         baseline, authority_agent_id, cancellation
                     )
                     raise
-                # Execute POST_TOOL_USE hooks
-                if self.hooks_manager:
-                    from kestrel_sdk.hooks.base import HookEvent, HookInput
-
-                    post_hook_input = HookInput(
-                        session_id=session_id,
-                        hook_event_name=HookEvent.POST_TOOL_USE.value,
-                        tool_name=skill_id,
-                        tool_input=args,
-                        feature_name=hook_feature_name,
-                        tool_response={
-                            "task_id": task.id,
-                            "state": task_state_label(task.status.state),
-                        },
-                    )
-                    # Post hooks run in parallel (non-blocking)
-                    await self.hooks_manager.execute_hooks_parallel(
-                        HookEvent.POST_TOOL_USE, post_hook_input
-                    )
-
-                return task
             else:
                 async def execute_original_provider():
                     with execution_registration:
@@ -879,7 +892,7 @@ class TaskManager:
                     execution.add_done_callback(retire_execution)
                 return task
 
-        if original_turn is not None:
+        if original_turn is not None and not sync:
             # Durable acceptance itself fences reissuing an asynchronous task,
             # even if the process dies before the worker reaches its tool leaf.
             return await execute_tool_effect(original_host,
@@ -1438,6 +1451,9 @@ class TaskManager:
         # Parse command arguments using the tool's parser if available
         args = {}
         _, handler = self._providers.get(agent_id, (None, None))
+        from kestrel_sdk.features.base import Feature
+
+        original_host = handler.agent if isinstance(handler, Feature) else None
         if handler:
             # Try to get the tool from the handler to use its parse_command_args
             tool = (
@@ -1456,6 +1472,7 @@ class TaskManager:
         # writes is attributed to the caller rather than to the agent (#2652).
         from kestrel_sovereign.llm.provider_policy import command_authored_scope
 
+        task = None
         try:
             with command_authored_scope(skill_id):
                 task = await self.execute_skill(
@@ -1491,8 +1508,12 @@ class TaskManager:
             return {"success": True, "result": "Task completed"}
 
         except Exception as e:
-            if is_execution_control_error(e):
-                raise
+            if task is not None and original_host is not None:
+                from kestrel_sovereign.tools.effect_journal import record_tool_effect_completion_failure
+
+                e = record_tool_effect_completion_failure(original_host, e)
+            if is_execution_control_error(e) or is_tool_execution_terminal_error(e):
+                raise e
             logger.error(f"Command execution failed: {e}")
             return {"success": False, "error": str(e)}
 

@@ -473,9 +473,10 @@ async def test_a_codex_envelope_is_recorded_when_its_turn_fails_before_its_bread
 
 
 @pytest.mark.asyncio
-async def test_native_codex_envelope_audit_refusal_withholds_reply_and_breadcrumbs(make_host, monkeypatch):
+@pytest.mark.parametrize('denied', [False, True], ids=['returned-body', 'denied-before-body'])
+async def test_native_codex_envelope_audit_refusal_withholds_reply_and_breadcrumbs(make_host, monkeypatch, denied):
     """A refused native audit cannot be healed or replayed by a breadcrumb."""
-    host = await make_host()
+    host = await make_host(decide=(DISPATCHER, HookOutput.deny('Denied before native work')) if denied else None)
     await host.backend.execute(
         "CREATE TRIGGER refuse_envelope BEFORE INSERT ON a2a_tool_dispatches "
         f"WHEN NEW.tool_name = '{DISPATCHER}' "
@@ -493,8 +494,48 @@ async def test_native_codex_envelope_audit_refusal_withholds_reply_and_breadcrum
     with pytest.raises(ResourceOutcomeUnknown):
         await _codex_dispatch(host, {"task": "claim, then cancel"}, before_record=heal)
     assert healed == [], 'An unconfirmed native audit reached normal delivery'
-    assert attempted == ['talon_claim', 'talon_cancel', DISPATCHER], 'An original audit was attempted twice'
-    assert [row['tool_name'] for row in await host.rows()] == ['talon_claim', 'talon_cancel']
+    assert attempted == ([DISPATCHER] if denied else ['talon_claim', 'talon_cancel', DISPATCHER]), 'An original audit was attempted twice'
+    assert [row['tool_name'] for row in await host.rows()] == ([] if denied else ['talon_claim', 'talon_cancel'])
+    if denied:
+        assert host.feature.calls == []
+
+
+@pytest.mark.asyncio
+async def test_prebody_native_audit_uncertainty_fences_the_original_input(make_host, tmp_path):
+    from kestrel_sovereign.tools.effect_journal import execute_tool_effect
+
+    host = await make_host(decide=(DISPATCHER, HookOutput.deny('Denied before native work')))
+    await host.backend.execute(
+        'CREATE TRIGGER refuse_original_prebody_audit BEFORE INSERT ON a2a_tool_dispatches '
+        f"WHEN NEW.tool_name = '{DISPATCHER}' "
+        "BEGIN SELECT RAISE(ABORT, 'prebody audit refused'); END")
+    witness = tmp_path / 'effect-after-unconfirmed-audit'
+    seen = {}
+    async def effect():
+        witness.write_text('unexpected')
+        return {'success': True}
+    async def operation():
+        try:
+            await host.agent.execute_named_tool(DISPATCHER, {'task': 'denied'},
+                session_id=SESSION, source='original-prebody-audit')
+        except Exception as error:
+            seen['first_error'] = error
+        try:
+            seen['second_result'] = await execute_tool_effect(host.agent,
+                registration='after-unconfirmed-prebody-audit', arguments={}, execute=effect)
+        except Exception as error:
+            seen['second_error'] = error
+    try:
+        await drive_native(host.agent, operation)
+    except ResourceOutcomeUnknown as error:
+        seen['root_error'] = error
+    assert host.feature.calls == []
+    assert not witness.exists(), 'An unconfirmed pre-body audit admitted another effect'
+    assert isinstance(seen.get('first_error'), ResourceOutcomeUnknown)
+    assert 'second_result' not in seen and isinstance(seen.get('second_error'), ResourceOutcomeUnknown)
+    assert 'root_error' in seen
+    assert seen['first_error'] in execution_evidence_carriers(seen['root_error'])
+    assert await host.agent.tool_effect_store.database.fetchall('SELECT state FROM tool_effect_claims') == []
 
 
 @pytest.mark.asyncio

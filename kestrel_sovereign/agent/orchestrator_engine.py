@@ -1016,9 +1016,10 @@ async def _run_tool_execution(host, operation, *, execution, dispatch_meta,
             turn.require_confirmed()
         return result
     except Exception as error:
-        if execution.returned:
+        if execution.returned or (turn is not None and observed_outcome_unknown(error)):
             # All producers retain completion uncertainty before either an
             # inline recovery or terminal propagation can hide it from Root.
+            # Required audit can become uncertain before a tool body starts.
             from kestrel_sovereign.tools.effect_journal import record_tool_effect_completion_failure
 
             error = record_tool_effect_completion_failure(host, error)

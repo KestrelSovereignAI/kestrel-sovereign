@@ -537,3 +537,237 @@ async def test_native_completion_conflict_preserves_acknowledgement_and_fences_r
     assert len(task_ids) == 1
     assert persisted.artifacts[0].parts[0].text == 'committed other value'
     assert await p.host.tool_effect_store.database.fetchall('SELECT state FROM tool_effect_claims') == [('RETURNED_OK',)] * (2 if lane == 'async' else 1), 'Native completion failure rewrote acknowledged effect receipts'
+
+
+@pytest.mark.parametrize('lane', ['direct', 'catcher', 'workflow'])
+@pytest.mark.parametrize('failure', ['ordinary', 'conflict', 'unknown'])
+async def test_native_task_post_completion_failure_cannot_replay_an_acknowledged_effect(
+    concrete_feature, monkeypatch, lane, failure,
+):
+    from kestrel_sdk.native_a2a.types import TaskState
+    from kestrel_sdk.resources import ResourceOutcomeUnknown
+    from kestrel_sovereign.a2a.scope import NativeRecipientScope
+    from kestrel_sovereign.execution_custody import execution_evidence_carriers
+    from kestrel_sovereign.features.tasks.feature import TaskFeature
+    from kestrel_sovereign.tools.effect_journal import current_tool_effect_turn
+    from kestrel_sovereign.features.subagent_dispatch import ensure_subagent_dispatch
+    from tests.utils.native_a2a import manager_for
+
+    p = concrete_feature
+    class CompletingFeature(type(p.feature)):
+        @tool(name='concrete_effect', description='Append one acknowledged native effect')
+        async def concrete_effect(self):
+            with self.agent.native_effect_target.open('a') as stream:
+                stream.write('once\n')
+            return {'success': True}
+    feature = ensure_subagent_dispatch(CompletingFeature)(p.host)
+    p.host.features[feature.name] = feature
+    original = {'ordinary': ValueError, 'conflict': ResourceConflict,
+        'unknown': ResourceOutcomeUnknown}[failure]('private-native-task-post-matcher')
+    class FailingMatcher(Hook):
+        calls = 0
+        def __init__(self):
+            super().__init__('original-native-task-post-matcher', [HookEvent.POST_TOOL_USE])
+        def matches(self, tool_name):
+            if tool_name != 'concrete_effect':
+                return False
+            self.calls += 1
+            if self.calls == 1:
+                raise original
+            return True
+        async def execute(self, value):
+            return HookOutput.allow()
+    matcher = FailingMatcher()
+    p.host.hooks_manager.register(matcher)
+    manager = manager_for(p.host.tool_effect_store.backend,
+        NativeRecipientScope(p.host.did), owns_backend=False,
+        hooks_manager=p.host.hooks_manager)
+    await manager.initialize()
+    manager.register_provider(feature.name, feature.get_agent_skills(), feature)
+    workflow = TaskFeature(p.host)
+    workflow.set_task_manager(manager)
+    p.host.features[workflow.name] = workflow
+    task_ids, seen = [], {}
+    create = manager.create_task
+    async def record_create(*args, **kwargs):
+        task = await create(*args, **kwargs)
+        task_ids.append(task.id)
+        return task
+    monkeypatch.setattr(manager, 'create_task', record_create)
+    async def operation():
+        async def invoke():
+            return await manager.execute_skill(feature.name, 'concrete_effect', {}, sync=True)
+        try:
+            if lane == 'workflow':
+                seen['result'] = await workflow.run_workflow([{
+                    'feature': feature.name, 'skill': 'concrete_effect',
+                    'max_retries': 1, 'retry_delay_ms': 0}])
+            else:
+                seen['result'] = await invoke()
+        except Exception as error:
+            seen['first_error'] = error
+        seen['unconfirmed'] = tuple(current_tool_effect_turn(p.host).unconfirmed)
+        if lane == 'catcher':
+            try:
+                seen['second_result'] = await invoke()
+            except Exception as error:
+                seen['second_error'] = error
+    try:
+        with caller_context_scope(CallerContext.sovereign()):
+            try:
+                await drive_native(p.host, operation)
+            except ResourceOutcomeUnknown as error:
+                seen['root_error'] = error
+        persisted = [await manager.task_store.get_for_recipient(task_id, manager.did)
+            for task_id in task_ids]
+    finally:
+        await manager.close()
+    assert p.host.native_effect_target.read_text().splitlines() == ['once'], (
+        'Native Task post-completion failure replayed its acknowledged physical effect')
+    assert any(original in execution_evidence_carriers(error) for error in seen['unconfirmed']), (
+        'Native Task post-completion failure lost original live uncertainty')
+    assert 'root_error' in seen and original in execution_evidence_carriers(seen['root_error'])
+    assert len(task_ids) == matcher.calls == 1, 'Uncertain native completion admitted another Task'
+    assert all(task.status.state == TaskState.TASK_STATE_COMPLETED for task in persisted), (
+        'Native completion failure rewrote its acknowledged Task outcome')
+    assert await p.host.tool_effect_store.database.fetchall(
+        'SELECT state FROM tool_effect_claims') == [('RETURNED_OK',)]
+
+
+@pytest.mark.parametrize('consumer', ['workflow', 'command'])
+@pytest.mark.parametrize('owner_change', [False, True], ids=['original-host', 'owner-changed'])
+async def test_native_task_result_readers_cannot_replay_after_decode_failure(
+    concrete_feature, consumer, owner_change,
+):
+    from kestrel_sdk.native_a2a.helpers.proto_helpers import new_raw_artifact
+    from kestrel_sdk.native_a2a.types import TaskState
+    from kestrel_sdk.resources import ResourceOutcomeUnknown
+    from kestrel_sovereign.a2a.scope import NativeRecipientScope
+    from kestrel_sovereign.execution_custody import execution_evidence_carriers
+    from kestrel_sovereign.features.tasks.feature import TaskFeature
+    from tests.utils.native_a2a import manager_for
+
+    p = concrete_feature
+    task_ids, seen = [], {}
+    async def native_handler(task, *, arguments=None):
+        task_ids.append(task.id)
+        with p.host.native_effect_target.open('a') as stream:
+            stream.write('once\n')
+        task.status.state = TaskState.TASK_STATE_COMPLETED
+        task.artifacts.append(new_raw_artifact('unreadable-native-result',
+            b'not-json', media_type='application/json'))
+        if owner_change:
+            p.feature.agent = p.foreign
+            workflow.agent = p.foreign
+        return task
+    p.feature.handle_task = native_handler
+    manager = manager_for(p.host.tool_effect_store.backend,
+        NativeRecipientScope(p.host.did), owns_backend=False)
+    await manager.initialize()
+    manager.register_provider(p.feature.name, p.feature.get_agent_skills(), p.feature,
+        command_prefixes={'!completed-native': 'concrete_effect'})
+    workflow = TaskFeature(p.host)
+    workflow.set_task_manager(manager)
+    p.host.features[workflow.name] = workflow
+    async def operation():
+        if consumer == 'workflow':
+            seen['result'] = await workflow.run_workflow([{
+                'feature': p.feature.name, 'skill': 'concrete_effect',
+                'max_retries': 1, 'retry_delay_ms': 0}])
+        else:
+            for attempt in range(2):
+                try:
+                    seen[f'result-{attempt}'] = await manager.execute_command('!completed-native')
+                except Exception as error:
+                    seen[f'error-{attempt}'] = error
+    try:
+        with caller_context_scope(CallerContext.sovereign()):
+            try:
+                await drive_native(p.host, operation)
+            except ResourceOutcomeUnknown as error:
+                seen['root_error'] = error
+        persisted = [await manager.task_store.get_for_recipient(task_id, manager.did)
+            for task_id in task_ids]
+    finally:
+        await manager.close()
+    assert p.host.native_effect_target.read_text().splitlines() == ['once'], (
+        'Native Task result reader replayed its completed effect after decode failed')
+    assert len(task_ids) == 1
+    assert 'root_error' in seen
+    assert any(isinstance(error, ValueError)
+        for error in execution_evidence_carriers(seen['root_error']))
+    assert persisted[0].status.state == TaskState.TASK_STATE_COMPLETED
+    assert await manager.task_store.backend.fetch_all('SELECT COUNT(*) FROM a2a_tasks') == [(1,)]
+    assert await p.foreign.tool_effect_store.database.fetchall('SELECT state FROM tool_effect_claims') == []
+    assert await p.host.tool_effect_store.database.fetchall(
+        'SELECT state FROM tool_effect_claims') == [('RETURNED_OK',)]
+
+
+@pytest.mark.parametrize('lane', ['direct', 'catcher', 'workflow', 'async'])
+@pytest.mark.parametrize('state', ['failed', 'completed'])
+async def test_opaque_native_unknown_reply_fences_its_original_input(
+    concrete_feature, lane, state,
+):
+    from kestrel_sdk.native_a2a.helpers.proto_helpers import new_raw_artifact
+    from kestrel_sdk.native_a2a.types import TaskState
+    from kestrel_sdk.resources import ResourceOutcomeUnknown
+    from kestrel_sovereign.a2a.lifecycle import mark_outcome_unknown, task_outcome_unknown
+    from kestrel_sovereign.a2a.scope import NativeRecipientScope
+    from kestrel_sovereign.features.tasks.feature import TaskFeature
+    from tests.utils.native_a2a import manager_for
+
+    p = concrete_feature
+    task_ids, seen = [], {}
+    expected_state = (TaskState.TASK_STATE_FAILED if state == 'failed'
+        else TaskState.TASK_STATE_COMPLETED)
+    async def native_handler(task, *, arguments=None):
+        task_ids.append(task.id)
+        with p.host.native_effect_target.open('a') as stream:
+            stream.write('once\n')
+        task.status.state = expected_state
+        task.artifacts.append(new_raw_artifact('original-native-reply',
+            b'{"partial":"receipt"}', media_type='application/json'))
+        mark_outcome_unknown(task)
+        return task
+    p.feature.handle_task = native_handler
+    manager = manager_for(p.host.tool_effect_store.backend,
+        NativeRecipientScope(p.host.did), owns_backend=False)
+    await manager.initialize()
+    manager.register_provider(p.feature.name, p.feature.get_agent_skills(), p.feature)
+    workflow = TaskFeature(p.host)
+    workflow.set_task_manager(manager)
+    p.host.features[workflow.name] = workflow
+    async def operation():
+        if lane == 'workflow':
+            seen['result'] = await workflow.run_workflow([{
+                'feature': p.feature.name, 'skill': 'concrete_effect',
+                'max_retries': 1, 'retry_delay_ms': 0}])
+        else:
+            seen['result'] = await manager.execute_skill(p.feature.name,
+                'concrete_effect', {}, sync=lane != 'async')
+            if lane == 'catcher':
+                try:
+                    seen['second_result'] = await manager.execute_skill(
+                        p.feature.name, 'concrete_effect', {}, sync=True)
+                except Exception as error:
+                    seen['second_error'] = error
+    try:
+        with caller_context_scope(CallerContext.sovereign()):
+            try:
+                await drive_native(p.host, operation)
+            except ResourceOutcomeUnknown as error:
+                seen['root_error'] = error
+        persisted = [await manager.task_store.get_for_recipient(task_id, manager.did)
+            for task_id in task_ids]
+    finally:
+        await manager.close()
+    assert p.host.native_effect_target.read_text().splitlines() == ['once'], (
+        'Explicit native unknown Task reply permitted another physical effect')
+    assert 'root_error' in seen, 'Explicit native unknown Task reply completed its original input'
+    assert len(task_ids) == 1
+    assert persisted[0].status.state == expected_state and task_outcome_unknown(persisted[0]), (
+        'Native explicit unknown reply lost its validated Task state')
+    assert persisted[0].artifacts[0].parts[0].raw == b'{"partial":"receipt"}', (
+        'Native explicit unknown reply lost its validated artifact receipt')
+    states = await p.host.tool_effect_store.database.fetchall('SELECT state FROM tool_effect_claims')
+    assert states == ([('RETURNED_OK',)] if lane == 'async' else []) + [('UNCONFIRMED',)]

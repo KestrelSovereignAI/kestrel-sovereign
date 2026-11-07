@@ -35,6 +35,36 @@ from kestrel_sovereign.tools.effect_journal import (
 )
 from tests.utils.native_a2a import manager_for
 from tests.utils.codex_inline import PreTurnReader
+from tests.utils.native_tool_effects import drive_native
+
+
+async def inspect_workflow_input(feature, *args, **kwargs):
+    """Inspect rollup diagnostics only after the actual input has settled.
+
+    An unknown step must refuse the original Root. Its captured internal
+    rollup remains inspectable; it is never a successfully delivered input.
+    Nested workflow calls stay inside their existing consuming input.
+    """
+    host = feature.agent
+    if current_tool_effect_turn(host) is not None:
+        return await feature.run_workflow(*args, **kwargs)
+    seen = {}
+    async def operation():
+        seen['result'] = await feature.run_workflow(*args, **kwargs)
+        return seen['result']
+    terminal = None
+    try:
+        await drive_native(host, operation)
+    except ResourceOutcomeUnknown as error:
+        if 'result' not in seen:
+            raise
+        terminal = error
+    result = seen['result']
+    records = (result.data or {}).get('results', [])
+    unknown = any(record.get('outcome_unknown') is True for record in records)
+    assert (terminal is not None) == unknown, (
+        'Original workflow input did not retain its reported completion uncertainty')
+    return result
 
 
 @pytest_asyncio.fixture
@@ -159,7 +189,7 @@ def payload(result, index=0):
 
 
 async def test_single_step_retains_an_official_task_and_result(task_feature, manager):
-    result = await task_feature.run_workflow(
+    result = await inspect_workflow_input(task_feature,
         [{"feature": "model_agent", "skill": "get_current_model"}]
     )
     assert result.status is ToolResultStatus.OK
@@ -178,7 +208,7 @@ async def test_single_step_retains_an_official_task_and_result(task_feature, man
 
 
 async def test_multi_step_workflow_runs_in_order_and_retains_metadata(task_feature):
-    result = await task_feature.run_workflow(
+    result = await inspect_workflow_input(task_feature,
         [
             {"feature": "model_agent", "skill": "get_current_model"},
             {"feature": "memory_feature", "skill": "memory_status"},
@@ -213,7 +243,7 @@ async def test_multi_step_workflow_runs_in_order_and_retains_metadata(task_featu
     "arguments", [{"provider": "selected"}, '{"provider":"selected"}']
 )
 async def test_object_and_json_encoded_tool_arguments(task_feature, arguments):
-    result = await task_feature.run_workflow(
+    result = await inspect_workflow_input(task_feature,
         [{"feature": "model_agent", "skill": "list_models", "args": arguments}]
     )
     assert (
@@ -226,7 +256,7 @@ async def test_object_and_json_encoded_tool_arguments(task_feature, arguments):
 async def test_references_are_resolved_into_typed_native_arguments(
     task_feature, reference
 ):
-    result = await task_feature.run_workflow(
+    result = await inspect_workflow_input(task_feature,
         [
             {"feature": "model_agent", "skill": "get_current_model"},
             {
@@ -252,7 +282,7 @@ async def test_references_are_resolved_into_typed_native_arguments(
 async def test_invalid_arguments_keep_the_step_target_and_reason(
     task_feature, arguments, expected
 ):
-    result = await task_feature.run_workflow(
+    result = await inspect_workflow_input(task_feature,
         [{"feature": "model_agent", "skill": "list_models", "args": arguments}]
     )
     assert result.status is ToolResultStatus.ERROR and result.data["failed"] == 1
@@ -265,7 +295,7 @@ async def test_invalid_arguments_keep_the_step_target_and_reason(
 
 
 async def test_unknown_provider_has_a_clear_failure(task_feature):
-    result = await task_feature.run_workflow(
+    result = await inspect_workflow_input(task_feature,
         [{"feature": "missing", "skill": "missing"}]
     )
     assert result.status is ToolResultStatus.ERROR and result.data["failed"] == 1
@@ -273,7 +303,7 @@ async def test_unknown_provider_has_a_clear_failure(task_feature):
 
 
 async def test_native_skill_rejection_keeps_its_reason(task_feature, manager):
-    result = await task_feature.run_workflow(
+    result = await inspect_workflow_input(task_feature,
         [{"feature": "model_agent", "skill": "missing"}]
     )
     assert result.status is ToolResultStatus.ERROR and result.data["failed"] == 1
@@ -286,7 +316,7 @@ async def test_native_skill_rejection_keeps_its_reason(task_feature, manager):
 
 
 async def test_failure_does_not_hide_the_successful_steps(task_feature):
-    result = await task_feature.run_workflow(
+    result = await inspect_workflow_input(task_feature,
         [
             {"feature": "model_agent", "skill": "get_current_model"},
             {"feature": "missing", "skill": "missing"},
@@ -304,7 +334,7 @@ async def test_failure_does_not_hide_the_successful_steps(task_feature):
 
 @pytest.mark.parametrize("steps", [[], None, "invalid"])
 async def test_invalid_workflow_input_is_rejected(task_feature, steps):
-    result = await task_feature.run_workflow(steps)
+    result = await inspect_workflow_input(task_feature, steps)
     assert result.status is ToolResultStatus.ERROR and "non-empty list" in result.error
 
 
@@ -312,7 +342,7 @@ async def test_invalid_workflow_input_is_rejected(task_feature, steps):
     "step", ["invalid", {"feature": "model_agent"}, {"skill": "list_models"}]
 )
 async def test_invalid_step_keeps_a_clear_failure(task_feature, step):
-    result = await task_feature.run_workflow([step])
+    result = await inspect_workflow_input(task_feature, [step])
     assert result.status is ToolResultStatus.ERROR and result.data["failed"] == 1
     assert result.data["results"][0]["error"]
 
@@ -344,7 +374,7 @@ async def test_returned_semantic_failure_is_not_reported_as_success(
     task_feature, providers, manager, outcome, expected, reason
 ):
     providers.memory.supplier = lambda _attempt: outcome
-    result = await task_feature.run_workflow(
+    result = await inspect_workflow_input(task_feature,
         [{"feature": "memory_feature", "skill": "memory_status"}]
     )
     assert result.status is expected
@@ -362,23 +392,25 @@ async def test_returned_semantic_failure_is_not_reported_as_success(
     assert providers.memory.calls == 1
 
 
-async def test_raised_tool_error_is_reported_without_stopping_other_steps(
-    task_feature, providers
+async def test_raised_tool_error_prevents_further_steps_in_the_same_input(
+    task_feature, providers, manager,
 ):
     def unavailable(_attempt):
         raise OSError("Tool storage unavailable")
 
     providers.memory.supplier = unavailable
-    result = await task_feature.run_workflow(
+    result = await inspect_workflow_input(task_feature,
         [
             {"feature": "memory_feature", "skill": "memory_status"},
             {"feature": "model_agent", "skill": "get_current_model"},
         ]
     )
-    assert result.status is ToolResultStatus.PARTIAL
+    assert result.status is ToolResultStatus.ERROR
     assert result.data["results"][0]["outcome_unknown"] is True
     assert result.data["results"][0]["error"] == "tool_effect_outcome_unconfirmed"
-    assert result.data["completed"] == result.data["failed"] == 1
+    assert result.data['completed'] == 0 and result.data['failed'] == 2
+    assert result.data['results'][1]['outcome_unknown'] is True
+    assert await manager.task_store.backend.fetch_all('SELECT COUNT(*) FROM a2a_tasks') == [(1,)]
 
 
 async def test_explicit_retry_reports_the_attempt_that_succeeded(
@@ -389,7 +421,7 @@ async def test_explicit_retry_reports_the_attempt_that_succeeded(
         if attempt == 1
         else ToolResult.ok("Ready", data={"attempt": attempt})
     )
-    result = await task_feature.run_workflow(
+    result = await inspect_workflow_input(task_feature,
         [
             {
                 "feature": "memory_feature",
@@ -415,7 +447,7 @@ async def test_execution_control_keeps_its_original_identity_and_is_not_retried(
 
     providers.memory.supplier = deny
     with pytest.raises(ExecutionAuthorityError) as observed:
-        await task_feature.run_workflow(
+        await inspect_workflow_input(task_feature,
             [
                 {
                     "feature": "memory_feature",
@@ -559,7 +591,7 @@ async def test_a_step_whose_outcome_is_unknown_is_never_retried(
     task_feature, effect, manager
 ):
     effect.supplier = raise_unknown
-    result = await task_feature.run_workflow([effect_step(max_retries=2)])
+    result = await inspect_workflow_input(task_feature, [effect_step(max_retries=2)])
     assert effect.calls == 1
     assert result.status is ToolResultStatus.ERROR
     [record] = result.data["results"]
@@ -575,7 +607,7 @@ async def test_a_step_whose_outcome_is_unknown_is_never_retried(
 @pytest.mark.parametrize("effect", EVERY_SKILL_FORM, ids=skill_form_id, indirect=True)
 async def test_an_ordinary_raised_failure_is_not_retried_after_native_admission(task_feature, effect, manager):
     effect.supplier = raise_unavailable
-    result = await task_feature.run_workflow([effect_step(max_retries=2)])
+    result = await inspect_workflow_input(task_feature, [effect_step(max_retries=2)])
     assert effect.calls == 1
     [record] = result.data["results"]
     assert record["status"] == "failed" and record["attempts"] == 1
@@ -650,7 +682,7 @@ async def test_an_unknown_outcome_raised_to_the_workflow_is_not_retried(
         raise ResourceOutcomeUnknown(UNKNOWN)
 
     monkeypatch.setattr(manager, "execute_skill", execute_skill)
-    result = await task_feature.run_workflow(
+    result = await inspect_workflow_input(task_feature,
         [
             {
                 "feature": "memory_feature",
@@ -719,7 +751,7 @@ async def test_an_unknown_outcome_another_error_carries_is_never_retried(
     # A skill running its effects in an asyncio.TaskGroup raises an
     # ExceptionGroup; one wrapping its effect's error names it as the cause.
     effect.supplier = supplier
-    result = await task_feature.run_workflow([effect_step(max_retries=2)])
+    result = await inspect_workflow_input(task_feature, [effect_step(max_retries=2)])
     assert effect.calls == 1
     [record] = result.data["results"]
     assert record["status"] == "failed" and record["outcome_unknown"] is True
@@ -736,7 +768,7 @@ async def test_an_ordinary_exception_group_is_not_retried_after_native_admission
     task_feature, effect, manager
 ):
     effect.supplier = raise_unavailable_from_a_task_group
-    result = await task_feature.run_workflow([effect_step(max_retries=2)])
+    result = await inspect_workflow_input(task_feature, [effect_step(max_retries=2)])
     assert effect.calls == 1
     [record] = result.data["results"]
     assert record["status"] == "failed" and record["attempts"] == 1
@@ -775,7 +807,7 @@ async def test_a_grouped_unknown_outcome_raised_to_the_workflow_is_not_retried(
         )
 
     monkeypatch.setattr(manager, "execute_skill", execute_skill)
-    result = await task_feature.run_workflow(
+    result = await inspect_workflow_input(task_feature,
         [
             {
                 "feature": "memory_feature",
@@ -867,28 +899,25 @@ async def test_a_flagged_step_whose_result_cannot_be_read_is_not_retried(
 ):
     effect.supplier = raise_unknown
     unreadable_step_results(monkeypatch)
-    result = await task_feature.run_workflow([effect_step(max_retries=2)])
+    result = await inspect_workflow_input(task_feature, [effect_step(max_retries=2)])
     assert effect.calls == 1
     [record] = result.data["results"]
     assert record["status"] == "failed" and record["outcome_unknown"] is True
     assert record["attempts"] == 1
-    assert record["error"] == (
-        "Step 0 outcome is unknown; its result could not be read: "
-        "Step result unreadable"
-    )
+    assert "unconfirmed" in record["error"]
 
 
 @pytest.mark.parametrize("effect", EVERY_SKILL_FORM, ids=skill_form_id, indirect=True)
-async def test_an_unflagged_step_whose_result_cannot_be_read_is_still_retried(
+async def test_an_unflagged_completed_step_whose_result_cannot_be_read_is_never_retried(
     task_feature, effect, monkeypatch
 ):
     effect.supplier = lambda _attempt: ToolResult.failed("Known business failure")
     unreadable_step_results(monkeypatch)
-    result = await task_feature.run_workflow([effect_step(max_retries=2)])
-    assert effect.calls == 3
+    result = await inspect_workflow_input(task_feature, [effect_step(max_retries=2)])
+    assert effect.calls == 1
     [record] = result.data["results"]
-    assert record["status"] == "failed" and record["attempts"] == 3
-    assert "outcome_unknown" not in record
+    assert record["status"] == "failed" and record["attempts"] == 1
+    assert record["outcome_unknown"] is True
 
 
 def reject_task_writes(manager, monkeypatch, rejected):
@@ -924,7 +953,7 @@ async def test_an_unknown_outcome_survives_a_failed_task_write(
     assert any(isinstance(error, QueryError) for error in execution_evidence_carriers(raised.value))
     assert str(raised.value) == f"{UNKNOWN}; its failed task could not be recorded"
 
-    result = await task_feature.run_workflow([effect_step(max_retries=2)])
+    result = await inspect_workflow_input(task_feature, [effect_step(max_retries=2)])
     assert effect.calls == 2
     [record] = result.data["results"]
     assert record["status"] == "failed" and record["outcome_unknown"] is True
@@ -939,7 +968,7 @@ async def test_post_admission_exception_and_failed_task_write_cannot_trigger_ret
     reject_failed_task_writes(manager, monkeypatch)
     with pytest.raises((ResourceOutcomeUnknown, BaseExceptionGroup)):
         await manager.execute_skill("effect_feature", "apply_effect", {}, sync=True)
-    result = await task_feature.run_workflow([effect_step(max_retries=2)])
+    result = await inspect_workflow_input(task_feature, [effect_step(max_retries=2)])
     assert effect.calls == 2
     [record] = result.data["results"]
     assert record["status"] == "failed" and record["attempts"] == 1
@@ -961,7 +990,7 @@ async def test_an_unknown_outcome_survives_another_writers_terminal_state(
         raise ResourceOutcomeUnknown(UNKNOWN)
 
     effect.supplier = cancel_then_lose_the_outcome
-    result = await task_feature.run_workflow([effect_step(max_retries=2)])
+    result = await inspect_workflow_input(task_feature, [effect_step(max_retries=2)])
     assert effect.calls == 1
     [record] = result.data["results"]
     assert record["status"] == "failed" and record["outcome_unknown"] is True
@@ -1006,7 +1035,7 @@ async def test_an_enclosing_workflow_never_reruns_an_unknown_inner_outcome(
         reject_failed_task_writes(manager, monkeypatch)
     # Every inner step fails, so the inner workflow fails as a whole.
     inner = [effect_step(max_retries=2), effect_step(max_retries=2)]
-    result = await nested_workflow.run_workflow([outer_step(inner, max_retries=2)])
+    result = await inspect_workflow_input(nested_workflow, [outer_step(inner, max_retries=2)])
     assert effect.calls == 1
     [record] = result.data["results"]
     assert record["status"] == "failed" and record["outcome_unknown"] is True
@@ -1018,7 +1047,7 @@ async def test_an_enclosing_workflow_fences_an_ordinary_inner_exception(
     nested_workflow, effect, manager
 ):
     effect.supplier = raise_unavailable
-    result = await nested_workflow.run_workflow(
+    result = await inspect_workflow_input(nested_workflow,
         [outer_step([effect_step(max_retries=0)], max_retries=2)]
     )
     assert effect.calls == 1
@@ -1052,7 +1081,7 @@ async def test_a_partial_inner_workflow_carries_its_unknown_outcome(
     # One step succeeded, so the inner workflow completes with a partial
     # result. The uncertain step still decides whether it may run again.
     effect.supplier = raise_unknown
-    result = await nested_workflow.run_workflow(
+    result = await inspect_workflow_input(nested_workflow,
         [outer_step(mixed_inner_workflow(), max_retries=2)]
     )
     assert effect.calls == 1
@@ -1071,7 +1100,7 @@ async def test_a_partial_inner_workflow_whose_task_write_fails_is_not_rerun(
 ):
     effect.supplier = raise_unknown
     reject_task_writes(manager, monkeypatch, is_workflow_task)
-    result = await nested_workflow.run_workflow(
+    result = await inspect_workflow_input(nested_workflow,
         [outer_step(mixed_inner_workflow(), max_retries=2)]
     )
     assert effect.calls == 1
@@ -1099,7 +1128,7 @@ async def test_a_partial_inner_workflow_canceled_meanwhile_is_not_rerun(
         raise ResourceOutcomeUnknown(UNKNOWN)
 
     effect.supplier = cancel_the_inner_workflow_then_lose_the_outcome
-    result = await nested_workflow.run_workflow(
+    result = await inspect_workflow_input(nested_workflow,
         [outer_step(mixed_inner_workflow(), max_retries=2)]
     )
     assert effect.calls == 1
@@ -1135,7 +1164,7 @@ async def test_a_workflow_reports_a_partial_steps_unknown_outcome_upward(
     if not persisted:
         reject_task_writes(manager, monkeypatch, encloses_a_workflow)
     middle = [outer_step(mixed_inner_workflow(), max_retries=2)]
-    result = await nested_workflow.run_workflow([outer_step(middle, max_retries=2)])
+    result = await inspect_workflow_input(nested_workflow, [outer_step(middle, max_retries=2)])
     assert effect.calls == 1
     [record] = result.data["results"]
     assert record["outcome_unknown"] is True and record["attempts"] == 1
@@ -1216,7 +1245,7 @@ async def test_a_skill_that_ran_an_uncertain_skill_is_never_rerun(
         # The child's task cannot be recorded, so the coordinator catches the
         # raised error instead of reading a flagged task.
         reject_task_writes(manager, monkeypatch, is_effect_task)
-    result = await task_feature.run_workflow([coordinator_step(max_retries=2)])
+    result = await inspect_workflow_input(task_feature, [coordinator_step(max_retries=2)])
     assert effect.calls == 1
     [record] = result.data["results"]
     assert record["status"] == "failed" and record["outcome_unknown"] is True
@@ -1236,7 +1265,7 @@ async def test_a_skill_that_ran_an_ordinarily_failing_skill_is_not_rerun_after_n
     task_feature, effect, coordinator, manager
 ):
     effect.supplier = raise_unavailable
-    result = await task_feature.run_workflow([coordinator_step(max_retries=2)])
+    result = await inspect_workflow_input(task_feature, [coordinator_step(max_retries=2)])
     assert effect.calls == 1
     [record] = result.data["results"]
     assert record["status"] == "failed" and record["attempts"] == 1
@@ -1309,7 +1338,7 @@ async def test_a_skill_whose_completion_ran_an_uncertain_skill_is_never_rerun(
     effect.supplier = raise_unknown
     if not persisted:
         reject_task_writes(manager, monkeypatch, is_effect_task)
-    result = await task_feature.run_workflow([deferring_step(max_retries=2)])
+    result = await inspect_workflow_input(task_feature, [deferring_step(max_retries=2)])
     assert effect.calls == 1
     [record] = result.data["results"]
     assert record["status"] == "failed" and record["outcome_unknown"] is True
@@ -1328,7 +1357,7 @@ async def test_a_skill_whose_completion_ran_an_ordinarily_failing_skill_is_not_r
     task_feature, effect, deferring, manager
 ):
     effect.supplier = raise_unavailable
-    result = await task_feature.run_workflow([deferring_step(max_retries=2)])
+    result = await inspect_workflow_input(task_feature, [deferring_step(max_retries=2)])
     assert effect.calls == 1
     [record] = result.data["results"]
     assert record["status"] == "failed" and record["attempts"] == 1
@@ -1383,7 +1412,7 @@ async def test_a_subagent_tool_step_carries_its_unknown_outcome(
     task_feature, delegating, manager
 ):
     delegating.supplier = raise_unknown
-    result = await task_feature.run_workflow([delegating_step(max_retries=2)])
+    result = await inspect_workflow_input(task_feature, [delegating_step(max_retries=2)])
     assert delegating.calls == 1
     [record] = result.data["results"]
     assert record["status"] == "failed" and record["outcome_unknown"] is True
@@ -1397,7 +1426,7 @@ async def test_a_subagent_tool_steps_ordinary_failure_is_not_retried_after_nativ
     task_feature, delegating, manager
 ):
     delegating.supplier = raise_unavailable
-    result = await task_feature.run_workflow([delegating_step(max_retries=2)])
+    result = await inspect_workflow_input(task_feature, [delegating_step(max_retries=2)])
     assert delegating.calls == 1
     [record] = result.data["results"]
     assert record["status"] == "failed" and record["attempts"] == 1
@@ -1409,7 +1438,7 @@ async def test_a_subagent_tool_step_carries_a_grouped_unknown_outcome(
     task_feature, delegating, manager
 ):
     delegating.supplier = raise_unknown_from_a_task_group
-    result = await task_feature.run_workflow([delegating_step(max_retries=2)])
+    result = await inspect_workflow_input(task_feature, [delegating_step(max_retries=2)])
     assert delegating.calls == 1
     [record] = result.data["results"]
     assert record["status"] == "failed" and record["outcome_unknown"] is True
@@ -1473,7 +1502,7 @@ async def test_an_unknown_outcome_flattened_on_a_codex_reader_is_never_rerun(
     effect.supplier = raise_unknown
     if not persisted:
         reject_failed_task_writes(manager, monkeypatch)
-    result = await task_feature.run_workflow([codex_runner_step(max_retries=2)])
+    result = await inspect_workflow_input(task_feature, [codex_runner_step(max_retries=2)])
     assert effect.calls == 1
     [record] = result.data["results"]
     assert record["status"] == "failed" and record["outcome_unknown"] is True
@@ -1485,7 +1514,7 @@ async def test_an_ordinary_failure_flattened_on_a_codex_reader_is_not_retried_af
     task_feature, effect, codex_runner, manager
 ):
     effect.supplier = raise_unavailable
-    result = await task_feature.run_workflow([codex_runner_step(max_retries=2)])
+    result = await inspect_workflow_input(task_feature, [codex_runner_step(max_retries=2)])
     assert effect.calls == 1
     [record] = result.data["results"]
     assert record["status"] == "failed" and record["attempts"] == 1
@@ -1515,7 +1544,7 @@ async def test_the_inline_executor_reports_a_grouped_unknown_outcome(
         raise ExceptionGroup("Subagent step failed", [member()])
 
     monkeypatch.setattr(effect, "_execute_subagent_tool", subagent_step)
-    result = await task_feature.run_workflow([codex_runner_step(max_retries=2)])
+    result = await inspect_workflow_input(task_feature, [codex_runner_step(max_retries=2)])
     [record] = result.data["results"]
     assert record["status"] == "failed"
     assert record["error"] == "Subagent step failed (1 sub-exception)"
@@ -1578,7 +1607,7 @@ async def test_nested_results_and_task_projections_remain_json_serializable(
     providers.memory.supplier = lambda _attempt: {
         "nested": ToolResult.ok("Nested", data={"count": 3})
     }
-    result = await task_feature.run_workflow(
+    result = await inspect_workflow_input(task_feature,
         [{"feature": "memory_feature", "skill": "memory_status"}]
     )
     assert result.status is ToolResultStatus.OK
@@ -1724,7 +1753,7 @@ async def test_domain_status_is_not_mistaken_for_a_tool_result_envelope(
     domain_status,
 ):
     providers.memory.supplier = lambda _attempt: {"status": domain_status, "items": [1]}
-    result = await task_feature.run_workflow(
+    result = await inspect_workflow_input(task_feature,
         [
             {"feature": "memory_feature", "skill": "memory_status"},
         ]
