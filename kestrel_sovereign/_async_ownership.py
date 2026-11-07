@@ -177,8 +177,20 @@ def owned_task_join_ancestors(task=None):
 def _tracks_owned_task_join(function):
     @wraps(function)
     async def joined(task, *args, **kwargs):
-        async with owned_native_wait((task,)):
-            return await function(task, *args, **kwargs)
+        outcome = None
+        try:
+            async with owned_native_wait((task,)):
+                outcome = await function(task, *args, **kwargs)
+        except BaseException as error:
+            if outcome is None:
+                raise
+            # The native join already collected its exact outcome. Restoring
+            # a delegated writer belongs to this observer; withdrawal there
+            # cannot discard the original receipt or an earlier cancellation.
+            from kestrel_sovereign.execution_custody import execution_observation_error
+            return OwnedTaskOutcome(outcome.result,
+                execution_observation_error(outcome.error, error), outcome.cancellation)
+        return outcome
     return joined
 
 

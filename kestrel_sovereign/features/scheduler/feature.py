@@ -1269,7 +1269,8 @@ class SchedulerFeature(Feature):
     # ------------------------------------------------------------------
 
     async def _run_tool_hook_gated(
-        self, feature_name: str, agent_tool: Any, args: dict, *, feature: Feature
+        self, feature_name: str, agent_tool: Any, args: dict, *, feature: Feature,
+        complete: Callable[[Any], Any] | None = None,
     ) -> Any:
         """Admit the original scheduled intent before hooks or tool effects."""
         from kestrel_sdk.resources import ResourceConflict
@@ -1298,11 +1299,13 @@ class SchedulerFeature(Feature):
         return await run_scheduled_tool_operation(host,
             feature_name=feature_name, tool_name=agent_tool.name, arguments=args,
             operation=lambda owned: self._run_tool_hook_gated_body(feature_name, agent_tool, owned,
-                host=host, selected_generation=selected_generation, validate_registration=validate_registration))
+                host=host, selected_generation=selected_generation,
+                validate_registration=validate_registration, complete=complete))
 
     async def _run_tool_hook_gated_body(
         self, feature_name: str, agent_tool: Any, args: dict, *,
         host: Any, selected_generation: int, validate_registration: Callable[[], None],
+        complete: Callable[[Any], Any] | None,
     ) -> Any:
         """Run a feature tool on a scheduler tick through the SAME
         PRE_TOOL_USE / POST_TOOL_USE hook envelope the chat and subagent
@@ -1330,13 +1333,49 @@ class SchedulerFeature(Feature):
             refused_tool_result,
         )
         from kestrel_sovereign.tools.effect_journal import execute_tool_effect
+        from kestrel_sovereign.signals.sources.scheduler import ScheduledToolResultFailure
+
+        def finish(result):
+            return complete(result) if complete is not None else result
 
         async def execute_approved(approved):
-            return await execute_tool_effect(host,
+            result = await execute_tool_effect(host,
                 registration=['scheduler', feature_name, agent_tool.name],
                 arguments=approved, expected_generation=selected_generation,
                 validate_registration=validate_registration,
                 execute=lambda: agent_tool.execute(**approved))
+            try:
+                if hooks_manager is not None:
+                    from kestrel_sdk.hooks.base import HookEvent, HookInput
+
+                    post_input = HookInput(
+                        session_id="scheduler",
+                        hook_event_name=HookEvent.POST_TOOL_USE.value,
+                        tool_name=agent_tool.name,
+                        tool_input=approved,
+                        feature_name=feature_name,
+                        tool_response=(
+                            result if isinstance(result, dict) else {"result": str(result)}
+                        ),
+                    )
+                    await hooks_manager.execute_hooks_parallel(HookEvent.POST_TOOL_USE, post_input)
+            except BaseException as error:
+                # Delivery remains inside the original journal, through hooks,
+                # validation and serialization. Preserve its acknowledged claim
+                # while fencing further effects in this same live turn.
+                from kestrel_sovereign.tools.effect_journal import record_tool_effect_completion_failure
+
+                raise record_tool_effect_completion_failure(host, error)
+            try:
+                return finish(result)
+            except ScheduledToolResultFailure:
+                # Validation delivered the tool's known failed result. This
+                # is not uncertainty about its acknowledged effect/delivery.
+                raise
+            except BaseException as error:
+                from kestrel_sovereign.tools.effect_journal import record_tool_effect_completion_failure
+
+                raise record_tool_effect_completion_failure(host, error)
 
         # #3921: coerce before PRE_TOOL_USE, as every dispatch path does, so
         # the hooks authorize the binding the tool runs with. A value that
@@ -1345,7 +1384,7 @@ class SchedulerFeature(Feature):
             agent_tool.name, agent_tool, args,
         )
         if argument_error is not None:
-            return refused_tool_result(agent_tool.name, argument_error)
+            return finish(refused_tool_result(agent_tool.name, argument_error))
         hooks_manager = getattr(host, "hooks_manager", None)
         effective_args = args
         if hooks_manager is not None:
@@ -1391,10 +1430,10 @@ class SchedulerFeature(Feature):
                     "on a later tick (%s)",
                     agent_tool.name, blocked.failed_hook, blocked.reason,
                 )
-                return ScheduledTaskOutcome.hook_failed(
+                return finish(ScheduledTaskOutcome.hook_failed(
                     task_name=agent_tool.name,
                     reason=blocked.reason,
-                )
+                ))
             if blocked is not None:
                 # Only the structured cause is logged or kept: the hook's
                 # reason is free-form and can repeat the call's arguments, so
@@ -1406,11 +1445,11 @@ class SchedulerFeature(Feature):
                     blocked.deciding_hook or "unknown",
                     blocked.decision.value,
                 )
-                return ScheduledTaskOutcome.blocked(
+                return finish(ScheduledTaskOutcome.blocked(
                     task_name=agent_tool.name,
                     decision=blocked.decision.value,
                     hook=blocked.deciding_hook,
-                )
+                ))
 
             # The hooks authorized ``effective_args``: a rewrite the tool's
             # wrapper would still coerce is not what it would run with.
@@ -1423,24 +1462,9 @@ class SchedulerFeature(Feature):
                     "hook rewrote its arguments to another type",
                     agent_tool.name,
                 )
-                return refused_tool_result(agent_tool.name, rewrite_error)
+                return finish(refused_tool_result(agent_tool.name, rewrite_error))
 
-            result = await execute_approved(effective_args)
-
-            post_input = HookInput(
-                session_id="scheduler",
-                hook_event_name=HookEvent.POST_TOOL_USE.value,
-                tool_name=agent_tool.name,
-                tool_input=effective_args,
-                feature_name=feature_name,
-                tool_response=(
-                    result if isinstance(result, dict) else {"result": str(result)}
-                ),
-            )
-            await hooks_manager.execute_hooks_parallel(
-                HookEvent.POST_TOOL_USE, post_input,
-            )
-            return result
+            return await execute_approved(effective_args)
 
         return await execute_approved(effective_args)
 
@@ -1589,22 +1613,20 @@ class SchedulerFeature(Feature):
     async def _lookup_and_run_tool(self, task_name: str, args: dict) -> Any:
         """Run a tool directly through the canonical scheduler result boundary.
 
-        Source-registered tasks call :meth:`_lookup_raw_tool_result` and let the
-        source factory apply this same preparation. Direct fallback/custom-tool
-        paths use this wrapper so validation and JSON serialization still have
-        exactly one owner per invocation.
+        Source-registered tasks supply their completion policy to
+        :meth:`_lookup_raw_tool_result`. Direct/custom schedules supply the
+        same preparation here, before the original operation retires.
         """
         from kestrel_sovereign.signals.sources.scheduler import (
             _prepare_scheduled_tool_result,
         )
 
-        return _prepare_scheduled_tool_result(
-            task_name,
-            await self._lookup_raw_tool_result(task_name, args),
-            declared_reason_codes=self._declared_reason_codes(task_name),
-        )
+        return await self._lookup_raw_tool_result(task_name, args,
+            lambda result: _prepare_scheduled_tool_result(task_name, result,
+                declared_reason_codes=self._declared_reason_codes(task_name)))
 
-    async def _lookup_raw_tool_result(self, task_name: str, args: dict) -> Any:
+    async def _lookup_raw_tool_result(self, task_name: str, args: dict,
+        complete: Callable[[Any], Any] | None = None) -> Any:
         """Tool-lookup body shared by every cron source handler that
         delegates to a feature tool. This is the existing executor's
         tool-search logic, lifted out so the source registrations can
@@ -1622,7 +1644,8 @@ class SchedulerFeature(Feature):
             task_name
         )
         if agent_tool is not None:
-            return await self._run_tool_hook_gated(owner_name, agent_tool, args, feature=feature)
+            return await self._run_tool_hook_gated(owner_name, agent_tool, args,
+                feature=feature, complete=complete)
 
         # A persisted schedule that names a tool owned by a NOW-disabled feature
         # must not execute it. Skip benignly rather than raising, so a disable

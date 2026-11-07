@@ -151,6 +151,121 @@ async def test_scheduled_tool_without_an_occurrence_cannot_open_a_journal(schedu
     assert await case.database.fetchone('SELECT COUNT(*) FROM tool_effect_operations') == (0,)
 
 
+@pytest.mark.parametrize('completion', ['matcher', 'result-shaping'])
+@pytest.mark.parametrize('route', ['direct', 'action', 'artifact'])
+@pytest.mark.parametrize('journal', ['retained', 'fresh'])
+async def test_scheduled_completion_failure_fences_the_original_live_turn(scheduled_case, completion, route, journal):
+    from kestrel_sdk.hooks.base import Hook, HookEvent, HookOutput
+    from kestrel_sdk.resources import ResourceOutcomeUnknown
+    from kestrel_sovereign.tools.effect_journal import (
+        ToolEffectOutcomeUnconfirmed, current_tool_effect_turn, execute_tool_effect,
+    )
+    from tests.unit.test_tool_effect_invocation import governed
+    from kestrel_sdk.signals import Signal, SignalMode
+    from kestrel_sovereign.signals.sources.scheduler import build_cron_registrations, cron_source_name
+    from kestrel_sovereign.tool_effect_store import ToolEffectReconciliationRequired
+
+    case = scheduled_case
+    failure = ValueError('original scheduled completion failed')
+    observed, fenced = [], []
+    second = case.witness.with_name('second-scheduled-effect')
+    task_name = 'morning_signal' if route == 'artifact' else 'signal_dispatch'
+
+    class CompletionHook(Hook):
+        def __init__(self):
+            super().__init__('owned-scheduled-completion', [HookEvent.POST_TOOL_USE])
+
+        def matches(self, name):
+            if completion == 'matcher':
+                raise failure
+            return True
+
+        async def execute(self, value):
+            return HookOutput.allow()
+
+    class FailedResponse:
+        def __str__(self):
+            raise failure
+
+    class ResponseFeature(Feature):
+        @property
+        def tool_description(self):
+            return 'Native scheduled completion failure'
+
+        async def initialize(self):
+            pass
+
+        @tool(name=task_name, description='Write before delivering the result')
+        async def scheduled_completion_effect(self):
+            case.witness.write_text('one acknowledged scheduled effect')
+            return FailedResponse() if completion == 'result-shaping' else {'success': True}
+
+    feature = ResponseFeature(case.owner)
+    case.owner.features[feature.name] = feature
+    case.owner.hooks_manager.register(CompletionHook())
+    registration = next(item for item in build_cron_registrations(
+        tool_lookup=case.scheduler._lookup_raw_tool_result,
+        reason_codes_lookup=case.scheduler._declared_reason_codes,
+    ) if item.name == cron_source_name(task_name))
+
+    async def dispatch():
+        if route == 'direct':
+            return await case.scheduler._lookup_and_run_tool(task_name, {})
+        if route == 'action':
+            return await registration.handler({})
+        return await registration.artifact_handler(Signal(source=registration.name,
+            kind='run', mode=SignalMode.ARTIFACT, payload={}, target_agent=case.owner.did))
+
+    @governed
+    async def live_turn(agent, user_input, *, invocation_id=None):
+        try:
+            await dispatch()
+        except Exception as error:
+            observed.append(error)
+        assert case.witness.read_text() == 'one acknowledged scheduled effect'
+        assert await case.database.fetchone('SELECT state FROM tool_effect_claims') == ('RETURNED_OK',)
+        assert observed and isinstance(observed[0], ResourceOutcomeUnknown), (
+            'scheduler completion failure escaped the live-turn uncertainty fence')
+        assert observed[0].__cause__ is failure
+        assert current_tool_effect_turn(agent).unconfirmed
+
+        async def another_effect():
+            second.write_text('must remain refused')
+
+        with pytest.raises(ToolEffectOutcomeUnconfirmed):
+            await execute_tool_effect(agent, registration='later-scheduled-effect',
+                arguments={}, execute=another_effect)
+
+    async def execute(name, arguments):
+        if journal == 'retained':
+            with pytest.raises(ToolEffectOutcomeUnconfirmed):
+                await live_turn(case.owner, 'original scheduled turn', invocation_id='scheduled-completion')
+        else:
+            with pytest.raises(ResourceOutcomeUnknown) as caught:
+                await dispatch()
+            observed.append(caught.value)
+            assert caught.value.__cause__ is failure
+            assert case.witness.read_text() == 'one acknowledged scheduled effect'
+            assert await case.database.fetchone('SELECT state FROM tool_effect_claims') == ('RETURNED_OK',)
+            with pytest.raises(ToolEffectReconciliationRequired):
+                await case.scheduler._lookup_and_run_tool(task_name, {})
+        fenced.append(True)
+        return 'Original completion failure fenced'
+
+    runner = SchedulerRunner(case.database, case.owner.did, execute,
+        owner_id='owned-native-completion-scheduler')
+    try:
+        await seed_occurrence(case, runner, task_name, {})
+        await tick_and_settle(runner)
+        assert observed, 'Original scheduler completion path did not run'
+        if not fenced:
+            raise AssertionError('scheduler completion failure escaped the live-turn uncertainty fence') from observed[0]
+        assert not second.exists()
+        assert await case.database.fetchone('SELECT COUNT(*) FROM tool_effect_claims') == (1,)
+    finally:
+        await runner.stop()
+
+
 async def test_foreign_scheduled_occurrence_cannot_open_this_agents_journal(scheduled_case):
     case = scheduled_case
     entered = []

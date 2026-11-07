@@ -304,7 +304,7 @@ async def followup_env(tmp_path):
     agent.dispatcher = dispatcher
     agent.signal_registry = registry
 
-    async def _lookup(name, args):  # no cron tool is exercised here
+    async def _lookup(name, args, complete):  # no cron tool is exercised here
         raise AssertionError(f"unexpected tool lookup for {name}")
 
     for registration in build_cron_registrations(

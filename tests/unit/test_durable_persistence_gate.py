@@ -138,9 +138,9 @@ async def rig(native_tool_effect_agent):
     registry = SourceRegistry()
     tool_calls: list = []
 
-    async def lookup(task_name, payload):
+    async def lookup(task_name, payload, complete):
         tool_calls.append((task_name, dict(payload)))
-        return f"{task_name} ran"
+        return complete(f"{task_name} ran")
 
     for registration in build_cron_registrations(
         tool_lookup=lookup,

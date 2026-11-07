@@ -212,8 +212,8 @@ def test_state_mutating_tasks_declare_memory():
 
 
 def test_build_cron_registrations_match_cron_tasks_table():
-    async def _lookup(name, args):
-        return None
+    async def _lookup(name, args, complete):
+        return complete(None)
 
     regs = build_cron_registrations(reason_codes_lookup=_NO_REASON_CODES, tool_lookup=_lookup)
     assert len(regs) == len(CRON_TASKS)
@@ -223,8 +223,8 @@ def test_build_cron_registrations_match_cron_tasks_table():
 
 
 def test_action_registrations_have_handler_artifact_have_artifact_handler():
-    async def _lookup(name, args):
-        return f"lookup:{name}"
+    async def _lookup(name, args, complete):
+        return complete(f"lookup:{name}")
 
     regs = build_cron_registrations(reason_codes_lookup=_NO_REASON_CODES, tool_lookup=_lookup)
     for reg in regs:
@@ -259,7 +259,7 @@ def test_builtin_handlers_override_tool_lookup():
     handler."""
     captured = []
 
-    async def lookup(name, args):
+    async def lookup(name, args, complete):
         raise AssertionError("lookup should not be called for builtins")
 
     async def fake_backup(args):
@@ -298,9 +298,9 @@ async def test_user_scheduled_signal_dispatch_uses_cron_action_source(
     agent, registry, dispatcher, backend = dispatcher_components
     captured = []
 
-    async def fake_lookup(name, args):
+    async def fake_lookup(name, args, complete):
         captured.append((name, args))
-        return f"ran:{name}"
+        return complete(f"ran:{name}")
 
     for reg in build_cron_registrations(reason_codes_lookup=_NO_REASON_CODES, tool_lookup=fake_lookup):
         registry.register(reg)
@@ -335,8 +335,8 @@ async def test_artifact_task_dispatches_through_artifact_handler(
     the Signal envelope → result.artifact carries the workflow output."""
     agent, registry, dispatcher, _ = dispatcher_components
 
-    async def fake_lookup(name, args):
-        return f"briefing:{name}"
+    async def fake_lookup(name, args, complete):
+        return complete(f"briefing:{name}")
 
     for reg in build_cron_registrations(reason_codes_lookup=_NO_REASON_CODES, tool_lookup=fake_lookup):
         registry.register(reg)
@@ -386,8 +386,8 @@ async def test_json_shaped_string_artifact_is_not_a_scheduler_envelope(
     agent, registry, dispatcher, _ = dispatcher_components
     artifact = json.dumps({"error": "quoted error text from a report"})
 
-    async def fake_lookup(name, args):
-        return artifact
+    async def fake_lookup(name, args, complete):
+        return complete(artifact)
 
     for reg in build_cron_registrations(reason_codes_lookup=_NO_REASON_CODES, tool_lookup=fake_lookup):
         registry.register(reg)
@@ -412,7 +412,7 @@ async def test_handler_exception_becomes_failed_status(
     """Raised tool details stay in trusted logs, not durable audit errors."""
     agent, registry, dispatcher, _ = dispatcher_components
 
-    async def lookup_raises(name, args):
+    async def lookup_raises(name, args, complete):
         raise RuntimeError("tool blew up")
 
     for reg in build_cron_registrations(reason_codes_lookup=_NO_REASON_CODES, tool_lookup=lookup_raises):
@@ -520,8 +520,8 @@ async def test_permission_block_is_expected_outcome_without_dispatcher_traceback
         decision="ask",
     )
 
-    async def lookup_blocked(name, args):
-        return blocked
+    async def lookup_blocked(name, args, complete):
+        return complete(blocked)
 
     for reg in build_cron_registrations(reason_codes_lookup=_NO_REASON_CODES, tool_lookup=lookup_blocked):
         registry.register(reg)
@@ -585,9 +585,9 @@ async def test_dispatch_audit_and_scheduler_history_agree_end_to_end(
         decision="ask",
     )
 
-    async def lookup(name, args):
+    async def lookup(name, args, complete):
         if name == "restart_coordinator":
-            return blocked
+            return complete(blocked)
         raise AssertionError(f"unexpected lookup for {name}")
 
     agent.sleep = sleep
@@ -728,7 +728,7 @@ async def test_builtin_json_envelopes_follow_scheduler_result_contract(
         else run_trash_retention
     )
 
-    async def unused_lookup(name, args):
+    async def unused_lookup(name, args, complete):
         raise AssertionError(f"unexpected tool lookup for {name}")
 
     for registration in build_cron_registrations(reason_codes_lookup=_NO_REASON_CODES, 
@@ -807,7 +807,7 @@ async def test_backup_without_sync_service_is_a_successful_skipped_dispatch(
     feature = SchedulerFeature(agent)
     feature._agent_id = agent.did
 
-    async def unused_lookup(name, args):
+    async def unused_lookup(name, args, complete):
         raise AssertionError(f"unexpected tool lookup for {name}")
 
     for registration in build_cron_registrations(reason_codes_lookup=_NO_REASON_CODES, 
@@ -843,7 +843,7 @@ async def test_backup_without_targets_is_a_successful_skipped_dispatch(
     feature = SchedulerFeature(agent)
     feature._agent_id = agent.did
 
-    async def unused_lookup(name, args):
+    async def unused_lookup(name, args, complete):
         raise AssertionError(f"unexpected tool lookup for {name}")
 
     for registration in build_cron_registrations(reason_codes_lookup=_NO_REASON_CODES, 
@@ -890,7 +890,7 @@ async def test_backup_with_failed_targets_is_a_failed_dispatch(
     feature = SchedulerFeature(agent)
     feature._agent_id = agent.did
 
-    async def unused_lookup(name, args):
+    async def unused_lookup(name, args, complete):
         raise AssertionError(f"unexpected tool lookup for {name}")
 
     for registration in build_cron_registrations(reason_codes_lookup=_NO_REASON_CODES, 
@@ -935,7 +935,7 @@ async def test_failed_sleep_audit_uses_bounded_error_not_raw_report(
     feature = SchedulerFeature(agent)
     feature._agent_id = agent.did
 
-    async def unused_lookup(name, args):
+    async def unused_lookup(name, args, complete):
         raise AssertionError(f"unexpected tool lookup for {name}")
 
     for registration in build_cron_registrations(reason_codes_lookup=feature._declared_reason_codes, 
@@ -997,7 +997,7 @@ async def test_real_sleep_privacy_skip_then_export_failure_names_the_export(
     feature = SchedulerFeature(agent)
     feature._agent_id = agent.did
 
-    async def unused_lookup(name, task_args):
+    async def unused_lookup(name, task_args, complete):
         raise AssertionError(f"unexpected tool lookup for {name}")
 
     for registration in build_cron_registrations(reason_codes_lookup=feature._declared_reason_codes, 
@@ -1059,7 +1059,7 @@ async def test_real_sleep_nonterminal_reports_remain_successful_cron_dispatches(
     feature = SchedulerFeature(agent)
     feature._agent_id = agent.did
 
-    async def unused_lookup(name, task_args):
+    async def unused_lookup(name, task_args, complete):
         raise AssertionError(f"unexpected tool lookup for {name}")
 
     for registration in build_cron_registrations(reason_codes_lookup=feature._declared_reason_codes, 
@@ -1112,7 +1112,7 @@ async def test_privacy_skip_does_not_mask_artifact_sweep_failure(
     feature = SchedulerFeature(agent)
     feature._agent_id = agent.did
 
-    async def unused_lookup(name, task_args):
+    async def unused_lookup(name, task_args, complete):
         raise AssertionError(f"unexpected tool lookup for {name}")
 
     for registration in build_cron_registrations(reason_codes_lookup=feature._declared_reason_codes, 
@@ -1145,8 +1145,8 @@ async def test_signal_log_writes_redacted_args(dispatcher_components):
     in a debuggable form without blowing the column."""
     agent, registry, dispatcher, backend = dispatcher_components
 
-    async def lookup(name, args):
-        return "ok"
+    async def lookup(name, args, complete):
+        return complete("ok")
 
     for reg in build_cron_registrations(reason_codes_lookup=_NO_REASON_CODES, tool_lookup=lookup):
         registry.register(reg)
@@ -1184,13 +1184,13 @@ async def test_concurrent_memory_tasks_serialize(dispatcher_components):
     order = []
     order_lock = asyncio.Lock()
 
-    async def lookup(name, args):
+    async def lookup(name, args, complete):
         async with order_lock:
             order.append(f"start:{name}")
         await asyncio.sleep(0.05)
         async with order_lock:
             order.append(f"end:{name}")
-        return None
+        return complete(None)
 
     for reg in build_cron_registrations(reason_codes_lookup=_NO_REASON_CODES, tool_lookup=lookup):
         registry.register(reg)

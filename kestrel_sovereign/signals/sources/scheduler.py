@@ -230,12 +230,16 @@ _REDACTION = RedactionPolicy(
 # Tool lookup signature shared by all "find a feature tool by name and
 # call it" cron sources. Builtin tasks (backup_snapshot, trash_retention)
 # get their own handlers wired by SchedulerFeature.
-ToolLookup = Callable[[str, dict], Awaitable[Any]]
+ToolLookup = Callable[[str, dict, Callable[[Any], Any]], Awaitable[Any]]
 #: ``task_name -> the closed vocabulary of ``data["reason_code"]`` values the
 #: feature owning that task declared`` (``Feature.tool_reason_codes``). Resolved
 #: per failure, not at registration, because features load after the
 #: scheduler registers its sources.
 ReasonCodeLookup = Callable[[str], frozenset[str]]
+
+
+class ScheduledToolResultFailure(RuntimeError):
+    """An acknowledged failed result, distinct from failed completion I/O."""
 
 
 def _require_successful_task_result(
@@ -283,10 +287,10 @@ def _require_successful_task_result(
             result.reason_code, task_name=task_name, declared=declared_reason_codes
         )
         if reason_code:
-            raise RuntimeError(
+            raise ScheduledToolResultFailure(
                 f"scheduled task {task_name} returned {result.status} ({reason_code})"
             )
-        raise RuntimeError(
+        raise ScheduledToolResultFailure(
             f"scheduled task {task_name} returned {result.status}"
         )
 
@@ -357,10 +361,10 @@ def _require_successful_task_result(
             evaluated_result, task_name=task_name, declared=declared_reason_codes
         )
         if reason_code:
-            raise RuntimeError(
+            raise ScheduledToolResultFailure(
                 f"scheduled tool {task_name} failed ({reason_code})"
             )
-        raise RuntimeError(f"scheduled tool {task_name} failed")
+        raise ScheduledToolResultFailure(f"scheduled tool {task_name} failed")
     return result
 
 
@@ -412,25 +416,37 @@ def _wrap_builtin_action_handler(
     return checked_handler
 
 
+async def _complete_tool_lookup(lookup: ToolLookup, task_name: str, payload: dict,
+                              reason_codes: ReasonCodeLookup) -> Any:
+    """Supply completion policy while the executor still owns its journal."""
+    completion_error = None
+
+    def complete(result):
+        nonlocal completion_error
+        try:
+            return _prepare_scheduled_tool_result(task_name, result,
+                declared_reason_codes=reason_codes(task_name))
+        except Exception as error:
+            completion_error = error
+            raise
+
+    try:
+        return await lookup(task_name, payload, complete)
+    except Exception as error:
+        from kestrel_sovereign.execution_custody import is_tool_execution_terminal_error
+        if error is completion_error or is_tool_execution_terminal_error(error):
+            raise
+        logger.exception("Scheduled tool %s raised", task_name)
+        raise RuntimeError(f"scheduled tool {task_name} raised") from None
+
+
 def _make_action_handler(
     lookup: ToolLookup, task_name: str, reason_codes: ReasonCodeLookup
 ) -> ActionHandler:
-    """Return an ACTION handler that runs `lookup(task_name, payload)`."""
+    """Return an ACTION handler with journal-owned completion."""
 
     async def handler(payload: dict) -> Any:
-        try:
-            result = await lookup(task_name, payload)
-        except Exception as error:
-            from kestrel_sovereign.execution_custody import is_execution_control_error
-            if is_execution_control_error(error):
-                raise
-            logger.exception("Scheduled tool %s raised", task_name)
-            raise RuntimeError(
-                f"scheduled tool {task_name} raised"
-            ) from None
-        return _prepare_scheduled_tool_result(
-            task_name, result, declared_reason_codes=reason_codes(task_name)
-        )
+        return await _complete_tool_lookup(lookup, task_name, payload, reason_codes)
 
     return handler
 
@@ -438,23 +454,10 @@ def _make_action_handler(
 def _make_artifact_handler(
     lookup: ToolLookup, task_name: str, reason_codes: ReasonCodeLookup
 ) -> ArtifactHandler:
-    """Return an ARTIFACT handler that runs `lookup(task_name, signal.payload)`
-    and returns the tool's output as the artifact."""
+    """Return an ARTIFACT handler with the same owned completion contract."""
 
     async def handler(signal: Signal) -> Any:
-        try:
-            result = await lookup(task_name, signal.payload)
-        except Exception as error:
-            from kestrel_sovereign.execution_custody import is_execution_control_error
-            if is_execution_control_error(error):
-                raise
-            logger.exception("Scheduled tool %s raised", task_name)
-            raise RuntimeError(
-                f"scheduled tool {task_name} raised"
-            ) from None
-        return _prepare_scheduled_tool_result(
-            task_name, result, declared_reason_codes=reason_codes(task_name)
-        )
+        return await _complete_tool_lookup(lookup, task_name, signal.payload, reason_codes)
 
     return handler
 
@@ -474,10 +477,11 @@ def build_cron_registrations(
     """Build SourceRegistration instances for all built-in cron tasks.
 
     Args:
-        tool_lookup: Async fn `(task_name, args) -> result`. Used by all
-            tasks not in `builtin_handlers`. It returns the raw feature-tool
-            result; the source handler owns structured failure validation and
-            legacy JSON serialization for every caller of this builder.
+        tool_lookup: Async fn `(task_name, args, complete) -> result`. Used by
+            tasks not in `builtin_handlers`. It must invoke `complete` on the
+            raw result before retiring its operation. The source supplies the
+            single validation/serialization policy; the executor retains the
+            original journal through that fallible completion.
         reason_codes_lookup: Fn `(task_name) -> frozenset[str]`: the
             ``reason_code`` vocabulary the task's owning feature declared.
             Every handler (tool and built-in) resolves it at failure time and

@@ -18,6 +18,76 @@ from kestrel_sovereign.storage.privacy_wrapper import ReentrantTransitionLock, b
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize('first_cancellation', [False, True])
+@pytest.mark.parametrize('receipt', ['returned', 'committed-error'])
+async def test_general_join_retains_native_outcome_through_writer_restoration(first_cancellation, receipt):
+    lock = ReentrantTransitionLock()
+    entered, release_child, release_writer = (asyncio.Event() for _ in range(3))
+    children, observations = [], []
+    original = RuntimeError('original general-join acknowledgement')
+    original.__cause__ = ExecutionCommitOutcomeError('committed')
+
+    async def native_writer():
+        entered.set()
+        await release_writer.wait()
+
+    async def native():
+        children.append(lock.start_owned_native_work(native_writer))
+        await release_child.wait()
+        if receipt == 'committed-error':
+            raise original
+        return 'original general-join result'
+
+    async def writer():
+        async with lock:
+            async with lock:
+                child = lock.start_owned_native_work(native, acquire_span=False)
+                children.append(child)
+                result = await await_owned_task(child)
+                observations.append((result, lock._writer is asyncio.current_task(), lock._depth))
+
+    async def restoring():
+        while not lock._parked or not lock._parked[0].restoring:
+            await asyncio.sleep(0)
+
+    owner = create_owned_task(writer())
+    try:
+        await asyncio.wait_for(entered.wait(), .3)
+        if first_cancellation:
+            owner.cancel('first general-join withdrawal')
+            await asyncio.sleep(0)
+        release_child.set()
+        await asyncio.wait_for(restoring(), .3)
+        owner.cancel('general-join writer restoration withdrawal')
+        await asyncio.sleep(0)
+    finally:
+        release_child.set()
+        release_writer.set()
+        settled = await await_owned_task(owner)
+        for child in children:
+            await await_owned_task(child)
+    assert observations, 'general join discarded its native outcome during writer restoration'
+    result, restored, depth = observations[0]
+    assert restored and depth == 2
+    assert any(error.args == ('general-join writer restoration withdrawal',)
+        for error in execution_evidence_carriers(result.error))
+    if receipt == 'committed-error':
+        assert any(error is original for error in execution_evidence_carriers(result.error)), (
+            'general join lost its original native receipt during restoration')
+        assert execution_native_source_error(result.error) is original
+        assert len(execution_observer_cancellations(result.error)) == 1
+    else:
+        assert result.result == 'original general-join result'
+    if first_cancellation:
+        assert result.cancellation is not None and result.cancellation.args == ('first general-join withdrawal',), (
+            'general join lost its first observer withdrawal')
+    else:
+        assert result.cancellation is None
+    assert settled.error is None and settled.cancellation is None
+    assert not lock.locked() and not lock._native_work and not lock._admissions
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("depth", [1, 2])
 async def test_bounded_wait_parks_its_original_reentrant_writer(depth):
     lock = ReentrantTransitionLock()
