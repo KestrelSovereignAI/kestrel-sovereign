@@ -47,24 +47,20 @@ class TestStreamingBasics:
         assert "Command executed" in "".join(chunks)
 
     @pytest.mark.asyncio
-    async def test_preinitialization_streaming_defers_before_genesis_gate(self):
-        """Streaming matches the retryable pre-init behavior of process_input."""
-        from kestrel_sovereign.agent.streaming import StreamingMixin
+    async def test_preinitialization_streaming_defers_before_genesis_gate(self, native_tool_effect_agent):
+        """An unavailable primary refuses before genesis or journal mutation."""
+        agent = await native_tool_effect_agent(did="did:test:streaming-preinit")
+        database = agent.tool_effect_store.database
+        agent.storage = None
+        agent._genesis_audit_cognition_block = AsyncMock(return_value=None)
 
-        mock_agent = MagicMock()
-        mock_agent.storage = None
-        mock_agent._genesis_audit_cognition_block = AsyncMock(return_value=None)
-        mock_agent.process_input_streaming = (
-            StreamingMixin.process_input_streaming.__get__(mock_agent)
-        )
-
-        from kestrel_sovereign.tools.effect_journal import ToolEffectJournalUnavailable
-
-        with pytest.raises(ToolEffectJournalUnavailable, match="tool_effect_journal_unavailable"):
-            async for _chunk in mock_agent.process_input_streaming("hello"):
+        with pytest.raises(RuntimeError, match="not fully initialized"):
+            async for _chunk in agent.process_input_streaming("hello"):
                 pass
 
-        mock_agent._genesis_audit_cognition_block.assert_not_called()
+        agent._genesis_audit_cognition_block.assert_not_called()
+        assert await database.fetchone("SELECT COUNT(*) FROM tool_effect_operations") == (0,)
+        assert await database.fetchone("SELECT COUNT(*) FROM tool_effect_claims") == (0,)
 
 
 class TestRealStreaming:
