@@ -194,3 +194,75 @@ async def test_native_a2a_claim_retains_original_feature_registration(
             'SELECT state FROM tool_effect_claims') == [('NOT_EXECUTED',)]
     finally:
         await manager.close()
+
+
+@pytest.mark.parametrize('lane', ['direct', 'manager'])
+async def test_a2a_deferred_original_audit_joins_before_cancellation_retires_its_owner(
+    native_tool_effect_agent, tmp_path, monkeypatch, lane,
+):
+    import asyncio
+    from kestrel_sdk.tools.deferred import DeferredToolResult
+    from kestrel_sdk.resources import ResourceOutcomeUnknown
+    from kestrel_sovereign.execution_custody import execution_evidence_carriers
+    from kestrel_sovereign.a2a.scope import NativeRecipientScope
+    from tests.unit.test_tool_effect_invocation import governed
+    from tests.utils.native_a2a import manager_for
+
+    host = await native_tool_effect_agent(did='did:test:a2a-original-audit')
+    witness = tmp_path / 'original-a2a-deferred-effect'
+    published = []
+    class DeferredFeature(Feature):
+        tool_description = 'Retain the original A2A deferred audit'
+        async def initialize(self):
+            pass
+        @tool(name='a2a_deferred_effect', description='Write before required audit')
+        async def a2a_deferred_effect(self):
+            with witness.open('a') as stream:
+                stream.write('once\n')
+            return DeferredToolResult(ToolResult.ok('Complete').to_dict(),
+                publish=lambda: published.append('published') or [])
+
+    native = DeferredFeature(host)
+    host.features[native.name] = native
+    manager = manager_for(host.tool_effect_store.database.backend,
+        NativeRecipientScope(host.did), owns_backend=False)
+    await manager.initialize()
+    manager.register_provider('feature', native.get_agent_skills(), native)
+    entered, release = asyncio.Event(), asyncio.Event()
+    attempts = []
+    write = host.observability_store.log_tool_dispatch
+    async def pending_write(entry, **kwargs):
+        attempts.append(entry.dispatch_id)
+        entered.set()
+        await release.wait()
+        return await write(entry, **kwargs)
+    monkeypatch.setattr(host.observability_store, 'log_tool_dispatch', pending_write)
+
+    @governed
+    async def invoke(agent, user_input, *, invocation_id=None):
+        if lane == 'manager':
+            return await manager.execute_skill('feature', 'a2a_deferred_effect', {})
+        return await native.handle_task(task(skill='a2a_deferred_effect', args={}))
+
+    calling = asyncio.create_task(invoke(host, 'one original deferred A2A input',
+        invocation_id='original-a2a-deferred'))
+    try:
+        await asyncio.wait_for(entered.wait(), 5)
+        assert witness.read_text().splitlines() == ['once']
+        for _ in range(2):
+            calling.cancel()
+            await asyncio.sleep(0.02)
+            assert not calling.done(), 'A2A deferred completion abandoned its original required audit'
+        release.set()
+        with pytest.raises((asyncio.CancelledError, ResourceOutcomeUnknown, BaseExceptionGroup)) as caught:
+            await calling
+        assert any(isinstance(error, asyncio.CancelledError)
+            for error in execution_evidence_carriers(caught.value))
+        assert len(attempts) == 1 and attempts[0]
+        assert await host.tool_effect_store.database.fetchone(
+            'SELECT result_status FROM a2a_tool_dispatches') == ('success',)
+        assert published == []
+    finally:
+        release.set()
+        await asyncio.gather(calling, return_exceptions=True)
+        await manager.close()

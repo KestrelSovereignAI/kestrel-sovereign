@@ -384,6 +384,8 @@ async def _complete_feature_deferred_result(
     result: DeferredToolResult,
     *,
     host: Any,
+    execution_witness: Any,
+    dispatch_id: str,
     tool_name: str,
     tool_input: Dict[str, Any],
     session_id: str,
@@ -391,8 +393,6 @@ async def _complete_feature_deferred_result(
     adapter: str,
     destination: Any,
     parent_dispatch_id: Optional[str] = None,
-    dispatch_id: Optional[str] = None,
-    execution_witness: Optional[Any] = None,
 ) -> Dict[str, Any]:
     """Complete a feature route's deferred result at the main boundary.
 
@@ -1522,9 +1522,19 @@ class Feature(_SdkFeature):
         )
         require_persistent_tool_effects(host)
 
-        def require_original_feature_registration():
-            if self.agent is not host or getattr(self, "enabled", True) is not True:
-                raise ResourceConflict("Original native A2A feature registration changed")
+        from kestrel_sovereign.agent.tool_registry import (
+            _ToolExecution, _capture_tool_feature_registration,
+        )
+
+        require_original_feature_registration = _capture_tool_feature_registration(host, selected, self)
+        execution = _ToolExecution()
+        dispatch_id = uuid4().hex
+
+        async def execute_registered():
+            execution.started = True
+            result = await selected.execute(**args)
+            execution.returned = True
+            return result
 
         task.status.CopyFrom(TaskStatus(state=TaskState.TASK_STATE_WORKING))
         from kestrel_sovereign.a2a.lifecycle import mark_outcome_unknown
@@ -1559,7 +1569,7 @@ class Feature(_SdkFeature):
                 result = await execute_tool_effect(host,
                     registration=[type(self).__name__, skill_name], arguments=args,
                     validate_registration=require_original_feature_registration,
-                    execute=lambda: selected.execute(**args))
+                    execute=execute_registered)
                 if isinstance(result, DeferredToolResult):
                     # An A2A task has no chat, so its publication is headless.
                     # The artifact carries only the completed public result.
@@ -1572,6 +1582,7 @@ class Feature(_SdkFeature):
                         session_id="", exec_start=exec_start,
                         adapter=f"a2a:{type(self).__name__}.{skill_name}",
                         destination=HEADLESS_PUBLICATION,
+                        execution_witness=execution, dispatch_id=dispatch_id,
                     )
                 result = _serialize_tool_result(result)
                 # Inline standard JSON preserves integer types and identifiers
@@ -2137,9 +2148,12 @@ class Feature(_SdkFeature):
             when a hook rewrote them, leaking PII into log storage."""
         host = _dispatch_host if _dispatch_host is not None else self.agent
 
+        from kestrel_sovereign.agent.tool_registry import _capture_tool_feature_registration
+
+        feature_registration = _capture_tool_feature_registration(host, None, self)
+
         def require_original_registration():
-            if self.agent is not host:
-                raise ResourceConflict("Original subagent host changed")
+            feature_registration()
             if _validate_registration is not None:
                 _validate_registration()
 
@@ -2203,6 +2217,8 @@ class Feature(_SdkFeature):
                 status="error", error_class="UnknownToolError",
                 error_message=unknown_error,
             )
+
+        feature_registration = _capture_tool_feature_registration(host, selected_tool, self)
 
         # #3921: coerce before PRE_TOOL_USE, as the direct and named paths do,
         # so the hooks authorize and the audit records the binding the tool

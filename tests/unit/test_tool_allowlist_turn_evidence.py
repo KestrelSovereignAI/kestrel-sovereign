@@ -639,8 +639,7 @@ class _NestingFeature(Feature):
         return []
 
     async def execute_as_subagent(self, task, context=None, **_kwargs):
-        step = MagicMock()
-        step.name = "run_step"
+        step = _make_tool("run_step")
         step.execute = self._run_step
         self.executor = self._make_feature_inline_tool_executor(
             parts_sink=None, runtime_tools=[step]

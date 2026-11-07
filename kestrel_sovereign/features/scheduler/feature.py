@@ -1269,32 +1269,40 @@ class SchedulerFeature(Feature):
     # ------------------------------------------------------------------
 
     async def _run_tool_hook_gated(
-        self, feature_name: str, agent_tool: Any, args: dict
+        self, feature_name: str, agent_tool: Any, args: dict, *, feature: Feature
     ) -> Any:
         """Admit the original scheduled intent before hooks or tool effects."""
         from kestrel_sdk.resources import ResourceConflict
         from kestrel_sovereign.agent.tool_allowlist import registry_generation
         from kestrel_sovereign.tools.effect_invocation import run_scheduled_tool_operation
 
-        selected_generation = registry_generation(self.agent)
+        from kestrel_sovereign.agent.tool_registry import _capture_tool_feature_registration
+
+        host = self.agent
+        selected_generation = registry_generation(host)
+        require_scheduler = _capture_tool_feature_registration(host, None, self)
+        require_feature = _capture_tool_feature_registration(host, agent_tool, feature)
         selected_function = getattr(agent_tool, 'func', agent_tool.execute)
 
         def validate_registration():
-            owner, current, _disabled = self._resolve_scheduled_tool(agent_tool.name)
+            require_scheduler()
+            if require_feature is not None:
+                require_feature()
+            owner, current, _disabled, current_feature = self._resolve_scheduled_tool(agent_tool.name)
             same_tool = current is agent_tool or (current is not None
                 and getattr(current, 'func', current.execute) == selected_function)
-            if owner != feature_name or not same_tool:
+            if owner != feature_name or current_feature is not feature or not same_tool:
                 raise ResourceConflict('Scheduled tool registration changed before execution')
 
         validate_registration()
-        return await run_scheduled_tool_operation(self.agent,
+        return await run_scheduled_tool_operation(host,
             feature_name=feature_name, tool_name=agent_tool.name, arguments=args,
             operation=lambda owned: self._run_tool_hook_gated_body(feature_name, agent_tool, owned,
-                selected_generation=selected_generation, validate_registration=validate_registration))
+                host=host, selected_generation=selected_generation, validate_registration=validate_registration))
 
     async def _run_tool_hook_gated_body(
         self, feature_name: str, agent_tool: Any, args: dict, *,
-        selected_generation: int, validate_registration: Callable[[], None],
+        host: Any, selected_generation: int, validate_registration: Callable[[], None],
     ) -> Any:
         """Run a feature tool on a scheduler tick through the SAME
         PRE_TOOL_USE / POST_TOOL_USE hook envelope the chat and subagent
@@ -1324,7 +1332,7 @@ class SchedulerFeature(Feature):
         from kestrel_sovereign.tools.effect_journal import execute_tool_effect
 
         async def execute_approved(approved):
-            return await execute_tool_effect(self.agent,
+            return await execute_tool_effect(host,
                 registration=['scheduler', feature_name, agent_tool.name],
                 arguments=approved, expected_generation=selected_generation,
                 validate_registration=validate_registration,
@@ -1338,7 +1346,7 @@ class SchedulerFeature(Feature):
         )
         if argument_error is not None:
             return refused_tool_result(agent_tool.name, argument_error)
-        hooks_manager = getattr(self.agent, "hooks_manager", None)
+        hooks_manager = getattr(host, "hooks_manager", None)
         effective_args = args
         if hooks_manager is not None:
             from kestrel_sdk.hooks.base import HookEvent, HookInput
@@ -1610,11 +1618,11 @@ class SchedulerFeature(Feature):
             blocked = await self._training_cycle_semantic_maintenance_gate()
             if blocked is not None:
                 return blocked
-        owner_name, agent_tool, disabled_owner = self._resolve_scheduled_tool(
+        owner_name, agent_tool, disabled_owner, feature = self._resolve_scheduled_tool(
             task_name
         )
         if agent_tool is not None:
-            return await self._run_tool_hook_gated(owner_name, agent_tool, args)
+            return await self._run_tool_hook_gated(owner_name, agent_tool, args, feature=feature)
 
         # A persisted schedule that names a tool owned by a NOW-disabled feature
         # must not execute it. Skip benignly rather than raising, so a disable
@@ -1644,10 +1652,10 @@ class SchedulerFeature(Feature):
 
     def _resolve_scheduled_tool(
         self, task_name: str
-    ) -> tuple[Optional[str], Optional[Any], Optional[str]]:
+    ) -> tuple[Optional[str], Optional[Any], Optional[str], Optional[Feature]]:
         """Resolve the tool a scheduled task names, as the executor would.
 
-        Returns ``(owner_name, tool, disabled_owner_name)``: the enabled owner
+        Returns ``(owner_name, tool, disabled_owner_name, feature)``: the enabled owner
         and its tool when one exists (an enabled owner always wins), otherwise
         the name of a disabled feature exposing the tool, otherwise all None.
         """
@@ -1662,13 +1670,13 @@ class SchedulerFeature(Feature):
                 continue
             for agent_tool in feature.get_tools():
                 if agent_tool.name == task_name:
-                    return type(feature).__name__, agent_tool, None
+                    return type(feature).__name__, agent_tool, None, feature
 
         # Also check our own tools (SchedulerFeature has !schedule
         # commands but they're not typically scheduled themselves).
         for agent_tool in self.get_tools():
             if agent_tool.name == task_name:
-                return type(self).__name__, agent_tool, None
+                return type(self).__name__, agent_tool, None, self
 
         for feature in features.values():
             if not hasattr(feature, "get_tools") or self._feature_enabled(feature):
@@ -1684,8 +1692,9 @@ class SchedulerFeature(Feature):
                     None,
                     None,
                     getattr(feature, "name", type(feature).__name__),
+                    feature,
                 )
-        return None, None, None
+        return None, None, None, None
 
     async def _require_scheduled_tool_owner(
         self, task_name: str
@@ -1697,7 +1706,7 @@ class SchedulerFeature(Feature):
         runs before the dispatcher applies Hold, and no-execution under Hold is
         a skip, not a failure. ``None`` means dispatch may proceed.
         """
-        _owner, agent_tool, disabled_owner = self._resolve_scheduled_tool(
+        _owner, agent_tool, disabled_owner, _feature = self._resolve_scheduled_tool(
             task_name
         )
         if agent_tool is None and disabled_owner is None:

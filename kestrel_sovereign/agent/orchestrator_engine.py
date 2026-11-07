@@ -1054,10 +1054,10 @@ async def _execute_feature_subagent(host, feature, dispatch, arguments, *,
             type(current) is MethodType and type(dispatch) is MethodType
             and current.__self__ is dispatch.__self__
             and current.__func__ is dispatch.__func__))
-        if (getattr(feature, "agent", None) is not host
-                or not any(value is feature for value in host.features.values())
-                or getattr(feature, "enabled", True) is not True
-                or not same_dispatch):
+        from kestrel_sovereign.agent.tool_registry import _require_original_feature_registration
+
+        _require_original_feature_registration(host, feature, registered=True)
+        if not same_dispatch:
             raise ResourceConflict("Original feature dispatcher registration changed")
 
     async def execute():
@@ -2185,6 +2185,10 @@ class OrchestratorEngineMixin:
             execute_tool_effect, require_persistent_tool_effects,
         )
         require_persistent_tool_effects(self)
+        from kestrel_sovereign.agent.tool_registry import _capture_tool_feature_registration
+
+        registration_validator = _capture_tool_feature_registration(self, found_tool,
+            found_feature if found_feature is not None else self.features.get(direct_tool_feature_name))
 
         # --- PRE_TOOL_USE hook ---
         # The real HookManager threads input through the hook chain,
@@ -2268,7 +2272,7 @@ class OrchestratorEngineMixin:
 
         result = await execute_tool_effect(self, registration=[feature_name, tool_name],
             arguments=effective_args, execute=execute_registered,
-            expected_generation=selected_generation)
+            expected_generation=selected_generation, validate_registration=registration_validator)
         mark_current_invocation_effect_completed(session_id)
         require_execution_work(self)
         exec_duration_ms = int((time.time() - exec_start) * 1000)
@@ -3013,7 +3017,7 @@ class OrchestratorEngineMixin:
                     tool_call, tool_name, args, dispatch_start, dispatch_event_id,
                     tool_events=tool_events, streaming=streaming,
                     session_id=session_id, dispatch_meta=dispatch_meta,
-                    tool=registered_tool,
+                    tool=registered_tool, feature=registered_feature,
                     feature_name=(
                         getattr(registered_feature, "name", None)
                         or type(registered_feature).__name__
@@ -3562,7 +3566,7 @@ class OrchestratorEngineMixin:
     async def _dispatch_direct_tool(
         self, tool_call, tool_name, args, dispatch_start, dispatch_event_id,
         *, tool_events=None, streaming=False, session_id="orchestrator",
-        dispatch_meta=None, tool=None, feature_name=None,
+        dispatch_meta=None, tool=None, feature_name=None, feature=None,
         call_context: Optional[ToolCallContext] = None,
         bound_tool=None,
         bound_execution=None,
@@ -3593,6 +3597,10 @@ class OrchestratorEngineMixin:
         hook_feature_name = (
             feature_name or self._security_feature_name_for_tool(tool_name)
         )
+        from kestrel_sovereign.agent.tool_registry import _capture_tool_feature_registration
+
+        registration_validator = _capture_tool_feature_registration(self, tool,
+            feature if feature is not None else self.features.get(hook_feature_name))
 
         async def _failed(error_message, *, error_class, status="error"):
             if dispatch_meta is not None:
@@ -3678,7 +3686,7 @@ class OrchestratorEngineMixin:
             return await execute_tool_effect(self, registration=[hook_feature_name, tool_name],
                 arguments=effective_args, execute=execute_registered,
                 expected_generation=selected_generation,
-                validate_registration=bound_tool.require_current if bound_tool is not None else None)
+                validate_registration=bound_tool.require_current if bound_tool is not None else registration_validator)
 
         async def run():
             from kestrel_sovereign.tools.effect_journal import require_persistent_tool_effects

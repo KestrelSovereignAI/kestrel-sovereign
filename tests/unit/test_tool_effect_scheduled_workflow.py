@@ -146,7 +146,7 @@ async def test_scheduled_tool_without_an_occurrence_cannot_open_a_journal(schedu
     case = scheduled_case
     selected, = case.feature.get_tools()
     with pytest.raises(ToolEffectJournalUnavailable, match='scheduler_occurrence_unavailable'):
-        await case.scheduler._run_tool_hook_gated(type(case.feature).__name__, selected, {})
+        await case.scheduler._run_tool_hook_gated(type(case.feature).__name__, selected, {}, feature=case.feature)
     assert not case.witness.exists()
     assert await case.database.fetchone('SELECT COUNT(*) FROM tool_effect_operations') == (0,)
 
@@ -255,5 +255,48 @@ async def test_native_workflow_does_not_repeat_a_tool_effect_after_its_ordinary_
         assert case.witness.read_text() == 'original uncertain effect\n'
         states = await case.database.fetchall('SELECT state FROM tool_effect_claims')
         assert states == [('RETURNED_ERROR',), ('UNCONFIRMED',)]
+    finally:
+        await runner.stop()
+
+
+@pytest.mark.parametrize('timing', ['permission', 'claim-ack'])
+async def test_scheduled_concrete_tool_retains_original_feature_host(
+    scheduled_case, native_tool_effect_agent, monkeypatch, timing,
+):
+    from kestrel_sdk.hooks.base import Hook, HookEvent, HookOutput
+
+    case = scheduled_case
+    foreign = await native_tool_effect_agent(did=case.owner.did)
+    withdrawals = []
+
+    def withdraw():
+        case.feature.agent = foreign
+        withdrawals.append(True)
+
+    if timing == 'permission':
+        class Withdraw(Hook):
+            def __init__(self):
+                super().__init__('withdraw-scheduled-feature-host', [HookEvent.PRE_TOOL_USE])
+            async def execute(self, value):
+                withdraw()
+                return HookOutput.allow()
+        case.owner.hooks_manager.register(Withdraw())
+    else:
+        original_claim = case.owner.tool_effect_store.claim
+        async def after_ack(*args, **kwargs):
+            receipt = await original_claim(*args, **kwargs)
+            withdraw()
+            return receipt
+        monkeypatch.setattr(case.owner.tool_effect_store, 'claim', after_ack)
+    runner = SchedulerRunner(case.database, case.owner.did, case.scheduler._lookup_and_run_tool,
+        owner_id='owned-native-original-host-scheduler')
+    try:
+        await seed_occurrence(case, runner, 'scheduled_file_effect', {})
+        await tick_and_settle(runner)
+        assert withdrawals, 'Original scheduled producer never reached the withdrawal boundary'
+        assert not case.witness.exists(), 'Scheduled concrete tool executed after its Feature changed host'
+        assert not case.observed
+        assert await case.database.fetchone('SELECT state FROM tool_effect_claims') == ('NOT_EXECUTED',)
+        assert await foreign.tool_effect_store.database.fetchone('SELECT COUNT(*) FROM tool_effect_claims') == (0,)
     finally:
         await runner.stop()

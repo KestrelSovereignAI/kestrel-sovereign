@@ -30,6 +30,42 @@ from kestrel_sovereign.tools.result_contract import enforce_tool_result_contract
 from kestrel_sovereign.tools.execution_outcome import TOOL_OUTCOME_UNCONFIRMED
 
 
+def _require_original_feature_registration(host, feature, *, registered):
+    """Validate the original Feature, independently of its concrete producer."""
+    if (getattr(feature, "agent", None) is not host
+            or getattr(feature, "enabled", True) is not True
+            or (registered and not any(value is feature
+                for value in getattr(host, "features", {}).values()))):
+        raise ResourceConflict("Original feature ownership or registration changed")
+
+
+def _capture_tool_feature_registration(host, tool, feature=None):
+    """Retain both the exposing Feature and a wrapper's actual bound Feature.
+
+    A plain mounted tool has no Feature. Feature-less registrations remain
+    governed by their existing owner batch and registry generation. A Feature
+    mounted only through a tool batch retains that batch as its registration;
+    a loaded Feature must also remain in its original host's feature map.
+    """
+    attached = getattr(tool, "feature", None)
+    originals = []
+    for selected in (feature, attached):
+        if selected is not None and not any(value is selected for value, _ in originals):
+            registered = any(value is selected for value in getattr(host, "features", {}).values())
+            originals.append((selected, registered))
+    if not originals:
+        return None
+    originals = tuple(originals)
+
+    def require_current():
+        for selected, registered in originals:
+            _require_original_feature_registration(host, selected, registered=registered)
+        if attached is not None and getattr(tool, "feature", None) is not attached:
+            raise ResourceConflict("Original concrete tool feature changed")
+
+    return require_current
+
+
 @dataclass
 class _ToolExecution:
     """Caller-local execution facts, independent of a tool's business result."""
@@ -79,14 +115,24 @@ class _GovernedToolBinding:
     registration: object
     tool: Any
     security_feature: str
+    validate_feature_registration: Callable[[], None] | None = None
 
     @property
     def is_current(self) -> bool:
-        return (
+        current = (
             self.agent._explored_features.get(self.owner) is self.registration
             and self.agent._direct_tools.get(self.name) is self.tool
             and self.agent._tool_to_feature.get(self.name) == self.owner
         )
+
+        if not current:
+            return False
+        if self.validate_feature_registration is not None:
+            try:
+                self.validate_feature_registration()
+            except ResourceConflict:
+                return False
+        return True
 
     def require_current(self) -> None:
         if not self.is_current:
@@ -546,6 +592,8 @@ class ToolRegistryMixin:
                 on_registered(tool, _GovernedToolBinding(
                     self, name, owner, registration, tool,
                     self._security_feature_name_for_tool(name),
+                    validate_feature_registration=_capture_tool_feature_registration(
+                        self, tool, getattr(self, "features", {}).get(owner)),
                 ))
         return registered
 

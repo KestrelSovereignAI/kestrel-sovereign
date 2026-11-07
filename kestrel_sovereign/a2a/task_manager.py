@@ -601,18 +601,27 @@ class TaskManager:
         from kestrel_sovereign.agent.tool_allowlist import registry_generation
         from kestrel_sdk.resources import ResourceConflict
 
-        selected_generation = registry_generation(handler.agent) if isinstance(handler, Feature) else None
+        from kestrel_sovereign.agent.tool_registry import _capture_tool_feature_registration
+
+        original_host = handler.agent if isinstance(handler, Feature) else None
+        selected_generation = registry_generation(original_host) if original_host is not None else None
+        require_feature = (_capture_tool_feature_registration(original_host, None, handler)
+            if original_host is not None else None)
 
         def require_original_registration():
             if self._providers.get(agent_id) is not registration:
                 raise ResourceConflict('Task provider registration changed during admission')
+            if require_feature is not None:
+                require_feature()
+                if registry_generation(original_host) != selected_generation:
+                    raise ResourceConflict('Task provider generation changed during admission')
 
         execution_registration = (
-            bind_tool_effect_registration(handler.agent, selected_generation, require_original_registration)
+            bind_tool_effect_registration(original_host, selected_generation, require_original_registration)
             if isinstance(handler, Feature) else nullcontext())
 
         if isinstance(handler, Feature):
-            require_persistent_tool_effects(handler.agent)
+            require_persistent_tool_effects(original_host)
 
         from kestrel_sovereign.tools.effect_journal import (
             current_tool_effect_turn, execute_tool_effect,
@@ -621,12 +630,12 @@ class TaskManager:
         if isinstance(handler, Feature) and not sync:
             from copy import deepcopy
 
-            original_turn = current_tool_effect_turn(handler.agent)
+            original_turn = current_tool_effect_turn(original_host)
             if original_turn is None:
                 from kestrel_sovereign.tools.effect_journal import ToolEffectJournalUnavailable
 
                 raise ToolEffectJournalUnavailable('tool_effect_attempt_unavailable')
-            original_turn.require_live(handler.agent)
+            original_turn.require_live(original_host)
             args = deepcopy(args)
 
         async def execute_original_skill():
@@ -688,6 +697,8 @@ class TaskManager:
                 metadata=metadata,
             )
             request.message.parts.append(argument_part)
+            if original_turn is not None:
+                require_original_registration()
             task = await self.create_task(
                 request,
                 creator_agent_id=authority_agent_id,
@@ -801,7 +812,7 @@ class TaskManager:
                     execute_original_provider,
                     task.id,
                     authority_agent_id,
-                    work_factory=(handler.agent._get_privacy_transition_lock()
+                    work_factory=(original_host._get_privacy_transition_lock()
                         .capture_native_work_factory(acquire_span=False)
                         if original_turn is not None else None),
                 )
@@ -818,7 +829,7 @@ class TaskManager:
         if original_turn is not None:
             # Durable acceptance itself fences reissuing an asynchronous task,
             # even if the process dies before the worker reaches its tool leaf.
-            return await execute_tool_effect(handler.agent,
+            return await execute_tool_effect(original_host,
                 registration=['a2a-task-dispatch', agent_id, skill_id], arguments=args,
                 expected_generation=selected_generation,
                 validate_registration=require_original_registration,

@@ -518,8 +518,8 @@ async def test_original_registration_withdrawn_during_pre_hook_cannot_execute(ow
         except ResourceConflict:
             pass
         assert not witness.exists(), 'PRE_TOOL_USE withdrawal executed the stale selected tool'
-        assert await owner.tool_effect_store.database.fetchone(
-            'SELECT state FROM tool_effect_claims') == ('NOT_EXECUTED',)
+        states = await owner.tool_effect_store.database.fetchall('SELECT state FROM tool_effect_claims')
+        assert states == ([] if lane == 'subagent' else [('NOT_EXECUTED',)])
     finally:
         await store.close()
 

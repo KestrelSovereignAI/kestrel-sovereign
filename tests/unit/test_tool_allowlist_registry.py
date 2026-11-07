@@ -38,7 +38,9 @@ from kestrel_sovereign.security.tool_audit import (
 # =============================================================================
 
 def _make_tool(name: str):
-    tool = MagicMock()
+    from kestrel_sdk.tools.base import AgentTool
+
+    tool = MagicMock(spec=AgentTool)
     tool.name = name
     tool.schema = ToolSchema(
         name=name,
