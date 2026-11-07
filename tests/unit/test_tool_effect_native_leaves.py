@@ -126,7 +126,7 @@ async def test_async_registration_refusal_settles_the_native_task_without_dispat
 
 
 @pytest.mark.parametrize('uncertain', [False, True])
-async def test_async_feature_task_retains_its_original_journal_until_native_completion(owner, tmp_path, uncertain):
+async def test_async_feature_task_retains_its_original_journal_until_native_completion(owner, tmp_path, monkeypatch, uncertain):
     from kestrel_sovereign.a2a.scope import NativeRecipientScope
     from tests.utils.native_a2a import manager_for
 
@@ -147,16 +147,11 @@ async def test_async_feature_task_retains_its_original_journal_until_native_comp
         async def initialize(self):
             pass
 
-        async def handle_task(self, task, *, arguments=None):
-            entered.set()
-            await resume.wait()
-            return await super().handle_task(task, arguments=arguments)
-
         @tool(name='owned_async_task_effect', description='Append the original task marker')
         async def owned_async_task_effect(self) -> dict:
             rows = await owner.tool_effect_store.database.fetchall(
                 'SELECT parent_claim_id,state FROM tool_effect_claims')
-            assert len(rows) == 3 and sum(state == 'STARTED' for _parent, state in rows) == 2 and any(parent is not None and state == 'STARTED'
+            assert len(rows) == 2 and any(parent is not None and state == 'STARTED'
                 for parent, state in rows), 'Async task did not retain its original dispatch claim'
             witness.write_text('one original asynchronous effect')
             if uncertain:
@@ -166,6 +161,15 @@ async def test_async_feature_task_retains_its_original_journal_until_native_comp
     feature = AsyncFileFeature(owner)
     owner.features[feature.name] = feature
     manager.register_provider(feature.name, feature.get_agent_skills(), feature)
+    execute_async = manager._execute_async
+    async def before_original_handler(*args, **kwargs):
+        # Hold the actual accepted worker before any handler/leaf claim can
+        # independently retain the journal. Only original worker enrollment
+        # can own this pre-dispatch interval.
+        entered.set()
+        await resume.wait()
+        return await execute_async(*args, **kwargs)
+    monkeypatch.setattr(manager, '_execute_async', before_original_handler)
 
     @governed
     async def invoke(agent, user_input, *, invocation_id=None):
@@ -181,7 +185,7 @@ async def test_async_feature_task_retains_its_original_journal_until_native_comp
         assert accepted.is_set(), 'Native asynchronous acceptance waited for a whole-worker privacy span'
         assert entered.is_set(), 'Accepted native asynchronous worker never entered its original handler'
         assert not invocation.done(), 'Originating journal retired before its accepted worker'
-        assert await owner.tool_effect_store.database.fetchall('SELECT state FROM tool_effect_claims') == [('RETURNED_OK',), ('STARTED',)]
+        assert await owner.tool_effect_store.database.fetchall('SELECT state FROM tool_effect_claims') == [('RETURNED_OK',)]
         resume.set()
         if uncertain:
             from kestrel_sovereign.execution_custody import execution_evidence_carriers
@@ -203,7 +207,7 @@ async def test_async_feature_task_retains_its_original_journal_until_native_comp
             assert task_outcome_unknown(persisted)
         assert await owner.tool_effect_store.database.fetchone('SELECT state FROM tool_effect_operations') == ('CLOSED',)
         assert await owner.tool_effect_store.database.fetchall('SELECT state FROM tool_effect_claims') == [
-            ('RETURNED_OK',), ('RETURNED_OK',), ('UNCONFIRMED' if uncertain else 'RETURNED_OK',)]
+            ('RETURNED_OK',), ('UNCONFIRMED' if uncertain else 'RETURNED_OK',)]
         with pytest.raises(ToolEffectReconciliationRequired):
             await invoke(owner, 'original async intention', invocation_id='original-async-task-intent')
         assert witness.read_text() == 'one original asynchronous effect'
