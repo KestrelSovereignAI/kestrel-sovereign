@@ -604,7 +604,10 @@ async def test_canonical_parent_cannot_deliver_a_swallowed_terminal_leaf_result(
 
     host, feature, witness, model, _, _, _ = canonical_subagent
     monkeypatch.setenv(CONTINUATION_CHECK_ENV, continuation_check)
-    monkeypatch.setenv(CONTINUATION_CHECK_MODEL_ENV, 'openrouter:api/owned-decision')
+    if continuation_check == 'decision':
+        monkeypatch.setenv(CONTINUATION_CHECK_MODEL_ENV, 'openrouter:api/owned-decision')
+    else:
+        monkeypatch.delenv(CONTINUATION_CHECK_MODEL_ENV, raising=False)
     decisions = []
     async def decide(request, **kwargs):
         decisions.append(request)
