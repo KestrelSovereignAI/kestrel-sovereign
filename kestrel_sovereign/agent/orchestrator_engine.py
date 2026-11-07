@@ -1015,7 +1015,7 @@ async def _run_tool_execution(host, operation, *, execution, dispatch_meta,
         if turn is not None:
             turn.require_confirmed()
         return result
-    except Exception as error:
+    except BaseException as error:
         if execution.returned or (turn is not None and observed_outcome_unknown(error)):
             # All producers retain completion uncertainty before either an
             # inline recovery or terminal propagation can hide it from Root.
@@ -1023,6 +1023,10 @@ async def _run_tool_execution(host, operation, *, execution, dispatch_meta,
             from kestrel_sovereign.tools.effect_journal import record_tool_effect_completion_failure
 
             error = record_tool_effect_completion_failure(host, error)
+        if not isinstance(error, Exception):
+            # Cancellation and process-control carriers retain the same
+            # object after recording uncertainty; they are never tool replies.
+            raise error
         if is_tool_execution_terminal_error(error):
             if execution.started:
                 mark_current_invocation_effect_completed(session_id)

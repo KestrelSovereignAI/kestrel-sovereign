@@ -378,7 +378,12 @@ retain uncertainty when a returned Task cannot be read; a completion failure
 cannot become another execution attempt. The original Feature host and input
 are retained across those readers, and the existing journal refuses further
 Task admission after uncertainty. Required audit uncertainty also fences that
-input when it occurs before a tool body starts.
+input when it occurs before a tool body starts. The complete inner leaf boundary
+includes unknown-tool, argument, permission and hook-rewrite refusal audits;
+an inline provider catching their error cannot authorize another leaf.
+Completion retention covers cancellation and mixed `BaseExceptionGroup`
+carriers as well as ordinary errors. Cancellation and process-control objects
+propagate unchanged after their original uncertainty is retained.
 
 Terminal retirement closes only the original attempt through the shared native
 result-custody writer. It retains the original connection generation or pool

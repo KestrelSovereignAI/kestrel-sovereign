@@ -2220,182 +2220,185 @@ class Feature(_SdkFeature):
             )
             return _shape(effective_args_value, result_value)
 
-        selected_tool = tools_by_name.get(tool_name)
-        if selected_tool is None:
-            unknown_error = (
-                f"Tool {tool_name!r} is not in subagent "
-                f"{self.name!r}'s palette; available: "
-                f"{sorted(tools_by_name)}"
-            )
-            return await _recorded(
-                args, {"success": False, "error": unknown_error},
-                status="error", error_class="UnknownToolError",
-                error_message=unknown_error,
-            )
+        effective_args = args
 
-        feature_registration = _capture_tool_feature_registration(host, selected_tool, self)
-
-        # #3921: coerce before PRE_TOOL_USE, as the direct and named paths do,
-        # so the hooks authorize and the audit records the binding the tool
-        # runs with. A value that cannot be coerced fails as the tool's own
-        # wrapper fails it.
-        from kestrel_sovereign.agent.direct_tool_arguments import (
-            ToolArgumentRewriteError,
-            coerce_declared_tool_arguments,
-            hook_rewrite_argument_error,
-            refused_tool_result,
-        )
-        args, coercion_error = coerce_declared_tool_arguments(
-            tool_name, selected_tool, args,
-        )
-        if coercion_error is not None:
-            return await _recorded(
-                args, refused_tool_result(tool_name, coercion_error),
-                status="error", error_class=_TOOL_ARGUMENT_ERROR,
-                error_message=coercion_error,
-            )
-
-        from kestrel_sovereign.tools.effect_journal import (
-            execute_tool_effect, require_persistent_tool_effects,
-        )
-        from kestrel_sovereign.agent.tool_allowlist import registry_generation
-
-        selected_generation = registry_generation(host)
-        require_persistent_tool_effects(host)
-
-        # #2641: bind the subagent-local parts sink as the active collector
-        # for the WHOLE gated call — PRE_TOOL_USE hooks included, not just the
-        # tool body — so ``emit_part`` lands deterministically on THIS
-        # subagent's buffer no matter which task/context the transport
-        # dispatched the call on (the codex app-server runs inline calls on
-        # reader-spawned tasks whose frozen context has no live collector —
-        # the exact gap parts.py documents for the parent-turn executor).
-        # Covering the hooks matters for ordering: a part emitted by a PRE
-        # hook must land on the same buffer as the tool's own parts, in
-        # emission order (hook part first). This binding is the ONLY
-        # ContextVar-side capture the subagent path performs — the ambient
-        # collector outside this scope is the PARENT turn's (the dispatch
-        # loop runs on the parent's task, and orchestrator+feature share one
-        # hooks manager in production), so draining it from subagent code
-        # steals the outer PRE_TOOL_USE gate's parts and reorders them
-        # behind tool-body parts (#2641 review P1, both rounds).
-        #
-        # The parent's collector is read, never drained: a deferred result
-        # publishes to the parent turn's chat destination (#3922), and this
-        # subagent's own buffer is no destination.
-        from kestrel_sovereign.agent.parts import current_part_collector
-        parent_collector = current_part_collector()
-        if parts_sink is None:
-            sink_scope = contextlib.nullcontext()
-        else:
-            from kestrel_sovereign.agent.parts import bind_part_collector
-            sink_scope = bind_part_collector(parts_sink)
-
-        hook_session_id = session_id or ""
-        with sink_scope:
-            hooks_manager = getattr(host, "hooks_manager", None)
-            effective_args = args
-            if hooks_manager is not None:
-                from kestrel_sdk.hooks.base import (
-                    HookEvent,
-                    HookInput,
+        async def operation():
+            nonlocal args, feature_registration, effective_args
+            selected_tool = tools_by_name.get(tool_name)
+            if selected_tool is None:
+                unknown_error = (
+                    f"Tool {tool_name!r} is not in subagent "
+                    f"{self.name!r}'s palette; available: "
+                    f"{sorted(tools_by_name)}"
                 )
-                hook_input = HookInput(
-                    session_id=hook_session_id,
-                    hook_event_name=HookEvent.PRE_TOOL_USE.value,
-                    tool_name=tool_name,
-                    tool_input=args,
-                    feature_name=type(self).__name__,
+                return await _recorded(
+                    args, {"success": False, "error": unknown_error},
+                    status="error", error_class="UnknownToolError",
+                    error_message=unknown_error,
                 )
-                hook_output = await hooks_manager.execute_hooks(
-                    HookEvent.PRE_TOOL_USE, hook_input,
+
+            feature_registration = _capture_tool_feature_registration(host, selected_tool, self)
+
+            # #3921: coerce before PRE_TOOL_USE, as the direct and named paths do,
+            # so the hooks authorize and the audit records the binding the tool
+            # runs with. A value that cannot be coerced fails as the tool's own
+            # wrapper fails it.
+            from kestrel_sovereign.agent.direct_tool_arguments import (
+                ToolArgumentRewriteError,
+                coerce_declared_tool_arguments,
+                hook_rewrite_argument_error,
+                refused_tool_result,
+            )
+            args, coercion_error = coerce_declared_tool_arguments(
+                tool_name, selected_tool, args,
+            )
+            if coercion_error is not None:
+                return await _recorded(
+                    args, refused_tool_result(tool_name, coercion_error),
+                    status="error", error_class=_TOOL_ARGUMENT_ERROR,
+                    error_message=coercion_error,
                 )
-                require_original_registration()
-                # Compute the effective args from the post-hook state FIRST,
-                # before the block check. A hook chain may redact via an
-                # early MODIFY hook (in-place mutation of
-                # ``hook_input.tool_input``) and then DENY via a later
-                # PermissionHook; the blocking branch must surface the
-                # REDACTED args to the codex audit path or PII the
-                # redaction hook removed will leak straight into
-                # ``a2a_tool_dispatches.args_redacted`` /
-                # ``executed_tool_calls``. Codex round 5 P1 on #1461
-                # follow-up.
-                from kestrel_sovereign.hooks.decision_gate import decided_tool_input
-                effective_args = decided_tool_input(hook_input, hook_output)
 
-                # The loop and inline executors share the same DENY, ASK,
-                # and explicit-stop rule as the orchestrator.
-                from kestrel_sovereign.hooks.decision_gate import evaluate_blocking_decision
+            from kestrel_sovereign.tools.effect_journal import (
+                execute_tool_effect, require_persistent_tool_effects,
+            )
+            from kestrel_sovereign.agent.tool_allowlist import registry_generation
 
-                blocked = evaluate_blocking_decision(hook_output)
-                if blocked is not None:
-                    reason = blocked.reason
-                    decision_label = (
-                        "APPROVAL REQUIRED" if blocked.is_ask else "PERMISSION DENIED"
+            selected_generation = registry_generation(host)
+            require_persistent_tool_effects(host)
+
+            # #2641: bind the subagent-local parts sink as the active collector
+            # for the WHOLE gated call — PRE_TOOL_USE hooks included, not just the
+            # tool body — so ``emit_part`` lands deterministically on THIS
+            # subagent's buffer no matter which task/context the transport
+            # dispatched the call on (the codex app-server runs inline calls on
+            # reader-spawned tasks whose frozen context has no live collector —
+            # the exact gap parts.py documents for the parent-turn executor).
+            # Covering the hooks matters for ordering: a part emitted by a PRE
+            # hook must land on the same buffer as the tool's own parts, in
+            # emission order (hook part first). This binding is the ONLY
+            # ContextVar-side capture the subagent path performs — the ambient
+            # collector outside this scope is the PARENT turn's (the dispatch
+            # loop runs on the parent's task, and orchestrator+feature share one
+            # hooks manager in production), so draining it from subagent code
+            # steals the outer PRE_TOOL_USE gate's parts and reorders them
+            # behind tool-body parts (#2641 review P1, both rounds).
+            #
+            # The parent's collector is read, never drained: a deferred result
+            # publishes to the parent turn's chat destination (#3922), and this
+            # subagent's own buffer is no destination.
+            from kestrel_sovereign.agent.parts import current_part_collector
+            parent_collector = current_part_collector()
+            if parts_sink is None:
+                sink_scope = contextlib.nullcontext()
+            else:
+                from kestrel_sovereign.agent.parts import bind_part_collector
+                sink_scope = bind_part_collector(parts_sink)
+
+            hook_session_id = session_id or ""
+            with sink_scope:
+                hooks_manager = getattr(host, "hooks_manager", None)
+                effective_args = args
+                if hooks_manager is not None:
+                    from kestrel_sdk.hooks.base import (
+                        HookEvent,
+                        HookInput,
                     )
-                    logger.info(
-                        "[SUBAGENT-TOOL] %s blocked (%s): reason %s",
-                        tool_name, decision_label, content_log_summary(str(reason)),
+                    hook_input = HookInput(
+                        session_id=hook_session_id,
+                        hook_event_name=HookEvent.PRE_TOOL_USE.value,
+                        tool_name=tool_name,
+                        tool_input=args,
+                        feature_name=type(self).__name__,
                     )
-                    # Surface the POST-hook args even on the block path —
-                    # an upstream redaction hook may have run before the
-                    # downstream permission hook denied, and the codex
-                    # audit row should record the redacted form, not the
-                    # raw PII (codex round 5 P1 on #1461 follow-up).
+                    hook_output = await hooks_manager.execute_hooks(
+                        HookEvent.PRE_TOOL_USE, hook_input,
+                    )
+                    require_original_registration()
+                    # Compute the effective args from the post-hook state FIRST,
+                    # before the block check. A hook chain may redact via an
+                    # early MODIFY hook (in-place mutation of
+                    # ``hook_input.tool_input``) and then DENY via a later
+                    # PermissionHook; the blocking branch must surface the
+                    # REDACTED args to the codex audit path or PII the
+                    # redaction hook removed will leak straight into
+                    # ``a2a_tool_dispatches.args_redacted`` /
+                    # ``executed_tool_calls``. Codex round 5 P1 on #1461
+                    # follow-up.
+                    from kestrel_sovereign.hooks.decision_gate import decided_tool_input
+                    effective_args = decided_tool_input(hook_input, hook_output)
+
+                    # The loop and inline executors share the same DENY, ASK,
+                    # and explicit-stop rule as the orchestrator.
+                    from kestrel_sovereign.hooks.decision_gate import evaluate_blocking_decision
+
+                    blocked = evaluate_blocking_decision(hook_output)
+                    if blocked is not None:
+                        reason = blocked.reason
+                        decision_label = (
+                            "APPROVAL REQUIRED" if blocked.is_ask else "PERMISSION DENIED"
+                        )
+                        logger.info(
+                            "[SUBAGENT-TOOL] %s blocked (%s): reason %s",
+                            tool_name, decision_label, content_log_summary(str(reason)),
+                        )
+                        # Surface the POST-hook args even on the block path —
+                        # an upstream redaction hook may have run before the
+                        # downstream permission hook denied, and the codex
+                        # audit row should record the redacted form, not the
+                        # raw PII (codex round 5 P1 on #1461 follow-up).
+                        #
+                        # ``result_status`` has no approval status: an ASK is a
+                        # ``policy_denied`` row its ``error_class`` names, as on
+                        # the chat path (#3953).
+                        return await _recorded(effective_args, {
+                            "success": False,
+                            "error": (
+                                f"{decision_label}: {reason}. The tool was "
+                                f"NOT executed. Do NOT tell the user this "
+                                f"action succeeded — inform them it was "
+                                f"blocked by security policy."
+                            ),
+                        }, status="policy_denied", error_class=(
+                            "ApprovalRequired" if decision_label == "APPROVAL REQUIRED"
+                            else "PermissionDenied"
+                        ), error_message=reason)
+                    # ``effective_args`` was already resolved above to the
+                    # post-hook state (mutated ``tool_input`` first, then any
+                    # ``updated_input`` override) — see the comment block
+                    # before the DENY/ASK branch.
                     #
-                    # ``result_status`` has no approval status: an ASK is a
-                    # ``policy_denied`` row its ``error_class`` names, as on
-                    # the chat path (#3953).
-                    return await _recorded(effective_args, {
-                        "success": False,
-                        "error": (
-                            f"{decision_label}: {reason}. The tool was "
-                            f"NOT executed. Do NOT tell the user this "
-                            f"action succeeded — inform them it was "
-                            f"blocked by security policy."
-                        ),
-                    }, status="policy_denied", error_class=(
-                        "ApprovalRequired" if decision_label == "APPROVAL REQUIRED"
-                        else "PermissionDenied"
-                    ), error_message=reason)
-                # ``effective_args`` was already resolved above to the
-                # post-hook state (mutated ``tool_input`` first, then any
-                # ``updated_input`` override) — see the comment block
-                # before the DENY/ASK branch.
-                #
-                # #3921: those are the arguments the hooks authorized. A
-                # rewrite the tool's wrapper would still coerce is not what
-                # it would run with, so it does not run.
-                rewrite_error = hook_rewrite_argument_error(
-                    tool_name, selected_tool, effective_args,
-                )
-                if rewrite_error is not None:
-                    logger.info(
-                        "[SUBAGENT-TOOL] %s hook rewrite refused: %s",
-                        tool_name, content_log_summary(rewrite_error),
+                    # #3921: those are the arguments the hooks authorized. A
+                    # rewrite the tool's wrapper would still coerce is not what
+                    # it would run with, so it does not run.
+                    rewrite_error = hook_rewrite_argument_error(
+                        tool_name, selected_tool, effective_args,
                     )
-                    return await _recorded(
-                        effective_args, refused_tool_result(tool_name, rewrite_error),
-                        status="error",
-                        error_class=ToolArgumentRewriteError.__name__,
-                        error_message=rewrite_error,
-                    )
+                    if rewrite_error is not None:
+                        logger.info(
+                            "[SUBAGENT-TOOL] %s hook rewrite refused: %s",
+                            tool_name, content_log_summary(rewrite_error),
+                        )
+                        return await _recorded(
+                            effective_args, refused_tool_result(tool_name, rewrite_error),
+                            status="error",
+                            error_class=ToolArgumentRewriteError.__name__,
+                            error_message=rewrite_error,
+                        )
 
-            require_execution_work(host)
-            exec_start = time.time()
+                require_execution_work(host)
+                exec_start = time.time()
 
-            async def execute():
-                execution.started = True
-                if _dispatch_execution is not None:
-                    _dispatch_execution.started = True
-                result = await selected_tool.execute(**effective_args)
-                execution.returned = True
-                if _dispatch_execution is not None:
-                    _dispatch_execution.returned = True
-                return result
+                async def execute():
+                    execution.started = True
+                    if _dispatch_execution is not None:
+                        _dispatch_execution.started = True
+                    result = await selected_tool.execute(**effective_args)
+                    execution.returned = True
+                    if _dispatch_execution is not None:
+                        _dispatch_execution.returned = True
+                    return result
 
-            async def operation():
                 result = await execute_tool_effect(host,
                     registration=[type(self).__name__, tool_name], arguments=effective_args,
                     expected_generation=selected_generation,
@@ -2458,17 +2461,17 @@ class Feature(_SdkFeature):
                 require_execution_work(host)
                 return recorded
 
-            async def failed(error, unknown):
-                raise error
+        async def failed(error, unknown):
+            raise error
 
-            return await _run_tool_execution(host, operation,
-                execution=execution, dispatch_meta=dispatch_meta, session_id=session_id,
-                on_failure=failed,
-                on_terminal=lambda error: _record_terminal_tool_dispatch(
-                    host, error, execution, dispatch_meta, tool_name=tool_name,
-                    adapter=dispatch_adapter, args=effective_args, session_id=session_id,
-                    dispatch_start=dispatch_start, dispatch_id=dispatch_id,
-                    parent_dispatch_id=parent_dispatch_id))
+        return await _run_tool_execution(host, operation,
+            execution=execution, dispatch_meta=dispatch_meta, session_id=session_id,
+            on_failure=failed,
+            on_terminal=lambda error: _record_terminal_tool_dispatch(
+                host, error, execution, dispatch_meta, tool_name=tool_name,
+                adapter=dispatch_adapter, args=effective_args, session_id=session_id,
+                dispatch_start=dispatch_start, dispatch_id=dispatch_id,
+                parent_dispatch_id=parent_dispatch_id))
 
     def _compose_subagent_runtime_tools(
         self, denied_tools: Optional[Any] = None

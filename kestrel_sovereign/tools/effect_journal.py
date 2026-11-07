@@ -40,7 +40,8 @@ class ToolEffectOutcomeUnconfirmed(ResourceOutcomeUnknown):
 
 
 def _requires_original_terminal_error(error: BaseException | None) -> bool:
-    return (is_tool_execution_terminal_error(error)
+    return ((error is not None and not isinstance(error, Exception))
+        or is_tool_execution_terminal_error(error)
         or any(issubclass(type(item), asyncio.CancelledError)
             for item in execution_evidence_carriers(error)))
 

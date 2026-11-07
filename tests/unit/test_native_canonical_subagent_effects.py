@@ -32,7 +32,7 @@ async def canonical_subagent(bound_operation, request):
             pass
 
         @tool(name='native_leaf', description='Write one original marker')
-        async def native_leaf(self, marker: str):
+        async def native_leaf(self, marker: str, count: int = 1):
             checkpoints.append(current_invocation_effect_checkpoint())
             with witness.open('a') as stream:
                 stream.write(marker + '\n')
@@ -705,3 +705,129 @@ async def test_canonical_repair_rechecks_original_completion_after_decision(
     assert model.continuations == 0, 'A repair model ran after the decision observed uncertain completion'
     assert 'result' not in seen and isinstance(seen.get('error'), ResourceOutcomeUnknown)
     assert original in execution_evidence_carriers(seen['error'])
+
+
+@pytest.mark.parametrize('refusal', ['unknown-tool', 'arguments', 'denied', 'rewrite'])
+async def test_inner_prebody_audit_uncertainty_fences_every_leaf_refusal(
+    canonical_subagent, monkeypatch, refusal,
+):
+    from kestrel_sovereign.storage.db.interface import DatabaseError
+    from kestrel_sovereign.tools.effect_journal import current_tool_effect_turn
+    from tests.utils.native_tool_effects import drive_native
+
+    host, feature, witness, _, _, _, _ = canonical_subagent
+    selected = 'unknown_leaf' if refusal == 'unknown-tool' else 'native_leaf'
+    await host.tool_effect_store.database.execute(
+        "CREATE TRIGGER refuse_inner_prebody_audit BEFORE INSERT ON a2a_tool_dispatches "
+        "WHEN NEW.tool_name = '" + selected + "' "
+        "BEGIN SELECT RAISE(ABORT, 'original inner audit refused'); END")
+    sql_errors, attempts = [], []
+    write = host.observability_store.log_tool_dispatch
+    async def record(entry, **kwargs):
+        attempts.append(entry.tool_name)
+        try:
+            return await write(entry, **kwargs)
+        except DatabaseError as error:
+            sql_errors.append(error)
+            raise
+    monkeypatch.setattr(host.observability_store, 'log_tool_dispatch', record)
+    class Refuse(Hook):
+        def __init__(self):
+            super().__init__('original-inner-refusal', [HookEvent.PRE_TOOL_USE])
+            self.calls = 0
+        async def execute(self, value):
+            self.calls += 1
+            if self.calls == 1:
+                return HookOutput.deny('original inner denial') if refusal == 'denied' else HookOutput.modify({'marker': 'refused', 'count': '7'})
+            return HookOutput.allow()
+    if refusal in ('denied', 'rewrite'):
+        host.hooks_manager.register(Refuse())
+    seen = {}
+    async def operation():
+        tools = {tool.name: tool for tool in feature.get_tools()}
+        try:
+            await feature._execute_subagent_tool(tool_name=selected,
+                args={'marker': 'refused', 'count': 'invalid'} if refusal == 'arguments' else {'marker': 'refused'},
+                tools_by_name=tools, session_id='inner-prebody')
+        except Exception as error:
+            seen['first_error'] = error
+        seen['unconfirmed'] = tuple(current_tool_effect_turn(host).unconfirmed)
+        try:
+            seen['second_result'] = await feature._execute_subagent_tool(
+                tool_name='native_leaf', args={'marker': 'unexpected'},
+                tools_by_name=tools, session_id='inner-prebody')
+        except Exception as error:
+            seen['second_error'] = error
+    try:
+        await drive_native(host, operation)
+    except ResourceOutcomeUnknown as error:
+        seen['root_error'] = error
+    assert not witness.exists(), 'Inner pre-body audit uncertainty admitted a physical leaf effect'
+    assert attempts == [selected] and len(sql_errors) == 1
+    assert isinstance(seen.get('first_error'), ResourceOutcomeUnknown)
+    assert 'second_result' not in seen and isinstance(seen.get('second_error'), ResourceOutcomeUnknown)
+    assert any(sql_errors[0] is node for error in seen['unconfirmed']
+        for node in execution_evidence_carriers(error)), 'Inner refusal lost its original live uncertainty'
+    assert 'root_error' in seen and sql_errors[0] in execution_evidence_carriers(seen['root_error'])
+    assert await host.tool_effect_store.database.fetchall('SELECT state FROM tool_effect_claims') == []
+
+
+@pytest.mark.parametrize('completion', ['serialize', 'post-matcher'])
+@pytest.mark.parametrize('carrier', ['mixed-group', 'cancel', 'interrupt', 'exit', 'base-control', 'base-group'])
+async def test_leaf_post_return_control_retains_original_and_blocks_same_input_replay(
+    canonical_subagent, completion, carrier,
+):
+    import asyncio
+    from kestrel_sovereign.tools.effect_journal import current_tool_effect_turn
+    from tests.utils.native_tool_effects import drive_native
+
+    host, feature, witness, _, _, _, _ = canonical_subagent
+    cancelled = asyncio.CancelledError('original leaf completion cancellation')
+    original = (BaseExceptionGroup('original mixed leaf completion', [
+        ResourceOutcomeUnknown('original leaf completion unknown'), cancelled])
+        if carrier == 'mixed-group' else {
+            'cancel': cancelled, 'interrupt': KeyboardInterrupt('original interrupt'),
+            'exit': SystemExit('original exit'), 'base-control': BaseException('original control'),
+            'base-group': BaseExceptionGroup('original control group', [BaseException('original grouped control')]),
+        }[carrier])
+    if completion == 'serialize':
+        class NativeValue:
+            def to_dict(self):
+                raise original
+        feature.native_result = {'success': True, 'payload': NativeValue()}
+    else:
+        class PostMatcher(Hook):
+            def __init__(self):
+                super().__init__('original-control-post-matcher', [HookEvent.POST_TOOL_USE])
+            def matches(self, tool_name):
+                if tool_name == 'native_leaf':
+                    raise original
+                return False
+            async def execute(self, value):
+                return HookOutput.allow()
+        host.hooks_manager.register(PostMatcher())
+    seen = {}
+    async def operation():
+        tools = {tool.name: tool for tool in feature.get_tools()}
+        for index in ('first', 'second'):
+            try:
+                seen[index + '_result'] = await feature._execute_subagent_tool(
+                    tool_name='native_leaf', args={'marker': 'original'},
+                    tools_by_name=tools, session_id='control-completion')
+            except BaseException as error:
+                seen[index + '_error'] = error
+            if index == 'first':
+                seen['unconfirmed'] = tuple(current_tool_effect_turn(host).unconfirmed)
+    try:
+        await drive_native(host, operation)
+    except BaseException as error:
+        seen['root_error'] = error
+    assert witness.read_text().splitlines() == ['original'], 'Post-return control carrier repeated the physical leaf effect'
+    assert seen.get('first_error') is original, 'Completion changed the original cancellation/control carrier'
+    assert any(original is node for error in seen['unconfirmed']
+        for node in execution_evidence_carriers(error)), 'Post-return control lost its original live uncertainty'
+    assert 'second_result' not in seen and isinstance(seen.get('second_error'), ResourceOutcomeUnknown)
+    assert 'root_error' in seen and original in execution_evidence_carriers(seen['root_error'])
+    if carrier in ('mixed-group', 'cancel'):
+        assert cancelled in execution_evidence_carriers(seen['root_error'])
+    assert await host.tool_effect_store.database.fetchall('SELECT state FROM tool_effect_claims') == [('RETURNED_OK',)]
