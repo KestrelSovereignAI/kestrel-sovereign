@@ -60,6 +60,28 @@ async def admit(store, *, key="owned-operation", request=None, namespace=None):
 
 
 @pytest.mark.asyncio
+async def test_observe_actual_postgres_journal_catalog(journal):
+    import json
+    from kestrel_sovereign.storage.db.tool_effect_relation import _tool_effect_program_identity
+
+    store, _, _ = journal
+    if not store.is_postgres:
+        pytest.skip('Actual PostgreSQL catalog observation')
+    observed = []
+    async with store.backend._pool.acquire() as connection:
+        relation = await connection.fetchrow("SELECT c.oid::bigint AS relation_oid, c.relnamespace::bigint AS namespace_oid FROM pg_catalog.pg_class c WHERE c.oid=pg_catalog.to_regclass('tool_effect_operations')")
+        class ObservedCatalog:
+            async def fetch(self, query, *arguments):
+                rows = await connection.fetch(query, *arguments)
+                observed.append([dict(row) for row in rows])
+                return rows
+        identity = await _tool_effect_program_identity(ObservedCatalog(), dict(relation))
+    if identity is None:
+        pytest.fail('ACTUAL_NATIVE_CATALOG=' + json.dumps(observed,
+            default=lambda value: {'bytes_hex': value.hex()} if isinstance(value, bytes) else str(value)), pytrace=False)
+
+
+@pytest.mark.asyncio
 async def test_native_terminal_closes_original_without_admitting_cleanup_work(journal):
     from kestrel_sovereign.execution_custody import (
         ExecutionAuthorityError, ExecutionCustody, ProcessRuntimeExecutionFence,

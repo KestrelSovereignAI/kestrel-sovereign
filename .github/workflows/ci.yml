@@ -1061,6 +1061,18 @@ jobs:
       - name: Install dependencies
         run: uv sync
 
+      - name: Observe actual PostgreSQL journal catalog
+        run: uv run pytest tests/integration/test_tool_effect_store.py::test_observe_actual_postgres_journal_catalog -p pytest_asyncio.plugin -p pytest_timeout -o addopts='' -v --tb=short -x --timeout=120 -m native_postgres
+        env:
+          TEST_POSTGRES_URL: postgresql://kestrel_user:kestrel_password@localhost:5433/kestrel
+          KESTREL_REQUIRE_POSTGRES_TESTS: "1"
+          PYTEST_DISABLE_PLUGIN_AUTOLOAD: "1"
+          PYTHON_DOTENV_DISABLED: "1"
+          KESTREL_SKIP_DOTENV: "1"
+          KESTREL_PHOENIX_ENABLED: "0"
+          KESTREL_TRACING_ENABLED: "0"
+          AWS_EC2_METADATA_DISABLED: "true"
+
       - name: Run required native PostgreSQL tests
         # Run 40273423637 reached 3569/3672 cases before the serial 2700s
         # session deadline. Reuse the unit tier's per-worker database isolation
