@@ -6,14 +6,14 @@ from tests.unit.test_tool_effect_invocation import governed
 from kestrel_sovereign.auth import current_caller_context
 
 
-async def drive_native(host, operation):
+async def drive_native(host, operation, *, invocation_id=None):
     """A fresh input owns one native lifetime; retirement errors remain errors.
 
-    Tests of redelivery use their original operation IDs explicitly instead.
+    An explicit invocation ID exercises redelivery of that same original input.
     """
     @governed
     async def invoke(agent, user_input, *, invocation_id=None, caller=None):
         return await operation()
 
-    return await invoke(host, "Owned native component input", invocation_id=uuid4().hex,
+    return await invoke(host, "Owned native component input", invocation_id=uuid4().hex if invocation_id is None else invocation_id,
         caller=current_caller_context())

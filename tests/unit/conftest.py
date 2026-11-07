@@ -70,6 +70,8 @@ from tests.shared.host_runtime_isolation import (
 from tests.utils.ci_budget import refuse_unbudgeted_timeouts
 from tests.utils.native_a2a import (
     native_a2a_backend_factory,  # noqa: F401 - pytest fixture
+    native_feature_case,  # noqa: F401 - pytest fixture
+    native_feature_case_factory,  # noqa: F401 - pytest fixture
 )
 from tests.utils.native_a2a_security import (
     admission as native_request_admission,  # noqa: F401 - pytest fixture

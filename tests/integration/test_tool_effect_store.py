@@ -60,6 +60,43 @@ async def admit(store, *, key="owned-operation", request=None, namespace=None):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize('journal', [pytest.param('postgres', marks=pytest.mark.native_postgres)], indirect=True)
+@pytest.mark.parametrize('untyped_projection', [
+    None, 'k.contype', 'k.confupdtype', 'k.confdeltype', 'k.confmatchtype', 't.tgenabled',
+])
+async def test_postgres_catalog_requires_native_text_codes(journal, untyped_projection):
+    from kestrel_sovereign.storage.db.tool_effect_relation import _tool_effect_program_identity
+
+    store, _, _ = journal
+    assert store.is_postgres
+    changed = []
+    async with store.backend._pool.acquire() as connection:
+        relation = await connection.fetchrow(
+            "SELECT c.oid::bigint AS relation_oid, c.relnamespace::bigint AS namespace_oid "
+            "FROM pg_catalog.pg_class c WHERE c.oid=pg_catalog.to_regclass('tool_effect_operations')"
+        )
+
+        class CatalogReader:
+            async def fetch(self, query, *arguments):
+                if untyped_projection is not None:
+                    projection = untyped_projection + '::pg_catalog.text'
+                    if projection in query:
+                        assert query.count(projection) == 1
+                        query = query.replace(projection, untyped_projection)
+                        changed.append(untyped_projection)
+                return await connection.fetch(query, *arguments)
+
+        identity = await _tool_effect_program_identity(CatalogReader(), dict(relation))
+    if untyped_projection is None:
+        assert identity is not None
+        assert changed == []
+    else:
+        assert changed == [untyped_projection]
+        assert identity is None, 'An untyped native catalog code escaped the closed grammar'
+    assert await store.database.fetchone('SELECT COUNT(*) FROM tool_effect_claims') == (0,)
+
+
+@pytest.mark.asyncio
 async def test_native_terminal_closes_original_without_admitting_cleanup_work(journal):
     from kestrel_sovereign.execution_custody import (
         ExecutionAuthorityError, ExecutionCustody, ProcessRuntimeExecutionFence,
@@ -102,10 +139,10 @@ async def test_native_terminal_refuses_added_program_before_effect(journal, tabl
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize('journal', [pytest.param('postgres', marks=pytest.mark.native_postgres)], indirect=True)
 async def test_terminal_deadline_retires_original_when_postgres_pool_is_full(journal):
     store, _, _ = journal
-    if not store.is_postgres:
-        pytest.skip('Native PostgreSQL pool checkout contract')
+    assert store.is_postgres
     store.terminal_timeout_seconds = 0.1
     attempt = await admit(store)
     await store.claim(attempt, registration='owned-before-pool-exhaustion', arguments={})
@@ -121,6 +158,7 @@ async def test_terminal_deadline_retires_original_when_postgres_pool_is_full(jou
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize('journal', ['sqlite'], indirect=True)
 @pytest.mark.parametrize('cleanup_only', [False, True])
 async def test_sqlite_auxiliary_generation_uses_the_original_primary_admission(journal, cleanup_only):
     from contextlib import nullcontext
@@ -130,8 +168,7 @@ async def test_sqlite_auxiliary_generation_uses_the_original_primary_admission(j
     )
 
     store, reopen, cleanup = journal
-    if not store.is_sqlite:
-        pytest.skip('SQLite native data_version contract')
+    assert store.is_sqlite
     await store.database.execute('CREATE TABLE unrelated_native_witness(value BIGINT)')
     other = await reopen()
     cleanup.push_async_callback(other.close)
@@ -150,10 +187,10 @@ async def test_sqlite_auxiliary_generation_uses_the_original_primary_admission(j
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize('journal', ['sqlite'], indirect=True)
 async def test_sqlite_terminal_deadline_joins_native_lock_retirement(journal):
     store, reopen, cleanup = journal
-    if not store.is_sqlite:
-        pytest.skip('SQLite native lock retirement contract')
+    assert store.is_sqlite
     store.terminal_timeout_seconds = 0.03
     other = await reopen()
     cleanup.push_async_callback(other.close)
@@ -395,11 +432,9 @@ async def test_uncommitted_caller_transaction_cannot_receive_claim_admission(jou
 
 @pytest.mark.asyncio
 async def test_noncanonical_arguments_fail_before_a_claim_exists(journal):
-    import rfc8785
-
     store, _, _ = journal
     attempt = await admit(store)
-    with pytest.raises(rfc8785.CanonicalizationError):
+    with pytest.raises(ValueError, match='non-finite'):
         await store.claim(attempt, registration="owned-tool", arguments={"invalid": float("nan")})
     assert await store.database.fetchone("SELECT COUNT(*) FROM tool_effect_claims") == (0,)
 
@@ -470,11 +505,14 @@ async def test_unavailable_encryption_fails_without_changing_original_rows(journ
 
 
 @pytest.mark.asyncio
-async def test_unknown_schema_revision_is_not_migrated_or_marked_initialized(journal):
+@pytest.mark.parametrize('unsupported_revision', [1, 999])
+async def test_unknown_schema_revision_is_not_migrated_or_marked_initialized(journal, unsupported_revision):
     store, _, _ = journal
-    await store.database.execute("UPDATE tool_effect_schema SET revision = 2 WHERE singleton = 1")
+    before = await store.database.fetchall('SELECT * FROM tool_effect_keys')
+    await store.database.execute("UPDATE tool_effect_schema SET revision = ? WHERE singleton = 1", (unsupported_revision,))
     restarted = ToolEffectStore(store.database, scope=NativeRecipientScope("did:test:owned-journal", "tenant"))
     with pytest.raises(ToolEffectIntegrityError, match="unsupported tool effect schema revision"):
         await restarted.initialize()
     assert restarted._root is None
-    assert await store.database.fetchone("SELECT revision FROM tool_effect_schema WHERE singleton = 1") == (2,)
+    assert await store.database.fetchone("SELECT revision FROM tool_effect_schema WHERE singleton = 1") == (unsupported_revision,)
+    assert await store.database.fetchall('SELECT * FROM tool_effect_keys') == before

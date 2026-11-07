@@ -46,6 +46,27 @@ def test_inline_json_preserves_exact_integers_and_filesystem_names():
     assert os.fsencode(decoded["name"]) == b"report-\xff.txt"
 
 
+def test_sorted_native_json_keeps_exact_values_and_has_one_object_order():
+    import json
+    import os
+    from kestrel_sovereign.a2a.media import encode_inline_json
+
+    value = {"z": {"name": os.fsdecode(b"report-\xff.txt"), "id": 10**30}, "a": [False, 0]}
+    reordered = {"a": [False, 0], "z": {"id": 10**30, "name": value["z"]["name"]}}
+    encoded = encode_inline_json(value, sort_keys=True)
+    assert encoded == encode_inline_json(reordered, sort_keys=True)
+    assert json.loads(encoded) == value
+    assert list(value) == ['z', 'a']
+
+
+@pytest.mark.parametrize('value', [{1: 'one'}, {'nested': {None: 'none'}}])
+def test_native_json_rejects_object_keys_that_would_change_type(value):
+    from kestrel_sovereign.a2a.media import encode_inline_json
+
+    with pytest.raises(TypeError, match='keys'):
+        encode_inline_json(value)
+
+
 @pytest.mark.parametrize("value", [float("nan"), float("inf"), -float("inf")])
 def test_inline_json_rejects_nonfinite_numbers(value):
     from kestrel_sovereign.a2a.media import encode_inline_json

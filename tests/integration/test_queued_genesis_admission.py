@@ -55,7 +55,7 @@ async def test_queued_cognition_cannot_use_a_new_pending_governing_hash(
         await native._anchor_constitution_governance(digest)
 
         agent = _configure_turn_probe(await native_tool_effect_agent(
-            did=identity, borrowed_database=storage.db))
+            did=identity, borrowed_storage=storage))
         assert agent.tool_effect_store.database is storage.db
         agent.storage = agent._raw_storage = storage
         agent._genesis_audit_cognition_block = (

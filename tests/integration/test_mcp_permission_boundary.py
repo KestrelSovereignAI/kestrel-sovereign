@@ -12,12 +12,13 @@ import uuid
 
 import pytest
 import pytest_asyncio
+from kestrel_sdk.resources import ResourceConflict
 
 from tests.integration.mcp_permission_peers import (
     MCPTestPeer, docker_peer, https_peer, owned_provider_network,
 )
+from tests.utils.native_tool_effects import drive_native
 from kestrel_sovereign.a2a.stores.unified.feature_enablement_store import FeatureEnablementStore
-from kestrel_sovereign.storage.db.sqlite import SQLiteBackend
 
 from kestrel_sovereign.agent.orchestrator_engine import ToolNotRegisteredError
 from kestrel_sovereign.features.security.approval_queue import ApprovalQueue
@@ -195,10 +196,13 @@ class MCPBoundary:
     selector: str
     peer: MCPTestPeer
 
-    def invoke(self, marker):
-        task = asyncio.create_task(self.agent.execute_named_tool(
-            self.handle, {'marker': marker}, session_id='mcp-boundary', source='mcp-seam-test',
+    async def run_named(self, tool, arguments):
+        return await drive_native(self.agent, lambda: self.agent.execute_named_tool(
+            tool, arguments, session_id='mcp-boundary', source='mcp-seam-test',
         ))
+
+    def invoke(self, marker):
+        task = asyncio.create_task(self.run_named(self.handle, {'marker': marker}))
         self.calls.append(task)
         return task
 
@@ -213,9 +217,17 @@ class MCPBoundary:
         assert await self.witness() == expected_witness
         return result
 
+    async def registration_refused_with_witness(self, call):
+        with pytest.raises(ResourceConflict, match='Tool registration changed during effect admission'):
+            await call
+        assert await self.witness() == []
+        assert await self.agent.tool_effect_store.database.fetchall(
+            'SELECT state FROM tool_effect_claims',
+        ) == [('NOT_EXECUTED',)]
+
 
 @pytest_asyncio.fixture(params=[pytest.param("container", marks=pytest.mark.docker_mcp), "remote"])
-async def mcp_boundary(request, tmp_path, monkeypatch):
+async def mcp_boundary(request, tmp_path, monkeypatch, native_tool_effect_agent):
     # No importorskip: the installed-feature job must fail on a missing package.
     import kestrel_feature_mcp
     from kestrel_feature_mcp.feature import MCPAgent
@@ -225,12 +237,9 @@ async def mcp_boundary(request, tmp_path, monkeypatch):
     async with AsyncExitStack() as cleanup:
         peer = await cleanup.enter_async_context(
             docker_peer(tmp_path) if request.param == "container" else https_peer(tmp_path, monkeypatch))
-        agent = KestrelAgent(did=f'did:test:mcp-seam-{identity}', storage_path=str(tmp_path / 'agent.db'))
-        cleanup.push_async_callback(agent.llm_service.close)
-        backend = SQLiteBackend(str(tmp_path / "enablement.db"))
-        await backend.connect()
-        cleanup.push_async_callback(backend.close)
-        enablement = FeatureEnablementStore(backend)
+        agent = await native_tool_effect_agent(did=f'did:test:mcp-seam-{identity}')
+        await agent._raw_storage.initialize()
+        enablement = FeatureEnablementStore(agent._raw_storage.db.backend)
         await enablement.initialize()
         agent._feature_enablement_store = enablement
         feature = MCPAgent(agent)
@@ -290,7 +299,7 @@ async def test_denied_tool_has_no_generic_dispatcher_bypass(mcp_boundary):
         ('mcp_gateway_call', {'tool_name': 'record_marker', 'arguments': {'marker': 'gateway-denied'}}),
     ]:
         with pytest.raises(ToolNotRegisteredError):
-            await peer.agent.execute_named_tool(generic, arguments, session_id='mcp-boundary')
+            await peer.run_named(generic, arguments)
     assert await peer.witness() == []
     audit = await peer.store.get_audit_log()
     assert any(row['feature'] == peer.owner and row['tool'] == peer.handle
@@ -333,9 +342,7 @@ async def test_pending_approval_cannot_execute_against_a_replacement_connection(
     current = peer.current_connection()
     assert current is not original and not original.is_connected
     assert await peer.queue.submit_decision(request.id, True, scope='once')
-    result = await peer.result_with_witness(asyncio.wait_for(pending, 5), [])
-    assert result['status'] == 'error', result
-    assert 'changed; rediscover' in result['error']
+    await peer.registration_refused_with_witness(asyncio.wait_for(pending, 5))
     fresh = peer.invoke('approved-for-new-connection')
     following = await asyncio.wait_for(peer.requests.get(), 5)
     assert await peer.queue.submit_decision(following.id, True, scope='once')
@@ -364,8 +371,7 @@ async def test_same_instance_disable_enable_restores_the_governed_connection(mcp
         assert peer.feature.manager is not original_manager
     assert peer.current_connection() is not original_connection
     assert await peer.queue.submit_decision(request.id, True, scope="once")
-    result = await peer.result_with_witness(asyncio.wait_for(pending, 5), [])
-    assert result["status"] == "error" and "changed; rediscover" in result["error"]
+    await peer.registration_refused_with_witness(asyncio.wait_for(pending, 5))
 
     fresh = peer.invoke("approved-after-reenable")
     following = await asyncio.wait_for(peer.requests.get(), 5)
@@ -419,7 +425,7 @@ async def test_disable_cannot_release_custody_ahead_of_an_admitted_docker_acquis
         assert not await peer.agent.get_enablement_deltas("mcp_server")
         assert not any(owner.startswith("mcp:") for owner in peer.agent._tool_to_feature.values())
         with pytest.raises(ToolNotRegisteredError):
-            await peer.agent.execute_named_tool(peer.handle, {"marker": "after-disable"}, session_id="mcp-boundary")
+            await peer.run_named(peer.handle, {"marker": "after-disable"})
         refused = await peer.feature.load_tool(peer.selector)
         assert refused.status.value == "error" and "shutting down" in refused.error
         assert len(managers) == 1
@@ -448,8 +454,7 @@ async def test_pending_approval_cannot_execute_while_remote_unload_waits_on_stor
     try:
         await asyncio.wait_for(entered.wait(), 5)
         assert await peer.queue.submit_decision(request.id, True, scope="once")
-        result = await peer.result_with_witness(asyncio.wait_for(pending, 5), [])
-        assert result["status"] == "error" and "changed; rediscover" in result["error"]
+        await peer.registration_refused_with_witness(asyncio.wait_for(pending, 5))
     finally:
         release.set()
         unloaded = await asyncio.wait_for(unloading, 5)
@@ -541,9 +546,7 @@ async def test_restore_database_read_failure_does_not_block_another_remote(mcp_b
         handles = [name for name, candidate in peer.agent._tool_to_feature.items() if candidate == owner]
         assert len(handles) == 1
         await peer.store.set_permission(owner, handles[0], PermissionLevel.ALLOW)
-        result = await peer.agent.execute_named_tool(
-            handles[0], {"marker": "after-store-read-failure"}, session_id="mcp-boundary",
-        )
+        result = await peer.run_named(handles[0], {"marker": "after-store-read-failure"})
         assert await peer.witness() == ["after-store-read-failure"]
         assert result["status"] == "ok"
     finally:

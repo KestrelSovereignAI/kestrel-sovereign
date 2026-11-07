@@ -6,7 +6,6 @@ execution component, not model cognition or the four dispatch producers.
 
 import asyncio
 
-from cryptography.fernet import Fernet
 import pytest
 import pytest_asyncio
 
@@ -16,7 +15,7 @@ from kestrel_sovereign.a2a.scope import NativeRecipientScope
 from kestrel_sovereign.features.privacy.feature import PrivacyAgent
 from kestrel_sovereign.privacy import PrivacyMode
 from kestrel_sovereign.tool_effect_store import (
-    ToolEffectAttemptClosed, ToolEffectReconciliationRequired, ToolEffectStore,
+    ToolEffectReconciliationRequired, ToolEffectStore,
 )
 from kestrel_sovereign.tools.effect_journal import (
     ToolEffectJournalUnavailable, ToolEffectOutcomeUnconfirmed,
@@ -24,7 +23,6 @@ from kestrel_sovereign.tools.effect_journal import (
     execute_tool_effect, logical_operation_key, require_persistent_tool_effects,
 )
 from kestrel_sovereign.turn_scope import capture_turn_scope
-from tests.unit.test_cleanup_task_admission import _partial_native_agent
 from kestrel_sovereign.testing.fixtures import native_tool_effect_agent as native_tool_effect_agent
 
 
@@ -364,7 +362,7 @@ def test_wire_identifiers_encode_to_bounded_stable_store_keys(key):
 
 
 def test_noncanonical_key_is_refused_before_admission():
-    with pytest.raises(ValueError, match="canonical JSON"):
+    with pytest.raises(ValueError, match="non-finite"):
         logical_operation_key(float("nan"))
 
 
@@ -397,7 +395,7 @@ async def test_native_fixture_refuses_two_primary_database_owners(owner, native_
     before = await database.fetchone('SELECT COUNT(*) FROM tool_effect_keys')
     with pytest.raises(ValueError, match='one primary database owner'):
         await native_tool_effect_agent(did='did:test:ambiguous-primary',
-            connected_backend=database.backend, borrowed_database=database)
+            connected_backend=database.backend, borrowed_storage=owner._raw_storage)
     assert database.backend.is_connected
     assert await database.fetchone('SELECT COUNT(*) FROM tool_effect_keys') == before
 

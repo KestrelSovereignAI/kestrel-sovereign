@@ -29,12 +29,14 @@ async def native_tool_effect_agent(tmp_path, monkeypatch):
 
     SQLite, journal keys, privacy, hooks and request lifecycle are real. No
     READY publication, model response or provider acceptance is fabricated.
-    Each created Agent owns only its test directory and native resources. A
-    supplied connected backend transfers ownership to that Agent, allowing the
+    Each created Agent owns only its test directory and native resources.
+    Existing configured encryption belongs to the caller and is preserved.
+    A supplied connected backend transfers ownership to that Agent, allowing the
     same primary SQLite/PostgreSQL store to serve journal and task contracts.
-    An explicitly borrowed AsyncDatabase retains its caller's ownership.
+    An explicitly borrowed initialized AsyncStorage retains its caller's ownership.
     """
     from contextlib import AsyncExitStack
+    import os
     from uuid import uuid4
     from cryptography.fernet import Fernet
     from kestrel_sovereign.a2a.scope import NativeRecipientScope
@@ -42,34 +44,39 @@ async def native_tool_effect_agent(tmp_path, monkeypatch):
     from kestrel_sovereign.features.privacy.feature import PrivacyAgent
     from kestrel_sovereign.kestrel_agent import KestrelAgent
     from kestrel_sovereign.llm import service as service_module
-    from kestrel_sovereign.storage.async_database import AsyncDatabase
     from kestrel_sovereign.storage.async_storage import AsyncStorage
+    from kestrel_sovereign.storage.db import SQLiteBackend
     from kestrel_sovereign.storage.privacy_wrapper import PrivacyEnforcingStorage
     from kestrel_sovereign.tool_effect_store import ToolEffectStore
 
-    monkeypatch.setenv('KESTREL_DATA_KEY', Fernet.generate_key().decode())
+    if 'KESTREL_DATA_KEY' not in os.environ and 'KESTREL_DATA_KEY_FILE' not in os.environ:
+        monkeypatch.setenv('KESTREL_DATA_KEY', Fernet.generate_key().decode())
     # Explicitly unconfigured real provider service: no ambient operator
     # routes or credentials are inputs to this component fixture.
     monkeypatch.setattr(service_module, 'load_section', lambda _section: {})
+    monkeypatch.setattr(service_module.ProviderRegistry,
+        '_discover_entrypoint_providers', lambda _registry: [])
     async with AsyncExitStack() as resources:
-        async def create(*, did, connected_backend=None, borrowed_database=None):
-            if connected_backend is not None and borrowed_database is not None:
+        async def create(*, did, connected_backend=None, borrowed_storage=None):
+            if connected_backend is not None and borrowed_storage is not None:
                 raise ValueError("A native test Agent must have one primary database owner")
             root = tmp_path / ('native-tool-effect-' + uuid4().hex)
             root.mkdir()
-            if borrowed_database is not None:
-                database = borrowed_database
+            if borrowed_storage is not None:
+                if not borrowed_storage._initialized or borrowed_storage.agent_id != did:
+                    raise ValueError("Borrowed native storage must be initialized for the Agent DID")
+                storage = borrowed_storage
             else:
-                database = (await AsyncDatabase.sqlite(str(root / 'primary.db'))
-                    if connected_backend is None else
-                    await AsyncDatabase.from_connected_backend(connected_backend))
-                resources.push_async_callback(database.close)
+                backend = (SQLiteBackend(str(root / 'primary.db'))
+                    if connected_backend is None else connected_backend)
+                storage = AsyncStorage(backend=backend, agent_id=did)
+                resources.push_async_callback(storage.close)
+                await storage.initialize()
+            database = storage.db
             service = service_module.LLMService(usage_db=database, agent_data_dir=root)
             resources.push_async_callback(service.close)
             agent = KestrelAgent(did=did, storage_path=str(root / 'agent.db'),
                 llm_service=service, allowed_features=[], sync_enabled=False)
-            storage = AsyncStorage(backend=database.backend)
-            storage.db = database
             agent._raw_storage = storage
             agent.storage = PrivacyEnforcingStorage(storage, agent.privacy_mode)
             agent.privacy_agent = PrivacyAgent(storage)

@@ -10,6 +10,7 @@ from dataclasses import replace
 
 import pytest
 from unittest.mock import MagicMock, AsyncMock
+from tests.utils.native_tool_effects import drive_native
 
 
 class _MemoryStopReceiptStore:
@@ -64,42 +65,22 @@ def _attach_test_stop_receipts(app):
 
 
 @pytest.mark.asyncio
-async def test_process_input_is_the_canonical_active_turn_inventory():
+async def test_process_input_is_the_canonical_active_turn_inventory(native_tool_effect_agent):
     """Every transport reaches Stop tracking through ``process_input`` itself."""
     from kestrel_sovereign.agent.invocation import InvocationCancelledError
-    from kestrel_sovereign.agent.request_lifecycle import RequestLifecycleMixin
-    from kestrel_sovereign.kestrel_agent import KestrelAgent
 
     started = asyncio.Event()
     owner_continued = asyncio.Event()
     release_owner = asyncio.Event()
 
-    class CanonicalAgent(RequestLifecycleMixin):
-        process_input = KestrelAgent.process_input
+    agent = await native_tool_effect_agent(did="did:test:canonical-stop-inventory")
+    agent._maybe_refresh_user_byok_resolver = AsyncMock()
 
-        def __init__(self):
-            self._current_request_id = None
-            self._active_request_ids = set()
-            self._active_request_counts = {}
-            self._active_request_generations = {}
-            self._next_request_generation = 0
-            self._abandoned_request_generations = {}
-            self._abandoned_request_dispositions = {}
-            self._active_request_started_at = {}
-            self._cancelled_requests = set()
-            self._cancelled_request_generations = set()
-            self._pending_request_cancellations = {}
-            self._request_completion_events = {}
-            self.storage = object()
+    async def block_genesis(_user_input):
+        started.set()
+        await asyncio.Event().wait()
 
-        async def _maybe_refresh_user_byok_resolver(self, _passphrase):
-            return None
-
-        async def _genesis_audit_cognition_block(self, _user_input):
-            started.set()
-            await asyncio.Event().wait()
-
-    agent = CanonicalAgent()
+    agent._genesis_audit_cognition_block = block_genesis
     async def persistent_owner():
         with pytest.raises(InvocationCancelledError):
             await agent.process_input(
@@ -298,51 +279,29 @@ async def test_stop_racing_with_isolated_completion_suppresses_normal_result():
 
 
 @pytest.mark.asyncio
-async def test_stop_waits_for_side_effecting_tool_batch_boundary():
+async def test_stop_waits_for_side_effecting_tool_batch_boundary(native_tool_effect_agent):
     """A synchronous Stop cannot cancel a tool halfway through its effect."""
 
-    from kestrel_sovereign.agent.invocation import (
-        InvocationCancelledError,
-        bind_async_invocation,
-    )
-    from kestrel_sovereign.agent.orchestrator_engine import (
-        OrchestratorEngineMixin,
-    )
-    from kestrel_sovereign.agent.request_lifecycle import RequestLifecycleMixin
+    from kestrel_sovereign.agent.invocation import InvocationCancelledError
 
     batch_started = asyncio.Event()
     release_batch = asyncio.Event()
     batch_completed = asyncio.Event()
 
-    class Owner(RequestLifecycleMixin):
-        _execute_tool_batch_at_stop_boundary = (
-            OrchestratorEngineMixin._execute_tool_batch_at_stop_boundary
-        )
+    owner = await native_tool_effect_agent(did="did:test:stop-batch")
 
-        def __init__(self):
-            self._current_request_id = None
-            self._active_request_ids = set()
-            self._active_request_counts = {}
-            self._active_request_generations = {}
-            self._next_request_generation = 0
-            self._active_request_started_at = {}
-            self._cancelled_requests = set()
-            self._cancelled_request_generations = set()
-            self._pending_request_cancellations = {}
-            self._request_completion_events = {}
+    async def batch():
+        batch_started.set()
+        await release_batch.wait()
+        batch_completed.set()
 
-        async def _execute_tool_batch(self):
-            batch_started.set()
-            await release_batch.wait()
-            batch_completed.set()
+    owner._execute_tool_batch = batch
 
-        @bind_async_invocation("invocation_id", track_request_lifecycle=True)
-        async def run(self, *, invocation_id=None):
-            await self._execute_tool_batch_at_stop_boundary()
-            return "must not publish"
+    async def operation():
+        await owner._execute_tool_batch_at_stop_boundary()
+        return "must not publish"
 
-    owner = Owner()
-    turn = asyncio.create_task(owner.run(invocation_id="safe-tool-batch"))
+    turn = asyncio.create_task(drive_native(owner, operation, invocation_id="safe-tool-batch"))
     await batch_started.wait()
 
     assert owner.cancel_current_request("safe-tool-batch") is True
@@ -357,35 +316,29 @@ async def test_stop_waits_for_side_effecting_tool_batch_boundary():
 
 
 @pytest.mark.asyncio
-async def test_owned_tool_batch_marks_completed_invocation_effect():
+async def test_owned_tool_batch_marks_completed_invocation_effect(native_tool_effect_agent):
     """A normal batch return arms the later top-level cancellation fence."""
 
     from kestrel_sovereign.agent.invocation import (
         current_invocation_effect_checkpoint,
-        invocation_scope,
     )
-    from kestrel_sovereign.agent.orchestrator_engine import (
-        OrchestratorEngineMixin,
-    )
+    owner = await native_tool_effect_agent(did="did:test:completed-batch")
 
-    class Owner:
-        _execute_tool_batch_at_stop_boundary = (
-            OrchestratorEngineMixin._execute_tool_batch_at_stop_boundary
-        )
+    async def batch(*, tool_results, session_id):
+        tool_results.append({"result": {"success": True}})
 
-        async def _execute_tool_batch(self, *, tool_results, session_id):
-            tool_results.append({"result": {"success": True}})
+    owner._execute_tool_batch = batch
 
-    with invocation_scope("completed-batch"):
+    async def operation():
         state = current_invocation_effect_checkpoint()
-        await Owner()._execute_tool_batch_at_stop_boundary(
-            tool_results=[],
-            session_id="batch-session",
+        await owner._execute_tool_batch_at_stop_boundary(
+            tool_results=[], session_id="batch-session",
         )
-
         assert state is not None
         assert state.completed is True
         assert state.session_id == "batch-session"
+
+    await drive_native(owner, operation, invocation_id="completed-batch")
 
 
 @pytest.mark.asyncio
@@ -739,39 +692,32 @@ async def test_caller_cancellation_after_stop_marker_is_clean_completion():
     assert not owner._abandoned_generations("caller-shutdown")
 
 
-@pytest.mark.asyncio
-async def test_streaming_command_treats_isolated_stop_as_clean_end_of_stream():
+async def _blocking_command_agent(native_tool_effect_agent, started):
+    """Real streamed command owner; block only the nested command body."""
     from kestrel_sovereign.agent.invocation import bind_async_invocation
+
+    agent = await native_tool_effect_agent(did="did:test:streaming-command-stop")
+    agent._genesis_audit_cognition_block = AsyncMock(return_value=None)
+    agent._maybe_audit = AsyncMock()
+
+    @bind_async_invocation("invocation_id", track_request_lifecycle=True)
+    async def command(self, *_args, invocation_id=None, **_kwargs):
+        started.set()
+        await asyncio.Event().wait()
+
+    agent.process_input = command.__get__(agent)
+    return agent
+
+
+@pytest.mark.asyncio
+async def test_streaming_command_treats_isolated_stop_as_clean_end_of_stream(native_tool_effect_agent):
     from kestrel_sovereign.agent.request_lifecycle import (
         RequestCompletionDisposition,
-        RequestLifecycleMixin,
     )
-    from kestrel_sovereign.agent.streaming import StreamingMixin
 
     started = asyncio.Event()
 
-    class CommandAgent(StreamingMixin, RequestLifecycleMixin):
-        def __init__(self):
-            self.storage = object()
-            self._current_request_id = None
-            self._active_request_ids = set()
-            self._active_request_counts = {}
-            self._active_request_started_at = {}
-            self._cancelled_requests = set()
-            self._request_completion_events = {}
-
-        async def _genesis_audit_cognition_block(self, _user_input):
-            return None
-
-        async def _maybe_audit(self):
-            return None
-
-        @bind_async_invocation("invocation_id", track_request_lifecycle=True)
-        async def process_input(self, *_args, invocation_id=None, **_kwargs):
-            started.set()
-            await asyncio.Event().wait()
-
-    agent = CommandAgent()
+    agent = await _blocking_command_agent(native_tool_effect_agent, started)
     stream = agent.process_input_streaming(
         "!continue",
         request_id="command-stop",
@@ -791,43 +737,19 @@ async def test_streaming_command_treats_isolated_stop_as_clean_end_of_stream():
 
 
 @pytest.mark.asyncio
-async def test_outer_stream_stop_does_not_abandon_clean_nested_command():
+async def test_outer_stream_stop_does_not_abandon_clean_nested_command(native_tool_effect_agent):
     """Endpoint-owner cancellation classifies the nested child's real unwind."""
 
     from kestrel_sovereign._async_ownership import OwnedAsyncIterator
-    from kestrel_sovereign.agent.invocation import bind_async_invocation
     from kestrel_sovereign.agent.request_lifecycle import (
         RequestCompletionDisposition,
-        RequestLifecycleMixin,
         bind_request_operation_if_supported,
     )
-    from kestrel_sovereign.agent.streaming import StreamingMixin
 
     started = asyncio.Event()
 
-    class CommandAgent(StreamingMixin, RequestLifecycleMixin):
-        def __init__(self):
-            self.storage = object()
-            self._current_request_id = None
-            self._active_request_ids = set()
-            self._active_request_counts = {}
-            self._active_request_started_at = {}
-            self._cancelled_requests = set()
-            self._request_completion_events = {}
-
-        async def _genesis_audit_cognition_block(self, _user_input):
-            return None
-
-        async def _maybe_audit(self):
-            return None
-
-        @bind_async_invocation("invocation_id", track_request_lifecycle=True)
-        async def process_input(self, *_args, invocation_id=None, **_kwargs):
-            started.set()
-            await asyncio.Event().wait()
-
     request_id = "outer-command-stop"
-    agent = CommandAgent()
+    agent = await _blocking_command_agent(native_tool_effect_agent, started)
     endpoint_generation = agent.register_active_request(request_id)
     owned = OwnedAsyncIterator(
         lambda: agent.process_input_streaming(
@@ -3709,7 +3631,7 @@ class TestStreamEndpointErrorContract:
 
 
 @pytest.mark.asyncio
-async def test_stop_boundary_batch_task_keeps_the_turns_lock_ownership():
+async def test_stop_boundary_batch_task_keeps_the_turns_lock_ownership(native_tool_effect_agent):
     """The batch runs in a child task; the turn's holds must follow it.
 
     ``_execute_tool_batch_at_stop_boundary`` moves the SAME logical turn into a
@@ -3721,31 +3643,23 @@ async def test_stop_boundary_batch_task_keeps_the_turns_lock_ownership():
     re-acquires a lock its own turn owns. The invocation boundary and the
     dispatcher both delegate at their task boundaries.
     """
-    from kestrel_sovereign.agent.orchestrator_engine import OrchestratorEngineMixin
-    from kestrel_sovereign.signals import OrderedLockManager
     from kestrel_sovereign.signals.lock_manager import ResourceLock
 
-    locks = OrderedLockManager()
-    owned_inside_batch: list[bool] = []
+    owner = await native_tool_effect_agent(did="did:test:batch-conversation-lock")
+    locks = owner._get_lock_manager()
+    owned_inside_batch = []
 
-    class Owner:
-        _execute_tool_batch_at_stop_boundary = (
-            OrchestratorEngineMixin._execute_tool_batch_at_stop_boundary
-        )
+    async def batch():
+        owned_inside_batch.append(locks.is_owned_by_current_task(ResourceLock.CONVERSATION))
 
-        def _get_lock_manager(self):
-            return locks
+    owner._execute_tool_batch = batch
 
-        async def _execute_tool_batch(self):
-            owned_inside_batch.append(
-                locks.is_owned_by_current_task(ResourceLock.CONVERSATION)
-            )
+    async def operation():
+        async with locks.acquire({ResourceLock.CONVERSATION}):
+            assert locks.is_owned_by_current_task(ResourceLock.CONVERSATION) is True
+            await owner._execute_tool_batch_at_stop_boundary()
 
-    owner = Owner()
-    async with locks.acquire({ResourceLock.CONVERSATION}):
-        # Precondition: the turn really does hold it in the parent task.
-        assert locks.is_owned_by_current_task(ResourceLock.CONVERSATION) is True
-        await owner._execute_tool_batch_at_stop_boundary()
+    await drive_native(owner, operation)
 
     assert owned_inside_batch == [True], (
         "the tool batch task lost the turn's CONVERSATION ownership"

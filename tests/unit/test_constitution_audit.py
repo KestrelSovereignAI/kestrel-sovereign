@@ -6,7 +6,6 @@ import os
 from datetime import datetime, timezone, timedelta
 from unittest.mock import AsyncMock, MagicMock, patch
 from kestrel_sovereign.kestrel_agent import KestrelAgent
-from kestrel_sovereign.privacy import PrivacyMode
 
 
 @pytest.fixture
@@ -391,12 +390,17 @@ async def test_durable_first_identity_marker_allows_native_initial_anchor(tmp_pa
         await storage.close()
 
 
-async def _open_durable_harness(db_path, now, *, is_new_identity=False):
+async def _open_durable_harness(db_path, now, *, is_new_identity=False, native_tool_effect_agent=None):
     from kestrel_sovereign.storage import AsyncStorage
 
     storage = AsyncStorage(str(db_path), agent_id="did:web:test:durable-constitution")
     await storage.initialize()
-    harness = _DurableConstitutionHarness(storage, now)
+    if native_tool_effect_agent is None:
+        harness = _DurableConstitutionHarness(storage, now)
+    else:
+        harness = await native_tool_effect_agent(did=storage.agent_id, borrowed_storage=storage)
+        harness._constitution_clock = lambda: now
+        harness._genesis_audit_cognition_block = AsyncMock(return_value=None)
     await harness._initialize_constitution_runtime_state(
         is_new_identity=is_new_identity
     )
@@ -752,7 +756,7 @@ async def test_explicit_audit_is_one_serialized_durable_transition(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_safe_mode_and_reason_survive_real_database_reopen(tmp_path):
+async def test_safe_mode_and_reason_survive_real_database_reopen(tmp_path, native_tool_effect_agent):
     """Integrity failure -> close/reopen -> normal cognition stays blocked."""
     db_path = tmp_path / "agent.db"
     now = datetime(2026, 7, 17, 12, 0, tzinfo=timezone.utc)
@@ -763,7 +767,7 @@ async def test_safe_mode_and_reason_survive_real_database_reopen(tmp_path):
     await storage.close()
 
     restarted, storage = await _open_durable_harness(
-        db_path, now + timedelta(minutes=5)
+        db_path, now + timedelta(minutes=5), native_tool_effect_agent=native_tool_effect_agent
     )
     try:
         assert restarted._safe_mode is True
@@ -771,8 +775,8 @@ async def test_safe_mode_and_reason_survive_real_database_reopen(tmp_path):
         assert restarted._safe_mode_entered_at == now
 
         # Exercise the production process-input boundary up to its Safe Mode
-        # return. No context manager/LLM exists on this harness, proving it did
-        # not get past the restriction.
+        # return. The real partial Agent has no model routes and must not
+        # get past the restriction.
         restarted._maybe_refresh_user_byok_resolver = AsyncMock()
         response = await KestrelAgent.process_input(restarted, "normal prompt")
         assert "SAFE MODE ACTIVE" in response
@@ -795,7 +799,7 @@ async def test_safe_mode_and_reason_survive_real_database_reopen(tmp_path):
     ],
 )
 async def test_streaming_cognition_is_blocked_by_constitutional_restriction(
-    safe_mode, audit_pending, cause, expected_reason
+    safe_mode, audit_pending, cause, expected_reason, native_tool_effect_agent
 ):
     """The primary streamed chat path must not bypass restored restriction.
 
@@ -803,19 +807,15 @@ async def test_streaming_cognition_is_blocked_by_constitutional_restriction(
     actually reads, and it claimed an integrity failure unconditionally —
     reporting a constitutional violation for a missing decryption key.
     """
-    from kestrel_sovereign.agent.streaming import StreamingMixin
-
-    agent = MagicMock()
+    agent = await native_tool_effect_agent(did="did:test:streaming-restriction")
     agent._safe_mode = safe_mode
     agent._constitution_audit_pending = audit_pending
-    # Stated, because an unset attribute on a MagicMock is a truthy Mock and
-    # would match no cause at all.
     agent._safe_mode_cause = cause
     agent._maybe_audit = AsyncMock()
     agent._genesis_audit_cognition_block = AsyncMock(return_value=None)
-    agent.process_input_streaming = StreamingMixin.process_input_streaming.__get__(
-        agent
-    )
+    agent._turn_lifecycle = MagicMock(wraps=agent._turn_lifecycle)
+    agent._process_input_streaming_traced_locked = MagicMock(
+        side_effect=AssertionError("Restricted streaming turn reached cognition"))
 
     chunks = [chunk async for chunk in agent.process_input_streaming("normal prompt")]
 
@@ -1104,10 +1104,10 @@ async def test_failed_audit_never_advances_last_successful_deadline(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_legacy_row_migration_requires_real_startup_audit(tmp_path):
+async def test_legacy_row_migration_requires_real_startup_audit(tmp_path, native_tool_effect_agent):
     """No row does not fabricate a successful audit timestamp."""
     now = datetime(2026, 7, 17, 12, 0, tzinfo=timezone.utc)
-    agent, storage = await _open_durable_harness(tmp_path / "agent.db", now)
+    agent, storage = await _open_durable_harness(tmp_path / "agent.db", now, native_tool_effect_agent=native_tool_effect_agent)
     await _seed_exit_governance(agent, storage)
     agent._verify_constitution_integrity = AsyncMock(
         return_value=(True, "Constitution integrity verified")
@@ -1971,12 +1971,11 @@ async def test_a_recovered_write_persists_the_trigger_it_recorded(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_a_blocked_command_reports_the_recorded_cause():
+async def test_a_blocked_command_reports_the_recorded_cause(native_tool_effect_agent):
     """The branch an operator hits while trying to diagnose must not misreport."""
     from kestrel_sovereign.agent.constitution import SafeModeCause
-    from kestrel_sovereign.kestrel_agent import KestrelAgent
 
-    agent = MagicMock()
+    agent = await native_tool_effect_agent(did="did:test:blocked-command")
     agent._safe_mode = True
     agent._constitution_audit_pending = False
     agent._constitution_state_persistence_pending = False
@@ -1984,7 +1983,6 @@ async def test_a_blocked_command_reports_the_recorded_cause():
     agent._maybe_audit = AsyncMock()
     agent._genesis_audit_cognition_block = AsyncMock(return_value=None)
     agent._maybe_refresh_user_byok_resolver = AsyncMock()
-    agent.process_input = KestrelAgent.process_input.__get__(agent)
 
     reply = await agent.process_input("!privacy")
 
@@ -1995,7 +1993,7 @@ async def test_a_blocked_command_reports_the_recorded_cause():
 
     # The non-command path carries the remediation suffix; it must not send
     # the operator after an integrity failure that did not happen either.
-    agent2 = MagicMock()
+    agent2 = await native_tool_effect_agent(did="did:test:blocked-plain")
     agent2._safe_mode = True
     agent2._constitution_audit_pending = False
     agent2._constitution_state_persistence_pending = False
@@ -2003,7 +2001,6 @@ async def test_a_blocked_command_reports_the_recorded_cause():
     agent2._maybe_audit = AsyncMock()
     agent2._genesis_audit_cognition_block = AsyncMock(return_value=None)
     agent2._maybe_refresh_user_byok_resolver = AsyncMock()
-    agent2.process_input = KestrelAgent.process_input.__get__(agent2)
 
     plain = await agent2.process_input("what is the weather")
     assert "could not be decrypted" in plain, plain

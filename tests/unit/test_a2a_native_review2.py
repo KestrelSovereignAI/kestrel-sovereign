@@ -11,7 +11,6 @@ from kestrel_sdk.tools.result import ToolResult
 
 from kestrel_sovereign.a2a.projections import embedded_json_value
 from kestrel_sovereign.a2a.question_supervisor import NativeQuestionSupervisor
-from kestrel_sovereign.a2a.scope import NativeRecipientScope
 from kestrel_sovereign.a2a.skill_handler import TaskHandler
 from kestrel_sovereign.a2a.stores.unified.outbound_store import DispatchState
 from kestrel_sovereign.features.base import Feature, tool
@@ -21,7 +20,7 @@ from kestrel_sovereign.features.restart_coordinator.feature import (
 from tests.unit.test_a2a_native_question_store import questions as questions
 from tests.unit.test_a2a_native_question_store import reserve, response
 from tests.unit.test_a2a_native_question_supervisor import dispatcher_for
-from tests.utils.native_a2a import manager_for
+from tests.utils.native_tool_effects import drive_native
 
 
 @pytest.mark.parametrize("fault", ["correlation", "context", "missing-id"])
@@ -149,10 +148,12 @@ class LocalFeature(Feature):
         return ToolResult.failed("The provider produced nothing")
 
 
-def local_feature(manager):
-    feature = LocalFeature(SimpleNamespace(did=manager.did, _execution_custody=None))
+def local_feature(case):
+    manager = case.manager
+    feature = LocalFeature(case.agent)
     feature.name = "local"
     feature.effects = 0
+    case.agent.features[feature.name] = feature
     assert isinstance(feature, TaskHandler)
     manager.register_provider(
         "local", feature.get_agent_skills(), feature, {"!local-fail": "local_failure"}
@@ -162,45 +163,37 @@ def local_feature(manager):
 
 @pytest.mark.parametrize("sync", [False, True])
 async def test_local_skill_arguments_never_round_trip_through_struct(
-    native_a2a_backend_factory, sync
+    native_feature_case_factory, sync
 ):
-    backend = native_a2a_backend_factory()
-    await backend.connect()
-    manager = manager_for(backend, NativeRecipientScope("did:local"))
-    try:
-        await manager.initialize()
-        feature = local_feature(manager)
-        args = {"limit": 2**53 + 1, "nested": {"count": 2}}
-        task = await manager.execute_skill("local", "local_int", args, sync=sync)
-        await manager.drain_execution_tasks()
-        stored = await manager.get_task_for_recipient(task.id, manager.did)
-        assert stored.status.state == TaskState.TASK_STATE_COMPLETED
-        assert feature.observed == (2**53 + 1, {"count": 2})
-        assert args == {"limit": 2**53 + 1, "nested": {"count": 2}}
-    finally:
-        await manager.close()
+    case = await native_feature_case_factory(did="did:local", tenant="")
+    manager = case.manager
+    backend = manager.task_store.backend
+    feature = local_feature(case)
+    args = {"limit": 2**53 + 1, "nested": {"count": 2}}
+    task = await drive_native(case.agent, lambda: manager.execute_skill("local", "local_int", args, sync=sync))
+    await manager.drain_execution_tasks()
+    stored = await manager.get_task_for_recipient(task.id, manager.did)
+    assert stored.status.state == TaskState.TASK_STATE_COMPLETED
+    assert feature.observed == (2**53 + 1, {"count": 2})
+    assert args == {"limit": 2**53 + 1, "nested": {"count": 2}}
 
 
 async def test_rich_tool_result_completes_once_and_command_retains_failure_text(
-    native_a2a_backend_factory,
+    native_feature_case_factory,
 ):
-    backend = native_a2a_backend_factory()
-    await backend.connect()
-    manager = manager_for(backend, NativeRecipientScope("did:local"))
-    try:
-        await manager.initialize()
-        feature = local_feature(manager)
-        task = await manager.execute_skill("local", "local_datetime", {})
-        assert task.status.state == TaskState.TASK_STATE_COMPLETED
-        assert feature.effects == 1
-        data = embedded_json_value(task.artifacts[0].parts[0])[1]
-        assert data["result"]["at"] == "2026-10-20 00:00:00+00:00"
-        command = await manager.execute_command("!local-fail")
-        assert command == {"success": False, "error": "The provider produced nothing"}
-        rows = await backend.fetch_all("SELECT status FROM a2a_tasks")
-        assert sorted(row[0] for row in rows) == ["completed", "failed"]
-    finally:
-        await manager.close()
+    case = await native_feature_case_factory(did="did:local", tenant="")
+    manager = case.manager
+    backend = manager.task_store.backend
+    feature = local_feature(case)
+    task = await drive_native(case.agent, lambda: manager.execute_skill("local", "local_datetime", {}))
+    assert task.status.state == TaskState.TASK_STATE_COMPLETED
+    assert feature.effects == 1
+    data = embedded_json_value(task.artifacts[0].parts[0])[1]
+    assert data["result"]["at"] == "2026-10-20 00:00:00+00:00"
+    command = await drive_native(case.agent, lambda: manager.execute_command("!local-fail"))
+    assert command == {"success": False, "error": "The provider produced nothing"}
+    rows = await backend.fetch_all("SELECT status FROM a2a_tasks")
+    assert sorted(row[0] for row in rows) == ["completed", "failed"]
 
 
 async def test_unresolved_reads_back_off_without_delaying_deadline_or_explicit_recovery(
@@ -324,19 +317,32 @@ async def test_terminal_cognition_failure_is_retained_without_ack_or_endless_rea
 
 
 async def test_nonfinite_result_fails_durably_after_one_effect_without_stranding_submission(
-    native_a2a_backend_factory,
+    native_feature_case_factory,
 ):
-    backend = native_a2a_backend_factory()
-    await backend.connect()
-    manager = manager_for(backend, NativeRecipientScope("did:local"))
-    try:
-        await manager.initialize()
-        feature = local_feature(manager)
-        result = await manager.execute_skill("local", "local_nonfinite", {})
-        assert feature.effects == 1
-        assert result.status.state == TaskState.TASK_STATE_FAILED
-        assert not result.artifacts
-        stored = await manager.get_task_for_recipient(result.id, manager.did)
-        assert stored == result
-    finally:
-        await manager.close()
+    from kestrel_sovereign.tool_effect_store import ToolEffectReconciliationRequired
+    from kestrel_sovereign.tools.effect_journal import ToolEffectOutcomeUnconfirmed
+
+    case = await native_feature_case_factory(did="did:local", tenant="")
+    manager = case.manager
+    backend = manager.task_store.backend
+    feature = local_feature(case)
+    async def invoke():
+        return await drive_native(case.agent,
+            lambda: manager.execute_skill("local", "local_nonfinite", {}),
+            invocation_id='owned-nonfinite-input')
+
+    with pytest.raises(ToolEffectOutcomeUnconfirmed):
+        await invoke()
+    assert feature.effects == 1
+    (task_id,), = await backend.fetch_all('SELECT id FROM a2a_tasks')
+    result = await manager.get_task_for_recipient(task_id, manager.did)
+    assert result.status.state == TaskState.TASK_STATE_FAILED
+    assert not result.artifacts
+    assert result.metadata['outcome_unknown'] is True
+    assert await backend.fetch_all('SELECT state FROM tool_effect_claims') == [('RETURNED_OK',)]
+    stored = await manager.get_task_for_recipient(result.id, manager.did)
+    assert stored == result
+    with pytest.raises(ToolEffectReconciliationRequired):
+        await invoke()
+    assert feature.effects == 1
+    assert await backend.fetch_all('SELECT id FROM a2a_tasks') == [(task_id,)]

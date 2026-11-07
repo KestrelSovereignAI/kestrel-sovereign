@@ -4,21 +4,21 @@ import asyncio
 
 import pytest
 
-from kestrel_sovereign.agent.invocation import bind_async_invocation, bind_async_generator_invocation
-from kestrel_sovereign.agent.orchestrator_engine import OrchestratorEngineMixin
+from kestrel_sovereign.agent.invocation import bind_async_generator_invocation
 from kestrel_sovereign.agent.request_lifecycle import RequestCompletionDisposition
 from kestrel_sovereign.execution_custody import (
     ExecutionAuthorityError, ExecutionCommitOutcomeError, _explicit_control_chain,
     execution_commit_outcome, is_execution_control_error,
 )
 from tests.unit.test_tool_concurrency import FakeTool, FakeToolCall
+from tests.utils.native_tool_effects import drive_native
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("first", ["cancel", "ordinary"])
 @pytest.mark.parametrize("control", ["denied", "unknown", "committed"])
 @pytest.mark.parametrize("carrier", ["direct", "wrapped", "cancel"])
-async def test_parallel_late_control_survives_actual_invocation(first, control, carrier):
+async def test_parallel_late_control_survives_actual_invocation(first, control, carrier, native_tool_effect_agent, monkeypatch):
     started = asyncio.Event()
     joined = asyncio.Event()
     dispositions = []
@@ -37,43 +37,36 @@ async def test_parallel_late_control_survives_actual_invocation(first, control, 
                    if first == "cancel" else ValueError("ordinary first failure"))
     original_chain = tuple(_explicit_control_chain(expected))
 
-    class Agent(OrchestratorEngineMixin):
-        _direct_tools = {"first": FakeTool(safe=True), "late": FakeTool(safe=True)}
-        _tool_to_feature = {}
-        features = {}
+    agent = await native_tool_effect_agent(did="did:test:parallel-control")
+    agent._direct_tools = {"first": FakeTool(safe=True), "late": FakeTool(safe=True)}
+    cleanup = agent._cleanup_cancelled_request
 
-        def register_active_request(self, request_id, *, nested=False):
-            pass
+    def record_cleanup(request_id, **kwargs):
+        dispositions.append(kwargs.get("disposition"))
+        return cleanup(request_id, **kwargs)
 
-        async def await_durable_request_admission(self, request_id):
-            return True
+    async def dispatch(call, *args, **kwargs):
+        if call.name == "first":
+            await started.wait()
+            raise first_error
+        started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            joined.set()
+            raise expected
 
-        def bind_request_operation(self, request_id, operation):
-            pass
+    monkeypatch.setattr(agent, "_cleanup_cancelled_request", record_cleanup)
+    monkeypatch.setattr(agent, "_dispatch_tool_call", dispatch)
 
-        def _cleanup_cancelled_request(self, request_id, **kwargs):
-            dispositions.append(kwargs.get("disposition"))
-
-        async def _dispatch_tool_call(self, call, *args, **kwargs):
-            if call.name == "first":
-                await started.wait()
-                raise first_error
-            started.set()
-            try:
-                await asyncio.Event().wait()
-            except asyncio.CancelledError:
-                joined.set()
-                raise expected
-
-        @bind_async_invocation("request_id", track_request_lifecycle=True)
-        async def turn(self, request_id=None):
-            await self._execute_tool_batch(
-                [FakeToolCall("first", "first", {}), FakeToolCall("late", "late", {})],
-                {}, set(), [], 0, "provider-free probe",
-            )
+    async def operation():
+        await agent._execute_tool_batch(
+            [FakeToolCall("first", "first", {}), FakeToolCall("late", "late", {})],
+            {}, set(), [], 0, "provider-free probe",
+        )
 
     with pytest.raises(BaseException) as caught:
-        await Agent().turn(request_id="parallel-control")
+        await drive_native(agent, operation, invocation_id="parallel-control")
     assert expected in tuple(_explicit_control_chain(caught.value))
     assert first_error in tuple(_explicit_control_chain(caught.value))
     assert is_execution_control_error(caught.value)

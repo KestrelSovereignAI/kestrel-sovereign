@@ -261,8 +261,8 @@ class _AllowingHooksManager:
 
 
 async def _InlineRestartAgent(backend, *, native_tool_effect_agent):
-    """A native component host borrowing the fixture-owned primary database."""
-    agent = await native_tool_effect_agent(did="did:test:agent", borrowed_database=backend)
+    """A native component host owning storage on the test primary backend."""
+    agent = await native_tool_effect_agent(did="did:test:agent", connected_backend=backend.backend)
     agent._agent_name = "Test Agent"
     agent.hooks_manager = _AllowingHooksManager()
     return agent

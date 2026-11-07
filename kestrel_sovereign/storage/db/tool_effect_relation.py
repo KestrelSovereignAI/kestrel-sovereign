@@ -118,13 +118,13 @@ async def _tool_effect_program_identity(connection, relation):
     if len(ids) != 2 or relation['relation_oid'] not in ids:
         return None
     constraints = await connection.fetch('''
-        SELECT k.oid::bigint AS oid, k.conrelid::bigint AS owner, k.contype AS kind,
+        SELECT k.oid::bigint AS oid, k.conrelid::bigint AS owner, k.contype::pg_catalog.text AS kind,
                k.convalidated AS validated, k.conislocal AS "local", k.coninhcount AS inherited,
                COALESCE((pg_catalog.to_jsonb(k) OPERATOR(pg_catalog.->>) 'conenforced')::pg_catalog.bool, TRUE) AS enforced,
                k.conparentid::bigint AS parent, k.condeferrable AS deferrable, k.condeferred AS deferred,
                k.conkey AS keys, k.confkey AS foreign_keys, k.confrelid::bigint AS referenced,
-               k.conindid::bigint AS "index", k.confupdtype AS update_action,
-               k.confdeltype AS delete_action, k.confmatchtype AS "match",
+               k.conindid::bigint AS "index", k.confupdtype::pg_catalog.text AS update_action,
+               k.confdeltype::pg_catalog.text AS delete_action, k.confmatchtype::pg_catalog.text AS "match",
                pg_catalog.pg_get_expr(k.conbin, k.conrelid) AS expression,
                NOT EXISTS (SELECT 1 FROM pg_catalog.pg_depend d
                  WHERE d.classid OPERATOR(pg_catalog.=) 'pg_catalog.pg_constraint'::pg_catalog.regclass
@@ -148,7 +148,7 @@ async def _tool_effect_program_identity(connection, relation):
                (p.oid OPERATOR(pg_catalog.<) $2::pg_catalog.oid
                 AND p.pronamespace OPERATOR(pg_catalog.=) 'pg_catalog'::pg_catalog.regnamespace
                 AND l.lanname OPERATOR(pg_catalog.=) 'internal') AS builtin_function,
-               t.tgenabled AS enabled, t.tgdeferrable AS deferrable, t.tginitdeferred AS deferred,
+               t.tgenabled::pg_catalog.text AS enabled, t.tgdeferrable AS deferrable, t.tginitdeferred AS deferred,
                t.tgparentid::bigint AS parent, t.tgnargs AS nargs, t.tgattr::pg_catalog.int2[] AS attributes,
                t.tgargs AS args, t.tgqual::pg_catalog.text AS "when", t.tgoldtable AS old_table, t.tgnewtable AS new_table
         FROM pg_catalog.pg_trigger t

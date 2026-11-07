@@ -338,6 +338,12 @@ tool arguments or results. The journal key is wrapped by the original data key;
 boot refuses an unavailable or inconsistent journal rather than creating a fresh
 replay history. An operation identifier correlates intent and grants no authority.
 
+Journal schema revision 2 hashes the same exact finite JSON value domain as
+native inline content, with sorted object keys and ASCII escaping. Large
+integers and surrogateescaped filenames retain their original values. Earlier
+journal revisions refuse initialization before creating keys or admitting work;
+a different hash encoding cannot silently replace existing replay history.
+
 Each governed tool leaf acknowledges a STARTED claim before dispatch. A claim
 that might have executed fences replay after a lost reply or process restart,
 including a known returned error. An uncertain settlement also fences further

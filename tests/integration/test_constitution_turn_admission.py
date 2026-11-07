@@ -53,7 +53,7 @@ async def test_turn_cannot_outrun_native_restriction_or_governing_receipt(db_bac
     task = None
     reached, release = asyncio.Event(), asyncio.Event()
     try:
-        execution_agent = await native_tool_effect_agent(did=storage.agent_id, borrowed_database=storage.db)
+        execution_agent = await native_tool_effect_agent(did=storage.agent_id, borrowed_storage=storage)
         assert execution_agent.tool_effect_store.database is storage.db
         agent, content = await _ready_turn(storage, execution_agent=execution_agent)
         cognition = AsyncMock(side_effect=AssertionError("restricted turn reached cognition"))

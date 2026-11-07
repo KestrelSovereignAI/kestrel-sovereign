@@ -65,8 +65,7 @@ async def test_default_refresh_is_physically_joined_and_original_control_retaine
     client._proc, client._initialized = proc, True
     closer = None
     client._dispatch({"id": 1, "method": "account/chatgptAuthTokens/refresh"})
-    refresh_tasks = tuple(t for t in asyncio.all_tasks()
-        if t.get_coro().__qualname__.endswith("_handle_server_request"))
+    refresh_tasks = tuple(client._server_request_tasks)
     try:
         await asyncio.wait_for(entered.wait(), 2)
         assert len(refresh_tasks) == 1
@@ -133,8 +132,7 @@ async def test_cancel_resistant_default_refresh_cannot_publish_after_close(
     proc = await native_process()
     client._proc = proc
     client._dispatch({"id": 1, "method": "account/chatgptAuthTokens/refresh"})
-    refresh_tasks = tuple(t for t in asyncio.all_tasks()
-        if t.get_coro().__qualname__.endswith("_handle_server_request"))
+    refresh_tasks = tuple(client._server_request_tasks)
     closer = None
     try:
         await asyncio.wait_for(entered.wait(), 2)
@@ -175,8 +173,7 @@ async def test_native_stdout_eof_retires_requests_before_restart():
     proc = await native_process(close_stdout=True)
     client._proc, client._initialized = proc, True
     client._dispatch({"id": 1, "method": "offline/default"})
-    requests = tuple(t for t in asyncio.all_tasks()
-        if t.get_coro().__qualname__.endswith("_handle_server_request"))
+    requests = tuple(client._server_request_tasks)
     reader = None
     try:
         await asyncio.wait_for(entered.wait(), 2)
