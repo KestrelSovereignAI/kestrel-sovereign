@@ -30,3 +30,17 @@ async def streaming_agent(native_tool_effect_agent, *, persisted=None, connected
 
     agent.privacy_agent.add_conversation = AsyncMock(side_effect=record)
     return agent
+
+
+async def collect_native_stream(agent, operation, *, chunks=None):
+    """One explicit input owns a private streaming component through settlement."""
+    from tests.utils.native_tool_effects import drive_native
+
+    observed = [] if chunks is None else chunks
+
+    async def collect():
+        async for chunk in operation():
+            observed.append(chunk)
+        return observed
+
+    return await drive_native(agent, collect)

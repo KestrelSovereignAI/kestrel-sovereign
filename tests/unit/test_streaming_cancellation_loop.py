@@ -24,7 +24,6 @@ These tests pin the new contract:
      tool batches and aborts cleanly.
 """
 import asyncio
-from contextlib import asynccontextmanager
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -35,6 +34,9 @@ from kestrel_sovereign.agent.streaming import (
     _STRICT_AUDIT_TOOL_BATCH_CHECKPOINT_METADATA,
 )
 from kestrel_sovereign.llm.adapter import LLMResponse, ToolCall
+from kestrel_sovereign.features.base import Feature
+from tests.utils.native_streaming import streaming_agent, collect_native_stream
+from tests.utils.native_tool_effects import drive_native
 
 
 # ---------------------------------------------------------------------------
@@ -153,89 +155,54 @@ async def test_persist_no_marker_when_request_id_not_provided():
 # ---------------------------------------------------------------------------
 
 
-@asynccontextmanager
-async def _passthrough():
-    yield
-
-
-def _build_mock_agent(*, cancel_on_call: int = None):
-    """Mock agent for ``process_input_streaming``. ``cancel_on_call``
-    makes ``is_request_cancelled`` return True starting from the Nth
-    call (1-indexed). None means never cancel."""
-    privacy_agent = MagicMock()
-    privacy_agent.add_conversation = AsyncMock()
-    privacy_agent.privacy_config.allows_cloud_llm.return_value = True
-    privacy_agent.privacy_mode.name = "normal"
-    privacy_agent.get_conversation_history = AsyncMock(return_value=[])
-
-    agent = MagicMock()
-    agent.privacy_agent = privacy_agent
-    agent.features = {}
-    agent.did = "did:test"
-    agent.extension = None
-    agent._cached_features_prompt = ""
-
+async def _streaming_agent(native_tool_effect_agent, *, cancel_on_call=None):
+    agent = await streaming_agent(native_tool_effect_agent)
     state = {"calls": 0}
 
-    def is_cancelled(rid=None):
+    def is_cancelled(request_id=None):
         state["calls"] += 1
-        if cancel_on_call is None:
-            return False
-        return state["calls"] >= cancel_on_call
+        return cancel_on_call is not None and state["calls"] >= cancel_on_call
+
     agent.is_request_cancelled = is_cancelled
     agent._is_cancelled_state = state
 
-    agent._maybe_audit = AsyncMock()
-    agent._genesis_audit_cognition_block = AsyncMock(return_value=None)
-    agent._get_privacy_transition_lock = MagicMock(return_value=_passthrough())
-    agent._turn_lifecycle = MagicMock(return_value=_passthrough())
-    agent.hooks_manager = None
-    agent._get_governing_constitution = AsyncMock(return_value="")
-    agent.check_solvency = AsyncMock(return_value="test-model")
-    agent._build_all_tools = MagicMock(return_value=[])
-    agent.user_prompt_template = MagicMock()
-    agent.user_prompt_template.format.return_value = "rendered"
-    agent._current_request_id = None
-    agent.emit_event = AsyncMock()
-    agent.operator_signal_producer = None
-
-    ctx = MagicMock()
-    ctx.system_prompt = "system"
-    ctx.dynamic_user_context = ""
-    ctx.messages = []
-    agent.context_manager = MagicMock()
-    agent.context_manager.build_context = AsyncMock(return_value=ctx)
-
-    agent.observability_store = MagicMock()
-    agent.observability_store.log_tool_call = AsyncMock(return_value="evt-1")
-    agent.observability_store.log_tool_response = AsyncMock()
-    agent.observability_store.log_metric = AsyncMock()
-
-    agent.process_input_streaming = (
-        StreamingMixin.process_input_streaming.__get__(agent)
-    )
-    agent._process_input_streaming_traced_locked = (
-        StreamingMixin._process_input_streaming_traced_locked.__get__(agent)
-    )
-    agent._persist_assistant_turn_safely = (
-        StreamingMixin._persist_assistant_turn_safely.__get__(agent)
-    )
-    agent._emit_revising_event = (
-        StreamingMixin._emit_revising_event.__get__(agent)
-    )
-    agent._fire_post_response_hook = (
-        StreamingMixin._fire_post_response_hook.__get__(agent)
-    )
-
-    # Tool path stubbed; tests that exercise tools override it.
     async def post_tool(*args, **kwargs):
         yield "should not run"
+
     agent._handle_orchestrator_response_streaming = post_tool
     return agent
 
 
+class _CancellationFeature(Feature):
+    @property
+    def tool_name(self):
+        return "test_tool"
+
+    @property
+    def tool_description(self):
+        return "Owned cancellation-loop component"
+
+    async def initialize(self):
+        pass
+
+
+async def _orchestrator_agent(native_tool_effect_agent):
+    agent = await streaming_agent(native_tool_effect_agent)
+    feature = _CancellationFeature(agent)
+    feature.name = "test_feature"
+    agent.features[feature.name] = feature
+    return agent, feature
+
+
+async def _native_persist_agent(native_tool_effect_agent):
+    captured = []
+    agent = await streaming_agent(native_tool_effect_agent, persisted=captured)
+    agent._captured = captured
+    return agent
+
+
 @pytest.mark.asyncio
-async def test_stream_loop_breaks_when_cancel_arrives_mid_stream():
+async def test_stream_loop_breaks_when_cancel_arrives_mid_stream(native_tool_effect_agent):
     """The inner ``async for item in stream_with_tool_detection`` loop
     must break the moment ``is_request_cancelled`` returns True.
     Chunks that follow the cancellation point must NOT reach the
@@ -245,7 +212,7 @@ async def test_stream_loop_breaks_when_cancel_arrives_mid_stream():
     # Cancellation flips True on the 3rd is_request_cancelled call.
     # Loop checks at top of each iteration — so iter 1, iter 2 produce
     # output; iter 3 detects cancel and breaks before processing.
-    agent = _build_mock_agent(cancel_on_call=3)
+    agent = await _streaming_agent(native_tool_effect_agent, cancel_on_call=3)
 
     async def stream(**kw):
         yield "first "
@@ -253,7 +220,6 @@ async def test_stream_loop_breaks_when_cancel_arrives_mid_stream():
         yield "should-not-reach-client"
         # Tool detection would normally yield LLMResponse here; we
         # don't because the cancel breaks first.
-    agent.llm_service = MagicMock()
     agent.llm_service.stream_with_tool_detection = stream
 
     chunks = []
@@ -281,7 +247,7 @@ async def test_stream_loop_breaks_when_cancel_arrives_mid_stream():
 
 
 @pytest.mark.asyncio
-async def test_cancel_between_llm_and_tool_dispatch_skips_tools():
+async def test_cancel_between_llm_and_tool_dispatch_skips_tools(native_tool_effect_agent):
     """If the user hits stop AFTER the LLM finished but BEFORE the
     orchestrator dispatched the first tool, tools with side effects
     must NOT run. The pre-tool prose persists with the cancellation
@@ -293,7 +259,7 @@ async def test_cancel_between_llm_and_tool_dispatch_skips_tools():
     # cancel_on_call: 1st call is in the stream loop (returns False —
     # we want the stream to complete). 2nd call is the new branch we
     # added before tool dispatch. Set cancel to fire on the 2nd call.
-    agent = _build_mock_agent(cancel_on_call=2)
+    agent = await _streaming_agent(native_tool_effect_agent, cancel_on_call=2)
 
     async def stream(**kw):
         yield "pre-tool prose "
@@ -301,7 +267,6 @@ async def test_cancel_between_llm_and_tool_dispatch_skips_tools():
             content="",
             tool_calls=[ToolCall(id="tc1", name="send_message", arguments={})],
         )
-    agent.llm_service = MagicMock()
     agent.llm_service.stream_with_tool_detection = stream
 
     # If the orchestrator were called we'd see "TOOL RAN" in output;
@@ -336,7 +301,7 @@ async def test_cancel_between_llm_and_tool_dispatch_skips_tools():
 
 
 @pytest.mark.asyncio
-async def test_cancel_during_tool_batch_persists_completed_result_before_unwind():
+async def test_cancel_during_tool_batch_persists_completed_result_before_unwind(native_tool_effect_agent):
     """A completed external effect must cross the history checkpoint on Stop.
 
     The stopped turn records no answer (#3552): the row is the fixed
@@ -346,7 +311,7 @@ async def test_cancel_during_tool_batch_persists_completed_result_before_unwind(
         OrchestratorEngineMixin,
     )
 
-    agent = _build_mock_agent(cancel_on_call=None)
+    agent = await _streaming_agent(native_tool_effect_agent, cancel_on_call=None)
     cancelled = False
     batch_started = asyncio.Event()
     release_batch = asyncio.Event()
@@ -410,7 +375,6 @@ async def test_cancel_during_tool_batch_persists_completed_result_before_unwind(
             ],
         )
 
-    agent.llm_service = MagicMock()
     agent.llm_service.stream_with_tool_detection = stream
 
     async def consume():
@@ -452,14 +416,14 @@ async def test_cancel_during_tool_batch_persists_completed_result_before_unwind(
 
 
 @pytest.mark.asyncio
-async def test_nonstreaming_cancelled_batch_checkpoints_before_unwind():
+async def test_nonstreaming_cancelled_batch_checkpoints_before_unwind(native_tool_effect_agent):
     """The non-streaming orchestrator cannot strand a completed effect."""
 
     from kestrel_sovereign.agent.orchestrator_engine import (
         OrchestratorEngineMixin,
     )
 
-    agent = _make_persist_agent(cancelled_request_id=None)
+    agent = await _native_persist_agent(native_tool_effect_agent)
     batch_started = asyncio.Event()
     release_batch = asyncio.Event()
     batch_completed = asyncio.Event()
@@ -510,7 +474,7 @@ async def test_nonstreaming_cancelled_batch_checkpoints_before_unwind():
     )
 
     turn = asyncio.create_task(
-        OrchestratorEngineMixin._handle_orchestrator_response(
+        drive_native(agent, lambda: OrchestratorEngineMixin._handle_orchestrator_response(
             agent,
             response=response,
             feature_tools=[],
@@ -520,7 +484,7 @@ async def test_nonstreaming_cancelled_batch_checkpoints_before_unwind():
             user_message="send it",
             session_id="s-nonstream",
             tool_results=[],
-        )
+        ))
     )
     await batch_started.wait()
     turn.cancel()
@@ -541,14 +505,14 @@ async def test_nonstreaming_cancelled_batch_checkpoints_before_unwind():
 
 
 @pytest.mark.asyncio
-async def test_nonstreaming_cancel_after_batch_before_synthesis_checkpoints():
+async def test_nonstreaming_cancel_after_batch_before_synthesis_checkpoints(native_tool_effect_agent):
     """A later provider await remains behind the completed-batch fence."""
 
     from kestrel_sovereign.agent.orchestrator_engine import (
         OrchestratorEngineMixin,
     )
 
-    agent = _make_persist_agent(cancelled_request_id=None)
+    agent = await _native_persist_agent(native_tool_effect_agent)
     synthesis_started = asyncio.Event()
     required = []
     persist = agent._persist_assistant_turn_safely
@@ -590,7 +554,6 @@ async def test_nonstreaming_cancel_after_batch_before_synthesis_checkpoints():
         side_effect=lambda messages, *_args, **_kwargs: messages
     )
     agent._make_inline_tool_executor = MagicMock(return_value=None)
-    agent.llm_service = MagicMock()
     agent.llm_service.generate_with_messages = AsyncMock(
         side_effect=wait_for_synthesis
     )
@@ -606,7 +569,7 @@ async def test_nonstreaming_cancel_after_batch_before_synthesis_checkpoints():
     )
 
     turn = asyncio.create_task(
-        OrchestratorEngineMixin._handle_orchestrator_response(
+        drive_native(agent, lambda: OrchestratorEngineMixin._handle_orchestrator_response(
             agent,
             response=response,
             feature_tools=[],
@@ -616,7 +579,7 @@ async def test_nonstreaming_cancel_after_batch_before_synthesis_checkpoints():
             user_message="send it",
             session_id="s-late-cancel",
             tool_results=[],
-        )
+        ))
     )
     await synthesis_started.wait()
     turn.cancel()
@@ -629,12 +592,12 @@ async def test_nonstreaming_cancel_after_batch_before_synthesis_checkpoints():
 
 
 @pytest.mark.asyncio
-async def test_inline_effect_requires_successful_history_persistence():
+async def test_inline_effect_requires_successful_history_persistence(native_tool_effect_agent):
     """Codex inline effects cannot complete behind a best-effort history write."""
 
     from kestrel_sovereign.llm.adapter import LLMResponse
 
-    agent = _build_mock_agent(cancel_on_call=None)
+    agent = await _streaming_agent(native_tool_effect_agent, cancel_on_call=None)
 
     async def fail_assistant_persistence(role, _content, **_kwargs):
         if role == "assistant":
@@ -657,7 +620,6 @@ async def test_inline_effect_requires_successful_history_persistence():
         yield "sent"
         yield response
 
-    agent.llm_service = MagicMock()
     agent.llm_service.stream_with_tool_detection = stream
 
     with pytest.raises(RuntimeError, match="history unavailable"):
@@ -670,16 +632,15 @@ async def test_inline_effect_requires_successful_history_persistence():
 
 
 @pytest.mark.asyncio
-async def test_no_cancel_path_unaffected_for_normal_completion():
+async def test_no_cancel_path_unaffected_for_normal_completion(native_tool_effect_agent):
     """Control: a turn that never gets cancelled persists with no
     ``cancelled`` marker in metadata. Guards against the marker leaking
     onto normally-completed turns."""
-    agent = _build_mock_agent(cancel_on_call=None)
+    agent = await _streaming_agent(native_tool_effect_agent, cancel_on_call=None)
 
     async def stream(**kw):
         yield "complete "
         yield "answer"
-    agent.llm_service = MagicMock()
     agent.llm_service.stream_with_tool_detection = stream
 
     chunks = []
@@ -707,206 +668,80 @@ async def test_no_cancel_path_unaffected_for_normal_completion():
 
 
 @pytest.mark.asyncio
-async def test_orchestrator_loop_returns_early_when_cancelled_between_iterations():
-    """``_handle_orchestrator_response_streaming`` runs a
-    ``for iteration in range(max_iterations)`` loop where each iteration
-    runs a tool batch then a follow-up LLM call. The cancel check at
-    the top of each iteration (and after the batch) means an in-flight
-    batch finishes cleanly, but the next iteration is skipped — no
-    runaway tool loops after the user hits stop."""
-    from kestrel_sovereign.kestrel_agent import KestrelAgent
+async def test_orchestrator_loop_returns_early_when_cancelled_between_iterations(native_tool_effect_agent):
+    """A real Stop after the first acknowledged batch forbids another batch."""
+    from kestrel_sovereign.agent.invocation import current_invocation_id, InvocationCancelledError
 
-    state = {"calls": 0}
+    agent, feature = await _orchestrator_agent(native_tool_effect_agent)
+    feature.execute_as_subagent = AsyncMock(return_value={"success": True, "data": "result"})
+    execute_batch = agent._execute_tool_batch
 
-    def is_cancelled(rid=None):
-        # Return False during the first iteration's batch; True
-        # afterward so the next-iteration cancel check fires.
-        state["calls"] += 1
-        return state["calls"] > 1
-    state["is_cancelled"] = is_cancelled
+    async def stop_after_batch(*args, **kwargs):
+        result = await execute_batch(*args, **kwargs)
+        assert agent.cancel_current_request(current_invocation_id())
+        return result
 
-    mock_feature = MagicMock()
-    mock_feature.tool_name = "test_tool"
-    mock_feature.name = "test_feature"
-    mock_feature.execute_as_subagent = AsyncMock(
-        return_value={"success": True, "data": "result"}
-    )
-    mock_feature.to_orchestrator_tool.return_value = {
-        "type": "function",
-        "function": {"name": "test_tool", "description": "", "parameters": {}},
-    }
+    agent._execute_tool_batch = stop_after_batch
 
-    mock_agent = MagicMock()
-    mock_agent.did = "did:test"
-    mock_agent.features = {"test_feature": mock_feature}
-    mock_agent.observability_store = MagicMock()
-    mock_agent.observability_store.log_tool_call = AsyncMock(return_value="e1")
-    mock_agent.observability_store.log_tool_response = AsyncMock()
-    mock_agent.observability_store.log_metric = AsyncMock()
-    mock_agent._direct_tools = {}
-    mock_agent._tool_to_feature = {}
-    from kestrel_sovereign.hooks import HooksManager
-    mock_agent.hooks_manager = HooksManager()
-    mock_agent.is_request_cancelled = is_cancelled
-    mock_agent._explored_features = {}
-    mock_agent._direct_tool_defs = []
-    mock_agent._register_explored_feature_tools = MagicMock()
+    async def followup(**kwargs):
+        yield LLMResponse(content="", tool_calls=[ToolCall(id="tc2", name="test_tool", arguments={})])
 
-    # llm_service: stream_with_tool_detection yields ANOTHER tool call
-    # (forcing iteration 2), so we can verify cancellation stops the
-    # loop before iteration 2 runs.
-    second_response = LLMResponse(
-        content="",
-        tool_calls=[ToolCall(id="tc2", name="test_tool", arguments={})],
-    )
-
-    async def streamed_followup(**_kw):
-        yield second_response
-
-    mock_agent.llm_service = MagicMock()
-    mock_agent.llm_service.stream_with_tool_detection = streamed_followup
-
-    for method_name in (
-        "_handle_orchestrator_response_streaming",
-        "_execute_tool_batch_at_stop_boundary",
-        "_execute_tool_with_hooks", "_execute_tool_batch",
-        "_partition_tool_calls", "_dispatch_tool_call",
-        "_dispatch_feature_tool", "_dispatch_direct_tool",
-        "_get_denied_tools", "_handle_feature_error",
-        "_prune_orchestrator_messages", "_build_all_tools",
-        "_build_feature_tools", "_visible_features_by_tool_name",
-        "_visible_known_tool_names", "_known_tool_names",
-        "_registered_tool_names", "_registered_features_by_tool_name",
-        "_feature_supports_subagent_dispatch", "_hidden_context_features",
-        "_hidden_context_tools", "_feature_hidden_from_context",
-        "_direct_tool_hidden_from_context",
-    ):
-        setattr(
-            mock_agent, method_name,
-            getattr(KestrelAgent, method_name).__get__(mock_agent),
-        )
-    mock_agent._build_tool_calls_msg = KestrelAgent._build_tool_calls_msg
-
-    first_response = LLMResponse(
-        content="",
-        tool_calls=[ToolCall(id="tc1", name="test_tool", arguments={})],
-    )
-
-    chunks = []
-    async for chunk in mock_agent._handle_orchestrator_response_streaming(
-        response=first_response,
-        feature_tools=[],
-        system_prompt="sys",
-        force_local_only=False,
-        effective_model="m",
-        user_message="hi",
-        request_id="req-cancel-between",
-    ):
-        chunks.append(chunk)
-
-    # First iteration's tool ran once. Second iteration's tool MUST
-    # NOT have run — the cancel check after the batch stopped it.
-    assert mock_feature.execute_as_subagent.await_count == 1, (
-        "the second iteration's tool batch must be skipped when the "
-        "user cancels between iterations"
-    )
+    agent.llm_service.stream_with_tool_detection = followup
+    first = LLMResponse(content="", tool_calls=[ToolCall(id="tc1", name="test_tool", arguments={})])
+    with pytest.raises(InvocationCancelledError):
+        await collect_native_stream(agent, lambda: agent._handle_orchestrator_response_streaming(
+            response=first, feature_tools=[], system_prompt="sys", force_local_only=False,
+            effective_model="m", user_message="hi", request_id=current_invocation_id(),
+        ))
+    assert feature.execute_as_subagent.await_count == 1
+    assert await agent._raw_storage.db.fetchone("SELECT state FROM tool_effect_claims") == ("RETURNED_OK",)
 
 
 @pytest.mark.asyncio
-async def test_orchestrator_loop_runs_normally_without_request_id():
-    """Without ``request_id``, the cancel predicate inside the
-    orchestrator loop is a no-op. Existing callers that don't thread
-    request_id (non-streaming paths, tests) must see the pre-#1256
-    behavior."""
-    from kestrel_sovereign.kestrel_agent import KestrelAgent
+async def test_orchestrator_loop_runs_with_its_assigned_native_request(native_tool_effect_agent):
+    """An input without a supplied ID still owns one real native invocation."""
 
-    mock_feature = MagicMock()
-    mock_feature.tool_name = "test_tool"
-    mock_feature.name = "test_feature"
-    mock_feature.execute_as_subagent = AsyncMock(
+    agent, feature = await _orchestrator_agent(native_tool_effect_agent)
+    feature.execute_as_subagent = AsyncMock(
         return_value={"success": True}
     )
-    mock_feature.to_orchestrator_tool.return_value = {
-        "type": "function",
-        "function": {"name": "test_tool", "description": "", "parameters": {}},
-    }
 
-    mock_agent = MagicMock()
-    mock_agent.did = "did:test"
-    mock_agent.features = {"test_feature": mock_feature}
-    mock_agent.observability_store = MagicMock()
-    mock_agent.observability_store.log_tool_call = AsyncMock(return_value="e1")
-    mock_agent.observability_store.log_tool_response = AsyncMock()
-    mock_agent.observability_store.log_metric = AsyncMock()
-    mock_agent._direct_tools = {}
-    mock_agent._tool_to_feature = {}
-    from kestrel_sovereign.hooks import HooksManager
-    mock_agent.hooks_manager = HooksManager()
-    # If this is consulted, the test catches it via cancel side-effects.
-    mock_agent.is_request_cancelled = MagicMock(return_value=True)
-    mock_agent._explored_features = {}
-    mock_agent._direct_tool_defs = []
-    mock_agent._register_explored_feature_tools = MagicMock()
-
-    mock_agent.llm_service = MagicMock()
     final_response = LLMResponse(content="final", tool_calls=[])
 
+    ids = []
     async def streamed_followup(**_kw):
+        from kestrel_sovereign.agent.invocation import current_invocation_id
+        ids.append(current_invocation_id())
         # stream_with_tool_detection: yield text chunks, then a final
         # LLMResponse with detected tool_calls (empty here = no more
         # tool calls, terminating turn).
         yield "final"
         yield final_response
 
-    mock_agent.llm_service.stream_with_tool_detection = streamed_followup
+    agent.llm_service.stream_with_tool_detection = streamed_followup
 
-    for method_name in (
-        "_handle_orchestrator_response_streaming",
-        "_execute_tool_batch_at_stop_boundary",
-        "_execute_tool_with_hooks", "_execute_tool_batch",
-        "_partition_tool_calls", "_dispatch_tool_call",
-        "_dispatch_feature_tool", "_dispatch_direct_tool",
-        "_get_denied_tools", "_handle_feature_error",
-        "_prune_orchestrator_messages", "_build_all_tools",
-        "_build_feature_tools", "_visible_features_by_tool_name",
-        "_visible_known_tool_names", "_known_tool_names",
-        "_registered_tool_names", "_registered_features_by_tool_name",
-        "_feature_supports_subagent_dispatch", "_hidden_context_features",
-        "_hidden_context_tools", "_feature_hidden_from_context",
-        "_direct_tool_hidden_from_context",
-    ):
-        setattr(
-            mock_agent, method_name,
-            getattr(KestrelAgent, method_name).__get__(mock_agent),
-        )
-    mock_agent._build_tool_calls_msg = KestrelAgent._build_tool_calls_msg
 
     first_response = LLMResponse(
         content="",
         tool_calls=[ToolCall(id="tc1", name="test_tool", arguments={})],
     )
 
-    chunks = []
-    async for chunk in mock_agent._handle_orchestrator_response_streaming(
+    chunks = await collect_native_stream(agent, lambda: agent._handle_orchestrator_response_streaming(
         response=first_response,
         feature_tools=[],
         system_prompt="sys",
         force_local_only=False,
         effective_model="m",
         user_message="hi",
-        # request_id omitted — cancel must not fire even with
-        # is_request_cancelled stubbed to True.
-    ):
-        chunks.append(chunk)
+    ))
 
-    # Tool ran and synthesis text reached us — cancel was correctly
-    # ignored because no request_id was threaded.
-    assert mock_feature.execute_as_subagent.await_count == 1
+    assert ids and ids[0]
+    assert feature.execute_as_subagent.await_count == 1
     assert "final" in "".join(chunks)
 
 
 @pytest.mark.asyncio
-async def test_orchestrator_loop_streams_followup_text_in_real_time():
+async def test_orchestrator_loop_streams_followup_text_in_real_time(native_tool_effect_agent):
     """The fix that prompted this: Emma's chat showed
     "🔧 Calling mesh_inbox..." then silence. Root cause was the
     multi-iteration loop's follow-up LLM call used the non-streaming
@@ -919,34 +754,11 @@ async def test_orchestrator_loop_streams_followup_text_in_real_time():
     test asserts the text chunks flow OUT of the orchestrator loop in
     the same order they came IN — proving no buffering happens at the
     iteration boundary."""
-    from kestrel_sovereign.kestrel_agent import KestrelAgent
 
-    mock_feature = MagicMock()
-    mock_feature.tool_name = "test_tool"
-    mock_feature.name = "test_feature"
-    mock_feature.execute_as_subagent = AsyncMock(
+    agent, feature = await _orchestrator_agent(native_tool_effect_agent)
+    feature.execute_as_subagent = AsyncMock(
         return_value={"success": True}
     )
-    mock_feature.to_orchestrator_tool.return_value = {
-        "type": "function",
-        "function": {"name": "test_tool", "description": "", "parameters": {}},
-    }
-
-    mock_agent = MagicMock()
-    mock_agent.did = "did:test"
-    mock_agent.features = {"test_feature": mock_feature}
-    mock_agent.observability_store = MagicMock()
-    mock_agent.observability_store.log_tool_call = AsyncMock(return_value="e1")
-    mock_agent.observability_store.log_tool_response = AsyncMock()
-    mock_agent.observability_store.log_metric = AsyncMock()
-    mock_agent._direct_tools = {}
-    mock_agent._tool_to_feature = {}
-    from kestrel_sovereign.hooks import HooksManager
-    mock_agent.hooks_manager = HooksManager()
-    mock_agent.is_request_cancelled = MagicMock(return_value=False)
-    mock_agent._explored_features = {}
-    mock_agent._direct_tool_defs = []
-    mock_agent._register_explored_feature_tools = MagicMock()
 
     final_response = LLMResponse(
         content="Looks like the mailbox is empty", tool_calls=[],
@@ -961,45 +773,22 @@ async def test_orchestrator_loop_streams_followup_text_in_real_time():
             yield word
         yield final_response
 
-    mock_agent.llm_service = MagicMock()
-    mock_agent.llm_service.stream_with_tool_detection = streamed_followup
+    agent.llm_service.stream_with_tool_detection = streamed_followup
 
-    for method_name in (
-        "_handle_orchestrator_response_streaming",
-        "_execute_tool_batch_at_stop_boundary",
-        "_execute_tool_with_hooks", "_execute_tool_batch",
-        "_partition_tool_calls", "_dispatch_tool_call",
-        "_dispatch_feature_tool", "_dispatch_direct_tool",
-        "_get_denied_tools", "_handle_feature_error",
-        "_prune_orchestrator_messages", "_build_all_tools",
-        "_build_feature_tools", "_visible_features_by_tool_name",
-        "_visible_known_tool_names", "_known_tool_names",
-        "_registered_tool_names", "_registered_features_by_tool_name",
-        "_feature_supports_subagent_dispatch", "_hidden_context_features",
-        "_hidden_context_tools", "_feature_hidden_from_context",
-        "_direct_tool_hidden_from_context",
-    ):
-        setattr(
-            mock_agent, method_name,
-            getattr(KestrelAgent, method_name).__get__(mock_agent),
-        )
-    mock_agent._build_tool_calls_msg = KestrelAgent._build_tool_calls_msg
 
     first_response = LLMResponse(
         content="",
         tool_calls=[ToolCall(id="tc1", name="test_tool", arguments={})],
     )
 
-    chunks = []
-    async for chunk in mock_agent._handle_orchestrator_response_streaming(
+    chunks = await collect_native_stream(agent, lambda: agent._handle_orchestrator_response_streaming(
         response=first_response, feature_tools=[],
         system_prompt="sys", force_local_only=False,
         effective_model="m", user_message="check inbox",
-    ):
-        chunks.append(chunk)
+    ))
 
     # The tool ran exactly once (single iteration).
-    assert mock_feature.execute_as_subagent.await_count == 1
+    assert feature.execute_as_subagent.await_count == 1
     # The follow-up's words reach us as individual chunks in order —
     # no buffering at the iteration boundary.
     text = "".join(c for c in chunks if isinstance(c, str))
@@ -1010,312 +799,98 @@ async def test_orchestrator_loop_streams_followup_text_in_real_time():
     assert "empty" in chunks
 
 
-@pytest.mark.asyncio
-async def test_orchestrator_loop_timeout_surfaces_failed_marker(monkeypatch):
-    """Per-iteration ``asyncio.timeout`` wraps the follow-up
-    ``stream_with_tool_detection`` so a stuck upstream surfaces as a
-    visible ❌ failure marker instead of silent dead air. The chat-UI
-    parser keys on ``❌ <name> failed`` to render the tool card's
-    error state — without this the user saw nothing after the first
-    🔧 marker (Emma's bug)."""
-    from kestrel_sovereign.kestrel_agent import KestrelAgent
+async def _timeout_followup(native_tool_effect_agent, monkeypatch):
+    """Retain streamed observations even when the native turn raises its timeout."""
     import kestrel_sovereign.agent.orchestrator_engine as oe
 
-    # Drop the timeout to a tiny value so the test runs quickly while
-    # still exercising the real ``asyncio.timeout`` path.
     monkeypatch.setattr(oe, "ORCHESTRATOR_TURN_TIMEOUT_SECS", 0.2)
+    agent, feature = await _orchestrator_agent(native_tool_effect_agent)
+    feature.execute_as_subagent = AsyncMock(return_value={"success": True})
 
-    mock_feature = MagicMock()
-    mock_feature.tool_name = "test_tool"
-    mock_feature.name = "test_feature"
-    mock_feature.execute_as_subagent = AsyncMock(
-        return_value={"success": True}
-    )
-    mock_feature.to_orchestrator_tool.return_value = {
-        "type": "function",
-        "function": {"name": "test_tool", "description": "", "parameters": {}},
-    }
-
-    mock_agent = MagicMock()
-    mock_agent.did = "did:test"
-    mock_agent.features = {"test_feature": mock_feature}
-    mock_agent.observability_store = MagicMock()
-    mock_agent.observability_store.log_tool_call = AsyncMock(return_value="e1")
-    mock_agent.observability_store.log_tool_response = AsyncMock()
-    mock_agent.observability_store.log_metric = AsyncMock()
-    mock_agent._direct_tools = {}
-    mock_agent._tool_to_feature = {}
-    from kestrel_sovereign.hooks import HooksManager
-    mock_agent.hooks_manager = HooksManager()
-    mock_agent.is_request_cancelled = MagicMock(return_value=False)
-    mock_agent._explored_features = {}
-    mock_agent._direct_tool_defs = []
-    mock_agent._register_explored_feature_tools = MagicMock()
-
-    async def stuck_followup(**_kw):
-        # Simulates a hung anthropic-style call: yields nothing,
-        # never completes. The orchestrator's timeout must trip.
+    async def stuck_followup(**kwargs):
         await asyncio.sleep(10)
         yield "this never arrives"
 
-    mock_agent.llm_service = MagicMock()
-    mock_agent.llm_service.stream_with_tool_detection = stuck_followup
+    agent.llm_service.stream_with_tool_detection = stuck_followup
+    first = LLMResponse(content="", tool_calls=[ToolCall(id="tc1", name="test_tool", arguments={})])
+    chunks = []
+    with pytest.raises(oe.LLMCallInactivityTimeout):
+        await collect_native_stream(agent, lambda: agent._handle_orchestrator_response_streaming(
+            response=first, feature_tools=[], system_prompt="sys", force_local_only=False,
+            effective_model="m", user_message="hi",
+        ), chunks=chunks)
+    return chunks, feature
 
-    for method_name in (
-        "_handle_orchestrator_response_streaming",
-        "_execute_tool_batch_at_stop_boundary",
-        "_execute_tool_with_hooks", "_execute_tool_batch",
-        "_partition_tool_calls", "_dispatch_tool_call",
-        "_dispatch_feature_tool", "_dispatch_direct_tool",
-        "_get_denied_tools", "_handle_feature_error",
-        "_prune_orchestrator_messages", "_build_all_tools",
-        "_build_feature_tools", "_visible_features_by_tool_name",
-        "_visible_known_tool_names", "_known_tool_names",
-        "_registered_tool_names", "_registered_features_by_tool_name",
-        "_feature_supports_subagent_dispatch", "_hidden_context_features",
-        "_hidden_context_tools", "_feature_hidden_from_context",
-        "_direct_tool_hidden_from_context",
-    ):
-        setattr(
-            mock_agent, method_name,
-            getattr(KestrelAgent, method_name).__get__(mock_agent),
-        )
-    mock_agent._build_tool_calls_msg = KestrelAgent._build_tool_calls_msg
 
-    first_response = LLMResponse(
-        content="",
-        tool_calls=[ToolCall(id="tc1", name="test_tool", arguments={})],
+@pytest.mark.asyncio
+async def test_orchestrator_loop_timeout_surfaces_failed_marker(native_tool_effect_agent, monkeypatch):
+    from kestrel_sovereign.agent.streaming import _parse_stream_sentinels
+
+    chunks, feature = await _timeout_followup(native_tool_effect_agent, monkeypatch)
+    text = "".join(c for c in chunks if isinstance(c, str))
+    _clean, parts, _ = _parse_stream_sentinels(text)
+    assert any(p["phase"] == "error" and "timeout" in (p.get("detail") or "") for p in parts), (
+        f"expected an error tool sentinel with timeout, got: {text!r}"
+    )
+    assert feature.execute_as_subagent.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_orchestrator_loop_timeout_marker_precedes_separator(native_tool_effect_agent, monkeypatch):
+    from kestrel_sovereign.agent.streaming import _parse_stream_sentinels
+
+    chunks, _feature = await _timeout_followup(native_tool_effect_agent, monkeypatch)
+    text = "".join(c for c in chunks if isinstance(c, str))
+    assert "\n---\n" not in text, f"separator must NOT precede timeout marker. Got: {text!r}"
+    _clean, parts, _ = _parse_stream_sentinels(text)
+    assert any(p["phase"] == "error" and "timeout" in (p.get("detail") or "") for p in parts), (
+        f"expected an error tool sentinel with timeout, got: {text!r}"
     )
 
-    chunks = []
-    # #3552: the timed-out follow-up is a failed attempt, raised out of the
-    # turn after its error card rather than ending it as if it had answered.
-    with pytest.raises(oe.LLMCallInactivityTimeout):
-        async for chunk in mock_agent._handle_orchestrator_response_streaming(
-            response=first_response, feature_tools=[],
-            system_prompt="sys", force_local_only=False,
-            effective_model="m", user_message="hi",
-        ):
-            chunks.append(chunk)
-
-    text = "".join(c for c in chunks if isinstance(c, str))
-    # #1659: the follow-up timeout surfaces as a typed error tool sentinel
-    # (rendered as a tool-card error), not emoji prose.
-    from kestrel_sovereign.agent.streaming import _parse_stream_sentinels
-    _clean, parts, _ = _parse_stream_sentinels(text)
-    assert any(
-        p["phase"] == "error" and "timeout" in (p.get("detail") or "")
-        for p in parts
-    ), f"expected an error tool sentinel with timeout, got: {text!r}"
-    # Tool still ran exactly once — only the FOLLOW-UP timed out.
-    assert mock_feature.execute_as_subagent.await_count == 1
-
 
 @pytest.mark.asyncio
-async def test_orchestrator_loop_timeout_marker_precedes_separator():
-    """Codex P2 on PR #1346: chat.js's ``splitToolActivity`` groups
-    everything BEFORE the first ``\\n---\\n`` into the tool-activity
-    block and everything AFTER as response. The timeout failure marker
-    must land in the tool-activity block — emitting it after the
-    separator would render it as response prose instead of the tool
-    card's error state.
-
-    The implementation defers separator emission until the first text
-    chunk arrives; a timeout BEFORE any text leaves the separator
-    un-emitted, so the ❌ marker is alone in the activity block."""
-    from kestrel_sovereign.kestrel_agent import KestrelAgent
-    import kestrel_sovereign.agent.orchestrator_engine as oe
-
-    monkeypatch_undo = None
-    oe_original_timeout = oe.ORCHESTRATOR_TURN_TIMEOUT_SECS
-    oe.ORCHESTRATOR_TURN_TIMEOUT_SECS = 0.2
-    try:
-        mock_feature = MagicMock()
-        mock_feature.tool_name = "test_tool"
-        mock_feature.name = "test_feature"
-        mock_feature.execute_as_subagent = AsyncMock(
-            return_value={"success": True}
-        )
-        mock_feature.to_orchestrator_tool.return_value = {
-            "type": "function",
-            "function": {"name": "test_tool", "description": "", "parameters": {}},
-        }
-
-        mock_agent = MagicMock()
-        mock_agent.did = "did:test"
-        mock_agent.features = {"test_feature": mock_feature}
-        mock_agent.observability_store = MagicMock()
-        mock_agent.observability_store.log_tool_call = AsyncMock(return_value="e1")
-        mock_agent.observability_store.log_tool_response = AsyncMock()
-        mock_agent.observability_store.log_metric = AsyncMock()
-        mock_agent._direct_tools = {}
-        mock_agent._tool_to_feature = {}
-        from kestrel_sovereign.hooks import HooksManager
-        mock_agent.hooks_manager = HooksManager()
-        mock_agent.is_request_cancelled = MagicMock(return_value=False)
-        mock_agent._explored_features = {}
-        mock_agent._direct_tool_defs = []
-        mock_agent._register_explored_feature_tools = MagicMock()
-
-        async def stuck_followup(**_kw):
-            await asyncio.sleep(10)
-            yield "never"
-
-        mock_agent.llm_service = MagicMock()
-        mock_agent.llm_service.stream_with_tool_detection = stuck_followup
-
-        for method_name in (
-            "_handle_orchestrator_response_streaming",
-            "_execute_tool_batch_at_stop_boundary",
-            "_execute_tool_with_hooks", "_execute_tool_batch",
-            "_partition_tool_calls", "_dispatch_tool_call",
-            "_dispatch_feature_tool", "_dispatch_direct_tool",
-            "_get_denied_tools", "_handle_feature_error",
-            "_prune_orchestrator_messages", "_build_all_tools",
-            "_build_feature_tools", "_visible_features_by_tool_name",
-            "_visible_known_tool_names", "_known_tool_names",
-            "_registered_tool_names", "_registered_features_by_tool_name",
-            "_feature_supports_subagent_dispatch", "_hidden_context_features",
-            "_hidden_context_tools", "_feature_hidden_from_context",
-            "_direct_tool_hidden_from_context",
-        ):
-            setattr(
-                mock_agent, method_name,
-                getattr(KestrelAgent, method_name).__get__(mock_agent),
-            )
-        mock_agent._build_tool_calls_msg = KestrelAgent._build_tool_calls_msg
-
-        first_response = LLMResponse(
-            content="",
-            tool_calls=[ToolCall(id="tc1", name="test_tool", arguments={})],
-        )
-
-        chunks = []
-        with pytest.raises(oe.LLMCallInactivityTimeout):
-            async for chunk in mock_agent._handle_orchestrator_response_streaming(
-                response=first_response, feature_tools=[],
-                system_prompt="sys", force_local_only=False,
-                effective_model="m", user_message="hi",
-            ):
-                chunks.append(chunk)
-
-        text = "".join(c for c in chunks if isinstance(c, str))
-        # No separator should have been emitted (no text chunk arrived
-        # before the timeout) — the timeout error rides a typed sentinel,
-        # so there is no stray `---` rendered as prose.
-        assert "\n---\n" not in text, (
-            f"separator must NOT precede timeout marker. Got: {text!r}"
-        )
-        # #1659: typed error sentinel instead of the ❌ emoji marker.
-        from kestrel_sovereign.agent.streaming import _parse_stream_sentinels
-        _clean, parts, _ = _parse_stream_sentinels(text)
-        assert any(
-            p["phase"] == "error" and "timeout" in (p.get("detail") or "")
-            for p in parts
-        ), f"expected an error tool sentinel with timeout, got: {text!r}"
-    finally:
-        oe.ORCHESTRATOR_TURN_TIMEOUT_SECS = oe_original_timeout
-
-
-@pytest.mark.asyncio
-async def test_orchestrator_loop_follow_up_tool_call_emits_revise_sentinel():
+async def test_orchestrator_loop_follow_up_tool_call_emits_revise_sentinel(native_tool_effect_agent):
     """Codex P1 on PR #1346: a follow-up iteration's stream can yield
     text BEFORE another ToolCallStarted. That mid-stream tool start
     must fire the same honesty-layer revise sentinel the first-level
     streaming path does, so the chat client can clear any speculative
     pre-tool prose for THIS tool call. Without this, the model's
     "I'll check Y" text stays on screen unverified before Y runs."""
-    from kestrel_sovereign.kestrel_agent import KestrelAgent
     from kestrel_sdk.llm import ToolCallStarted as TCS
 
-    mock_feature = MagicMock()
-    mock_feature.tool_name = "test_tool"
-    mock_feature.name = "test_feature"
-    mock_feature.execute_as_subagent = AsyncMock(
+    agent, feature = await _orchestrator_agent(native_tool_effect_agent)
+    feature.execute_as_subagent = AsyncMock(
         return_value={"success": True}
     )
-    mock_feature.to_orchestrator_tool.return_value = {
-        "type": "function",
-        "function": {"name": "test_tool", "description": "", "parameters": {}},
-    }
-
-    mock_agent = MagicMock()
-    mock_agent.did = "did:test"
-    mock_agent.features = {"test_feature": mock_feature}
-    mock_agent.observability_store = MagicMock()
-    mock_agent.observability_store.log_tool_call = AsyncMock(return_value="e1")
-    mock_agent.observability_store.log_tool_response = AsyncMock()
-    mock_agent.observability_store.log_metric = AsyncMock()
-    mock_agent._direct_tools = {}
-    mock_agent._tool_to_feature = {}
-    from kestrel_sovereign.hooks import HooksManager
-    mock_agent.hooks_manager = HooksManager()
-    mock_agent.is_request_cancelled = MagicMock(return_value=False)
-    mock_agent._explored_features = {}
-    mock_agent._direct_tool_defs = []
-    mock_agent._register_explored_feature_tools = MagicMock()
     # Stub the SSE emit — we only care that the in-band sentinel
     # makes it into the stream.
-    mock_agent._emit_revising_event = AsyncMock()
+    agent._emit_revising_event = AsyncMock()
 
     async def streamed_followup(**_kw):
+        if feature.execute_as_subagent.await_count >= 2:
+            yield LLMResponse(content="done", tool_calls=[])
+            return
         # Pre-tool prose, then a ToolCallStarted, then the terminal
         # LLMResponse carrying that tool call.
         yield "Let me also check Y "
-        yield TCS(index=0, id="tc2", name="other_tool")
+        yield TCS(index=0, id="tc2", name="test_tool")
         yield LLMResponse(
             content="Let me also check Y ",
             tool_calls=[ToolCall(id="tc2", name="test_tool", arguments={})],
         )
 
-    mock_agent.llm_service = MagicMock()
-    mock_agent.llm_service.stream_with_tool_detection = streamed_followup
+    agent.llm_service.stream_with_tool_detection = streamed_followup
 
-    for method_name in (
-        "_handle_orchestrator_response_streaming",
-        "_execute_tool_batch_at_stop_boundary",
-        "_execute_tool_with_hooks", "_execute_tool_batch",
-        "_partition_tool_calls", "_dispatch_tool_call",
-        "_dispatch_feature_tool", "_dispatch_direct_tool",
-        "_get_denied_tools", "_handle_feature_error",
-        "_prune_orchestrator_messages", "_build_all_tools",
-        "_build_feature_tools", "_visible_features_by_tool_name",
-        "_visible_known_tool_names", "_known_tool_names",
-        "_registered_tool_names", "_registered_features_by_tool_name",
-        "_feature_supports_subagent_dispatch", "_hidden_context_features",
-        "_hidden_context_tools", "_feature_hidden_from_context",
-        "_direct_tool_hidden_from_context",
-    ):
-        setattr(
-            mock_agent, method_name,
-            getattr(KestrelAgent, method_name).__get__(mock_agent),
-        )
-    mock_agent._build_tool_calls_msg = KestrelAgent._build_tool_calls_msg
-    mock_agent._build_assistant_tool_history_msg = (
-        KestrelAgent._build_assistant_tool_history_msg.__get__(mock_agent)
-    )
 
     first_response = LLMResponse(
         content="",
         tool_calls=[ToolCall(id="tc1", name="test_tool", arguments={})],
     )
 
-    chunks = []
-    try:
-        async for chunk in mock_agent._handle_orchestrator_response_streaming(
-            response=first_response, feature_tools=[],
-            system_prompt="sys", force_local_only=False,
-            effective_model="m", user_message="hi",
-            request_id="req-rev-followup",
-        ):
-            chunks.append(chunk)
-            # Stop after we observe enough to assert on — the iteration
-            # would otherwise loop into another tool batch that has no
-            # stub. (The fake feature would keep being invoked.)
-            if mock_feature.execute_as_subagent.await_count >= 2:
-                break
-    except Exception:
-        pass
+    chunks = await collect_native_stream(agent, lambda: agent._handle_orchestrator_response_streaming(
+        response=first_response, feature_tools=[], system_prompt="sys", force_local_only=False,
+        effective_model="m", user_message="hi", request_id="req-rev-followup",
+    ))
 
     text = "".join(c for c in chunks if isinstance(c, str))
     # In-band revise sentinel for the follow-up tool call must appear
@@ -1328,44 +903,21 @@ async def test_orchestrator_loop_follow_up_tool_call_emits_revise_sentinel():
     )
     # The corresponding SSE emit should also have been invoked at
     # least once (parity with first-level honesty-layer signaling).
-    assert mock_agent._emit_revising_event.await_count >= 1
+    assert agent._emit_revising_event.await_count >= 1
 
 
 @pytest.mark.asyncio
-async def test_orchestrator_loop_followup_separator_emitted_once_per_turn():
+async def test_orchestrator_loop_followup_separator_emitted_once_per_turn(native_tool_effect_agent):
     """The "\\n---\\n" separator is the chat UI's wire-protocol marker
     between tool activity and final synthesis. Pre-rewrite it fired
     exactly once per turn. Post-rewrite the orchestrator must preserve
     that semantic — multiple iterations of the loop yield only ONE
     separator total, not one per iteration."""
-    from kestrel_sovereign.kestrel_agent import KestrelAgent
 
-    mock_feature = MagicMock()
-    mock_feature.tool_name = "test_tool"
-    mock_feature.name = "test_feature"
-    mock_feature.execute_as_subagent = AsyncMock(
+    agent, feature = await _orchestrator_agent(native_tool_effect_agent)
+    feature.execute_as_subagent = AsyncMock(
         return_value={"success": True}
     )
-    mock_feature.to_orchestrator_tool.return_value = {
-        "type": "function",
-        "function": {"name": "test_tool", "description": "", "parameters": {}},
-    }
-
-    mock_agent = MagicMock()
-    mock_agent.did = "did:test"
-    mock_agent.features = {"test_feature": mock_feature}
-    mock_agent.observability_store = MagicMock()
-    mock_agent.observability_store.log_tool_call = AsyncMock(return_value="e1")
-    mock_agent.observability_store.log_tool_response = AsyncMock()
-    mock_agent.observability_store.log_metric = AsyncMock()
-    mock_agent._direct_tools = {}
-    mock_agent._tool_to_feature = {}
-    from kestrel_sovereign.hooks import HooksManager
-    mock_agent.hooks_manager = HooksManager()
-    mock_agent.is_request_cancelled = MagicMock(return_value=False)
-    mock_agent._explored_features = {}
-    mock_agent._direct_tool_defs = []
-    mock_agent._register_explored_feature_tools = MagicMock()
 
     call_count = {"n": 0}
 
@@ -1383,45 +935,22 @@ async def test_orchestrator_loop_followup_separator_emitted_once_per_turn():
             yield "done"
             yield LLMResponse(content="done", tool_calls=[])
 
-    mock_agent.llm_service = MagicMock()
-    mock_agent.llm_service.stream_with_tool_detection = streamed_followup
+    agent.llm_service.stream_with_tool_detection = streamed_followup
 
-    for method_name in (
-        "_handle_orchestrator_response_streaming",
-        "_execute_tool_batch_at_stop_boundary",
-        "_execute_tool_with_hooks", "_execute_tool_batch",
-        "_partition_tool_calls", "_dispatch_tool_call",
-        "_dispatch_feature_tool", "_dispatch_direct_tool",
-        "_get_denied_tools", "_handle_feature_error",
-        "_prune_orchestrator_messages", "_build_all_tools",
-        "_build_feature_tools", "_visible_features_by_tool_name",
-        "_visible_known_tool_names", "_known_tool_names",
-        "_registered_tool_names", "_registered_features_by_tool_name",
-        "_feature_supports_subagent_dispatch", "_hidden_context_features",
-        "_hidden_context_tools", "_feature_hidden_from_context",
-        "_direct_tool_hidden_from_context",
-    ):
-        setattr(
-            mock_agent, method_name,
-            getattr(KestrelAgent, method_name).__get__(mock_agent),
-        )
-    mock_agent._build_tool_calls_msg = KestrelAgent._build_tool_calls_msg
 
     first_response = LLMResponse(
         content="",
         tool_calls=[ToolCall(id="tc1", name="test_tool", arguments={})],
     )
 
-    chunks = []
-    async for chunk in mock_agent._handle_orchestrator_response_streaming(
+    chunks = await collect_native_stream(agent, lambda: agent._handle_orchestrator_response_streaming(
         response=first_response, feature_tools=[],
         system_prompt="sys", force_local_only=False,
         effective_model="m", user_message="hi",
-    ):
-        chunks.append(chunk)
+    ))
 
     # Two iterations ran (tool ran twice).
-    assert mock_feature.execute_as_subagent.await_count == 2
+    assert feature.execute_as_subagent.await_count == 2
     # But the separator fired exactly once.
     text = "".join(c for c in chunks if isinstance(c, str))
     assert text.count("\n---\n") == 1, (
