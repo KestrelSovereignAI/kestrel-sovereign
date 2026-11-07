@@ -362,6 +362,10 @@ retains the actual return evidence of its leaves, and its own hooks, delivery
 and final named-result serialization remain inside the shared boundary. The
 original turn must be confirmed before another protected operation starts and
 before any recovered output is handed to a consumer.
+Canonical subagent repair checks that same original confirmation before its
+decision model and again after the decision returns, before requesting a
+repair turn. An adapter swallowing a terminal leaf cannot spend another
+model call, and a leaf failing during the decision cannot authorize repair.
 Opaque Feature task handlers validate required fields and canonical Task outcome
 invariants before acknowledging their claim. A malformed reply produces a FAILED
 Task with `outcome_unknown` from the admitted baseline for the recipient writer;

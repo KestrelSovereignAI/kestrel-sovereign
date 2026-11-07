@@ -575,16 +575,41 @@ async def test_canonical_parent_completion_retains_returned_leaf_evidence(
     assert rows == [('success', None)]
 
 
+def _unfinished_decision():
+    from types import MappingProxyType
+    from kestrel_sdk.llm.decisions import DecisionResult, NoulAnswer
+    from kestrel_sovereign.turn_completion import CONTINUATION_QUESTION
+
+    return DecisionResult(
+        answers=MappingProxyType({CONTINUATION_QUESTION: NoulAnswer(p_true=1.0)}),
+        vendor='openrouter', route='openrouter:api', model='owned-decision',
+        thresholds=MappingProxyType({CONTINUATION_QUESTION: .5}),
+        calibrated=True, input_tokens=1, duration_ms=0,
+    )
+
+
+@pytest.mark.parametrize('content', ['done', 'Let me check the file.'])
+@pytest.mark.parametrize('continuation_check', ['regex', 'decision'])
 @pytest.mark.parametrize('route', ['chat', 'named-inline'])
 async def test_canonical_parent_cannot_deliver_a_swallowed_terminal_leaf_result(
-    canonical_subagent, monkeypatch, route,
+    canonical_subagent, monkeypatch, route, continuation_check, content,
 ):
     from uuid import uuid4
     from kestrel_sovereign.agent.parts import part_collector
     from kestrel_sovereign.llm.codex_adapter import CodexAdapter
+    from kestrel_sovereign.turn_completion import (
+        CONTINUATION_CHECK_ENV, CONTINUATION_CHECK_MODEL_ENV,
+    )
     from tests.utils.native_tool_effects import drive_native
 
     host, feature, witness, model, _, _, _ = canonical_subagent
+    monkeypatch.setenv(CONTINUATION_CHECK_ENV, continuation_check)
+    monkeypatch.setenv(CONTINUATION_CHECK_MODEL_ENV, 'openrouter:api/owned-decision')
+    decisions = []
+    async def decide(request, **kwargs):
+        decisions.append(request)
+        return _unfinished_decision()
+    model.decide = decide
     original = ValueError('private-swallowed-leaf-completion')
     class NativeValue:
         def to_dict(self):
@@ -601,7 +626,7 @@ async def test_canonical_parent_cannot_deliver_a_swallowed_terminal_leaf_result(
                 'arguments': {'marker': 'original'}})
         except Exception as error:
             seen['leaf_error'] = error
-        return LLMResponse(content='done', tool_calls=None)
+        return LLMResponse(content=content, tool_calls=None)
     monkeypatch.setattr(model, 'generate', provider)
     async def operation():
         with part_collector(host=host, session_id='swallowed-terminal'):
@@ -626,3 +651,54 @@ async def test_canonical_parent_cannot_deliver_a_swallowed_terminal_leaf_result(
     assert isinstance(seen.get('parent_error'), ResourceOutcomeUnknown)
     assert original in execution_evidence_carriers(seen['parent_error'])
     assert 'root_error' in seen and witness.read_text().splitlines() == ['original']
+    assert decisions == [], 'A decision model ran after the original leaf completion became uncertain'
+    assert model.continuations == 0, 'A repair model ran after the original leaf completion became uncertain'
+    assert model.calls == 1
+
+
+async def test_canonical_repair_rechecks_original_completion_after_decision(
+    canonical_subagent, monkeypatch,
+):
+    from kestrel_sovereign.llm.codex_adapter import CodexAdapter
+    from kestrel_sovereign.turn_completion import CONTINUATION_CHECK_ENV
+    from tests.utils.native_tool_effects import drive_native
+
+    host, feature, witness, model, _, _, _ = canonical_subagent
+    monkeypatch.setenv(CONTINUATION_CHECK_ENV, 'decision')
+    original = ValueError('private-leaf-completion-during-decision')
+    class NativeValue:
+        def to_dict(self):
+            raise original
+    feature.native_result = {'success': True, 'data': NativeValue()}
+    decisions, seen = [], {}
+    async def operation():
+        executor = feature._make_feature_inline_tool_executor()
+        async def decide(request, **kwargs):
+            decisions.append(request)
+            handler = CodexAdapter()._make_tool_call_handler(
+                executor, 'decision-thread', frozenset({'native_leaf'}),
+                executed_log=[], terminal_errors=[])
+            try:
+                await handler({'threadId': 'decision-thread', 'name': 'native_leaf',
+                    'arguments': {'marker': 'original'}})
+            except Exception as error:
+                seen['leaf_error'] = error
+            return _unfinished_decision()
+        model.decide = decide
+        try:
+            seen['result'] = await feature._repair_subagent_premature_yield(
+                LLMResponse(content='Let me check the file.', tool_calls=None),
+                [], [item.schema.to_openai_format() for item in feature.get_tools()],
+                tool_executor=executor)
+        except Exception as error:
+            seen['error'] = error
+    try:
+        await drive_native(host, operation)
+    except ResourceOutcomeUnknown as error:
+        seen['root_error'] = error
+    assert len(decisions) == 1
+    assert original in execution_evidence_carriers(seen['leaf_error'])
+    assert 'root_error' in seen and witness.read_text().splitlines() == ['original']
+    assert model.continuations == 0, 'A repair model ran after the decision observed uncertain completion'
+    assert 'result' not in seen and isinstance(seen.get('error'), ResourceOutcomeUnknown)
+    assert original in execution_evidence_carriers(seen['error'])

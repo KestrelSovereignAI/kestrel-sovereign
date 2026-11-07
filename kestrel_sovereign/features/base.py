@@ -595,15 +595,25 @@ class Feature(_SdkFeature):
         :func:`_subagent_turn_identity` for why that distinction is load-bearing.
         """
         host = _dispatch_host if _dispatch_host is not None else self.agent
+        from kestrel_sovereign.tools.effect_journal import current_tool_effect_turn
+
+        turn = current_tool_effect_turn(host)
         content = getattr(response, "content", "") or ""
         if not tools or not self._signals_unfinished_tool_work(content):
             return response
         # The pattern is usually a finished answer's plan; confirm it first
         # when the decision check is on (#3527).
         require_execution_work(host)
-        if not await confirm_unfinished(
+        if turn is not None:
+            turn.require_confirmed()
+        unfinished = await confirm_unfinished(
             host.llm_service, content, request=request, session_id=session_id,
-        ):
+        )
+        # A provider can catch a terminal inline leaf while this decision
+        # awaits. Recheck the original turn before another model is called.
+        if turn is not None:
+            turn.require_confirmed()
+        if not unfinished:
             return response
 
         logger.warning(
