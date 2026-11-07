@@ -1335,6 +1335,8 @@ async def wait_owned_or_pending(
     The caller MUST retain and physically join the task elsewhere. One timer
     starts on first cancellation; repeated interruption cannot reset it or
     re-cancel the native unwind. A pending result does not assert settlement.
+    A delegated privacy writer must finish restoration before caller code
+    resumes, even when its original child outlives the observation grace.
     """
     if not math.isfinite(cancellation_grace) or cancellation_grace <= 0:
         raise ValueError("cancellation_grace must be finite and positive")
@@ -1347,15 +1349,18 @@ async def wait_owned_or_pending(
     cancellation = None
     timer = None
     try:
-        while not task.done() and not completion.done():
-            try:
-                await asyncio.wait((completion,))
-            except asyncio.CancelledError as error:
-                if cancellation is None:
-                    cancellation = error
-                    timer = loop.call_later(cancellation_grace, wake)
-                    if cancel_on_caller_cancellation:
-                        task.cancel()
+        async with owned_native_wait((task,)):
+            while not task.done() and not completion.done():
+                try:
+                    await asyncio.wait((completion,))
+                except asyncio.CancelledError as error:
+                    if cancellation is None:
+                        cancellation = error
+                        timer = loop.call_later(cancellation_grace, wake)
+                        if cancel_on_caller_cancellation:
+                            task.cancel()
+        # Restoring a delegated writer can outlive the grace. Observe the
+        # original owner again so a now-settled receipt is never called pending.
         if not task.done():
             return PendingOwnedTask(task, cancellation)
         return await await_owned_task(task, cancellation)

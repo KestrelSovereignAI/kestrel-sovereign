@@ -2,16 +2,113 @@
 import asyncio
 import sqlite3
 import threading
-from contextlib import closing
+from contextlib import AsyncExitStack, closing
 
 import pytest
 
 from kestrel_sovereign._async_ownership import (
-    PendingOwnedTask, await_owned_task, create_owned_task, run_blocking_operation,
+    PendingOwnedTask, await_owned_task, create_owned_task, run_blocking_operation, owned_task_error,
     wait_owned_or_pending,
 )
 from kestrel_sovereign.execution_custody import ExecutionAuthorityError, ExecutionCommitOutcomeError
 from kestrel_sovereign.storage.privacy_wrapper import ReentrantTransitionLock, bind_transition_lock_reentry
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("depth", [1, 2])
+async def test_bounded_wait_parks_its_original_reentrant_writer(depth):
+    lock = ReentrantTransitionLock()
+    observations = []
+    entered = []
+
+    async def native():
+        entered.append(asyncio.current_task())
+        assert lock._writer is asyncio.current_task()
+        return "original native result"
+
+    async def writer():
+        async with AsyncExitStack() as stack:
+            for _ in range(depth):
+                await stack.enter_async_context(lock)
+            child = lock.start_owned_native_work(native)
+            result = await wait_owned_or_pending(child, cancellation_grace=.03)
+            observations.append((child, result, lock._writer is asyncio.current_task(), lock._depth))
+
+    owner = create_owned_task(writer())
+    try:
+        _, pending = await asyncio.wait({owner}, timeout=.3)
+    finally:
+        # A regression must retire its original blocked child before failing;
+        # cancellation starts the existing bounded observer's handoff.
+        if not owner.done():
+            owner.cancel()
+        settled = await await_owned_task(owner)
+    assert not pending, "bounded observation did not park the original privacy writer for its accepted child"
+    assert settled.error is None and settled.cancellation is None
+    child, result, restored, restored_depth = observations[0]
+    assert entered == [child] and child.done()
+    assert result.error is None and result.result == "original native result"
+    assert restored and restored_depth == depth
+    assert not lock.locked() and not lock._native_work and not lock._admissions
+
+
+@pytest.mark.asyncio
+async def test_bounded_writer_restores_only_after_original_cancelled_child_settles():
+    lock = ReentrantTransitionLock()
+    entered, release, sibling_entered = asyncio.Event(), asyncio.Event(), asyncio.Event()
+    children, observations = [], []
+    original = RuntimeError("original native acknowledgement")
+    original.__cause__ = ExecutionCommitOutcomeError("committed")
+
+    async def native():
+        entered.set()
+        try:
+            await release.wait()
+        except asyncio.CancelledError:
+            await release.wait()
+        raise original
+
+    async def writer():
+        async with lock:
+            child = lock.start_owned_native_work(native)
+            children.append(child)
+            result = await wait_owned_or_pending(child, cancellation_grace=.03)
+            observations.append((result, lock._writer is asyncio.current_task()))
+
+    async def sibling():
+        async with lock:
+            sibling_entered.set()
+
+    owner = create_owned_task(writer())
+    ready = asyncio.create_task(entered.wait())
+    peer = None
+    try:
+        completed, _ = await asyncio.wait({ready}, timeout=.3)
+        admitted = bool(completed)
+        if admitted:
+            peer = create_owned_task(sibling())
+            owner.cancel()
+            await asyncio.sleep(.05)
+            held = not owner.done() and not sibling_entered.is_set()
+    finally:
+        release.set()
+        if not entered.is_set() and not owner.done():
+            owner.cancel()
+        if not ready.done():
+            ready.cancel()
+        await await_owned_task(ready)
+        settled = await await_owned_task(owner)
+        if peer is not None:
+            await await_owned_task(peer)
+    assert admitted, "bounded observation did not park the original privacy writer for its accepted child"
+    assert held, "bounded observation resumed its writer before the original child settled"
+    result, restored = observations[0]
+    assert restored and children[0].done() and sibling_entered.is_set()
+    assert not isinstance(result, PendingOwnedTask), "bounded observation returned pending after original physical settlement"
+    assert result.error is owned_task_error(children[0]) is original
+    assert isinstance(result.cancellation, asyncio.CancelledError)
+    assert settled.error is None and settled.cancellation is None
+    assert not lock.locked() and not lock._native_work and not lock._admissions
 
 
 @pytest.mark.asyncio
