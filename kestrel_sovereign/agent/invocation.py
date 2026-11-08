@@ -700,7 +700,18 @@ def bind_async_invocation(
                             # Cancellation is a carrier, not rollback proof.
                             # Preserve native irreversible/control evidence
                             # before checkpointing or classifying typed Stop.
-                            if is_execution_control_error(error):
+                            from kestrel_sovereign._async_ownership import owned_task_error
+                            from kestrel_sovereign.execution_custody import is_tool_execution_terminal_error
+                            original = owned_task_error(isolated_operation) if isolated_operation.done() else None
+                            if original is not None:
+                                # The creator's completion receipt may already
+                                # have consumed asyncio's one-shot cancellation.
+                                # Use the original carrier even for ordinary
+                                # cancellation before classifying typed Stop.
+                                if not isinstance(original, asyncio.CancelledError) or is_tool_execution_terminal_error(original):
+                                    raise original
+                                error = original
+                            if is_tool_execution_terminal_error(error):
                                 raise
                             # An adapter/tool batch may have returned normally
                             # before cancellation lands at a later await in the
@@ -713,7 +724,7 @@ def bind_async_invocation(
                                 and caller_task.cancelling()
                                 > caller_cancellation_baseline
                             ):
-                                raise
+                                raise error
                             is_self_fenced = getattr(
                                 type(lifecycle_owner),
                                 "is_request_self_fenced",

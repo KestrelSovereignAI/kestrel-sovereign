@@ -59,6 +59,10 @@ body-error cache cannot hide a later completion-publication failure. The origina
 creator's first completion callback captures even a cancelled physical Task,
 before an unrelated native await can consume its original exception. All later
 readers use that one terminal receipt and the creator's original error policy.
+A caller that directly awaits the native Task must recover its completed receipt
+with `owned_task_error` before classifying a cause-free cancellation as Stop.
+Invocation uses this same canonical reader while retaining native await
+cancellation delivery, rather than adding a second observation or source owner.
 Iterator terminal inspection uses that same canonical task reader, including
 completion failures raised after the source has already physically closed.
 Cancellation observers retain the exact private Stop they actually received.

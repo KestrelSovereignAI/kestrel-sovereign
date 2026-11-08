@@ -232,3 +232,44 @@ async def test_invocation_admission_retires_exact_original_child_and_registratio
                 actual_cleanup(agent, rid, disposition=RequestCompletionDisposition.ABANDONED, generation=generation)
         await agent.llm_service.close()
         await db.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", [None, "plain", "unknown", "committed", "sdk", "audit"])
+async def test_isolated_invocation_recovers_original_terminal_cancellation_receipt(
+    tmp_path, monkeypatch, kind,
+):
+    from kestrel_sdk.resources import ResourceOutcomeUnknown
+    from kestrel_sovereign.execution_custody import (
+        ExecutionCommitOutcomeError, ToolAuditUnconfirmedError, _explicit_control_chain,
+    )
+    monkeypatch.setattr("kestrel_sovereign.entrypoints.discover_entry_point_classes", lambda *_args, **_kwargs: {})
+    agent, db = await _partial_native_agent(tmp_path, monkeypatch)
+    await db.execute("CREATE TABLE original_invocation_receipt_effects (id INTEGER)")
+    original = asyncio.CancelledError("original isolated invocation acknowledgement")
+    if kind not in {None, "plain"}:
+        original.__cause__ = (ResourceOutcomeUnknown("original SDK acknowledgement unknown") if kind == "sdk"
+            else ToolAuditUnconfirmedError("original audit acknowledgement unknown") if kind == "audit"
+            else ExecutionCommitOutcomeError(kind))
+
+    @bind_async_invocation("request_id", track_request_lifecycle=True)
+    async def invoke(self, request_id=None):
+        await db.execute("INSERT INTO original_invocation_receipt_effects VALUES (1)")
+        if kind is not None:
+            raise original
+        return "original invocation completed"
+
+    try:
+        outcome = await await_owned_task(create_owned_task(
+            invoke(agent, request_id="original-terminal-receipt"), retain_originals=True))
+        if kind is None:
+            assert outcome.error is outcome.cancellation is None
+            assert outcome.result == "original invocation completed"
+        else:
+            assert original in tuple(_explicit_control_chain(outcome.error)), (
+                "Isolated invocation replaced its original terminal cancellation with typed Stop")
+        assert await db.fetchval("SELECT COUNT(*) FROM original_invocation_receipt_effects") == 1
+        assert not any(vars(agent).get("_request_operation_tasks", {}).values())
+    finally:
+        await agent.llm_service.close()
+        await db.close()
