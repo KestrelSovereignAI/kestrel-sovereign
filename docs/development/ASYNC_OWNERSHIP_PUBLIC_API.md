@@ -66,6 +66,10 @@ explicit uncertainty and retirement debt naming the exact original Task. All
 later readers use that one terminal receipt and the creator's error policy.
 Implicit exception context from an observer's active error handler is not
 physical completion evidence and cannot certify that capture succeeded.
+Later admission publication failures extend that same combined receipt even
+after physical completion was captured. They retain the original physical
+failure if a diagnostic cache was withdrawn, and never retrieve the consumed
+native cancellation a second time.
 A caller that directly awaits the native Task must recover its completed receipt
 with `owned_task_error` before classifying a cause-free cancellation as Stop.
 Failed request admission joins a positively identified canonical wrapper whose

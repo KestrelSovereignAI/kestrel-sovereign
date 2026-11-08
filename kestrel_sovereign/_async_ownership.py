@@ -313,7 +313,10 @@ def _retain_owned_admission_error(task, error, *, admission=None, gate=None):
         except BaseException as publication:
             receipt_error = publication
     if type(admission) is OwnedTaskAdmission and admission.task is task:
-        receipt_error = execution_observation_error(receipt_error, admission.error)
+        receipt_error = execution_observation_error(
+            receipt_error, admission.error,
+            admission._terminal_error if admission._terminal_error is not _TASK_ERROR_UNSET else None,
+        )
     try:
         cached = getattr(task, "_kestrel_owned_terminal_error", None)
     except BaseException as publication:
@@ -325,6 +328,11 @@ def _retain_owned_admission_error(task, error, *, admission=None, gate=None):
         terminal = retained_execution_error(execution_observation_error(terminal, publication))
     if type(admission) is OwnedTaskAdmission and admission.task is task:
         admission.error = terminal
+        if admission._terminal_error is not _TASK_ERROR_UNSET:
+            # Physical observation is single-capture, but ownership publication
+            # can still fail after an eager Task finishes. Extend its original
+            # receipt without harvesting the consumed native exception again.
+            admission._terminal_error = terminal
     if gate is not None and not gate.done():
         gate.set_result(terminal)
     return terminal

@@ -1,11 +1,92 @@
 """Exclusive privacy writers across original native task joins."""
 import asyncio
+import sys
 
 import pytest
 from tests.unit.test_tool_effect_bound_operation import owner as owner, bound_operation as bound_operation
 
 from kestrel_sovereign._async_ownership import await_owned_task, create_owned_task, gather_owned, owned_task_error
 from kestrel_sovereign.storage.privacy_wrapper import ReentrantTransitionLock, bind_transition_lock_reentry
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(sys.version_info < (3, 12), reason="native eager Task requires Python 3.12")
+@pytest.mark.parametrize("withdraw_cache", [False, True])
+@pytest.mark.parametrize("physical_kind", [None, "ordinary", "sdk", "audit"])
+@pytest.mark.parametrize("publication_kind", [None, "ordinary", "sdk", "audit"])
+async def test_eager_native_completion_keeps_later_privacy_publication_failure(
+    tmp_path, withdraw_cache, physical_kind, publication_kind,
+):
+    from kestrel_sdk.resources import ResourceOutcomeUnknown
+    from kestrel_sovereign._async_ownership import OwnedTaskAdmission
+    from kestrel_sovereign.execution_custody import (
+        ToolAuditUnconfirmedError, _explicit_control_chain,
+    )
+    lock = ReentrantTransitionLock()
+    receipt = OwnedTaskAdmission()
+    effect = tmp_path / "original-eager-privacy-physical-effect"
+    bodies, owners, reads, publications = [], [], [], []
+    def failure(kind, phase):
+        if kind is None:
+            return None
+        error = RuntimeError("original " + phase + " failure")
+        if kind in {"sdk", "audit"}:
+            error = asyncio.CancelledError("original " + phase + " cancellation")
+            error.__cause__ = (ResourceOutcomeUnknown("original " + phase + " outcome uncertain")
+                if kind == "sdk" else ToolAuditUnconfirmedError("original " + phase + " audit uncertain"))
+        return error
+    physical = failure(physical_kind, "physical")
+    publication = failure(publication_kind, "publication")
+    async def operation():
+        bodies.append(asyncio.current_task())
+    class OriginalTask(asyncio.Task):
+        def exception(self):
+            reads.append(self)
+            return super().exception()
+        def add_done_callback(self, callback, *, context=None):
+            if getattr(callback, "__name__", "") == "completed":
+                publications.append(self)
+                if publication is not None:
+                    if withdraw_cache:
+                        self._kestrel_owned_terminal_error = None
+                    raise publication
+            return super().add_done_callback(callback, context=context)
+    loop, previous = asyncio.get_running_loop(), asyncio.get_running_loop().get_task_factory()
+    def factory(loop, coroutine, **options):
+        async def outer():
+            coroutine.close()
+            effect.write_text("original native outer physically completed once")
+            if physical is not None:
+                raise physical
+            return "original physical success"
+        options["eager_start"] = True
+        task = OriginalTask(outer(), loop=loop, **options)
+        owners.append(task)
+        return task
+    try:
+        loop.set_task_factory(factory)
+        task = lock.start_owned_native_work(operation, admission=receipt)
+        loop.set_task_factory(previous)
+        outcome = await await_owned_task(task)
+        chain = tuple(_explicit_control_chain(outcome.error))
+        if publication is not None:
+            assert publication in chain, "Physical completion snapshot erased later privacy publication failure"
+        if physical is not None:
+            assert physical in chain, "Late publication erased the single captured original physical failure"
+        if physical is publication is None:
+            assert outcome.error is None and outcome.result == "original physical success"
+        assert owned_task_error(task) is outcome.error
+        assert (await await_owned_task(task)).error is outcome.error
+        await asyncio.sleep(0)
+        assert owned_task_error(task) is outcome.error
+        assert reads == [task], "Late admission failure re-harvested consumed original native completion"
+        assert owners == publications == [task] and receipt.task is task and task.done()
+        assert not bodies and not lock._native_work and not lock.locked()
+        assert effect.read_text() == "original native outer physically completed once"
+    finally:
+        loop.set_task_factory(previous)
+        for task in owners:
+            await await_owned_task(task)
 
 
 @pytest.mark.asyncio
