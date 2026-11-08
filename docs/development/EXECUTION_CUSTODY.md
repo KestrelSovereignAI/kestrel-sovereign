@@ -2242,20 +2242,32 @@ Journal seal follows physical native completion, including required audits that
 have not created business claims. The privacy coordinator owns one canonical
 join routine. Journal closure joins its actual admitting Task's accepted native
 descendants without retiring borrowed outer privacy backing or joining its
-ancestors/unrelated cohorts. Only then does the fixed original terminal writer
+ancestors/unrelated cohorts. It harvests original native control and retirement
+debt even when a descendant completed before closure began. Ordinary errors
+from task ancestry do not establish this journal's business uncertainty. General
+privacy cleanup still joins outstanding owners without replaying handled errors.
+Only then does the fixed original terminal writer
 capture and persist operation uncertainty. The final privacy retirement reuses
 the same join routine and additionally waits for its physical writer.
 
 An owned Task can supply a synchronous completion publisher. The canonical
 physical wrapper invokes it outside the payload start gate, after settling the
 body, even if Task callback subscriptions failed. A publisher's failure retains
-all original causes in a fresh finite envelope. Async publishers and deferred
+all original causes in a fresh finite envelope. Declared async functions,
+callable objects and async generators refuse before native allocation. Deferred
 return values fail clearly; they cannot silently leave completion unobserved.
 Codex stores the original publisher/caller snapshot with its exact accepted Task
 in one inventory. It does not depend on fallible duplicate Task metadata or a
 second callback subscription. Connection retirement harvests that same publisher
 if cancellation prevented the Task from taking its first step. A caller snapshot
 used to classify a scoped refusal still confers no business authority.
+
+After an inline tool returns, a failed Codex reply is delivery uncertainty.
+The original physical completion owner publishes it to the journal captured at
+registration and to the original handler's terminal latch, independently of the
+resident reader's context or a turn event consumer. It blocks a later live
+effect and survives operation closure without changing confirmed claims or
+successful required audit rows. The original send error remains explicit.
 
 Stream-journal exit and source close use immutable finite observation composition.
 An original native closer error cannot acquire GeneratorExit or another finite

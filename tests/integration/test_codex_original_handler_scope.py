@@ -15,6 +15,7 @@ from kestrel_sovereign._async_ownership import await_owned_task, create_owned_ta
 from kestrel_sovereign.execution_custody import (
     ExecutionCustody,
     _explicit_control_chain,
+    _native_source_originals,
     bind_execution_custody_snapshot,
     execution_cleanup_debts,
     execution_commit_outcome,
@@ -144,7 +145,20 @@ async def test_codex_registered_callback_compares_actual_original_scope(
             # A canonical finite group is a composition, not another native
             # source. Shared latches retain its exact native leaves; genuine
             # source withdrawal carriers remain exact and cannot be flattened.
-            assert all(any(error is node for node in chain) for error in originals)
+            assert all(any(source is node for node in chain)
+                for error in originals for source in _native_source_originals(error))
+            # The owning turn keeps the complete original observation, even
+            # when its commit classifier has a separate authenticated native
+            # source projection for the shared connection.
+            own_events = []
+            while not queues['original'].empty():
+                own_events.append(queues['original'].get_nowait())
+            own_chain = tuple(node for event in own_events if '__bridge_error__' in event
+                for node in _explicit_control_chain(event['__bridge_error__']))
+            assert all(any(error is node for node in own_chain) for error in originals)
+            if denied == 'committed':
+                assert execution_commit_outcome(failure) == 'committed'
+                assert not execution_cleanup_debts(failure)
             if retirement != "public":
                 assert any(carried[0] is node for node in chain)
             observed_scopes = execution_denial_scopes(failure)

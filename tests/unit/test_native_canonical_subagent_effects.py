@@ -19,6 +19,84 @@ from tests.utils.codex_inline import OwnedCallbackReader
 pytestmark = [pytest.mark.asyncio, pytest.mark.timeout(30)]
 
 
+@pytest.mark.parametrize('closed', [False, True], ids=['delivered', 'closed'])
+async def test_closed_codex_reply_fences_the_original_live_journal(canonical_subagent, closed):
+    import asyncio
+    import contextvars
+    import sys
+    from kestrel_sovereign._async_ownership import OwnedCallbackScope, await_owned_task, create_owned_task
+    from kestrel_sovereign.llm.codex_adapter import CodexAdapter
+    from kestrel_sovereign.llm.codex_app_server import CodexAppServerClient, CodexAppServerConnectionClosed
+    from kestrel_sovereign.tools.effect_journal import current_tool_effect_turn
+    from tests.utils.native_tool_effects import drive_native
+
+    host, feature, witness, _, _, _, _ = canonical_subagent
+    process = await asyncio.create_subprocess_exec(sys.executable, '-u', '-c',
+        'import sys\nfor line in sys.stdin:\n sys.stdout.write(line); sys.stdout.flush()',
+        stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+    client = CodexAppServerClient(binary='owned-stdio-echo-only')
+    client._proc, client._initialized = process, True
+    # The real original effect closes the actual pipe. Its SQL acknowledgment
+    # and required audit still complete before the adapter attempts its reply.
+    feature.after_effect = process.stdin.close if closed else None
+    terminal, executed, seen = [], [], {}
+
+    async def operation():
+        executor = feature._make_feature_inline_tool_executor(
+            runtime_tools=feature.get_tools(), session_id='closed-original-reply')
+        handler = CodexAdapter()._make_tool_call_handler(executor, 'original-thread',
+            frozenset({'native_leaf'}), executed_log=executed, terminal_errors=terminal)
+        scope = OwnedCallbackScope()
+        handler._codex_native_callback_scope = scope
+        unregister = client.register_server_request_handler('item/tool/call', handler,
+            thread_id='original-thread')
+        params = {'threadId': 'original-thread', 'name': 'native_leaf', 'arguments': {'marker': 'original'}}
+        try:
+            # A resident reader has no original journal in its ambient context.
+            contextvars.Context().run(client._dispatch,
+                {'id': 721, 'method': 'item/tool/call', 'params': params})
+            for task in tuple(scope.tasks):
+                await await_owned_task(task)
+            if not closed:
+                import json
+                reply = json.loads(await asyncio.wait_for(process.stdout.readline(), 2))
+                assert reply['id'] == 721 and reply['result']['success']
+            seen['unconfirmed'] = tuple(current_tool_effect_turn(host).unconfirmed)
+            try:
+                await handler(dict(params, arguments={'marker': 'incorrect-followup'}))
+            except BaseException as error:
+                seen['followup_error'] = error
+        finally:
+            scope.close()
+            unregister()
+
+    try:
+        try:
+            await drive_native(host, operation)
+        except ResourceOutcomeUnknown as error:
+            seen['root_error'] = error
+    finally:
+        await await_owned_task(create_owned_task(client.aclose(), retain_originals=True))
+    if closed:
+        assert terminal, 'post-tool native reply failure never reached the original handler completion owner'
+        assert seen['unconfirmed'], 'post-tool native reply failure never reached its original live journal'
+        assert 'followup_error' in seen and 'root_error' in seen
+        assert seen['followup_error'] is terminal[0], 'original handler lost its post-tool delivery terminal latch'
+        assert witness.read_text().splitlines() == ['original'], 'delivery failure admitted another live effect'
+        assert any(isinstance(error, CodexAppServerConnectionClosed)
+            for error in execution_evidence_carriers(seen['root_error']))
+    else:
+        assert not terminal and not seen['unconfirmed']
+        assert 'followup_error' not in seen and 'root_error' not in seen
+        assert witness.read_text().splitlines() == ['original', 'incorrect-followup']
+    count = 1 if closed else 2
+    assert await host.tool_effect_store.database.fetchall('SELECT state FROM tool_effect_claims') == [('RETURNED_OK',)] * count
+    assert await host.tool_effect_store.database.fetchall(
+        'SELECT result_status FROM a2a_tool_dispatches WHERE tool_name=?', ('native_leaf',)) == [('success',)] * count
+    assert await host.tool_effect_store.database.fetchone('SELECT state,latched FROM tool_effect_operations') == ('CLOSED', int(closed))
+    assert process.returncode is not None
+
+
 @pytest_asyncio.fixture(params=[Feature, SDKFeature], ids=['core', 'sdk'])
 async def canonical_subagent(bound_operation, request):
     host, binding, witness = bound_operation

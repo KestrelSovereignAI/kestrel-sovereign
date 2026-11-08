@@ -363,9 +363,12 @@ def create_owned_task(operation, *, name=None, context=None, retain_originals=Fa
         if (type(admission) is not OwnedTaskAdmission or admission.task is not None
                 or admission._acceptance_unknown):
             raise TypeError("owned admission requires a fresh original receipt")
-        if on_completion is not None and (not callable(on_completion)
-                or inspect.iscoroutinefunction(on_completion)):
-            raise TypeError("native completion publisher must be a synchronous callable")
+        if on_completion is not None:
+            publisher_call = getattr(on_completion, '__call__', None)
+            if (not callable(on_completion)
+                    or any(inspect.iscoroutinefunction(publisher) or inspect.isasyncgenfunction(publisher)
+                           for publisher in (on_completion, publisher_call))):
+                raise TypeError("native completion publisher must be a synchronous callable")
         owner_loop = asyncio.get_running_loop()
         gate = owner_loop.create_future()
         task_factory = owner_loop.get_task_factory()

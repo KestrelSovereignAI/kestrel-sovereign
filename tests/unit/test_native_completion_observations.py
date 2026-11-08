@@ -481,6 +481,98 @@ async def test_native_completion_publisher_must_finish_synchronously(tmp_path, d
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize('form', ['async-callable', 'async-generator', 'async-generator-callable'])
+async def test_declared_deferred_publisher_is_refused_before_native_allocation(tmp_path, form):
+    body_receipt = tmp_path / 'body'
+    allocated = []
+    loop, prior = asyncio.get_running_loop(), asyncio.get_running_loop().get_task_factory()
+
+    async def body():
+        body_receipt.write_text('body ran before declared async publisher refusal')
+
+    async def generator(task, error):
+        yield None
+
+    class DeferredCallable:
+        async def __call__(self, task, error):
+            return None
+
+    class GeneratorCallable:
+        async def __call__(self, task, error):
+            yield None
+
+    publisher = {'async-callable': DeferredCallable(), 'async-generator': generator,
+        'async-generator-callable': GeneratorCallable()}[form]
+
+    def allocate(loop, coroutine, **kwargs):
+        task = asyncio.Task(coroutine, loop=loop, **kwargs)
+        allocated.append(task)
+        return task
+
+    operation, task, refused = body(), None, None
+    try:
+        loop.set_task_factory(allocate)
+        try:
+            task = create_owned_task(operation, on_completion=publisher)
+        except TypeError as error:
+            refused = error
+    finally:
+        loop.set_task_factory(prior)
+        for accepted in allocated:
+            await await_owned_task(accepted)
+    assert not allocated, 'declared deferred publisher was accepted by the native Task constructor'
+    assert isinstance(refused, TypeError) and task is None
+    assert operation.cr_frame is None and not body_receipt.exists()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('borrowed', [False, True])
+@pytest.mark.parametrize('kind', ['unknown', 'committed', 'group'])
+async def test_completed_original_native_failure_is_harvested_before_journal_seal(owner, borrowed, kind):
+    from kestrel_sovereign.tool_effect_store import ToolEffectReconciliationRequired
+    from kestrel_sovereign.tools.effect_journal import bind_tool_effect_turn
+    from tests.unit.test_tool_effect_execution import admit
+    original, cause = native_failure(kind)
+    async with AsyncExitStack() as resources:
+        if borrowed:
+            await resources.enter_async_context(owner._get_privacy_transition_lock().policy_span())
+        turn = await admit(owner, key='completed-original-native-failure')
+
+        async def audit():
+            await write_required_denial_audit(owner)
+            raise original
+
+        with bind_tool_effect_turn((turn, None)):
+            worker = turn.privacy_lock.start_owned_native_work(audit, acquire_span=False)
+            outcome = await await_owned_task(worker)
+        await asyncio.sleep(0)
+        assert worker.done() and worker not in turn.privacy_lock._native_work
+        assert not turn.pending and not turn.unconfirmed
+        assert any(error is original for error in execution_evidence_carriers(outcome.error))
+        terminal = None
+        try:
+            await turn.close()
+        except BaseException as error:
+            terminal = error
+        # A borrowed lifetime must itself retain its genuine native failure;
+        # dispose it here before making assertions about the journal boundary.
+        if borrowed:
+            try:
+                await resources.aclose()
+            except BaseException as error:
+                assert any(node is original for node in execution_evidence_carriers(error))
+    assert any(error is original for error in execution_evidence_carriers(terminal)), (
+        'journal retirement discarded an already completed original native failure')
+    assert original.__cause__ is cause
+    db = owner.tool_effect_store.database
+    assert await db.fetchone('SELECT COUNT(*) FROM a2a_tool_dispatches') == (1,)
+    assert await db.fetchone('SELECT COUNT(*) FROM tool_effect_claims') == (0,)
+    assert await db.fetchone('SELECT state,latched FROM tool_effect_operations') == ('CLOSED', 1)
+    with pytest.raises(ToolEffectReconciliationRequired):
+        await admit(owner, key='completed-original-native-failure')
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize('kind', ['ordinary', 'unknown', 'committed'])
 async def test_original_uncertain_root_terminal_fences_claim_free_replay(owner, kind):
     from kestrel_sovereign.tool_effect_store import ToolEffectReconciliationRequired

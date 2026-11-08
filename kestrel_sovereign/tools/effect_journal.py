@@ -66,6 +66,22 @@ def record_tool_effect_completion_failure(owner, error: BaseException) -> BaseEx
     return _record_uncertain_effect(turn, error, message=TOOL_OUTCOME_UNCONFIRMED)
 
 
+def capture_tool_effect_completion_failure():
+    """Retain the original journal's failure publisher before reader handoff.
+
+    Publishing failure grants no work authority and never opens a new journal.
+    The native callback lifetime must settle before this original journal seals.
+    """
+    turn = _current_turn.get()
+    if turn is None:
+        return None
+
+    def record(error):
+        return _record_uncertain_effect(turn, error, message=TOOL_OUTCOME_UNCONFIRMED)
+
+    return record
+
+
 def logical_operation_key(value: object) -> str:
     """Encode opaque transport keys once without narrowing their wire domain."""
     encoded = encode_inline_json(["kestrel-tool-effect-client-key-v2", value], sort_keys=True)

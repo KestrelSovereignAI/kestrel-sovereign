@@ -2185,6 +2185,14 @@ class CodexAdapter(LLMAdapter):
 
         terminal_error: BaseException | None = None
 
+        def reply_delivery_failed(error):
+            nonlocal terminal_error
+            from kestrel_sovereign.execution_custody import execution_observation_error
+            terminal_error = execution_observation_error(terminal_error, error)
+            if terminal_errors is not None:
+                terminal_errors.append(terminal_error)
+            return terminal_error
+
         async def handler(params: Dict[str, Any]) -> Dict[str, Any]:
             nonlocal terminal_error
             task = asyncio.current_task()
@@ -2216,6 +2224,7 @@ class CodexAdapter(LLMAdapter):
         # close the create_task-before-first-timeslice Stop race by itself.
         if active_handlers is not None:
             setattr(handler, "_codex_active_tasks", active_handlers)
+        handler._codex_reply_delivery_failed = reply_delivery_failed
         return handler
 
     def _make_codex_approval_handler(

@@ -666,9 +666,14 @@ class ReentrantTransitionLock:
         current = asyncio.current_task()
         ancestors = owned_task_join_ancestors(current) if root is not None else ()
         terminal = pending
+        harvested = set()
         while True:
+            # A journal's seal certifies its whole original subtree, including
+            # owners already completed before close. General privacy cleanup
+            # only joins outstanding owners; it does not replay handled errors.
             children = [task for task in scope.admissions
-                        if task is not current and not task.done()
+                        if task is not current and task not in harvested
+                        and (root is not None or not task.done())
                         and (root is None or (task is not root and task not in ancestors
                             and self._descends_from(task, root, scope=scope)))]
             active_writer = root is None and self._token is scope and self._writer is not None
@@ -676,6 +681,7 @@ class ReentrantTransitionLock:
                 break
             for child in children:
                 outcome = await await_owned_task(child)
+                harvested.add(child)
                 if outcome.error is not None and is_execution_control_error(outcome.error):
                     terminal = execution_observation_error(terminal, outcome.error,
                         prefer_cancellation=isinstance(terminal, asyncio.CancelledError))
