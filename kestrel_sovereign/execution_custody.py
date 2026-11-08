@@ -2035,10 +2035,10 @@ class _ExecutionForwarder:
                 await close_execution_stream(self._runtime_owner, self._iterator, self._scopes)
         except BaseException as caught:
             error = caught
-        if (self._iterator is not None and not self._producer_started
-                and self._iterator.producer_task.done()):
+        if (self._iterator is not None and self._iterator.producer_task.done()
+                and (not self._producer_started or not self._source_closed)):
             # A terminal pull can mark the iterator closed before raising its
-            # source failure. Observe that original producer AND watcher even
+            # physical close failure. Observe the original producer AND watcher even
             # when the physical aclose path has already become a no-op.
             try:
                 outcome = await self._iterator.join_source_owners(closing=True)

@@ -2353,8 +2353,14 @@ class TestToolExecutorBridge:
         turn.cancel()
         release_tool.set()
 
-        with pytest.raises(RuntimeError, match="checkpoint write failed"):
+        from kestrel_sovereign.execution_custody import (
+            _explicit_control_chain, execution_observer_cancellations,
+        )
+        with pytest.raises(BaseExceptionGroup) as caught:
             await turn
+        assert any(isinstance(error, RuntimeError) and str(error) == 'checkpoint write failed'
+            for error in _explicit_control_chain(caught.value))
+        assert execution_observer_cancellations(caught.value)
 
     @pytest.mark.asyncio
     async def test_dispatch_admits_inline_handler_before_its_first_timeslice(self):

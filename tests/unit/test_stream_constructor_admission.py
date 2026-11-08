@@ -840,6 +840,93 @@ async def test_failed_reserved_owner_keeps_a_valid_writer_for_remaining_source_c
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize('terminal_first', [False, True], ids=['close-first', 'terminal-first'])
+@pytest.mark.parametrize('failed_close', [False, True], ids=['body-failed-close-acknowledged', 'physical-close-failed'])
+async def test_entered_source_retirement_keeps_physical_close_failure_after_terminal_pull(tmp_path, terminal_first, failed_close):
+    from kestrel_sovereign._async_ownership import await_owned_operation
+
+    body_error, close_error = OSError('original source body failed'), OSError('original entered physical close failed')
+    handle = (tmp_path / 'entered-original-physical-close').open('w')
+    attempts = []
+    class Source:
+        pulls = 0
+        def __aiter__(self):
+            return self
+        async def __anext__(self):
+            self.pulls += 1
+            if self.pulls == 1:
+                return b'original'
+            if not failed_close:
+                raise body_error
+            raise StopAsyncIteration
+        async def aclose(self):
+            attempts.append(asyncio.current_task())
+            handle.close()
+            if failed_close:
+                raise close_error
+    stream = execution_stream(None, Source())
+    try:
+        assert await anext(stream) == b'original'
+        if terminal_first:
+            terminal = await await_owned_operation(anext(stream), retain_originals=True)
+            expected = close_error if failed_close else body_error
+            assert expected in tuple(_explicit_control_chain(terminal.error))
+        for _ in range(2):
+            outcome = await await_owned_operation(stream.aclose(), retain_originals=True)
+            if failed_close:
+                assert close_error in tuple(_explicit_control_chain(outcome.error)), (
+                    'Terminal pull certified a failed original physical close as successful retirement')
+            else:
+                assert outcome.error is outcome.cancellation is None
+        assert handle.closed and len(attempts) == 1
+        assert stream.retirement_task.done() and stream._iterator.owner_task.done()
+    finally:
+        await await_owned_operation(stream.aclose(), retain_originals=True)
+        if not handle.closed:
+            handle.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('mode', ['close', 'reserve', 'pull'])
+@pytest.mark.parametrize('owned_foreign', [False, True], ids=['raw-task', 'other-original-admission'])
+async def test_native_task_cleanup_receipt_must_belong_to_this_original_operation(tmp_path, mode, owned_foreign):
+    from kestrel_sovereign._async_ownership import await_owned_operation
+    from kestrel_sovereign.execution_custody import execution_cleanup_debts
+
+    handle = (tmp_path / 'original-source-with-foreign-retirement-receipt').open('w')
+    bodies = []
+    class Source:
+        def __aiter__(self):
+            return self
+        async def __anext__(self):
+            bodies.append(asyncio.current_task())
+            handle.write('payload without an original retirement receipt')
+            handle.flush()
+            return b'payload'
+        async def aclose(self):
+            handle.close()
+    foreign = (create_owned_task(asyncio.sleep(0)) if owned_foreign else asyncio.create_task(asyncio.sleep(0)))
+    await await_owned_task(foreign)
+    def factory(body, context, admission, resource):
+        admission.task = foreign
+        return foreign
+    source = Source()
+    stream = execution_stream(None, source, lifecycle=ExecutionStreamLifecycle(
+        None, None, lambda: None, cleanup_factory=factory))
+    try:
+        operation = stream.aclose() if mode == 'close' else stream.reserve() if mode == 'reserve' else anext(stream)
+        outcome = await await_owned_operation(operation, retain_originals=True)
+        assert any(isinstance(error, TypeError) for error in _explicit_control_chain(outcome.error)), (
+            'Foreign native Task falsely certified this operation retirement ownership')
+        assert any(getattr(resource, '_source', None) is source and task is None
+            for resource, task in execution_cleanup_debts(outcome.error))
+        assert not handle.closed and not bodies
+    finally:
+        if stream._iterator is not None:
+            await await_owned_operation(stream._iterator.aclose(), retain_originals=True)
+        if not handle.closed:
+            handle.close()
+@pytest.mark.asyncio
 async def test_private_close_interrupt_of_unentered_native_source_is_not_caller_withdrawal(tmp_path):
     from kestrel_sovereign._async_ownership import await_owned_operation
     from kestrel_sovereign.execution_custody import reserve_execution_stream

@@ -785,6 +785,7 @@ class OwnedOperation:
                  retain_originals=False, name=None, context=None, owner_factory=None):
         admission = OwnedTaskAdmission()
         self._opening = None
+        factory_returned = False
         try:
             if owner_factory is None:
                 self._task = create_owned_task(
@@ -794,7 +795,9 @@ class OwnedOperation:
                 )
             else:
                 self._task = owner_factory(operation, context, admission, retirement_resource)
-                if not isinstance(self._task, _NATIVE_TASK) or self._task is not admission.task:
+                factory_returned = True
+                if (not isinstance(self._task, _NATIVE_TASK) or self._task is not admission.task
+                        or getattr(self._task, '_kestrel_owned_admission', None) is not admission):
                     raise TypeError("original operation factory did not retain its native admission")
                 opening = getattr(self._task, '_kestrel_owned_admission_error', None)
                 if opening is not None:
@@ -802,7 +805,9 @@ class OwnedOperation:
         except BaseException as failure:
             # Only a native Task is an accepted physical owner. A malformed
             # factory publication cannot turn an arbitrary value into a receipt.
-            accepted = admission if isinstance(admission.task, _NATIVE_TASK) else OwnedTaskAdmission()
+            accepted = (admission if isinstance(admission.task, _NATIVE_TASK)
+                and (not factory_returned or getattr(admission.task, '_kestrel_owned_admission', None) is admission)
+                else OwnedTaskAdmission())
             self._opening = owned_task_admission_error(retirement_resource, accepted, failure)
             self._task = accepted.task
 

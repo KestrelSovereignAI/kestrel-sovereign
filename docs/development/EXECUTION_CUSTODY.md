@@ -114,6 +114,10 @@ caller's withdrawal from later observers. Invalid cleanup factories must fail
 with resource debt: neither an absent return nor a published non-Task value is
 an admitted physical retirement owner. Repeated close retains an original
 cancellation carrying native control; it does not acknowledge that failure away.
+The native Task must carry this exact original admission binding; a completed
+Task borrowed from another operation cannot certify cleanup. After terminal
+consumption, any unacknowledged physical source close still harvests the same
+producer and watcher outcome, including entered sources, without closing twice.
 Writer restoration preserves a collected physical-close result alongside a
 later observer withdrawal. A terminal pull before close cannot discard an unentered producer's
 original admission failure; the closer observes the canonical source-owner
