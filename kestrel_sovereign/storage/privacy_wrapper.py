@@ -41,7 +41,7 @@ from kestrel_sovereign.deidentification import (
     EvidenceValidationError,
 )
 from kestrel_sovereign.execution_custody import (
-    execution_observation_error,
+    execution_native_source_error, execution_observation_error,
     is_execution_control_error,
     ExecutionAuthorityError,
 )
@@ -650,6 +650,35 @@ class ReentrantTransitionLock:
     async def _close_span(self, pending):
         await self.close_native_scope(self._token, pending)
 
+    def _native_scope_children(self, scope, *, root=None):
+        """Select only this original lifetime's accepted join obligations."""
+        if scope not in self._native_scopes:
+            raise RuntimeError("native privacy lifetime is already retired")
+        if root is not None and self._scope_for(root, original=True) is not scope:
+            raise ExecutionAuthorityError("native join requires its original admitted root")
+        from kestrel_sovereign._async_ownership import owned_task_join_ancestors
+        current = asyncio.current_task()
+        ancestors = owned_task_join_ancestors(current) if root is not None else ()
+        return [task for task in scope.admissions
+                if task is not current and (root is None or (
+                    task is not root and task not in ancestors
+                    and self._descends_from(task, root, scope=scope)))]
+
+    def native_scope_control(self, scope, *, root):
+        """Observe settled native controls without adopting consumer context.
+
+        Pending work remains owned by the asynchronous join. Ordinary consumer
+        failures cannot establish a business journal's uncertainty by ancestry.
+        """
+        terminal = None
+        for child in self._native_scope_children(scope, root=root):
+            if child.done():
+                error = owned_task_error(child)
+                if is_execution_control_error(error):
+                    terminal = execution_observation_error(terminal,
+                        execution_native_source_error(error))
+        return terminal
+
     async def join_native_scope(self, scope, pending=None, *, root=None):
         """Join original accepted owners without retiring their privacy backing.
 
@@ -658,24 +687,14 @@ class ReentrantTransitionLock:
         unrelated cohorts are neither business authority nor join obligations.
         Full privacy retirement additionally waits for its physical writer.
         """
-        if scope not in self._native_scopes:
-            raise RuntimeError("native privacy lifetime is already retired")
-        if root is not None and self._scope_for(root, original=True) is not scope:
-            raise ExecutionAuthorityError("native join requires its original admitted root")
-        from kestrel_sovereign._async_ownership import owned_task_join_ancestors
-        current = asyncio.current_task()
-        ancestors = owned_task_join_ancestors(current) if root is not None else ()
         terminal = pending
         harvested = set()
         while True:
             # A journal's seal certifies its whole original subtree, including
             # owners already completed before close. General privacy cleanup
             # only joins outstanding owners; it does not replay handled errors.
-            children = [task for task in scope.admissions
-                        if task is not current and task not in harvested
-                        and (root is not None or not task.done())
-                        and (root is None or (task is not root and task not in ancestors
-                            and self._descends_from(task, root, scope=scope)))]
+            children = [task for task in self._native_scope_children(scope, root=root)
+                        if task not in harvested and (root is not None or not task.done())]
             active_writer = root is None and self._token is scope and self._writer is not None
             if not children and not active_writer:
                 break

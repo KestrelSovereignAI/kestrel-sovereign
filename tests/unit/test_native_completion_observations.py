@@ -16,6 +16,25 @@ from tests.unit.test_tool_effect_execution import owner as owner
 from tests.unit.test_tool_effect_invocation import governed
 
 
+def sqlite_commit_ack_loss(connection, table, *, after):
+    import aiosqlite
+    native_commit = aiosqlite.Connection.commit
+    original, lost = OSError('original prebody SQLite COMMIT acknowledgment lost'), []
+
+    async def lose_ack(target):
+        if target is connection and not lost:
+            async with target.execute('SELECT COUNT(*) FROM ' + table) as cursor:
+                present = (await cursor.fetchone())[0]
+            if present:
+                lost.append(True)
+                if after:
+                    await native_commit(target)
+                raise original
+        await native_commit(target)
+
+    return original, lost, lose_ack
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize('phase,loss', [
     ('claim', 'before'), ('claim', 'after'), ('audit', 'before'), ('audit', 'after'),
@@ -30,22 +49,11 @@ async def test_original_prebody_commit_failure_fences_live_effects(owner, monkey
 
     database = owner.tool_effect_store.database
     connection = database.backend._connection
-    native_commit = aiosqlite.Connection.commit
-    original = OSError('original prebody SQLite COMMIT acknowledgment lost')
-    lost, seen = [], {}
+    seen = {}
     witness = tmp_path / 'live-effect-after-prebody-commit-loss'
     table = 'tool_effect_claims' if phase == 'claim' else 'a2a_tool_dispatches'
 
-    async def lose_ack(target):
-        if target is connection and not lost:
-            async with target.execute('SELECT COUNT(*) FROM ' + table) as cursor:
-                present = (await cursor.fetchone())[0]
-            if present:
-                lost.append(True)
-                if loss == 'after':
-                    await native_commit(target)
-                raise original
-        await native_commit(target)
+    original, lost, lose_ack = sqlite_commit_ack_loss(connection, table, after=loss == 'after')
 
     async def first_effect():
         witness.write_text('first unadmitted effect ran')
@@ -785,3 +793,93 @@ async def test_copied_loop_callback_cannot_construct_an_admitting_journal_root(o
     await turn.close()
     assert isinstance(refused, RuntimeError)
     assert str(refused) == 'tool effect journal requires its original admitting Task'
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('kind', ['ordinary', 'cancel', 'unknown', 'committed', 'group'])
+async def test_original_owned_handoff_preserves_every_source_graph(tmp_path, kind):
+    from kestrel_sovereign._async_ownership import OwnedTaskHandoff
+    original, cause = native_failure(kind)
+    delivery = OSError('original consumer result delivery failed')
+    witness = tmp_path / 'original-physical-result'
+
+    async def producer():
+        witness.write_text('original result physically settled')
+        raise original
+
+    task = create_owned_task(producer(), retain_originals=True)
+    outcome = await await_owned_task(task)
+    before = execution_evidence_carriers(original)
+    handoff = OwnedTaskHandoff(outcome, operation='original owned result delivery')
+    observed = None
+    try:
+        with handoff.handoff():
+            raise delivery
+    except BaseException as error:
+        observed = error
+    assert execution_evidence_carriers(original) == before, 'finite handoff rewrote its original owned source graph'
+    assert original.__cause__ is cause
+    if kind == 'cancel':
+        assert isinstance(observed, asyncio.CancelledError), 'owned handoff changed its original cancellation contract'
+    assert all(any(node is error for node in execution_evidence_carriers(observed))
+        for error in (original, cause, delivery))
+    assert witness.read_text() == 'original result physically settled'
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('kind', ['native', 'ordinary-consumer'])
+async def test_completed_original_native_control_fences_live_effect_before_root_close(owner, monkeypatch, tmp_path, kind):
+    import aiosqlite
+    import contextvars
+    from kestrel_sovereign.tools.effect_journal import current_tool_effect_turn, execute_tool_effect
+    database = owner.tool_effect_store.database
+    original, lost, lose_ack = sqlite_commit_ack_loss(database.backend._connection,
+        'a2a_tool_dispatches', after=True)
+    ordinary, cause = native_failure('ordinary')
+    witness, seen = tmp_path / 'effect-after-completed-native-control', {}
+
+    async def audit():
+        await write_required_denial_audit(owner)
+        if kind == 'ordinary-consumer':
+            raise ordinary
+
+    async def effect():
+        witness.write_text('later effect')
+        return 'acknowledged'
+
+    @governed
+    async def invoke(agent, user_input, *, invocation_id=None):
+        turn = current_tool_effect_turn(agent)
+        if kind == 'native':
+            monkeypatch.setattr(aiosqlite.Connection, 'commit', lose_ack)
+        # Business context can belong to another consumer. Physical native
+        # membership is retained by the original factory, independently.
+        worker = turn.privacy_lock.start_owned_native_work(audit,
+            context=contextvars.Context(), acquire_span=False)
+        outcome = await await_owned_task(worker)
+        await asyncio.sleep(0)
+        assert worker.done() and worker not in turn.privacy_lock._native_work
+        assert not turn.unconfirmed and outcome.error is not None
+        seen['source'] = outcome.error
+        try:
+            seen['result'] = await execute_tool_effect(agent, registration='after-completed-native',
+                arguments={}, execute=effect)
+        except BaseException as error:
+            seen['refused'] = error
+
+    try:
+        await invoke(owner, 'original completed native control', invocation_id='completed-native-live-fence')
+    except BaseException as error:
+        seen['root_error'] = error
+    if kind == 'ordinary-consumer':
+        assert witness.read_text() == 'later effect' and seen['result'] == 'acknowledged'
+        assert 'refused' not in seen and 'root_error' not in seen
+        assert ordinary.__cause__ is cause
+        assert await database.fetchone('SELECT state,latched FROM tool_effect_operations') == ('CLOSED', 0)
+    else:
+        assert not witness.exists(), 'completed original native control admitted another live effect'
+        assert lost == [True] and 'refused' in seen and 'root_error' in seen
+        assert any(error is original for error in execution_evidence_carriers(seen['refused']))
+        assert await database.fetchone('SELECT COUNT(*) FROM tool_effect_claims') == (0,)
+        assert await database.fetchone('SELECT state,latched FROM tool_effect_operations') == ('CLOSED', 1)
+    assert await database.fetchone('SELECT COUNT(*) FROM a2a_tool_dispatches') == (1,)

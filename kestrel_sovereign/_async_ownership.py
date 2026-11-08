@@ -742,11 +742,12 @@ class OwnedTaskHandoff(Generic[_T]):
 
     def raise_outcome(self, consumer_error: BaseException | None = None):
         if consumer_error is not None:
-            from kestrel_sovereign.execution_custody import execution_terminal_error
+            from kestrel_sovereign.execution_custody import execution_observation_error
 
-            raise execution_terminal_error(
+            raise execution_observation_error(
                 self.outcome.error, self.outcome.cancellation, consumer_error,
-                retain_originals=True, isolate_control_originals=True,
+                prefer_cancellation=(self.outcome.cancellation is not None
+                    or isinstance(self.outcome.error, asyncio.CancelledError)),
             )
         return raise_owned_outcome(
             self.outcome, operation=self.operation, retain_originals=True,

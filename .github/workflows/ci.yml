@@ -588,7 +588,7 @@ jobs:
         # tripped first. --maxfail bounds a truly broken tree without hiding
         # the set. Reading a red run now means reading every failure, which is
         # what tells you flake from regression.
-        run: uv run pytest tests/unit/ -n logical -v --tb=short --maxfail=25 --timeout=60 --session-timeout=2100
+        run: uv run pytest tests/unit/ -n logical -v --tb=short --maxfail=25 --timeout=60 --session-timeout=2100 --durations=50
         # Budgeted the way the integration tier below is (#3212), because the
         # unit tier hit the same wall for the same reason (#3330). 10 min was
         # too tight, then 20 was: at 44e77ec5 the push run passed the step in

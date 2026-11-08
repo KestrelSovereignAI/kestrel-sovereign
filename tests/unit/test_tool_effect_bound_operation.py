@@ -1105,3 +1105,140 @@ async def test_original_required_audit_joins_before_repeated_cancellation_retire
             release.set()
             if calling is not None:
                 await asyncio.gather(calling, return_exceptions=True)
+
+
+@pytest.mark.parametrize('route', ['named', 'bound', 'nested-invocation', 'native-admit'])
+@pytest.mark.parametrize('uncertain', [False, True], ids=['known-refusal', 'uncertain'])
+async def test_explicit_nested_intent_cannot_replace_original_uncertainty_fence(bound_operation, route, uncertain):
+    from kestrel_sdk.resources import ResourceOutcomeUnknown
+    from kestrel_sovereign.execution_custody import execution_evidence_carriers
+    from kestrel_sovereign.tools.effect_journal import bind_tool_effect_turn, current_tool_effect_turn, execute_tool_effect
+    from tests.unit.test_tool_effect_execution import admit
+    from tests.unit.test_tool_effect_invocation import governed
+    host, binding, witness = bound_operation
+    original, seen = ResourceOutcomeUnknown('original input effect reply unavailable'), {}
+
+    async def first():
+        with witness.open('a') as stream:
+            stream.write('original\n')
+        raise original
+
+    async def later():
+        with witness.open('a') as stream:
+            stream.write('nested\n')
+        return 'acknowledged nested effect'
+
+    @governed
+    async def nested(agent, user_input, *, invocation_id=None):
+        return await execute_tool_effect(agent, registration='nested-input-effect', arguments={}, execute=later)
+
+    async def invoke_nested():
+        if route == 'named':
+            return await host.execute_named_tool(binding.name, {'marker': 'nested'},
+                session_id='original-session', operation_id='unused-nested-named-intent')
+        if route == 'bound':
+            return await binding.invoke({'marker': 'nested'}, session_id='original-session',
+                operation_id='unused-nested-bound-intent')
+        if route == 'nested-invocation':
+            return await nested(host, 'nested input', invocation_id='unused-nested-input')
+        turn = await admit(host, key='unused-native-nested-intent')
+        try:
+            with bind_tool_effect_turn((turn, None)):
+                return await execute_tool_effect(host, registration='nested-direct-effect', arguments={}, execute=later)
+        finally:
+            await turn.close()
+
+    @governed
+    async def invoke(agent, user_input, *, invocation_id=None):
+        try:
+            await execute_tool_effect(agent, registration='original-input-effect',
+                arguments=({} if uncertain else {'invalid_json': object()}), execute=first)
+        except BaseException as error:
+            seen['first'] = error
+        assert bool(current_tool_effect_turn(agent).unconfirmed) is uncertain
+        try:
+            seen['nested_result'] = await invoke_nested()
+        except BaseException as error:
+            seen['nested_error'] = error
+
+    try:
+        await invoke(host, 'one original input', invocation_id='original-before-explicit-intent')
+    except BaseException as error:
+        seen['root_error'] = error
+    lines = witness.read_text().splitlines() if witness.exists() else []
+    if uncertain:
+        assert lines == ['original'], 'a new explicit operation identity bypassed the original live uncertainty fence'
+        assert 'nested_error' in seen and 'root_error' in seen
+        assert any(node is original for node in execution_evidence_carriers(seen['root_error']))
+        assert await host.tool_effect_store.database.fetchone('SELECT COUNT(*) FROM tool_effect_operations') == (1,), 'a fenced parent admitted a replacement durable operation'
+        assert await host.tool_effect_store.database.fetchall('SELECT state FROM tool_effect_claims') == [('UNCONFIRMED',)]
+    else:
+        assert lines == ['nested'] and 'nested_error' not in seen and 'root_error' not in seen
+
+
+@pytest.mark.parametrize('uncertain', [False, True], ids=['known-refusal', 'uncertain'])
+async def test_nested_admitted_input_retains_one_original_live_uncertainty_fence(bound_operation, uncertain):
+    from kestrel_sdk.resources import ResourceOutcomeUnknown
+    from kestrel_sovereign.execution_custody import execution_evidence_carriers
+    from kestrel_sovereign.tools.effect_journal import current_tool_effect_turn, execute_tool_effect
+    from tests.unit.test_tool_effect_invocation import governed
+    host, _binding, witness = bound_operation
+    original, seen = ResourceOutcomeUnknown('nested original effect reply unavailable'), {}
+
+    async def first():
+        witness.write_text('original\n')
+        raise original
+
+    async def later():
+        with witness.open('a') as stream:
+            stream.write('later\n')
+        return 'acknowledged'
+
+    @governed
+    async def nested(agent, user_input, *, invocation_id=None):
+        await execute_tool_effect(agent, registration='original-nested-input',
+            arguments=({} if uncertain else {'invalid_json': object()}), execute=first)
+
+    @governed
+    async def invoke(agent, user_input, *, invocation_id=None):
+        seen['parent'] = current_tool_effect_turn(agent)
+        try:
+            await nested(agent, 'original nested input', invocation_id='original-nested-input')
+        except BaseException as error:
+            seen['nested_error'] = error
+        try:
+            await execute_tool_effect(agent, registration='later-parent-effect', arguments={}, execute=later)
+        except BaseException as error:
+            seen['later_error'] = error
+
+    try:
+        await invoke(host, 'original owning input', invocation_id='original-parent-input')
+    except BaseException as error:
+        seen['root_error'] = error
+    assert 'nested_error' in seen
+    if uncertain:
+        assert witness.read_text().splitlines() == ['original'], 'nested uncertainty escaped its original owning input fence'
+        assert 'later_error' in seen and 'root_error' in seen
+        assert any(node is original for node in execution_evidence_carriers(seen['root_error']))
+        assert await host.tool_effect_store.database.fetchall('SELECT state FROM tool_effect_claims') == [('UNCONFIRMED',)]
+    else:
+        assert witness.read_text().splitlines() == ['later']
+        assert 'later_error' not in seen and 'root_error' not in seen
+
+
+async def test_fresh_intent_requires_original_parent_native_membership(bound_operation):
+    from kestrel_sovereign.execution_custody import ExecutionAuthorityError
+    from tests.unit.test_tool_effect_execution import admit
+    from tests.unit.test_tool_effect_invocation import governed
+    host, _binding, witness = bound_operation
+
+    @governed
+    async def invoke(agent, user_input, *, invocation_id=None):
+        # A raw Task inherits the business context, but has no original native
+        # admission. A new intent must refuse before creating another SQL row.
+        with pytest.raises(ExecutionAuthorityError, match='original native privacy lifetime'):
+            await asyncio.create_task(admit(agent, key='unadmitted-copied-parent'))
+        assert await host.tool_effect_store.database.fetchone('SELECT COUNT(*) FROM tool_effect_operations') == (1,)
+
+    await invoke(host, 'original admitted input', invocation_id='original-parent-native-membership')
+    assert not witness.exists()

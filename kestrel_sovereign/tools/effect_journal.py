@@ -147,6 +147,11 @@ class ToolEffectTurn:
 
     def require_confirmed(self) -> None:
         """An uncertain effect cannot be followed by ordinary turn output."""
+        if not self.unconfirmed:
+            control = self.privacy_lock.native_scope_control(
+                self.privacy_scope, root=self.native_root)
+            if requires_tool_effect_reconciliation(control):
+                _record_uncertain_effect(self, control)
         if self.unconfirmed:
             raise ToolEffectOutcomeUnconfirmed("tool_effect_outcome_unconfirmed") from self.unconfirmed[0]
 
@@ -280,6 +285,11 @@ async def admit_tool_effect_turn(
     invocation_id: str,
 ) -> ToolEffectTurn | None:
     """Admit before model work, retaining no journal rows in volatile modes."""
+    parent = current_tool_effect_turn(owner)
+    if parent is not None:
+        parent.require_live(owner)
+        parent.privacy_lock.require_native_scope(parent.privacy_scope)
+        parent.require_confirmed()
     async with owner._get_durable_persistence_gate().shared_lock():
         privacy = owner.privacy_config
         if privacy is None:
@@ -291,7 +301,11 @@ async def admit_tool_effect_turn(
             namespace=namespace, client_key=logical_operation_key(client_key),
             request=request,
         )
-        return ToolEffectTurn(owner, store, attempt, invocation_id)
+        # Nested intent keys name separate durable operations, but cannot
+        # replace this original input's live uncertainty fence in either
+        # direction. Native membership was checked before admission above.
+        return ToolEffectTurn(owner, store, attempt, invocation_id,
+            unconfirmed=parent.unconfirmed if parent is not None else [])
 
 
 async def execute_tool_effect(

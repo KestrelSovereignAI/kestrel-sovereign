@@ -2278,6 +2278,17 @@ producers keep its handoff active until consumer advance; non-streaming journal
 returns keep that same handoff active through journal retirement. If retirement
 raises before the result reaches its consumer, both the native source and the
 original caller withdrawal remain explicit. The handoff grants no work authority.
+Every source graph, including ordinary SDK unknowns and cancellation, stays
+immutable when the consumer itself fails; the canonical observation composer
+retains the finite delivery error separately.
+
+A fresh explicit intent must pass its original caller's live/native-scope and
+uncertainty checks before durable admission. Admitted same-input nested turns
+share one live uncertainty fence in both directions, while retaining distinct
+durable operation keys. No copied context or unrelated task acquires authority.
+The live fence also observes already-completed native controls through the same
+original-child selector used by journal closure. It projects physical sources,
+not a finite observer's withdrawal or ordinary foreign consumer failures.
 
 Claim admission and protected pre-body audit use the same reconciliation
 classification as Root closure. A native COMMIT acknowledgment or retirement
