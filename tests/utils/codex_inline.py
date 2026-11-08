@@ -13,7 +13,9 @@ from __future__ import annotations
 import asyncio
 from typing import Any
 
-from kestrel_sovereign.execution_custody import is_tool_execution_terminal_error
+from kestrel_sovereign.execution_custody import (
+    execution_observation_error, is_tool_execution_terminal_error,
+)
 from kestrel_sovereign._async_ownership import OwnedCallbackScope, await_owned_task
 
 
@@ -46,6 +48,8 @@ class OwnedCallbackReader:
         self.baseline = dict(contextvars.copy_context().items())
         while (call := await self._calls.get()) is not None:
             scope, *request = call
+            if scope.closed:
+                continue
             handler = scope.start(lambda request=request: self._handle(*request),
                 name='owned-test-codex-callback')
             self._handlers.add(handler)
@@ -56,7 +60,9 @@ class OwnedCallbackReader:
 
     async def _handle(self, executor, name, args, done: asyncio.Future) -> None:
         try:
-            done.set_result(await self._execute(executor, name, args))
+            result = await self._execute(executor, name, args)
+            if not done.done():
+                done.set_result(result)
         except BaseException as error:
             if not done.done():
                 done.set_exception(error)
@@ -65,16 +71,23 @@ class OwnedCallbackReader:
     async def dispatch(self, executor, name: str = 'tool', args: dict | None = None) -> Any:
         scope = OwnedCallbackScope()
         done = asyncio.get_running_loop().create_future()
+        result, failures = None, []
         try:
             await self._calls.put((scope, executor, name, args or {}, done))
             async with scope.wait():
-                return await done
+                result = await done
+        except BaseException as error:
+            failures.append(error)
         finally:
             scope.close()
             for task in tuple(scope.tasks):
                 outcome = await await_owned_task(task)
                 if outcome.error is not None:
-                    raise outcome.error
+                    failures.append(outcome.error)
+        terminal = execution_observation_error(*failures)
+        if terminal is not None:
+            raise terminal
+        return result
 
     async def stop(self) -> None:
         await self._calls.put(None)
