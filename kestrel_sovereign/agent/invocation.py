@@ -660,9 +660,10 @@ def bind_async_invocation(
                             cleanup_abandoned = True
                             raise
                         try:
-                            from kestrel_sovereign._async_ownership import owned_native_wait
-                            async with owned_native_wait((isolated_operation,)):
-                                result = await isolated_operation
+                            from kestrel_sovereign._async_ownership import owned_native_completion, owned_native_wait
+                            with owned_native_completion(isolated_operation):
+                                async with owned_native_wait((isolated_operation,)):
+                                    result = await isolated_operation
                             require_execution_work(lifecycle_owner)
                             # ``Task.cancel()`` is a no-op once the isolated
                             # child has produced a result.  Stop can linearize
@@ -702,16 +703,6 @@ def bind_async_invocation(
                             # Cancellation is a carrier, not rollback proof.
                             # Preserve native irreversible/control evidence
                             # before checkpointing or classifying typed Stop.
-                            from kestrel_sovereign._async_ownership import owned_task_cancellation_error
-                            original = owned_task_cancellation_error(isolated_operation, error)
-                            if original is not None:
-                                # The creator's completion receipt may already
-                                # have consumed asyncio's one-shot cancellation.
-                                # Use the original carrier even for ordinary
-                                # cancellation before classifying typed Stop.
-                                if not isinstance(original, asyncio.CancelledError) or is_tool_execution_terminal_error(original):
-                                    raise original
-                                error = original
                             if is_tool_execution_terminal_error(error):
                                 raise
                             # An adapter/tool batch may have returned normally

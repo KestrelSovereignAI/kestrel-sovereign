@@ -131,7 +131,7 @@ watcher error. The same check applies before source entry, during unwinding, and
 at terminal close. Genuine teardown cancellation still propagates, with every
 original carrier retained. Multiple pure cancellations use the canonical finite
 cancellation envelope; their original graph remains intact. Invocation and Kite
-recover native-await evidence through `owned_task_cancellation_error` before Stop
+recover native-await evidence through `owned_task_completion_error` before Stop
 classification. Recovery also retains actual caller withdrawal received while
 restoring the privacy writer; the native receipt cannot replace that finite
 observation. A composed cancellation or an explicitly caused cancellation is
@@ -162,3 +162,7 @@ A native Task whose actual coroutine is exactly the canonical wrapper, which
 never entered that wrapper, cannot have run an outer completion epilogue. This
 positive identity/entry proof retains its known gate failure without inventing
 completion uncertainty. An outer custom-factory coroutine does not satisfy it.
+
+Native result consumers enclose their existing await and privacy writer restoration in `owned_native_completion`. Success and ordinary exceptions must consult the same authoritative receipt as cancellation before returning output or retiring a request. This synchronous observation scope adds no Task, waiter or await and preserves native cancellation delivery. SQLite read shielding retains its original queue-drain policy.
+
+Session-backed lifecycle owners apply the same tool-terminal classifier through release, retry, status, compensation and close. SDK or audit uncertainty retains the original resource and physical attempt; it cannot become ordinary cancellation or authorize a replacement release. Explicit denial-scope evidence still distinguishes a veto before physical work from unresolved release, and existing deadlines remain unchanged.

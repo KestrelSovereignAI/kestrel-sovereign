@@ -933,17 +933,17 @@ async def test_private_cancellation_is_bound_to_its_original_admission_and_carri
 
 
 def test_native_cancellation_helpers_reject_invalid_input():
-    from kestrel_sovereign._async_ownership import cancel_owned_task, owned_task_cancellation_error
+    from kestrel_sovereign._async_ownership import cancel_owned_task, owned_task_completion_error
     with pytest.raises(TypeError, match="original native Task"):
         cancel_owned_task(object())
-    with pytest.raises(TypeError, match="requires CancelledError"):
-        owned_task_cancellation_error(object(), RuntimeError("not cancellation"))
+    with pytest.raises(TypeError, match="requires BaseException or None"):
+        owned_task_completion_error(object(), object())
 
 
 @pytest.mark.asyncio
 async def test_native_cancellation_recovery_never_uses_exception_truthiness():
     from kestrel_sdk.resources import ResourceOutcomeUnknown
-    from kestrel_sovereign._async_ownership import owned_task_cancellation_error
+    from kestrel_sovereign._async_ownership import owned_task_completion_error
     class FalsyCancellation(asyncio.CancelledError):
         def __bool__(self):
             return False
@@ -955,7 +955,7 @@ async def test_native_cancellation_recovery_never_uses_exception_truthiness():
     try:
         await owner
     except asyncio.CancelledError as received:
-        assert owned_task_cancellation_error(owner, received) is original, (
+        assert owned_task_completion_error(owner, received) is original, (
             "Native cancellation recovery replaced an original because its truth value was false")
     else:
         pytest.fail("Original native cancellation disappeared")
@@ -966,7 +966,7 @@ async def test_native_cancellation_recovery_never_uses_exception_truthiness():
 async def test_native_cancellation_recovery_preserves_actual_writer_restoration_withdrawal(
     tmp_path, withdraw_during_restoration,
 ):
-    from kestrel_sovereign._async_ownership import owned_native_wait, owned_task_cancellation_error, owned_task_error
+    from kestrel_sovereign._async_ownership import owned_native_wait, owned_task_completion_error, owned_task_error
     from kestrel_sovereign.execution_custody import ExecutionCommitOutcomeError, _explicit_control_chain
     from kestrel_sovereign.storage.privacy_wrapper import ReentrantTransitionLock
     lock = ReentrantTransitionLock()
@@ -996,7 +996,7 @@ async def test_native_cancellation_recovery_preserves_actual_writer_restoration_
                         await source
                 except asyncio.CancelledError as received:
                     received_errors.append(received)
-                    recovered = owned_task_cancellation_error(source, received)
+                    recovered = owned_task_completion_error(source, received)
                     assert lock._writer is asyncio.current_task(), "Cancellation escaped before original writer restoration"
                     return source, recovered
                 pytest.fail("Original native cancellation disappeared")
@@ -1039,7 +1039,7 @@ async def test_native_cancellation_recovery_preserves_actual_writer_restoration_
 async def test_original_completion_capture_cannot_rely_on_callback_registration(tmp_path, mode, kind, handling_error):
     import inspect
     from kestrel_sdk.resources import ResourceOutcomeUnknown
-    from kestrel_sovereign._async_ownership import OwnedTaskAdmission, owned_task_cancellation_error, owned_task_error
+    from kestrel_sovereign._async_ownership import OwnedTaskAdmission, owned_task_completion_error, owned_task_error
     from kestrel_sovereign.execution_custody import (
         ToolAuditUnconfirmedError, _explicit_control_chain, execution_cleanup_debts,
         is_tool_execution_terminal_error,
@@ -1105,7 +1105,7 @@ async def test_original_completion_capture_cannot_rely_on_callback_registration(
         try:
             value = await owner
         except asyncio.CancelledError as received:
-            recovered = owned_task_cancellation_error(owner, received)
+            recovered = owned_task_completion_error(owner, received)
         else:
             assert kind is None and value == "original outer success"
             recovered = owned_task_error(owner)
@@ -1134,3 +1134,54 @@ async def test_original_completion_capture_cannot_rely_on_callback_registration(
         for owner in owners:
             await await_owned_task(owner)
         payload.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", [None, "ordinary", "sdk", "audit"])
+@pytest.mark.parametrize("observer_fails", [False, True])
+async def test_native_completion_retains_independent_observer_io_failure(tmp_path, kind, observer_fails):
+    from kestrel_sdk.resources import ResourceOutcomeUnknown
+    from kestrel_sovereign._async_ownership import owned_native_completion
+    from kestrel_sovereign.execution_custody import ToolAuditUnconfirmedError, _explicit_control_chain
+    source = RuntimeError("original native physical failure") if kind == "ordinary" else None
+    if kind in {"sdk", "audit"}:
+        source = asyncio.CancelledError("original native physical cancellation")
+        source.__cause__ = (ResourceOutcomeUnknown("original native effect uncertain") if kind == "sdk"
+            else ToolAuditUnconfirmedError("original native audit uncertain"))
+    effect = tmp_path / "original-native-source-effect"
+    async def operation():
+        effect.write_text("original native source physically completed")
+        if source is not None:
+            raise source
+        return "original physical success"
+    owner = create_owned_task(operation(), retain_originals=True)
+    handle = (tmp_path / "actual-observer-receipt").open("w")
+    observer_errors = []
+    observed, value = None, None
+    try:
+        with owned_native_completion(owner):
+            try:
+                value = await owner
+            finally:
+                handle.close()
+                if observer_fails:
+                    try:
+                        handle.write("receipt after actual close")
+                    except ValueError as error:
+                        observer_errors.append(error)
+                        raise
+    except BaseException as error:
+        observed = error
+    finally:
+        handle.close()
+        await await_owned_task(owner)
+    chain = tuple(_explicit_control_chain(observed))
+    if source is not None:
+        assert source in chain
+    if observer_fails:
+        assert len(observer_errors) == 1 and observer_errors[0] in chain, (
+            "Original native completion erased independent observer I/O failure")
+    elif source is None:
+        assert observed is None and value == "original physical success"
+    assert owner.done() and handle.closed
+    assert effect.read_text() == "original native source physically completed"

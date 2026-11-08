@@ -1,5 +1,8 @@
 """Real callback admission and physical closure keep finite observer evidence local."""
 import asyncio
+import sys
+
+
 from contextlib import AsyncExitStack
 
 import pytest
@@ -14,6 +17,209 @@ from kestrel_sovereign.llm.codex_app_server import CodexAppServerClient
 from kestrel_sovereign.storage.privacy_wrapper import ReentrantTransitionLock
 from tests.unit.test_tool_effect_execution import owner as owner
 from tests.unit.test_tool_effect_invocation import governed
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(sys.version_info < (3, 12), reason="native eager Task requires Python 3.12")
+@pytest.mark.parametrize("kind", [None, "ordinary", "sdk", "audit"])
+async def test_original_sqlite_read_shield_observes_admission_receipt(owner, monkeypatch, kind):
+    from kestrel_sovereign.execution_custody import ToolAuditUnconfirmedError, _explicit_control_chain
+    backend = owner.tool_effect_store.database.backend
+    connection = backend._connection
+    cursor = await connection.execute("SELECT 7 AS original_native_value")
+    original_close, original_execute = cursor.close, connection.execute
+    closes, results, owners = [], [], []
+    publication = (ResourceOutcomeUnknown("original SQL read admission uncertain") if kind == "sdk"
+        else ToolAuditUnconfirmedError("original SQL read audit uncertain") if kind == "audit"
+        else RuntimeError("original SQL read callback publication refused"))
+    async def close():
+        await original_close()
+        closes.append(cursor)
+    def execute(*args, **kwargs):
+        result = original_execute(*args, **kwargs)
+        results.append(result)
+        return result
+    class OriginalTask(asyncio.Task):
+        def add_done_callback(self, callback, *, context=None):
+            if kind is not None and getattr(callback, "__name__", "") == "close_unstarted":
+                raise publication
+            return super().add_done_callback(callback, context=context)
+    loop, previous = asyncio.get_running_loop(), asyncio.get_running_loop().get_task_factory()
+    def factory(loop, coroutine, **options):
+        frame = getattr(coroutine, "cr_frame", None)
+        operation = frame.f_locals.get("operation") if frame is not None else None
+        if not results or operation is not results[-1]:
+            return previous(loop, coroutine, **options) if previous else asyncio.Task(coroutine, loop=loop, **options)
+        async def outer():
+            coroutine.close()
+            return cursor
+        options["eager_start"] = True
+        task = OriginalTask(outer(), loop=loop, **options)
+        owners.append(task)
+        return task
+    try:
+        monkeypatch.setattr(cursor, "close", close)
+        monkeypatch.setattr(connection, "execute", execute)
+        loop.set_task_factory(factory)
+        observed = None
+        try:
+            value = await backend._fetch_on_connection(connection, "SELECT 7 AS original_native_value", (), one=True)
+        except BaseException as error:
+            observed = error
+        loop.set_task_factory(previous)
+        if kind is None:
+            assert observed is None and value == (7,)
+        else:
+            assert publication in tuple(_explicit_control_chain(observed)), (
+                "Native SQL read shield bypassed original admission receipt")
+        assert len(owners) == len(results) == 1 and owners[0].done()
+        assert closes == [cursor]
+        assert not backend._pending_read_executions
+    finally:
+        loop.set_task_factory(previous)
+        for task in owners:
+            await await_owned_task(task)
+        if not closes:
+            await original_close()
+
+def native_training_component(*, release_session=None):
+    from kestrel_sovereign.features.training.adapters._session_training_lifecycle import (
+        SessionProviderHooks, SessionTrainingLifecycle,
+    )
+    async def unused_provider(*args, **kwargs):
+        raise AssertionError("Native component must not call an external provider")
+    return SessionTrainingLifecycle(SessionProviderHooks(
+        provider_name="native-component", display_name="Native component",
+        acquire_session=unused_provider, session_id=lambda session: str(session.name),
+        submit_job=unused_provider,
+        release_session=unused_provider if release_session is None else release_session,
+    ))
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(sys.version_info < (3, 12), reason="native eager Task requires Python 3.12")
+@pytest.mark.parametrize("late", [False, True])
+@pytest.mark.parametrize("kind", [None, "ordinary", "sdk", "audit"])
+@pytest.mark.parametrize("refuse", [False, True])
+async def test_original_bounded_native_owner_keeps_sdk_completion(tmp_path, kind, refuse, late):
+    from kestrel_sovereign._async_ownership import _retain_owned_admission_error
+    from kestrel_sovereign.execution_custody import ToolAuditUnconfirmedError, _explicit_control_chain
+    lifecycle = native_training_component()
+    physical = asyncio.CancelledError("original bounded native completion")
+    if kind == "ordinary":
+        physical = RuntimeError("original bounded physical failure")
+    elif kind is not None:
+        physical.__cause__ = (ResourceOutcomeUnknown("original bounded effect uncertain") if kind == "sdk"
+            else ToolAuditUnconfirmedError("original bounded audit uncertain"))
+    publication = RuntimeError("original bounded completion publication refused")
+    effect = tmp_path / "original-bounded-native-effect"
+    owners, bodies = [], []
+    def physical_effect():
+        effect.write_text("original bounded native effect completed once")
+        if kind is not None:
+            raise physical
+        return "original bounded physical success"
+    async def operation():
+        bodies.append(asyncio.current_task())
+        return physical_effect()
+    class OriginalTask(asyncio.Task):
+        def add_done_callback(self, callback, *, context=None):
+            if refuse and not late and getattr(callback, "__name__", "") == "close_unstarted":
+                raise publication
+            return super().add_done_callback(callback, context=context)
+    loop, previous = asyncio.get_running_loop(), asyncio.get_running_loop().get_task_factory()
+    def publish(task):
+        if refuse:
+            _retain_owned_admission_error(task, publication)
+    def factory(loop, coroutine, **options):
+        async def outer():
+            coroutine.close()
+            return physical_effect()
+        options["eager_start"] = True
+        task = OriginalTask(coroutine if late else outer(), loop=loop, **options)
+        owners.append(task)
+        if late:
+            task.add_done_callback(publish)
+        return task
+    try:
+        loop.set_task_factory(factory)
+        observed = None
+        try:
+            value = await lifecycle._bounded(operation())
+        except BaseException as error:
+            observed = error
+        loop.set_task_factory(previous)
+        chain = tuple(_explicit_control_chain(observed))
+        if kind is not None:
+            assert physical in chain, "Bounded native owner discarded original SDK or audit completion"
+        if refuse:
+            assert publication in chain
+        if kind is None and not refuse:
+            assert observed is None and value == "original bounded physical success"
+        assert len(owners) == 1 and owners[0].done() and len(bodies) == int(late)
+        assert effect.read_text() == "original bounded native effect completed once"
+    finally:
+        loop.set_task_factory(previous)
+        for task in owners:
+            await await_owned_task(task)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", [None, "sdk", "audit"])
+@pytest.mark.parametrize("cancellation", [False, True])
+async def test_original_release_uncertainty_never_replays_file_resource(tmp_path, kind, cancellation):
+    from datetime import datetime, timezone
+    from kestrel_sovereign._async_ownership import run_blocking_operation
+    from kestrel_sovereign.execution_custody import ToolAuditUnconfirmedError, _explicit_control_chain
+    from kestrel_sovereign.features.training.adapters._session_training_lifecycle import (
+        ReleaseIntent, SessionJobPhase, SessionTrainingRecord,
+    )
+    from kestrel_sovereign.features.training.types import TrainingConfig
+    original = (ResourceOutcomeUnknown("original physical release uncertain") if kind == "sdk"
+        else ToolAuditUnconfirmedError("original release audit uncertain"))
+    if cancellation and kind is not None:
+        carrier = asyncio.CancelledError("original physical release cancellation")
+        carrier.__cause__ = original
+        original = carrier
+    resource = (tmp_path / "original-native-release-resource").open("w")
+    calls = []
+    async def release(session):
+        await run_blocking_operation(session.close)
+        calls.append(session)
+        if kind is not None:
+            raise original
+    lifecycle = native_training_component(release_session=release)
+    now = datetime.now(timezone.utc)
+    record = SessionTrainingRecord(
+        job_id="original-native-release", companion_id="native-component", trigger_word="native",
+        config=TrainingConfig(), session=resource, created_at=now, started_at=now,
+        phase=SessionJobPhase.TRAINING,
+    )
+    lifecycle.records[record.job_id] = record
+    outcomes, errors, tasks = [], [], []
+    try:
+        for _ in range(2):
+            error, value = None, None
+            try:
+                value = await lifecycle.release(record.job_id, ReleaseIntent.CLEANUP)
+            except BaseException as observed:
+                error = observed
+            outcomes.append(value)
+            errors.append(error)
+            tasks.append(record.release_task)
+        assert calls == [resource], "Uncertain original release was replayed on its actual resource"
+        assert tasks[0] is tasks[1] and tasks[0].done()
+        if kind is None:
+            assert outcomes == [True, True] and errors == [None, None]
+            assert record.session_released and record.phase is SessionJobPhase.RELEASED
+        else:
+            assert record.native_release_control is not None and not record.session_released
+            assert lifecycle.records[record.job_id] is record
+            assert record.phase is SessionJobPhase.RELEASE_FAILED
+            assert all(original in tuple(_explicit_control_chain(error)) for error in errors)
+        assert resource.closed
+    finally:
+        await run_blocking_operation(resource.close)
 
 
 def sqlite_commit_ack_loss(connection, table=None, *, after, ready=None):

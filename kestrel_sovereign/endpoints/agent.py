@@ -589,11 +589,12 @@ async def invoke_agent(request: Request, http_response: Response):
                 cleanup_opening = opening
                 raise
             try:
-                operation, observation = await evidence_task
+                from kestrel_sovereign._async_ownership import owned_native_completion
+                with owned_native_completion(evidence_task):
+                    operation, observation = await evidence_task
             except asyncio.CancelledError as error:
-                from kestrel_sovereign._async_ownership import owned_task_cancellation_error, is_owned_task_cancellation
-                error = owned_task_cancellation_error(evidence_task, error)
-                if not isinstance(error, asyncio.CancelledError) or is_tool_execution_terminal_error(error):
+                from kestrel_sovereign._async_ownership import is_owned_task_cancellation
+                if is_tool_execution_terminal_error(error):
                     raise error
                 if (
                     owner_task is not None

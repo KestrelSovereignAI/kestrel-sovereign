@@ -2623,14 +2623,15 @@ class SQLiteBackend(DatabaseBackend):
         body_error = None
         try:
             if conn is self._connection:
-                from kestrel_sovereign._async_ownership import create_owned_task
+                from kestrel_sovereign._async_ownership import create_owned_task, owned_native_completion
                 execute_task = create_owned_task(conn.execute(query, params))
                 self._pending_read_executions.add(execute_task)
                 try:
                     # Do not cancel the native cursor-return owner. If this
                     # caller unwinds, the cancellation drain closes that exact
                     # returned statement before permitting another write.
-                    cursor = await asyncio.shield(execute_task)
+                    with owned_native_completion(execute_task):
+                        cursor = await asyncio.shield(execute_task)
                 except asyncio.CancelledError as error:
                     # shield synthesizes a cancellation when its child raises
                     # CancelledError. Recover that child's original receipt;

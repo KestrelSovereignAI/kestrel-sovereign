@@ -38,6 +38,96 @@ def _kite_invocation_request(agent, request_id):
 
 
 @pytest.mark.asyncio
+@pytest.mark.skipif(sys.version_info < (3, 12), reason="native eager Task requires Python 3.12")
+@pytest.mark.parametrize("physical_kind", [None, "ordinary", "sdk"])
+@pytest.mark.parametrize("publication_kind", [None, "ordinary", "sdk", "audit"])
+@pytest.mark.parametrize("stop", [False, True])
+async def test_actual_privacy_invocation_observes_every_native_completion(
+    tmp_path, monkeypatch, physical_kind, publication_kind, stop,
+):
+    from kestrel_sdk.resources import ResourceOutcomeUnknown
+    from kestrel_sovereign.agent.invocation import InvocationCancelledError
+    from kestrel_sovereign.execution_custody import ToolAuditUnconfirmedError, _explicit_control_chain
+    monkeypatch.setattr("kestrel_sovereign.entrypoints.discover_entry_point_classes", lambda *_args, **_kwargs: {})
+    agent, db = await _partial_native_agent(tmp_path, monkeypatch)
+    await db.execute("CREATE TABLE native_completion_payload_effects (id INTEGER)")
+    lock = agent._get_privacy_transition_lock()
+    request_id = "original-privacy-native-completion"
+    physical = RuntimeError("original physical invocation failure") if physical_kind == "ordinary" else None
+    if physical_kind == "sdk":
+        physical = asyncio.CancelledError("original physical invocation cancellation")
+        physical.__cause__ = ResourceOutcomeUnknown("original physical invocation uncertain")
+    publication = RuntimeError("original privacy ownership publication failure") if publication_kind == "ordinary" else None
+    if publication_kind in {"sdk", "audit"}:
+        publication = asyncio.CancelledError("original privacy ownership publication cancellation")
+        publication.__cause__ = (ResourceOutcomeUnknown("original publication outcome uncertain")
+            if publication_kind == "sdk" else ToolAuditUnconfirmedError("original publication audit uncertain"))
+    effect = tmp_path / "original-privacy-invocation-physical-effect"
+    owners, generations, publications = [], [], []
+    @bind_async_invocation("request_id", track_request_lifecycle=True)
+    async def invoke(self, request_id=None):
+        await db.execute("INSERT INTO native_completion_payload_effects VALUES (1)")
+        return "payload must stay unentered"
+    class OriginalTask(asyncio.Task):
+        def add_done_callback(self, callback, *, context=None):
+            if getattr(callback, "__name__", "") == "completed":
+                publications.append(self)
+                if publication is not None:
+                    raise publication
+            return super().add_done_callback(callback, context=context)
+    loop, previous = asyncio.get_running_loop(), asyncio.get_running_loop().get_task_factory()
+    def factory(loop, coroutine, **options):
+        operation = _actual_operation(coroutine)
+        code = getattr(operation, "cr_code", None)
+        if code is None or not code.co_qualname.endswith(".start_owned_native_work.<locals>.run"):
+            return previous(loop, coroutine, **options) if previous else asyncio.Task(coroutine, loop=loop, **options)
+        async def outer():
+            generations.append(agent._active_request_generations[request_id])
+            coroutine.close()
+            effect.write_text("original native physical effect completed once")
+            if stop:
+                assert agent.cancel_current_request(request_id)
+            if physical is not None:
+                raise physical
+            return "original physical success"
+        options["eager_start"] = True
+        task = OriginalTask(outer(), loop=loop, **options)
+        owners.append(task)
+        return task
+    async def drive():
+        async with lock:
+            return await invoke(agent, request_id=request_id)
+    try:
+        loop.set_task_factory(factory)
+        outcome = await await_owned_task(create_owned_task(drive(), retain_originals=True))
+        loop.set_task_factory(previous)
+        chain = tuple(_explicit_control_chain(outcome.error))
+        if publication is not None:
+            assert publication in chain, "Native invocation completion bypassed original publication receipt"
+        if physical is not None:
+            assert physical in chain
+        if publication is physical is None:
+            if stop:
+                assert isinstance(outcome.error, InvocationCancelledError)
+            else:
+                assert outcome.error is None and outcome.result == "original physical success"
+        terminal = physical_kind == "sdk" or publication_kind in {"sdk", "audit"}
+        assert await agent.wait_for_request_completion(request_id, generation=generations[0]) is (
+            RequestCompletionDisposition.ABANDONED if terminal else RequestCompletionDisposition.COMPLETED), (
+                "Native invocation receipt uncertainty retired as successful completion")
+        assert owners == publications and len(owners) == 1 and owners[0].done()
+        assert effect.read_text() == "original native physical effect completed once"
+        assert await db.fetchval("SELECT COUNT(*) FROM native_completion_payload_effects") == 0
+        assert not lock.locked() and not lock._native_work
+    finally:
+        loop.set_task_factory(previous)
+        for task in owners:
+            await await_owned_task(task)
+        await agent.llm_service.close()
+        await db.close()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("mode", ["allocation", "binding", "callback-before", "callback-after",
                                   "canonical-before", "canonical-after"])
 @pytest.mark.parametrize("prior", [False, True])

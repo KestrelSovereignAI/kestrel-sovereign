@@ -267,22 +267,48 @@ def is_owned_task_cancellation(task, error) -> bool:
         and not is_tool_execution_terminal_error(error))
 
 
-def owned_task_cancellation_error(task, cancellation):
-    """Recover a native await's original receipt before finite Stop handling."""
-    if not isinstance(cancellation, asyncio.CancelledError):
-        raise TypeError("native cancellation recovery requires CancelledError")
+def owned_task_completion_error(task, observed=None):
+    """Reconcile every native completion with its authoritative original receipt."""
+    if observed is not None and not isinstance(observed, BaseException):
+        raise TypeError("native completion observation requires BaseException or None")
     original = owned_task_error(task) if task.done() else None
     if original is None:
-        return cancellation
+        return observed
     from kestrel_sovereign.execution_custody import (
-        execution_observation_error, execution_observer_cancellations,
+        execution_evidence_carriers, execution_observation_error,
+        execution_observer_cancellations,
     )
     # A bare native await can consume the Task's exception and manufacture a
     # cancellation surrogate. Recover its receipt, while retaining any actual
     # withdrawal already composed during privacy writer restoration.
-    if execution_observer_cancellations(cancellation):
-        return execution_observation_error(original, cancellation, prefer_cancellation=True)
-    return original
+    if isinstance(observed, asyncio.CancelledError):
+        if execution_observer_cancellations(observed):
+            return execution_observation_error(original, observed, prefer_cancellation=True)
+        return original
+    if observed is None or any(error is observed for error in execution_evidence_carriers(original)):
+        return original
+    return execution_observation_error(original, observed)
+
+
+@contextmanager
+def owned_native_completion(task):
+    """Observe an original native await without changing its ownership or timing.
+
+    Enclose the existing native wait and writer restoration. Physical success,
+    ordinary failure and cancellation all reconcile the same original receipt;
+    no replacement Task, completion waiter or additional await is introduced.
+    """
+    try:
+        yield
+    except BaseException as observed:
+        terminal = owned_task_completion_error(task, observed)
+        if terminal is observed:
+            raise
+        raise terminal
+    else:
+        terminal = owned_task_completion_error(task)
+        if terminal is not None:
+            raise terminal
 
 
 def _has_owned_task_metadata(task) -> bool:

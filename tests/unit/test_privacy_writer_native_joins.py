@@ -11,14 +11,15 @@ from kestrel_sovereign.storage.privacy_wrapper import ReentrantTransitionLock, b
 
 @pytest.mark.asyncio
 @pytest.mark.skipif(sys.version_info < (3, 12), reason="native eager Task requires Python 3.12")
+@pytest.mark.parametrize("native_observation", [False, True])
 @pytest.mark.parametrize("withdraw_cache", [False, True])
 @pytest.mark.parametrize("physical_kind", [None, "ordinary", "sdk", "audit"])
 @pytest.mark.parametrize("publication_kind", [None, "ordinary", "sdk", "audit"])
 async def test_eager_native_completion_keeps_later_privacy_publication_failure(
-    tmp_path, withdraw_cache, physical_kind, publication_kind,
+    tmp_path, withdraw_cache, physical_kind, publication_kind, native_observation,
 ):
     from kestrel_sdk.resources import ResourceOutcomeUnknown
-    from kestrel_sovereign._async_ownership import OwnedTaskAdmission
+    from kestrel_sovereign._async_ownership import OwnedTaskAdmission, owned_native_completion
     from kestrel_sovereign.execution_custody import (
         ToolAuditUnconfirmedError, _explicit_control_chain,
     )
@@ -67,18 +68,27 @@ async def test_eager_native_completion_keeps_later_privacy_publication_failure(
         loop.set_task_factory(factory)
         task = lock.start_owned_native_work(operation, admission=receipt)
         loop.set_task_factory(previous)
-        outcome = await await_owned_task(task)
-        chain = tuple(_explicit_control_chain(outcome.error))
+        if native_observation:
+            result, observed = None, None
+            try:
+                with owned_native_completion(task):
+                    result = await task
+            except BaseException as error:
+                observed = error
+        else:
+            outcome = await await_owned_task(task)
+            result, observed = outcome.result, outcome.error
+        chain = tuple(_explicit_control_chain(observed))
         if publication is not None:
             assert publication in chain, "Physical completion snapshot erased later privacy publication failure"
         if physical is not None:
             assert physical in chain, "Late publication erased the single captured original physical failure"
         if physical is publication is None:
-            assert outcome.error is None and outcome.result == "original physical success"
-        assert owned_task_error(task) is outcome.error
-        assert (await await_owned_task(task)).error is outcome.error
+            assert observed is None and result == "original physical success"
+        assert owned_task_error(task) is observed
+        assert (await await_owned_task(task)).error is observed
         await asyncio.sleep(0)
-        assert owned_task_error(task) is outcome.error
+        assert owned_task_error(task) is observed
         assert reads == [task], "Late admission failure re-harvested consumed original native completion"
         assert owners == publications == [task] and receipt.task is task and task.done()
         assert not bodies and not lock._native_work and not lock.locked()

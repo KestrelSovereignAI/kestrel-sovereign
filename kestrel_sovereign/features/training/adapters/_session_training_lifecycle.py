@@ -87,13 +87,14 @@ from kestrel_sovereign._async_ownership import (
     OwnedTaskOutcome,
     await_owned_task,
     create_owned_task,
+    owned_task_completion_error,
     owned_task_error,
     raise_owned_outcome,
 )
 from kestrel_sovereign.execution_custody import (
     execution_denial_scopes,
     execution_terminal_error,
-    is_execution_control_error,
+    is_tool_execution_terminal_error,
 )
 from kestrel_sovereign.kestrel_config.timeouts import (
     TRAINING_SESSION_CLOSE_DEADLINE,
@@ -467,7 +468,7 @@ class SessionTrainingLifecycle(Generic[SessionT]):
     def _work_control(self, record):
         errors = [self._task_error(record, field) for field in
                   ("submission_task", "compensation_task")]
-        if not any(is_execution_control_error(error) for error in errors):
+        if not any(is_tool_execution_terminal_error(error) for error in errors):
             return None
         return execution_terminal_error(*errors, retain_originals=True,
                                         isolate_control_originals=True)
@@ -487,10 +488,10 @@ class SessionTrainingLifecycle(Generic[SessionT]):
         # Only admission or PHYSICAL release uncertainty may fence retries.
         native_release = (
             record.task_opening_errors.get("release_task")
-            if is_execution_control_error(record.task_opening_errors.get("release_task"))
+            if is_tool_execution_terminal_error(record.task_opening_errors.get("release_task"))
             else record.physical_release_error if record.release_body_started else error
         )
-        if is_execution_control_error(native_release) and record.native_release_control is None:
+        if is_tool_execution_terminal_error(native_release) and record.native_release_control is None:
             debt = RuntimeError("original accepted release remains unresolved")
             debt._kestrel_native_retirement_debts = ((record.session, task),)
             record.native_release_control = execution_terminal_error(native_release, debt,
@@ -515,7 +516,7 @@ class SessionTrainingLifecycle(Generic[SessionT]):
         native = execution_terminal_error(self._work_control(record),
             record.native_release_control, self._task_error(record, "release_task"),
             retain_originals=True, isolate_control_originals=True)
-        if is_execution_control_error(native):
+        if is_tool_execution_terminal_error(native):
             raise native
         status = phase_status(
             record,
@@ -596,7 +597,7 @@ class SessionTrainingLifecycle(Generic[SessionT]):
             raise AssertionError("rejected opening did not propagate")
         if opening.cancelled():
             original = owned_task_error(opening)
-            if is_execution_control_error(original):
+            if is_tool_execution_terminal_error(original):
                 raise execution_terminal_error(
                     original, retain_originals=True, isolate_control_originals=True,
                 )
@@ -758,7 +759,7 @@ class SessionTrainingLifecycle(Generic[SessionT]):
             isolate_control_originals=True,
         )
         if failure is not None:
-            native = is_execution_control_error(failure) and execution_denial_scopes(failure) != ()
+            native = is_tool_execution_terminal_error(failure) and execution_denial_scopes(failure) != ()
             control = None
             if native:
                 debt = RuntimeError("original rejected session release is unresolved")
@@ -777,7 +778,7 @@ class SessionTrainingLifecycle(Generic[SessionT]):
                 release_task=(physical.task or release) if native else None,
                 native_release_control=control,
             )
-            if native or is_execution_control_error(cause):
+            if native or is_tool_execution_terminal_error(cause):
                 raise execution_terminal_error(
                     cause, failure, control, outcome.cancellation,
                     retain_originals=True, isolate_control_originals=True,
@@ -844,7 +845,7 @@ class SessionTrainingLifecycle(Generic[SessionT]):
             self._settle_stopping(record)
             raise
         except Exception as error:
-            if is_execution_control_error(error):
+            if is_tool_execution_terminal_error(error):
                 raise
             logger.error(
                 "[%s] %s background submission failed: %s",
@@ -1052,7 +1053,7 @@ class SessionTrainingLifecycle(Generic[SessionT]):
             native = execution_terminal_error(self._work_control(record),
                 self._task_error(record, "release_task"), retain_originals=True,
                 isolate_control_originals=True)
-            if is_execution_control_error(native):
+            if is_tool_execution_terminal_error(native):
                 raise native
             return True
         outcome = await await_owned_task(self._ensure_release(record, intent))
@@ -1065,7 +1066,7 @@ class SessionTrainingLifecycle(Generic[SessionT]):
         return self._release_result(outcome, job_id)
 
     def _release_result(self, outcome: OwnedTaskOutcome[bool], job_id: str) -> bool:
-        if not is_execution_control_error(outcome.error) and outcome.cancellation is None and isinstance(
+        if not is_tool_execution_terminal_error(outcome.error) and outcome.cancellation is None and isinstance(
             outcome.error, asyncio.CancelledError
         ):
             logger.error(
@@ -1110,7 +1111,7 @@ class SessionTrainingLifecycle(Generic[SessionT]):
                 resource=record.session,
             )
         except BaseException as error:
-            if is_execution_control_error(error):
+            if is_tool_execution_terminal_error(error):
                 debt = RuntimeError("original session release admission failed")
                 debt._kestrel_native_retirement_debts = ((record.session, record.release_task),)
                 record.native_release_control = execution_terminal_error(
@@ -1145,7 +1146,7 @@ class SessionTrainingLifecycle(Generic[SessionT]):
                         SessionJobPhase.RELEASE_FAILED,
                         error=f"session release failed: {error}",
                     )
-                    if is_execution_control_error(error):
+                    if is_tool_execution_terminal_error(error):
                         if execution_denial_scopes(error) != ():
                             debt = RuntimeError("original session release is unresolved")
                             debt._kestrel_native_retirement_debts = ((record.session, physical.task),)
@@ -1157,7 +1158,7 @@ class SessionTrainingLifecycle(Generic[SessionT]):
                         raise
                     if not isinstance(error, Exception):
                         raise
-                    if is_execution_control_error(operational):
+                    if is_tool_execution_terminal_error(operational):
                         raise execution_terminal_error(error, operational,
                             retain_originals=True, isolate_control_originals=True)
                     logger.error(
@@ -1191,7 +1192,7 @@ class SessionTrainingLifecycle(Generic[SessionT]):
             terminal = execution_terminal_error(operational, self._work_control(record),
                 self._task_error(record, "release_task"), retain_originals=True,
                 isolate_control_originals=True)
-            if is_execution_control_error(terminal):
+            if is_tool_execution_terminal_error(terminal):
                 raise terminal
             return True
         except BaseException as error:
@@ -1238,7 +1239,7 @@ class SessionTrainingLifecycle(Generic[SessionT]):
         if task is not None and not task.done():
             return task
         prior = self._task_error(record, "compensation_task")
-        if is_execution_control_error(prior):
+        if is_tool_execution_terminal_error(prior):
             if task is not None:
                 return task
             raise prior
@@ -1266,7 +1267,7 @@ class SessionTrainingLifecycle(Generic[SessionT]):
         try:
             result = await self._bounded(cancel(record, provider_job_id))
         except Exception as error:
-            if is_execution_control_error(error):
+            if is_tool_execution_terminal_error(error):
                 raise
             record.compensation_error = str(error)
             logger.warning(
@@ -1298,11 +1299,15 @@ class SessionTrainingLifecycle(Generic[SessionT]):
             opening, task = error, receipt.task
         if opening is None:
             try:
-                return await asyncio.wait_for(task, timeout=self._timeouts.release)
+                result = await asyncio.wait_for(task, timeout=self._timeouts.release)
+                terminal = owned_task_error(task)
+                if terminal is not None:
+                    raise terminal
+                return result
             except BaseException as error:
                 opening = error
         outcome = await await_owned_task(task)
-        native = is_execution_control_error(outcome.error) or is_execution_control_error(opening)
+        native = is_tool_execution_terminal_error(outcome.error) or is_tool_execution_terminal_error(opening)
         if native:
             current = asyncio.current_task()
             withdrawal = opening if isinstance(opening, asyncio.CancelledError) and current is not None and current.cancelling() else None
@@ -1311,7 +1316,11 @@ class SessionTrainingLifecycle(Generic[SessionT]):
                 None if isinstance(opening, asyncio.CancelledError) and withdrawal is None else opening,
                 retain_originals=True, isolate_control_originals=True,
             )
-        raise opening
+        if isinstance(opening, TimeoutError):
+            # The existing deadline owns its ordinary cancellation ACK. A
+            # terminal receipt above still takes precedence over that timeout.
+            raise opening
+        raise owned_task_completion_error(task, opening)
 
     # ------------------------------------------------------------------
     # Close
@@ -1384,12 +1393,12 @@ class SessionTrainingLifecycle(Generic[SessionT]):
             if record.native_release_control is not None:
                 native_failures.append(record.native_release_control)
             for candidate in (self._work_control(record), self._task_error(record, "release_task")):
-                if is_execution_control_error(candidate):
+                if is_tool_execution_terminal_error(candidate):
                     native_failures.append(candidate)
         for task in set(openings) | {record.release_task for record in self._records.values() if record.release_task is not None}:
             if task.done():
                 original = owned_task_error(task)
-                if is_execution_control_error(original):
+                if is_tool_execution_terminal_error(original):
                     native_failures.append(original)
         incomplete = None
         if retained or pending:
@@ -1417,7 +1426,7 @@ class SessionTrainingLifecycle(Generic[SessionT]):
             try:
                 releases.add(self._ensure_release(record, ReleaseIntent.CLOSE))
             except BaseException as error:
-                if not is_execution_control_error(error):
+                if not is_tool_execution_terminal_error(error):
                     raise
                 failures.append(error)
         return releases
