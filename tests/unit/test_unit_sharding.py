@@ -11,7 +11,7 @@ from tests.utils.ci_budget import CI_WORKFLOW
 from tests.utils.unit_sharding import shard_for_node, verify_manifests
 
 
-def _run_actual_shards(tmp_path: Path, *, selectors=(), distributed=False, reorder=False):
+def _run_actual_shards(tmp_path: Path, *, selectors=(), distributed=False, reorder=False, lastfailed=False):
     reports = tmp_path / 'reports'
     witness = tmp_path / 'executed'
     results = []
@@ -19,6 +19,13 @@ def _run_actual_shards(tmp_path: Path, *, selectors=(), distributed=False, reord
         root = tmp_path / f'run-{index}'
         root.mkdir()
         workers = ['-p', 'xdist.plugin', '-n', '2'] if distributed else []
+        cached = []
+        if lastfailed:
+            cache = root / '.pytest_cache' / 'v' / 'cache'
+            cache.mkdir(parents=True)
+            (cache / 'lastfailed').write_text(json.dumps({
+                f'test_owned_shards.py::test_owned_case[{case}]': True for case in ['alpha', 'beta']}))
+            cached = ['-p', 'cacheprovider', '--lf', 'test_owned_shards.py']
         conftest = 'def pytest_collection_modifyitems(items):\n    items.reverse()\n' if reorder else ''
         result = run_child_pytest(root, conftest=conftest, test_file='test_owned_shards.py',
             source=f'''import pytest
@@ -29,7 +36,7 @@ def test_owned_case(case):
     with Path({str(witness)!r}).open('a') as output:
         output.write(case + '\\n')
 ''', args=['-q', *workers, '-p', 'tests.utils.unit_sharding', '--unit-shard', str(index),
-                '--unit-shard-count', '2', '--unit-shard-manifests', str(reports), *selectors], timeout=15)
+                '--unit-shard-count', '2', '--unit-shard-manifests', str(reports), *selectors, *cached], timeout=15)
         results.append(result)
     return reports, witness, results
 
@@ -157,3 +164,13 @@ def test_later_hooks_may_reorder_the_complete_shard(tmp_path, distributed):
     assert verify_manifests(reports, 2)['assigned_tests'] == 8
     assert sorted(witness.read_text().splitlines()) == sorted(
         ['alpha', 'beta', 'gamma', 'delta', 'epsilon', 'zeta', 'eta', 'theta'])
+
+
+def test_late_lastfailed_wrapper_cannot_certify_unexecuted_tests(tmp_path):
+    reports, witness, results = _run_actual_shards(tmp_path, lastfailed=True)
+    for child in results:
+        assert child.returncode == 4, child.stdout
+        assert 'Unit shard final collection changed after assignment' in child.stdout
+    with pytest.raises(ValueError, match='No unit shard'):
+        verify_manifests(reports, 2)
+    assert not witness.exists(), 'A filtered shard started execution before final collection validation'
