@@ -71,6 +71,21 @@ other turn values come from the consumer context copied at Task construction;
 the tap does not rebind any part of the consumer's turn context by hand.
 Stopped, foreign, or unsuccessfully completed deliveries cannot admit work.
 
+`reserve_execution_stream()` reserves that original native producer before its
+parent admission closes, using the same forwarder as `execution_stream()`.
+Reservation does not advance the source: its first admitted consumer pull opens
+the dispatch gate. Every later consumer adds its custody to that same producer,
+including work already queued on a native executor. A lifecycle may derive its
+descendant factory inside the actually admitted producer; copying the original
+parent factory cannot authorize descendants after that parent begins closing.
+An invalid descendant lifecycle fails before source work. Callers must close a
+reserved stream even when it is never pulled. The forwarder retains one owned
+close operation across repeated or concurrent observers, preserving original
+admission and physical-close failures without closing the source twice. A
+reserved producer that never entered its body is joined before its acquired
+source is closed; an entered generator advances and closes in its original Task
+and context.
+
 Closing journal admission uses the original native parent-admission tree of a
 retained worker, not the writer-loan wait graph. Its admitted gather children can
 finish in the original journal; unrelated native siblings and copied-context

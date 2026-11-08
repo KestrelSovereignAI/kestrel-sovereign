@@ -1773,6 +1773,7 @@ class ExecutionStreamLifecycle:
     owner_factory: Callable
     owner_started: Callable
     require_work: Callable
+    descendant_lifecycle: Callable[[], "ExecutionStreamLifecycle"] | None = None
 
 
 _STREAM_LIFECYCLE: ContextVar[tuple[asyncio.Task, ExecutionStreamLifecycle] | None] = ContextVar("execution_stream_lifecycle", default=None)
@@ -1808,6 +1809,10 @@ class _ExecutionForwarder:
         # A deferred HTTP response may never be consumed at all.
         self._owner_context = context
         self._iterator = None
+        self._consumer_started = asyncio.Event()
+        self._producer_started = False
+        self._source_closed = False
+        self._close_operation = None
         inherited = _STREAM_LIFECYCLE.get()
         self._lifecycle = lifecycle if lifecycle is not None else (
             inherited[1] if inherited is not None and inherited[0] is asyncio.current_task() else None
@@ -1816,10 +1821,51 @@ class _ExecutionForwarder:
     def __aiter__(self):
         return self
 
-    async def __anext__(self):
+    def _retain_consumer_restrictions(self):
         additional = current_execution_custody(self._runtime_owner)
         self._scopes += tuple(scope for scope in additional if scope not in self._scopes)
         self._cleanup_state.scopes = self._scopes
+
+    async def _ensure_iterator(self):
+        if self._iterator is None:
+            from kestrel_sovereign._async_ownership import create_owned_iterator
+            from kestrel_sovereign.llm.call_progress import inherit_call_progress
+
+            inherit_call_progress(self._owner_context)
+            with self._turn_scope.bind():
+                self._iterator = await create_owned_iterator(
+                    self._produce, operation="execution-stream-forward",
+                    owner_context=self._owner_context,
+                    owner_factory=None if self._lifecycle is None else self._lifecycle.owner_factory,
+                    owner_started=None if self._lifecycle is None else self._lifecycle.owner_started,
+                )
+
+    async def _retire_failed_step(self, error):
+        try:
+            await self.aclose()
+        except BaseException as cleanup_error:
+            raise execution_terminal_error(error, cleanup_error, retain_originals=True, isolate_control_originals=True)
+        if not is_execution_control_error(error):
+            with _bind_captured_custody(self._scopes):
+                require_execution_work(self._runtime_owner)
+        raise error
+
+    async def reserve(self):
+        """Own the original worker now; leave payload dispatch to the first pull."""
+        if self._source_closed or self._source_exhausted or self._cleanup_state.requested:
+            raise ExecutionAuthorityError("closed execution stream cannot reserve native work")
+        self._retain_consumer_restrictions()
+        try:
+            with _bind_captured_custody(self._scopes):
+                if self._lifecycle is not None:
+                    self._lifecycle.require_work()
+                await self._ensure_iterator()
+        except BaseException as error:
+            await self._retire_failed_step(error)
+        return self
+
+    async def __anext__(self):
+        self._retain_consumer_restrictions()
         try:
             with _bind_captured_custody(self._scopes), bind_native_execution_admission_snapshot(self._native_admission):
                 if self._lifecycle is not None:
@@ -1828,19 +1874,8 @@ class _ExecutionForwarder:
                 # reentry only for validation, never across consumer delivery.
                 with self._turn_scope.bind():
                     await require_native_execution_admission(self._runtime_owner)
-                if self._iterator is None:
-                    from kestrel_sovereign._async_ownership import create_owned_iterator
-                    from kestrel_sovereign.llm.call_progress import (
-                        inherit_call_progress,
-                    )
-                    inherit_call_progress(self._owner_context)
-                    with self._turn_scope.bind():
-                        self._iterator = await create_owned_iterator(
-                            self._produce, operation="execution-stream-forward",
-                            owner_context=self._owner_context,
-                            owner_factory=None if self._lifecycle is None else self._lifecycle.owner_factory,
-                            owner_started=None if self._lifecycle is None else self._lifecycle.owner_started,
-                        )
+                await self._ensure_iterator()
+                self._consumer_started.set()
                 item = await anext(self._iterator)
                 require_execution_work(self._runtime_owner)
                 if self._lifecycle is not None:
@@ -1848,24 +1883,24 @@ class _ExecutionForwarder:
                 with self._turn_scope.bind():
                     await require_native_execution_admission(self._runtime_owner)
         except BaseException as error:
-            # Admission can fail while ENTERING the original binding, before
-            # the next native pull. The suspended producer still has to retire.
-            try:
-                await self.aclose()
-            except BaseException as cleanup_error:
-                raise execution_terminal_error(error, cleanup_error, retain_originals=True, isolate_control_originals=True)
-            if not is_execution_control_error(error):
-                with _bind_captured_custody(self._scopes):
-                    require_execution_work(self._runtime_owner)
-            raise error
+            # Admission can fail before the original source is advanced.
+            await self._retire_failed_step(error)
         return item
 
     async def _produce(self):
+        self._producer_started = True
         error = None
-        lifetime_token = _STREAM_LIFECYCLE.set(
-            None if self._lifecycle is None else (asyncio.current_task(), self._lifecycle)
-        )
+        lifetime_token = None
         try:
+            await self._consumer_started.wait()
+            inherited = self._lifecycle
+            if inherited is not None and inherited.descendant_lifecycle is not None:
+                inherited.require_work()
+                inherited = inherited.descendant_lifecycle()
+                if not isinstance(inherited, ExecutionStreamLifecycle):
+                    raise TypeError("native descendant stream lifecycle is unavailable")
+            lifetime_token = _STREAM_LIFECYCLE.set(
+                None if inherited is None else (asyncio.current_task(), inherited))
             with self._turn_scope.bind(), _bind_stream_cleanup((self._cleanup_state,)):
                 while True:
                     with _bind_captured_custody(self._scopes), bind_execution_runtime(self._runtime_owner), bind_native_execution_admission_snapshot(self._native_admission):
@@ -1888,7 +1923,8 @@ class _ExecutionForwarder:
             self._cleanup_state.requested = True
             raise
         finally:
-            _STREAM_LIFECYCLE.reset(lifetime_token)
+            if lifetime_token is not None:
+                _STREAM_LIFECYCLE.reset(lifetime_token)
             # Carrier admission itself can fail before source advancement.
             # Already-acquired handles still need physical cleanup in that case.
             close = getattr(self._source, "aclose", None)
@@ -1900,6 +1936,7 @@ class _ExecutionForwarder:
                         self._source_exhausted = False
                         self._cleanup_state.requested = True
                         raise execution_terminal_error(error, cleanup_error, retain_originals=True, isolate_control_originals=True)
+            self._source_closed = True
 
     async def aclose(self):
         # Normal EOF completes this source, not a queued child's independent
@@ -1907,11 +1944,43 @@ class _ExecutionForwarder:
         # synchronously before the source owner is cancelled.
         if not self._source_exhausted:
             self._cleanup_state.requested = True
-        await close_execution_stream(
-            self._runtime_owner,
-            self._source if self._iterator is None else self._iterator,
-            self._scopes,
-        )
+        from kestrel_sovereign._async_ownership import OwnedOperation
+
+        with bind_execution_cleanup(self._runtime_owner, self._scopes):
+            if self._close_operation is None:
+                self._close_operation = OwnedOperation(self._close(),
+                    retirement_resource=self, retain_originals=True)
+            outcome = await self._close_operation.observe()
+            error = execution_terminal_error(outcome.error, outcome.cancellation,
+                retain_originals=True, isolate_control_originals=True)
+            if error is not None:
+                raise error
+
+    async def _close(self):
+        error = None
+        try:
+            if self._iterator is None:
+                await self._close_unstarted_source()
+            else:
+                await close_execution_stream(self._runtime_owner, self._iterator, self._scopes)
+        except BaseException as caught:
+            error = caught
+        # A reserved owner can fail before entering _produce. Its completed
+        # Task then cannot run the source-closing finally. Never close a source
+        # concurrently with a live producer, or retry its failed physical close.
+        if (self._iterator is not None and not self._producer_started
+                and self._iterator.producer_task.done()):
+            try:
+                await self._close_unstarted_source()
+            except BaseException as cleanup_error:
+                raise execution_terminal_error(error, cleanup_error, retain_originals=True, isolate_control_originals=True)
+        if error is not None:
+            raise error
+
+    async def _close_unstarted_source(self):
+        if not self._source_closed:
+            await close_execution_stream(self._runtime_owner, self._source, self._scopes)
+            self._source_closed = True
 
 
 async def close_execution_stream(
@@ -1953,6 +2022,16 @@ def execution_stream(owner: Any, stream: AsyncIterator[Any], *, captured_custody
     ClosingStreamingResponse). Construction does not dispatch source work.
     """
     return _ExecutionForwarder(owner, stream, captured_custody, lifecycle=lifecycle)
+
+
+async def reserve_execution_stream(owner: Any, stream: AsyncIterator[Any], *, captured_custody: tuple[ExecutionCustody, ...] = (), lifecycle: ExecutionStreamLifecycle | None = None) -> AsyncIterator[Any]:
+    """Reserve the canonical source owner before the original admission retires.
+
+    No source payload runs until an admitted consumer pull. Later consumers
+    retain cumulative custody in this SAME owner. Callers must close the handle
+    even if no pull happens; failed native construction closes its source.
+    """
+    return await _ExecutionForwarder(owner, stream, captured_custody, lifecycle=lifecycle).reserve()
 
 
 turn_scoped(

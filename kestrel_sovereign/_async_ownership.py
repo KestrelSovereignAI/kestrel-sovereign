@@ -773,42 +773,55 @@ def owned_task_admission_error(resource, admission, failure):
     )
 
 
+class OwnedOperation:
+    """One lifecycle-retained operation and its original admission outcome.
+
+    Construction admits once. Every observer joins that exact native Task;
+    repeated or concurrent observations never retry its physical operation.
+    """
+
+    def __init__(self, operation, *, retirement_resource=None,
+                 retain_originals=False, name=None, context=None):
+        admission = OwnedTaskAdmission()
+        self._opening = None
+        try:
+            self._task = create_owned_task(
+                operation, retirement_resource=retirement_resource,
+                retain_originals=retain_originals, name=name, context=context,
+                admission=admission,
+            )
+        except BaseException as failure:
+            self._opening = owned_task_admission_error(retirement_resource, admission, failure)
+            self._task = admission.task
+
+    async def observe(self, **observation):
+        from kestrel_sovereign.execution_custody import execution_terminal_error
+
+        if self._task is None:
+            return OwnedTaskOutcome(None, self._opening, observation.get("pending_cancellation"))
+        if self._opening is None:
+            return await await_owned_task(self._task, **observation)
+        # Do not cancel a failed start gate into a substitute CancelledError.
+        outcome = await await_owned_task(
+            self._task, pending_cancellation=observation.get("pending_cancellation"))
+        return OwnedTaskOutcome(
+            outcome.result,
+            execution_terminal_error(self._opening, outcome.error, retain_originals=True,
+                                     isolate_control_originals=True),
+            outcome.cancellation,
+        )
+
+
 async def await_owned_operation(operation, *, retirement_resource=None,
                                 retain_originals=False, name=None, context=None,
                                 **observation):
     """Admit and physically join one operation, including publication failure.
 
-    This is only for an existing asynchronous join boundary. Bounded or
-    synchronous handoffs must instead inventory their explicit receipt in the
-    existing lifecycle owner. No registry, replacement Task, retry or new
-    observation deadline is introduced here.
+    Lifecycles that need multiple observers retain an OwnedOperation directly.
+    This convenience boundary uses the same original admission and join path.
     """
-    from kestrel_sovereign.execution_custody import execution_terminal_error
-    admission = OwnedTaskAdmission()
-    opening = None
-    try:
-        task = create_owned_task(
-            operation, retirement_resource=retirement_resource,
-            retain_originals=retain_originals, name=name, context=context,
-            admission=admission,
-        )
-    except BaseException as failure:
-        opening = owned_task_admission_error(retirement_resource, admission, failure)
-        task = admission.task
-        if task is None:
-            return OwnedTaskOutcome(None, opening, observation.get("pending_cancellation"))
-    if opening is None:
-        return await await_owned_task(task, **observation)
-    # Do not cancel the failed start gate into a substitute CancelledError.
-    outcome = await await_owned_task(
-        task, pending_cancellation=observation.get("pending_cancellation"),
-    )
-    return OwnedTaskOutcome(
-        outcome.result,
-        execution_terminal_error(opening, outcome.error, retain_originals=True,
-                                 isolate_control_originals=True),
-        outcome.cancellation,
-    )
+    return await OwnedOperation(operation, retirement_resource=retirement_resource,
+        retain_originals=retain_originals, name=name, context=context).observe(**observation)
 
 
 def owned_task_observation_control(outcome):
@@ -984,6 +997,11 @@ class OwnedAsyncIterator(Generic[_T]):
             return self._owner.exception()
         except asyncio.CancelledError as error:
             return error
+
+    @property
+    def producer_task(self) -> asyncio.Task[None]:
+        """Return the exact physical source owner, independently of its watcher."""
+        return self._owner
 
     @property
     def owner_task(self) -> asyncio.Task[None]:

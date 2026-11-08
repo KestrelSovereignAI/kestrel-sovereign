@@ -17,6 +17,7 @@ from kestrel_sovereign.storage.privacy_wrapper import ReentrantTransitionLock, b
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("reserved", [False, True], ids=["lazy", "reserved"])
 @pytest.mark.parametrize("eager", [False, True] if hasattr(asyncio, "eager_task_factory") else [False])
 @pytest.mark.parametrize("phase,factory_kind,first_kind", [
     (phase, factory, kind)
@@ -25,7 +26,7 @@ from kestrel_sovereign.storage.privacy_wrapper import ReentrantTransitionLock, b
     if phase != "owner-admission" or kind is None
     if phase != "privacy-completion" or factory == "privacy"
 ])
-async def test_native_constructor_failure_joins_all_original_tasks(tmp_path, factory_kind, first_kind, phase, eager):
+async def test_native_constructor_failure_joins_all_original_tasks(tmp_path, factory_kind, first_kind, phase, eager, reserved):
     db = await AsyncDatabase.sqlite(str(tmp_path / "stream-effects.db"))
     await db.execute("CREATE TABLE effects(id INTEGER)")
     first = (None if first_kind is None else OSError("original gate A")
@@ -93,7 +94,11 @@ async def test_native_constructor_failure_joins_all_original_tasks(tmp_path, fac
         if factory_kind == "privacy" else custom_factory)
     stream = execution_stream(None, source(), lifecycle=ExecutionStreamLifecycle(factory, started, lambda: None))
     loop.set_task_factory(native_factory)
-    reader = asyncio.create_task(anext(stream))
+    async def drive():
+        if reserved:
+            await stream.reserve()
+        return await anext(stream)
+    reader = asyncio.create_task(drive())
     try:
         done, _ = await asyncio.wait({reader}, timeout=1)
         assert reader in done, "constructor failure left its original reader blocked"
@@ -333,3 +338,217 @@ async def test_lazy_genai_stream_retains_original_creation_authority(tmp_path, f
                 await await_owned_task(create_owned_task(stream.aclose(), retain_originals=True))
         finally:
             await db.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('pull', [False, True], ids=['unpulled', 'pulled'])
+@pytest.mark.parametrize('deny', [False, True], ids=['live', 'retired'])
+async def test_public_reservation_defers_payload_and_joins_its_exact_original_owner(tmp_path, pull, deny):
+    from kestrel_sovereign.execution_custody import (
+        ExecutionCustody, ExecutionAuthorityError, ProcessRuntimeExecutionFence,
+        bind_execution_custody_snapshot, reserve_execution_stream,
+    )
+
+    path = tmp_path / 'reserved-native-source'
+    handle = path.open('w')
+    owners, bodies = [], []
+    class Source:
+        def __aiter__(self):
+            return self
+        async def __anext__(self):
+            bodies.append(asyncio.current_task())
+            handle.write('payload\n')
+            handle.flush()
+            return b'payload'
+        async def aclose(self):
+            handle.write('closed\n')
+            handle.close()
+
+    fence = ProcessRuntimeExecutionFence('owned-native-stream-reservation')
+    custody = ExecutionCustody(fence)
+    lifecycle = ExecutionStreamLifecycle(None, lambda iterator, task: owners.append((iterator, task)), lambda: None)
+    with bind_execution_custody_snapshot((custody,)):
+        stream = await reserve_execution_stream(None, Source(), lifecycle=lifecycle)
+    await asyncio.sleep(0)
+    assert not bodies and path.read_text() == ''
+    assert len(owners) == 1, 'Reservation did not retain exactly one original native producer'
+    original, = owners
+    iterator, task = original
+    if deny:
+        fence.retire()
+    if pull:
+        if deny:
+            with pytest.raises(ExecutionAuthorityError):
+                await anext(stream)
+        else:
+            assert await anext(stream) == b'payload'
+            assert bodies == [task]
+    await stream.aclose()
+    await stream.aclose()
+    assert task.done() and iterator.producer_task is task and iterator.owner_task.done()
+    assert path.read_text().splitlines() == (['payload', 'closed'] if pull and not deny else ['closed'])
+    with pytest.raises(ExecutionAuthorityError, match='closed execution stream'):
+        await stream.reserve()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('concurrent', [None, False, True], ids=['single', 'repeated', 'concurrent'])
+async def test_unstarted_reserved_source_keeps_one_original_failed_close(tmp_path, concurrent):
+    from kestrel_sovereign.execution_custody import reserve_execution_stream
+    from kestrel_sovereign._async_ownership import await_owned_operation
+
+    opening = OSError('original native producer start publication refused')
+    close_error = ExecutionCommitOutcomeError('unknown')
+    calls, entered, release = [], asyncio.Event(), asyncio.Event()
+    handle = (tmp_path / 'native-source-resource').open('w')
+    class Source:
+        def __aiter__(self):
+            return self
+        async def __anext__(self):
+            raise AssertionError('A refused original worker dispatched payload')
+        async def aclose(self):
+            calls.append(asyncio.current_task())
+            entered.set()
+            await release.wait()
+            if not handle.closed:
+                handle.write('original physical close\n')
+                handle.close()
+            raise close_error
+
+    loop, previous = asyncio.get_running_loop(), asyncio.get_running_loop().get_task_factory()
+    refused = False
+    class PublicationTask(asyncio.Task):
+        def add_done_callback(self, callback, *, context=None):
+            if getattr(callback, '__name__', '') == 'close_unstarted':
+                raise opening
+            return super().add_done_callback(callback, context=context)
+    def task_factory(loop, coroutine, **options):
+        nonlocal refused
+        operation = coroutine.cr_frame.f_locals.get('operation') if coroutine.cr_frame else None
+        if not refused and getattr(getattr(operation, 'cr_code', None), 'co_name', '') == 'run_owned':
+            refused = True
+            return PublicationTask(coroutine, loop=loop, **options)
+        return asyncio.Task(coroutine, loop=loop, **options)
+    def original_factory(body, context):
+        admission = OwnedTaskAdmission()
+        try:
+            return create_owned_task(body(), context=context, admission=admission, retain_originals=True)
+        except BaseException:
+            assert admission.task is not None
+            return admission.task
+
+    loop.set_task_factory(task_factory)
+    try:
+        stream = await reserve_execution_stream(None, Source(),
+            lifecycle=ExecutionStreamLifecycle(original_factory, lambda *_: None, lambda: None))
+    finally:
+        loop.set_task_factory(previous)
+    if concurrent is None:
+        release.set()
+    first = create_owned_task(await_owned_operation(stream.aclose(), retain_originals=True))
+    second = None
+    try:
+        if concurrent is not None:
+            await asyncio.wait_for(entered.wait(), 2)
+        if concurrent:
+            second = create_owned_task(await_owned_operation(stream.aclose(), retain_originals=True))
+        release.set()
+        observations = [(await await_owned_task(first)).result]
+        if concurrent is not None:
+            observations.append((await await_owned_task(second)).result if second is not None else
+                await await_owned_operation(stream.aclose(), retain_originals=True))
+    finally:
+        release.set()
+        await await_owned_task(first)
+        if second is not None:
+            await await_owned_task(second)
+    assert len(calls) == 1, 'Repeated observers executed the original failed physical source close again'
+    assert all(opening in tuple(_explicit_control_chain(item.error))
+        and close_error in tuple(_explicit_control_chain(item.error)) for item in observations)
+    assert (tmp_path / 'native-source-resource').read_text() == 'original physical close\n'
+
+
+@pytest.mark.asyncio
+async def test_reserved_native_producer_derives_descendants_while_original_parent_closes(tmp_path):
+    from kestrel_sovereign.execution_custody import reserve_execution_stream
+
+    lock, ready = ReentrantTransitionLock(), asyncio.Event()
+    streams, scopes, owners, descendants = [], [], [], []
+    path = tmp_path / 'original-native-descendant'
+
+    def lifecycle(factory):
+        def descendant():
+            descendants.append(asyncio.current_task())
+            assert lock.current_native_scope() is scopes[0]
+            return lifecycle(lock.capture_native_work_factory())
+        return ExecutionStreamLifecycle(
+            lambda body, context: factory(body, context=context),
+            lambda iterator, task: owners.append((iterator, task)), lambda: None,
+            descendant_lifecycle=descendant)
+
+    async def leaf():
+        assert lock.current_native_scope() is scopes[0]
+        path.write_text('original descendant physically completed')
+        yield b'descendant'
+
+    async def source():
+        child = execution_stream(None, leaf())
+        try:
+            yield await anext(child)
+        finally:
+            await child.aclose()
+
+    async def parent():
+        async with lock.policy_span():
+            scopes.append(lock.current_native_scope())
+            streams.append(await reserve_execution_stream(None, source(),
+                lifecycle=lifecycle(lock.capture_native_work_factory())))
+            ready.set()
+
+    original = create_owned_task(parent(), retain_originals=True)
+    try:
+        await asyncio.wait_for(ready.wait(), 2)
+        assert scopes[0].closing and not original.done()
+        assert not path.exists() and len(owners) == 1
+        stream, = streams
+        assert await anext(stream) == b'descendant'
+        await stream.aclose()
+        outcome = await await_owned_task(original)
+        assert outcome.error is None
+        assert len(owners) == 2 and descendants == [task for _, task in owners]
+        assert path.read_text() == 'original descendant physically completed'
+        assert not lock.locked() and not lock._native_scopes
+        assert all(task.done() and iterator.owner_task.done() for iterator, task in owners)
+    finally:
+        for stream in streams:
+            await stream.aclose()
+        await await_owned_task(original)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('returned', [None, object()], ids=['none', 'foreign-object'])
+async def test_reserved_native_descendant_lifecycle_refuses_invalid_result_before_payload(tmp_path, returned):
+    from kestrel_sovereign.execution_custody import reserve_execution_stream
+    from kestrel_sovereign._async_ownership import await_owned_operation
+
+    handle = (tmp_path / 'descendant-resource').open('w')
+    calls, owners = [], []
+    class Source:
+        def __aiter__(self):
+            return self
+        async def __anext__(self):
+            calls.append('payload')
+            handle.write('unauthorized payload')
+            return b'payload'
+        async def aclose(self):
+            calls.append('close')
+            handle.close()
+    stream = await reserve_execution_stream(None, Source(), lifecycle=ExecutionStreamLifecycle(
+        None, lambda iterator, task: owners.append((iterator, task)), lambda: None,
+        descendant_lifecycle=lambda: returned))
+    outcome = await await_owned_operation(anext(stream), retain_originals=True)
+    await await_owned_operation(stream.aclose(), retain_originals=True)
+    assert any(isinstance(error, TypeError) and 'descendant stream lifecycle' in str(error)
+        for error in _explicit_control_chain(outcome.error)), 'Invalid descendant lifecycle dispatched source payload'
+    assert calls == ['close'] and handle.closed
+    assert all(task.done() and iterator.owner_task.done() for iterator, task in owners)
