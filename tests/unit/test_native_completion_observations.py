@@ -16,15 +16,19 @@ from tests.unit.test_tool_effect_execution import owner as owner
 from tests.unit.test_tool_effect_invocation import governed
 
 
-def sqlite_commit_ack_loss(connection, table, *, after):
+def sqlite_commit_ack_loss(connection, table=None, *, after, ready=None):
     import aiosqlite
+    assert (table is None) != (ready is None), 'select one original commit readiness source'
     native_commit = aiosqlite.Connection.commit
     original, lost = OSError('original prebody SQLite COMMIT acknowledgment lost'), []
 
     async def lose_ack(target):
         if target is connection and not lost:
-            async with target.execute('SELECT COUNT(*) FROM ' + table) as cursor:
-                present = (await cursor.fetchone())[0]
+            if ready is not None:
+                present = ready()
+            else:
+                async with target.execute('SELECT COUNT(*) FROM ' + table) as cursor:
+                    present = (await cursor.fetchone())[0]
             if present:
                 lost.append(True)
                 if after:

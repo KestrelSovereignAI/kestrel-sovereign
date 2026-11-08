@@ -1242,3 +1242,180 @@ async def test_fresh_intent_requires_original_parent_native_membership(bound_ope
 
     await invoke(host, 'original admitted input', invocation_id='original-parent-native-membership')
     assert not witness.exists()
+
+
+@pytest.mark.parametrize('uncertain', [False, True], ids=['known-refusal', 'uncertain'])
+async def test_nested_claim_free_terminal_publishes_original_input_uncertainty(bound_operation, uncertain):
+    from kestrel_sdk.resources import ResourceConflict, ResourceOutcomeUnknown
+    from kestrel_sovereign.execution_custody import execution_evidence_carriers
+    from kestrel_sovereign.tools.effect_journal import current_tool_effect_turn, execute_tool_effect
+    from tests.unit.test_tool_effect_invocation import governed
+    host, _binding, witness = bound_operation
+    original = (ResourceOutcomeUnknown if uncertain else ResourceConflict)('original claim-free nested terminal')
+    seen = {}
+
+    async def nested(agent):
+        from kestrel_sovereign.tools.effect_invocation import ToolEffectOperation, journal_tool_operation
+        operation = ToolEffectOperation('claim-free-native-operation', 'claim-free-nested-input',
+            'original-host', 'original-pre-body-input', {}, 'original-session')
+        async with journal_tool_operation(agent, operation):
+            child = current_tool_effect_turn(agent)
+            assert child.native_root is seen['parent'].native_root is asyncio.current_task()
+            assert child.unconfirmed is seen['parent'].unconfirmed
+            assert await host.tool_effect_store.database.fetchone('SELECT COUNT(*) FROM tool_effect_claims') == (0,)
+            raise original
+
+    async def later():
+        witness.write_text('later parent effect')
+        return 'acknowledged'
+
+    @governed
+    async def invoke(agent, user_input, *, invocation_id=None):
+        seen['parent'] = current_tool_effect_turn(agent)
+        try:
+            await nested(agent)
+        except BaseException as error:
+            seen['nested_error'] = error
+        assert await host.tool_effect_store.database.fetchall(
+            'SELECT state,latched FROM tool_effect_operations ORDER BY rowid') == [('OPEN', 0), ('CLOSED', int(uncertain))]
+        try:
+            await execute_tool_effect(agent, registration='later-parent-after-claim-free', arguments={}, execute=later)
+        except BaseException as error:
+            seen['later_error'] = error
+
+    try:
+        await invoke(host, 'original parent input', invocation_id='parent-before-claim-free-terminal')
+    except BaseException as error:
+        seen['root_error'] = error
+    assert 'nested_error' in seen and any(node is original for node in execution_evidence_carriers(seen['nested_error']))
+    if uncertain:
+        assert not witness.exists(), 'claim-free nested terminal escaped the original input live fence'
+        assert len(seen['parent'].unconfirmed) == 1, 'the same original terminal was published more than once'
+        assert 'later_error' in seen and 'root_error' in seen
+        assert any(node is original for node in execution_evidence_carriers(seen['root_error']))
+        assert await host.tool_effect_store.database.fetchone('SELECT COUNT(*) FROM tool_effect_claims') == (0,)
+        assert await host.tool_effect_store.database.fetchall(
+            'SELECT state,latched FROM tool_effect_operations') == [('CLOSED', 1), ('CLOSED', 1)]
+    else:
+        assert witness.read_text() == 'later parent effect'
+        assert 'later_error' not in seen and 'root_error' not in seen
+        assert await host.tool_effect_store.database.fetchall('SELECT state FROM tool_effect_claims') == [('RETURNED_OK',)]
+
+
+@pytest.mark.parametrize('after', [False, True], ids=['before-commit', 'after-commit'])
+async def test_nested_close_commit_uncertainty_fences_original_parent(bound_operation, monkeypatch, after):
+    import aiosqlite
+    from kestrel_sovereign.execution_custody import execution_commit_outcome, execution_evidence_carriers
+    from kestrel_sovereign.tools.effect_invocation import ToolEffectOperation, journal_tool_operation
+    from kestrel_sovereign.tools.effect_journal import current_tool_effect_turn, execute_tool_effect
+    from tests.unit.test_native_completion_observations import sqlite_commit_ack_loss
+    from tests.unit.test_tool_effect_invocation import governed
+    host, _binding, witness = bound_operation
+    armed = []
+    original, lost, lose_ack = sqlite_commit_ack_loss(host.tool_effect_store.database.backend._connection,
+        after=after, ready=lambda: bool(armed))
+    seen = {}
+
+    async def later():
+        witness.write_text('later effect after nested close commit uncertainty')
+        return 'acknowledged'
+
+    @governed
+    async def invoke(agent, user_input, *, invocation_id=None):
+        operation = ToolEffectOperation('close-commit-operation', 'original-nested-close',
+            'original-host', 'original-input', {}, 'original-session')
+        try:
+            async with journal_tool_operation(agent, operation):
+                # Arm only after real admission. The same original native
+                # callback is captured before either journal is admitted; no
+                # extra SQL is issued inside the sealed terminal program.
+                armed.append(True)
+        except BaseException as error:
+            seen['nested_error'] = error
+            seen['published'] = tuple(current_tool_effect_turn(agent).unconfirmed)
+        try:
+            await execute_tool_effect(agent, registration='later-after-nested-close', arguments={}, execute=later)
+        except BaseException as error:
+            seen['later_error'] = error
+
+    monkeypatch.setattr(aiosqlite.Connection, 'commit', lose_ack)
+    try:
+        await invoke(host, 'original parent before close commit', invocation_id='parent-before-close-commit')
+    except BaseException as error:
+        seen['root_error'] = error
+    assert not witness.exists(), 'nested terminal COMMIT uncertainty escaped the original parent live fence'
+    assert lost == [True], [(type(error).__name__, str(error)) for error in execution_evidence_carriers(seen.get('nested_error'))]
+    assert all(name in seen for name in ['nested_error', 'later_error', 'root_error'])
+    assert seen['published'], 'nested terminal writer did not publish uncertainty before consumer handoff'
+    assert execution_commit_outcome(seen['nested_error']) == 'unknown'
+    assert any(node is original for node in execution_evidence_carriers(seen['root_error']))
+    assert await host.tool_effect_store.database.fetchone('SELECT COUNT(*) FROM tool_effect_claims') == (0,)
+
+
+@pytest.mark.parametrize('uncertain', [False, True], ids=['known-refusal', 'uncertain'])
+async def test_nested_terminal_fences_parent_before_native_retirement(bound_operation, monkeypatch, uncertain):
+    from kestrel_sdk.resources import ResourceConflict, ResourceOutcomeUnknown
+    from kestrel_sovereign._async_ownership import await_owned_task, create_owned_task
+    from kestrel_sovereign.execution_custody import execution_evidence_carriers
+    from kestrel_sovereign.tools.effect_invocation import ToolEffectOperation, journal_tool_operation
+    from kestrel_sovereign.tools.effect_journal import current_tool_effect_turn, execute_tool_effect
+    from tests.unit.test_native_completion_observations import write_required_denial_audit
+    from tests.unit.test_tool_effect_invocation import governed
+    host, _binding, witness = bound_operation
+    original = (ResourceOutcomeUnknown if uncertain else ResourceConflict)('original nested terminal before retirement')
+    entered, release, joining = asyncio.Event(), asyncio.Event(), asyncio.Event()
+    seen, lock = {}, host._get_privacy_transition_lock()
+    join = lock.join_native_scope
+
+    async def observe_join(scope, pending=None, *, root=None):
+        if root is seen.get('child_root') and pending is original:
+            joining.set()
+        return await join(scope, pending, root=root)
+
+    monkeypatch.setattr(lock, 'join_native_scope', observe_join)
+
+    async def audit():
+        entered.set()
+        await release.wait()
+        await write_required_denial_audit(host)
+
+    async def later():
+        witness.write_text('parent effect while original nested work is retiring')
+        return 'acknowledged'
+
+    async def nested():
+        operation = ToolEffectOperation('nested-draining-operation', 'original-nested-drain',
+            'original-host', 'original-input', {}, 'original-session')
+        async with journal_tool_operation(host, operation):
+            child = current_tool_effect_turn(host)
+            seen['child_root'] = child.native_root
+            lock.start_owned_native_work(audit, acquire_span=False)
+            await entered.wait()
+            raise original
+
+    @governed
+    async def invoke(agent, user_input, *, invocation_id=None):
+        child = create_owned_task(nested(), retain_originals=True)
+        try:
+            await asyncio.wait_for(joining.wait(), 5)
+            assert not child.done() and seen['child_root'] is not asyncio.current_task()
+            try:
+                await execute_tool_effect(agent, registration='parent-during-original-retirement', arguments={}, execute=later)
+            except BaseException as error:
+                seen['later_error'] = error
+        finally:
+            release.set()
+            seen['nested_outcome'] = await await_owned_task(child)
+
+    try:
+        await invoke(host, 'original parent during native retirement', invocation_id='parent-before-nested-native-retirement')
+    except BaseException as error:
+        seen['root_error'] = error
+    assert any(node is original for node in execution_evidence_carriers(seen['nested_outcome'].error))
+    if uncertain:
+        assert not witness.exists(), 'a known nested terminal admitted a parent effect while native retirement was pending'
+        assert 'later_error' in seen and 'root_error' in seen
+    else:
+        assert witness.read_text() == 'parent effect while original nested work is retiring'
+        assert 'later_error' not in seen and 'root_error' not in seen
+    assert await host.tool_effect_store.database.fetchone('SELECT COUNT(*) FROM a2a_tool_dispatches') == (1,)

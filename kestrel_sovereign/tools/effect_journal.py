@@ -64,6 +64,12 @@ def _record_uncertain_effect(turn, error: BaseException, *,
     return error
 
 
+def _record_terminal_uncertainty(turn, error: BaseException | None) -> None:
+    """Publish this journal's own terminal to its original input's live fence."""
+    if requires_tool_effect_reconciliation(error):
+        _record_uncertain_effect(turn, error)
+
+
 def record_tool_effect_completion_failure(owner, error: BaseException) -> BaseException:
     """Fence failed delivery without rewriting an acknowledged effect/audit."""
     turn = current_tool_effect_turn(owner)
@@ -164,6 +170,9 @@ class ToolEffectTurn:
                 self.privacy_scope.closing = True
             terminal = error
             try:
+                # Publish before the first cleanup await: a nested consumer
+                # cannot catch its own terminal and resume an unfenced parent.
+                _record_terminal_uncertainty(self, terminal)
                 while self.pending:
                     for completion, executor in tuple(self.pending.items()):
                         from kestrel_sovereign._async_ownership import owned_native_wait
@@ -180,15 +189,17 @@ class ToolEffectTurn:
                 # Keep borrowed outer privacy backing live for that writer.
                 terminal = await self.privacy_lock.join_native_scope(
                     self.privacy_scope, terminal, root=self.native_root)
+                _record_terminal_uncertainty(self, terminal)
                 try:
                     async with self.owner._get_durable_persistence_gate().shared_lock():
                         privacy = self.owner.privacy_config
                         if privacy is None:
                             raise ToolEffectJournalUnavailable("tool_effect_journal_unavailable")
                         if privacy.allows_persistent_storage():
-                            uncertain = bool(self.unconfirmed or requires_tool_effect_reconciliation(terminal))
+                            uncertain = bool(self.unconfirmed)
                             await self.store.finish(self.attempt, unconfirmed=uncertain)
                 except BaseException as finish_error:
+                    _record_terminal_uncertainty(self, finish_error)
                     terminal = execution_observation_error(terminal, finish_error,
                         prefer_cancellation=isinstance(terminal, asyncio.CancelledError))
                 # Keep original terminals and uncertain effects in one finite

@@ -2303,3 +2303,11 @@ precondition refusals still allow acknowledged clean readmission; they are not
 relabeled as uncertain business claims. Aggregated denial scopes preserve exact
 original scope identities and membership; finite composition does not promise
 a particular ordering for independent source errors.
+
+A journal publishes its own qualifying terminal into that shared live fence
+before its first retirement await, after joining native owners, and if the
+terminal writer fails. The fixed writer derives its persistent latch from the
+same fence. Claim-free SDK unknowns therefore cannot close a nested operation
+and then resume an unfenced parent, even on the same original Task or while
+native retirement remains pending. Repeated publication retains one original
+terminal carrier; known refusals remain recoverable.
