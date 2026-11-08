@@ -13,7 +13,7 @@ import pytest_asyncio
 from kestrel_sovereign.a2a.scope import NativeRecipientScope
 from kestrel_sovereign.storage.async_database import AsyncDatabase
 from kestrel_sovereign.tool_effect_store import (
-    ToolEffectAttemptClosed, ToolEffectAttemptSuperseded, ToolEffectClaimConflict, ToolEffectOperationConflict,
+    ToolEffectAttemptClosed, ToolEffectClaimConflict, ToolEffectOperationConflict,
     ToolEffectIntegrityError, ToolEffectReconciliationRequired, ToolEffectStore,
 )
 from kestrel_sdk.storage.database.interface import TransactionError
@@ -106,16 +106,18 @@ async def test_native_terminal_closes_original_without_admitting_cleanup_work(jo
     store, _, _ = journal
     first = await admit(store)
     await store.finish(first)
-    successor = await admit(store)
+    with pytest.raises(ToolEffectReconciliationRequired):
+        await admit(store)
+    successor = await admit(store, key='fresh-native-terminal-intention')
     scope = ExecutionCustody(ProcessRuntimeExecutionFence('owned-native-terminal'))
     with bind_execution_cleanup(store.database, (scope,)):
         await store.finish(first)
-    assert await store.database.fetchone('SELECT attempt_id,state FROM tool_effect_operations') == (successor.attempt_id, 'OPEN')
+    assert await store.database.fetchone('SELECT attempt_id,state FROM tool_effect_operations WHERE operation_digest=?', (successor.operation_digest,)) == (successor.attempt_id, 'OPEN')
     with bind_execution_cleanup(store.database, (scope,)):
         await store.finish(successor)
         with pytest.raises(ExecutionAuthorityError, match='cleanup-only'):
             await store.claim(successor, registration='forbidden', arguments={})
-    assert await store.database.fetchone('SELECT attempt_id,state FROM tool_effect_operations') == (successor.attempt_id, 'CLOSED')
+    assert await store.database.fetchone('SELECT attempt_id,state FROM tool_effect_operations WHERE operation_digest=?', (successor.operation_digest,)) == (successor.attempt_id, 'CLOSED')
     assert await store.database.fetchone('SELECT COUNT(*) FROM tool_effect_claims') == (0,)
 
 
@@ -247,7 +249,7 @@ async def test_replay_after_actual_effect_and_clean_database_restart_is_fenced(j
 
 
 @pytest.mark.asyncio
-async def test_zero_effect_supersession_fences_the_old_owner_and_changed_input_conflicts(journal):
+async def test_zero_effect_closure_keeps_its_key_consumed_and_changed_input_conflicts(journal):
     store, _, _ = journal
     name = os.fsdecode(b"report-\xff.txt")
     request = {"input": {"id": 10**30, "name": name}, "route": "chat"}
@@ -256,14 +258,15 @@ async def test_zero_effect_supersession_fences_the_old_owner_and_changed_input_c
     with pytest.raises(ToolEffectReconciliationRequired):
         await admit(store, request=reordered)
     await store.finish(old)
-    current = await admit(store, request=reordered)
-    assert old.operation_digest == current.operation_digest
+    with pytest.raises(ToolEffectReconciliationRequired):
+        await admit(store, request=reordered)
     assert await store.database.fetchval("SELECT COUNT(*) FROM tool_effect_operations") == 1
-    assert old.attempt_id != current.attempt_id
-    with pytest.raises(ToolEffectAttemptSuperseded):
+    with pytest.raises(ToolEffectAttemptClosed):
         await store.claim(old, registration="owned-tool", arguments={})
     with pytest.raises(ToolEffectOperationConflict):
         await admit(store, request={"input": {"id": 10**30 + 1, "name": name}, "route": "chat"})
+    current = await admit(store, key='fresh-zero-effect-intention', request=reordered)
+    assert old.operation_digest != current.operation_digest
     await store.claim(current, registration="owned-tool", arguments={})
 
 
@@ -280,7 +283,7 @@ async def test_every_effect_capable_claim_blocks_transport_replay(journal, termi
 
 
 @pytest.mark.asyncio
-async def test_not_executed_allows_new_attempt_but_terminal_claim_cannot_be_reopened(journal):
+async def test_not_executed_preserves_the_original_closed_intention(journal):
     store, _, _ = journal
     first = await admit(store)
     claim = await store.claim(first, registration="owned-tool", arguments={})
@@ -290,8 +293,10 @@ async def test_not_executed_allows_new_attempt_but_terminal_claim_cannot_be_reop
     with pytest.raises(ToolEffectReconciliationRequired):
         await admit(store)
     await store.finish(first)
-    second = await admit(store)
-    with pytest.raises(ToolEffectAttemptSuperseded):
+    with pytest.raises(ToolEffectReconciliationRequired):
+        await admit(store)
+    second = await admit(store, key='fresh-intention-after-not-executed')
+    with pytest.raises(ToolEffectAttemptClosed):
         await store.claim(first, registration="owned-tool", arguments={})
     await store.claim(second, registration="owned-tool", arguments={})
 
@@ -312,7 +317,7 @@ async def test_unknown_latch_stops_new_claims_while_original_parallel_claim_can_
 
 
 @pytest.mark.asyncio
-async def test_independent_connections_serialize_supersession_against_claim(journal):
+async def test_independent_connections_cannot_readmit_the_original_claim_owner(journal):
     first, reopen, cleanup = journal
     db = await reopen()
     cleanup.push_async_callback(db.close)
@@ -323,11 +328,8 @@ async def test_independent_connections_serialize_supersession_against_claim(jour
         first.claim(original, registration="owned-tool", arguments={}),
         admit(second), return_exceptions=True,
     )
-    # Either the original claim commits first, or the new attempt wins. Both
-    # owners must never obtain acknowledged admission for that logical effect.
-    assert sum(isinstance(value, (ToolEffectAttemptSuperseded, ToolEffectReconciliationRequired)) for value in results) == 1
-    if not isinstance(results[1], Exception):
-        await second.claim(results[1], registration="owned-tool", arguments={})
+    assert not isinstance(results[0], BaseException)
+    assert isinstance(results[1], ToolEffectReconciliationRequired)
     count, = await db.fetchone("SELECT COUNT(*) FROM tool_effect_claims")
     assert count == 1
 

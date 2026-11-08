@@ -50,7 +50,7 @@ from kestrel_sovereign.agent.invocation import (
 )
 from kestrel_sovereign.agent.request_lifecycle import (
     RequestCompletionDisposition,
-    bind_request_operation_if_supported,
+    capture_request_stream_binding_if_supported,
 )
 from kestrel_sovereign._async_ownership import create_owned_iterator
 from kestrel_sovereign.endpoints.closing_streaming_response import (
@@ -354,6 +354,7 @@ def get_router() -> APIRouter:
         )
         session = None
         try:
+            operation_binding = capture_request_stream_binding_if_supported(agent, request_id)
             if not setup_cancelled:
                 session = await bridge.get_or_create_session(
                     gateway_session_id=body.session_id,
@@ -446,11 +447,7 @@ def get_router() -> APIRouter:
                     cleanup_requested=lambda: agent.is_request_cancelled(
                         request_id
                     ),
-                )
-                bind_request_operation_if_supported(
-                    agent,
-                    request_id,
-                    agent_stream.owner_task,
+                    owner_started=operation_binding,
                 )
                 async for chunk in agent_stream:
                     # The iterator owner and this SSE serializer are separate

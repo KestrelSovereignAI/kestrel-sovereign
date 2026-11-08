@@ -1486,3 +1486,66 @@ async def test_independent_copied_input_key_cannot_reuse_live_parent_journal(bou
         assert await host.tool_effect_store.database.fetchone('SELECT COUNT(*) FROM tool_effect_operations') == (1,)
 
     await invoke(host, 'original input', invocation_id=same_key)
+
+
+@pytest.mark.parametrize('after', [False, True], ids=['before-commit', 'after-commit'])
+async def test_root_terminal_commit_loss_cannot_replay_after_database_restart(
+    bound_operation, native_tool_effect_agent, monkeypatch, after,
+):
+    import aiosqlite
+    from kestrel_sovereign.execution_custody import execution_commit_outcome, execution_evidence_carriers
+    from kestrel_sovereign.storage.db import SQLiteBackend
+    from kestrel_sovereign.tools.effect_journal import execute_tool_effect
+    from tests.unit.test_native_completion_observations import sqlite_commit_ack_loss
+    from tests.unit.test_tool_effect_invocation import governed
+
+    host, _binding, witness = bound_operation
+    database = host.tool_effect_store.database
+    path = (await database.fetchone('PRAGMA database_list'))[2]
+    assert path, 'restart probe requires the actual file-backed database'
+    armed, entered = [], []
+    original, lost, lose_ack = sqlite_commit_ack_loss(
+        database.backend._connection, after=after, ready=lambda: bool(armed))
+    replaying = False
+
+    @governed
+    async def invoke(agent, user_input, *, invocation_id=None):
+        entered.append(invocation_id)
+        if not replaying:
+            armed.append(True)
+            return 'claim-free original result'
+
+        async def physical_effect():
+            witness.write_text('effect after original terminal uncertainty')
+            return 'acknowledged'
+
+        return await execute_tool_effect(agent, registration='root-restart-effect',
+            arguments={}, execute=physical_effect)
+
+    monkeypatch.setattr(aiosqlite.Connection, 'commit', lose_ack)
+    with pytest.raises(BaseException) as failed:
+        await invoke(host, 'original claim-free input', invocation_id='root-terminal-restart')
+    assert lost == [True]
+    assert execution_commit_outcome(failed.value) == 'unknown'
+    assert any(error is original for error in execution_evidence_carriers(failed.value))
+    assert await database.fetchone('SELECT state,latched FROM tool_effect_operations') == (
+        'CLOSED' if after else 'OPEN', 0)
+    assert await database.fetchone('SELECT COUNT(*) FROM tool_effect_claims') == (0,)
+    await host.tool_effect_store.close()
+    await host.observability_store.close()
+    await host.llm_service.close()
+    await host._raw_storage.close()
+    backend = SQLiteBackend(path)
+    await backend.connect()
+    restarted = await native_tool_effect_agent(did=host.did, connected_backend=backend)
+    replaying = True
+    refused = False
+    try:
+        await invoke(restarted, 'original claim-free input', invocation_id='root-terminal-restart')
+    except ToolEffectReconciliationRequired:
+        refused = True
+    assert not witness.exists(), 'root terminal COMMIT uncertainty replayed a physical effect after restart'
+    assert refused and entered == ['root-terminal-restart'], 'original input reentered cognition after restart'
+    assert await invoke(restarted, 'original claim-free input', invocation_id='fresh-root-terminal-intent') == 'acknowledged'
+    assert witness.read_text() == 'effect after original terminal uncertainty'
+    assert await restarted.tool_effect_store.database.fetchone('SELECT COUNT(*) FROM tool_effect_operations') == (2,)

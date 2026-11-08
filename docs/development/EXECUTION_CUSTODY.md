@@ -2217,11 +2217,12 @@ caller's finite evidence without publishing that caller history into shared stat
 Tool-effect operation closure also certifies pre-claim work. A required audit
 can become uncertain before any business claim exists. The original native
 terminal writer persists that uncertainty in the operation latch without
-inventing a claim or changing an acknowledged business result. Readmission
-requires acknowledged clean CLOSED state, no latch and no effect-capable
-claims. An interrupted OPEN operation requires reconciliation even with zero
-claims; removing a SQL refusal or restarting cannot certify clean closure.
-A safely CLOSED claim-free/NOT_EXECUTED operation can admit a fresh attempt.
+inventing a claim or changing an acknowledged business result. An operation key
+is single use. Both interrupted OPEN and completed CLOSED operations require
+reconciliation on reuse, including claim-free and NOT_EXECUTED attempts. A
+physical CLOSED row cannot certify that the original caller observed its COMMIT
+acknowledgment. Removing a refusal or restarting cannot reopen that key. A new
+explicit intention receives a fresh key; it never supersedes the old attempt.
 
 Finite composition preserves the public SDK ResourceOutcomeUnknown type and
 the first uncertainty diagnostic in a fresh envelope. Its explicit cause keeps
@@ -2299,8 +2300,9 @@ counts reflect the actual SQL outcome; uncertainty never invents a business clai
 Operation uncertainty includes the Root's original SDK unknown-outcome, native
 commit outcome and unresolved native retirement debt, even if no individual
 business claimant populated the live uncertainty list. Known claim-free
-precondition refusals still allow acknowledged clean readmission; they are not
-relabeled as uncertain business claims. Aggregated denial scopes preserve exact
+precondition refusals retain their known classification and can be followed by
+a new explicit intention. They never authorize implicit reuse of the closed
+operation key or invent an uncertain business claim. Aggregated denial scopes preserve exact
 original scope identities and membership; finite composition does not promise
 a particular ordering for independent source errors.
 
@@ -2328,3 +2330,7 @@ the payload gate. The same inventory pairs that producer with its cancellation
 task, so Stop retains the existing final-item/cleanup handshake. Publication
 uses the captured delivery's cancellation generation and expires with that
 registration; it grants no input ownership to the foreign response driver.
+Chat and bridge capture the same stream-binding callback at original request
+registration. Neither deferred serializer may publish from copied context after
+the producer has started. Both publish the actual producer and its existing
+Stop watcher before opening the payload gate.

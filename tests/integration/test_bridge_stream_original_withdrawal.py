@@ -35,7 +35,7 @@ async def test_actual_bridge_stream_keeps_serializer_withdrawal(
 ):
     n = native_memory_owners
     started, source_retired = asyncio.Event(), asyncio.Event()
-    source_tasks, originals, withdrawals = [], [], []
+    source_tasks, source_generations, originals, withdrawals = [], [], [], []
     actual_terminal = bridge_router.execution_terminal_error
 
     def observed_terminal(*errors, **kwargs):
@@ -59,6 +59,8 @@ async def test_actual_bridge_stream_keeps_serializer_withdrawal(
 
         async def process_input_streaming(self, *args, **kwargs):
             source_tasks.append(asyncio.current_task())
+            source_generations.append(self._request_generation_for_current_task(
+                kwargs['request_id'], original_only=True))
             try:
                 started.set()
                 await asyncio.Event().wait()
@@ -114,6 +116,7 @@ async def test_actual_bridge_stream_keeps_serializer_withdrawal(
             request,
             BridgeRequest(message="component input", request_id=request_id),
         )
+        original_generation = agent._request_generation_for_current_task(request_id)
 
         async def serialize():
             return await anext(response.body_iterator)
@@ -129,6 +132,7 @@ async def test_actual_bridge_stream_keeps_serializer_withdrawal(
             and source_tasks
             and all(task.done() for task in source_tasks)
         )
+        assert source_generations == [original_generation], 'bridge producer lost original request binding'
         assert outcome.error is not None
         chain = tuple(_explicit_control_chain(outcome.error))
         if kind == "healthy":

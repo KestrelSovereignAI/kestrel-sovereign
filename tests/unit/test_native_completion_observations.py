@@ -701,9 +701,10 @@ async def write_required_denial_audit(owner):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize('native', [False, True])
-async def test_known_claim_free_refusal_still_allows_acknowledged_clean_readmission(owner, native):
+async def test_known_claim_free_refusal_retains_classification_and_requires_fresh_intent(owner, native):
     from kestrel_sdk.resources import ResourceConflict
     from kestrel_sovereign.execution_custody import ExecutionAuthorityError
+    from kestrel_sovereign.tool_effect_store import ToolEffectReconciliationRequired
     from tests.unit.test_tool_effect_execution import admit
     turn = await admit(owner, key='known-safe-claim-free-refusal')
     original = (ExecutionAuthorityError if native else ResourceConflict)('known admission refusal')
@@ -713,7 +714,9 @@ async def test_known_claim_free_refusal_still_allows_acknowledged_clean_readmiss
     assert caught.value is original
     assert await owner.tool_effect_store.database.fetchone('SELECT state,latched FROM tool_effect_operations') == ('CLOSED', 0)
     assert await owner.tool_effect_store.database.fetchone('SELECT COUNT(*) FROM tool_effect_claims') == (0,)
-    successor = await admit(owner, key='known-safe-claim-free-refusal')
+    with pytest.raises(ToolEffectReconciliationRequired):
+        await admit(owner, key='known-safe-claim-free-refusal')
+    successor = await admit(owner, key='fresh-explicit-intent-after-known-refusal')
     await successor.close()
 
 

@@ -47,7 +47,7 @@ class ToolEffectClaimConflict(NativeStoreConflict):
 
 
 class ToolEffectReconciliationRequired(NativeStoreConflict):
-    """Existing effects make replay unsafe, regardless of their reported result."""
+    """An existing operation cannot authorize another execution of its input."""
 
     def __init__(self, counts: dict[str, int]):
         super().__init__("tool effect operation requires reconciliation")
@@ -225,7 +225,7 @@ class ToolEffectStore(UnifiedStoreBase):
             (self.scope_digest, operation, attempt_id))
         attempt = ToolEffectAttempt(self.scope_digest, operation, attempt_id, terminal)
         async with self.write_transaction():
-            await self.database.execute(
+            created = await self.database.execute(
                 "INSERT INTO tool_effect_operations(scope_digest, operation_digest, request_digest, attempt_id, revision, state, latched) VALUES (?, ?, ?, ?, 0, 'OPEN', 0) ON CONFLICT(scope_digest, operation_digest) DO NOTHING",
                 (self.scope_digest, operation, request_digest, attempt.attempt_id),
             )
@@ -234,18 +234,15 @@ class ToolEffectStore(UnifiedStoreBase):
                 "UPDATE tool_effect_operations SET revision = revision + 1 WHERE scope_digest = ? AND operation_digest = ?",
                 (self.scope_digest, operation),
             )
-            row = await self.database.fetchone("SELECT request_digest, attempt_id, state, latched FROM tool_effect_operations WHERE scope_digest = ? AND operation_digest = ?", (self.scope_digest, operation))
+            row = await self.database.fetchone("SELECT request_digest FROM tool_effect_operations WHERE scope_digest = ? AND operation_digest = ?", (self.scope_digest, operation))
             if row[0] != request_digest:
                 raise ToolEffectOperationConflict("tool effect operation key has different input")
-            effect = await self.database.fetchone(
-                "SELECT 1 FROM tool_effect_claims WHERE scope_digest = ? AND operation_digest = ? AND state <> 'NOT_EXECUTED' LIMIT 1",
-                (self.scope_digest, operation),
-            )
-            # Only acknowledged clean closure certifies a claim-free attempt.
-            # An interrupted OPEN operation can include a required audit whose
-            # ACK was lost before any business-effect claim was created.
-            interrupted = row[1] != attempt.attempt_id and row[2] != 'CLOSED'
-            if effect is not None or interrupted or row[3]:
+            # CLOSED records a physical transition, not proof that its COMMIT
+            # acknowledgment reached the original caller. Every operation key
+            # is single use, including claim-free and NOT_EXECUTED closures.
+            # A new explicit intention requires a fresh key; no later writer
+            # or process restart may turn uncertain closure into readmission.
+            if created != 1:
                 raise ToolEffectReconciliationRequired(await self._counts(operation))
             await self.database.execute(
                 "UPDATE tool_effect_operations SET attempt_id = ?, state = 'OPEN', latched = 0 WHERE scope_digest = ? AND operation_digest = ?",

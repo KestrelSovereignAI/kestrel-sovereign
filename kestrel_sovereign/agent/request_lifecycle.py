@@ -58,8 +58,8 @@ def bind_request_operation_if_supported(
     return True
 
 
-def capture_request_operation_binding_if_supported(agent: object, request_id: str):
-    """Capture a real declared lifecycle publisher at original registration."""
+def capture_request_stream_binding_if_supported(agent: object, request_id: str):
+    """Capture one stream's producer and Stop handoff before response driving."""
     try:
         inspect.getattr_static(agent, "bind_request_operation")
     except AttributeError:
@@ -71,7 +71,12 @@ def capture_request_operation_binding_if_supported(agent: object, request_id: st
     capture = getattr(agent, "capture_request_operation_binding")
     if not callable(capture):
         raise TypeError("original request binding publisher must be callable")
-    return capture(request_id)
+    publish = capture(request_id)
+
+    def owner_started(iterator, producer):
+        publish(producer, cancel_via=iterator.owner_task)
+
+    return owner_started
 
 
 class RequestLifecycleMixin:

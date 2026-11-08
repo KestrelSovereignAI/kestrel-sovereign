@@ -216,7 +216,11 @@ async def test_registration_withdrawal_after_claim_ack_cannot_start_an_effect(ow
     await turn.close()
     assert not witness.exists()
     assert await owner.tool_effect_store.database.fetchone('SELECT state FROM tool_effect_claims') == ('NOT_EXECUTED',)
-    assert (await admit(owner)).attempt.attempt_id != turn.attempt.attempt_id
+    with pytest.raises(ToolEffectReconciliationRequired):
+        await admit(owner)
+    fresh = await admit(owner, key='fresh-intention-after-registration-withdrawal')
+    assert fresh.attempt.operation_digest != turn.attempt.operation_digest
+    await fresh.close()
 
 
 @pytest.mark.asyncio
