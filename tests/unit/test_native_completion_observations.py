@@ -689,6 +689,9 @@ async def test_original_uncertain_root_terminal_fences_claim_free_replay(owner, 
     assert original.__cause__ is cause
     assert await owner.tool_effect_store.database.fetchone('SELECT COUNT(*) FROM a2a_tool_dispatches') == (1,)
     assert await owner.tool_effect_store.database.fetchone('SELECT COUNT(*) FROM tool_effect_claims') == (0,)
+    assert await owner.tool_effect_store.database.fetchone(
+        'SELECT state,latched FROM tool_effect_operations') == ('CLOSED', 1), (
+        'Original root terminal uncertainty was not durably recorded')
     with pytest.raises(ToolEffectReconciliationRequired):
         await admit(owner, key='original-root-finalization-uncertainty')
 
