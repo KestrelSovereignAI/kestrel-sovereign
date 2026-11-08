@@ -814,6 +814,7 @@ async def test_partial_gather_admission_keeps_all_original_cleanup_writers(tmp_p
     lock = ReentrantTransitionLock()
     started = [asyncio.Event(), asyncio.Event()]
     stall = asyncio.Event()
+    second_retired = asyncio.Event()
     witness = tmp_path / 'original-sibling-cleanup'
     accepted = []
     publication_error = RuntimeError('original postaccept native publication refusal')
@@ -833,7 +834,9 @@ async def test_partial_gather_admission_keeps_all_original_cleanup_writers(tmp_p
         try:
             await stall.wait()
         finally:
-            await await_owned_task(accepted[1])
+            # This business acknowledgement is distinct from a direct Task
+            # join. The gather already owns BOTH original cleanup writers.
+            await second_retired.wait()
 
     async def second():
         started[1].set()
@@ -842,6 +845,7 @@ async def test_partial_gather_admission_keeps_all_original_cleanup_writers(tmp_p
         finally:
             async with lock:
                 witness.write_text('original sibling physically retired')
+            second_retired.set()
 
     async def third():
         await asyncio.gather(*(event.wait() for event in started))
