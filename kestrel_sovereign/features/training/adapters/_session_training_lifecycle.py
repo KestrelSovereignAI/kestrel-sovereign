@@ -88,6 +88,7 @@ from kestrel_sovereign._async_ownership import (
     await_owned_task,
     create_owned_task,
     owned_task_completion_error,
+    owned_native_completion,
     owned_task_error,
     raise_owned_outcome,
 )
@@ -595,18 +596,21 @@ class SessionTrainingLifecycle(Generic[SessionT]):
                 opening.cancel()
             await self._settle_rejected_opening(opening, error)
             raise AssertionError("rejected opening did not propagate")
-        if opening.cancelled():
-            original = owned_task_error(opening)
-            if is_tool_execution_terminal_error(original):
-                raise execution_terminal_error(
-                    original, retain_originals=True, isolate_control_originals=True,
+        try:
+            if opening.cancelled():
+                original = owned_task_error(opening)
+                if is_tool_execution_terminal_error(original):
+                    raise original
+                raise TrainingSubmissionError(
+                    f"{self._hooks.display_name} training adapter closed while "
+                    "starting a session",
+                    provider=self._hooks.provider_name,
                 )
-            raise TrainingSubmissionError(
-                f"{self._hooks.display_name} training adapter closed while "
-                "starting a session",
-                provider=self._hooks.provider_name,
-            )
-        return opening.result()
+            with owned_native_completion(opening):
+                return opening.result()
+        except BaseException as error:
+            await self._settle_rejected_opening(opening, error)
+            raise AssertionError("rejected opening did not propagate")
 
     async def _settle_rejected_opening(self, opening, cause: BaseException) -> None:
         """Join an accepted opening and release any unpublished session."""
@@ -618,7 +622,14 @@ class SessionTrainingLifecycle(Generic[SessionT]):
             # which this cancelled caller still owns the responsibility to
             # release, nor replace the observer's original native evidence.
             observations = [cause, outcome.error]
-            record = opening.result() if owned_task_error(opening) is None else None
+            record = None
+            if not opening.cancelled():
+                try:
+                    # The receipt can contain publication failure even though
+                    # the physical opening returned a live billable resource.
+                    record = opening.result()
+                except BaseException as physical:
+                    observations.append(owned_task_completion_error(opening, physical))
             if record is not None:
                 try:
                     release = self._ensure_release(record, ReleaseIntent.CANCEL)

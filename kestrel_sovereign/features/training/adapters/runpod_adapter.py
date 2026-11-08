@@ -12,7 +12,7 @@ import os
 from collections.abc import Awaitable, Mapping
 from typing import NoReturn, Optional
 
-from kestrel_sovereign.execution_custody import is_execution_control_error, require_execution_work
+from kestrel_sovereign.execution_custody import is_tool_execution_terminal_error, require_execution_work
 
 import httpx
 
@@ -85,7 +85,7 @@ async def _pod_action(action: Awaitable[object], pod_id: str) -> None:
     try:
         await action
     except Exception as error:
-        if is_execution_control_error(error):
+        if is_tool_execution_terminal_error(error):
             raise
         if not _is_pod_not_found(error):
             raise
@@ -109,7 +109,7 @@ async def _read_pod_status(
     try:
         observed = await asyncio.to_thread(get_status, pod_id)
     except Exception as error:
-        if is_execution_control_error(error):
+        if is_tool_execution_terminal_error(error):
             raise
         if _is_pod_not_found(error):
             return None, _POD_GONE
@@ -197,14 +197,14 @@ class RunPodTrainingAdapter:
                 from kestrel_cloud_runpod.manager import RunPodManager
                 self._manager = RunPodManager()
             except ImportError as e:
-                if is_execution_control_error(e):
+                if is_tool_execution_terminal_error(e):
                     raise
                 raise ProviderNotAvailableError(
                     f"RunPod manager not available — install kestrel-cloud-runpod "
                     f"to enable RunPod-as-training-provider: {e}"
                 )
             except Exception as e:
-                if is_execution_control_error(e):
+                if is_tool_execution_terminal_error(e):
                     raise
                 raise ProviderNotAvailableError(
                     f"Failed to initialize RunPod manager: {e}"
@@ -227,11 +227,11 @@ class RunPodTrainingAdapter:
             manager = self._get_manager()
             return manager is not None
         except (ProviderNotAvailableError, ImportError) as error:
-            if is_execution_control_error(error):
+            if is_tool_execution_terminal_error(error):
                 raise
             return False
         except Exception as error:
-            if is_execution_control_error(error):
+            if is_tool_execution_terminal_error(error):
                 raise
             logger.debug("RunPod availability check failed", exc_info=True)
             return False
@@ -448,17 +448,17 @@ class RunPodTrainingAdapter:
         except TrainingProviderError:
             raise
         except (httpx.HTTPError, ConnectionError, TimeoutError) as e:
-            if is_execution_control_error(e):
+            if is_tool_execution_terminal_error(e):
                 raise
             logger.error(f"RunPod training status network error: {e}")
             raise TrainingStatusError(f"Status check failed: {e}")
         except (KeyError, ValueError) as e:
-            if is_execution_control_error(e):
+            if is_tool_execution_terminal_error(e):
                 raise
             logger.error(f"RunPod training status parse error: {e}")
             raise TrainingStatusError(f"Status check failed: {e}")
         except Exception as e:
-            if is_execution_control_error(e):
+            if is_tool_execution_terminal_error(e):
                 raise
             logger.error(f"Failed to get RunPod training status: {e}", exc_info=True)
             raise TrainingStatusError(f"Status check failed: {e}")
@@ -498,12 +498,12 @@ class RunPodTrainingAdapter:
         except TrainingProviderError:
             raise
         except (httpx.HTTPError, ConnectionError, TimeoutError) as e:
-            if is_execution_control_error(e):
+            if is_tool_execution_terminal_error(e):
                 raise
             logger.error(f"RunPod LoRA download network error: {e}")
             raise DownloadError(f"Download failed: {e}")
         except Exception as e:
-            if is_execution_control_error(e):
+            if is_tool_execution_terminal_error(e):
                 raise
             logger.error(f"Failed to download RunPod LoRA weights: {e}", exc_info=True)
             raise DownloadError(f"Download failed: {e}")
@@ -551,7 +551,7 @@ class RunPodTrainingAdapter:
                     job_id, preparing_message=_HISTORICAL_PREPARING_MESSAGE
                 )
             except TrainingStatusError as error:
-                if is_execution_control_error(error):
+                if is_tool_execution_terminal_error(error):
                     raise
                 raise TrainingProviderError(
                     "Runpod cleanup was not confirmed for this unknown original "
@@ -600,12 +600,12 @@ class RunPodTrainingAdapter:
 
             return await manager.get_current_job(session)
         except (httpx.HTTPError, ConnectionError, TimeoutError) as e:
-            if is_execution_control_error(e):
+            if is_tool_execution_terminal_error(e):
                 raise
             logger.warning(f"Failed to check training status: {e}")
             return None
         except Exception as e:
-            if is_execution_control_error(e):
+            if is_tool_execution_terminal_error(e):
                 raise
             logger.warning(f"Failed to check training status: {e}", exc_info=True)
             return None

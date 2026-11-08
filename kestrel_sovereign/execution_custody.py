@@ -533,7 +533,9 @@ def execution_terminal_error(*errors: BaseException | None, retain_originals: bo
     present = tuple(error for error in errors if error is not None)
     if isolate_control_originals:
         retain_originals = True
-        if any(is_execution_control_error(error) for error in present):
+        # Delivery uncertainty also belongs to its original source. Isolation
+        # protects that graph without granting it Core control or authority.
+        if any(is_tool_execution_terminal_error(error) for error in present):
             unique = []
             for error in present:
                 if all(error is not prior for prior in unique):

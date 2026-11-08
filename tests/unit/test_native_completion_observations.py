@@ -222,6 +222,149 @@ async def test_original_release_uncertainty_never_replays_file_resource(tmp_path
         await run_blocking_operation(resource.close)
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", [None, "sdk", "audit"])
+@pytest.mark.parametrize("withdraw", [False, True])
+async def test_original_training_opening_receipt_releases_unpublished_file(tmp_path, monkeypatch, kind, withdraw):
+    from kestrel_sovereign._async_ownership import _retain_owned_admission_error
+    from kestrel_sovereign.execution_custody import ToolAuditUnconfirmedError
+    from kestrel_sovereign.features.training.adapters._session_training_lifecycle import (
+        SessionLifecycleTimeouts, SessionProviderHooks, SessionTrainingLifecycle,
+    )
+    from kestrel_sovereign.features.training.types import TrainingConfig
+    import kestrel_sovereign.features.training.adapters._session_training_lifecycle as module
+    original = (ResourceOutcomeUnknown("original opening publication uncertain") if kind == "sdk"
+        else ToolAuditUnconfirmedError("original opening audit uncertain"))
+    resources, released, openings = [], [], []
+    submitted = asyncio.Event()
+    async def acquire(*args):
+        resource = (tmp_path / "original-training-session").open("w")
+        resource.write("original acquired session")
+        resources.append(resource)
+        return resource
+    async def submit(*args):
+        submitted.set()
+        await asyncio.Event().wait()
+    async def release(resource):
+        resource.close()
+        released.append(resource)
+    lifecycle = SessionTrainingLifecycle(SessionProviderHooks(
+        provider_name="native-component", display_name="Native component",
+        acquire_session=acquire, session_id=lambda resource: resource.name,
+        submit_job=submit, release_session=release,
+    ), SessionLifecycleTimeouts(submission_drain=.5, release=.5, close=2))
+    create = module.create_owned_task
+    caller = asyncio.current_task()
+    def publish(task):
+        if kind is not None:
+            _retain_owned_admission_error(task, original)
+        if withdraw:
+            caller.cancel("original opening observer withdrew")
+    def create_with_publication(operation, **options):
+        task = create(operation, **options)
+        if options.get("name", "").startswith("native-component-training-open:"):
+            openings.append(task)
+            task.add_done_callback(publish)
+        return task
+    monkeypatch.setattr(module, "create_owned_task", create_with_publication)
+    observed = None
+    try:
+        try:
+            record = await lifecycle.start(job_id="original-opening", companion_id="native",
+                trigger_word="native", config=TrainingConfig(), avatar_data=b"original")
+        except BaseException as error:
+            observed = error
+        assert len(resources) == len(openings) == 1 and openings[0].done()
+        if kind is not None or withdraw:
+            assert observed is not None, "Successful acquisition discarded its original completion receipt"
+            if kind is not None:
+                assert original in tuple(execution_evidence_carriers(observed))
+            assert released == resources, "Rejected original acquisition lost its physically successful resource"
+            assert resources[0].closed and not lifecycle.records
+        else:
+            assert observed is None and record.session is resources[0] and not resources[0].closed
+    finally:
+        await lifecycle.close()
+        for resource in resources:
+            resource.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", [None, "sdk", "audit"])
+async def test_original_bounded_deadline_preserves_source_exception_graph(tmp_path, kind):
+    from kestrel_sovereign.execution_custody import ToolAuditUnconfirmedError
+    from kestrel_sovereign.features.training.adapters._session_training_lifecycle import SessionLifecycleTimeouts
+    lifecycle = native_training_component()
+    lifecycle._timeouts = SessionLifecycleTimeouts(submission_drain=.5, release=.02, close=2)
+    source = asyncio.CancelledError("original deadline cancellation")
+    cause = (ResourceOutcomeUnknown("original deadline effect uncertain") if kind == "sdk"
+        else ToolAuditUnconfirmedError("original deadline audit uncertain"))
+    source.__cause__ = cause if kind is not None else None
+    cause.__cause__ = ValueError("original provider diagnostic")
+    source_cause, cause_cause = source.__cause__, cause.__cause__
+    effect = tmp_path / "original-deadline-effect"
+    async def operation():
+        effect.write_text("one original physical operation")
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            raise source
+    observed = None
+    try:
+        await lifecycle._bounded(operation())
+    except BaseException as error:
+        observed = error
+    assert observed is not None and effect.read_text() == "one original physical operation"
+    assert source.__cause__ is source_cause, "Deadline observation mutated the original source cause"
+    assert cause.__cause__ is cause_cause
+    chain = tuple(execution_evidence_carriers(observed))
+    assert any(isinstance(error, TimeoutError) for error in chain)
+    if kind is not None:
+        assert source in chain and cause in chain
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", [None, "sdk", "audit"])
+@pytest.mark.parametrize("provider", ["vastai", "gcp", "runpod"])
+async def test_original_training_public_status_keeps_terminal_delivery(tmp_path, provider, kind):
+    from datetime import datetime, timezone
+    from kestrel_sovereign.execution_custody import ToolAuditUnconfirmedError, is_tool_execution_terminal_error
+    from kestrel_sovereign.features.training.adapters._session_training_lifecycle import SessionTrainingRecord, SessionJobPhase
+    from kestrel_sovereign.features.training.adapters.vastai_adapter import VastAITrainingAdapter
+    from kestrel_sovereign.features.training.adapters.gcp_compute_adapter import GCPComputeTrainingAdapter
+    from kestrel_sovereign.features.training.adapters.runpod_adapter import RunPodTrainingAdapter
+    from kestrel_sovereign.features.training.types import TrainingConfig, TrainingState
+    adapter = {"vastai": VastAITrainingAdapter, "gcp": GCPComputeTrainingAdapter,
+        "runpod": RunPodTrainingAdapter}[provider](manager=object())
+    original = (ResourceOutcomeUnknown("original submission uncertain") if kind == "sdk"
+        else ToolAuditUnconfirmedError("original submission audit uncertain"))
+    resource = (tmp_path / "original-status-resource").open("w")
+    resource.instance_id = 1
+    resource.instance_name = "original-status-resource"
+    resource.pod_id = "original-status-resource"
+    now = datetime.now(timezone.utc)
+    record = SessionTrainingRecord(job_id="original-status", companion_id="native", trigger_word="native",
+        config=TrainingConfig(), session=resource, created_at=now, started_at=now,
+        phase=SessionJobPhase.FAILED)
+    if kind is not None:
+        record.task_opening_errors["submission_task"] = original
+    adapter._lifecycle.records[record.job_id] = record
+    observed, result = None, None
+    try:
+        try:
+            result = await adapter.get_status(record.job_id)
+        except BaseException as error:
+            observed = error
+        if kind is None:
+            assert observed is None and result.state is TrainingState.FAILED
+        else:
+            assert is_tool_execution_terminal_error(observed), "Public training status erased original terminal classification"
+            assert original in tuple(execution_evidence_carriers(observed))
+        assert adapter._lifecycle.records[record.job_id] is record
+    finally:
+        resource.close()
+
+
 def sqlite_commit_ack_loss(connection, table=None, *, after, ready=None):
     import aiosqlite
     assert (table is None) != (ready is None), 'select one original commit readiness source'
