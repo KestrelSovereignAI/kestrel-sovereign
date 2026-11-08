@@ -249,7 +249,6 @@ class _CurrentVisualStepMutation(_OriginalResultCustody):
                 "Original current step native commit owner differs"
             )
         self._require_captured_native_lifetime()
-        self._native_backing.work_check()
         # The worker borrows the SAME original restrictions. It never creates
         # a Work scope, binds a replacement caller or enters ordinary SQL.
         for scope in self._backend_work_scopes:

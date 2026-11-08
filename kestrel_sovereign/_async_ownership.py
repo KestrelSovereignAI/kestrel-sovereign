@@ -794,14 +794,17 @@ class OwnedOperation:
                 )
             else:
                 self._task = owner_factory(operation, context, admission, retirement_resource)
-                if self._task is not admission.task:
+                if not isinstance(self._task, _NATIVE_TASK) or self._task is not admission.task:
                     raise TypeError("original operation factory did not retain its native admission")
                 opening = getattr(self._task, '_kestrel_owned_admission_error', None)
                 if opening is not None:
                     self._opening = owned_task_admission_error(retirement_resource, admission, opening)
         except BaseException as failure:
-            self._opening = owned_task_admission_error(retirement_resource, admission, failure)
-            self._task = admission.task
+            # Only a native Task is an accepted physical owner. A malformed
+            # factory publication cannot turn an arbitrary value into a receipt.
+            accepted = admission if isinstance(admission.task, _NATIVE_TASK) else OwnedTaskAdmission()
+            self._opening = owned_task_admission_error(retirement_resource, accepted, failure)
+            self._task = accepted.task
 
     @property
     def task(self):
@@ -813,7 +816,7 @@ class OwnedOperation:
         return self._opening
 
     async def observe(self, **observation):
-        from kestrel_sovereign.execution_custody import execution_terminal_error
+        from kestrel_sovereign.execution_custody import execution_observation_error
 
         if self._task is None:
             return OwnedTaskOutcome(None, self._opening, observation.get("pending_cancellation"))
@@ -824,8 +827,7 @@ class OwnedOperation:
             self._task, pending_cancellation=observation.get("pending_cancellation"))
         return OwnedTaskOutcome(
             outcome.result,
-            execution_terminal_error(self._opening, outcome.error, retain_originals=True,
-                                     isolate_control_originals=True),
+            execution_observation_error(self._opening, outcome.error),
             outcome.cancellation,
         )
 
@@ -1112,11 +1114,7 @@ class OwnedAsyncIterator(Generic[_T]):
 
     async def join_source_owners(self, *, closing=False):
         """Retain the source AND its original cancellation observer outcomes."""
-        from kestrel_sovereign.execution_custody import execution_terminal_error, execution_observation_error, is_execution_control_error
-        def compose(*errors):
-            if self._construction_error is not None:
-                return execution_observation_error(*errors)
-            return execution_terminal_error(*errors, retain_originals=True, isolate_control_originals=True)
+        from kestrel_sovereign.execution_custody import execution_observation_error, is_execution_control_error
         outcome = await await_owned_task(self._owner)
         watcher = await await_owned_task(self._cancellation_owner) if self._cancellation_owner is not None else None
         watcher_error = watcher.error if watcher is not None else None
@@ -1124,8 +1122,8 @@ class OwnedAsyncIterator(Generic[_T]):
             watcher_error = None  # The watcher's private Stop handoff, not reader withdrawal.
         result = OwnedTaskOutcome(
             outcome.result,
-            compose(self._terminal_error, outcome.error, watcher_error),
-            compose(outcome.cancellation, watcher.cancellation if watcher is not None else None),
+            execution_observation_error(self._terminal_error, outcome.error, watcher_error),
+            execution_observation_error(outcome.cancellation, watcher.cancellation if watcher is not None else None),
         )
         if (closing and (self._owner_cancelled_by_close or self._construction_error is not None)
                 and issubclass(type(result.error), asyncio.CancelledError)

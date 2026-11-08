@@ -108,6 +108,12 @@ in its inventory until the retained retirement task settles.
 
 Close suppresses only its own private interruption of an unentered producer;
 native admission/COMMIT failures and real observer withdrawals remain visible.
+Finite close observations use the canonical observation composer for ordinary
+errors too, preserving each retained source graph and excluding an earlier
+caller's withdrawal from later observers. Invalid cleanup factories must fail
+with resource debt: neither an absent return nor a published non-Task value is
+an admitted physical retirement owner. Repeated close retains an original
+cancellation carrying native control; it does not acknowledge that failure away.
 Writer restoration preserves a collected physical-close result alongside a
 later observer withdrawal. A terminal pull before close cannot discard an unentered producer's
 original admission failure; the closer observes the canonical source-owner

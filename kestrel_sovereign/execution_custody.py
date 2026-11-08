@@ -1905,10 +1905,9 @@ class _ExecutionForwarder:
     def terminal_error(self):
         from kestrel_sovereign._async_ownership import owned_task_error
         task = self.retirement_task
-        return execution_terminal_error(
+        return execution_observation_error(
             None if self._iterator is None else self._iterator.terminal_error,
-            owned_task_error(task) if task is not None and task.done() else None,
-            retain_originals=True, isolate_control_originals=True)
+            owned_task_error(task) if task is not None and task.done() else None)
 
     @property
     def cleanup_error(self):
@@ -1919,7 +1918,7 @@ class _ExecutionForwarder:
         try:
             await self.aclose()
         except BaseException as cleanup_error:
-            raise execution_terminal_error(error, cleanup_error, retain_originals=True, isolate_control_originals=True)
+            raise execution_observation_error(error, cleanup_error)
         if not is_execution_control_error(error):
             with _bind_captured_custody(self._scopes):
                 require_execution_work(self._runtime_owner)
@@ -2023,8 +2022,7 @@ class _ExecutionForwarder:
             self._reserve_close_owner()
             self._close_requested.set()
             outcome = await self._close_operation.observe()
-            error = execution_terminal_error(outcome.error, outcome.cancellation,
-                retain_originals=True, isolate_control_originals=True)
+            error = execution_observation_error(outcome.error, outcome.cancellation)
             if error is not None:
                 raise error
 
@@ -2078,7 +2076,7 @@ async def close_execution_stream(
     if callable(close):
         with bind_execution_cleanup(owner, captured):
             outcome = await await_owned_operation(close(), retirement_resource=stream, retain_originals=True)
-            error = execution_terminal_error(outcome.error, outcome.cancellation, retain_originals=True, isolate_control_originals=True)
+            error = execution_observation_error(outcome.error, outcome.cancellation)
             if error is not None:
                 raise error
 
@@ -2097,7 +2095,7 @@ async def owned_execution_stream(owner: Any, stream: AsyncIterator[Any]):
         try:
             await iterator.aclose()
         except BaseException as cleanup_error:
-            raise execution_terminal_error(error, cleanup_error, retain_originals=True, isolate_control_originals=True)
+            raise execution_observation_error(error, cleanup_error)
 
 
 def execution_stream(owner: Any, stream: AsyncIterator[Any], *, captured_custody: tuple[ExecutionCustody, ...] = (), lifecycle: ExecutionStreamLifecycle | None = None) -> AsyncIterator[Any]:

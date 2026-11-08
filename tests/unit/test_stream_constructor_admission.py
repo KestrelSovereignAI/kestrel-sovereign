@@ -1017,3 +1017,94 @@ async def test_native_retirement_owner_admission_refusal_retains_original_unclos
     finally:
         loop.set_task_factory(previous)
         handle.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('cancel', [False, True], ids=['live-observer', 'withdrawn-observer'])
+async def test_ordinary_close_source_never_retains_a_finite_observer_withdrawal(tmp_path, cancel):
+    from kestrel_sovereign._async_ownership import await_owned_operation
+    from kestrel_sovereign.execution_custody import execution_observer_cancellations
+
+    original = OSError('original ordinary native source close failed')
+    entered, release = asyncio.Event(), asyncio.Event()
+    handle = (tmp_path / 'ordinary-source-close').open('w')
+    attempts = []
+    class Source:
+        def __aiter__(self):
+            return self
+        async def __anext__(self):
+            raise AssertionError('Unpulled source dispatched payload')
+        async def aclose(self):
+            attempts.append(asyncio.current_task())
+            entered.set()
+            await release.wait()
+            handle.close()
+            raise original
+    stream = execution_stream(None, Source())
+    caller = create_owned_task(stream.aclose(), retain_originals=True)
+    try:
+        await entered.wait()
+        if cancel:
+            caller.cancel('first finite observer withdrew')
+            await asyncio.sleep(0)
+        release.set()
+        first = await await_owned_task(caller)
+        assert original in tuple(_explicit_control_chain(first.error))
+        assert original.__cause__ is None, 'Finite close observer mutated the retained ordinary source graph'
+        assert bool(execution_observer_cancellations(first.error)) == cancel
+        repeated = await await_owned_operation(stream.aclose(), retain_originals=True)
+        assert original in tuple(_explicit_control_chain(repeated.error))
+        assert not execution_observer_cancellations(repeated.error), 'Later close inherited an earlier observer withdrawal'
+        assert not execution_observer_cancellations(stream.terminal_error)
+        assert handle.closed and len(attempts) == 1
+    finally:
+        release.set()
+        await await_owned_task(caller)
+        if not handle.closed:
+            handle.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('mode', ['close', 'reserve', 'pull'])
+@pytest.mark.parametrize('returned', ['none', 'object', 'published-object', 'published-future'])
+async def test_cleanup_factory_must_return_an_actual_original_task(tmp_path, mode, returned):
+    from kestrel_sovereign._async_ownership import await_owned_operation
+    from kestrel_sovereign.execution_custody import execution_cleanup_debts
+
+    handle = (tmp_path / 'original-acquired-source-without-retirement-owner').open('w')
+    bodies, closes = [], []
+    class Source:
+        def __aiter__(self):
+            return self
+        async def __anext__(self):
+            bodies.append(asyncio.current_task())
+            handle.write('payload without admitted retirement')
+            handle.flush()
+            return b'payload'
+        async def aclose(self):
+            closes.append(asyncio.current_task())
+            handle.close()
+    source = Source()
+    def factory(body, context, admission, resource):
+        answer = None if returned == 'none' else object()
+        if returned == 'published-future':
+            answer = asyncio.get_running_loop().create_future()
+            answer.set_result(None)
+        if returned.startswith('published-'):
+            admission.task = answer
+        return answer
+    stream = execution_stream(None, source, lifecycle=ExecutionStreamLifecycle(
+        None, None, lambda: None, cleanup_factory=factory))
+    try:
+        operation = stream.aclose() if mode == 'close' else stream.reserve() if mode == 'reserve' else anext(stream)
+        outcome = await await_owned_operation(operation, retain_originals=True)
+        assert any(isinstance(error, TypeError) for error in _explicit_control_chain(outcome.error)), (
+            'Cleanup factory without an admitted Task reported successful ownership')
+        assert any(getattr(resource, '_source', None) is source and task is None
+            for resource, task in execution_cleanup_debts(outcome.error))
+        assert not bodies and not closes and not handle.closed, 'Invalid cleanup factory dispatched unowned source work'
+    finally:
+        if stream._iterator is not None:
+            await await_owned_operation(stream._iterator.aclose(), retain_originals=True)
+        if not handle.closed:
+            handle.close()
