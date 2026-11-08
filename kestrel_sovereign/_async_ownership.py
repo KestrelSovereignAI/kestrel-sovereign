@@ -231,6 +231,13 @@ class OwnedTaskAdmission:
     _completion_capture_registered: bool = field(default=False, repr=False)
     _canonical_wrapper_only: bool = field(default=False, repr=False)
     _wrapper_started: bool = field(default=False, repr=False)
+    _canonical_error: BaseException | None = field(default=None, repr=False)
+    _start_refused: bool = field(default=False, repr=False)
+
+    @property
+    def dispatch_refused(self) -> bool:
+        """The exact canonical wrapper can only retire its sealed failed gate."""
+        return self._start_refused and self._canonical_wrapper_only
 
 
 def cancel_owned_task(task: asyncio.Task) -> bool:
@@ -371,6 +378,9 @@ def create_owned_task(operation, *, name=None, context=None, retain_originals=Fa
                 execution_observation_error,
                 retained_execution_error,
             )
+            admission._canonical_error = execution_terminal_error(
+                error, retain_originals=retain_originals,
+            )
             observed = error
             try:
                 task = asyncio.current_task()
@@ -383,6 +393,7 @@ def create_owned_task(operation, *, name=None, context=None, retain_originals=Fa
                 task._kestrel_owned_terminal_error = observed
             except BaseException as publication:
                 observed = execution_observation_error(observed, publication)
+                admission._canonical_error = observed
                 raise observed
             raise
         finally:
@@ -403,6 +414,7 @@ def create_owned_task(operation, *, name=None, context=None, retain_originals=Fa
                         asyncio.current_task()._kestrel_owned_terminal_error = combined
                     except BaseException as cache_error:
                         combined = execution_observation_error(combined, cache_error)
+                    admission._canonical_error = combined
                     raise combined
     wrapper = run()
     def close_unstarted(_task):
@@ -438,6 +450,7 @@ def create_owned_task(operation, *, name=None, context=None, retain_originals=Fa
             finally:
                 if not gate.done():
                     gate.set_result(terminal)
+                admission._start_refused = not gate.cancelled() and gate.result() is not None
         return terminal
 
     creation_attempted = False
@@ -550,6 +563,11 @@ def create_owned_task(operation, *, name=None, context=None, retain_originals=Fa
         task._kestrel_owned_admission = admission
         task.add_done_callback(close_unstarted)
         admission._completion_capture_registered = True
+        # An eager factory can return an already-finished outer Task. Capture
+        # and close its unentered payload before exposing it to native awaiters;
+        # scheduling a done callback alone leaves the original C consumable.
+        if task.done():
+            close_unstarted(task)
         # An explicit context narrows the original ownership handoff. Resident
         # contexts deliberately carry no invocation coordinator. Routing still
         # cannot enroll anything unless the actual creator is an original member.
@@ -1432,6 +1450,15 @@ def owned_task_error(task: asyncio.Future[_T]) -> BaseException | None:
         physical = task.exception()
     except asyncio.CancelledError as cancellation:
         physical = cancellation
+    bare_cancellation = (
+        isinstance(physical, asyncio.CancelledError) and not physical.args
+        and physical.__cause__ is None and physical.__context__ is None
+    )
+    if (admission is not None and admission._canonical_wrapper_only
+            and admission._canonical_error is not None and bare_cancellation):
+        # Exact wrapper identity rules out an independent outer epilogue. Its
+        # own source receipt survives an earlier observer consuming native C.
+        physical = admission._canonical_error
     if admission is not None:
         # Composition can inspect a retirement debt naming THIS completed Task.
         # Its physical result is already harvested: expose that same snapshot
@@ -1440,19 +1467,22 @@ def owned_task_error(task: asyncio.Future[_T]) -> BaseException | None:
         physical = execution_terminal_error(physical, retain_originals=admission._retain_originals)
         admission._terminal_error = physical
     unobservable = None
-    if (admission is not None and not admission._completion_capture_registered
+    if (admission is not None
+            and (not admission._completion_capture_registered
+                 or (not admission._canonical_wrapper_only and bare_cancellation))
             and not (admission._canonical_wrapper_only and not admission._wrapper_started)
             and task.cancelled() and physical is not cached):
         from kestrel_sdk.resources import ResourceOutcomeUnknown
-        # A refused capture followed by a foreign native await can consume an
-        # independent physical C. Its exact lost graph is unrecoverable. Keep
+        # A foreign observer can consume an independent physical C even when
+        # our callback was registered. Its exact lost graph is unrecoverable. Keep
         # this original Task's observation debt; ordinary gate failure cannot
         # certify that the outer physical completion was ordinary or successful.
-        missing = ResourceOutcomeUnknown("original native completion is unobservable after callback publication refusal")
+        missing = ResourceOutcomeUnknown("original native completion is unobservable before owned capture")
         missing.__cause__ = admission.error
         unobservable = owned_task_admission_error(admission, admission, missing)
     error = execution_observation_error(
         admission.error if admission is not None else None,
+        admission._canonical_error if admission is not None else None,
         cached if cached is not _TASK_ERROR_UNSET else None,
         physical, unobservable,
     )

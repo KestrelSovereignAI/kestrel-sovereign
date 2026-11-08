@@ -1026,3 +1026,100 @@ async def test_native_cancellation_recovery_preserves_actual_writer_restoration_
     finally:
         release.set()
         await asyncio.gather(owner, *tasks, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", [
+    pytest.param("eager", marks=pytest.mark.skipif(sys.version_info < (3, 12), reason="native eager Task requires Python 3.12")),
+    pytest.param("eager-preconsumed", marks=pytest.mark.skipif(sys.version_info < (3, 12), reason="native eager Task requires Python 3.12")),
+    "prior-callback", "canonical-prior-callback",
+])
+@pytest.mark.parametrize("kind", [None, "plain", "sdk", "audit"])
+async def test_original_completion_capture_cannot_rely_on_callback_registration(tmp_path, mode, kind):
+    import inspect
+    from kestrel_sdk.resources import ResourceOutcomeUnknown
+    from kestrel_sovereign._async_ownership import OwnedTaskAdmission, owned_task_cancellation_error, owned_task_error
+    from kestrel_sovereign.execution_custody import (
+        ToolAuditUnconfirmedError, _explicit_control_chain, execution_cleanup_debts,
+        is_tool_execution_terminal_error,
+    )
+    original = asyncio.CancelledError("original outer completion before capture")
+    if kind in {"sdk", "audit"}:
+        original.__cause__ = (ResourceOutcomeUnknown("original outer effect uncertain") if kind == "sdk"
+            else ToolAuditUnconfirmedError("original outer audit uncertain"))
+    effect = tmp_path / "original-outer-completion-effect"
+    bodies, consumed, owners = [], [], []
+    async def operation():
+        bodies.append(asyncio.current_task())
+        effect.write_text("original physical effect completed once")
+        if kind is not None:
+            raise original
+        return "original outer success"
+    payload = operation()
+    admission = OwnedTaskAdmission()
+    loop, previous = asyncio.get_running_loop(), asyncio.get_running_loop().get_task_factory()
+    def consume(task):
+        if mode == "canonical-prior-callback":
+            task._kestrel_owned_terminal_error = None
+        try:
+            task.exception()
+        except asyncio.CancelledError as error:
+            consumed.append(error)
+    def factory(loop, coroutine, **options):
+        if mode == "canonical-prior-callback":
+            task = asyncio.Task(coroutine, loop=loop, **options)
+            owners.append(task)
+            task.add_done_callback(consume)
+            return task
+        async def outer():
+            if mode == "prior-callback":
+                await asyncio.sleep(0)
+            coroutine.close()
+            effect.write_text("original physical effect completed once")
+            if kind is not None:
+                raise original
+            return "original outer success"
+        if mode.startswith("eager"):
+            options["eager_start"] = True
+        task = asyncio.Task(outer(), loop=loop, **options)
+        owners.append(task)
+        if mode == "prior-callback":
+            task.add_done_callback(consume)
+        elif mode == "eager-preconsumed":
+            consume(task)
+        return task
+    try:
+        loop.set_task_factory(factory)
+        owner = create_owned_task(payload, admission=admission, retain_originals=True)
+        loop.set_task_factory(previous)
+        try:
+            value = await owner
+        except asyncio.CancelledError as received:
+            recovered = owned_task_cancellation_error(owner, received)
+        else:
+            assert kind is None and value == "original outer success"
+            recovered = owned_task_error(owner)
+        if kind is None:
+            assert recovered is None
+        elif mode in {"eager", "canonical-prior-callback"}:
+            assert recovered is original, (
+                "Scheduled completion capture lost an already-terminal original before native await")
+            assert is_tool_execution_terminal_error(recovered) is (kind in {"sdk", "audit"})
+        else:
+            assert consumed and consumed[0] is original
+            assert is_tool_execution_terminal_error(recovered), (
+                "Registered completion callback falsely certified a consumed original cancellation")
+            assert any(task is owner for _, task in execution_cleanup_debts(recovered)), (
+                "Unobservable original completion lost its exact native owner debt")
+            assert original not in tuple(_explicit_control_chain(recovered)), "Lost original identity was fabricated"
+        assert owned_task_error(owner) is recovered
+        assert (await await_owned_task(owner)).error is recovered
+        assert effect.read_text() == "original physical effect completed once"
+        assert len(bodies) == int(mode == "canonical-prior-callback")
+        assert len(owners) == 1 and owner.done()
+        assert inspect.getcoroutinestate(payload) == inspect.CORO_CLOSED
+    finally:
+        loop.set_task_factory(previous)
+        for owner in owners:
+            await await_owned_task(owner)
+        payload.close()

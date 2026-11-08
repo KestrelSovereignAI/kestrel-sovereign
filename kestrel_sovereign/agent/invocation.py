@@ -185,7 +185,8 @@ async def admit_request_operation(
     except BaseException as opening:
         if admission.task is not None:
             cancellation_token = object()
-            induced = not admission.task.done() and not admission.task.cancelling()
+            induced = (not admission.dispatch_refused and not admission.task.done()
+                       and not admission.task.cancelling())
             if induced:
                 admission.task.cancel(cancellation_token)
             outcome = await await_owned_task(admission.task)

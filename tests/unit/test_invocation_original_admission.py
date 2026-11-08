@@ -6,6 +6,7 @@ the decorated SQL component is not process_input, Agent READY or real cognition.
 import asyncio
 import inspect
 import json
+import sys
 
 import pytest
 
@@ -607,5 +608,97 @@ async def test_actual_stream_retirement_classifies_late_terminal_outcomes(tmp_pa
             await await_owned_operation(response.body_iterator.aclose(), retain_originals=True)
         AgentStreamTap.reset()
         handle.close()
+        await agent.llm_service.close()
+        await db.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", [
+    pytest.param("eager", marks=pytest.mark.skipif(sys.version_info < (3, 12), reason="native eager Task requires Python 3.12")),
+    pytest.param("eager-preconsumed", marks=pytest.mark.skipif(sys.version_info < (3, 12), reason="native eager Task requires Python 3.12")),
+    "prior-callback",
+])
+@pytest.mark.parametrize("kind", [None, "sdk", "audit"])
+@pytest.mark.parametrize("stop", [False, True])
+async def test_actual_invocation_retains_eager_or_preobserved_original_completion(tmp_path, monkeypatch, mode, kind, stop):
+    from kestrel_sdk.resources import ResourceOutcomeUnknown
+    from kestrel_sovereign.agent.invocation import InvocationCancelledError
+    from kestrel_sovereign.execution_custody import (
+        ToolAuditUnconfirmedError, _explicit_control_chain, execution_cleanup_debts,
+        is_tool_execution_terminal_error,
+    )
+    monkeypatch.setattr("kestrel_sovereign.entrypoints.discover_entry_point_classes", lambda *_args, **_kwargs: {})
+    agent, db = await _partial_native_agent(tmp_path, monkeypatch)
+    await db.execute("CREATE TABLE eager_original_payload_effects (id INTEGER)")
+    request_id = "original-eager-invocation"
+    original = asyncio.CancelledError("original eager invocation physical failure")
+    if kind is not None:
+        original.__cause__ = (ResourceOutcomeUnknown("original eager external effect uncertain") if kind == "sdk"
+            else ToolAuditUnconfirmedError("original eager audit uncertain"))
+    effect = tmp_path / "actual-original-eager-invocation-effect"
+    original_owners, generations, consumed = [], [], []
+    @bind_async_invocation("request_id", track_request_lifecycle=True)
+    async def invoke(self, request_id=None):
+        await db.execute("INSERT INTO eager_original_payload_effects VALUES (1)")
+        return "payload must stay unentered"
+    loop, previous = asyncio.get_running_loop(), asyncio.get_running_loop().get_task_factory()
+    def consume(task):
+        try:
+            task.exception()
+        except asyncio.CancelledError as error:
+            consumed.append(error)
+    def factory(loop, coroutine, **options):
+        operation = _actual_operation(coroutine)
+        code = getattr(operation, "cr_code", None)
+        if code is None or not code.co_qualname.endswith(".run_isolated_operation"):
+            return previous(loop, coroutine, **options) if previous else asyncio.Task(coroutine, loop=loop, **options)
+        async def outer():
+            if mode == "prior-callback":
+                await asyncio.sleep(0)
+            generations.append(agent._active_request_generations[request_id])
+            coroutine.close()
+            effect.write_text("original native outer effect completed once")
+            if stop:
+                assert agent.cancel_current_request(request_id)
+            if kind is not None:
+                raise original
+            return "original outer success"
+        if mode.startswith("eager"):
+            options["eager_start"] = True
+        task = asyncio.Task(outer(), loop=loop, **options)
+        original_owners.append(task)
+        if mode == "prior-callback":
+            task.add_done_callback(consume)
+        elif mode == "eager-preconsumed":
+            consume(task)
+        return task
+    try:
+        loop.set_task_factory(factory)
+        outcome = await await_owned_task(create_owned_task(
+            invoke(agent, request_id=request_id), retain_originals=True))
+        loop.set_task_factory(previous)
+        if kind is None:
+            if stop:
+                assert isinstance(outcome.error, InvocationCancelledError)
+            else:
+                assert outcome.error is outcome.cancellation is None and outcome.result == "original outer success"
+        else:
+            assert is_tool_execution_terminal_error(outcome.error), (
+                "Eager or preobserved original uncertainty became typed invocation Stop")
+            if mode == "eager":
+                assert original in tuple(_explicit_control_chain(outcome.error))
+            else:
+                assert consumed and consumed[0] is original
+                assert any(task is original_owners[0] for _, task in execution_cleanup_debts(outcome.error))
+        assert await agent.wait_for_request_completion(request_id, generation=generations[0]) is (
+            RequestCompletionDisposition.COMPLETED if kind is None else RequestCompletionDisposition.ABANDONED), (
+                "Eager or preobserved original uncertainty retired as completed")
+        assert effect.read_text() == "original native outer effect completed once"
+        assert len(original_owners) == 1 and original_owners[0].done()
+        assert await db.fetchval("SELECT COUNT(*) FROM eager_original_payload_effects") == 0
+    finally:
+        loop.set_task_factory(previous)
+        for task in original_owners:
+            await await_owned_task(task)
         await agent.llm_service.close()
         await db.close()

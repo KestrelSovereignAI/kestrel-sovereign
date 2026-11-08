@@ -56,11 +56,23 @@ the original admission failure, even if that diagnostic cache is unavailable.
 Multiple failed publications compose into that same receipt. Its terminal
 snapshot also reconciles the physical task exception, so an earlier diagnostic
 body-error cache cannot hide a later completion-publication failure. The original
-creator's first completion callback captures even a cancelled physical Task,
-before an unrelated native await can consume its original exception. All later
-readers use that one terminal receipt and the creator's original error policy.
+creator synchronously captures an already-finished Task before exposing it;
+pending Tasks retain a completion callback. The canonical wrapper records its
+own failure on that same receipt before publishing diagnostic attributes. An
+earlier foreign observer of an outer factory Task can still consume native
+cancellation evidence: callback registration alone cannot certify observation.
+If that original physical outcome cannot be recovered, the receipt retains
+explicit uncertainty and retirement debt naming the exact original Task. All
+later readers use that one terminal receipt and the creator's error policy.
 A caller that directly awaits the native Task must recover its completed receipt
 with `owned_task_error` before classifying a cause-free cancellation as Stop.
+Failed request admission joins a positively identified canonical wrapper whose
+start gate already holds the refusal; it does not inject another cancellation
+into that sealed gate. An opaque outer factory has no such proof. Durable
+settlement uses the same original completion reader and shared terminal
+classifier: SDK or audit uncertainty abandons its registration. Failed
+settlement publication omits only its authenticated private cancellation and
+retains every independent physical completion failure.
 Invocation uses this same canonical reader while retaining native await
 cancellation delivery, rather than adding a second observation or source owner.
 Iterator terminal inspection uses that same canonical task reader, including

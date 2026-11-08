@@ -1593,7 +1593,9 @@ class SignalDispatcher:
         async def await_settlement_release() -> None:
             await settlement_release.wait()
 
-        from kestrel_sovereign._async_ownership import await_owned_task
+        from kestrel_sovereign._async_ownership import (
+            await_owned_task, cancel_owned_task, is_owned_task_cancellation,
+        )
         from kestrel_sovereign.agent.invocation import admit_request_operation
         operation = None
         completion_callback = None
@@ -1617,7 +1619,7 @@ class SignalDispatcher:
                 from kestrel_sovereign._async_ownership import owned_task_error
                 owner_error = owned_task_error(completed_owner)
                 unresolved_control = (
-                    owner_error is not None and is_execution_control_error(owner_error)
+                    owner_error is not None and is_tool_execution_terminal_error(owner_error)
                 )
                 # Race matrix for the single release invariant:
                 #
@@ -1665,11 +1667,11 @@ class SignalDispatcher:
             if completion_callback is not None:
                 owner.remove_done_callback(completion_callback)
             if operation is not None:
-                operation.cancel()
+                cancel_owned_task(operation)
                 outcome = await await_owned_task(operation)
                 opening = execution_finite_error(
                     opening,
-                    outcome.error if is_execution_control_error(outcome.error) else None,
+                    None if is_owned_task_cancellation(operation, outcome.error) else outcome.error,
                     outcome.cancellation, retain_originals=True,
                     prefer_cancellation=True, isolate_control_originals=True,
                 )
