@@ -953,7 +953,7 @@ async def test_close_observer_retains_native_outcome_through_original_writer_res
 @pytest.mark.asyncio
 @pytest.mark.parametrize('publication', ['allocate', 'accepted-start'])
 async def test_native_retirement_owner_admission_refusal_retains_original_unclosed_resource(tmp_path, publication):
-    from kestrel_sovereign.execution_custody import reserve_execution_stream, execution_cleanup_debts
+    from kestrel_sovereign.execution_custody import execution_cleanup_debts
     from kestrel_sovereign._async_ownership import await_owned_operation
 
     lock, owners, bodies, accepted = ReentrantTransitionLock(), [], [], []
@@ -993,18 +993,27 @@ async def test_native_retirement_owner_admission_refusal_retains_original_unclos
                     retirement_resource=resource, acquire_span=False)
             lifecycle = ExecutionStreamLifecycle(lambda body, context: native(body, context=context),
                 lambda iterator, task: owners.append(task), lambda: None, cleanup_factory=cleanup)
+            stream = execution_stream(None, source, lifecycle=lifecycle)
             loop.set_task_factory(factory)
             try:
-                outcome = await await_owned_operation(reserve_execution_stream(None, source, lifecycle=lifecycle), retain_originals=True)
+                outcome = await await_owned_operation(stream.reserve(), retain_originals=True)
+                loop.set_task_factory(previous)
+                assert refusal in tuple(_explicit_control_chain(outcome.error)), (
+                    'Failed retirement admission dispatched an original producer')
+                debts = execution_cleanup_debts(outcome.error)
+                assert any(getattr(resource, '_source', None) is source for resource, task in debts), (
+                    'Failed retirement admission discarded its original acquired source')
+                assert not handle.closed and not owners and not bodies
+                assert len(accepted) == (publication == 'accepted-start')
+                assert all(task.done() for task in accepted)
             finally:
                 loop.set_task_factory(previous)
-            assert refusal in tuple(_explicit_control_chain(outcome.error))
-            debts = execution_cleanup_debts(outcome.error)
-            assert any(getattr(resource, '_source', None) is source for resource, task in debts), (
-                'Failed retirement admission discarded its original acquired source')
-            assert not handle.closed and not owners and not bodies
-            assert len(accepted) == (publication == 'accepted-start')
-            assert all(task.done() for task in accepted)
+                # Even a broken admission guard must not strand its original
+                # accepted producer in the fixture's native parent lifetime.
+                # Dispose that exact iterator; the failed retirement receipt
+                # and acquired-source handle above remain unacknowledged.
+                if stream._iterator is not None:
+                    await await_owned_operation(stream._iterator.aclose(), retain_originals=True)
     finally:
         loop.set_task_factory(previous)
         handle.close()
