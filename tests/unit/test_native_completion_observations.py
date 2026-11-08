@@ -219,8 +219,21 @@ async def test_failed_native_codex_callback_notifies_only_its_original_turn(priv
         unregister = client.register_server_request_handler('item/tool/call', handler, thread_id='original-thread')
         try:
             loop.set_task_factory(refuse_after_acceptance)
-            client._dispatch({'id': 41, 'method': 'item/tool/call', 'params': {'threadId': 'original-thread'}})
-            loop.set_task_factory(prior)
+            escaped = None
+            try:
+                client._dispatch({'id': 41, 'method': 'item/tool/call', 'params': {'threadId': 'original-thread'}})
+            except BaseException as error:
+                escaped = error
+            finally:
+                loop.set_task_factory(prior)
+            if escaped is not None:
+                # A broken producer can strand this test's exact accepted gate.
+                # Dispose only these owned Tasks before asserting the escape;
+                # a pytest timeout is not evidence that the guard caught it.
+                for task in tuple(scope.tasks):
+                    task.cancel('dispose fixture-owned unadmitted callback')
+                    await await_owned_task(task)
+            assert escaped is None, 'native callback publication escaped resident dispatch'
             for task in tuple(scope.tasks):
                 await await_owned_task(task)
             await asyncio.sleep(0)

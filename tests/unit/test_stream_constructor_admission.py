@@ -101,12 +101,10 @@ async def test_native_constructor_failure_joins_all_original_tasks(tmp_path, fac
             await reader
         assert accepted and all(task.done() for task in accepted), "constructor returned with an unjoined original Task"
         chain = tuple(_explicit_control_chain(caught.value))
-        if factory_kind == "privacy" and phase == "privacy-completion" and first is not None:
-            # The earlier failed canonical gate never reaches privacy's later
-            # publication. Fail-fast returns that exact failed Task instead.
-            assert second not in chain
-        else:
-            assert second in chain
+        # Even a failed start gate retains its actual native ownership.
+        # A later failed publication is another real original, not permission
+        # to discard either failure or enter the body behind the failed gate.
+        assert second in chain, "original native publication error was discarded"
         if phase == "join-publication":
             assert third in chain and third.__cause__ is None
         if first is not None:
